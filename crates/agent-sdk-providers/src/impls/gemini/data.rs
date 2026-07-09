@@ -218,6 +218,19 @@ const GEMINI_STRIPPED_SCHEMA_KEYS: [&str; 6] = [
 /// document anyway.
 const GEMINI_MAX_REF_DEPTH: usize = 64;
 
+/// Schema keywords whose value is a map of arbitrary *member name* → subschema
+/// (a `{ name: schema }` object), as opposed to a nested schema-keyword object.
+///
+/// The member **names** here are user data, not schema keywords: a property can
+/// legitimately be called `title`, `additionalProperties`, `enum`, `$ref`, etc.
+/// Those names must be preserved verbatim — only each member's subschema *value*
+/// is sanitized. Recursing into these maps with the generic keyword-strip pass
+/// would silently delete a property literally named `title` (a
+/// [`GEMINI_STRIPPED_SCHEMA_KEYS`] entry) while a sibling `required` array still
+/// referenced it, which makes Gemini 400 the entire `generateContent` request
+/// with `properties[...].required[i]: property is not defined`.
+const GEMINI_NAMED_SUBSCHEMA_MAPS: [&str; 2] = ["properties", "patternProperties"];
+
 /// Resolve a local JSON-pointer `$ref` (`#/$defs/Name` or
 /// `#/definitions/Name`) to its definition name.
 fn resolve_local_ref_name(reference: &str) -> Option<&str> {
@@ -241,6 +254,44 @@ fn collect_schema_defs(schema: &serde_json::Value) -> serde_json::Map<String, se
     defs
 }
 
+/// Sanitize one `key: value` entry of a schema object into `out`.
+///
+/// Shared by both the plain object walk and the `$ref`-merge path so member-name
+/// preservation and keyword stripping stay identical on both. Stripped keys
+/// (and unresolved `$ref`) are dropped. For a [`GEMINI_NAMED_SUBSCHEMA_MAPS`]
+/// key (`properties` / `patternProperties`) the value is a `{ name: subschema }`
+/// map whose **names** are preserved verbatim while each subschema is sanitized;
+/// every other value is sanitized generically.
+fn insert_sanitized_entry(
+    out: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    val: &serde_json::Value,
+    defs: &serde_json::Map<String, serde_json::Value>,
+    depth: usize,
+) {
+    // `$ref` is dropped here only when it could not be resolved by the caller;
+    // leaving it would point at a stripped `$defs` target.
+    if key == "$ref" || GEMINI_STRIPPED_SCHEMA_KEYS.contains(&key) {
+        return;
+    }
+    let sanitized = if GEMINI_NAMED_SUBSCHEMA_MAPS.contains(&key)
+        && let serde_json::Value::Object(members) = val
+    {
+        let mut sanitized_members = serde_json::Map::with_capacity(members.len());
+        for (member_name, subschema) in members {
+            // Preserve the member NAME verbatim; only sanitize its subschema.
+            sanitized_members.insert(
+                member_name.clone(),
+                sanitize_schema_value(subschema, defs, depth),
+            );
+        }
+        serde_json::Value::Object(sanitized_members)
+    } else {
+        sanitize_schema_value(val, defs, depth)
+    };
+    out.insert(key.to_owned(), sanitized);
+}
+
 fn sanitize_schema_value(
     value: &serde_json::Value,
     defs: &serde_json::Map<String, serde_json::Value>,
@@ -260,11 +311,7 @@ fn sanitize_schema_value(
                 // overriding `description`) on top of the inlined definition.
                 if let serde_json::Value::Object(inlined_map) = &mut inlined {
                     for (key, val) in map {
-                        if key == "$ref" || GEMINI_STRIPPED_SCHEMA_KEYS.contains(&key.as_str()) {
-                            continue;
-                        }
-                        inlined_map
-                            .insert(key.clone(), sanitize_schema_value(val, defs, depth + 1));
+                        insert_sanitized_entry(inlined_map, key.as_str(), val, defs, depth + 1);
                     }
                 }
                 return inlined;
@@ -272,12 +319,7 @@ fn sanitize_schema_value(
 
             let mut out = serde_json::Map::with_capacity(map.len());
             for (key, val) in map {
-                // `$ref` is dropped here only when it could not be resolved
-                // above; leaving it would point at a stripped `$defs` target.
-                if key == "$ref" || GEMINI_STRIPPED_SCHEMA_KEYS.contains(&key.as_str()) {
-                    continue;
-                }
-                out.insert(key.clone(), sanitize_schema_value(val, defs, depth));
+                insert_sanitized_entry(&mut out, key.as_str(), val, defs, depth);
             }
             serde_json::Value::Object(out)
         }
@@ -291,6 +333,51 @@ fn sanitize_schema_value(
     }
 }
 
+/// Defensive final pass: at every object level, drop any `required` entry that
+/// names a property absent from the sibling `properties` map.
+///
+/// Belt-and-braces guarantee that no schema — however mangled by upstream
+/// conversion — can 400 a `generateContent` call, since Gemini rejects the
+/// *whole* request on a single dangling `required` reference. In the normal path
+/// the primary [`insert_sanitized_entry`] fix already keeps `properties` and
+/// `required` in sync, so this pass is a no-op; it only fires (with a
+/// debug-level log) if some other transform ever drops a referenced property.
+fn prune_dangling_required(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            // Snapshot the defined property names first (owned, so the immutable
+            // borrow ends before we mutate `required`).
+            let defined: Option<std::collections::BTreeSet<String>> = map
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .map(|props| props.keys().cloned().collect());
+            if let Some(defined) = defined
+                && let Some(serde_json::Value::Array(required)) = map.get_mut("required")
+            {
+                required.retain(|entry| match entry.as_str() {
+                    Some(name) if !defined.contains(name) => {
+                        log::debug!(
+                            "gemini schema sanitize: dropping `required` entry {name:?} with no \
+                             matching property after conversion"
+                        );
+                        false
+                    }
+                    _ => true,
+                });
+            }
+            for child in map.values_mut() {
+                prune_dangling_required(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                prune_dangling_required(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Sanitize a JSON Schema document into the subset Gemini accepts for
 /// `responseSchema` and `functionDeclarations.parameters`.
 ///
@@ -300,14 +387,19 @@ fn sanitize_schema_value(
 /// for any nested struct, so this first **inlines** every resolvable local
 /// `$ref` against the document's `$defs`/`definitions`, then strips the
 /// unsupported keys recursively while preserving the structural keywords
-/// (`type`, `properties`, `items`, `required`, `enum`). The result is a
-/// self-contained document with no dangling `$ref` pointing at a removed target.
+/// (`type`, `properties`, `items`, `required`, `enum`) — including nested
+/// `items` and object subschemas, whose member names survive verbatim. The
+/// result is a self-contained document with no dangling `$ref` pointing at a
+/// removed target. A final [`prune_dangling_required`] pass drops any `required`
+/// entry left without a matching property, so no schema can 400 the request.
 /// The runtime still validates the *model output* against the original,
 /// un-sanitized schema, so sanitization only relaxes what is sent on the wire.
 #[must_use]
 pub fn gemini_response_schema(schema: &serde_json::Value) -> serde_json::Value {
     let defs = collect_schema_defs(schema);
-    sanitize_schema_value(schema, &defs, 0)
+    let mut sanitized = sanitize_schema_value(schema, &defs, 0);
+    prune_dangling_required(&mut sanitized);
+    sanitized
 }
 
 // ============================================================================
@@ -1528,5 +1620,131 @@ mod tests {
         assert!(!serialized.contains("$defs"));
         assert!(!serialized.contains("additionalProperties"));
         assert_eq!(params["properties"]["part"]["type"], "string");
+    }
+
+    /// Regression for the live Gemini 400
+    /// `properties[issues].items.required[1]: property is not defined`.
+    ///
+    /// Mirrors `linear_plan_apply`'s `issues` array: an array whose `items`
+    /// object carries both `properties` and `required`, where one required
+    /// property is literally named `title` — a JSON-Schema annotation keyword
+    /// that the keyword-strip pass must NOT delete when it is a property name.
+    #[test]
+    fn test_convert_tools_preserves_nested_array_item_properties() {
+        let tools = vec![agent_sdk_foundation::llm::Tool {
+            name: "linear_plan_apply".to_string(),
+            description: "apply a plan".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["summary"],
+                "properties": {
+                    "summary": { "type": "string" },
+                    "issues": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["ref", "title", "what_to_build", "verification_criteria"],
+                            "properties": {
+                                "ref": { "type": "string", "description": "local handle" },
+                                "title": { "type": "string" },
+                                "what_to_build": { "type": "string" },
+                                "verification_criteria": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "items": { "type": "string" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }),
+            display_name: "Plan Apply".to_string(),
+            tier: agent_sdk_foundation::ToolTier::Observe,
+        }];
+
+        let config = convert_tools_to_config(tools);
+        let params = &config.function_declarations[0].parameters;
+        let item_props = &params["properties"]["issues"]["items"]["properties"];
+
+        // Every property survives conversion, including the one named `title`.
+        for name in ["ref", "title", "what_to_build", "verification_criteria"] {
+            assert!(
+                item_props.get(name).is_some(),
+                "nested array-item property `{name}` was dropped by sanitization"
+            );
+        }
+        assert_eq!(item_props["title"]["type"], "string");
+        assert_eq!(item_props["ref"]["description"], "local handle");
+        assert_eq!(
+            params["properties"]["issues"]["items"]["properties"]["verification_criteria"]["items"]
+                ["type"],
+            "string"
+        );
+
+        // Every `required` entry references a surviving property, so Gemini's
+        // strict validator cannot 400 the request.
+        let required = params["properties"]["issues"]["items"]["required"]
+            .as_array()
+            .expect("required array");
+        for entry in required {
+            let name = entry.as_str().expect("required entry is a string");
+            assert!(
+                item_props.get(name).is_some(),
+                "required entry `{name}` has no matching property (would 400 Gemini)"
+            );
+        }
+
+        // Annotation keywords are still stripped at the schema level.
+        let serialized = serde_json::to_string(params).unwrap_or_default();
+        assert!(!serialized.contains("additionalProperties"));
+    }
+
+    /// A property whose *name* collides with a stripped annotation keyword is
+    /// preserved (the strip list only applies to schema keywords, not member
+    /// names). Guards `additionalProperties` / `definitions` / `$defs` names too.
+    #[test]
+    fn test_property_named_like_stripped_keyword_survives() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["title", "additionalProperties", "definitions"],
+            "properties": {
+                "title": { "type": "string", "title": "annotation dropped" },
+                "additionalProperties": { "type": "boolean" },
+                "definitions": { "type": "string" }
+            }
+        });
+
+        let sanitized = gemini_response_schema(&schema);
+        let props = sanitized["properties"].as_object().expect("properties");
+        assert!(props.contains_key("title"));
+        assert!(props.contains_key("additionalProperties"));
+        assert!(props.contains_key("definitions"));
+        // The `title` *annotation* inside the `title` property subschema is
+        // still stripped — only the member NAME is preserved.
+        assert!(sanitized["properties"]["title"].get("title").is_none());
+        assert_eq!(sanitized["properties"]["title"]["type"], "string");
+    }
+
+    /// The defensive post-pass drops a `required` entry that has no matching
+    /// property, so a single dangling reference cannot 400 the whole request.
+    #[test]
+    fn test_prune_dangling_required_drops_unmatched_entry() {
+        // `ghost` is required but never defined in `properties`.
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["name", "ghost"],
+            "properties": { "name": { "type": "string" } }
+        });
+
+        let sanitized = gemini_response_schema(&schema);
+        let required: Vec<&str> = sanitized["required"]
+            .as_array()
+            .expect("required")
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(required, vec!["name"]);
     }
 }
