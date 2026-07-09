@@ -620,6 +620,16 @@ fn apply_tool_forcing(request: &mut ChatRequest, response_format: &ResponseForma
         None => request.tools = Some(vec![respond_tool]),
     }
     request.tool_choice = Some(ToolChoice::Tool(RESPOND_TOOL_NAME.to_owned()));
+    // Forcing a specific tool is incompatible with extended thinking on
+    // Anthropic-family models (the API 400s when `thinking` is active alongside
+    // a `tool_choice` that names a tool). Clearing `request.thinking` here is
+    // *not* sufficient on its own: the Claude providers fall back to their
+    // provider-configured thinking default when the request field is `None`
+    // (see `resolve_thinking_config`), which would resurrect thinking on the
+    // wire. The authoritative guard lives at the wire boundary — the Claude
+    // request builders drop thinking whenever `tool_choice` names a tool (see
+    // `provider::thinking_for_forced_tool`) — so we do not touch
+    // `request.thinking` here and instead rely on that single source of truth.
 }
 
 /// Pull the candidate structured value out of a response according to how the
@@ -1348,5 +1358,40 @@ mod tests {
         );
         assert!(partial_from_buffer("").is_none());
         assert!(partial_from_buffer("not json").is_none());
+    }
+
+    #[test]
+    fn apply_tool_forcing_forces_the_respond_tool() {
+        // `apply_tool_forcing` injects the `respond` tool and forces it via
+        // `tool_choice`. It intentionally leaves `request.thinking` untouched:
+        // clearing it here would be resurrected by `resolve_thinking_config`'s
+        // fallback to the provider-configured default, so the actual
+        // thinking-incompatible-with-forced-tool guard lives at the Claude wire
+        // boundary (see `provider::thinking_for_forced_tool` and the
+        // `forced_tool_drops_configured_thinking_on_the_wire` regression in the
+        // Anthropic provider). This test locks in the forcing contract.
+        let mut request = request_with_format();
+        request.thinking = Some(agent_sdk_foundation::llm::ThinkingConfig::new(10_000));
+        let response_format = request
+            .response_format
+            .clone()
+            .expect("request_with_format sets a response format");
+
+        apply_tool_forcing(&mut request, &response_format);
+
+        assert!(matches!(
+            request.tool_choice,
+            Some(ToolChoice::Tool(ref name)) if name == RESPOND_TOOL_NAME
+        ));
+        assert!(
+            request
+                .tools
+                .as_ref()
+                .is_some_and(|tools| tools.iter().any(|t| t.name == RESPOND_TOOL_NAME)),
+            "the respond tool must be present"
+        );
+        // Thinking is deliberately not mutated here; the wire-boundary guard
+        // drops it. See the module-level comment in `apply_tool_forcing`.
+        assert!(request.thinking.is_some());
     }
 }

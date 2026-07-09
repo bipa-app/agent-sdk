@@ -67,6 +67,7 @@ use crate::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskStatus, WorkerId,
 };
 use crate::journal::task_state::TaskState;
+use crate::journal::task_wakeup::WakeupSignal;
 use crate::journal::thread_store::ThreadStore;
 use crate::journal::turn_attempt::{
     CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptOutcome, TurnAttemptSchemaError,
@@ -144,12 +145,40 @@ pub struct RootTurnDeps<'a> {
     /// `None` (the default) preserves the prior "run to completion
     /// regardless of cancellation" behaviour for every existing host.
     pub cancel: Option<&'a CancellationToken>,
+    /// Optional worker-pool wakeup signal.
+    ///
+    /// When `Some`, the worker fires a nudge the instant it journals a
+    /// batch of runnable tool children (via `spawn_tool_children` or a
+    /// subagent-invocation spawn) so parked workers pick the children up
+    /// immediately instead of waiting out the host's
+    /// `acquisition_interval` ticker — and so the whole batch starts
+    /// together rather than staggered across successive ticks.
+    ///
+    /// `None` (the default) preserves the poll-only behaviour for every
+    /// existing host; the ticker remains the lost-wakeup backstop even
+    /// when a signal is wired.
+    pub wakeup: Option<&'a WakeupSignal>,
 }
 
 impl RootTurnDeps<'_> {
     /// True when a cancellation token is wired and has been tripped.
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancel.is_some_and(CancellationToken::is_cancelled)
+    }
+
+    /// Nudge every parked worker that a batch of children just became
+    /// runnable. No-op when no [`WakeupSignal`] is wired.
+    ///
+    /// Uses `wake_all_now` (a broadcast) rather than a single
+    /// `notify_workers` permit because a batch typically makes several
+    /// children runnable at once and every idle worker should be free to
+    /// claim one — the `Pending → Running` CAS in `acquire_next_runnable`
+    /// still serialises them, so a broadcast only ever costs a few
+    /// no-op wakeups, never a double execution.
+    fn wake_workers_for_batch(&self) {
+        if let Some(signal) = self.wakeup {
+            signal.wake_all_now();
+        }
     }
 }
 
@@ -1327,7 +1356,7 @@ async fn commit_text_only_turn(
     committed_events.push(close_ctx.start_committed);
     committed_events.extend(commit.committed_events.iter().cloned());
 
-    let (completed_task, _parent) = deps
+    let (completed_task, resumed_invocation) = deps
         .task_store
         .complete_task(
             task_id,
@@ -1337,6 +1366,19 @@ async fn commit_text_only_turn(
         )
         .await
         .context("complete root task")?;
+
+    // When this root turn is a subagent's child root, its terminal
+    // transition resumes the linked subagent invocation task
+    // (`WaitingOnChildren` → `Pending`) in the same locked scope. Nudge
+    // a parked worker so it claims the now-runnable invocation
+    // immediately instead of waiting out the acquisition ticker. A
+    // `None` (no linked invocation) or non-runnable row leaves the poll
+    // backstop to handle it.
+    if resumed_invocation.is_some_and(|t| t.status.is_runnable())
+        && let Some(signal) = deps.wakeup
+    {
+        signal.notify_workers();
+    }
 
     // Text-only completion: the turn is done, so finalize the root
     // `invoke_agent` span with its full duration + outcome. Usage is
@@ -3182,12 +3224,12 @@ async fn apply_batch_routing(
     now: OffsetDateTime,
 ) -> Result<(AgentTask, Vec<AgentTask>)> {
     let task_id = &inputs.bootstrap.task_id;
-    match routing {
+    let spawned = match routing {
         super::subagent_spawn_selector::BatchRouting::SingleSubagent { spawn_index, plan } => {
             let spawned =
                 spawn_single_subagent_invocation(inputs, deps, &plan, payload, spawn_index, now)
                     .await?;
-            Ok((spawned.parent_task, vec![spawned.invocation_task]))
+            (spawned.parent_task, vec![spawned.invocation_task])
         }
         super::subagent_spawn_selector::BatchRouting::MultiSubagent { plans } => {
             let batch = spawn_multi_subagent_invocations(inputs, deps, plans, payload, now).await?;
@@ -3196,7 +3238,7 @@ async fn apply_batch_routing(
                 .into_iter()
                 .map(|inv| inv.invocation_task)
                 .collect();
-            Ok((batch.parent_task, invocation_tasks))
+            (batch.parent_task, invocation_tasks)
         }
         super::subagent_spawn_selector::BatchRouting::AllTools
         | super::subagent_spawn_selector::BatchRouting::UnsupportedMixedBatch => {
@@ -3223,9 +3265,17 @@ async fn apply_batch_routing(
                     now,
                 )
                 .await
-                .context(tool_children_context)
+                .context(tool_children_context)?
         }
-    }
+    };
+
+    // The batch is durably runnable now (children `Pending`, parent
+    // parked). Nudge the pool so a parked worker claims a child on this
+    // tick instead of the next `acquisition_interval` poll, and so every
+    // child of the batch starts together rather than staggered across
+    // successive ticks. The ticker remains the lost-wakeup backstop.
+    deps.wake_workers_for_batch();
+    Ok(spawned)
 }
 
 /// Close the parent's turn attempt, treating
@@ -3832,7 +3882,7 @@ async fn commit_resumed_turn(
     let committed_events = commit.committed_events.clone();
 
     // Advance the root task to Completed.
-    let (completed_task, _parent) = deps
+    let (completed_task, resumed_invocation) = deps
         .task_store
         .complete_task(
             task_id,
@@ -3842,6 +3892,19 @@ async fn commit_resumed_turn(
         )
         .await
         .context("complete resumed root task")?;
+
+    // When this root turn is a subagent's child root, its terminal
+    // transition resumes the linked subagent invocation task
+    // (`WaitingOnChildren` → `Pending`) in the same locked scope. Nudge
+    // a parked worker so it claims the now-runnable invocation
+    // immediately instead of waiting out the acquisition ticker. A
+    // `None` (no linked invocation) or non-runnable row leaves the poll
+    // backstop to handle it.
+    if resumed_invocation.is_some_and(|t| t.status.is_runnable())
+        && let Some(signal) = deps.wakeup
+    {
+        signal.notify_workers();
+    }
 
     // The resumed turn completed (no further tool calls) — finalize the
     // root `invoke_agent` span with its full duration spanning the tool
