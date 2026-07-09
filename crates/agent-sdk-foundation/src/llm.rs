@@ -1324,7 +1324,10 @@ mod tests {
         // Order: assistant tool_use, synthetic results, then the user prompt.
         assert!(!message_tool_use_ids(&out[0]).is_empty());
         assert!(!message_tool_result_ids(&out[1]).is_empty());
-        assert!(out[2].content.first_text() == Some("a brand new question from the user"));
+        assert_eq!(
+            out[2].content.first_text(),
+            Some("a brand new question from the user")
+        );
     }
 
     #[test]
