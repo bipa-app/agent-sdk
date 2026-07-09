@@ -123,6 +123,24 @@ impl StagedMessageStore {
         let guard = self.messages.read().ok().context("lock poisoned")?;
         Ok(guard.clone())
     }
+
+    /// Snapshot only the messages appended after the seed — the same
+    /// post-seed delta [`Self::drain_messages`] would return — without
+    /// consuming the buffer.
+    ///
+    /// Non-consuming twin of `drain_messages`. The cancellation-commit
+    /// path uses it to read the completed delta while the turn's error
+    /// still propagates unperturbed, so the buffer is never mutated on
+    /// the failure path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the internal lock is poisoned.
+    pub fn snapshot_appended_messages(&self) -> Result<Vec<llm::Message>> {
+        let guard = self.messages.read().ok().context("lock poisoned")?;
+        let seed_len = *self.seed_len.read().ok().context("lock poisoned")?;
+        Ok(guard.iter().skip(seed_len).cloned().collect())
+    }
 }
 
 #[async_trait]
@@ -776,6 +794,36 @@ mod tests {
         let state = staged.state.load(&thread_a()).await?.context("Some")?;
         assert_eq!(state.turn_count, 99);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_appended_matches_drain_without_consuming() -> Result<()> {
+        // Seed 2, append 1: the appended-delta snapshot must return only
+        // the post-seed append (like `drain_messages`) but leave the
+        // buffer intact so a later drain still sees the same delta.
+        let store = StagedMessageStore::new(thread_a(), sample_messages());
+        store
+            .append(&thread_a(), llm::Message::user("delta"))
+            .await?;
+
+        let appended = store.snapshot_appended_messages()?;
+        assert_eq!(appended.len(), 1);
+
+        // Non-consuming: the full history is still present.
+        let history = store.get_history(&thread_a()).await?;
+        assert_eq!(history.len(), 3);
+
+        // And a subsequent drain returns the same delta.
+        let drained = store.drain_messages()?;
+        assert_eq!(drained.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_appended_is_empty_before_any_append() -> Result<()> {
+        let store = StagedMessageStore::new(thread_a(), sample_messages());
+        assert!(store.snapshot_appended_messages()?.is_empty());
         Ok(())
     }
 

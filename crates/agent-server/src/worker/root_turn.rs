@@ -357,15 +357,23 @@ pub async fn fail_root_turn(
 
 /// Cancel a root turn and its entire subtree.
 ///
-/// Calls [`AgentTaskStore::cancel_tree`] to atomically cancel the root
-/// task and any live descendant tasks (e.g. `tool_runtime` children
-/// spawned during suspension). Best-effort closes any open turn
-/// attempts for the root task.
+/// Before tearing the subtree down, this commits the completed prefix of
+/// a **parked** turn (`WaitingOnChildren`, or `Pending` +
+/// [`TaskState::ReadyToResume`]) so the next turn's LLM context survives
+/// the cancel — see `commit_partial_turn_on_cancel`. A `Running` task
+/// is skipped here: its live worker loop owns the commit (seam B), and
+/// committing from both seams would race on the same turn number. The
+/// partial commit is best-effort — any error is logged and swallowed so
+/// the cancel always wins.
 ///
-/// Because staged projections are in-memory only and no durable writes
-/// occur on the suspension path, cancellation at any lifecycle point
-/// leaves the journal in a coherent state: the task is terminal, its
-/// `TaskState` is cleared to `None`, and no stale projections exist.
+/// Then, exactly as before, it best-effort closes any open turn attempts
+/// and calls [`AgentTaskStore::cancel_tree`] to atomically cancel the
+/// root task and any live descendant tasks (e.g. `tool_runtime` children
+/// spawned during suspension). `cancel_tree` clears each row's
+/// `TaskState` to `None`; the durable message-projection draft slot
+/// survives, so a re-seeded suffix (the dropped trailing
+/// `assistant + tool_use`) is closed by the next turn's
+/// `backfill_orphaned_tool_results`.
 ///
 /// # Returns
 ///
@@ -379,6 +387,14 @@ pub async fn cancel_root_turn(
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<Vec<AgentTaskId>> {
+    // Commit the completed prefix of a parked turn before the task goes
+    // terminal. Read the row first so the candidate is sourced from the
+    // durable draft / suspended messages *before* `cancel_tree` clears
+    // the typed state.
+    if let Ok(Some(task)) = deps.task_store.get(task_id).await {
+        best_effort_commit_parked_cancel(&task, deps, now).await;
+    }
+
     best_effort_close_open_attempts(task_id, deps.attempt_store, now).await;
 
     let cancelled = deps
@@ -504,6 +520,382 @@ async fn best_effort_close_open_attempts(
         if !attempt.is_closed() {
             close_attempt_with(attempt, TurnAttemptOutcome::Cancelled, attempt_store, now).await;
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Commit the completed prefix of a cancelled turn
+// ─────────────────────────────────────────────────────────────────────
+
+/// Zero-sized marker attached to the error a root turn bails with when
+/// it is cancelled (`stop` / ESC → `cancel_tree`).
+///
+/// The live worker loop propagates the cancel as an ordinary
+/// `anyhow::Error`, but the caller that still owns the in-memory staged
+/// buffer needs to distinguish "the turn was cancelled" from any other
+/// failure so it can commit the completed prefix before the task goes
+/// terminal. Callers detect it via
+/// `error.chain().any(|c| c.is::<RootTurnCancelledMarker>())` — see
+/// [`is_root_turn_cancelled`].
+#[derive(Debug)]
+pub(crate) struct RootTurnCancelledMarker;
+
+impl std::fmt::Display for RootTurnCancelledMarker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("root turn cancelled")
+    }
+}
+
+impl std::error::Error for RootTurnCancelledMarker {}
+
+/// True when `error` carries a [`RootTurnCancelledMarker`] anywhere in
+/// its cause chain — i.e. the turn bailed because it was cancelled
+/// mid-stream rather than for any other reason.
+pub(crate) fn is_root_turn_cancelled(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<RootTurnCancelledMarker>().is_some())
+}
+
+/// Split `messages` into `(committable prefix, retained suffix)` per the
+/// provider-validity rule: the prefix is the largest leading slice with
+/// no assistant `tool_use` block left unanswered by a `tool_result`
+/// within that same slice.
+///
+/// Walks back from the tail while
+/// [`llm::has_unbalanced_tool_use`](agent_sdk_foundation::llm::has_unbalanced_tool_use)
+/// holds, so the returned prefix is always a provider-legal request
+/// history — it ends on a user message (a bare prompt or a tool-results
+/// message), which every provider accepts. Messages are moved, never
+/// mutated or re-ordered: text, `tool_use`, `tool_result`, `thinking`
+/// (+ signature), and `redacted_thinking` blocks commit byte-verbatim.
+pub(crate) fn provider_valid_split(
+    mut messages: Vec<llm::Message>,
+) -> (Vec<llm::Message>, Vec<llm::Message>) {
+    let mut n = messages.len();
+    while n > 0 && llm::has_unbalanced_tool_use(&messages[..n]) {
+        n -= 1;
+    }
+    let suffix = messages.split_off(n);
+    (messages, suffix)
+}
+
+/// Parameters for `commit_partial_turn_on_cancel`.
+pub(crate) struct PartialCancelCommit<'a> {
+    /// Thread the cancelled turn belongs to.
+    pub(crate) thread_id: &'a agent_sdk_foundation::ThreadId,
+    /// Task that was running (or parked on) the cancelled turn.
+    pub(crate) task_id: &'a AgentTaskId,
+    /// Candidate messages accumulated for the turn, in order. The source
+    /// depends on the seam: the live loop supplies `[user prompt] +`
+    /// staged delta (fresh) or the staged `[suspended…, tool_results]`
+    /// delta (resume); the external-cancel seam supplies the durable
+    /// draft or the parked `suspended_messages`.
+    pub(crate) candidate: Vec<llm::Message>,
+    /// `thread.committed_turns + 1` — the turn number this commit
+    /// consumes. The in-transaction CAS in `commit_completed_turn` is the
+    /// sole idempotency authority.
+    pub(crate) expected_turn: u32,
+    /// Agent-state snapshot for the checkpoint written at `expected_turn`.
+    pub(crate) agent_state_snapshot: serde_json::Value,
+}
+
+/// Durably commit the largest provider-valid prefix of a cancelled
+/// turn's accumulated messages, returning the retained suffix.
+///
+/// A no-op when the prefix is empty (`commit_completed_turn` rejects
+/// empty batches anyway) or when the turn was already committed. The
+/// partial commit rides `commit_completed_turn`'s in-transaction
+/// `expected_turn` CAS, so a racing full commit, a duplicate cancel, or
+/// a stale-lease worker can never double-append the prefix. Token usage
+/// is zeroed — the real usage was already audited on the per-attempt
+/// rows of the cancelled attempt(s), so billing it again on the thread
+/// aggregate would double-count. No lifecycle events are emitted: the
+/// partial transcript already streamed as delta events, and the absence
+/// of a `TurnComplete` / `Done` lets replay render this as a cancelled
+/// turn.
+pub(crate) async fn commit_partial_turn_on_cancel(
+    params: PartialCancelCommit<'_>,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<Vec<llm::Message>> {
+    let PartialCancelCommit {
+        thread_id,
+        task_id,
+        candidate,
+        expected_turn,
+        agent_state_snapshot,
+    } = params;
+
+    let (prefix, suffix) = provider_valid_split(candidate);
+    if prefix.is_empty() {
+        // Nothing provider-valid to commit. Strict no-op: no attempt row,
+        // no thread mutation.
+        return Ok(suffix);
+    }
+
+    // Cheap pre-check; the in-transaction CAS below is the authority.
+    ensure_turn_not_already_committed(deps.thread_store, thread_id, expected_turn).await?;
+
+    // Open a synthetic attempt: `commit_completed_turn` unconditionally
+    // closes an attempt, and by the time either seam reaches this point
+    // every prior attempt for the task is already closed (mid-stream
+    // cancel closed it `Cancelled`; a parked parent's attempt closed
+    // `Success` at suspension). The row doubles as the audit record tying
+    // the partial commit to the cancel.
+    let existing = deps
+        .attempt_store
+        .list_by_task(task_id)
+        .await
+        .context("list attempts for cancel-commit")?;
+    let attempt_number = u32::try_from(existing.len()).context("attempt count overflow")? + 1;
+    let synthetic = deps
+        .attempt_store
+        .open_attempt(OpenAttemptParams {
+            task_id: task_id.clone(),
+            attempt_number,
+            provenance: AuditProvenance::new("cancel-commit", "cancel-commit"),
+            request_blob: serde_json::json!({ "user_prompt": "<cancel-commit>" }),
+            now,
+            otel_trace_id: None,
+            otel_span_id: None,
+        })
+        .await
+        .context("open synthetic cancel-commit attempt")?;
+
+    commit_completed_turn(
+        CompletedTurnCommit {
+            thread_id: thread_id.clone(),
+            task_id: task_id.clone(),
+            expected_turn,
+            turn_attempt_id: synthetic.id.clone(),
+            close_attempt_params: CloseAttemptParams {
+                response_blob: serde_json::json!({ "partial_commit_on_cancel": true }),
+                response_id: None,
+                response_model: None,
+                stop_reason: None,
+                outcome: TurnAttemptOutcome::Cancelled,
+                // Zero by design: this synthetic attempt exists only
+                // because the commit transaction requires an attempt id
+                // to close — the turn's REAL token usage already lives
+                // on its real attempt rows, closed by the cancel path.
+                // Repeating those numbers here would double-count in
+                // every consumer that sums attempt rows (cost ledgers,
+                // usage sweeps).
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+            },
+            messages: prefix,
+            // Zero for the same reason: `turn_usage` advances the
+            // thread's aggregate token totals, which never included
+            // uncommitted turns — the measured usage stays on the
+            // attempt rows (the billing source of truth). Folding it in
+            // here would change aggregate semantics and double-count
+            // against attempt-summing readers.
+            turn_usage: TokenUsage::default(),
+            agent_state_snapshot,
+            // Empty by design: the turn's real events (tool calls,
+            // deltas) were committed INCREMENTALLY during streaming —
+            // that persistence is the very thing this salvage relies
+            // on. This field carries lifecycle events (`turn_complete`
+            // etc.), and fabricating one would falsely mark a cancelled
+            // turn as completed to every downstream consumer.
+            events: Vec::new(),
+            outbox_max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+            now,
+        },
+        deps.thread_store,
+        deps.message_store,
+        deps.attempt_store,
+        deps.checkpoint_store,
+        deps.event_repo,
+    )
+    .await
+    .context("commit partial turn on cancel")?;
+
+    Ok(suffix)
+}
+
+/// Best snapshot of the agent state for a cancelled turn's checkpoint:
+/// the staged state if present, otherwise the recovery view's committed
+/// snapshot. Falls back to the recovery snapshot if serialization fails.
+fn staged_or_recovery_snapshot(inputs: &RootWorkerInputs) -> serde_json::Value {
+    match inputs.staged_stores.state.snapshot_state() {
+        Ok(Some(state)) => serde_json::to_value(&state)
+            .unwrap_or_else(|_| inputs.recovery_view.agent_state_snapshot.clone()),
+        _ => inputs.recovery_view.agent_state_snapshot.clone(),
+    }
+}
+
+/// Seam B: the live worker loop's cancellation branch. Commit the
+/// completed prefix of the cancelled turn from the in-memory staged
+/// buffer, then let the caller propagate the original cancel error.
+///
+/// Guarded on a fresh re-read of the task row: only a task whose durable
+/// status is [`TaskStatus::Cancelled`] may consume this turn number. A
+/// lease-lost requeue (the row bounced back to `Pending` / was
+/// re-acquired) is left untouched so the new lease holder owns turn `N`.
+/// Every error is logged and swallowed — a partial-commit failure must
+/// never mask the cancellation the caller is about to surface.
+async fn commit_cancelled_partial_turn(
+    inputs: &RootWorkerInputs,
+    candidate: Vec<llm::Message>,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) {
+    let task_id = &inputs.bootstrap.task_id;
+    let thread_id = &inputs.bootstrap.thread_id;
+
+    match deps.task_store.get(task_id).await {
+        Ok(Some(task)) if task.status == TaskStatus::Cancelled => {}
+        // Not cancelled (lease-lost requeue), missing, or unreadable:
+        // do not partial-commit — a re-run will own turn N.
+        Ok(_) => return,
+        Err(error) => {
+            log::warn!("cancel-commit: re-read task {task_id} failed: {error:#}");
+            return;
+        }
+    }
+
+    let agent_state_snapshot = staged_or_recovery_snapshot(inputs);
+    let suffix = match commit_partial_turn_on_cancel(
+        PartialCancelCommit {
+            thread_id,
+            task_id,
+            candidate,
+            expected_turn: inputs.recovery_view.next_turn_number,
+            agent_state_snapshot,
+        },
+        deps,
+        now,
+    )
+    .await
+    {
+        Ok(suffix) => suffix,
+        Err(error) => {
+            log::warn!("cancel-commit: partial commit failed on thread {thread_id}: {error:#}");
+            return;
+        }
+    };
+
+    // A non-empty suffix is only reachable if a resume delta ends
+    // unbalanced (defensive) — re-seed it so the next turn's backfill
+    // closes it. Best-effort: the draft is a recovery aid.
+    if !suffix.is_empty()
+        && let Err(error) = deps.message_store.set_draft(thread_id, suffix, now).await
+    {
+        log::warn!("cancel-commit: re-seed draft failed on thread {thread_id}: {error:#}");
+    }
+}
+
+/// Seam A: commit the completed prefix of a **parked** cancelled turn.
+///
+/// Handles only the states the external-cancel caller owns:
+/// `WaitingOnChildren`, or `Pending` + [`TaskState::ReadyToResume`]. A
+/// `Running` task is skipped — its live loop (seam B) owns the commit.
+/// A parked task with no continuation (e.g. a `SubagentInvocation`
+/// parent) or an empty candidate is a no-op. All errors are logged and
+/// swallowed so the cancel always proceeds.
+async fn best_effort_commit_parked_cancel(
+    task: &AgentTask,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) {
+    let parked = match task.status {
+        TaskStatus::WaitingOnChildren => true,
+        TaskStatus::Pending => matches!(task.state, TaskState::ReadyToResume { .. }),
+        _ => false,
+    };
+    if !parked {
+        return;
+    }
+
+    // A parked turn always carries a continuation; its embedded agent
+    // state seeds the checkpoint. Absent (e.g. `SubagentInvocation`) →
+    // there is no root-turn transcript to commit here.
+    let Some(continuation) = task.state.continuation() else {
+        return;
+    };
+    let agent_state_snapshot = match serde_json::to_value(&continuation.payload.state) {
+        Ok(value) => value,
+        Err(error) => {
+            log::warn!(
+                "cancel-commit: serialize agent state failed on thread {}: {error:#}",
+                task.thread_id,
+            );
+            return;
+        }
+    };
+
+    // Prefer the durable draft (richer); fall back to the parked
+    // suspended_messages. Read BEFORE `cancel_tree` clears the state.
+    let candidate = match deps.message_store.get(&task.thread_id).await {
+        Ok(Some(projection)) if !projection.draft_messages.is_empty() => projection.draft_messages,
+        Ok(_) => task.state.suspended_messages().to_vec(),
+        Err(error) => {
+            log::warn!(
+                "cancel-commit: read draft failed on thread {}: {error:#}",
+                task.thread_id,
+            );
+            task.state.suspended_messages().to_vec()
+        }
+    };
+    if candidate.is_empty() {
+        return;
+    }
+
+    let expected_turn = match deps.thread_store.get(&task.thread_id).await {
+        Ok(Some(thread)) => thread.committed_turns.saturating_add(1),
+        Ok(None) => return,
+        Err(error) => {
+            log::warn!(
+                "cancel-commit: read thread failed on {}: {error:#}",
+                task.thread_id,
+            );
+            return;
+        }
+    };
+
+    let suffix = match commit_partial_turn_on_cancel(
+        PartialCancelCommit {
+            thread_id: &task.thread_id,
+            task_id: &task.id,
+            candidate,
+            expected_turn,
+            agent_state_snapshot,
+        },
+        deps,
+        now,
+    )
+    .await
+    {
+        Ok(suffix) => suffix,
+        Err(error) => {
+            log::warn!(
+                "cancel-commit: partial commit failed on thread {}: {error:#}",
+                task.thread_id,
+            );
+            return;
+        }
+    };
+
+    // Re-seed the draft with the dropped trailing `assistant + tool_use`
+    // (the commit cleared the slot in-transaction). The next turn's
+    // `backfill_orphaned_tool_results` closes it with
+    // `USER_CANCELLED_TOOL_RESULT` without duplicating the committed
+    // prefix. Best-effort — a crash here loses only that trailing
+    // message, strictly better than today.
+    if !suffix.is_empty()
+        && let Err(error) = deps
+            .message_store
+            .set_draft(&task.thread_id, suffix, now)
+            .await
+    {
+        log::warn!(
+            "cancel-commit: re-seed draft failed on thread {}: {error:#}",
+            task.thread_id,
+        );
     }
 }
 
@@ -752,25 +1144,47 @@ async fn execute_root_turn_inner(
     // `ContextGuard` across this `.await` would make the worker future
     // `!Send` and unspawnable.
     #[cfg(feature = "otel")]
-    let StreamedTurn {
-        response,
-        content_ids,
-        attempt,
-    } = {
+    let streamed = {
         use opentelemetry::trace::FutureExt;
         match root_otel_ids.as_ref().and_then(|(trace, span)| {
             agent_sdk::observability::loop_instrument::remote_parent_context(trace, span)
         }) {
-            Some(cx) => llm_call.with_context(cx).await?,
-            None => llm_call.await?,
+            Some(cx) => llm_call.with_context(cx).await,
+            None => llm_call.await,
         }
     };
     #[cfg(not(feature = "otel"))]
+    let streamed = llm_call.await;
+
     let StreamedTurn {
         response,
         content_ids,
         attempt,
-    } = llm_call.await?;
+    } = match streamed {
+        Ok(streamed) => streamed,
+        Err(error) => {
+            // Seam B (fresh turn): on a mid-stream (or between-retry)
+            // cancel, commit the completed prefix from the staged buffer
+            // before the task goes terminal, then propagate the original
+            // error unchanged. The candidate is the user prompt (`Some`
+            // on non-resume turns) plus any staged post-seed delta, so
+            // the agent at least remembers what was asked.
+            if is_root_turn_cancelled(&error) {
+                let mut candidate: Vec<llm::Message> =
+                    user_input.clone().into_message().into_iter().collect();
+                match inputs.staged_stores.messages.snapshot_appended_messages() {
+                    Ok(delta) => candidate.extend(delta),
+                    Err(snapshot_err) => log::warn!(
+                        "cancel-commit: snapshot staged delta failed on thread {}: \
+                         {snapshot_err:#}",
+                        inputs.bootstrap.thread_id,
+                    ),
+                }
+                commit_cancelled_partial_turn(&inputs, candidate, deps, now).await;
+            }
+            return Err(error);
+        }
+    };
 
     // Capture a post-LLM timestamp so the turn attempt's duration_ms
     // reflects actual wall-clock latency instead of always being 0.
@@ -1343,8 +1757,11 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
     loop {
         // Cooperative cancellation: bail before opening a (billed) LLM
         // attempt when the root turn has been cancelled between retries.
+        // Tag the error with the cancel marker so the caller that owns
+        // the staged buffer commits the completed prefix (seam B).
         if deps.is_cancelled() {
-            bail!("root turn cancelled before LLM attempt");
+            return Err(anyhow::Error::new(RootTurnCancelledMarker)
+                .context("root turn cancelled before LLM attempt"));
         }
         let attempt_now = if retries == 0 && compaction_retries == 0 {
             now
@@ -1409,9 +1826,11 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
             }
             Err(StreamAttemptError::Cancelled { message }) => {
                 // The turn was cancelled mid-stream — the attempt is
-                // already closed `Cancelled`. Bail immediately, skipping
-                // both retry/backoff and the commit path.
-                bail!("{message}");
+                // already closed `Cancelled`. Bail immediately with the
+                // cancel marker so the caller that still owns the staged
+                // buffer commits the completed prefix (seam B); skip both
+                // retry/backoff and the normal commit path.
+                return Err(anyhow::Error::new(RootTurnCancelledMarker).context(message));
             }
         }
     }
@@ -3204,23 +3623,40 @@ pub async fn resume_root_turn(
         now,
     });
     #[cfg(feature = "otel")]
-    let StreamedTurn {
-        response,
-        content_ids,
-        attempt,
-    } = {
+    let streamed = {
         use opentelemetry::trace::FutureExt;
         match resume_root_cx {
-            Some(cx) => llm_call.with_context(cx).await?,
-            None => llm_call.await?,
+            Some(cx) => llm_call.with_context(cx).await,
+            None => llm_call.await,
         }
     };
     #[cfg(not(feature = "otel"))]
+    let streamed = llm_call.await;
+
     let StreamedTurn {
         response,
         content_ids,
         attempt,
-    } = llm_call.await?;
+    } = match streamed {
+        Ok(streamed) => streamed,
+        Err(error) => {
+            // Seam B (resume): the staged post-seed delta is
+            // `[suspended…, tool_results]` — balanced by construction, so
+            // it commits in full and the interrupted resume response is
+            // dropped. This also permanently fixes the balanced-draft
+            // drop: the delta becomes committed history instead of a
+            // draft that dies at the next commit.
+            if is_root_turn_cancelled(&error) {
+                let candidate = inputs
+                    .staged_stores
+                    .messages
+                    .snapshot_appended_messages()
+                    .unwrap_or_default();
+                commit_cancelled_partial_turn(&inputs, candidate, deps, now).await;
+            }
+            return Err(error);
+        }
+    };
     let commit_now = OffsetDateTime::now_utc();
 
     // 5. Branch: tool calls → re-suspend; text-only → commit.

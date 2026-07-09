@@ -466,6 +466,11 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
             lease_duration,
             heartbeat_interval: heartbeat_interval_for(lease_duration),
             cancel: heartbeat_cancel.clone(),
+            // A Confirm-tier tool heartbeat is not a root turn, so the
+            // partial-commit-on-cancel path (seam B) does not apply here;
+            // reuse the heartbeat's own token so a lease rejection has no
+            // extra effect beyond stopping the ticker.
+            task_cancel: heartbeat_cancel.clone(),
         },
     ));
 
