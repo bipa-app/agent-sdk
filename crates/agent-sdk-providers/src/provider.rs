@@ -4,7 +4,8 @@
 //! as well as the [`collect_stream`] helper for consuming a streaming response.
 
 use agent_sdk_foundation::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, ContentBlock, ThinkingConfig, ThinkingMode, Usage,
+    ChatOutcome, ChatRequest, ChatResponse, ContentBlock, ThinkingConfig, ThinkingMode, ToolChoice,
+    Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -276,6 +277,33 @@ pub trait LlmProvider: Send + Sync {
     }
 }
 
+/// Drop extended thinking when the request forces a specific tool.
+///
+/// Anthropic-family models (native Anthropic and Claude-on-Vertex) reject a
+/// request that pairs extended `thinking` with a `tool_choice` that names a
+/// tool (HTTP 400). The forced-tool constraint is orthogonal to *where* the
+/// thinking came from: clearing `ChatRequest.thinking` upstream is not enough,
+/// because [`resolve_thinking_config`](LlmProvider::resolve_thinking_config)
+/// falls back to the provider-configured default when the request field is
+/// `None` — resurrecting thinking on the wire. The Claude request builders
+/// therefore funnel their already-resolved thinking through this at the wire
+/// boundary so a forced-tool request (e.g. structured-output's `respond` tool)
+/// stays well-formed regardless of the provider's configured thinking default.
+///
+/// `ToolChoice::Auto` (and the absence of any `tool_choice`) keeps thinking,
+/// matching the API's rule that thinking is only incompatible with a
+/// tool-forcing choice.
+#[must_use]
+pub(crate) const fn thinking_for_forced_tool(
+    thinking: Option<ThinkingConfig>,
+    tool_choice: Option<&ToolChoice>,
+) -> Option<ThinkingConfig> {
+    match tool_choice {
+        Some(ToolChoice::Tool(_)) => None,
+        Some(ToolChoice::Auto) | None => thinking,
+    }
+}
+
 /// Helper function to consume a stream and collect it into a `ChatResponse`.
 ///
 /// This is useful for providers that want to test their streaming implementation
@@ -462,5 +490,34 @@ mod tests {
             support_for("some-new-provider", "x"),
             StructuredOutputSupport::ToolForcing
         );
+    }
+
+    #[test]
+    fn thinking_for_forced_tool_drops_thinking_when_a_tool_is_forced() {
+        let cfg = ThinkingConfig::new(10_000);
+        let forced = ToolChoice::Tool("respond".to_owned());
+        assert!(
+            thinking_for_forced_tool(Some(cfg), Some(&forced)).is_none(),
+            "thinking must be dropped when tool_choice names a tool"
+        );
+    }
+
+    #[test]
+    fn thinking_for_forced_tool_keeps_thinking_for_auto_and_none() {
+        let auto = ToolChoice::Auto;
+        assert!(
+            thinking_for_forced_tool(Some(ThinkingConfig::new(10_000)), Some(&auto)).is_some(),
+            "thinking must survive with ToolChoice::Auto"
+        );
+        assert!(
+            thinking_for_forced_tool(Some(ThinkingConfig::new(10_000)), None).is_some(),
+            "thinking must survive with no tool_choice"
+        );
+    }
+
+    #[test]
+    fn thinking_for_forced_tool_is_a_noop_when_thinking_absent() {
+        let forced = ToolChoice::Tool("respond".to_owned());
+        assert!(thinking_for_forced_tool(None, Some(&forced)).is_none());
     }
 }

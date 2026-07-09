@@ -19,7 +19,7 @@ use crate::impls::gemini::data::{
     convert_tools_to_config, gemini_response_schema, map_finish_reason, map_thinking_config,
     stream_gemini_response,
 };
-use crate::provider::LlmProvider;
+use crate::provider::{LlmProvider, thinking_for_forced_tool};
 use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind};
 use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ResponseFormat, ThinkingConfig, ThinkingMode, Usage,
@@ -619,7 +619,10 @@ fn gemini_response_format(
 impl VertexProvider {
     async fn chat_claude(&self, request: ChatRequest) -> Result<ChatOutcome> {
         let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
-            Ok(thinking) => thinking,
+            // Forcing a specific tool is incompatible with extended thinking on
+            // Claude (the API 400s), so drop thinking at the wire boundary even
+            // when it was resurrected from the provider-configured default.
+            Ok(thinking) => thinking_for_forced_tool(thinking, request.tool_choice.as_ref()),
             Err(error) => return Ok(ChatOutcome::InvalidRequest(error.to_string())),
         };
         if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
@@ -736,7 +739,11 @@ impl VertexProvider {
     fn chat_stream_claude(&self, request: ChatRequest) -> StreamBox<'_> {
         Box::pin(async_stream::stream! {
             let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
-                Ok(thinking) => thinking,
+                // Forcing a specific tool is incompatible with extended thinking
+                // on Claude (the API 400s), so drop thinking at the wire boundary
+                // even when it was resurrected from the provider-configured
+                // default.
+                Ok(thinking) => thinking_for_forced_tool(thinking, request.tool_choice.as_ref()),
                 Err(error) => {
                     yield Ok(StreamDelta::Error {
                         message: error.to_string(),

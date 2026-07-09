@@ -7,7 +7,7 @@
 pub(crate) mod data;
 
 use crate::attachments::validate_request_attachments;
-use crate::provider::LlmProvider;
+use crate::provider::{LlmProvider, thinking_for_forced_tool};
 use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind};
 use agent_sdk_foundation::llm::{
     CacheTtl, ChatOutcome, ChatRequest, ChatResponse, ContentBlock, ThinkingConfig, ThinkingMode,
@@ -535,7 +535,10 @@ impl AnthropicProvider {
 impl LlmProvider for AnthropicProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
         let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
-            Ok(thinking) => thinking,
+            // Forcing a specific tool is incompatible with extended thinking on
+            // Anthropic (the API 400s), so drop thinking at the wire boundary
+            // even when it was resurrected from the provider-configured default.
+            Ok(thinking) => thinking_for_forced_tool(thinking, request.tool_choice.as_ref()),
             Err(error) => return Ok(ChatOutcome::InvalidRequest(error.to_string())),
         };
         if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
@@ -749,7 +752,11 @@ impl LlmProvider for AnthropicProvider {
                 build_api_tools_with_cache(&request, tools_cache)
             };
             let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
-                Ok(thinking) => thinking,
+                // Forcing a specific tool is incompatible with extended thinking
+                // on Anthropic (the API 400s), so drop thinking at the wire
+                // boundary even when it was resurrected from the
+                // provider-configured default.
+                Ok(thinking) => thinking_for_forced_tool(thinking, request.tool_choice.as_ref()),
                 Err(error) => {
                     yield Ok(StreamDelta::Error {
                         message: error.to_string(),
@@ -1576,5 +1583,89 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    // ===================
+    // Forced-tool ⇒ thinking dropped on the wire (Fix 8)
+    // ===================
+
+    /// Drive a `chat` call against a mock server and return the JSON body the
+    /// provider actually put on the wire. The mock replies with a body the
+    /// response parser rejects — we only care about the *request*, which
+    /// wiremock records regardless of how the outcome is parsed.
+    async fn captured_request_body(
+        provider: &AnthropicProvider,
+        request: ChatRequest,
+        server: &wiremock::MockServer,
+    ) -> serde_json::Value {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(server)
+            .await;
+
+        let _ = provider.chat(request).await;
+
+        let received = server
+            .received_requests()
+            .await
+            .expect("mock server records requests");
+        assert_eq!(received.len(), 1, "expected exactly one request");
+        serde_json::from_slice(&received[0].body).expect("request body is JSON")
+    }
+
+    #[tokio::test]
+    async fn forced_tool_drops_configured_thinking_on_the_wire() {
+        // Regression for Fix 8: a Claude provider built `.with_thinking(...)`
+        // must NOT emit `thinking` on the wire when the request forces a
+        // specific tool (the Messages API 400s on that pairing). Clearing
+        // `ChatRequest.thinking` alone is insufficient — `resolve_thinking_config`
+        // would resurrect the provider-configured default — so the guard lives
+        // at the wire boundary.
+        let server = wiremock::MockServer::start().await;
+        let provider = AnthropicProvider::sonnet_45("sk-ant-api-test")
+            .with_thinking(ThinkingConfig::new(10_000))
+            .with_base_url(server.uri());
+
+        let mut request = request_with_tools(vec![tool("respond")]);
+        request.tool_choice = Some(agent_sdk_foundation::llm::ToolChoice::Tool(
+            "respond".to_owned(),
+        ));
+
+        let body = captured_request_body(&provider, request, &server).await;
+
+        assert!(
+            body.get("thinking").is_none(),
+            "thinking must be absent when a tool is forced, got: {body}"
+        );
+        assert_eq!(
+            body["tool_choice"]["type"], "tool",
+            "the forced tool_choice must survive, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_thinking_survives_without_forced_tool() {
+        // Guard the other direction: `tool_choice = Auto` (the non-forcing case)
+        // keeps the provider-configured thinking on the wire, so the Fix 8 guard
+        // is narrowly scoped to tool forcing and does not regress ordinary
+        // thinking requests.
+        let server = wiremock::MockServer::start().await;
+        let provider = AnthropicProvider::sonnet_45("sk-ant-api-test")
+            .with_thinking(ThinkingConfig::new(10_000))
+            .with_base_url(server.uri());
+
+        let mut request = request_with_tools(vec![tool("read")]);
+        request.tool_choice = Some(agent_sdk_foundation::llm::ToolChoice::Auto);
+
+        let body = captured_request_body(&provider, request, &server).await;
+
+        assert_eq!(
+            body["thinking"]["type"], "enabled",
+            "configured thinking must survive when no tool is forced, got: {body}"
+        );
     }
 }
