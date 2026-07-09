@@ -3,9 +3,10 @@
 //! This module defines the [`LlmProvider`] trait that all LLM backends implement,
 //! as well as the [`collect_stream`] helper for consuming a streaming response.
 
+#[cfg(feature = "anthropic")]
+use agent_sdk_foundation::llm::ToolChoice;
 use agent_sdk_foundation::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, ContentBlock, ThinkingConfig, ThinkingMode, ToolChoice,
-    Usage,
+    ChatOutcome, ChatRequest, ChatResponse, ContentBlock, ThinkingConfig, ThinkingMode, Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -294,6 +295,7 @@ pub trait LlmProvider: Send + Sync {
 /// matching the API's rule that thinking is only incompatible with a
 /// tool-forcing choice.
 #[must_use]
+#[cfg(feature = "anthropic")]
 pub(crate) const fn thinking_for_forced_tool(
     thinking: Option<ThinkingConfig>,
     tool_choice: Option<&ToolChoice>,
@@ -493,6 +495,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "anthropic")]
     fn thinking_for_forced_tool_drops_thinking_when_a_tool_is_forced() {
         let cfg = ThinkingConfig::new(10_000);
         let forced = ToolChoice::Tool("respond".to_owned());
@@ -503,6 +506,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "anthropic")]
     fn thinking_for_forced_tool_keeps_thinking_for_auto_and_none() {
         let auto = ToolChoice::Auto;
         assert!(
@@ -516,6 +520,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "anthropic")]
     fn thinking_for_forced_tool_is_a_noop_when_thinking_absent() {
         let forced = ToolChoice::Tool("respond".to_owned());
         assert!(thinking_for_forced_tool(None, Some(&forced)).is_none());
