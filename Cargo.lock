@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk"
-version = "0.11.5"
+version = "0.11.6"
 dependencies = [
  "agent-sdk-foundation",
  "agent-sdk-macros",
@@ -59,7 +59,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-cli"
-version = "0.11.5"
+version = "0.11.6"
 dependencies = [
  "agent-sdk",
  "anyhow",
@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-foundation"
-version = "0.11.5"
+version = "0.11.6"
 dependencies = [
  "insta",
  "proptest",
@@ -86,7 +86,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-macros"
-version = "0.11.5"
+version = "0.11.6"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -95,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-otel"
-version = "0.11.5"
+version = "0.11.6"
 dependencies = [
  "agent-sdk",
  "anyhow",
@@ -110,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-providers"
-version = "0.11.5"
+version = "0.11.6"
 dependencies = [
  "agent-sdk-foundation",
  "anyhow",
@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-tools"
-version = "0.11.5"
+version = "0.11.6"
 dependencies = [
  "agent-sdk-foundation",
  "anyhow",
