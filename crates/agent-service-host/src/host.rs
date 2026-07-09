@@ -341,6 +341,13 @@ impl ServiceHost {
         };
 
         let wakeup_signal = WakeupSignal::shared();
+        // Hand the same signal to the execution runtime *before* the
+        // worker pool spawns so the worker task-execution paths can nudge
+        // a parked worker the instant they journal new runnable work
+        // (a tool-child batch, a parent whose last child just finished)
+        // instead of waiting out the `acquisition_interval` ticker. The
+        // ticker stays wired as the lost-wakeup backstop.
+        self.runtime.set_wakeup_signal(Arc::clone(&wakeup_signal));
         let sweep_handle = tokio::spawn(lease_sweep_loop(
             self.stores.clone(),
             self.config.worker.sweep_interval(),
@@ -1167,6 +1174,7 @@ async fn execute_root_task(
                 runtime.compaction_config().map(|_| &provider),
             );
             deps.cancel = Some(cancel);
+            deps.wakeup = runtime.wakeup_signal();
             resume_for_steering(inputs, &task, provider.as_ref(), &deps, now)
                 .await
                 .context("resume parked root task for steering wake")
@@ -1178,6 +1186,7 @@ async fn execute_root_task(
                 runtime.compaction_config().map(|_| &provider),
             );
             deps.cancel = Some(cancel);
+            deps.wakeup = runtime.wakeup_signal();
             resume_from_children(inputs, &task, provider.as_ref(), &deps, now)
                 .await
                 .context("resume root task from durable child results")
@@ -1190,6 +1199,7 @@ async fn execute_root_task(
                 runtime.compaction_config().map(|_| &provider),
             );
             deps.cancel = Some(cancel);
+            deps.wakeup = runtime.wakeup_signal();
             agent_server::worker::execute_root_turn(
                 inputs,
                 user_input,
@@ -1392,13 +1402,29 @@ async fn execute_tool_task(
     match outcome {
         Ok(
             ToolTaskOutcome::Completed {
-                committed_events, ..
+                committed_events,
+                parent,
+                ..
             }
             | ToolTaskOutcome::Failed {
-                committed_events, ..
+                committed_events,
+                parent,
+                ..
             },
         ) => {
             publish_events(stores, &committed_events);
+            // When this was the batch's last outstanding child, the
+            // journal flips the parent from `WaitingOnChildren` to
+            // `Pending` (runnable) in the same terminal transition. Nudge
+            // a parked worker so it resumes the parent turn immediately
+            // rather than waiting out the acquisition ticker. A `None`
+            // parent (still other live children) or a non-runnable parent
+            // leaves the poll backstop to handle it.
+            if parent.is_some_and(|p| p.status.is_runnable())
+                && let Some(signal) = runtime.wakeup_signal()
+            {
+                signal.notify_workers();
+            }
             Ok(())
         }
         Ok(ToolTaskOutcome::Cancelled) => Ok(()),
@@ -3018,6 +3044,335 @@ mod tests {
         assert!(
             snap.is_ready(),
             "host must remain ready during broker outage",
+        );
+
+        token.cancel();
+        host_handle.await??;
+        Ok(())
+    }
+
+    // ── Fix 1: task-wakeup wiring (batch spawn + parent resume) ─────
+    //
+    // These tests exercise the in-process nudges wired by
+    // `ServiceHost::run` → `ExecutionRuntime` → the worker paths:
+    //   * `apply_batch_routing` fires `wake_all_now()` once a tool-child
+    //     batch is durably runnable, and
+    //   * `execute_tool_task` fires `notify_workers()` when the last
+    //     child flips the parent to `Pending`.
+    // A scripted provider drives one 2-tool batch then a text close; a
+    // recording tool executor timestamps each child so the batch's
+    // "start together" property is observable.
+
+    struct ScriptedBatchProvider {
+        responses: std::sync::Mutex<std::collections::VecDeque<ChatResponse>>,
+    }
+
+    impl ScriptedBatchProvider {
+        fn new(responses: Vec<ChatResponse>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses.into()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ScriptedBatchProvider {
+        async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+            let response = {
+                let mut queue = self
+                    .responses
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("scripted responses lock poisoned"))?;
+                queue
+                    .pop_front()
+                    .context("scripted provider ran out of responses")?
+            };
+            Ok(ChatOutcome::Success(response))
+        }
+
+        fn model(&self) -> &'static str {
+            "mock-model"
+        }
+
+        fn provider(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    struct RecordingToolExecutor {
+        starts: Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+    }
+
+    impl RecordingToolExecutor {
+        fn new(starts: Arc<std::sync::Mutex<Vec<std::time::Instant>>>) -> Self {
+            Self { starts }
+        }
+    }
+
+    #[async_trait]
+    impl crate::runtime::ToolCallExecutor for RecordingToolExecutor {
+        async fn execute_tool_call(
+            &self,
+            _bootstrap: &agent_server::worker::ToolTaskBootstrap,
+            _collector: agent_server::worker::ToolEventCollector,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<agent_sdk_foundation::ToolResult> {
+            if let Ok(mut starts) = self.starts.lock() {
+                starts.push(std::time::Instant::now());
+            }
+            Ok(agent_sdk_foundation::ToolResult::success("probe ok"))
+        }
+    }
+
+    fn probe_tool() -> agent_sdk_foundation::llm::Tool {
+        agent_sdk_foundation::llm::Tool {
+            name: "probe".into(),
+            description: "A fast read-only probe".into(),
+            input_schema: serde_json::json!({ "type": "object" }),
+            display_name: "Probe".into(),
+            tier: agent_sdk_foundation::ToolTier::Observe,
+        }
+    }
+
+    fn probe_definition() -> AgentDefinition {
+        let mut definition = sample_definition();
+        definition.tools = vec![probe_tool()];
+        definition
+    }
+
+    fn text_response(id: &str, text: &str) -> ChatResponse {
+        ChatResponse {
+            id: id.into(),
+            content: vec![ContentBlock::Text { text: text.into() }],
+            model: "mock-model".into(),
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+        }
+    }
+
+    fn tool_use_batch_response(id: &str, calls: &[(&str, &str)]) -> ChatResponse {
+        let content = calls
+            .iter()
+            .map(|(call_id, name)| ContentBlock::ToolUse {
+                id: (*call_id).into(),
+                name: (*name).into(),
+                input: serde_json::json!({}),
+                thought_signature: None,
+            })
+            .collect();
+        ChatResponse {
+            id: id.into(),
+            content,
+            model: "mock-model".into(),
+            stop_reason: Some(StopReason::ToolUse),
+            usage: Usage {
+                input_tokens: 12,
+                output_tokens: 6,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+        }
+    }
+
+    fn tool_runtime(
+        provider: Arc<dyn LlmProvider>,
+        executor: Arc<dyn crate::runtime::ToolCallExecutor>,
+    ) -> Result<Arc<ExecutionRuntime>> {
+        let resolver = Arc::new(StaticProviderResolver::new());
+        resolver.set_fallback(provider)?;
+        Ok(Arc::new(ExecutionRuntime::new(
+            resolver,
+            executor,
+            Arc::new(AllowAllConfirmationPolicy),
+        )))
+    }
+
+    #[tokio::test]
+    async fn wakeup_nudges_drive_batch_and_resume_without_polling() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+        use std::time::{Duration, Instant};
+
+        // A 30 s acquisition ticker and NO fallback sweep: after the
+        // initial root pickup, the only thing that can move work across a
+        // task hop within the assertion window is the in-process wakeup
+        // nudge wired by Fix 1. If either nudge failed to fire — the
+        // batch spawn's `wake_all_now` (child pickup) or the last child's
+        // `notify_workers` (parent resume) — the flow would stall until
+        // the 30 s ticker, far outside the 5 s window below.
+        let config = ServiceConfig {
+            worker: crate::config::WorkerConfig {
+                pool_size: 3,
+                acquisition_interval_secs: 30,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let starts = Arc::new(std::sync::Mutex::new(Vec::<Instant>::new()));
+        let provider = Arc::new(ScriptedBatchProvider::new(vec![
+            tool_use_batch_response("resp_batch", &[("call_a", "probe"), ("call_b", "probe")]),
+            text_response("resp_final", "all probes done"),
+        ]));
+        let executor = Arc::new(RecordingToolExecutor::new(Arc::clone(&starts)));
+        let runtime = tool_runtime(provider, executor)?;
+        let runtime_kick = Arc::clone(&runtime);
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(probe_definition()));
+
+        let host = ServiceHost::new(config, registry, runtime)?;
+        let stores = host.stores().clone();
+        let token = host.shutdown_token();
+
+        let thread = ThreadId::from_string("t-wakeup-batch");
+        let task = AgentTask::new_root_turn_with_input(
+            thread,
+            vec![SubmittedInputItem::Text {
+                text: "probe twice".into(),
+            }],
+            time::OffsetDateTime::now_utc(),
+            3,
+        );
+        let root_id = task.id.clone();
+        stores.task_store.submit_root_turn(task).await?;
+
+        let host_handle = tokio::spawn(async move { host.run().await });
+
+        // Wait for `run()` to install the signal on the shared runtime,
+        // then fire ONE nudge to kick the initial root pickup — standing
+        // in for the production 1 s ticker / submit backstop, which is
+        // not what this test exercises. Every hop AFTER this kick must be
+        // driven purely by the Fix 1 nudges under test.
+        let mut kicked = false;
+        for _ in 0..200 {
+            if let Some(signal) = runtime_kick.wakeup_signal() {
+                signal.notify_workers();
+                kicked = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            kicked,
+            "run() must install the wakeup signal on the shared runtime",
+        );
+
+        let mut completed = false;
+        for _ in 0..250 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let row = stores
+                .task_store
+                .get(&root_id)
+                .await?
+                .context("root task must still exist")?;
+            if row.status == TaskStatus::Completed {
+                completed = true;
+                break;
+            }
+        }
+        assert!(
+            completed,
+            "root turn should complete within 5 s via wakeup nudges (30 s ticker, no fallback sweep)",
+        );
+
+        // Both batch children were dispatched together, not staggered
+        // across the 30 s ticker: their execution start timestamps land
+        // within a small window of each other. Snapshot out of the lock
+        // so no guard is held across the shutdown await below.
+        let recorded: Vec<Instant> = {
+            let starts = starts
+                .lock()
+                .map_err(|_| anyhow::anyhow!("starts lock poisoned"))?;
+            starts.clone()
+        };
+        assert_eq!(
+            recorded.len(),
+            2,
+            "both probe children should have executed",
+        );
+        let (first, second) = if recorded[0] <= recorded[1] {
+            (recorded[0], recorded[1])
+        } else {
+            (recorded[1], recorded[0])
+        };
+        let delta = second.duration_since(first);
+        assert!(
+            delta < Duration::from_secs(2),
+            "batch children started {delta:?} apart — expected them to start together, \
+             not staggered across the acquisition ticker",
+        );
+
+        token.cancel();
+        host_handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tool_flow_completes_on_acquisition_ticker_backstop() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+        use std::time::Duration;
+
+        // No manual kick and no fallback sweep: every task hop here is
+        // eligible to be driven solely by the 1 s acquisition ticker.
+        // This proves the poll backstop still carries a full tool-call
+        // turn (root → batch children → resume) to completion — the
+        // wakeup nudges are a latency optimisation layered on top, never
+        // a correctness requirement.
+        let config = ServiceConfig {
+            worker: crate::config::WorkerConfig {
+                pool_size: 3,
+                acquisition_interval_secs: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let starts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(ScriptedBatchProvider::new(vec![
+            tool_use_batch_response("resp_batch", &[("call_a", "probe"), ("call_b", "probe")]),
+            text_response("resp_final", "done"),
+        ]));
+        let executor = Arc::new(RecordingToolExecutor::new(Arc::clone(&starts)));
+        let runtime = tool_runtime(provider, executor)?;
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(probe_definition()));
+
+        let host = ServiceHost::new(config, registry, runtime)?;
+        let stores = host.stores().clone();
+        let token = host.shutdown_token();
+
+        let thread = ThreadId::from_string("t-ticker-backstop");
+        let task = AgentTask::new_root_turn_with_input(
+            thread,
+            vec![SubmittedInputItem::Text {
+                text: "probe twice".into(),
+            }],
+            time::OffsetDateTime::now_utc(),
+            3,
+        );
+        let root_id = task.id.clone();
+        stores.task_store.submit_root_turn(task).await?;
+
+        let host_handle = tokio::spawn(async move { host.run().await });
+
+        let mut completed = false;
+        for _ in 0..300 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let row = stores
+                .task_store
+                .get(&root_id)
+                .await?
+                .context("root task must still exist")?;
+            if row.status == TaskStatus::Completed {
+                completed = true;
+                break;
+            }
+        }
+        assert!(
+            completed,
+            "tool-call turn must complete on the acquisition-ticker backstop even without wakeup nudges",
         );
 
         token.cancel();

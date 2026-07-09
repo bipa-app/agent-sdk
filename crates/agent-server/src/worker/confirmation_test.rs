@@ -254,6 +254,7 @@ impl TestStores {
             compaction_config: None,
             compaction_provider: None,
             cancel: None,
+            wakeup: None,
         }
     }
 }

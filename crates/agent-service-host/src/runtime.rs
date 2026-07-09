@@ -7,11 +7,12 @@
 //! execution behavior without coupling the host to a specific stack.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use agent_sdk::context::CompactionConfig;
 use agent_sdk_foundation::{PendingToolCallInfo, ToolResult};
 use agent_sdk_providers::LlmProvider;
+use agent_server::journal::WakeupSignal;
 use agent_server::worker::{
     AgentDefinition, ConfirmationPolicy, NoopSubagentSpawnSelector, PolicyVerdict,
     SubagentSpawnSelector, ToolEventCollector, ToolTaskBootstrap,
@@ -61,6 +62,20 @@ pub struct ExecutionRuntime {
     /// hosts keep today's "no automatic compaction" behaviour
     /// unchanged.
     compaction_config: Option<CompactionConfig>,
+    /// Shared worker-pool wakeup signal, attached by
+    /// [`crate::host::ServiceHost::run`] before the worker pool spawns
+    /// so the worker execution paths can nudge a parked worker the
+    /// instant new runnable work is journaled (a tool-child batch, a
+    /// parent resuming after its last child) instead of paying the
+    /// `acquisition_interval` poll latency on every task hop.
+    ///
+    /// A [`OnceLock`] rather than a plain `Option` because the signal is
+    /// created inside `ServiceHost::run` — after the runtime is already
+    /// `Arc`-wrapped and shared with the transport layer — so it must be
+    /// installed through a `&self` handle. Empty (`None`) for every
+    /// library consumer that never runs the service host, which
+    /// preserves the poll-only behaviour unchanged.
+    wakeup_signal: OnceLock<Arc<WakeupSignal>>,
 }
 
 impl ExecutionRuntime {
@@ -76,6 +91,7 @@ impl ExecutionRuntime {
             confirmation_policy,
             subagent_spawn_selector: Arc::new(NoopSubagentSpawnSelector),
             compaction_config: None,
+            wakeup_signal: OnceLock::new(),
         }
     }
 
@@ -143,6 +159,26 @@ impl ExecutionRuntime {
     #[must_use]
     pub const fn compaction_config(&self) -> Option<&CompactionConfig> {
         self.compaction_config.as_ref()
+    }
+
+    /// Install the shared worker-pool [`WakeupSignal`].
+    ///
+    /// Called once by [`crate::host::ServiceHost::run`] before the
+    /// worker pool spawns. Idempotent: a second call (or a call after
+    /// the pool is running) is ignored so a stray installer can never
+    /// swap the signal out from under the running workers.
+    pub fn set_wakeup_signal(&self, signal: Arc<WakeupSignal>) {
+        let _ = self.wakeup_signal.set(signal);
+    }
+
+    /// The shared worker-pool wakeup signal, if one has been installed.
+    ///
+    /// `None` for any runtime that is not driving a live service host —
+    /// callers treat that as "no fast nudge available" and fall back to
+    /// the worker acquisition ticker.
+    #[must_use]
+    pub fn wakeup_signal(&self) -> Option<&WakeupSignal> {
+        self.wakeup_signal.get().map(AsRef::as_ref)
     }
 }
 
