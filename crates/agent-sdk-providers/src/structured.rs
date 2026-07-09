@@ -620,6 +620,12 @@ fn apply_tool_forcing(request: &mut ChatRequest, response_format: &ResponseForma
         None => request.tools = Some(vec![respond_tool]),
     }
     request.tool_choice = Some(ToolChoice::Tool(RESPOND_TOOL_NAME.to_owned()));
+    // Forcing a specific tool is incompatible with extended thinking on most
+    // Anthropic models (the API 400s when `thinking` is active alongside a
+    // `tool_choice` that names a tool). Sonnet 5 tolerates it by silently
+    // skipping thinking, but we must not rely on that — clear thinking so the
+    // forced-tool path is well-formed on every provider.
+    request.thinking = None;
 }
 
 /// Pull the candidate structured value out of a response according to how the
@@ -1348,5 +1354,29 @@ mod tests {
         );
         assert!(partial_from_buffer("").is_none());
         assert!(partial_from_buffer("not json").is_none());
+    }
+
+    #[test]
+    fn apply_tool_forcing_clears_thinking() {
+        // Forcing a named tool 400s alongside active thinking on most Anthropic
+        // models; `apply_tool_forcing` must strip thinking so the request stays
+        // well-formed.
+        let mut request = request_with_format();
+        request.thinking = Some(agent_sdk_foundation::llm::ThinkingConfig::new(10_000));
+        let response_format = request
+            .response_format
+            .clone()
+            .expect("request_with_format sets a response format");
+
+        apply_tool_forcing(&mut request, &response_format);
+
+        assert!(
+            request.thinking.is_none(),
+            "thinking must be cleared when a tool is forced"
+        );
+        assert!(matches!(
+            request.tool_choice,
+            Some(ToolChoice::Tool(ref name)) if name == RESPOND_TOOL_NAME
+        ));
     }
 }
