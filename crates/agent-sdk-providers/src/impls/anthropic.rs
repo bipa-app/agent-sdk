@@ -273,9 +273,23 @@ impl AnthropicProvider {
             builder.header("anthropic-version", API_VERSION)
         } else {
             match self.auth_mode {
-                AuthMode::ApiKey => builder
-                    .header("x-api-key", &self.api_key)
-                    .header("anthropic-version", API_VERSION),
+                AuthMode::ApiKey => {
+                    let builder = builder
+                        .header("x-api-key", &self.api_key)
+                        .header("anthropic-version", API_VERSION);
+                    // Budget-thinking models (e.g. Sonnet 4.5, Haiku 4.5) only
+                    // emit interleaved (mid-loop) thinking blocks when this beta
+                    // is set. Adaptive-thinking models (4.6+) interleave
+                    // server-side and ignore the header, so gate on the same
+                    // predicate as the OAuth arm to keep the cached request
+                    // prefix minimal and stable. Do NOT add other OAuth-identity
+                    // betas here — API-key auth is not Claude Code.
+                    if self.requires_adaptive_thinking() {
+                        builder
+                    } else {
+                        builder.header("anthropic-beta", "interleaved-thinking-2025-05-14")
+                    }
+                }
                 AuthMode::OAuth => {
                     // Build beta features list matching Claude Code's behaviour.
                     // Adaptive-thinking models (4.6) have interleaved thinking
@@ -1508,6 +1522,59 @@ mod tests {
         let tools = vec![tool("task"), tool("Task")];
         // The gate would only trigger in OAuth mode.
         assert!(oauth_tool_name_collision(Some(&tools)).is_some());
+        Ok(())
+    }
+
+    // ===================
+    // Interleaved-thinking beta on API-key auth (Fix 3)
+    // ===================
+
+    fn apply_auth_beta_header(provider: &AnthropicProvider) -> anyhow::Result<Option<String>> {
+        let builder = reqwest::Client::new().post("http://localhost/v1/messages");
+        let request = provider.apply_auth(builder).build()?;
+        Ok(request
+            .headers()
+            .get("anthropic-beta")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned))
+    }
+
+    #[test]
+    fn api_key_auth_sends_interleaved_beta_for_budget_thinking_models() -> anyhow::Result<()> {
+        // Sonnet 4.5 / Haiku 4.5 are budget-thinking models: interleaved
+        // mid-loop thinking only appears when this beta header is present.
+        for provider in [
+            AnthropicProvider::sonnet_45("test-key-not-a-secret"),
+            AnthropicProvider::haiku("test-key-not-a-secret"),
+        ] {
+            assert!(!provider.is_oauth());
+            assert_eq!(
+                apply_auth_beta_header(&provider)?.as_deref(),
+                Some("interleaved-thinking-2025-05-14"),
+                "expected interleaved beta for {}",
+                provider.model()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn api_key_auth_omits_interleaved_beta_for_adaptive_models() -> anyhow::Result<()> {
+        // Adaptive-thinking models (4.6+) interleave server-side and treat the
+        // header as deprecated/ignored, so we keep the cached prefix minimal.
+        for provider in [
+            AnthropicProvider::opus_48("test-key-not-a-secret"),
+            AnthropicProvider::sonnet_5("test-key-not-a-secret"),
+            AnthropicProvider::fable("test-key-not-a-secret"),
+        ] {
+            assert!(!provider.is_oauth());
+            assert_eq!(
+                apply_auth_beta_header(&provider)?,
+                None,
+                "expected no beta header for adaptive model {}",
+                provider.model()
+            );
+        }
         Ok(())
     }
 }
