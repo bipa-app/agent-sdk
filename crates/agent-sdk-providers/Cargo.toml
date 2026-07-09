@@ -1,6 +1,6 @@
 [package]
 name = "agent-sdk-providers"
-version = "0.11.4"
+version = "0.11.5"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
