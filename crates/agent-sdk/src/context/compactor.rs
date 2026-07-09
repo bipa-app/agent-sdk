@@ -162,6 +162,26 @@ impl<P: LlmProvider + ?Sized> LlmContextCompactor<P> {
         )
     }
 
+    /// Return true when history contains provider-owned state that must be
+    /// replayed byte-for-byte on a follow-up request.
+    ///
+    /// A generic prose summary cannot stand in for this state: doing so would
+    /// both discard the payload and change its position relative to the
+    /// surrounding conversation. Until a provider-native compaction path can
+    /// preserve it, the only safe generic behavior is to leave the history
+    /// intact.
+    fn has_opaque_reasoning(messages: &[Message]) -> bool {
+        messages.iter().any(|message| {
+            matches!(
+                &message.content,
+                Content::Blocks(blocks)
+                    if blocks
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::OpaqueReasoning { .. }))
+            )
+        })
+    }
+
     /// Shift split point backwards until a `tool_use`/`tool_result` pair is not
     /// split.
     ///
@@ -374,6 +394,13 @@ impl<P: LlmProvider + ?Sized> LlmContextCompactor<P> {
                             ContentBlock::RedactedThinking { .. } => {
                                 let _ = writeln!(output, "[Redacted thinking]");
                             }
+                            ContentBlock::OpaqueReasoning { .. } => {
+                                // Provider state is deliberately not rendered
+                                // into a summarization prompt. Moving or
+                                // paraphrasing it would both expose the opaque
+                                // payload and break exact replay semantics.
+                                let _ = writeln!(output, "[Opaque reasoning state omitted]");
+                            }
                             ContentBlock::ToolUse { name, input, .. } => {
                                 let _ = writeln!(
                                     output,
@@ -557,6 +584,14 @@ impl<P: LlmProvider + ?Sized> ContextCompactor for LlmContextCompactor<P> {
             return false;
         }
 
+        // Provider-owned opaque reasoning state has exact replay semantics.
+        // Do not repeatedly schedule a generic compaction that must refuse to
+        // rewrite this history; a provider-native compactor can replace this
+        // guard when it becomes available.
+        if Self::has_opaque_reasoning(messages) {
+            return false;
+        }
+
         if messages.len() < self.config.min_messages_for_compaction {
             return false;
         }
@@ -568,6 +603,23 @@ impl<P: LlmProvider + ?Sized> ContextCompactor for LlmContextCompactor<P> {
     async fn compact_history(&self, mut messages: Vec<Message>) -> Result<CompactionResult> {
         let original_count = messages.len();
         let original_tokens = self.estimate_tokens(&messages);
+
+        // OpenAI Responses reasoning items (and any future provider-owned
+        // opaque state) must remain in their original history position for a
+        // valid follow-up. Generic compaction turns older messages into prose,
+        // so it cannot preserve that contract safely.
+        if Self::has_opaque_reasoning(&messages) {
+            log::debug!(
+                "skipping generic context compaction for history with opaque provider reasoning state"
+            );
+            return Ok(CompactionResult {
+                messages,
+                original_count,
+                new_count: original_count,
+                original_tokens,
+                new_tokens: original_tokens,
+            });
+        }
 
         // Ensure we have enough messages to compact
         if messages.len() <= self.config.retain_recent {
@@ -800,6 +852,112 @@ mod tests {
         ];
 
         assert!(!compactor.needs_compaction(&messages));
+    }
+
+    #[test]
+    fn summary_prompt_redacts_opaque_reasoning_payload() {
+        let secret = "opaque-secret-that-must-not-enter-the-summary-prompt";
+        let message = Message::assistant_with_content(vec![ContentBlock::OpaqueReasoning {
+            provider: "test-provider".to_owned(),
+            data: serde_json::json!({"encrypted_content": secret}),
+        }]);
+
+        let rendered = LlmContextCompactor::<MockProvider>::format_messages_for_summary([&message]);
+        assert!(rendered.contains("[Opaque reasoning state omitted]"));
+        assert!(!rendered.contains(secret));
+    }
+
+    #[tokio::test]
+    async fn compact_history_preserves_opaque_reasoning_in_retained_tail() -> Result<()> {
+        let provider = Arc::new(MockProvider::new("older context"));
+        let config = CompactionConfig::default()
+            .with_retain_recent(2)
+            .with_min_messages(3);
+        let compactor = LlmContextCompactor::new(provider, config);
+        let opaque_data = serde_json::json!({
+            "id": "reasoning_1",
+            "encrypted_content": "ciphertext"
+        });
+        let messages = vec![
+            Message::user("old question"),
+            Message::assistant("old answer"),
+            Message::user("current question"),
+            Message::assistant_with_content(vec![ContentBlock::OpaqueReasoning {
+                provider: "test-provider".to_owned(),
+                data: opaque_data.clone(),
+            }]),
+        ];
+
+        let result = compactor.compact_history(messages).await?;
+        let retained = result
+            .messages
+            .last()
+            .context("compacted history should retain the newest assistant message")?;
+        let Content::Blocks(blocks) = &retained.content else {
+            bail!("retained assistant message should contain blocks");
+        };
+        assert!(matches!(
+            blocks.first(),
+            Some(ContentBlock::OpaqueReasoning { provider, data })
+                if provider == "test-provider" && data == &opaque_data
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compact_history_bypasses_opaque_reasoning_before_the_split() -> Result<()> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(MockProvider::new_with_request_log(
+            "summary that must not be requested",
+            Arc::clone(&requests),
+        ));
+        let config = CompactionConfig::default()
+            .with_retain_recent(1)
+            .with_min_messages(1)
+            .with_threshold_tokens(1);
+        let compactor = LlmContextCompactor::new(provider, config);
+        let opaque_data = serde_json::json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "encrypted_content": "ciphertext"
+        });
+        let messages = vec![
+            Message::user("older user context"),
+            // This message lies before the normal `len - retain_recent` split
+            // and would previously have been converted into a prose summary.
+            Message::assistant_with_content(vec![
+                ContentBlock::OpaqueReasoning {
+                    provider: "openai-responses".to_owned(),
+                    data: opaque_data,
+                },
+                ContentBlock::Text {
+                    text: "older assistant response".to_owned(),
+                },
+            ]),
+            Message::user("newer user context"),
+            Message::assistant("newer assistant response"),
+        ];
+        let serialized_before = serde_json::to_value(&messages)?;
+
+        assert!(
+            !compactor.needs_compaction(&messages),
+            "generic compaction must not be scheduled for opaque replay state"
+        );
+
+        let result = compactor.compact_history(messages).await?;
+
+        assert_eq!(serde_json::to_value(&result.messages)?, serialized_before);
+        assert_eq!(result.new_count, result.original_count);
+        assert_eq!(result.new_tokens, result.original_tokens);
+        let recorded = requests
+            .lock()
+            .map_err(|_| anyhow::anyhow!("request log poisoned"))?;
+        assert!(
+            recorded.is_empty(),
+            "opaque replay state must not be sent to the generic summarizer"
+        );
+        drop(recorded);
+        Ok(())
     }
 
     #[tokio::test]

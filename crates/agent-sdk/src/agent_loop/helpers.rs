@@ -230,6 +230,12 @@ pub(super) fn build_assistant_message(response: &ChatResponse) -> Message {
             ContentBlock::RedactedThinking { data } => {
                 blocks.push(ContentBlock::RedactedThinking { data: data.clone() });
             }
+            ContentBlock::OpaqueReasoning { provider, data } => {
+                blocks.push(ContentBlock::OpaqueReasoning {
+                    provider: provider.clone(),
+                    data: data.clone(),
+                });
+            }
             ContentBlock::ToolUse {
                 id,
                 name,
@@ -384,5 +390,49 @@ mod tests {
         } else {
             panic!("Expected Content::Blocks");
         }
+    }
+
+    #[test]
+    fn build_assistant_message_preserves_opaque_reasoning_exactly() -> anyhow::Result<()> {
+        let response = ChatResponse {
+            id: "msg_opaque".to_owned(),
+            content: vec![
+                ContentBlock::OpaqueReasoning {
+                    provider: "test-provider".to_owned(),
+                    data: json!({
+                        "id": "reasoning_1",
+                        "encrypted_content": "ciphertext"
+                    }),
+                },
+                ContentBlock::Text {
+                    text: "visible".to_owned(),
+                },
+            ],
+            model: "test".to_owned(),
+            stop_reason: None,
+            usage: Usage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+        };
+
+        let message = build_assistant_message(&response);
+        let Content::Blocks(blocks) = message.content else {
+            anyhow::bail!("assistant history must use content blocks");
+        };
+        assert!(matches!(
+            &blocks[0],
+            ContentBlock::OpaqueReasoning { provider, data }
+                if provider == "test-provider"
+                    && data["id"] == "reasoning_1"
+                    && data["encrypted_content"] == "ciphertext"
+        ));
+        assert!(matches!(
+            &blocks[1],
+            ContentBlock::Text { text } if text == "visible"
+        ));
+        Ok(())
     }
 }

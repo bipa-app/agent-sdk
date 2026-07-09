@@ -2338,6 +2338,10 @@ fn map_message(message: &llm::Message) -> RpcResult<pb::ConversationMessage> {
             pb::ConversationContentList {
                 items: blocks
                     .iter()
+                    // Provider-owned reasoning state is required for internal
+                    // replay but must never be projected through the public
+                    // conversation API.
+                    .filter(|block| !matches!(block, ContentBlock::OpaqueReasoning { .. }))
                     .map(map_content_block)
                     .collect::<RpcResult<Vec<_>>>()?,
             },
@@ -2747,6 +2751,30 @@ mod tests {
     type EventClient = pb::agent_event_service_client::AgentEventServiceClient<Channel>;
     type StreamItem = pb::stream_thread_events_response::Item;
     type EventPayload = pb::event_envelope::Event;
+
+    #[test]
+    fn map_message_omits_opaque_reasoning_from_public_conversation() -> Result<()> {
+        let message = llm::Message::assistant_with_content(vec![
+            ContentBlock::OpaqueReasoning {
+                provider: "test-provider".to_owned(),
+                data: json!({"encrypted_content": "opaque-secret"}),
+            },
+            ContentBlock::Text {
+                text: "visible".to_owned(),
+            },
+        ]);
+
+        let mapped = map_message(&message).map_err(|error| anyhow!(error.to_string()))?;
+        let Some(pb::conversation_message::Content::Blocks(blocks)) = mapped.content else {
+            bail!("assistant block content should map to a block list");
+        };
+        assert_eq!(blocks.items.len(), 1);
+        assert!(matches!(
+            blocks.items.first().and_then(|item| item.block.as_ref()),
+            Some(pb::conversation_content_block::Block::Text(text)) if text.text == "visible"
+        ));
+        Ok(())
+    }
 
     struct ScriptedProvider {
         responses: Mutex<VecDeque<ChatResponse>>,

@@ -897,8 +897,32 @@ for envelope in event_store.get_events(&thread_id).await? {
 | Provider | Models | Usage |
 |----------|--------|-------|
 | Anthropic | Claude Sonnet, Opus, Haiku | `AnthropicProvider::sonnet(api_key)` |
-| OpenAI | GPT-5.4, GPT-5.3-Codex, GPT-4.1, o-series | `OpenAIProvider::gpt54(api_key)` |
+| OpenAI | GPT-5.6, GPT-5.4, GPT-5.3-Codex, GPT-4.1, o-series | `OpenAIProvider::gpt56(api_key)` |
 | Google | Gemini 3.x and 2.x families | `GeminiProvider::new(api_key, model)` |
+
+GPT-5.6 uses the Responses API automatically on the official OpenAI endpoint. Exact controls that
+do not fit the provider-neutral thinking config are available through `OpenAIReasoningConfig`:
+
+```rust
+use agent_sdk_providers::{
+    OpenAIPromptCacheMode, OpenAIPromptCacheTtl, OpenAIProvider, OpenAIReasoningConfig,
+    OpenAIReasoningContext, OpenAIReasoningEffort, OpenAIReasoningMode, OpenAIReasoningSummary,
+};
+
+let provider = OpenAIProvider::gpt56(api_key).with_reasoning(
+    OpenAIReasoningConfig::new()
+        .with_effort(OpenAIReasoningEffort::Max)
+        .with_mode(OpenAIReasoningMode::Standard)
+        .with_context(OpenAIReasoningContext::AllTurns)
+        .with_summary(OpenAIReasoningSummary::Auto)
+        .with_prompt_cache_mode(OpenAIPromptCacheMode::Implicit)
+        .with_prompt_cache_ttl(OpenAIPromptCacheTtl::ThirtyMinutes),
+);
+```
+
+Responses are not stored by default. Encrypted reasoning items are retained internally and replayed
+across tool turns without exposing them through conversation or observability payloads. Set a
+`ChatRequest` session ID to populate OpenAI's `prompt_cache_key`.
 
 Implement `LlmProvider` trait to add your own.
 

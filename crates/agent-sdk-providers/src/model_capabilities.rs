@@ -115,8 +115,12 @@ const ANTHROPIC_MODELS_URL: &str =
     "https://docs.anthropic.com/en/docs/about-claude/models/all-models";
 const OPENAI_MODELS_URL: &str = "https://developers.openai.com/api/docs/models";
 const OPENAI_PRICING_URL: &str = "https://developers.openai.com/api/docs/pricing";
+const OPENAI_GPT56_SOL_URL: &str = "https://developers.openai.com/api/docs/models/gpt-5.6-sol";
+const OPENAI_GPT56_TERRA_URL: &str = "https://developers.openai.com/api/docs/models/gpt-5.6-terra";
+const OPENAI_GPT56_LUNA_URL: &str = "https://developers.openai.com/api/docs/models/gpt-5.6-luna";
 const OPENAI_GPT54_URL: &str = "https://developers.openai.com/api/docs/models/gpt-5.4";
 const OPENAI_GPT53_CODEX_URL: &str = "https://developers.openai.com/api/docs/models/gpt-5.3-codex";
+const OPENAI_GPT52_PRO_URL: &str = "https://developers.openai.com/api/docs/models/gpt-5.2-pro";
 const GOOGLE_MODELS_URL: &str = "https://ai.google.dev/gemini-api/docs/models";
 const GOOGLE_PRICING_URL: &str = "https://ai.google.dev/gemini-api/docs/pricing";
 
@@ -283,6 +287,54 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
     // OpenAI
     ModelCapabilities {
         provider: "openai",
+        model_id: "gpt-5.6",
+        context_window: Some(1_050_000),
+        max_output_tokens: Some(128_000),
+        pricing: None,
+        supports_thinking: true,
+        supports_adaptive_thinking: true,
+        source_url: OPENAI_GPT56_SOL_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("Official alias for GPT-5.6 Sol. Base rates are $5 input, $0.50 cached input, and $30 output per 1M tokens. Structured pricing is omitted because the current Pricing type cannot represent long-context or cache-write rates."),
+    },
+    ModelCapabilities {
+        provider: "openai",
+        model_id: "gpt-5.6-sol",
+        context_window: Some(1_050_000),
+        max_output_tokens: Some(128_000),
+        pricing: None,
+        supports_thinking: true,
+        supports_adaptive_thinking: true,
+        source_url: OPENAI_GPT56_SOL_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("Supports Chat Completions and Responses, 1.05M context, and 128K max output. Base rates are $5 input, $0.50 cached input, and $30 output per 1M tokens; structured pricing is omitted because long-context and cache-write rates are not representable."),
+    },
+    ModelCapabilities {
+        provider: "openai",
+        model_id: "gpt-5.6-terra",
+        context_window: Some(1_050_000),
+        max_output_tokens: Some(128_000),
+        pricing: None,
+        supports_thinking: true,
+        supports_adaptive_thinking: true,
+        source_url: OPENAI_GPT56_TERRA_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("Supports Chat Completions and Responses, 1.05M context, and 128K max output. Base rates are $2.50 input, $0.25 cached input, and $15 output per 1M tokens; structured pricing is omitted because long-context and cache-write rates are not representable."),
+    },
+    ModelCapabilities {
+        provider: "openai",
+        model_id: "gpt-5.6-luna",
+        context_window: Some(1_050_000),
+        max_output_tokens: Some(128_000),
+        pricing: None,
+        supports_thinking: true,
+        supports_adaptive_thinking: true,
+        source_url: OPENAI_GPT56_LUNA_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("Supports Chat Completions and Responses, 1.05M context, and 128K max output. Base rates are $1 input, $0.10 cached input, and $6 output per 1M tokens; structured pricing is omitted because long-context and cache-write rates are not representable."),
+    },
+    ModelCapabilities {
+        provider: "openai",
         model_id: "gpt-5.4",
         context_window: Some(1_050_000),
         max_output_tokens: Some(128_000),
@@ -297,13 +349,13 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         provider: "openai",
         model_id: "gpt-5.3-codex",
         context_window: Some(400_000),
-        max_output_tokens: Some(120_000),
+        max_output_tokens: Some(128_000),
         pricing: Some(Pricing::flat_with_cached(1.50, 6.0, 0.375)),
         supports_thinking: true,
-        supports_adaptive_thinking: false,
+        supports_adaptive_thinking: true,
         source_url: OPENAI_GPT53_CODEX_URL,
         source_status: SourceStatus::Official,
-        notes: Some("OpenAI model docs list Chat Completions and Responses API support plus reasoning.effort levels."),
+        notes: Some("OpenAI model docs list Responses-only access, a 272K maximum input, 128K maximum output, and reasoning.effort levels."),
     },
     ModelCapabilities {
         provider: "openai",
@@ -370,12 +422,12 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         model_id: "gpt-5.2-pro",
         context_window: Some(400_000),
         max_output_tokens: Some(128_000),
-        pricing: Some(Pricing::flat(10.50, 84.0)),
-        supports_thinking: false,
+        pricing: Some(Pricing::flat(21.0, 168.0)),
+        supports_thinking: true,
         supports_adaptive_thinking: false,
-        source_url: OPENAI_PRICING_URL,
+        source_url: OPENAI_GPT52_PRO_URL,
         source_status: SourceStatus::Official,
-        notes: Some("Pricing verified from OpenAI pricing page. Context/max output still need clean extraction from models docs."),
+        notes: Some("Responses-only pro model. Supports medium, high, and xhigh reasoning effort."),
     },
     ModelCapabilities {
         provider: "openai",
@@ -881,10 +933,51 @@ mod tests {
     }
 
     #[test]
+    fn test_lookup_openai_gpt52_pro() -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let caps = get_model_capabilities("openai", "gpt-5.2-pro")
+            .context("gpt-5.2-pro capabilities missing")?;
+        assert_eq!(caps.context_window, Some(400_000));
+        assert_eq!(caps.max_output_tokens, Some(128_000));
+        assert!(caps.supports_thinking);
+        assert_eq!(caps.source_status, SourceStatus::Official);
+        let pricing = caps.pricing.context("gpt-5.2-pro pricing missing")?;
+        let input = pricing.input.context("input price missing")?;
+        let output = pricing.output.context("output price missing")?;
+        assert!((input.usd_per_million_tokens - 21.0).abs() < f64::EPSILON);
+        assert!((output.usd_per_million_tokens - 168.0).abs() < f64::EPSILON);
+        Ok(())
+    }
+
+    #[test]
+    fn test_lookup_openai_gpt56_family() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        for model_id in ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let caps = get_model_capabilities("openai", model_id)
+                .with_context(|| format!("{model_id} capabilities missing"))?;
+            assert_eq!(caps.context_window, Some(1_050_000));
+            assert_eq!(caps.max_output_tokens, Some(128_000));
+            assert!(caps.supports_thinking);
+            assert!(caps.supports_adaptive_thinking);
+            assert_eq!(caps.source_status, SourceStatus::Official);
+            assert!(
+                caps.pricing.is_none(),
+                "tiered GPT-5.6 pricing must not produce a flat cost estimate"
+            );
+            assert!(caps.notes.is_some_and(|notes| notes.contains("Base rates")));
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn test_lookup_openai_gpt53_codex() {
         let caps = get_model_capabilities("openai", "gpt-5.3-codex").unwrap();
         assert_eq!(caps.context_window, Some(400_000));
-        assert_eq!(caps.max_output_tokens, Some(120_000));
+        assert_eq!(caps.max_output_tokens, Some(128_000));
+        assert!(caps.supports_adaptive_thinking);
         assert!(caps.supports_thinking);
         assert_eq!(caps.source_status, SourceStatus::Official);
     }

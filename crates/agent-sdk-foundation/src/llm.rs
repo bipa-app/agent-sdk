@@ -511,6 +511,19 @@ pub enum ContentBlock {
     #[serde(rename = "redacted_thinking")]
     RedactedThinking { data: String },
 
+    /// Provider-owned reasoning state that must be replayed exactly on a
+    /// later request, but must never be interpreted or surfaced by the SDK.
+    ///
+    /// `provider` names the wire protocol that owns `data`; providers must
+    /// ignore blocks owned by a different protocol. The JSON payload is kept
+    /// opaque so a provider can evolve its state-item shape without requiring
+    /// another SDK wire-format change.
+    #[serde(rename = "opaque_reasoning")]
+    OpaqueReasoning {
+        provider: String,
+        data: serde_json::Value,
+    },
+
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -1036,6 +1049,17 @@ mod tests {
             })?,
             serde_json::json!({"type": "document", "source": {"media_type": "application/pdf", "data": "b64"}})
         );
+        assert_eq!(
+            serde_json::to_value(ContentBlock::OpaqueReasoning {
+                provider: "test-provider".into(),
+                data: serde_json::json!({"id": "reasoning_1", "encrypted": "ciphertext"}),
+            })?,
+            serde_json::json!({
+                "type": "opaque_reasoning",
+                "provider": "test-provider",
+                "data": {"id": "reasoning_1", "encrypted": "ciphertext"}
+            })
+        );
         Ok(())
     }
 
@@ -1048,6 +1072,10 @@ mod tests {
                 signature: Some("s".into()),
             },
             ContentBlock::RedactedThinking { data: "d".into() },
+            ContentBlock::OpaqueReasoning {
+                provider: "test-provider".into(),
+                data: serde_json::json!({"id": "reasoning_1", "state": [1, 2, 3]}),
+            },
             ContentBlock::ToolUse {
                 id: "i".into(),
                 name: "n".into(),

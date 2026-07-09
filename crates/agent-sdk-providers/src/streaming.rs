@@ -137,6 +137,20 @@ pub enum StreamDelta {
         block_index: usize,
     },
 
+    /// A complete provider-owned reasoning-state item.
+    ///
+    /// Unlike text/thinking deltas this item is not user-visible and must not
+    /// be interpreted. It is carried through the stream solely so agent
+    /// history can replay it to the provider that owns it.
+    OpaqueReasoning {
+        /// Provider protocol that owns the payload.
+        provider: String,
+        /// Exact provider response item to preserve.
+        data: serde_json::Value,
+        /// Index used to retain the provider's output-item ordering.
+        block_index: usize,
+    },
+
     /// Error during streaming.
     Error {
         /// Error message
@@ -207,6 +221,8 @@ pub struct StreamAccumulator {
     thinking_signatures: HashMap<usize, String>,
     /// Redacted thinking blocks: (`block_index`, data)
     redacted_thinking_blocks: Vec<(usize, String)>,
+    /// Provider-owned opaque reasoning: (`block_index`, provider, data)
+    opaque_reasoning_blocks: Vec<(usize, String, serde_json::Value)>,
     /// Accumulated tool use calls
     tool_uses: Vec<ToolUseAccumulator>,
     /// Usage information from the stream
@@ -293,6 +309,14 @@ impl StreamAccumulator {
                 self.redacted_thinking_blocks
                     .push((*block_index, data.clone()));
             }
+            StreamDelta::OpaqueReasoning {
+                provider,
+                data,
+                block_index,
+            } => {
+                self.opaque_reasoning_blocks
+                    .push((*block_index, provider.clone(), data.clone()));
+            }
             StreamDelta::Usage(u) => {
                 self.usage = Some(u.clone());
             }
@@ -341,6 +365,11 @@ impl StreamAccumulator {
         // Add redacted thinking blocks
         for (idx, data) in self.redacted_thinking_blocks {
             blocks.push((idx, ContentBlock::RedactedThinking { data }));
+        }
+
+        // Add provider-owned reasoning state without interpreting its payload.
+        for (idx, provider, data) in self.opaque_reasoning_blocks {
+            blocks.push((idx, ContentBlock::OpaqueReasoning { provider, data }));
         }
 
         // Add text blocks with their indices
@@ -453,6 +482,37 @@ mod tests {
             &blocks[0],
             ContentBlock::Thinking { thinking, signature }
             if thinking == "Reasoning" && signature.as_deref() == Some("sig_123")
+        ));
+    }
+
+    #[test]
+    fn accumulator_preserves_opaque_reasoning_payload_and_order() {
+        let mut acc = StreamAccumulator::new();
+        acc.apply(&StreamDelta::TextDelta {
+            delta: "visible".to_owned(),
+            block_index: 2,
+        });
+        acc.apply(&StreamDelta::OpaqueReasoning {
+            provider: "test-provider".to_owned(),
+            data: serde_json::json!({
+                "id": "reasoning_1",
+                "encrypted_content": "do-not-inspect"
+            }),
+            block_index: 1,
+        });
+
+        let blocks = acc.into_content_blocks();
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(
+            &blocks[0],
+            ContentBlock::OpaqueReasoning { provider, data }
+                if provider == "test-provider"
+                    && data["id"] == "reasoning_1"
+                    && data["encrypted_content"] == "do-not-inspect"
+        ));
+        assert!(matches!(
+            &blocks[1],
+            ContentBlock::Text { text } if text == "visible"
         ));
     }
 

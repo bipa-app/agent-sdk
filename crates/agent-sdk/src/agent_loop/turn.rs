@@ -684,6 +684,11 @@ pub(super) fn log_chat_request(request: &ChatRequest) {
                         ContentBlock::RedactedThinking { .. } => {
                             debug!("    block[{block_idx}]: RedactedThinking");
                         }
+                        ContentBlock::OpaqueReasoning { provider, .. } => {
+                            debug!(
+                                "    block[{block_idx}]: OpaqueReasoning(provider={provider}, payload=<redacted>)"
+                            );
+                        }
                         ContentBlock::ToolUse {
                             id, name, input, ..
                         } => {
@@ -1195,6 +1200,7 @@ where
 {
     let stop_reason = response.stop_reason;
     let (thinking_content, text_content, tool_uses) = extract_content(&response);
+    let accepts_tool_uses = response_allows_tool_execution(stop_reason);
 
     if let Some(thinking) = &thinking_content {
         send_event(
@@ -1220,7 +1226,24 @@ where
         .await?;
     }
 
-    let assistant_msg = build_assistant_message(&response);
+    // A provider may produce a malformed or partially assembled response
+    // containing tool-use blocks while explicitly reporting a terminal
+    // reason such as `end_turn` or `max_tokens`.  Treat the explicit reason
+    // as authoritative: neither execute nor persist those tool uses.  Leaving
+    // them in history without matching results would poison subsequent calls.
+    if !accepts_tool_uses && !tool_uses.is_empty() {
+        warn!(
+            "Ignoring {} tool-use block(s) paired with terminal stop reason {:?}",
+            tool_uses.len(),
+            stop_reason
+        );
+    }
+
+    let assistant_msg = if accepts_tool_uses {
+        build_assistant_message(&response)
+    } else {
+        build_terminal_assistant_message(&response)
+    };
     if let Err(error) = message_store.append(thread_id, assistant_msg).await {
         send_event(
             event_store,
@@ -1243,8 +1266,33 @@ where
     Ok(ProcessedTurnResponse {
         stop_reason,
         text_content,
-        pending_tool_calls: build_pending_tool_calls(tools, &tool_uses),
+        pending_tool_calls: if accepts_tool_uses {
+            build_pending_tool_calls(tools, &tool_uses)
+        } else {
+            Vec::new()
+        },
     })
+}
+
+/// Whether a response may initiate tool execution.
+///
+/// An explicit terminal stop reason is authoritative even if a provider also
+/// emitted `ToolUse` blocks.  `None` remains accepted for compatibility with
+/// legacy providers that did not report a stop reason for tool calls.
+pub(super) const fn response_allows_tool_execution(stop_reason: Option<StopReason>) -> bool {
+    matches!(stop_reason, None | Some(StopReason::ToolUse))
+}
+
+/// Build a terminal assistant message without tool-use blocks.
+///
+/// Terminal responses cannot have their tool uses executed, so retaining them
+/// would create an orphaned tool-use entry in persisted conversation history.
+fn build_terminal_assistant_message(response: &ChatResponse) -> Message {
+    let mut terminal_response = response.clone();
+    terminal_response
+        .content
+        .retain(|block| !matches!(block, ContentBlock::ToolUse { .. }));
+    build_assistant_message(&terminal_response)
 }
 
 pub(super) fn build_pending_tool_calls<Ctx>(
@@ -2520,4 +2568,29 @@ where
         cancel_token,
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_tool_use_or_missing_stop_reason_allows_tool_execution() {
+        assert!(response_allows_tool_execution(None));
+        assert!(response_allows_tool_execution(Some(StopReason::ToolUse)));
+
+        for stop_reason in [
+            StopReason::EndTurn,
+            StopReason::MaxTokens,
+            StopReason::StopSequence,
+            StopReason::Refusal,
+            StopReason::ModelContextWindowExceeded,
+            StopReason::Unknown,
+        ] {
+            assert!(
+                !response_allows_tool_execution(Some(stop_reason)),
+                "terminal stop reason {stop_reason:?} must not authorize tool execution"
+            );
+        }
+    }
 }

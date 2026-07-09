@@ -2045,6 +2045,98 @@ async fn test_external_tool_runtime_no_tools_returns_done() -> anyhow::Result<()
 }
 
 #[tokio::test]
+async fn terminal_stop_reason_ignores_tool_blocks_before_execution_and_persistence()
+-> anyhow::Result<()> {
+    use crate::llm::{ChatResponse, StopReason, Usage};
+
+    let executions = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let provider = MockProvider::new(vec![ChatOutcome::Success(ChatResponse {
+        id: "msg_terminal_tool".to_string(),
+        content: vec![
+            ContentBlock::Text {
+                text: "I cannot continue.".to_string(),
+            },
+            ContentBlock::ToolUse {
+                id: "tool_should_not_run".to_string(),
+                name: "counter".to_string(),
+                input: json!({ "tag": "unexpected" }),
+                thought_signature: None,
+            },
+        ],
+        model: "mock-model".to_string(),
+        stop_reason: Some(StopReason::EndTurn),
+        usage: Usage {
+            input_tokens: 10,
+            output_tokens: 20,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        },
+    })]);
+
+    let mut tools = ToolRegistry::new();
+    tools.register(CountingTool {
+        executions: Arc::clone(&executions),
+    });
+    let message_store = InMemoryStore::new();
+    let agent = builder::<()>()
+        .provider(provider)
+        .hooks(AllowAllHooks)
+        .tools(tools)
+        .message_store(message_store.clone())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+
+    let (outcome, events) = run_turn_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("do the thing".to_string()),
+        ToolContext::new(()),
+        TurnOptions::default(),
+    )
+    .await?;
+
+    assert!(
+        matches!(outcome, TurnOutcome::Done { .. }),
+        "a terminal response must not hand off tools, got {outcome:?}"
+    );
+    {
+        let executions = executions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("execution counter lock poisoned"))?;
+        assert!(
+            executions.is_empty(),
+            "a terminal response must not execute its tool blocks"
+        );
+        drop(executions);
+    }
+    assert!(
+        !events.iter().any(|event| matches!(
+            event.event,
+            AgentEvent::ToolCallStart { .. } | AgentEvent::ToolCallEnd { .. }
+        )),
+        "a terminal response must not emit tool lifecycle events"
+    );
+
+    let history = message_store.get_history(&thread_id).await?;
+    assert!(
+        !history.iter().any(|message| matches!(
+            &message.content,
+            Content::Blocks(blocks)
+                if blocks.iter().any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+        )),
+        "ignored tool blocks must not be persisted without results: {history:?}"
+    );
+    assert!(
+        !crate::llm::has_unbalanced_tool_use(&history),
+        "terminal response history must remain balanced: {history:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_strict_durability_saves_state_checkpoints() -> anyhow::Result<()> {
     // Verify strict durability mode runs without errors.
     let provider = MockProvider::new(vec![

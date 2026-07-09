@@ -20,7 +20,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_sdk_foundation::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Usage,
+    CacheConfig, ChatOutcome, ChatRequest, ChatResponse, ContentBlock, Effort, StopReason,
+    ThinkingConfig, ThinkingMode, ToolChoice, Usage,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -349,6 +350,11 @@ enum CassetteDelta {
         data: String,
         block_index: usize,
     },
+    OpaqueReasoning {
+        provider: String,
+        data: serde_json::Value,
+        block_index: usize,
+    },
     Usage(Usage),
     Done {
         stop_reason: Option<StopReason>,
@@ -398,6 +404,15 @@ impl CassetteDelta {
                 data: data.clone(),
                 block_index: *block_index,
             },
+            StreamDelta::OpaqueReasoning {
+                provider,
+                data,
+                block_index,
+            } => Self::OpaqueReasoning {
+                provider: provider.clone(),
+                data: data.clone(),
+                block_index: *block_index,
+            },
             StreamDelta::Usage(usage) => Self::Usage(usage.clone()),
             StreamDelta::Done { stop_reason } => Self::Done {
                 stop_reason: *stop_reason,
@@ -441,6 +456,15 @@ impl CassetteDelta {
             Self::RedactedThinking { data, block_index } => {
                 StreamDelta::RedactedThinking { data, block_index }
             }
+            Self::OpaqueReasoning {
+                provider,
+                data,
+                block_index,
+            } => StreamDelta::OpaqueReasoning {
+                provider,
+                data,
+                block_index,
+            },
             Self::Usage(usage) => StreamDelta::Usage(usage),
             Self::Done { stop_reason } => StreamDelta::Done { stop_reason },
             Self::Error { message, kind } => StreamDelta::Error {
@@ -486,14 +510,25 @@ fn millis_from_duration(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// A stable fingerprint of the request's caller-visible content.
+/// A stable fingerprint of every caller-visible field that can change a
+/// provider response.
+///
+/// The canonical JSON stays in-process and is immediately hashed; only the
+/// digest is stored in a cassette key or included in an error, so request
+/// fields such as session identifiers never appear in logs.
 fn fingerprint(request: &ChatRequest) -> String {
     let canonical = serde_json::json!({
         "system": request.system,
         "messages": request.messages,
         "tools": request.tools,
         "max_tokens": request.max_tokens,
+        "max_tokens_explicit": request.max_tokens_explicit,
+        "session_id": request.session_id,
+        "cached_content": request.cached_content,
+        "thinking": canonical_thinking(request.thinking.as_ref()),
+        "tool_choice": canonical_tool_choice(request.tool_choice.as_ref()),
         "response_format": request.response_format,
+        "cache": canonical_cache(request.cache.as_ref()),
     });
     let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
     // FNV-1a (64-bit): self-contained and stable across runs, unlike the
@@ -504,6 +539,54 @@ fn fingerprint(request: &ChatRequest) -> String {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("{hash:016x}")
+}
+
+fn canonical_thinking(thinking: Option<&ThinkingConfig>) -> serde_json::Value {
+    let Some(thinking) = thinking else {
+        return serde_json::Value::Null;
+    };
+
+    let mode = match &thinking.mode {
+        ThinkingMode::Enabled { budget_tokens } => serde_json::json!({
+            "type": "enabled",
+            "budget_tokens": budget_tokens,
+        }),
+        ThinkingMode::Adaptive => serde_json::json!({"type": "adaptive"}),
+    };
+    let effort = thinking.effort.map(|effort| match effort {
+        Effort::Low => "low",
+        Effort::Medium => "medium",
+        Effort::High => "high",
+        Effort::Max => "max",
+    });
+
+    serde_json::json!({
+        "mode": mode,
+        "effort": effort,
+    })
+}
+
+fn canonical_tool_choice(choice: Option<&ToolChoice>) -> serde_json::Value {
+    match choice {
+        None => serde_json::Value::Null,
+        Some(ToolChoice::Auto) => serde_json::Value::String("auto".to_owned()),
+        Some(ToolChoice::Tool(name)) => serde_json::json!({
+            "type": "tool",
+            "name": name,
+        }),
+    }
+}
+
+fn canonical_cache(cache: Option<&CacheConfig>) -> serde_json::Value {
+    let Some(cache) = cache else {
+        return serde_json::Value::Null;
+    };
+
+    serde_json::json!({
+        "enabled": cache.enabled,
+        "ttl": cache.ttl.map(|ttl| ttl.as_wire_str()),
+        "max_breakpoints": cache.max_breakpoints,
+    })
 }
 
 fn entry_key(method: &str, request: &ChatRequest) -> String {
@@ -530,7 +613,7 @@ fn build_replay_map(cassette: &Cassette) -> HashMap<String, VecDeque<CassetteInt
 mod tests {
     use super::*;
 
-    use agent_sdk_foundation::llm::Message;
+    use agent_sdk_foundation::llm::{CacheTtl, Message};
 
     /// A scripted inner provider used only in record mode.
     struct InnerProvider {
@@ -595,6 +678,41 @@ mod tests {
 
     fn request() -> ChatRequest {
         ChatRequest::new("sys", vec![Message::user("hello")])
+    }
+
+    #[test]
+    fn fingerprint_distinguishes_response_shaping_request_controls() {
+        let baseline = request();
+        let mut explicitly_default_max_tokens = baseline.clone();
+        explicitly_default_max_tokens.max_tokens_explicit = true;
+        let mut cached_content = baseline.clone();
+        cached_content.cached_content = Some("cached-content-1".to_owned());
+
+        let variants = [
+            baseline.clone(),
+            baseline
+                .clone()
+                .with_thinking(ThinkingConfig::adaptive_with_effort(Effort::High)),
+            baseline
+                .clone()
+                .with_tool_choice(ToolChoice::Tool("lookup".to_owned())),
+            baseline.clone().with_cache(
+                CacheConfig::enabled()
+                    .with_ttl(CacheTtl::OneHour)
+                    .with_max_breakpoints(2),
+            ),
+            baseline.clone().with_session_id("session-1"),
+            cached_content,
+            explicitly_default_max_tokens,
+        ];
+
+        let mut fingerprints = std::collections::HashSet::new();
+        for variant in &variants {
+            assert!(
+                fingerprints.insert(fingerprint(variant)),
+                "response-shaping request controls must not share cassette keys"
+            );
+        }
     }
 
     #[tokio::test]
@@ -716,5 +834,33 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         Ok(())
+    }
+
+    #[test]
+    fn cassette_delta_round_trips_opaque_reasoning_exactly() {
+        let delta = StreamDelta::OpaqueReasoning {
+            provider: "test-provider".to_owned(),
+            data: serde_json::json!({
+                "id": "reasoning_1",
+                "summary": [],
+                "encrypted_content": "ciphertext"
+            }),
+            block_index: 4,
+        };
+
+        let replayed = CassetteDelta::from_delta(&delta).into_delta();
+        assert!(matches!(
+            replayed,
+            StreamDelta::OpaqueReasoning {
+                provider,
+                data,
+                block_index: 4,
+            } if provider == "test-provider"
+                && data == serde_json::json!({
+                    "id": "reasoning_1",
+                    "summary": [],
+                    "encrypted_content": "ciphertext"
+                })
+        ));
     }
 }

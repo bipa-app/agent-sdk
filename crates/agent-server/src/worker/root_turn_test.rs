@@ -93,6 +93,7 @@ impl LlmProvider for MockTextProvider {
 /// Mock provider that returns a response with tool-use blocks.
 struct MockToolCallProvider {
     tool_calls: Vec<(String, String, serde_json::Value)>,
+    stop_reason: StopReason,
     call_count: AtomicUsize,
 }
 
@@ -100,12 +101,18 @@ impl MockToolCallProvider {
     fn new(tool_calls: Vec<(String, String, serde_json::Value)>) -> Self {
         Self {
             tool_calls,
+            stop_reason: StopReason::ToolUse,
             call_count: AtomicUsize::new(0),
         }
     }
 
     fn single(id: &str, name: &str, input: serde_json::Value) -> Self {
         Self::new(vec![(id.into(), name.into(), input)])
+    }
+
+    fn with_stop_reason(mut self, stop_reason: StopReason) -> Self {
+        self.stop_reason = stop_reason;
+        self
     }
 
     fn calls(&self) -> usize {
@@ -132,7 +139,7 @@ impl LlmProvider for MockToolCallProvider {
             id: "msg_tool_01".into(),
             content,
             model: "mock-model".into(),
-            stop_reason: Some(StopReason::ToolUse),
+            stop_reason: Some(self.stop_reason),
             usage: Usage {
                 input_tokens: 120,
                 output_tokens: 60,
@@ -607,6 +614,64 @@ async fn llm_error_propagates() -> Result<()> {
 // ─────────────────────────────────────────────────────────────────────
 // Phase 4.4 — tool-boundary suspension tests
 // ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn terminal_stop_reason_with_tool_blocks_commits_without_child_dispatch() -> Result<()> {
+    let stores = TestStores::new();
+    let provider = MockToolCallProvider::single(
+        "call_terminal",
+        "bash",
+        serde_json::json!({"command": "must-not-run"}),
+    )
+    .with_stop_reason(StopReason::EndTurn);
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let bootstrap = sample_bootstrap_with_tools(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    let outcome = execute_root_turn(
+        inputs,
+        "finish without tools",
+        &provider,
+        &stores.deps(),
+        t_plus(5),
+    )
+    .await?;
+
+    let RootTurnOutcome::Completed { completed_task, .. } = outcome else {
+        panic!("terminal stop reasons must not suspend for tool blocks");
+    };
+    assert_eq!(provider.calls(), 1);
+    assert_eq!(completed_task.status, TaskStatus::Completed);
+    assert!(
+        stores.tasks.list_children(&task_id).await?.is_empty(),
+        "a terminal response must not create tool children"
+    );
+
+    let history = stores.messages.get_history(&thread_a()).await?;
+    assert!(
+        !history.iter().any(|message| matches!(
+            &message.content,
+            agent_sdk_foundation::llm::Content::Blocks(blocks)
+                if blocks.iter().any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+        )),
+        "terminal tool blocks must not be persisted without results: {history:?}"
+    );
+    assert!(
+        !agent_sdk_foundation::llm::has_unbalanced_tool_use(&history),
+        "terminal response history must remain balanced: {history:?}"
+    );
+
+    Ok(())
+}
 
 #[tokio::test]
 async fn tool_suspension_end_to_end() -> Result<()> {
