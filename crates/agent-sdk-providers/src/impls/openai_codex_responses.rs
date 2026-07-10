@@ -257,12 +257,12 @@ impl OpenAICodexResponsesProvider {
         self.websockets_disabled || self.websockets_unhealthy.load(Ordering::Relaxed)
     }
 
-    /// The ChatGPT-backend Codex Responses contract does not accept
+    /// The `ChatGPT`-backend Codex Responses contract does not accept
     /// `max_output_tokens` — the backend manages the output budget and
     /// rejects the parameter with `400 InvalidRequest` ("Unsupported
-    /// parameter: max_output_tokens", verified live 2026-07-10 against
-    /// `gpt-5.4` on a ChatGPT account). The official Codex CLI never sends
-    /// it, and the reverse-engineered request contract (bip's
+    /// parameter: `max_output_tokens`", verified live 2026-07-10 against
+    /// `gpt-5.4` on a `ChatGPT` account). The official Codex CLI never
+    /// sends it, and the reverse-engineered request contract (bip's
     /// `docs/codex-oauth-study-2026-06-13.md`) carries no such field. The
     /// caller's `max_tokens` is therefore intentionally dropped on this
     /// transport regardless of `max_tokens_explicit` — hosts like
