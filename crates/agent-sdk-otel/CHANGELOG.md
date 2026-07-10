@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.6](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-otel-v0.11.5...agent-sdk-otel-v0.11.6) - 2026-07-10
+
+### Other
+
+- release v0.11.6 ([#341](https://github.com/bipa-app/agent-sdk/pull/341))
+
 ## [0.11.3](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-otel-v0.11.2...agent-sdk-otel-v0.11.3) - 2026-07-01
 
 ### Other
