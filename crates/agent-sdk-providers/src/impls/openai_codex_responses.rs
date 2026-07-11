@@ -1194,6 +1194,11 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                     }
                                                 };
                                                 let block_index = event.output_index.unwrap_or(0);
+                                                accumulate_completed_tool_call(
+                                                    &item,
+                                                    block_index,
+                                                    &mut tool_calls,
+                                                );
                                                 let include_summary = !streamed_reasoning_summaries
                                                     .contains(&block_index);
                                                 for delta in output_item_stream_deltas(
@@ -1419,6 +1424,11 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                         };
                                                     let block_index =
                                                         event.output_index.unwrap_or(0);
+                                                    accumulate_completed_tool_call(
+                                                        &item,
+                                                        block_index,
+                                                        &mut tool_calls,
+                                                    );
                                                     let include_summary =
                                                         !streamed_reasoning_summaries
                                                             .contains(&block_index);
@@ -1756,6 +1766,11 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                     }
                                 };
                                 let block_index = event.output_index.unwrap_or(0);
+                                accumulate_completed_tool_call(
+                                    &item,
+                                    block_index,
+                                    &mut tool_calls,
+                                );
                                 let include_summary =
                                     !streamed_reasoning_summaries.contains(&block_index);
                                 for delta in output_item_stream_deltas(
@@ -2477,6 +2492,35 @@ fn output_item_stream_deltas(
         }
         ApiOutputItem::FunctionCall { .. } | ApiOutputItem::Unknown => Vec::new(),
     }
+}
+
+fn accumulate_completed_tool_call(
+    item: &ApiOutputItem,
+    output_index: usize,
+    tool_calls: &mut HashMap<String, ToolCallAccumulator>,
+) {
+    let ApiOutputItem::FunctionCall {
+        call_id,
+        name,
+        arguments,
+    } = item
+    else {
+        return;
+    };
+
+    let order = tool_calls.len();
+    let accumulator = tool_calls
+        .entry(call_id.clone())
+        .or_insert_with(|| ToolCallAccumulator {
+            id: call_id.clone(),
+            name: name.clone(),
+            arguments: String::new(),
+            order,
+            block_index: Some(output_index.saturating_mul(2)),
+        });
+    accumulator.name.clone_from(name);
+    accumulator.arguments.clone_from(arguments);
+    accumulator.block_index = Some(output_index.saturating_mul(2));
 }
 
 fn emit_accumulated_tool_calls(
@@ -4211,6 +4255,47 @@ mod tests {
             ));
             assert!(stream.next().await.is_none());
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn atomic_http_function_call_is_not_dropped() -> anyhow::Result<()> {
+        let sse_body = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"ciphertext\",\"summary\":[]}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"src/lib.rs\\\"}\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (base_url, _, _) = spawn_http_only_server_with_body(sse_body).await;
+        let provider = OpenAICodexResponsesProvider::with_base_url(
+            oauth_token(),
+            MODEL_GPT53_CODEX.to_owned(),
+            base_url,
+        )
+        .with_websockets_disabled(true);
+        let mut stream =
+            std::pin::pin!(provider.chat_stream(streaming_request("atomic-function-call")));
+        let mut deltas = Vec::new();
+        while let Some(delta) = stream.next().await {
+            deltas.push(delta?);
+        }
+
+        assert!(deltas.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::ToolUseStart { id, name, .. }
+                if id == "call_1" && name == "read"
+        )));
+        assert!(deltas.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::ToolInputDelta { id, delta, .. }
+                if id == "call_1" && delta == r#"{"path":"src/lib.rs"}"#
+        )));
+        assert!(matches!(
+            deltas.last(),
+            Some(StreamDelta::Done {
+                stop_reason: Some(StopReason::ToolUse)
+            })
+        ));
         Ok(())
     }
 
