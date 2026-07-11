@@ -814,6 +814,13 @@ mod tests {
     /// makes both directions instant and deterministic: the sleep and the
     /// deadline are virtual, so neither the happy path nor a regression
     /// burns wall-clock time.
+    ///
+    /// The assertions pin the *virtual* elapsed time and the timeout error
+    /// provenance — not merely "some error": if `send` regressed to the
+    /// default deadline (or dropped the outer timeout), paused time would
+    /// auto-advance through the 30s stall and the poster's junk body would
+    /// still make `send` fail, but at 30s virtual and without the timeout
+    /// context, so both assertions below catch it.
     #[tokio::test(start_paused = true)]
     async fn configured_send_deadline_fails_fast() -> Result<()> {
         struct StallingPoster;
@@ -833,15 +840,18 @@ mod tests {
                 .with_request_timeout(Duration::from_millis(50)),
         );
 
-        let started = std::time::Instant::now();
-        let result = transport.send(JsonRpcRequest::new("ping", None, 0)).await;
+        let started = tokio::time::Instant::now();
+        let Err(error) = transport.send(JsonRpcRequest::new("ping", None, 0)).await else {
+            bail!("a stalled server must trip the configured send deadline");
+        };
         assert!(
-            result.is_err(),
-            "a stalled server must trip the configured send deadline"
+            format!("{error:#}").contains("timed out"),
+            "error must come from the send deadline, not response parsing: {error:#}"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "must fail fast at the configured deadline, not wait the default minute (elapsed {:?})",
+            started.elapsed() < Duration::from_secs(1),
+            "deadline must fire at the configured 50ms (virtual), not after the 30s stall \
+             (virtual elapsed {:?})",
             started.elapsed(),
         );
         Ok(())
