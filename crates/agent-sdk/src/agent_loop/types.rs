@@ -41,6 +41,15 @@ pub(super) enum InternalTurnResult {
         description: String,
         continuation: Box<AgentContinuation>,
     },
+    /// A run-level usage budget was crossed by spend that accrued *inside*
+    /// the turn (compaction summarization, or the turn's own LLM usage on
+    /// the overflow-recovery path), detected before paying for the next
+    /// LLM call. The terminal [`crate::events::AgentEvent::BudgetExceeded`]
+    /// was already emitted under the still-open turn at the detection site.
+    BudgetExceeded {
+        limit: crate::types::BudgetLimitKind,
+        estimated_cost_usd: Option<f64>,
+    },
     /// Tool calls ready for external execution (server mode)
     PendingToolCalls {
         turn_usage: TokenUsage,
@@ -676,6 +685,9 @@ pub(super) struct TurnStopReasonParams<'a, P, H, M> {
     /// Run provenance, used to price the usage of any emergency compaction
     /// triggered by `ModelContextWindowExceeded`.
     pub(super) provenance: &'a AuditProvenance,
+    /// Run-level usage budgets, consulted before the overflow-driven
+    /// emergency compaction pays for a summarization call.
+    pub(super) usage_limits: Option<&'a UsageLimits>,
     /// Run-level cancellation token, forwarded into the overflow-driven
     /// compaction path triggered by `ModelContextWindowExceeded`.
     pub(super) cancel_token: &'a CancellationToken,

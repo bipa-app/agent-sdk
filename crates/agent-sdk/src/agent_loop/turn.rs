@@ -19,7 +19,7 @@ use crate::stores::{EventStore, MessageStore, StateStore, ToolExecutionStore};
 use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::{
     AgentConfig, AgentContinuation, AgentError, PendingToolCallInfo, ThreadId, TokenUsage,
-    ToolResult, ToolRuntime, ToolTier, TurnOptions,
+    ToolResult, ToolRuntime, ToolTier, TurnOptions, UsageLimits,
 };
 use agent_sdk_foundation::audit::AuditProvenance;
 
@@ -111,12 +111,17 @@ pub(super) enum LoadedMessages {
     Ready {
         messages: Vec<Message>,
         /// Provider-billed usage of the compaction summarization call(s)
-        /// that ran while loading (zero when no compaction happened).
+        /// that ran while loading (zero when no compaction happened —
+        /// including failed attempts whose billed calls still count).
         /// Folded into the run's cumulative usage by the caller so
         /// compaction spend is visible to budgets and `Done` reporting.
         compaction_usage: TokenUsage,
     },
-    Cancelled,
+    Cancelled {
+        /// Usage billed by summarization calls that completed before the
+        /// cancel was honored (zero when the cancel landed mid-call).
+        compaction_usage: TokenUsage,
+    },
 }
 
 pub(super) async fn load_turn_messages<P, H, M>(
@@ -297,12 +302,22 @@ struct ThresholdCompactionParams<'a, C: ?Sized, H, M> {
 
 /// Outcome of a single compaction attempt that ends in storing the
 /// summarized history.
+///
+/// Every variant carries the provider-billed usage of summarization calls
+/// that actually ran: a failed or cancelled-after-summarize attempt was
+/// still billed, and cumulative usage/cost must include every billed call
+/// even when the history is left untouched.
 enum CompactionOutcome {
     Stored(StoredCompactionResult),
     /// Cancel fired before the destructive `replace_history` write —
     /// history is untouched.
-    Cancelled,
-    Failed(AgentError),
+    Cancelled {
+        llm_usage: TokenUsage,
+    },
+    Failed {
+        error: AgentError,
+        llm_usage: TokenUsage,
+    },
 }
 
 async fn compact_messages_for_threshold<C, H, M>(
@@ -362,12 +377,16 @@ where
                 compaction_usage: result.llm_usage,
             })
         }
-        CompactionOutcome::Cancelled => Ok(LoadedMessages::Cancelled),
-        CompactionOutcome::Failed(error) => {
+        CompactionOutcome::Cancelled { llm_usage } => Ok(LoadedMessages::Cancelled {
+            compaction_usage: llm_usage,
+        }),
+        CompactionOutcome::Failed { error, llm_usage } => {
             warn!("Context compaction failed, continuing with full history: {error}");
+            // The failed attempt's summarization calls were still billed —
+            // surface their usage so the turn folds it into the totals.
             Ok(LoadedMessages::Ready {
                 messages: original_messages,
-                compaction_usage: TokenUsage::default(),
+                compaction_usage: llm_usage,
             })
         }
     }
@@ -405,21 +424,30 @@ where
                 "context_compaction_cancelled",
                 "cancelled",
             );
-            return CompactionOutcome::Cancelled;
+            // The in-flight summarization future was dropped mid-call; no
+            // usable usage was observed.
+            return CompactionOutcome::Cancelled {
+                llm_usage: TokenUsage::default(),
+            };
         }
-        res = compactor.compact_history(messages) => match res {
+        res = compactor.compact_history_with_usage(messages) => match res {
             Ok(result) => result,
-            Err(error) => {
+            Err(failure) => {
                 #[cfg(feature = "otel")]
                 finish_compaction_span_error(
                     &mut compaction_span,
                     "context_compaction_failed",
-                    &error.to_string(),
+                    &failure.error.to_string(),
                 );
-                return CompactionOutcome::Failed(AgentError::new(
-                    format!("{compaction_error_prefix}: {error}"),
-                    false,
-                ));
+                // Summarization calls made before the failure were still
+                // billed; carry their usage so the caller can account it.
+                return CompactionOutcome::Failed {
+                    error: AgentError::new(
+                        format!("{compaction_error_prefix}: {}", failure.error),
+                        false,
+                    ),
+                    llm_usage: failure.llm_usage,
+                };
             }
         },
     };
@@ -437,7 +465,10 @@ where
             "context_compaction_cancelled",
             "cancelled",
         );
-        return CompactionOutcome::Cancelled;
+        // Summarization completed (and was billed) before the cancel won.
+        return CompactionOutcome::Cancelled {
+            llm_usage: result.llm_usage,
+        };
     }
 
     let stored_result = StoredCompactionResult {
@@ -462,10 +493,10 @@ where
             "context_compaction_history_replace_failed",
             &error.to_string(),
         );
-        return CompactionOutcome::Failed(AgentError::new(
-            format!("{replace_history_error_prefix}: {error}"),
-            false,
-        ));
+        return CompactionOutcome::Failed {
+            error: AgentError::new(format!("{replace_history_error_prefix}: {error}"), false),
+            llm_usage: stored_result.llm_usage,
+        };
     }
 
     #[cfg(feature = "otel")]
@@ -764,6 +795,29 @@ pub(super) fn log_chat_request(request: &ChatRequest) {
     }
 }
 
+/// Run the `on_llm_response` output guardrail on a successful LLM outcome.
+///
+/// Runs here, BEFORE any observability payload capture, because the hook
+/// contract promises the decision fires before the response is persisted or
+/// surfaced — and an externally-persisting `ObservabilityStore` is
+/// persistence. The hook runs exactly once; the returned decision is handed
+/// to the caller, which handles usage accounting, retry caps, and feedback
+/// without re-invoking the hook. `None` iff the outcome carries no response.
+async fn output_guardrail_decision<H>(
+    hooks: &Arc<H>,
+    result: &LlmOutcome,
+) -> Option<super::llm::PostLlmGuardrail>
+where
+    H: AgentHooks,
+{
+    match result {
+        LlmOutcome::Response(response) => {
+            Some(super::llm::apply_on_llm_response(hooks, response).await)
+        }
+        LlmOutcome::Cancelled | LlmOutcome::Error(_) => None,
+    }
+}
+
 pub(super) async fn request_llm_response<P, H>(
     LlmCallParams {
         provider,
@@ -780,7 +834,7 @@ pub(super) async fn request_llm_response<P, H>(
         #[cfg(feature = "otel")]
         observability_store,
     }: LlmCallParams<'_, P, H>,
-) -> LlmOutcome
+) -> (LlmOutcome, Option<super::llm::PostLlmGuardrail>)
 where
     P: LlmProvider,
     H: AgentHooks,
@@ -840,6 +894,8 @@ where
         .await
     };
 
+    let response_decision = output_guardrail_decision(hooks, &result).await;
+
     // Project the three-state outcome onto a `Result` for the OTel
     // span / payload bookkeeping. A cancellation is recorded as an
     // `AgentError` purely so the span carries a stable, filterable
@@ -858,16 +914,27 @@ where
         request_for_capture.as_ref(),
         span_result.as_ref(),
     ) {
-        capture_llm_payloads(
-            &mut llm_span,
-            observability_store.as_ref(),
-            provider,
-            request,
-            response,
-            thread_id,
-            turn,
-        )
-        .await;
+        if matches!(
+            response_decision,
+            Some(super::llm::PostLlmGuardrail::Accept)
+        ) {
+            capture_llm_payloads(
+                &mut llm_span,
+                observability_store.as_ref(),
+                provider,
+                request,
+                response,
+                thread_id,
+                turn,
+            )
+            .await;
+        } else {
+            // A Blocked / RetryWithFeedback response must not escape to an
+            // externally-persisting store. Non-payload metrics (duration,
+            // status) are still recorded by `finish_llm_span` below.
+            use opentelemetry::trace::Span;
+            llm_span.add_event("payload_capture_skipped_by_guardrail", vec![]);
+        }
     }
 
     #[cfg(feature = "otel")]
@@ -884,7 +951,7 @@ where
     let _ = retry_count;
     let _ = thread_id;
 
-    result
+    (result, response_decision)
 }
 
 /// Build the per-call `chat <model>` span with the
@@ -1743,7 +1810,13 @@ pub(super) enum OverflowCompaction {
     /// run's cumulative usage.
     Done(TokenUsage),
     /// Cancel fired during the emergency compaction; history untouched.
-    Cancelled,
+    /// Carries any usage billed before the cancel was honored.
+    Cancelled(TokenUsage),
+    /// The recovery failed; carries any usage billed before the failure.
+    Failed {
+        error: AgentError,
+        llm_usage: TokenUsage,
+    },
 }
 
 pub(super) async fn compact_after_context_overflow<P, H, M>(
@@ -1754,21 +1827,24 @@ pub(super) async fn compact_after_context_overflow<P, H, M>(
     message_store: &Arc<M>,
     thread_id: &ThreadId,
     cancel_token: &CancellationToken,
-) -> Result<OverflowCompaction, AgentError>
+) -> OverflowCompaction
 where
     P: LlmProvider,
     H: AgentHooks,
     M: MessageStore,
 {
-    let history = message_store
-        .get_history(thread_id)
-        .await
-        .map_err(|error| {
-            AgentError::new(
-                format!("Failed to get history for compaction after context overflow: {error}"),
-                false,
-            )
-        })?;
+    let history = match message_store.get_history(thread_id).await {
+        Ok(history) => history,
+        Err(error) => {
+            return OverflowCompaction::Failed {
+                error: AgentError::new(
+                    format!("Failed to get history for compaction after context overflow: {error}"),
+                    false,
+                ),
+                llm_usage: TokenUsage::default(),
+            };
+        }
+    };
 
     let outcome = if let Some(compactor) = compactor {
         compact_history_and_store(
@@ -1807,10 +1883,12 @@ where
                 "Context compacted after overflow (original_tokens={}, new_tokens={})",
                 result.original_tokens, result.new_tokens
             );
-            Ok(OverflowCompaction::Done(result.llm_usage))
+            OverflowCompaction::Done(result.llm_usage)
         }
-        CompactionOutcome::Cancelled => Ok(OverflowCompaction::Cancelled),
-        CompactionOutcome::Failed(error) => Err(error),
+        CompactionOutcome::Cancelled { llm_usage } => OverflowCompaction::Cancelled(llm_usage),
+        CompactionOutcome::Failed { error, llm_usage } => {
+            OverflowCompaction::Failed { error, llm_usage }
+        }
     }
 }
 
@@ -1825,6 +1903,13 @@ struct OverflowRecoveryParams<'a, P, H, M> {
     compactor: Option<&'a Arc<dyn ContextCompactor>>,
     /// Run provenance, used to price the emergency compaction's usage.
     provenance: &'a AuditProvenance,
+    /// Event plumbing + limits for the pre-recovery budget gate: when the
+    /// overflow turn's own (already folded) usage crossed a limit, the
+    /// recovery stops with a terminal budget event instead of paying for
+    /// emergency summarization first.
+    event_store: &'a Arc<dyn EventStore>,
+    authority: &'a Arc<dyn EventAuthority>,
+    usage_limits: Option<&'a UsageLimits>,
     cancel_token: &'a CancellationToken,
 }
 
@@ -1844,6 +1929,7 @@ pub(super) async fn handle_turn_stop_reason<P, H, M>(
         hooks,
         authority,
         provenance,
+        usage_limits,
         cancel_token,
     }: TurnStopReasonParams<'_, P, H, M>,
 ) -> InternalTurnResult
@@ -1915,6 +2001,9 @@ where
                     compaction_config,
                     compactor,
                     provenance,
+                    event_store,
+                    authority,
+                    usage_limits,
                     cancel_token,
                 },
             )
@@ -1958,6 +2047,9 @@ async fn handle_context_window_exceeded<P, H, M>(
         compaction_config,
         compactor,
         provenance,
+        event_store,
+        authority,
+        usage_limits,
         cancel_token,
     }: OverflowRecoveryParams<'_, P, H, M>,
 ) -> InternalTurnResult
@@ -1967,6 +2059,17 @@ where
     M: MessageStore,
 {
     warn!("Model context window exceeded (turn={})", ctx.turn);
+    // The overflow turn's own usage was already folded by
+    // `apply_turn_usage`; if it crossed a limit, stop with the terminal
+    // budget outcome instead of paying for emergency summarization first.
+    if let Some((limit, cost)) = super::budget::status(
+        usage_limits,
+        provenance,
+        &ctx.total_usage,
+        ctx.state.accumulated_cost_usd,
+    ) {
+        return budget_exceeded_mid_turn(ctx, event_store, hooks, authority, limit, cost).await;
+    }
     #[cfg(feature = "otel")]
     crate::observability::instrument::record_root_event(
         "agent.context_window_exceeded",
@@ -1997,13 +2100,18 @@ where
         )
         .await
         {
-            Ok(OverflowCompaction::Done(compaction_usage)) => {
+            OverflowCompaction::Done(compaction_usage) => {
                 fold_llm_usage(ctx, provenance, &compaction_usage);
             }
-            Ok(OverflowCompaction::Cancelled) => {
+            OverflowCompaction::Cancelled(compaction_usage) => {
+                fold_llm_usage(ctx, provenance, &compaction_usage);
                 return InternalTurnResult::Cancelled { turn_usage };
             }
-            Err(error) => return InternalTurnResult::Error(error),
+            OverflowCompaction::Failed { error, llm_usage } => {
+                // Billed-but-wasted summarization spend still counts.
+                fold_llm_usage(ctx, provenance, &llm_usage);
+                return InternalTurnResult::Error(error);
+            }
         }
         // Keep the turn counter monotonic. The overflow turn was opened by
         // `begin_turn` and is closed by the looping result handler's
@@ -2035,6 +2143,10 @@ fn is_prompt_too_long_error(msg: &str) -> bool {
 /// rather than a `stop_reason`), attempt compaction and retry instead of failing immediately.
 async fn try_recover_prompt_too_long<P, H, M>(
     error: &AgentError,
+    // The budget-gate fields are deliberately unused here: this recovery
+    // runs after a FAILED LLM call, which bills nothing the SDK accounts,
+    // so no new spend can have accrued since the checks that already ran
+    // (loop boundary + post-compaction recheck).
     OverflowRecoveryParams {
         ctx,
         provider,
@@ -2044,6 +2156,7 @@ async fn try_recover_prompt_too_long<P, H, M>(
         compactor,
         provenance,
         cancel_token,
+        ..
     }: OverflowRecoveryParams<'_, P, H, M>,
 ) -> Option<InternalTurnResult>
 where
@@ -2079,16 +2192,19 @@ where
         )
         .await
         {
-            Ok(OverflowCompaction::Done(compaction_usage)) => {
+            OverflowCompaction::Done(compaction_usage) => {
                 fold_llm_usage(ctx, provenance, &compaction_usage);
             }
-            Ok(OverflowCompaction::Cancelled) => {
+            OverflowCompaction::Cancelled(compaction_usage) => {
+                fold_llm_usage(ctx, provenance, &compaction_usage);
                 return Some(InternalTurnResult::Cancelled {
                     turn_usage: TokenUsage::default(),
                 });
             }
-            Err(compact_err) => {
-                return Some(InternalTurnResult::Error(compact_err));
+            OverflowCompaction::Failed { error, llm_usage } => {
+                // Billed-but-wasted summarization spend still counts.
+                fold_llm_usage(ctx, provenance, &llm_usage);
+                return Some(InternalTurnResult::Error(error));
             }
         }
         // Keep the turn counter monotonic (see `handle_context_window_exceeded`):
@@ -2304,6 +2420,14 @@ fn record_turn_span(params: &RecordTurnSpanParams<'_>) {
             turn_span.set_attribute(attrs::kv_bool(attrs::SDK_TURN_HAD_TOOL_CALLS, false));
             "cancelled"
         }
+        InternalTurnResult::BudgetExceeded { .. } => {
+            turn_span.set_attribute(KeyValue::new(
+                attrs::SDK_TURN_STOP_REASON,
+                "budget_exceeded",
+            ));
+            turn_span.set_attribute(attrs::kv_bool(attrs::SDK_TURN_HAD_TOOL_CALLS, false));
+            "budget_exceeded"
+        }
     };
     turn_span.end();
 
@@ -2317,6 +2441,95 @@ fn record_turn_span(params: &RecordTurnSpanParams<'_>) {
             KeyValue::new(attrs::GEN_AI_PROVIDER_NAME, provider_name),
         ],
     );
+}
+
+/// Fold threshold-compaction spend into the run totals and re-evaluate the
+/// budget.
+///
+/// Compaction summarization is a paid LLM call on this run's provider: its
+/// usage (and cost, priced at the run's provenance) must land in the
+/// cumulative totals so budgets see it and `Done` does not under-report.
+/// The loop-boundary budget check ran BEFORE compaction, so if the
+/// summarization spend itself crossed a limit this returns the mid-turn
+/// terminal result and the main-model call is never paid for.
+async fn fold_compaction_spend<H>(
+    ctx: &mut TurnContext,
+    compaction_usage: &TokenUsage,
+    usage_limits: Option<&UsageLimits>,
+    provenance: &AuditProvenance,
+    event_store: &Arc<dyn EventStore>,
+    hooks: &Arc<H>,
+    authority: &Arc<dyn EventAuthority>,
+) -> Option<InternalTurnResult>
+where
+    H: AgentHooks,
+{
+    fold_llm_usage(ctx, provenance, compaction_usage);
+    if !super::budget::usage_is_zero(compaction_usage)
+        && let Some((limit, cost)) = super::budget::status(
+            usage_limits,
+            provenance,
+            &ctx.total_usage,
+            ctx.state.accumulated_cost_usd,
+        )
+    {
+        return Some(
+            budget_exceeded_mid_turn(ctx, event_store, hooks, authority, limit, cost).await,
+        );
+    }
+    None
+}
+
+/// Load (and possibly compact) the turn's history, folding any compaction
+/// spend into the run totals and re-evaluating the budget.
+///
+/// `Err` carries the `InternalTurnResult` the turn must return instead:
+/// a mid-turn budget stop, a cancellation during compaction (whose billed
+/// summarization usage is still folded), or a load error.
+async fn load_turn_messages_accounted<P, H, M>(
+    load_params: TurnMessageLoadParams<'_, P, H, M>,
+    ctx: &mut TurnContext,
+    usage_limits: Option<&UsageLimits>,
+    provenance: &AuditProvenance,
+) -> Result<Vec<Message>, InternalTurnResult>
+where
+    P: LlmProvider,
+    H: AgentHooks,
+    M: MessageStore,
+{
+    let event_store = load_params.event_store;
+    let hooks = load_params.hooks;
+    let authority = load_params.authority;
+    match load_turn_messages(load_params).await {
+        Ok(LoadedMessages::Ready {
+            messages,
+            compaction_usage,
+        }) => {
+            if let Some(stop) = fold_compaction_spend(
+                ctx,
+                &compaction_usage,
+                usage_limits,
+                provenance,
+                event_store,
+                hooks,
+                authority,
+            )
+            .await
+            {
+                return Err(stop);
+            }
+            Ok(messages)
+        }
+        Ok(LoadedMessages::Cancelled { compaction_usage }) => {
+            // A summarization that completed before the cancel won was
+            // still billed: account it even though the turn is closing.
+            fold_llm_usage(ctx, provenance, &compaction_usage);
+            Err(InternalTurnResult::Cancelled {
+                turn_usage: TokenUsage::default(),
+            })
+        }
+        Err(error) => Err(InternalTurnResult::Error(error)),
+    }
 }
 
 async fn execute_turn_inner<Ctx, P, H, M, S>(
@@ -2354,37 +2567,31 @@ where
         return InternalTurnResult::Error(error);
     }
 
-    let messages = match load_turn_messages(TurnMessageLoadParams {
-        thread_id: &ctx.thread_id,
-        turn: ctx.turn,
-        provider,
-        message_store,
-        compaction_config,
-        compactor,
-        event_store,
-        hooks,
-        authority,
-        cancel_token,
-    })
+    // Snapshot the identity fields so the load params can borrow them while
+    // `ctx` itself is handed to the helper mutably.
+    let turn_thread_id = ctx.thread_id.clone();
+    let turn_number = ctx.turn;
+    let messages = match load_turn_messages_accounted(
+        TurnMessageLoadParams {
+            thread_id: &turn_thread_id,
+            turn: turn_number,
+            provider,
+            message_store,
+            compaction_config,
+            compactor,
+            event_store,
+            hooks,
+            authority,
+            cancel_token,
+        },
+        ctx,
+        config.usage_limits.as_ref(),
+        provenance,
+    )
     .await
     {
-        Ok(LoadedMessages::Ready {
-            messages,
-            compaction_usage,
-        }) => {
-            // Compaction summarization is a paid LLM call on this run's
-            // provider: fold its usage (and cost, priced at the run's
-            // provenance) into the cumulative totals so budgets see it and
-            // `Done` does not under-report.
-            fold_llm_usage(ctx, provenance, &compaction_usage);
-            messages
-        }
-        Ok(LoadedMessages::Cancelled) => {
-            return InternalTurnResult::Cancelled {
-                turn_usage: TokenUsage::default(),
-            };
-        }
-        Err(error) => return InternalTurnResult::Error(error),
+        Ok(messages) => messages,
+        Err(result) => return result,
     };
 
     // Inject the turn-budget reminder as a user message if one was set.
@@ -2552,7 +2759,7 @@ where
 
     let mut message_id = uuid::Uuid::new_v4().to_string();
     let mut thinking_id = uuid::Uuid::new_v4().to_string();
-    let response = match request_llm_response(LlmCallParams {
+    let (llm_outcome, response_decision) = request_llm_response(LlmCallParams {
         provider,
         request,
         config,
@@ -2567,8 +2774,8 @@ where
         #[cfg(feature = "otel")]
         observability_store,
     })
-    .await
-    {
+    .await;
+    let response = match llm_outcome {
         LlmOutcome::Response(response) => response,
         LlmOutcome::Cancelled => {
             // The cancel was honored before any assistant message was
@@ -2590,6 +2797,9 @@ where
                     compaction_config,
                     compactor,
                     provenance,
+                    event_store,
+                    authority,
+                    usage_limits: config.usage_limits.as_ref(),
                     cancel_token,
                 },
             )
@@ -2601,11 +2811,20 @@ where
         }
     };
 
-    // Output guardrail (`on_llm_response`): runs once on the produced
-    // response, before it is processed/persisted. `DefaultHooks` accepts.
+    // Output guardrail decision handling: the hook itself already ran
+    // inside `request_llm_response` (BEFORE observability payload capture,
+    // honoring the before-persist contract); here the pre-computed decision
+    // drives usage accounting, retry caps, and feedback.
+    let Some(decision) = response_decision else {
+        return Err(InternalTurnResult::Error(AgentError::new(
+            "output guardrail decision missing for a successful LLM response",
+            false,
+        )));
+    };
     apply_response_guardrail(ResponseGuardrailParams {
         ctx,
         response: &response,
+        decision,
         message_store,
         state_store,
         event_store,
@@ -2626,6 +2845,10 @@ where
 struct ResponseGuardrailParams<'a, H, M, S> {
     ctx: &'a mut TurnContext,
     response: &'a ChatResponse,
+    /// The `on_llm_response` decision, already produced by
+    /// `request_llm_response` (the hook runs exactly once, before payload
+    /// capture).
+    decision: super::llm::PostLlmGuardrail,
     message_store: &'a Arc<M>,
     state_store: &'a Arc<S>,
     event_store: &'a Arc<dyn EventStore>,
@@ -2636,8 +2859,7 @@ struct ResponseGuardrailParams<'a, H, M, S> {
     provenance: &'a AuditProvenance,
 }
 
-/// Run the `on_llm_response` output guardrail and map its decision onto the
-/// turn result.
+/// Map the pre-computed `on_llm_response` decision onto the turn result.
 ///
 /// `Ok(())` means the response was accepted and the turn proceeds; an `Err`
 /// carries the `InternalTurnResult` the turn must return instead (block
@@ -2647,6 +2869,7 @@ async fn apply_response_guardrail<H, M, S>(
     ResponseGuardrailParams {
         ctx,
         response,
+        decision,
         message_store,
         state_store,
         event_store,
@@ -2661,7 +2884,7 @@ where
     M: MessageStore,
     S: StateStore,
 {
-    match super::llm::apply_on_llm_response(hooks, response).await {
+    match decision {
         super::llm::PostLlmGuardrail::Accept => {
             // Any accepted response ends the current rejection streak. The
             // reset rides in `AgentState` so it is persisted by the same
@@ -2768,6 +2991,53 @@ where
         return InternalTurnResult::Error(error);
     }
     InternalTurnResult::Error(AgentError::new(message, false))
+}
+
+/// Emit the terminal [`crate::events::AgentEvent::BudgetExceeded`] under the
+/// still-open turn and build the mid-turn terminal result.
+///
+/// Used when spend that accrued *inside* the turn — compaction
+/// summarization, or the overflow turn's own usage — crosses a configured
+/// limit before the next loop-boundary check would run, so the run stops
+/// before paying for another LLM call.
+async fn budget_exceeded_mid_turn<H>(
+    ctx: &TurnContext,
+    event_store: &Arc<dyn EventStore>,
+    hooks: &Arc<H>,
+    authority: &Arc<dyn EventAuthority>,
+    limit: crate::types::BudgetLimitKind,
+    estimated_cost_usd: Option<f64>,
+) -> InternalTurnResult
+where
+    H: AgentHooks,
+{
+    warn!(
+        "Run-level usage budget exceeded mid-turn (turn={}, limit={limit:?})",
+        ctx.turn
+    );
+    if let Err(error) = send_event(
+        event_store,
+        &ctx.thread_id,
+        ctx.turn,
+        hooks,
+        authority,
+        AgentEvent::budget_exceeded(
+            ctx.thread_id.clone(),
+            ctx.turn,
+            ctx.total_usage.clone(),
+            ctx.start_time.elapsed(),
+            estimated_cost_usd,
+            limit,
+        ),
+    )
+    .await
+    {
+        return InternalTurnResult::Error(error);
+    }
+    InternalTurnResult::BudgetExceeded {
+        limit,
+        estimated_cost_usd,
+    }
 }
 
 /// Emit the error event and build the terminal [`InternalTurnResult::Error`]
@@ -3061,6 +3331,7 @@ where
         hooks,
         authority,
         provenance,
+        usage_limits: config.usage_limits.as_ref(),
         cancel_token,
     })
     .await

@@ -122,6 +122,18 @@ impl Default for AgentConfig {
 /// Each limit is independent and optional. A `None` field imposes no
 /// constraint. When a limit is exceeded the run terminates with a
 /// [`BudgetLimitKind`] identifying which limit fired.
+///
+/// # Evaluation boundaries and bounded overshoot
+///
+/// Budgets are evaluated at loop boundaries — before a fresh prompt is
+/// ingested, before every LLM turn is dispatched, immediately after
+/// context-compaction spend is folded in, and before overflow-recovery
+/// summarization — never mid-call. Any single boundary may therefore
+/// overshoot by the calls already in flight: one turn call, or up to two
+/// compaction summarization calls (the second only when the first summary
+/// was truncated and retried with a doubled token budget). All such calls
+/// are folded into the cumulative usage and re-checked at the next
+/// boundary, so the overshoot is bounded and never compounds.
 #[derive(Clone, Debug, Default)]
 pub struct UsageLimits {
     /// Maximum cumulative tokens (input + output, summed across every

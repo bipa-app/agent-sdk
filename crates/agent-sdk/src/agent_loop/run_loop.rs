@@ -1130,27 +1130,6 @@ fn done_run_state(ctx: &TurnContext, provenance: &AuditProvenance) -> AgentRunSt
     }
 }
 
-/// Evaluate the run-level usage budget against the cumulative `usage`.
-///
-/// Returns `Some((limit, estimated_cost))` when a configured limit has been
-/// exceeded — the cost is carried alongside so terminal events / states can
-/// report it — and `None` when budgeting is disabled or the run is still
-/// within budget. `accumulated_cost_usd` is the state's per-call cost
-/// accumulator (see [`crate::types::AgentState::accumulated_cost_usd`]);
-/// when absent the aggregate is repriced at the current provenance as a
-/// best-effort fallback for legacy snapshots.
-fn budget_status(
-    usage_limits: Option<&UsageLimits>,
-    provenance: &AuditProvenance,
-    usage: &TokenUsage,
-    accumulated_cost_usd: Option<f64>,
-) -> Option<(BudgetLimitKind, Option<f64>)> {
-    let limits = usage_limits?;
-    let cost = budget::run_cost_usd(accumulated_cost_usd, provenance, usage);
-    let limit = budget::check_budget(limits, usage, cost)?;
-    Some((limit, cost))
-}
-
 /// Evaluate the persisted usage BEFORE a fresh `Text` / `Message` prompt is
 /// ingested into the thread.
 ///
@@ -1178,7 +1157,7 @@ where
     // A load failure is deliberately not surfaced here: initialization
     // performs its own load and reports the error through the normal path.
     let state = state_store.load(thread_id).await.ok().flatten()?;
-    let (limit, cost) = budget_status(
+    let (limit, cost) = budget::status(
         usage_limits,
         provenance,
         &state.total_usage,
@@ -1593,7 +1572,7 @@ where
     // parking on the input channel. Otherwise an over-budget run would sit
     // waiting, accept a later prompt into history, and then terminate
     // without answering it — consuming the caller's message for nothing.
-    if let Some((limit, cost)) = budget_status(
+    if let Some((limit, cost)) = budget::status(
         usage_limits,
         provenance,
         &ctx.total_usage,
@@ -1695,6 +1674,52 @@ async fn finish_turn_or_run_state(
         .map_err(|error| RunLoopTurnAction::Return(AgentRunState::Error(error)))
 }
 
+/// Inputs for [`mid_turn_budget_run_state`].
+struct MidTurnBudgetParams<'a, S> {
+    ctx: &'a TurnContext,
+    state_store: &'a Arc<S>,
+    event_store: &'a Arc<dyn EventStore>,
+    current_turn: usize,
+    limit: BudgetLimitKind,
+    estimated_cost_usd: Option<f64>,
+}
+
+/// Close out a looping-mode mid-turn budget stop.
+///
+/// Spend that accrued *inside* the turn (compaction summarization / the
+/// overflow turn's own usage) crossed a limit before the next LLM call.
+/// The terminal event was already emitted under the still-open turn at the
+/// detection site; this is a real, begun turn, so persist the advanced
+/// counter and close it like the other real-turn terminal arms.
+async fn mid_turn_budget_run_state<S>(
+    MidTurnBudgetParams {
+        ctx,
+        state_store,
+        event_store,
+        current_turn,
+        limit,
+        estimated_cost_usd,
+    }: MidTurnBudgetParams<'_, S>,
+) -> AgentRunState
+where
+    S: StateStore,
+{
+    persist_terminal_turn_state(ctx, state_store).await;
+    if let Err(store_error) = finish_turn_or_error(event_store, &ctx.thread_id, current_turn).await
+    {
+        warn!(
+            "Failed to finish turn {current_turn} after mid-turn budget stop (preserving terminal state): {}",
+            store_error.message
+        );
+    }
+    AgentRunState::BudgetExceeded {
+        total_turns: turns_to_u32(ctx.turn),
+        total_usage: ctx.total_usage.clone(),
+        estimated_cost_usd,
+        limit,
+    }
+}
+
 async fn handle_run_loop_turn_result<H, M, S>(
     RunLoopTurnResultParams {
         result,
@@ -1746,23 +1771,23 @@ where
                 RunLoopTurnAction::FinishRun
             }
         }
-        InternalTurnResult::Refusal => {
-            // The refusal turn is finished below; persist the advanced turn
-            // counter or the next run re-enters the finished turn and
-            // bricks the thread.
-            persist_terminal_turn_state(ctx, state_store).await;
-            // A failed `finish_turn` must not replace the terminal Refusal
-            // state — log it and still return the refusal.
-            if let Err(store_error) =
-                finish_turn_or_error(event_store, &ctx.thread_id, current_turn).await
-            {
-                warn!(
-                    "Failed to finish turn {current_turn} after refusal (preserving refusal state): {}",
-                    store_error.message
-                );
-            }
-            RunLoopTurnAction::Return(refusal_run_state(ctx))
-        }
+        InternalTurnResult::BudgetExceeded {
+            limit,
+            estimated_cost_usd,
+        } => RunLoopTurnAction::Return(
+            mid_turn_budget_run_state(MidTurnBudgetParams {
+                ctx,
+                state_store,
+                event_store,
+                current_turn,
+                limit,
+                estimated_cost_usd,
+            })
+            .await,
+        ),
+        InternalTurnResult::Refusal => RunLoopTurnAction::Return(
+            refusal_turn_run_state(ctx, state_store, event_store, current_turn).await,
+        ),
         InternalTurnResult::Cancelled { .. } => {
             // The LLM call or compaction was cancelled mid-turn. The
             // turn is still open (begin_turn started it, no finish has
@@ -1810,31 +1835,69 @@ where
                 false,
             )))
         }),
-        InternalTurnResult::Error(error) => {
-            // The errored turn is finished below; persist the advanced turn
-            // counter first or the next run re-enters the finished turn and
-            // bricks the thread. This matters even for *designed* error
-            // outcomes like a `pre_llm_request` guardrail block, where the
-            // caller is expected to rephrase and retry. (If the turn's
-            // `Start` append never landed — e.g. `begin_turn` failed — the
-            // advanced counter is still safe: the event store auto-creates
-            // unstarted turns.)
-            persist_terminal_turn_state(ctx, state_store).await;
-            // The turn already produced an error. A failed `finish_turn` —
-            // common when the same store rejection that broke the append
-            // also rejects the finish — must not mask the real cause. Log
-            // the finish failure and return the original turn error.
-            if let Err(store_error) =
-                finish_turn_or_error(event_store, &ctx.thread_id, current_turn).await
-            {
-                warn!(
-                    "Failed to finish turn {current_turn} after turn error (preserving original error): {}",
-                    store_error.message
-                );
-            }
-            RunLoopTurnAction::Return(AgentRunState::Error(error))
-        }
+        InternalTurnResult::Error(error) => RunLoopTurnAction::Return(
+            error_turn_run_state(ctx, state_store, event_store, current_turn, error).await,
+        ),
     }
+}
+
+/// Close out a looping-mode turn that ended in a refusal.
+///
+/// The refusal turn is finished here; the advanced turn counter is
+/// persisted first or the next run re-enters the finished turn and bricks
+/// the thread. A failed `finish_turn` must not replace the terminal Refusal
+/// state — it is logged and the refusal is still returned.
+async fn refusal_turn_run_state<S>(
+    ctx: &TurnContext,
+    state_store: &Arc<S>,
+    event_store: &Arc<dyn EventStore>,
+    current_turn: usize,
+) -> AgentRunState
+where
+    S: StateStore,
+{
+    persist_terminal_turn_state(ctx, state_store).await;
+    if let Err(store_error) = finish_turn_or_error(event_store, &ctx.thread_id, current_turn).await
+    {
+        warn!(
+            "Failed to finish turn {current_turn} after refusal (preserving refusal state): {}",
+            store_error.message
+        );
+    }
+    refusal_run_state(ctx)
+}
+
+/// Close out a looping-mode turn that ended in an error.
+///
+/// The errored turn is finished here; the advanced turn counter is
+/// persisted first or the next run re-enters the finished turn and bricks
+/// the thread. This matters even for *designed* error outcomes like a
+/// `pre_llm_request` guardrail block, where the caller is expected to
+/// rephrase and retry. (If the turn's `Start` append never landed — e.g.
+/// `begin_turn` failed — the advanced counter is still safe: the event
+/// store auto-creates unstarted turns.) A failed `finish_turn` — common
+/// when the same store rejection that broke the append also rejects the
+/// finish — must not mask the real cause: it is logged and the original
+/// turn error is returned.
+async fn error_turn_run_state<S>(
+    ctx: &TurnContext,
+    state_store: &Arc<S>,
+    event_store: &Arc<dyn EventStore>,
+    current_turn: usize,
+    error: AgentError,
+) -> AgentRunState
+where
+    S: StateStore,
+{
+    persist_terminal_turn_state(ctx, state_store).await;
+    if let Err(store_error) = finish_turn_or_error(event_store, &ctx.thread_id, current_turn).await
+    {
+        warn!(
+            "Failed to finish turn {current_turn} after turn error (preserving original error): {}",
+            store_error.message
+        );
+    }
+    AgentRunState::Error(error)
 }
 
 async fn finish_run_loop_success<H, S>(
@@ -1956,7 +2019,7 @@ where
         // dispatch edge with the same code: the first turn of a run on a
         // thread whose usage was rehydrated from state, the turn following
         // a completed resume, and every loop-back after a completed turn.
-        if let Some((limit, cost)) = budget_status(
+        if let Some((limit, cost)) = budget::status(
             config.usage_limits.as_ref(),
             provenance,
             &ctx.total_usage,
@@ -2237,7 +2300,7 @@ where
     // keyed under `turn`, which is still open — the resume-state
     // wrapper finishes it after this returns.
     if let Some((limit, estimated_cost_usd)) =
-        budget_status(usage_limits, provenance, &total_usage, accumulated_cost_usd)
+        budget::status(usage_limits, provenance, &total_usage, accumulated_cost_usd)
     {
         warn!("Run-level usage budget exceeded on resume (turn={turn}, limit={limit:?})");
         if let Err(error) = send_event(
@@ -2936,7 +2999,7 @@ where
     // the cumulative usage rehydrated from state BEFORE dispatching the
     // turn, so a fresh `run_turn` (or a `SubmitToolResults` follow-up) on a
     // thread that already crossed a limit terminates without an LLM call.
-    if let Some((limit, estimated_cost_usd)) = budget_status(
+    if let Some((limit, estimated_cost_usd)) = budget::status(
         config.usage_limits.as_ref(),
         &provenance,
         &ctx.total_usage,
@@ -3238,7 +3301,7 @@ async fn convert_continue_turn<H: AgentHooks, S: StateStore>(
     if let Err(e) = state_store.save(&ctx.state).await {
         warn!("Failed to save state checkpoint: {e}");
     }
-    if let Some((limit, estimated_cost_usd)) = budget_status(
+    if let Some((limit, estimated_cost_usd)) = budget::status(
         usage_limits,
         provenance,
         &ctx.total_usage,
@@ -3281,6 +3344,74 @@ async fn convert_continue_turn<H: AgentHooks, S: StateStore>(
         turn: ctx.turn,
         turn_usage,
         total_usage: ctx.total_usage,
+        summary,
+    }
+}
+
+/// Single-turn conversion of a mid-turn budget stop (see the looping
+/// handler's [`mid_turn_budget_run_state`]). The caller finishes this turn
+/// right after; persist the advanced counter first. No LLM turn call
+/// happened past the detection point, so the summary carries zero turn
+/// usage.
+async fn convert_mid_turn_budget<S>(
+    ctx: &TurnContext,
+    state_store: &Arc<S>,
+    provenance: &AuditProvenance,
+    turn_options: &TurnOptions,
+    limit: BudgetLimitKind,
+    estimated_cost_usd: Option<f64>,
+) -> TurnOutcome
+where
+    S: StateStore,
+{
+    persist_terminal_turn_state(ctx, state_store).await;
+    let summary = build_turn_summary(ctx, provenance, turn_options, TokenUsage::default());
+    TurnOutcome::BudgetExceeded {
+        total_turns: turns_to_u32(ctx.turn),
+        total_usage: ctx.total_usage.clone(),
+        estimated_cost_usd,
+        limit,
+        summary,
+    }
+}
+
+/// Single-turn conversion of a refusal: the caller finishes this turn right
+/// after, so persist the advanced turn counter first or the next `run_turn`
+/// re-enters the finished turn and bricks the thread.
+async fn convert_refusal_turn<S>(
+    ctx: &TurnContext,
+    state_store: &Arc<S>,
+    provenance: &AuditProvenance,
+    turn_options: &TurnOptions,
+) -> TurnOutcome
+where
+    S: StateStore,
+{
+    persist_terminal_turn_state(ctx, state_store).await;
+    let summary = build_turn_summary(ctx, provenance, turn_options, ctx.total_usage.clone());
+    TurnOutcome::Refusal {
+        total_turns: turns_to_u32(ctx.turn),
+        total_usage: ctx.total_usage.clone(),
+        summary,
+    }
+}
+
+/// Single-turn conversion of an external-runtime tool handoff.
+fn convert_pending_tool_calls(
+    ctx: &TurnContext,
+    provenance: &AuditProvenance,
+    turn_options: &TurnOptions,
+    turn_usage: TokenUsage,
+    pending_tool_calls: Vec<crate::types::PendingToolCallInfo>,
+    continuation: Box<AgentContinuation>,
+) -> TurnOutcome {
+    let summary = build_turn_summary(ctx, provenance, turn_options, turn_usage.clone());
+    TurnOutcome::PendingToolCalls {
+        turn: ctx.turn,
+        turn_usage,
+        total_usage: ctx.total_usage.clone(),
+        tool_calls: pending_tool_calls,
+        continuation: Box::new(ContinuationEnvelope::wrap(*continuation)),
         summary,
     }
 }
@@ -3331,18 +3462,22 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
             })
             .await
         }
+        InternalTurnResult::BudgetExceeded {
+            limit,
+            estimated_cost_usd,
+        } => {
+            convert_mid_turn_budget(
+                &ctx,
+                state_store,
+                provenance,
+                turn_options,
+                limit,
+                estimated_cost_usd,
+            )
+            .await
+        }
         InternalTurnResult::Refusal => {
-            // The caller finishes this turn right after; persist the
-            // advanced turn counter or the next `run_turn` re-enters the
-            // finished turn and bricks the thread.
-            persist_terminal_turn_state(&ctx, state_store).await;
-            let summary =
-                build_turn_summary(&ctx, provenance, turn_options, ctx.total_usage.clone());
-            TurnOutcome::Refusal {
-                total_turns: turns_to_u32(ctx.turn),
-                total_usage: ctx.total_usage.clone(),
-                summary,
-            }
+            convert_refusal_turn(&ctx, state_store, provenance, turn_options).await
         }
         InternalTurnResult::Cancelled { turn_usage } => {
             convert_cancelled_turn(ConvertCancelledParams {
@@ -3381,17 +3516,14 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
             turn_usage,
             pending_tool_calls,
             continuation,
-        } => {
-            let summary = build_turn_summary(&ctx, provenance, turn_options, turn_usage.clone());
-            TurnOutcome::PendingToolCalls {
-                turn: ctx.turn,
-                turn_usage,
-                total_usage: ctx.total_usage,
-                tool_calls: pending_tool_calls,
-                continuation: Box::new(ContinuationEnvelope::wrap(*continuation)),
-                summary,
-            }
-        }
+        } => convert_pending_tool_calls(
+            &ctx,
+            provenance,
+            turn_options,
+            turn_usage,
+            pending_tool_calls,
+            continuation,
+        ),
         InternalTurnResult::Error(e) => {
             // The caller finishes this turn right after; persist the
             // advanced turn counter or the next `run_turn` re-enters the

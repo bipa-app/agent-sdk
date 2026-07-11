@@ -8128,3 +8128,181 @@ async fn test_budget_breach_does_not_consume_max_turns() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Round 5: mid-turn budget stops around compaction, billed usage of
+// failed compaction attempts.
+// ──────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_compaction_spend_alone_trips_budget_before_main_call() -> anyhow::Result<()> {
+    // The loop-boundary budget check runs BEFORE compaction; when the
+    // summarization call itself (30 tokens from the mock) crosses the
+    // 25-token budget, the run must stop with BudgetExceeded WITHOUT paying
+    // for the main-model call.
+    let message_store = Arc::new(InMemoryStore::new());
+    let thread_id = ThreadId::new();
+    seed_compactable_history(&message_store, &thread_id).await?;
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![
+            // Call 1: the compaction summarizer (30 tokens) — crosses the
+            // budget on its own. The main-turn call must never happen.
+            MockProvider::text_response("compact summary"),
+            MockProvider::tool_use_response("call_1", "echo", json!({"message": "x"})),
+        ]))
+        .tools(tools)
+        .hooks(AllowAllHooks)
+        .config(AgentConfig {
+            usage_limits: Some(UsageLimits {
+                max_total_tokens: Some(25),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .with_compaction(tiny_compaction_config())
+        .message_store(Arc::clone(&message_store))
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let (state, events) = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    let AgentRunState::BudgetExceeded { total_usage, .. } = state else {
+        anyhow::bail!("compaction spend alone must trip the budget, got {state:?}");
+    };
+    assert_eq!(
+        agent.provider.calls(),
+        1,
+        "the main-model turn call must not be paid for after the breach",
+    );
+    assert_eq!(
+        u64::from(total_usage.input_tokens + total_usage.output_tokens),
+        30,
+        "only the summarization call was billed",
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.event, AgentEvent::BudgetExceeded { .. })),
+        "the terminal budget event must be emitted",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_failed_compaction_usage_still_counts() -> anyhow::Result<()> {
+    // A compaction attempt whose summary is rejected by the output
+    // guardrail fails — but the summarization call was still billed, so its
+    // tokens must land in the cumulative totals (30 summarizer + 30 turn).
+    let message_store = Arc::new(InMemoryStore::new());
+    let thread_id = ThreadId::new();
+    seed_compactable_history(&message_store, &thread_id).await?;
+
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![
+            MockProvider::text_response("COMPACTION_SUMMARY leaking a secret"),
+            MockProvider::text_response("turn answer"),
+        ]))
+        .hooks(BlockMarkedResponseHooks {
+            marker: "COMPACTION_SUMMARY",
+        })
+        .with_compaction(tiny_compaction_config())
+        .message_store(Arc::clone(&message_store))
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let (state, _events) = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    let AgentRunState::Done { total_usage, .. } = state else {
+        anyhow::bail!("the run continues with uncompacted history, got {state:?}");
+    };
+    assert_eq!(
+        u64::from(total_usage.input_tokens + total_usage.output_tokens),
+        60,
+        "the blocked summarization call's 30 billed tokens must be counted \
+         alongside the turn's 30",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_overflow_turn_over_budget_skips_emergency_compaction() -> anyhow::Result<()> {
+    // A turn that reports ModelContextWindowExceeded already folded its own
+    // usage; when that crossed the budget, the run must stop with
+    // BudgetExceeded instead of paying for the emergency summarization
+    // call first. The history is seeded large enough that the emergency
+    // compaction WOULD make a real summarization call, while the huge
+    // threshold keeps the (pre-turn) threshold compaction from firing.
+    let message_store = Arc::new(InMemoryStore::new());
+    let thread_id = ThreadId::new();
+    seed_compactable_history(&message_store, &thread_id).await?;
+    let overflow_only_config = CompactionConfig::default()
+        .with_threshold_tokens(1_000_000)
+        .with_retain_recent(1)
+        .with_min_messages(2);
+
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![
+            // Call 1: the overflow turn (5 input tokens > 3-token budget).
+            MockProvider::context_window_exceeded(),
+            // Never reached: neither the emergency summarizer nor a retry.
+            MockProvider::text_response("should not be reached"),
+        ]))
+        .hooks(AllowAllHooks)
+        .config(AgentConfig {
+            usage_limits: Some(UsageLimits {
+                max_total_tokens: Some(3),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .with_compaction(overflow_only_config)
+        .message_store(Arc::clone(&message_store))
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let (state, events) = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    assert!(
+        matches!(state, AgentRunState::BudgetExceeded { .. }),
+        "the over-budget overflow turn must stop the run, got {state:?}",
+    );
+    assert_eq!(
+        agent.provider.calls(),
+        1,
+        "emergency summarization must not be paid for once the budget tripped",
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.event, AgentEvent::BudgetExceeded { .. })),
+        "the terminal budget event must be emitted",
+    );
+
+    Ok(())
+}

@@ -5014,7 +5014,6 @@ mod tests {
         result
     }
 
-<<<<<<< HEAD
     /// Create a thread and admit one root turn through the in-process
     /// control service. No host/worker runs in this fixture, so the
     /// returned root turn stays non-terminal (`Pending`) until a cancel

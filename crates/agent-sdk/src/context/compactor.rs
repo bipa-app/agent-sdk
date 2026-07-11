@@ -5,7 +5,7 @@ use crate::llm::{
     ChatOutcome, ChatRequest, Content, ContentBlock, LlmProvider, Message, Role, StopReason,
 };
 use crate::types::TokenUsage;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::fmt::Write;
 use std::sync::Arc;
@@ -47,6 +47,29 @@ pub trait ContextCompactor: Send + Sync {
     /// # Errors
     /// Returns an error if compaction fails.
     async fn compact_history(&self, messages: Vec<Message>) -> Result<CompactionResult>;
+
+    /// Like [`compact_history`](Self::compact_history), but a failure
+    /// additionally reports the provider-billed usage of any summarization
+    /// calls already made, so callers can account billed-but-wasted spend.
+    ///
+    /// The default delegates to `compact_history` and reports zero usage on
+    /// failure — custom compactors that bill LLM calls should override this
+    /// (best-effort: an un-overridden custom compactor under-reports failed
+    /// attempts' usage, never over-reports).
+    ///
+    /// # Errors
+    /// Returns [`FailedCompaction`] when compaction fails.
+    async fn compact_history_with_usage(
+        &self,
+        messages: Vec<Message>,
+    ) -> Result<CompactionResult, FailedCompaction> {
+        self.compact_history(messages)
+            .await
+            .map_err(|error| FailedCompaction {
+                error,
+                llm_usage: TokenUsage::default(),
+            })
+    }
 }
 
 /// Result of a compaction operation.
@@ -71,9 +94,37 @@ pub struct CompactionResult {
     pub llm_usage: TokenUsage,
 }
 
+/// A failed compaction attempt, carrying the provider-billed usage of any
+/// summarization LLM calls that were already made before the failure.
+///
+/// Surfaced by [`ContextCompactor::compact_history_with_usage`] so the agent
+/// loop can fold billed-but-wasted summarization spend into the run's
+/// cumulative usage even when the history is left uncompacted (guardrail
+/// block, truncation-retry error, `replace_history` failure).
+#[derive(Debug)]
+pub struct FailedCompaction {
+    /// Why the compaction attempt failed.
+    pub error: anyhow::Error,
+    /// Usage billed by summarization calls made before the failure (zero
+    /// when the failure preceded any LLM call).
+    pub llm_usage: TokenUsage,
+}
+
 /// LLM-based context compactor.
 ///
 /// Uses the LLM itself to summarize older messages into a compact form.
+///
+/// # Budgets
+///
+/// The compactor performs no budget evaluation of its own: it may issue up
+/// to **two** summarization LLM calls per compaction (the second only when
+/// the first summary was truncated, retried with a doubled token budget)
+/// before the agent loop's next [`UsageLimits`](crate::types::UsageLimits)
+/// boundary check runs. Every call's usage — including failed attempts — is
+/// reported via [`CompactionResult::llm_usage`] /
+/// [`FailedCompaction::llm_usage`] and folded by the loop immediately after
+/// compaction, so the overshoot is bounded and consistent with the loop's
+/// boundary-check semantics.
 ///
 /// `P` is `?Sized` so callers can hold an `Arc<dyn LlmProvider>` —
 /// useful when the provider is resolved dynamically per-thread (e.g.
@@ -523,7 +574,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
         &self,
         prompt: String,
         max_tokens: usize,
-    ) -> Result<SummarizationCall> {
+    ) -> Result<SummarizationCall, SummarizationFailure> {
         let mut request = ChatRequest {
             system: self.system_prompt.clone(),
             messages: vec![Message::user(prompt)],
@@ -545,7 +596,12 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
             match hooks.pre_llm_request(&request).await {
                 RequestDecision::Modify(modified) => request = *modified,
                 RequestDecision::Block(reason) => {
-                    bail!("Summarization request blocked by guardrail: {reason}")
+                    return Err(SummarizationFailure {
+                        error: anyhow::anyhow!(
+                            "Summarization request blocked by guardrail: {reason}"
+                        ),
+                        usage: TokenUsage::default(),
+                    });
                 }
                 // `Proceed`, plus any future `#[non_exhaustive]` variant,
                 // sends the request unchanged (mirrors the agent loop).
@@ -557,10 +613,23 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
             .provider
             .chat(request)
             .await
-            .context("Failed to call LLM for summarization")?;
+            .context("Failed to call LLM for summarization")
+            .map_err(|error| SummarizationFailure {
+                error,
+                usage: TokenUsage::default(),
+            })?;
 
         match outcome {
             ChatOutcome::Success(response) => {
+                // The provider billed this call regardless of what happens
+                // next, so its usage rides every outcome — including
+                // guardrail rejections — for budget accounting.
+                let usage = TokenUsage {
+                    input_tokens: response.usage.input_tokens,
+                    output_tokens: response.usage.output_tokens,
+                    cached_input_tokens: response.usage.cached_input_tokens,
+                    cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
+                };
                 // Output guardrail: a rejected summary aborts the compaction
                 // attempt so it is never persisted. `RetryWithFeedback` is
                 // deliberately NOT retried here — the compactor has no
@@ -570,13 +639,21 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
                 if let Some(hooks) = &self.hooks {
                     match hooks.on_llm_response(&response).await {
                         ResponseDecision::Block(reason) => {
-                            bail!("Summarization response blocked by guardrail: {reason}")
+                            return Err(SummarizationFailure {
+                                error: anyhow::anyhow!(
+                                    "Summarization response blocked by guardrail: {reason}"
+                                ),
+                                usage,
+                            });
                         }
                         ResponseDecision::RetryWithFeedback(reason) => {
-                            bail!(
-                                "Summarization response rejected by guardrail \
-                                 (RetryWithFeedback is not retried during compaction): {reason}"
-                            )
+                            return Err(SummarizationFailure {
+                                error: anyhow::anyhow!(
+                                    "Summarization response rejected by guardrail \
+                                     (RetryWithFeedback is not retried during compaction): {reason}"
+                                ),
+                                usage,
+                            });
                         }
                         // `Accept`, plus any future `#[non_exhaustive]`
                         // variant, keeps the summary (mirrors the agent loop).
@@ -584,36 +661,36 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
                     }
                 }
                 let truncated = response.stop_reason == Some(StopReason::MaxTokens);
-                let usage = TokenUsage {
-                    input_tokens: response.usage.input_tokens,
-                    output_tokens: response.usage.output_tokens,
-                    cached_input_tokens: response.usage.cached_input_tokens,
-                    cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
+                let Some(text) = response.first_text().map(String::from) else {
+                    return Err(SummarizationFailure {
+                        error: anyhow::anyhow!("No text in summarization response"),
+                        usage,
+                    });
                 };
-                let text = response
-                    .first_text()
-                    .map(String::from)
-                    .context("No text in summarization response")?;
                 Ok(SummarizationCall {
                     text,
                     truncated,
                     usage,
                 })
             }
-            ChatOutcome::RateLimited(_) => {
-                bail!("Rate limited during summarization")
-            }
-            ChatOutcome::InvalidRequest(msg) => {
-                bail!("Invalid request during summarization: {msg}")
-            }
-            ChatOutcome::ServerError(msg) => {
-                bail!("Server error during summarization: {msg}")
-            }
+            ChatOutcome::RateLimited(_) => Err(SummarizationFailure {
+                error: anyhow::anyhow!("Rate limited during summarization"),
+                usage: TokenUsage::default(),
+            }),
+            ChatOutcome::InvalidRequest(msg) => Err(SummarizationFailure {
+                error: anyhow::anyhow!("Invalid request during summarization: {msg}"),
+                usage: TokenUsage::default(),
+            }),
+            ChatOutcome::ServerError(msg) => Err(SummarizationFailure {
+                error: anyhow::anyhow!("Server error during summarization: {msg}"),
+                usage: TokenUsage::default(),
+            }),
             // `ChatOutcome` is `#[non_exhaustive]`; an unrecognized outcome
             // fails the summarization rather than returning an empty summary.
-            _ => {
-                bail!("Unrecognized provider outcome during summarization")
-            }
+            _ => Err(SummarizationFailure {
+                error: anyhow::anyhow!("Unrecognized provider outcome during summarization"),
+                usage: TokenUsage::default(),
+            }),
         }
     }
 
@@ -624,7 +701,10 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
     /// [`ContextCompactor::compact`] trait method (which discards the usage
     /// for backward compatibility) and [`ContextCompactor::compact_history`]
     /// (which surfaces it via [`CompactionResult::llm_usage`]).
-    async fn summarize_with_usage(&self, messages: &[Message]) -> Result<(String, TokenUsage)> {
+    async fn summarize_with_usage(
+        &self,
+        messages: &[Message],
+    ) -> Result<(String, TokenUsage), SummarizationFailure> {
         // Separate prior compaction summaries (whose prose must be carried
         // forward) from fresh messages (which still need summarizing). Prior
         // summaries used to be filtered out and silently dropped, destroying
@@ -663,9 +743,18 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
                 "compaction summary hit the max_tokens budget ({budget}); \
                  retrying with a larger budget to avoid silent context loss"
             );
-            let retry = self
+            let retry = match self
                 .run_summarization(prompt, budget.saturating_mul(2))
-                .await?;
+                .await
+            {
+                Ok(retry) => retry,
+                Err(mut failure) => {
+                    // The first (truncated) call was still billed: carry its
+                    // usage on the failure so the caller can account it.
+                    failure.usage.add(&total_usage);
+                    return Err(failure);
+                }
+            };
             total_usage.add(&retry.usage);
             summary = retry.text;
             if retry.truncated {
@@ -688,39 +777,21 @@ struct SummarizationCall {
     usage: TokenUsage,
 }
 
-#[async_trait]
-impl<P: LlmProvider + ?Sized, H: AgentHooks> ContextCompactor for LlmContextCompactor<P, H> {
-    async fn compact(&self, messages: &[Message]) -> Result<String> {
-        let (summary, _usage) = self.summarize_with_usage(messages).await?;
-        Ok(summary)
-    }
+/// A failed summarization round-trip, carrying whatever usage was billed
+/// before the failure (a response rejected by the output guardrail was
+/// still billed; a request blocked before dispatch was not).
+struct SummarizationFailure {
+    error: anyhow::Error,
+    usage: TokenUsage,
+}
 
-    fn estimate_tokens(&self, messages: &[Message]) -> usize {
-        TokenEstimator::estimate_history(messages)
-    }
-
-    fn needs_compaction(&self, messages: &[Message]) -> bool {
-        if !self.config.auto_compact {
-            return false;
-        }
-
-        // Provider-owned opaque reasoning state has exact replay semantics.
-        // Do not repeatedly schedule a generic compaction that must refuse to
-        // rewrite this history; a provider-native compactor can replace this
-        // guard when it becomes available.
-        if Self::has_opaque_reasoning(messages) {
-            return false;
-        }
-
-        if messages.len() < self.config.min_messages_for_compaction {
-            return false;
-        }
-
-        let estimated_tokens = self.estimate_tokens(messages);
-        estimated_tokens > self.config.threshold_tokens
-    }
-
-    async fn compact_history(&self, mut messages: Vec<Message>) -> Result<CompactionResult> {
+impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
+    /// Usage-aware core of [`ContextCompactor::compact_history`]: a failure
+    /// carries the billed usage of any summarization calls already made.
+    async fn compact_history_inner(
+        &self,
+        mut messages: Vec<Message>,
+    ) -> Result<CompactionResult, FailedCompaction> {
         let original_count = messages.len();
         let original_tokens = self.estimate_tokens(&messages);
 
@@ -768,7 +839,13 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> ContextCompactor for LlmContextComp
         let to_summarize = messages;
 
         // Summarize old messages
-        let (summary, llm_usage) = self.summarize_with_usage(&to_summarize).await?;
+        let (summary, llm_usage) =
+            self.summarize_with_usage(&to_summarize)
+                .await
+                .map_err(|failure| FailedCompaction {
+                    error: failure.error,
+                    llm_usage: failure.usage,
+                })?;
 
         // Build new message history
         let mut new_messages = Vec::with_capacity(2 + to_keep.len());
@@ -807,10 +884,60 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> ContextCompactor for LlmContextComp
     }
 }
 
+#[async_trait]
+impl<P: LlmProvider + ?Sized, H: AgentHooks> ContextCompactor for LlmContextCompactor<P, H> {
+    async fn compact(&self, messages: &[Message]) -> Result<String> {
+        let (summary, _usage) = self
+            .summarize_with_usage(messages)
+            .await
+            .map_err(|failure| failure.error)?;
+        Ok(summary)
+    }
+
+    fn estimate_tokens(&self, messages: &[Message]) -> usize {
+        TokenEstimator::estimate_history(messages)
+    }
+
+    fn needs_compaction(&self, messages: &[Message]) -> bool {
+        if !self.config.auto_compact {
+            return false;
+        }
+
+        // Provider-owned opaque reasoning state has exact replay semantics.
+        // Do not repeatedly schedule a generic compaction that must refuse to
+        // rewrite this history; a provider-native compactor can replace this
+        // guard when it becomes available.
+        if Self::has_opaque_reasoning(messages) {
+            return false;
+        }
+
+        if messages.len() < self.config.min_messages_for_compaction {
+            return false;
+        }
+
+        let estimated_tokens = self.estimate_tokens(messages);
+        estimated_tokens > self.config.threshold_tokens
+    }
+
+    async fn compact_history(&self, messages: Vec<Message>) -> Result<CompactionResult> {
+        self.compact_history_inner(messages)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    async fn compact_history_with_usage(
+        &self,
+        messages: Vec<Message>,
+    ) -> Result<CompactionResult, FailedCompaction> {
+        self.compact_history_inner(messages).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::llm::{ChatResponse, StopReason, Usage};
+    use anyhow::bail;
     use std::sync::Mutex;
 
     struct MockProvider {

@@ -68,7 +68,7 @@ fn lookup_capabilities(
 
 /// Whether a usage delta carries no tokens at all.
 #[must_use]
-const fn usage_is_zero(usage: &TokenUsage) -> bool {
+pub(super) const fn usage_is_zero(usage: &TokenUsage) -> bool {
     usage.input_tokens == 0
         && usage.output_tokens == 0
         && usage.cached_input_tokens == 0
@@ -111,6 +111,28 @@ pub(super) fn run_cost_usd(
     usage: &TokenUsage,
 ) -> Option<f64> {
     accumulated.or_else(|| estimate_cost_usd(provenance, usage))
+}
+
+/// Evaluate the run-level usage budget against the cumulative `usage`.
+///
+/// Returns `Some((limit, estimated_cost))` when a configured limit has been
+/// exceeded — the cost is carried alongside so terminal events / states can
+/// report it — and `None` when budgeting is disabled or the run is still
+/// within budget. `accumulated_cost_usd` is the state's per-call cost
+/// accumulator (see [`crate::types::AgentState::accumulated_cost_usd`]);
+/// when absent the aggregate is repriced at the current provenance as a
+/// best-effort fallback for legacy snapshots.
+#[must_use]
+pub(super) fn status(
+    usage_limits: Option<&UsageLimits>,
+    provenance: &AuditProvenance,
+    usage: &TokenUsage,
+    accumulated_cost_usd: Option<f64>,
+) -> Option<(BudgetLimitKind, Option<f64>)> {
+    let limits = usage_limits?;
+    let cost = run_cost_usd(accumulated_cost_usd, provenance, usage);
+    let limit = check_budget(limits, usage, cost)?;
+    Some((limit, cost))
 }
 
 /// Total billable tokens for budgeting: input + output summed.
