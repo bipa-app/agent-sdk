@@ -124,6 +124,28 @@ pub(super) enum LoadedMessages {
     },
 }
 
+/// A failed history load, carrying any compaction spend billed before the
+/// failure.
+///
+/// The critical case: summarization AND `replace_history` succeeded, then
+/// the `ContextCompacted` event append failed — the run terminates on the
+/// error, but the billed summarization tokens must still reach the
+/// cumulative totals or they vanish from usage/cost accounting.
+pub(super) struct LoadFailure {
+    pub(super) error: AgentError,
+    pub(super) compaction_usage: TokenUsage,
+}
+
+impl LoadFailure {
+    /// A failure with no billed compaction spend.
+    fn unbilled(error: AgentError) -> Self {
+        Self {
+            error,
+            compaction_usage: TokenUsage::default(),
+        }
+    }
+}
+
 pub(super) async fn load_turn_messages<P, H, M>(
     TurnMessageLoadParams {
         thread_id,
@@ -137,7 +159,7 @@ pub(super) async fn load_turn_messages<P, H, M>(
         authority,
         cancel_token,
     }: TurnMessageLoadParams<'_, P, H, M>,
-) -> Result<LoadedMessages, AgentError>
+) -> Result<LoadedMessages, LoadFailure>
 where
     P: LlmProvider,
     H: AgentHooks,
@@ -146,7 +168,7 @@ where
     let messages = match message_store.get_history(thread_id).await {
         Ok(m) => m,
         Err(error) => {
-            send_event(
+            if let Err(send_error) = send_event(
                 event_store,
                 thread_id,
                 turn,
@@ -154,11 +176,14 @@ where
                 authority,
                 AgentEvent::error(format!("Failed to get history: {error}"), false),
             )
-            .await?;
-            return Err(AgentError::new(
+            .await
+            {
+                return Err(LoadFailure::unbilled(send_error));
+            }
+            return Err(LoadFailure::unbilled(AgentError::new(
                 format!("Failed to get history: {error}"),
                 false,
-            ));
+            )));
         }
     };
 
@@ -206,7 +231,7 @@ async fn maybe_compact_messages<P, H, M>(
         authority,
         cancel_token,
     }: MaybeCompactParams<'_, P, H, M>,
-) -> Result<LoadedMessages, AgentError>
+) -> Result<LoadedMessages, LoadFailure>
 where
     P: LlmProvider,
     H: AgentHooks,
@@ -332,7 +357,7 @@ async fn compact_messages_for_threshold<C, H, M>(
         authority,
         cancel_token,
     }: ThresholdCompactionParams<'_, C, H, M>,
-) -> Result<LoadedMessages, AgentError>
+) -> Result<LoadedMessages, LoadFailure>
 where
     C: ContextCompactor + ?Sized,
     H: AgentHooks,
@@ -352,7 +377,7 @@ where
     .await
     {
         CompactionOutcome::Stored(result) => {
-            send_event(
+            if let Err(error) = send_event(
                 event_store,
                 thread_id,
                 turn,
@@ -365,7 +390,16 @@ where
                     result.new_tokens,
                 ),
             )
-            .await?;
+            .await
+            {
+                // Compaction itself succeeded (history replaced, the
+                // summarization billed): the spend must survive this
+                // terminal error path so it still reaches the totals.
+                return Err(LoadFailure {
+                    error,
+                    compaction_usage: result.llm_usage,
+                });
+            }
 
             info!(
                 "Context compacted successfully (original_count={}, new_count={}, original_tokens={}, new_tokens={})",
@@ -2528,7 +2562,14 @@ where
                 turn_usage: TokenUsage::default(),
             })
         }
-        Err(error) => Err(InternalTurnResult::Error(error)),
+        Err(failure) => {
+            // A failed load can still carry billed compaction spend (e.g.
+            // the ContextCompacted event append failed AFTER summarization
+            // and replace_history succeeded): fold it before surfacing the
+            // error so the totals include every billed call.
+            fold_llm_usage(ctx, provenance, &failure.compaction_usage);
+            Err(InternalTurnResult::Error(failure.error))
+        }
     }
 }
 

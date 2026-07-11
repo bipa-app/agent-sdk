@@ -681,14 +681,7 @@ impl GrpcControlService {
             .get_events(source_thread_id)
             .await
             .map_err(internal_status("loading source events for fork"))?;
-        let events: Vec<_> = source_events
-            .into_iter()
-            .take_while(|committed| {
-                turn_number_for_event(&committed.event)
-                    .is_none_or(|turn| turn <= u64::from(fork_after))
-            })
-            .map(|committed| committed.event)
-            .collect();
+        let events = events_up_to_fork_boundary(source_events, fork_after);
 
         Ok(ForkCommitParams {
             new_thread_id: new_thread_id.clone(),
@@ -2212,18 +2205,48 @@ fn decode_idempotency_result<T: serde::de::DeserializeOwned>(
 /// events in sequence, take while the *running* turn `<= cap`, and
 /// stop the moment a `Done` increments the running turn past it.
 ///
-/// Returning `None` for non-`Done` events lets the caller's
+/// Returning `None` for non-boundary events lets the caller's
 /// `take_while` accept them under the current running turn rather
 /// than reset it — the agent-server's commit pipeline always emits
-/// the `Done` last, so any non-`Done` event seen at sequence S
-/// belongs to a turn whose `Done` is at some sequence `>= S`.
+/// the terminal marker last, so any non-boundary event seen at
+/// sequence S belongs to a turn whose marker is at some sequence
+/// `>= S`.
+///
+/// `Done` is not the only terminal marker the pipeline commits:
+/// `BudgetExceeded` is emitted in place of `Done` when a budget trips
+/// (carrying `total_turns`), and `Cancelled` is the durable marker an
+/// effective `CancelTask` commits (carrying `turn`). All three are
+/// boundaries — without them a fork below a budget-stop or cancel
+/// point would copy the terminal marker past the cutoff and the fork
+/// would immediately read as completed/cancelled.
 const fn turn_number_for_event(event: &agent_sdk_foundation::events::AgentEvent) -> Option<u64> {
     match event {
-        agent_sdk_foundation::events::AgentEvent::Done { total_turns, .. } => {
+        agent_sdk_foundation::events::AgentEvent::Done { total_turns, .. }
+        | agent_sdk_foundation::events::AgentEvent::BudgetExceeded { total_turns, .. } => {
             Some(*total_turns as u64)
         }
+        agent_sdk_foundation::events::AgentEvent::Cancelled { turn, .. } => Some(*turn as u64),
         _ => None,
     }
+}
+
+/// Source events whose enclosing turn is `<= fork_after`, in commit order.
+///
+/// Walks the committed log and takes events while the running turn (per
+/// [`turn_number_for_event`]) stays within the cap — stopping at the first
+/// boundary marker (`Done` / `BudgetExceeded` / `Cancelled`) past it, so a
+/// fork below a terminal marker never inherits it.
+fn events_up_to_fork_boundary(
+    source_events: Vec<agent_server::CommittedEvent>,
+    fork_after: u32,
+) -> Vec<agent_sdk_foundation::events::AgentEvent> {
+    source_events
+        .into_iter()
+        .take_while(|committed| {
+            turn_number_for_event(&committed.event).is_none_or(|turn| turn <= u64::from(fork_after))
+        })
+        .map(|committed| committed.event)
+        .collect()
 }
 
 /// Rewrite the `thread_id` field on a JSON `AgentState` snapshot.
@@ -2764,7 +2787,7 @@ fn map_tool_event_payload(event: &AgentEvent) -> RpcResult<Option<pb::event_enve
 /// the `done` frame with `stop_reason` distinguishing the disposition.
 /// This keeps the streaming contract additive — a replay/follow consumer
 /// always receives a closing `done` frame and the stream terminates (see
-/// [`is_done_event`]) instead of failing with INTERNAL on an unmapped
+/// [`terminal_close_reason`]) instead of failing with INTERNAL on an unmapped
 /// variant. Both variants carry the run's wall-clock duration.
 fn map_done_event(
     thread_id: &ThreadId,
@@ -5588,5 +5611,52 @@ mod tests {
             terminal_close_reason(&committed),
             Some(pb::StreamCloseReason::ThreadCompleted)
         );
+    }
+
+    /// A fork below a terminal marker must not inherit it: `BudgetExceeded`
+    /// and `Cancelled` are turn boundaries exactly like `Done`, or the fork
+    /// would immediately read as completed/cancelled even though its state
+    /// predates the stop.
+    #[test]
+    fn fork_boundary_excludes_budget_and_cancel_markers() {
+        let committed = |sequence: u64, event: AgentEvent| agent_server::CommittedEvent {
+            event_id: uuid::Uuid::now_v7(),
+            thread_id: ThreadId::from_string("t-fork"),
+            sequence,
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+            event,
+        };
+        let done_turn_1 = AgentEvent::done(
+            ThreadId::from_string("t-fork"),
+            1,
+            TokenUsage::default(),
+            std::time::Duration::ZERO,
+        );
+
+        // Budget marker past the cutoff: excluded (its total_turns > fork_after).
+        let mut budget_marker = budget_exceeded_event();
+        if let AgentEvent::BudgetExceeded { total_turns, .. } = &mut budget_marker {
+            *total_turns = 2;
+        }
+        let kept = events_up_to_fork_boundary(
+            vec![
+                committed(1, done_turn_1.clone()),
+                committed(2, budget_marker),
+            ],
+            1,
+        );
+        assert_eq!(kept.len(), 1, "the budget marker must not cross the cutoff");
+        assert!(matches!(kept[0], AgentEvent::Done { .. }));
+
+        // Cancel marker past the cutoff: excluded the same way.
+        let kept = events_up_to_fork_boundary(
+            vec![
+                committed(1, done_turn_1),
+                committed(2, AgentEvent::cancelled(2, TokenUsage::default())),
+            ],
+            1,
+        );
+        assert_eq!(kept.len(), 1, "the cancel marker must not cross the cutoff");
+        assert!(matches!(kept[0], AgentEvent::Done { .. }));
     }
 }

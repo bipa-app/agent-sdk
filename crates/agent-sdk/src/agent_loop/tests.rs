@@ -8244,6 +8244,238 @@ async fn test_failed_compaction_usage_still_counts() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn test_mid_turn_budget_stop_thread_can_rerun() -> anyhow::Result<()> {
+    // A mid-turn budget stop (compaction spend crossing the limit inside a
+    // begun turn) is a real-turn terminal: the thread must be rerunnable
+    // after the budget is raised, like every other terminal state.
+    let message_store = Arc::new(InMemoryStore::new());
+    let state_store = Arc::new(InMemoryStore::new());
+    let event_store = new_event_store();
+    let thread_id = ThreadId::new();
+    seed_compactable_history(&message_store, &thread_id).await?;
+
+    let budget_agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::text_response(
+            "compact summary",
+        )]))
+        .hooks(AllowAllHooks)
+        .config(AgentConfig {
+            usage_limits: Some(UsageLimits {
+                max_total_tokens: Some(25),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .with_compaction(tiny_compaction_config())
+        .message_store(Arc::clone(&message_store))
+        .state_store(Arc::clone(&state_store))
+        .event_store(event_store.clone())
+        .build_with_stores();
+
+    let (state, _events) = run_recorded(
+        &budget_agent,
+        thread_id.clone(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(
+        matches!(state, AgentRunState::BudgetExceeded { .. }),
+        "compaction spend must trip the budget mid-turn, got {state:?}",
+    );
+
+    // Same stores, budget removed: the thread must rerun to completion.
+    let unbudgeted_agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::text_response(
+            "recovered",
+        )]))
+        .hooks(AllowAllHooks)
+        .message_store(message_store)
+        .state_store(state_store)
+        .event_store(event_store)
+        .build_with_stores();
+    let (state, _events) = run_recorded(
+        &unbudgeted_agent,
+        thread_id,
+        AgentInput::Text("try again".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "rerun after a mid-turn budget stop must succeed, got {state:?}",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_mid_turn_budget_marker_survives_state_save_failure() -> anyhow::Result<()> {
+    // When the mid-turn terminal state save fails, the real turn must be
+    // left UNFINISHED: finishing it would leave the stored turn counter
+    // pointing at a finished turn — the rerun brick.
+    let message_store = Arc::new(InMemoryStore::new());
+    let state_store = Arc::new(FailAfterNStateStore {
+        inner: InMemoryStore::new(),
+        allow: 0,
+        saves: AtomicUsize::new(0),
+    });
+    let event_store = new_event_store();
+    let thread_id = ThreadId::new();
+    seed_compactable_history(&message_store, &thread_id).await?;
+
+    let budget_agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::text_response(
+            "compact summary",
+        )]))
+        .hooks(AllowAllHooks)
+        .config(AgentConfig {
+            usage_limits: Some(UsageLimits {
+                max_total_tokens: Some(25),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .with_compaction(tiny_compaction_config())
+        .message_store(Arc::clone(&message_store))
+        .state_store(Arc::clone(&state_store))
+        .event_store(event_store.clone())
+        .build_with_stores();
+
+    let (state, _events) = run_recorded(
+        &budget_agent,
+        thread_id.clone(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(matches!(state, AgentRunState::BudgetExceeded { .. }));
+
+    // The begun turn carries the marker and stays unfinished.
+    let marker_turn = event_store
+        .get_turn(&thread_id, 1)
+        .await?
+        .context("expected the mid-turn marker turn")?;
+    assert!(
+        !marker_turn.finished,
+        "a real turn whose terminal state save failed must stay unfinished",
+    );
+    assert!(
+        marker_turn
+            .events
+            .iter()
+            .any(|e| matches!(e.event, AgentEvent::BudgetExceeded { .. })),
+        "the marker turn must carry the terminal event",
+    );
+
+    // Rerun with the budget removed on the same stores: must succeed.
+    let unbudgeted_agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::text_response(
+            "recovered",
+        )]))
+        .hooks(AllowAllHooks)
+        .message_store(message_store)
+        .state_store(state_store)
+        .event_store(event_store)
+        .build_with_stores();
+    let (state, _events) = run_recorded(
+        &unbudgeted_agent,
+        thread_id,
+        AgentInput::Text("try again".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "rerun after a failed mid-turn terminal save must succeed, got {state:?}",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_compaction_event_append_failure_still_counts_usage() -> anyhow::Result<()> {
+    // Summarization and replace_history succeed, then the ContextCompacted
+    // event append fails: the run terminates on the error, but the billed
+    // summarization tokens must still land in the persisted totals.
+    struct FailOnContextCompactedStore {
+        inner: Arc<InMemoryEventStore>,
+    }
+
+    #[async_trait]
+    impl EventStore for FailOnContextCompactedStore {
+        async fn append(
+            &self,
+            thread_id: &ThreadId,
+            turn: usize,
+            envelope: AgentEventEnvelope,
+        ) -> anyhow::Result<()> {
+            if matches!(envelope.event, AgentEvent::ContextCompacted { .. }) {
+                anyhow::bail!("synthetic ContextCompacted append failure");
+            }
+            self.inner.append(thread_id, turn, envelope).await
+        }
+        async fn finish_turn(&self, thread_id: &ThreadId, turn: usize) -> anyhow::Result<()> {
+            self.inner.finish_turn(thread_id, turn).await
+        }
+        async fn get_turn(
+            &self,
+            thread_id: &ThreadId,
+            turn: usize,
+        ) -> anyhow::Result<Option<StoredTurnEvents>> {
+            self.inner.get_turn(thread_id, turn).await
+        }
+        async fn get_turns(&self, thread_id: &ThreadId) -> anyhow::Result<Vec<StoredTurnEvents>> {
+            self.inner.get_turns(thread_id).await
+        }
+        async fn clear(&self, thread_id: &ThreadId) -> anyhow::Result<()> {
+            self.inner.clear(thread_id).await
+        }
+    }
+
+    let message_store = Arc::new(InMemoryStore::new());
+    let state_store = Arc::new(InMemoryStore::new());
+    let thread_id = ThreadId::new();
+    seed_compactable_history(&message_store, &thread_id).await?;
+
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![
+            MockProvider::text_response("compact summary"),
+            MockProvider::text_response("never reached"),
+        ]))
+        .hooks(AllowAllHooks)
+        .with_compaction(tiny_compaction_config())
+        .message_store(Arc::clone(&message_store))
+        .state_store(Arc::clone(&state_store))
+        .event_store(Arc::new(FailOnContextCompactedStore {
+            inner: Arc::new(InMemoryEventStore::new()),
+        }) as Arc<dyn EventStore>)
+        .build_with_stores();
+
+    let (state, _events) = run_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(
+        matches!(state, AgentRunState::Error(_)),
+        "the failed event append surfaces as a terminal error, got {state:?}",
+    );
+
+    let persisted = state_store
+        .load(&thread_id)
+        .await?
+        .context("terminal state must be persisted")?;
+    assert_eq!(
+        u64::from(persisted.total_usage.input_tokens + persisted.total_usage.output_tokens),
+        30,
+        "the billed summarization call must reach the persisted totals even \
+         when the ContextCompacted append fails",
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_overflow_turn_over_budget_skips_emergency_compaction() -> anyhow::Result<()> {
     // A turn that reports ModelContextWindowExceeded already folded its own
     // usage; when that crossed the budget, the run must stop with

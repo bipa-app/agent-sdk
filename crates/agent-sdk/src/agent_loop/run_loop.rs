@@ -1393,14 +1393,55 @@ where
 /// terminal outcome; the synthetic marker turn is never finished, so a
 /// failed save here cannot brick the thread either (see the module note
 /// above).
-async fn persist_terminal_turn_state<S>(ctx: &TurnContext, state_store: &Arc<S>)
+/// Returns whether the save succeeded. Callers that `finish_turn` a REAL
+/// turn afterwards must do so only on `true`: finishing a turn whose
+/// advanced counter never persisted leaves the stored `turn_count` pointing
+/// at a finished turn — the rerun brick — whereas leaving the turn
+/// unfinished fails benign (appends to unfinished turns are allowed; see
+/// the synthetic terminal markers note). Use
+/// [`finish_terminal_turn_if_saved`] for that pattern.
+async fn persist_terminal_turn_state<S>(ctx: &TurnContext, state_store: &Arc<S>) -> bool
 where
     S: StateStore,
 {
-    if let Err(error) = state_store.save(&ctx.state).await {
+    match state_store.save(&ctx.state).await {
+        Ok(()) => true,
+        Err(error) => {
+            warn!(
+                "Failed to save state after terminal turn {}: {error}",
+                ctx.turn
+            );
+            false
+        }
+    }
+}
+
+/// Finish a real terminal turn only when its state save succeeded.
+///
+/// On a failed save the turn is deliberately left unfinished: the stored
+/// `turn_count` still points at (or before) this turn, so a rerun re-enters
+/// it via the unfinished-turn append path instead of bricking on "cannot
+/// append to finished turn". A failed `finish_turn` after a successful save
+/// is logged and swallowed so it never masks the terminal outcome.
+async fn finish_terminal_turn_if_saved(
+    saved: bool,
+    event_store: &Arc<dyn EventStore>,
+    thread_id: &ThreadId,
+    current_turn: usize,
+    outcome_label: &str,
+) {
+    if !saved {
         warn!(
-            "Failed to save state after terminal turn {}: {error}",
-            ctx.turn
+            "Leaving turn {current_turn} unfinished after {outcome_label}: the state save \
+             failed, and finishing would leave the stored turn counter pointing at a \
+             finished turn (rerun brick)"
+        );
+        return;
+    }
+    if let Err(store_error) = finish_turn_or_error(event_store, thread_id, current_turn).await {
+        warn!(
+            "Failed to finish turn {current_turn} after {outcome_label} (preserving terminal state): {}",
+            store_error.message
         );
     }
 }
@@ -1704,14 +1745,15 @@ async fn mid_turn_budget_run_state<S>(
 where
     S: StateStore,
 {
-    persist_terminal_turn_state(ctx, state_store).await;
-    if let Err(store_error) = finish_turn_or_error(event_store, &ctx.thread_id, current_turn).await
-    {
-        warn!(
-            "Failed to finish turn {current_turn} after mid-turn budget stop (preserving terminal state): {}",
-            store_error.message
-        );
-    }
+    let saved = persist_terminal_turn_state(ctx, state_store).await;
+    finish_terminal_turn_if_saved(
+        saved,
+        event_store,
+        &ctx.thread_id,
+        current_turn,
+        "mid-turn budget stop",
+    )
+    .await;
     AgentRunState::BudgetExceeded {
         total_turns: turns_to_u32(ctx.turn),
         total_usage: ctx.total_usage.clone(),
@@ -1801,7 +1843,16 @@ where
             {
                 return RunLoopTurnAction::Return(AgentRunState::Error(error));
             }
-            persist_terminal_turn_state(ctx, state_store).await;
+            if !persist_terminal_turn_state(ctx, state_store).await {
+                // Failed save: leave the turn unfinished so the stored
+                // turn counter never points at a finished turn (see
+                // `finish_terminal_turn_if_saved`).
+                warn!(
+                    "Leaving turn {current_turn} unfinished after mid-turn cancel: the state \
+                     save failed"
+                );
+                return RunLoopTurnAction::Return(cancelled_run_state(ctx));
+            }
             finish_turn_or_run_state(event_store, &ctx.thread_id, current_turn)
                 .await
                 .map_or_else(std::convert::identity, |()| {
@@ -1856,14 +1907,9 @@ async fn refusal_turn_run_state<S>(
 where
     S: StateStore,
 {
-    persist_terminal_turn_state(ctx, state_store).await;
-    if let Err(store_error) = finish_turn_or_error(event_store, &ctx.thread_id, current_turn).await
-    {
-        warn!(
-            "Failed to finish turn {current_turn} after refusal (preserving refusal state): {}",
-            store_error.message
-        );
-    }
+    let saved = persist_terminal_turn_state(ctx, state_store).await;
+    finish_terminal_turn_if_saved(saved, event_store, &ctx.thread_id, current_turn, "refusal")
+        .await;
     refusal_run_state(ctx)
 }
 
@@ -1889,14 +1935,15 @@ async fn error_turn_run_state<S>(
 where
     S: StateStore,
 {
-    persist_terminal_turn_state(ctx, state_store).await;
-    if let Err(store_error) = finish_turn_or_error(event_store, &ctx.thread_id, current_turn).await
-    {
-        warn!(
-            "Failed to finish turn {current_turn} after turn error (preserving original error): {}",
-            store_error.message
-        );
-    }
+    let saved = persist_terminal_turn_state(ctx, state_store).await;
+    finish_terminal_turn_if_saved(
+        saved,
+        event_store,
+        &ctx.thread_id,
+        current_turn,
+        "turn error",
+    )
+    .await;
     AgentRunState::Error(error)
 }
 
@@ -3050,7 +3097,10 @@ where
     })
     .await;
 
-    let outcome = convert_turn_result(ConvertTurnResultParams {
+    let ConvertedTurn {
+        outcome,
+        may_finish_turn,
+    } = convert_turn_result(ConvertTurnResultParams {
         result,
         ctx,
         event_store: &event_store,
@@ -3065,7 +3115,8 @@ where
     })
     .await;
 
-    if !turn_outcome_keeps_turn_open(&outcome)
+    if may_finish_turn
+        && !turn_outcome_keeps_turn_open(&outcome)
         && let Err(store_error) = finish_turn_or_error(&event_store, &thread_id, current_turn).await
     {
         return TurnOutcome::Error(store_error);
@@ -3152,6 +3203,41 @@ where
     }
 }
 
+/// A converted single-turn outcome plus whether the caller may run the
+/// tail `finish_turn` barrier.
+///
+/// `may_finish_turn` is `false` when a terminal arm's state save failed:
+/// finishing the turn then would leave the stored `turn_count` pointing at
+/// a finished turn — the rerun brick — whereas leaving it unfinished fails
+/// benign (appends to unfinished turns are allowed).
+pub(super) struct ConvertedTurn {
+    outcome: TurnOutcome,
+    may_finish_turn: bool,
+}
+
+impl ConvertedTurn {
+    /// Outcome whose turn may be finished normally by the caller's tail.
+    const fn finish(outcome: TurnOutcome) -> Self {
+        Self {
+            outcome,
+            may_finish_turn: true,
+        }
+    }
+
+    /// Outcome from a gated terminal arm: finish only when `saved`.
+    fn gated(outcome: TurnOutcome, saved: bool, outcome_label: &str) -> Self {
+        if !saved {
+            warn!(
+                "Leaving the turn unfinished after {outcome_label}: the state save failed,                  and finishing would leave the stored turn counter pointing at a finished                  turn (rerun brick)"
+            );
+        }
+        Self {
+            outcome,
+            may_finish_turn: saved,
+        }
+    }
+}
+
 /// Inputs for [`convert_cancelled_turn`].
 struct ConvertCancelledParams<'a, H, S> {
     ctx: &'a TurnContext,
@@ -3181,21 +3267,25 @@ async fn convert_cancelled_turn<H, S>(
         turn_options,
         turn_usage,
     }: ConvertCancelledParams<'_, H, S>,
-) -> TurnOutcome
+) -> ConvertedTurn
 where
     H: AgentHooks,
     S: StateStore,
 {
     if let Err(error) = emit_cancelled_event(ctx, event_store, hooks, authority, ctx.turn).await {
-        return TurnOutcome::Error(error);
+        return ConvertedTurn::finish(TurnOutcome::Error(error));
     }
-    persist_terminal_turn_state(ctx, state_store).await;
+    let saved = persist_terminal_turn_state(ctx, state_store).await;
     let summary = build_turn_summary(ctx, provenance, turn_options, turn_usage);
-    TurnOutcome::Cancelled {
-        total_turns: turns_to_u32(ctx.turn),
-        total_usage: ctx.total_usage.clone(),
-        summary,
-    }
+    ConvertedTurn::gated(
+        TurnOutcome::Cancelled {
+            total_turns: turns_to_u32(ctx.turn),
+            total_usage: ctx.total_usage.clone(),
+            summary,
+        },
+        saved,
+        "mid-turn cancel",
+    )
 }
 
 struct ConvertDoneParams<'a, H, S> {
@@ -3360,19 +3450,23 @@ async fn convert_mid_turn_budget<S>(
     turn_options: &TurnOptions,
     limit: BudgetLimitKind,
     estimated_cost_usd: Option<f64>,
-) -> TurnOutcome
+) -> ConvertedTurn
 where
     S: StateStore,
 {
-    persist_terminal_turn_state(ctx, state_store).await;
+    let saved = persist_terminal_turn_state(ctx, state_store).await;
     let summary = build_turn_summary(ctx, provenance, turn_options, TokenUsage::default());
-    TurnOutcome::BudgetExceeded {
-        total_turns: turns_to_u32(ctx.turn),
-        total_usage: ctx.total_usage.clone(),
-        estimated_cost_usd,
-        limit,
-        summary,
-    }
+    ConvertedTurn::gated(
+        TurnOutcome::BudgetExceeded {
+            total_turns: turns_to_u32(ctx.turn),
+            total_usage: ctx.total_usage.clone(),
+            estimated_cost_usd,
+            limit,
+            summary,
+        },
+        saved,
+        "mid-turn budget stop",
+    )
 }
 
 /// Single-turn conversion of a refusal: the caller finishes this turn right
@@ -3383,17 +3477,21 @@ async fn convert_refusal_turn<S>(
     state_store: &Arc<S>,
     provenance: &AuditProvenance,
     turn_options: &TurnOptions,
-) -> TurnOutcome
+) -> ConvertedTurn
 where
     S: StateStore,
 {
-    persist_terminal_turn_state(ctx, state_store).await;
+    let saved = persist_terminal_turn_state(ctx, state_store).await;
     let summary = build_turn_summary(ctx, provenance, turn_options, ctx.total_usage.clone());
-    TurnOutcome::Refusal {
-        total_turns: turns_to_u32(ctx.turn),
-        total_usage: ctx.total_usage.clone(),
-        summary,
-    }
+    ConvertedTurn::gated(
+        TurnOutcome::Refusal {
+            total_turns: turns_to_u32(ctx.turn),
+            total_usage: ctx.total_usage.clone(),
+            summary,
+        },
+        saved,
+        "refusal",
+    )
 }
 
 /// Single-turn conversion of an external-runtime tool handoff.
@@ -3430,9 +3528,9 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
         turn_options,
         usage_limits,
     }: ConvertTurnResultParams<'_, H, S>,
-) -> TurnOutcome {
+) -> ConvertedTurn {
     match result {
-        InternalTurnResult::Continue { turn_usage } => {
+        InternalTurnResult::Continue { turn_usage } => ConvertedTurn::finish(
             convert_continue_turn(ConvertContinueParams {
                 ctx,
                 turn_usage,
@@ -3446,9 +3544,9 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
                 turn_options,
                 usage_limits,
             })
-            .await
-        }
-        InternalTurnResult::Done => {
+            .await,
+        ),
+        InternalTurnResult::Done => ConvertedTurn::finish(
             convert_done_turn(ConvertDoneParams {
                 ctx: &ctx,
                 state_store,
@@ -3460,8 +3558,8 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
                 provenance,
                 turn_options,
             })
-            .await
-        }
+            .await,
+        ),
         InternalTurnResult::BudgetExceeded {
             limit,
             estimated_cost_usd,
@@ -3502,7 +3600,7 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
         } => {
             let turn_usage = continuation.turn_usage.clone();
             let summary = build_turn_summary(&ctx, provenance, turn_options, turn_usage);
-            TurnOutcome::AwaitingConfirmation {
+            ConvertedTurn::finish(TurnOutcome::AwaitingConfirmation {
                 tool_call_id,
                 tool_name,
                 display_name,
@@ -3510,28 +3608,29 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
                 description,
                 continuation: Box::new(ContinuationEnvelope::wrap(*continuation)),
                 summary,
-            }
+            })
         }
         InternalTurnResult::PendingToolCalls {
             turn_usage,
             pending_tool_calls,
             continuation,
-        } => convert_pending_tool_calls(
+        } => ConvertedTurn::finish(convert_pending_tool_calls(
             &ctx,
             provenance,
             turn_options,
             turn_usage,
             pending_tool_calls,
             continuation,
-        ),
+        )),
         InternalTurnResult::Error(e) => {
-            // The caller finishes this turn right after; persist the
-            // advanced turn counter or the next `run_turn` re-enters the
-            // finished turn and bricks the thread. This matters even for
-            // *designed* error outcomes like a `pre_llm_request` guardrail
-            // block, where the caller is expected to rephrase and retry.
-            persist_terminal_turn_state(&ctx, state_store).await;
-            TurnOutcome::Error(e)
+            // The caller finishes this turn right after (only when the save
+            // landed); persist the advanced turn counter or the next
+            // `run_turn` re-enters the finished turn and bricks the thread.
+            // This matters even for *designed* error outcomes like a
+            // `pre_llm_request` guardrail block, where the caller is
+            // expected to rephrase and retry.
+            let saved = persist_terminal_turn_state(&ctx, state_store).await;
+            ConvertedTurn::gated(TurnOutcome::Error(e), saved, "turn error")
         }
     }
 }
