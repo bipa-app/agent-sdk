@@ -58,6 +58,10 @@ opentelemetry = { workspace = true, optional = true }
 serde_yaml_ng = { workspace = true, optional = true }
 # HTML→text rendering — only the `web` fetch tool uses it.
 html2text = { workspace = true, optional = true }
+# Embedded single-file durable session store — only the `sqlite` feature uses
+# it. `bundled` vendors SQLite so no system library is required; the driver is
+# synchronous, so the store wraps every call in `spawn_blocking`.
+rusqlite = { workspace = true, optional = true }
 
 [features]
 # The common case is an Anthropic agent, so `anthropic` is the only default
@@ -80,6 +84,12 @@ web = ["dep:html2text"]
 mcp = []
 # Skill/command loading from markdown; `serde_yaml_ng` parses frontmatter.
 skills = ["dep:serde_yaml_ng"]
+# Embedded single-file durable session store (`SqliteStore`). Pulls a
+# lightweight synchronous SQLite driver (`rusqlite`, bundled) so an in-process
+# agent can persist conversation/state/events/tool-executions across restarts
+# without the heavier async `sqlx` stack. Off by default — the default build is
+# unchanged.
+sqlite = ["dep:rusqlite"]
 
 # ── Observability (unchanged) ──────────────────────────────────────────
 otel = ["opentelemetry"]
