@@ -69,6 +69,10 @@ use super::{EventStore, MessageStore, StateStore, StoredTurnEvents, ToolExecutio
 /// checkpointing the WAL, so we wait a few seconds rather than failing fast.
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// On-disk format version stamped into `PRAGMA user_version`. Bump when the
+/// table layout changes and add a migration path in [`SqliteStore::open`].
+const SCHEMA_VERSION: i64 = 1;
+
 /// Schema applied on open. `CREATE TABLE IF NOT EXISTS` makes opening an
 /// existing database a no-op, which is exactly the resume path.
 const SCHEMA: &str = "\
@@ -112,7 +116,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_tool_executions_operation
 
 /// Single-file SQLite-backed implementation of every SDK store trait.
 ///
-/// See the [module docs](self) for resume semantics and a wiring example.
+/// See the module docs for resume semantics and a wiring example.
 /// Cloning shares the same single `Arc<Mutex<Connection>>` (not a pool), so a
 /// clone handed to the agent builder observes everything the kept handle
 /// records (and vice versa); all database calls serialize on that one mutex.
@@ -129,14 +133,15 @@ impl SqliteStore {
     /// no-op and all previously persisted rows remain available.
     ///
     /// This constructor is synchronous — it opens the file, converts it to
-    /// WAL, and applies the schema on the calling thread (waiting up to
-    /// [`BUSY_TIMEOUT`] if another process holds the write lock). Call it
-    /// during startup, or wrap it in `spawn_blocking` on a latency-sensitive
-    /// async runtime.
+    /// WAL, and applies the schema on the calling thread (waiting up to five
+    /// seconds if another process holds the write lock). Call it during
+    /// startup, or wrap it in `spawn_blocking` on a latency-sensitive async
+    /// runtime.
     ///
     /// # Errors
-    /// Returns an error if the database cannot be opened or the schema cannot
-    /// be initialized.
+    /// Returns an error if the database cannot be opened, the schema cannot
+    /// be initialized, or the file carries a schema version newer than this
+    /// SDK understands.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let conn = Connection::open(path)
@@ -152,16 +157,26 @@ impl SqliteStore {
         // WAL lets readers run concurrently with a writer.
         conn.pragma_update(None, "journal_mode", "WAL")
             .context("failed to enable WAL journal mode")?;
-        conn.execute_batch(SCHEMA)
-            .context("failed to initialize sqlite store schema")?;
-        // Stamp the on-disk format so a future schema change can migrate by
-        // version instead of inferring shape from the tables. Version 1 is
-        // the initial format; 0 means "pre-versioning", which is also v1.
+        // Validate the on-disk format version BEFORE touching the schema: a
+        // file stamped by a newer SDK must fail safely here, not have v1 DDL
+        // re-applied over (or v1 queries run against) a format this binary
+        // does not understand. 0 means "fresh or pre-versioning", which is
+        // the v1 layout this store initializes below.
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .context("failed to read sqlite user_version")?;
+        if version > SCHEMA_VERSION {
+            anyhow::bail!(
+                "sqlite store at {} has schema version {version}, newer than the \
+                 version {SCHEMA_VERSION} this SDK supports; upgrade the SDK (or point at a \
+                 different file)",
+                path.display()
+            );
+        }
+        conn.execute_batch(SCHEMA)
+            .context("failed to initialize sqlite store schema")?;
         if version == 0 {
-            conn.pragma_update(None, "user_version", 1)
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)
                 .context("failed to stamp sqlite user_version")?;
         }
         Ok(Self {
@@ -832,6 +847,33 @@ mod tests {
             bail!("append after finish must fail");
         };
         assert!(error.to_string().contains("cannot append to finished turn"));
+        Ok(())
+    }
+
+    /// A database stamped by a newer SDK must be rejected on open, not have
+    /// v1 DDL applied over a format this binary does not understand. A v1
+    /// stamp reopens fine.
+    #[tokio::test]
+    async fn rejects_newer_schema_version() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("agent.db");
+
+        {
+            let _store = SqliteStore::open(&path)?;
+        }
+        // Simulate a future SDK bumping the format version.
+        {
+            let conn = Connection::open(&path)?;
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)?;
+        }
+
+        let Err(error) = SqliteStore::open(&path) else {
+            bail!("opening a newer-versioned database must fail");
+        };
+        assert!(
+            error.to_string().contains("newer than the"),
+            "unexpected error: {error}"
+        );
         Ok(())
     }
 
