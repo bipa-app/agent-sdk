@@ -6812,7 +6812,7 @@ async fn test_guardrail_retry_cap_terminates_run() -> anyhow::Result<()> {
         .event_store(new_event_store())
         .build_with_stores();
 
-    let (state, _events) = run_recorded(
+    let (state, events) = run_recorded(
         &agent,
         ThreadId::new(),
         AgentInput::Text("go".to_string()),
@@ -6832,6 +6832,17 @@ async fn test_guardrail_retry_cap_terminates_run() -> anyhow::Result<()> {
         agent.provider.calls(),
         types::MAX_CONSECUTIVE_GUARDRAIL_RETRIES,
         "the run must stop after exactly the cap count of LLM calls",
+    );
+    // Every paid rejection — including the cap-reaching one, whose early
+    // return bypasses the normal retry path — emits its usage-bearing
+    // completion edge, or consumers under-report the final LLM call.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e.event, AgentEvent::TurnComplete { .. }))
+            .count(),
+        types::MAX_CONSECUTIVE_GUARDRAIL_RETRIES,
+        "each rejected round-trip must emit TurnComplete, cap call included",
     );
 
     Ok(())
@@ -7132,6 +7143,89 @@ async fn test_run_turn_guardrail_blocked_thread_can_rerun() -> anyhow::Result<()
         "run_turn after a guardrail block must succeed, got {outcome:?}",
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_turn_budget_stop_survives_state_save_failure() -> anyhow::Result<()> {
+    // Single-turn Continue conversion: when the post-turn checkpoint save
+    // fails AND the budget trips, the turn must stay unfinished — finishing
+    // it would leave the durable turn counter pointing at a finished turn
+    // and every later run_turn would fail "cannot append to finished turn".
+    let message_store = Arc::new(InMemoryStore::new());
+    let state_store = Arc::new(FailAfterNStateStore {
+        inner: InMemoryStore::new(),
+        allow: 0,
+        saves: AtomicUsize::new(0),
+    });
+    let event_store = new_event_store();
+    let thread_id = ThreadId::new();
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+    let budget_agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::tool_use_response(
+            "call_1",
+            "echo",
+            json!({"message": "x"}),
+        )]))
+        .tools(tools)
+        .hooks(AllowAllHooks)
+        .config(AgentConfig {
+            usage_limits: Some(UsageLimits {
+                max_total_tokens: Some(25),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .message_store(Arc::clone(&message_store))
+        .state_store(Arc::clone(&state_store))
+        .event_store(event_store.clone())
+        .build_with_stores();
+
+    let outcome = Box::pin(budget_agent.run_turn(
+        thread_id.clone(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+        TurnOptions::default(),
+    ))
+    .await;
+    assert!(
+        matches!(outcome, TurnOutcome::BudgetExceeded { .. }),
+        "the turn's usage must trip the budget, got {outcome:?}",
+    );
+    let marker_turn = event_store
+        .get_turn(&thread_id, 1)
+        .await?
+        .context("expected the budget-stopped turn")?;
+    assert!(
+        !marker_turn.finished,
+        "a budget-stopped turn whose state save failed must stay unfinished",
+    );
+
+    // Same stores, budget removed: the thread must stay drivable.
+    let unbudgeted_agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::text_response(
+            "recovered",
+        )]))
+        .hooks(AllowAllHooks)
+        .message_store(message_store)
+        .state_store(state_store)
+        .event_store(event_store)
+        .build_with_stores();
+    let outcome = Box::pin(unbudgeted_agent.run_turn(
+        thread_id,
+        AgentInput::Text("try again".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+        TurnOptions::default(),
+    ))
+    .await;
+    assert!(
+        matches!(outcome, TurnOutcome::Done { .. }),
+        "run_turn after a failed budget-stop save must succeed, got {outcome:?}",
+    );
     Ok(())
 }
 

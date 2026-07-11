@@ -3389,10 +3389,14 @@ async fn convert_continue_turn<H: AgentHooks, S: StateStore>(
         turn_options,
         usage_limits,
     }: ConvertContinueParams<'_, H, S>,
-) -> TurnOutcome {
-    if let Err(e) = state_store.save(&ctx.state).await {
-        warn!("Failed to save state checkpoint: {e}");
-    }
+) -> ConvertedTurn {
+    let saved = match state_store.save(&ctx.state).await {
+        Ok(()) => true,
+        Err(e) => {
+            warn!("Failed to save state checkpoint: {e}");
+            false
+        }
+    };
     if let Some((limit, estimated_cost_usd)) = budget::status(
         usage_limits,
         provenance,
@@ -3421,23 +3425,31 @@ async fn convert_continue_turn<H: AgentHooks, S: StateStore>(
         )
         .await
         {
-            return TurnOutcome::Error(error);
+            return ConvertedTurn::finish(TurnOutcome::Error(error));
         }
-        return TurnOutcome::BudgetExceeded {
-            total_turns: turns_to_u32(ctx.turn),
-            total_usage: ctx.total_usage,
-            estimated_cost_usd,
-            limit,
-            summary,
-        };
+        // The checkpoint above IS this terminal's state save: when it
+        // failed, finishing the turn would leave the durable turn_count
+        // pointing at a finished turn (rerun brick) — gate like every
+        // other real-turn terminal arm.
+        return ConvertedTurn::gated(
+            TurnOutcome::BudgetExceeded {
+                total_turns: turns_to_u32(ctx.turn),
+                total_usage: ctx.total_usage,
+                estimated_cost_usd,
+                limit,
+                summary,
+            },
+            saved,
+            "single-turn budget stop",
+        );
     }
     let summary = build_turn_summary(&ctx, provenance, turn_options, turn_usage.clone());
-    TurnOutcome::NeedsMoreTurns {
+    ConvertedTurn::finish(TurnOutcome::NeedsMoreTurns {
         turn: ctx.turn,
         turn_usage,
         total_usage: ctx.total_usage,
         summary,
-    }
+    })
 }
 
 /// Single-turn conversion of a mid-turn budget stop (see the looping
@@ -3532,7 +3544,7 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
     }: ConvertTurnResultParams<'_, H, S>,
 ) -> ConvertedTurn {
     match result {
-        InternalTurnResult::Continue { turn_usage } => ConvertedTurn::finish(
+        InternalTurnResult::Continue { turn_usage } => {
             convert_continue_turn(ConvertContinueParams {
                 ctx,
                 turn_usage,
@@ -3546,8 +3558,8 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
                 turn_options,
                 usage_limits,
             })
-            .await,
-        ),
+            .await
+        }
         InternalTurnResult::Done => ConvertedTurn::finish(
             convert_done_turn(ConvertDoneParams {
                 ctx: &ctx,

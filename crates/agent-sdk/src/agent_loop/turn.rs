@@ -2965,6 +2965,23 @@ where
             // host-driven single-turn `run_turn` invocations.
             ctx.state.guardrail_retries = ctx.state.guardrail_retries.saturating_add(1);
             if ctx.state.guardrail_retries >= super::types::MAX_CONSECUTIVE_GUARDRAIL_RETRIES {
+                // The cap-reaching response was a paid LLM round-trip whose
+                // usage was folded above; emit its completion edge before
+                // erroring out, or event-stream/gRPC consumers under-report
+                // the final call (the terminal `Error` carries no usage).
+                // Best-effort: a failed append must not mask the cap error.
+                let _ = send_event(
+                    event_store,
+                    &ctx.thread_id,
+                    ctx.turn,
+                    hooks,
+                    authority,
+                    AgentEvent::TurnComplete {
+                        turn: ctx.turn,
+                        usage: turn_usage.clone(),
+                    },
+                )
+                .await;
                 return Err(guardrail_retry_cap_result(
                     &ctx.thread_id,
                     ctx.turn,
