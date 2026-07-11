@@ -233,10 +233,20 @@ message DecideConfirmationResponse {
 // the CANCELLED status as "a cancel was requested", not as proof the
 // output was suppressed.
 //
-// Every effective cancel commits a terminal `cancelled` event to the
-// thread journal (see `CancelledEvent` in events.proto), so
-// REPLAY_AND_FOLLOW subscribers receive a closing frame instead of
-// waiting for a `done` that will never come.
+// An effective cancel of the thread's ACTIVE root commits a terminal
+// `cancelled` event to the thread journal (see `CancelledEvent` in
+// events.proto), so REPLAY_AND_FOLLOW subscribers receive a closing
+// frame instead of waiting for a `done` that will never come.
+// Cancelling a QUEUED root behind a live active root emits no marker —
+// the active root's stream continues undisturbed; observe the queued
+// cancel via `GetTask` or this RPC's `cancelled_task_ids`. The marker
+// is best-effort: it is committed after the durable cancel
+// transaction, so a crash in between loses it (retries stay silent),
+// cascade-cancelled child-thread roots emit no marker on their own
+// threads, and a RUNNING root's worker may still append salvaged
+// events for up to one heartbeat after the marker lands. Committing
+// the marker inside the cancellation transaction on every backend is
+// the tracked store-level follow-up.
 //
 // That deferred prefix commit also races the thread's NEXT turn:
 // cancelling a RUNNING root immediately frees the thread's active-root

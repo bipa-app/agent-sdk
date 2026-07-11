@@ -1425,7 +1425,7 @@ impl AgentControlService for GrpcControlService {
         info!(
             task_id = %task_id,
             thread_id = %task.thread_id,
-            reason = %request.reason,
+            reason = %bounded_log_str(&request.reason, MAX_CANCEL_REASON_LOG_CHARS),
             "cancelling task tree",
         );
 
@@ -2129,6 +2129,21 @@ fn parse_task_id(task_id: &str) -> RpcResult<AgentTaskId> {
         return Err(Status::invalid_argument("task_id is required").into());
     }
     Ok(AgentTaskId::from_string(task_id))
+}
+
+/// Log-line budget for the client-controlled `CancelTask.reason` string.
+/// Matches the spirit of `SubmitThreadWork`'s input caps: the field is
+/// documented as logs-only, so bounding it here is the whole guard.
+const MAX_CANCEL_REASON_LOG_CHARS: usize = 256;
+
+/// Bound a client-controlled string before it reaches structured logs,
+/// truncating on a char boundary and marking the cut with an ellipsis.
+/// Borrowed (no allocation) when the value is already within budget.
+fn bounded_log_str(value: &str, max_chars: usize) -> std::borrow::Cow<'_, str> {
+    match value.char_indices().nth(max_chars) {
+        None => std::borrow::Cow::Borrowed(value),
+        Some((byte_index, _)) => std::borrow::Cow::Owned(format!("{}…", &value[..byte_index])),
+    }
 }
 
 fn internal_status(
@@ -5155,6 +5170,28 @@ mod tests {
         Ok(())
     }
 
+    /// The client-controlled cancel `reason` is bounded before it
+    /// reaches structured logs: short values pass through unallocated,
+    /// oversized ones are cut on a char boundary with an ellipsis.
+    #[test]
+    fn bounded_log_str_truncates_oversized_client_strings() {
+        let short = "user aborted";
+        assert!(matches!(
+            bounded_log_str(short, MAX_CANCEL_REASON_LOG_CHARS),
+            std::borrow::Cow::Borrowed(_)
+        ));
+
+        // Multi-byte chars: truncation must stay on a char boundary.
+        let oversized = "é".repeat(MAX_CANCEL_REASON_LOG_CHARS + 100);
+        let bounded = bounded_log_str(&oversized, MAX_CANCEL_REASON_LOG_CHARS);
+        assert_eq!(
+            bounded.chars().count(),
+            MAX_CANCEL_REASON_LOG_CHARS + 1,
+            "capped chars plus the ellipsis marker",
+        );
+        assert!(bounded.ends_with('…'));
+    }
+
     /// Read the next frame from an in-process event stream, bounded so a
     /// missing terminal frame fails the test instead of hanging it.
     async fn next_inline_frame(stream: &mut EventStream) -> Result<pb::StreamThreadEventsResponse> {
@@ -5247,6 +5284,104 @@ mod tests {
             closed.reason,
             pb::StreamCloseReason::TurnCancelled as i32,
             "{closed:?}",
+        );
+        Ok(())
+    }
+
+    /// Cancelling a QUEUED root behind a live active root must NOT close
+    /// the thread's followers: no `Cancelled` marker is committed, the
+    /// stream stays open, and subsequent events (the active root's work)
+    /// are still delivered.
+    #[tokio::test]
+    async fn cancel_of_queued_root_leaves_followers_streaming() -> Result<()> {
+        use agent_sdk_foundation::events::AgentEvent;
+
+        let shared = event_test_shared()?;
+        let control = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+        let events = GrpcEventService {
+            shared: Arc::clone(&shared),
+        };
+
+        // Active root occupies the slot; the second submit queues.
+        let (thread, _active_task_id) = seed_pending_root(&control, "cancel-queued-follow").await?;
+        let queued = control
+            .submit_thread_work(Request::new(pb::SubmitThreadWorkRequest {
+                request_id: "cancel-queued-follow-second".into(),
+                thread_id: thread.clone(),
+                input: vec![text_input("queued work")],
+            }))
+            .await?
+            .into_inner()
+            .task
+            .context("second submit missing task")?;
+        assert_eq!(
+            queued.status,
+            pb::TaskStatus::Queued as i32,
+            "precondition: second root queues behind the active one",
+        );
+
+        let mut stream = events
+            .stream_thread_events(Request::new(pb::StreamThreadEventsRequest {
+                thread_id: thread.clone(),
+                after_sequence: None,
+                follow_mode: pb::FollowMode::ReplayAndFollow as i32,
+            }))
+            .await?
+            .into_inner();
+        let opened = next_inline_frame(&mut stream).await?;
+        ensure!(
+            matches!(opened.item, Some(StreamItem::ReplayOpened(_))),
+            "expected replay_opened, got {opened:?}",
+        );
+        let catchup = next_inline_frame(&mut stream).await?;
+        ensure!(
+            matches!(catchup.item, Some(StreamItem::ReplayCatchupComplete(_))),
+            "expected replay_catchup_complete, got {catchup:?}",
+        );
+
+        let cancel = control
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: queued.task_id.clone(),
+                reason: "queued cancel".into(),
+                thread_id: String::new(),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(cancel.cancelled_task_ids, vec![queued.task_id]);
+
+        // Prove the follower is still live: commit + notify a probe
+        // event and assert it is the very next frame — not a Cancelled
+        // marker, not a Closed frame.
+        let committed = shared
+            .stores
+            .event_repo
+            .commit_event(
+                &ThreadId::from_string(&thread),
+                AgentEvent::TextDelta {
+                    message_id: "probe".into(),
+                    delta: "still streaming".into(),
+                },
+                OffsetDateTime::now_utc(),
+            )
+            .await?;
+        shared
+            .stores
+            .event_notifier
+            .notify(std::slice::from_ref(&committed));
+
+        let frame = next_inline_frame(&mut stream).await?;
+        let Some(StreamItem::Event(envelope)) = frame.item else {
+            bail!("expected the probe event frame, got {frame:?}");
+        };
+        ensure!(
+            matches!(
+                envelope.event,
+                Some(pb::event_envelope::Event::TextDelta(_))
+            ),
+            "queued cancel must not interject a Cancelled marker, got {:?}",
+            envelope.event,
         );
         Ok(())
     }
