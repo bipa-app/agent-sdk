@@ -78,7 +78,10 @@ regex = { version = "1.12.3", default-features = false, features = ["std", "unic
 glob = { version = "0.3", default-features = false }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 time = { version = "0.3", features = ["serde", "std", "formatting", "parsing"] }
-reqwest = { version = "0.13.2", features = ["gzip", "json", "query", "default-tls", "stream", "http2"], default-features = false }
+# Use one native TLS stack across HTTP, WebSocket, AMQP, and SQLx clients.
+# Reqwest's `default-tls` selects AWS-LC in 0.13, adding a large native build
+# even for SQLite-only service hosts.
+reqwest = { version = "0.13.2", features = ["gzip", "json", "query", "native-tls", "stream", "http2"], default-features = false }
 async-stream = "0.3"
 bytes = "1"
 log = { version = "0.4", features = ["kv_std"] }
@@ -86,12 +89,12 @@ url = "2"
 tokio-util = "0.7"
 html2text = "0.17.1"
 base64 = "0.22"
-tokio-tungstenite = { version = "0.29.0", features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.29.0", features = ["connect", "handshake", "native-tls"] }
 opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "rt-tokio"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace", "metrics"] }
-sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "migrate", "macros", "time", "json"] }
-lapin = { version = "4.4.0", default-features = false, features = ["rustls", "tokio"] }
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-native-tls", "migrate", "macros", "time", "json"] }
+lapin = { version = "4.4.0", default-features = false, features = ["native-tls", "tokio"] }
 clap = { version = "4", features = ["derive"] }
 
 # Proc-macro toolchain for the Phase 13·E ergonomics crate
