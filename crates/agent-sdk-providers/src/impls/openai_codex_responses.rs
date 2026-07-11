@@ -413,7 +413,16 @@ impl OpenAICodexResponsesProvider {
         } else {
             api_response.status.map(|status| match status {
                 ApiStatus::Completed => StopReason::EndTurn,
-                ApiStatus::Incomplete | ApiStatus::Failed => StopReason::Unknown,
+                // Terminal failures and any non-terminal/unknown status
+                // that leaked into a final response map to Unknown, exactly
+                // as the old Incomplete|Failed arm did. Spelled out per
+                // variant so adding a status forces a decision here.
+                ApiStatus::Incomplete
+                | ApiStatus::Failed
+                | ApiStatus::InProgress
+                | ApiStatus::Queued
+                | ApiStatus::Cancelled
+                | ApiStatus::Other => StopReason::Unknown,
             })
         };
 
@@ -2418,7 +2427,16 @@ fn reasoning_summary_block_index(output_index: Option<usize>) -> usize {
 }
 
 fn decode_stream_event(data: &str) -> Result<ApiStreamEvent> {
-    serde_json::from_str(data).context("invalid OpenAI Codex Responses stream event")
+    serde_json::from_str(data).with_context(|| {
+        // Include a bounded snippet of the offending event: SSE payloads
+        // carry no credentials, and "invalid stream event" without the
+        // event is undiagnosable in the field (2026-07-10, GPT-5.6 rollout).
+        let mut snippet: String = data.chars().take(512).collect();
+        if data.chars().count() > 512 {
+            snippet.push('…');
+        }
+        format!("invalid OpenAI Codex Responses stream event: {snippet}")
+    })
 }
 
 fn decode_output_item(item: Option<serde_json::Value>) -> Result<ApiOutputItem> {
@@ -2502,10 +2520,18 @@ fn stop_reason_from_stream_state(
         ApiStatus::Incomplete => {
             incomplete_reason.map_or(StopReason::Unknown, incomplete_stop_reason)
         }
-        ApiStatus::Failed => StopReason::Unknown,
         ApiStatus::Completed if refused => StopReason::Refusal,
         ApiStatus::Completed if !tool_calls.is_empty() => StopReason::ToolUse,
         ApiStatus::Completed => StopReason::EndTurn,
+        // Failed, a non-terminal status leaking into the final state, or a
+        // status this build does not know: same Unknown as the old Failed
+        // arm. Spelled out per variant so adding a status forces a
+        // decision here.
+        ApiStatus::Failed
+        | ApiStatus::InProgress
+        | ApiStatus::Queued
+        | ApiStatus::Cancelled
+        | ApiStatus::Other => StopReason::Unknown,
     })
 }
 
@@ -2957,6 +2983,17 @@ enum ApiStatus {
     Completed,
     Incomplete,
     Failed,
+    // Non-terminal statuses ride lifecycle events (`response.created`
+    // streams `"status":"in_progress"` on the GPT-5.6 ChatGPT backend,
+    // observed live 2026-07-10) — they must parse without killing the
+    // stream even though no consumer branches on them.
+    InProgress,
+    Queued,
+    Cancelled,
+    // Forward-compat: a status this build does not know is not a broken
+    // stream. Consumers treat it like the existing non-completed arms.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Deserialize)]
