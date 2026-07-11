@@ -1816,6 +1816,9 @@ where
         InternalTurnResult::BudgetExceeded {
             limit,
             estimated_cost_usd,
+            // The looping run state reports run totals; the per-turn usage
+            // only feeds the single-turn summary path.
+            turn_usage: _,
         } => RunLoopTurnAction::Return(
             mid_turn_budget_run_state(MidTurnBudgetParams {
                 ctx,
@@ -3462,9 +3465,9 @@ async fn convert_continue_turn<H: AgentHooks, S: StateStore>(
 
 /// Single-turn conversion of a mid-turn budget stop (see the looping
 /// handler's [`mid_turn_budget_run_state`]). The caller finishes this turn
-/// right after; persist the advanced counter first. No LLM turn call
-/// happened past the detection point, so the summary carries zero turn
-/// usage.
+/// right after; persist the advanced counter first. The summary carries
+/// the stopping turn's own usage: the overflow turn's usage on the
+/// overflow-recovery path, zero for compaction-only stops.
 async fn convert_mid_turn_budget<S>(
     ctx: &TurnContext,
     state_store: &Arc<S>,
@@ -3472,12 +3475,13 @@ async fn convert_mid_turn_budget<S>(
     turn_options: &TurnOptions,
     limit: BudgetLimitKind,
     estimated_cost_usd: Option<f64>,
+    turn_usage: TokenUsage,
 ) -> ConvertedTurn
 where
     S: StateStore,
 {
     let saved = persist_terminal_turn_state(ctx, state_store).await;
-    let summary = build_turn_summary(ctx, provenance, turn_options, TokenUsage::default());
+    let summary = build_turn_summary(ctx, provenance, turn_options, turn_usage);
     ConvertedTurn::gated(
         TurnOutcome::BudgetExceeded {
             total_turns: turns_to_u32(ctx.turn),
@@ -3536,6 +3540,43 @@ fn convert_pending_tool_calls(
     }
 }
 
+/// Single-turn conversion of a confirmation pause. Takes the whole
+/// [`InternalTurnResult`] (must be the `AwaitingConfirmation` variant) so
+/// the caller's match stays within the line ceiling without a
+/// one-shot params struct; any other variant is a caller bug.
+fn convert_awaiting_confirmation(
+    ctx: &TurnContext,
+    provenance: &AuditProvenance,
+    turn_options: &TurnOptions,
+    result: InternalTurnResult,
+) -> ConvertedTurn {
+    let InternalTurnResult::AwaitingConfirmation {
+        tool_call_id,
+        tool_name,
+        display_name,
+        input,
+        description,
+        continuation,
+    } = result
+    else {
+        return ConvertedTurn::finish(TurnOutcome::Error(AgentError::new(
+            "convert_awaiting_confirmation called with a non-confirmation result".to_string(),
+            false,
+        )));
+    };
+    let turn_usage = continuation.turn_usage.clone();
+    let summary = build_turn_summary(ctx, provenance, turn_options, turn_usage);
+    ConvertedTurn::finish(TurnOutcome::AwaitingConfirmation {
+        tool_call_id,
+        tool_name,
+        display_name,
+        input,
+        description,
+        continuation: Box::new(ContinuationEnvelope::wrap(*continuation)),
+        summary,
+    })
+}
+
 pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
     ConvertTurnResultParams {
         result,
@@ -3585,6 +3626,7 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
         InternalTurnResult::BudgetExceeded {
             limit,
             estimated_cost_usd,
+            turn_usage,
         } => {
             convert_mid_turn_budget(
                 &ctx,
@@ -3593,6 +3635,7 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
                 turn_options,
                 limit,
                 estimated_cost_usd,
+                turn_usage,
             )
             .await
         }
@@ -3612,25 +3655,8 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
             })
             .await
         }
-        InternalTurnResult::AwaitingConfirmation {
-            tool_call_id,
-            tool_name,
-            display_name,
-            input,
-            description,
-            continuation,
-        } => {
-            let turn_usage = continuation.turn_usage.clone();
-            let summary = build_turn_summary(&ctx, provenance, turn_options, turn_usage);
-            ConvertedTurn::finish(TurnOutcome::AwaitingConfirmation {
-                tool_call_id,
-                tool_name,
-                display_name,
-                input,
-                description,
-                continuation: Box::new(ContinuationEnvelope::wrap(*continuation)),
-                summary,
-            })
+        awaiting @ InternalTurnResult::AwaitingConfirmation { .. } => {
+            convert_awaiting_confirmation(&ctx, provenance, turn_options, awaiting)
         }
         InternalTurnResult::PendingToolCalls {
             turn_usage,

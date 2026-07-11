@@ -2102,7 +2102,18 @@ where
         &ctx.total_usage,
         ctx.state.accumulated_cost_usd,
     ) {
-        return budget_exceeded_mid_turn(ctx, event_store, hooks, authority, limit, cost).await;
+        // The overflow turn's own (already-folded) usage is the stopping
+        // turn's usage: carry it so the TurnSummary agrees with the totals.
+        return budget_exceeded_mid_turn(
+            ctx,
+            event_store,
+            hooks,
+            authority,
+            limit,
+            cost,
+            turn_usage,
+        )
+        .await;
     }
     #[cfg(feature = "otel")]
     crate::observability::instrument::record_root_event(
@@ -2508,7 +2519,19 @@ where
         )
     {
         return Some(
-            budget_exceeded_mid_turn(ctx, event_store, hooks, authority, limit, cost).await,
+            budget_exceeded_mid_turn(
+                ctx,
+                event_store,
+                hooks,
+                authority,
+                limit,
+                cost,
+                // Compaction-only stop: the turn made no main LLM call, so
+                // the per-turn summary carries zero (the compaction spend
+                // rides in the cumulative totals).
+                TokenUsage::default(),
+            )
+            .await,
         );
     }
     None
@@ -3082,6 +3105,7 @@ async fn budget_exceeded_mid_turn<H>(
     authority: &Arc<dyn EventAuthority>,
     limit: crate::types::BudgetLimitKind,
     estimated_cost_usd: Option<f64>,
+    turn_usage: TokenUsage,
 ) -> InternalTurnResult
 where
     H: AgentHooks,
@@ -3112,6 +3136,7 @@ where
     InternalTurnResult::BudgetExceeded {
         limit,
         estimated_cost_usd,
+        turn_usage,
     }
 }
 

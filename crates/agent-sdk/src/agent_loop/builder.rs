@@ -349,6 +349,17 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
     }
 
     /// Override the default compactor with a custom implementation.
+    ///
+    /// **Guardrail and pricing boundary:** the loop only wires its
+    /// `pre_llm_request` / `on_llm_response` guardrail hooks into the
+    /// compactor it constructs itself — it cannot reach inside an arbitrary
+    /// [`ContextCompactor`]'s own LLM calls. A custom compactor that talks
+    /// to a model is responsible for its own guardrail coverage (for the
+    /// built-in summarizer, construct it with
+    /// `LlmContextCompactor::with_guardrail_hooks`). Its reported usage is
+    /// priced at the *run's* provider/model for cost budgets, so
+    /// `max_cost_usd` is approximate when the compactor uses a different
+    /// backend.
     #[must_use]
     pub fn with_custom_compactor(mut self, compactor: impl ContextCompactor + 'static) -> Self {
         self.compactor = Some(Arc::new(compactor));

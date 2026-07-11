@@ -49,6 +49,11 @@ pub(super) enum InternalTurnResult {
     BudgetExceeded {
         limit: crate::types::BudgetLimitKind,
         estimated_cost_usd: Option<f64>,
+        /// The stopping turn's own LLM usage: the overflow turn's usage on
+        /// the overflow-recovery path, zero for compaction-only stops (the
+        /// turn made no main LLM call — compaction spend rides in the
+        /// cumulative totals, not the per-turn summary).
+        turn_usage: TokenUsage,
     },
     /// Tool calls ready for external execution (server mode)
     PendingToolCalls {
