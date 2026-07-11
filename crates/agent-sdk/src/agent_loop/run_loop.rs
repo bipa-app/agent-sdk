@@ -3228,7 +3228,9 @@ impl ConvertedTurn {
     fn gated(outcome: TurnOutcome, saved: bool, outcome_label: &str) -> Self {
         if !saved {
             warn!(
-                "Leaving the turn unfinished after {outcome_label}: the state save failed,                  and finishing would leave the stored turn counter pointing at a finished                  turn (rerun brick)"
+                "Leaving the turn unfinished after {outcome_label}: the state save failed, \
+                 and finishing would leave the stored turn counter pointing at a finished \
+                 turn (rerun brick)"
             );
         }
         Self {
