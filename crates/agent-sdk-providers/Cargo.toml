@@ -64,7 +64,7 @@ record-replay = []
 model-discovery = []
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util", "net", "io-util"] }
 wiremock = { workspace = true }
 # Tier-C live smoke constructs a `Tool` whose `tier` is the core
 # `ToolTier` enum (not re-exported through the `llm` glob).

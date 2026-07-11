@@ -1807,8 +1807,9 @@ async fn backfill_orphaned_tool_results(
 /// (which governs lease re-acquisition).  Empirically `Stream ended
 /// unexpectedly without completion` from the Anthropic SSE provider
 /// almost always succeeds on the first retry; budgeting three
-/// attempts (~14 s worst-case at the default backoff) covers a longer
-/// transient blip without dragging out a genuinely poisoned turn.
+/// attempts (~5 s total at the default backoff: ~0.5s/1s/2s + jitter)
+/// covers a longer transient blip without dragging out a genuinely
+/// poisoned turn.
 const STREAM_MAX_RETRIES: u32 = 3;
 
 /// Base backoff for the exponential retry schedule (`base * 2^(n-1)`
@@ -1819,6 +1820,36 @@ const STREAM_BASE_DELAY_MS: u64 = 500;
 /// daemon-reconnect ceiling in the bipi/desktop loops so a transient
 /// blip and a daemon respawn share the same wall-clock vocabulary.
 const STREAM_MAX_DELAY_MS: u64 = 8_000;
+
+/// Maximum time a freshly opened LLM stream may go without yielding its
+/// FIRST event before the attempt is treated as a stalled connection
+/// and retried through the normal [`StreamAttemptError::Recoverable`]
+/// path.
+///
+/// Without this bound the poll loop in [`call_llm_once_inner`] awaits
+/// `stream.next()` forever: a request written to a half-open pooled
+/// connection produces no events, no error, and no journal activity —
+/// on 2026-07-11 three workers hung exactly this way until an external
+/// watchdog tree-killed them, losing all of their work, when a simple
+/// retry would have succeeded within a second.
+///
+/// This is deliberately the OUTERMOST, most generous guard: providers
+/// and consumer-side decorators with protocol knowledge (ping/liveness
+/// visibility, thinking-mode awareness) should always fire first. The
+/// widest such guard in the fleet allows healthy reasoning streams
+/// 300s of pre-first-delta silence, so this backstop sits just above
+/// it.
+const STREAM_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(330);
+
+/// Maximum silence BETWEEN stream events before the attempt is treated
+/// as stalled (same recovery path as [`STREAM_FIRST_EVENT_TIMEOUT`]).
+///
+/// Once a stream has yielded anything, healthy gaps are bounded by
+/// token cadence plus provider keep-alives; two minutes of mid-stream
+/// silence means the connection died. Kept at or above every
+/// provider-level inter-event guard (60–120s) so those get first
+/// crack; a tie is benign — both surface the same recoverable error.
+const STREAM_INTER_EVENT_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// Maximum number of consecutive emergency compactions the worker
 /// will run inside a single [`call_llm_with_retry`] invocation
@@ -2490,6 +2521,82 @@ const STREAMING_DELTA_BATCH_SIZE: usize = 16;
 /// close. The flush fires on whichever bound trips first.
 const STREAMING_DELTA_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Parameters for [`close_stalled_attempt`]. Bundled to dodge
+/// `clippy::too_many_arguments` and keep the poll loop in
+/// [`call_llm_once_inner`] readable.
+struct StalledAttemptParams<'a, 'deps> {
+    deps: &'a RootTurnDeps<'deps>,
+    thread_id: &'a agent_sdk_foundation::ThreadId,
+    pending_deltas: &'a mut Vec<AgentEvent>,
+    attempt: &'a TurnAttempt,
+    received_first_item: bool,
+    stall_budget: Duration,
+    now: OffsetDateTime,
+}
+
+/// Close an attempt whose stream went silent past its stall budget
+/// ([`STREAM_FIRST_EVENT_TIMEOUT`] / [`STREAM_INTER_EVENT_TIMEOUT`]).
+///
+/// A stalled stream is indistinguishable from a dead connection at this
+/// layer — the attempt is closed like any other transport failure so
+/// the retry wrapper re-sends on a fresh attempt.
+async fn close_stalled_attempt(params: StalledAttemptParams<'_, '_>) -> StreamAttemptError {
+    let StalledAttemptParams {
+        deps,
+        thread_id,
+        pending_deltas,
+        attempt,
+        received_first_item,
+        stall_budget,
+        now,
+    } = params;
+    let stage = if received_first_item {
+        "mid-stream"
+    } else {
+        "before its first event"
+    };
+    flush_and_close(
+        deps,
+        thread_id,
+        pending_deltas,
+        attempt,
+        TurnAttemptOutcome::ServerError,
+        now,
+    )
+    .await;
+    StreamAttemptError::Recoverable {
+        kind: StreamErrorKind::ServerError,
+        message: format!(
+            "LLM stream stalled {stage}: no events for {}s — treating the connection as dead",
+            stall_budget.as_secs(),
+        ),
+    }
+}
+
+/// Close an attempt whose root turn was cancelled mid-stream via the
+/// [`RootTurnDeps::cancel`] token and build the matching non-retryable
+/// error (see [`StreamAttemptError::Cancelled`]).
+async fn close_cancelled_attempt(
+    deps: &RootTurnDeps<'_>,
+    thread_id: &agent_sdk_foundation::ThreadId,
+    pending_deltas: &mut Vec<AgentEvent>,
+    attempt: &TurnAttempt,
+    now: OffsetDateTime,
+) -> StreamAttemptError {
+    flush_and_close(
+        deps,
+        thread_id,
+        pending_deltas,
+        attempt,
+        TurnAttemptOutcome::Cancelled,
+        now,
+    )
+    .await;
+    StreamAttemptError::Cancelled {
+        message: "root turn cancelled mid-stream".to_owned(),
+    }
+}
+
 /// Streaming/journal/retry body of [`call_llm_once`]. Consumes the LLM
 /// stream, coalescing per-token delta events into batched commits,
 /// honouring cooperative cancellation, and requiring a completion
@@ -2513,35 +2620,58 @@ async fn call_llm_once_inner(
     // its partial transcript in the journal.
     let mut pending_deltas: Vec<AgentEvent> = Vec::new();
     let mut last_flush = std::time::Instant::now();
+    // Latched on the first yielded item; selects which stall budget the
+    // next poll runs under (first-event vs inter-event).
+    let mut received_first_item = false;
 
     loop {
+        let stall_budget = if received_first_item {
+            STREAM_INTER_EVENT_TIMEOUT
+        } else {
+            STREAM_FIRST_EVENT_TIMEOUT
+        };
         // Poll the next stream item, racing it against the cancellation
-        // token so a cancelled root turn stops consuming the (billed)
-        // stream promptly instead of draining it to completion.
-        let next = match deps.cancel {
+        // token (so a cancelled root turn stops consuming the (billed)
+        // stream promptly instead of draining it to completion) and the
+        // stall budget (so a silent stream — e.g. a request written to
+        // a half-open connection — is retried instead of hanging until
+        // an external watchdog kills the whole task tree).
+        let polled = match deps.cancel {
             Some(cancel) => {
                 tokio::select! {
                     biased;
                     () = cancel.cancelled() => {
-                        flush_and_close(
+                        return Err(close_cancelled_attempt(
                             deps,
                             thread_id,
                             &mut pending_deltas,
                             attempt,
-                            TurnAttemptOutcome::Cancelled,
                             now,
                         )
-                        .await;
-                        return Err(StreamAttemptError::Cancelled {
-                            message: "root turn cancelled mid-stream".to_owned(),
-                        });
+                        .await);
                     }
-                    next = stream.next() => next,
+                    polled = tokio::time::timeout(stall_budget, stream.next()) => polled,
                 }
             }
-            None => stream.next().await,
+            None => tokio::time::timeout(stall_budget, stream.next()).await,
+        };
+        let next = match polled {
+            Ok(next) => next,
+            Err(_elapsed) => {
+                return Err(close_stalled_attempt(StalledAttemptParams {
+                    deps,
+                    thread_id,
+                    pending_deltas: &mut pending_deltas,
+                    attempt,
+                    received_first_item,
+                    stall_budget,
+                    now,
+                })
+                .await);
+            }
         };
         let Some(result) = next else { break };
+        received_first_item = true;
 
         let delta = match result {
             Ok(delta) => delta,
