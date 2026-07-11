@@ -33,11 +33,20 @@ pub(super) fn estimate_cost_usd(provenance: &AuditProvenance, usage: &TokenUsage
 /// The capability registry keys entries under the canonical provider names
 /// (`anthropic` / `openai` / `gemini`), but several [`crate::llm::LlmProvider`]
 /// implementations report a transport-specific name in their provenance:
-/// `openai-responses` and `openai-codex` serve `openai` models, and `vertex`
-/// serves `anthropic` (`claude-*`) or `gemini` models. Without the alias
-/// step those runs would silently report `None` cost and
-/// [`crate::types::UsageLimits::max_cost_usd`] could never trip. The alias
-/// set mirrors `LlmProvider::capabilities` in `agent-sdk-providers`.
+/// `openai-responses` and `openai-codex` serve `openai` models, `vertex`
+/// serves `anthropic` (`claude-*`) or `gemini` models, and
+/// `cloudflare-ai-gateway` wraps an anthropic / openai / gemini backend
+/// chosen at construction. Without the alias step those runs would silently
+/// report `None` cost and [`crate::types::UsageLimits::max_cost_usd`] could
+/// never trip.
+///
+/// The single-catalog aliases mirror the `LlmProvider::capabilities` default
+/// in `agent-sdk-providers`; the gateway arm mirrors
+/// `CloudflareAIGatewayProvider::capabilities`, which delegates to the
+/// wrapped backend. From the provenance alone only the model remains, so the
+/// gateway lookup scans the three backend catalogs in the gateway's own
+/// `Inner` order (anthropic, openai, gemini) — model ids are disjoint across
+/// catalogs, so the first hit is the wrapped backend's entry.
 fn lookup_capabilities(
     provider: &str,
     model: &str,
@@ -50,6 +59,9 @@ fn lookup_capabilities(
             crate::model_capabilities::get_model_capabilities("anthropic", model)
         }
         "vertex" => crate::model_capabilities::get_model_capabilities("gemini", model),
+        "cloudflare-ai-gateway" => ["anthropic", "openai", "gemini"]
+            .into_iter()
+            .find_map(|backend| crate::model_capabilities::get_model_capabilities(backend, model)),
         _ => None,
     })
 }
@@ -172,6 +184,45 @@ mod tests {
                 .context("gemini-3.1-pro has pricing")?;
         let aliased = estimate_cost_usd(&AuditProvenance::new("vertex", "gemini-3.1-pro"), &usage)
             .context("vertex non-claude must resolve to the gemini catalog entry")?;
+        assert!((aliased - canonical).abs() < 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn estimate_cost_resolves_cloudflare_gateway_claude_alias() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let usage = TokenUsage {
+            input_tokens: 2_000,
+            output_tokens: 1_000,
+            ..Default::default()
+        };
+        let canonical =
+            estimate_cost_usd(&AuditProvenance::new("anthropic", "claude-fable-5"), &usage)
+                .context("claude-fable-5 has pricing")?;
+        let aliased = estimate_cost_usd(
+            &AuditProvenance::new("cloudflare-ai-gateway", "claude-fable-5"),
+            &usage,
+        )
+        .context("gateway claude-* must resolve to the anthropic catalog entry")?;
+        assert!((aliased - canonical).abs() < 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn estimate_cost_resolves_cloudflare_gateway_openai_alias() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let usage = TokenUsage {
+            input_tokens: 2_000,
+            output_tokens: 1_000,
+            ..Default::default()
+        };
+        let canonical = estimate_cost_usd(&AuditProvenance::new("openai", "gpt-4o"), &usage)
+            .context("gpt-4o has pricing")?;
+        let aliased = estimate_cost_usd(
+            &AuditProvenance::new("cloudflare-ai-gateway", "gpt-4o"),
+            &usage,
+        )
+        .context("gateway gpt-* must resolve to the openai catalog entry")?;
         assert!((aliased - canonical).abs() < 1e-12);
         Ok(())
     }

@@ -1507,8 +1507,13 @@ fn apply_tool_reminders(
         let Some(reminders) = config.tool_reminders.get(&pending.name) else {
             continue;
         };
+        // Evaluate every trigger against an immutable snapshot of the
+        // ORIGINAL result: appending a fired reminder mutates the result,
+        // and a later `ResultContains` trigger must not fire because an
+        // earlier reminder's appended text matched its pattern.
+        let original = result.clone();
         for reminder in reminders {
-            if reminder.trigger.should_trigger(&pending.input, result) {
+            if reminder.trigger.should_trigger(&pending.input, &original) {
                 crate::reminders::append_reminder(result, &reminder.content);
             }
         }
@@ -2546,8 +2551,10 @@ where
 {
     match super::llm::apply_on_llm_response(hooks, response).await {
         super::llm::PostLlmGuardrail::Accept => {
-            // Any accepted response ends the current rejection streak.
-            ctx.guardrail_retries = 0;
+            // Any accepted response ends the current rejection streak. The
+            // reset rides in `AgentState` so it is persisted by the same
+            // checkpoints that save the turn's usage.
+            ctx.state.guardrail_retries = 0;
             Ok(())
         }
         super::llm::PostLlmGuardrail::Blocked(reason) => {
@@ -2577,9 +2584,11 @@ where
             // Every retry pays for another LLM round-trip; a hook that
             // rejects deterministically must not loop (and bill) forever
             // under the default config, so consecutive rejections are
-            // capped.
-            ctx.guardrail_retries += 1;
-            if ctx.guardrail_retries >= super::types::MAX_CONSECUTIVE_GUARDRAIL_RETRIES {
+            // capped. The streak lives in `AgentState` (persisted by the
+            // Continue-path checkpoints) so it also accumulates across
+            // host-driven single-turn `run_turn` invocations.
+            ctx.state.guardrail_retries = ctx.state.guardrail_retries.saturating_add(1);
+            if ctx.state.guardrail_retries >= super::types::MAX_CONSECUTIVE_GUARDRAIL_RETRIES {
                 return Err(guardrail_retry_cap_result(
                     &ctx.thread_id,
                     ctx.turn,

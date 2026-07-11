@@ -5836,13 +5836,18 @@ async fn test_run_stream_yields_same_events_as_store() -> anyhow::Result<()> {
         .build();
 
     let thread_id = ThreadId::new();
-    let stream = agent.run_stream(
+    let run_stream = agent.run_stream(
         thread_id.clone(),
         AgentInput::Text("hi".to_string()),
         ToolContext::new(()),
         CancellationToken::new(),
     );
-    let streamed: Vec<AgentEvent> = stream.collect().await;
+    let streamed: Vec<AgentEvent> = run_stream.events.collect().await;
+    let final_state = run_stream.final_state.await?;
+    assert!(
+        matches!(final_state, AgentRunState::Done { .. }),
+        "expected Done, got {final_state:?}"
+    );
 
     assert!(!streamed.is_empty(), "run_stream must yield events");
 
@@ -7003,4 +7008,603 @@ fn history_mentions_tool_call(history: &[Message], tool_call_id: &str) -> bool {
             _ => false,
         })
     })
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Round 3: Error-arm rerunnability, persistent channel-close checkpoint,
+// durable guardrail streak, pre-ingestion budget check, RunStream final
+// state, reminder trigger isolation.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Hooks whose `pre_llm_request` blocks only the first request — the
+/// designed "policy rejection, user rephrases and retries" flow.
+struct BlockFirstRequestHooks {
+    seen: AtomicUsize,
+}
+
+#[async_trait]
+impl AgentHooks for BlockFirstRequestHooks {
+    async fn pre_llm_request(&self, _request: &ChatRequest) -> RequestDecision {
+        if self.seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            RequestDecision::Block("policy violation".to_string())
+        } else {
+            RequestDecision::Proceed
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_guardrail_blocked_thread_can_rerun() -> anyhow::Result<()> {
+    // A pre_llm_request Block is a designed policy outcome: the errored turn
+    // is finished, so the persisted turn counter must advance with it or
+    // every later run on the thread fails with "cannot append to finished
+    // turn".
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::text_response(
+            "allowed answer",
+        )]))
+        .hooks(BlockFirstRequestHooks {
+            seen: AtomicUsize::new(0),
+        })
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+
+    let (state, _events) = run_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("blocked prompt".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    let AgentRunState::Error(error) = state else {
+        anyhow::bail!("expected the guardrail block to error the run, got {state:?}");
+    };
+    assert!(
+        error.message.contains("blocked by guardrail"),
+        "unexpected error: {}",
+        error.message
+    );
+
+    let (state, _events) = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("rephrased prompt".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "rerun after a guardrail block must succeed, got {state:?}",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_turn_guardrail_blocked_thread_can_rerun() -> anyhow::Result<()> {
+    // Single-turn-mode equivalent of the guardrail-block rerun seam.
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::text_response(
+            "allowed answer",
+        )]))
+        .hooks(BlockFirstRequestHooks {
+            seen: AtomicUsize::new(0),
+        })
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+
+    let outcome = Box::pin(agent.run_turn(
+        thread_id.clone(),
+        AgentInput::Text("blocked prompt".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+        TurnOptions::default(),
+    ))
+    .await;
+    assert!(
+        matches!(outcome, TurnOutcome::Error(_)),
+        "expected the guardrail block to error the turn, got {outcome:?}",
+    );
+
+    let outcome = Box::pin(agent.run_turn(
+        thread_id,
+        AgentInput::Text("rephrased prompt".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+        TurnOptions::default(),
+    ))
+    .await;
+    assert!(
+        matches!(outcome, TurnOutcome::Done { .. }),
+        "run_turn after a guardrail block must succeed, got {outcome:?}",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_retry_cap_thread_can_rerun() -> anyhow::Result<()> {
+    // A retry-cap termination is an Error terminal outcome on a real turn;
+    // the thread must stay runnable once the hook starts accepting.
+    let agent = builder::<()>()
+        .provider(MockProvider::new(Vec::new()))
+        .hooks(RejectNHooks::new(
+            "never good enough",
+            types::MAX_CONSECUTIVE_GUARDRAIL_RETRIES,
+        ))
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+
+    let (state, _events) = run_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    let AgentRunState::Error(error) = state else {
+        anyhow::bail!("expected the retry cap to error the run, got {state:?}");
+    };
+    assert!(
+        error.message.contains("on_llm_response"),
+        "unexpected error: {}",
+        error.message
+    );
+
+    // The hook now accepts (its rejection quota is spent), so the rerun
+    // completes — and resets the persisted streak.
+    let (state, _events) = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("try again".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "rerun after a retry-cap error must succeed, got {state:?}",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_persistent_channel_close_thread_can_rerun() -> anyhow::Result<()> {
+    // The NORMAL end of a persistent run (input channel closed) must leave
+    // the thread runnable: a text-only final turn has no other state
+    // checkpoint in looping mode.
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![
+            MockProvider::text_response("first answer"),
+            MockProvider::text_response("second answer"),
+        ]))
+        .hooks(AllowAllHooks)
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+
+    let handle = agent.run_persistent(
+        thread_id.clone(),
+        AgentInput::Text("one question".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    drop(handle.input_tx);
+    let state = tokio::time::timeout(std::time::Duration::from_secs(5), handle.state_rx)
+        .await
+        .context("persistent run must end when the channel closes")??;
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "expected Done from the channel-close path, got {state:?}",
+    );
+
+    let state = agent
+        .run(
+            thread_id,
+            AgentInput::Text("follow up".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "rerun after a persistent channel-close must succeed, got {state:?}",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_turn_guardrail_retry_cap_accumulates_across_calls() -> anyhow::Result<()> {
+    // The rejection streak is persisted in AgentState, so host-driven
+    // single-turn orchestration (run_turn + Continue re-dispatch) hits the
+    // cap after exactly MAX_CONSECUTIVE_GUARDRAIL_RETRIES total LLM calls
+    // even though every run_turn rebuilds its in-memory context.
+    let agent = builder::<()>()
+        .provider(MockProvider::new(Vec::new()))
+        .hooks(RejectNHooks::new("never good enough", usize::MAX))
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+
+    let mut input = AgentInput::Text("go".to_string());
+    let mut capped_error = None;
+    for _dispatch in 0..types::MAX_CONSECUTIVE_GUARDRAIL_RETRIES {
+        let outcome = Box::pin(agent.run_turn(
+            thread_id.clone(),
+            input,
+            ToolContext::new(()),
+            CancellationToken::new(),
+            TurnOptions::default(),
+        ))
+        .await;
+        match outcome {
+            TurnOutcome::NeedsMoreTurns { .. } => {
+                input = AgentInput::Continue;
+            }
+            TurnOutcome::Error(error) => {
+                capped_error = Some(error);
+                break;
+            }
+            other => anyhow::bail!("unexpected outcome mid-streak: {other:?}"),
+        }
+    }
+
+    let Some(error) = capped_error else {
+        anyhow::bail!(
+            "the persisted streak must trip the cap within {} dispatches",
+            types::MAX_CONSECUTIVE_GUARDRAIL_RETRIES
+        );
+    };
+    assert!(
+        error.message.contains("on_llm_response"),
+        "the cap error must name the hook, got: {}",
+        error.message
+    );
+    assert_eq!(
+        agent.provider.calls(),
+        types::MAX_CONSECUTIVE_GUARDRAIL_RETRIES,
+        "the cap must bind after exactly the cap count of LLM calls",
+    );
+
+    Ok(())
+}
+
+/// Serialize a message history to comparable JSON.
+fn history_json(history: &[Message]) -> anyhow::Result<serde_json::Value> {
+    serde_json::to_value(history).map_err(anyhow::Error::from)
+}
+
+#[tokio::test]
+async fn test_over_budget_entry_does_not_record_prompt() -> anyhow::Result<()> {
+    // A fresh prompt sent to an over-budget thread must be rejected BEFORE
+    // it is ingested: history stays byte-identical, and resubmitting after
+    // raising the budget answers the prompt exactly once.
+    let message_store = Arc::new(InMemoryStore::new());
+    let state_store = Arc::new(InMemoryStore::new());
+    let event_store = new_event_store();
+    let thread_id = ThreadId::new();
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+    let budget_agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::tool_use_response(
+            "call_1",
+            "echo",
+            json!({"message": "x"}),
+        )]))
+        .tools(tools)
+        .hooks(AllowAllHooks)
+        .config(AgentConfig {
+            usage_limits: Some(UsageLimits {
+                max_total_tokens: Some(25),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .message_store(Arc::clone(&message_store))
+        .state_store(Arc::clone(&state_store))
+        .event_store(event_store.clone())
+        .build_with_stores();
+
+    let (state, _events) = run_recorded(
+        &budget_agent,
+        thread_id.clone(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(matches!(state, AgentRunState::BudgetExceeded { .. }));
+    let snapshot = history_json(&message_store.get_history(&thread_id).await?)?;
+
+    // Over-budget entry: rejected without recording the prompt.
+    let (state, _events) = run_recorded(
+        &budget_agent,
+        thread_id.clone(),
+        AgentInput::Text("unanswered prompt".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(
+        matches!(state, AgentRunState::BudgetExceeded { .. }),
+        "over-budget entry must terminate with BudgetExceeded, got {state:?}",
+    );
+    assert_eq!(
+        budget_agent.provider.calls(),
+        1,
+        "the rejected entry must make no LLM call",
+    );
+    let after_reject = history_json(&message_store.get_history(&thread_id).await?)?;
+    assert_eq!(
+        after_reject, snapshot,
+        "an over-budget entry must leave the message history byte-identical",
+    );
+
+    // Budget raised (removed): resubmitting answers the prompt exactly once.
+    let unbudgeted_agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::text_response(
+            "answered",
+        )]))
+        .hooks(AllowAllHooks)
+        .message_store(Arc::clone(&message_store))
+        .state_store(state_store)
+        .event_store(event_store)
+        .build_with_stores();
+    let (state, _events) = run_recorded(
+        &unbudgeted_agent,
+        thread_id.clone(),
+        AgentInput::Text("unanswered prompt".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(matches!(state, AgentRunState::Done { .. }));
+
+    let history = message_store.get_history(&thread_id).await?;
+    let prompt_count = history
+        .iter()
+        .filter(|m| m.role == Role::User && message_text(m).contains("unanswered prompt"))
+        .count();
+    assert_eq!(
+        prompt_count, 1,
+        "the resubmitted prompt must appear exactly once in history",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_turn_over_budget_entry_does_not_record_prompt() -> anyhow::Result<()> {
+    // Single-turn-mode equivalent: run_turn with a fresh prompt on an
+    // over-budget thread terminates before ingesting it.
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::tool_use_response(
+            "call_1",
+            "echo",
+            json!({"message": "x"}),
+        )]))
+        .tools(tools)
+        .hooks(AllowAllHooks)
+        .config(AgentConfig {
+            usage_limits: Some(UsageLimits {
+                max_total_tokens: Some(25),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+
+    let (outcome, _events) = run_turn_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+        TurnOptions::default(),
+    )
+    .await?;
+    assert!(matches!(outcome, TurnOutcome::BudgetExceeded { .. }));
+    let snapshot = history_json(&agent.message_store.get_history(&thread_id).await?)?;
+
+    let outcome = Box::pin(agent.run_turn(
+        thread_id.clone(),
+        AgentInput::Text("unanswered prompt".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+        TurnOptions::default(),
+    ))
+    .await;
+    assert!(
+        matches!(outcome, TurnOutcome::BudgetExceeded { .. }),
+        "over-budget run_turn entry must yield BudgetExceeded, got {outcome:?}",
+    );
+    assert_eq!(agent.provider.calls(), 1, "no LLM call on rejected entry");
+    let after_reject = history_json(&agent.message_store.get_history(&thread_id).await?)?;
+    assert_eq!(
+        after_reject, snapshot,
+        "an over-budget run_turn entry must leave the message history byte-identical",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_stream_final_state_allows_resume_after_confirmation() -> anyhow::Result<()> {
+    use futures::StreamExt as _;
+
+    // A Confirm-tier pause must not evaporate behind run_stream: the final
+    // state carries the AwaitingConfirmation continuation needed to resume.
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![
+            MockProvider::tool_use_response("call_1", "echo", json!({"message": "hi"})),
+            MockProvider::text_response("resumed and done"),
+        ]))
+        .tools(tools)
+        .hooks(ConfirmToolCallHook { target: "call_1" })
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+
+    let run_stream = agent.run_stream(
+        thread_id.clone(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    let events: Vec<AgentEvent> = run_stream.events.collect().await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolRequiresConfirmation { .. })),
+        "the confirmation request must appear on the live stream",
+    );
+
+    let final_state = run_stream.final_state.await?;
+    let AgentRunState::AwaitingConfirmation {
+        continuation,
+        tool_call_id,
+        ..
+    } = final_state
+    else {
+        anyhow::bail!("expected AwaitingConfirmation from final_state, got {final_state:?}");
+    };
+
+    let state = agent
+        .run(
+            thread_id,
+            AgentInput::Resume {
+                continuation,
+                tool_call_id,
+                confirmed: true,
+                rejection_reason: None,
+            },
+            ToolContext::new(()),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "resuming from the run_stream continuation must succeed, got {state:?}",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_stream_final_state_surfaces_startup_error() -> anyhow::Result<()> {
+    use futures::StreamExt as _;
+
+    // A startup failure emits no events; the error must still be observable
+    // through the final-state handle instead of a silent EOF.
+    let agent = builder::<()>()
+        .provider(MockProvider::new(Vec::new()))
+        .event_store(new_event_store())
+        .build();
+
+    let run_stream = agent.run_stream(
+        ThreadId::new(),
+        AgentInput::Continue,
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    let events: Vec<AgentEvent> = run_stream.events.collect().await;
+    assert!(
+        events.is_empty(),
+        "a startup failure must not emit events, got {events:?}",
+    );
+
+    let final_state = run_stream.final_state.await?;
+    let AgentRunState::Error(error) = final_state else {
+        anyhow::bail!("expected the startup error via final_state, got {final_state:?}");
+    };
+    assert!(
+        error.message.contains("Cannot continue"),
+        "unexpected startup error: {}",
+        error.message
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_reminder_trigger_ignores_prior_reminder_text() -> anyhow::Result<()> {
+    // Triggers must evaluate the tool's ORIGINAL output: a second reminder
+    // whose pattern appears only in the first reminder's appended text must
+    // not fire.
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("call_1", "echo", json!({"message": "hi"})),
+        MockProvider::text_response("done"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let reminders = ReminderConfig::new()
+        .with_tool_reminder("echo", ToolReminder::always("MAGIC_TOKEN"))
+        .with_tool_reminder(
+            "echo",
+            ToolReminder::on_result_contains("MAGIC_TOKEN", "SECOND_REMINDER"),
+        );
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .hooks(AllowAllHooks)
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .with_reminders(reminders)
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let thread_id = ThreadId::new();
+    let (state, _events) = run_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(matches!(state, AgentRunState::Done { .. }));
+
+    let history = agent.message_store.get_history(&thread_id).await?;
+    let mut saw_first = false;
+    let mut saw_second = false;
+    for message in &history {
+        let Content::Blocks(blocks) = &message.content else {
+            continue;
+        };
+        for block in blocks {
+            if let ContentBlock::ToolResult { content, .. } = block {
+                saw_first |= content.contains("MAGIC_TOKEN");
+                saw_second |= content.contains("SECOND_REMINDER");
+            }
+        }
+    }
+    assert!(saw_first, "the Always reminder must fire");
+    assert!(
+        !saw_second,
+        "a trigger matching only an earlier reminder's appended text must not fire",
+    );
+
+    Ok(())
 }

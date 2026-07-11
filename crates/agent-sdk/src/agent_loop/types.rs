@@ -63,8 +63,13 @@ pub(super) const MAX_COMPACTION_RETRIES: usize = 3;
 /// None`, no usage budget) would otherwise loop — and bill — forever. Eight
 /// attempts is generous for the intended steering use case (moderation
 /// feedback usually lands within one or two retries) while capping the
-/// worst-case spend of a mis-implemented hook at single-digit calls. The
-/// counter resets whenever the hook accepts a response.
+/// worst-case spend of a mis-implemented hook at single-digit calls.
+///
+/// The streak lives in [`crate::types::AgentState::guardrail_retries`] and
+/// is persisted with every state checkpoint, so the cap binds both
+/// in-process looping runs and host-driven single-turn orchestration (where
+/// each `run_turn` rehydrates the streak from the state store). It resets
+/// whenever the hook accepts a response.
 pub(super) const MAX_CONSECUTIVE_GUARDRAIL_RETRIES: usize = 8;
 
 /// Mutable context for turn execution.
@@ -78,10 +83,6 @@ pub(super) struct TurnContext {
     pub(super) start_time: Instant,
     /// Number of consecutive compaction retries for context overflow.
     pub(super) compaction_retries: usize,
-    /// Number of consecutive `on_llm_response` guardrail rejections
-    /// (`RetryWithFeedback`). Bounded by
-    /// [`MAX_CONSECUTIVE_GUARDRAIL_RETRIES`]; reset on any accepted response.
-    pub(super) guardrail_retries: usize,
     /// Optional system reminder to inject into the next LLM call.
     ///
     /// Set by `begin_turn` when approaching the turn limit, then consumed

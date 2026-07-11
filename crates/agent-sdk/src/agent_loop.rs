@@ -59,7 +59,6 @@ use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::{AgentConfig, AgentError, AgentInput, AgentRunState, RunOptions, ThreadId};
 use async_trait::async_trait;
 use futures::FutureExt;
-use futures::Stream;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -300,6 +299,27 @@ pub struct AgentHandle {
     pub state_rx: oneshot::Receiver<AgentRunState>,
     /// Cancel the running agent.
     pub cancel_token: CancellationToken,
+}
+
+/// A live event stream paired with the run's final state.
+///
+/// Returned by [`AgentLoop::run_stream`]. `events` yields each
+/// [`AgentEvent`] as the run persists it (see the delivery semantics on
+/// [`AgentLoop::run_stream`]) and ends when the run finishes. `final_state`
+/// resolves exactly once with the run's terminal [`AgentRunState`] — the
+/// only place that state lives: an
+/// [`AgentRunState::AwaitingConfirmation`] carries the continuation needed
+/// to resume, and a startup failure surfaces as [`AgentRunState::Error`]
+/// even when no event was ever emitted. Await it after (or concurrently
+/// with) consuming `events`; dropping it is fine when only the event feed
+/// matters.
+pub struct RunStream {
+    /// Live event feed; ends when the run completes.
+    pub events: tokio_stream::wrappers::ReceiverStream<AgentEvent>,
+    /// Resolves with the run's final state. Fails only if the runtime
+    /// shut down before the run could report (see
+    /// [`AgentLoop::run`]'s error contract).
+    pub final_state: oneshot::Receiver<AgentRunState>,
 }
 
 /// Inputs shared by the three `spawn_run_loop` callers
@@ -873,11 +893,17 @@ where
 
     /// Stream the agent's [`AgentEvent`]s live as they are emitted.
     ///
-    /// Returns a [`Stream`] that yields each [`AgentEvent`] the moment the
-    /// run loop writes it to the event store, so callers consume events
-    /// in real time without implementing an [`EventStore`]. The same events
-    /// are still persisted to the loop's configured store — the stream is an
-    /// additional tee, not a replacement.
+    /// Returns a [`RunStream`]: a live event feed plus a handle to the
+    /// run's final [`AgentRunState`]. [`RunStream::events`] yields each
+    /// [`AgentEvent`] the moment the run loop writes it to the event store,
+    /// so callers consume events in real time without implementing an
+    /// [`EventStore`]. The same events are still persisted to the loop's
+    /// configured store — the stream is an additional tee, not a
+    /// replacement. [`RunStream::final_state`] resolves once when the run
+    /// ends; it is the only place the terminal state lives, including
+    /// [`AgentRunState::AwaitingConfirmation`] (whose continuation is
+    /// required to resume) and startup errors that occur before any event
+    /// is emitted.
     ///
     /// The run is spawned on a Tokio task before this returns; the stream
     /// ends when the run finishes (or is cancelled via `cancel_token`).
@@ -905,7 +931,7 @@ where
         input: AgentInput,
         tool_context: ToolContext<Ctx>,
         cancel_token: CancellationToken,
-    ) -> impl Stream<Item = AgentEvent> + Send + 'static
+    ) -> RunStream
     where
         Ctx: Clone,
     {
@@ -927,7 +953,7 @@ where
         tool_context: ToolContext<Ctx>,
         cancel_token: CancellationToken,
         run_options: RunOptions,
-    ) -> impl Stream<Item = AgentEvent> + Send + 'static
+    ) -> RunStream
     where
         Ctx: Clone,
     {
@@ -946,14 +972,17 @@ where
             run_options,
             input_rx: None,
         });
-        // The run drives itself to completion; the stream only needs the
-        // teed events. Detach the join handle and drop the state receiver —
+        // The run drives itself to completion. Detach the join handle —
         // when the run ends, the tee store (and its sender) drop, closing
-        // the stream.
+        // the stream — and hand the state receiver to the caller: the
+        // terminal state (AwaitingConfirmation continuations, startup
+        // errors) only exists there.
         warn_on_detached_run_handle(handle);
-        drop(state_rx);
 
-        tokio_stream::wrappers::ReceiverStream::new(rx)
+        RunStream {
+            events: tokio_stream::wrappers::ReceiverStream::new(rx),
+            final_state: state_rx,
+        }
     }
 
     /// Run a single turn of the agent loop — the authoritative server boundary.

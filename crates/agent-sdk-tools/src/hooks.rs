@@ -133,8 +133,11 @@ pub trait AgentHooks: Send + Sync {
     /// **Retry cap:** every `RetryWithFeedback` pays for another LLM
     /// round-trip, so the loop bounds *consecutive* rejections at 8. When
     /// the cap is reached the run terminates with an error naming this hook
-    /// instead of retrying (and billing) indefinitely. The counter resets
-    /// whenever a response is accepted.
+    /// instead of retrying (and billing) indefinitely. The rejection streak
+    /// is persisted in the thread's `AgentState`, so the cap binds both
+    /// in-process looping runs and host-driven single-turn orchestration
+    /// (repeated `run_turn` calls rehydrate the streak from the state
+    /// store). The counter resets whenever a response is accepted.
     ///
     /// **Streaming caveat:** the hook runs on the *complete* response, after
     /// the model has finished. In streaming mode the text deltas have already

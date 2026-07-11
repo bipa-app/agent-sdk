@@ -316,6 +316,16 @@ pub struct AgentState {
     pub metadata: HashMap<String, serde_json::Value>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    /// Number of consecutive `on_llm_response` guardrail rejections
+    /// (`RetryWithFeedback`) across the thread's turns.
+    ///
+    /// Persisted so the loop's consecutive-rejection cap also binds
+    /// host-driven single-turn orchestration, where each `run_turn` rebuilds
+    /// its in-memory context from this state. Reset to zero whenever the
+    /// hook accepts a response. Additive and wire-compatible: absent in
+    /// older snapshots, defaulting to zero.
+    #[serde(default)]
+    pub guardrail_retries: usize,
 }
 
 impl AgentState {
@@ -327,6 +337,7 @@ impl AgentState {
             total_usage: TokenUsage::default(),
             metadata: HashMap::new(),
             created_at: OffsetDateTime::now_utc(),
+            guardrail_retries: 0,
         }
     }
 }
