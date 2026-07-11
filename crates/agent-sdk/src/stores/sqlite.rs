@@ -128,6 +128,12 @@ impl SqliteStore {
     /// Reopening an existing file is the resume path: the schema creation is a
     /// no-op and all previously persisted rows remain available.
     ///
+    /// This constructor is synchronous — it opens the file, converts it to
+    /// WAL, and applies the schema on the calling thread (waiting up to
+    /// [`BUSY_TIMEOUT`] if another process holds the write lock). Call it
+    /// during startup, or wrap it in `spawn_blocking` on a latency-sensitive
+    /// async runtime.
+    ///
     /// # Errors
     /// Returns an error if the database cannot be opened or the schema cannot
     /// be initialized.
@@ -135,16 +141,29 @@ impl SqliteStore {
         let path = path.as_ref();
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open sqlite database at {}", path.display()))?;
-        // WAL lets readers run concurrently with a writer, and `busy_timeout`
-        // makes a blocked writer wait for a competing connection instead of
-        // failing fast with `SQLITE_BUSY` — important for restart-and-resume,
-        // where a lingering process may still be checkpointing the WAL.
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .context("failed to enable WAL journal mode")?;
+        // `busy_timeout` first: it makes every subsequent lock-taking
+        // statement — including the WAL conversion below, the very first one
+        // — wait for a competing connection instead of failing fast with
+        // `SQLITE_BUSY`. Important for restart-and-resume, where a lingering
+        // process may still be checkpointing the WAL when the replacement
+        // opens the file.
         conn.busy_timeout(BUSY_TIMEOUT)
             .context("failed to set sqlite busy timeout")?;
+        // WAL lets readers run concurrently with a writer.
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .context("failed to enable WAL journal mode")?;
         conn.execute_batch(SCHEMA)
             .context("failed to initialize sqlite store schema")?;
+        // Stamp the on-disk format so a future schema change can migrate by
+        // version instead of inferring shape from the tables. Version 1 is
+        // the initial format; 0 means "pre-versioning", which is also v1.
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .context("failed to read sqlite user_version")?;
+        if version == 0 {
+            conn.pragma_update(None, "user_version", 1)
+                .context("failed to stamp sqlite user_version")?;
+        }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -431,7 +450,14 @@ impl EventStore for SqliteStore {
         let thread = thread_id.0.clone();
         let turn_i64 = i64::try_from(turn).context("turn index exceeds i64 range")?;
         self.with_conn(move |conn| {
-            let finished: Option<i64> = conn
+            // Deferred read transaction so the turn row and its events come
+            // from one WAL snapshot: without it another process could finish
+            // the turn (or clear the thread) between the two queries,
+            // yielding a torn `finished`/events view.
+            let tx = conn
+                .transaction()
+                .context("failed to begin turn read transaction")?;
+            let finished: Option<i64> = tx
                 .query_row(
                     "SELECT finished FROM agent_event_turns WHERE thread_id = ?1 AND turn = ?2",
                     params![thread, turn_i64],
@@ -442,20 +468,24 @@ impl EventStore for SqliteStore {
             let Some(finished) = finished else {
                 return Ok(None);
             };
-            let mut stmt = conn
-                .prepare(
-                    "SELECT payload FROM agent_events
-                     WHERE thread_id = ?1 AND turn = ?2 ORDER BY id",
-                )
-                .context("failed to prepare turn events query")?;
-            let rows = stmt
-                .query_map(params![thread, turn_i64], |row| row.get::<_, String>(0))
-                .context("failed to read turn events")?;
-            let mut events = Vec::new();
-            for row in rows {
-                let payload = row.context("failed to read event row")?;
-                events.push(serde_json::from_str(&payload).context("failed to decode event")?);
-            }
+            let events = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT payload FROM agent_events
+                         WHERE thread_id = ?1 AND turn = ?2 ORDER BY id",
+                    )
+                    .context("failed to prepare turn events query")?;
+                let rows = stmt
+                    .query_map(params![thread, turn_i64], |row| row.get::<_, String>(0))
+                    .context("failed to read turn events")?;
+                let mut events = Vec::new();
+                for row in rows {
+                    let payload = row.context("failed to read event row")?;
+                    events.push(serde_json::from_str(&payload).context("failed to decode event")?);
+                }
+                events
+            };
+            tx.commit().context("failed to end turn read transaction")?;
             Ok(Some(StoredTurnEvents {
                 turn,
                 events,
@@ -468,47 +498,59 @@ impl EventStore for SqliteStore {
     async fn get_turns(&self, thread_id: &ThreadId) -> Result<Vec<StoredTurnEvents>> {
         let thread = thread_id.0.clone();
         self.with_conn(move |conn| {
-            let mut turn_stmt = conn
-                .prepare(
-                    "SELECT turn, finished FROM agent_event_turns
-                     WHERE thread_id = ?1 ORDER BY turn",
-                )
-                .context("failed to prepare turns query")?;
-            let turn_rows = turn_stmt
-                .query_map(params![thread], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-                })
-                .context("failed to read turns")?;
+            // Deferred read transaction: both statements must observe one WAL
+            // snapshot, or a turn appended (or a clear run) by another
+            // process between them produces a torn view — events silently
+            // dropped for unknown turns, or turn entries with emptied lists.
+            let tx = conn
+                .transaction()
+                .context("failed to begin turns read transaction")?;
             let mut turns: Vec<StoredTurnEvents> = Vec::new();
-            let mut position = std::collections::HashMap::new();
-            for row in turn_rows {
-                let (turn_i64, finished) = row.context("failed to read turn row")?;
-                let turn = usize::try_from(turn_i64).context("turn index is negative")?;
-                position.insert(turn_i64, turns.len());
-                turns.push(StoredTurnEvents {
-                    turn,
-                    events: Vec::new(),
-                    finished: finished != 0,
-                });
-            }
-            let mut event_stmt = conn
-                .prepare(
-                    "SELECT turn, payload FROM agent_events
-                     WHERE thread_id = ?1 ORDER BY turn, id",
-                )
-                .context("failed to prepare events query")?;
-            let event_rows = event_stmt
-                .query_map(params![thread], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                })
-                .context("failed to read events")?;
-            for row in event_rows {
-                let (turn_i64, payload) = row.context("failed to read event row")?;
-                let envelope = serde_json::from_str(&payload).context("failed to decode event")?;
-                if let Some(&index) = position.get(&turn_i64) {
-                    turns[index].events.push(envelope);
+            {
+                let mut turn_stmt = tx
+                    .prepare(
+                        "SELECT turn, finished FROM agent_event_turns
+                         WHERE thread_id = ?1 ORDER BY turn",
+                    )
+                    .context("failed to prepare turns query")?;
+                let turn_rows = turn_stmt
+                    .query_map(params![thread], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .context("failed to read turns")?;
+                let mut position = std::collections::HashMap::new();
+                for row in turn_rows {
+                    let (turn_i64, finished) = row.context("failed to read turn row")?;
+                    let turn = usize::try_from(turn_i64).context("turn index is negative")?;
+                    position.insert(turn_i64, turns.len());
+                    turns.push(StoredTurnEvents {
+                        turn,
+                        events: Vec::new(),
+                        finished: finished != 0,
+                    });
+                }
+                let mut event_stmt = tx
+                    .prepare(
+                        "SELECT turn, payload FROM agent_events
+                         WHERE thread_id = ?1 ORDER BY turn, id",
+                    )
+                    .context("failed to prepare events query")?;
+                let event_rows = event_stmt
+                    .query_map(params![thread], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .context("failed to read events")?;
+                for row in event_rows {
+                    let (turn_i64, payload) = row.context("failed to read event row")?;
+                    let envelope =
+                        serde_json::from_str(&payload).context("failed to decode event")?;
+                    if let Some(&index) = position.get(&turn_i64) {
+                        turns[index].events.push(envelope);
+                    }
                 }
             }
+            tx.commit()
+                .context("failed to end turns read transaction")?;
             Ok(turns)
         })
         .await
@@ -637,8 +679,11 @@ impl ToolExecutionStore for SqliteStore {
         let id = operation_id.to_owned();
         self.with_conn(move |conn| {
             // Two rows can share an `operation_id`; pick the most recently
-            // written one so this matches `InMemoryExecutionStore`'s
-            // latest-wins contract (its `HashMap` keeps only the last writer).
+            // *inserted* one (upserts keep their original rowid, so an
+            // update to an older row does not promote it — unlike
+            // `InMemoryExecutionStore`, whose index tracks the last writer).
+            // Colliding operation ids are degenerate and no caller depends
+            // on the tiebreak; a deterministic order is what matters here.
             let payload: Option<String> = conn
                 .query_row(
                     "SELECT payload FROM agent_tool_executions WHERE operation_id = ?1
@@ -665,6 +710,7 @@ mod tests {
     use agent_sdk_foundation::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
     use agent_sdk_foundation::llm::Message;
     use agent_sdk_foundation::types::ToolResult;
+    use anyhow::bail;
     use tempfile::tempdir;
 
     /// Open, write across all four stores, drop, reopen the same file, and
@@ -775,14 +821,16 @@ mod tests {
         }
 
         let store = SqliteStore::open(&path)?;
-        let error = EventStore::append(
+        let Err(error) = EventStore::append(
             &store,
             &thread_id,
             1,
             AgentEventEnvelope::wrap(AgentEvent::text("late", "late"), &seq),
         )
         .await
-        .expect_err("append after finish must fail");
+        else {
+            bail!("append after finish must fail");
+        };
         assert!(error.to_string().contains("cannot append to finished turn"));
         Ok(())
     }
@@ -807,14 +855,16 @@ mod tests {
         .await?;
         store.finish_turn(&thread_id, 1).await?;
 
-        let error = EventStore::append(
+        let Err(error) = EventStore::append(
             &store,
             &thread_id,
             1,
             AgentEventEnvelope::wrap(AgentEvent::text("late", "late"), &seq),
         )
         .await
-        .expect_err("append after finish must fail");
+        else {
+            bail!("append after finish must fail");
+        };
         assert!(error.to_string().contains("cannot append to finished turn"));
 
         // A different, unfinished turn still accepts appends.
