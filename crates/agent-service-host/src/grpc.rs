@@ -1523,8 +1523,8 @@ impl GrpcEventService {
                 follow_mode,
             );
 
-            let last_replayed_done = replay_events.last().is_some_and(is_done_event);
-            if let Some(reason) = post_replay_close_reason(follow_mode, last_replayed_done) {
+            let last_replayed_terminal = replay_events.last().and_then(terminal_close_reason);
+            if let Some(reason) = post_replay_close_reason(follow_mode, last_replayed_terminal) {
                 yield closed_stream_response(&thread_id, reason, last_delivered_sequence);
                 return;
             }
@@ -1550,16 +1550,19 @@ impl GrpcEventService {
 
 /// Close reason for a stream once replay catch-up finishes, or `None`
 /// when the stream should transition to the live follow phase.
+///
+/// `last_replayed_terminal` is the close reason derived from the last
+/// replayed event ([`terminal_close_reason`]): a replay that ends on a
+/// terminal lifecycle event (`Done` / `Cancelled`) closes instead of
+/// following a thread whose work already finished.
 const fn post_replay_close_reason(
     follow_mode: pb::FollowMode,
-    last_replayed_done: bool,
+    last_replayed_terminal: Option<pb::StreamCloseReason>,
 ) -> Option<pb::StreamCloseReason> {
     if matches!(follow_mode, pb::FollowMode::ReplayOnly) {
         Some(pb::StreamCloseReason::ReplayExhausted)
-    } else if last_replayed_done {
-        Some(pb::StreamCloseReason::ThreadCompleted)
     } else {
-        None
+        last_replayed_terminal
     }
 }
 
@@ -1626,12 +1629,12 @@ fn follow_live_events(
                                     continue;
                                 }
                                 last_delivered_sequence = Some(missed_event.sequence);
-                                let is_done = is_done_event(missed_event);
+                                let close_reason = terminal_close_reason(missed_event);
                                 yield event_stream_response(missed_event)?;
-                                if is_done {
+                                if let Some(reason) = close_reason {
                                     yield closed_stream_response(
                                         &thread_id,
-                                        pb::StreamCloseReason::ThreadCompleted,
+                                        reason,
                                         last_delivered_sequence,
                                     );
                                     return;
@@ -1639,12 +1642,12 @@ fn follow_live_events(
                             }
                         }
                         last_delivered_sequence = Some(event.sequence);
-                        let is_done = is_done_event(&event);
+                        let close_reason = terminal_close_reason(&event);
                         yield event_stream_response(&event)?;
-                        if is_done {
+                        if let Some(reason) = close_reason {
                             yield closed_stream_response(
                                 &thread_id,
-                                pb::StreamCloseReason::ThreadCompleted,
+                                reason,
                                 last_delivered_sequence,
                             );
                             return;
@@ -2720,6 +2723,12 @@ fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelo
             message: message.clone(),
             recoverable: *recoverable,
         })),
+        AgentEvent::Cancelled { turn, usage } => {
+            Ok(pb::event_envelope::Event::Cancelled(pb::CancelledEvent {
+                turn: map_u64(*turn, "turn")?,
+                usage: Some(map_token_usage(usage)),
+            }))
+        }
         AgentEvent::ContextCompacted {
             original_count,
             new_count,
@@ -2733,41 +2742,7 @@ fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelo
                 new_tokens: map_u64(*new_tokens, "new_tokens")?,
             },
         )),
-        AgentEvent::SubagentProgress {
-            subagent_id,
-            subagent_name,
-            nickname,
-            child_thread_id,
-            child_root_task_id,
-            subagent_task_id,
-            max_turns,
-            current_turn,
-            model,
-            tool_name,
-            tool_context,
-            completed,
-            success,
-            tool_count,
-            total_tokens,
-        } => Ok(pb::event_envelope::Event::SubagentProgress(
-            pb::SubagentProgressEvent {
-                subagent_id: subagent_id.clone(),
-                subagent_name: subagent_name.clone(),
-                nickname: nickname.clone(),
-                child_thread_id: child_thread_id.as_ref().map(ToString::to_string),
-                child_root_task_id: child_root_task_id.clone(),
-                subagent_task_id: subagent_task_id.clone(),
-                max_turns: *max_turns,
-                current_turn: *current_turn,
-                model: model.clone(),
-                tool_name: tool_name.clone(),
-                tool_context: tool_context.clone(),
-                completed: *completed,
-                success: *success,
-                tool_count: *tool_count,
-                total_tokens: *total_tokens,
-            },
-        )),
+        AgentEvent::SubagentProgress { .. } => map_subagent_progress_payload(event),
         AgentEvent::AutoRetryStart {
             attempt,
             max_attempts,
@@ -2796,6 +2771,51 @@ fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelo
     }
 }
 
+/// Map [`AgentEvent::SubagentProgress`] onto its protobuf payload.
+/// Split from [`map_lifecycle_event_payload`] purely for length; any
+/// other variant is an internal error.
+fn map_subagent_progress_payload(event: &AgentEvent) -> RpcResult<pb::event_envelope::Event> {
+    let AgentEvent::SubagentProgress {
+        subagent_id,
+        subagent_name,
+        nickname,
+        child_thread_id,
+        child_root_task_id,
+        subagent_task_id,
+        max_turns,
+        current_turn,
+        model,
+        tool_name,
+        tool_context,
+        completed,
+        success,
+        tool_count,
+        total_tokens,
+    } = event
+    else {
+        return Err(Status::internal("expected a subagent-progress event").into());
+    };
+    Ok(pb::event_envelope::Event::SubagentProgress(
+        pb::SubagentProgressEvent {
+            subagent_id: subagent_id.clone(),
+            subagent_name: subagent_name.clone(),
+            nickname: nickname.clone(),
+            child_thread_id: child_thread_id.as_ref().map(ToString::to_string),
+            child_root_task_id: child_root_task_id.clone(),
+            subagent_task_id: subagent_task_id.clone(),
+            max_turns: *max_turns,
+            current_turn: *current_turn,
+            model: model.clone(),
+            tool_name: tool_name.clone(),
+            tool_context: tool_context.clone(),
+            completed: *completed,
+            success: *success,
+            tool_count: *tool_count,
+            total_tokens: *total_tokens,
+        },
+    ))
+}
+
 fn map_u64<T>(value: T, field: &'static str) -> RpcResult<u64>
 where
     T: TryInto<u64>,
@@ -2805,8 +2825,19 @@ where
         .map_err(|_| Status::internal(format!("{field} out of range for protobuf")).into())
 }
 
-const fn is_done_event(event: &agent_server::CommittedEvent) -> bool {
-    matches!(event.event, AgentEvent::Done { .. })
+/// Close reason implied by a terminal lifecycle event, or `None` for
+/// every non-terminal event. `Done` completes the followed work;
+/// `Cancelled` is the durable marker committed by an effective cancel
+/// (see `CancelledEvent` in `events.proto`) — both close the stream so
+/// followers of cancelled work never hang waiting for a `Done`.
+const fn terminal_close_reason(
+    event: &agent_server::CommittedEvent,
+) -> Option<pb::StreamCloseReason> {
+    match event.event {
+        AgentEvent::Done { .. } => Some(pb::StreamCloseReason::ThreadCompleted),
+        AgentEvent::Cancelled { .. } => Some(pb::StreamCloseReason::TurnCancelled),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -2833,7 +2864,7 @@ mod tests {
     use agent_server::journal::task::{ChildSpawnSpec, SuspensionPayload};
     use agent_server::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
     use agent_server::worker::registry::InMemoryAgentDefinitionRegistry;
-    use anyhow::{Context, Result, anyhow, bail};
+    use anyhow::{Context, Result, anyhow, bail, ensure};
     use async_trait::async_trait;
     use serde_json::json;
     #[cfg(feature = "postgres")]
@@ -5121,6 +5152,102 @@ mod tests {
             .into_inner();
         assert_eq!(cancel.cancelled_task_ids, vec![root_id, child_id]);
         assert_eq!(cancel.cancelled_count, 2);
+        Ok(())
+    }
+
+    /// Read the next frame from an in-process event stream, bounded so a
+    /// missing terminal frame fails the test instead of hanging it.
+    async fn next_inline_frame(stream: &mut EventStream) -> Result<pb::StreamThreadEventsResponse> {
+        tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .context("timed out waiting for a stream frame")?
+            .context("stream ended unexpectedly")?
+            .context("stream frame error")
+    }
+
+    /// Cancelling a parked root gives an existing `REPLAY_AND_FOLLOW`
+    /// subscriber a terminal `Cancelled` event frame followed by a
+    /// `Closed(TURN_CANCELLED)` control frame — without it the follower
+    /// would wait forever for a `Done` that never comes (a cancelled
+    /// turn commits no other lifecycle event).
+    #[tokio::test]
+    async fn cancel_task_gives_followers_a_terminal_cancelled_frame() -> Result<()> {
+        let shared = event_test_shared()?;
+        let control = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+        let events = GrpcEventService {
+            shared: Arc::clone(&shared),
+        };
+
+        // Mint a real thread row first — the event stream RPC rejects
+        // unknown threads — then park a root (with a tool child) on it.
+        let thread_name = control
+            .create_thread(Request::new(pb::CreateThreadRequest {
+                request_id: "cancel-follower-create".into(),
+            }))
+            .await?
+            .into_inner()
+            .thread
+            .and_then(|view| view.thread)
+            .context("create_thread missing snapshot")?
+            .thread_id;
+        let (thread_id, root_id, _child_id) =
+            seed_interior_tool_child(&shared, &thread_name).await?;
+
+        let mut stream = events
+            .stream_thread_events(Request::new(pb::StreamThreadEventsRequest {
+                thread_id: thread_id.to_string(),
+                after_sequence: None,
+                follow_mode: pb::FollowMode::ReplayAndFollow as i32,
+            }))
+            .await?
+            .into_inner();
+
+        // Drain the (empty-journal) replay phase.
+        let opened = next_inline_frame(&mut stream).await?;
+        ensure!(
+            matches!(opened.item, Some(StreamItem::ReplayOpened(_))),
+            "expected replay_opened, got {opened:?}",
+        );
+        let catchup = next_inline_frame(&mut stream).await?;
+        ensure!(
+            matches!(catchup.item, Some(StreamItem::ReplayCatchupComplete(_))),
+            "expected replay_catchup_complete, got {catchup:?}",
+        );
+
+        control
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: root_id,
+                reason: "follower test".into(),
+                thread_id: String::new(),
+            }))
+            .await?;
+
+        // The follower receives the terminal Cancelled event...
+        let event_frame = next_inline_frame(&mut stream).await?;
+        let Some(StreamItem::Event(envelope)) = event_frame.item else {
+            bail!("expected an event frame, got {event_frame:?}");
+        };
+        ensure!(
+            matches!(
+                envelope.event,
+                Some(pb::event_envelope::Event::Cancelled(_))
+            ),
+            "expected a cancelled event, got {:?}",
+            envelope.event,
+        );
+
+        // ...then the stream closes with the cancelled reason.
+        let closed_frame = next_inline_frame(&mut stream).await?;
+        let Some(StreamItem::Closed(closed)) = closed_frame.item else {
+            bail!("expected a closed frame, got {closed_frame:?}");
+        };
+        assert_eq!(
+            closed.reason,
+            pb::StreamCloseReason::TurnCancelled as i32,
+            "{closed:?}",
+        );
         Ok(())
     }
 

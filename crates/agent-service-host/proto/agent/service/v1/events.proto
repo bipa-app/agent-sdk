@@ -29,6 +29,9 @@ enum StreamCloseReason {
   STREAM_CLOSE_REASON_REPLAY_EXHAUSTED = 1;
   STREAM_CLOSE_REASON_THREAD_COMPLETED = 2;
   STREAM_CLOSE_REASON_SERVER_SHUTDOWN = 3;
+  // The followed work reached a terminal `cancelled` event; the stream
+  // closes so followers do not wait for a `done` that will never come.
+  STREAM_CLOSE_REASON_TURN_CANCELLED = 4;
 }
 
 message StartEvent {
@@ -121,6 +124,25 @@ message ErrorEvent {
   bool recoverable = 2;
 }
 
+// A root task (queued, parked, or running) was cancelled via the
+// durable cancellation tree (`CancelTask`).
+//
+// Terminal for the cancelled work: streams treat it like `done` and
+// close with `STREAM_CLOSE_REASON_TURN_CANCELLED`, so followers never
+// hang waiting for a `done` that will not come. Committed exactly once
+// per effective cancel (idempotent cancel retries emit nothing); a
+// running worker's later abort commits salvaged content but no second
+// lifecycle marker.
+//
+// `turn` is the thread's committed turn count when the cancel was
+// honored. `usage` is any additional usage recorded by the cancel
+// itself — zero by design; the interrupted turn's real usage lives on
+// its turn-attempt audit rows.
+message CancelledEvent {
+  uint64 turn = 1;
+  TokenUsage usage = 2;
+}
+
 message RefusalEvent {
   string message_id = 1;
   optional string text = 2;
@@ -204,6 +226,7 @@ message EventEnvelope {
     AutoRetryStartEvent auto_retry_start = 25;
     AutoRetryEndEvent auto_retry_end = 26;
     UserInputEvent user_input = 27;
+    CancelledEvent cancelled = 28;
   }
 }
 

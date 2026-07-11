@@ -225,6 +225,19 @@ message DecideConfirmationResponse {
 // cost) for up to one heartbeat interval before it aborts and commits
 // the completed prefix of the interrupted turn.
 //
+// A cancel that lands while a RUNNING worker is already committing its
+// finished turn can also lose the race the other way: the turn commits
+// in full (transcript, usage, `done` event) while the task row reports
+// CANCELLED — only the worker's final task transition is rejected. The
+// transcript stays consistent and the next turn is unaffected; treat
+// the CANCELLED status as "a cancel was requested", not as proof the
+// output was suppressed.
+//
+// Every effective cancel commits a terminal `cancelled` event to the
+// thread journal (see `CancelledEvent` in events.proto), so
+// REPLAY_AND_FOLLOW subscribers receive a closing frame instead of
+// waiting for a `done` that will never come.
+//
 // That deferred prefix commit also races the thread's NEXT turn:
 // cancelling a RUNNING root immediately frees the thread's active-root
 // slot (a queued successor is promoted in the same transaction), and a

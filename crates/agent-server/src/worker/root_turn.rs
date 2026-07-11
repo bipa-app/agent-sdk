@@ -414,6 +414,14 @@ pub async fn fail_root_turn(
 /// `assistant + tool_use`) is closed by the next turn's
 /// `backfill_orphaned_tool_results`.
 ///
+/// After a successful `cancel_tree` that transitioned at least one row,
+/// this commits a terminal [`AgentEvent::Cancelled`] to the thread
+/// journal and wakes the event notifier, so event-stream followers get
+/// a closing frame instead of waiting forever for a `Done` that will
+/// never come. Idempotent cancel retries emit nothing, and the running
+/// worker's abort path (seam B) commits no lifecycle events, so the
+/// marker is committed exactly once per effective cancel.
+///
 /// # Known race: cancelled `Running` root vs the successor turn
 ///
 /// `cancel_tree` frees the thread's active-root slot and promotes a
@@ -443,9 +451,26 @@ pub async fn cancel_root_turn(
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<Vec<AgentTaskId>> {
+    // Snapshot the attempt list BEFORE reading the row. The snapshot ↔
+    // row-read order closes the acquisition TOCTOU: a worker that
+    // acquires the task after the snapshot either flips the row to
+    // `Running` before we read it (→ the close below is skipped), or
+    // opens its attempt after the snapshot (→ the attempt is not in the
+    // snapshot and is never pre-closed). Nothing else fences acquisition
+    // until `cancel_tree` removes the row from the runnable indexes.
+    // Residual: a zombie worker whose lease already expired (row
+    // requeued to `Pending`) can still see its old attempt pre-closed —
+    // the same pre-existing class as `fail_root_turn`'s unconditional
+    // close.
+    let attempts_snapshot = deps
+        .attempt_store
+        .list_by_task(task_id)
+        .await
+        .unwrap_or_default();
+
     // Read the row once: it sources the parked-turn prefix commit and
     // decides who owns the attempt close. A read error degrades to the
-    // prior behaviour (no salvage, attempts closed here).
+    // prior behaviour (no salvage, snapshot attempts closed here).
     let task = deps.task_store.get(task_id).await.ok().flatten();
 
     // Commit the completed prefix of a parked turn before the task goes
@@ -466,7 +491,7 @@ pub async fn cancel_root_turn(
         .as_ref()
         .is_some_and(|task| task.status == TaskStatus::Running);
     if !has_live_worker {
-        best_effort_close_open_attempts(task_id, deps.attempt_store, now).await;
+        best_effort_close_attempts(&attempts_snapshot, deps.attempt_store, now).await;
     }
 
     let cancelled = deps
@@ -474,6 +499,37 @@ pub async fn cancel_root_turn(
         .cancel_tree(task_id, now)
         .await
         .context("cancel root turn tree")?;
+
+    // Durable terminal marker for event-stream followers. A cancelled
+    // turn otherwise commits no lifecycle event at all — seam B
+    // deliberately emits none — so a REPLAY_AND_FOLLOW subscriber would
+    // wait forever for a `Done` that never comes. Committed once per
+    // effective cancel: idempotent retries (empty `cancelled`) stay
+    // silent, and the worker's abort path adds no second marker.
+    // Best-effort — the cancel is already durable and an event-commit
+    // failure must not override it. `turn` is the thread's committed
+    // turn count when the cancel was honored; usage is zero by design
+    // (the interrupted turn's real usage lives on its attempt rows).
+    if !cancelled.is_empty()
+        && let Some(task) = &task
+    {
+        let turn = match deps.thread_store.get(&task.thread_id).await {
+            Ok(Some(thread)) => usize::try_from(thread.committed_turns).unwrap_or(0),
+            _ => 0,
+        };
+        let event = AgentEvent::cancelled(turn, TokenUsage::default());
+        match deps
+            .event_repo
+            .commit_event(&task.thread_id, event, now)
+            .await
+        {
+            Ok(committed) => deps.event_notifier.notify(std::slice::from_ref(&committed)),
+            Err(error) => log::warn!(
+                "cancel: terminal cancelled-event commit failed on thread {}: {error:#}",
+                task.thread_id,
+            ),
+        }
+    }
 
     // Finalize the root `invoke_agent` span with the cancelled outcome
     // (no-op if a prior process owns the live span).
@@ -588,7 +644,19 @@ async fn best_effort_close_open_attempts(
     let Ok(attempts) = attempt_store.list_by_task(task_id).await else {
         return;
     };
-    for attempt in &attempts {
+    best_effort_close_attempts(&attempts, attempt_store, now).await;
+}
+
+/// Close every still-open attempt in `attempts` with the `Cancelled`
+/// outcome. Split from [`best_effort_close_open_attempts`] so
+/// [`cancel_root_turn`] can close a pre-read snapshot instead of a
+/// fresh listing (see the acquisition-TOCTOU comment there).
+async fn best_effort_close_attempts(
+    attempts: &[TurnAttempt],
+    attempt_store: &dyn TurnAttemptStore,
+    now: OffsetDateTime,
+) {
+    for attempt in attempts {
         if !attempt.is_closed() {
             close_attempt_with(attempt, TurnAttemptOutcome::Cancelled, attempt_store, now).await;
         }

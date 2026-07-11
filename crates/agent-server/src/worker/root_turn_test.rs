@@ -279,6 +279,7 @@ fn assert_tool_results_follow_tool_use(
     );
 }
 
+#[derive(Clone)]
 struct TestStores {
     tasks: InMemoryAgentTaskStore,
     threads: InMemoryThreadStore,
@@ -5701,5 +5702,155 @@ async fn cancel_of_parked_root_closes_open_attempts() -> Result<()> {
         "a parked root's open attempt is closed by the cancel seam",
     );
     assert_eq!(reread.outcome, Some(TurnAttemptOutcome::Cancelled));
+    Ok(())
+}
+
+/// Count the `AgentEvent::Cancelled` markers committed on `thread`.
+async fn cancelled_event_count(
+    events: &InMemoryEventRepository,
+    thread: &ThreadId,
+) -> Result<usize> {
+    use agent_sdk_foundation::events::AgentEvent;
+    Ok(events
+        .get_events(thread)
+        .await?
+        .iter()
+        .filter(|committed| matches!(committed.event, AgentEvent::Cancelled { .. }))
+        .count())
+}
+
+/// An effective cancel commits exactly one terminal `Cancelled` event
+/// (delivered to live subscribers via the notifier), and an idempotent
+/// retry on the already-terminal tree emits nothing.
+#[tokio::test]
+async fn cancel_root_turn_commits_single_terminal_cancelled_event() -> Result<()> {
+    use agent_sdk_foundation::events::AgentEvent;
+
+    let stores = TestStores::new();
+    let task = AgentTask::new_root_turn(thread_a(), t0(), 3);
+    let task_id = task.id.clone();
+    stores.tasks.submit_root_turn(task).await?;
+
+    let mut live_rx = stores.event_notifier.subscribe(&thread_a());
+
+    let cancelled = cancel_root_turn(&task_id, &stores.deps(), t_plus(1)).await?;
+    assert_eq!(cancelled.len(), 1);
+    assert_eq!(cancelled_event_count(&stores.events, &thread_a()).await?, 1);
+
+    // The notifier woke live followers with the terminal marker.
+    let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), live_rx.recv())
+        .await
+        .context("timed out waiting for the notified cancelled event")?
+        .context("notifier channel closed")?;
+    assert!(
+        matches!(delivered.event, AgentEvent::Cancelled { .. }),
+        "live followers must receive the terminal marker, got {:?}",
+        delivered.event,
+    );
+
+    // Idempotent retry: nothing transitioned, so no second marker.
+    let second = cancel_root_turn(&task_id, &stores.deps(), t_plus(2)).await?;
+    assert!(second.is_empty());
+    assert_eq!(cancelled_event_count(&stores.events, &thread_a()).await?, 1);
+    Ok(())
+}
+
+/// Streaming provider that models the real RPC-cancel-while-running
+/// sequence: it streams one delta, runs the full `cancel_root_turn`
+/// lifecycle (which commits the terminal `Cancelled` marker), trips the
+/// worker's token, then streams once more so the biased cancel branch
+/// aborts the turn and seam B salvages the prefix.
+struct MidStreamCancelRootTurnProvider {
+    cancel: CancellationToken,
+    stores: TestStores,
+    task_id: AgentTaskId,
+    cancel_at: time::OffsetDateTime,
+}
+
+#[async_trait]
+impl LlmProvider for MidStreamCancelRootTurnProvider {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        anyhow::bail!("MidStreamCancelRootTurnProvider drives only the streaming path")
+    }
+
+    fn chat_stream(&self, _request: ChatRequest) -> StreamBox<'_> {
+        let cancel = self.cancel.clone();
+        let stores = self.stores.clone();
+        let task_id = self.task_id.clone();
+        let cancel_at = self.cancel_at;
+        Box::pin(async_stream::stream! {
+            yield Ok(StreamDelta::TextDelta {
+                delta: "partial ".to_owned(),
+                block_index: 0,
+            });
+            let _ = cancel_root_turn(&task_id, &stores.deps(), cancel_at).await;
+            cancel.cancel();
+            yield Ok(StreamDelta::TextDelta {
+                delta: "answer".to_owned(),
+                block_index: 0,
+            });
+        })
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
+/// The RPC-cancel-then-worker-abort sequence commits exactly ONE
+/// terminal `Cancelled` marker: `cancel_root_turn` emits it, and the
+/// running worker's abort path (seam B) salvages the prefix without
+/// adding a second lifecycle event.
+#[tokio::test]
+async fn running_abort_after_cancel_commits_single_cancelled_event() -> Result<()> {
+    let stores = TestStores::new();
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let bootstrap = sample_bootstrap(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    let cancel = CancellationToken::new();
+    let provider = MidStreamCancelRootTurnProvider {
+        cancel: cancel.clone(),
+        stores: stores.clone(),
+        task_id: task_id.clone(),
+        cancel_at: t_plus(2),
+    };
+    let mut deps = stores.deps();
+    deps.cancel = Some(&cancel);
+
+    let result = execute_root_turn(
+        inputs,
+        "What is the capital of France?",
+        &provider,
+        &deps,
+        t_plus(5),
+    )
+    .await;
+    let error = result.err().context("cancelled turn must return Err")?;
+    assert!(
+        format!("{error:#}").to_lowercase().contains("cancel"),
+        "expected a cancellation error, got: {error:#}",
+    );
+
+    // Seam B still salvaged the prefix (the user prompt) as turn 1.
+    let thread = stores.threads.get(&thread_a()).await?.context("thread")?;
+    assert_eq!(thread.committed_turns, 1);
+
+    // Exactly one terminal marker: the cancel's, not a second from the
+    // worker's abort path.
+    assert_eq!(cancelled_event_count(&stores.events, &thread_a()).await?, 1);
     Ok(())
 }
