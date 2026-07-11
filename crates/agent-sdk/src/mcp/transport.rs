@@ -74,9 +74,6 @@ pub trait McpTransport: Send + Sync {
     async fn close(&self) -> Result<()>;
 }
 
-/// Default response timeout for MCP requests (60 seconds).
-const DEFAULT_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
-
 /// Map of in-flight requests to the channel that delivers their response.
 ///
 /// A `std::sync::Mutex` (not a `tokio::sync::Mutex`) is used deliberately: the
@@ -139,6 +136,14 @@ pub struct StdioTransport {
 }
 
 impl StdioTransport {
+    /// Default per-request response timeout (60 seconds).
+    ///
+    /// Applied by [`StdioTransport::spawn`] and [`StdioTransport::spawn_with_env`].
+    /// Override it per connection with [`StdioTransport::spawn_with_timeout`] or
+    /// [`StdioTransport::spawn_with_env_and_timeout`]; reference it to base a
+    /// custom timeout off the default (e.g. `DEFAULT_RESPONSE_TIMEOUT * 5`).
+    pub const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_mins(1);
+
     /// Spawn a new MCP server process.
     ///
     /// # Arguments
@@ -165,7 +170,7 @@ impl StdioTransport {
     ///
     /// Returns an error if the process fails to spawn.
     pub fn spawn_with_env(command: &str, args: &[&str], env: &[(&str, &str)]) -> Result<Arc<Self>> {
-        Self::spawn_inner(command, args, env, DEFAULT_RESPONSE_TIMEOUT)
+        Self::spawn_inner(command, args, env, Self::DEFAULT_RESPONSE_TIMEOUT)
     }
 
     /// Spawn a transport with a custom response timeout.
@@ -308,6 +313,15 @@ impl StdioTransport {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len()
     }
+
+    /// Per-request response timeout configured on this transport.
+    ///
+    /// Test-only accessor used to assert constructors store the timeout the
+    /// caller supplied (or the documented default when none is given).
+    #[cfg(test)]
+    const fn response_timeout(&self) -> Duration {
+        self.response_timeout
+    }
 }
 
 #[async_trait]
@@ -414,6 +428,38 @@ mod tests {
         assert_eq!(next_id.fetch_add(1, Ordering::SeqCst), 1);
         assert_eq!(next_id.fetch_add(1, Ordering::SeqCst), 2);
         assert_eq!(next_id.fetch_add(1, Ordering::SeqCst), 3);
+    }
+
+    /// The documented default response timeout must stay at 60 seconds so
+    /// existing callers see no behavioural change.
+    #[test]
+    fn default_response_timeout_is_sixty_seconds() {
+        assert_eq!(
+            StdioTransport::DEFAULT_RESPONSE_TIMEOUT,
+            Duration::from_mins(1)
+        );
+    }
+
+    /// Constructors with no timeout argument must store the documented default,
+    /// while the `*_with_timeout` constructors must store the caller's value.
+    #[tokio::test]
+    async fn constructors_store_configured_timeout() -> Result<()> {
+        let default = StdioTransport::spawn_with_env("sh", &["-c", "cat > /dev/null"], &[])?;
+        ensure!(
+            default.response_timeout() == StdioTransport::DEFAULT_RESPONSE_TIMEOUT,
+            "spawn_with_env must store the default timeout"
+        );
+
+        let custom = StdioTransport::spawn_with_timeout(
+            "sh",
+            &["-c", "cat > /dev/null"],
+            Duration::from_millis(250),
+        )?;
+        ensure!(
+            custom.response_timeout() == Duration::from_millis(250),
+            "spawn_with_timeout must store the caller's timeout"
+        );
+        Ok(())
     }
 
     /// Regression test for ENG-8736: a server that never replies must not leak
