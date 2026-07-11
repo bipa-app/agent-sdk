@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.7](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.11.6...agent-sdk-providers-v0.11.7) - 2026-07-11
+
+### Fixed
+
+- *(openai-codex)* parse non-terminal response statuses in stream events ([#347](https://github.com/bipa-app/agent-sdk/pull/347))
+
 ### Added
 
 - *(openai)* add GPT-5.6 Sol, Terra, and Luna factories; exact reasoning, API-surface, tool, storage, and prompt-cache controls; and surface-scoped capability metadata
