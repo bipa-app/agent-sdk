@@ -54,6 +54,19 @@ pub(super) enum InternalTurnResult {
 /// Maximum number of compaction retries before giving up.
 pub(super) const MAX_COMPACTION_RETRIES: usize = 3;
 
+/// Maximum number of *consecutive* `on_llm_response` rejections
+/// ([`crate::hooks::ResponseDecision::RetryWithFeedback`]) before the run is
+/// terminated with an error.
+///
+/// Every guardrail retry pays for a full LLM round-trip, so a
+/// deterministically-rejecting hook under the default config (`max_turns:
+/// None`, no usage budget) would otherwise loop — and bill — forever. Eight
+/// attempts is generous for the intended steering use case (moderation
+/// feedback usually lands within one or two retries) while capping the
+/// worst-case spend of a mis-implemented hook at single-digit calls. The
+/// counter resets whenever the hook accepts a response.
+pub(super) const MAX_CONSECUTIVE_GUARDRAIL_RETRIES: usize = 8;
+
 /// Mutable context for turn execution.
 ///
 /// This holds all the state that's modified during execution.
@@ -65,6 +78,10 @@ pub(super) struct TurnContext {
     pub(super) start_time: Instant,
     /// Number of consecutive compaction retries for context overflow.
     pub(super) compaction_retries: usize,
+    /// Number of consecutive `on_llm_response` guardrail rejections
+    /// (`RetryWithFeedback`). Bounded by
+    /// [`MAX_CONSECUTIVE_GUARDRAIL_RETRIES`]; reset on any accepted response.
+    pub(super) guardrail_retries: usize,
     /// Optional system reminder to inject into the next LLM call.
     ///
     /// Set by `begin_turn` when approaching the turn limit, then consumed
@@ -362,10 +379,13 @@ pub(super) struct RunLoopTurnsParams<'a, Ctx, P, H, M, S> {
     pub(super) observability_store: Option<&'a Arc<dyn crate::observability::ObservabilityStore>>,
 }
 
-pub(super) struct PersistentDoneParams<'a, H, M> {
+pub(super) struct PersistentDoneParams<'a, H, M, S> {
     pub(super) ctx: &'a TurnContext,
     pub(super) rx: &'a mut mpsc::Receiver<AgentInput>,
     pub(super) message_store: &'a Arc<M>,
+    /// State store, needed so a terminal event keyed under a synthetic
+    /// (never-executed) turn can persist the advanced `turn_count`.
+    pub(super) state_store: &'a Arc<S>,
     pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) hooks: &'a Arc<H>,
     pub(super) authority: &'a Arc<dyn EventAuthority>,
@@ -374,6 +394,11 @@ pub(super) struct PersistentDoneParams<'a, H, M> {
     /// Provider/model provenance, used to estimate the run cost reported
     /// on the terminal `Done` state when the input channel closes.
     pub(super) provenance: &'a AuditProvenance,
+    /// Run-level usage budgets, evaluated after every completed turn and
+    /// **before** parking for injected input, so an over-budget persistent
+    /// run terminates instead of consuming a later prompt it can never
+    /// answer.
+    pub(super) usage_limits: Option<&'a UsageLimits>,
 }
 
 pub(super) struct RunLoopTurnResultParams<'a, H, M, S> {
@@ -390,6 +415,9 @@ pub(super) struct RunLoopTurnResultParams<'a, H, M, S> {
     /// Provider/model provenance, used to estimate the run cost reported on
     /// the terminal `Done` state on the persistent input-channel-closed path.
     pub(super) provenance: &'a AuditProvenance,
+    /// Run-level usage budgets, forwarded into the persistent-mode `Done`
+    /// handler so it can stop before parking for input.
+    pub(super) usage_limits: Option<&'a UsageLimits>,
 }
 
 pub(super) struct SingleTurnResumeParams<Ctx, H, M, S> {
@@ -415,6 +443,10 @@ pub(super) struct SingleTurnResumeParams<Ctx, H, M, S> {
     /// Wall-clock instant when the enclosing `run_turn` invocation
     /// started — used to measure `duration_ms` for the summary.
     pub(super) start_time: Instant,
+    /// Run-level usage budgets, checked when the resume completes so the
+    /// caller receives [`crate::types::TurnOutcome::BudgetExceeded`] instead
+    /// of `NeedsMoreTurns` when the paused turn already crossed a limit.
+    pub(super) usage_limits: Option<UsageLimits>,
 }
 
 pub(super) struct TurnParameters<Ctx, P, H, M, S> {

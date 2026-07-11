@@ -77,18 +77,48 @@ use tokio_util::sync::CancellationToken;
 /// read the configured [`EventStore`] back instead of relying on the stream.
 const RUN_STREAM_CHANNEL_CAPACITY: usize = 1024;
 
-/// An [`EventStore`] decorator that forwards a clone of every appended
-/// [`AgentEvent`] to a bounded channel before delegating to the wrapped
-/// store.
+/// How long [`TeeEventStore::append`] waits to forward a **terminal** event
+/// onto a full tee channel before dropping it.
+///
+/// Terminal events are the stream's closing marker; silently dropping one on
+/// a full buffer would let the stream end with no terminal frame. Blocking
+/// briefly gives a slow-but-live consumer time to drain a slot, while the
+/// bound keeps a dead (never-reading) consumer from stalling the run.
+const RUN_STREAM_TERMINAL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether an event is a terminal run-closing marker on the live stream.
+///
+/// These are the events emitted exactly once at the end of a run
+/// ([`AgentEvent::Done`], [`AgentEvent::BudgetExceeded`],
+/// [`AgentEvent::Cancelled`], [`AgentEvent::Refusal`]); a stream consumer
+/// relies on observing one of them before the stream closes.
+const fn is_terminal_stream_event(event: &AgentEvent) -> bool {
+    matches!(
+        event,
+        AgentEvent::Done { .. }
+            | AgentEvent::BudgetExceeded { .. }
+            | AgentEvent::Cancelled { .. }
+            | AgentEvent::Refusal { .. }
+    )
+}
+
+/// An [`EventStore`] decorator that delegates every append to the wrapped
+/// store and, **after the durable append succeeds**, forwards a clone of the
+/// [`AgentEvent`] to a bounded channel.
 ///
 /// This is the tee behind [`AgentLoop::run_stream`]: the run loop writes
 /// every event through the configured store as usual, and the matching
 /// [`AgentEvent`] is mirrored onto the stream so callers consume events live
-/// without implementing an [`EventStore`]. The forward is best-effort and
-/// lossy under backpressure — if the consumer has dropped the stream, or is
-/// too slow and the bounded buffer ([`RUN_STREAM_CHANNEL_CAPACITY`]) is full,
-/// the send is skipped (the newest event is dropped) and the run continues
-/// unaffected. The dropped events remain durably recorded in `inner`.
+/// without implementing an [`EventStore`]. Persistence comes first — a
+/// failed durable append never reaches the stream, so consumers cannot
+/// observe a phantom event. The forward is best-effort and lossy under
+/// backpressure — if the consumer has dropped the stream, or is too slow and
+/// the bounded buffer ([`RUN_STREAM_CHANNEL_CAPACITY`]) is full, a
+/// non-terminal event is dropped from the live stream and the run continues
+/// unaffected. Terminal events (see [`is_terminal_stream_event`]) instead
+/// wait up to [`RUN_STREAM_TERMINAL_SEND_TIMEOUT`] for buffer space so a
+/// slow-but-live consumer still receives the closing marker. Dropped events
+/// remain durably recorded in `inner`.
 struct TeeEventStore {
     inner: Arc<dyn EventStore>,
     tx: mpsc::Sender<AgentEvent>,
@@ -102,17 +132,40 @@ impl EventStore for TeeEventStore {
         turn: usize,
         envelope: AgentEventEnvelope,
     ) -> anyhow::Result<()> {
-        // `try_send` (never `send().await`): the run loop must not stall on a
-        // slow stream consumer. A `Full` error means the consumer is behind,
-        // so the event is dropped from the live stream only — it is still
-        // persisted to `inner` below and readable via the store.
-        if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(envelope.event.clone()) {
+        let event = envelope.event.clone();
+        // Persist FIRST: forwarding before a failed durable append would let
+        // the stream consumer observe an event that never landed in the
+        // store (a phantom event).
+        self.inner.append(thread_id, turn, envelope).await?;
+
+        if is_terminal_stream_event(&event) {
+            // Terminal events are the stream's closing marker: give a
+            // slow-but-live consumer a bounded window to make room instead
+            // of silently dropping the frame, while a dead consumer can
+            // only stall the run for the timeout.
+            if self
+                .tx
+                .send_timeout(event, RUN_STREAM_TERMINAL_SEND_TIMEOUT)
+                .await
+                .is_err()
+            {
+                log::debug!(
+                    "run_stream tee could not deliver terminal event within \
+                     {RUN_STREAM_TERMINAL_SEND_TIMEOUT:?}; dropping it from the live stream \
+                     (still persisted to the store)"
+                );
+            }
+        } else if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(event) {
+            // `try_send` (never `send().await`): the run loop must not stall
+            // on a slow stream consumer. A `Full` error means the consumer
+            // is behind, so the event is dropped from the live stream only —
+            // it was already persisted to `inner` above.
             log::debug!(
                 "run_stream tee channel full (capacity {RUN_STREAM_CHANNEL_CAPACITY}); \
                  dropping event from live stream (still persisted to the store)"
             );
         }
-        self.inner.append(thread_id, turn, envelope).await
+        Ok(())
     }
 
     async fn finish_turn(&self, thread_id: &ThreadId, turn: usize) -> anyhow::Result<()> {
@@ -829,6 +882,19 @@ where
     /// The run is spawned on a Tokio task before this returns; the stream
     /// ends when the run finishes (or is cancelled via `cancel_token`).
     /// Dropping the stream does **not** stop the run — use `cancel_token`.
+    ///
+    /// # Delivery semantics
+    ///
+    /// Events reach the stream only **after** their durable append to the
+    /// event store succeeds, so the stream never shows an event the store
+    /// rejected. The stream is bounded and lossy under backpressure: when
+    /// the buffer is full, non-terminal events are dropped from the live
+    /// feed (they remain in the store). Terminal events (`Done`,
+    /// `BudgetExceeded`, `Cancelled`, `Refusal`) are special-cased — the
+    /// run waits up to one second for buffer space so a slow-but-live
+    /// consumer still receives the closing marker, while a consumer that
+    /// never reads cannot stall the run beyond that bound. Callers that
+    /// need every event must read the configured [`EventStore`] back.
     ///
     /// This is additive alongside [`run`](Self::run) /
     /// [`run_persistent`](Self::run_persistent): use it when you want a

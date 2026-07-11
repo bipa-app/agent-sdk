@@ -132,6 +132,13 @@ pub struct UsageLimits {
     /// Only enforced when the run's provider/model has pricing metadata in
     /// [`agent_sdk_providers`](https://docs.rs/agent-sdk-providers); models
     /// without pricing never trip this limit.
+    ///
+    /// Cost tracking follows the loop's configured provider provenance (the
+    /// provider/model the top-level provider reports). Behind
+    /// fallback-provider or model-router wrappers the provenance may name a
+    /// different backend than the one that actually served a given call, so
+    /// the estimated cost — and therefore this limit — may be inaccurate
+    /// there.
     pub max_cost_usd: Option<f64>,
 }
 

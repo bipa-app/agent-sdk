@@ -2765,14 +2765,12 @@ fn map_tool_event_payload(event: &AgentEvent) -> RpcResult<Option<pb::event_enve
 /// This keeps the streaming contract additive — a replay/follow consumer
 /// always receives a closing `done` frame and the stream terminates (see
 /// [`is_done_event`]) instead of failing with INTERNAL on an unmapped
-/// variant. `BudgetExceeded` carries no wall-clock duration (its emission
-/// sites sit outside the timed run path), so `duration` is left unset
-/// rather than fabricated.
+/// variant. Both variants carry the run's wall-clock duration.
 fn map_done_event(
     thread_id: &ThreadId,
     total_turns: usize,
     total_usage: &TokenUsage,
-    duration: Option<std::time::Duration>,
+    duration: std::time::Duration,
     stop_reason: pb::RunStopReason,
     estimated_cost_usd: Option<f64>,
 ) -> RpcResult<pb::event_envelope::Event> {
@@ -2780,7 +2778,7 @@ fn map_done_event(
         thread_id: thread_id.0.clone(),
         total_turns: map_u64(total_turns, "total_turns")?,
         total_usage: Some(map_token_usage(total_usage)),
-        duration: duration.map(map_duration).transpose()?,
+        duration: Some(map_duration(duration)?),
         stop_reason: stop_reason.into(),
         estimated_cost_usd,
     }))
@@ -2818,7 +2816,7 @@ fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelo
             thread_id,
             *total_turns,
             total_usage,
-            Some(*duration),
+            *duration,
             pb::RunStopReason::Completed,
             *estimated_cost_usd,
         ),
@@ -2826,13 +2824,14 @@ fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelo
             thread_id,
             total_turns,
             total_usage,
+            duration,
             estimated_cost_usd,
             limit,
         } => map_done_event(
             thread_id,
             *total_turns,
             total_usage,
-            None,
+            *duration,
             budget_stop_reason(*limit),
             *estimated_cost_usd,
         ),
@@ -5542,6 +5541,7 @@ mod tests {
                 output_tokens: 50,
                 ..Default::default()
             },
+            duration: Duration::from_millis(2500),
             estimated_cost_usd: Some(0.25),
             limit: agent_sdk_foundation::types::BudgetLimitKind::TotalTokens,
         }
@@ -5562,10 +5562,11 @@ mod tests {
                 assert_eq!(usage.output_tokens, 50);
                 assert_eq!(done.stop_reason(), pb::RunStopReason::BudgetTotalTokens);
                 assert_eq!(done.estimated_cost_usd, Some(0.25));
-                assert!(
-                    done.duration.is_none(),
-                    "budget stop must not fabricate a duration"
-                );
+                let duration = done
+                    .duration
+                    .context("budget stop must carry the run's wall-clock duration")?;
+                assert_eq!(duration.seconds, 2);
+                assert_eq!(duration.nanos, 500_000_000);
             }
             other => bail!("BudgetExceeded must map to a Done event, got {other:?}"),
         }

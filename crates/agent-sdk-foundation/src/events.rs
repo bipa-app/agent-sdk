@@ -172,6 +172,12 @@ pub enum AgentEvent {
         thread_id: ThreadId,
         total_turns: usize,
         total_usage: TokenUsage,
+        /// Wall-clock run duration up to the moment the budget tripped.
+        ///
+        /// Serialized on the wire as `duration_ms` (a millisecond integer),
+        /// mirroring [`AgentEvent::Done`].
+        #[serde(rename = "duration_ms", with = "duration_ms_serde")]
+        duration: Duration,
         /// Estimated cost of the run in USD at the moment the budget was
         /// hit, when pricing metadata is available.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -431,6 +437,7 @@ impl AgentEvent {
         thread_id: ThreadId,
         total_turns: usize,
         total_usage: TokenUsage,
+        duration: Duration,
         estimated_cost_usd: Option<f64>,
         limit: BudgetLimitKind,
     ) -> Self {
@@ -438,6 +445,7 @@ impl AgentEvent {
             thread_id,
             total_turns,
             total_usage,
+            duration,
             estimated_cost_usd,
             limit,
         }
@@ -853,6 +861,42 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn budget_exceeded_event_serializes_duration_as_millis() -> serde_json::Result<()> {
+        let seq = SequenceCounter::new();
+        let envelope = AgentEventEnvelope::wrap(
+            AgentEvent::budget_exceeded(
+                ThreadId::from_string("t"),
+                2,
+                TokenUsage::default(),
+                Duration::from_millis(1200),
+                Some(0.5),
+                BudgetLimitKind::TotalTokens,
+            ),
+            &seq,
+        );
+        let json = serde_json::to_value(&envelope)?;
+
+        // Flat millisecond integer, mirroring the `Done` wire form.
+        assert_eq!(
+            json.get("duration_ms").and_then(serde_json::Value::as_u64),
+            Some(1200)
+        );
+        assert!(
+            json.get("duration").is_none(),
+            "no nested `duration` key expected: {json}"
+        );
+
+        let restored: AgentEventEnvelope = serde_json::from_value(json)?;
+        match restored.event {
+            AgentEvent::BudgetExceeded { duration, .. } => {
+                assert_eq!(duration, Duration::from_millis(1200));
+            }
+            other => panic!("expected BudgetExceeded, got {other:?}"),
+        }
+        Ok(())
+    }
+
     /// One representative value of every [`AgentEvent`] variant, so the
     /// envelope round-trip test exercises the full streaming contract.
     ///
@@ -996,6 +1040,7 @@ mod tests {
                 thread_id: ThreadId::from_string("thread-1"),
                 total_turns: 3,
                 total_usage: usage.clone(),
+                duration: Duration::from_millis(750),
                 estimated_cost_usd: Some(0.5),
                 limit: BudgetLimitKind::CostUsd,
             },

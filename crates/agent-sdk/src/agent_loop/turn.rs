@@ -2315,11 +2315,13 @@ where
         config,
         provider,
         message_store,
+        state_store,
         compaction_config,
         compactor,
         event_store,
         hooks,
         authority,
+        turn_options,
         cancel_token,
         #[cfg(feature = "otel")]
         observability_store,
@@ -2364,17 +2366,22 @@ struct TurnLlmResponse {
     thinking_id: String,
 }
 
-struct TurnLlmRequestParams<'a, P, H, M> {
+struct TurnLlmRequestParams<'a, P, H, M, S> {
     ctx: &'a mut TurnContext,
     request: ChatRequest,
     config: &'a AgentConfig,
     provider: &'a Arc<P>,
     message_store: &'a Arc<M>,
+    /// State store for the strict-durability checkpoint on the guardrail
+    /// `RetryWithFeedback` path, which returns `Continue` without reaching
+    /// the normal post-LLM checkpoint in `process_response_and_run_tools`.
+    state_store: &'a Arc<S>,
     compaction_config: Option<&'a CompactionConfig>,
     compactor: Option<&'a Arc<dyn ContextCompactor>>,
     event_store: &'a Arc<dyn EventStore>,
     hooks: &'a Arc<H>,
     authority: &'a Arc<dyn EventAuthority>,
+    turn_options: &'a TurnOptions,
     cancel_token: &'a CancellationToken,
     #[cfg(feature = "otel")]
     observability_store: Option<&'a Arc<dyn crate::observability::ObservabilityStore>>,
@@ -2391,27 +2398,30 @@ struct TurnLlmRequestParams<'a, P, H, M> {
 /// unrecoverable error (after attempting an emergency compaction for a
 /// prompt-too-long error), is mapped onto the `InternalTurnResult` the
 /// caller should return.
-async fn request_turn_response<P, H, M>(
+async fn request_turn_response<P, H, M, S>(
     TurnLlmRequestParams {
         ctx,
         request,
         config,
         provider,
         message_store,
+        state_store,
         compaction_config,
         compactor,
         event_store,
         hooks,
         authority,
+        turn_options,
         cancel_token,
         #[cfg(feature = "otel")]
         observability_store,
-    }: TurnLlmRequestParams<'_, P, H, M>,
+    }: TurnLlmRequestParams<'_, P, H, M, S>,
 ) -> Result<TurnLlmResponse, InternalTurnResult>
 where
     P: LlmProvider,
     H: AgentHooks,
     M: MessageStore,
+    S: StateStore,
 {
     // Input guardrail (`pre_llm_request`): runs once per turn, before the
     // retry-wrapped chat call. `DefaultHooks` proceeds unchanged.
@@ -2480,10 +2490,71 @@ where
 
     // Output guardrail (`on_llm_response`): runs once on the produced
     // response, before it is processed/persisted. `DefaultHooks` accepts.
-    match super::llm::apply_on_llm_response(hooks, &response).await {
-        super::llm::PostLlmGuardrail::Accept => {}
+    apply_response_guardrail(ResponseGuardrailParams {
+        ctx,
+        response: &response,
+        message_store,
+        state_store,
+        event_store,
+        hooks,
+        authority,
+        turn_options,
+    })
+    .await?;
+
+    Ok(TurnLlmResponse {
+        response,
+        message_id,
+        thinking_id,
+    })
+}
+
+struct ResponseGuardrailParams<'a, H, M, S> {
+    ctx: &'a mut TurnContext,
+    response: &'a ChatResponse,
+    message_store: &'a Arc<M>,
+    state_store: &'a Arc<S>,
+    event_store: &'a Arc<dyn EventStore>,
+    hooks: &'a Arc<H>,
+    authority: &'a Arc<dyn EventAuthority>,
+    turn_options: &'a TurnOptions,
+}
+
+/// Run the `on_llm_response` output guardrail and map its decision onto the
+/// turn result.
+///
+/// `Ok(())` means the response was accepted and the turn proceeds; an `Err`
+/// carries the `InternalTurnResult` the turn must return instead (block
+/// error, retry-cap error, strict-checkpoint failure, or the
+/// retry-with-feedback `Continue`).
+async fn apply_response_guardrail<H, M, S>(
+    ResponseGuardrailParams {
+        ctx,
+        response,
+        message_store,
+        state_store,
+        event_store,
+        hooks,
+        authority,
+        turn_options,
+    }: ResponseGuardrailParams<'_, H, M, S>,
+) -> Result<(), InternalTurnResult>
+where
+    H: AgentHooks,
+    M: MessageStore,
+    S: StateStore,
+{
+    match super::llm::apply_on_llm_response(hooks, response).await {
+        super::llm::PostLlmGuardrail::Accept => {
+            // Any accepted response ends the current rejection streak.
+            ctx.guardrail_retries = 0;
+            Ok(())
+        }
         super::llm::PostLlmGuardrail::Blocked(reason) => {
-            return Err(guardrail_block_result(
+            // The provider billed for the rejected response, so its tokens
+            // must still land in the cumulative totals before the run ends.
+            apply_turn_usage(ctx, response);
+            Err(guardrail_block_result(
                 &ctx.thread_id,
                 ctx.turn,
                 event_store,
@@ -2492,7 +2563,7 @@ where
                 "response",
                 &reason,
             )
-            .await);
+            .await)
         }
         super::llm::PostLlmGuardrail::RetryWithFeedback(feedback) => {
             // Account the rejected turn's usage into the cumulative total
@@ -2501,11 +2572,39 @@ where
             // `max_turns: None`, a deterministically-rejecting guardrail
             // would loop forever because `total_usage` never advances and
             // the budget check can never trip.
-            let turn_usage = apply_turn_usage(ctx, &response);
-            return Err(retry_with_feedback_result(RetryWithFeedbackParams {
+            let turn_usage = apply_turn_usage(ctx, response);
+
+            // Every retry pays for another LLM round-trip; a hook that
+            // rejects deterministically must not loop (and bill) forever
+            // under the default config, so consecutive rejections are
+            // capped.
+            ctx.guardrail_retries += 1;
+            if ctx.guardrail_retries >= super::types::MAX_CONSECUTIVE_GUARDRAIL_RETRIES {
+                return Err(guardrail_retry_cap_result(
+                    &ctx.thread_id,
+                    ctx.turn,
+                    event_store,
+                    hooks,
+                    authority,
+                )
+                .await);
+            }
+
+            // Strict durability: the retry returns `Continue` to the caller
+            // exactly like a completed turn, so it must pass the same
+            // post-LLM checkpoint — a best-effort save could silently fail
+            // and leave durable state without the updated turn/usage while
+            // the caller already observed `Continue`.
+            if turn_options.strict_durability
+                && let Err(result) =
+                    save_strict_checkpoint(state_store, &ctx.state, "post-LLM").await
+            {
+                return Err(result);
+            }
+
+            Err(retry_with_feedback_result(RetryWithFeedbackParams {
                 thread_id: &ctx.thread_id,
                 turn: ctx.turn,
-                response: &response,
                 feedback: &feedback,
                 turn_usage,
                 message_store,
@@ -2513,15 +2612,9 @@ where
                 hooks,
                 authority,
             })
-            .await);
+            .await)
         }
     }
-
-    Ok(TurnLlmResponse {
-        response,
-        message_id,
-        thinking_id,
-    })
 }
 
 /// Emit a guardrail-block error event and build the terminal
@@ -2556,10 +2649,43 @@ where
     InternalTurnResult::Error(AgentError::new(message, false))
 }
 
+/// Emit the error event and build the terminal [`InternalTurnResult::Error`]
+/// returned when [`super::types::MAX_CONSECUTIVE_GUARDRAIL_RETRIES`]
+/// consecutive `RetryWithFeedback` rejections have been paid for.
+async fn guardrail_retry_cap_result<H>(
+    thread_id: &ThreadId,
+    turn: usize,
+    event_store: &Arc<dyn EventStore>,
+    hooks: &Arc<H>,
+    authority: &Arc<dyn EventAuthority>,
+) -> InternalTurnResult
+where
+    H: AgentHooks,
+{
+    let message = format!(
+        "on_llm_response guardrail rejected {} consecutive responses with RetryWithFeedback; \
+         terminating the run instead of paying for further LLM retries",
+        super::types::MAX_CONSECUTIVE_GUARDRAIL_RETRIES
+    );
+    warn!("{message}");
+    if let Err(error) = send_event(
+        event_store,
+        thread_id,
+        turn,
+        hooks,
+        authority,
+        AgentEvent::error(message.clone(), false),
+    )
+    .await
+    {
+        return InternalTurnResult::Error(error);
+    }
+    InternalTurnResult::Error(AgentError::new(message, false))
+}
+
 struct RetryWithFeedbackParams<'a, H, M> {
     thread_id: &'a ThreadId,
     turn: usize,
-    response: &'a ChatResponse,
     feedback: &'a str,
     /// Usage already applied to `ctx.total_usage` for the rejected turn, so
     /// the returned `Continue { turn_usage }` carries it into the turn
@@ -2571,57 +2697,21 @@ struct RetryWithFeedbackParams<'a, H, M> {
     authority: &'a Arc<dyn EventAuthority>,
 }
 
-/// Build the user message that carries guardrail feedback back to the model
-/// after a [`ResponseDecision::RetryWithFeedback`].
+/// Honor [`ResponseDecision::RetryWithFeedback`]: append **only** the
+/// guardrail feedback as a user message and continue to the next turn.
 ///
-/// When the rejected assistant response contained `tool_use` blocks, the
-/// persisted assistant message still carries them, so the very next user
-/// message **must** contain a matching `tool_result` for each `tool_use` id
-/// or Anthropic-style providers reject the request with a 400 (every
-/// `tool_use` must be answered by a `tool_result`). We attach the guardrail
-/// feedback to each synthesized `tool_result` (flagged `is_error`) so the
-/// model both sees the steering and the conversation stays balanced.
-///
-/// When there are no `tool_use` blocks, a plain-text user message is enough.
-fn build_retry_feedback_message(response: &ChatResponse, feedback: &str) -> Message {
-    let tool_use_ids: Vec<&str> = response
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
-            _ => None,
-        })
-        .collect();
-
-    if tool_use_ids.is_empty() {
-        return Message::user(feedback);
-    }
-
-    let blocks = tool_use_ids
-        .into_iter()
-        .map(|id| ContentBlock::ToolResult {
-            tool_use_id: id.to_string(),
-            content: feedback.to_string(),
-            is_error: Some(true),
-        })
-        .collect();
-    Message::user_with_content(blocks)
-}
-
-/// Honor [`ResponseDecision::RetryWithFeedback`]: persist the rejected
-/// assistant response (so message alternation stays valid), append the
-/// guardrail feedback as a user message so the model can correct itself,
-/// and continue to the next turn.
-///
-/// If the rejected assistant response contained `tool_use` blocks, the
-/// feedback user message carries a matching `tool_result` for each of them
-/// (see [`build_retry_feedback_message`]) so the persisted history stays a
-/// valid Anthropic-style conversation (`tool_use` → `tool_result`).
+/// The rejected assistant response is deliberately never written to the
+/// message store — the hook contract promises that retry-rejected content
+/// stays out of the thread's history and out of the model's context (the
+/// secret-leakage use case must not durably store, or re-send, the secret).
+/// Because the rejected message (and any `tool_use` blocks it carried) is
+/// never persisted, there is no orphan `tool_use` to balance: the history
+/// simply gains one feedback user message. The rejected call's tokens were
+/// already added to the cumulative totals by the caller.
 async fn retry_with_feedback_result<H, M>(
     RetryWithFeedbackParams {
         thread_id,
         turn,
-        response,
         feedback,
         turn_usage,
         message_store,
@@ -2635,15 +2725,10 @@ where
     M: MessageStore,
 {
     warn!("LLM response rejected by guardrail; steering a retry with feedback");
-    let assistant = build_assistant_message(response);
-    if let Err(error) = message_store.append(thread_id, assistant).await {
-        return InternalTurnResult::Error(AgentError::new(
-            format!("Failed to append assistant message for guardrail retry: {error}"),
-            false,
-        ));
-    }
-    let feedback_message = build_retry_feedback_message(response, feedback);
-    if let Err(error) = message_store.append(thread_id, feedback_message).await {
+    if let Err(error) = message_store
+        .append(thread_id, Message::user(feedback))
+        .await
+    {
         return InternalTurnResult::Error(AgentError::new(
             format!("Failed to append guardrail feedback message: {error}"),
             false,
@@ -2651,7 +2736,7 @@ where
     }
     // Best-effort: surface the steering as an error-tier event so streaming
     // consumers can see the retry was triggered. A persistence failure here
-    // must not mask the (successful) message appends, so it is ignored.
+    // must not mask the (successful) feedback append, so it is ignored.
     let _ = send_event(
         event_store,
         thread_id,
@@ -2664,6 +2749,25 @@ where
         ),
     )
     .await;
+    // The looping result handler closes this storage turn without ever
+    // reaching the tool-phase `TurnComplete` emission, so emit it here —
+    // with the rejected attempt's usage — or replay/streaming consumers
+    // miss the completion edge for every rejected attempt.
+    if let Err(error) = send_event(
+        event_store,
+        thread_id,
+        turn,
+        hooks,
+        authority,
+        AgentEvent::TurnComplete {
+            turn,
+            usage: turn_usage.clone(),
+        },
+    )
+    .await
+    {
+        return InternalTurnResult::Error(error);
+    }
     // Carry the rejected turn's usage (already added to `ctx.total_usage`
     // by the caller) into the turn summary so cost accounting and the
     // budget check both advance.

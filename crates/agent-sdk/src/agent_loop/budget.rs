@@ -18,13 +18,39 @@ use agent_sdk_foundation::llm::Usage;
 /// callers treat an un-priced model as "cost unknown" rather than free.
 #[must_use]
 pub(super) fn estimate_cost_usd(provenance: &AuditProvenance, usage: &TokenUsage) -> Option<f64> {
-    let caps =
-        crate::model_capabilities::get_model_capabilities(&provenance.provider, &provenance.model)?;
+    let caps = lookup_capabilities(&provenance.provider, &provenance.model)?;
     caps.estimate_cost_usd(&Usage {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         cached_input_tokens: usage.cached_input_tokens,
         cache_creation_input_tokens: usage.cache_creation_input_tokens,
+    })
+}
+
+/// Resolve pricing metadata for a provenance provider/model pair,
+/// normalizing known provider aliases before giving up.
+///
+/// The capability registry keys entries under the canonical provider names
+/// (`anthropic` / `openai` / `gemini`), but several [`crate::llm::LlmProvider`]
+/// implementations report a transport-specific name in their provenance:
+/// `openai-responses` and `openai-codex` serve `openai` models, and `vertex`
+/// serves `anthropic` (`claude-*`) or `gemini` models. Without the alias
+/// step those runs would silently report `None` cost and
+/// [`crate::types::UsageLimits::max_cost_usd`] could never trip. The alias
+/// set mirrors `LlmProvider::capabilities` in `agent-sdk-providers`.
+fn lookup_capabilities(
+    provider: &str,
+    model: &str,
+) -> Option<&'static crate::model_capabilities::ModelCapabilities> {
+    crate::model_capabilities::get_model_capabilities(provider, model).or_else(|| match provider {
+        "openai-responses" | "openai-codex" => {
+            crate::model_capabilities::get_model_capabilities("openai", model)
+        }
+        "vertex" if model.starts_with("claude-") => {
+            crate::model_capabilities::get_model_capabilities("anthropic", model)
+        }
+        "vertex" => crate::model_capabilities::get_model_capabilities("gemini", model),
+        _ => None,
     })
 }
 
@@ -80,6 +106,73 @@ mod tests {
         };
         let cost = estimate_cost_usd(&provenance, &usage).context("gpt-4o has pricing")?;
         assert!((cost - 0.0075).abs() < 1e-9, "unexpected cost: {cost}");
+        Ok(())
+    }
+
+    #[test]
+    fn estimate_cost_resolves_openai_responses_alias() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let usage = TokenUsage {
+            input_tokens: 2_000,
+            output_tokens: 1_000,
+            ..Default::default()
+        };
+        let canonical = estimate_cost_usd(&AuditProvenance::new("openai", "gpt-4o"), &usage)
+            .context("gpt-4o has pricing")?;
+        let aliased =
+            estimate_cost_usd(&AuditProvenance::new("openai-responses", "gpt-4o"), &usage)
+                .context("openai-responses must resolve to the openai catalog entry")?;
+        assert!((aliased - canonical).abs() < 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn estimate_cost_resolves_openai_codex_alias() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let usage = TokenUsage {
+            input_tokens: 2_000,
+            output_tokens: 1_000,
+            ..Default::default()
+        };
+        let canonical = estimate_cost_usd(&AuditProvenance::new("openai", "gpt-4o"), &usage)
+            .context("gpt-4o has pricing")?;
+        let aliased = estimate_cost_usd(&AuditProvenance::new("openai-codex", "gpt-4o"), &usage)
+            .context("openai-codex must resolve to the openai catalog entry")?;
+        assert!((aliased - canonical).abs() < 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn estimate_cost_resolves_vertex_claude_alias() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let usage = TokenUsage {
+            input_tokens: 2_000,
+            output_tokens: 1_000,
+            ..Default::default()
+        };
+        let canonical =
+            estimate_cost_usd(&AuditProvenance::new("anthropic", "claude-fable-5"), &usage)
+                .context("claude-fable-5 has pricing")?;
+        let aliased = estimate_cost_usd(&AuditProvenance::new("vertex", "claude-fable-5"), &usage)
+            .context("vertex claude-* must resolve to the anthropic catalog entry")?;
+        assert!((aliased - canonical).abs() < 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn estimate_cost_resolves_vertex_gemini_alias() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let usage = TokenUsage {
+            input_tokens: 2_000,
+            output_tokens: 1_000,
+            ..Default::default()
+        };
+        let canonical =
+            estimate_cost_usd(&AuditProvenance::new("gemini", "gemini-3.1-pro"), &usage)
+                .context("gemini-3.1-pro has pricing")?;
+        let aliased = estimate_cost_usd(&AuditProvenance::new("vertex", "gemini-3.1-pro"), &usage)
+            .context("vertex non-claude must resolve to the gemini catalog entry")?;
+        assert!((aliased - canonical).abs() < 1e-12);
         Ok(())
     }
 

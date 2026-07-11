@@ -5954,11 +5954,11 @@ fn assert_tool_use_history_balanced(history: &[Message]) -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn test_retry_with_feedback_balances_tool_use_history() -> anyhow::Result<()> {
+async fn test_retry_with_feedback_leaves_history_balanced_and_unpolluted() -> anyhow::Result<()> {
     // The first response carries a `tool_use` block and is rejected once.
-    // The appended feedback user message must contain a matching
-    // `tool_result` so the persisted history stays valid for Anthropic-style
-    // providers (which 400 on an unanswered `tool_use`).
+    // The hook contract keeps the rejected response out of the durable
+    // history entirely: no assistant `tool_use` (so nothing to balance) and
+    // no synthesized `tool_result` — only the feedback user message.
     let provider = MockProvider::new(vec![
         MockProvider::tool_use_response("call_1", "echo", json!({"message": "hi"})),
         MockProvider::text_response("recovered"),
@@ -5991,26 +5991,19 @@ async fn test_retry_with_feedback_balances_tool_use_history() -> anyhow::Result<
 
     let history = agent.message_store.get_history(&thread_id).await?;
     assert_tool_use_history_balanced(&history)?;
+    assert!(
+        !history_mentions_tool_call(&history, "call_1"),
+        "the rejected assistant response (and any synthesized tool_result) \
+         must never be persisted",
+    );
 
-    // The synthesized tool_result must carry the guardrail feedback and be
-    // flagged as an error so the model sees the steering.
+    // The steering arrives as a plain user message instead.
     let fed_back = history.iter().any(|m| {
-        let Content::Blocks(blocks) = &m.content else {
-            return false;
-        };
-        blocks.iter().any(|b| {
-            matches!(
-                b,
-                ContentBlock::ToolResult { tool_use_id, content, is_error }
-                    if tool_use_id == "call_1"
-                        && content.contains("please avoid calling that tool")
-                        && *is_error == Some(true)
-            )
-        })
+        m.role == Role::User && message_text(m).contains("please avoid calling that tool")
     });
     assert!(
         fed_back,
-        "the guardrail feedback must be delivered via the call_1 tool_result",
+        "the guardrail feedback must be delivered as a user message",
     );
 
     Ok(())
@@ -6132,4 +6125,882 @@ async fn test_run_stream_tee_channel_is_bounded() -> anyhow::Result<()> {
     );
 
     Ok(())
+}
+
+#[tokio::test]
+async fn test_run_stream_terminal_event_delivered_when_buffer_full() -> anyhow::Result<()> {
+    use crate::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
+    use tokio::sync::mpsc;
+
+    // Fill the tee buffer to capacity with nobody reading, then append a
+    // terminal `Done` event. The terminal send must wait (bounded) for a
+    // slow-but-live consumer to free a slot instead of dropping the closing
+    // marker like a regular event.
+    let inner = new_event_store();
+    let (tx, mut rx) = mpsc::channel(RUN_STREAM_CHANNEL_CAPACITY);
+    let tee = Arc::new(TeeEventStore {
+        inner: Arc::clone(&inner) as Arc<dyn EventStore>,
+        tx,
+    });
+
+    let thread_id = ThreadId::new();
+    let seq = SequenceCounter::new();
+    for i in 0..RUN_STREAM_CHANNEL_CAPACITY {
+        let envelope =
+            AgentEventEnvelope::wrap(AgentEvent::text("msg", format!("event {i}")), &seq);
+        tee.append(&thread_id, 0, envelope).await?;
+    }
+
+    let terminal = AgentEventEnvelope::wrap(
+        AgentEvent::done(
+            thread_id.clone(),
+            1,
+            crate::types::TokenUsage::default(),
+            std::time::Duration::from_millis(5),
+        ),
+        &seq,
+    );
+    let tee_task = Arc::clone(&tee);
+    let thread_task = thread_id.clone();
+    let append_handle =
+        tokio::spawn(async move { tee_task.append(&thread_task, 0, terminal).await });
+
+    // The slow-but-live consumer reads one event, freeing a slot for the
+    // blocked terminal send.
+    let first = rx.recv().await;
+    assert!(first.is_some(), "buffered events must be readable");
+    append_handle
+        .await
+        .context("terminal append task panicked")??;
+
+    drop(tee);
+    let mut saw_terminal = false;
+    while let Ok(event) = rx.try_recv() {
+        if matches!(event, AgentEvent::Done { .. }) {
+            saw_terminal = true;
+        }
+    }
+    assert!(
+        saw_terminal,
+        "the terminal Done event must reach a live consumer even when the buffer was full",
+    );
+
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Budget-stop / cancel-stop rerunnability and pre-dispatch budget checks.
+// ──────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_budget_exceeded_thread_can_rerun_with_raised_budget() -> anyhow::Result<()> {
+    // A budget-stopped thread must stay runnable: the terminal event is
+    // keyed under a synthetic (never-executed) turn, and the persisted
+    // turn_count must advance past it. Regression: the next run seeded the
+    // stale turn_count, re-entered the finished synthetic turn, and every
+    // rerun failed with "cannot append to finished turn".
+    let message_store = Arc::new(InMemoryStore::new());
+    let state_store = Arc::new(InMemoryStore::new());
+    let event_store = new_event_store();
+    let thread_id = ThreadId::new();
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+    let budget_agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::tool_use_response(
+            "call_1",
+            "echo",
+            json!({"message": "x"}),
+        )]))
+        .tools(tools)
+        .hooks(AllowAllHooks)
+        .config(AgentConfig {
+            usage_limits: Some(UsageLimits {
+                max_total_tokens: Some(25),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .message_store(Arc::clone(&message_store))
+        .state_store(Arc::clone(&state_store))
+        .event_store(event_store.clone())
+        .build_with_stores();
+
+    let (state, _events) = run_recorded(
+        &budget_agent,
+        thread_id.clone(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    let AgentRunState::BudgetExceeded { .. } = state else {
+        anyhow::bail!("expected BudgetExceeded from the first run, got {state:?}");
+    };
+
+    // Same thread, same stores, budget removed: the rerun must succeed.
+    let unbudgeted_agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::text_response(
+            "recovered",
+        )]))
+        .hooks(AllowAllHooks)
+        .message_store(message_store)
+        .state_store(state_store)
+        .event_store(event_store)
+        .build_with_stores();
+
+    let (state, _events) = run_recorded(
+        &unbudgeted_agent,
+        thread_id,
+        AgentInput::Text("try again".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "rerun after a budget stop must succeed, got {state:?}",
+    );
+
+    Ok(())
+}
+
+/// Hooks that fire a cancellation token after any tool completes, so the
+/// run reaches the between-turns cancel seam deterministically.
+struct CancelAfterToolHooks {
+    token: CancellationToken,
+}
+
+#[async_trait]
+impl AgentHooks for CancelAfterToolHooks {
+    async fn pre_tool_use(&self, _invocation: &ToolInvocation) -> ToolDecision {
+        ToolDecision::Allow
+    }
+
+    async fn post_tool_use(&self, _tool_name: &str, _result: &ToolResult) {
+        self.token.cancel();
+    }
+}
+
+#[tokio::test]
+async fn test_cancelled_between_turns_thread_can_rerun() -> anyhow::Result<()> {
+    // The between-turns cancel path keys its terminal event under a
+    // synthetic turn exactly like the budget stop; the persisted turn_count
+    // must advance with it or the rerun bricks the thread.
+    let cancel_token = CancellationToken::new();
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("call_1", "echo", json!({"message": "x"})),
+        MockProvider::text_response("second run answer"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .hooks(CancelAfterToolHooks {
+            token: cancel_token.clone(),
+        })
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+
+    let state = agent
+        .run(
+            thread_id.clone(),
+            AgentInput::Text("go".to_string()),
+            ToolContext::new(()),
+            cancel_token,
+        )
+        .await?;
+    assert!(
+        matches!(state, AgentRunState::Cancelled { .. }),
+        "expected the run to cancel between turns, got {state:?}",
+    );
+
+    let state = agent
+        .run(
+            thread_id,
+            AgentInput::Text("try again".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "rerun after a between-turns cancel must succeed, got {state:?}",
+    );
+
+    Ok(())
+}
+
+/// A terminal response whose stop reason is a model refusal.
+fn refusal_response() -> ChatOutcome {
+    ChatOutcome::Success(ChatResponse {
+        id: "msg_refusal".to_string(),
+        content: vec![ContentBlock::Text {
+            text: "I can't help with that".to_string(),
+        }],
+        model: "mock-model".to_string(),
+        stop_reason: Some(StopReason::Refusal),
+        usage: Usage {
+            input_tokens: 10,
+            output_tokens: 20,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        },
+    })
+}
+
+#[tokio::test]
+async fn test_refusal_thread_can_rerun() -> anyhow::Result<()> {
+    // A refusal ends the run with the refusal turn finished; the persisted
+    // turn_count must advance with it. Regression: the next run seeded the
+    // stale counter, re-entered the finished turn, and failed with "cannot
+    // append to finished turn".
+    let provider = MockProvider::new(vec![
+        refusal_response(),
+        MockProvider::text_response("second run answer"),
+    ]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+
+    let (state, _events) = run_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(
+        matches!(state, AgentRunState::Refusal { .. }),
+        "expected Refusal from the first run, got {state:?}",
+    );
+
+    let (state, _events) = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("try again".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "rerun after a refusal must succeed, got {state:?}",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_turn_refusal_thread_can_rerun() -> anyhow::Result<()> {
+    // Single-turn-mode equivalent of the refusal rerun seam.
+    let provider = MockProvider::new(vec![
+        refusal_response(),
+        MockProvider::text_response("second turn answer"),
+    ]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+
+    let outcome = Box::pin(agent.run_turn(
+        thread_id.clone(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+        TurnOptions::default(),
+    ))
+    .await;
+    assert!(
+        matches!(outcome, TurnOutcome::Refusal { .. }),
+        "expected Refusal from the first turn, got {outcome:?}",
+    );
+
+    let outcome = Box::pin(agent.run_turn(
+        thread_id,
+        AgentInput::Text("try again".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+        TurnOptions::default(),
+    ))
+    .await;
+    assert!(
+        matches!(outcome, TurnOutcome::Done { .. }),
+        "run_turn after a refusal must succeed, got {outcome:?}",
+    );
+
+    Ok(())
+}
+
+/// Provider that cancels the run's token from inside its first `chat` call
+/// and then never returns, deterministically driving the mid-LLM-call
+/// cancel path (`InternalTurnResult::Cancelled` on a begun turn). Later
+/// calls answer normally so a rerun can complete.
+struct CancelOnFirstCallProvider {
+    token: CancellationToken,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl crate::llm::LlmProvider for CancelOnFirstCallProvider {
+    async fn chat(&self, _request: ChatRequest) -> anyhow::Result<ChatOutcome> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.token.cancel();
+            // Never resolves — the run loop's cancel race must win.
+            futures::future::pending::<()>().await;
+        }
+        Ok(MockProvider::text_response("second run answer"))
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
+#[tokio::test]
+async fn test_cancelled_mid_turn_thread_can_rerun() -> anyhow::Result<()> {
+    // A cancel honored mid-LLM-call finishes the (begun) turn with a
+    // terminal Cancelled event; the persisted turn_count must advance with
+    // it or the rerun bricks the thread.
+    let cancel_token = CancellationToken::new();
+    let agent = builder::<()>()
+        .provider(CancelOnFirstCallProvider {
+            token: cancel_token.clone(),
+            calls: AtomicUsize::new(0),
+        })
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+
+    let state = agent
+        .run(
+            thread_id.clone(),
+            AgentInput::Text("go".to_string()),
+            ToolContext::new(()),
+            cancel_token,
+        )
+        .await?;
+    assert!(
+        matches!(state, AgentRunState::Cancelled { .. }),
+        "expected the run to cancel mid-turn, got {state:?}",
+    );
+
+    let state = agent
+        .run(
+            thread_id,
+            AgentInput::Text("try again".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "rerun after a mid-turn cancel must succeed, got {state:?}",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_turn_cancelled_mid_turn_thread_can_rerun() -> anyhow::Result<()> {
+    // Single-turn-mode equivalent of the mid-turn cancel rerun seam.
+    let cancel_token = CancellationToken::new();
+    let agent = builder::<()>()
+        .provider(CancelOnFirstCallProvider {
+            token: cancel_token.clone(),
+            calls: AtomicUsize::new(0),
+        })
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+
+    let outcome = Box::pin(agent.run_turn(
+        thread_id.clone(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+        cancel_token,
+        TurnOptions::default(),
+    ))
+    .await;
+    assert!(
+        matches!(outcome, TurnOutcome::Cancelled { .. }),
+        "expected the turn to cancel mid-LLM-call, got {outcome:?}",
+    );
+
+    let outcome = Box::pin(agent.run_turn(
+        thread_id,
+        AgentInput::Text("try again".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+        TurnOptions::default(),
+    ))
+    .await;
+    assert!(
+        matches!(outcome, TurnOutcome::Done { .. }),
+        "run_turn after a mid-turn cancel must succeed, got {outcome:?}",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_entry_budget_check_makes_no_llm_calls() -> anyhow::Result<()> {
+    // A run on a thread whose rehydrated usage already exceeds the budget
+    // must terminate with BudgetExceeded before dispatching any LLM turn.
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::tool_use_response(
+            "call_1",
+            "echo",
+            json!({"message": "x"}),
+        )]))
+        .tools(tools)
+        .hooks(AllowAllHooks)
+        .config(AgentConfig {
+            usage_limits: Some(UsageLimits {
+                max_total_tokens: Some(25),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+
+    let (state, _events) = run_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(
+        matches!(state, AgentRunState::BudgetExceeded { .. }),
+        "first run must stop on budget, got {state:?}",
+    );
+    assert_eq!(agent.provider.calls(), 1, "first run pays exactly one call");
+
+    let (state, _events) = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("again".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(
+        matches!(state, AgentRunState::BudgetExceeded { .. }),
+        "over-budget rerun must stop before the LLM, got {state:?}",
+    );
+    assert_eq!(
+        agent.provider.calls(),
+        1,
+        "an over-budget run must make ZERO additional LLM calls",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_turn_entry_budget_check_makes_no_llm_calls() -> anyhow::Result<()> {
+    // Single-turn mode: a run_turn dispatched on an over-budget thread must
+    // report BudgetExceeded without paying for an LLM call.
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::tool_use_response(
+            "call_1",
+            "echo",
+            json!({"message": "x"}),
+        )]))
+        .tools(tools)
+        .hooks(AllowAllHooks)
+        .config(AgentConfig {
+            usage_limits: Some(UsageLimits {
+                max_total_tokens: Some(25),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+
+    let (outcome, _events) = run_turn_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+        TurnOptions::default(),
+    )
+    .await?;
+    assert!(
+        matches!(outcome, TurnOutcome::BudgetExceeded { .. }),
+        "the first turn crosses the budget, got {outcome:?}",
+    );
+    assert_eq!(agent.provider.calls(), 1);
+
+    let outcome = Box::pin(agent.run_turn(
+        thread_id,
+        AgentInput::Continue,
+        ToolContext::new(()),
+        CancellationToken::new(),
+        TurnOptions::default(),
+    ))
+    .await;
+    assert!(
+        matches!(outcome, TurnOutcome::BudgetExceeded { .. }),
+        "an over-budget run_turn must stop before the LLM (and must not error), got {outcome:?}",
+    );
+    assert_eq!(
+        agent.provider.calls(),
+        1,
+        "an over-budget run_turn must make ZERO additional LLM calls",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_persistent_run_stops_on_budget_before_parking() -> anyhow::Result<()> {
+    // In persistent mode a no-tool response that crosses the budget must
+    // terminate the run immediately after the completed turn, not park on
+    // the input channel waiting for a prompt it can never answer.
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::text_response(
+            "thirty tokens of usage",
+        )]))
+        .config(AgentConfig {
+            usage_limits: Some(UsageLimits {
+                max_total_tokens: Some(25),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .event_store(new_event_store())
+        .build();
+
+    let handle = agent.run_persistent(
+        ThreadId::new(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    // Keep `input_tx` alive: the pre-fix behavior parked on the channel, so
+    // a held sender makes the regression observable as a timeout.
+    let _input_tx = handle.input_tx.clone();
+
+    let state = tokio::time::timeout(std::time::Duration::from_secs(5), handle.state_rx)
+        .await
+        .context("persistent run must terminate on budget instead of parking for input")??;
+    assert!(
+        matches!(state, AgentRunState::BudgetExceeded { .. }),
+        "expected BudgetExceeded, got {state:?}",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_resume_completion_checks_budget_without_new_llm_call() -> anyhow::Result<()> {
+    // A turn that crosses the budget but pauses on AwaitingConfirmation must
+    // not hand the caller NeedsMoreTurns after the resume — that invites a
+    // paid follow-up turn. The resume completes the tool work (no LLM call)
+    // and reports BudgetExceeded.
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::tool_use_response(
+            "call_1",
+            "echo",
+            json!({"message": "x"}),
+        )]))
+        .tools(tools)
+        .hooks(ConfirmToolCallHook { target: "call_1" })
+        .config(AgentConfig {
+            usage_limits: Some(UsageLimits {
+                max_total_tokens: Some(25),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+
+    let outcome = Box::pin(agent.run_turn(
+        thread_id.clone(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+        TurnOptions::default(),
+    ))
+    .await;
+    let TurnOutcome::AwaitingConfirmation {
+        continuation,
+        tool_call_id,
+        ..
+    } = outcome
+    else {
+        anyhow::bail!("expected AwaitingConfirmation, got {outcome:?}");
+    };
+    assert_eq!(agent.provider.calls(), 1);
+
+    let outcome = Box::pin(agent.run_turn(
+        thread_id,
+        AgentInput::Resume {
+            continuation,
+            tool_call_id,
+            confirmed: true,
+            rejection_reason: None,
+        },
+        ToolContext::new(()),
+        CancellationToken::new(),
+        TurnOptions::default(),
+    ))
+    .await;
+    assert!(
+        matches!(outcome, TurnOutcome::BudgetExceeded { .. }),
+        "resume on an over-budget turn must yield BudgetExceeded, got {outcome:?}",
+    );
+    assert_eq!(
+        agent.provider.calls(),
+        1,
+        "the resume must not pay for another LLM call",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_guardrail_retry_cap_terminates_run() -> anyhow::Result<()> {
+    // A hook that rejects every response with RetryWithFeedback under the
+    // default config (max_turns: None, no budget) must not loop — and bill —
+    // forever: the consecutive-rejection cap terminates the run after
+    // exactly MAX_CONSECUTIVE_GUARDRAIL_RETRIES paid LLM calls.
+    let agent = builder::<()>()
+        .provider(MockProvider::new(Vec::new()))
+        .hooks(RejectNHooks::new("never good enough", usize::MAX))
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let (state, _events) = run_recorded(
+        &agent,
+        ThreadId::new(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    let AgentRunState::Error(error) = state else {
+        anyhow::bail!("an always-rejecting guardrail must end in Error, got {state:?}");
+    };
+    assert!(
+        error.message.contains("on_llm_response"),
+        "the error must name the hook, got: {}",
+        error.message
+    );
+    assert_eq!(
+        agent.provider.calls(),
+        types::MAX_CONSECUTIVE_GUARDRAIL_RETRIES,
+        "the run must stop after exactly the cap count of LLM calls",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_retry_with_feedback_never_reaches_store_or_next_request() -> anyhow::Result<()> {
+    // The hook contract: retry-rejected content stays out of the durable
+    // history AND out of the model's context. Only the feedback (as a user
+    // message) may appear.
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("call_1", "echo", json!({"message": "secret"})),
+        MockProvider::text_response("recovered"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .hooks(RejectNHooks::new("please avoid calling that tool", 1))
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let thread_id = ThreadId::new();
+    let (state, _events) = run_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "run should complete after the steered retry, got {state:?}",
+    );
+
+    let history = agent.message_store.get_history(&thread_id).await?;
+    assert_tool_use_history_balanced(&history)?;
+    assert!(
+        !history_mentions_tool_call(&history, "call_1"),
+        "the rejected tool_use must never reach the message store",
+    );
+    let feedback_in_history = history.iter().any(|m| {
+        m.role == Role::User && message_text(m).contains("please avoid calling that tool")
+    });
+    assert!(
+        feedback_in_history,
+        "the guardrail feedback must be persisted as a user message",
+    );
+
+    // The retry request (second LLM call) must carry the feedback but none
+    // of the rejected content.
+    let requests = agent.provider.recorded_requests()?;
+    assert_eq!(requests.len(), 2, "one rejected call plus one retry");
+    let retry_request = &requests[1];
+    for message in &retry_request.messages {
+        if let Content::Blocks(blocks) = &message.content {
+            let has_rejected = blocks.iter().any(|b| {
+                matches!(
+                    b,
+                    ContentBlock::ToolUse { id, .. } if id == "call_1"
+                ) || matches!(
+                    b,
+                    ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_1"
+                )
+            });
+            assert!(
+                !has_rejected,
+                "the rejected tool_use/tool_result must not reach the next ChatRequest",
+            );
+        }
+    }
+    let feedback_in_request = retry_request.messages.iter().any(|m| {
+        m.role == Role::User && message_text(m).contains("please avoid calling that tool")
+    });
+    assert!(
+        feedback_in_request,
+        "the retry request must deliver the guardrail feedback",
+    );
+
+    Ok(())
+}
+
+/// State store that starts failing after `allow` successful saves, so a test
+/// can target a specific checkpoint in the strict-durability sequence.
+struct FailAfterNStateStore {
+    inner: InMemoryStore,
+    allow: usize,
+    saves: AtomicUsize,
+}
+
+#[async_trait]
+impl StateStore for FailAfterNStateStore {
+    async fn save(&self, state: &AgentState) -> anyhow::Result<()> {
+        let n = self.saves.fetch_add(1, Ordering::SeqCst);
+        anyhow::ensure!(n < self.allow, "scripted state store failure (save #{n})");
+        self.inner.save(state).await
+    }
+
+    async fn load(&self, thread_id: &ThreadId) -> anyhow::Result<Option<AgentState>> {
+        self.inner.load(thread_id).await
+    }
+
+    async fn delete(&self, thread_id: &ThreadId) -> anyhow::Result<()> {
+        self.inner.delete(thread_id).await
+    }
+}
+
+#[tokio::test]
+async fn test_guardrail_retry_honors_strict_durability_checkpoint() -> anyhow::Result<()> {
+    // With strict_durability the RetryWithFeedback branch must pass the same
+    // post-LLM checkpoint as an accepted response. The first save (pre-LLM)
+    // succeeds; the second — the retry branch's checkpoint — fails, and the
+    // failure must surface as a hard error instead of a silent best-effort
+    // save followed by NeedsMoreTurns.
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::text_response(
+            "reject me",
+        )]))
+        .hooks(RejectNHooks::new("steer away", 1))
+        .message_store(InMemoryStore::new())
+        .state_store(FailAfterNStateStore {
+            inner: InMemoryStore::new(),
+            allow: 1,
+            saves: AtomicUsize::new(0),
+        })
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let outcome = Box::pin(agent.run_turn(
+        ThreadId::new(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+        TurnOptions {
+            tool_runtime: crate::types::ToolRuntime::Inline,
+            strict_durability: true,
+        },
+    ))
+    .await;
+
+    let TurnOutcome::Error(error) = outcome else {
+        anyhow::bail!("a failed strict checkpoint on guardrail retry must error, got {outcome:?}");
+    };
+    assert!(
+        error.message.contains("Strict durability"),
+        "the error must surface the strict checkpoint failure, got: {}",
+        error.message
+    );
+
+    Ok(())
+}
+
+/// Concatenated text content of a message (plain text plus `Text` blocks).
+fn message_text(message: &Message) -> String {
+    match &message.content {
+        Content::Text(text) => text.clone(),
+        Content::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect(),
+    }
+}
+
+/// Whether any message in `history` carries a `tool_use` or `tool_result`
+/// block with the given tool call id.
+fn history_mentions_tool_call(history: &[Message], tool_call_id: &str) -> bool {
+    history.iter().any(|m| {
+        let Content::Blocks(blocks) = &m.content else {
+            return false;
+        };
+        blocks.iter().any(|b| match b {
+            ContentBlock::ToolUse { id, .. } => id == tool_call_id,
+            ContentBlock::ToolResult { tool_use_id, .. } => tool_use_id == tool_call_id,
+            _ => false,
+        })
+    })
 }
