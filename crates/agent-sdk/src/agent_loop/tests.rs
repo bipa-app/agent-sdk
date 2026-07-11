@@ -4652,6 +4652,7 @@ impl ContextCompactor for ShrinkCompactor {
             new_count: 1,
             original_tokens: 1_000,
             new_tokens: 10,
+            llm_usage: crate::types::TokenUsage::default(),
         })
     }
 }
@@ -5398,14 +5399,20 @@ async fn run_persistent_cancel_between_turns_is_cancelled() -> anyhow::Result<()
         "cancelling while parked should yield Cancelled, got {state:?}"
     );
 
-    // The terminal Cancelled event is keyed under turn+1 (turn 1 was finished),
-    // and that turn is itself finished.
+    // The terminal Cancelled event is keyed under turn+1 (turn 1 was
+    // finished). The synthetic marker turn is deliberately left UNFINISHED
+    // and turn_count is not advanced past it, so a rerun re-enters it
+    // without bricking or consuming an executed turn; followers close on
+    // the Cancelled event itself, not on the turn-finish barrier.
     let turn_2 = agent
         .event_store
         .get_turn(&thread_id, 2)
         .await?
         .context("expected a turn 2 carrying the terminal Cancelled event")?;
-    assert!(turn_2.finished, "the cancel turn must be finished");
+    assert!(
+        !turn_2.finished,
+        "the synthetic cancel marker turn must stay unfinished"
+    );
     assert!(
         turn_2
             .events
@@ -7604,6 +7611,519 @@ async fn test_reminder_trigger_ignores_prior_reminder_text() -> anyhow::Result<(
     assert!(
         !saw_second,
         "a trigger matching only an earlier reminder's appended text must not fire",
+    );
+
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Round 4: compaction guardrails + budgeted compaction usage, cost
+// provenance across model rotations, unfinished synthetic terminal
+// markers (save-failure resilience + max_turns preservation).
+// ──────────────────────────────────────────────────────────────────────
+
+/// Seed enough history that the default LLM compactor's threshold check
+/// fires on the next turn (paired user/assistant prose, well over a tiny
+/// `threshold_tokens`).
+async fn seed_compactable_history(
+    message_store: &InMemoryStore,
+    thread_id: &ThreadId,
+) -> anyhow::Result<()> {
+    for i in 0..4 {
+        message_store
+            .append(
+                thread_id,
+                Message::user(format!(
+                    "Question {i}: a reasonably long user message so the token \
+                     estimator sees enough content to cross the threshold."
+                )),
+            )
+            .await?;
+        message_store
+            .append(
+                thread_id,
+                Message::assistant(format!(
+                    "Answer {i}: an equally long assistant reply, adding more \
+                     estimated tokens to the seeded conversation history."
+                )),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+/// Tiny thresholds so the seeded history always triggers compaction.
+fn tiny_compaction_config() -> CompactionConfig {
+    CompactionConfig::default()
+        .with_threshold_tokens(10)
+        .with_min_messages(2)
+        .with_retain_recent(1)
+}
+
+/// Hooks that block any LLM response carrying the given marker — used to
+/// reject only the compaction summary while accepting regular turns.
+struct BlockMarkedResponseHooks {
+    marker: &'static str,
+}
+
+#[async_trait]
+impl AgentHooks for BlockMarkedResponseHooks {
+    async fn pre_tool_use(&self, _invocation: &ToolInvocation) -> ToolDecision {
+        ToolDecision::Allow
+    }
+
+    async fn on_llm_response(&self, response: &ChatResponse) -> crate::hooks::ResponseDecision {
+        let leaked = response
+            .first_text()
+            .is_some_and(|text| text.contains(self.marker));
+        if leaked {
+            crate::hooks::ResponseDecision::Block("summary contains blocked content".to_string())
+        } else {
+            crate::hooks::ResponseDecision::Accept
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_blocked_compaction_summary_is_never_persisted() -> anyhow::Result<()> {
+    // The compaction summarization call runs through on_llm_response; a
+    // Blocked summary aborts the compaction attempt, so the durable history
+    // keeps the original messages and the run continues uncompacted.
+    let message_store = Arc::new(InMemoryStore::new());
+    let thread_id = ThreadId::new();
+    seed_compactable_history(&message_store, &thread_id).await?;
+
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![
+            // Call 1 is the compaction summarizer (compaction runs before
+            // the turn's own LLM call); its distinctive text is blocked.
+            MockProvider::text_response("COMPACTION_SUMMARY leaking a secret"),
+            MockProvider::text_response("turn answer"),
+        ]))
+        .hooks(BlockMarkedResponseHooks {
+            marker: "COMPACTION_SUMMARY",
+        })
+        .with_compaction(tiny_compaction_config())
+        .message_store(Arc::clone(&message_store))
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let (state, events) = run_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "the run must continue with uncompacted history, got {state:?}",
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.event, AgentEvent::ContextCompacted { .. })),
+        "a blocked summary must not produce a ContextCompacted event",
+    );
+
+    let history = message_store.get_history(&thread_id).await?;
+    for message in &history {
+        let text = message_text(message);
+        assert!(
+            !text.contains("COMPACTION_SUMMARY"),
+            "the blocked summary must never reach the message store",
+        );
+        assert!(
+            !text.contains("[Previous conversation summary]"),
+            "history must not have been replaced by a summary",
+        );
+    }
+    assert_eq!(agent.provider.calls(), 2, "one summarizer call + one turn");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_compaction_usage_counts_toward_budget() -> anyhow::Result<()> {
+    // The summarization call bills 30 tokens (10 in / 20 out from the mock)
+    // and the tool-use turn another 30. With a 45-token budget the run must
+    // stop on BudgetExceeded — it only can if compaction usage is folded
+    // into the cumulative totals.
+    let message_store = Arc::new(InMemoryStore::new());
+    let thread_id = ThreadId::new();
+    seed_compactable_history(&message_store, &thread_id).await?;
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![
+            // Call 1: compaction summarizer (30 tokens).
+            MockProvider::text_response("compact summary"),
+            // Call 2: the turn's own LLM call (30 tokens, wants a tool).
+            MockProvider::tool_use_response("call_1", "echo", json!({"message": "x"})),
+            // Never reached: the budget must trip first.
+            MockProvider::text_response("should not be reached"),
+        ]))
+        .tools(tools)
+        .hooks(AllowAllHooks)
+        .config(AgentConfig {
+            usage_limits: Some(UsageLimits {
+                max_total_tokens: Some(45),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .with_compaction(tiny_compaction_config())
+        .message_store(Arc::clone(&message_store))
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let (state, _events) = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    let AgentRunState::BudgetExceeded { total_usage, .. } = state else {
+        anyhow::bail!(
+            "the budget must trip because of the summarization call's tokens, got {state:?}"
+        );
+    };
+    assert_eq!(
+        u64::from(total_usage.input_tokens + total_usage.output_tokens),
+        60,
+        "total usage must include the summarization call (30) plus the turn (30)",
+    );
+    assert_eq!(
+        agent.provider.calls(),
+        2,
+        "no further LLM turn may be dispatched once the budget tripped",
+    );
+
+    Ok(())
+}
+
+/// Priced provider on a different catalog entry than [`PricedProvider`]:
+/// anthropic / claude-fable-5 ($10/M input, $50/M output), fixed usage
+/// 2000 in / 1000 out = $0.07 per call.
+struct FablePricedProvider;
+
+#[async_trait]
+impl crate::llm::LlmProvider for FablePricedProvider {
+    async fn chat(&self, _request: ChatRequest) -> anyhow::Result<ChatOutcome> {
+        Ok(ChatOutcome::Success(ChatResponse {
+            id: "msg_fable".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "fable answer".to_string(),
+            }],
+            model: "claude-fable-5".to_string(),
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage {
+                input_tokens: 2_000,
+                output_tokens: 1_000,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+        }))
+    }
+
+    fn model(&self) -> &'static str {
+        "claude-fable-5"
+    }
+
+    fn provider(&self) -> &'static str {
+        "anthropic"
+    }
+}
+
+#[tokio::test]
+async fn test_cost_accumulates_per_model_across_rotation() -> anyhow::Result<()> {
+    // Turn 1 on gpt-4o costs $0.0075 (2000 in / 1000 out); turn 2 on
+    // claude-fable-5 costs $0.07. The accumulated total must be the true
+    // sum ($0.0775), NOT the whole aggregate repriced at the newest model's
+    // rates (4000/2000 at fable = $0.14).
+    let message_store = Arc::new(InMemoryStore::new());
+    let state_store = Arc::new(InMemoryStore::new());
+    let event_store = new_event_store();
+    let thread_id = ThreadId::new();
+
+    let gpt_agent = builder::<()>()
+        .provider(PricedProvider)
+        .hooks(AllowAllHooks)
+        .message_store(Arc::clone(&message_store))
+        .state_store(Arc::clone(&state_store))
+        .event_store(event_store.clone())
+        .build_with_stores();
+    let (state, _events) = run_recorded(
+        &gpt_agent,
+        thread_id.clone(),
+        AgentInput::Text("first question".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    let AgentRunState::Done {
+        estimated_cost_usd: Some(first_cost),
+        ..
+    } = state
+    else {
+        anyhow::bail!("expected Done with a cost from the first run, got {state:?}");
+    };
+    assert!((first_cost - 0.0075).abs() < 1e-9, "got {first_cost}");
+
+    let fable_agent = builder::<()>()
+        .provider(FablePricedProvider)
+        .hooks(AllowAllHooks)
+        .message_store(message_store)
+        .state_store(state_store)
+        .event_store(event_store)
+        .build_with_stores();
+    let (state, _events) = run_recorded(
+        &fable_agent,
+        thread_id,
+        AgentInput::Text("second question".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    let AgentRunState::Done {
+        estimated_cost_usd: Some(total_cost),
+        ..
+    } = state
+    else {
+        anyhow::bail!("expected Done with a cost from the second run, got {state:?}");
+    };
+    assert!(
+        (total_cost - 0.0775).abs() < 1e-9,
+        "each turn must be priced at the model that served it: got {total_cost}, \
+         expected 0.0775 (repricing the aggregate at fable rates would give 0.14)",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_legacy_snapshot_cost_seeds_from_aggregate_once() -> anyhow::Result<()> {
+    // A state snapshot predating cost accumulation (accumulated_cost_usd:
+    // None with existing usage) is seeded once by repricing the aggregate
+    // at the current provenance, then accumulates normally: seed $0.0075
+    // (2000/1000 at gpt-4o) + turn 2's $0.0075 = $0.015.
+    let message_store = Arc::new(InMemoryStore::new());
+    let state_store = Arc::new(InMemoryStore::new());
+    let thread_id = ThreadId::new();
+
+    message_store
+        .append(&thread_id, Message::user("old question"))
+        .await?;
+    message_store
+        .append(&thread_id, Message::assistant("old answer"))
+        .await?;
+    let mut legacy_state = AgentState::new(thread_id.clone());
+    legacy_state.turn_count = 1;
+    legacy_state.total_usage = crate::types::TokenUsage {
+        input_tokens: 2_000,
+        output_tokens: 1_000,
+        ..Default::default()
+    };
+    // `AgentState::new` leaves accumulated_cost_usd = None — exactly the
+    // shape of a snapshot written before the field existed.
+    state_store.save(&legacy_state).await?;
+
+    let agent = builder::<()>()
+        .provider(PricedProvider)
+        .hooks(AllowAllHooks)
+        .message_store(message_store)
+        .state_store(state_store)
+        .event_store(new_event_store())
+        .build_with_stores();
+    let (state, _events) = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("new question".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    let AgentRunState::Done {
+        estimated_cost_usd: Some(cost),
+        ..
+    } = state
+    else {
+        anyhow::bail!("expected Done with a cost, got {state:?}");
+    };
+    assert!(
+        (cost - 0.015).abs() < 1e-9,
+        "legacy aggregate must seed once at current rates and then accumulate, got {cost}",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_budget_marker_survives_state_save_failure() -> anyhow::Result<()> {
+    // The synthetic terminal turn is never finished, so a failed state save
+    // at the terminal seam cannot recreate the finished-turn + stale-counter
+    // brick: the rerun simply re-enters the unfinished marker turn.
+    let message_store = Arc::new(InMemoryStore::new());
+    let state_store = Arc::new(FailAfterNStateStore {
+        inner: InMemoryStore::new(),
+        // Allow the pre-tool and post-turn checkpoints of turn 1; fail the
+        // terminal-seam save (and everything after).
+        allow: 2,
+        saves: AtomicUsize::new(0),
+    });
+    let event_store = new_event_store();
+    let thread_id = ThreadId::new();
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+    let budget_agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::tool_use_response(
+            "call_1",
+            "echo",
+            json!({"message": "x"}),
+        )]))
+        .tools(tools)
+        .hooks(AllowAllHooks)
+        .config(AgentConfig {
+            usage_limits: Some(UsageLimits {
+                max_total_tokens: Some(25),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .message_store(Arc::clone(&message_store))
+        .state_store(Arc::clone(&state_store))
+        .event_store(event_store.clone())
+        .build_with_stores();
+
+    let (state, _events) = run_recorded(
+        &budget_agent,
+        thread_id.clone(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(matches!(state, AgentRunState::BudgetExceeded { .. }));
+
+    // The synthetic marker turn exists, carries the terminal event, and is
+    // left unfinished.
+    let marker_turn = event_store
+        .get_turn(&thread_id, 2)
+        .await?
+        .context("expected the synthetic marker turn")?;
+    assert!(
+        !marker_turn.finished,
+        "the synthetic terminal turn must stay unfinished",
+    );
+    assert!(
+        marker_turn
+            .events
+            .iter()
+            .any(|e| matches!(e.event, AgentEvent::BudgetExceeded { .. })),
+        "the marker turn must carry the terminal event",
+    );
+
+    // Rerun with the budget removed (same stores, still-failing saves):
+    // must succeed despite the failed terminal save.
+    let unbudgeted_agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::text_response(
+            "recovered",
+        )]))
+        .hooks(AllowAllHooks)
+        .message_store(message_store)
+        .state_store(state_store)
+        .event_store(event_store)
+        .build_with_stores();
+    let (state, _events) = run_recorded(
+        &unbudgeted_agent,
+        thread_id,
+        AgentInput::Text("try again".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "rerun after a failed terminal-seam save must succeed, got {state:?}",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_budget_breach_does_not_consume_max_turns() -> anyhow::Result<()> {
+    // codex's exact scenario: budget breach at turn 1 with max_turns = 2.
+    // The synthetic terminal marker must not advance turn_count, so a rerun
+    // after raising the budget still gets to EXECUTE turn 2 instead of
+    // immediately hitting the max-turns error.
+    let message_store = Arc::new(InMemoryStore::new());
+    let state_store = Arc::new(InMemoryStore::new());
+    let event_store = new_event_store();
+    let thread_id = ThreadId::new();
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+    let budget_agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::tool_use_response(
+            "call_1",
+            "echo",
+            json!({"message": "x"}),
+        )]))
+        .tools(tools)
+        .hooks(AllowAllHooks)
+        .config(AgentConfig {
+            max_turns: Some(2),
+            usage_limits: Some(UsageLimits {
+                max_total_tokens: Some(25),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .message_store(Arc::clone(&message_store))
+        .state_store(Arc::clone(&state_store))
+        .event_store(event_store.clone())
+        .build_with_stores();
+    let (state, _events) = run_recorded(
+        &budget_agent,
+        thread_id.clone(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(
+        matches!(state, AgentRunState::BudgetExceeded { .. }),
+        "turn 1 must breach the budget, got {state:?}",
+    );
+
+    let raised_agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::text_response(
+            "turn two answer",
+        )]))
+        .hooks(AllowAllHooks)
+        .config(AgentConfig {
+            max_turns: Some(2),
+            ..Default::default()
+        })
+        .message_store(message_store)
+        .state_store(state_store)
+        .event_store(event_store)
+        .build_with_stores();
+    let (state, _events) = run_recorded(
+        &raised_agent,
+        thread_id,
+        AgentInput::Text("continue please".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "the rerun must execute turn 2 under max_turns=2, got {state:?}",
+    );
+    assert_eq!(
+        raised_agent.provider.calls(),
+        1,
+        "turn 2 must actually run an LLM call",
     );
 
     Ok(())

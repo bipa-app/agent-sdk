@@ -108,7 +108,14 @@ where
 /// `replace_history` write and report [`LoadedMessages::Cancelled`] so
 /// the turn closes as `Cancelled` with history left untouched.
 pub(super) enum LoadedMessages {
-    Ready(Vec<Message>),
+    Ready {
+        messages: Vec<Message>,
+        /// Provider-billed usage of the compaction summarization call(s)
+        /// that ran while loading (zero when no compaction happened).
+        /// Folded into the run's cumulative usage by the caller so
+        /// compaction spend is visible to budgets and `Done` reporting.
+        compaction_usage: TokenUsage,
+    },
     Cancelled,
 }
 
@@ -223,12 +230,18 @@ where
 
         #[cfg(feature = "otel")]
         record_compaction_skipped(&messages);
-        return Ok(LoadedMessages::Ready(messages));
+        return Ok(LoadedMessages::Ready {
+            messages,
+            compaction_usage: TokenUsage::default(),
+        });
     }
 
     if let Some(compact_config) = compaction_config {
+        // Attach the run's hooks so the summarization call passes the same
+        // pre_llm_request / on_llm_response guardrails as regular turns.
         let default_compactor =
-            LlmContextCompactor::new(Arc::clone(provider), compact_config.clone());
+            LlmContextCompactor::new(Arc::clone(provider), compact_config.clone())
+                .with_guardrail_hooks(Arc::clone(hooks));
         if default_compactor.needs_compaction(&messages) {
             debug!(
                 "Context compaction triggered (turn={}, message_count={})",
@@ -253,7 +266,10 @@ where
         record_compaction_skipped(&messages);
     }
 
-    Ok(LoadedMessages::Ready(messages))
+    Ok(LoadedMessages::Ready {
+        messages,
+        compaction_usage: TokenUsage::default(),
+    })
 }
 
 struct StoredCompactionResult {
@@ -262,6 +278,9 @@ struct StoredCompactionResult {
     new_count: usize,
     original_tokens: usize,
     new_tokens: usize,
+    /// Provider-billed usage of the summarization call(s); see
+    /// [`crate::context::CompactionResult::llm_usage`].
+    llm_usage: TokenUsage,
 }
 
 struct ThresholdCompactionParams<'a, C: ?Sized, H, M> {
@@ -338,12 +357,18 @@ where
                 result.original_count, result.new_count, result.original_tokens, result.new_tokens
             );
 
-            Ok(LoadedMessages::Ready(result.messages))
+            Ok(LoadedMessages::Ready {
+                messages: result.messages,
+                compaction_usage: result.llm_usage,
+            })
         }
         CompactionOutcome::Cancelled => Ok(LoadedMessages::Cancelled),
         CompactionOutcome::Failed(error) => {
             warn!("Context compaction failed, continuing with full history: {error}");
-            Ok(LoadedMessages::Ready(original_messages))
+            Ok(LoadedMessages::Ready {
+                messages: original_messages,
+                compaction_usage: TokenUsage::default(),
+            })
         }
     }
 }
@@ -421,6 +446,7 @@ where
         new_count: result.new_count,
         original_tokens: result.original_tokens,
         new_tokens: result.new_tokens,
+        llm_usage: result.llm_usage,
     };
 
     #[cfg(feature = "otel")]
@@ -1141,15 +1167,34 @@ fn classify_llm_error(msg: &str) -> &'static str {
     }
 }
 
-pub(super) fn apply_turn_usage(ctx: &mut TurnContext, response: &ChatResponse) -> TokenUsage {
+/// Fold one LLM call's usage delta into the run totals and the state's
+/// accumulated cost, priced at the provenance that served the call.
+///
+/// This is the single anchor where usage is committed — once per provider
+/// response (turn calls, guardrail-rejected calls) and once per compaction
+/// summarization — so cost accumulation cannot double-count on retry paths.
+pub(super) fn fold_llm_usage(
+    ctx: &mut TurnContext,
+    provenance: &AuditProvenance,
+    delta: &TokenUsage,
+) {
+    super::budget::accumulate_cost(&mut ctx.state, provenance, &ctx.total_usage, delta);
+    ctx.total_usage.add(delta);
+    ctx.state.total_usage = ctx.total_usage.clone();
+}
+
+pub(super) fn apply_turn_usage(
+    ctx: &mut TurnContext,
+    provenance: &AuditProvenance,
+    response: &ChatResponse,
+) -> TokenUsage {
     let turn_usage = TokenUsage {
         input_tokens: response.usage.input_tokens,
         output_tokens: response.usage.output_tokens,
         cached_input_tokens: response.usage.cached_input_tokens,
         cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
     };
-    ctx.total_usage.add(&turn_usage);
-    ctx.state.total_usage = ctx.total_usage.clone();
+    fold_llm_usage(ctx, provenance, &turn_usage);
 
     // Capture provider-level provenance into the turn context so that
     // the [`agent_sdk_foundation::TurnSummary`] emitted at outcome time
@@ -1693,13 +1738,17 @@ where
 
 /// Outcome of an overflow-driven (emergency) compaction.
 pub(super) enum OverflowCompaction {
-    Done,
+    /// Compaction stored a summarized history; carries the provider-billed
+    /// usage of the summarization call(s) so callers can fold it into the
+    /// run's cumulative usage.
+    Done(TokenUsage),
     /// Cancel fired during the emergency compaction; history untouched.
     Cancelled,
 }
 
-pub(super) async fn compact_after_context_overflow<P, M>(
+pub(super) async fn compact_after_context_overflow<P, H, M>(
     provider: &Arc<P>,
+    hooks: &Arc<H>,
     compaction_config: &CompactionConfig,
     compactor: Option<&Arc<dyn ContextCompactor>>,
     message_store: &Arc<M>,
@@ -1708,6 +1757,7 @@ pub(super) async fn compact_after_context_overflow<P, M>(
 ) -> Result<OverflowCompaction, AgentError>
 where
     P: LlmProvider,
+    H: AgentHooks,
     M: MessageStore,
 {
     let history = message_store
@@ -1733,8 +1783,11 @@ where
         )
         .await
     } else {
+        // Attach the run's hooks so the summarization call passes the same
+        // pre_llm_request / on_llm_response guardrails as regular turns.
         let default_compactor =
-            LlmContextCompactor::new(Arc::clone(provider), compaction_config.clone());
+            LlmContextCompactor::new(Arc::clone(provider), compaction_config.clone())
+                .with_guardrail_hooks(Arc::clone(hooks));
         compact_history_and_store(
             &default_compactor,
             history,
@@ -1754,11 +1807,25 @@ where
                 "Context compacted after overflow (original_tokens={}, new_tokens={})",
                 result.original_tokens, result.new_tokens
             );
-            Ok(OverflowCompaction::Done)
+            Ok(OverflowCompaction::Done(result.llm_usage))
         }
         CompactionOutcome::Cancelled => Ok(OverflowCompaction::Cancelled),
         CompactionOutcome::Failed(error) => Err(error),
     }
+}
+
+/// Inputs shared by the two overflow-recovery entry points
+/// ([`handle_context_window_exceeded`] / [`try_recover_prompt_too_long`]).
+struct OverflowRecoveryParams<'a, P, H, M> {
+    ctx: &'a mut TurnContext,
+    provider: &'a Arc<P>,
+    hooks: &'a Arc<H>,
+    message_store: &'a Arc<M>,
+    compaction_config: Option<&'a CompactionConfig>,
+    compactor: Option<&'a Arc<dyn ContextCompactor>>,
+    /// Run provenance, used to price the emergency compaction's usage.
+    provenance: &'a AuditProvenance,
+    cancel_token: &'a CancellationToken,
 }
 
 pub(super) async fn handle_turn_stop_reason<P, H, M>(
@@ -1776,6 +1843,7 @@ pub(super) async fn handle_turn_stop_reason<P, H, M>(
         event_store,
         hooks,
         authority,
+        provenance,
         cancel_token,
     }: TurnStopReasonParams<'_, P, H, M>,
 ) -> InternalTurnResult
@@ -1838,13 +1906,17 @@ where
         }
         Some(StopReason::ModelContextWindowExceeded) => {
             handle_context_window_exceeded(
-                ctx,
                 turn_usage,
-                provider,
-                message_store,
-                compaction_config,
-                compactor,
-                cancel_token,
+                OverflowRecoveryParams {
+                    ctx,
+                    provider,
+                    hooks,
+                    message_store,
+                    compaction_config,
+                    compactor,
+                    provenance,
+                    cancel_token,
+                },
             )
             .await
         }
@@ -1876,17 +1948,22 @@ where
     }
 }
 
-async fn handle_context_window_exceeded<P, M>(
-    ctx: &mut TurnContext,
+async fn handle_context_window_exceeded<P, H, M>(
     turn_usage: TokenUsage,
-    provider: &Arc<P>,
-    message_store: &Arc<M>,
-    compaction_config: Option<&CompactionConfig>,
-    compactor: Option<&Arc<dyn ContextCompactor>>,
-    cancel_token: &CancellationToken,
+    OverflowRecoveryParams {
+        ctx,
+        provider,
+        hooks,
+        message_store,
+        compaction_config,
+        compactor,
+        provenance,
+        cancel_token,
+    }: OverflowRecoveryParams<'_, P, H, M>,
 ) -> InternalTurnResult
 where
     P: LlmProvider,
+    H: AgentHooks,
     M: MessageStore,
 {
     warn!("Model context window exceeded (turn={})", ctx.turn);
@@ -1911,6 +1988,7 @@ where
     if let Some(compact_config) = compaction_config {
         match compact_after_context_overflow(
             provider,
+            hooks,
             compact_config,
             compactor,
             message_store,
@@ -1919,7 +1997,9 @@ where
         )
         .await
         {
-            Ok(OverflowCompaction::Done) => {}
+            Ok(OverflowCompaction::Done(compaction_usage)) => {
+                fold_llm_usage(ctx, provenance, &compaction_usage);
+            }
             Ok(OverflowCompaction::Cancelled) => {
                 return InternalTurnResult::Cancelled { turn_usage };
             }
@@ -1953,17 +2033,22 @@ fn is_prompt_too_long_error(msg: &str) -> bool {
 
 /// When the prompt exceeds the model's context window at the API level (returned as a 400 error
 /// rather than a `stop_reason`), attempt compaction and retry instead of failing immediately.
-async fn try_recover_prompt_too_long<P, M>(
+async fn try_recover_prompt_too_long<P, H, M>(
     error: &AgentError,
-    ctx: &mut TurnContext,
-    compaction_config: Option<&CompactionConfig>,
-    compactor: Option<&Arc<dyn ContextCompactor>>,
-    provider: &Arc<P>,
-    message_store: &Arc<M>,
-    cancel_token: &CancellationToken,
+    OverflowRecoveryParams {
+        ctx,
+        provider,
+        hooks,
+        message_store,
+        compaction_config,
+        compactor,
+        provenance,
+        cancel_token,
+    }: OverflowRecoveryParams<'_, P, H, M>,
 ) -> Option<InternalTurnResult>
 where
     P: LlmProvider,
+    H: AgentHooks,
     M: MessageStore,
 {
     if is_prompt_too_long_error(&error.message)
@@ -1985,6 +2070,7 @@ where
         );
         match compact_after_context_overflow(
             provider,
+            hooks,
             compact_config,
             compactor,
             message_store,
@@ -1993,7 +2079,9 @@ where
         )
         .await
         {
-            Ok(OverflowCompaction::Done) => {}
+            Ok(OverflowCompaction::Done(compaction_usage)) => {
+                fold_llm_usage(ctx, provenance, &compaction_usage);
+            }
             Ok(OverflowCompaction::Cancelled) => {
                 return Some(InternalTurnResult::Cancelled {
                     turn_usage: TokenUsage::default(),
@@ -2280,7 +2368,17 @@ where
     })
     .await
     {
-        Ok(LoadedMessages::Ready(messages)) => messages,
+        Ok(LoadedMessages::Ready {
+            messages,
+            compaction_usage,
+        }) => {
+            // Compaction summarization is a paid LLM call on this run's
+            // provider: fold its usage (and cost, priced at the run's
+            // provenance) into the cumulative totals so budgets see it and
+            // `Done` does not under-report.
+            fold_llm_usage(ctx, provenance, &compaction_usage);
+            messages
+        }
         Ok(LoadedMessages::Cancelled) => {
             return InternalTurnResult::Cancelled {
                 turn_usage: TokenUsage::default(),
@@ -2327,6 +2425,7 @@ where
         hooks,
         authority,
         turn_options,
+        provenance,
         cancel_token,
         #[cfg(feature = "otel")]
         observability_store,
@@ -2387,6 +2486,10 @@ struct TurnLlmRequestParams<'a, P, H, M, S> {
     hooks: &'a Arc<H>,
     authority: &'a Arc<dyn EventAuthority>,
     turn_options: &'a TurnOptions,
+    /// Run provenance: prices the usage committed by this call's response
+    /// (including guardrail-rejected responses) and any emergency
+    /// compaction it triggers.
+    provenance: &'a AuditProvenance,
     cancel_token: &'a CancellationToken,
     #[cfg(feature = "otel")]
     observability_store: Option<&'a Arc<dyn crate::observability::ObservabilityStore>>,
@@ -2417,6 +2520,7 @@ async fn request_turn_response<P, H, M, S>(
         hooks,
         authority,
         turn_options,
+        provenance,
         cancel_token,
         #[cfg(feature = "otel")]
         observability_store,
@@ -2478,12 +2582,16 @@ where
         LlmOutcome::Error(error) => {
             if let Some(result) = try_recover_prompt_too_long(
                 &error,
-                ctx,
-                compaction_config,
-                compactor,
-                provider,
-                message_store,
-                cancel_token,
+                OverflowRecoveryParams {
+                    ctx,
+                    provider,
+                    hooks,
+                    message_store,
+                    compaction_config,
+                    compactor,
+                    provenance,
+                    cancel_token,
+                },
             )
             .await
             {
@@ -2504,6 +2612,7 @@ where
         hooks,
         authority,
         turn_options,
+        provenance,
     })
     .await?;
 
@@ -2523,6 +2632,8 @@ struct ResponseGuardrailParams<'a, H, M, S> {
     hooks: &'a Arc<H>,
     authority: &'a Arc<dyn EventAuthority>,
     turn_options: &'a TurnOptions,
+    /// Run provenance, used to price the rejected response's usage.
+    provenance: &'a AuditProvenance,
 }
 
 /// Run the `on_llm_response` output guardrail and map its decision onto the
@@ -2542,6 +2653,7 @@ async fn apply_response_guardrail<H, M, S>(
         hooks,
         authority,
         turn_options,
+        provenance,
     }: ResponseGuardrailParams<'_, H, M, S>,
 ) -> Result<(), InternalTurnResult>
 where
@@ -2560,7 +2672,7 @@ where
         super::llm::PostLlmGuardrail::Blocked(reason) => {
             // The provider billed for the rejected response, so its tokens
             // must still land in the cumulative totals before the run ends.
-            apply_turn_usage(ctx, response);
+            apply_turn_usage(ctx, provenance, response);
             Err(guardrail_block_result(
                 &ctx.thread_id,
                 ctx.turn,
@@ -2579,7 +2691,7 @@ where
             // `max_turns: None`, a deterministically-rejecting guardrail
             // would loop forever because `total_usage` never advances and
             // the budget check can never trip.
-            let turn_usage = apply_turn_usage(ctx, response);
+            let turn_usage = apply_turn_usage(ctx, provenance, response);
 
             // Every retry pays for another LLM round-trip; a hook that
             // rejects deterministically must not loop (and bill) forever
@@ -2842,7 +2954,7 @@ where
     M: MessageStore,
     S: StateStore,
 {
-    let turn_usage = apply_turn_usage(ctx, &response);
+    let turn_usage = apply_turn_usage(ctx, provenance, &response);
     let ProcessedTurnResponse {
         stop_reason,
         text_content,
@@ -2948,6 +3060,7 @@ where
         event_store,
         hooks,
         authority,
+        provenance,
         cancel_token,
     })
     .await

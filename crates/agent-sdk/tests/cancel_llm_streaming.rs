@@ -31,8 +31,8 @@ use agent_sdk::llm::{
 };
 use agent_sdk::{
     AgentEvent, AgentInput, AgentRunState, AgentState, AllowAllHooks, CancellationToken,
-    EventStore, InMemoryEventStore, InMemoryStore, MessageStore, StateStore, ThreadId, ToolContext,
-    ToolRegistry, builder,
+    EventStore, InMemoryEventStore, InMemoryStore, MessageStore, StateStore, ThreadId, TokenUsage,
+    ToolContext, ToolRegistry, builder,
 };
 use anyhow::{Context as _, Result, anyhow};
 use async_trait::async_trait;
@@ -403,6 +403,7 @@ impl ContextCompactor for BlockingCompactor {
             new_count: 1,
             original_tokens: 1_000_000,
             new_tokens: 10,
+            llm_usage: TokenUsage::default(),
         })
     }
 }

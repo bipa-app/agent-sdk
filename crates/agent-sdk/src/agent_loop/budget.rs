@@ -66,6 +66,53 @@ fn lookup_capabilities(
     })
 }
 
+/// Whether a usage delta carries no tokens at all.
+#[must_use]
+const fn usage_is_zero(usage: &TokenUsage) -> bool {
+    usage.input_tokens == 0
+        && usage.output_tokens == 0
+        && usage.cached_input_tokens == 0
+        && usage.cache_creation_input_tokens == 0
+}
+
+/// Fold one LLM call's cost into the state's accumulated total, priced at
+/// the provenance that served the call.
+///
+/// `pre_delta_total` is the thread's aggregate usage BEFORE `delta` was
+/// added; when the state predates cost accumulation (`accumulated_cost_usd`
+/// is `None` while usage already exists) it is used to seed the accumulator
+/// once by repricing the aggregate at the current provenance's rates — a
+/// documented best-effort for legacy snapshots (see
+/// [`crate::types::AgentState::accumulated_cost_usd`]). Un-priced deltas
+/// (no pricing metadata) contribute nothing and never turn the accumulator
+/// `Some` on their own.
+pub(super) fn accumulate_cost(
+    state: &mut crate::types::AgentState,
+    provenance: &AuditProvenance,
+    pre_delta_total: &TokenUsage,
+    delta: &TokenUsage,
+) {
+    if state.accumulated_cost_usd.is_none() && !usage_is_zero(pre_delta_total) {
+        state.accumulated_cost_usd = estimate_cost_usd(provenance, pre_delta_total);
+    }
+    if let Some(delta_cost) = estimate_cost_usd(provenance, delta) {
+        state.accumulated_cost_usd = Some(state.accumulated_cost_usd.unwrap_or(0.0) + delta_cost);
+    }
+}
+
+/// The run's estimated cost so far: the per-call accumulated total when
+/// tracked, falling back to repricing the aggregate usage at the current
+/// provenance (legacy snapshots / states that never saw a priced call —
+/// best-effort, may misprice history across model rotations).
+#[must_use]
+pub(super) fn run_cost_usd(
+    accumulated: Option<f64>,
+    provenance: &AuditProvenance,
+    usage: &TokenUsage,
+) -> Option<f64> {
+    accumulated.or_else(|| estimate_cost_usd(provenance, usage))
+}
+
 /// Total billable tokens for budgeting: input + output summed.
 ///
 /// Cache-creation / cache-read counts are already components of

@@ -1,8 +1,10 @@
 //! Context compaction implementation.
 
+use crate::hooks::{AgentHooks, DefaultHooks, RequestDecision, ResponseDecision};
 use crate::llm::{
     ChatOutcome, ChatRequest, Content, ContentBlock, LlmProvider, Message, Role, StopReason,
 };
+use crate::types::TokenUsage;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use std::fmt::Write;
@@ -60,6 +62,13 @@ pub struct CompactionResult {
     pub original_tokens: usize,
     /// Estimated tokens after compaction.
     pub new_tokens: usize,
+    /// Provider-billed usage of the summarization LLM call(s) that produced
+    /// this result (zero when compaction completed without an LLM call).
+    ///
+    /// Surfaced so the agent loop can fold compaction spend into the run's
+    /// cumulative usage — otherwise summarization tokens would be invisible
+    /// to `UsageLimits` budgets and under-reported on `Done`.
+    pub llm_usage: TokenUsage,
 }
 
 /// LLM-based context compactor.
@@ -72,9 +81,14 @@ pub struct CompactionResult {
 /// type wraps whichever concrete provider the host's resolver picks).
 /// Concrete-type users (`Arc<AnthropicProvider>`, etc.) still work
 /// unchanged.
-pub struct LlmContextCompactor<P: LlmProvider + ?Sized> {
+pub struct LlmContextCompactor<P: LlmProvider + ?Sized, H: AgentHooks = DefaultHooks> {
     provider: Arc<P>,
     config: CompactionConfig,
+    /// Guardrail hooks applied to the summarization LLM call. `None` (the
+    /// default) skips the guardrails, preserving the historical behavior for
+    /// direct constructions; the agent loop always attaches its run hooks so
+    /// compaction cannot bypass `pre_llm_request` / `on_llm_response`.
+    hooks: Option<Arc<H>>,
     system_prompt: String,
     summary_prompt_prefix: String,
     summary_prompt_suffix: String,
@@ -87,6 +101,7 @@ impl<P: LlmProvider + ?Sized> LlmContextCompactor<P> {
         Self {
             provider,
             config,
+            hooks: None,
             system_prompt: COMPACTION_SYSTEM_PROMPT.to_string(),
             summary_prompt_prefix: COMPACTION_SUMMARY_PROMPT_PREFIX.to_string(),
             summary_prompt_suffix: COMPACTION_SUMMARY_PROMPT_SUFFIX.to_string(),
@@ -97,6 +112,34 @@ impl<P: LlmProvider + ?Sized> LlmContextCompactor<P> {
     #[must_use]
     pub fn with_defaults(provider: Arc<P>) -> Self {
         Self::new(provider, CompactionConfig::default())
+    }
+}
+
+impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
+    /// Apply the run's guardrail hooks to every summarization LLM call.
+    ///
+    /// `pre_llm_request` runs before the call (`Proceed`/`Modify` apply;
+    /// `Block` aborts the compaction attempt with an error) and
+    /// `on_llm_response` runs on the produced summary (`Accept` applies;
+    /// `Block` **and** `RetryWithFeedback` abort the compaction attempt —
+    /// the compactor never retries a rejected summary, so a
+    /// deterministically-rejecting hook cannot start a paid retry loop
+    /// here). An aborted compaction surfaces as a `compact_history` error;
+    /// the agent loop then continues with the uncompacted history
+    /// (threshold trigger) or fails the recovery (overflow trigger).
+    #[must_use]
+    pub fn with_guardrail_hooks<H2: AgentHooks>(
+        self,
+        hooks: Arc<H2>,
+    ) -> LlmContextCompactor<P, H2> {
+        LlmContextCompactor {
+            provider: self.provider,
+            config: self.config,
+            hooks: Some(hooks),
+            system_prompt: self.system_prompt,
+            summary_prompt_prefix: self.summary_prompt_prefix,
+            summary_prompt_suffix: self.summary_prompt_suffix,
+        }
     }
 
     /// Get the configuration.
@@ -470,10 +513,18 @@ impl<P: LlmProvider + ?Sized> LlmContextCompactor<P> {
         )
     }
 
-    /// Run a single summarization LLM call, returning the summary text and
-    /// whether the response was truncated by the `max_tokens` budget.
-    async fn run_summarization(&self, prompt: String, max_tokens: usize) -> Result<(String, bool)> {
-        let request = ChatRequest {
+    /// Run a single summarization LLM call, applying the configured
+    /// guardrail hooks around it.
+    ///
+    /// The returned [`SummarizationCall`] reports whether the response hit
+    /// the `max_tokens` budget and carries the provider-billed usage so the
+    /// caller can surface compaction spend to the agent loop's budgets.
+    async fn run_summarization(
+        &self,
+        prompt: String,
+        max_tokens: usize,
+    ) -> Result<SummarizationCall> {
+        let mut request = ChatRequest {
             system: self.system_prompt.clone(),
             messages: vec![Message::user(prompt)],
             tools: None,
@@ -487,6 +538,21 @@ impl<P: LlmProvider + ?Sized> LlmContextCompactor<P> {
             cache: None,
         };
 
+        // Input guardrail: the summarization call goes through the same
+        // `pre_llm_request` hook as regular turns, so compaction cannot be
+        // used to smuggle history past a request policy.
+        if let Some(hooks) = &self.hooks {
+            match hooks.pre_llm_request(&request).await {
+                RequestDecision::Modify(modified) => request = *modified,
+                RequestDecision::Block(reason) => {
+                    bail!("Summarization request blocked by guardrail: {reason}")
+                }
+                // `Proceed`, plus any future `#[non_exhaustive]` variant,
+                // sends the request unchanged (mirrors the agent loop).
+                _ => {}
+            }
+        }
+
         let outcome = self
             .provider
             .chat(request)
@@ -495,12 +561,44 @@ impl<P: LlmProvider + ?Sized> LlmContextCompactor<P> {
 
         match outcome {
             ChatOutcome::Success(response) => {
+                // Output guardrail: a rejected summary aborts the compaction
+                // attempt so it is never persisted. `RetryWithFeedback` is
+                // deliberately NOT retried here — the compactor has no
+                // feedback loop, and honoring it would let a
+                // deterministically-rejecting hook start a paid retry loop
+                // inside compaction.
+                if let Some(hooks) = &self.hooks {
+                    match hooks.on_llm_response(&response).await {
+                        ResponseDecision::Block(reason) => {
+                            bail!("Summarization response blocked by guardrail: {reason}")
+                        }
+                        ResponseDecision::RetryWithFeedback(reason) => {
+                            bail!(
+                                "Summarization response rejected by guardrail \
+                                 (RetryWithFeedback is not retried during compaction): {reason}"
+                            )
+                        }
+                        // `Accept`, plus any future `#[non_exhaustive]`
+                        // variant, keeps the summary (mirrors the agent loop).
+                        _ => {}
+                    }
+                }
                 let truncated = response.stop_reason == Some(StopReason::MaxTokens);
+                let usage = TokenUsage {
+                    input_tokens: response.usage.input_tokens,
+                    output_tokens: response.usage.output_tokens,
+                    cached_input_tokens: response.usage.cached_input_tokens,
+                    cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
+                };
                 let text = response
                     .first_text()
                     .map(String::from)
                     .context("No text in summarization response")?;
-                Ok((text, truncated))
+                Ok(SummarizationCall {
+                    text,
+                    truncated,
+                    usage,
+                })
             }
             ChatOutcome::RateLimited(_) => {
                 bail!("Rate limited during summarization")
@@ -518,11 +616,15 @@ impl<P: LlmProvider + ?Sized> LlmContextCompactor<P> {
             }
         }
     }
-}
 
-#[async_trait]
-impl<P: LlmProvider + ?Sized> ContextCompactor for LlmContextCompactor<P> {
-    async fn compact(&self, messages: &[Message]) -> Result<String> {
+    /// Summarize `messages`, tracking the provider-billed usage of every
+    /// LLM call made (including the enlarged-budget retry on truncation).
+    ///
+    /// This is the usage-aware core behind both the
+    /// [`ContextCompactor::compact`] trait method (which discards the usage
+    /// for backward compatibility) and [`ContextCompactor::compact_history`]
+    /// (which surfaces it via [`CompactionResult::llm_usage`]).
+    async fn summarize_with_usage(&self, messages: &[Message]) -> Result<(String, TokenUsage)> {
         // Separate prior compaction summaries (whose prose must be carried
         // forward) from fresh messages (which still need summarizing). Prior
         // summaries used to be filtered out and silently dropped, destroying
@@ -543,27 +645,30 @@ impl<P: LlmProvider + ?Sized> ContextCompactor for LlmContextCompactor<P> {
         // (no LLM call needed) rather than discarding them.
         if fresh.is_empty() {
             if prior_summaries.is_empty() {
-                return Ok(COMPACT_EMPTY_SUMMARY.to_string());
+                return Ok((COMPACT_EMPTY_SUMMARY.to_string(), TokenUsage::default()));
             }
-            return Ok(prior_summaries.join("\n\n"));
+            return Ok((prior_summaries.join("\n\n"), TokenUsage::default()));
         }
 
         let messages_text = Self::format_messages_for_summary(fresh.iter().copied());
         let prompt = self.build_summary_prompt(&prior_summaries, &messages_text);
 
         let budget = self.config.summary_max_tokens;
-        let (mut summary, truncated) = self.run_summarization(prompt.clone(), budget).await?;
+        let first = self.run_summarization(prompt.clone(), budget).await?;
+        let mut summary = first.text;
+        let mut total_usage = first.usage;
 
-        if truncated {
+        if first.truncated {
             log::warn!(
                 "compaction summary hit the max_tokens budget ({budget}); \
                  retrying with a larger budget to avoid silent context loss"
             );
-            let (retry_summary, still_truncated) = self
+            let retry = self
                 .run_summarization(prompt, budget.saturating_mul(2))
                 .await?;
-            summary = retry_summary;
-            if still_truncated {
+            total_usage.add(&retry.usage);
+            summary = retry.text;
+            if retry.truncated {
                 log::warn!(
                     "compaction summary still truncated after retry; appending a \
                      truncation marker so downstream context loss is visible"
@@ -572,6 +677,21 @@ impl<P: LlmProvider + ?Sized> ContextCompactor for LlmContextCompactor<P> {
             }
         }
 
+        Ok((summary, total_usage))
+    }
+}
+
+/// Outcome of one summarization LLM round-trip.
+struct SummarizationCall {
+    text: String,
+    truncated: bool,
+    usage: TokenUsage,
+}
+
+#[async_trait]
+impl<P: LlmProvider + ?Sized, H: AgentHooks> ContextCompactor for LlmContextCompactor<P, H> {
+    async fn compact(&self, messages: &[Message]) -> Result<String> {
+        let (summary, _usage) = self.summarize_with_usage(messages).await?;
         Ok(summary)
     }
 
@@ -618,6 +738,7 @@ impl<P: LlmProvider + ?Sized> ContextCompactor for LlmContextCompactor<P> {
                 new_count: original_count,
                 original_tokens,
                 new_tokens: original_tokens,
+                llm_usage: TokenUsage::default(),
             });
         }
 
@@ -629,6 +750,7 @@ impl<P: LlmProvider + ?Sized> ContextCompactor for LlmContextCompactor<P> {
                 new_count: original_count,
                 original_tokens,
                 new_tokens: original_tokens,
+                llm_usage: TokenUsage::default(),
             });
         }
 
@@ -646,7 +768,7 @@ impl<P: LlmProvider + ?Sized> ContextCompactor for LlmContextCompactor<P> {
         let to_summarize = messages;
 
         // Summarize old messages
-        let summary = self.compact(&to_summarize).await?;
+        let (summary, llm_usage) = self.summarize_with_usage(&to_summarize).await?;
 
         // Build new message history
         let mut new_messages = Vec::with_capacity(2 + to_keep.len());
@@ -680,6 +802,7 @@ impl<P: LlmProvider + ?Sized> ContextCompactor for LlmContextCompactor<P> {
             new_count,
             original_tokens,
             new_tokens,
+            llm_usage,
         })
     }
 }
@@ -1664,6 +1787,174 @@ mod tests {
         assert_eq!(recorded.len(), 2, "truncation should trigger one retry");
         drop(recorded);
 
+        Ok(())
+    }
+
+    /// Long-enough history that `compact_history` performs a real
+    /// summarization call (more messages than `retain_recent`).
+    fn summarizable_messages() -> Vec<Message> {
+        vec![
+            Message::user("First question with enough words to summarize meaningfully."),
+            Message::assistant("First answer, also carrying plenty of prose to compact."),
+            Message::user("Second question continuing the earlier conversation topic."),
+            Message::assistant("Second answer expanding on the topic at some length."),
+            Message::user("Third question?"),
+            Message::assistant("Third answer."),
+        ]
+    }
+
+    struct BlockRequestHooks;
+
+    #[async_trait]
+    impl crate::hooks::AgentHooks for BlockRequestHooks {
+        async fn pre_llm_request(&self, _request: &ChatRequest) -> RequestDecision {
+            RequestDecision::Block("summaries are not allowed".to_string())
+        }
+    }
+
+    struct ModifyRequestHooks;
+
+    #[async_trait]
+    impl crate::hooks::AgentHooks for ModifyRequestHooks {
+        async fn pre_llm_request(&self, request: &ChatRequest) -> RequestDecision {
+            let mut modified = request.clone();
+            modified.messages = vec![Message::user("MODIFIED_SUMMARY_PROMPT")];
+            RequestDecision::Modify(Box::new(modified))
+        }
+    }
+
+    struct BlockResponseHooks;
+
+    #[async_trait]
+    impl crate::hooks::AgentHooks for BlockResponseHooks {
+        async fn on_llm_response(&self, _response: &ChatResponse) -> ResponseDecision {
+            ResponseDecision::Block("summary leaks a secret".to_string())
+        }
+    }
+
+    struct RetryResponseHooks;
+
+    #[async_trait]
+    impl crate::hooks::AgentHooks for RetryResponseHooks {
+        async fn on_llm_response(&self, _response: &ChatResponse) -> ResponseDecision {
+            ResponseDecision::RetryWithFeedback("try harder".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn blocking_request_hook_aborts_compaction_before_the_llm_call() -> Result<()> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(MockProvider::new_with_request_log(
+            "summary",
+            requests.clone(),
+        ));
+        let config = CompactionConfig::default().with_retain_recent(2);
+        let compactor = LlmContextCompactor::new(provider, config)
+            .with_guardrail_hooks(Arc::new(BlockRequestHooks));
+
+        let error = match compactor.compact_history(summarizable_messages()).await {
+            Ok(result) => anyhow::bail!("blocked compaction must not succeed: {result:?}"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("blocked by guardrail"),
+            "unexpected error: {error}"
+        );
+
+        let recorded = requests
+            .lock()
+            .map_err(|_| anyhow::anyhow!("request log poisoned"))?;
+        assert!(
+            recorded.is_empty(),
+            "a blocked request must never reach the provider"
+        );
+        drop(recorded);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn modify_request_hook_reaches_the_provider() -> Result<()> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(MockProvider::new_with_request_log(
+            "summary",
+            requests.clone(),
+        ));
+        let config = CompactionConfig::default().with_retain_recent(2);
+        let compactor = LlmContextCompactor::new(provider, config)
+            .with_guardrail_hooks(Arc::new(ModifyRequestHooks));
+
+        let result = compactor.compact_history(summarizable_messages()).await?;
+        assert!(result.new_count < result.original_count);
+
+        let recorded = requests
+            .lock()
+            .map_err(|_| anyhow::anyhow!("request log poisoned"))?;
+        assert_eq!(
+            recorded.as_slice(),
+            ["MODIFIED_SUMMARY_PROMPT"],
+            "the provider must receive the hook-modified request"
+        );
+        drop(recorded);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blocked_response_aborts_compaction() -> Result<()> {
+        let provider = Arc::new(MockProvider::new("a summary that leaks the secret"));
+        let config = CompactionConfig::default().with_retain_recent(2);
+        let compactor = LlmContextCompactor::new(provider, config)
+            .with_guardrail_hooks(Arc::new(BlockResponseHooks));
+
+        let error = match compactor.compact_history(summarizable_messages()).await {
+            Ok(result) => anyhow::bail!("blocked summary must not be returned: {result:?}"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("blocked by guardrail"),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retry_with_feedback_response_aborts_compaction_without_retrying() -> Result<()> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(MockProvider::new_with_request_log(
+            "summary",
+            requests.clone(),
+        ));
+        let config = CompactionConfig::default().with_retain_recent(2);
+        let compactor = LlmContextCompactor::new(provider, config)
+            .with_guardrail_hooks(Arc::new(RetryResponseHooks));
+
+        let error = match compactor.compact_history(summarizable_messages()).await {
+            Ok(result) => anyhow::bail!("rejected summary must not be returned: {result:?}"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("not retried during compaction"),
+            "unexpected error: {error}"
+        );
+
+        // No paid retry loop: exactly one LLM call was made.
+        let recorded = requests
+            .lock()
+            .map_err(|_| anyhow::anyhow!("request log poisoned"))?;
+        assert_eq!(recorded.len(), 1, "RetryWithFeedback must not retry");
+        drop(recorded);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compact_history_reports_summarization_usage() -> Result<()> {
+        let provider = Arc::new(MockProvider::new("summary"));
+        let config = CompactionConfig::default().with_retain_recent(2);
+        let compactor = LlmContextCompactor::new(provider, config);
+
+        let result = compactor.compact_history(summarizable_messages()).await?;
+        // The mock bills 100 input / 50 output per call; one call was made.
+        assert_eq!(result.llm_usage.input_tokens, 100);
+        assert_eq!(result.llm_usage.output_tokens, 50);
         Ok(())
     }
 }

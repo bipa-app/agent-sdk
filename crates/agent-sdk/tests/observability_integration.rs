@@ -14,7 +14,7 @@ use agent_sdk::observability::{
 };
 use agent_sdk::{
     AgentInput, AgentState, AllowAllHooks, CancellationToken, DynamicToolName, InMemoryEventStore,
-    InMemoryStore, LlmProvider, MessageStore, StateStore, ThreadId, Tool, ToolContext,
+    InMemoryStore, LlmProvider, MessageStore, StateStore, ThreadId, TokenUsage, Tool, ToolContext,
     ToolRegistry, ToolResult, ToolTier, TurnOptions, builder,
 };
 use anyhow::{Context, Result, anyhow};
@@ -3380,6 +3380,7 @@ mod metrics {
                 original_tokens: 100,
                 new_tokens: 250,
                 messages,
+                llm_usage: TokenUsage::default(),
             })
         }
     }

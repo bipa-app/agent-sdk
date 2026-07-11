@@ -326,6 +326,19 @@ pub struct AgentState {
     /// older snapshots, defaulting to zero.
     #[serde(default)]
     pub guardrail_retries: usize,
+    /// Estimated USD cost accumulated across the thread's LLM calls.
+    ///
+    /// Each call's usage is priced at the provider/model that served it and
+    /// added here, so a thread that rotates models keeps the true sum
+    /// instead of repricing its whole history at the newest model's rates.
+    /// `None` means no priced usage has been tracked yet: a fresh thread
+    /// before its first priced call, a thread whose models have no pricing
+    /// metadata, or a snapshot predating this field. Legacy snapshots are
+    /// seeded once (best-effort) by repricing the aggregate usage at the
+    /// rates current when the thread next runs, then accumulate normally.
+    /// Additive and wire-compatible via `#[serde(default)]`.
+    #[serde(default)]
+    pub accumulated_cost_usd: Option<f64>,
 }
 
 impl AgentState {
@@ -338,6 +351,7 @@ impl AgentState {
             metadata: HashMap::new(),
             created_at: OffsetDateTime::now_utc(),
             guardrail_retries: 0,
+            accumulated_cost_usd: None,
         }
     }
 }

@@ -381,6 +381,7 @@ mod tests {
             metadata: std::collections::HashMap::default(),
             created_at: t0(),
             guardrail_retries: 0,
+            accumulated_cost_usd: None,
         })?;
 
         s.commit_turn(
@@ -455,6 +456,7 @@ mod tests {
             metadata: std::collections::HashMap::default(),
             created_at: t0(),
             guardrail_retries: 0,
+            accumulated_cost_usd: None,
         })?;
 
         s.commit_turn(

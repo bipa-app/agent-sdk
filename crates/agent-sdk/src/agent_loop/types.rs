@@ -673,6 +673,9 @@ pub(super) struct TurnStopReasonParams<'a, P, H, M> {
     pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) hooks: &'a Arc<H>,
     pub(super) authority: &'a Arc<dyn EventAuthority>,
+    /// Run provenance, used to price the usage of any emergency compaction
+    /// triggered by `ModelContextWindowExceeded`.
+    pub(super) provenance: &'a AuditProvenance,
     /// Run-level cancellation token, forwarded into the overflow-driven
     /// compaction path triggered by `ModelContextWindowExceeded`.
     pub(super) cancel_token: &'a CancellationToken,

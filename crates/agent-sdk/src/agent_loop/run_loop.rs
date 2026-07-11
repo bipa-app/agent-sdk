@@ -1122,7 +1122,11 @@ fn done_run_state(ctx: &TurnContext, provenance: &AuditProvenance) -> AgentRunSt
     AgentRunState::Done {
         total_turns: turns_to_u32(ctx.turn),
         total_usage: ctx.total_usage.clone(),
-        estimated_cost_usd: budget::estimate_cost_usd(provenance, &ctx.total_usage),
+        estimated_cost_usd: budget::run_cost_usd(
+            ctx.state.accumulated_cost_usd,
+            provenance,
+            &ctx.total_usage,
+        ),
     }
 }
 
@@ -1131,14 +1135,18 @@ fn done_run_state(ctx: &TurnContext, provenance: &AuditProvenance) -> AgentRunSt
 /// Returns `Some((limit, estimated_cost))` when a configured limit has been
 /// exceeded — the cost is carried alongside so terminal events / states can
 /// report it — and `None` when budgeting is disabled or the run is still
-/// within budget.
+/// within budget. `accumulated_cost_usd` is the state's per-call cost
+/// accumulator (see [`crate::types::AgentState::accumulated_cost_usd`]);
+/// when absent the aggregate is repriced at the current provenance as a
+/// best-effort fallback for legacy snapshots.
 fn budget_status(
     usage_limits: Option<&UsageLimits>,
     provenance: &AuditProvenance,
     usage: &TokenUsage,
+    accumulated_cost_usd: Option<f64>,
 ) -> Option<(BudgetLimitKind, Option<f64>)> {
     let limits = usage_limits?;
-    let cost = budget::estimate_cost_usd(provenance, usage);
+    let cost = budget::run_cost_usd(accumulated_cost_usd, provenance, usage);
     let limit = budget::check_budget(limits, usage, cost)?;
     Some((limit, cost))
 }
@@ -1170,7 +1178,12 @@ where
     // A load failure is deliberately not surfaced here: initialization
     // performs its own load and reports the error through the normal path.
     let state = state_store.load(thread_id).await.ok().flatten()?;
-    let (limit, cost) = budget_status(usage_limits, provenance, &state.total_usage)?;
+    let (limit, cost) = budget_status(
+        usage_limits,
+        provenance,
+        &state.total_usage,
+        state.accumulated_cost_usd,
+    )?;
     Some((state, limit, cost))
 }
 
@@ -1368,54 +1381,39 @@ where
     .await
 }
 
-/// Close a synthetic (never-executed) turn a terminal event was keyed
-/// under and persist the state with `turn_count` advanced to it.
-///
-/// Terminal events emitted *between* turns (budget stop, between-turns
-/// cancel) cannot append to the previous turn — it was already closed via
-/// `finish_turn` — so they are keyed under the next, never-started turn and
-/// that turn is finished too. The persisted `turn_count` must advance with
-/// it: otherwise the next run on this thread seeds its counter from the
-/// stale value, `begin_turn` re-enters the already-finished synthetic turn,
-/// and the event store rejects the `Start` append ("cannot append to
-/// finished turn"), permanently bricking the thread.
-async fn close_synthetic_terminal_turn<S>(
-    ctx: &TurnContext,
-    event_store: &Arc<dyn EventStore>,
-    state_store: &Arc<S>,
-    event_turn: usize,
-) where
-    S: StateStore,
-{
-    // Save the state BEFORE finishing the event-store turn: a crash between
-    // the two steps then leaves an advanced counter pointing past an
-    // unfinished turn — benign, the next run simply keys a fresh turn —
-    // whereas the reverse order would leave a finished turn with a stale
-    // counter, which bricks the thread.
-    let mut state = ctx.state.clone();
-    state.turn_count = event_turn;
-    state.total_usage = ctx.total_usage.clone();
-    if let Err(error) = state_store.save(&state).await {
-        warn!("Failed to save state after synthetic terminal turn {event_turn}: {error}");
-    }
-    if let Err(error) = finish_turn_or_error(event_store, &ctx.thread_id, event_turn).await {
-        warn!(
-            "Failed to finish synthetic terminal turn {event_turn}: {}",
-            error.message
-        );
-    }
-}
+// ── Synthetic terminal markers ─────────────────────────────────────────
+//
+// Terminal events emitted *between* turns (budget stop, between-turns
+// cancel, over-budget entry rejection) cannot append to the previous turn —
+// it was already closed via `finish_turn` — so they are keyed under the
+// next, never-executed turn. That synthetic turn is deliberately left
+// **unfinished** and `turn_count` is NOT advanced past it:
+//
+// - Appends to unfinished turns are allowed, so the next run on the thread
+//   simply re-enters the synthetic turn (`begin_turn` appends its `Start`
+//   after the marker) — no "cannot append to finished turn" brick, and no
+//   crash window between a state save and a turn finish can recreate one.
+// - The marker never consumes an executed turn: a budget breach at turn 1
+//   under `max_turns = 2` leaves `turn_count = 1`, so a rerun after raising
+//   the budget still gets to execute turn 2.
+// - Streaming/replay consumers do not depend on the turn being finished:
+//   the terminal event itself is the closing marker (`run_stream` forwards
+//   it; the host's follow streams close on `is_done_event`, which matches
+//   the event, not the turn-finish barrier).
 
-/// Best-effort persist of the run state when a **real** turn ends the run
-/// terminally (refusal, mid-turn cancel).
+/// Best-effort persist of the run state when a turn (real or synthetic)
+/// ends the run terminally (refusal, mid-turn cancel, budget stop).
 ///
-/// `begin_turn` already advanced `ctx.state.turn_count` to the current turn,
-/// but nothing else on these paths writes it back to the store. Without this
-/// save the next run on the thread seeds a stale turn counter, `begin_turn`
-/// re-enters the finished turn, and the event store rejects the append
-/// ("cannot append to finished turn") — the same brick as the
-/// synthetic-turn seams (see [`close_synthetic_terminal_turn`]). The save is
-/// best-effort so a state-store failure never masks the terminal outcome.
+/// `begin_turn` already advanced `ctx.state.turn_count` to the last
+/// executed turn, but nothing else on these paths writes it back to the
+/// store — and the terminal seams are the last chance to persist the run's
+/// final usage/cost accounting. Without this save the next run on the
+/// thread seeds a stale turn counter, `begin_turn` re-enters the finished
+/// turn, and the event store rejects the append ("cannot append to finished
+/// turn"). The save is best-effort so a state-store failure never masks the
+/// terminal outcome; the synthetic marker turn is never finished, so a
+/// failed save here cannot brick the thread either (see the module note
+/// above).
 async fn persist_terminal_turn_state<S>(ctx: &TurnContext, state_store: &Arc<S>)
 where
     S: StateStore,
@@ -1434,8 +1432,9 @@ where
 /// Mirrors [`emit_cancelled_event`]: the previous turn was already closed
 /// by the in-loop result handler, so the terminal event is keyed under
 /// `ctx.turn + 1` to avoid appending to a finished turn. The synthetic turn
-/// is then closed and the state persisted with `turn_count` advanced to it
-/// (see [`close_synthetic_terminal_turn`]) so the thread stays runnable.
+/// is left unfinished and `turn_count` is not advanced (see the synthetic
+/// terminal markers note above), so a rerun re-enters it without bricking
+/// or consuming an executed turn.
 async fn budget_exceeded_run_state<H, S>(
     ctx: &TurnContext,
     event_store: &Arc<dyn EventStore>,
@@ -1473,7 +1472,7 @@ where
     {
         return AgentRunState::Error(error);
     }
-    close_synthetic_terminal_turn(ctx, event_store, state_store, event_turn).await;
+    persist_terminal_turn_state(ctx, state_store).await;
     AgentRunState::BudgetExceeded {
         total_turns: turns_to_u32(ctx.turn),
         total_usage: ctx.total_usage.clone(),
@@ -1594,7 +1593,12 @@ where
     // parking on the input channel. Otherwise an over-budget run would sit
     // waiting, accept a later prompt into history, and then terminate
     // without answering it — consuming the caller's message for nothing.
-    if let Some((limit, cost)) = budget_status(usage_limits, provenance, &ctx.total_usage) {
+    if let Some((limit, cost)) = budget_status(
+        usage_limits,
+        provenance,
+        &ctx.total_usage,
+        ctx.state.accumulated_cost_usd,
+    ) {
         return Some(
             budget_exceeded_run_state(ctx, event_store, state_store, hooks, authority, limit, cost)
                 .await,
@@ -1666,14 +1670,16 @@ where
             );
             // `current_turn` was just closed by
             // `emit_persistent_turn_complete`; key the terminal event
-            // under the next turn so the append is accepted.
+            // under the next turn so the append is accepted. The synthetic
+            // turn stays unfinished and `turn_count` untouched (see the
+            // synthetic terminal markers note); the state was already
+            // persisted right after the turn completed above.
             let event_turn = current_turn.saturating_add(1);
             if let Err(error) =
                 emit_cancelled_event(ctx, event_store, hooks, authority, event_turn).await
             {
                 return Some(AgentRunState::Error(error));
             }
-            close_synthetic_terminal_turn(ctx, event_store, state_store, event_turn).await;
             Some(cancelled_run_state(ctx))
         }
     }
@@ -1848,7 +1854,8 @@ where
     }
 
     let duration = ctx.start_time.elapsed();
-    let estimated_cost_usd = budget::estimate_cost_usd(provenance, &ctx.total_usage);
+    let estimated_cost_usd =
+        budget::run_cost_usd(ctx.state.accumulated_cost_usd, provenance, &ctx.total_usage);
     if let Err(error) = send_event(
         event_store,
         &ctx.thread_id,
@@ -1930,15 +1937,17 @@ where
             // The previous turn (`ctx.turn`) was already finished by
             // the in-loop result handler, so key the terminal event
             // under the next (never-started) turn to avoid appending to
-            // a closed turn, then close it and persist the advanced
-            // turn counter so the thread stays runnable.
+            // a closed turn. The synthetic turn stays unfinished and
+            // `turn_count` untouched (see the synthetic terminal markers
+            // note), so a rerun re-enters it without bricking or
+            // consuming an executed turn.
             let event_turn = ctx.turn.saturating_add(1);
             if let Err(error) =
                 emit_cancelled_event(ctx, event_store, hooks, authority, event_turn).await
             {
                 return Some(AgentRunState::Error(error));
             }
-            close_synthetic_terminal_turn(ctx, event_store, state_store, event_turn).await;
+            persist_terminal_turn_state(ctx, state_store).await;
             return Some(cancelled_run_state(ctx));
         }
 
@@ -1947,9 +1956,12 @@ where
         // dispatch edge with the same code: the first turn of a run on a
         // thread whose usage was rehydrated from state, the turn following
         // a completed resume, and every loop-back after a completed turn.
-        if let Some((limit, cost)) =
-            budget_status(config.usage_limits.as_ref(), provenance, &ctx.total_usage)
-        {
+        if let Some((limit, cost)) = budget_status(
+            config.usage_limits.as_ref(),
+            provenance,
+            &ctx.total_usage,
+            ctx.state.accumulated_cost_usd,
+        ) {
             return Some(
                 budget_exceeded_run_state(
                     ctx,
@@ -2197,6 +2209,7 @@ where
 {
     let mut updated_state = state;
     updated_state.turn_count = turn;
+    let accumulated_cost_usd = updated_state.accumulated_cost_usd;
     if let Err(error) = state_store.save(&updated_state).await {
         warn!("Failed to save state checkpoint: {error}");
     }
@@ -2223,7 +2236,8 @@ where
     // limits and yield the terminal outcome instead. The event is
     // keyed under `turn`, which is still open — the resume-state
     // wrapper finishes it after this returns.
-    if let Some((limit, estimated_cost_usd)) = budget_status(usage_limits, provenance, &total_usage)
+    if let Some((limit, estimated_cost_usd)) =
+        budget_status(usage_limits, provenance, &total_usage, accumulated_cost_usd)
     {
         warn!("Run-level usage budget exceeded on resume (turn={turn}, limit={limit:?})");
         if let Err(error) = send_event(
@@ -2922,9 +2936,12 @@ where
     // the cumulative usage rehydrated from state BEFORE dispatching the
     // turn, so a fresh `run_turn` (or a `SubmitToolResults` follow-up) on a
     // thread that already crossed a limit terminates without an LLM call.
-    if let Some((limit, estimated_cost_usd)) =
-        budget_status(config.usage_limits.as_ref(), &provenance, &ctx.total_usage)
-    {
+    if let Some((limit, estimated_cost_usd)) = budget_status(
+        config.usage_limits.as_ref(),
+        &provenance,
+        &ctx.total_usage,
+        ctx.state.accumulated_cost_usd,
+    ) {
         return budget_exceeded_before_single_turn(BudgetBeforeSingleTurnParams {
             ctx: &ctx,
             event_store: &event_store,
@@ -3014,11 +3031,11 @@ struct BudgetBeforeSingleTurnParams<'a, H, S> {
 ///
 /// The terminal [`AgentEvent::BudgetExceeded`] is keyed under `event_turn`
 /// (the turn that would have run — never started, so the append is
-/// accepted), the synthetic turn is closed, and the state's `turn_count` is
-/// advanced past it (see [`close_synthetic_terminal_turn`]) so the thread
-/// stays runnable. A failed terminal-event append is surfaced as
-/// [`TurnOutcome::Error`], matching how the `Done` path treats terminal
-/// persistence failures.
+/// accepted); the synthetic turn stays unfinished and `turn_count`
+/// untouched (see the synthetic terminal markers note), so a later
+/// `run_turn` re-enters it without bricking or consuming an executed turn.
+/// A failed terminal-event append is surfaced as [`TurnOutcome::Error`],
+/// matching how the `Done` path treats terminal persistence failures.
 async fn budget_exceeded_before_single_turn<H, S>(
     BudgetBeforeSingleTurnParams {
         ctx,
@@ -3060,7 +3077,7 @@ where
     {
         return TurnOutcome::Error(error);
     }
-    close_synthetic_terminal_turn(ctx, event_store, state_store, event_turn).await;
+    persist_terminal_turn_state(ctx, state_store).await;
     // No LLM call happened, so the summary carries zero turn usage.
     let summary = build_turn_summary(ctx, provenance, turn_options, TokenUsage::default());
     TurnOutcome::BudgetExceeded {
@@ -3154,7 +3171,8 @@ where
         warn!("Failed to save final state: {e}");
     }
     let duration = ctx.start_time.elapsed();
-    let estimated_cost_usd = budget::estimate_cost_usd(provenance, &ctx.total_usage);
+    let estimated_cost_usd =
+        budget::run_cost_usd(ctx.state.accumulated_cost_usd, provenance, &ctx.total_usage);
     if let Err(error) = send_event(
         event_store,
         thread_id,
@@ -3220,9 +3238,12 @@ async fn convert_continue_turn<H: AgentHooks, S: StateStore>(
     if let Err(e) = state_store.save(&ctx.state).await {
         warn!("Failed to save state checkpoint: {e}");
     }
-    if let Some((limit, estimated_cost_usd)) =
-        budget_status(usage_limits, provenance, &ctx.total_usage)
-    {
+    if let Some((limit, estimated_cost_usd)) = budget_status(
+        usage_limits,
+        provenance,
+        &ctx.total_usage,
+        ctx.state.accumulated_cost_usd,
+    ) {
         let summary = build_turn_summary(&ctx, provenance, turn_options, turn_usage);
         // A failed terminal-event append must surface as an error (matching
         // the run-loop path, which returns `AgentRunState::Error`): silently
