@@ -29,6 +29,9 @@ enum StreamCloseReason {
   STREAM_CLOSE_REASON_REPLAY_EXHAUSTED = 1;
   STREAM_CLOSE_REASON_THREAD_COMPLETED = 2;
   STREAM_CLOSE_REASON_SERVER_SHUTDOWN = 3;
+  // The followed work reached a terminal `cancelled` event; the stream
+  // closes so followers do not wait for a `done` that will never come.
+  STREAM_CLOSE_REASON_TURN_CANCELLED = 4;
 }
 
 message StartEvent {
@@ -121,6 +124,43 @@ message ErrorEvent {
   bool recoverable = 2;
 }
 
+// A root task (queued, parked, or running) was cancelled via the
+// durable cancellation tree (`CancelTask`).
+//
+// Terminal for the cancelled work: streams treat it like `done` and
+// close with `STREAM_CLOSE_REASON_TURN_CANCELLED`, so followers never
+// hang waiting for a `done` that will not come. Committed at most once
+// per effective cancel, and only when the cancelled root actually
+// occupied its thread's active-root slot — cancelling a QUEUED root
+// behind a live active root emits no marker (the active root's stream
+// continues; observe the queued cancel via `GetTask` /
+// `cancelled_task_ids`). Idempotent cancel retries emit nothing, and a
+// running worker's later abort commits salvaged content but no second
+// lifecycle marker.
+//
+// Best-effort caveats (store-level follow-up: commit the marker inside
+// the cancellation transaction on every backend):
+// * A crash between the durable cancel and this marker loses the
+//   marker; a retried cancel sees a terminal tree and stays silent.
+// * A RUNNING root's worker may append salvaged deltas for up to one
+//   heartbeat after the marker; replay cursors past the marker's
+//   sequence can still observe them.
+// * Child-thread roots cancelled through a subagent cascade emit no
+//   marker on their own threads.
+//
+// `turn` is the thread's committed turn count when the cancel was
+// honored. `usage` is the cumulative usage accumulated on the thread
+// so far (mirroring `done`'s total-usage semantics): derived from the
+// parked turn's durable continuation when one exists (it includes the
+// suspended turn's already-billed calls), otherwise the thread's
+// committed aggregate; zero only for a thread that never ran. A
+// RUNNING turn's in-flight usage is with its worker and is not
+// included here — it lands on the turn-attempt audit rows.
+message CancelledEvent {
+  uint64 turn = 1;
+  TokenUsage usage = 2;
+}
+
 message RefusalEvent {
   string message_id = 1;
   optional string text = 2;
@@ -204,6 +244,7 @@ message EventEnvelope {
     AutoRetryStartEvent auto_retry_start = 25;
     AutoRetryEndEvent auto_retry_end = 26;
     UserInputEvent user_input = 27;
+    CancelledEvent cancelled = 28;
   }
 }
 

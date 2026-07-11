@@ -1363,6 +1363,99 @@ impl AgentControlService for GrpcControlService {
                 .await?,
         ))
     }
+
+    /// Cancel a root task and its entire descendant subtree.
+    ///
+    /// Interior (non-root) task ids are rejected with
+    /// `FAILED_PRECONDITION`: on the durable SQL backends `cancel_tree`
+    /// does not rebalance an out-of-subtree parent left in
+    /// `WaitingOnChildren`, so cancelling an interior task would strand
+    /// that parent forever. Restricting the RPC to roots avoids that
+    /// liveness deadlock until the rebalance lands.
+    ///
+    /// The `reason` is recorded in the server logs only; it is not
+    /// persisted on the task row.
+    ///
+    /// Cancelling a `Running` root is asynchronous for its worker and
+    /// races the thread's next turn — see the `CancelTask` proto docs
+    /// and the known-race note on
+    /// [`agent_server::worker::cancel_root_turn`].
+    async fn cancel_task(
+        &self,
+        request: Request<pb::CancelTaskRequest>,
+    ) -> Result<Response<pb::CancelTaskResponse>, Status> {
+        let request = request.into_inner();
+        let task_id = parse_task_id(&request.task_id)?;
+
+        // Resolve the task first so an unknown id surfaces a clean
+        // NOT_FOUND (matching `GetTask`) instead of the INTERNAL that
+        // `cancel_tree`'s own existence-check error would map to. The
+        // loaded row also carries the thread id for the cancellation log.
+        let task = self
+            .shared
+            .stores
+            .task_store
+            .get(&task_id)
+            .await
+            .map_err(internal_status("loading task for cancellation"))?
+            .ok_or_else(|| not_found_status("task", &task_id.to_string()))?;
+
+        // Thread guard: reject a `(thread_id, task_id)` pair whose task
+        // belongs to a different thread rather than cancelling some other
+        // thread's work. An empty `thread_id` skips the guard.
+        if !request.thread_id.trim().is_empty() {
+            let thread_id = parse_thread_id(&request.thread_id)?;
+            if task.thread_id != thread_id {
+                return Err(Status::failed_precondition(format!(
+                    "task {task_id} does not belong to thread {thread_id}",
+                )));
+            }
+        }
+
+        // Restrict cancellation to root turns. `cancel_tree` on an
+        // interior task cancels that subtree but leaves an out-of-subtree
+        // parent stuck in `WaitingOnChildren` on the durable SQL backends
+        // — a liveness deadlock this RPC would make client-triggerable.
+        if !task.kind.is_root() {
+            return Err(Status::failed_precondition(
+                "CancelTask only supports root tasks; cancelling an interior task is not yet supported",
+            ));
+        }
+
+        info!(
+            task_id = %task_id,
+            thread_id = %task.thread_id,
+            reason = %bounded_log_str(&request.reason, MAX_CANCEL_REASON_LOG_CHARS),
+            "cancelling task tree",
+        );
+
+        // Route through the worker's cancel lifecycle, not bare
+        // `cancel_tree`: for a root parked in `WaitingOnChildren` (or
+        // `Pending` + `ReadyToResume`) there is no live worker to salvage
+        // the turn, so `cancel_root_turn` first commits the completed
+        // prefix of the parked turn and closes open attempts — otherwise
+        // `cancel_tree` clears the durable continuation and the next turn
+        // resumes from stale conversation history. A `Running` root is
+        // still handled by its worker (lease loss trips the cancel token
+        // and seam B commits the prefix).
+        let now = OffsetDateTime::now_utc();
+        let cancelled = agent_server::worker::cancel_root_turn(
+            &task_id,
+            &self.shared.stores.root_turn_deps(),
+            now,
+        )
+        .await
+        .map_err(internal_status("cancelling task tree"))?;
+
+        let cancelled_task_ids: Vec<String> = cancelled.iter().map(ToString::to_string).collect();
+        let cancelled_count = u32::try_from(cancelled_task_ids.len())
+            .map_err(|_| Status::internal("cancelled task count out of range"))?;
+
+        Ok(Response::new(pb::CancelTaskResponse {
+            cancelled_task_ids,
+            cancelled_count,
+        }))
+    }
 }
 
 type EventStream =
@@ -1430,8 +1523,8 @@ impl GrpcEventService {
                 follow_mode,
             );
 
-            let last_replayed_done = replay_events.last().is_some_and(is_done_event);
-            if let Some(reason) = post_replay_close_reason(follow_mode, last_replayed_done) {
+            let last_replayed_terminal = replay_events.last().and_then(terminal_close_reason);
+            if let Some(reason) = post_replay_close_reason(follow_mode, last_replayed_terminal) {
                 yield closed_stream_response(&thread_id, reason, last_delivered_sequence);
                 return;
             }
@@ -1457,16 +1550,19 @@ impl GrpcEventService {
 
 /// Close reason for a stream once replay catch-up finishes, or `None`
 /// when the stream should transition to the live follow phase.
+///
+/// `last_replayed_terminal` is the close reason derived from the last
+/// replayed event ([`terminal_close_reason`]): a replay that ends on a
+/// terminal lifecycle event (`Done` / `Cancelled`) closes instead of
+/// following a thread whose work already finished.
 const fn post_replay_close_reason(
     follow_mode: pb::FollowMode,
-    last_replayed_done: bool,
+    last_replayed_terminal: Option<pb::StreamCloseReason>,
 ) -> Option<pb::StreamCloseReason> {
     if matches!(follow_mode, pb::FollowMode::ReplayOnly) {
         Some(pb::StreamCloseReason::ReplayExhausted)
-    } else if last_replayed_done {
-        Some(pb::StreamCloseReason::ThreadCompleted)
     } else {
-        None
+        last_replayed_terminal
     }
 }
 
@@ -1533,12 +1629,12 @@ fn follow_live_events(
                                     continue;
                                 }
                                 last_delivered_sequence = Some(missed_event.sequence);
-                                let is_done = is_done_event(missed_event);
+                                let close_reason = terminal_close_reason(missed_event);
                                 yield event_stream_response(missed_event)?;
-                                if is_done {
+                                if let Some(reason) = close_reason {
                                     yield closed_stream_response(
                                         &thread_id,
-                                        pb::StreamCloseReason::ThreadCompleted,
+                                        reason,
                                         last_delivered_sequence,
                                     );
                                     return;
@@ -1546,12 +1642,12 @@ fn follow_live_events(
                             }
                         }
                         last_delivered_sequence = Some(event.sequence);
-                        let is_done = is_done_event(&event);
+                        let close_reason = terminal_close_reason(&event);
                         yield event_stream_response(&event)?;
-                        if is_done {
+                        if let Some(reason) = close_reason {
                             yield closed_stream_response(
                                 &thread_id,
-                                pb::StreamCloseReason::ThreadCompleted,
+                                reason,
                                 last_delivered_sequence,
                             );
                             return;
@@ -2033,6 +2129,21 @@ fn parse_task_id(task_id: &str) -> RpcResult<AgentTaskId> {
         return Err(Status::invalid_argument("task_id is required").into());
     }
     Ok(AgentTaskId::from_string(task_id))
+}
+
+/// Log-line budget for the client-controlled `CancelTask.reason` string.
+/// Matches the spirit of `SubmitThreadWork`'s input caps: the field is
+/// documented as logs-only, so bounding it here is the whole guard.
+const MAX_CANCEL_REASON_LOG_CHARS: usize = 256;
+
+/// Bound a client-controlled string before it reaches structured logs,
+/// truncating on a char boundary and marking the cut with an ellipsis.
+/// Borrowed (no allocation) when the value is already within budget.
+fn bounded_log_str(value: &str, max_chars: usize) -> std::borrow::Cow<'_, str> {
+    match value.char_indices().nth(max_chars) {
+        None => std::borrow::Cow::Borrowed(value),
+        Some((byte_index, _)) => std::borrow::Cow::Owned(format!("{}…", &value[..byte_index])),
+    }
 }
 
 fn internal_status(
@@ -2627,6 +2738,12 @@ fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelo
             message: message.clone(),
             recoverable: *recoverable,
         })),
+        AgentEvent::Cancelled { turn, usage } => {
+            Ok(pb::event_envelope::Event::Cancelled(pb::CancelledEvent {
+                turn: map_u64(*turn, "turn")?,
+                usage: Some(map_token_usage(usage)),
+            }))
+        }
         AgentEvent::ContextCompacted {
             original_count,
             new_count,
@@ -2640,41 +2757,7 @@ fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelo
                 new_tokens: map_u64(*new_tokens, "new_tokens")?,
             },
         )),
-        AgentEvent::SubagentProgress {
-            subagent_id,
-            subagent_name,
-            nickname,
-            child_thread_id,
-            child_root_task_id,
-            subagent_task_id,
-            max_turns,
-            current_turn,
-            model,
-            tool_name,
-            tool_context,
-            completed,
-            success,
-            tool_count,
-            total_tokens,
-        } => Ok(pb::event_envelope::Event::SubagentProgress(
-            pb::SubagentProgressEvent {
-                subagent_id: subagent_id.clone(),
-                subagent_name: subagent_name.clone(),
-                nickname: nickname.clone(),
-                child_thread_id: child_thread_id.as_ref().map(ToString::to_string),
-                child_root_task_id: child_root_task_id.clone(),
-                subagent_task_id: subagent_task_id.clone(),
-                max_turns: *max_turns,
-                current_turn: *current_turn,
-                model: model.clone(),
-                tool_name: tool_name.clone(),
-                tool_context: tool_context.clone(),
-                completed: *completed,
-                success: *success,
-                tool_count: *tool_count,
-                total_tokens: *total_tokens,
-            },
-        )),
+        AgentEvent::SubagentProgress { .. } => map_subagent_progress_payload(event),
         AgentEvent::AutoRetryStart {
             attempt,
             max_attempts,
@@ -2703,6 +2786,51 @@ fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelo
     }
 }
 
+/// Map [`AgentEvent::SubagentProgress`] onto its protobuf payload.
+/// Split from [`map_lifecycle_event_payload`] purely for length; any
+/// other variant is an internal error.
+fn map_subagent_progress_payload(event: &AgentEvent) -> RpcResult<pb::event_envelope::Event> {
+    let AgentEvent::SubagentProgress {
+        subagent_id,
+        subagent_name,
+        nickname,
+        child_thread_id,
+        child_root_task_id,
+        subagent_task_id,
+        max_turns,
+        current_turn,
+        model,
+        tool_name,
+        tool_context,
+        completed,
+        success,
+        tool_count,
+        total_tokens,
+    } = event
+    else {
+        return Err(Status::internal("expected a subagent-progress event").into());
+    };
+    Ok(pb::event_envelope::Event::SubagentProgress(
+        pb::SubagentProgressEvent {
+            subagent_id: subagent_id.clone(),
+            subagent_name: subagent_name.clone(),
+            nickname: nickname.clone(),
+            child_thread_id: child_thread_id.as_ref().map(ToString::to_string),
+            child_root_task_id: child_root_task_id.clone(),
+            subagent_task_id: subagent_task_id.clone(),
+            max_turns: *max_turns,
+            current_turn: *current_turn,
+            model: model.clone(),
+            tool_name: tool_name.clone(),
+            tool_context: tool_context.clone(),
+            completed: *completed,
+            success: *success,
+            tool_count: *tool_count,
+            total_tokens: *total_tokens,
+        },
+    ))
+}
+
 fn map_u64<T>(value: T, field: &'static str) -> RpcResult<u64>
 where
     T: TryInto<u64>,
@@ -2712,8 +2840,19 @@ where
         .map_err(|_| Status::internal(format!("{field} out of range for protobuf")).into())
 }
 
-const fn is_done_event(event: &agent_server::CommittedEvent) -> bool {
-    matches!(event.event, AgentEvent::Done { .. })
+/// Close reason implied by a terminal lifecycle event, or `None` for
+/// every non-terminal event. `Done` completes the followed work;
+/// `Cancelled` is the durable marker committed by an effective cancel
+/// (see `CancelledEvent` in `events.proto`) — both close the stream so
+/// followers of cancelled work never hang waiting for a `Done`.
+const fn terminal_close_reason(
+    event: &agent_server::CommittedEvent,
+) -> Option<pb::StreamCloseReason> {
+    match event.event {
+        AgentEvent::Done { .. } => Some(pb::StreamCloseReason::ThreadCompleted),
+        AgentEvent::Cancelled { .. } => Some(pb::StreamCloseReason::TurnCancelled),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -2733,12 +2872,14 @@ mod tests {
     use agent_sdk_foundation::llm::{
         ChatOutcome, ChatRequest, ChatResponse, StopReason, Tool, Usage,
     };
+    use agent_sdk_foundation::{AgentContinuation, AgentState, ContinuationEnvelope};
     use agent_sdk_providers::LlmProvider;
     #[cfg(feature = "postgres")]
     use agent_server::AgentTaskId;
+    use agent_server::journal::task::{ChildSpawnSpec, SuspensionPayload};
     use agent_server::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
     use agent_server::worker::registry::InMemoryAgentDefinitionRegistry;
-    use anyhow::{Context, Result, anyhow, bail};
+    use anyhow::{Context, Result, anyhow, bail, ensure};
     use async_trait::async_trait;
     use serde_json::json;
     #[cfg(feature = "postgres")]
@@ -4764,5 +4905,522 @@ mod tests {
 
         daemon.stop().await?;
         result
+    }
+
+    /// Create a thread and admit one root turn through the in-process
+    /// control service. No host/worker runs in this fixture, so the
+    /// returned root turn stays non-terminal (`Pending`) until a cancel
+    /// transitions it — exactly the state `CancelTask` must handle.
+    ///
+    /// Returns `(thread_id, root_task_id)`.
+    async fn seed_pending_root(
+        service: &GrpcControlService,
+        label: &str,
+    ) -> Result<(String, String)> {
+        let thread = service
+            .create_thread(Request::new(pb::CreateThreadRequest {
+                request_id: format!("{label}-create"),
+            }))
+            .await?
+            .into_inner()
+            .thread
+            .and_then(|view| view.thread)
+            .context("create_thread missing snapshot")?
+            .thread_id;
+        let task = service
+            .submit_thread_work(Request::new(pb::SubmitThreadWorkRequest {
+                request_id: format!("{label}-submit"),
+                thread_id: thread.clone(),
+                input: vec![text_input("do work")],
+            }))
+            .await?
+            .into_inner()
+            .task
+            .context("submit_thread_work missing task")?;
+        Ok((thread, task.task_id))
+    }
+
+    /// `CancelTask` transitions a queued/running root turn to
+    /// `CANCELLED` and reports the ids it cancelled.
+    #[tokio::test]
+    async fn cancel_task_cancels_a_pending_root_turn() -> Result<()> {
+        let shared = event_test_shared()?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+
+        let (_thread, task_id) = seed_pending_root(&service, "cancel-pending").await?;
+
+        let cancel = service
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: task_id.clone(),
+                reason: "user aborted".into(),
+                thread_id: String::new(),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(cancel.cancelled_task_ids, vec![task_id.clone()]);
+        assert_eq!(cancel.cancelled_count, 1);
+
+        let after = service
+            .get_task(Request::new(pb::GetTaskRequest {
+                task_id: task_id.clone(),
+            }))
+            .await?
+            .into_inner()
+            .task
+            .context("get_task missing task")?;
+        assert_eq!(after.status, pb::TaskStatus::Cancelled as i32, "{after:?}");
+        Ok(())
+    }
+
+    /// Cancelling an unknown task id is a clean `NOT_FOUND`, not the
+    /// INTERNAL that `cancel_tree`'s own existence check would surface.
+    #[tokio::test]
+    async fn cancel_task_returns_not_found_for_unknown_task() -> Result<()> {
+        let shared = event_test_shared()?;
+        let service = GrpcControlService { shared };
+
+        let err = service
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: "00000000-0000-7000-8000-000000000000".into(),
+                reason: String::new(),
+                thread_id: String::new(),
+            }))
+            .await
+            .expect_err("cancel on unknown task must error");
+        assert_eq!(err.code(), tonic::Code::NotFound, "{err:?}");
+        Ok(())
+    }
+
+    /// A blank `task_id` is rejected up front with `INVALID_ARGUMENT`.
+    #[tokio::test]
+    async fn cancel_task_rejects_blank_task_id() -> Result<()> {
+        let shared = event_test_shared()?;
+        let service = GrpcControlService { shared };
+
+        let err = service
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: "   ".into(),
+                reason: String::new(),
+                thread_id: String::new(),
+            }))
+            .await
+            .expect_err("blank task_id must reject");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+        Ok(())
+    }
+
+    /// Re-cancelling an already-terminal subtree is a no-op: the second
+    /// call succeeds and reports zero newly-cancelled ids.
+    #[tokio::test]
+    async fn cancel_task_is_idempotent_on_already_terminal_subtree() -> Result<()> {
+        let shared = event_test_shared()?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+
+        let (_thread, task_id) = seed_pending_root(&service, "cancel-idem").await?;
+
+        let first = service
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: task_id.clone(),
+                reason: String::new(),
+                thread_id: String::new(),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(first.cancelled_count, 1);
+
+        let second = service
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: task_id.clone(),
+                reason: String::new(),
+                thread_id: String::new(),
+            }))
+            .await?
+            .into_inner();
+        assert!(
+            second.cancelled_task_ids.is_empty(),
+            "{:?}",
+            second.cancelled_task_ids,
+        );
+        assert_eq!(second.cancelled_count, 0);
+        Ok(())
+    }
+
+    /// Seed a real interior task: admit a root turn, lease it `Running`,
+    /// then spawn one `ToolRuntime` child under it. The child is a
+    /// non-root, out-of-subtree task — the case `CancelTask` must reject.
+    ///
+    /// Returns `(thread_id, root_task_id, child_task_id)`.
+    async fn seed_interior_tool_child(
+        shared: &GrpcShared,
+        thread_name: &str,
+    ) -> Result<(ThreadId, String, String)> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let thread_id = ThreadId::from_string(thread_name);
+        let root = AgentTask::new_root_turn(thread_id.clone(), now, 5);
+        let root_id = root.id.clone();
+        let store = &shared.stores.task_store;
+        store
+            .submit_root_turn(root.clone())
+            .await
+            .context("submit root for interior-child fixture")?;
+
+        let worker = WorkerId::from_string("w-interior");
+        let lease = LeaseId::from_string("l-interior");
+        store
+            .try_acquire_task(
+                &root_id,
+                worker.clone(),
+                lease.clone(),
+                now + time::Duration::seconds(60),
+                now,
+            )
+            .await
+            .context("acquire root for interior-child fixture")?
+            .context("acquire returned None")?;
+
+        let continuation = ContinuationEnvelope::wrap(AgentContinuation {
+            thread_id: thread_id.clone(),
+            turn: 1,
+            total_usage: TokenUsage::default(),
+            turn_usage: TokenUsage::default(),
+            pending_tool_calls: Vec::new(),
+            awaiting_index: 0,
+            completed_results: Vec::new(),
+            state: AgentState::new(thread_id.clone()),
+            response_id: None,
+            stop_reason: None,
+            response_content: Vec::new(),
+        });
+        let (_parent, children) = store
+            .spawn_tool_children(
+                &root_id,
+                &worker,
+                &lease,
+                vec![ChildSpawnSpec::new(2)],
+                SuspensionPayload {
+                    continuation,
+                    suspended_messages: Vec::new(),
+                },
+                None,
+                now,
+            )
+            .await
+            .context("spawn tool child for interior-child fixture")?;
+        let child = children
+            .first()
+            .context("spawn_tool_children returned no child")?;
+        assert!(!child.kind.is_root(), "child must be a non-root task");
+
+        Ok((thread_id, root_id.to_string(), child.id.to_string()))
+    }
+
+    /// `CancelTask` rejects an interior (non-root) task id with
+    /// `FAILED_PRECONDITION`. Cancelling such a task on the durable SQL
+    /// backends would strand the out-of-subtree parent in
+    /// `WaitingOnChildren`, so the RPC only supports root tasks.
+    #[tokio::test]
+    async fn cancel_task_rejects_interior_task() -> Result<()> {
+        let shared = event_test_shared()?;
+        let (_thread, _root_id, child_id) =
+            seed_interior_tool_child(&shared, "t-cancel-interior").await?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+
+        let Err(err) = service
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: child_id,
+                reason: String::new(),
+                thread_id: String::new(),
+            }))
+            .await
+        else {
+            bail!("cancelling an interior task must reject");
+        };
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+        Ok(())
+    }
+
+    /// The headline behavior through the RPC: cancelling a root with a
+    /// live descendant cancels the whole subtree and reports the ids in
+    /// cancellation order (root first, then the child).
+    #[tokio::test]
+    async fn cancel_task_cascades_to_descendants() -> Result<()> {
+        let shared = event_test_shared()?;
+        let (_thread, root_id, child_id) =
+            seed_interior_tool_child(&shared, "t-cancel-cascade").await?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+
+        let cancel = service
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: root_id.clone(),
+                reason: "cascade".into(),
+                thread_id: String::new(),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(cancel.cancelled_task_ids, vec![root_id, child_id]);
+        assert_eq!(cancel.cancelled_count, 2);
+        Ok(())
+    }
+
+    /// The client-controlled cancel `reason` is bounded before it
+    /// reaches structured logs: short values pass through unallocated,
+    /// oversized ones are cut on a char boundary with an ellipsis.
+    #[test]
+    fn bounded_log_str_truncates_oversized_client_strings() {
+        let short = "user aborted";
+        assert!(matches!(
+            bounded_log_str(short, MAX_CANCEL_REASON_LOG_CHARS),
+            std::borrow::Cow::Borrowed(_)
+        ));
+
+        // Multi-byte chars: truncation must stay on a char boundary.
+        let oversized = "é".repeat(MAX_CANCEL_REASON_LOG_CHARS + 100);
+        let bounded = bounded_log_str(&oversized, MAX_CANCEL_REASON_LOG_CHARS);
+        assert_eq!(
+            bounded.chars().count(),
+            MAX_CANCEL_REASON_LOG_CHARS + 1,
+            "capped chars plus the ellipsis marker",
+        );
+        assert!(bounded.ends_with('…'));
+    }
+
+    /// Read the next frame from an in-process event stream, bounded so a
+    /// missing terminal frame fails the test instead of hanging it.
+    async fn next_inline_frame(stream: &mut EventStream) -> Result<pb::StreamThreadEventsResponse> {
+        tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .context("timed out waiting for a stream frame")?
+            .context("stream ended unexpectedly")?
+            .context("stream frame error")
+    }
+
+    /// Cancelling a parked root gives an existing `REPLAY_AND_FOLLOW`
+    /// subscriber a terminal `Cancelled` event frame followed by a
+    /// `Closed(TURN_CANCELLED)` control frame — without it the follower
+    /// would wait forever for a `Done` that never comes (a cancelled
+    /// turn commits no other lifecycle event).
+    #[tokio::test]
+    async fn cancel_task_gives_followers_a_terminal_cancelled_frame() -> Result<()> {
+        let shared = event_test_shared()?;
+        let control = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+        let events = GrpcEventService {
+            shared: Arc::clone(&shared),
+        };
+
+        // Mint a real thread row first — the event stream RPC rejects
+        // unknown threads — then park a root (with a tool child) on it.
+        let thread_name = control
+            .create_thread(Request::new(pb::CreateThreadRequest {
+                request_id: "cancel-follower-create".into(),
+            }))
+            .await?
+            .into_inner()
+            .thread
+            .and_then(|view| view.thread)
+            .context("create_thread missing snapshot")?
+            .thread_id;
+        let (thread_id, root_id, _child_id) =
+            seed_interior_tool_child(&shared, &thread_name).await?;
+
+        let mut stream = events
+            .stream_thread_events(Request::new(pb::StreamThreadEventsRequest {
+                thread_id: thread_id.to_string(),
+                after_sequence: None,
+                follow_mode: pb::FollowMode::ReplayAndFollow as i32,
+            }))
+            .await?
+            .into_inner();
+
+        // Drain the (empty-journal) replay phase.
+        let opened = next_inline_frame(&mut stream).await?;
+        ensure!(
+            matches!(opened.item, Some(StreamItem::ReplayOpened(_))),
+            "expected replay_opened, got {opened:?}",
+        );
+        let catchup = next_inline_frame(&mut stream).await?;
+        ensure!(
+            matches!(catchup.item, Some(StreamItem::ReplayCatchupComplete(_))),
+            "expected replay_catchup_complete, got {catchup:?}",
+        );
+
+        control
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: root_id,
+                reason: "follower test".into(),
+                thread_id: String::new(),
+            }))
+            .await?;
+
+        // The follower receives the terminal Cancelled event...
+        let event_frame = next_inline_frame(&mut stream).await?;
+        let Some(StreamItem::Event(envelope)) = event_frame.item else {
+            bail!("expected an event frame, got {event_frame:?}");
+        };
+        ensure!(
+            matches!(
+                envelope.event,
+                Some(pb::event_envelope::Event::Cancelled(_))
+            ),
+            "expected a cancelled event, got {:?}",
+            envelope.event,
+        );
+
+        // ...then the stream closes with the cancelled reason.
+        let closed_frame = next_inline_frame(&mut stream).await?;
+        let Some(StreamItem::Closed(closed)) = closed_frame.item else {
+            bail!("expected a closed frame, got {closed_frame:?}");
+        };
+        assert_eq!(
+            closed.reason,
+            pb::StreamCloseReason::TurnCancelled as i32,
+            "{closed:?}",
+        );
+        Ok(())
+    }
+
+    /// Cancelling a QUEUED root behind a live active root must NOT close
+    /// the thread's followers: no `Cancelled` marker is committed, the
+    /// stream stays open, and subsequent events (the active root's work)
+    /// are still delivered.
+    #[tokio::test]
+    async fn cancel_of_queued_root_leaves_followers_streaming() -> Result<()> {
+        use agent_sdk_foundation::events::AgentEvent;
+
+        let shared = event_test_shared()?;
+        let control = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+        let events = GrpcEventService {
+            shared: Arc::clone(&shared),
+        };
+
+        // Active root occupies the slot; the second submit queues.
+        let (thread, _active_task_id) = seed_pending_root(&control, "cancel-queued-follow").await?;
+        let queued = control
+            .submit_thread_work(Request::new(pb::SubmitThreadWorkRequest {
+                request_id: "cancel-queued-follow-second".into(),
+                thread_id: thread.clone(),
+                input: vec![text_input("queued work")],
+            }))
+            .await?
+            .into_inner()
+            .task
+            .context("second submit missing task")?;
+        assert_eq!(
+            queued.status,
+            pb::TaskStatus::Queued as i32,
+            "precondition: second root queues behind the active one",
+        );
+
+        let mut stream = events
+            .stream_thread_events(Request::new(pb::StreamThreadEventsRequest {
+                thread_id: thread.clone(),
+                after_sequence: None,
+                follow_mode: pb::FollowMode::ReplayAndFollow as i32,
+            }))
+            .await?
+            .into_inner();
+        let opened = next_inline_frame(&mut stream).await?;
+        ensure!(
+            matches!(opened.item, Some(StreamItem::ReplayOpened(_))),
+            "expected replay_opened, got {opened:?}",
+        );
+        let catchup = next_inline_frame(&mut stream).await?;
+        ensure!(
+            matches!(catchup.item, Some(StreamItem::ReplayCatchupComplete(_))),
+            "expected replay_catchup_complete, got {catchup:?}",
+        );
+
+        let cancel = control
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: queued.task_id.clone(),
+                reason: "queued cancel".into(),
+                thread_id: String::new(),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(cancel.cancelled_task_ids, vec![queued.task_id]);
+
+        // Prove the follower is still live: commit + notify a probe
+        // event and assert it is the very next frame — not a Cancelled
+        // marker, not a Closed frame.
+        let committed = shared
+            .stores
+            .event_repo
+            .commit_event(
+                &ThreadId::from_string(&thread),
+                AgentEvent::TextDelta {
+                    message_id: "probe".into(),
+                    delta: "still streaming".into(),
+                },
+                OffsetDateTime::now_utc(),
+            )
+            .await?;
+        shared
+            .stores
+            .event_notifier
+            .notify(std::slice::from_ref(&committed));
+
+        let frame = next_inline_frame(&mut stream).await?;
+        let Some(StreamItem::Event(envelope)) = frame.item else {
+            bail!("expected the probe event frame, got {frame:?}");
+        };
+        ensure!(
+            matches!(
+                envelope.event,
+                Some(pb::event_envelope::Event::TextDelta(_))
+            ),
+            "queued cancel must not interject a Cancelled marker, got {:?}",
+            envelope.event,
+        );
+        Ok(())
+    }
+
+    /// `CancelTask` enforces the thread guard: a `(thread_id, task_id)`
+    /// pair whose task belongs to a different thread is rejected with
+    /// `FAILED_PRECONDITION` rather than cancelling another thread's work.
+    #[tokio::test]
+    async fn cancel_task_rejects_thread_mismatch() -> Result<()> {
+        let shared = event_test_shared()?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+
+        let (thread, task_id) = seed_pending_root(&service, "cancel-thread-guard").await?;
+
+        let Err(err) = service
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: task_id.clone(),
+                reason: String::new(),
+                thread_id: format!("{thread}-other"),
+            }))
+            .await
+        else {
+            bail!("thread mismatch must reject");
+        };
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+
+        // The matching thread guard still permits the cancel, proving the
+        // guard only blocks genuine mismatches.
+        let ok = service
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: task_id.clone(),
+                reason: String::new(),
+                thread_id: thread,
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(ok.cancelled_task_ids, vec![task_id]);
+        Ok(())
     }
 }

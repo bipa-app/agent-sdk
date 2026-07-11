@@ -209,6 +209,100 @@ message DecideConfirmationResponse {
   TaskSnapshot parent_task = 2;
 }
 
+// Cancel a queued or running root task and its entire descendant subtree.
+//
+// `task_id` must reference a root turn. Cancellation cascades from the
+// root through every live descendant (tool-runtime children, and across
+// subagent-invocation links into child threads) by way of the durable
+// `cancel_tree` transition. Each cancelled row drops its worker lease, so
+// any worker still holding the row fails its next heartbeat / complete /
+// fail CAS.
+//
+// For a RUNNING task the cancel is asynchronous from the worker's point
+// of view: this RPC returns OK once the rows are durably cancelled, but
+// the worker only notices when its next heartbeat is rejected, so the
+// task may keep executing (streaming model output, incurring provider
+// cost) for up to one heartbeat interval before it aborts and commits
+// the completed prefix of the interrupted turn.
+//
+// A cancel that lands while a RUNNING worker is already committing its
+// finished turn can also lose the race the other way: the turn commits
+// in full (transcript, usage, `done` event) while the task row reports
+// CANCELLED — only the worker's final task transition is rejected. The
+// transcript stays consistent and the next turn is unaffected; treat
+// the CANCELLED status as "a cancel was requested", not as proof the
+// output was suppressed.
+//
+// An effective cancel of the thread's ACTIVE root commits a terminal
+// `cancelled` event to the thread journal (see `CancelledEvent` in
+// events.proto), so REPLAY_AND_FOLLOW subscribers receive a closing
+// frame instead of waiting for a `done` that will never come.
+// Cancelling a QUEUED root behind a live active root emits no marker —
+// the active root's stream continues undisturbed; observe the queued
+// cancel via `GetTask` or this RPC's `cancelled_task_ids`. The marker
+// is best-effort: it is committed after the durable cancel
+// transaction, so a crash in between loses it (retries stay silent),
+// cascade-cancelled child-thread roots emit no marker on their own
+// threads, and a RUNNING root's worker may still append salvaged
+// events for up to one heartbeat after the marker lands. Committing
+// the marker inside the cancellation transaction on every backend is
+// the tracked store-level follow-up.
+//
+// That deferred prefix commit also races the thread's NEXT turn:
+// cancelling a RUNNING root immediately frees the thread's active-root
+// slot (a queued successor is promoted in the same transaction), and a
+// successor turn that starts before the interrupted worker's prefix
+// commit lands binds the same turn number. Whichever commit lands
+// second is rejected — a losing prefix commit is dropped silently
+// (best-effort salvage), but a losing successor turn FAILS and must be
+// resubmitted. Callers that submit follow-up work on the same thread
+// right after cancelling a RUNNING task should be prepared to retry it,
+// or wait one heartbeat interval before submitting.
+//
+// Cancelling an interior (non-root) task is not yet supported: the durable
+// SQL backends do not rebalance an out-of-subtree parent left in
+// `WAITING_ON_CHILDREN`, which would strand the parent forever. The RPC
+// rejects interior task ids with `FAILED_PRECONDITION` until that
+// rebalance lands; interior cancel is a planned future addition.
+//
+// The call is idempotent: rows already in a terminal state
+// (`COMPLETED` / `FAILED` / `CANCELLED`) are left untouched and are
+// not reported back, so retrying a cancel on an already-settled subtree
+// returns an empty `cancelled_task_ids`.
+//
+// # Errors
+//
+// * `INVALID_ARGUMENT` for a blank `task_id`.
+// * `NOT_FOUND` if `task_id` doesn't resolve to a known task.
+// * `FAILED_PRECONDITION` if `task_id` resolves to a non-root task, or if
+//   the loaded task does not belong to the supplied `thread_id` guard.
+message CancelTaskRequest {
+  // The root task whose subtree should be cancelled. Must reference a
+  // root turn; interior (non-root) task ids are rejected with
+  // `FAILED_PRECONDITION`.
+  string task_id = 1;
+
+  // Optional human-readable reason recorded in the server logs. May be
+  // empty; it is not persisted and does not alter cancellation behaviour.
+  string reason = 2;
+
+  // Thread guard. When non-empty, the server rejects a `(thread_id,
+  // task_id)` pair whose task does not belong to `thread_id` rather than
+  // cancelling some other thread's work. May be empty to skip the guard.
+  string thread_id = 3;
+}
+
+message CancelTaskResponse {
+  // Ids of the tasks actually transitioned to `CANCELLED`, in
+  // cancellation order (`[root, child_1, ..., grandchildren, ...]`).
+  // Rows that were already terminal before the call are omitted, so an
+  // empty list means the subtree was already settled.
+  repeated string cancelled_task_ids = 1;
+
+  // Convenience count of `cancelled_task_ids`.
+  uint32 cancelled_count = 2;
+}
+
 service AgentControlService {
   // Allocate a new active thread and return its committed snapshot.
   rpc CreateThread(CreateThreadRequest) returns (CreateThreadResponse);
@@ -241,4 +335,9 @@ service AgentControlService {
 
   // Apply a durable confirmation decision to an awaiting task.
   rpc DecideConfirmation(DecideConfirmationRequest) returns (DecideConfirmationResponse);
+
+  // Cancel a queued or running root task and its entire descendant
+  // subtree via the durable cancellation-tree transition. Interior
+  // (non-root) task ids are rejected; see `CancelTaskRequest`.
+  rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
 }

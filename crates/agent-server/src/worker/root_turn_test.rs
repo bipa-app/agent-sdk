@@ -19,23 +19,31 @@ use crate::journal::event_repository::{EventRepository, InMemoryEventRepository}
 use crate::journal::execution_context::build_root_worker_inputs;
 use crate::journal::message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
 use crate::journal::store::{AgentTaskStore, InMemoryAgentTaskStore};
-use crate::journal::task::{AgentTask, AgentTaskId, LeaseId, TaskKind, TaskStatus, WorkerId};
+use crate::journal::task::{
+    AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskKind, TaskStatus,
+    WorkerId,
+};
 use crate::journal::task_state::TaskState;
 use crate::journal::thread_store::{InMemoryThreadStore, ThreadStore};
-use crate::journal::turn_attempt::{TurnAttempt, TurnAttemptOutcome};
+use crate::journal::turn_attempt::{
+    CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptId, TurnAttemptOutcome,
+};
 use crate::journal::turn_attempt_store::{InMemoryTurnAttemptStore, TurnAttemptStore};
 use crate::worker::bootstrap::WorkerBootstrapContext;
 use crate::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
-use agent_sdk_foundation::ThreadId;
+use agent_sdk_foundation::audit::AuditProvenance;
 use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, Role, StopReason, Tool, Usage,
+};
+use agent_sdk_foundation::{
+    AgentContinuation, AgentState, ContinuationEnvelope, ThreadId, TokenUsage,
 };
 use agent_sdk_providers::LlmProvider;
 use agent_sdk_providers::streaming::{StreamBox, StreamDelta};
 use agent_sdk_tools::stores::MessageStore;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -278,6 +286,7 @@ fn assert_tool_results_follow_tool_use(
     );
 }
 
+#[derive(Clone)]
 struct TestStores {
     tasks: InMemoryAgentTaskStore,
     threads: InMemoryThreadStore,
@@ -5611,5 +5620,438 @@ async fn double_cancel_root_turn_commits_prefix_once() -> Result<()> {
         stores.checkpoints.list_by_thread(&thread_a()).await?.len(),
         1,
     );
+    Ok(())
+}
+
+/// Open an attempt row for `task_id` so a test can observe who closes it.
+async fn open_test_attempt(
+    attempts: &InMemoryTurnAttemptStore,
+    task_id: &AgentTaskId,
+    attempt_number: u32,
+    now: time::OffsetDateTime,
+) -> Result<TurnAttempt> {
+    attempts
+        .open_attempt(OpenAttemptParams {
+            task_id: task_id.clone(),
+            attempt_number,
+            provenance: AuditProvenance::new("test-provider", "test-model"),
+            request_blob: serde_json::json!({ "user_prompt": "test" }),
+            now,
+            otel_trace_id: None,
+            otel_span_id: None,
+        })
+        .await
+        .context("open test attempt")
+}
+
+/// Cancelling a `Running` root must NOT pre-close its open attempt:
+/// `close_attempt` is single-shot, and the live worker's own close (the
+/// stream-abort `Cancelled` close, or a suspension / commit close that
+/// carries the round's real token usage) would be rejected against a
+/// zero-usage row pinned here.
+#[tokio::test]
+async fn cancel_of_running_root_leaves_attempt_close_to_its_worker() -> Result<()> {
+    let stores = TestStores::new();
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let attempt = open_test_attempt(&stores.attempts, &task_id, 1, t0()).await?;
+
+    let cancelled = cancel_root_turn(&task_id, &stores.deps(), t_plus(1)).await?;
+    assert_eq!(cancelled, vec![task_id.clone()]);
+    let row = stores.tasks.get(&task_id).await?.context("task")?;
+    assert_eq!(row.status, TaskStatus::Cancelled);
+
+    let reread = stores.attempts.get(&attempt.id).await?.context("attempt")?;
+    assert!(
+        !reread.is_closed(),
+        "a running root's attempt stays open for its live worker to close",
+    );
+    Ok(())
+}
+
+/// A parked root has no live worker, so the cancel seam still owns the
+/// attempt-close hygiene: an attempt left open on a `WaitingOnChildren`
+/// row (e.g. a steering exchange whose process died mid-flight) is
+/// closed `Cancelled` by `cancel_root_turn`.
+#[tokio::test]
+async fn cancel_of_parked_root_closes_open_attempts() -> Result<()> {
+    let stores = TestStores::new();
+    let provider =
+        MockToolCallProvider::single("call_a", "bash", serde_json::json!({"command": "ls"}));
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let bootstrap = sample_bootstrap_with_tools(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let outcome = execute_root_turn(inputs, "run ls", &provider, &stores.deps(), t_plus(5)).await?;
+    assert!(matches!(outcome, RootTurnOutcome::Suspended { .. }));
+    let parked = stores.tasks.get(&task_id).await?.context("parked task")?;
+    assert_eq!(parked.status, TaskStatus::WaitingOnChildren);
+
+    // Simulate an attempt left open on the parked row.
+    let existing = stores.attempts.list_by_task(&task_id).await?;
+    let next_number = u32::try_from(existing.len()).context("attempt count")? + 1;
+    let orphan = open_test_attempt(&stores.attempts, &task_id, next_number, t_plus(6)).await?;
+
+    cancel_root_turn(&task_id, &stores.deps(), t_plus(7)).await?;
+
+    let reread = stores.attempts.get(&orphan.id).await?.context("attempt")?;
+    assert!(
+        reread.is_closed(),
+        "a parked root's open attempt is closed by the cancel seam",
+    );
+    assert_eq!(reread.outcome, Some(TurnAttemptOutcome::Cancelled));
+    Ok(())
+}
+
+/// Count the `AgentEvent::Cancelled` markers committed on `thread`.
+async fn cancelled_event_count(
+    events: &InMemoryEventRepository,
+    thread: &ThreadId,
+) -> Result<usize> {
+    use agent_sdk_foundation::events::AgentEvent;
+    Ok(events
+        .get_events(thread)
+        .await?
+        .iter()
+        .filter(|committed| matches!(committed.event, AgentEvent::Cancelled { .. }))
+        .count())
+}
+
+/// An effective cancel commits exactly one terminal `Cancelled` event
+/// (delivered to live subscribers via the notifier), and an idempotent
+/// retry on the already-terminal tree emits nothing.
+#[tokio::test]
+async fn cancel_root_turn_commits_single_terminal_cancelled_event() -> Result<()> {
+    use agent_sdk_foundation::events::AgentEvent;
+
+    let stores = TestStores::new();
+    let task = AgentTask::new_root_turn(thread_a(), t0(), 3);
+    let task_id = task.id.clone();
+    stores.tasks.submit_root_turn(task).await?;
+
+    let mut live_rx = stores.event_notifier.subscribe(&thread_a());
+
+    let cancelled = cancel_root_turn(&task_id, &stores.deps(), t_plus(1)).await?;
+    assert_eq!(cancelled.len(), 1);
+    assert_eq!(cancelled_event_count(&stores.events, &thread_a()).await?, 1);
+
+    // The notifier woke live followers with the terminal marker.
+    let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), live_rx.recv())
+        .await
+        .context("timed out waiting for the notified cancelled event")?
+        .context("notifier channel closed")?;
+    let AgentEvent::Cancelled { turn, usage } = &delivered.event else {
+        bail!(
+            "live followers must receive the terminal marker, got {:?}",
+            delivered.event,
+        );
+    };
+    // A plain Pending root on a fresh thread has no durable usage
+    // anywhere — the honest report is zero at turn zero.
+    assert_eq!(*turn, 0);
+    assert_eq!(usage, &TokenUsage::default());
+
+    // Idempotent retry: nothing transitioned, so no second marker.
+    let second = cancel_root_turn(&task_id, &stores.deps(), t_plus(2)).await?;
+    assert!(second.is_empty());
+    assert_eq!(cancelled_event_count(&stores.events, &thread_a()).await?, 1);
+    Ok(())
+}
+
+/// Cancelling a QUEUED root parked behind a live active root must NOT
+/// commit a thread-terminal `Cancelled` marker — that would close every
+/// follower mid-stream while the active root keeps producing events.
+/// The queued cancel stays observable via the returned ids / `GetTask`.
+#[tokio::test]
+async fn queued_root_cancel_emits_no_thread_terminal_marker() -> Result<()> {
+    let stores = TestStores::new();
+
+    // First root takes the active slot; the second queues behind it.
+    let active = AgentTask::new_root_turn(thread_a(), t0(), 3);
+    let active_id = active.id.clone();
+    stores.tasks.submit_root_turn(active).await?;
+    let queued = AgentTask::new_root_turn(thread_a(), t_plus(1), 3);
+    let queued_id = queued.id.clone();
+    stores.tasks.submit_root_turn(queued).await?;
+    let queued_row = stores.tasks.get(&queued_id).await?.context("queued row")?;
+    assert_eq!(queued_row.status, TaskStatus::Queued, "precondition");
+
+    let cancelled = cancel_root_turn(&queued_id, &stores.deps(), t_plus(2)).await?;
+    assert_eq!(cancelled, vec![queued_id]);
+
+    // No thread-terminal marker, and the active root is undisturbed.
+    assert_eq!(cancelled_event_count(&stores.events, &thread_a()).await?, 0);
+    let active_row = stores.tasks.get(&active_id).await?.context("active row")?;
+    assert_eq!(active_row.status, TaskStatus::Pending);
+    Ok(())
+}
+
+/// Attempt store that simulates the successor-slot race in the exact
+/// window that would leak the salvage's synthetic attempt: the first
+/// `open_attempt` advances the thread's turn counter AFTER the
+/// salvage's stale-turn pre-check has passed, so the salvage's
+/// `commit_completed_turn` loses the stale-turn guard while the
+/// synthetic attempt sits open.
+struct TurnStealingAttemptStore {
+    inner: InMemoryTurnAttemptStore,
+    threads: InMemoryThreadStore,
+    thread_id: ThreadId,
+    fired: AtomicBool,
+}
+
+#[async_trait]
+impl TurnAttemptStore for TurnStealingAttemptStore {
+    async fn open_attempt(&self, params: OpenAttemptParams) -> Result<TurnAttempt> {
+        if !self.fired.swap(true, Ordering::SeqCst) {
+            self.threads
+                .commit_turn(&self.thread_id, &TokenUsage::default(), params.now)
+                .await
+                .context("steal the turn slot")?;
+        }
+        self.inner.open_attempt(params).await
+    }
+
+    async fn close_attempt(
+        &self,
+        id: &TurnAttemptId,
+        params: CloseAttemptParams,
+        now: time::OffsetDateTime,
+    ) -> Result<TurnAttempt> {
+        self.inner.close_attempt(id, params, now).await
+    }
+
+    async fn get(&self, id: &TurnAttemptId) -> Result<Option<TurnAttempt>> {
+        self.inner.get(id).await
+    }
+
+    async fn list_by_task(&self, task_id: &AgentTaskId) -> Result<Vec<TurnAttempt>> {
+        self.inner.list_by_task(task_id).await
+    }
+}
+
+/// A salvage commit that fails (here: the stale-turn guard losing to a
+/// racing successor) must close the synthetic cancel-commit attempt it
+/// opened — otherwise the attempt leaks open forever on a terminal
+/// task, invisible to the cancel seam's snapshot-scoped close.
+#[tokio::test]
+async fn failed_salvage_commit_closes_its_synthetic_attempt() -> Result<()> {
+    let stores = TestStores::new();
+    let thread = thread_a();
+    stores.threads.get_or_create(&thread, t0()).await?;
+
+    let stealing = TurnStealingAttemptStore {
+        inner: stores.attempts.clone(),
+        threads: stores.threads.clone(),
+        thread_id: thread.clone(),
+        fired: AtomicBool::new(false),
+    };
+    let mut deps = stores.deps();
+    deps.attempt_store = &stealing;
+
+    let task = AgentTask::new_root_turn(thread.clone(), t0(), 3);
+    let task_id = task.id.clone();
+
+    let result = commit_partial_turn_on_cancel(
+        PartialCancelCommit {
+            thread_id: &thread,
+            task_id: &task_id,
+            candidate: vec![agent_sdk_foundation::llm::Message::user("salvage me")],
+            expected_turn: 1,
+            agent_state_snapshot: serde_json::json!({}),
+        },
+        &deps,
+        t_plus(1),
+    )
+    .await;
+    let error = result
+        .err()
+        .context("a stolen turn slot must fail the salvage commit")?;
+    assert!(
+        format!("{error:#}").contains("stale turn commit"),
+        "expected the stale-turn guard to reject, got: {error:#}",
+    );
+
+    // The synthetic attempt must not leak open.
+    let attempts = stores.attempts.list_by_task(&task_id).await?;
+    assert_eq!(attempts.len(), 1, "exactly the synthetic attempt");
+    assert!(
+        attempts[0].is_closed(),
+        "the failed salvage must close its own synthetic attempt",
+    );
+    assert_eq!(attempts[0].outcome, Some(TurnAttemptOutcome::Cancelled));
+    Ok(())
+}
+
+/// The terminal `Cancelled` event derives its usage from the parked
+/// turn's durable continuation (`total_usage` — the cumulative usage
+/// accumulated so far, matching the SDK's own `Cancelled` emission),
+/// not a zero default.
+#[tokio::test]
+async fn cancelled_event_derives_usage_from_parked_continuation() -> Result<()> {
+    use agent_sdk_foundation::events::AgentEvent;
+
+    let stores = TestStores::new();
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+
+    let seeded_usage = TokenUsage {
+        input_tokens: 111,
+        output_tokens: 22,
+        cached_input_tokens: 3,
+        cache_creation_input_tokens: 4,
+    };
+    let continuation = ContinuationEnvelope::wrap(AgentContinuation {
+        thread_id: thread_a(),
+        turn: 1,
+        total_usage: seeded_usage.clone(),
+        turn_usage: TokenUsage::default(),
+        pending_tool_calls: Vec::new(),
+        awaiting_index: 0,
+        completed_results: Vec::new(),
+        state: AgentState::new(thread_a()),
+        response_id: None,
+        stop_reason: None,
+        response_content: Vec::new(),
+    });
+    stores
+        .tasks
+        .spawn_tool_children(
+            &task_id,
+            &WorkerId::from_string("worker_test"),
+            &LeaseId::from_string("lease_test"),
+            vec![ChildSpawnSpec::new(2)],
+            SuspensionPayload {
+                continuation,
+                suspended_messages: Vec::new(),
+            },
+            None,
+            t_plus(1),
+        )
+        .await
+        .context("park the root on a tool child")?;
+
+    cancel_root_turn(&task_id, &stores.deps(), t_plus(2)).await?;
+
+    let events = stores.events.get_events(&thread_a()).await?;
+    let cancelled = events
+        .iter()
+        .find(|committed| matches!(committed.event, AgentEvent::Cancelled { .. }))
+        .context("terminal cancelled event")?;
+    let AgentEvent::Cancelled { usage, .. } = &cancelled.event else {
+        bail!("filtered to a cancelled event above");
+    };
+    assert_eq!(
+        usage, &seeded_usage,
+        "usage must come from the parked continuation's total_usage",
+    );
+    Ok(())
+}
+
+/// Streaming provider that models the real RPC-cancel-while-running
+/// sequence: it streams one delta, runs the full `cancel_root_turn`
+/// lifecycle (which commits the terminal `Cancelled` marker), trips the
+/// worker's token, then streams once more so the biased cancel branch
+/// aborts the turn and seam B salvages the prefix.
+struct MidStreamCancelRootTurnProvider {
+    cancel: CancellationToken,
+    stores: TestStores,
+    task_id: AgentTaskId,
+    cancel_at: time::OffsetDateTime,
+}
+
+#[async_trait]
+impl LlmProvider for MidStreamCancelRootTurnProvider {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        anyhow::bail!("MidStreamCancelRootTurnProvider drives only the streaming path")
+    }
+
+    fn chat_stream(&self, _request: ChatRequest) -> StreamBox<'_> {
+        let cancel = self.cancel.clone();
+        let stores = self.stores.clone();
+        let task_id = self.task_id.clone();
+        let cancel_at = self.cancel_at;
+        Box::pin(async_stream::stream! {
+            yield Ok(StreamDelta::TextDelta {
+                delta: "partial ".to_owned(),
+                block_index: 0,
+            });
+            let _ = cancel_root_turn(&task_id, &stores.deps(), cancel_at).await;
+            cancel.cancel();
+            yield Ok(StreamDelta::TextDelta {
+                delta: "answer".to_owned(),
+                block_index: 0,
+            });
+        })
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
+/// The RPC-cancel-then-worker-abort sequence commits exactly ONE
+/// terminal `Cancelled` marker: `cancel_root_turn` emits it, and the
+/// running worker's abort path (seam B) salvages the prefix without
+/// adding a second lifecycle event.
+#[tokio::test]
+async fn running_abort_after_cancel_commits_single_cancelled_event() -> Result<()> {
+    let stores = TestStores::new();
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let bootstrap = sample_bootstrap(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    let cancel = CancellationToken::new();
+    let provider = MidStreamCancelRootTurnProvider {
+        cancel: cancel.clone(),
+        stores: stores.clone(),
+        task_id: task_id.clone(),
+        cancel_at: t_plus(2),
+    };
+    let mut deps = stores.deps();
+    deps.cancel = Some(&cancel);
+
+    let result = execute_root_turn(
+        inputs,
+        "What is the capital of France?",
+        &provider,
+        &deps,
+        t_plus(5),
+    )
+    .await;
+    let error = result.err().context("cancelled turn must return Err")?;
+    assert!(
+        format!("{error:#}").to_lowercase().contains("cancel"),
+        "expected a cancellation error, got: {error:#}",
+    );
+
+    // Seam B still salvaged the prefix (the user prompt) as turn 1.
+    let thread = stores.threads.get(&thread_a()).await?.context("thread")?;
+    assert_eq!(thread.committed_turns, 1);
+
+    // Exactly one terminal marker: the cancel's, not a second from the
+    // worker's abort path.
+    assert_eq!(cancelled_event_count(&stores.events, &thread_a()).await?, 1);
     Ok(())
 }
