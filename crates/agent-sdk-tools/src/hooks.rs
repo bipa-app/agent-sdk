@@ -35,6 +35,13 @@ pub enum ToolDecision {
 ///
 /// This is the place for prompt-injection scrubbing, PII gating, or
 /// system-prompt policy enforcement.
+///
+/// **Forward-compat is fail-open:** the agent loop matches this enum with a
+/// wildcard arm that treats unknown variants as `Proceed`, so a *restrictive*
+/// variant added here in a future release is silently ignored by loops built
+/// against older SDKs. Never add a variant whose ignored meaning weakens a
+/// security decision — extend `Block`/`Modify` semantics instead, or plan a
+/// breaking change.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum RequestDecision {
@@ -51,6 +58,13 @@ pub enum RequestDecision {
 /// and surfaced.
 ///
 /// This is the place for output moderation or secret-leakage detection.
+///
+/// **Forward-compat is fail-open:** the agent loop matches this enum with a
+/// wildcard arm that treats unknown variants as `Accept`, so a *restrictive*
+/// variant added here in a future release is silently ignored by loops built
+/// against older SDKs. Never add a variant whose ignored meaning weakens a
+/// security decision — extend `Block`/`RetryWithFeedback` semantics instead,
+/// or plan a breaking change.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ResponseDecision {
