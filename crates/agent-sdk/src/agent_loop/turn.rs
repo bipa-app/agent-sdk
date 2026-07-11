@@ -2936,7 +2936,24 @@ where
         super::llm::PostLlmGuardrail::Blocked(reason) => {
             // The provider billed for the rejected response, so its tokens
             // must still land in the cumulative totals before the run ends.
-            apply_turn_usage(ctx, provenance, response);
+            let turn_usage = apply_turn_usage(ctx, provenance, response);
+            // And its completion edge must reach event consumers: the
+            // terminal Error state/event carries no usage, so without this
+            // the paid call is under-reported (mirrors the retry and
+            // retry-cap paths). Best-effort — a failed append must not mask
+            // the block error.
+            let _ = send_event(
+                event_store,
+                &ctx.thread_id,
+                ctx.turn,
+                hooks,
+                authority,
+                AgentEvent::TurnComplete {
+                    turn: ctx.turn,
+                    usage: turn_usage,
+                },
+            )
+            .await;
             Err(guardrail_block_result(
                 &ctx.thread_id,
                 ctx.turn,

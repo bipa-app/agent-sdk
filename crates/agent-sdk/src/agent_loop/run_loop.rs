@@ -3425,7 +3425,15 @@ async fn convert_continue_turn<H: AgentHooks, S: StateStore>(
         )
         .await
         {
-            return ConvertedTurn::finish(TurnOutcome::Error(error));
+            // Even the error return must respect the state-save gate: with
+            // a failed save AND a failed terminal append, finishing the
+            // turn would still leave the stale durable turn_count pointing
+            // at a finished turn (rerun brick).
+            return ConvertedTurn::gated(
+                TurnOutcome::Error(error),
+                saved,
+                "single-turn budget stop (terminal append failed)",
+            );
         }
         // The checkpoint above IS this terminal's state save: when it
         // failed, finishing the turn would leave the durable turn_count

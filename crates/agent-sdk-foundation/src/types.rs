@@ -134,6 +134,14 @@ impl Default for AgentConfig {
 /// was truncated and retried with a doubled token budget). All such calls
 /// are folded into the cumulative usage and re-checked at the next
 /// boundary, so the overshoot is bounded and never compounds.
+///
+/// Two accounting gaps are known and deliberate: a streamed attempt that
+/// fails mid-response and is retried may have billed partial tokens the
+/// provider error channel does not carry, so those are not counted
+/// (tracked alongside the channel's other gaps); and a custom compactor
+/// installed via `with_custom_compactor` has its reported usage priced at
+/// the run's provider/model, so cost is approximate when the compactor
+/// uses a different backend.
 #[derive(Clone, Debug, Default)]
 pub struct UsageLimits {
     /// Maximum cumulative tokens (input + output, summed across every
