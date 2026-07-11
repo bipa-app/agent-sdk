@@ -1424,14 +1424,23 @@ impl AgentControlService for GrpcControlService {
             "cancelling task tree",
         );
 
+        // Route through the worker's cancel lifecycle, not bare
+        // `cancel_tree`: for a root parked in `WaitingOnChildren` (or
+        // `Pending` + `ReadyToResume`) there is no live worker to salvage
+        // the turn, so `cancel_root_turn` first commits the completed
+        // prefix of the parked turn and closes open attempts — otherwise
+        // `cancel_tree` clears the durable continuation and the next turn
+        // resumes from stale conversation history. A `Running` root is
+        // still handled by its worker (lease loss trips the cancel token
+        // and seam B commits the prefix).
         let now = OffsetDateTime::now_utc();
-        let cancelled = self
-            .shared
-            .stores
-            .task_store
-            .cancel_tree(&task_id, now)
-            .await
-            .map_err(internal_status("cancelling task tree"))?;
+        let cancelled = agent_server::worker::cancel_root_turn(
+            &task_id,
+            &self.shared.stores.root_turn_deps(),
+            now,
+        )
+        .await
+        .map_err(internal_status("cancelling task tree"))?;
 
         let cancelled_task_ids: Vec<String> = cancelled.iter().map(ToString::to_string).collect();
         let cancelled_count = u32::try_from(cancelled_task_ids.len())
@@ -5071,15 +5080,42 @@ mod tests {
             shared: Arc::clone(&shared),
         };
 
-        let err = service
+        let Err(err) = service
             .cancel_task(Request::new(pb::CancelTaskRequest {
                 task_id: child_id,
                 reason: String::new(),
                 thread_id: String::new(),
             }))
             .await
-            .expect_err("cancelling an interior task must reject");
+        else {
+            bail!("cancelling an interior task must reject");
+        };
         assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+        Ok(())
+    }
+
+    /// The headline behavior through the RPC: cancelling a root with a
+    /// live descendant cancels the whole subtree and reports the ids in
+    /// cancellation order (root first, then the child).
+    #[tokio::test]
+    async fn cancel_task_cascades_to_descendants() -> Result<()> {
+        let shared = event_test_shared()?;
+        let (_thread, root_id, child_id) =
+            seed_interior_tool_child(&shared, "t-cancel-cascade").await?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+
+        let cancel = service
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: root_id.clone(),
+                reason: "cascade".into(),
+                thread_id: String::new(),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(cancel.cancelled_task_ids, vec![root_id, child_id]);
+        assert_eq!(cancel.cancelled_count, 2);
         Ok(())
     }
 
@@ -5095,14 +5131,16 @@ mod tests {
 
         let (thread, task_id) = seed_pending_root(&service, "cancel-thread-guard").await?;
 
-        let err = service
+        let Err(err) = service
             .cancel_task(Request::new(pb::CancelTaskRequest {
                 task_id: task_id.clone(),
                 reason: String::new(),
                 thread_id: format!("{thread}-other"),
             }))
             .await
-            .expect_err("thread mismatch must reject");
+        else {
+            bail!("thread mismatch must reject");
+        };
         assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
 
         // The matching thread guard still permits the cancel, proving the

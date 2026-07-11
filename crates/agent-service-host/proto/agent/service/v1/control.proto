@@ -218,6 +218,13 @@ message DecideConfirmationResponse {
 // any worker still holding the row fails its next heartbeat / complete /
 // fail CAS.
 //
+// For a RUNNING task the cancel is asynchronous from the worker's point
+// of view: this RPC returns OK once the rows are durably cancelled, but
+// the worker only notices when its next heartbeat is rejected, so the
+// task may keep executing (streaming model output, incurring provider
+// cost) for up to one heartbeat interval before it aborts and commits
+// the completed prefix of the interrupted turn.
+//
 // Cancelling an interior (non-root) task is not yet supported: the durable
 // SQL backends do not rebalance an out-of-subtree parent left in
 // `WAITING_ON_CHILDREN`, which would strand the parent forever. The RPC
