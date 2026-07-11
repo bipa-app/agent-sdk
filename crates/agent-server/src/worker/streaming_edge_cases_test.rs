@@ -433,6 +433,91 @@ async fn mid_stream_rate_limit_retries_then_succeeds() -> Result<()> {
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Edge case 3b — a silent stream trips the stall budgets and retries
+// ─────────────────────────────────────────────────────────────────────
+
+// Regression for the 2026-07-11 incident: a request written to a
+// half-open connection yields no events, no error, and no journal
+// activity — before STREAM_FIRST_EVENT_TIMEOUT the poll loop hung
+// forever and an external watchdog eventually killed the whole task
+// tree. The stall must instead surface as a recoverable error that the
+// normal retry path absorbs.
+#[tokio::test(start_paused = true)]
+async fn first_event_stall_is_retried_then_succeeds() -> Result<()> {
+    let stores = Stores::new();
+    // Attempt 1: the script sleeps 400s (virtual) before its first
+    // delta — past the 330s first-event stall budget, so nothing is
+    // ever delivered. Attempt 2: clean success.
+    let first = TurnScript::text("never delivered").with_delay(std::time::Duration::from_secs(400));
+    let second = TurnScript::text("recovered answer");
+    let provider = StreamingScriptedProvider::new(vec![first, second]);
+
+    let outcome = run_turn(&stores, &provider).await?;
+    let RootTurnOutcome::Completed { response_text, .. } = outcome else {
+        panic!("expected Completed after first-event stall retry");
+    };
+    assert_eq!(response_text, "recovered answer");
+
+    let attempts = stores
+        .attempts
+        .list_by_task(&acquire_existing_task_id(&stores).await?)
+        .await?;
+    assert_eq!(attempts.len(), 2, "one stalled attempt + one success");
+
+    // The stall rides the standard recoverable path: an auto-retry
+    // envelope lands in the journal (this commit is also what keeps
+    // consumer-side stall watchdogs from declaring the thread dead).
+    let kinds = event_kinds(&stores.events.get_events(&thread_id()).await?);
+    assert!(
+        kinds.contains(&"AutoRetryStart"),
+        "expected AutoRetryStart in {kinds:?}",
+    );
+    assert_eq!(kinds.last(), Some(&"Done"));
+
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn mid_stream_stall_is_retried_then_succeeds() -> Result<()> {
+    let stores = Stores::new();
+    // Attempt 1: every delta is gated behind a uniform 200s delay. The
+    // first delta lands (200s < 330s first-event budget) and latches
+    // the tighter inter-event budget; the gap before the second delta
+    // (another 200s > 120s) then trips the mid-stream stall. Attempt 2:
+    // clean success.
+    let first = TurnScript::from_deltas(vec![
+        StreamDelta::TextDelta {
+            delta: "partial".into(),
+            block_index: 0,
+        },
+        StreamDelta::TextDelta {
+            delta: " never lands".into(),
+            block_index: 0,
+        },
+        StreamDelta::Done {
+            stop_reason: Some(StopReason::EndTurn),
+        },
+    ])
+    .with_delay(std::time::Duration::from_secs(200));
+    let second = TurnScript::text("recovered answer");
+    let provider = StreamingScriptedProvider::new(vec![first, second]);
+
+    let outcome = run_turn(&stores, &provider).await?;
+    let RootTurnOutcome::Completed { response_text, .. } = outcome else {
+        panic!("expected Completed after mid-stream stall retry");
+    };
+    assert_eq!(response_text, "recovered answer");
+
+    let attempts = stores
+        .attempts
+        .list_by_task(&acquire_existing_task_id(&stores).await?)
+        .await?;
+    assert_eq!(attempts.len(), 2, "one stalled attempt + one success");
+
+    Ok(())
+}
+
 /// The single root task's id (there is exactly one in these tests).
 async fn acquire_existing_task_id(stores: &Stores) -> Result<crate::journal::task::AgentTaskId> {
     let tasks = stores.tasks.list_by_thread(&thread_id()).await?;

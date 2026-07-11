@@ -33,6 +33,37 @@ const MODELS_PAGE_LIMIT: u32 = 1000;
 /// that never clears `has_more`. At `MODELS_PAGE_LIMIT` rows/page this covers
 /// far more models than any provider ships.
 const MODELS_MAX_PAGES: usize = 100;
+/// Deadline for receiving HTTP response headers on a **streaming** request.
+///
+/// With `stream: true` Anthropic returns `200` + `message_start` promptly and
+/// pings through any generation gap, so slow headers are never healthy. What
+/// slow headers DO indicate is a half-open pooled connection: after a
+/// multi-minute streaming response the server/edge can drop connection state
+/// without notifying the client, and the next request written to that
+/// connection waits for headers forever (the 2026-07-11 incident: streams
+/// hanging 3+ minutes with zero SSE events until an external watchdog killed
+/// the whole worker). `connect_timeout` never covers reused connections; this
+/// deadline does. Elapsing surfaces a retryable transport error ("timed out")
+/// so every retry layer above re-sends on a fresh connection.
+const STREAM_HEADERS_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
+/// Maximum silence between SSE byte chunks before the stream is treated as a
+/// stalled connection.
+///
+/// Measured at the **byte** level, where `message_start` and periodic `ping`
+/// events keep a healthy stream audibly alive even while no content delta is
+/// ready (long adaptive-thinking pauses, large-prompt processing). Byte-level
+/// silence past this budget therefore means the connection is dead, not that
+/// the model is thinking — consumers measuring at the delta level need 300s
+/// to say the same safely.
+const SSE_BYTE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+/// Total request deadline for the **non-streaming** `chat` path, where the
+/// server holds headers until generation completes so no faster bound is
+/// safe. Mirrors `CHAT_READ_TIMEOUT_SECS` on the Gemini/Vertex providers.
+const CHAT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
+/// How long an idle pooled connection may be reused. Bounds the aged-idle
+/// half of the stale-connection class (the immediate-reuse half is covered by
+/// [`STREAM_HEADERS_TIMEOUT`]); reqwest's default is 90s.
+const POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub const MODEL_HAIKU_35: &str = "claude-3-5-haiku-20241022";
 pub const MODEL_SONNET_35: &str = "claude-3-5-sonnet-20241022";
@@ -216,6 +247,10 @@ pub struct AnthropicProvider {
     thinking: Option<ThinkingConfig>,
     /// Extra headers applied to every request (e.g. for gateway authentication).
     extra_headers: Vec<(String, String)>,
+    /// Streaming-path deadline for response headers ([`STREAM_HEADERS_TIMEOUT`]).
+    stream_headers_timeout: std::time::Duration,
+    /// Streaming-path byte-level inactivity budget ([`SSE_BYTE_IDLE_TIMEOUT`]).
+    sse_byte_idle_timeout: std::time::Duration,
 }
 
 impl AnthropicProvider {
@@ -237,14 +272,25 @@ impl AnthropicProvider {
         };
 
         // Configure client with appropriate timeouts for streaming
-        // - No overall timeout (streaming can take a long time)
-        // - 30 second connect timeout
+        // - No overall timeout (streaming can take a long time); the
+        //   streaming path bounds headers + byte gaps per request instead
+        // - 30 second connect timeout (fresh dials only)
         // - TCP keepalive to prevent connection drops
+        // - Bounded idle-connection reuse (see POOL_IDLE_TIMEOUT)
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(30))
             .tcp_keepalive(std::time::Duration::from_secs(30))
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .build()
-            .unwrap_or_default();
+            .unwrap_or_else(|error| {
+                // A default client still works; it just loses the timeout
+                // hardening above — say so instead of degrading silently.
+                log::error!(
+                    "failed to build Anthropic HTTP client with timeouts, \
+                     falling back to reqwest defaults: {error}"
+                );
+                reqwest::Client::default()
+            });
 
         Self {
             client,
@@ -254,6 +300,8 @@ impl AnthropicProvider {
             auth_mode,
             thinking: None,
             extra_headers: Vec::new(),
+            stream_headers_timeout: STREAM_HEADERS_TIMEOUT,
+            sse_byte_idle_timeout: SSE_BYTE_IDLE_TIMEOUT,
         }
     }
 
@@ -510,6 +558,22 @@ impl AnthropicProvider {
         self
     }
 
+    /// Override the streaming stall guards: the response-headers deadline
+    /// (default 1 minute — `STREAM_HEADERS_TIMEOUT`) and the SSE
+    /// byte-inactivity budget (default 90s — `SSE_BYTE_IDLE_TIMEOUT`).
+    /// The defaults suit `api.anthropic.com`; gateways with slower
+    /// first-byte behaviour can widen them.
+    #[must_use]
+    pub const fn with_stream_stall_timeouts(
+        mut self,
+        headers_timeout: std::time::Duration,
+        byte_idle_timeout: std::time::Duration,
+    ) -> Self {
+        self.stream_headers_timeout = headers_timeout;
+        self.sse_byte_idle_timeout = byte_idle_timeout;
+        self
+    }
+
     /// Add extra HTTP headers applied to every request.
     #[must_use]
     pub fn with_extra_headers(mut self, headers: Vec<(String, String)>) -> Self {
@@ -613,9 +677,14 @@ impl LlmProvider for AnthropicProvider {
             }
         }
 
+        // Non-streaming: the server holds headers until generation completes,
+        // so a fast headers deadline is unsafe here — bound the whole request
+        // instead (same shape as the Gemini/Vertex providers). Without any
+        // bound, a half-open pooled connection hangs this call forever.
         let builder = self
             .client
             .post(format!("{}/v1/messages", self.base_url))
+            .timeout(CHAT_REQUEST_TIMEOUT)
             .header("Content-Type", "application/json");
         let response = self
             .apply_auth(builder)
@@ -807,15 +876,31 @@ impl LlmProvider for AnthropicProvider {
                 .client
                 .post(format!("{}/v1/messages", self.base_url))
                 .header("Content-Type", "application/json");
-            let response = match self
-                .apply_auth(builder)
-                .json(&api_request)
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
+            // With `stream: true` the server answers promptly (200 +
+            // `message_start`, then pings through generation gaps), so slow
+            // headers only ever mean a dead connection — typically a pooled
+            // keep-alive the server/edge half-closed after a long previous
+            // response. `connect_timeout` never covers reused connections;
+            // this deadline does. The message says "timed out" so every
+            // retry layer classifies it as a retryable transport error and
+            // re-sends on a fresh connection.
+            let headers_timeout = self.stream_headers_timeout;
+            let send = self.apply_auth(builder).json(&api_request).send();
+            let response = match tokio::time::timeout(headers_timeout, send).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
                     yield Err(anyhow::anyhow!("request failed: {e}"));
+                    return;
+                }
+                Err(_elapsed) => {
+                    log::error!(
+                        "Anthropic streaming request timed out awaiting response headers after {}s — stalled connection",
+                        headers_timeout.as_secs()
+                    );
+                    yield Err(anyhow::anyhow!(
+                        "request timed out awaiting response headers after {}s — treating as a stalled connection",
+                        headers_timeout.as_secs()
+                    ));
                     return;
                 }
             };
@@ -893,7 +978,27 @@ impl LlmProvider for AnthropicProvider {
 
             log::debug!("Starting SSE stream processing");
 
-            while let Some(chunk_result) = stream.next().await {
+            // Byte-level inactivity guard: `message_start` and periodic
+            // `ping` events keep a healthy stream's bytes flowing even while
+            // no content delta is ready, so silence past the budget means
+            // the connection is dead — not that the model is thinking.
+            let byte_idle_timeout = self.sse_byte_idle_timeout;
+            loop {
+                let next = match tokio::time::timeout(byte_idle_timeout, stream.next()).await {
+                    Ok(next) => next,
+                    Err(_elapsed) => {
+                        log::error!(
+                            "SSE stream timed out: no bytes for {}s chunk_count={chunk_count} total_bytes={total_bytes} — stalled connection",
+                            byte_idle_timeout.as_secs()
+                        );
+                        yield Err(anyhow::anyhow!(
+                            "SSE stream timed out: no bytes for {}s — treating as a stalled connection",
+                            byte_idle_timeout.as_secs()
+                        ));
+                        return;
+                    }
+                };
+                let Some(chunk_result) = next else { break };
                 let chunk = match chunk_result {
                     Ok(c) => c,
                     Err(e) => {
@@ -1667,5 +1772,96 @@ mod tests {
             body["thinking"]["type"], "enabled",
             "configured thinking must survive when no tool is forced, got: {body}"
         );
+    }
+
+    /// A streaming request whose response headers never arrive (the
+    /// half-open pooled-connection shape from the 2026-07-11 incident)
+    /// must surface a retryable "timed out" error instead of hanging
+    /// until an external watchdog kills the caller.
+    #[tokio::test]
+    async fn streaming_headers_stall_yields_timeout_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)))
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::sonnet_45("sk-ant-api-test")
+            .with_base_url(server.uri())
+            .with_stream_stall_timeouts(
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_secs(5),
+            );
+
+        let items: Vec<_> = provider
+            .chat_stream(request_with_tools(vec![]))
+            .collect()
+            .await;
+
+        assert_eq!(items.len(), 1, "a stalled send yields exactly one item");
+        let err = items[0]
+            .as_ref()
+            .expect_err("headers stall must surface as Err");
+        assert!(
+            err.to_string()
+                .contains("timed out awaiting response headers"),
+            "message must name the headers stall: {err}"
+        );
+    }
+
+    /// A stream that goes byte-silent after headers (server sent a ping,
+    /// then the connection went half-open) must surface a retryable
+    /// "timed out" error. Hand-rolled server: wiremock cannot hold a
+    /// connection open mid-body.
+    #[tokio::test]
+    async fn sse_byte_stall_yields_timeout_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            // Consume enough of the request to unblock the client.
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let headers = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
+            socket.write_all(headers.as_bytes()).await.expect("headers");
+            // One healthy liveness event, then silence with the socket
+            // held open — the stall shape the guard exists for.
+            let ping = "event: ping\ndata: {\"type\": \"ping\"}\n\n";
+            let chunk = format!("{:x}\r\n{ping}\r\n", ping.len());
+            socket
+                .write_all(chunk.as_bytes())
+                .await
+                .expect("ping chunk");
+            socket.flush().await.expect("flush");
+            std::future::pending::<()>().await;
+        });
+
+        let provider = AnthropicProvider::sonnet_45("sk-ant-api-test")
+            .with_base_url(format!("http://{addr}"))
+            .with_stream_stall_timeouts(
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_millis(200),
+            );
+
+        let items: Vec<_> = provider
+            .chat_stream(request_with_tools(vec![]))
+            .collect()
+            .await;
+
+        let last = items.last().expect("at least the stall error");
+        let err = last.as_ref().expect_err("byte stall must surface as Err");
+        assert!(
+            err.to_string().contains("no bytes for"),
+            "message must name the byte stall: {err}"
+        );
+        server.abort();
     }
 }
