@@ -2761,25 +2761,41 @@ fn map_tool_event_payload(event: &AgentEvent) -> RpcResult<Option<pb::event_enve
 ///
 /// Shared by [`AgentEvent::Done`] and [`AgentEvent::BudgetExceeded`]: the
 /// proto has no dedicated budget event, so a budget-terminated run reuses
-/// the `done` frame. This keeps the streaming contract additive — a
-/// replay/follow consumer always receives a closing `done` frame and the
-/// stream terminates (see [`is_done_event`]) instead of failing with
-/// INTERNAL on an unmapped variant. `BudgetExceeded` carries no wall-clock
-/// duration, so it passes [`std::time::Duration::ZERO`]; the limit/cost
-/// detail stays available via the durable event log. (`estimated_cost_usd`
-/// is likewise not yet surfaced on the wire `DoneEvent`.)
+/// the `done` frame with `stop_reason` distinguishing the disposition.
+/// This keeps the streaming contract additive — a replay/follow consumer
+/// always receives a closing `done` frame and the stream terminates (see
+/// [`is_done_event`]) instead of failing with INTERNAL on an unmapped
+/// variant. `BudgetExceeded` carries no wall-clock duration (its emission
+/// sites sit outside the timed run path), so `duration` is left unset
+/// rather than fabricated.
 fn map_done_event(
     thread_id: &ThreadId,
     total_turns: usize,
     total_usage: &TokenUsage,
-    duration: std::time::Duration,
+    duration: Option<std::time::Duration>,
+    stop_reason: pb::RunStopReason,
+    estimated_cost_usd: Option<f64>,
 ) -> RpcResult<pb::event_envelope::Event> {
     Ok(pb::event_envelope::Event::Done(pb::DoneEvent {
         thread_id: thread_id.0.clone(),
         total_turns: map_u64(total_turns, "total_turns")?,
         total_usage: Some(map_token_usage(total_usage)),
-        duration: Some(map_duration(duration)?),
+        duration: duration.map(map_duration).transpose()?,
+        stop_reason: stop_reason.into(),
+        estimated_cost_usd,
     }))
+}
+
+/// Wire disposition for a budget-terminated run, by the limit that tripped.
+const fn budget_stop_reason(
+    limit: agent_sdk_foundation::types::BudgetLimitKind,
+) -> pb::RunStopReason {
+    match limit {
+        agent_sdk_foundation::types::BudgetLimitKind::TotalTokens => {
+            pb::RunStopReason::BudgetTotalTokens
+        }
+        agent_sdk_foundation::types::BudgetLimitKind::CostUsd => pb::RunStopReason::BudgetCostUsd,
+    }
 }
 
 fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelope::Event> {
@@ -2797,18 +2813,28 @@ fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelo
             total_turns,
             total_usage,
             duration,
-            ..
-        } => map_done_event(thread_id, *total_turns, total_usage, *duration),
-        AgentEvent::BudgetExceeded {
-            thread_id,
-            total_turns,
-            total_usage,
-            ..
+            estimated_cost_usd,
         } => map_done_event(
             thread_id,
             *total_turns,
             total_usage,
-            std::time::Duration::ZERO,
+            Some(*duration),
+            pb::RunStopReason::Completed,
+            *estimated_cost_usd,
+        ),
+        AgentEvent::BudgetExceeded {
+            thread_id,
+            total_turns,
+            total_usage,
+            estimated_cost_usd,
+            limit,
+        } => map_done_event(
+            thread_id,
+            *total_turns,
+            total_usage,
+            None,
+            budget_stop_reason(*limit),
+            *estimated_cost_usd,
         ),
         AgentEvent::Error {
             message,
@@ -5534,6 +5560,12 @@ mod tests {
                 let usage = done.total_usage.context("done event must carry usage")?;
                 assert_eq!(usage.input_tokens, 100);
                 assert_eq!(usage.output_tokens, 50);
+                assert_eq!(done.stop_reason(), pb::RunStopReason::BudgetTotalTokens);
+                assert_eq!(done.estimated_cost_usd, Some(0.25));
+                assert!(
+                    done.duration.is_none(),
+                    "budget stop must not fabricate a duration"
+                );
             }
             other => bail!("BudgetExceeded must map to a Done event, got {other:?}"),
         }

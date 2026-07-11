@@ -96,7 +96,8 @@ pub struct AgentConfig {
     /// `None` (default) keeps the historical unbounded behavior — every
     /// adjacent observe-tier call in a turn is dispatched at once.
     /// `Some(1)` forces strictly sequential execution; `Some(n)` caps the
-    /// in-flight count at `n`. Result ordering is always preserved.
+    /// in-flight count at `n`. `Some(0)` is not meaningful and is treated
+    /// as `Some(1)` (sequential). Result ordering is always preserved.
     pub max_parallel_tools: Option<usize>,
 }
 

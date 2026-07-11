@@ -129,6 +129,14 @@ pub trait AgentHooks: Send + Sync {
     /// [`ResponseDecision::RetryWithFeedback`] to reject it and steer a retry
     /// (e.g. output moderation or secret-leakage detection). The default
     /// accepts.
+    ///
+    /// **Streaming caveat:** the hook runs on the *complete* response, after
+    /// the model has finished. In streaming mode the text deltas have already
+    /// been emitted (and recorded) as stream events by then, so a `Block` /
+    /// `RetryWithFeedback` decision keeps the response out of the thread's
+    /// message history and out of the model's context, but a live consumer
+    /// may have rendered the deltas. Disable streaming when blocked content
+    /// must never be surfaced.
     async fn on_llm_response(&self, _response: &llm::ChatResponse) -> ResponseDecision {
         ResponseDecision::Accept
     }
