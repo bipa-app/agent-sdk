@@ -395,14 +395,41 @@ pub async fn fail_root_turn(
 /// partial commit is best-effort — any error is logged and swallowed so
 /// the cancel always wins.
 ///
-/// Then, exactly as before, it best-effort closes any open turn attempts
-/// and calls [`AgentTaskStore::cancel_tree`] to atomically cancel the
+/// Then it best-effort closes any open turn attempts — with the same
+/// ownership split as the prefix commit: a **`Running`** row's attempts
+/// are left to its live worker, whose cancel path closes the streaming
+/// attempt when the tripped token aborts the stream and whose
+/// suspension / commit closes record the round's **real token usage**.
+/// [`TurnAttemptStore::close_attempt`] is single-shot (an
+/// already-closed row rejects), so closing here first would pin a
+/// zero-usage `Cancelled` row over that usage — or abort an in-flight
+/// completed-turn transaction whose in-transaction close then hits
+/// `AlreadyClosed`. Parked / queued rows have no live worker, so this
+/// seam closes them. Finally it calls
+/// [`AgentTaskStore::cancel_tree`] to atomically cancel the
 /// root task and any live descendant tasks (e.g. `tool_runtime` children
 /// spawned during suspension). `cancel_tree` clears each row's
 /// `TaskState` to `None`; the durable message-projection draft slot
 /// survives, so a re-seeded suffix (the dropped trailing
 /// `assistant + tool_use`) is closed by the next turn's
 /// `backfill_orphaned_tool_results`.
+///
+/// # Known race: cancelled `Running` root vs the successor turn
+///
+/// `cancel_tree` frees the thread's active-root slot and promotes a
+/// queued successor in the same store transaction, but a cancelled
+/// `Running` root's worker only notices on its next rejected heartbeat
+/// — and its seam-B salvage commits into the turn slot it bootstrapped
+/// with (`recovery_view.next_turn_number`). A successor that bootstraps
+/// before that salvage lands pins the **same** slot, and the
+/// `expected_turn` CAS makes whichever commit lands second fail: the
+/// salvage loses silently (dropped prefix, benign), but a losing
+/// successor turn fails terminally. Closing this fully needs a
+/// store-level change (defer promotion until the cancelled root's
+/// lease is released, or teach the commit layer to distinguish
+/// cross-task slot collisions from same-task duplicate commits);
+/// callers that need the successor safe should delay follow-up work by
+/// one heartbeat interval after cancelling a `Running` root.
 ///
 /// # Returns
 ///
@@ -416,15 +443,31 @@ pub async fn cancel_root_turn(
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<Vec<AgentTaskId>> {
+    // Read the row once: it sources the parked-turn prefix commit and
+    // decides who owns the attempt close. A read error degrades to the
+    // prior behaviour (no salvage, attempts closed here).
+    let task = deps.task_store.get(task_id).await.ok().flatten();
+
     // Commit the completed prefix of a parked turn before the task goes
-    // terminal. Read the row first so the candidate is sourced from the
-    // durable draft / suspended messages *before* `cancel_tree` clears
-    // the typed state.
-    if let Ok(Some(task)) = deps.task_store.get(task_id).await {
-        best_effort_commit_parked_cancel(&task, deps, now).await;
+    // terminal — sourced from the durable draft / suspended messages
+    // *before* `cancel_tree` clears the typed state.
+    if let Some(task) = &task {
+        best_effort_commit_parked_cancel(task, deps, now).await;
     }
 
-    best_effort_close_open_attempts(task_id, deps.attempt_store, now).await;
+    // A `Running` row's live worker owns the attempt close (see the doc
+    // above): pre-closing here would win the store's single-close CAS
+    // with a zeroed row and discard the real usage its suspension /
+    // commit close carries, or roll back an in-flight completed-turn
+    // transaction. If that worker dies before closing, the attempt row
+    // stays open — the same already-tolerated state every non-cancel
+    // process death leaves behind (nothing sweeps orphaned attempts).
+    let has_live_worker = task
+        .as_ref()
+        .is_some_and(|task| task.status == TaskStatus::Running);
+    if !has_live_worker {
+        best_effort_close_open_attempts(task_id, deps.attempt_store, now).await;
+    }
 
     let cancelled = deps
         .task_store

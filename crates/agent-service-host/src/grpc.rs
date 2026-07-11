@@ -1375,6 +1375,11 @@ impl AgentControlService for GrpcControlService {
     ///
     /// The `reason` is recorded in the server logs only; it is not
     /// persisted on the task row.
+    ///
+    /// Cancelling a `Running` root is asynchronous for its worker and
+    /// races the thread's next turn — see the `CancelTask` proto docs
+    /// and the known-race note on
+    /// [`agent_server::worker::cancel_root_turn`].
     async fn cancel_task(
         &self,
         request: Request<pb::CancelTaskRequest>,

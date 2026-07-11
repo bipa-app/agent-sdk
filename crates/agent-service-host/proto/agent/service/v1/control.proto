@@ -225,6 +225,17 @@ message DecideConfirmationResponse {
 // cost) for up to one heartbeat interval before it aborts and commits
 // the completed prefix of the interrupted turn.
 //
+// That deferred prefix commit also races the thread's NEXT turn:
+// cancelling a RUNNING root immediately frees the thread's active-root
+// slot (a queued successor is promoted in the same transaction), and a
+// successor turn that starts before the interrupted worker's prefix
+// commit lands binds the same turn number. Whichever commit lands
+// second is rejected — a losing prefix commit is dropped silently
+// (best-effort salvage), but a losing successor turn FAILS and must be
+// resubmitted. Callers that submit follow-up work on the same thread
+// right after cancelling a RUNNING task should be prepared to retry it,
+// or wait one heartbeat interval before submitting.
+//
 // Cancelling an interior (non-root) task is not yet supported: the durable
 // SQL backends do not rebalance an out-of-subtree parent left in
 // `WAITING_ON_CHILDREN`, which would strand the parent forever. The RPC

@@ -22,11 +22,12 @@ use crate::journal::store::{AgentTaskStore, InMemoryAgentTaskStore};
 use crate::journal::task::{AgentTask, AgentTaskId, LeaseId, TaskKind, TaskStatus, WorkerId};
 use crate::journal::task_state::TaskState;
 use crate::journal::thread_store::{InMemoryThreadStore, ThreadStore};
-use crate::journal::turn_attempt::{TurnAttempt, TurnAttemptOutcome};
+use crate::journal::turn_attempt::{OpenAttemptParams, TurnAttempt, TurnAttemptOutcome};
 use crate::journal::turn_attempt_store::{InMemoryTurnAttemptStore, TurnAttemptStore};
 use crate::worker::bootstrap::WorkerBootstrapContext;
 use crate::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
 use agent_sdk_foundation::ThreadId;
+use agent_sdk_foundation::audit::AuditProvenance;
 use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, Role, StopReason, Tool, Usage,
 };
@@ -5611,5 +5612,94 @@ async fn double_cancel_root_turn_commits_prefix_once() -> Result<()> {
         stores.checkpoints.list_by_thread(&thread_a()).await?.len(),
         1,
     );
+    Ok(())
+}
+
+/// Open an attempt row for `task_id` so a test can observe who closes it.
+async fn open_test_attempt(
+    attempts: &InMemoryTurnAttemptStore,
+    task_id: &AgentTaskId,
+    attempt_number: u32,
+    now: time::OffsetDateTime,
+) -> Result<TurnAttempt> {
+    attempts
+        .open_attempt(OpenAttemptParams {
+            task_id: task_id.clone(),
+            attempt_number,
+            provenance: AuditProvenance::new("test-provider", "test-model"),
+            request_blob: serde_json::json!({ "user_prompt": "test" }),
+            now,
+            otel_trace_id: None,
+            otel_span_id: None,
+        })
+        .await
+        .context("open test attempt")
+}
+
+/// Cancelling a `Running` root must NOT pre-close its open attempt:
+/// `close_attempt` is single-shot, and the live worker's own close (the
+/// stream-abort `Cancelled` close, or a suspension / commit close that
+/// carries the round's real token usage) would be rejected against a
+/// zero-usage row pinned here.
+#[tokio::test]
+async fn cancel_of_running_root_leaves_attempt_close_to_its_worker() -> Result<()> {
+    let stores = TestStores::new();
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let attempt = open_test_attempt(&stores.attempts, &task_id, 1, t0()).await?;
+
+    let cancelled = cancel_root_turn(&task_id, &stores.deps(), t_plus(1)).await?;
+    assert_eq!(cancelled, vec![task_id.clone()]);
+    let row = stores.tasks.get(&task_id).await?.context("task")?;
+    assert_eq!(row.status, TaskStatus::Cancelled);
+
+    let reread = stores.attempts.get(&attempt.id).await?.context("attempt")?;
+    assert!(
+        !reread.is_closed(),
+        "a running root's attempt stays open for its live worker to close",
+    );
+    Ok(())
+}
+
+/// A parked root has no live worker, so the cancel seam still owns the
+/// attempt-close hygiene: an attempt left open on a `WaitingOnChildren`
+/// row (e.g. a steering exchange whose process died mid-flight) is
+/// closed `Cancelled` by `cancel_root_turn`.
+#[tokio::test]
+async fn cancel_of_parked_root_closes_open_attempts() -> Result<()> {
+    let stores = TestStores::new();
+    let provider =
+        MockToolCallProvider::single("call_a", "bash", serde_json::json!({"command": "ls"}));
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let bootstrap = sample_bootstrap_with_tools(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let outcome = execute_root_turn(inputs, "run ls", &provider, &stores.deps(), t_plus(5)).await?;
+    assert!(matches!(outcome, RootTurnOutcome::Suspended { .. }));
+    let parked = stores.tasks.get(&task_id).await?.context("parked task")?;
+    assert_eq!(parked.status, TaskStatus::WaitingOnChildren);
+
+    // Simulate an attempt left open on the parked row.
+    let existing = stores.attempts.list_by_task(&task_id).await?;
+    let next_number = u32::try_from(existing.len()).context("attempt count")? + 1;
+    let orphan = open_test_attempt(&stores.attempts, &task_id, next_number, t_plus(6)).await?;
+
+    cancel_root_turn(&task_id, &stores.deps(), t_plus(7)).await?;
+
+    let reread = stores.attempts.get(&orphan.id).await?.context("attempt")?;
+    assert!(
+        reread.is_closed(),
+        "a parked root's open attempt is closed by the cancel seam",
+    );
+    assert_eq!(reread.outcome, Some(TurnAttemptOutcome::Cancelled));
     Ok(())
 }
