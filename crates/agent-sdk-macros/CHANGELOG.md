@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.7](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-macros-v0.11.6...agent-sdk-macros-v0.11.7) - 2026-07-11
+
+### Other
+
+- release v0.11.7 ([#348](https://github.com/bipa-app/agent-sdk/pull/348))
+
 ## [0.11.6](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-macros-v0.11.5...agent-sdk-macros-v0.11.6) - 2026-07-10
 
 ### Other
