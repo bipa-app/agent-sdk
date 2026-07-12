@@ -131,6 +131,18 @@ pub trait AgentHooks: Send + Sync {
     /// [`RequestDecision::Modify`] to substitute a sanitized request, or
     /// [`RequestDecision::Block`] to refuse the call (e.g. prompt-injection or
     /// PII policy). The default proceeds unchanged.
+    ///
+    /// **Fresh-input timing:** for a run's first call on fresh `Text` /
+    /// `Message` input the hook runs at *ingestion time*, against the
+    /// request built from existing history plus the candidate message —
+    /// BEFORE the message is durably appended, so a `Block` leaves nothing
+    /// in history. The request actually sent may then differ only by
+    /// SDK-added content: context compaction (a summary of the exact
+    /// content the hook already saw — `Block` decisions err conservative)
+    /// or a turn-budget reminder. A `Modify` on that first call is sent
+    /// as-is (bypassing compaction once; an oversized replacement degrades
+    /// to the normal overflow recovery). The hook fires exactly once per
+    /// LLM call in every mode.
     async fn pre_llm_request(&self, _request: &llm::ChatRequest) -> RequestDecision {
         RequestDecision::Proceed
     }
