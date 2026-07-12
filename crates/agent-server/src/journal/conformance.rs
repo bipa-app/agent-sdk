@@ -219,6 +219,15 @@ mod in_memory_bundle {
         ) -> Result<Option<AgentTask>> {
             self.task.promote_next_queued_root(thread_id, now).await
         }
+        async fn requeue_owned_task(
+            &self,
+            id: &AgentTaskId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+            now: OffsetDateTime,
+        ) -> Result<crate::journal::store::RequeueOutcome> {
+            self.task.requeue_owned_task(id, worker, lease, now).await
+        }
         async fn try_acquire_task(
             &self,
             task_id: &AgentTaskId,

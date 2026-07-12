@@ -381,6 +381,94 @@ mod tests {
         Ok(())
     }
 
+    /// Worker-initiated requeue of an owned Running row (issue #354):
+    /// the collision path's twin of the expiry sweep. Owned rows
+    /// return to `Pending` with the lease cleared; a stale lease or a
+    /// cancelled row reports `NotOwned` without touching the row; a
+    /// budget-exhausted row reports `BudgetExhausted` leaving the row
+    /// owned so the caller can run its terminal envelope.
+    async fn test_requeue_owned_task(task_store: &dyn AgentTaskStore) -> Result<()> {
+        use agent_server::journal::store::RequeueOutcome;
+
+        let root = fresh_root("conformance-requeue", 20);
+        let _ = task_store.submit_root_turn(root.clone()).await?;
+        let worker = WorkerId::new();
+        let lease = LeaseId::new();
+        let _ = task_store
+            .try_acquire_task(
+                &root.id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(50),
+                t_plus(21),
+            )
+            .await?;
+
+        // Stale lease: NotOwned, row untouched.
+        let stale = task_store
+            .requeue_owned_task(&root.id, &worker, &LeaseId::new(), t_plus(22))
+            .await?;
+        assert!(matches!(stale, RequeueOutcome::NotOwned));
+        let row = task_store.get(&root.id).await?.context("row")?;
+        assert_eq!(row.status, TaskStatus::Running);
+
+        // Owned: requeued to Pending, lease cleared, re-acquirable.
+        let outcome = task_store
+            .requeue_owned_task(&root.id, &worker, &lease, t_plus(23))
+            .await?;
+        let RequeueOutcome::Requeued(row) = outcome else {
+            anyhow::bail!("expected Requeued, got {outcome:?}");
+        };
+        assert_eq!(row.status, TaskStatus::Pending);
+        assert!(row.worker_id.is_none() && row.lease_id.is_none());
+        let reacquired = task_store
+            .try_acquire_task(
+                &root.id,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(80),
+                t_plus(24),
+            )
+            .await?;
+        assert!(reacquired.is_some(), "requeued row must be re-acquirable");
+
+        // Budget-exhausted (max_attempts = 1, attempt consumed at
+        // acquire): reported without transitioning.
+        let capped =
+            AgentTask::new_root_turn(thread_id("conformance-requeue-capped"), t_plus(30), 1);
+        let _ = task_store.submit_root_turn(capped.clone()).await?;
+        let cw = WorkerId::new();
+        let cl = LeaseId::new();
+        let _ = task_store
+            .try_acquire_task(&capped.id, cw.clone(), cl.clone(), t_plus(60), t_plus(31))
+            .await?;
+        let outcome = task_store
+            .requeue_owned_task(&capped.id, &cw, &cl, t_plus(32))
+            .await?;
+        assert!(matches!(outcome, RequeueOutcome::BudgetExhausted));
+        let row = task_store.get(&capped.id).await?.context("capped row")?;
+        assert_eq!(row.status, TaskStatus::Running);
+        assert_eq!(row.worker_id, Some(cw));
+
+        // Cancelled row: NotOwned even with the original lease — a
+        // requeue must never resurrect a cancelled task.
+        let doomed = fresh_root("conformance-requeue-cancelled", 40);
+        let _ = task_store.submit_root_turn(doomed.clone()).await?;
+        let dw = WorkerId::new();
+        let dl = LeaseId::new();
+        let _ = task_store
+            .try_acquire_task(&doomed.id, dw.clone(), dl.clone(), t_plus(90), t_plus(41))
+            .await?;
+        let _ = task_store.cancel_tree(&doomed.id, t_plus(42)).await?;
+        let outcome = task_store
+            .requeue_owned_task(&doomed.id, &dw, &dl, t_plus(43))
+            .await?;
+        assert!(matches!(outcome, RequeueOutcome::NotOwned));
+        let row = task_store.get(&doomed.id).await?.context("doomed row")?;
+        assert_eq!(row.status, TaskStatus::Cancelled);
+        Ok(())
+    }
+
     /// Completed-turn commit creates a checkpoint.
     async fn test_completed_turn_commit(
         task_store: &dyn AgentTaskStore,
@@ -2135,6 +2223,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_requeue_owned_task() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_requeue_owned_task(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_completed_turn() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_completed_turn_commit(
@@ -2408,6 +2502,13 @@ mod tests {
     async fn conformance_sqlite_lease_expiry() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_lease_expiry_sweep(&store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_requeue_owned_task() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_requeue_owned_task(&store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -2901,6 +3002,15 @@ mod tests {
             return Ok(());
         };
         test_lease_expiry_sweep(&store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_requeue_owned_task() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_requeue_owned_task(&store).await
     }
 
     #[cfg(feature = "postgres")]

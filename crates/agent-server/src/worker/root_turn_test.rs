@@ -6549,8 +6549,9 @@ async fn successor_turn_shifts_past_cancelled_salvage_slot_collision() -> Result
 /// refuse the shift — the successor's snapshot and `Done` totals were
 /// built before the predecessor's fully billed turn landed, so shifting
 /// would durably drop that usage/cost. The collision surfaces instead
-/// (the host retries from the fresh committed head). Only a
-/// `CancelSalvage` occupant is state-compatible with a shift.
+/// (the host's collision handler requeues the task to re-run from the
+/// fresh committed head). Only a `CancelSalvage` occupant is
+/// state-compatible with a shift.
 #[tokio::test]
 async fn billed_foreign_commit_refuses_the_shift() -> Result<()> {
     let stores = TestStores::new();

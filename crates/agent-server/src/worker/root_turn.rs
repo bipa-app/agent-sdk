@@ -1901,8 +1901,11 @@ async fn shifted_turn_slot(
         // correct. A FULL foreign turn in our slot means a live
         // predecessor's completion landed after we bootstrapped — our
         // cumulative state lacks its usage/cost, so shifting would
-        // durably drop it; refuse and let the collision surface (the
-        // host retries the turn from the fresh committed head).
+        // durably drop it; refuse and let the collision surface. The
+        // host's collision handler requeues the refused task (via
+        // `AgentTaskStore::requeue_owned_task`, sweep-identical budget
+        // accounting) so it re-runs from the fresh committed head
+        // instead of failing terminally.
         Some(checkpoint)
             if checkpoint.task_id != params.task_id
                 && checkpoint.kind == CheckpointKind::CancelSalvage => {}

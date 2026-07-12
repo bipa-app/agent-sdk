@@ -59,8 +59,8 @@ use agent_server::journal::relay::{
 };
 use agent_server::journal::retention::{RetentionCursor, RetentionStore};
 use agent_server::journal::store::{
-    AgentTaskStore, CancelTreeOutcome, SubagentInvocationSpawn, SubmitRootTurnError,
-    SubmitRootTurnOutcome, SubmitRootTurnParams,
+    AgentTaskStore, CancelTreeOutcome, RequeueOutcome, SubagentInvocationSpawn,
+    SubmitRootTurnError, SubmitRootTurnOutcome, SubmitRootTurnParams,
 };
 use agent_server::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskKind, TaskStatus,
@@ -2598,6 +2598,34 @@ impl AgentTaskStore for SqliteDurableStore {
 
         tx.commit().await.context("commit release_expired_leases")?;
         Ok(released)
+    }
+
+    async fn requeue_owned_task(
+        &self,
+        id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        now: OffsetDateTime,
+    ) -> Result<RequeueOutcome> {
+        let mut tx = self.begin().await?;
+        let Some(old) = Self::load_task_tx(&mut tx, id).await? else {
+            return Ok(RequeueOutcome::NotOwned);
+        };
+        let still_owned = old.status == TaskStatus::Running
+            && old.worker_id.as_ref() == Some(worker)
+            && old.lease_id.as_ref() == Some(lease);
+        if !still_owned {
+            return Ok(RequeueOutcome::NotOwned);
+        }
+        if old.is_budget_exhausted() {
+            return Ok(RequeueOutcome::BudgetExhausted);
+        }
+        let released_row = old
+            .release_lease(now)
+            .context("requeue_owned_task: release transition failed")?;
+        Self::update_task_tx(&mut tx, &released_row).await?;
+        tx.commit().await.context("commit requeue_owned_task")?;
+        Ok(RequeueOutcome::Requeued(Box::new(released_row)))
     }
 
     async fn pause_on_children(

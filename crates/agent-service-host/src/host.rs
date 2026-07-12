@@ -55,9 +55,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use agent_sdk_foundation::ToolTier;
+use agent_server::journal::commit::StaleTurnCommit;
 use agent_server::journal::committed_event::CommittedEvent;
 use agent_server::journal::execution_context::build_root_worker_inputs;
 use agent_server::journal::execution_intent::{GuardedExecutionDeps, classify_tool_effect};
+use agent_server::journal::store::RequeueOutcome;
 use agent_server::journal::task::{AgentTask, LeaseId, TaskKind, TaskStatus, WorkerId};
 use agent_server::journal::task_state::TaskState;
 use agent_server::worker::{
@@ -1748,6 +1750,25 @@ async fn fail_or_revert_root_task(
             }
         }
     }
+    if is_turn_slot_collision_error(err) {
+        match requeue_collided_root_task(stores, task, now).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
+                // Budget exhausted or no longer owned — fall through to
+                // the ordinary terminal path, which re-checks ownership
+                // itself and skips cleanly when the row moved on.
+            }
+            Err(requeue_err) => {
+                warn!(
+                    task_id = %task.id,
+                    thread_id = %task.thread_id,
+                    collision_error = %err,
+                    requeue_error = %requeue_err,
+                    "turn-slot collision requeue failed; falling back to failing the root task",
+                );
+            }
+        }
+    }
     warn!(
         task_id = %task.id,
         thread_id = %task.thread_id,
@@ -1757,6 +1778,74 @@ async fn fail_or_revert_root_task(
     fail_root_task(stores, task, err, error_watermark, now).await?;
     promote_next_root(stores, task, now).await?;
     Ok(())
+}
+
+/// `true` if `err`'s chain bottoms out in the completed-turn slot CAS
+/// rejection ([`StaleTurnCommit`]) — the one failure shape that means
+/// the turn's work was fine but its slot was consumed by another
+/// task's commit (issue #354). Every other failure keeps the ordinary
+/// terminal path.
+fn is_turn_slot_collision_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<StaleTurnCommit>().is_some())
+}
+
+/// Requeue a promoted root whose completed-turn commit lost its slot
+/// to a foreign FULL-TURN checkpoint, so it re-runs from the fresh
+/// committed head instead of failing terminally (issue #354; codex
+/// round-5 finding).
+///
+/// The worker-side shift path already absorbs the benign salvage
+/// collision; the case that reaches here is a cancelled predecessor's
+/// fully billed turn landing after the successor bootstrapped. The
+/// successor's answer was built on a head that lacks that turn, so it
+/// must be re-executed — and re-execution from an uncommitted turn is
+/// exactly the crash-recovery contract the journal already promises
+/// (guarded tools go through durable execution intents; the same
+/// retry budget applies via [`AgentTask::release_lease`]'s
+/// sweep-identical accounting).
+///
+/// Returns `Ok(true)` when the row was requeued (the dispatcher will
+/// re-run it); `Ok(false)` when the store reports the row has no
+/// retry budget left or is no longer owned — the caller falls through
+/// to its terminal path.
+async fn requeue_collided_root_task(
+    stores: &StoreRegistry,
+    task: &AgentTask,
+    now: time::OffsetDateTime,
+) -> Result<bool> {
+    let (worker_id, lease_id) = running_lease(task)?;
+    // The failed commit rolled back its in-transaction attempt close,
+    // so the execution's attempt rows are still open. Close them
+    // before the row leaves this worker's ownership — nothing sweeps
+    // orphaned attempts, and the re-driven execution opens fresh ones.
+    best_effort_close_open_attempts(&task.id, stores.attempt_store.as_ref(), now).await;
+    let outcome = stores
+        .task_store
+        .requeue_owned_task(&task.id, &worker_id, &lease_id, now)
+        .await
+        .context("requeue collided root task")?;
+    match outcome {
+        RequeueOutcome::Requeued(row) => {
+            warn!(
+                task_id = %task.id,
+                thread_id = %task.thread_id,
+                attempt = row.attempt,
+                max_attempts = row.max_attempts,
+                "turn-slot collision: requeued root task to re-run from the fresh committed head",
+            );
+            Ok(true)
+        }
+        RequeueOutcome::BudgetExhausted => {
+            warn!(
+                task_id = %task.id,
+                thread_id = %task.thread_id,
+                "turn-slot collision: retry budget exhausted; failing the root task",
+            );
+            Ok(false)
+        }
+        RequeueOutcome::NotOwned => Ok(false),
+    }
 }
 
 /// Revert a failed steering wake back to its pre-wake parked state so
@@ -2870,6 +2959,145 @@ mod tests {
         let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
         let _stores = host.stores();
         let _deps = host.stores().root_turn_deps();
+        Ok(())
+    }
+
+    /// Issue #354 (codex round-5): a completed-turn slot collision the
+    /// shift refused must REQUEUE the promoted root — the cancellation
+    /// contract promises follow-up work completes, so re-running from
+    /// the fresh committed head (crash-equivalent semantics) replaces
+    /// the old terminal failure.
+    #[tokio::test]
+    async fn turn_slot_collision_requeues_the_root_instead_of_failing() -> Result<()> {
+        let config = ServiceConfig::default();
+        let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
+        let stores = host.stores().clone();
+
+        let thread = agent_sdk_foundation::ThreadId::from_string("t-collision-requeue");
+        let root = AgentTask::new_root_turn(thread, time::OffsetDateTime::now_utc(), 3);
+        let id = root.id.clone();
+        stores.task_store.submit_root_turn(root).await?;
+        let worker = WorkerId::from_string("w-collided");
+        let lease = LeaseId::from_string("l-collided");
+        let acquired = stores
+            .task_store
+            .try_acquire_task(
+                &id,
+                worker.clone(),
+                lease.clone(),
+                time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+                time::OffsetDateTime::now_utc(),
+            )
+            .await?
+            .context("acquire")?;
+
+        let collision = anyhow::Error::new(agent_server::journal::commit::StaleTurnCommit {
+            expected_turn: 1,
+            committed_turns: 1,
+        })
+        .context("commit completed turn")
+        .context("execute fresh root task");
+        fail_or_revert_root_task(
+            &stores,
+            &acquired,
+            &collision,
+            0,
+            time::OffsetDateTime::now_utc(),
+        )
+        .await?;
+
+        let row = stores.task_store.get(&id).await?.context("row")?;
+        assert_eq!(
+            row.status,
+            TaskStatus::Pending,
+            "a slot collision must requeue, not fail; got {:?} ({:?})",
+            row.status,
+            row.last_error,
+        );
+        assert!(row.worker_id.is_none() && row.lease_id.is_none());
+        Ok(())
+    }
+
+    /// The requeue inherits the sweep's retry budget: a budget-1 root
+    /// that collides has nothing left to spend and takes the ordinary
+    /// terminal path instead of looping forever.
+    #[tokio::test]
+    async fn turn_slot_collision_with_exhausted_budget_fails_terminally() -> Result<()> {
+        let config = ServiceConfig::default();
+        let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
+        let stores = host.stores().clone();
+
+        let thread = agent_sdk_foundation::ThreadId::from_string("t-collision-capped");
+        let root = AgentTask::new_root_turn(thread, time::OffsetDateTime::now_utc(), 1);
+        let id = root.id.clone();
+        stores.task_store.submit_root_turn(root).await?;
+        let acquired = stores
+            .task_store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w-capped"),
+                LeaseId::from_string("l-capped"),
+                time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+                time::OffsetDateTime::now_utc(),
+            )
+            .await?
+            .context("acquire")?;
+
+        let collision = anyhow::Error::new(agent_server::journal::commit::StaleTurnCommit {
+            expected_turn: 1,
+            committed_turns: 1,
+        })
+        .context("execute fresh root task");
+        fail_or_revert_root_task(
+            &stores,
+            &acquired,
+            &collision,
+            0,
+            time::OffsetDateTime::now_utc(),
+        )
+        .await?;
+
+        let row = stores.task_store.get(&id).await?.context("row")?;
+        assert_eq!(row.status, TaskStatus::Failed);
+        Ok(())
+    }
+
+    /// Non-collision errors keep the ordinary terminal path — the
+    /// requeue arm must not swallow genuine failures.
+    #[tokio::test]
+    async fn ordinary_execution_error_still_fails_the_root() -> Result<()> {
+        let config = ServiceConfig::default();
+        let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
+        let stores = host.stores().clone();
+
+        let thread = agent_sdk_foundation::ThreadId::from_string("t-ordinary-failure");
+        let root = AgentTask::new_root_turn(thread, time::OffsetDateTime::now_utc(), 3);
+        let id = root.id.clone();
+        stores.task_store.submit_root_turn(root).await?;
+        let acquired = stores
+            .task_store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w-ordinary"),
+                LeaseId::from_string("l-ordinary"),
+                time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+                time::OffsetDateTime::now_utc(),
+            )
+            .await?
+            .context("acquire")?;
+
+        let error = anyhow::anyhow!("provider exploded").context("execute fresh root task");
+        fail_or_revert_root_task(
+            &stores,
+            &acquired,
+            &error,
+            0,
+            time::OffsetDateTime::now_utc(),
+        )
+        .await?;
+
+        let row = stores.task_store.get(&id).await?.context("row")?;
+        assert_eq!(row.status, TaskStatus::Failed);
         Ok(())
     }
 
@@ -5505,6 +5733,15 @@ mod tests {
             thread_id: &agent_sdk_foundation::ThreadId,
         ) -> Result<Vec<AgentTask>> {
             self.inner.list_queued_roots(thread_id).await
+        }
+        async fn requeue_owned_task(
+            &self,
+            id: &agent_server::AgentTaskId,
+            worker: &agent_server::WorkerId,
+            lease: &agent_server::LeaseId,
+            now: time::OffsetDateTime,
+        ) -> Result<RequeueOutcome> {
+            self.inner.requeue_owned_task(id, worker, lease, now).await
         }
         async fn promote_next_queued_root(
             &self,

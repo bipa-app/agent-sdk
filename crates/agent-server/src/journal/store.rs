@@ -295,6 +295,28 @@ pub struct SubmitRootTurnOutcome {
     pub queued_depth: u32,
 }
 
+/// Outcome of [`AgentTaskStore::requeue_owned_task`].
+#[derive(Clone, Debug)]
+pub enum RequeueOutcome {
+    /// The row was returned to [`TaskStatus::Pending`] with the lease
+    /// cleared; the dispatcher will re-acquire it and re-run the turn
+    /// from the fresh committed head. Boxed so the enum's unit
+    /// variants do not pay the full row's size.
+    Requeued(Box<AgentTask>),
+    /// The row has no retry budget left (`attempt == max_attempts`);
+    /// NO transition was applied and the row is still `Running` under
+    /// the caller's lease. The caller owns routing it through its full
+    /// terminal-failure envelope (attempt close, `Error` event,
+    /// successor promotion) — the store must not fail it silently.
+    BudgetExhausted,
+    /// The row is no longer a `Running` row owned by the caller
+    /// (cancelled, swept, or re-acquired); NO transition was applied.
+    /// Whichever path took the row over owns its terminal state — the
+    /// caller must skip cleanly, exactly like the fail path's
+    /// still-owned guard.
+    NotOwned,
+}
+
 /// Typed failure modes for
 /// [`AgentTaskStore::submit_root_turn_idempotent`] that the transport
 /// layer maps to specific gRPC status codes.
@@ -878,6 +900,42 @@ pub trait AgentTaskStore: Send + Sync {
     /// Returns an error if a release or fail-closed transition, or
     /// the underlying store write, fails.
     async fn release_expired_leases(&self, now: OffsetDateTime) -> Result<Vec<RecoveryRecord>>;
+
+    /// Return a `Running` row this worker still owns to the runnable
+    /// queue — the worker-initiated twin of the expiry sweep's requeue
+    /// arm (issue #354).
+    ///
+    /// The one production caller is the host's completed-turn
+    /// collision handler: a promoted successor whose commit lost its
+    /// turn slot to a foreign FULL-TURN checkpoint must not shift past
+    /// it (its snapshot lacks the occupant's billed usage) and must
+    /// not fail terminally either — the cancellation contract promises
+    /// follow-up work completes. Requeueing re-runs the turn from the
+    /// fresh committed head with crash-equivalent semantics: the turn
+    /// never committed, so re-execution is exactly what the durable
+    /// journal already promises after a worker crash, and the same
+    /// retry budget applies.
+    ///
+    /// A successful call CAS-checks that the row exists, is
+    /// [`TaskStatus::Running`], and is owned by exactly
+    /// `(worker, lease)`, then applies [`AgentTask::release_lease`] —
+    /// the identical transition (and identical budget accounting) the
+    /// expiry sweep uses — and persists the row. The three non-error
+    /// outcomes are reported as [`RequeueOutcome`] variants rather
+    /// than errors because each has a distinct correct caller
+    /// reaction; see the variant docs.
+    ///
+    /// # Errors
+    /// Returns an error only for store I/O failures or an invalid
+    /// release transition (an internal invariant bug); ownership and
+    /// budget conditions are reported through the outcome enum.
+    async fn requeue_owned_task(
+        &self,
+        id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        now: OffsetDateTime,
+    ) -> Result<RequeueOutcome>;
 
     /// Pause a running task on outstanding child work, dropping the
     /// lease atomically with the typed-state mutation.
@@ -3065,6 +3123,36 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         crate::observability::ServerMetrics::global().record_lease_expiry_outcomes(&released);
 
         Ok(released)
+    }
+
+    async fn requeue_owned_task(
+        &self,
+        id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        now: OffsetDateTime,
+    ) -> Result<RequeueOutcome> {
+        let mut inner = self.inner.write().await;
+        let Some(old) = inner.by_id.get(id).cloned() else {
+            return Ok(RequeueOutcome::NotOwned);
+        };
+        let still_owned = old.status == TaskStatus::Running
+            && old.worker_id.as_ref() == Some(worker)
+            && old.lease_id.as_ref() == Some(lease);
+        if !still_owned {
+            return Ok(RequeueOutcome::NotOwned);
+        }
+        if old.is_budget_exhausted() {
+            return Ok(RequeueOutcome::BudgetExhausted);
+        }
+        let released_row = old
+            .clone()
+            .release_lease(now)
+            .context("requeue_owned_task: release transition failed")?;
+        inner.rebalance_after_row_change(&old, &released_row);
+        inner.by_id.insert(id.clone(), released_row.clone());
+        drop(inner);
+        Ok(RequeueOutcome::Requeued(Box::new(released_row)))
     }
 
     async fn pause_on_children(
@@ -7602,6 +7690,124 @@ mod tests {
             message.contains("invalid transition") || message.contains("InvalidTransition"),
             "unexpected: {message}"
         );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn requeue_owned_task_returns_running_row_to_pending() -> Result<()> {
+        // Issue #354: the worker-initiated requeue twin of the sweep.
+        // A promoted successor whose commit lost its turn slot re-runs
+        // from the fresh head instead of failing terminally.
+        let store = InMemoryAgentTaskStore::new();
+        let root = AgentTask::new_root_turn(thread("t"), t0(), 3);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+        let worker = WorkerId::from_string("w-collided");
+        let lease = LeaseId::from_string("l-collided");
+        store
+            .try_acquire_task(&id, worker.clone(), lease.clone(), t_plus(10), t_plus(1))
+            .await
+            .context("acquire")?
+            .context("claimed")?;
+
+        let outcome = store
+            .requeue_owned_task(&id, &worker, &lease, t_plus(2))
+            .await
+            .context("requeue")?;
+        let RequeueOutcome::Requeued(row) = outcome else {
+            anyhow::bail!("expected Requeued, got {outcome:?}");
+        };
+        assert_eq!(row.status, TaskStatus::Pending);
+        assert!(row.worker_id.is_none() && row.lease_id.is_none());
+
+        // The row is genuinely runnable again: a fresh worker can
+        // re-acquire it, and the old lease can no longer heartbeat.
+        let reacquired = store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w-fresh"),
+                LeaseId::from_string("l-fresh"),
+                t_plus(30),
+                t_plus(3),
+            )
+            .await
+            .context("re-acquire")?
+            .context("re-claimed")?;
+        assert_eq!(reacquired.status, TaskStatus::Running);
+        assert!(
+            store
+                .heartbeat_task(&id, &worker, &lease, t_plus(60), t_plus(4))
+                .await
+                .is_err(),
+            "the requeued-then-reacquired row must reject the old lease",
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn requeue_owned_task_reports_not_owned_without_touching_the_row() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let root = AgentTask::new_root_turn(thread("t"), t0(), 3);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+        let worker = WorkerId::from_string("w-owner");
+        let lease = LeaseId::from_string("l-owner");
+        store
+            .try_acquire_task(&id, worker.clone(), lease.clone(), t_plus(10), t_plus(1))
+            .await
+            .context("acquire")?
+            .context("claimed")?;
+
+        // Wrong lease: NotOwned, row untouched.
+        let outcome = store
+            .requeue_owned_task(&id, &worker, &LeaseId::from_string("l-stale"), t_plus(2))
+            .await
+            .context("requeue with stale lease")?;
+        assert!(matches!(outcome, RequeueOutcome::NotOwned));
+        let row = store.get(&id).await?.context("row")?;
+        assert_eq!(row.status, TaskStatus::Running);
+        assert_eq!(row.lease_id.as_ref(), Some(&lease));
+
+        // Cancelled row: NotOwned even with the right lease — the
+        // cancel owns the terminal state and a requeue must never
+        // resurrect it.
+        store.cancel_tree(&id, t_plus(3)).await.context("cancel")?;
+        let outcome = store
+            .requeue_owned_task(&id, &worker, &lease, t_plus(4))
+            .await
+            .context("requeue after cancel")?;
+        assert!(matches!(outcome, RequeueOutcome::NotOwned));
+        let row = store.get(&id).await?.context("row")?;
+        assert_eq!(row.status, TaskStatus::Cancelled);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn requeue_owned_task_reports_budget_exhausted_leaving_row_owned() -> Result<()> {
+        // A budget-1 root that collides has nothing left to spend on a
+        // re-run; the store reports it WITHOUT transitioning so the
+        // caller can route it through its full terminal-failure
+        // envelope (which CAS-checks ownership itself).
+        let store = InMemoryAgentTaskStore::new();
+        let root = AgentTask::new_root_turn(thread("t"), t0(), 1);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+        let worker = WorkerId::from_string("w-last");
+        let lease = LeaseId::from_string("l-last");
+        store
+            .try_acquire_task(&id, worker.clone(), lease.clone(), t_plus(10), t_plus(1))
+            .await
+            .context("acquire")?
+            .context("claimed")?;
+
+        let outcome = store
+            .requeue_owned_task(&id, &worker, &lease, t_plus(2))
+            .await
+            .context("requeue")?;
+        assert!(matches!(outcome, RequeueOutcome::BudgetExhausted));
+        let row = store.get(&id).await?.context("row")?;
+        assert_eq!(row.status, TaskStatus::Running);
+        assert_eq!(row.worker_id.as_ref(), Some(&worker));
         Ok(())
     }
 

@@ -4571,6 +4571,15 @@ mod tests {
         async fn list_queued_roots(&self, thread_id: &ThreadId) -> Result<Vec<AgentTask>> {
             self.inner.list_queued_roots(thread_id).await
         }
+        async fn requeue_owned_task(
+            &self,
+            id: &agent_server::AgentTaskId,
+            worker: &agent_server::WorkerId,
+            lease: &agent_server::LeaseId,
+            now: time::OffsetDateTime,
+        ) -> Result<agent_server::journal::store::RequeueOutcome> {
+            self.inner.requeue_owned_task(id, worker, lease, now).await
+        }
         async fn promote_next_queued_root(
             &self,
             thread_id: &ThreadId,
