@@ -9021,3 +9021,160 @@ async fn test_double_save_failure_budget_stop_stays_rerunnable() -> anyhow::Resu
 
     Ok(())
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Round 11: budget stops surfaced by ask/send, run_stream termination
+// independent of leaked tool-context clones.
+// ──────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_ask_surfaces_budget_stop_as_error() -> anyhow::Result<()> {
+    // ask()/send() assemble the reply text and must not present a
+    // budget-stopped run as a completed answer: a mid-run stop has only
+    // interim text and a pre-entry rejection none at all.
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::tool_use_response(
+            "call_1",
+            "echo",
+            json!({"message": "x"}),
+        )]))
+        .tools(tools)
+        .hooks(AllowAllHooks)
+        .config(AgentConfig {
+            usage_limits: Some(UsageLimits {
+                max_total_tokens: Some(25),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+
+    // Mid-run budget stop.
+    let error = match agent.ask(thread_id.clone(), "go").await {
+        Ok(reply) => anyhow::bail!("a budget-stopped ask must not return Ok({reply:?})"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("usage budget exceeded"),
+        "the error must name the budget stop, got: {error}"
+    );
+    assert!(
+        error.to_string().contains("TotalTokens"),
+        "the error must name the tripped limit, got: {error}"
+    );
+
+    // Pre-entry rejection on the now-over-budget thread: still an error,
+    // never Ok("").
+    let error = match agent.ask(thread_id, "again").await {
+        Ok(reply) => anyhow::bail!("an over-budget ask must not return Ok({reply:?})"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("usage budget exceeded"),
+        "the pre-entry rejection must also surface, got: {error}"
+    );
+
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LeakyToolName {
+    Leaky,
+}
+
+impl crate::tools::ToolName for LeakyToolName {}
+
+/// Tool that clones its [`ToolContext`] (which carries the `run_stream` tee
+/// event store — and thus a live channel sender) into a background task
+/// that never finishes.
+struct LeakyContextTool;
+
+impl crate::tools::Tool<()> for LeakyContextTool {
+    type Name = LeakyToolName;
+
+    fn name(&self) -> LeakyToolName {
+        LeakyToolName::Leaky
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Leaky"
+    }
+
+    fn description(&self) -> &'static str {
+        "Parks a ToolContext clone in background work."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        json!({ "type": "object", "properties": {} })
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Observe
+    }
+
+    async fn execute(
+        &self,
+        ctx: &ToolContext<()>,
+        _input: serde_json::Value,
+    ) -> anyhow::Result<ToolResult> {
+        let leaked = ctx.clone();
+        tokio::spawn(async move {
+            let _hold = leaked;
+            futures::future::pending::<()>().await;
+        });
+        Ok(ToolResult::success("leaked"))
+    }
+}
+
+#[tokio::test]
+async fn test_run_stream_ends_despite_leaked_tool_context_clone() -> anyhow::Result<()> {
+    use futures::StreamExt as _;
+
+    // The tee's channel sender rides inside every ToolContext clone; a tool
+    // that parks a clone in background work must not keep the event stream
+    // open past run completion — the run-completed signal closes it after
+    // draining, with the terminal Done still delivered.
+    let mut tools = ToolRegistry::new();
+    tools.register(LeakyContextTool);
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![
+            MockProvider::tool_use_response("call_1", "leaky", json!({})),
+            MockProvider::text_response("done despite the leak"),
+        ]))
+        .tools(tools)
+        .hooks(AllowAllHooks)
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let run_stream = agent.run_stream(
+        ThreadId::new(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    let events: Vec<AgentEvent> = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        run_stream.events.collect(),
+    )
+    .await
+    .context("the event stream must end even though a sender clone leaked")?;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Done { .. })),
+        "the terminal Done event must still be delivered",
+    );
+    let state = run_stream.final_state.await?;
+    assert!(matches!(state, AgentRunState::Done { .. }));
+
+    Ok(())
+}

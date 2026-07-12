@@ -59,9 +59,12 @@ use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::{AgentConfig, AgentError, AgentInput, AgentRunState, RunOptions, ThreadId};
 use async_trait::async_trait;
 use futures::FutureExt;
+use futures::Stream;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -314,12 +317,63 @@ pub struct AgentHandle {
 /// with) consuming `events`; dropping it is fine when only the event feed
 /// matters.
 pub struct RunStream {
-    /// Live event feed; ends when the run completes.
-    pub events: tokio_stream::wrappers::ReceiverStream<AgentEvent>,
+    /// Live event feed; ends when the run completes (see
+    /// [`RunEventStream`] for the exact termination contract).
+    pub events: RunEventStream,
     /// Resolves with the run's final state. Fails only if the runtime
     /// shut down before the run could report (see
     /// [`AgentLoop::run`]'s error contract).
     pub final_state: oneshot::Receiver<AgentRunState>,
+}
+
+/// Live event feed for [`RunStream`].
+///
+/// Ends when either the tee channel closes (every sender dropped) or the
+/// run itself completes — whichever happens first. The completion signal
+/// matters because the tee's channel sender travels inside every
+/// [`ToolContext`] clone handed to tools (via the turn-scoped event
+/// store): a tool that parks a clone in background work would otherwise
+/// keep the channel open past `Done` and the stream would never end even
+/// though `final_state` already resolved.
+///
+/// Ordering guarantee: the completion signal fires only AFTER the run
+/// future resolved — i.e. after the terminal event was persisted and
+/// forwarded — and buffered events are always drained before the stream
+/// ends, so no event emitted by the run is lost. Events appended by leaked
+/// tool-context clones after run completion are not delivered on the live
+/// stream (they are still persisted to the underlying store).
+pub struct RunEventStream {
+    rx: mpsc::Receiver<AgentEvent>,
+    run_completed: Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
+    draining: bool,
+}
+
+impl Stream for RunEventStream {
+    type Item = AgentEvent;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            // Buffered events always win over the completion signal so the
+            // terminal event can never be dropped by the early close.
+            match this.rx.poll_recv(cx) {
+                Poll::Ready(Some(event)) => return Poll::Ready(Some(event)),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => {}
+            }
+            if this.draining {
+                // The run completed and the channel is drained: end the
+                // stream even if a leaked sender clone keeps it open.
+                return Poll::Ready(None);
+            }
+            match this.run_completed.as_mut().poll(cx) {
+                // Re-poll the channel once more: an event forwarded just
+                // before the signal fired may have raced in.
+                Poll::Ready(()) => this.draining = true,
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
 }
 
 /// Inputs shared by the three `spawn_run_loop` callers
@@ -334,6 +388,11 @@ struct SpawnRunLoopParams<Ctx> {
     cancel_token: CancellationToken,
     run_options: RunOptions,
     input_rx: Option<mpsc::Receiver<AgentInput>>,
+    /// Cancelled by the spawned task right after the run future resolves
+    /// (before the final state is sent), so `run_stream` consumers get a
+    /// stream-termination signal that does not depend on every tee sender
+    /// clone being dropped. `None` for the non-streaming entry points.
+    run_completed: Option<CancellationToken>,
 }
 
 /// Configuration bundle for constructing an [`AgentLoop`] with compaction.
@@ -724,6 +783,7 @@ where
             cancel_token,
             run_options,
             input_rx: None,
+            run_completed: None,
         })
     }
 
@@ -746,6 +806,7 @@ where
             cancel_token,
             run_options,
             input_rx,
+            run_completed,
         }: SpawnRunLoopParams<Ctx>,
     ) -> (
         oneshot::Receiver<AgentRunState>,
@@ -808,6 +869,15 @@ where
             })
             .await;
 
+            // Signal run completion BEFORE handing over the final state:
+            // every event the run emitted has already been persisted and
+            // forwarded (the tee runs inside the loop), so a consumer that
+            // observes `final_state` can rely on the event stream
+            // terminating even if a tool leaked a ToolContext clone that
+            // still holds the tee's sender.
+            if let Some(run_completed) = run_completed {
+                run_completed.cancel();
+            }
             let _ = state_tx.send(result);
         };
 
@@ -879,6 +949,7 @@ where
             cancel_token,
             run_options,
             input_rx: Some(input_rx),
+            run_completed: None,
         });
         // The persistent run is stopped via the cancel token or by dropping
         // `input_tx`, not by aborting the task, so detach the handle.
@@ -906,8 +977,10 @@ where
     /// is emitted.
     ///
     /// The run is spawned on a Tokio task before this returns; the stream
-    /// ends when the run finishes (or is cancelled via `cancel_token`).
-    /// Dropping the stream does **not** stop the run — use `cancel_token`.
+    /// ends when the run finishes (or is cancelled via `cancel_token`) —
+    /// termination does not depend on tools dropping their [`ToolContext`]
+    /// clones (see [`RunEventStream`]). Dropping the stream does **not**
+    /// stop the run — use `cancel_token`.
     ///
     /// # Delivery semantics
     ///
@@ -963,6 +1036,12 @@ where
             tx,
         });
 
+        // Completion signal for the event stream: tool contexts carry the
+        // tee (and thus a channel sender), so channel EOF alone cannot be
+        // relied on — a tool may leak a ToolContext clone into background
+        // work. See `RunEventStream` for the termination contract.
+        let run_completed = CancellationToken::new();
+
         let (state_rx, handle) = self.spawn_run_loop(SpawnRunLoopParams {
             event_store,
             thread_id,
@@ -971,16 +1050,21 @@ where
             cancel_token,
             run_options,
             input_rx: None,
+            run_completed: Some(run_completed.clone()),
         });
         // The run drives itself to completion. Detach the join handle —
-        // when the run ends, the tee store (and its sender) drop, closing
-        // the stream — and hand the state receiver to the caller: the
-        // terminal state (AwaitingConfirmation continuations, startup
-        // errors) only exists there.
+        // when the run ends, the completion signal (or the tee sender
+        // dropping) closes the stream — and hand the state receiver to the
+        // caller: the terminal state (AwaitingConfirmation continuations,
+        // startup errors) only exists there.
         warn_on_detached_run_handle(handle);
 
         RunStream {
-            events: tokio_stream::wrappers::ReceiverStream::new(rx),
+            events: RunEventStream {
+                rx,
+                run_completed: Box::pin(run_completed.cancelled_owned()),
+                draining: false,
+            },
             final_state: state_rx,
         }
     }
@@ -1180,8 +1264,9 @@ where
     /// # Errors
     ///
     /// Returns an error if the run task is dropped before reporting a state,
-    /// if the run ends in [`AgentRunState::Error`], or if the event store
-    /// cannot be read back.
+    /// if the run ends in [`AgentRunState::Error`], if it stops on a usage
+    /// budget ([`AgentRunState::BudgetExceeded`] — the reply would be
+    /// missing or truncated), or if the event store cannot be read back.
     pub async fn ask(
         &self,
         thread_id: ThreadId,
@@ -1200,8 +1285,9 @@ where
     /// # Errors
     ///
     /// Returns an error if the run task is dropped before reporting a state,
-    /// if the run ends in [`AgentRunState::Error`], or if the event store
-    /// cannot be read back.
+    /// if the run ends in [`AgentRunState::Error`], if it stops on a usage
+    /// budget ([`AgentRunState::BudgetExceeded`] — the reply would be
+    /// missing or truncated), or if the event store cannot be read back.
     pub async fn send(&self, thread_id: ThreadId, input: AgentInput) -> anyhow::Result<String> {
         use crate::events::AgentEvent;
 
@@ -1221,8 +1307,24 @@ where
             )
             .await?;
 
-        if let AgentRunState::Error(error) = state {
-            return Err(anyhow::Error::new(error));
+        match state {
+            AgentRunState::Error(error) => return Err(anyhow::Error::new(error)),
+            // A budget stop is not a completed answer: a pre-entry
+            // rejection produced no text at all and a mid-run stop only
+            // interim text — returning either as `Ok` would read as a
+            // finished reply. Surface it as an error naming the limit.
+            AgentRunState::BudgetExceeded {
+                limit,
+                estimated_cost_usd,
+                ..
+            } => {
+                let cost_note = estimated_cost_usd
+                    .map_or_else(String::new, |cost| format!(", estimated cost: ${cost:.4}"));
+                return Err(anyhow::anyhow!(
+                    "agent run stopped: usage budget exceeded (limit: {limit:?}{cost_note})"
+                ));
+            }
+            _ => {}
         }
 
         let events = self

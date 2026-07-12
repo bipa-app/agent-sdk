@@ -474,7 +474,8 @@ mod types;
 
 // agent-sdk (owned — agent loop)
 pub use agent_loop::{
-    AgentHandle, AgentLoop, AgentLoopBuilder, AgentLoopCompactionConfig, RunStream, builder,
+    AgentHandle, AgentLoop, AgentLoopBuilder, AgentLoopCompactionConfig, RunEventStream, RunStream,
+    builder,
 };
 pub use capabilities::AgentCapabilities;
 pub use filesystem::{InMemoryFileSystem, LocalFileSystem};

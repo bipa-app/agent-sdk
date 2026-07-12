@@ -22,9 +22,27 @@ use time::OffsetDateTime;
 
 /// Serde adapter encoding a [`Duration`] as a millisecond integer
 /// (`duration_ms`) instead of serde's default `{secs,nanos}` object.
+///
+/// Deserialization is deliberately lenient: durable event rows written
+/// before the wire form changed to `duration_ms` carry serde's default
+/// `{"secs":..,"nanos":..}` object (under the old `duration` key, accepted
+/// via `#[serde(alias = "duration")]` on the fields). Hosts replay those
+/// rows with `serde_json::from_value`, so both representations must decode
+/// or every thread containing a pre-change terminal event becomes
+/// unreadable after an upgrade. Serialization always writes millis.
 mod duration_ms_serde {
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
+
+    /// The two wire shapes a duration value can arrive in.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum DurationRepr {
+        /// Current form: a flat millisecond integer.
+        Millis(u64),
+        /// Legacy form: serde's default `Duration` object.
+        Legacy { secs: u64, nanos: u32 },
+    }
 
     pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -38,8 +56,10 @@ mod duration_ms_serde {
     where
         D: Deserializer<'de>,
     {
-        let ms = u64::deserialize(deserializer)?;
-        Ok(Duration::from_millis(ms))
+        match DurationRepr::deserialize(deserializer)? {
+            DurationRepr::Millis(ms) => Ok(Duration::from_millis(ms)),
+            DurationRepr::Legacy { secs, nanos } => Ok(Duration::new(secs, nanos)),
+        }
     }
 }
 
@@ -152,7 +172,7 @@ pub enum AgentEvent {
         /// flattened envelope previously encoded this as a nested
         /// `{"secs":..,"nanos":..}` object, inconsistent with the rest of the
         /// streaming contract. The Rust field keeps the `Duration` type.
-        #[serde(rename = "duration_ms", with = "duration_ms_serde")]
+        #[serde(rename = "duration_ms", alias = "duration", with = "duration_ms_serde")]
         duration: Duration,
         /// Estimated cost of the run in USD, when the run's provider/model
         /// has pricing metadata. Omitted from the wire form when `None` so
@@ -176,7 +196,7 @@ pub enum AgentEvent {
         ///
         /// Serialized on the wire as `duration_ms` (a millisecond integer),
         /// mirroring [`AgentEvent::Done`].
-        #[serde(rename = "duration_ms", with = "duration_ms_serde")]
+        #[serde(rename = "duration_ms", alias = "duration", with = "duration_ms_serde")]
         duration: Duration,
         /// Estimated cost of the run in USD at the moment the budget was
         /// hit, when pricing metadata is available.
@@ -858,6 +878,86 @@ mod tests {
             }
             other => panic!("expected Done, got {other:?}"),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn done_event_deserializes_legacy_duration_object() -> serde_json::Result<()> {
+        // Durable rows written before the wire form changed to `duration_ms`
+        // carry serde's default object under the old `duration` key. Hosts
+        // replay them with `serde_json::from_value`; they must keep
+        // decoding after an upgrade.
+        let legacy = serde_json::json!({
+            "type": "done",
+            "thread_id": "t-legacy",
+            "total_turns": 3,
+            "total_usage": TokenUsage::default(),
+            "duration": { "secs": 2, "nanos": 500_000_000 },
+        });
+        let event: AgentEvent = serde_json::from_value(legacy)?;
+        match event {
+            AgentEvent::Done {
+                duration,
+                total_turns,
+                ..
+            } => {
+                assert_eq!(duration, Duration::from_millis(2500));
+                assert_eq!(total_turns, 3);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+
+        // The current flat-millis form decodes too...
+        let current = serde_json::json!({
+            "type": "done",
+            "thread_id": "t-current",
+            "total_turns": 3,
+            "total_usage": TokenUsage::default(),
+            "duration_ms": 2500,
+        });
+        let event: AgentEvent = serde_json::from_value(current)?;
+        let AgentEvent::Done { duration, .. } = event else {
+            panic!("expected Done");
+        };
+        assert_eq!(duration, Duration::from_millis(2500));
+
+        // ...and a re-serialized legacy event is normalized to millis.
+        let legacy_event: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "done",
+            "thread_id": "t-roundtrip",
+            "total_turns": 1,
+            "total_usage": TokenUsage::default(),
+            "duration": { "secs": 1, "nanos": 0 },
+        }))?;
+        let reserialized = serde_json::to_value(&legacy_event)?;
+        assert_eq!(
+            reserialized
+                .get("duration_ms")
+                .and_then(serde_json::Value::as_u64),
+            Some(1000),
+            "round-trips must write the millis form: {reserialized}"
+        );
+        assert!(reserialized.get("duration").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn budget_exceeded_event_deserializes_legacy_duration_object() -> serde_json::Result<()> {
+        // BudgetExceeded has no pre-rename durable rows, but the field uses
+        // the same adapter — keep it uniformly lenient.
+        let legacy = serde_json::json!({
+            "type": "budget_exceeded",
+            "thread_id": "t-legacy",
+            "total_turns": 2,
+            "total_usage": TokenUsage::default(),
+            "duration": { "secs": 1, "nanos": 250_000_000 },
+            "limit": "total_tokens",
+        });
+        let event: AgentEvent = serde_json::from_value(legacy)?;
+        let AgentEvent::BudgetExceeded { duration, .. } = event else {
+            panic!("expected BudgetExceeded");
+        };
+        assert_eq!(duration, Duration::from_millis(1250));
         Ok(())
     }
 
