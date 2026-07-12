@@ -2147,6 +2147,12 @@ impl LocalDaemon {
     ///   decorators must not perform store I/O inside `decorate`
     ///   itself — on Postgres the schema has not been migrated yet at
     ///   that point.
+    /// - On the in-memory backend, `cancel_tree`'s terminal `Cancelled`
+    ///   markers are committed through sink handles bound at registry
+    ///   construction (before decoration), so an `event_repo` decorator
+    ///   observes every event *except* those markers — the same class
+    ///   as the durable backends, whose atomic commits bypass
+    ///   `event_repo` decoration entirely.
     ///
     /// # Errors
     ///

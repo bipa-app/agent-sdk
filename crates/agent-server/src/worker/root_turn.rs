@@ -1607,6 +1607,13 @@ async fn ensure_turn_not_already_committed(
 /// predecessor's seam-B salvage); more than a couple in one turn means
 /// something other than the known cancel race is advancing the thread
 /// and the honest outcome is the CAS error.
+/// Occupancy-lookup retries across the in-memory committer's
+/// aggregate-then-checkpoint gap (the durable backends commit both in
+/// one transaction and resolve on the first read).
+const OCCUPANT_LOOKUP_RETRIES: usize = 5;
+/// Delay between occupancy-lookup retries.
+const OCCUPANT_LOOKUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+
 const MAX_TURN_SLOT_SHIFTS: u32 = 3;
 
 /// Does this error carry the completed-turn slot CAS rejection?
@@ -1809,25 +1816,56 @@ async fn shifted_turn_slot(
     //    task. Our own task id there means this call is a duplicate of
     //    a commit that already landed — rejecting is the idempotency
     //    guarantee the CAS exists for.
-    let occupant = match deps
-        .checkpoint_store
-        .get_by_turn(&params.thread_id, params.expected_turn)
-        .await
-    {
-        Ok(checkpoint) => checkpoint,
-        Err(error) => {
-            log::warn!(
-                "turn-slot shift: checkpoint lookup for turn {} on thread {} failed: {error:#}",
-                params.expected_turn,
-                params.thread_id,
-            );
-            return None;
+    // The in-memory committer advances the thread aggregate before the
+    // checkpoint row exists (separate store locks), so a collision
+    // observed in that gap reads `None` here. Retry briefly: if the
+    // aggregate really advanced, the occupying checkpoint appears within
+    // a few polls; a persistent `None` falls through to the conservative
+    // no-shift arm. The durable backends write both in one transaction
+    // and never take a retry.
+    let mut occupant = None;
+    for attempt in 0..OCCUPANT_LOOKUP_RETRIES {
+        match deps
+            .checkpoint_store
+            .get_by_turn(&params.thread_id, params.expected_turn)
+            .await
+        {
+            Ok(Some(checkpoint)) => {
+                occupant = Some(checkpoint);
+                break;
+            }
+            Ok(None) => {
+                if attempt + 1 < OCCUPANT_LOOKUP_RETRIES {
+                    tokio::time::sleep(OCCUPANT_LOOKUP_RETRY_DELAY).await;
+                }
+            }
+            Err(error) => {
+                log::warn!(
+                    "turn-slot shift: checkpoint lookup for turn {} on thread {} failed: {error:#}",
+                    params.expected_turn,
+                    params.thread_id,
+                );
+                return None;
+            }
         }
-    };
+    }
     match occupant {
-        Some(checkpoint) if checkpoint.task_id != params.task_id => {}
-        // No checkpoint (thread advanced through a path we don't
-        // understand) or our own duplicate — do not shift.
+        // Only a zero-usage foreign checkpoint is shift-eligible: the
+        // synthetic cancel-salvage commit is the sole production path
+        // that lands a foreign checkpoint with zero `turn_usage`, and
+        // zero usage is exactly what makes the shift state-compatible
+        // (our snapshot and `Done` totals, built before the collision,
+        // are still correct). A BILLED foreign commit means a live
+        // predecessor's full turn landed after we bootstrapped — our
+        // cumulative state lacks its usage/cost, so shifting would
+        // durably drop it; refuse and let the collision surface (the
+        // host retries the turn from the fresh committed head).
+        Some(checkpoint)
+            if checkpoint.task_id != params.task_id
+                && checkpoint.turn_usage == TokenUsage::default() => {}
+        // Billed foreign occupant, no checkpoint (thread advanced
+        // through a path we don't understand), or our own duplicate —
+        // do not shift.
         _ => return None,
     }
 
