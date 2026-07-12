@@ -35,6 +35,13 @@ pub enum ToolDecision {
 ///
 /// This is the place for prompt-injection scrubbing, PII gating, or
 /// system-prompt policy enforcement.
+///
+/// **Forward-compat is fail-open:** the agent loop matches this enum with a
+/// wildcard arm that treats unknown variants as `Proceed`, so a *restrictive*
+/// variant added here in a future release is silently ignored by loops built
+/// against older SDKs. Never add a variant whose ignored meaning weakens a
+/// security decision — extend `Block`/`Modify` semantics instead, or plan a
+/// breaking change.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum RequestDecision {
@@ -51,6 +58,13 @@ pub enum RequestDecision {
 /// and surfaced.
 ///
 /// This is the place for output moderation or secret-leakage detection.
+///
+/// **Forward-compat is fail-open:** the agent loop matches this enum with a
+/// wildcard arm that treats unknown variants as `Accept`, so a *restrictive*
+/// variant added here in a future release is silently ignored by loops built
+/// against older SDKs. Never add a variant whose ignored meaning weakens a
+/// security decision — extend `Block`/`RetryWithFeedback` semantics instead,
+/// or plan a breaking change.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ResponseDecision {
@@ -117,6 +131,18 @@ pub trait AgentHooks: Send + Sync {
     /// [`RequestDecision::Modify`] to substitute a sanitized request, or
     /// [`RequestDecision::Block`] to refuse the call (e.g. prompt-injection or
     /// PII policy). The default proceeds unchanged.
+    ///
+    /// **Fresh-input timing:** for a run's first call on fresh `Text` /
+    /// `Message` input the hook runs at *ingestion time*, against the
+    /// request built from existing history plus the candidate message —
+    /// BEFORE the message is durably appended, so a `Block` leaves nothing
+    /// in history. The request actually sent may then differ only by
+    /// SDK-added content: context compaction (a summary of the exact
+    /// content the hook already saw — `Block` decisions err conservative)
+    /// or a turn-budget reminder. A `Modify` on that first call is sent
+    /// as-is (bypassing compaction once; an oversized replacement degrades
+    /// to the normal overflow recovery). The hook fires exactly once per
+    /// LLM call in every mode.
     async fn pre_llm_request(&self, _request: &llm::ChatRequest) -> RequestDecision {
         RequestDecision::Proceed
     }
@@ -129,6 +155,23 @@ pub trait AgentHooks: Send + Sync {
     /// [`ResponseDecision::RetryWithFeedback`] to reject it and steer a retry
     /// (e.g. output moderation or secret-leakage detection). The default
     /// accepts.
+    ///
+    /// **Retry cap:** every `RetryWithFeedback` pays for another LLM
+    /// round-trip, so the loop bounds *consecutive* rejections at 8. When
+    /// the cap is reached the run terminates with an error naming this hook
+    /// instead of retrying (and billing) indefinitely. The rejection streak
+    /// is persisted in the thread's `AgentState`, so the cap binds both
+    /// in-process looping runs and host-driven single-turn orchestration
+    /// (repeated `run_turn` calls rehydrate the streak from the state
+    /// store). The counter resets whenever a response is accepted.
+    ///
+    /// **Streaming caveat:** the hook runs on the *complete* response, after
+    /// the model has finished. In streaming mode the text deltas have already
+    /// been emitted (and recorded) as stream events by then, so a `Block` /
+    /// `RetryWithFeedback` decision keeps the response out of the thread's
+    /// message history and out of the model's context, but a live consumer
+    /// may have rendered the deltas. Disable streaming when blocked content
+    /// must never be surfaced.
     async fn on_llm_response(&self, _response: &llm::ChatResponse) -> ResponseDecision {
         ResponseDecision::Accept
     }

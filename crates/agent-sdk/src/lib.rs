@@ -474,7 +474,8 @@ mod types;
 
 // agent-sdk (owned — agent loop)
 pub use agent_loop::{
-    AgentHandle, AgentLoop, AgentLoopBuilder, AgentLoopCompactionConfig, builder,
+    AgentHandle, AgentLoop, AgentLoopBuilder, AgentLoopCompactionConfig, RunEventStream, RunStream,
+    builder,
 };
 pub use capabilities::AgentCapabilities;
 pub use filesystem::{InMemoryFileSystem, LocalFileSystem};
@@ -487,9 +488,10 @@ pub use agent_sdk_foundation::privacy::{
 };
 pub use events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 pub use types::{
-    AgentConfig, AgentError, AgentInput, AgentRunState, AgentState, ExecutionStatus,
-    ExternalToolResult, PendingToolCallInfo, RetryConfig, RunOptions, ThreadId, TokenUsage,
-    ToolExecution, ToolInvocation, ToolOutcome, ToolResult, ToolRuntime, ToolTier, TurnOptions,
+    AgentConfig, AgentError, AgentInput, AgentRunState, AgentState, BudgetLimitKind,
+    ExecutionStatus, ExternalToolResult, PendingToolCallInfo, RetryConfig, RunOptions, ThreadId,
+    TokenUsage, ToolExecution, ToolInvocation, ToolOutcome, ToolResult, ToolRuntime, ToolTier,
+    TurnOptions, UsageLimits,
 };
 
 // agent-sdk-tools (via thin modules)

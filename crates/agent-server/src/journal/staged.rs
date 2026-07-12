@@ -381,6 +381,8 @@ impl StagedStores {
                 total_usage: agent_sdk_foundation::TokenUsage::default(),
                 metadata: std::collections::HashMap::new(),
                 created_at: view.thread.created_at,
+                guardrail_retries: 0,
+                accumulated_cost_usd: None,
             }
         } else {
             serde_json::from_value(view.agent_state_snapshot.clone())
@@ -610,6 +612,8 @@ mod tests {
             },
             metadata: std::collections::HashMap::default(),
             created_at: time::OffsetDateTime::now_utc(),
+            guardrail_retries: 0,
+            accumulated_cost_usd: None,
         };
         let snapshot = serde_json::to_value(&seed_state)?;
 
@@ -650,6 +654,8 @@ mod tests {
             },
             metadata: std::collections::HashMap::default(),
             created_at: time::OffsetDateTime::now_utc(),
+            guardrail_retries: 0,
+            accumulated_cost_usd: None,
         };
         let snapshot = serde_json::to_value(&seed_state)?;
         let committed = vec![llm::Message::user("committed")];

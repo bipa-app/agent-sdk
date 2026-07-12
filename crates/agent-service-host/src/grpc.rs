@@ -681,14 +681,7 @@ impl GrpcControlService {
             .get_events(source_thread_id)
             .await
             .map_err(internal_status("loading source events for fork"))?;
-        let events: Vec<_> = source_events
-            .into_iter()
-            .take_while(|committed| {
-                turn_number_for_event(&committed.event)
-                    .is_none_or(|turn| turn <= u64::from(fork_after))
-            })
-            .map(|committed| committed.event)
-            .collect();
+        let events = events_up_to_fork_boundary(source_events, fork_after);
 
         Ok(ForkCommitParams {
             new_thread_id: new_thread_id.clone(),
@@ -2212,18 +2205,48 @@ fn decode_idempotency_result<T: serde::de::DeserializeOwned>(
 /// events in sequence, take while the *running* turn `<= cap`, and
 /// stop the moment a `Done` increments the running turn past it.
 ///
-/// Returning `None` for non-`Done` events lets the caller's
+/// Returning `None` for non-boundary events lets the caller's
 /// `take_while` accept them under the current running turn rather
 /// than reset it — the agent-server's commit pipeline always emits
-/// the `Done` last, so any non-`Done` event seen at sequence S
-/// belongs to a turn whose `Done` is at some sequence `>= S`.
+/// the terminal marker last, so any non-boundary event seen at
+/// sequence S belongs to a turn whose marker is at some sequence
+/// `>= S`.
+///
+/// `Done` is not the only terminal marker the pipeline commits:
+/// `BudgetExceeded` is emitted in place of `Done` when a budget trips
+/// (carrying `total_turns`), and `Cancelled` is the durable marker an
+/// effective `CancelTask` commits (carrying `turn`). All three are
+/// boundaries — without them a fork below a budget-stop or cancel
+/// point would copy the terminal marker past the cutoff and the fork
+/// would immediately read as completed/cancelled.
 const fn turn_number_for_event(event: &agent_sdk_foundation::events::AgentEvent) -> Option<u64> {
     match event {
-        agent_sdk_foundation::events::AgentEvent::Done { total_turns, .. } => {
+        agent_sdk_foundation::events::AgentEvent::Done { total_turns, .. }
+        | agent_sdk_foundation::events::AgentEvent::BudgetExceeded { total_turns, .. } => {
             Some(*total_turns as u64)
         }
+        agent_sdk_foundation::events::AgentEvent::Cancelled { turn, .. } => Some(*turn as u64),
         _ => None,
     }
+}
+
+/// Source events whose enclosing turn is `<= fork_after`, in commit order.
+///
+/// Walks the committed log and takes events while the running turn (per
+/// [`turn_number_for_event`]) stays within the cap — stopping at the first
+/// boundary marker (`Done` / `BudgetExceeded` / `Cancelled`) past it, so a
+/// fork below a terminal marker never inherits it.
+fn events_up_to_fork_boundary(
+    source_events: Vec<agent_server::CommittedEvent>,
+    fork_after: u32,
+) -> Vec<agent_sdk_foundation::events::AgentEvent> {
+    source_events
+        .into_iter()
+        .take_while(|committed| {
+            turn_number_for_event(&committed.event).is_none_or(|turn| turn <= u64::from(fork_after))
+        })
+        .map(|committed| committed.event)
+        .collect()
 }
 
 /// Rewrite the `thread_id` field on a JSON `AgentState` snapshot.
@@ -2589,7 +2612,52 @@ fn map_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelope::Event>
     if let Some(payload) = map_tool_event_payload(event)? {
         return Ok(payload);
     }
+    if let Some(payload) = map_subagent_event_payload(event) {
+        return Ok(payload);
+    }
     map_lifecycle_event_payload(event)
+}
+
+fn map_subagent_event_payload(event: &AgentEvent) -> Option<pb::event_envelope::Event> {
+    let AgentEvent::SubagentProgress {
+        subagent_id,
+        subagent_name,
+        nickname,
+        child_thread_id,
+        child_root_task_id,
+        subagent_task_id,
+        max_turns,
+        current_turn,
+        model,
+        tool_name,
+        tool_context,
+        completed,
+        success,
+        tool_count,
+        total_tokens,
+    } = event
+    else {
+        return None;
+    };
+    Some(pb::event_envelope::Event::SubagentProgress(
+        pb::SubagentProgressEvent {
+            subagent_id: subagent_id.clone(),
+            subagent_name: subagent_name.clone(),
+            nickname: nickname.clone(),
+            child_thread_id: child_thread_id.as_ref().map(ToString::to_string),
+            child_root_task_id: child_root_task_id.clone(),
+            subagent_task_id: subagent_task_id.clone(),
+            max_turns: *max_turns,
+            current_turn: *current_turn,
+            model: model.clone(),
+            tool_name: tool_name.clone(),
+            tool_context: tool_context.clone(),
+            completed: *completed,
+            success: *success,
+            tool_count: *tool_count,
+            total_tokens: *total_tokens,
+        },
+    ))
 }
 
 fn map_message_event_payload(event: &AgentEvent) -> RpcResult<Option<pb::event_envelope::Event>> {
@@ -2712,6 +2780,45 @@ fn map_tool_event_payload(event: &AgentEvent) -> RpcResult<Option<pb::event_enve
     }
 }
 
+/// Project a terminal run-completion event onto the wire `DoneEvent`.
+///
+/// Shared by [`AgentEvent::Done`] and [`AgentEvent::BudgetExceeded`]: the
+/// proto has no dedicated budget event, so a budget-terminated run reuses
+/// the `done` frame with `stop_reason` distinguishing the disposition.
+/// This keeps the streaming contract additive — a replay/follow consumer
+/// always receives a closing `done` frame and the stream terminates (see
+/// [`terminal_close_reason`]) instead of failing with INTERNAL on an unmapped
+/// variant. Both variants carry the run's wall-clock duration.
+fn map_done_event(
+    thread_id: &ThreadId,
+    total_turns: usize,
+    total_usage: &TokenUsage,
+    duration: std::time::Duration,
+    stop_reason: pb::RunStopReason,
+    estimated_cost_usd: Option<f64>,
+) -> RpcResult<pb::event_envelope::Event> {
+    Ok(pb::event_envelope::Event::Done(pb::DoneEvent {
+        thread_id: thread_id.0.clone(),
+        total_turns: map_u64(total_turns, "total_turns")?,
+        total_usage: Some(map_token_usage(total_usage)),
+        duration: Some(map_duration(duration)?),
+        stop_reason: stop_reason.into(),
+        estimated_cost_usd,
+    }))
+}
+
+/// Wire disposition for a budget-terminated run, by the limit that tripped.
+const fn budget_stop_reason(
+    limit: agent_sdk_foundation::types::BudgetLimitKind,
+) -> pb::RunStopReason {
+    match limit {
+        agent_sdk_foundation::types::BudgetLimitKind::TotalTokens => {
+            pb::RunStopReason::BudgetTotalTokens
+        }
+        agent_sdk_foundation::types::BudgetLimitKind::CostUsd => pb::RunStopReason::BudgetCostUsd,
+    }
+}
+
 fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelope::Event> {
     match event {
         AgentEvent::TurnComplete { turn, usage } => Ok(pb::event_envelope::Event::TurnComplete(
@@ -2720,17 +2827,37 @@ fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelo
                 usage: Some(map_token_usage(usage)),
             },
         )),
+        // Both terminal run-completion markers project to `DoneEvent`. See
+        // `map_done_event` for why `BudgetExceeded` reuses the `done` frame.
         AgentEvent::Done {
             thread_id,
             total_turns,
             total_usage,
             duration,
-        } => Ok(pb::event_envelope::Event::Done(pb::DoneEvent {
-            thread_id: thread_id.0.clone(),
-            total_turns: map_u64(*total_turns, "total_turns")?,
-            total_usage: Some(map_token_usage(total_usage)),
-            duration: Some(map_duration(*duration)?),
-        })),
+            estimated_cost_usd,
+        } => map_done_event(
+            thread_id,
+            *total_turns,
+            total_usage,
+            *duration,
+            pb::RunStopReason::Completed,
+            *estimated_cost_usd,
+        ),
+        AgentEvent::BudgetExceeded {
+            thread_id,
+            total_turns,
+            total_usage,
+            duration,
+            estimated_cost_usd,
+            limit,
+        } => map_done_event(
+            thread_id,
+            *total_turns,
+            total_usage,
+            *duration,
+            budget_stop_reason(*limit),
+            *estimated_cost_usd,
+        ),
         AgentEvent::Error {
             message,
             recoverable,
@@ -2841,15 +2968,18 @@ where
 }
 
 /// Close reason implied by a terminal lifecycle event, or `None` for
-/// every non-terminal event. `Done` completes the followed work;
+/// every non-terminal event. `Done` and `BudgetExceeded` complete the
+/// followed work (the latter is emitted in place of `Done` when a budget
+/// trips, so a budget-terminated thread closes cleanly instead of hanging);
 /// `Cancelled` is the durable marker committed by an effective cancel
-/// (see `CancelledEvent` in `events.proto`) — both close the stream so
-/// followers of cancelled work never hang waiting for a `Done`.
+/// (see `CancelledEvent` in `events.proto`) — all three close the stream.
 const fn terminal_close_reason(
     event: &agent_server::CommittedEvent,
 ) -> Option<pb::StreamCloseReason> {
     match event.event {
-        AgentEvent::Done { .. } => Some(pb::StreamCloseReason::ThreadCompleted),
+        AgentEvent::Done { .. } | AgentEvent::BudgetExceeded { .. } => {
+            Some(pb::StreamCloseReason::ThreadCompleted)
+        }
         AgentEvent::Cancelled { .. } => Some(pb::StreamCloseReason::TurnCancelled),
         _ => None,
     }
@@ -5422,5 +5552,111 @@ mod tests {
             .into_inner();
         assert_eq!(ok.cancelled_task_ids, vec![task_id]);
         Ok(())
+    }
+
+    fn budget_exceeded_event() -> AgentEvent {
+        AgentEvent::BudgetExceeded {
+            thread_id: ThreadId::from_string("t-budget"),
+            total_turns: 3,
+            total_usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                ..Default::default()
+            },
+            duration: Duration::from_millis(2500),
+            estimated_cost_usd: Some(0.25),
+            limit: agent_sdk_foundation::types::BudgetLimitKind::TotalTokens,
+        }
+    }
+
+    #[test]
+    fn budget_exceeded_projects_to_done_event() -> Result<()> {
+        // Previously `BudgetExceeded` fell through to `Status::internal`, so a
+        // budget-terminated thread's replay/follow stream failed with INTERNAL.
+        // It must now project to a terminal `DoneEvent` carrying the run totals.
+        let payload = map_event_payload(&budget_exceeded_event())?;
+        match payload {
+            EventPayload::Done(done) => {
+                assert_eq!(done.thread_id, "t-budget");
+                assert_eq!(done.total_turns, 3);
+                let usage = done.total_usage.context("done event must carry usage")?;
+                assert_eq!(usage.input_tokens, 100);
+                assert_eq!(usage.output_tokens, 50);
+                assert_eq!(done.stop_reason(), pb::RunStopReason::BudgetTotalTokens);
+                assert_eq!(done.estimated_cost_usd, Some(0.25));
+                let duration = done
+                    .duration
+                    .context("budget stop must carry the run's wall-clock duration")?;
+                assert_eq!(duration.seconds, 2);
+                assert_eq!(duration.nanos, 500_000_000);
+            }
+            other => bail!("BudgetExceeded must map to a Done event, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn budget_exceeded_is_terminal_for_follow_streams() {
+        // `terminal_close_reason` drives stream closure, so a
+        // budget-terminated thread closes with ThreadCompleted instead of
+        // hanging waiting for `Done`.
+        let committed = agent_server::CommittedEvent {
+            event_id: uuid::Uuid::now_v7(),
+            thread_id: ThreadId::from_string("t-budget"),
+            sequence: 7,
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+            event: budget_exceeded_event(),
+        };
+        assert_eq!(
+            terminal_close_reason(&committed),
+            Some(pb::StreamCloseReason::ThreadCompleted)
+        );
+    }
+
+    /// A fork below a terminal marker must not inherit it: `BudgetExceeded`
+    /// and `Cancelled` are turn boundaries exactly like `Done`, or the fork
+    /// would immediately read as completed/cancelled even though its state
+    /// predates the stop.
+    #[test]
+    fn fork_boundary_excludes_budget_and_cancel_markers() {
+        let committed = |sequence: u64, event: AgentEvent| agent_server::CommittedEvent {
+            event_id: uuid::Uuid::now_v7(),
+            thread_id: ThreadId::from_string("t-fork"),
+            sequence,
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+            event,
+        };
+        let done_turn_1 = AgentEvent::done(
+            ThreadId::from_string("t-fork"),
+            1,
+            TokenUsage::default(),
+            std::time::Duration::ZERO,
+        );
+
+        // Budget marker past the cutoff: excluded (its total_turns > fork_after).
+        let mut budget_marker = budget_exceeded_event();
+        if let AgentEvent::BudgetExceeded { total_turns, .. } = &mut budget_marker {
+            *total_turns = 2;
+        }
+        let kept = events_up_to_fork_boundary(
+            vec![
+                committed(1, done_turn_1.clone()),
+                committed(2, budget_marker),
+            ],
+            1,
+        );
+        assert_eq!(kept.len(), 1, "the budget marker must not cross the cutoff");
+        assert!(matches!(kept[0], AgentEvent::Done { .. }));
+
+        // Cancel marker past the cutoff: excluded the same way.
+        let kept = events_up_to_fork_boundary(
+            vec![
+                committed(1, done_turn_1),
+                committed(2, AgentEvent::cancelled(2, TokenUsage::default())),
+            ],
+            1,
+        );
+        assert_eq!(kept.len(), 1, "the cancel marker must not cross the cutoff");
+        assert!(matches!(kept[0], AgentEvent::Done { .. }));
     }
 }

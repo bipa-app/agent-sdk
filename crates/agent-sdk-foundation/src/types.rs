@@ -80,6 +80,25 @@ pub struct AgentConfig {
     /// non-cooperative tools. `None` (default) disables the boundary
     /// timeout entirely.
     pub tool_timeout_ms: Option<u64>,
+    /// Optional run-level token / cost budgets.
+    ///
+    /// When set, the agent loop checks the cumulative token usage (and the
+    /// estimated USD cost, when the provider/model has pricing metadata)
+    /// at every turn-continuation boundary. If a configured limit is
+    /// exceeded the run stops with
+    /// [`AgentRunState::BudgetExceeded`] / [`TurnOutcome::BudgetExceeded`]
+    /// instead of starting another turn. `None` (default) disables
+    /// budgeting entirely.
+    pub usage_limits: Option<UsageLimits>,
+    /// Maximum number of read-only (`ToolTier::Observe`) tool calls the SDK
+    /// runs concurrently within a single parallel batch.
+    ///
+    /// `None` (default) keeps the historical unbounded behavior — every
+    /// adjacent observe-tier call in a turn is dispatched at once.
+    /// `Some(1)` forces strictly sequential execution; `Some(n)` caps the
+    /// in-flight count at `n`. `Some(0)` is not meaningful and is treated
+    /// as `Some(1)` (sequential). Result ordering is always preserved.
+    pub max_parallel_tools: Option<usize>,
 }
 
 impl Default for AgentConfig {
@@ -92,8 +111,68 @@ impl Default for AgentConfig {
             retry: RetryConfig::default(),
             streaming: false,
             tool_timeout_ms: None,
+            usage_limits: None,
+            max_parallel_tools: None,
         }
     }
+}
+
+/// Run-level token / cost budgets applied by the agent loop.
+///
+/// Each limit is independent and optional. A `None` field imposes no
+/// constraint. When a limit is exceeded the run terminates with a
+/// [`BudgetLimitKind`] identifying which limit fired.
+///
+/// # Evaluation boundaries and bounded overshoot
+///
+/// Budgets are evaluated at loop boundaries — before a fresh prompt is
+/// ingested, before every LLM turn is dispatched, immediately after
+/// context-compaction spend is folded in, and before overflow-recovery
+/// summarization — never mid-call. Any single boundary may therefore
+/// overshoot by the calls already in flight: one turn call, or up to two
+/// compaction summarization calls (the second only when the first summary
+/// was truncated and retried with a doubled token budget). All such calls
+/// are folded into the cumulative usage and re-checked at the next
+/// boundary, so the overshoot is bounded and never compounds.
+///
+/// Three accounting gaps are known and deliberate: a streamed attempt
+/// that fails mid-response and is retried may have billed partial tokens
+/// the provider error channel does not carry, so those are not counted
+/// (tracked alongside the channel's other gaps); a compaction cancelled
+/// between its first (billed) summarization call and a truncation retry
+/// drops that first call's usage (the in-flight future is torn down with
+/// the accumulator inside); and a custom compactor installed via
+/// `with_custom_compactor` has its reported usage priced at the run's
+/// provider/model, so cost is approximate when the compactor uses a
+/// different backend.
+#[derive(Clone, Debug, Default)]
+pub struct UsageLimits {
+    /// Maximum cumulative tokens (input + output, summed across every
+    /// turn) before the run stops.
+    pub max_total_tokens: Option<u64>,
+    /// Maximum estimated cost in USD before the run stops.
+    ///
+    /// Only enforced when the run's provider/model has pricing metadata in
+    /// [`agent_sdk_providers`](https://docs.rs/agent-sdk-providers); models
+    /// without pricing never trip this limit.
+    ///
+    /// Cost tracking follows the loop's configured provider provenance (the
+    /// provider/model the top-level provider reports). Behind
+    /// fallback-provider or model-router wrappers the provenance may name a
+    /// different backend than the one that actually served a given call, so
+    /// the estimated cost — and therefore this limit — may be inaccurate
+    /// there.
+    pub max_cost_usd: Option<f64>,
+}
+
+/// Which run-level budget was exceeded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetLimitKind {
+    /// The cumulative token budget ([`UsageLimits::max_total_tokens`]) was hit.
+    TotalTokens,
+    /// The estimated-cost budget ([`UsageLimits::max_cost_usd`]) was hit.
+    CostUsd,
 }
 
 /// Configuration for retry behavior on transient errors.
@@ -260,6 +339,29 @@ pub struct AgentState {
     pub metadata: HashMap<String, serde_json::Value>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    /// Number of consecutive `on_llm_response` guardrail rejections
+    /// (`RetryWithFeedback`) across the thread's turns.
+    ///
+    /// Persisted so the loop's consecutive-rejection cap also binds
+    /// host-driven single-turn orchestration, where each `run_turn` rebuilds
+    /// its in-memory context from this state. Reset to zero whenever the
+    /// hook accepts a response. Additive and wire-compatible: absent in
+    /// older snapshots, defaulting to zero.
+    #[serde(default)]
+    pub guardrail_retries: usize,
+    /// Estimated USD cost accumulated across the thread's LLM calls.
+    ///
+    /// Each call's usage is priced at the provider/model that served it and
+    /// added here, so a thread that rotates models keeps the true sum
+    /// instead of repricing its whole history at the newest model's rates.
+    /// `None` means no priced usage has been tracked yet: a fresh thread
+    /// before its first priced call, a thread whose models have no pricing
+    /// metadata, or a snapshot predating this field. Legacy snapshots are
+    /// seeded once (best-effort) by repricing the aggregate usage at the
+    /// rates current when the thread next runs, then accumulate normally.
+    /// Additive and wire-compatible via `#[serde(default)]`.
+    #[serde(default)]
+    pub accumulated_cost_usd: Option<f64>,
 }
 
 impl AgentState {
@@ -271,6 +373,8 @@ impl AgentState {
             total_usage: TokenUsage::default(),
             metadata: HashMap::new(),
             created_at: OffsetDateTime::now_utc(),
+            guardrail_retries: 0,
+            accumulated_cost_usd: None,
         }
     }
 }
@@ -310,6 +414,20 @@ pub enum AgentRunState {
     Done {
         total_turns: u32,
         total_usage: TokenUsage,
+        /// Estimated cost of the run in USD, when the provider/model has
+        /// pricing metadata; `None` otherwise.
+        estimated_cost_usd: Option<f64>,
+    },
+
+    /// Agent was stopped because a run-level usage budget was exceeded.
+    BudgetExceeded {
+        total_turns: u32,
+        total_usage: TokenUsage,
+        /// Estimated cost of the run in USD at the moment the budget was
+        /// hit, when pricing metadata is available.
+        estimated_cost_usd: Option<f64>,
+        /// Which budget limit was exceeded.
+        limit: BudgetLimitKind,
     },
 
     /// Agent was refused by the model (safety/policy).
@@ -778,6 +896,21 @@ pub enum TurnOutcome {
         summary: TurnSummary,
     },
 
+    /// A run-level usage budget was exceeded; the turn stops instead of
+    /// continuing to the next LLM round-trip.
+    BudgetExceeded {
+        /// Total turns executed
+        total_turns: u32,
+        /// Cumulative token usage
+        total_usage: TokenUsage,
+        /// Estimated cost of the run in USD, when pricing is available.
+        estimated_cost_usd: Option<f64>,
+        /// Which budget limit was exceeded.
+        limit: BudgetLimitKind,
+        /// Structured server-facing outcome metadata.
+        summary: TurnSummary,
+    },
+
     /// A tool requires user confirmation.
     ///
     /// Present this to the user and call `run_turn` with `AgentInput::Resume`
@@ -860,6 +993,7 @@ impl TurnOutcome {
         match self {
             Self::NeedsMoreTurns { summary, .. }
             | Self::Done { summary, .. }
+            | Self::BudgetExceeded { summary, .. }
             | Self::AwaitingConfirmation { summary, .. }
             | Self::Refusal { summary, .. }
             | Self::Cancelled { summary, .. }

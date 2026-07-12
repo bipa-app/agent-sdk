@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub struct MockProvider {
     responses: RwLock<Vec<ChatOutcome>>,
     call_count: AtomicUsize,
+    requests: RwLock<Vec<ChatRequest>>,
 }
 
 impl MockProvider {
@@ -27,7 +28,24 @@ impl MockProvider {
         Self {
             responses: RwLock::new(responses),
             call_count: AtomicUsize::new(0),
+            requests: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Number of `chat` calls served so far.
+    pub fn calls(&self) -> usize {
+        self.call_count.load(Ordering::SeqCst)
+    }
+
+    /// Every `ChatRequest` received so far, in call order.
+    pub fn recorded_requests(&self) -> anyhow::Result<Vec<ChatRequest>> {
+        use anyhow::Context as _;
+        Ok(self
+            .requests
+            .read()
+            .ok()
+            .context("requests lock poisoned")?
+            .clone())
     }
 
     pub fn text_response(text: &str) -> ChatOutcome {
@@ -117,9 +135,15 @@ impl MockProvider {
 
 #[async_trait]
 impl crate::llm::LlmProvider for MockProvider {
-    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+    async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
+        use anyhow::Context as _;
         let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
-        let responses = self.responses.read().expect("lock poisoned");
+        self.requests
+            .write()
+            .ok()
+            .context("requests lock poisoned")?
+            .push(request);
+        let responses = self.responses.read().ok().context("lock poisoned")?;
         if idx < responses.len() {
             Ok(responses[idx].clone())
         } else {

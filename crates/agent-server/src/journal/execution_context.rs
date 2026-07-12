@@ -380,6 +380,8 @@ mod tests {
             total_usage: usage(200, 100),
             metadata: std::collections::HashMap::default(),
             created_at: t0(),
+            guardrail_retries: 0,
+            accumulated_cost_usd: None,
         })?;
 
         s.commit_turn(
@@ -453,6 +455,8 @@ mod tests {
             total_usage: usage(100, 50),
             metadata: std::collections::HashMap::default(),
             created_at: t0(),
+            guardrail_retries: 0,
+            accumulated_cost_usd: None,
         })?;
 
         s.commit_turn(

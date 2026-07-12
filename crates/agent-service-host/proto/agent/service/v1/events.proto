@@ -112,11 +112,29 @@ message TurnCompleteEvent {
   TokenUsage usage = 2;
 }
 
+// Why the run reached its terminal `done` frame. Older servers never set
+// this field, so UNSPECIFIED must be read as "normal completion".
+enum RunStopReason {
+  RUN_STOP_REASON_UNSPECIFIED = 0;
+  RUN_STOP_REASON_COMPLETED = 1;
+  RUN_STOP_REASON_BUDGET_TOTAL_TOKENS = 2;
+  RUN_STOP_REASON_BUDGET_COST_USD = 3;
+}
+
 message DoneEvent {
   string thread_id = 1;
   uint64 total_turns = 2;
   TokenUsage total_usage = 3;
+  // Wall-clock run duration. Always set: both normal completion and a
+  // budget-limited stop report the run's elapsed time. May be unset only
+  // on frames from servers that predate this guarantee.
   google.protobuf.Duration duration = 4;
+  // Terminal disposition; distinguishes a budget-stopped run from normal
+  // completion. Unset on frames from servers that predate this field.
+  RunStopReason stop_reason = 5;
+  // Estimated run cost in USD, when the provider/model has pricing
+  // metadata.
+  optional double estimated_cost_usd = 6;
 }
 
 message ErrorEvent {

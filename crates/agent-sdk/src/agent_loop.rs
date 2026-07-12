@@ -28,6 +28,7 @@
 //!     .build();
 //! ```
 
+mod budget;
 mod builder;
 mod helpers;
 mod idempotency;
@@ -50,17 +51,161 @@ pub use self::builder::AgentLoopBuilder;
 
 use crate::authority::{EventAuthority, LocalEventAuthority};
 use crate::context::{CompactionConfig, ContextCompactor};
+use crate::events::{AgentEvent, AgentEventEnvelope};
 use crate::hooks::AgentHooks;
 use crate::llm::LlmProvider;
-use crate::stores::{EventStore, MessageStore, StateStore, ToolExecutionStore};
+use crate::stores::{EventStore, MessageStore, StateStore, StoredTurnEvents, ToolExecutionStore};
 use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::{AgentConfig, AgentError, AgentInput, AgentRunState, RunOptions, ThreadId};
+use async_trait::async_trait;
 use futures::FutureExt;
+use futures::Stream;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+
+/// Bound on the [`AgentLoop::run_stream`] tee channel.
+///
+/// The event store is the durable source of truth, so the live stream is a
+/// best-effort mirror. Bounding the channel keeps a slow (or stalled) stream
+/// consumer from growing memory without limit: once this many events are
+/// buffered, [`TeeEventStore::append`] drops the newest event rather than
+/// blocking the run loop (whose forward progress and persistence must not
+/// depend on a consumer's read rate). Callers that need every event should
+/// read the configured [`EventStore`] back instead of relying on the stream.
+const RUN_STREAM_CHANNEL_CAPACITY: usize = 1024;
+
+/// How long [`TeeEventStore::append`] waits to forward a **terminal** event
+/// onto a full tee channel before dropping it.
+///
+/// Terminal events are the stream's closing marker; silently dropping one on
+/// a full buffer would let the stream end with no terminal frame. Blocking
+/// briefly gives a slow-but-live consumer time to drain a slot, while the
+/// bound keeps a dead (never-reading) consumer from stalling the run.
+const RUN_STREAM_TERMINAL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether an event is a terminal run-closing marker on the live stream.
+///
+/// These are the events emitted exactly once at the end of a run
+/// ([`AgentEvent::Done`], [`AgentEvent::BudgetExceeded`],
+/// [`AgentEvent::Cancelled`], [`AgentEvent::Refusal`]); a stream consumer
+/// relies on observing one of them before the stream closes.
+const fn is_terminal_stream_event(event: &AgentEvent) -> bool {
+    matches!(
+        event,
+        AgentEvent::Done { .. }
+            | AgentEvent::BudgetExceeded { .. }
+            | AgentEvent::Cancelled { .. }
+            | AgentEvent::Refusal { .. }
+    )
+}
+
+/// An [`EventStore`] decorator that delegates every append to the wrapped
+/// store and, **after the durable append succeeds**, forwards a clone of the
+/// [`AgentEvent`] to a bounded channel.
+///
+/// This is the tee behind [`AgentLoop::run_stream`]: the run loop writes
+/// every event through the configured store as usual, and the matching
+/// [`AgentEvent`] is mirrored onto the stream so callers consume events live
+/// without implementing an [`EventStore`]. Persistence comes first — a
+/// failed durable append never reaches the stream, so consumers cannot
+/// observe a phantom event. The forward is best-effort and lossy under
+/// backpressure — if the consumer has dropped the stream, or is too slow and
+/// the bounded buffer ([`RUN_STREAM_CHANNEL_CAPACITY`]) is full, a
+/// non-terminal event is dropped from the live stream and the run continues
+/// unaffected. Terminal events (see [`is_terminal_stream_event`]) instead
+/// wait up to [`RUN_STREAM_TERMINAL_SEND_TIMEOUT`] for buffer space so a
+/// slow-but-live consumer still receives the closing marker. Dropped events
+/// remain durably recorded in `inner`.
+struct TeeEventStore {
+    inner: Arc<dyn EventStore>,
+    tx: mpsc::Sender<AgentEvent>,
+}
+
+#[async_trait]
+impl EventStore for TeeEventStore {
+    async fn append(
+        &self,
+        thread_id: &ThreadId,
+        turn: usize,
+        envelope: AgentEventEnvelope,
+    ) -> anyhow::Result<()> {
+        let event = envelope.event.clone();
+        // Persist FIRST: forwarding before a failed durable append would let
+        // the stream consumer observe an event that never landed in the
+        // store (a phantom event).
+        self.inner.append(thread_id, turn, envelope).await?;
+
+        if is_terminal_stream_event(&event) {
+            // Terminal events are the stream's closing marker: give a
+            // slow-but-live consumer a bounded window to make room instead
+            // of silently dropping the frame, while a dead consumer can
+            // only stall the run for the timeout.
+            if self
+                .tx
+                .send_timeout(event, RUN_STREAM_TERMINAL_SEND_TIMEOUT)
+                .await
+                .is_err()
+            {
+                log::debug!(
+                    "run_stream tee could not deliver terminal event within \
+                     {RUN_STREAM_TERMINAL_SEND_TIMEOUT:?}; dropping it from the live stream \
+                     (still persisted to the store)"
+                );
+            }
+        } else if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(event) {
+            // `try_send` (never `send().await`): the run loop must not stall
+            // on a slow stream consumer. A `Full` error means the consumer
+            // is behind, so the event is dropped from the live stream only —
+            // it was already persisted to `inner` above.
+            log::debug!(
+                "run_stream tee channel full (capacity {RUN_STREAM_CHANNEL_CAPACITY}); \
+                 dropping event from live stream (still persisted to the store)"
+            );
+        }
+        Ok(())
+    }
+
+    async fn finish_turn(&self, thread_id: &ThreadId, turn: usize) -> anyhow::Result<()> {
+        self.inner.finish_turn(thread_id, turn).await
+    }
+
+    async fn get_turn(
+        &self,
+        thread_id: &ThreadId,
+        turn: usize,
+    ) -> anyhow::Result<Option<StoredTurnEvents>> {
+        self.inner.get_turn(thread_id, turn).await
+    }
+
+    async fn get_turns(&self, thread_id: &ThreadId) -> anyhow::Result<Vec<StoredTurnEvents>> {
+        self.inner.get_turns(thread_id).await
+    }
+
+    async fn get_events(&self, thread_id: &ThreadId) -> anyhow::Result<Vec<AgentEventEnvelope>> {
+        self.inner.get_events(thread_id).await
+    }
+
+    async fn event_count(&self, thread_id: &ThreadId) -> anyhow::Result<usize> {
+        self.inner.event_count(thread_id).await
+    }
+
+    async fn get_events_since(
+        &self,
+        thread_id: &ThreadId,
+        offset: usize,
+    ) -> anyhow::Result<Vec<AgentEventEnvelope>> {
+        self.inner.get_events_since(thread_id, offset).await
+    }
+
+    async fn clear(&self, thread_id: &ThreadId) -> anyhow::Result<()> {
+        self.inner.clear(thread_id).await
+    }
+}
 
 /// Run the agent loop with panic isolation at the spawned-task boundary.
 ///
@@ -159,6 +304,101 @@ pub struct AgentHandle {
     pub cancel_token: CancellationToken,
 }
 
+/// A live event stream paired with the run's final state.
+///
+/// Returned by [`AgentLoop::run_stream`]. `events` yields each
+/// [`AgentEvent`] as the run persists it (see the delivery semantics on
+/// [`AgentLoop::run_stream`]) and ends when the run finishes. `final_state`
+/// resolves exactly once with the run's terminal [`AgentRunState`] — the
+/// only place that state lives: an
+/// [`AgentRunState::AwaitingConfirmation`] carries the continuation needed
+/// to resume, and a startup failure surfaces as [`AgentRunState::Error`]
+/// even when no event was ever emitted. Await it after (or concurrently
+/// with) consuming `events`; dropping it is fine when only the event feed
+/// matters.
+pub struct RunStream {
+    /// Live event feed; ends when the run completes (see
+    /// [`RunEventStream`] for the exact termination contract).
+    pub events: RunEventStream,
+    /// Resolves with the run's final state. Fails only if the runtime
+    /// shut down before the run could report (see
+    /// [`AgentLoop::run`]'s error contract).
+    pub final_state: oneshot::Receiver<AgentRunState>,
+}
+
+/// Live event feed for [`RunStream`].
+///
+/// Ends when either the tee channel closes (every sender dropped) or the
+/// run itself completes — whichever happens first. The completion signal
+/// matters because the tee's channel sender travels inside every
+/// [`ToolContext`] clone handed to tools (via the turn-scoped event
+/// store): a tool that parks a clone in background work would otherwise
+/// keep the channel open past `Done` and the stream would never end even
+/// though `final_state` already resolved.
+///
+/// Ordering guarantee: the completion signal fires only AFTER the run
+/// future resolved — i.e. after the terminal event was persisted and
+/// forwarded — and buffered events are always drained before the stream
+/// ends, so no event emitted by the run is lost. Events appended by leaked
+/// tool-context clones after run completion are not delivered on the live
+/// stream (they are still persisted to the underlying store).
+pub struct RunEventStream {
+    rx: mpsc::Receiver<AgentEvent>,
+    run_completed: Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
+    draining: bool,
+}
+
+impl Stream for RunEventStream {
+    type Item = AgentEvent;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        // Observe run completion BEFORE the channel: a leaked sender clone
+        // that keeps appending would otherwise hold the channel ready on
+        // every poll and starve the completion signal forever. Closing the
+        // receiver stops any further sends while the already-buffered
+        // (finite) events — including the terminal one, which the run task
+        // forwards before firing the signal — still drain below.
+        if !this.draining && this.run_completed.as_mut().poll(cx).is_ready() {
+            this.draining = true;
+            this.rx.close();
+        }
+        match this.rx.poll_recv(cx) {
+            Poll::Ready(Some(event)) => Poll::Ready(Some(event)),
+            Poll::Ready(None) => Poll::Ready(None),
+            // Reachable only while the run is live (both the token and the
+            // channel registered wakers above); a closed, drained channel
+            // reports `None` from `poll_recv` itself.
+            Poll::Pending => {
+                if this.draining {
+                    Poll::Ready(None)
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+}
+
+/// Inputs shared by the three `spawn_run_loop` callers
+/// (`run_abortable_with_options`, `run_persistent_with_options`,
+/// `run_stream_with_options`). Bundled so the private spawn helper takes a
+/// single argument instead of a long positional list.
+struct SpawnRunLoopParams<Ctx> {
+    event_store: Arc<dyn EventStore>,
+    thread_id: ThreadId,
+    input: AgentInput,
+    tool_context: ToolContext<Ctx>,
+    cancel_token: CancellationToken,
+    run_options: RunOptions,
+    input_rx: Option<mpsc::Receiver<AgentInput>>,
+    /// Cancelled by the spawned task right after the run future resolves
+    /// (before the final state is sent), so `run_stream` consumers get a
+    /// stream-termination signal that does not depend on every tee sender
+    /// clone being dropped. `None` for the non-streaming entry points.
+    run_completed: Option<CancellationToken>,
+}
+
 /// Configuration bundle for constructing an [`AgentLoop`] with compaction.
 pub struct AgentLoopCompactionConfig {
     pub agent_config: AgentConfig,
@@ -229,6 +469,7 @@ where
     pub(super) compactor: Option<Arc<dyn ContextCompactor>>,
     pub(super) execution_store: Option<Arc<dyn ToolExecutionStore>>,
     pub(super) audit_sink: Arc<dyn crate::hooks::ToolAuditSink>,
+    pub(super) reminder_config: Option<crate::reminders::ReminderConfig>,
     #[cfg(feature = "otel")]
     pub(super) observability_store: Option<Arc<dyn crate::observability::ObservabilityStore>>,
 }
@@ -271,6 +512,7 @@ where
             compactor: None,
             execution_store: None,
             audit_sink: Arc::new(crate::hooks::NoopAuditSink),
+            reminder_config: None,
             #[cfg(feature = "otel")]
             observability_store: None,
         }
@@ -304,6 +546,7 @@ where
             compactor: None,
             execution_store: None,
             audit_sink: Arc::new(crate::hooks::NoopAuditSink),
+            reminder_config: None,
             #[cfg(feature = "otel")]
             observability_store: None,
         }
@@ -536,6 +779,46 @@ where
     where
         Ctx: Clone,
     {
+        self.spawn_run_loop(SpawnRunLoopParams {
+            event_store: Arc::clone(&self.event_store),
+            thread_id,
+            input,
+            tool_context,
+            cancel_token,
+            run_options,
+            input_rx: None,
+            run_completed: None,
+        })
+    }
+
+    /// Spawn the run loop on a Tokio task and return its state channel +
+    /// join handle.
+    ///
+    /// Shared by [`run_abortable_with_options`](Self::run_abortable_with_options),
+    /// [`run_persistent_with_options`](Self::run_persistent_with_options), and
+    /// [`run_stream_with_options`](Self::run_stream_with_options) so all three
+    /// build [`RunLoopParameters`] identically. The `event_store` is a
+    /// parameter (not always `self.event_store`) so the streaming path can
+    /// inject a teeing decorator.
+    fn spawn_run_loop(
+        &self,
+        SpawnRunLoopParams {
+            event_store,
+            thread_id,
+            input,
+            tool_context,
+            cancel_token,
+            run_options,
+            input_rx,
+            run_completed,
+        }: SpawnRunLoopParams<Ctx>,
+    ) -> (
+        oneshot::Receiver<AgentRunState>,
+        tokio::task::JoinHandle<()>,
+    )
+    where
+        Ctx: Clone,
+    {
         // `run_options` only feeds OTel root-span metadata. On
         // non-otel builds the value is genuinely not needed —
         // explicitly drop it so the unused-variable / needless-pass
@@ -552,12 +835,12 @@ where
         let hooks = Arc::clone(&self.hooks);
         let message_store = Arc::clone(&self.message_store);
         let state_store = Arc::clone(&self.state_store);
-        let event_store = Arc::clone(&self.event_store);
         let config = self.config.clone();
         let compaction_config = self.compaction_config.clone();
         let compactor = self.compactor.clone();
         let execution_store = self.execution_store.clone();
         let audit_sink = Arc::clone(&self.audit_sink);
+        let reminder_config = self.reminder_config.clone();
         #[cfg(feature = "otel")]
         let observability_store = self.observability_store.clone();
         #[cfg(feature = "otel")]
@@ -581,7 +864,8 @@ where
                 execution_store,
                 audit_sink,
                 cancel_token,
-                input_rx: None,
+                input_rx,
+                reminder_config,
                 #[cfg(feature = "otel")]
                 run_options,
                 #[cfg(feature = "otel")]
@@ -589,6 +873,15 @@ where
             })
             .await;
 
+            // Signal run completion BEFORE handing over the final state:
+            // every event the run emitted has already been persisted and
+            // forwarded (the tee runs inside the loop), so a consumer that
+            // observes `final_state` can rely on the event stream
+            // terminating even if a tool leaked a ToolContext clone that
+            // still holds the tee's sender.
+            if let Some(run_completed) = run_completed {
+                run_completed.cancel();
+            }
             let _ = state_tx.send(result);
         };
 
@@ -649,73 +942,134 @@ where
     where
         Ctx: Clone,
     {
-        // See `run_abortable_with_options` for why we explicitly
-        // drop `run_options` on non-otel builds.
-        #[cfg(not(feature = "otel"))]
-        drop(run_options);
-
-        let (state_tx, state_rx) = oneshot::channel();
         let (input_tx, input_rx) = mpsc::channel(32);
-        let authority = self.resolve_authority();
-
-        let provider = Arc::clone(&self.provider);
-        let tools = Arc::clone(&self.tools);
-        let hooks = Arc::clone(&self.hooks);
-        let message_store = Arc::clone(&self.message_store);
-        let state_store = Arc::clone(&self.state_store);
-        let event_store = Arc::clone(&self.event_store);
-        let config = self.config.clone();
-        let compaction_config = self.compaction_config.clone();
-        let compactor = self.compactor.clone();
-        let execution_store = self.execution_store.clone();
-        let audit_sink = Arc::clone(&self.audit_sink);
-        #[cfg(feature = "otel")]
-        let observability_store = self.observability_store.clone();
         let cancel_handle = cancel_token.clone();
-        #[cfg(feature = "otel")]
-        let parent_cx = crate::observability::context::capture_context();
 
-        let task = async move {
-            let result = run_loop_isolated(RunLoopParameters {
-                event_store,
-                authority,
-                thread_id,
-                input,
-                tool_context,
-                provider,
-                tools,
-                hooks,
-                message_store,
-                state_store,
-                config,
-                compaction_config,
-                compactor,
-                execution_store,
-                audit_sink,
-                cancel_token,
-                input_rx: Some(input_rx),
-                #[cfg(feature = "otel")]
-                run_options,
-                #[cfg(feature = "otel")]
-                observability_store,
-            })
-            .await;
-
-            let _ = state_tx.send(result);
-        };
-
-        #[cfg(feature = "otel")]
-        let task = {
-            use opentelemetry::trace::FutureExt;
-            task.with_context(parent_cx)
-        };
-
-        tokio::spawn(task);
+        let (state_rx, handle) = self.spawn_run_loop(SpawnRunLoopParams {
+            event_store: Arc::clone(&self.event_store),
+            thread_id,
+            input,
+            tool_context,
+            cancel_token,
+            run_options,
+            input_rx: Some(input_rx),
+            run_completed: None,
+        });
+        // The persistent run is stopped via the cancel token or by dropping
+        // `input_tx`, not by aborting the task, so detach the handle.
+        drop(handle);
 
         AgentHandle {
             input_tx,
             state_rx,
             cancel_token: cancel_handle,
+        }
+    }
+
+    /// Stream the agent's [`AgentEvent`]s live as they are emitted.
+    ///
+    /// Returns a [`RunStream`]: a live event feed plus a handle to the
+    /// run's final [`AgentRunState`]. [`RunStream::events`] yields each
+    /// [`AgentEvent`] the moment the run loop writes it to the event store,
+    /// so callers consume events in real time without implementing an
+    /// [`EventStore`]. The same events are still persisted to the loop's
+    /// configured store — the stream is an additional tee, not a
+    /// replacement. [`RunStream::final_state`] resolves once when the run
+    /// ends; it is the only place the terminal state lives, including
+    /// [`AgentRunState::AwaitingConfirmation`] (whose continuation is
+    /// required to resume) and startup errors that occur before any event
+    /// is emitted.
+    ///
+    /// The run is spawned on a Tokio task before this returns; the stream
+    /// ends when the run finishes (or is cancelled via `cancel_token`) —
+    /// termination does not depend on tools dropping their [`ToolContext`]
+    /// clones (see [`RunEventStream`]). Dropping the stream does **not**
+    /// stop the run — use `cancel_token`.
+    ///
+    /// # Delivery semantics
+    ///
+    /// Events reach the stream only **after** their durable append to the
+    /// event store succeeds, so the stream never shows an event the store
+    /// rejected. The stream is bounded and lossy under backpressure: when
+    /// the buffer is full, non-terminal events are dropped from the live
+    /// feed (they remain in the store). Terminal events (`Done`,
+    /// `BudgetExceeded`, `Cancelled`, `Refusal`) are special-cased — the
+    /// run waits up to one second for buffer space so a slow-but-live
+    /// consumer still receives the closing marker, while a consumer that
+    /// never reads cannot stall the run beyond that bound. Callers that
+    /// need every event must read the configured [`EventStore`] back.
+    ///
+    /// This is additive alongside [`run`](Self::run) /
+    /// [`run_persistent`](Self::run_persistent): use it when you want a
+    /// live event feed without reading the store back.
+    pub fn run_stream(
+        &self,
+        thread_id: ThreadId,
+        input: AgentInput,
+        tool_context: ToolContext<Ctx>,
+        cancel_token: CancellationToken,
+    ) -> RunStream
+    where
+        Ctx: Clone,
+    {
+        self.run_stream_with_options(
+            thread_id,
+            input,
+            tool_context,
+            cancel_token,
+            RunOptions::default(),
+        )
+    }
+
+    /// Like [`run_stream`](Self::run_stream), but with caller-supplied trace
+    /// metadata. See [`run_with_options`](Self::run_with_options).
+    pub fn run_stream_with_options(
+        &self,
+        thread_id: ThreadId,
+        input: AgentInput,
+        tool_context: ToolContext<Ctx>,
+        cancel_token: CancellationToken,
+        run_options: RunOptions,
+    ) -> RunStream
+    where
+        Ctx: Clone,
+    {
+        let (tx, rx) = mpsc::channel(RUN_STREAM_CHANNEL_CAPACITY);
+        let event_store: Arc<dyn EventStore> = Arc::new(TeeEventStore {
+            inner: Arc::clone(&self.event_store),
+            tx,
+        });
+
+        // Completion signal for the event stream: tool contexts carry the
+        // tee (and thus a channel sender), so channel EOF alone cannot be
+        // relied on — a tool may leak a ToolContext clone into background
+        // work. See `RunEventStream` for the termination contract.
+        let run_completed = CancellationToken::new();
+
+        let (state_rx, handle) = self.spawn_run_loop(SpawnRunLoopParams {
+            event_store,
+            thread_id,
+            input,
+            tool_context,
+            cancel_token,
+            run_options,
+            input_rx: None,
+            run_completed: Some(run_completed.clone()),
+        });
+        // The run drives itself to completion. Detach the join handle —
+        // when the run ends, the completion signal (or the tee sender
+        // dropping) closes the stream — and hand the state receiver to the
+        // caller: the terminal state (AwaitingConfirmation continuations,
+        // startup errors) only exists there.
+        warn_on_detached_run_handle(handle);
+
+        RunStream {
+            events: RunEventStream {
+                rx,
+                run_completed: Box::pin(run_completed.cancelled_owned()),
+                draining: false,
+            },
+            final_state: state_rx,
         }
     }
 
@@ -871,6 +1225,7 @@ where
             audit_sink: Arc::clone(&self.audit_sink),
             cancel_token,
             turn_options,
+            reminder_config: self.reminder_config.clone(),
             #[cfg(feature = "otel")]
             run_options,
             #[cfg(feature = "otel")]
@@ -913,8 +1268,9 @@ where
     /// # Errors
     ///
     /// Returns an error if the run task is dropped before reporting a state,
-    /// if the run ends in [`AgentRunState::Error`], or if the event store
-    /// cannot be read back.
+    /// if the run ends in [`AgentRunState::Error`], if it stops on a usage
+    /// budget ([`AgentRunState::BudgetExceeded`] — the reply would be
+    /// missing or truncated), or if the event store cannot be read back.
     pub async fn ask(
         &self,
         thread_id: ThreadId,
@@ -933,8 +1289,9 @@ where
     /// # Errors
     ///
     /// Returns an error if the run task is dropped before reporting a state,
-    /// if the run ends in [`AgentRunState::Error`], or if the event store
-    /// cannot be read back.
+    /// if the run ends in [`AgentRunState::Error`], if it stops on a usage
+    /// budget ([`AgentRunState::BudgetExceeded`] — the reply would be
+    /// missing or truncated), or if the event store cannot be read back.
     pub async fn send(&self, thread_id: ThreadId, input: AgentInput) -> anyhow::Result<String> {
         use crate::events::AgentEvent;
 
@@ -954,8 +1311,24 @@ where
             )
             .await?;
 
-        if let AgentRunState::Error(error) = state {
-            return Err(anyhow::Error::new(error));
+        match state {
+            AgentRunState::Error(error) => return Err(anyhow::Error::new(error)),
+            // A budget stop is not a completed answer: a pre-entry
+            // rejection produced no text at all and a mid-run stop only
+            // interim text — returning either as `Ok` would read as a
+            // finished reply. Surface it as an error naming the limit.
+            AgentRunState::BudgetExceeded {
+                limit,
+                estimated_cost_usd,
+                ..
+            } => {
+                let cost_note = estimated_cost_usd
+                    .map_or_else(String::new, |cost| format!(", estimated cost: ${cost:.4}"));
+                return Err(anyhow::anyhow!(
+                    "agent run stopped: usage budget exceeded (limit: {limit:?}{cost_note})"
+                ));
+            }
+            _ => {}
         }
 
         let events = self

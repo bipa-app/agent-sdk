@@ -97,6 +97,9 @@ async fn main() -> anyhow::Result<()> {
 
     match outcome {
         TurnOutcome::Done { .. } => println!("\nAgent finished."),
+        TurnOutcome::BudgetExceeded { limit, .. } => {
+            println!("\nRun stopped: usage budget exceeded ({limit:?}).");
+        }
         TurnOutcome::NeedsMoreTurns { .. } => {
             println!("\nAgent needs another turn (tool results already appended).");
         }

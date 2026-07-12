@@ -14,7 +14,7 @@ use agent_sdk::observability::{
 };
 use agent_sdk::{
     AgentInput, AgentState, AllowAllHooks, CancellationToken, DynamicToolName, InMemoryEventStore,
-    InMemoryStore, LlmProvider, MessageStore, StateStore, ThreadId, Tool, ToolContext,
+    InMemoryStore, LlmProvider, MessageStore, StateStore, ThreadId, TokenUsage, Tool, ToolContext,
     ToolRegistry, ToolResult, ToolTier, TurnOptions, builder,
 };
 use anyhow::{Context, Result, anyhow};
@@ -1040,6 +1040,116 @@ async fn payload_store_is_called_for_non_recording_spans() -> Result<()> {
 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
+    Ok(())
+}
+
+/// Output guardrail that blocks every response — models a moderation /
+/// secret-leakage hook whose rejected payloads must never escape to an
+/// externally-persisting observability store.
+struct BlockEveryResponseHooks;
+
+#[async_trait]
+impl agent_sdk::AgentHooks for BlockEveryResponseHooks {
+    async fn on_llm_response(&self, _response: &ChatResponse) -> agent_sdk::ResponseDecision {
+        agent_sdk::ResponseDecision::Block("secret detected".to_string())
+    }
+}
+
+/// Rejects the first response with `RetryWithFeedback`, accepts the rest.
+struct RejectFirstResponseHooks {
+    seen: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl agent_sdk::AgentHooks for RejectFirstResponseHooks {
+    async fn on_llm_response(&self, _response: &ChatResponse) -> agent_sdk::ResponseDecision {
+        if self.seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            agent_sdk::ResponseDecision::RetryWithFeedback("try again".to_string())
+        } else {
+            agent_sdk::ResponseDecision::Accept
+        }
+    }
+}
+
+#[tokio::test]
+async fn payload_store_never_sees_guardrail_rejected_responses() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (tp, _exporter) = setup_tracer();
+
+    // A Blocked response must not be captured at all.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let agent = builder::<()>()
+        .provider(TestProvider::new(vec![TestProvider::text_response(
+            "leaks a secret",
+        )]))
+        .hooks(BlockEveryResponseHooks)
+        .observability_store(CountingPayloadStore {
+            calls: Arc::clone(&calls),
+        })
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+    let final_state = agent.run(
+        ThreadId::new(),
+        AgentInput::Text("Hello".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    let state = final_state
+        .await
+        .context("agent run did not report a state")?;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        matches!(state, agent_sdk::AgentRunState::Error(_)),
+        "a blocked response ends the run in Error, got {state:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a guardrail-rejected payload must never reach the observability store",
+    );
+
+    // A RetryWithFeedback rejection is likewise not captured; only the
+    // eventually accepted response is.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let agent = builder::<()>()
+        .provider(TestProvider::new(vec![
+            TestProvider::text_response("rejected draft"),
+            TestProvider::text_response("accepted answer"),
+        ]))
+        .hooks(RejectFirstResponseHooks {
+            seen: Arc::new(AtomicUsize::new(0)),
+        })
+        .observability_store(CountingPayloadStore {
+            calls: Arc::clone(&calls),
+        })
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+    let final_state = agent.run(
+        ThreadId::new(),
+        AgentInput::Text("Hello".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    let state = final_state
+        .await
+        .context("agent run did not report a state")?;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        matches!(state, agent_sdk::AgentRunState::Done { .. }),
+        "the steered retry completes the run, got {state:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "only the ACCEPTED response may be captured (two LLM calls were made)",
+    );
+
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
     Ok(())
 }
 
@@ -3380,6 +3490,7 @@ mod metrics {
                 original_tokens: 100,
                 new_tokens: 250,
                 messages,
+                llm_usage: TokenUsage::default(),
             })
         }
     }

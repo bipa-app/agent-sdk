@@ -8,7 +8,7 @@ use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::RunOptions;
 use crate::types::{
     AgentConfig, AgentContinuation, AgentError, AgentInput, AgentState, ListenExecutionContext,
-    PendingToolCallInfo, ThreadId, TokenUsage, ToolResult, TurnOptions,
+    PendingToolCallInfo, ThreadId, TokenUsage, ToolResult, TurnOptions, UsageLimits,
 };
 use agent_sdk_foundation::audit::AuditProvenance;
 use std::sync::Arc;
@@ -41,6 +41,20 @@ pub(super) enum InternalTurnResult {
         description: String,
         continuation: Box<AgentContinuation>,
     },
+    /// A run-level usage budget was crossed by spend that accrued *inside*
+    /// the turn (compaction summarization, or the turn's own LLM usage on
+    /// the overflow-recovery path), detected before paying for the next
+    /// LLM call. The terminal [`crate::events::AgentEvent::BudgetExceeded`]
+    /// was already emitted under the still-open turn at the detection site.
+    BudgetExceeded {
+        limit: crate::types::BudgetLimitKind,
+        estimated_cost_usd: Option<f64>,
+        /// The stopping turn's own LLM usage: the overflow turn's usage on
+        /// the overflow-recovery path, zero for compaction-only stops (the
+        /// turn made no main LLM call — compaction spend rides in the
+        /// cumulative totals, not the per-turn summary).
+        turn_usage: TokenUsage,
+    },
     /// Tool calls ready for external execution (server mode)
     PendingToolCalls {
         turn_usage: TokenUsage,
@@ -53,6 +67,24 @@ pub(super) enum InternalTurnResult {
 
 /// Maximum number of compaction retries before giving up.
 pub(super) const MAX_COMPACTION_RETRIES: usize = 3;
+
+/// Maximum number of *consecutive* `on_llm_response` rejections
+/// ([`crate::hooks::ResponseDecision::RetryWithFeedback`]) before the run is
+/// terminated with an error.
+///
+/// Every guardrail retry pays for a full LLM round-trip, so a
+/// deterministically-rejecting hook under the default config (`max_turns:
+/// None`, no usage budget) would otherwise loop — and bill — forever. Eight
+/// attempts is generous for the intended steering use case (moderation
+/// feedback usually lands within one or two retries) while capping the
+/// worst-case spend of a mis-implemented hook at single-digit calls.
+///
+/// The streak lives in [`crate::types::AgentState::guardrail_retries`] and
+/// is persisted with every state checkpoint, so the cap binds both
+/// in-process looping runs and host-driven single-turn orchestration (where
+/// each `run_turn` rehydrates the streak from the state store). It resets
+/// whenever the hook accepts a response.
+pub(super) const MAX_CONSECUTIVE_GUARDRAIL_RETRIES: usize = 8;
 
 /// Mutable context for turn execution.
 ///
@@ -70,6 +102,10 @@ pub(super) struct TurnContext {
     /// Set by `begin_turn` when approaching the turn limit, then consumed
     /// by `execute_turn_inner` to append a user message to the conversation.
     pub(super) pending_reminder: Option<String>,
+    /// Ingestion-time `pre_llm_request` decision awaiting the run's first
+    /// LLM call; consumed (`take`) by `request_turn_response` so the hook
+    /// is never invoked twice for that call. See [`PreEvaluatedRequest`].
+    pub(super) pending_first_request: Option<PreEvaluatedRequest>,
     // ── Turn summary accumulators ───────────────────────────────────
     //
     // These mirror fields on `agent_sdk_foundation::TurnSummary` and are
@@ -104,12 +140,39 @@ pub(super) struct ResumeData {
     pub(super) rejection_reason: Option<String>,
 }
 
-/// Result of initializing state from agent input.
+/// The `pre_llm_request` decision produced at fresh-input ingestion time,
+/// carried into the run's FIRST LLM call so the hook fires exactly once per
+/// call.
+///
+/// For fresh `Text` / `Message` input the hook is evaluated against the
+/// request the next turn would send (existing history + the candidate user
+/// message) BEFORE the candidate is durably appended — a `Block` must leave
+/// nothing ingested, or a same-thread rephrase-and-retry would rebuild its
+/// request WITH the blocked content in history and the rejected material
+/// would still reach the provider.
+pub(super) enum PreEvaluatedRequest {
+    /// The hook proceeded: the first turn builds and sends its request
+    /// normally (it may differ from the evaluated request by SDK-added
+    /// content only — compaction summarizing what the hook already saw, or
+    /// a turn-budget reminder) without re-invoking the hook.
+    Proceed,
+    /// The hook returned `Modify`: this replacement is sent as-is for the
+    /// first call. The ORIGINAL user message is what persists, matching
+    /// mid-run `Modify` semantics (the hook shapes the outbound request,
+    /// never the durable history).
+    Modified(Box<crate::llm::ChatRequest>),
+}
+
 pub(super) struct InitializedState {
     pub(super) turn: usize,
     pub(super) total_usage: TokenUsage,
     pub(super) state: AgentState,
     pub(super) resume_data: Option<ResumeData>,
+    /// Ingestion-time `pre_llm_request` decision for the first LLM call.
+    /// `Some` only for fresh `Text` / `Message` input; `None` for
+    /// `Resume` / `Continue` / `SubmitToolResults`, whose first call
+    /// evaluates the hook at turn time as usual.
+    pub(super) first_request_decision: Option<PreEvaluatedRequest>,
 }
 
 /// Outcome of executing a single tool call.
@@ -304,6 +367,8 @@ pub(super) struct RunLoopParameters<Ctx, P, H, M, S> {
     pub(super) cancel_token: CancellationToken,
     /// Optional channel for receiving new messages in persistent mode.
     pub(super) input_rx: Option<mpsc::Receiver<AgentInput>>,
+    /// Per-tool reminder configuration for the run.
+    pub(super) reminder_config: Option<crate::reminders::ReminderConfig>,
     /// Trace metadata applied to the root span (and threaded through
     /// every event emission as `langfuse.trace.output`).
     ///
@@ -354,32 +419,62 @@ pub(super) struct RunLoopTurnsParams<'a, Ctx, P, H, M, S> {
     /// Optional channel for receiving new messages in persistent mode.
     pub(super) input_rx: Option<&'a mut mpsc::Receiver<AgentInput>>,
     pub(super) turn_options: &'a TurnOptions,
+    /// Per-tool reminder configuration applied after tools execute.
+    pub(super) reminder_config: Option<&'a crate::reminders::ReminderConfig>,
     #[cfg(feature = "otel")]
     pub(super) observability_store: Option<&'a Arc<dyn crate::observability::ObservabilityStore>>,
 }
 
-pub(super) struct PersistentDoneParams<'a, H, M> {
+pub(super) struct PersistentDoneParams<'a, Ctx, P, H, M, S> {
     pub(super) ctx: &'a TurnContext,
     pub(super) rx: &'a mut mpsc::Receiver<AgentInput>,
     pub(super) message_store: &'a Arc<M>,
+    /// Provider / tools / config for the injected-input `pre_llm_request`
+    /// guard, which evaluates the hook BEFORE the injected message is
+    /// durably appended (the same seam as fresh-input initialization).
+    pub(super) provider: &'a Arc<P>,
+    pub(super) tools: &'a Arc<ToolRegistry<Ctx>>,
+    pub(super) config: &'a AgentConfig,
+    /// State store, needed so a terminal event keyed under a synthetic
+    /// (never-executed) turn can persist the advanced `turn_count`.
+    pub(super) state_store: &'a Arc<S>,
     pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) hooks: &'a Arc<H>,
     pub(super) authority: &'a Arc<dyn EventAuthority>,
     pub(super) current_turn: usize,
     pub(super) cancel_token: &'a CancellationToken,
+    /// Provider/model provenance, used to estimate the run cost reported
+    /// on the terminal `Done` state when the input channel closes.
+    pub(super) provenance: &'a AuditProvenance,
+    /// Run-level usage budgets, evaluated after every completed turn and
+    /// **before** parking for injected input, so an over-budget persistent
+    /// run terminates instead of consuming a later prompt it can never
+    /// answer.
+    pub(super) usage_limits: Option<&'a UsageLimits>,
 }
 
-pub(super) struct RunLoopTurnResultParams<'a, H, M, S> {
+pub(super) struct RunLoopTurnResultParams<'a, Ctx, P, H, M, S> {
     pub(super) result: InternalTurnResult,
     pub(super) ctx: &'a TurnContext,
     pub(super) input_rx: Option<&'a mut mpsc::Receiver<AgentInput>>,
     pub(super) message_store: &'a Arc<M>,
+    /// Forwarded into the persistent-mode `Done` handler for the
+    /// injected-input `pre_llm_request` guard.
+    pub(super) provider: &'a Arc<P>,
+    pub(super) tools: &'a Arc<ToolRegistry<Ctx>>,
+    pub(super) config: &'a AgentConfig,
     pub(super) state_store: &'a Arc<S>,
     pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) hooks: &'a Arc<H>,
     pub(super) authority: &'a Arc<dyn EventAuthority>,
     pub(super) cancel_token: &'a CancellationToken,
     pub(super) current_turn: usize,
+    /// Provider/model provenance, used to estimate the run cost reported on
+    /// the terminal `Done` state on the persistent input-channel-closed path.
+    pub(super) provenance: &'a AuditProvenance,
+    /// Run-level usage budgets, forwarded into the persistent-mode `Done`
+    /// handler so it can stop before parking for input.
+    pub(super) usage_limits: Option<&'a UsageLimits>,
 }
 
 pub(super) struct SingleTurnResumeParams<Ctx, H, M, S> {
@@ -405,6 +500,10 @@ pub(super) struct SingleTurnResumeParams<Ctx, H, M, S> {
     /// Wall-clock instant when the enclosing `run_turn` invocation
     /// started — used to measure `duration_ms` for the summary.
     pub(super) start_time: Instant,
+    /// Run-level usage budgets, checked when the resume completes so the
+    /// caller receives [`crate::types::TurnOutcome::BudgetExceeded`] instead
+    /// of `NeedsMoreTurns` when the paused turn already crossed a limit.
+    pub(super) usage_limits: Option<UsageLimits>,
 }
 
 pub(super) struct TurnParameters<Ctx, P, H, M, S> {
@@ -425,6 +524,8 @@ pub(super) struct TurnParameters<Ctx, P, H, M, S> {
     pub(super) audit_sink: Arc<dyn ToolAuditSink>,
     pub(super) cancel_token: CancellationToken,
     pub(super) turn_options: TurnOptions,
+    /// Per-tool reminder configuration for the turn.
+    pub(super) reminder_config: Option<crate::reminders::ReminderConfig>,
     /// Trace metadata applied to the root span. See
     /// [`RunLoopParameters::run_options`] for the full contract.
     /// Only consumed on the otel build path — see the gating note
@@ -456,6 +557,8 @@ pub(super) struct ExecuteTurnParameters<'a, Ctx, P, H, M, S> {
     pub(super) audit_sink: &'a Arc<dyn ToolAuditSink>,
     pub(super) provenance: &'a AuditProvenance,
     pub(super) turn_options: &'a TurnOptions,
+    /// Per-tool reminder configuration applied after tools execute.
+    pub(super) reminder_config: Option<&'a crate::reminders::ReminderConfig>,
     /// Run-level cancellation token, threaded into the LLM call and the
     /// compaction path so both phases are raced against cancel.
     pub(super) cancel_token: &'a CancellationToken,
@@ -562,6 +665,13 @@ pub(super) struct ToolBatchExecutionParams<'a, Ctx, H> {
     /// Copied into any [`AgentContinuation`] this phase emits so the
     /// resume-side [`TurnSummary`] can report the same value.
     pub(super) stop_reason: Option<StopReason>,
+    /// Cap on how many adjacent `Observe`-tier tool calls run concurrently
+    /// within one parallel batch. `None` keeps the unbounded behavior.
+    pub(super) max_parallel_tools: Option<usize>,
+    /// Per-tool reminders (keyed by tool name) appended to matching tool
+    /// results before they are fed back to the model. `None` disables the
+    /// reminder pass.
+    pub(super) reminder_config: Option<&'a crate::reminders::ReminderConfig>,
 }
 
 pub(super) struct TurnCompletionParams<'a, H, M> {
@@ -597,6 +707,12 @@ pub(super) struct TurnToolPhaseParams<'a, Ctx, H, M> {
     /// Stop reason from the LLM call that produced `pending_tool_calls`.
     /// Forwarded into any [`AgentContinuation`] this phase emits.
     pub(super) stop_reason: Option<StopReason>,
+    /// Cap on concurrent `Observe`-tier tool execution; see
+    /// [`AgentConfig::max_parallel_tools`].
+    pub(super) max_parallel_tools: Option<usize>,
+    /// Per-tool reminders to apply to matching results; see
+    /// [`crate::reminders::ReminderConfig`].
+    pub(super) reminder_config: Option<&'a crate::reminders::ReminderConfig>,
 }
 
 pub(super) struct TurnStopReasonParams<'a, P, H, M> {
@@ -613,6 +729,12 @@ pub(super) struct TurnStopReasonParams<'a, P, H, M> {
     pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) hooks: &'a Arc<H>,
     pub(super) authority: &'a Arc<dyn EventAuthority>,
+    /// Run provenance, used to price the usage of any emergency compaction
+    /// triggered by `ModelContextWindowExceeded`.
+    pub(super) provenance: &'a AuditProvenance,
+    /// Run-level usage budgets, consulted before the overflow-driven
+    /// emergency compaction pays for a summarization call.
+    pub(super) usage_limits: Option<&'a UsageLimits>,
     /// Run-level cancellation token, forwarded into the overflow-driven
     /// compaction path triggered by `ModelContextWindowExceeded`.
     pub(super) cancel_token: &'a CancellationToken,
@@ -633,6 +755,10 @@ pub(super) struct ConvertTurnResultParams<'a, H, S> {
     pub(super) provenance: &'a AuditProvenance,
     /// Execution options selected by the caller for this turn.
     pub(super) turn_options: &'a TurnOptions,
+    /// Run-level usage budgets, checked at the single-turn continuation
+    /// boundary so the turn yields [`TurnOutcome::BudgetExceeded`] instead
+    /// of [`TurnOutcome::NeedsMoreTurns`] when a limit is hit.
+    pub(super) usage_limits: Option<&'a UsageLimits>,
 }
 
 /// Extracted content from an LLM response: (thinking, text, `tool_uses`).

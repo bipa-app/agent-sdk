@@ -24,14 +24,20 @@
 //! # Integration status
 //!
 //! [`wrap_reminder`] and [`append_reminder`] are the wired primitives — callers
-//! and the primitive tools use them directly. The higher-level
-//! [`ReminderTracker`] / [`ReminderConfig`] / [`ToolReminder`] /
-//! [`ReminderTrigger`] machinery is **not yet driven by the agent loop**: the
-//! run loop does not currently call [`ReminderTracker::record_tool_use`],
-//! [`ReminderTracker::advance_turn`], or [`ReminderTracker::get_periodic_reminders`],
-//! nor does it evaluate per-tool [`ToolReminder`]s. Until that wiring lands in
-//! the agent loop's tool-execution path, SDK users who build a
-//! [`ReminderConfig`] must drive the tracker themselves (record tool uses,
+//! and the primitive tools use them directly. Per-tool [`ToolReminder`]s are
+//! driven by the agent loop when a [`ReminderConfig`] is installed via
+//! `AgentLoopBuilder::with_reminders`: after each tool batch completes in the
+//! turn's inline execution path, every reminder whose [`ReminderTrigger`]
+//! fires is appended to the tool result the model sees. Results that are
+//! *not* assembled by that inline path — e.g. a confirmation-suspended tool
+//! resumed on a later turn, or externally handed-off executions — do not get
+//! reminders applied.
+//!
+//! The periodic [`ReminderTracker`] machinery is **not yet driven by the
+//! agent loop**: the run loop does not call
+//! [`ReminderTracker::record_tool_use`], [`ReminderTracker::advance_turn`],
+//! or [`ReminderTracker::get_periodic_reminders`]. SDK users who want
+//! periodic reminders must drive the tracker themselves (record tool uses,
 //! advance turns, and append the returned reminders to tool results).
 
 use std::collections::HashMap;

@@ -13,7 +13,7 @@
 //! 4. `Done` - Agent completed successfully, or `Error` if failed
 
 use crate::llm::ContentBlock;
-use crate::types::{ThreadId, TokenUsage, ToolResult, ToolTier};
+use crate::types::{BudgetLimitKind, ThreadId, TokenUsage, ToolResult, ToolTier};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,9 +22,27 @@ use time::OffsetDateTime;
 
 /// Serde adapter encoding a [`Duration`] as a millisecond integer
 /// (`duration_ms`) instead of serde's default `{secs,nanos}` object.
+///
+/// Deserialization is deliberately lenient: durable event rows written
+/// before the wire form changed to `duration_ms` carry serde's default
+/// `{"secs":..,"nanos":..}` object (under the old `duration` key, accepted
+/// via `#[serde(alias = "duration")]` on the fields). Hosts replay those
+/// rows with `serde_json::from_value`, so both representations must decode
+/// or every thread containing a pre-change terminal event becomes
+/// unreadable after an upgrade. Serialization always writes millis.
 mod duration_ms_serde {
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
+
+    /// The two wire shapes a duration value can arrive in.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum DurationRepr {
+        /// Current form: a flat millisecond integer.
+        Millis(u64),
+        /// Legacy form: serde's default `Duration` object.
+        Legacy { secs: u64, nanos: u32 },
+    }
 
     pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -38,8 +56,10 @@ mod duration_ms_serde {
     where
         D: Deserializer<'de>,
     {
-        let ms = u64::deserialize(deserializer)?;
-        Ok(Duration::from_millis(ms))
+        match DurationRepr::deserialize(deserializer)? {
+            DurationRepr::Millis(ms) => Ok(Duration::from_millis(ms)),
+            DurationRepr::Legacy { secs, nanos } => Ok(Duration::new(secs, nanos)),
+        }
     }
 }
 
@@ -152,8 +172,38 @@ pub enum AgentEvent {
         /// flattened envelope previously encoded this as a nested
         /// `{"secs":..,"nanos":..}` object, inconsistent with the rest of the
         /// streaming contract. The Rust field keeps the `Duration` type.
-        #[serde(rename = "duration_ms", with = "duration_ms_serde")]
+        #[serde(rename = "duration_ms", alias = "duration", with = "duration_ms_serde")]
         duration: Duration,
+        /// Estimated cost of the run in USD, when the run's provider/model
+        /// has pricing metadata. Omitted from the wire form when `None` so
+        /// the streaming contract stays compatible with consumers that
+        /// predate cost accounting.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        estimated_cost_usd: Option<f64>,
+    },
+
+    /// The run was stopped because a run-level usage budget was exceeded.
+    ///
+    /// This is a **terminal** event, emitted once on the budget-exceeded
+    /// return site in place of [`AgentEvent::Done`], so a streaming
+    /// consumer always receives a closing marker. `limit` identifies which
+    /// budget tripped.
+    BudgetExceeded {
+        thread_id: ThreadId,
+        total_turns: usize,
+        total_usage: TokenUsage,
+        /// Wall-clock run duration up to the moment the budget tripped.
+        ///
+        /// Serialized on the wire as `duration_ms` (a millisecond integer),
+        /// mirroring [`AgentEvent::Done`].
+        #[serde(rename = "duration_ms", alias = "duration", with = "duration_ms_serde")]
+        duration: Duration,
+        /// Estimated cost of the run in USD at the moment the budget was
+        /// hit, when pricing metadata is available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        estimated_cost_usd: Option<f64>,
+        /// Which budget limit was exceeded.
+        limit: BudgetLimitKind,
     },
 
     /// An error occurred during execution
@@ -381,6 +431,43 @@ impl AgentEvent {
             total_turns,
             total_usage,
             duration,
+            estimated_cost_usd: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn done_with_cost(
+        thread_id: ThreadId,
+        total_turns: usize,
+        total_usage: TokenUsage,
+        duration: Duration,
+        estimated_cost_usd: Option<f64>,
+    ) -> Self {
+        Self::Done {
+            thread_id,
+            total_turns,
+            total_usage,
+            duration,
+            estimated_cost_usd,
+        }
+    }
+
+    #[must_use]
+    pub const fn budget_exceeded(
+        thread_id: ThreadId,
+        total_turns: usize,
+        total_usage: TokenUsage,
+        duration: Duration,
+        estimated_cost_usd: Option<f64>,
+        limit: BudgetLimitKind,
+    ) -> Self {
+        Self::BudgetExceeded {
+            thread_id,
+            total_turns,
+            total_usage,
+            duration,
+            estimated_cost_usd,
+            limit,
         }
     }
 
@@ -794,6 +881,122 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn done_event_deserializes_legacy_duration_object() -> serde_json::Result<()> {
+        // Durable rows written before the wire form changed to `duration_ms`
+        // carry serde's default object under the old `duration` key. Hosts
+        // replay them with `serde_json::from_value`; they must keep
+        // decoding after an upgrade.
+        let legacy = serde_json::json!({
+            "type": "done",
+            "thread_id": "t-legacy",
+            "total_turns": 3,
+            "total_usage": TokenUsage::default(),
+            "duration": { "secs": 2, "nanos": 500_000_000 },
+        });
+        let event: AgentEvent = serde_json::from_value(legacy)?;
+        match event {
+            AgentEvent::Done {
+                duration,
+                total_turns,
+                ..
+            } => {
+                assert_eq!(duration, Duration::from_millis(2500));
+                assert_eq!(total_turns, 3);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+
+        // The current flat-millis form decodes too...
+        let current = serde_json::json!({
+            "type": "done",
+            "thread_id": "t-current",
+            "total_turns": 3,
+            "total_usage": TokenUsage::default(),
+            "duration_ms": 2500,
+        });
+        let event: AgentEvent = serde_json::from_value(current)?;
+        let AgentEvent::Done { duration, .. } = event else {
+            panic!("expected Done");
+        };
+        assert_eq!(duration, Duration::from_millis(2500));
+
+        // ...and a re-serialized legacy event is normalized to millis.
+        let legacy_event: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "done",
+            "thread_id": "t-roundtrip",
+            "total_turns": 1,
+            "total_usage": TokenUsage::default(),
+            "duration": { "secs": 1, "nanos": 0 },
+        }))?;
+        let reserialized = serde_json::to_value(&legacy_event)?;
+        assert_eq!(
+            reserialized
+                .get("duration_ms")
+                .and_then(serde_json::Value::as_u64),
+            Some(1000),
+            "round-trips must write the millis form: {reserialized}"
+        );
+        assert!(reserialized.get("duration").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn budget_exceeded_event_deserializes_legacy_duration_object() -> serde_json::Result<()> {
+        // BudgetExceeded has no pre-rename durable rows, but the field uses
+        // the same adapter — keep it uniformly lenient.
+        let legacy = serde_json::json!({
+            "type": "budget_exceeded",
+            "thread_id": "t-legacy",
+            "total_turns": 2,
+            "total_usage": TokenUsage::default(),
+            "duration": { "secs": 1, "nanos": 250_000_000 },
+            "limit": "total_tokens",
+        });
+        let event: AgentEvent = serde_json::from_value(legacy)?;
+        let AgentEvent::BudgetExceeded { duration, .. } = event else {
+            panic!("expected BudgetExceeded");
+        };
+        assert_eq!(duration, Duration::from_millis(1250));
+        Ok(())
+    }
+
+    #[test]
+    fn budget_exceeded_event_serializes_duration_as_millis() -> serde_json::Result<()> {
+        let seq = SequenceCounter::new();
+        let envelope = AgentEventEnvelope::wrap(
+            AgentEvent::budget_exceeded(
+                ThreadId::from_string("t"),
+                2,
+                TokenUsage::default(),
+                Duration::from_millis(1200),
+                Some(0.5),
+                BudgetLimitKind::TotalTokens,
+            ),
+            &seq,
+        );
+        let json = serde_json::to_value(&envelope)?;
+
+        // Flat millisecond integer, mirroring the `Done` wire form.
+        assert_eq!(
+            json.get("duration_ms").and_then(serde_json::Value::as_u64),
+            Some(1200)
+        );
+        assert!(
+            json.get("duration").is_none(),
+            "no nested `duration` key expected: {json}"
+        );
+
+        let restored: AgentEventEnvelope = serde_json::from_value(json)?;
+        match restored.event {
+            AgentEvent::BudgetExceeded { duration, .. } => {
+                assert_eq!(duration, Duration::from_millis(1200));
+            }
+            other => panic!("expected BudgetExceeded, got {other:?}"),
+        }
+        Ok(())
+    }
+
     /// One representative value of every [`AgentEvent`] variant, so the
     /// envelope round-trip test exercises the full streaming contract.
     ///
@@ -895,6 +1098,7 @@ mod tests {
                 total_turns: 2,
                 total_usage: usage.clone(),
                 duration: Duration::from_millis(1500),
+                estimated_cost_usd: Some(0.0123),
             },
         ]
     }
@@ -931,6 +1135,14 @@ mod tests {
             AgentEvent::Cancelled {
                 turn: 1,
                 usage: usage.clone(),
+            },
+            AgentEvent::BudgetExceeded {
+                thread_id: ThreadId::from_string("thread-1"),
+                total_turns: 3,
+                total_usage: usage.clone(),
+                duration: Duration::from_millis(750),
+                estimated_cost_usd: Some(0.5),
+                limit: BudgetLimitKind::CostUsd,
             },
             AgentEvent::ContextCompacted {
                 original_count: 10,
