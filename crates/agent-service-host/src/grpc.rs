@@ -1424,9 +1424,12 @@ impl AgentControlService for GrpcControlService {
     /// The `reason` is recorded in the server logs only; it is not
     /// persisted on the task row.
     ///
-    /// Cancelling a `Running` root is asynchronous for its worker and
-    /// races the thread's next turn — see the `CancelTask` proto docs
-    /// and the known-race note on
+    /// The terminal `cancelled` marker (one per affected thread,
+    /// child threads included) is committed inside the cancellation
+    /// transaction by the store, with an outbox advisory for
+    /// cross-host followers. Cancelling a `Running` root is still
+    /// asynchronous for its worker (post-marker salvage, slot-shifted
+    /// successor commits) — see the `CancelTask` proto docs and
     /// [`agent_server::worker::cancel_root_turn`].
     async fn cancel_task(
         &self,

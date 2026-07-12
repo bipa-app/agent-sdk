@@ -28,7 +28,9 @@ use time::OffsetDateTime;
 
 use agent_server::journal::checkpoint::{Checkpoint, CheckpointId, NewCheckpointParams};
 use agent_server::journal::checkpoint_store::CheckpointStore;
-use agent_server::journal::commit::{CommitOutcome, CompletedTurnCommit};
+use agent_server::journal::commit::{
+    CommitOutcome, CompletedTurnCommit, DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+};
 use agent_server::journal::committed_event::CommittedEvent;
 use agent_server::journal::completed_turn_transaction::AtomicCompletedTurnCommitter;
 use agent_server::journal::event_outbox_transaction::{
@@ -55,8 +57,8 @@ use agent_server::journal::relay::{
 };
 use agent_server::journal::retention::{RetentionCursor, RetentionStore};
 use agent_server::journal::store::{
-    AgentTaskStore, SubagentInvocationSpawn, SubmitRootIdempotency, SubmitRootTurnError,
-    SubmitRootTurnOutcome, SubmitRootTurnParams,
+    AgentTaskStore, CancelTreeOutcome, SubagentInvocationSpawn, SubmitRootIdempotency,
+    SubmitRootTurnError, SubmitRootTurnOutcome, SubmitRootTurnParams,
 };
 use agent_server::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, SuspensionPayload,
@@ -3552,7 +3554,7 @@ ORDER BY created_at, id
         &self,
         root_id: &AgentTaskId,
         now: OffsetDateTime,
-    ) -> Result<Vec<AgentTaskId>> {
+    ) -> Result<CancelTreeOutcome> {
         let mut tx = self.begin().await?;
         let Some(_) = Self::load_task_tx(&mut tx, root_id, false).await? else {
             return Err(anyhow!(
@@ -3566,6 +3568,37 @@ ORDER BY created_at, id
         // cancels only its own subtree instead of no-opping on a
         // `root_id = $1` scan.
         let all_tasks = Self::collect_subtree_tx(&mut tx, root_id).await?;
+
+        // Terminal `Cancelled` markers (issue #354): one per blocking
+        // root this call will transition (pre-cancel occupant of its
+        // thread's active-root slot), on that root's OWN thread —
+        // cascade-cancelled child-thread roots included. Committed
+        // FIRST so every thread-row lock is taken before any task-row
+        // lock, matching `submit_root_turn`'s thread→task order; the
+        // whole set is atomic with the cancel transitions below, so a
+        // crash can neither lose the marker nor emit it without the
+        // cancellation. Queued roots never get a marker. BFS order
+        // makes the thread-lock order deterministic (parent thread
+        // before its descendants' threads) for concurrent overlapping
+        // cancels.
+        let mut markers: Vec<CommittedEvent> = Vec::new();
+        for row in &all_tasks {
+            if row.status.is_terminal()
+                || row.kind != TaskKind::RootTurn
+                || !row.is_root()
+                || !row.status.blocks_root_admission()
+            {
+                continue;
+            }
+            let continuation_usage = row
+                .state
+                .continuation()
+                .map(|continuation| continuation.payload.total_usage.clone());
+            let committed =
+                Self::insert_cancelled_marker_tx(&mut tx, &row.thread_id, continuation_usage, now)
+                    .await?;
+            markers.push(committed);
+        }
 
         // Apply the cancel UPDATEs deepest-first so the per-row locks are
         // taken in the same child-then-parent order as the terminal
@@ -3644,7 +3677,10 @@ ORDER BY created_at, id
         }
 
         tx.commit().await.context("commit cancel_tree")?;
-        Ok(transitioned)
+        Ok(CancelTreeOutcome {
+            transitioned,
+            markers,
+        })
     }
 
     async fn resume_from_confirmation(
@@ -4589,6 +4625,55 @@ VALUES ($1, 'task_wakeup', $2, NULL, NULL, 'pending', $3, $4, $4, 0, $5)
         .with_context(|| format!("insert task_wakeup outbox row for task {task_id}"))?;
 
         Ok(id)
+    }
+
+    /// Commit the terminal `Cancelled` marker for one cancelled
+    /// blocking root inside `cancel_tree`'s transaction: one committed
+    /// event on the root's own thread plus its coalesced
+    /// `thread_events_available` outbox advisory (issue #354).
+    ///
+    /// Locks the thread row first (bootstrap + `FOR UPDATE` via the
+    /// sequence allocator), which keeps the transaction's lock order —
+    /// thread rows before task rows — consistent with
+    /// `submit_root_turn`, so a concurrent submit on the same thread
+    /// cannot deadlock against the cancel.
+    ///
+    /// `continuation_usage` is the cumulative usage captured from the
+    /// root's parked continuation before the cancel clears its typed
+    /// state; when absent the thread aggregate is reported instead.
+    async fn insert_cancelled_marker_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        thread_id: &ThreadId,
+        continuation_usage: Option<TokenUsage>,
+        now: OffsetDateTime,
+    ) -> Result<CommittedEvent> {
+        // A blocking root's thread row always exists (submit
+        // bootstraps it), but bootstrap defensively so a marker on an
+        // exotic fixture cannot abort the whole cancellation.
+        Self::bootstrap_thread_row_tx(tx, thread_id, now).await?;
+        let start_seq = Self::next_event_sequence_tx(tx, thread_id).await?;
+        let thread = Self::lock_thread_tx(tx, thread_id)
+            .await?
+            .with_context(|| format!("thread {thread_id} missing after bootstrap"))?;
+
+        let turn = usize::try_from(thread.committed_turns).unwrap_or(0);
+        let usage = continuation_usage.unwrap_or(thread.total_usage);
+        let mut committed = Self::insert_events_tx(
+            tx,
+            thread_id,
+            vec![AgentEvent::cancelled(turn, usage)],
+            start_seq,
+            now,
+        )
+        .await?;
+        Self::insert_thread_events_outbox_row_tx(
+            tx,
+            &committed,
+            DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+            now,
+        )
+        .await?;
+        committed.pop().context("cancelled marker batch was empty")
     }
 }
 

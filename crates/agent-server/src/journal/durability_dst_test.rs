@@ -336,7 +336,8 @@ impl Simulation {
             .store
             .cancel_tree(&active.id, self.clock)
             .await
-            .context("dst: cancel_tree")?;
+            .context("dst: cancel_tree")?
+            .transitioned;
         // Record the active root AND every descendant the cancel touched
         // so the invariant pass can assert they stay terminal. Sibling
         // queued roots on the same thread are NOT part of this subtree,

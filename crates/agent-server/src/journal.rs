@@ -658,7 +658,10 @@ pub use retention_janitor::{
     JanitorCycleReport, RetentionJanitorDeps, RetentionPolicy, run_janitor_cycle,
 };
 pub use staged::{StagedMessageStore, StagedStateStore, StagedStores};
-pub use store::{AgentTaskStore, InMemoryAgentTaskStore, SubagentInvocationSpawn};
+pub use store::{
+    AgentTaskStore, CancelTreeOutcome, CancellationMarkerSink, InMemoryAgentTaskStore,
+    SubagentInvocationSpawn,
+};
 pub use task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskKind, TaskSchemaError,
     TaskStatus, WorkerId,

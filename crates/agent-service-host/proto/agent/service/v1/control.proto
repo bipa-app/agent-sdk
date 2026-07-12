@@ -233,31 +233,42 @@ message DecideConfirmationResponse {
 // the CANCELLED status as "a cancel was requested", not as proof the
 // output was suppressed.
 //
-// An effective cancel of the thread's ACTIVE root commits a terminal
-// `cancelled` event to the thread journal (see `CancelledEvent` in
-// events.proto), so REPLAY_AND_FOLLOW subscribers receive a closing
-// frame instead of waiting for a `done` that will never come.
-// Cancelling a QUEUED root behind a live active root emits no marker —
-// the active root's stream continues undisturbed; observe the queued
-// cancel via `GetTask` or this RPC's `cancelled_task_ids`. The marker
-// is best-effort: it is committed after the durable cancel
-// transaction, so a crash in between loses it (retries stay silent),
-// cascade-cancelled child-thread roots emit no marker on their own
-// threads, and a RUNNING root's worker may still append salvaged
-// events for up to one heartbeat after the marker lands. Committing
-// the marker inside the cancellation transaction on every backend is
-// the tracked store-level follow-up.
+// An effective cancel commits a terminal `cancelled` event (see
+// `CancelledEvent` in events.proto) INSIDE the durable cancellation
+// transaction, exactly once per affected thread: one marker for every
+// cancelled root that occupied its thread's active-root slot — the
+// root named by this RPC and any child-thread roots the cascade
+// reaches across subagent links — each on that root's own thread,
+// together with a `thread_events_available` outbox advisory so
+// followers on other hosts are woken through the relay.
+// REPLAY_AND_FOLLOW subscribers therefore receive a closing frame
+// instead of waiting for a `done` that will never come, a crash after
+// the cancel commits can no longer lose the marker, and idempotent
+// retries (already-terminal tree) emit nothing. Cancelling a QUEUED
+// root behind a live active root emits no marker — the active root's
+// stream continues undisturbed; observe the queued cancel via
+// `GetTask` or this RPC's `cancelled_task_ids`.
 //
-// That deferred prefix commit also races the thread's NEXT turn:
-// cancelling a RUNNING root immediately frees the thread's active-root
-// slot (a queued successor is promoted in the same transaction), and a
-// successor turn that starts before the interrupted worker's prefix
-// commit lands binds the same turn number. Whichever commit lands
-// second is rejected — a losing prefix commit is dropped silently
-// (best-effort salvage), but a losing successor turn FAILS and must be
-// resubmitted. Callers that submit follow-up work on the same thread
-// right after cancelling a RUNNING task should be prepared to retry it,
-// or wait one heartbeat interval before submitting.
+// Post-marker salvage ordering: a RUNNING root's worker only notices
+// the cancel on its next rejected heartbeat, so for up to one
+// heartbeat it may keep committing streaming deltas — which land at
+// sequences strictly AFTER the marker — and then salvages the turn's
+// completed prefix with no further lifecycle events. Subscribers that
+// closed on the marker miss only that post-terminal salvage; a
+// subscriber that reconnects with a cursor past the marker may replay
+// trailing salvage deltas and then see nothing further until a new
+// turn starts. Treat the marker as the authoritative close for the
+// cancelled turn.
+//
+// The salvage also races the thread's NEXT turn: cancelling a RUNNING
+// root immediately frees the thread's active-root slot (a queued
+// successor is promoted in the same transaction), and a successor turn
+// that bootstraps before the interrupted worker's salvage lands binds
+// the same turn number. Whichever commit lands second loses the slot
+// CAS — a losing salvage is dropped silently (best-effort), and a
+// losing successor detects the cross-task collision and shifts its
+// commit to the next turn number instead of failing, so follow-up work
+// submitted right after cancelling a RUNNING task completes normally.
 //
 // Cancelling an interior (non-root) task is not yet supported: the durable
 // SQL backends do not rebalance an out-of-subtree parent left in

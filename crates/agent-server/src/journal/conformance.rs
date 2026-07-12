@@ -409,7 +409,7 @@ mod in_memory_bundle {
             &self,
             root_id: &AgentTaskId,
             now: OffsetDateTime,
-        ) -> Result<Vec<AgentTaskId>> {
+        ) -> Result<crate::journal::store::CancelTreeOutcome> {
             self.task.cancel_tree(root_id, now).await
         }
         async fn resume_from_confirmation(

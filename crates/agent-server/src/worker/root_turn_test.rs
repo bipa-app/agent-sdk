@@ -18,7 +18,9 @@ use crate::journal::event_notifier::EventNotifier;
 use crate::journal::event_repository::{EventRepository, InMemoryEventRepository};
 use crate::journal::execution_context::build_root_worker_inputs;
 use crate::journal::message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
-use crate::journal::store::{AgentTaskStore, InMemoryAgentTaskStore};
+use crate::journal::outbox::{InMemoryOutboxStore, OutboxStore as _};
+use crate::journal::outbox_message::OutboxMessageKind;
+use crate::journal::store::{AgentTaskStore, CancellationMarkerSink, InMemoryAgentTaskStore};
 use crate::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskKind, TaskStatus,
     WorkerId,
@@ -294,18 +296,32 @@ struct TestStores {
     attempts: InMemoryTurnAttemptStore,
     checkpoints: InMemoryCheckpointStore,
     events: InMemoryEventRepository,
+    outbox: InMemoryOutboxStore,
     event_notifier: Arc<EventNotifier>,
 }
 
 impl TestStores {
     fn new() -> Self {
+        // Mirror the composed in-memory backend: `cancel_tree` commits
+        // its terminal `Cancelled` markers through the shared event /
+        // outbox / thread stores (issue #354).
+        let threads = InMemoryThreadStore::new();
+        let events = InMemoryEventRepository::new();
+        let outbox = InMemoryOutboxStore::new();
+        let tasks =
+            InMemoryAgentTaskStore::new().with_cancellation_markers(CancellationMarkerSink {
+                event_repo: Arc::new(events.clone()),
+                outbox_store: Arc::new(outbox.clone()),
+                thread_store: Arc::new(threads.clone()),
+            });
         Self {
-            tasks: InMemoryAgentTaskStore::new(),
-            threads: InMemoryThreadStore::new(),
+            tasks,
+            threads,
             messages: InMemoryMessageProjectionStore::new(),
             attempts: InMemoryTurnAttemptStore::new(),
             checkpoints: InMemoryCheckpointStore::new(),
-            events: InMemoryEventRepository::new(),
+            events,
+            outbox,
             event_notifier: Arc::new(EventNotifier::new()),
         }
     }
@@ -5818,6 +5834,23 @@ async fn cancel_root_turn_commits_single_terminal_cancelled_event() -> Result<()
     assert_eq!(*turn, 0);
     assert_eq!(usage, &TokenUsage::default());
 
+    // The marker's cross-host advisory landed in the outbox alongside
+    // the committed event (issue #354: remote followers are woken by
+    // the relay, not this process's notifier).
+    let advisory_rows = stores
+        .outbox
+        .claim_pending("marker-relay-probe", 16, t_plus(2))
+        .await?;
+    assert_eq!(
+        advisory_rows
+            .iter()
+            .filter(|row| row.kind == OutboxMessageKind::ThreadEventsAvailable
+                && row.thread_id == thread_a())
+            .count(),
+        1,
+        "exactly one thread_events_available advisory for the marker, got {advisory_rows:?}",
+    );
+
     // Idempotent retry: nothing transitioned, so no second marker.
     let second = cancel_root_turn(&task_id, &stores.deps(), t_plus(2)).await?;
     assert!(second.is_empty());
@@ -6111,5 +6144,269 @@ async fn running_abort_after_cancel_commits_single_cancelled_event() -> Result<(
     // Exactly one terminal marker: the cancel's, not a second from the
     // worker's abort path.
     assert_eq!(cancelled_event_count(&stores.events, &thread_a()).await?, 1);
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Issue #354 residual 5 — successor turn vs cancelled salvage slot race
+// ─────────────────────────────────────────────────────────────────────
+
+/// Minimal close params for the simulated salvage commit.
+fn salvage_close_params() -> CloseAttemptParams {
+    CloseAttemptParams {
+        response_blob: serde_json::json!({"salvage": true}),
+        response_id: None,
+        response_model: Some("mock-model".into()),
+        stop_reason: None,
+        outcome: TurnAttemptOutcome::Cancelled,
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_input_tokens: 0,
+    }
+}
+
+/// Attempt store that reproduces the successor-slot race
+/// deterministically: when the SUCCESSOR opens its turn attempt (i.e.
+/// after it bootstrapped with `next_turn_number = 1`), a cancelled
+/// predecessor's seam-B salvage lands a REAL completed-turn commit —
+/// checkpoint included — for a DIFFERENT task on the same slot.
+/// Optionally cancels a task first so the negative test can pin that a
+/// dead root never shifts.
+struct SalvageRacingAttemptStore {
+    inner: InMemoryTurnAttemptStore,
+    stores: TestStores,
+    salvager_task: AgentTaskId,
+    /// Task to cancel via `cancel_tree` before the salvage commit
+    /// lands (models an RPC cancel racing the running worker).
+    cancel_first: Option<AgentTaskId>,
+    fired: AtomicBool,
+}
+
+impl SalvageRacingAttemptStore {
+    async fn land_racing_salvage(&self, now: time::OffsetDateTime) -> Result<()> {
+        if let Some(cancel_id) = &self.cancel_first {
+            self.stores
+                .tasks
+                .cancel_tree(cancel_id, now)
+                .await
+                .context("cancel racing task")?;
+        }
+        let salvage_attempt = self
+            .inner
+            .open_attempt(OpenAttemptParams {
+                task_id: self.salvager_task.clone(),
+                attempt_number: 1,
+                provenance: AuditProvenance::new("mock", "mock-model"),
+                request_blob: serde_json::json!({}),
+                now,
+                otel_trace_id: None,
+                otel_span_id: None,
+            })
+            .await
+            .context("open salvage attempt")?;
+        crate::journal::commit::commit_completed_turn(
+            crate::journal::commit::CompletedTurnCommit {
+                thread_id: thread_a(),
+                task_id: self.salvager_task.clone(),
+                expected_turn: 1,
+                turn_attempt_id: salvage_attempt.id,
+                close_attempt_params: salvage_close_params(),
+                messages: vec![agent_sdk_foundation::llm::Message::assistant(
+                    "salvaged prefix",
+                )],
+                turn_usage: TokenUsage::default(),
+                agent_state_snapshot: serde_json::json!({}),
+                events: Vec::new(),
+                outbox_max_attempts: 3,
+                now,
+            },
+            &self.stores.threads,
+            &self.stores.messages,
+            &self.inner,
+            &self.stores.checkpoints,
+            &self.stores.events,
+        )
+        .await
+        .context("racing salvage commit")?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl TurnAttemptStore for SalvageRacingAttemptStore {
+    async fn open_attempt(&self, params: OpenAttemptParams) -> Result<TurnAttempt> {
+        let attempt = self.inner.open_attempt(params).await?;
+        if !self.fired.swap(true, Ordering::SeqCst) {
+            self.land_racing_salvage(t_plus(1)).await?;
+        }
+        Ok(attempt)
+    }
+
+    async fn close_attempt(
+        &self,
+        id: &TurnAttemptId,
+        params: CloseAttemptParams,
+        now: time::OffsetDateTime,
+    ) -> Result<TurnAttempt> {
+        self.inner.close_attempt(id, params, now).await
+    }
+
+    async fn get(&self, id: &TurnAttemptId) -> Result<Option<TurnAttempt>> {
+        self.inner.get(id).await
+    }
+
+    async fn list_by_task(&self, task_id: &AgentTaskId) -> Result<Vec<TurnAttempt>> {
+        self.inner.list_by_task(task_id).await
+    }
+}
+
+/// Issue #354, residual 5 (positive): a successor turn that loses its
+/// bootstrapped slot to a cancelled predecessor's salvage commit no
+/// longer fails terminally — the commit detects the cross-task
+/// collision, shifts to the next turn number, and completes, with the
+/// turn-indexed lifecycle events remapped to the landed turn.
+#[tokio::test]
+async fn successor_turn_shifts_past_cancelled_salvage_slot_collision() -> Result<()> {
+    use agent_sdk_foundation::events::AgentEvent;
+
+    let stores = TestStores::new();
+    stores.threads.get_or_create(&thread_a(), t0()).await?;
+
+    // The successor root turn: acquired, bootstrapped at turn 1.
+    let successor = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let successor_id = successor.id.clone();
+    let bootstrap = sample_bootstrap(successor);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    assert_eq!(inputs.recovery_view.next_turn_number, 1, "precondition");
+
+    // The cancelled predecessor whose salvage steals turn 1 after the
+    // successor bootstrapped.
+    let salvager_id = AgentTaskId::from_string("task_cancelled_salvager");
+    let racing = SalvageRacingAttemptStore {
+        inner: stores.attempts.clone(),
+        stores: stores.clone(),
+        salvager_task: salvager_id.clone(),
+        cancel_first: None,
+        fired: AtomicBool::new(false),
+    };
+    let mut deps = stores.deps();
+    deps.attempt_store = &racing;
+
+    let provider = MockTextProvider::new("successor answer");
+    let outcome = execute_root_turn(inputs, "run the successor", &provider, &deps, t_plus(5))
+        .await
+        .context("successor turn must not fail on the stolen slot")?;
+    let RootTurnOutcome::Completed { completed_task, .. } = outcome else {
+        bail!("expected Completed, got a suspension");
+    };
+    assert_eq!(completed_task.status, TaskStatus::Completed);
+
+    // The salvage kept turn 1; the successor landed on turn 2.
+    let thread = stores.threads.get(&thread_a()).await?.context("thread")?;
+    assert_eq!(thread.committed_turns, 2);
+    let salvage_checkpoint = stores
+        .checkpoints
+        .get_by_turn(&thread_a(), 1)
+        .await?
+        .context("salvage checkpoint at turn 1")?;
+    assert_eq!(salvage_checkpoint.task_id, salvager_id);
+    let successor_checkpoint = stores
+        .checkpoints
+        .get_by_turn(&thread_a(), 2)
+        .await?
+        .context("successor checkpoint at turn 2")?;
+    assert_eq!(successor_checkpoint.task_id, successor_id);
+
+    // Turn-indexed lifecycle events were remapped to the landed turn.
+    let events = stores.events.get_events(&thread_a()).await?;
+    let turn_complete = events
+        .iter()
+        .find_map(|committed| match &committed.event {
+            AgentEvent::TurnComplete { turn, .. } => Some(*turn),
+            _ => None,
+        })
+        .context("TurnComplete event")?;
+    assert_eq!(turn_complete, 2, "TurnComplete must carry the landed turn");
+    let done_turns = events
+        .iter()
+        .find_map(|committed| match &committed.event {
+            AgentEvent::Done { total_turns, .. } => Some(*total_turns),
+            _ => None,
+        })
+        .context("Done event")?;
+    assert_eq!(done_turns, 2, "Done must carry the landed turn");
+    Ok(())
+}
+
+/// Issue #354, residual 5 (negative): a root that was CANCELLED while
+/// running must never shift — its late full-turn commit loses to the
+/// successor's committed slot and propagates the collision error, so a
+/// dead root cannot splice its turn into a successor's history.
+#[tokio::test]
+async fn cancelled_root_commit_never_shifts_past_a_successor() -> Result<()> {
+    let stores = TestStores::new();
+    stores.threads.get_or_create(&thread_a(), t0()).await?;
+
+    // The soon-cancelled root, bootstrapped at turn 1.
+    let doomed = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let doomed_id = doomed.id.clone();
+    let bootstrap = sample_bootstrap(doomed);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    // Mid-turn: an external cancel lands on the doomed root, then a
+    // successor's commit takes turn 1.
+    let successor_id = AgentTaskId::from_string("task_fast_successor");
+    let racing = SalvageRacingAttemptStore {
+        inner: stores.attempts.clone(),
+        stores: stores.clone(),
+        salvager_task: successor_id.clone(),
+        cancel_first: Some(doomed_id.clone()),
+        fired: AtomicBool::new(false),
+    };
+    let mut deps = stores.deps();
+    deps.attempt_store = &racing;
+
+    let provider = MockTextProvider::new("too late");
+    let error = execute_root_turn(inputs, "doomed turn", &provider, &deps, t_plus(5))
+        .await
+        .err()
+        .context("a cancelled root's late commit must fail, not shift")?;
+    assert!(
+        format!("{error:#}").contains("already committed"),
+        "expected the slot-collision rejection, got: {error:#}",
+    );
+
+    // The successor's turn is the only committed turn; the dead root
+    // spliced nothing after it.
+    let thread = stores.threads.get(&thread_a()).await?.context("thread")?;
+    assert_eq!(thread.committed_turns, 1);
+    let occupant = stores
+        .checkpoints
+        .get_by_turn(&thread_a(), 1)
+        .await?
+        .context("checkpoint at turn 1")?;
+    assert_eq!(occupant.task_id, successor_id);
+    assert!(
+        stores
+            .checkpoints
+            .get_by_turn(&thread_a(), 2)
+            .await?
+            .is_none(),
+        "the cancelled root must not have committed a shifted turn 2",
+    );
     Ok(())
 }

@@ -28,7 +28,9 @@ use time::OffsetDateTime;
 
 use agent_server::journal::checkpoint::{Checkpoint, CheckpointId, NewCheckpointParams};
 use agent_server::journal::checkpoint_store::CheckpointStore;
-use agent_server::journal::commit::{CommitOutcome, CompletedTurnCommit};
+use agent_server::journal::commit::{
+    CommitOutcome, CompletedTurnCommit, DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+};
 use agent_server::journal::committed_event::CommittedEvent;
 use agent_server::journal::completed_turn_transaction::AtomicCompletedTurnCommitter;
 use agent_server::journal::event_outbox_transaction::{
@@ -54,8 +56,8 @@ use agent_server::journal::relay::{
 };
 use agent_server::journal::retention::{RetentionCursor, RetentionStore};
 use agent_server::journal::store::{
-    AgentTaskStore, SubagentInvocationSpawn, SubmitRootTurnError, SubmitRootTurnOutcome,
-    SubmitRootTurnParams,
+    AgentTaskStore, CancelTreeOutcome, SubagentInvocationSpawn, SubmitRootTurnError,
+    SubmitRootTurnOutcome, SubmitRootTurnParams,
 };
 use agent_server::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskKind, TaskStatus,
@@ -1652,6 +1654,44 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
         Ok(id)
     }
 
+    /// Commit the terminal `Cancelled` marker for one cancelled
+    /// blocking root inside `cancel_tree`'s transaction: one committed
+    /// event on the root's own thread plus its coalesced
+    /// `thread_events_available` outbox advisory (issue #354). See the
+    /// Postgres analogue for the full contract; `SQLite` serializes
+    /// writers via `BEGIN IMMEDIATE`, so no lock ordering applies.
+    async fn insert_cancelled_marker_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        thread_id: &ThreadId,
+        continuation_usage: Option<TokenUsage>,
+        now: OffsetDateTime,
+    ) -> Result<CommittedEvent> {
+        Self::bootstrap_thread_row_tx(tx, thread_id, now).await?;
+        let start_seq = Self::next_event_sequence_tx(tx, thread_id).await?;
+        let thread = Self::get_thread_tx(tx, thread_id)
+            .await?
+            .with_context(|| format!("thread {thread_id} missing after bootstrap"))?;
+
+        let turn = usize::try_from(thread.committed_turns).unwrap_or(0);
+        let usage = continuation_usage.unwrap_or(thread.total_usage);
+        let mut committed = Self::insert_events_tx(
+            tx,
+            thread_id,
+            vec![AgentEvent::cancelled(turn, usage)],
+            start_seq,
+            now,
+        )
+        .await?;
+        Self::insert_thread_events_outbox_row_tx(
+            tx,
+            &committed,
+            DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+            now,
+        )
+        .await?;
+        committed.pop().context("cancelled marker batch was empty")
+    }
+
     /// Atomic fork transaction for `SQLite`.
     ///
     /// Wraps the entire write set the fork RPC handler hands us
@@ -3078,7 +3118,7 @@ impl AgentTaskStore for SqliteDurableStore {
         &self,
         root_id: &AgentTaskId,
         now: OffsetDateTime,
-    ) -> Result<Vec<AgentTaskId>> {
+    ) -> Result<CancelTreeOutcome> {
         let mut tx = self.begin().await?;
         let Some(_) = Self::load_task_tx(&mut tx, root_id).await? else {
             return Err(anyhow!(
@@ -3101,12 +3141,31 @@ impl AgentTaskStore for SqliteDurableStore {
         // wake their linked invocations and promote queued successors.
         let mut cancelled_root_ids: Vec<AgentTaskId> = Vec::new();
         let mut cancelled_root_threads: Vec<ThreadId> = Vec::new();
+        // Terminal `Cancelled` markers (issue #354): one per blocking
+        // root this call transitions (pre-cancel occupant of its
+        // thread's active-root slot), on that root's OWN thread —
+        // cascade-cancelled child-thread roots included, queued roots
+        // never. Atomic with the cancel transitions: a crash can
+        // neither lose the marker nor emit it without the
+        // cancellation, and an idempotent retry (terminal tree) emits
+        // nothing.
+        let mut markers: Vec<CommittedEvent> = Vec::new();
         for row in all_tasks {
             if row.status.is_terminal() {
                 continue;
             }
             let is_root_turn_root = row.kind == TaskKind::RootTurn && row.is_root();
             let thread_id = row.thread_id.clone();
+            if is_root_turn_root && row.status.blocks_root_admission() {
+                let continuation_usage = row
+                    .state
+                    .continuation()
+                    .map(|continuation| continuation.payload.total_usage.clone());
+                let committed =
+                    Self::insert_cancelled_marker_tx(&mut tx, &thread_id, continuation_usage, now)
+                        .await?;
+                markers.push(committed);
+            }
             let cancelled = row
                 .cancel(now)
                 .context("cancel_tree: cancel transition failed")?;
@@ -3153,7 +3212,10 @@ impl AgentTaskStore for SqliteDurableStore {
         }
 
         tx.commit().await.context("commit cancel_tree")?;
-        Ok(transitioned)
+        Ok(CancelTreeOutcome {
+            transitioned,
+            markers,
+        })
     }
 
     async fn resume_from_confirmation(

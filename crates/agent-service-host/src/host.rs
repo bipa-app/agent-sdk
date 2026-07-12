@@ -2477,7 +2477,7 @@ async fn enforce_parked_child_deadline(
         if child.status.is_terminal() {
             continue;
         }
-        let cancelled = stores
+        let outcome = stores
             .task_store
             .cancel_tree(&child.id, now)
             .await
@@ -2489,8 +2489,18 @@ async fn enforce_parked_child_deadline(
         // resumed. Trip each cancelled task's live drive token now so
         // the in-flight tool aborts immediately; ids without a drive
         // are no-ops.
-        for cancelled_id in &cancelled {
+        for cancelled_id in &outcome.transitioned {
             stores.confirm_drive_cancels.cancel(cancelled_id);
+        }
+        // The cancelled descendants are tool children (no marker) or
+        // subagent invocations whose cascade reaches child-thread
+        // roots: those roots' terminal `Cancelled` markers were
+        // committed durably on their OWN threads (never the parent's)
+        // inside the cancel transaction. Wake same-process followers
+        // of those child threads now; cross-host followers ride the
+        // outbox advisory.
+        if !outcome.markers.is_empty() {
+            stores.event_notifier.notify(&outcome.markers);
         }
     }
 
@@ -5713,7 +5723,7 @@ mod tests {
             &self,
             root_id: &AgentTaskId,
             now: time::OffsetDateTime,
-        ) -> Result<Vec<AgentTaskId>> {
+        ) -> Result<agent_server::journal::store::CancelTreeOutcome> {
             self.inner.cancel_tree(root_id, now).await
         }
         async fn resume_from_confirmation(

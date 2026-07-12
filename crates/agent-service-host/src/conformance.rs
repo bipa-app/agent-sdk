@@ -45,6 +45,7 @@ mod tests {
     use time::{Duration, OffsetDateTime};
 
     use agent_sdk_foundation::audit::AuditProvenance;
+    use agent_sdk_foundation::events::AgentEvent;
     use agent_sdk_foundation::{ThreadId, TokenUsage};
     use agent_server::journal::checkpoint_store::CheckpointStore;
     use agent_server::journal::commit::{CompletedTurnCommit, commit_completed_turn};
@@ -56,6 +57,8 @@ mod tests {
         IdempotencyClaim, IdempotencyKind, IdempotencyRecord,
     };
     use agent_server::journal::message_store::MessageProjectionStore;
+    use agent_server::journal::outbox::OutboxStore;
+    use agent_server::journal::outbox_message::OutboxMessageKind;
     use agent_server::journal::recovery::RecoveryAction;
     use agent_server::journal::store::{AgentTaskStore, SubagentInvocationSpawn};
     use agent_server::journal::task::{
@@ -686,7 +689,10 @@ mod tests {
         assert_eq!(parent.status, TaskStatus::WaitingOnChildren);
         assert_eq!(children.len(), 2);
 
-        let cancelled = task_store.cancel_tree(&root.id, t_plus(73)).await?;
+        let cancelled = task_store
+            .cancel_tree(&root.id, t_plus(73))
+            .await?
+            .transitioned;
         // Root + both children must all be transitioned.
         assert_eq!(
             cancelled.len(),
@@ -734,7 +740,10 @@ mod tests {
             spawn_subagent_fixture(task_store, thread_store, "conformance-subagent-cascade")
                 .await?;
 
-        let cancelled = task_store.cancel_tree(&parent.id, t_plus(10)).await?;
+        let cancelled = task_store
+            .cancel_tree(&parent.id, t_plus(10))
+            .await?
+            .transitioned;
         assert_eq!(
             cancelled.len(),
             3,
@@ -751,6 +760,178 @@ mod tests {
         Ok(())
     }
 
+    /// Count the `AgentEvent::Cancelled` markers committed on `thread`.
+    async fn cancelled_marker_count(
+        event_repo: &dyn EventRepository,
+        thread: &ThreadId,
+    ) -> Result<usize> {
+        Ok(event_repo
+            .get_events(thread)
+            .await?
+            .iter()
+            .filter(|committed| matches!(committed.event, AgentEvent::Cancelled { .. }))
+            .count())
+    }
+
+    /// Terminal-marker contract (issue #354), part 1: cancelling the
+    /// thread's blocking root commits exactly ONE durable `Cancelled`
+    /// marker plus its `thread_events_available` outbox advisory,
+    /// atomically with the cancellation — and a crash-retry (the
+    /// caller "dies" right after `cancel_tree` commits, then retries)
+    /// finds the marker already durable and emits nothing new.
+    async fn test_cancel_marker_exactly_once_and_crash_retry_idempotent(
+        task_store: &dyn AgentTaskStore,
+        event_repo: &dyn EventRepository,
+        outbox_store: &dyn OutboxStore,
+    ) -> Result<()> {
+        let tid = "conformance-cancel-marker";
+        let root = fresh_root(tid, 300);
+        let _ = task_store.submit_root_turn(root.clone()).await?;
+
+        let outcome = task_store.cancel_tree(&root.id, t_plus(301)).await?;
+        assert_eq!(outcome.transitioned, vec![root.id.clone()]);
+        assert_eq!(
+            outcome.markers.len(),
+            1,
+            "one marker for the cancelled blocking root",
+        );
+        let marker = &outcome.markers[0];
+        assert_eq!(marker.thread_id, thread_id(tid));
+        assert!(
+            matches!(marker.event, AgentEvent::Cancelled { .. }),
+            "marker must be a Cancelled event, got {:?}",
+            marker.event,
+        );
+
+        // Durable in the committed-event journal (a follower replaying
+        // the thread sees the closing frame even if every process died
+        // the instant `cancel_tree` returned).
+        assert_eq!(
+            cancelled_marker_count(event_repo, &thread_id(tid)).await?,
+            1
+        );
+
+        // The advisory outbox row committed with the marker (cross-host
+        // followers are woken through the relay, not a process-local
+        // notifier).
+        let claimed = outbox_store
+            .claim_pending("conformance-marker-relay", 32, t_plus(302))
+            .await?;
+        let advisories: Vec<_> = claimed
+            .iter()
+            .filter(|row| {
+                row.kind == OutboxMessageKind::ThreadEventsAvailable
+                    && row.thread_id == thread_id(tid)
+            })
+            .collect();
+        assert_eq!(
+            advisories.len(),
+            1,
+            "exactly one thread_events_available advisory for the marker",
+        );
+        assert_eq!(advisories[0].sequence, Some(marker.sequence));
+
+        // Crash-retry: the retry sees a terminal tree — nothing
+        // transitions, no duplicate marker, no second advisory.
+        let retry = task_store.cancel_tree(&root.id, t_plus(303)).await?;
+        assert!(retry.transitioned.is_empty(), "retry must be a no-op");
+        assert!(retry.markers.is_empty(), "retry must not re-emit markers");
+        assert_eq!(
+            cancelled_marker_count(event_repo, &thread_id(tid)).await?,
+            1
+        );
+        let re_claimed = outbox_store
+            .claim_pending("conformance-marker-relay", 32, t_plus(304))
+            .await?;
+        assert!(
+            re_claimed
+                .iter()
+                .all(|row| row.kind != OutboxMessageKind::ThreadEventsAvailable),
+            "retry must not write a second advisory, got {re_claimed:?}",
+        );
+        Ok(())
+    }
+
+    /// Terminal-marker contract (issue #354), part 2: a cancel that
+    /// cascades across `SubagentInvocation` linkage commits one marker
+    /// per affected thread — the parent root's thread AND the
+    /// child-thread root's own thread (whose followers previously hung
+    /// forever). The invocation task itself (kind `subagent`, parent
+    /// thread) adds no extra marker.
+    async fn test_cancel_marker_covers_child_threads(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
+        event_repo: &dyn EventRepository,
+    ) -> Result<()> {
+        let (parent, _invocation, child_root) =
+            spawn_subagent_fixture(task_store, thread_store, "conformance-marker-cascade").await?;
+
+        let outcome = task_store.cancel_tree(&parent.id, t_plus(10)).await?;
+        assert_eq!(outcome.transitioned.len(), 3);
+        assert_eq!(
+            outcome.markers.len(),
+            2,
+            "parent root and child-thread root each get a marker, got {:?}",
+            outcome.markers,
+        );
+        for thread in [&parent.thread_id, &child_root.thread_id] {
+            assert_eq!(
+                cancelled_marker_count(event_repo, thread).await?,
+                1,
+                "exactly one marker on thread {thread}",
+            );
+        }
+        Ok(())
+    }
+
+    /// Terminal-marker contract (issue #354), part 3: cancelling a
+    /// QUEUED root parked behind a live active root emits NO marker
+    /// and no advisory — a thread-terminal frame would close the
+    /// active root's followers mid-stream.
+    async fn test_queued_root_cancel_emits_no_marker(
+        task_store: &dyn AgentTaskStore,
+        event_repo: &dyn EventRepository,
+        outbox_store: &dyn OutboxStore,
+    ) -> Result<()> {
+        let tid = "conformance-queued-no-marker";
+        let active = fresh_root(tid, 320);
+        let active_admitted = task_store.submit_root_turn(active).await?;
+        assert_eq!(active_admitted.status, TaskStatus::Pending);
+        let queued = fresh_root(tid, 321);
+        let queued_admitted = task_store.submit_root_turn(queued).await?;
+        assert_eq!(queued_admitted.status, TaskStatus::Queued);
+
+        let outcome = task_store
+            .cancel_tree(&queued_admitted.id, t_plus(322))
+            .await?;
+        assert_eq!(outcome.transitioned, vec![queued_admitted.id.clone()]);
+        assert!(
+            outcome.markers.is_empty(),
+            "queued-behind-active cancel must not emit a thread-terminal marker",
+        );
+        assert_eq!(
+            cancelled_marker_count(event_repo, &thread_id(tid)).await?,
+            0
+        );
+        let claimed = outbox_store
+            .claim_pending("conformance-queued-relay", 32, t_plus(323))
+            .await?;
+        assert!(
+            claimed
+                .iter()
+                .all(|row| row.kind != OutboxMessageKind::ThreadEventsAvailable),
+            "no thread_events_available advisory may exist for a queued cancel, got {claimed:?}",
+        );
+
+        // The active root is untouched.
+        let active_after = task_store
+            .get(&active_admitted.id)
+            .await?
+            .context("active root exists")?;
+        assert_eq!(active_after.status, TaskStatus::Pending);
+        Ok(())
+    }
+
     /// Cancelling a child-thread root must **wake** its linked parent
     /// subagent invocation (finding #7). Cancelling only the child root
     /// resumes the invocation to `Pending` with no pending children, so the
@@ -762,7 +943,10 @@ mod tests {
         let (_parent, invocation, child_root) =
             spawn_subagent_fixture(task_store, thread_store, "conformance-subagent-wake").await?;
 
-        let cancelled = task_store.cancel_tree(&child_root.id, t_plus(10)).await?;
+        let cancelled = task_store
+            .cancel_tree(&child_root.id, t_plus(10))
+            .await?
+            .transitioned;
         assert_eq!(cancelled, vec![child_root.id.clone()]);
 
         let woken = task_store
@@ -1698,6 +1882,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_cancel_marker_exactly_once_and_crash_retry() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_cancel_marker_exactly_once_and_crash_retry_idempotent(
+            s.task.as_ref(),
+            s.event.as_ref(),
+            s.outbox.as_ref(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_cancel_marker_covers_child_threads() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_cancel_marker_covers_child_threads(
+            s.task.as_ref(),
+            s.thread.as_ref(),
+            s.event.as_ref(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_queued_root_cancel_emits_no_marker() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_queued_root_cancel_emits_no_marker(
+            s.task.as_ref(),
+            s.event.as_ref(),
+            s.outbox.as_ref(),
+        )
+        .await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_cancel_child_root_wakes_invocation() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_cancel_child_root_wakes_invocation(s.task.as_ref(), s.thread.as_ref()).await
@@ -1752,23 +1969,43 @@ mod tests {
         attempt: std::sync::Arc<dyn TurnAttemptStore>,
         checkpoint: std::sync::Arc<dyn CheckpointStore>,
         event: std::sync::Arc<dyn EventRepository>,
+        outbox: std::sync::Arc<dyn OutboxStore>,
     }
 
     fn fresh_in_memory_stores() -> InMemoryStores {
         use agent_server::journal::checkpoint_store::InMemoryCheckpointStore;
         use agent_server::journal::event_repository::InMemoryEventRepository;
         use agent_server::journal::message_store::InMemoryMessageProjectionStore;
-        use agent_server::journal::store::InMemoryAgentTaskStore;
+        use agent_server::journal::outbox::InMemoryOutboxStore;
+        use agent_server::journal::store::{CancellationMarkerSink, InMemoryAgentTaskStore};
         use agent_server::journal::thread_store::InMemoryThreadStore;
         use agent_server::journal::turn_attempt_store::InMemoryTurnAttemptStore;
 
+        // Mirror `StoreRegistry::in_memory`: the task store commits its
+        // terminal `Cancelled` markers through the shared event /
+        // outbox / thread stores (issue #354), so the marker
+        // conformance battery runs on the same wiring production uses.
+        let thread: std::sync::Arc<InMemoryThreadStore> =
+            std::sync::Arc::new(InMemoryThreadStore::new());
+        let event: std::sync::Arc<InMemoryEventRepository> =
+            std::sync::Arc::new(InMemoryEventRepository::new());
+        let outbox: std::sync::Arc<InMemoryOutboxStore> =
+            std::sync::Arc::new(InMemoryOutboxStore::new());
+        let task =
+            InMemoryAgentTaskStore::new().with_cancellation_markers(CancellationMarkerSink {
+                event_repo: event.clone(),
+                outbox_store: outbox.clone(),
+                thread_store: thread.clone(),
+            });
+
         InMemoryStores {
-            task: std::sync::Arc::new(InMemoryAgentTaskStore::new()),
-            thread: std::sync::Arc::new(InMemoryThreadStore::new()),
+            task: std::sync::Arc::new(task),
+            thread,
             message: std::sync::Arc::new(InMemoryMessageProjectionStore::new()),
             attempt: std::sync::Arc::new(InMemoryTurnAttemptStore::new()),
             checkpoint: std::sync::Arc::new(InMemoryCheckpointStore::new()),
-            event: std::sync::Arc::new(InMemoryEventRepository::new()),
+            event,
+            outbox,
         }
     }
 
@@ -1898,6 +2135,27 @@ mod tests {
     async fn conformance_sqlite_cancel_subagent_cascade() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_cancel_tree_cascades_through_subagent(&store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_cancel_marker_exactly_once_and_crash_retry() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_cancel_marker_exactly_once_and_crash_retry_idempotent(&store, &store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_cancel_marker_covers_child_threads() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_cancel_marker_covers_child_threads(&store, &store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_queued_root_cancel_emits_no_marker() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_queued_root_cancel_emits_no_marker(&store, &store, &store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -2354,6 +2612,33 @@ mod tests {
             return Ok(());
         };
         test_cancel_tree_cascades_through_subagent(&store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_cancel_marker_exactly_once_and_crash_retry() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_cancel_marker_exactly_once_and_crash_retry_idempotent(&store, &store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_cancel_marker_covers_child_threads() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_cancel_marker_covers_child_threads(&store, &store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_queued_root_cancel_emits_no_marker() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_queued_root_cancel_emits_no_marker(&store, &store, &store).await
     }
 
     #[cfg(feature = "postgres")]
