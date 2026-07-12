@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-foundation-v0.11.8...agent-sdk-foundation-v0.12.0) - 2026-07-12
+
+### Added
+
+- *(agent-loop)* [**breaking**] usage/cost budgets, parallel-tool cap, guardrail-hook wiring, reminders, run_stream ([#312](https://github.com/bipa-app/agent-sdk/pull/312))
+
 ## [0.11.6](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-foundation-v0.11.5...agent-sdk-foundation-v0.11.6) - 2026-07-09
 
 ### Fixed

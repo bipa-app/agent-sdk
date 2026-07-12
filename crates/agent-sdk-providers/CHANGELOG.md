@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.11.8...agent-sdk-providers-v0.12.0) - 2026-07-12
+
+### Fixed
+
+- *(anthropic,server)* bound silent streams so stalled connections retry instead of hanging ([#357](https://github.com/bipa-app/agent-sdk/pull/357))
+- *(openai-codex)* preserve atomic streamed tool calls ([#353](https://github.com/bipa-app/agent-sdk/pull/353))
+
 ## [0.11.8](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.11.7...agent-sdk-providers-v0.11.8) - 2026-07-11
 
 ### Other

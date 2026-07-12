@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-sdk"
-version = "0.11.8"
+version = "0.12.0"
 dependencies = [
  "agent-sdk-foundation",
  "agent-sdk-macros",
@@ -49,7 +49,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-cli"
-version = "0.11.8"
+version = "0.12.0"
 dependencies = [
  "agent-sdk",
  "anyhow",
@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-foundation"
-version = "0.11.8"
+version = "0.12.0"
 dependencies = [
  "insta",
  "proptest",
@@ -76,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-macros"
-version = "0.11.8"
+version = "0.12.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-otel"
-version = "0.11.8"
+version = "0.12.0"
 dependencies = [
  "agent-sdk",
  "anyhow",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-providers"
-version = "0.11.8"
+version = "0.12.0"
 dependencies = [
  "agent-sdk-foundation",
  "anyhow",
@@ -125,7 +125,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-tools"
-version = "0.11.8"
+version = "0.12.0"
 dependencies = [
  "agent-sdk-foundation",
  "anyhow",
@@ -4464,9 +4464,9 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "trybuild"
-version = "1.0.117"
+version = "1.0.118"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0710d4dfbeae4f9c390baa784c49858a7468fa433f3fe5d0ec5ebef651cf59f9"
+checksum = "06649c6f63d86604ba0c8950d5a1829fc9a17afd70fc6629f481d75b6a624c78"
 dependencies = [
  "glob",
  "serde",
