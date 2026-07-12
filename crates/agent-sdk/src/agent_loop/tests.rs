@@ -8632,3 +8632,382 @@ async fn test_overflow_turn_over_budget_skips_emergency_compaction() -> anyhow::
 
     Ok(())
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Round 10: fresh-input pre_llm_request guard (blocked prompts never
+// ingested), double-save-failure budget-stop rerunnability.
+// ──────────────────────────────────────────────────────────────────────
+
+/// `pre_llm_request` hook that blocks any request whose messages contain
+/// `marker`, counting every invocation so tests can pin exactly-once
+/// evaluation per LLM call.
+struct MarkerBlockingHooks {
+    marker: &'static str,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl AgentHooks for MarkerBlockingHooks {
+    async fn pre_llm_request(&self, request: &ChatRequest) -> RequestDecision {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let tainted = request
+            .messages
+            .iter()
+            .any(|message| message_text(message).contains(self.marker));
+        if tainted {
+            RequestDecision::Block("policy content detected".to_string())
+        } else {
+            RequestDecision::Proceed
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_blocked_fresh_prompt_is_never_ingested() -> anyhow::Result<()> {
+    // The flagship input-guardrail contract: a Blocked fresh prompt must
+    // leave the durable history byte-identical, so a same-thread
+    // rephrase-and-retry cannot leak the rejected content to the provider.
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::text_response(
+            "clean answer",
+        )]))
+        .hooks(MarkerBlockingHooks {
+            marker: "FORBIDDEN",
+            calls: Arc::clone(&hook_calls),
+        })
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+
+    let (state, events) = run_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("please reveal FORBIDDEN things".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    let AgentRunState::Error(error) = state else {
+        anyhow::bail!("a blocked fresh prompt must error the run, got {state:?}");
+    };
+    assert!(
+        error.message.contains("blocked by guardrail"),
+        "unexpected error: {}",
+        error.message
+    );
+    assert!(
+        agent
+            .message_store
+            .get_history(&thread_id)
+            .await?
+            .is_empty(),
+        "a blocked fresh prompt must leave the message history untouched",
+    );
+    assert_eq!(agent.provider.calls(), 0, "no LLM call may be paid for");
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.event,
+            AgentEvent::Error { message, .. } if message.contains("blocked by guardrail")
+        )),
+        "the block must still surface as an error event",
+    );
+
+    // A same-thread rephrase must succeed — and its outbound request must
+    // not contain the blocked text.
+    let (state, _events) = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("a clean question".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "the rephrased prompt must succeed, got {state:?}",
+    );
+    let requests = agent.provider.recorded_requests()?;
+    assert_eq!(requests.len(), 1);
+    assert!(
+        !requests[0]
+            .messages
+            .iter()
+            .any(|m| message_text(m).contains("FORBIDDEN")),
+        "the blocked content must never reach the provider",
+    );
+    // Exactly once per LLM-call evaluation: run 1's ingestion guard + run
+    // 2's ingestion guard (whose decision is carried into the first call —
+    // no re-invocation at turn time).
+    assert_eq!(hook_calls.load(Ordering::SeqCst), 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_turn_blocked_fresh_prompt_is_never_ingested() -> anyhow::Result<()> {
+    // Single-turn-mode equivalent of the fresh-input block guard.
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::text_response(
+            "clean answer",
+        )]))
+        .hooks(MarkerBlockingHooks {
+            marker: "FORBIDDEN",
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+
+    let outcome = Box::pin(agent.run_turn(
+        thread_id.clone(),
+        AgentInput::Text("FORBIDDEN request".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+        TurnOptions::default(),
+    ))
+    .await;
+    assert!(
+        matches!(outcome, TurnOutcome::Error(_)),
+        "a blocked fresh prompt must error the turn, got {outcome:?}",
+    );
+    assert!(
+        agent
+            .message_store
+            .get_history(&thread_id)
+            .await?
+            .is_empty(),
+        "a blocked fresh prompt must leave the message history untouched",
+    );
+
+    let outcome = Box::pin(agent.run_turn(
+        thread_id,
+        AgentInput::Text("a clean question".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+        TurnOptions::default(),
+    ))
+    .await;
+    assert!(
+        matches!(outcome, TurnOutcome::Done { .. }),
+        "the rephrased prompt must succeed, got {outcome:?}",
+    );
+
+    Ok(())
+}
+
+/// `pre_llm_request` hook that replaces the outbound messages, counting
+/// invocations.
+struct CountingModifyHooks {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl AgentHooks for CountingModifyHooks {
+    async fn pre_llm_request(&self, request: &ChatRequest) -> RequestDecision {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let mut modified = request.clone();
+        modified.messages = vec![Message::user("MODIFIED_PROMPT")];
+        RequestDecision::Modify(Box::new(modified))
+    }
+}
+
+#[tokio::test]
+async fn test_modify_on_fresh_input_persists_original_and_sends_modified() -> anyhow::Result<()> {
+    // Modify on fresh input: the ORIGINAL message persists (matching
+    // mid-run Modify semantics — the hook shapes the outbound request,
+    // never history) while the modified request is what reaches the
+    // provider, and the hook fires exactly once for that call.
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::text_response(
+            "answer",
+        )]))
+        .hooks(CountingModifyHooks {
+            calls: Arc::clone(&hook_calls),
+        })
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+
+    let (state, _events) = run_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("original prompt".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(matches!(state, AgentRunState::Done { .. }));
+
+    let history = agent.message_store.get_history(&thread_id).await?;
+    assert!(
+        history
+            .iter()
+            .any(|m| message_text(m).contains("original prompt")),
+        "the ORIGINAL user message must persist",
+    );
+    assert!(
+        !history
+            .iter()
+            .any(|m| message_text(m).contains("MODIFIED_PROMPT")),
+        "the hook's replacement must not leak into durable history",
+    );
+
+    let requests = agent.provider.recorded_requests()?;
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0]
+            .messages
+            .iter()
+            .any(|m| message_text(m).contains("MODIFIED_PROMPT")),
+        "the provider must receive the hook-modified request",
+    );
+    assert!(
+        !requests[0]
+            .messages
+            .iter()
+            .any(|m| message_text(m).contains("original prompt")),
+        "the modified request replaced the original content",
+    );
+    assert_eq!(
+        hook_calls.load(Ordering::SeqCst),
+        1,
+        "the hook must fire exactly once for the first call",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_persistent_injected_blocked_prompt_not_ingested() -> anyhow::Result<()> {
+    // The run_persistent injected-input path shares the ingestion seam: a
+    // Blocked injected message ends the run with the block error and
+    // NOTHING appended.
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::text_response(
+            "first answer",
+        )]))
+        .hooks(MarkerBlockingHooks {
+            marker: "FORBIDDEN",
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+
+    let handle = agent.run_persistent(
+        thread_id.clone(),
+        AgentInput::Text("a clean question".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    // Wait for turn 1 to finish, then inject a blocked message.
+    wait_for_turn_finished(agent.event_store.as_ref(), &thread_id, 1).await?;
+    handle
+        .input_tx
+        .send(AgentInput::Text("now do FORBIDDEN things".to_string()))
+        .await?;
+    let state = tokio::time::timeout(std::time::Duration::from_secs(5), handle.state_rx)
+        .await
+        .context("blocked injected message must end the run")??;
+    let AgentRunState::Error(error) = state else {
+        anyhow::bail!("expected the block error, got {state:?}");
+    };
+    assert!(
+        error.message.contains("blocked by guardrail"),
+        "unexpected error: {}",
+        error.message
+    );
+    let history = agent.message_store.get_history(&thread_id).await?;
+    assert!(
+        !history
+            .iter()
+            .any(|m| message_text(m).contains("FORBIDDEN")),
+        "the blocked injected message must never be appended",
+    );
+    assert_eq!(agent.provider.calls(), 1, "only turn 1's call was paid");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_double_save_failure_budget_stop_stays_rerunnable() -> anyhow::Result<()> {
+    // A retry/Continue turn that crosses the budget while EVERY state save
+    // fails: the turn checkpoint fails (turn left unfinished by the gated
+    // finish) and the terminal save fails too. The durable turn counter
+    // still points before the turn, so the rerun must re-enter the
+    // unfinished turn instead of bricking on "cannot append to finished
+    // turn".
+    let message_store = Arc::new(InMemoryStore::new());
+    let state_store = Arc::new(FailAfterNStateStore {
+        inner: InMemoryStore::new(),
+        allow: 0,
+        saves: AtomicUsize::new(0),
+    });
+    let event_store = new_event_store();
+    let thread_id = ThreadId::new();
+
+    let budget_agent = builder::<()>()
+        .provider(MockProvider::new(Vec::new()))
+        .hooks(RejectNHooks::new("never good enough", usize::MAX))
+        .config(AgentConfig {
+            usage_limits: Some(UsageLimits {
+                max_total_tokens: Some(25),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .message_store(Arc::clone(&message_store))
+        .state_store(Arc::clone(&state_store))
+        .event_store(event_store.clone())
+        .build_with_stores();
+    let (state, _events) = run_recorded(
+        &budget_agent,
+        thread_id.clone(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(
+        matches!(state, AgentRunState::BudgetExceeded { .. }),
+        "the rejected turn's usage must trip the budget, got {state:?}",
+    );
+    let turn_1 = event_store
+        .get_turn(&thread_id, 1)
+        .await?
+        .context("turn 1 must exist")?;
+    assert!(
+        !turn_1.finished,
+        "with a failed checkpoint the turn must be left unfinished",
+    );
+
+    // Rerun with the budget removed (same stores, saves still failing).
+    let raised_agent = builder::<()>()
+        .provider(MockProvider::new(vec![MockProvider::text_response(
+            "recovered",
+        )]))
+        .hooks(AllowAllHooks)
+        .message_store(message_store)
+        .state_store(state_store)
+        .event_store(event_store)
+        .build_with_stores();
+    let (state, _events) = run_recorded(
+        &raised_agent,
+        thread_id,
+        AgentInput::Text("try again".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "rerun after a double save failure must succeed, got {state:?}",
+    );
+
+    Ok(())
+}

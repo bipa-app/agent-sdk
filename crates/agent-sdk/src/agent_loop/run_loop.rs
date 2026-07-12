@@ -3,10 +3,10 @@ use super::tool_execution::{append_tool_results, execute_confirmed_tool, execute
 use super::turn::execute_turn;
 use super::types::{
     ConvertTurnResultParams, ExecuteTurnParameters, InitializedState, InternalTurnResult,
-    PersistentDoneParams, ResumeData, ResumeProcessingParameters, ResumeProcessingResult,
-    ResumeSummaryMetrics, RunLoopParameters, RunLoopTurnResultParams, RunLoopTurnsParams,
-    SingleTurnResumeParams, ToolCallExecutionContext, ToolExecutionOutcome, TurnContext,
-    TurnParameters,
+    PersistentDoneParams, PreEvaluatedRequest, ResumeData, ResumeProcessingParameters,
+    ResumeProcessingResult, ResumeSummaryMetrics, RunLoopParameters, RunLoopTurnResultParams,
+    RunLoopTurnsParams, SingleTurnResumeParams, ToolCallExecutionContext, ToolExecutionOutcome,
+    TurnContext, TurnParameters,
 };
 
 use crate::types::TurnOptions;
@@ -32,7 +32,12 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 enum RunLoopTurnAction {
-    Continue,
+    Continue {
+        /// Ingestion-time `pre_llm_request` decision for the next turn's
+        /// first LLM call — `Some` only when the persistent-mode park just
+        /// ingested a fresh injected message (whose guard already ran).
+        first_request_decision: Option<PreEvaluatedRequest>,
+    },
     FinishRun,
     Return(AgentRunState),
 }
@@ -120,6 +125,7 @@ where
                     confirmed,
                     rejection_reason,
                 }),
+                first_request_decision: None,
             })
         }
         AgentInput::SubmitToolResults {
@@ -163,6 +169,7 @@ where
                 total_usage: state.total_usage.clone(),
                 state,
                 resume_data: None,
+                first_request_decision: None,
             })
         }
     }
@@ -208,6 +215,7 @@ where
         total_usage: state.total_usage.clone(),
         state,
         resume_data: None,
+        first_request_decision: None,
     })
 }
 
@@ -329,6 +337,7 @@ async fn initialize_from_tool_results<M: MessageStore>(
             total_usage: continuation.total_usage.clone(),
             state: continuation.state.clone(),
             resume_data: None,
+            first_request_decision: None,
         });
     }
 
@@ -374,6 +383,7 @@ async fn initialize_from_tool_results<M: MessageStore>(
         total_usage: continuation.total_usage.clone(),
         state: continuation.state.clone(),
         resume_data: None,
+        first_request_decision: None,
     })
 }
 
@@ -957,6 +967,7 @@ fn build_turn_context(
         start_time,
         compaction_retries: 0,
         pending_reminder: None,
+        pending_first_request: None,
         response_id: None,
         stop_reason: None,
         tool_call_count: 0,
@@ -1270,7 +1281,7 @@ where
 /// Inputs for the guarded initialization helpers
 /// ([`init_run_loop_with_entry_guard`] / [`init_single_turn_with_entry_guard`]):
 /// the pre-ingestion budget guard plus the mode's input initialization.
-struct GuardedInitParams<'a, H, M, S> {
+struct GuardedInitParams<'a, Ctx, P, H, M, S> {
     input: AgentInput,
     thread_id: &'a ThreadId,
     message_store: &'a Arc<M>,
@@ -1281,13 +1292,18 @@ struct GuardedInitParams<'a, H, M, S> {
     hooks: &'a Arc<H>,
     authority: &'a Arc<dyn EventAuthority>,
     provenance: &'a AuditProvenance,
+    /// Provider / tools / config for the fresh-input `pre_llm_request`
+    /// guard, which builds the request the first turn would send.
+    provider: &'a Arc<P>,
+    tools: &'a Arc<ToolRegistry<Ctx>>,
+    config: &'a AgentConfig,
     usage_limits: Option<&'a UsageLimits>,
     start_time: Instant,
     #[cfg(feature = "otel")]
     input_kind: &'static str,
 }
 
-impl<H, M, S> GuardedInitParams<'_, H, M, S> {
+impl<Ctx, P, H, M, S> GuardedInitParams<'_, Ctx, P, H, M, S> {
     /// Borrow the subset the budget entry guard needs.
     fn entry_guard(&self) -> EntryBudgetParams<'_, H, S> {
         EntryBudgetParams {
@@ -1306,15 +1322,142 @@ impl<H, M, S> GuardedInitParams<'_, H, M, S> {
     }
 }
 
-/// Looping-mode initialization behind the pre-ingestion budget guard: a
-/// fresh prompt sent to an over-budget thread terminates the run (`Err`)
-/// BEFORE `initialize_from_input` can append it, leaving the history
-/// untouched so the caller can raise the budget and resubmit the prompt
-/// without duplicating it.
-async fn init_run_loop_with_entry_guard<H, M, S>(
-    params: GuardedInitParams<'_, H, M, S>,
+/// The candidate user message a fresh `Text` / `Message` input would
+/// append, or `None` for every other input kind.
+fn fresh_input_candidate(input: &AgentInput) -> Option<Message> {
+    match input {
+        AgentInput::Text(text) => Some(Message::user(text)),
+        AgentInput::Message(blocks) => Some(Message::user_with_content(blocks.clone())),
+        _ => None,
+    }
+}
+
+/// Evaluate `pre_llm_request` against the request the next turn would send
+/// (current durable history + the candidate user message) BEFORE the
+/// candidate is appended.
+///
+/// This is the fresh-input mirror of the entry-budget guard: a `Block`
+/// decision must leave NOTHING ingested — otherwise a same-thread
+/// rephrase-and-retry would rebuild its request WITH the blocked content in
+/// history, and the PII/policy material the hook rejected would still reach
+/// the provider. The returned [`PreEvaluatedRequest`] is carried into the
+/// first LLM call so the hook fires exactly once per call (see the enum's
+/// docs for the `Proceed` / `Modify` semantics).
+async fn guard_fresh_user_message<Ctx, P, H, M>(
+    candidate: &Message,
+    thread_id: &ThreadId,
+    message_store: &Arc<M>,
+    provider: &Arc<P>,
+    tools: &Arc<ToolRegistry<Ctx>>,
+    config: &AgentConfig,
+    hooks: &Arc<H>,
+) -> Result<PreEvaluatedRequest, AgentError>
+where
+    Ctx: Send + Sync + 'static,
+    P: LlmProvider,
+    H: AgentHooks,
+    M: MessageStore,
+{
+    let mut messages = message_store.get_history(thread_id).await.map_err(|e| {
+        AgentError::new(
+            format!("Failed to get history for the input guardrail: {e}"),
+            false,
+        )
+    })?;
+    messages.push(candidate.clone());
+    let request = super::turn::build_turn_request(config, provider, thread_id, messages, tools)?;
+    match hooks.pre_llm_request(&request).await {
+        crate::hooks::RequestDecision::Modify(modified) => {
+            Ok(PreEvaluatedRequest::Modified(modified))
+        }
+        crate::hooks::RequestDecision::Block(reason) => Err(AgentError::new(
+            format!("LLM request blocked by guardrail: {reason}"),
+            false,
+        )),
+        // `Proceed`, plus any future `#[non_exhaustive]` variant, proceeds
+        // unchanged (mirrors `apply_pre_llm_request`).
+        _ => Ok(PreEvaluatedRequest::Proceed),
+    }
+}
+
+/// Run the fresh-input `pre_llm_request` guard for `Text` / `Message`
+/// input; other input kinds pass through with `None` (their first call
+/// evaluates the hook at turn time as usual).
+///
+/// Orphaned `tool_use` history is repaired first so the speculative request
+/// matches what initialization will leave in place (initialization repeats
+/// the recovery; it is an idempotent read + conditional rewrite).
+async fn guard_fresh_input<Ctx, P, H, M, S>(
+    params: &GuardedInitParams<'_, Ctx, P, H, M, S>,
+) -> Result<Option<PreEvaluatedRequest>, AgentError>
+where
+    Ctx: Send + Sync + 'static,
+    P: LlmProvider,
+    H: AgentHooks,
+    M: MessageStore,
+    S: StateStore,
+{
+    let Some(candidate) = fresh_input_candidate(&params.input) else {
+        return Ok(None);
+    };
+    recover_orphaned_tool_use(params.thread_id, params.message_store).await?;
+    match guard_fresh_user_message(
+        &candidate,
+        params.thread_id,
+        params.message_store,
+        params.provider,
+        params.tools,
+        params.config,
+        params.hooks,
+    )
+    .await
+    {
+        Ok(decision) => Ok(Some(decision)),
+        Err(error) => {
+            // Preserve the block-error event streaming consumers rely on:
+            // keyed under the next, never-executed turn (left unfinished —
+            // the same synthetic-marker mechanics as the entry-budget
+            // rejection), or turn 1 on a fresh thread. Best-effort: the
+            // block error itself must surface regardless.
+            let event_turn = params
+                .state_store
+                .load(params.thread_id)
+                .await
+                .ok()
+                .flatten()
+                .map_or(1, |state| state.turn_count.saturating_add(1));
+            if let Err(send_error) = send_event(
+                params.event_store,
+                params.thread_id,
+                event_turn,
+                params.hooks,
+                params.authority,
+                AgentEvent::error(error.message.clone(), error.recoverable),
+            )
+            .await
+            {
+                warn!(
+                    "Failed to emit pre-ingestion guardrail event: {}",
+                    send_error.message
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Looping-mode initialization behind the pre-ingestion guards: a fresh
+/// prompt sent to an over-budget thread — or one whose speculative request
+/// the `pre_llm_request` hook Blocks — terminates the run (`Err`) BEFORE
+/// `initialize_from_input` can append it, leaving the history untouched so
+/// the caller can raise the budget / rephrase and resubmit without the
+/// rejected prompt poisoning future context.
+async fn init_run_loop_with_entry_guard<Ctx, P, H, M, S>(
+    params: GuardedInitParams<'_, Ctx, P, H, M, S>,
 ) -> Result<InitializedState, AgentRunState>
 where
+    Ctx: Send + Sync + 'static,
+    P: LlmProvider,
     H: AgentHooks,
     M: MessageStore,
     S: StateStore,
@@ -1322,7 +1465,11 @@ where
     if let Some(rejected) = reject_over_budget_run_entry(params.entry_guard()).await {
         return Err(rejected);
     }
-    initialize_run_loop_state(
+    let first_request_decision = match guard_fresh_input(&params).await {
+        Ok(decision) => decision,
+        Err(error) => return Err(AgentRunState::Error(error)),
+    };
+    let mut init = initialize_run_loop_state(
         params.input,
         params.thread_id,
         params.message_store,
@@ -1331,15 +1478,19 @@ where
         params.audit_sink,
         params.provenance,
     )
-    .await
+    .await?;
+    init.first_request_decision = first_request_decision;
+    Ok(init)
 }
 
 /// Single-turn-mode counterpart of [`init_run_loop_with_entry_guard`].
-async fn init_single_turn_with_entry_guard<H, M, S>(
-    params: GuardedInitParams<'_, H, M, S>,
+async fn init_single_turn_with_entry_guard<Ctx, P, H, M, S>(
+    params: GuardedInitParams<'_, Ctx, P, H, M, S>,
     turn_options: &TurnOptions,
 ) -> Result<InitializedState, TurnOutcome>
 where
+    Ctx: Send + Sync + 'static,
+    P: LlmProvider,
     H: AgentHooks,
     M: MessageStore,
     S: StateStore,
@@ -1348,7 +1499,11 @@ where
     {
         return Err(rejected);
     }
-    initialize_single_turn_state(
+    let first_request_decision = match guard_fresh_input(&params).await {
+        Ok(decision) => decision,
+        Err(error) => return Err(TurnOutcome::Error(error)),
+    };
+    let mut init = initialize_single_turn_state(
         params.input,
         params.thread_id,
         params.message_store,
@@ -1357,7 +1512,9 @@ where
         params.audit_sink,
         params.provenance,
     )
-    .await
+    .await?;
+    init.first_request_decision = first_request_decision;
+    Ok(init)
 }
 
 // ── Synthetic terminal markers ─────────────────────────────────────────
@@ -1575,11 +1732,75 @@ where
     Ok(())
 }
 
-async fn handle_persistent_done<M, H, S>(
+/// Outcome of parking a persistent run between turns.
+enum PersistentParkOutcome {
+    /// A fresh injected message was ingested; its ingestion-time
+    /// `pre_llm_request` decision rides into the next turn's first call.
+    Resume(PreEvaluatedRequest),
+    /// The run ended with this terminal state.
+    End(AgentRunState),
+}
+
+/// Guard + append one injected user message.
+///
+/// The same before-append contract as fresh-input initialization
+/// ([`guard_fresh_user_message`]): the hook evaluates the request the next
+/// turn would send BEFORE the injected message is durably appended, so a
+/// `Block` ends the run with the block error and NOTHING ingested — the
+/// rejected content can never poison a later turn's context.
+async fn ingest_injected_message<Ctx, P, H, M>(
+    candidate: Message,
+    ctx: &TurnContext,
+    message_store: &Arc<M>,
+    provider: &Arc<P>,
+    tools: &Arc<ToolRegistry<Ctx>>,
+    config: &AgentConfig,
+    hooks: &Arc<H>,
+) -> PersistentParkOutcome
+where
+    Ctx: Send + Sync + 'static,
+    P: LlmProvider,
+    H: AgentHooks,
+    M: MessageStore,
+{
+    let decision = match guard_fresh_user_message(
+        &candidate,
+        &ctx.thread_id,
+        message_store,
+        provider,
+        tools,
+        config,
+        hooks,
+    )
+    .await
+    {
+        Ok(decision) => decision,
+        Err(error) => {
+            warn!(
+                "Injected message rejected before ingestion: {}",
+                error.message
+            );
+            return PersistentParkOutcome::End(AgentRunState::Error(error));
+        }
+    };
+    if let Err(error) = message_store.append(&ctx.thread_id, candidate).await {
+        warn!("Failed to append injected message: {error}");
+        return PersistentParkOutcome::End(AgentRunState::Error(AgentError::new(
+            format!("Failed to append injected message: {error}"),
+            false,
+        )));
+    }
+    PersistentParkOutcome::Resume(decision)
+}
+
+async fn handle_persistent_done<Ctx, P, H, M, S>(
     PersistentDoneParams {
         ctx,
         rx,
         message_store,
+        provider,
+        tools,
+        config,
         state_store,
         event_store,
         hooks,
@@ -1588,9 +1809,11 @@ async fn handle_persistent_done<M, H, S>(
         cancel_token,
         provenance,
         usage_limits,
-    }: PersistentDoneParams<'_, H, M, S>,
-) -> Option<AgentRunState>
+    }: PersistentDoneParams<'_, Ctx, P, H, M, S>,
+) -> PersistentParkOutcome
 where
+    Ctx: Send + Sync + 'static,
+    P: LlmProvider,
     M: MessageStore,
     H: AgentHooks,
     S: StateStore,
@@ -1598,7 +1821,7 @@ where
     if let Err(state) =
         emit_persistent_turn_complete(ctx, event_store, hooks, authority, current_turn).await
     {
-        return Some(state);
+        return PersistentParkOutcome::End(state);
     }
 
     // `current_turn` was just finished above, and a text-only final turn has
@@ -1619,7 +1842,7 @@ where
         &ctx.total_usage,
         ctx.state.accumulated_cost_usd,
     ) {
-        return Some(
+        return PersistentParkOutcome::End(
             budget_exceeded_run_state(ctx, event_store, state_store, hooks, authority, limit, cost)
                 .await,
         );
@@ -1629,26 +1852,28 @@ where
         msg = rx.recv() => {
             match msg {
                 Some(AgentInput::Text(text)) => {
-                    let user_msg = Message::user(&text);
-                    if let Err(error) = message_store.append(&ctx.thread_id, user_msg).await {
-                        warn!("Failed to append injected message: {error}");
-                        return Some(AgentRunState::Error(AgentError::new(
-                            format!("Failed to append injected message: {error}"),
-                            false,
-                        )));
-                    }
-                    None
+                    ingest_injected_message(
+                        Message::user(&text),
+                        ctx,
+                        message_store,
+                        provider,
+                        tools,
+                        config,
+                        hooks,
+                    )
+                    .await
                 }
                 Some(AgentInput::Message(blocks)) => {
-                    let user_msg = Message::user_with_content(blocks);
-                    if let Err(error) = message_store.append(&ctx.thread_id, user_msg).await {
-                        warn!("Failed to append injected message: {error}");
-                        return Some(AgentRunState::Error(AgentError::new(
-                            format!("Failed to append injected message: {error}"),
-                            false,
-                        )));
-                    }
-                    None
+                    ingest_injected_message(
+                        Message::user_with_content(blocks),
+                        ctx,
+                        message_store,
+                        provider,
+                        tools,
+                        config,
+                        hooks,
+                    )
+                    .await
                 }
                 // `Resume` / `SubmitToolResults` / `Continue` carry no meaning
                 // between injected user turns. Surface a clear error rather
@@ -1661,7 +1886,7 @@ where
                         AgentInput::Continue => "Continue",
                         AgentInput::Text(_) | AgentInput::Message(_) => "unsupported",
                     };
-                    Some(AgentRunState::Error(AgentError::new(
+                    PersistentParkOutcome::End(AgentRunState::Error(AgentError::new(
                         format!(
                             "AgentHandle::input_tx received an unsupported input variant ({kind}); \
                              only Text and Message may be injected between turns"
@@ -1670,7 +1895,7 @@ where
                     )))
                 }
                 // Sender dropped — no more injected messages. Exit cleanly.
-                None => Some(done_run_state(ctx, provenance)),
+                None => PersistentParkOutcome::End(done_run_state(ctx, provenance)),
             }
         }
         () = cancel_token.cancelled() => {
@@ -1698,9 +1923,9 @@ where
             if let Err(error) =
                 emit_cancelled_event(ctx, event_store, hooks, authority, event_turn).await
             {
-                return Some(AgentRunState::Error(error));
+                return PersistentParkOutcome::End(AgentRunState::Error(error));
             }
-            Some(cancelled_run_state(ctx))
+            PersistentParkOutcome::End(cancelled_run_state(ctx))
         }
     }
 }
@@ -1762,12 +1987,70 @@ where
     }
 }
 
-async fn handle_run_loop_turn_result<H, M, S>(
+/// Checkpoint a completed (continuing) turn and finish it — gated on the
+/// checkpoint (the same finish-only-on-saved contract as the terminal
+/// arms): if this save fails AND a later terminal save also fails — e.g.
+/// the loop-top budget stop right after this turn — the durable `turn_count`
+/// still points before this turn, and the unfinished turn is the only
+/// thing keeping the thread rerunnable (the synthetic marker cannot repair
+/// a finished turn with a stale counter).
+async fn checkpoint_and_continue<S>(
+    ctx: &TurnContext,
+    state_store: &Arc<S>,
+    event_store: &Arc<dyn EventStore>,
+    current_turn: usize,
+) -> RunLoopTurnAction
+where
+    S: StateStore,
+{
+    match state_store.save(&ctx.state).await {
+        Ok(()) => finish_turn_or_run_state(event_store, &ctx.thread_id, current_turn)
+            .await
+            .map_or_else(std::convert::identity, |()| RunLoopTurnAction::Continue {
+                first_request_decision: None,
+            }),
+        Err(error) => {
+            warn!(
+                "Failed to save state checkpoint: {error}; leaving turn {current_turn} \
+                 unfinished so a rerun cannot re-enter a finished turn"
+            );
+            RunLoopTurnAction::Continue {
+                first_request_decision: None,
+            }
+        }
+    }
+}
+
+/// Park a persistent run for injected input and map the outcome onto the
+/// loop action (an ingested message's `pre_llm_request` decision rides the
+/// `Continue`).
+async fn park_persistent_run<Ctx, P, H, M, S>(
+    params: super::types::PersistentDoneParams<'_, Ctx, P, H, M, S>,
+) -> RunLoopTurnAction
+where
+    Ctx: Send + Sync + 'static,
+    P: LlmProvider,
+    H: AgentHooks,
+    M: MessageStore,
+    S: StateStore,
+{
+    match handle_persistent_done(params).await {
+        PersistentParkOutcome::Resume(decision) => RunLoopTurnAction::Continue {
+            first_request_decision: Some(decision),
+        },
+        PersistentParkOutcome::End(state) => RunLoopTurnAction::Return(state),
+    }
+}
+
+async fn handle_run_loop_turn_result<Ctx, P, H, M, S>(
     RunLoopTurnResultParams {
         result,
         ctx,
         input_rx,
         message_store,
+        provider,
+        tools,
+        config,
         state_store,
         event_store,
         hooks,
@@ -1776,28 +2059,28 @@ async fn handle_run_loop_turn_result<H, M, S>(
         current_turn,
         provenance,
         usage_limits,
-    }: RunLoopTurnResultParams<'_, H, M, S>,
+    }: RunLoopTurnResultParams<'_, Ctx, P, H, M, S>,
 ) -> RunLoopTurnAction
 where
+    Ctx: Send + Sync + 'static,
+    P: LlmProvider,
     H: AgentHooks,
     M: MessageStore,
     S: StateStore,
 {
     match result {
         InternalTurnResult::Continue { .. } => {
-            if let Err(error) = state_store.save(&ctx.state).await {
-                warn!("Failed to save state checkpoint: {error}");
-            }
-            finish_turn_or_run_state(event_store, &ctx.thread_id, current_turn)
-                .await
-                .map_or_else(std::convert::identity, |()| RunLoopTurnAction::Continue)
+            checkpoint_and_continue(ctx, state_store, event_store, current_turn).await
         }
         InternalTurnResult::Done => {
             if let Some(rx) = input_rx {
-                handle_persistent_done(super::types::PersistentDoneParams {
+                park_persistent_run(super::types::PersistentDoneParams {
                     ctx,
                     rx,
                     message_store,
+                    provider,
+                    tools,
+                    config,
                     state_store,
                     event_store,
                     hooks,
@@ -1808,7 +2091,6 @@ where
                     usage_limits,
                 })
                 .await
-                .map_or(RunLoopTurnAction::Continue, RunLoopTurnAction::Return)
             } else {
                 RunLoopTurnAction::FinishRun
             }
@@ -1998,6 +2280,49 @@ where
     }
 }
 
+/// Terminal state for a cancel honored BETWEEN turns (at the top of the
+/// run loop).
+///
+/// The previous turn (`ctx.turn`) was already finished by the in-loop
+/// result handler, so the terminal event is keyed under the next
+/// (never-started) turn to avoid appending to a closed turn. The synthetic
+/// turn stays unfinished and `turn_count` untouched (see the synthetic
+/// terminal markers note), so a rerun re-enters it without bricking or
+/// consuming an executed turn.
+async fn between_turns_cancelled_state<H, S>(
+    ctx: &TurnContext,
+    event_store: &Arc<dyn EventStore>,
+    state_store: &Arc<S>,
+    hooks: &Arc<H>,
+    authority: &Arc<dyn EventAuthority>,
+) -> AgentRunState
+where
+    H: AgentHooks,
+    S: StateStore,
+{
+    log::info!("Agent run cancelled before turn {}", ctx.turn);
+    #[cfg(feature = "otel")]
+    crate::observability::instrument::record_root_event(
+        "agent.cancelled",
+        vec![
+            crate::observability::attrs::kv(
+                crate::observability::attrs::SDK_CANCEL_REASON,
+                "cancel_token",
+            ),
+            crate::observability::attrs::kv_i64(
+                crate::observability::attrs::SDK_TURN_NUMBER,
+                i64::try_from(ctx.turn).unwrap_or(0),
+            ),
+        ],
+    );
+    let event_turn = ctx.turn.saturating_add(1);
+    if let Err(error) = emit_cancelled_event(ctx, event_store, hooks, authority, event_turn).await {
+        return AgentRunState::Error(error);
+    }
+    persist_terminal_turn_state(ctx, state_store).await;
+    cancelled_run_state(ctx)
+}
+
 pub(super) async fn run_loop_turns<Ctx, P, H, M, S>(
     RunLoopTurnsParams {
         ctx,
@@ -2032,36 +2357,10 @@ where
 {
     loop {
         if cancel_token.is_cancelled() {
-            log::info!("Agent run cancelled before turn {}", ctx.turn);
-            #[cfg(feature = "otel")]
-            crate::observability::instrument::record_root_event(
-                "agent.cancelled",
-                vec![
-                    crate::observability::attrs::kv(
-                        crate::observability::attrs::SDK_CANCEL_REASON,
-                        "cancel_token",
-                    ),
-                    crate::observability::attrs::kv_i64(
-                        crate::observability::attrs::SDK_TURN_NUMBER,
-                        i64::try_from(ctx.turn).unwrap_or(0),
-                    ),
-                ],
+            return Some(
+                between_turns_cancelled_state(ctx, event_store, state_store, hooks, authority)
+                    .await,
             );
-            // The previous turn (`ctx.turn`) was already finished by
-            // the in-loop result handler, so key the terminal event
-            // under the next (never-started) turn to avoid appending to
-            // a closed turn. The synthetic turn stays unfinished and
-            // `turn_count` untouched (see the synthetic terminal markers
-            // note), so a rerun re-enters it without bricking or
-            // consuming an executed turn.
-            let event_turn = ctx.turn.saturating_add(1);
-            if let Err(error) =
-                emit_cancelled_event(ctx, event_store, hooks, authority, event_turn).await
-            {
-                return Some(AgentRunState::Error(error));
-            }
-            persist_terminal_turn_state(ctx, state_store).await;
-            return Some(cancelled_run_state(ctx));
         }
 
         // Evaluate the budget BEFORE dispatching a (billable) LLM turn.
@@ -2125,6 +2424,9 @@ where
             ctx,
             input_rx: input_rx.as_deref_mut(),
             message_store,
+            provider,
+            tools,
+            config,
             state_store,
             event_store,
             hooks,
@@ -2138,8 +2440,16 @@ where
         {
             // The turn completed and the run would continue; the budget
             // check at the top of the loop stops the run before another
-            // (potentially costly) turn is dispatched.
-            RunLoopTurnAction::Continue => {}
+            // (potentially costly) turn is dispatched. A persistent park
+            // that just ingested a fresh injected message hands its
+            // ingestion-time `pre_llm_request` decision to the next turn.
+            RunLoopTurnAction::Continue {
+                first_request_decision,
+            } => {
+                if let Some(decision) = first_request_decision {
+                    ctx.pending_first_request = Some(decision);
+                }
+            }
             RunLoopTurnAction::FinishRun => return None,
             RunLoopTurnAction::Return(state) => return Some(state),
         }
@@ -2580,6 +2890,22 @@ where
     .await
 }
 
+/// Run the looping-mode resume branch when the initialization carried
+/// resume data; `None` when there is nothing to resume or the resume
+/// completed and the run continues.
+async fn maybe_run_resume_branch<Ctx, H, M>(
+    init: &mut InitializedState,
+    deps: RunLoopResumeDeps<'_, Ctx, H, M>,
+) -> Option<AgentRunState>
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+    M: MessageStore,
+{
+    let resume_data = init.resume_data.take()?;
+    run_loop_resume_branch(resume_data, init.turn, &init.total_usage, &init.state, deps).await
+}
+
 async fn run_loop_inner<Ctx, P, H, M, S>(
     RunLoopParameters {
         event_store,
@@ -2632,6 +2958,9 @@ where
         hooks: &hooks,
         authority: &authority,
         provenance: &provenance,
+        provider: &provider,
+        tools: &tools,
+        config: &config,
         usage_limits: config.usage_limits.as_ref(),
         start_time,
         #[cfg(feature = "otel")]
@@ -2643,30 +2972,27 @@ where
         Err(state) => return state,
     };
 
-    if let Some(resume_data) = init.resume_data.take()
-        && let Some(outcome) = run_loop_resume_branch(
-            resume_data,
-            init.turn,
-            &init.total_usage,
-            &init.state,
-            RunLoopResumeDeps {
-                tool_context: &tool_context,
-                thread_id: &thread_id,
-                tools: &tools,
-                hooks: &hooks,
-                event_store: &event_store,
-                authority: &authority,
-                message_store: &message_store,
-                execution_store: execution_store.as_ref(),
-                audit_sink: &audit_sink,
-                provenance: &provenance,
-            },
-        )
-        .await
+    if let Some(outcome) = maybe_run_resume_branch(
+        &mut init,
+        RunLoopResumeDeps {
+            tool_context: &tool_context,
+            thread_id: &thread_id,
+            tools: &tools,
+            hooks: &hooks,
+            event_store: &event_store,
+            authority: &authority,
+            message_store: &message_store,
+            execution_store: execution_store.as_ref(),
+            audit_sink: &audit_sink,
+            provenance: &provenance,
+        },
+    )
+    .await
     {
         return outcome;
     }
 
+    let first_request_decision = init.first_request_decision.take();
     let mut ctx = build_turn_context(
         &thread_id,
         init.turn,
@@ -2676,6 +3002,9 @@ where
         #[cfg(feature = "otel")]
         input_kind,
     );
+    // Fresh-input runs already evaluated `pre_llm_request` at ingestion;
+    // hand the decision to the first turn so the hook fires exactly once.
+    ctx.pending_first_request = first_request_decision;
 
     let default_turn_options = TurnOptions::default();
 
@@ -2893,6 +3222,9 @@ where
             hooks: &hooks,
             authority: &authority,
             provenance: &provenance,
+            provider: &provider,
+            tools: &tools,
+            config: &config,
             usage_limits: config.usage_limits.as_ref(),
             start_time,
             #[cfg(feature = "otel")]
@@ -2952,6 +3284,7 @@ where
         turn: init.turn,
         total_usage: init.total_usage,
         state: init.state,
+        first_request_decision: init.first_request_decision,
         start_time,
         #[cfg(feature = "otel")]
         input_kind,
@@ -2989,6 +3322,8 @@ struct SingleTurnExecuteParams<Ctx, P, H, M, S> {
     turn: usize,
     total_usage: TokenUsage,
     state: AgentState,
+    /// Ingestion-time `pre_llm_request` decision for this (first) call.
+    first_request_decision: Option<PreEvaluatedRequest>,
     start_time: Instant,
     #[cfg(feature = "otel")]
     input_kind: &'static str,
@@ -3019,6 +3354,7 @@ async fn run_single_turn_execute<Ctx, P, H, M, S>(
         turn,
         total_usage,
         state,
+        first_request_decision,
         start_time,
         #[cfg(feature = "otel")]
         input_kind,
@@ -3042,6 +3378,9 @@ where
         #[cfg(feature = "otel")]
         input_kind,
     );
+    // Fresh-input turns already evaluated `pre_llm_request` at ingestion;
+    // hand the decision to this call so the hook fires exactly once.
+    ctx.pending_first_request = first_request_decision;
 
     let current_turn = ctx.turn.saturating_add(1);
 
@@ -3455,12 +3794,20 @@ async fn convert_continue_turn<H: AgentHooks, S: StateStore>(
         );
     }
     let summary = build_turn_summary(&ctx, provenance, turn_options, turn_usage.clone());
-    ConvertedTurn::finish(TurnOutcome::NeedsMoreTurns {
-        turn: ctx.turn,
-        turn_usage,
-        total_usage: ctx.total_usage,
-        summary,
-    })
+    // Same finish-only-on-saved contract as the terminal arms: a
+    // NeedsMoreTurns whose checkpoint failed must leave the turn
+    // unfinished, or the next `run_turn` (whose counter rehydrates from the
+    // stale store) re-enters a finished turn and bricks.
+    ConvertedTurn::gated(
+        TurnOutcome::NeedsMoreTurns {
+            turn: ctx.turn,
+            turn_usage,
+            total_usage: ctx.total_usage,
+            summary,
+        },
+        saved,
+        "turn checkpoint failure",
+    )
 }
 
 /// Single-turn conversion of a mid-turn budget stop (see the looping

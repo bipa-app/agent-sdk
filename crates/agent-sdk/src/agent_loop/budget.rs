@@ -47,6 +47,15 @@ pub(super) fn estimate_cost_usd(provenance: &AuditProvenance, usage: &TokenUsage
 /// gateway lookup scans the three backend catalogs in the gateway's own
 /// `Inner` order (anthropic, openai, gemini) — model ids are disjoint across
 /// catalogs, so the first hit is the wrapped backend's entry.
+///
+/// `record-replay` (`RecordReplayProvider`) wraps an arbitrary inner
+/// provider while preserving the inner model id, so it resolves the same
+/// way. Record mode forwards live billable calls — without the alias,
+/// `max_cost_usd` could never trip on a recorded run. Replay mode bills
+/// nothing but reproduces the recorded responses (and their usage)
+/// deterministically; pricing it identically is deliberate, so replayed
+/// runs exercise the same budget behavior the recording did — the
+/// provenance string does not distinguish the modes.
 fn lookup_capabilities(
     provider: &str,
     model: &str,
@@ -59,7 +68,7 @@ fn lookup_capabilities(
             crate::model_capabilities::get_model_capabilities("anthropic", model)
         }
         "vertex" => crate::model_capabilities::get_model_capabilities("gemini", model),
-        "cloudflare-ai-gateway" => ["anthropic", "openai", "gemini"]
+        "cloudflare-ai-gateway" | "record-replay" => ["anthropic", "openai", "gemini"]
             .into_iter()
             .find_map(|backend| crate::model_capabilities::get_model_capabilities(backend, model)),
         _ => None,
@@ -292,6 +301,62 @@ mod tests {
             &usage,
         )
         .context("gateway gpt-* must resolve to the openai catalog entry")?;
+        assert!((aliased - canonical).abs() < 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn estimate_cost_resolves_record_replay_anthropic_alias() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let usage = TokenUsage {
+            input_tokens: 2_000,
+            output_tokens: 1_000,
+            ..Default::default()
+        };
+        let canonical =
+            estimate_cost_usd(&AuditProvenance::new("anthropic", "claude-fable-5"), &usage)
+                .context("claude-fable-5 has pricing")?;
+        let aliased = estimate_cost_usd(
+            &AuditProvenance::new("record-replay", "claude-fable-5"),
+            &usage,
+        )
+        .context("record-replay claude-* must resolve to the anthropic catalog entry")?;
+        assert!((aliased - canonical).abs() < 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn estimate_cost_resolves_record_replay_openai_alias() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let usage = TokenUsage {
+            input_tokens: 2_000,
+            output_tokens: 1_000,
+            ..Default::default()
+        };
+        let canonical = estimate_cost_usd(&AuditProvenance::new("openai", "gpt-4o"), &usage)
+            .context("gpt-4o has pricing")?;
+        let aliased = estimate_cost_usd(&AuditProvenance::new("record-replay", "gpt-4o"), &usage)
+            .context("record-replay gpt-* must resolve to the openai catalog entry")?;
+        assert!((aliased - canonical).abs() < 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn estimate_cost_resolves_record_replay_gemini_alias() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let usage = TokenUsage {
+            input_tokens: 2_000,
+            output_tokens: 1_000,
+            ..Default::default()
+        };
+        let canonical =
+            estimate_cost_usd(&AuditProvenance::new("gemini", "gemini-3.1-pro"), &usage)
+                .context("gemini-3.1-pro has pricing")?;
+        let aliased = estimate_cost_usd(
+            &AuditProvenance::new("record-replay", "gemini-3.1-pro"),
+            &usage,
+        )
+        .context("record-replay gemini-* must resolve to the gemini catalog entry")?;
         assert!((aliased - canonical).abs() < 1e-12);
         Ok(())
     }

@@ -102,6 +102,10 @@ pub(super) struct TurnContext {
     /// Set by `begin_turn` when approaching the turn limit, then consumed
     /// by `execute_turn_inner` to append a user message to the conversation.
     pub(super) pending_reminder: Option<String>,
+    /// Ingestion-time `pre_llm_request` decision awaiting the run's first
+    /// LLM call; consumed (`take`) by `request_turn_response` so the hook
+    /// is never invoked twice for that call. See [`PreEvaluatedRequest`].
+    pub(super) pending_first_request: Option<PreEvaluatedRequest>,
     // ── Turn summary accumulators ───────────────────────────────────
     //
     // These mirror fields on `agent_sdk_foundation::TurnSummary` and are
@@ -137,11 +141,39 @@ pub(super) struct ResumeData {
 }
 
 /// Result of initializing state from agent input.
+/// The `pre_llm_request` decision produced at fresh-input ingestion time,
+/// carried into the run's FIRST LLM call so the hook fires exactly once per
+/// call.
+///
+/// For fresh `Text` / `Message` input the hook is evaluated against the
+/// request the next turn would send (existing history + the candidate user
+/// message) BEFORE the candidate is durably appended — a `Block` must leave
+/// nothing ingested, or a same-thread rephrase-and-retry would rebuild its
+/// request WITH the blocked content in history and the rejected material
+/// would still reach the provider.
+pub(super) enum PreEvaluatedRequest {
+    /// The hook proceeded: the first turn builds and sends its request
+    /// normally (it may differ from the evaluated request by SDK-added
+    /// content only — compaction summarizing what the hook already saw, or
+    /// a turn-budget reminder) without re-invoking the hook.
+    Proceed,
+    /// The hook returned `Modify`: this replacement is sent as-is for the
+    /// first call. The ORIGINAL user message is what persists, matching
+    /// mid-run `Modify` semantics (the hook shapes the outbound request,
+    /// never the durable history).
+    Modified(Box<crate::llm::ChatRequest>),
+}
+
 pub(super) struct InitializedState {
     pub(super) turn: usize,
     pub(super) total_usage: TokenUsage,
     pub(super) state: AgentState,
     pub(super) resume_data: Option<ResumeData>,
+    /// Ingestion-time `pre_llm_request` decision for the first LLM call.
+    /// `Some` only for fresh `Text` / `Message` input; `None` for
+    /// `Resume` / `Continue` / `SubmitToolResults`, whose first call
+    /// evaluates the hook at turn time as usual.
+    pub(super) first_request_decision: Option<PreEvaluatedRequest>,
 }
 
 /// Outcome of executing a single tool call.
@@ -394,10 +426,16 @@ pub(super) struct RunLoopTurnsParams<'a, Ctx, P, H, M, S> {
     pub(super) observability_store: Option<&'a Arc<dyn crate::observability::ObservabilityStore>>,
 }
 
-pub(super) struct PersistentDoneParams<'a, H, M, S> {
+pub(super) struct PersistentDoneParams<'a, Ctx, P, H, M, S> {
     pub(super) ctx: &'a TurnContext,
     pub(super) rx: &'a mut mpsc::Receiver<AgentInput>,
     pub(super) message_store: &'a Arc<M>,
+    /// Provider / tools / config for the injected-input `pre_llm_request`
+    /// guard, which evaluates the hook BEFORE the injected message is
+    /// durably appended (the same seam as fresh-input initialization).
+    pub(super) provider: &'a Arc<P>,
+    pub(super) tools: &'a Arc<ToolRegistry<Ctx>>,
+    pub(super) config: &'a AgentConfig,
     /// State store, needed so a terminal event keyed under a synthetic
     /// (never-executed) turn can persist the advanced `turn_count`.
     pub(super) state_store: &'a Arc<S>,
@@ -416,11 +454,16 @@ pub(super) struct PersistentDoneParams<'a, H, M, S> {
     pub(super) usage_limits: Option<&'a UsageLimits>,
 }
 
-pub(super) struct RunLoopTurnResultParams<'a, H, M, S> {
+pub(super) struct RunLoopTurnResultParams<'a, Ctx, P, H, M, S> {
     pub(super) result: InternalTurnResult,
     pub(super) ctx: &'a TurnContext,
     pub(super) input_rx: Option<&'a mut mpsc::Receiver<AgentInput>>,
     pub(super) message_store: &'a Arc<M>,
+    /// Forwarded into the persistent-mode `Done` handler for the
+    /// injected-input `pre_llm_request` guard.
+    pub(super) provider: &'a Arc<P>,
+    pub(super) tools: &'a Arc<ToolRegistry<Ctx>>,
+    pub(super) config: &'a AgentConfig,
     pub(super) state_store: &'a Arc<S>,
     pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) hooks: &'a Arc<H>,

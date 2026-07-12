@@ -2803,22 +2803,31 @@ where
     M: MessageStore,
     S: StateStore,
 {
-    // Input guardrail (`pre_llm_request`): runs once per turn, before the
-    // retry-wrapped chat call. `DefaultHooks` proceeds unchanged.
-    let request = match super::llm::apply_pre_llm_request(hooks, request).await {
-        super::llm::PreLlmGuardrail::Proceed(request) => *request,
-        super::llm::PreLlmGuardrail::Blocked(reason) => {
-            return Err(guardrail_block_result(
-                &ctx.thread_id,
-                ctx.turn,
-                event_store,
-                hooks,
-                authority,
-                "request",
-                &reason,
-            )
-            .await);
-        }
+    // Input guardrail (`pre_llm_request`): runs once per LLM call, before
+    // the retry-wrapped chat dispatch. For the FIRST call after fresh
+    // `Text` / `Message` input the hook already ran at ingestion time —
+    // BEFORE the user message was durably appended, so a Block left nothing
+    // in history — and its decision is consumed here instead of
+    // re-invoking the hook (exactly once per call). Every later call
+    // evaluates the hook against the turn-built request as usual.
+    let request = match ctx.pending_first_request.take() {
+        Some(super::types::PreEvaluatedRequest::Proceed) => request,
+        Some(super::types::PreEvaluatedRequest::Modified(modified)) => *modified,
+        None => match super::llm::apply_pre_llm_request(hooks, request).await {
+            super::llm::PreLlmGuardrail::Proceed(request) => *request,
+            super::llm::PreLlmGuardrail::Blocked(reason) => {
+                return Err(guardrail_block_result(
+                    &ctx.thread_id,
+                    ctx.turn,
+                    event_store,
+                    hooks,
+                    authority,
+                    "request",
+                    &reason,
+                )
+                .await);
+            }
+        },
     };
 
     let mut message_id = uuid::Uuid::new_v4().to_string();
