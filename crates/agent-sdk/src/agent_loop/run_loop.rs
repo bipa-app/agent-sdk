@@ -1748,14 +1748,31 @@ enum PersistentParkOutcome {
 /// turn would send BEFORE the injected message is durably appended, so a
 /// `Block` ends the run with the block error and NOTHING ingested — the
 /// rejected content can never poison a later turn's context.
+/// Borrowed plumbing for [`ingest_injected_message`], grouped so the
+/// ingestion seam stays under the argument ceiling.
+struct InjectedIngestParams<'a, Ctx, P, H, M> {
+    ctx: &'a TurnContext,
+    message_store: &'a Arc<M>,
+    provider: &'a Arc<P>,
+    tools: &'a Arc<ToolRegistry<Ctx>>,
+    config: &'a AgentConfig,
+    hooks: &'a Arc<H>,
+    event_store: &'a Arc<dyn EventStore>,
+    authority: &'a Arc<dyn EventAuthority>,
+}
+
 async fn ingest_injected_message<Ctx, P, H, M>(
     candidate: Message,
-    ctx: &TurnContext,
-    message_store: &Arc<M>,
-    provider: &Arc<P>,
-    tools: &Arc<ToolRegistry<Ctx>>,
-    config: &AgentConfig,
-    hooks: &Arc<H>,
+    InjectedIngestParams {
+        ctx,
+        message_store,
+        provider,
+        tools,
+        config,
+        hooks,
+        event_store,
+        authority,
+    }: InjectedIngestParams<'_, Ctx, P, H, M>,
 ) -> PersistentParkOutcome
 where
     Ctx: Send + Sync + 'static,
@@ -1780,6 +1797,25 @@ where
                 "Injected message rejected before ingestion: {}",
                 error.message
             );
+            // Mirror the fresh-input seam: streaming consumers need the
+            // block error on the event stream too, keyed under the next,
+            // never-executed turn (best-effort — the block error itself
+            // must surface regardless).
+            if let Err(send_error) = send_event(
+                event_store,
+                &ctx.thread_id,
+                ctx.turn.saturating_add(1),
+                hooks,
+                authority,
+                AgentEvent::error(error.message.clone(), error.recoverable),
+            )
+            .await
+            {
+                warn!(
+                    "Failed to emit injected-message guardrail event: {}",
+                    send_error.message
+                );
+            }
             return PersistentParkOutcome::End(AgentRunState::Error(error));
         }
     };
@@ -1854,24 +1890,32 @@ where
                 Some(AgentInput::Text(text)) => {
                     ingest_injected_message(
                         Message::user(&text),
-                        ctx,
-                        message_store,
-                        provider,
-                        tools,
-                        config,
-                        hooks,
+                        InjectedIngestParams {
+                            ctx,
+                            message_store,
+                            provider,
+                            tools,
+                            config,
+                            hooks,
+                            event_store,
+                            authority,
+                        },
                     )
                     .await
                 }
                 Some(AgentInput::Message(blocks)) => {
                     ingest_injected_message(
                         Message::user_with_content(blocks),
-                        ctx,
-                        message_store,
-                        provider,
-                        tools,
-                        config,
-                        hooks,
+                        InjectedIngestParams {
+                            ctx,
+                            message_store,
+                            provider,
+                            tools,
+                            config,
+                            hooks,
+                            event_store,
+                            authority,
+                        },
                     )
                     .await
                 }

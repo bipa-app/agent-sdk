@@ -140,7 +140,6 @@ pub(super) struct ResumeData {
     pub(super) rejection_reason: Option<String>,
 }
 
-/// Result of initializing state from agent input.
 /// The `pre_llm_request` decision produced at fresh-input ingestion time,
 /// carried into the run's FIRST LLM call so the hook fires exactly once per
 /// call.

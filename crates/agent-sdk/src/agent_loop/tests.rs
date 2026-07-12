@@ -8932,6 +8932,16 @@ async fn test_persistent_injected_blocked_prompt_not_ingested() -> anyhow::Resul
         "the blocked injected message must never be appended",
     );
     assert_eq!(agent.provider.calls(), 1, "only turn 1's call was paid");
+    // Streaming consumers get the block on the event stream too, keyed
+    // under the next, never-executed turn (mirroring the fresh-input seam).
+    let events = agent.event_store.get_events(&thread_id).await?;
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.event,
+            AgentEvent::Error { message, .. } if message.contains("blocked by guardrail")
+        )),
+        "the block error must reach the event stream",
+    );
 
     Ok(())
 }
