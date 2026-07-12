@@ -9133,6 +9133,57 @@ impl crate::tools::Tool<()> for LeakyContextTool {
     }
 }
 
+/// Like [`LeakyContextTool`], but the leaked clone keeps *emitting events*
+/// in a hot loop — the starvation case where the tee channel is ready on
+/// every poll and would starve a naive readiness check of the completion
+/// signal.
+struct AppendingLeakTool;
+
+impl crate::tools::Tool<()> for AppendingLeakTool {
+    type Name = LeakyToolName;
+
+    fn name(&self) -> LeakyToolName {
+        LeakyToolName::Leaky
+    }
+
+    fn display_name(&self) -> &'static str {
+        "AppendingLeak"
+    }
+
+    fn description(&self) -> &'static str {
+        "Leaks a ToolContext clone that keeps emitting events."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        json!({ "type": "object", "properties": {} })
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Observe
+    }
+
+    async fn execute(
+        &self,
+        ctx: &ToolContext<()>,
+        _input: serde_json::Value,
+    ) -> anyhow::Result<ToolResult> {
+        let leaked = ctx.clone();
+        tokio::spawn(async move {
+            loop {
+                if leaked
+                    .emit_event(AgentEvent::text("leak", "still here"))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+        Ok(ToolResult::success("leaked"))
+    }
+}
+
 #[tokio::test]
 async fn test_run_stream_ends_despite_leaked_tool_context_clone() -> anyhow::Result<()> {
     use futures::StreamExt as _;
@@ -9167,6 +9218,51 @@ async fn test_run_stream_ends_despite_leaked_tool_context_clone() -> anyhow::Res
     )
     .await
     .context("the event stream must end even though a sender clone leaked")?;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Done { .. })),
+        "the terminal Done event must still be delivered",
+    );
+    let state = run_stream.final_state.await?;
+    assert!(matches!(state, AgentRunState::Done { .. }));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_stream_ends_despite_actively_appending_leaked_clone() -> anyhow::Result<()> {
+    use futures::StreamExt as _;
+
+    // The starvation case: the leaked clone keeps the tee channel READY on
+    // every poll, so the stream must observe the completion signal before
+    // channel readiness (and close the receiver) or collect() never ends.
+    let mut tools = ToolRegistry::new();
+    tools.register(AppendingLeakTool);
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![
+            MockProvider::tool_use_response("call_1", "leaky", json!({})),
+            MockProvider::text_response("done despite the noisy leak"),
+        ]))
+        .tools(tools)
+        .hooks(AllowAllHooks)
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let run_stream = agent.run_stream(
+        ThreadId::new(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    let events: Vec<AgentEvent> = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        run_stream.events.collect(),
+    )
+    .await
+    .context("the stream must end even while a leaked clone keeps appending")?;
     assert!(
         events
             .iter()

@@ -353,24 +353,28 @@ impl Stream for RunEventStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        loop {
-            // Buffered events always win over the completion signal so the
-            // terminal event can never be dropped by the early close.
-            match this.rx.poll_recv(cx) {
-                Poll::Ready(Some(event)) => return Poll::Ready(Some(event)),
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Pending => {}
-            }
-            if this.draining {
-                // The run completed and the channel is drained: end the
-                // stream even if a leaked sender clone keeps it open.
-                return Poll::Ready(None);
-            }
-            match this.run_completed.as_mut().poll(cx) {
-                // Re-poll the channel once more: an event forwarded just
-                // before the signal fired may have raced in.
-                Poll::Ready(()) => this.draining = true,
-                Poll::Pending => return Poll::Pending,
+        // Observe run completion BEFORE the channel: a leaked sender clone
+        // that keeps appending would otherwise hold the channel ready on
+        // every poll and starve the completion signal forever. Closing the
+        // receiver stops any further sends while the already-buffered
+        // (finite) events — including the terminal one, which the run task
+        // forwards before firing the signal — still drain below.
+        if !this.draining && this.run_completed.as_mut().poll(cx).is_ready() {
+            this.draining = true;
+            this.rx.close();
+        }
+        match this.rx.poll_recv(cx) {
+            Poll::Ready(Some(event)) => Poll::Ready(Some(event)),
+            Poll::Ready(None) => Poll::Ready(None),
+            // Reachable only while the run is live (both the token and the
+            // channel registered wakers above); a closed, drained channel
+            // reports `None` from `poll_recv` itself.
+            Poll::Pending => {
+                if this.draining {
+                    Poll::Ready(None)
+                } else {
+                    Poll::Pending
+                }
             }
         }
     }
