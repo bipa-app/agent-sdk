@@ -2942,10 +2942,11 @@ FROM agent_sdk_tasks
 WHERE status = 'running'
   AND lease_expires_at <= $1
 ORDER BY lease_expires_at, id
-LIMIT 256
+LIMIT $2
 FOR UPDATE SKIP LOCKED
 ",
             now,
+            i64::try_from(agent_server::journal::store::LEASE_RELEASE_BATCH).unwrap_or(i64::MAX),
         )
         .fetch_all(&mut *tx)
         .await
@@ -3387,6 +3388,96 @@ FOR UPDATE SKIP LOCKED
         Ok((new_parent, prepared))
     }
 
+    async fn find_subagent_invocation_for_child_root(
+        &self,
+        child_root_id: &AgentTaskId,
+    ) -> Result<Option<AgentTask>> {
+        // Read-only counterpart of `resume_linked_subagent_invocation_tx`:
+        // same linkage predicate, no transition, no row lock.
+        let record = sqlx::query_as!(
+            TaskRecord,
+            r"
+SELECT
+    id,
+    kind,
+    status,
+    parent_id,
+    root_id,
+    depth,
+    thread_id,
+    submitted_input_json,
+    caller_metadata_json,
+    worker_id,
+    lease_id,
+    lease_expires_at,
+    last_heartbeat_at,
+    state_json,
+    attempt,
+    max_attempts,
+    last_error,
+    pending_child_count,
+    spawn_index,
+    result_payload,
+    otel_traceparent,
+    created_at,
+    updated_at,
+    completed_at
+FROM agent_sdk_tasks
+WHERE kind = 'subagent'
+  AND status = 'waiting_on_children'
+  AND state_json -> 'invocation' ->> 'child_root_task_id' = $1
+",
+            child_root_id.as_str(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| {
+            format!("find_subagent_invocation_for_child_root: lookup for {child_root_id}")
+        })?;
+        record.map(TryInto::try_into).transpose()
+    }
+
+    async fn list_parked_subagent_invocations(&self) -> Result<Vec<AgentTask>> {
+        let records = sqlx::query_as!(
+            TaskRecord,
+            r"
+SELECT
+    id,
+    kind,
+    status,
+    parent_id,
+    root_id,
+    depth,
+    thread_id,
+    submitted_input_json,
+    caller_metadata_json,
+    worker_id,
+    lease_id,
+    lease_expires_at,
+    last_heartbeat_at,
+    state_json,
+    attempt,
+    max_attempts,
+    last_error,
+    pending_child_count,
+    spawn_index,
+    result_payload,
+    otel_traceparent,
+    created_at,
+    updated_at,
+    completed_at
+FROM agent_sdk_tasks
+WHERE kind = 'subagent'
+  AND status = 'waiting_on_children'
+ORDER BY created_at, id
+",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("list parked subagent invocations")?;
+        records.into_iter().map(TryInto::try_into).collect()
+    }
+
     async fn complete_task(
         &self,
         child_id: &AgentTaskId,
@@ -3530,6 +3621,26 @@ FOR UPDATE SKIP LOCKED
         // queued successors.
         for thread_id in &cancelled_root_threads {
             Self::promote_next_queued_root_tx(&mut tx, thread_id, now).await?;
+        }
+
+        // Mid-tree cancel: when the cancelled subtree hangs under a
+        // parent OUTSIDE the subtree (e.g. the host's subagent-deadline
+        // sweep cancelling a parked root's tool children), recompute
+        // that parked parent's pending_child_count so it resumes —
+        // mirroring the in-memory store, whose per-row cancel
+        // propagates every terminal transition to the row's parent.
+        // Only the subtree's TOP row can have an out-of-subtree parent
+        // (every deeper row's parent lies inside the subtree and is
+        // itself cancelled), so one propagation suffices. Taking the
+        // parent lock after the child updates preserves the
+        // child-then-parent lock order the deepest-first cancel loop
+        // establishes.
+        if transitioned.first().is_some_and(|id| id == root_id)
+            && let Some(cancelled_top) = Self::load_task_tx(&mut tx, root_id, false).await?
+            && cancelled_top.parent_id.is_some()
+        {
+            Self::propagate_terminal_to_parent_tx(&mut tx, &cancelled_top, now, "cancel_tree")
+                .await?;
         }
 
         tx.commit().await.context("commit cancel_tree")?;

@@ -2453,16 +2453,18 @@ impl AgentTaskStore for SqliteDurableStore {
         let mut tx = self.begin().await?;
         // Bound the sweep to a batch so a mass worker outage cannot turn
         // one sweep into a giant transaction that locks every expired
-        // task at once; subsequent sweep ticks drain the remainder.
+        // task at once; the host's drain loop (and any other caller)
+        // keeps calling until a pass returns fewer than the batch.
         let expired = sqlx::query_as::<_, TaskRecord>(concat!(
             "SELECT ",
             task_columns!(),
             " FROM agent_sdk_tasks \
              WHERE status = 'running' AND lease_expires_at <= ?1 \
              ORDER BY lease_expires_at, id \
-             LIMIT 256",
+             LIMIT ?2",
         ))
         .bind(now)
+        .bind(i64::try_from(agent_server::journal::store::LEASE_RELEASE_BATCH).unwrap_or(i64::MAX))
         .fetch_all(&mut *tx)
         .await
         .context("load expired leases")?;
@@ -2965,6 +2967,43 @@ impl AgentTaskStore for SqliteDurableStore {
         Ok((new_parent, prepared))
     }
 
+    async fn find_subagent_invocation_for_child_root(
+        &self,
+        child_root_id: &AgentTaskId,
+    ) -> Result<Option<AgentTask>> {
+        // Read-only counterpart of `resume_linked_subagent_invocation_tx`:
+        // same linkage predicate, no transition, pool-level read.
+        let record = sqlx::query_as::<_, TaskRecord>(concat!(
+            "SELECT ",
+            task_columns!(),
+            " FROM agent_sdk_tasks \
+             WHERE kind = 'subagent' \
+               AND status = 'waiting_on_children' \
+               AND json_extract(state_json, '$.invocation.child_root_task_id') = ?1",
+        ))
+        .bind(child_root_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| {
+            format!("find_subagent_invocation_for_child_root: lookup for {child_root_id}")
+        })?;
+        record.map(TryInto::try_into).transpose()
+    }
+
+    async fn list_parked_subagent_invocations(&self) -> Result<Vec<AgentTask>> {
+        let records = sqlx::query_as::<_, TaskRecord>(concat!(
+            "SELECT ",
+            task_columns!(),
+            " FROM agent_sdk_tasks \
+             WHERE kind = 'subagent' AND status = 'waiting_on_children' \
+             ORDER BY created_at, id",
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .context("list parked subagent invocations")?;
+        records.into_iter().map(TryInto::try_into).collect()
+    }
+
     async fn complete_task(
         &self,
         child_id: &AgentTaskId,
@@ -3094,6 +3133,23 @@ impl AgentTaskStore for SqliteDurableStore {
         // queued successors.
         for thread_id in &cancelled_root_threads {
             Self::promote_next_queued_root_tx(&mut tx, thread_id, now).await?;
+        }
+
+        // Mid-tree cancel: when the cancelled subtree hangs under a
+        // parent OUTSIDE the subtree (e.g. the host's subagent-deadline
+        // sweep cancelling a parked root's tool children), recompute
+        // that parked parent's pending_child_count so it resumes —
+        // mirroring the in-memory store, whose per-row cancel
+        // propagates every terminal transition to the row's parent.
+        // Only the subtree's TOP row can have an out-of-subtree parent
+        // (every deeper row's parent lies inside the subtree and is
+        // itself cancelled), so one propagation suffices.
+        if transitioned.first().is_some_and(|id| id == root_id)
+            && let Some(cancelled_top) = Self::load_task_tx(&mut tx, root_id).await?
+            && cancelled_top.parent_id.is_some()
+        {
+            Self::propagate_terminal_to_parent_tx(&mut tx, &cancelled_top, now, "cancel_tree")
+                .await?;
         }
 
         tx.commit().await.context("commit cancel_tree")?;

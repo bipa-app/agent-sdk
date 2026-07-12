@@ -361,6 +361,17 @@ mod in_memory_bundle {
                 .spawn_subagent_batch(parent_id, worker, lease, spawns, payload, now)
                 .await
         }
+        async fn find_subagent_invocation_for_child_root(
+            &self,
+            child_root_id: &AgentTaskId,
+        ) -> Result<Option<AgentTask>> {
+            self.task
+                .find_subagent_invocation_for_child_root(child_root_id)
+                .await
+        }
+        async fn list_parked_subagent_invocations(&self) -> Result<Vec<AgentTask>> {
+            self.task.list_parked_subagent_invocations().await
+        }
         async fn complete_task(
             &self,
             task_id: &AgentTaskId,

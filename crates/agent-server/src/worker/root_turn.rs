@@ -354,7 +354,46 @@ pub async fn fail_root_turn(
 ) -> Result<AgentTask> {
     // Best-effort close any open turn attempts for this task.
     best_effort_close_open_attempts(task_id, deps.attempt_store, now).await;
+    fail_root_turn_inner(task_id, worker_id, lease_id, thread_id, error, deps, now).await
+}
 
+/// [`fail_root_turn`] without the open-attempt pre-close, for callers
+/// that fail a root turn whose worker is still LIVE in this process —
+/// the host's subagent-timeout heartbeat path.
+///
+/// The pre-close would race the live worker: in the window between a
+/// successful stream and `commit_completed_turn`, closing its open
+/// attempt as `Cancelled` with zero tokens both clobbers the
+/// real-usage close (the billing source of truth on attempt rows) and
+/// makes the in-transaction close hit `AlreadyClosed`, aborting the
+/// whole commit. The live worker's own abort path (mid-stream cancel
+/// close, or its terminal commit) owns its attempts; this variant only
+/// performs the durable fail + error event.
+///
+/// # Errors
+///
+/// Same envelope as [`fail_root_turn`].
+pub async fn fail_root_turn_leaving_attempts_open(
+    task_id: &AgentTaskId,
+    worker_id: &WorkerId,
+    lease_id: &LeaseId,
+    thread_id: &agent_sdk_foundation::ThreadId,
+    error: &anyhow::Error,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<AgentTask> {
+    fail_root_turn_inner(task_id, worker_id, lease_id, thread_id, error, deps, now).await
+}
+
+async fn fail_root_turn_inner(
+    task_id: &AgentTaskId,
+    worker_id: &WorkerId,
+    lease_id: &LeaseId,
+    thread_id: &agent_sdk_foundation::ThreadId,
+    error: &anyhow::Error,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<AgentTask> {
     let error_msg = format!("{error:#}");
     let (failed_task, _parent) = deps
         .task_store
@@ -678,7 +717,12 @@ pub async fn revert_steering_wake(
 /// Iterates all attempts and closes any that are still open with the
 /// `Cancelled` outcome. Errors are swallowed — the caller's primary
 /// operation (fail or cancel) takes precedence.
-async fn best_effort_close_open_attempts(
+///
+/// Public for the service host's force-drop path (issue #299): when an
+/// execution future ignores cancellation past the abort grace and is
+/// dropped, no live worker remains to close the attempts the drop
+/// orphaned, so the host settles them with the same best-effort close.
+pub async fn best_effort_close_open_attempts(
     task_id: &AgentTaskId,
     attempt_store: &dyn TurnAttemptStore,
     now: OffsetDateTime,
@@ -932,12 +976,16 @@ fn staged_or_recovery_snapshot(inputs: &RootWorkerInputs) -> serde_json::Value {
 /// completed prefix of the cancelled turn from the in-memory staged
 /// buffer, then let the caller propagate the original cancel error.
 ///
-/// Guarded on a fresh re-read of the task row: only a task whose durable
-/// status is [`TaskStatus::Cancelled`] may consume this turn number. A
-/// lease-lost requeue (the row bounced back to `Pending` / was
-/// re-acquired) is left untouched so the new lease holder owns turn `N`.
-/// Every error is logged and swallowed — a partial-commit failure must
-/// never mask the cancellation the caller is about to surface.
+/// Guarded on a fresh re-read of the task row: only a task whose
+/// durable status is already terminal — [`TaskStatus::Cancelled`]
+/// (external `cancel_tree`) or [`TaskStatus::Failed`] (the host's
+/// subagent-timeout path fails the row durably, then trips the same
+/// per-task token) — may consume this turn number, because no future
+/// lease holder can exist for a terminal row. A lease-lost requeue
+/// (the row bounced back to `Pending` / was re-acquired) is left
+/// untouched so the new lease holder owns turn `N`. Every error is
+/// logged and swallowed — a partial-commit failure must never mask
+/// the cancellation the caller is about to surface.
 async fn commit_cancelled_partial_turn(
     inputs: &RootWorkerInputs,
     candidate: Vec<llm::Message>,
@@ -948,8 +996,8 @@ async fn commit_cancelled_partial_turn(
     let thread_id = &inputs.bootstrap.thread_id;
 
     match deps.task_store.get(task_id).await {
-        Ok(Some(task)) if task.status == TaskStatus::Cancelled => {}
-        // Not cancelled (lease-lost requeue), missing, or unreadable:
+        Ok(Some(task)) if matches!(task.status, TaskStatus::Cancelled | TaskStatus::Failed) => {}
+        // Not terminal (lease-lost requeue), missing, or unreadable:
         // do not partial-commit — a re-run will own turn N.
         Ok(_) => return,
         Err(error) => {
@@ -2005,6 +2053,23 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
         // Tag the error with the cancel marker so the caller that owns
         // the staged buffer commits the completed prefix (seam B).
         if deps.is_cancelled() {
+            // The current attempt row is OPEN but never started
+            // streaming (this fires on entry — e.g. a subagent
+            // deadline landing between `open_attempt` and the first
+            // poll — and between retries). Nothing streamed, so a
+            // zero-usage Cancelled close is honest, and no later path
+            // owns this row: the host's timeout fail deliberately
+            // leaves live-worker attempts open for THIS code to
+            // close, and the task is already terminal so the normal
+            // commit-path close never runs. Without this close the
+            // row would stay OPEN forever in the billing/audit trail.
+            close_attempt_with(
+                &attempt,
+                TurnAttemptOutcome::Cancelled,
+                deps.attempt_store,
+                OffsetDateTime::now_utc(),
+            )
+            .await;
             return Err(anyhow::Error::new(RootTurnCancelledMarker)
                 .context("root turn cancelled before LLM attempt"));
         }

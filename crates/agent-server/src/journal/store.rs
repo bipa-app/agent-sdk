@@ -332,6 +332,17 @@ impl From<anyhow::Error> for SubmitRootTurnError {
     }
 }
 
+/// Maximum rows one [`AgentTaskStore::release_expired_leases`] call
+/// reclaims.
+///
+/// Uniform across every backend so callers can drain a backlog with a
+/// simple "loop until a call returns fewer than this" contract: the
+/// SQL backends bound their sweep transaction with `LIMIT` (a mass
+/// worker outage must not lock every expired task at once) and the
+/// in-memory reference store applies the same cap so the drain
+/// contract is testable without a database.
+pub const LEASE_RELEASE_BATCH: usize = 256;
+
 /// Shared shape gate for root-turn admission.
 ///
 /// Both [`AgentTaskStore::submit_root_turn`] and
@@ -783,6 +794,12 @@ pub trait AgentTaskStore: Send + Sync {
     /// so callers can log and react per-outcome without a second
     /// round trip to `get()`.
     ///
+    /// Each call reclaims at most [`LEASE_RELEASE_BATCH`] rows (in
+    /// expiry order) so a mass worker outage cannot turn one sweep
+    /// into a giant write set that locks every expired task at once.
+    /// A caller draining a backlog must loop until a call returns
+    /// fewer than [`LEASE_RELEASE_BATCH`] records.
+    ///
     /// # Errors
     /// Returns an error if a release or fail-closed transition, or
     /// the underlying store write, fails.
@@ -1119,6 +1136,51 @@ pub trait AgentTaskStore: Send + Sync {
         payload: SuspensionPayload,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Vec<(AgentTask, AgentTask)>)>;
+
+    /// Find the parked [`TaskKind::Subagent`] invocation whose durable
+    /// [`crate::journal::TaskState::SubagentInvocation`] linkage points
+    /// at `child_root_id`.
+    ///
+    /// This is the read-only counterpart of the terminal-transition
+    /// wake path (`resume_linked_subagent_invocation` in each backend):
+    /// it returns the invocation row only while it is still
+    /// [`TaskStatus::WaitingOnChildren`] on that child root — exactly
+    /// the window in which the child-thread root can be live. Once the
+    /// child root reaches a terminal state and the invocation has been
+    /// woken, the linkage is consumed and this returns `None`.
+    ///
+    /// The service host uses this at child-root acquisition time to
+    /// read the resolved `spec.timeout_ms` off the invocation and
+    /// derive the child's wall-clock execution deadline without any
+    /// schema addition — a re-acquiring worker (crash, lease expiry)
+    /// re-resolves the same deadline from the same durable rows.
+    ///
+    /// # Errors
+    /// Returns an error only for store-level read failures. "No linked
+    /// invocation" (plain root turns, already-woken invocations) is
+    /// `Ok(None)`, not an error.
+    async fn find_subagent_invocation_for_child_root(
+        &self,
+        child_root_id: &AgentTaskId,
+    ) -> Result<Option<AgentTask>>;
+
+    /// List every [`TaskKind::Subagent`] invocation currently parked in
+    /// [`TaskStatus::WaitingOnChildren`], ordered by `(created_at, id)`.
+    ///
+    /// This is the candidate feed for the host's subagent-deadline
+    /// sweep (issue #299): an invocation stays `WaitingOnChildren` for
+    /// its linked child root's whole lifetime, so this listing covers
+    /// every live child regardless of the child's own state. Compared
+    /// to `list_by_status(WaitingOnChildren)` + a client-side kind
+    /// filter, the kind predicate is pushed into the store so the
+    /// sweep never materializes unrelated parked parents (whose
+    /// `state_json` continuations dominate row size) — the SQL
+    /// backends serve this from the status index plus the kind
+    /// predicate.
+    ///
+    /// # Errors
+    /// Returns an error only for store-level read failures.
+    async fn list_parked_subagent_invocations(&self) -> Result<Vec<AgentTask>>;
 
     /// Transition a running child to [`TaskStatus::Completed`] and,
     /// under the same write lock, recompute the parent's
@@ -2749,14 +2811,18 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         let mut inner = self.inner.write().await;
 
         // Walk the lease-expiry index in ascending order, collecting
-        // every row whose expiry is `<= now`. Iteration stops on the
-        // first still-live lease, so the sweep cost is O(expired).
+        // rows whose expiry is `<= now`. Iteration stops on the first
+        // still-live lease, so the sweep cost is O(expired) — and is
+        // capped at [`LEASE_RELEASE_BATCH`] rows per call, matching the
+        // SQL backends' `LIMIT`, so the drain contract ("loop until a
+        // call returns fewer than the batch") holds on every backend.
         // Collecting up-front lets us mutate `inner` inside the loop
         // without fighting the borrow checker.
         let expired_keys: Vec<(OffsetDateTime, AgentTaskId)> = inner
             .leased_by_expiry
             .iter()
             .take_while(|(expires_at, _)| *expires_at <= now)
+            .take(LEASE_RELEASE_BATCH)
             .cloned()
             .collect();
 
@@ -3304,6 +3370,52 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
 
         drop(inner);
         Ok((new_parent, prepared))
+    }
+
+    async fn find_subagent_invocation_for_child_root(
+        &self,
+        child_root_id: &AgentTaskId,
+    ) -> Result<Option<AgentTask>> {
+        let inner = self.inner.read().await;
+        // The Phase 7.6 reverse index is a hint; the row state is
+        // authoritative (same contract as
+        // `resume_linked_subagent_invocation`). Verify kind, parked
+        // status, and the linkage before returning the row so a stale
+        // index entry can never surface a woken or repurposed
+        // invocation.
+        let invocation = inner
+            .invocation_by_child_root
+            .get(child_root_id)
+            .and_then(|invocation_id| inner.by_id.get(invocation_id));
+        let linked = invocation.is_some_and(|invocation| {
+            invocation.kind == TaskKind::Subagent
+                && invocation.status == TaskStatus::WaitingOnChildren
+                && invocation
+                    .state
+                    .subagent_invocation()
+                    .is_some_and(|state| state.child_root_task_id == *child_root_id)
+        });
+        let result = if linked { invocation.cloned() } else { None };
+        drop(inner);
+        Ok(result)
+    }
+
+    async fn list_parked_subagent_invocations(&self) -> Result<Vec<AgentTask>> {
+        let inner = self.inner.read().await;
+        let mut result: Vec<AgentTask> = inner
+            .by_status
+            .get(&TaskStatus::WaitingOnChildren)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| inner.by_id.get(id))
+            .filter(|task| task.kind == TaskKind::Subagent)
+            .cloned()
+            .collect();
+        drop(inner);
+        // `by_status` is hash-ordered; sort to the SQL backends'
+        // deterministic `(created_at, id)` order.
+        result.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        Ok(result)
     }
 
     async fn complete_task(
@@ -5885,6 +5997,52 @@ mod tests {
             .await
             .context("sweep idempotent")?;
         assert!(released.is_empty());
+        Ok(())
+    }
+
+    /// Issue #299 round 4: every backend reclaims at most
+    /// [`LEASE_RELEASE_BATCH`] rows per call (the SQL backends via
+    /// `LIMIT`, this reference store via the same cap) so the host's
+    /// drain loop has one uniform "keep calling until a pass returns
+    /// fewer than the batch" contract.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn release_expired_leases_caps_each_call_at_the_batch_size() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let backlog = LEASE_RELEASE_BATCH + 44;
+        for index in 0..backlog {
+            let root = AgentTask::new_root_turn(thread(&format!("t-batch-{index}")), t0(), 3);
+            let id = root.id.clone();
+            store.submit_root_turn(root).await.context("submit")?;
+            store
+                .try_acquire_task(
+                    &id,
+                    WorkerId::from_string(format!("w-{index}")),
+                    LeaseId::new(),
+                    t_plus(5),
+                    t_plus(1),
+                )
+                .await
+                .context("acquire")?
+                .context("row claims")?;
+        }
+
+        // Every lease is expired at t+10; one call reclaims exactly one
+        // batch, the next reclaims the remainder, the third is empty.
+        let first = store
+            .release_expired_leases(t_plus(10))
+            .await
+            .context("first sweep")?;
+        assert_eq!(first.len(), LEASE_RELEASE_BATCH);
+        let second = store
+            .release_expired_leases(t_plus(10))
+            .await
+            .context("second sweep")?;
+        assert_eq!(second.len(), 44);
+        let third = store
+            .release_expired_leases(t_plus(10))
+            .await
+            .context("third sweep")?;
+        assert!(third.is_empty());
         Ok(())
     }
 

@@ -820,6 +820,202 @@ mod tests {
         Ok(())
     }
 
+    /// Reverse linkage read (issue #299): while a subagent child-thread
+    /// root is live, `find_subagent_invocation_for_child_root` must
+    /// return the parked invocation carrying the resolved spec (the
+    /// host reads `spec.timeout_ms` off it to derive the child's
+    /// wall-clock deadline). Unlinked ids resolve to `None`, and the
+    /// window closes once the child root goes terminal and the
+    /// invocation has been woken — on every backend.
+    async fn test_find_invocation_for_child_root(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
+    ) -> Result<()> {
+        let (parent, invocation, child_root) =
+            spawn_subagent_fixture(task_store, thread_store, "conformance-subagent-linkage")
+                .await?;
+
+        let found = task_store
+            .find_subagent_invocation_for_child_root(&child_root.id)
+            .await?
+            .context("linkage lookup must find the parked invocation while the child is live")?;
+        assert_eq!(found.id, invocation.id);
+        let spec_timeout_ms = found
+            .state
+            .subagent_invocation()
+            .context("found invocation must carry the durable spec linkage")?
+            .spec
+            .timeout_ms;
+        assert_eq!(
+            spec_timeout_ms, 15_000,
+            "the resolved spec timeout must be readable through the linkage",
+        );
+
+        // The parent root is not a linked child root.
+        assert!(
+            task_store
+                .find_subagent_invocation_for_child_root(&parent.id)
+                .await?
+                .is_none(),
+            "unlinked task ids must resolve to None",
+        );
+
+        // Terminal child root wakes the invocation and consumes the
+        // linkage window.
+        task_store.cancel_tree(&child_root.id, t_plus(10)).await?;
+        assert!(
+            task_store
+                .find_subagent_invocation_for_child_root(&child_root.id)
+                .await?
+                .is_none(),
+            "the linkage window must close once the invocation has been woken",
+        );
+        Ok(())
+    }
+
+    /// The deadline sweep's candidate feed (issue #299 round 3):
+    /// `list_parked_subagent_invocations` must return exactly the
+    /// parked `Subagent` invocations — a plain root parked on tool
+    /// children must NOT be materialized — and the window closes once
+    /// the linked child root goes terminal and wakes the invocation.
+    async fn test_list_parked_subagent_invocations(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
+    ) -> Result<()> {
+        // A plain root parked on a tool child: same status, wrong kind.
+        let tid = "conformance-parked-listing-plain";
+        let plain = fresh_root(tid, 1);
+        let plain_id = plain.id.clone();
+        task_store.submit_root_turn(plain).await?;
+        let worker = WorkerId::new();
+        let lease = LeaseId::new();
+        task_store
+            .try_acquire_task(
+                &plain_id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(600),
+                t_plus(2),
+            )
+            .await?
+            .context("plain parent must acquire before spawning children")?;
+        let (parked_plain, _children) = task_store
+            .spawn_tool_children(
+                &plain_id,
+                &worker,
+                &lease,
+                vec![ChildSpawnSpec { max_attempts: 3 }],
+                suspension_payload(tid),
+                None,
+                t_plus(3),
+            )
+            .await?;
+        assert_eq!(parked_plain.status, TaskStatus::WaitingOnChildren);
+
+        // A parked subagent invocation: the one row the sweep wants.
+        let (_parent, invocation, child_root) =
+            spawn_subagent_fixture(task_store, thread_store, "conformance-parked-listing").await?;
+
+        let parked = task_store.list_parked_subagent_invocations().await?;
+        assert_eq!(
+            parked.len(),
+            1,
+            "only the subagent invocation may be listed (no plain parked parents), got {parked:?}",
+        );
+        let listed = &parked[0];
+        assert_eq!(listed.id, invocation.id);
+        assert!(
+            listed.state.subagent_invocation().is_some(),
+            "the listed row must carry its durable spec linkage",
+        );
+
+        // Terminal child root wakes the invocation and closes the window.
+        task_store.cancel_tree(&child_root.id, t_plus(10)).await?;
+        assert!(
+            task_store
+                .list_parked_subagent_invocations()
+                .await?
+                .is_empty(),
+            "a woken invocation must no longer be listed",
+        );
+        Ok(())
+    }
+
+    /// Mid-tree cancel must resume a parked parent OUTSIDE the
+    /// cancelled subtree (issue #299, parked leg). The host's subagent
+    /// deadline sweep cancels a parked root's hung tool children one
+    /// subtree at a time; when the last live child cancels, the parked
+    /// `WaitingOnChildren` parent must flip back to `Pending` — on
+    /// every backend. The in-memory store already propagated this
+    /// through its per-row cancel; the SQL backends previously only
+    /// handled parents INSIDE the cancelled subtree, leaving an
+    /// out-of-subtree parent parked forever.
+    async fn test_cancel_tool_child_resumes_parked_parent(
+        task_store: &dyn AgentTaskStore,
+    ) -> Result<()> {
+        let tid = "conformance-midtree-cancel";
+        let parent = fresh_root(tid, 1);
+        let parent_id = parent.id.clone();
+        task_store.submit_root_turn(parent).await?;
+        let worker = WorkerId::new();
+        let lease = LeaseId::new();
+        task_store
+            .try_acquire_task(
+                &parent_id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(600),
+                t_plus(2),
+            )
+            .await?
+            .context("parent must acquire before spawning children")?;
+        let (parked, children) = task_store
+            .spawn_tool_children(
+                &parent_id,
+                &worker,
+                &lease,
+                vec![
+                    ChildSpawnSpec { max_attempts: 3 },
+                    ChildSpawnSpec { max_attempts: 3 },
+                ],
+                suspension_payload(tid),
+                None,
+                t_plus(3),
+            )
+            .await?;
+        assert_eq!(parked.status, TaskStatus::WaitingOnChildren);
+        let [first, second] = children.as_slice() else {
+            anyhow::bail!("expected exactly two spawned children, got {children:?}");
+        };
+
+        // Cancelling one child leaves the parent parked on the other.
+        task_store.cancel_tree(&first.id, t_plus(4)).await?;
+        let still_parked = task_store
+            .get(&parent_id)
+            .await?
+            .context("parent exists after first child cancel")?;
+        assert_eq!(
+            still_parked.status,
+            TaskStatus::WaitingOnChildren,
+            "one live child must keep the parent parked",
+        );
+        assert_eq!(still_parked.pending_child_count, 1);
+
+        // Cancelling the LAST live child must resume the parked parent.
+        task_store.cancel_tree(&second.id, t_plus(5)).await?;
+        let resumed = task_store
+            .get(&parent_id)
+            .await?
+            .context("parent exists after last child cancel")?;
+        assert_eq!(
+            resumed.status,
+            TaskStatus::Pending,
+            "cancelling the last live child must flip the out-of-subtree parked parent to Pending",
+        );
+        assert_eq!(resumed.pending_child_count, 0);
+        Ok(())
+    }
+
     /// `claim_idempotency` is an atomic reservation (findings #3/#15):
     /// the first claim reserves the key (`Fresh`), a second claim before
     /// the result is recorded observes `Conflict` (reservation in-flight),
@@ -1514,6 +1710,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_find_invocation_for_child_root() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_find_invocation_for_child_root(s.task.as_ref(), s.thread.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_cancel_tool_child_resumes_parked_parent() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_cancel_tool_child_resumes_parked_parent(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_list_parked_subagent_invocations() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_list_parked_subagent_invocations(s.task.as_ref(), s.thread.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_claim_idempotency_reserve_then_replay() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_claim_idempotency_reserve_then_replay(s.task.as_ref()).await
@@ -1698,6 +1912,27 @@ mod tests {
     async fn conformance_sqlite_fail_closed_child_root_wakes_invocation() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_fail_closed_child_root_wakes_invocation(&store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_find_invocation_for_child_root() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_find_invocation_for_child_root(&store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_cancel_tool_child_resumes_parked_parent() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_cancel_tool_child_resumes_parked_parent(&store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_list_parked_subagent_invocations() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_list_parked_subagent_invocations(&store, &store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -2137,6 +2372,33 @@ mod tests {
             return Ok(());
         };
         test_fail_closed_child_root_wakes_invocation(&store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_find_invocation_for_child_root() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_find_invocation_for_child_root(&store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_cancel_tool_child_resumes_parked_parent() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_cancel_tool_child_resumes_parked_parent(&store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_list_parked_subagent_invocations() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_list_parked_subagent_invocations(&store, &store).await
     }
 
     #[cfg(feature = "postgres")]
