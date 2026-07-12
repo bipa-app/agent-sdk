@@ -55,7 +55,8 @@ use uuid::Uuid;
 use super::definition::{AgentDefinition, ThinkingPolicy};
 use crate::journal::checkpoint_store::CheckpointStore;
 use crate::journal::commit::{
-    CommitOutcome, CompletedTurnCommit, DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS, commit_completed_turn,
+    CommitOutcome, CommitOwnerGuard, CompletedTurnCommit, DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+    StaleTurnCommit, commit_completed_turn,
 };
 use crate::journal::committed_event::CommittedEvent;
 use crate::journal::event_notifier::EventNotifier;
@@ -885,6 +886,7 @@ pub(crate) async fn commit_partial_turn_on_cancel(
             // turn as completed to every downstream consumer.
             events: Vec::new(),
             outbox_max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+            owner_guard: None,
             now,
         },
         deps.thread_store,
@@ -1505,6 +1507,7 @@ async fn commit_text_only_turn(
             agent_state_snapshot,
             events: lifecycle_events,
             outbox_max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+            owner_guard: None,
             now,
         },
         &inputs.bootstrap.worker_id,
@@ -1583,13 +1586,17 @@ async fn ensure_turn_not_already_committed(
         .context("re-read thread for idempotency check")?
         .context("thread disappeared during turn execution")?;
 
-    ensure!(
-        current_thread.committed_turns < expected_turn,
-        "turn {expected_turn} was already committed on thread {} \
-         (committed_turns={}); skipping duplicate commit",
-        thread_id,
-        current_thread.committed_turns,
-    );
+    if current_thread.committed_turns >= expected_turn {
+        return Err(anyhow::Error::new(StaleTurnCommit {
+            expected_turn,
+            committed_turns: current_thread.committed_turns,
+        })
+        .context(format!(
+            "turn {expected_turn} was already committed on thread {thread_id} \
+             (committed_turns={}); skipping duplicate commit",
+            current_thread.committed_turns,
+        )));
+    }
 
     Ok(())
 }
@@ -1604,14 +1611,15 @@ const MAX_TURN_SLOT_SHIFTS: u32 = 3;
 
 /// Does this error carry the completed-turn slot CAS rejection?
 ///
-/// All three backends phrase the guard identically
-/// (`"stale turn commit: expected {}, thread at {}"` — see
-/// `journal::commit` and the durable committers), and the
-/// [`ensure_turn_not_already_committed`] pre-check uses the
-/// `"was already committed on thread"` phrasing.
+/// All three backends (and the [`ensure_turn_not_already_committed`]
+/// pre-check) attach a typed [`StaleTurnCommit`] root cause, so this is
+/// a downcast instead of message-string matching. A
+/// [`LostCommitOwnership`](crate::journal::commit::LostCommitOwnership)
+/// rejection from an owner-guarded retry is deliberately NOT a
+/// collision: the cancel / timeout / requeue owner has the row, and
+/// the shift loop must propagate it as terminal.
 fn is_turn_slot_collision(error: &anyhow::Error) -> bool {
-    let rendered = format!("{error:#}");
-    rendered.contains("stale turn commit") || rendered.contains("was already committed on thread")
+    error.downcast_ref::<StaleTurnCommit>().is_some()
 }
 
 /// Rewrite the turn index carried by the batch's turn-boundary
@@ -1664,6 +1672,36 @@ fn remap_turn_indexed_events(events: &mut [AgentEvent], turn: usize) {
 /// projection write, and the durable committers roll the whole
 /// transaction back (the attempt row stays open for the retry to
 /// close).
+///
+/// # Ownership is re-validated INSIDE the retried commit
+///
+/// The eligibility re-read in [`shifted_turn_slot`] and the retried
+/// commit are not atomic — a cancellation or lease loss can land
+/// between them. The retry therefore carries
+/// [`CompletedTurnCommit::owner_guard`]: the durable committers
+/// re-read the task row inside the commit transaction (`FOR UPDATE`
+/// on Postgres) and reject with
+/// [`LostCommitOwnership`](crate::journal::commit::LostCommitOwnership)
+/// unless the row is still `Running` under this `(worker, lease)` —
+/// so a shifted commit can never splice a dead root's turn into the
+/// slot on a durable backend. The non-atomic in-memory backend cannot
+/// enforce the guard transactionally (no cross-store transaction);
+/// there the pre-retry re-read is the strongest available check and a
+/// residual in-process window remains — the same class as every other
+/// non-atomic in-memory commit step. Closing that generally (CAS task
+/// ownership inside every completed-turn commit) is a store-level
+/// follow-up; it was deliberately scoped to the shifted retry here
+/// because unconditional fencing would discard fully-billed answers
+/// on benign cancel-after-completion races.
+///
+/// # Event turn indices after a shift
+///
+/// The turn's `Start` (and any streamed deltas) were durably committed
+/// BEFORE the collision was detected, carrying the original slot
+/// number, while the remapped `TurnComplete` / `Done` carry the landed
+/// slot — a shifted turn's journal reads `Start{N} … TurnComplete{N+1}
+/// / Done{N+1}`. Consumers must derive turn boundaries from event
+/// ORDER, not from the turn indices (see the `events.proto` contract).
 async fn commit_completed_turn_shifting_slot(
     mut params: CompletedTurnCommit,
     worker_id: &WorkerId,
@@ -1712,6 +1750,13 @@ async fn commit_completed_turn_shifting_slot(
         );
         params.expected_turn = next_turn;
         remap_turn_indexed_events(&mut params.events, usize::try_from(next_turn).unwrap_or(0));
+        // Every shifted retry is owner-guarded: the durable committers
+        // re-validate (Running, worker, lease) on the task row inside
+        // the commit transaction, closing the guard→retry TOCTOU.
+        params.owner_guard = Some(CommitOwnerGuard {
+            worker_id: worker_id.clone(),
+            lease_id: lease_id.clone(),
+        });
         shifts += 1;
     }
 }
@@ -1734,7 +1779,13 @@ async fn shifted_turn_slot(
     //    or requeued task must never shift: its in-flight work lost
     //    the thread the moment it lost the row, and re-landing it
     //    after the collision would splice a dead root's turn into a
-    //    successor's history.
+    //    successor's history. This re-read is only the ELIGIBILITY
+    //    check — it is not atomic with the retried commit. The
+    //    authoritative enforcement is the `owner_guard` the retry
+    //    carries: the durable committers re-validate (Running, worker,
+    //    lease) on the task row INSIDE the commit transaction. On the
+    //    non-atomic in-memory backend this re-read is the strongest
+    //    available check (documented residual window).
     let own_row = match deps.task_store.get(&params.task_id).await {
         Ok(row) => row,
         Err(error) => {
@@ -4398,6 +4449,7 @@ async fn commit_resumed_turn(
             agent_state_snapshot,
             events: lifecycle_events,
             outbox_max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+            owner_guard: None,
             now,
         },
         &inputs.bootstrap.worker_id,

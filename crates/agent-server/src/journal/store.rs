@@ -432,12 +432,19 @@ pub struct CancelTreeOutcome {
 /// are all-or-nothing. The in-memory backend keeps tasks, events, and
 /// outbox in separate stores, so it takes this sink at construction
 /// ([`InMemoryAgentTaskStore::with_cancellation_markers`]) and commits
-/// the marker in the same `cancel_tree` call, immediately after the
-/// task transitions. There is no crash window to close in-process
-/// (nothing survives a crash anyway), and exactly-once still holds
-/// because the marker is derived from the rows this call actually
-/// transitioned — an idempotent retry sees a terminal tree and emits
-/// nothing.
+/// the marker in the same `cancel_tree` call, while still holding the
+/// task-store write lock — a promoted successor cannot be acquired
+/// until that lock drops, so the marker's sequence always precedes
+/// the successor's `Start`. Exactly-once holds because the marker is
+/// derived from the rows this call actually transitioned — an
+/// idempotent retry sees a terminal tree and emits nothing.
+///
+/// Two windows remain on this backend only (no cross-store
+/// transaction exists): dropping the in-flight `cancel_tree` future
+/// mid-await can lose markers after the transitions applied, and a
+/// sink error surfaces as `Err` after the transitions applied — both
+/// documented on `cancel_tree`; the durable backends are the
+/// crash-safety story.
 ///
 /// A bare `InMemoryAgentTaskStore::new()` (no sink) emits no markers;
 /// composed deployments (the service host's in-memory registry, test
@@ -3674,6 +3681,13 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         // does not mutate `by_parent`, so the snapshot stays
         // consistent for the duration of the sweep even though we
         // are holding a mutable borrow of `inner`.
+        //
+        // Round-2 F1 audit: the snapshot, every transition, and the
+        // marker gating all run under this one write lock, so no
+        // concurrent writer can settle a row mid-sweep (and
+        // `cancel_row_in_place` re-reads `by_id` for each id anyway) —
+        // this backend is immune to the stale-snapshot race the
+        // Postgres path had to close with locked re-reads.
         let subtree = inner.collect_subtree(root_id);
         let mut transitioned = Vec::with_capacity(subtree.len());
         // Terminal-marker candidates, captured pre-transition (the
@@ -3702,16 +3716,29 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             }
         }
 
-        drop(inner);
-
-        // Commit the markers after releasing the task-store lock: the
-        // sink's stores serialise on their own locks, and holding the
-        // task lock across those awaits would nest lock scopes for no
-        // atomicity gain (in-process, a crash loses every store
-        // together anyway).
+        // Round-2 F2: commit the markers while STILL holding the
+        // task-store write lock. A promoted successor cannot be
+        // acquired (and so cannot commit its `Start`) until this lock
+        // drops, so the marker's journal sequence always precedes
+        // anything the successor emits — matching the SQL backends,
+        // where marker and cancellation share one transaction. The
+        // sink stores are in-process leaf stores that never call back
+        // into the task store, so holding the lock across their
+        // awaits cannot deadlock. Two windows remain, inherent to the
+        // non-atomic in-memory backend (the durable backends are the
+        // crash-safety story):
+        // - dropping this future mid-await (e.g. a disconnecting RPC
+        //   caller) can lose markers after the transitions applied —
+        //   the same class as every other non-atomic in-memory step;
+        // - a sink error surfaces as `Err` AFTER the transitions
+        //   applied (no rollback exists across separate stores). We
+        //   propagate rather than swallow so `Ok` always means "every
+        //   due marker is committed" — the half of the SQL contract
+        //   followers rely on.
         let markers = self
             .commit_cancellation_markers(marker_candidates, now)
             .await?;
+        drop(inner);
         Ok(CancelTreeOutcome {
             transitioned,
             markers,

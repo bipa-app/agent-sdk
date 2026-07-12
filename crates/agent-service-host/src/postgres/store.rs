@@ -29,7 +29,8 @@ use time::OffsetDateTime;
 use agent_server::journal::checkpoint::{Checkpoint, CheckpointId, NewCheckpointParams};
 use agent_server::journal::checkpoint_store::CheckpointStore;
 use agent_server::journal::commit::{
-    CommitOutcome, CompletedTurnCommit, DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+    CommitOutcome, CommitOwnerGuard, CompletedTurnCommit, DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+    LostCommitOwnership, StaleTurnCommit,
 };
 use agent_server::journal::committed_event::CommittedEvent;
 use agent_server::journal::completed_turn_transaction::AtomicCompletedTurnCommitter;
@@ -1327,6 +1328,58 @@ FOR UPDATE
         Ok(())
     }
 
+    /// Enforce [`CompletedTurnCommit::owner_guard`] on the locked task
+    /// row inside the completed-turn transaction (issue #354, residual
+    /// 5 hardening): the slot-shift retry validates that the
+    /// presenting worker still owns a live `Running` row, so a
+    /// cancellation / lease loss that landed between the caller's
+    /// shift-eligibility check and the retry rejects here — inside the
+    /// transaction — instead of splicing a dead root's turn into the
+    /// shifted slot. A `None` guard (every first, non-shifted commit)
+    /// is a no-op.
+    async fn enforce_commit_owner_guard_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        task_id: &AgentTaskId,
+        owner_guard: Option<&CommitOwnerGuard>,
+    ) -> Result<()> {
+        let Some(guard) = owner_guard else {
+            return Ok(());
+        };
+        let current = Self::load_task_tx(tx, task_id, true)
+            .await?
+            .ok_or_else(|| {
+                anyhow::Error::new(LostCommitOwnership {
+                    task_id: task_id.clone(),
+                })
+            })?;
+        if current.status != TaskStatus::Running
+            || current.worker_id.as_ref() != Some(&guard.worker_id)
+            || current.lease_id.as_ref() != Some(&guard.lease_id)
+        {
+            return Err(anyhow::Error::new(LostCommitOwnership {
+                task_id: task_id.clone(),
+            }));
+        }
+        Ok(())
+    }
+
+    /// # WARNING: inverted lock order — do not extend (round-2 F6)
+    ///
+    /// This helper locks the TASK row first (`load_task_tx(.., true)`
+    /// below) and only then, for root turns, the THREAD row — the
+    /// reverse of the thread→task order every production write path
+    /// observes (`submit_root_turn`, `cancel_tree`, the owner-guarded
+    /// completed-turn commit). It is reachable only through
+    /// [`AgentTaskStore::update`], the structural rehydration / test
+    /// primitive that worker code must never use for lifecycle
+    /// transitions, so the inversion is not on any concurrent
+    /// production path today. Do NOT route new runtime paths through
+    /// `update`, and do not add thread-row locking after task-row
+    /// locking elsewhere: pairing this order with any thread→task
+    /// path on live traffic is a 40P01 deadlock. Fixing the order
+    /// here would require locking the thread row before knowing the
+    /// row's kind (or re-reading), which is not worth it for a
+    /// test-only surface — hence this fence instead.
     async fn validate_update_row_invariants_tx(
         tx: &mut Transaction<'_, Postgres>,
         task: &AgentTask,
@@ -1925,12 +1978,19 @@ FOR UPDATE
         // lost the race to another worker fails here instead of durably
         // double-committing the turn (pure in-Rust comparison on the
         // already-locked row — no extra query).
-        ensure!(
-            old_thread.committed_turns.saturating_add(1) == params.expected_turn,
-            "stale turn commit: expected {}, thread at {}",
-            params.expected_turn,
-            old_thread.committed_turns,
-        );
+        if old_thread.committed_turns.saturating_add(1) != params.expected_turn {
+            return Err(anyhow::Error::new(StaleTurnCommit {
+                expected_turn: params.expected_turn,
+                committed_turns: old_thread.committed_turns,
+            }));
+        }
+
+        // Owner-guarded commit (issue #354, residual 5 hardening):
+        // called after the thread lock so the transaction's lock order
+        // stays thread→task, consistent with `submit_root_turn` and
+        // `cancel_tree`.
+        Self::enforce_commit_owner_guard_tx(&mut tx, &params.task_id, params.owner_guard.as_ref())
+            .await?;
         let thread = old_thread
             .apply_committed_turn(&params.turn_usage, params.now)
             .context("advance thread aggregate inside postgres completed-turn transaction")?;
@@ -3567,46 +3627,52 @@ ORDER BY created_at, id
         // SubagentInvocation linkage across threads). A mid-tree id
         // cancels only its own subtree instead of no-opping on a
         // `root_id = $1` scan.
+        //
+        // The snapshot only shapes the WALK (ids, depths, kinds,
+        // thread ids — all row-invariant). Statuses in it are advisory:
+        // under READ COMMITTED a concurrent cancel_tree / terminal CAS
+        // can settle any of these rows between this read and our
+        // UPDATEs, so every transition below is gated on a locked
+        // re-read instead (round-2 F1 — two racing cancels of the same
+        // root previously BOTH emitted a marker and both reported the
+        // transition, and a stale snapshot could clobber a
+        // concurrently-Completed root with Cancelled).
         let all_tasks = Self::collect_subtree_tx(&mut tx, root_id).await?;
 
-        // Terminal `Cancelled` markers (issue #354): one per blocking
-        // root this call will transition (pre-cancel occupant of its
-        // thread's active-root slot), on that root's OWN thread —
-        // cascade-cancelled child-thread roots included. Committed
-        // FIRST so every thread-row lock is taken before any task-row
-        // lock, matching `submit_root_turn`'s thread→task order; the
-        // whole set is atomic with the cancel transitions below, so a
-        // crash can neither lose the marker nor emit it without the
-        // cancellation. Queued roots never get a marker. BFS order
-        // makes the thread-lock order deterministic (parent thread
-        // before its descendants' threads) for concurrent overlapping
-        // cancels.
-        let mut markers: Vec<CommittedEvent> = Vec::new();
+        // Phase 1 — thread-row locks, FIRST. Every thread that MIGHT
+        // need a terminal marker is bootstrapped and locked before any
+        // task-row lock is taken, keeping this transaction's lock
+        // order (thread rows → task rows) consistent with
+        // `submit_root_turn` so a concurrent submit cannot deadlock
+        // the cancel. The candidate set is every root-turn root in the
+        // snapshot regardless of its snapshot status — status can
+        // change before the locked re-read below (e.g. a queued root
+        // promoted to Pending by a concurrent terminal transition),
+        // but kind / is_root / thread_id cannot. BFS order keeps the
+        // thread-lock order deterministic (parent thread before its
+        // descendants' threads) for concurrent overlapping cancels.
+        let mut marker_threads_locked: std::collections::HashSet<ThreadId> =
+            std::collections::HashSet::new();
         for row in &all_tasks {
-            if row.status.is_terminal()
-                || row.kind != TaskKind::RootTurn
-                || !row.is_root()
-                || !row.status.blocks_root_admission()
+            if row.kind == TaskKind::RootTurn
+                && row.is_root()
+                && marker_threads_locked.insert(row.thread_id.clone())
             {
-                continue;
+                Self::bootstrap_thread_row_tx(&mut tx, &row.thread_id, now).await?;
+                let _ = Self::lock_thread_tx(&mut tx, &row.thread_id).await?;
             }
-            let continuation_usage = row
-                .state
-                .continuation()
-                .map(|continuation| continuation.payload.total_usage.clone());
-            let committed =
-                Self::insert_cancelled_marker_tx(&mut tx, &row.thread_id, continuation_usage, now)
-                    .await?;
-            markers.push(committed);
         }
 
-        // Apply the cancel UPDATEs deepest-first so the per-row locks are
-        // taken in the same child-then-parent order as the terminal
-        // transition paths (`complete_task` / `fail_task`), removing the
-        // lock-order inversion that could deadlock (40P01) a concurrent
-        // `cancel_tree(root)` + `complete_task(child-of-root)`. The
-        // returned `transitioned` slice is still built in BFS (root-first)
-        // order so the observable result matches the in-memory store.
+        // Phase 2 — CAS cancel transitions. Apply the cancel UPDATEs
+        // deepest-first so the per-row locks are taken in the same
+        // child-then-parent order as the terminal transition paths
+        // (`complete_task` / `fail_task`), removing the lock-order
+        // inversion that could deadlock (40P01) a concurrent
+        // `cancel_tree(root)` + `complete_task(child-of-root)`. Each
+        // row is re-read FOR UPDATE and skipped if it settled
+        // concurrently — the transition, the returned `transitioned`
+        // slice, and the marker gating below all derive from the
+        // locked re-read, never from the snapshot.
         let mut cancel_order: Vec<&AgentTask> = all_tasks.iter().collect();
         cancel_order.sort_by_key(|t| std::cmp::Reverse(t.depth));
 
@@ -3616,20 +3682,43 @@ ORDER BY created_at, id
         // wake their linked invocations and promote queued successors.
         let mut cancelled_root_ids: Vec<AgentTaskId> = Vec::new();
         let mut cancelled_root_threads: Vec<ThreadId> = Vec::new();
+        // Blocking roots actually transitioned by THIS call, keyed by
+        // id so phase 3 can emit their markers in BFS order. The
+        // continuation usage is captured from the locked re-read
+        // before `cancel` clears the typed state.
+        let mut marker_candidates: std::collections::BTreeMap<
+            AgentTaskId,
+            (ThreadId, Option<TokenUsage>),
+        > = std::collections::BTreeMap::new();
         for row in cancel_order {
-            if row.status.is_terminal() {
+            let Some(current) = Self::load_task_tx(&mut tx, &row.id, true).await? else {
+                continue;
+            };
+            if current.status.is_terminal() {
                 continue;
             }
-            let is_root_turn_root = row.kind == TaskKind::RootTurn && row.is_root();
-            let cancelled = row
-                .clone()
+            let is_root_turn_root = current.kind == TaskKind::RootTurn && current.is_root();
+            let thread_id = current.thread_id.clone();
+            if is_root_turn_root && current.status.blocks_root_admission() {
+                marker_candidates.insert(
+                    current.id.clone(),
+                    (
+                        thread_id.clone(),
+                        current
+                            .state
+                            .continuation()
+                            .map(|continuation| continuation.payload.total_usage.clone()),
+                    ),
+                );
+            }
+            let cancelled = current
                 .cancel(now)
                 .context("cancel_tree: cancel transition failed")?;
             Self::update_task_tx(&mut tx, &cancelled).await?;
             cancelled_ids.insert(cancelled.id.clone());
             if is_root_turn_root {
                 cancelled_root_ids.push(cancelled.id.clone());
-                cancelled_root_threads.push(row.thread_id.clone());
+                cancelled_root_threads.push(thread_id);
             }
         }
         // Build the returned slice in BFS (root-first) order for parity.
@@ -3638,6 +3727,28 @@ ORDER BY created_at, id
             .filter(|task| cancelled_ids.contains(&task.id))
             .map(|task| task.id.clone())
             .collect();
+
+        // Phase 3 — terminal `Cancelled` markers (issue #354): exactly
+        // one per blocking root this call ACTUALLY transitioned (the
+        // pre-cancel occupant of its thread's active-root slot), on
+        // that root's OWN thread — cascade-cancelled child-thread
+        // roots included, queued roots never. Atomic with the cancel
+        // transitions above, so a crash can neither lose a marker nor
+        // emit one without its cancellation, and a racing duplicate
+        // cancel (whose re-read saw the row already terminal) emits
+        // nothing. The thread rows were locked in phase 1, so the
+        // sequence allocation here re-locks held rows (no new lock
+        // edges). Emitted in BFS order.
+        let mut markers: Vec<CommittedEvent> = Vec::new();
+        for row in &all_tasks {
+            let Some((thread_id, continuation_usage)) = marker_candidates.remove(&row.id) else {
+                continue;
+            };
+            let committed =
+                Self::insert_cancelled_marker_tx(&mut tx, &thread_id, continuation_usage, now)
+                    .await?;
+            markers.push(committed);
+        }
 
         // Phase 7.6: wake linked SubagentInvocation tasks that were
         // WaitingOnChildren on a now-cancelled child root. This
@@ -6266,6 +6377,7 @@ mod tests {
                     agent_state_snapshot: serde_json::json!({"turn": 1}),
                     events: Vec::new(),
                     outbox_max_attempts: 3,
+                    owner_guard: None,
                     now: t_plus(2),
                 },
                 Some(InjectedCommitFailure::ThreadAdvance),
@@ -6346,6 +6458,7 @@ mod tests {
                 turn: 1,
             }],
             outbox_max_attempts: 3,
+            owner_guard: None,
             now,
         };
 
@@ -6433,6 +6546,7 @@ mod tests {
                     turn: 1,
                 }],
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(2),
             },
             &store,

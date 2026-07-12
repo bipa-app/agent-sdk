@@ -337,6 +337,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({"turn": 1}),
                 events,
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: at,
             },
             store,

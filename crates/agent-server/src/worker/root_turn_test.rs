@@ -14,6 +14,7 @@ use super::root_turn::{
 use std::sync::Arc;
 
 use crate::journal::checkpoint_store::{CheckpointStore, InMemoryCheckpointStore};
+use crate::journal::committed_event::CommittedEvent;
 use crate::journal::event_notifier::EventNotifier;
 use crate::journal::event_repository::{EventRepository, InMemoryEventRepository};
 use crate::journal::execution_context::build_root_worker_inputs;
@@ -5858,6 +5859,191 @@ async fn cancel_root_turn_commits_single_terminal_cancelled_event() -> Result<()
     Ok(())
 }
 
+/// Event repo that parks the first `Cancelled` commit on a [`Notify`]
+/// until the test releases it — forcing the exact interleaving the
+/// in-lock marker commit must exclude (round-2 F2).
+#[derive(Clone)]
+struct StallingMarkerEventRepo {
+    inner: InMemoryEventRepository,
+    /// Signalled when the marker commit has parked (the cancel holds the
+    /// task-store write lock at that point).
+    parked: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl EventRepository for StallingMarkerEventRepo {
+    async fn commit_event(
+        &self,
+        thread_id: &ThreadId,
+        event: agent_sdk_foundation::events::AgentEvent,
+        now: time::OffsetDateTime,
+    ) -> Result<CommittedEvent> {
+        if matches!(
+            event,
+            agent_sdk_foundation::events::AgentEvent::Cancelled { .. }
+        ) {
+            self.parked.notify_one();
+            self.release.notified().await;
+        }
+        self.inner.commit_event(thread_id, event, now).await
+    }
+    async fn commit_event_batch(
+        &self,
+        thread_id: &ThreadId,
+        events: Vec<agent_sdk_foundation::events::AgentEvent>,
+        now: time::OffsetDateTime,
+    ) -> Result<Vec<CommittedEvent>> {
+        self.inner.commit_event_batch(thread_id, events, now).await
+    }
+    async fn next_sequence(&self, thread_id: &ThreadId) -> Result<u64> {
+        self.inner.next_sequence(thread_id).await
+    }
+    async fn get_events(&self, thread_id: &ThreadId) -> Result<Vec<CommittedEvent>> {
+        self.inner.get_events(thread_id).await
+    }
+    async fn get_events_in_range(
+        &self,
+        thread_id: &ThreadId,
+        after_sequence: u64,
+        up_to_sequence: u64,
+    ) -> Result<Vec<CommittedEvent>> {
+        self.inner
+            .get_events_in_range(thread_id, after_sequence, up_to_sequence)
+            .await
+    }
+    async fn threads_with_events_before(
+        &self,
+        cutoff: time::OffsetDateTime,
+        limit: u32,
+    ) -> Result<Vec<ThreadId>> {
+        self.inner.threads_with_events_before(cutoff, limit).await
+    }
+    async fn max_sequence_before(
+        &self,
+        thread_id: &ThreadId,
+        cutoff: time::OffsetDateTime,
+    ) -> Result<Option<u64>> {
+        self.inner.max_sequence_before(thread_id, cutoff).await
+    }
+    async fn min_sequence_at_or_after(
+        &self,
+        thread_id: &ThreadId,
+        cutoff: time::OffsetDateTime,
+    ) -> Result<Option<u64>> {
+        self.inner.min_sequence_at_or_after(thread_id, cutoff).await
+    }
+}
+
+/// Round-2 F2: the in-memory sink commits markers while the task-store
+/// write lock is still held, so a promoted successor cannot be acquired
+/// — and thus cannot journal its first event — before the marker's
+/// sequence. The stalling repo parks the marker commit; if the lock had
+/// been dropped first (the old post-lock sink), the successor's acquire
+/// would succeed during the stall and its events would precede the
+/// marker.
+#[tokio::test]
+async fn cancel_marker_sequence_precedes_promoted_successor_events() -> Result<()> {
+    let threads = InMemoryThreadStore::new();
+    let events = InMemoryEventRepository::new();
+    let outbox = InMemoryOutboxStore::new();
+    let parked = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let tasks = InMemoryAgentTaskStore::new().with_cancellation_markers(CancellationMarkerSink {
+        event_repo: Arc::new(StallingMarkerEventRepo {
+            inner: events.clone(),
+            parked: Arc::clone(&parked),
+            release: Arc::clone(&release),
+        }),
+        outbox_store: Arc::new(outbox.clone()),
+        thread_store: Arc::new(threads.clone()),
+    });
+
+    // Active blocking root + queued successor on the same thread.
+    let active = AgentTask::new_root_turn(thread_a(), t0(), 3);
+    let active_id = active.id.clone();
+    tasks.submit_root_turn(active).await?;
+    let queued = AgentTask::new_root_turn(thread_a(), t0(), 3);
+    let queued_id = queued.id.clone();
+    tasks.submit_root_turn(queued).await?;
+
+    // Cancel in the background; it parks inside the marker commit while
+    // still holding the task-store write lock.
+    let cancelling_tasks = tasks.clone();
+    let cancel_id = active_id.clone();
+    let cancel =
+        tokio::spawn(async move { cancelling_tasks.cancel_tree(&cancel_id, t_plus(1)).await });
+
+    // Wait until the marker commit is provably parked — the cancel holds
+    // the task-store write lock from here until the release.
+    tokio::time::timeout(std::time::Duration::from_secs(5), parked.notified())
+        .await
+        .context("the marker commit must park in the stalling repo")?;
+
+    // While the marker commit is parked, the promoted successor must NOT
+    // be acquirable: the write lock is held across the sink commit.
+    let blocked_acquire = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        tasks.try_acquire_task(
+            &queued_id,
+            WorkerId::from_string("w-race"),
+            LeaseId::from_string("l-race"),
+            t_plus(60),
+            t_plus(1),
+        ),
+    )
+    .await;
+    assert!(
+        blocked_acquire.is_err(),
+        "the successor must not be acquirable while the marker commit holds the lock",
+    );
+
+    // Release the marker commit; the cancel completes with the marker.
+    release.notify_one();
+    let outcome = cancel.await.context("cancel task join")??;
+    assert_eq!(outcome.markers.len(), 1);
+
+    // Now the successor acquires and journals its first event — strictly
+    // after the marker's sequence.
+    let acquired = tasks
+        .try_acquire_task(
+            &queued_id,
+            WorkerId::from_string("w-race"),
+            LeaseId::from_string("l-race"),
+            t_plus(60),
+            t_plus(2),
+        )
+        .await?;
+    let Some(_) = acquired else {
+        bail!("the promoted successor must be acquirable after the cancel completes");
+    };
+    let successor_event = events
+        .commit_event(
+            &thread_a(),
+            agent_sdk_foundation::events::AgentEvent::text("s", "successor start"),
+            t_plus(2),
+        )
+        .await?;
+
+    let journal = events.get_events(&thread_a()).await?;
+    let marker_seq = journal
+        .iter()
+        .find(|e| {
+            matches!(
+                e.event,
+                agent_sdk_foundation::events::AgentEvent::Cancelled { .. }
+            )
+        })
+        .map(|e| e.sequence)
+        .context("the marker must be in the journal")?;
+    assert!(
+        marker_seq < successor_event.sequence,
+        "the marker (seq {marker_seq}) must precede the successor's first event (seq {})",
+        successor_event.sequence,
+    );
+    Ok(())
+}
+
 /// Cancelling a QUEUED root parked behind a live active root must NOT
 /// commit a thread-terminal `Cancelled` marker — that would close every
 /// follower mid-stream while the active root keeps producing events.
@@ -6218,6 +6404,7 @@ impl SalvageRacingAttemptStore {
                 agent_state_snapshot: serde_json::json!({}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now,
             },
             &self.stores.threads,
@@ -6346,9 +6533,16 @@ async fn successor_turn_shifts_past_cancelled_salvage_slot_collision() -> Result
 }
 
 /// Issue #354, residual 5 (negative): a root that was CANCELLED while
-/// running must never shift — its late full-turn commit loses to the
-/// successor's committed slot and propagates the collision error, so a
-/// dead root cannot splice its turn into a successor's history.
+/// running must not shift — its late full-turn commit loses to the
+/// successor's committed slot and propagates the collision error.
+/// This test exercises the shift-eligibility guard (the caller-side
+/// re-read); the guard→retry pair is not atomic, so the authoritative
+/// enforcement on the durable backends is the `owner_guard` the
+/// shifted retry carries into the commit transaction (pinned by the
+/// `conformance_{sqlite,postgres}_owner_guarded_commit_rejects_lost_ownership`
+/// tests). On this in-memory backend the eligibility re-read is the
+/// strongest available check — the residual in-process window is
+/// documented on `CompletedTurnCommit::owner_guard`.
 #[tokio::test]
 async fn cancelled_root_commit_never_shifts_past_a_successor() -> Result<()> {
     let stores = TestStores::new();

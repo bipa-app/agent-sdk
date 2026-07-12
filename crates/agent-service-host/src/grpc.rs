@@ -2354,6 +2354,16 @@ fn decode_idempotency_result<T: serde::de::DeserializeOwned>(
 /// boundaries — without them a fork below a budget-stop or cancel
 /// point would copy the terminal marker past the cutoff and the fork
 /// would immediately read as completed/cancelled.
+///
+/// Slot-shifted turns (issue #354, residual 5): a successor turn that
+/// lost its bootstrapped slot to a cancelled predecessor's salvage
+/// commits with `Done.total_turns` remapped to the landed slot, so
+/// this boundary walk stays consistent with the thread's committed
+/// turn count and the checkpoint numbering. Only the already-committed
+/// `Start` may carry the stale index — deliberately not a boundary
+/// here (see the `StartEvent` contract in events.proto: boundaries
+/// derive from event order, completion-side indices are
+/// authoritative).
 const fn turn_number_for_event(event: &agent_sdk_foundation::events::AgentEvent) -> Option<u64> {
     match event {
         agent_sdk_foundation::events::AgentEvent::Done { total_turns, .. }

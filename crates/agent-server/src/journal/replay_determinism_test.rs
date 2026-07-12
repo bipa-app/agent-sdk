@@ -142,6 +142,7 @@ impl ReplayStores {
             agent_state_snapshot: turn.snapshot.clone(),
             events: turn.events.clone(),
             outbox_max_attempts: 3,
+            owner_guard: None,
             now: turn.committed_at,
         })
     }

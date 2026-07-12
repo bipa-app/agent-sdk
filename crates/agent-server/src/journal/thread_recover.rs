@@ -428,6 +428,7 @@ mod tests {
                     agent_state_snapshot: state_snapshot,
                     events: Vec::new(),
                     outbox_max_attempts: 3,
+                    owner_guard: None,
                     now: at,
                 },
                 &self.threads,

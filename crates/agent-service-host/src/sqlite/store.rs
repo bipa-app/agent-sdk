@@ -29,7 +29,8 @@ use time::OffsetDateTime;
 use agent_server::journal::checkpoint::{Checkpoint, CheckpointId, NewCheckpointParams};
 use agent_server::journal::checkpoint_store::CheckpointStore;
 use agent_server::journal::commit::{
-    CommitOutcome, CompletedTurnCommit, DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+    CommitOutcome, CommitOwnerGuard, CompletedTurnCommit, DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+    LostCommitOwnership, StaleTurnCommit,
 };
 use agent_server::journal::committed_event::CommittedEvent;
 use agent_server::journal::completed_turn_transaction::AtomicCompletedTurnCommitter;
@@ -1787,6 +1788,39 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
         Ok(())
     }
 
+    /// Enforce [`CompletedTurnCommit::owner_guard`] on the task row
+    /// inside the completed-turn transaction (issue #354, residual 5
+    /// hardening): the slot-shift retry validates — under `SQLite`'s
+    /// exclusive write transaction — that the presenting worker still
+    /// owns a live `Running` row, so a cancellation / lease loss
+    /// between the caller's shift-eligibility check and the retry
+    /// rejects here instead of splicing a dead root's turn into the
+    /// shifted slot. A `None` guard (every first, non-shifted commit)
+    /// is a no-op.
+    async fn enforce_commit_owner_guard_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        task_id: &AgentTaskId,
+        owner_guard: Option<&CommitOwnerGuard>,
+    ) -> Result<()> {
+        let Some(guard) = owner_guard else {
+            return Ok(());
+        };
+        let current = Self::load_task_tx(tx, task_id).await?.ok_or_else(|| {
+            anyhow::Error::new(LostCommitOwnership {
+                task_id: task_id.clone(),
+            })
+        })?;
+        if current.status != TaskStatus::Running
+            || current.worker_id.as_ref() != Some(&guard.worker_id)
+            || current.lease_id.as_ref() != Some(&guard.lease_id)
+        {
+            return Err(anyhow::Error::new(LostCommitOwnership {
+                task_id: task_id.clone(),
+            }));
+        }
+        Ok(())
+    }
+
     /// Atomic completed-turn transaction for `SQLite`.
     async fn commit_completed_turn_atomic_inner(
         &self,
@@ -1812,12 +1846,16 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
         // worker that lost the race to another worker fails here instead
         // of durably double-committing the turn (pure in-Rust comparison
         // on the already-loaded row — no extra query).
-        ensure!(
-            old_thread.committed_turns.saturating_add(1) == params.expected_turn,
-            "stale turn commit: expected {}, thread at {}",
-            params.expected_turn,
-            old_thread.committed_turns,
-        );
+        if old_thread.committed_turns.saturating_add(1) != params.expected_turn {
+            return Err(anyhow::Error::new(StaleTurnCommit {
+                expected_turn: params.expected_turn,
+                committed_turns: old_thread.committed_turns,
+            }));
+        }
+
+        // Owner-guarded commit (issue #354, residual 5 hardening).
+        Self::enforce_commit_owner_guard_tx(&mut tx, &params.task_id, params.owner_guard.as_ref())
+            .await?;
         let thread = old_thread
             .apply_committed_turn(&params.turn_usage, params.now)
             .context("advance thread aggregate inside sqlite completed-turn transaction")?;
@@ -3134,6 +3172,19 @@ impl AgentTaskStore for SqliteDurableStore {
         // BEGIN IMMEDIATE, so there is no lock-order deadlock to avoid;
         // cancelling in BFS order keeps the returned `transitioned` slice
         // identical to the in-memory reference store.
+        //
+        // Round-2 F1 audit: unlike Postgres (READ COMMITTED row locks),
+        // `begin()` here takes the database write lock up front
+        // (`BEGIN IMMEDIATE`), so no concurrent writer can settle any
+        // of these rows between this snapshot and the UPDATEs below —
+        // the snapshot IS the transaction's consistent view. Two
+        // racing `cancel_tree` calls fully serialize: the loser's
+        // snapshot already sees terminal rows and it transitions /
+        // emits nothing. A Postgres-style locked re-read would re-read
+        // identical data, so this backend intentionally keeps
+        // snapshot-driven transitions (pinned by the
+        // `conformance_sqlite_concurrent_cancels_single_marker` race
+        // test).
         let all_tasks = Self::collect_subtree_tx(&mut tx, root_id).await?;
 
         let mut transitioned = Vec::with_capacity(all_tasks.len());
@@ -5948,6 +5999,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({"turn": 1}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(3),
             },
         )
@@ -6057,6 +6109,7 @@ mod tests {
                     turn: 1,
                 }],
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(3),
             },
         )

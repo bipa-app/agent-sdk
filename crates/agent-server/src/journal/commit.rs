@@ -62,7 +62,7 @@
 
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::{ThreadId, TokenUsage, llm};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use time::OffsetDateTime;
 
 use super::checkpoint::Checkpoint;
@@ -71,7 +71,7 @@ use super::checkpoint_store::CheckpointStore;
 use super::committed_event::CommittedEvent;
 use super::event_repository::EventRepository;
 use super::message_store::MessageProjectionStore;
-use super::task::AgentTaskId;
+use super::task::{AgentTaskId, LeaseId, WorkerId};
 use super::thread::Thread;
 use super::thread_store::ThreadStore;
 use super::turn_attempt::{CloseAttemptParams, TurnAttempt, TurnAttemptId};
@@ -136,8 +136,37 @@ pub struct CompletedTurnCommit {
     /// committer (the in-memory path writes no outbox row from this
     /// helper).
     pub outbox_max_attempts: u32,
+    /// Optional task-row ownership validation performed **inside** the
+    /// commit transaction (issue #354, residual 5 hardening).
+    ///
+    /// When set, the atomic durable committers re-read the task row
+    /// (`FOR UPDATE` on Postgres; under `SQLite`'s exclusive write
+    /// transaction) and reject the commit with [`LostCommitOwnership`]
+    /// unless the row is still `Running` and owned by exactly this
+    /// `(worker, lease)` pair — closing the window where a
+    /// cancellation or lease loss lands between a caller-side
+    /// ownership check and the commit. Used only by the worker's
+    /// turn-slot-shift retry; the first (non-shifted) commit attempt
+    /// passes `None` so the normal path is unchanged.
+    ///
+    /// The non-atomic in-memory path cannot enforce this (it has no
+    /// handle on the task journal and no cross-store transaction);
+    /// there the worker's shift path re-validates ownership
+    /// immediately before the retry, accepting the same in-process
+    /// race window every other non-atomic in-memory step already has.
+    pub owner_guard: Option<CommitOwnerGuard>,
     /// Current wall-clock time.
     pub now: OffsetDateTime,
+}
+
+/// The `(worker, lease)` pair a guarded commit must still own — see
+/// [`CompletedTurnCommit::owner_guard`].
+#[derive(Clone, Debug)]
+pub struct CommitOwnerGuard {
+    /// Worker that believes it owns the task row.
+    pub worker_id: WorkerId,
+    /// Lease under which the worker acquired the row.
+    pub lease_id: LeaseId,
 }
 
 /// Default relay attempt budget for the coalesced `thread_events_available`
@@ -146,6 +175,64 @@ pub struct CompletedTurnCommit {
 /// Matches the long-standing 3-attempt default used elsewhere for the
 /// event outbox; production callers may override per [`CompletedTurnCommit`].
 pub const DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS: u32 = 3;
+
+/// Typed root cause for the completed-turn slot CAS rejection.
+///
+/// Every committer — the in-memory guard in [`commit_completed_turn`],
+/// the Postgres / `SQLite` atomic committers, and the worker's
+/// pre-commit idempotency check — returns this as the error's root
+/// cause when `expected_turn` no longer matches the thread's committed
+/// turn count, so callers (e.g. the worker's turn-slot-shift path) can
+/// `downcast_ref::<StaleTurnCommit>()` instead of matching message
+/// strings. The `Display` text is kept byte-identical to the
+/// historical message
+/// (`"stale turn commit: expected {expected}, thread at {committed}"`)
+/// for logs and existing assertions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StaleTurnCommit {
+    /// The turn number the rejected commit expected to produce.
+    pub expected_turn: u32,
+    /// The thread's committed turn count observed at rejection time.
+    pub committed_turns: u32,
+}
+
+impl std::fmt::Display for StaleTurnCommit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "stale turn commit: expected {}, thread at {}",
+            self.expected_turn, self.committed_turns,
+        )
+    }
+}
+
+impl std::error::Error for StaleTurnCommit {}
+
+/// Typed root cause for a rejected owner-guarded commit.
+///
+/// Returned when the task row is no longer a `Running` row owned by
+/// the presenting `(worker, lease)` — see
+/// [`CompletedTurnCommit::owner_guard`]. Deliberately distinct from
+/// [`StaleTurnCommit`]: the slot-shift path retries on the latter but
+/// must treat this as terminal (the cancel / timeout / requeue owner
+/// has the row).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LostCommitOwnership {
+    /// The task whose ownership validation failed.
+    pub task_id: AgentTaskId,
+}
+
+impl std::fmt::Display for LostCommitOwnership {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "commit ownership lost: task {} is no longer a Running row owned by the presenting lease",
+            self.task_id,
+        )
+    }
+}
+
+impl std::error::Error for LostCommitOwnership {}
 
 // ─────────────────────────────────────────────────────────────────────
 // Outcome
@@ -256,12 +343,12 @@ pub async fn commit_completed_turn(
         .await
         .context("commit: re-read thread for stale-turn guard")?
         .map_or(0, |thread| thread.committed_turns);
-    ensure!(
-        committed_turns_before.saturating_add(1) == params.expected_turn,
-        "stale turn commit: expected {}, thread at {}",
-        params.expected_turn,
-        committed_turns_before,
-    );
+    if committed_turns_before.saturating_add(1) != params.expected_turn {
+        return Err(anyhow::Error::new(StaleTurnCommit {
+            expected_turn: params.expected_turn,
+            committed_turns: committed_turns_before,
+        }));
+    }
 
     // 1. Close the turn attempt.
     let closed_attempt = turn_attempt_store
@@ -473,6 +560,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({"turn": 1}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(5),
             },
             &s.threads,
@@ -535,6 +623,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({"turn": 1}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(1),
             },
             &s.threads,
@@ -559,6 +648,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({"turn": 2}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(2),
             },
             &s.threads,
@@ -625,6 +715,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({"turn": 1}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(1),
             },
             &s.threads,
@@ -650,6 +741,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({"turn": 2}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(2),
             },
             &s.threads,
@@ -683,6 +775,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({"turn": 2}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(3),
             },
             &s.threads,
@@ -722,6 +815,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(1),
             },
             &s.threads,
@@ -745,6 +839,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(2),
             },
             &s.threads,
@@ -788,6 +883,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(1),
             },
             &s.threads,
@@ -842,6 +938,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(2),
             },
             &s.threads,
@@ -886,6 +983,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(1),
             },
             &s.threads,
@@ -915,6 +1013,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(3),
             },
             &s.threads,
@@ -981,6 +1080,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({"turn": 1}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(5),
             },
             &s.threads,
@@ -1028,6 +1128,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(1),
             },
             &s.threads,
@@ -1088,6 +1189,7 @@ mod tests {
                 agent_state_snapshot: snapshot.clone(),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(5),
             },
             &s.threads,

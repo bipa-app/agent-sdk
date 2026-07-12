@@ -1541,6 +1541,7 @@ async fn commit_one_turn<S: JournalStore>(
             agent_state_snapshot: serde_json::json!({ "turn": turn_number }),
             events: vec![],
             outbox_max_attempts: 3,
+            owner_guard: None,
             now,
         },
         store,
