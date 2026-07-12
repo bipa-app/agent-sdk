@@ -62,10 +62,10 @@ use agent_server::journal::task::{AgentTask, LeaseId, TaskKind, TaskStatus, Work
 use agent_server::journal::task_state::TaskState;
 use agent_server::worker::{
     AgentDefinitionRegistry, RootTurnOutcome, SubagentTaskOutcome, ToolTaskOutcome,
-    execute_subagent_task, fail_root_turn, fail_root_turn_leaving_attempts_open,
-    guarded_tool_execution, pause_tool_for_confirmation, resolve_bootstrap_context,
-    resolve_subagent_bootstrap, resolve_tool_bootstrap, resume_for_steering, resume_from_children,
-    revert_steering_wake,
+    best_effort_close_open_attempts, execute_subagent_task, fail_root_turn,
+    fail_root_turn_leaving_attempts_open, guarded_tool_execution, pause_tool_for_confirmation,
+    resolve_bootstrap_context, resolve_subagent_bootstrap, resolve_tool_bootstrap,
+    resume_for_steering, resume_from_children, revert_steering_wake,
 };
 
 use super::broker::{BrokerAdapter, InMemoryBrokerAdapter};
@@ -736,10 +736,10 @@ async fn lease_sweep_loop(
             }
             _ = ticker.tick() => {
                 let now = time::OffsetDateTime::now_utc();
-                match stores.task_store.release_expired_leases(now).await {
-                    Ok(records) if !records.is_empty() => {
-                        info!(count = records.len(), "released expired leases");
-                        metrics.record_lease_sweep(records.len());
+                match drain_expired_leases(&stores, now).await {
+                    Ok(count) if count > 0 => {
+                        info!(count, "released expired leases");
+                        metrics.record_lease_sweep(count);
                     }
                     Ok(_) => {
                         metrics.record_lease_sweep(0);
@@ -754,10 +754,12 @@ async fn lease_sweep_loop(
                 // children has no live heartbeat, so a hung tool child
                 // would otherwise wedge the parent past `timeout_ms`
                 // indefinitely. Piggybacks on the same sweep cadence,
-                // and MUST run after `release_expired_leases` above:
+                // and MUST run after the expired-lease drain above:
                 // the deadline pass skips Running rows on the strength
                 // of that ordering (ghost leases were just requeued to
-                // Pending, so Running there implies a live worker).
+                // Pending, so Running there implies a live worker) —
+                // which is also why the drain loops past the store's
+                // per-call batch instead of reclaiming one batch.
                 match enforce_subagent_deadlines(&stores, now, &cancel).await {
                     Ok(0) => {}
                     Ok(count) => {
@@ -770,6 +772,48 @@ async fn lease_sweep_loop(
             }
         }
     }
+}
+
+/// Rounds of [`AgentTaskStore::release_expired_leases`] one sweep tick
+/// may run while draining a backlog — a guard against a pathological
+/// store that keeps reporting full batches (the remainder defers to
+/// the next tick). 40 rounds × the store batch ≈ 10k rows per tick.
+const MAX_LEASE_SWEEP_ROUNDS: usize = 40;
+
+/// Drain expired leases until the backlog is exhausted, returning the
+/// total rows reclaimed.
+///
+/// `release_expired_leases` reclaims at most
+/// [`agent_server::journal::store::LEASE_RELEASE_BATCH`] rows per call
+/// on every backend. A single call under a larger backlog (mass worker
+/// outage) would leave later rows ghost-Running through this tick —
+/// and the subagent deadline pass that follows in the same tick skips
+/// Running rows on the assumption that this drain already requeued
+/// every ghost lease. Loop until a call returns fewer than the batch,
+/// bounded by [`MAX_LEASE_SWEEP_ROUNDS`].
+///
+/// # Errors
+/// Propagates the first store failure; rows reclaimed by earlier
+/// rounds stay reclaimed (each round commits independently).
+async fn drain_expired_leases(stores: &StoreRegistry, now: time::OffsetDateTime) -> Result<usize> {
+    let mut total = 0usize;
+    for _ in 0..MAX_LEASE_SWEEP_ROUNDS {
+        let records = stores
+            .task_store
+            .release_expired_leases(now)
+            .await
+            .context("release expired leases")?;
+        total = total.saturating_add(records.len());
+        if records.len() < agent_server::journal::store::LEASE_RELEASE_BATCH {
+            return Ok(total);
+        }
+    }
+    warn!(
+        rounds = MAX_LEASE_SWEEP_ROUNDS,
+        reclaimed = total,
+        "expired-lease drain hit its round guard; remaining backlog defers to the next tick",
+    );
+    Ok(total)
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1101,8 +1145,10 @@ async fn run_task_with_heartbeat(
 /// Cooperative cancellation paths (mid-stream abort, seam-B partial
 /// commit, attempt closes) complete in well under this; only a
 /// token-blind await (a hung provider resolve, a stuck DNS lookup)
-/// burns the full window before the slot is reclaimed.
-const EXECUTION_ABORT_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+/// burns the full window before the slot is reclaimed. `pub(crate)`
+/// because the detached approved-confirmation drive (grpc) applies
+/// the same abort-grace pattern to Confirm-tier tools.
+pub(crate) const EXECUTION_ABORT_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Race the execution future against the per-task token.
 ///
@@ -1128,7 +1174,7 @@ async fn execute_with_abort_grace(
     let task_id = task.id.clone();
     let thread_id = task.thread_id.clone();
     let mut exec_fut = Box::pin(execute_acquired_task(task, stores, runtime, task_cancel));
-    tokio::select! {
+    let outcome = tokio::select! {
         biased;
         result = &mut exec_fut => Some(result),
         () = task_cancel.cancelled() => {
@@ -1147,7 +1193,25 @@ async fn execute_with_abort_grace(
                 }
             }
         }
+    };
+    if outcome.is_none() {
+        drop(exec_fut);
+        // The drop killed the turn's live worker mid-flight, so the
+        // `LeaveOpenForLiveWorker` assumption behind the timeout fail
+        // no longer holds: if cancellation landed while execution was
+        // outside `call_llm_with_retry` (Start persistence,
+        // completed-turn persistence), that turn's OPEN attempt row
+        // would stay unsettled forever. Best-effort close it
+        // (Cancelled, zero usage) — by construction no live worker
+        // remains to clobber.
+        best_effort_close_open_attempts(
+            &task_id,
+            stores.attempt_store.as_ref(),
+            time::OffsetDateTime::now_utc(),
+        )
+        .await;
     }
+    outcome
 }
 
 /// Wall-clock execution deadline for a child-thread root task linked
@@ -2342,11 +2406,21 @@ async fn enforce_parked_child_deadline(
         if child.status.is_terminal() {
             continue;
         }
-        stores
+        let cancelled = stores
             .task_store
             .cancel_tree(&child.id, now)
             .await
             .with_context(|| format!("cancel hung descendant {} of timed-out child", child.id))?;
+        // An approved Confirm-tier tool in this subtree runs on a
+        // DETACHED drive (`drive_approved_confirmation`) that would
+        // otherwise only notice the cancel at its next heartbeat
+        // rejection — its side effect could land after the parent
+        // resumed. Trip each cancelled task's live drive token now so
+        // the in-flight tool aborts immediately; ids without a drive
+        // are no-ops.
+        for cancelled_id in &cancelled {
+            stores.confirm_drive_cancels.cancel(cancelled_id);
+        }
     }
 
     // 2. Re-read: the root must now be Pending (it already was for a
@@ -6188,6 +6262,210 @@ mod tests {
         // execution through the per-task token.
         cancel.cancel();
         handle.await?;
+        Ok(())
+    }
+
+    // ── Round 4: confirm-drive cancellation, force-drop attempt
+    //    settlement, multi-batch lease drain ───────────────────────
+
+    /// Item 1 (sweep edge): when deadline enforcement cancels a parked
+    /// child's tool subtree, any registered approved-confirmation
+    /// drive token for a cancelled task must trip immediately — not
+    /// wait for the drive's next heartbeat rejection.
+    #[tokio::test]
+    async fn sweep_cancels_registered_confirm_drives() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+
+        let config = ServiceConfig::default();
+        let provider = Arc::new(SubagentScriptProvider::new());
+        let runtime = subagent_timeout_runtime(provider)?;
+        let host = ServiceHost::new(config, sample_registry(), runtime)?;
+        let stores = host.stores().clone();
+
+        let backdated = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
+        let parent_thread = ThreadId::from_string("t-sweep-drive-cancel");
+        let (_parent, _invocation, child_root) =
+            persist_subagent_fixture(&stores, &parent_thread, 250, backdated).await?;
+        let tool_child = park_child_root_on_tool_child(&stores, &child_root, backdated).await?;
+
+        // Stands in for a live `drive_approved_confirmation` executing
+        // the (already approved) tool child.
+        let drive_token = CancellationToken::new();
+        stores
+            .confirm_drive_cancels
+            .register(tool_child.id.clone(), drive_token.clone());
+
+        let enforced = enforce_subagent_deadlines(
+            &stores,
+            time::OffsetDateTime::now_utc(),
+            &CancellationToken::new(),
+        )
+        .await?;
+        assert_eq!(enforced, 1);
+        assert!(
+            drive_token.is_cancelled(),
+            "cancelling the tool subtree must trip its registered confirm-drive token",
+        );
+        Ok(())
+    }
+
+    /// Item 2: when the execution future ignores cancellation past the
+    /// abort grace and is force-dropped, any attempt the drop orphaned
+    /// (the timeout fail left it open FOR the live worker) must be
+    /// settled — no live worker remains to close it.
+    #[tokio::test]
+    async fn force_drop_settles_the_open_attempt() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+        use agent_sdk_foundation::audit::AuditProvenance;
+        use agent_server::journal::turn_attempt::{OpenAttemptParams, TurnAttemptOutcome};
+
+        let config = ServiceConfig::default();
+        let provider = Arc::new(SubagentScriptProvider::new());
+        let static_resolver = Arc::new(StaticProviderResolver::new());
+        static_resolver.set_fallback(Arc::clone(&provider) as Arc<dyn LlmProvider>)?;
+        let runtime = Arc::new(
+            ExecutionRuntime::new(
+                Arc::new(HangOnceProviderResolver {
+                    inner: static_resolver,
+                    hung_once: std::sync::atomic::AtomicBool::new(false),
+                }),
+                Arc::new(NoopToolExecutor),
+                Arc::new(AllowAllConfirmationPolicy),
+            )
+            .with_subagent_spawn_selector(Arc::new(DeadlineSpawnSelector)),
+        );
+        let host = ServiceHost::new(config, sample_registry(), runtime.clone())?;
+        let stores = host.stores().clone();
+
+        let now = time::OffsetDateTime::now_utc();
+        let parent_thread = ThreadId::from_string("t-force-drop-attempt");
+        let (_parent, _invocation, child_root) =
+            persist_subagent_fixture(&stores, &parent_thread, 500, now).await?;
+        let worker = WorkerId::from_string("w-force-drop");
+        let lease = LeaseId::new();
+        let acquired = stores
+            .task_store
+            .try_acquire_task(
+                &child_root.id,
+                worker.clone(),
+                lease.clone(),
+                now + time::Duration::seconds(600),
+                now,
+            )
+            .await?
+            .context("child root must acquire")?;
+
+        // Simulates an attempt opened by execution before it wedged in
+        // a token-blind await outside `call_llm_with_retry`.
+        let attempt = stores
+            .attempt_store
+            .open_attempt(OpenAttemptParams {
+                task_id: child_root.id.clone(),
+                attempt_number: 1,
+                provenance: AuditProvenance::new("test", "test"),
+                request_blob: serde_json::json!({ "user_prompt": "wedged turn" }),
+                now,
+                otel_trace_id: None,
+                otel_span_id: None,
+            })
+            .await?;
+
+        // The 500ms deadline fires on a heartbeat tick while the
+        // resolver hangs token-blind; after the 3s grace the future is
+        // force-dropped and the branch must settle the attempt.
+        run_task_with_heartbeat(
+            acquired,
+            &worker,
+            &stores,
+            runtime,
+            &CancellationToken::new(),
+            time::Duration::seconds(30),
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+
+        let failed = stores
+            .task_store
+            .get(&child_root.id)
+            .await?
+            .context("child root exists")?;
+        assert_eq!(failed.status, TaskStatus::Failed);
+        let error = failed.last_error.unwrap_or_default();
+        assert!(
+            error.contains("subagent timed out after 500ms"),
+            "timed-out child must carry the timeout message, got {error:?}",
+        );
+
+        let attempts = stores.attempt_store.list_by_task(&child_root.id).await?;
+        let reread = attempts
+            .into_iter()
+            .find(|row| row.id == attempt.id)
+            .context("opened attempt still listed")?;
+        assert!(
+            reread.is_closed(),
+            "the force-drop branch must settle the attempt the drop orphaned",
+        );
+        assert_eq!(reread.outcome, Some(TurnAttemptOutcome::Cancelled));
+        Ok(())
+    }
+
+    /// Item 3: one sweep tick drains an expired-lease backlog larger
+    /// than the store's per-call batch, so no ghost-Running rows
+    /// survive into the deadline pass that runs later in the same
+    /// tick.
+    #[tokio::test]
+    async fn sweep_tick_drains_more_than_one_lease_batch() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+        use agent_server::journal::store::LEASE_RELEASE_BATCH;
+
+        let config = ServiceConfig::default();
+        let provider = Arc::new(SubagentScriptProvider::new());
+        let runtime = subagent_timeout_runtime(provider)?;
+        let host = ServiceHost::new(config, sample_registry(), runtime)?;
+        let stores = host.stores().clone();
+
+        let now = time::OffsetDateTime::now_utc();
+        let backlog = LEASE_RELEASE_BATCH + 44;
+        let mut task_ids = Vec::with_capacity(backlog);
+        for index in 0..backlog {
+            let task = AgentTask::new_root_turn(
+                ThreadId::from_string(format!("t-drain-{index}")),
+                now - time::Duration::seconds(10),
+                3,
+            );
+            let task_id = task.id.clone();
+            stores.task_store.submit_root_turn(task).await?;
+            stores
+                .task_store
+                .try_acquire_task(
+                    &task_id,
+                    WorkerId::from_string(format!("w-drain-{index}")),
+                    LeaseId::new(),
+                    now - time::Duration::seconds(5),
+                    now - time::Duration::seconds(9),
+                )
+                .await?
+                .context("row claims")?;
+            task_ids.push(task_id);
+        }
+
+        let drained = drain_expired_leases(&stores, now).await?;
+        assert_eq!(
+            drained, backlog,
+            "one sweep tick must drain the whole backlog, not one batch",
+        );
+        for task_id in &task_ids {
+            let row = stores
+                .task_store
+                .get(task_id)
+                .await?
+                .context("row exists")?;
+            assert_eq!(
+                row.status,
+                TaskStatus::Pending,
+                "no ghost-Running rows may survive the drain",
+            );
+        }
         Ok(())
     }
 }

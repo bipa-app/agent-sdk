@@ -133,9 +133,9 @@ pub use bootstrap::{WorkerBootstrapContext, resolve_bootstrap_context};
 pub use definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
 pub use registry::{AgentDefinitionRegistry, InMemoryAgentDefinitionRegistry};
 pub use root_turn::{
-    RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes, cancel_root_turn, execute_root_turn,
-    fail_root_turn, fail_root_turn_leaving_attempts_open, resume_for_steering,
-    resume_from_children, resume_root_turn, revert_steering_wake,
+    RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes, best_effort_close_open_attempts,
+    cancel_root_turn, execute_root_turn, fail_root_turn, fail_root_turn_leaving_attempts_open,
+    resume_for_steering, resume_from_children, resume_root_turn, revert_steering_wake,
 };
 pub use subagent::{
     EffectiveSubagentCapabilities, EffectiveSubagentMcpPolicy, EffectiveSubagentSpec,

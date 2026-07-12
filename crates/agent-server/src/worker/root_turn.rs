@@ -717,7 +717,12 @@ pub async fn revert_steering_wake(
 /// Iterates all attempts and closes any that are still open with the
 /// `Cancelled` outcome. Errors are swallowed — the caller's primary
 /// operation (fail or cancel) takes precedence.
-async fn best_effort_close_open_attempts(
+///
+/// Public for the service host's force-drop path (issue #299): when an
+/// execution future ignores cancellation past the abort grace and is
+/// dropped, no live worker remains to close the attempts the drop
+/// orphaned, so the host settles them with the same best-effort close.
+pub async fn best_effort_close_open_attempts(
     task_id: &AgentTaskId,
     attempt_store: &dyn TurnAttemptStore,
     now: OffsetDateTime,

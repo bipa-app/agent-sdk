@@ -2453,16 +2453,18 @@ impl AgentTaskStore for SqliteDurableStore {
         let mut tx = self.begin().await?;
         // Bound the sweep to a batch so a mass worker outage cannot turn
         // one sweep into a giant transaction that locks every expired
-        // task at once; subsequent sweep ticks drain the remainder.
+        // task at once; the host's drain loop (and any other caller)
+        // keeps calling until a pass returns fewer than the batch.
         let expired = sqlx::query_as::<_, TaskRecord>(concat!(
             "SELECT ",
             task_columns!(),
             " FROM agent_sdk_tasks \
              WHERE status = 'running' AND lease_expires_at <= ?1 \
              ORDER BY lease_expires_at, id \
-             LIMIT 256",
+             LIMIT ?2",
         ))
         .bind(now)
+        .bind(i64::try_from(agent_server::journal::store::LEASE_RELEASE_BATCH).unwrap_or(i64::MAX))
         .fetch_all(&mut *tx)
         .await
         .context("load expired leases")?;

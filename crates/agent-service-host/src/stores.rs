@@ -35,12 +35,14 @@ use agent_server::journal::message_store::{
 use agent_server::journal::outbox::{InMemoryOutboxStore, OutboxStore};
 use agent_server::journal::retention::{InMemoryRetentionStore, RetentionStore};
 use agent_server::journal::store::{AgentTaskStore, InMemoryAgentTaskStore};
+use agent_server::journal::task::AgentTaskId;
 use agent_server::journal::thread_store::{InMemoryThreadStore, ThreadStore};
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 use agent_server::journal::tool_audit::RedactingToolAuditEventStore;
 use agent_server::journal::tool_audit::{InMemoryToolAuditEventStore, ToolAuditEventStore};
 use agent_server::journal::turn_attempt_store::{InMemoryTurnAttemptStore, TurnAttemptStore};
 use agent_server::worker::registry::AgentDefinitionRegistry;
+use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "postgres")]
 use super::config::PostgresStorageConfig;
@@ -329,7 +331,66 @@ pub struct StoreRegistry {
     pub definition_registry: Arc<dyn AgentDefinitionRegistry>,
     /// Same-process event notification hub for replay-to-live handoff.
     pub event_notifier: Arc<EventNotifier>,
+    /// Live cancellation tokens for detached approved-confirmation
+    /// drives (issue #299): lets store-side enforcement (the deadline
+    /// sweep, `CancelTask`) abort an in-flight Confirm-tier tool the
+    /// moment its task row is cancelled instead of waiting out the
+    /// drive's next heartbeat rejection.
+    pub confirm_drive_cancels: Arc<ConfirmDriveCancels>,
     backend: RegistryBackend,
+}
+
+/// Registry of live cancellation tokens for detached
+/// approved-confirmation drives, keyed by the Confirm-tier tool task
+/// id.
+///
+/// A drive registers its per-drive token (a child of the server
+/// shutdown token) before executing and deregisters on completion.
+/// Enforcement paths that cancel the tool's task row out from under
+/// the drive — the subagent deadline sweep's `cancel_tree`, the
+/// external `CancelTask` RPC — call [`Self::cancel`] with every
+/// cancelled task id so the tool's side effect is aborted immediately;
+/// ids without a live drive are no-ops. The drive's heartbeat
+/// lease-rejection path trips the same token, so even an enforcement
+/// path that never consults this registry converges within one
+/// heartbeat interval.
+#[derive(Default)]
+pub struct ConfirmDriveCancels {
+    inner: std::sync::Mutex<std::collections::HashMap<AgentTaskId, CancellationToken>>,
+}
+
+impl ConfirmDriveCancels {
+    /// Recover the map even if a prior holder panicked — losing the
+    /// registry would silently disable immediate confirm-drive
+    /// cancellation.
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<AgentTaskId, CancellationToken>> {
+        match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Register the live drive token for `task_id`.
+    pub fn register(&self, task_id: AgentTaskId, token: CancellationToken) {
+        self.lock().insert(task_id, token);
+    }
+
+    /// Drop the registration for a completed drive.
+    pub fn deregister(&self, task_id: &AgentTaskId) {
+        self.lock().remove(task_id);
+    }
+
+    /// Cancel (and deregister) the live drive for `task_id`, if any.
+    /// Returns `true` when a live drive token was tripped.
+    pub fn cancel(&self, task_id: &AgentTaskId) -> bool {
+        let Some(token) = self.lock().remove(task_id) else {
+            return false;
+        };
+        token.cancel();
+        true
+    }
 }
 
 impl StoreRegistry {
@@ -439,6 +500,7 @@ impl StoreRegistry {
             retention_store: Arc::new(InMemoryRetentionStore::new()),
             definition_registry,
             event_notifier: Arc::new(EventNotifier::new()),
+            confirm_drive_cancels: Arc::new(ConfirmDriveCancels::default()),
             backend: RegistryBackend::InMemory,
         }
     }
@@ -466,6 +528,7 @@ impl StoreRegistry {
             retention_store: durable_store.clone(),
             definition_registry,
             event_notifier: Arc::new(EventNotifier::new()),
+            confirm_drive_cancels: Arc::new(ConfirmDriveCancels::default()),
             backend: RegistryBackend::Postgres(PostgresBackend {
                 store: durable_store,
                 init_once: Arc::new(tokio::sync::OnceCell::new()),
@@ -497,6 +560,7 @@ impl StoreRegistry {
             retention_store: durable_store,
             definition_registry,
             event_notifier: Arc::new(EventNotifier::new()),
+            confirm_drive_cancels: Arc::new(ConfirmDriveCancels::default()),
             backend: RegistryBackend::Sqlite,
         })
     }

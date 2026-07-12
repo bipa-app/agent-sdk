@@ -2942,10 +2942,11 @@ FROM agent_sdk_tasks
 WHERE status = 'running'
   AND lease_expires_at <= $1
 ORDER BY lease_expires_at, id
-LIMIT 256
+LIMIT $2
 FOR UPDATE SKIP LOCKED
 ",
             now,
+            i64::try_from(agent_server::journal::store::LEASE_RELEASE_BATCH).unwrap_or(i64::MAX),
         )
         .fetch_all(&mut *tx)
         .await

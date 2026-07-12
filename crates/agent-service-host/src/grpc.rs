@@ -452,9 +452,20 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
     let worker_id = bootstrap.worker_id.clone();
     let lease_id = bootstrap.lease_id.clone();
 
-    // Extend the lease for the lifetime of the tool call. The child
-    // token is rooted at the server shutdown token, so a host shutdown
-    // still tears the heartbeat down.
+    // Per-drive cancellation token (issue #299): a child of the server
+    // shutdown token, registered under the tool task id so enforcement
+    // paths that cancel this task's row out from under the drive — the
+    // subagent deadline sweep, the `CancelTask` RPC — can abort the
+    // in-flight tool IMMEDIATELY instead of letting its side effect
+    // land after the parent already resumed with a timeout failure.
+    let drive_cancel = shutdown.child_token();
+    stores
+        .confirm_drive_cancels
+        .register(task_id.clone(), drive_cancel.clone());
+
+    // Extend the lease for the lifetime of the tool call. The
+    // heartbeat token is rooted at the server shutdown token, so a
+    // host shutdown still tears the heartbeat down.
     let heartbeat_cancel = shutdown.child_token();
     let heartbeat_handle = tokio::spawn(crate::host::heartbeat_loop(
         crate::host::HeartbeatLoopParams {
@@ -466,67 +477,44 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
             lease_duration,
             heartbeat_interval: heartbeat_interval_for(lease_duration),
             cancel: heartbeat_cancel.clone(),
-            // A Confirm-tier tool heartbeat is not a root turn, so the
-            // partial-commit-on-cancel path (seam B) does not apply here;
-            // reuse the heartbeat's own token so a lease rejection has no
-            // extra effect beyond stopping the ticker.
-            task_cancel: heartbeat_cancel.clone(),
+            // A terminal lease rejection means the row was taken from
+            // us (most commonly a `cancel_tree`); trip the drive token
+            // so the in-flight tool aborts. This backstops enforcement
+            // paths that never consult the drive registry — they still
+            // converge within one heartbeat interval.
+            task_cancel: drive_cancel.clone(),
             // Not a subagent child-thread root — no wall-clock deadline.
             deadline: crate::host::SubagentDeadlineState::Exempt,
         },
     ));
 
     let now = OffsetDateTime::now_utc();
-    let executor_bootstrap = bootstrap.clone();
-    let tool_executor = Arc::clone(runtime.tool_executor());
-    let exec_cancel = shutdown.clone();
-    let deps = GuardedExecutionDeps {
-        task_store: stores.task_store.as_ref(),
-        intent_store: stores.execution_intent_store.as_ref(),
-        event_repo: stores.event_repo.as_ref(),
-    };
-
-    let outcome = Box::pin(resume_confirmed_tool(
-        bootstrap,
-        &deps,
-        runtime.confirmation_policy().as_ref(),
-        &shutdown,
-        move |_tool_call, collector| {
-            let tool_executor = Arc::clone(&tool_executor);
-            let executor_bootstrap = executor_bootstrap.clone();
-            let cancel = exec_cancel.clone();
-            async move {
-                tool_executor
-                    .execute_tool_call(&executor_bootstrap, collector, cancel)
-                    .await
-            }
-        },
-        now,
-    ))
-    .await;
+    let outcome =
+        resume_confirmed_tool_with_abort_grace(&stores, &runtime, bootstrap, &drive_cancel, now)
+            .await;
+    stores.confirm_drive_cancels.deregister(&task_id);
 
     heartbeat_cancel.cancel();
     if let Err(join_err) = heartbeat_handle.await {
         warn!(task_id = %task_id, error = %join_err, "approved confirmation heartbeat join failed");
     }
 
-    match outcome {
-        Ok(
-            ConfirmationResumeOutcome::Executed(_) | ConfirmationResumeOutcome::PolicyDenied { .. },
-        ) => {}
-        Err(error) => {
-            warn!(?error, task_id = %task_id, "approved confirmation resume failed");
-            if let Err(fail_err) = stores
-                .task_store
-                .fail_task(&task_id, &worker_id, &lease_id, format!("{error:#}"), now)
-                .await
-            {
-                warn!(
-                    task_id = %task_id,
-                    error = %fail_err,
-                    "failed to mark approved confirmation task failed after resume error",
-                );
-            }
+    // Success and policy-denied outcomes need no repair. A
+    // force-dropped drive (`None`) is owned by whoever tripped the
+    // token (deadline sweep, CancelTask, lease revocation): its row is
+    // already terminal, and failing it here would only CAS-reject.
+    if let Some(Err(error)) = outcome {
+        warn!(?error, task_id = %task_id, "approved confirmation resume failed");
+        if let Err(fail_err) = stores
+            .task_store
+            .fail_task(&task_id, &worker_id, &lease_id, format!("{error:#}"), now)
+            .await
+        {
+            warn!(
+                task_id = %task_id,
+                error = %fail_err,
+                "failed to mark approved confirmation task failed after resume error",
+            );
         }
     }
 
@@ -541,6 +529,68 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
                 ?error,
                 "loading committed events for approved confirmation publish failed",
             );
+        }
+    }
+}
+
+/// Run the confirmed-tool resume raced against the drive token with
+/// the same bounded abort grace the worker pool applies to executions
+/// (issue #299): a cooperative tool observes its cancel argument and
+/// returns within the grace; a token-blind tool is force-dropped
+/// (`None`) — whoever tripped the token already made the task row
+/// terminal, so the drop cannot orphan durable state.
+async fn resume_confirmed_tool_with_abort_grace(
+    stores: &StoreRegistry,
+    runtime: &Arc<ExecutionRuntime>,
+    bootstrap: agent_server::worker::ToolTaskBootstrap,
+    drive_cancel: &CancellationToken,
+    now: OffsetDateTime,
+) -> Option<Result<ConfirmationResumeOutcome>> {
+    let task_id = bootstrap.task_id.clone();
+    let thread_id = bootstrap.thread_id.clone();
+    let executor_bootstrap = bootstrap.clone();
+    let tool_executor = Arc::clone(runtime.tool_executor());
+    let exec_cancel = drive_cancel.clone();
+    let deps = GuardedExecutionDeps {
+        task_store: stores.task_store.as_ref(),
+        intent_store: stores.execution_intent_store.as_ref(),
+        event_repo: stores.event_repo.as_ref(),
+    };
+
+    let mut resume_fut = Box::pin(resume_confirmed_tool(
+        bootstrap,
+        &deps,
+        runtime.confirmation_policy().as_ref(),
+        drive_cancel,
+        move |_tool_call, collector| {
+            let tool_executor = Arc::clone(&tool_executor);
+            let executor_bootstrap = executor_bootstrap.clone();
+            let cancel = exec_cancel.clone();
+            async move {
+                tool_executor
+                    .execute_tool_call(&executor_bootstrap, collector, cancel)
+                    .await
+            }
+        },
+        now,
+    ));
+    tokio::select! {
+        biased;
+        outcome = &mut resume_fut => Some(outcome),
+        () = drive_cancel.cancelled() => {
+            match tokio::time::timeout(crate::host::EXECUTION_ABORT_GRACE, &mut resume_fut).await {
+                Ok(outcome) => Some(outcome),
+                Err(_elapsed) => {
+                    warn!(
+                        task_id = %task_id,
+                        thread_id = %thread_id,
+                        grace_secs = crate::host::EXECUTION_ABORT_GRACE.as_secs(),
+                        "approved confirmation drive ignored cancellation past the grace \
+                         window; dropping it (its task row is already terminal)",
+                    );
+                    None
+                }
+            }
         }
     }
 }
@@ -1441,6 +1491,18 @@ impl AgentControlService for GrpcControlService {
         )
         .await
         .map_err(internal_status("cancelling task tree"))?;
+
+        // Trip any live approved-confirmation drive whose tool task was
+        // just cancelled (issue #299): without this, the detached drive
+        // only notices at its next heartbeat rejection and its side
+        // effect could still land post-cancel. Ids without a live
+        // drive are no-ops.
+        for cancelled_id in &cancelled {
+            self.shared
+                .stores
+                .confirm_drive_cancels
+                .cancel(cancelled_id);
+        }
 
         let cancelled_task_ids: Vec<String> = cancelled.iter().map(ToString::to_string).collect();
         let cancelled_count = u32::try_from(cancelled_task_ids.len())
@@ -5123,6 +5185,165 @@ mod tests {
             .expect_err("cancel on unknown task must error");
         assert_eq!(err.code(), tonic::Code::NotFound, "{err:?}");
         Ok(())
+    }
+
+    /// Tool executor whose side effect lands only after `delay` — and
+    /// whose cancel argument aborts it first, like any well-behaved
+    /// external tool. `started` observes dispatch; `landed` observes
+    /// the side effect.
+    struct SlowSideEffectExecutor {
+        started: Arc<std::sync::atomic::AtomicBool>,
+        landed: Arc<std::sync::atomic::AtomicBool>,
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl ToolCallExecutor for SlowSideEffectExecutor {
+        async fn execute_tool_call(
+            &self,
+            _bootstrap: &agent_server::ToolTaskBootstrap,
+            _collector: agent_server::worker::ToolEventCollector,
+            cancel: CancellationToken,
+        ) -> Result<ToolResult> {
+            self.started
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            tokio::select! {
+                () = cancel.cancelled() => Ok(ToolResult {
+                    success: false,
+                    output: "aborted before side effect".into(),
+                    data: None,
+                    documents: Vec::new(),
+                    duration_ms: None,
+                }),
+                () = tokio::time::sleep(self.delay) => {
+                    self.landed
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(ToolResult::success("side effect landed"))
+                }
+            }
+        }
+    }
+
+    /// Issue #299 round 4 (item 1): an APPROVED Confirm-tier tool runs
+    /// on a detached drive under the server shutdown token; before
+    /// this fix, cancelling its task row (`CancelTask`, the subagent
+    /// deadline sweep) left the drive executing and its side effect
+    /// could land AFTER the cancellation. The drive now registers a
+    /// per-drive token that the cancel paths trip, and the executor's
+    /// cancel argument observes it before the effect lands.
+    #[tokio::test]
+    async fn cancel_task_aborts_in_flight_approved_confirm_drive() -> Result<()> {
+        let transfer_tool = Tool {
+            name: "transfer".into(),
+            description: "Transfer funds".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "amount": { "type": "number" } },
+                "required": ["amount"]
+            }),
+            display_name: "Transfer".into(),
+            tier: ToolTier::Confirm,
+        };
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(vec![
+            transfer_tool,
+        ])));
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let landed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(vec![tool_use_response(
+                "resp_drive_cancel_1",
+                "tool_call_drive_cancel",
+                "transfer",
+                json!({"amount": 7}),
+            )])),
+            Arc::new(SlowSideEffectExecutor {
+                started: Arc::clone(&started),
+                landed: Arc::clone(&landed),
+                delay: Duration::from_millis(1_500),
+            }),
+        )?;
+        let daemon = LocalDaemon::start(ServiceConfig::default(), registry, runtime).await?;
+
+        let result = async {
+            let (mut control, _events) = connect_clients(&daemon.endpoint()).await?;
+            let thread_id = create_thread(&mut control, "drive-cancel-create").await?;
+            let root = submit_text_work(
+                &mut control,
+                "drive-cancel-submit",
+                &thread_id,
+                "transfer 7",
+            )
+            .await?;
+
+            let awaiting = wait_for_awaiting_confirmation(&control, &thread_id).await?;
+            control
+                .decide_confirmation(pb::DecideConfirmationRequest {
+                    request_id: "drive-cancel-approve".into(),
+                    thread_id: thread_id.clone(),
+                    task_id: awaiting.task_id.clone(),
+                    decision: Some(pb::ConfirmationDecision {
+                        decision: Some(pb::confirmation_decision::Decision::Approved(
+                            pb::ApprovedConfirmation {},
+                        )),
+                    }),
+                })
+                .await
+                .context("decide_confirmation rpc")?;
+
+            // Wait until the tool is genuinely mid-flight on the
+            // detached drive, then cancel the root task tree.
+            let started_probe = Arc::clone(&started);
+            wait_for(move || {
+                let started_probe = Arc::clone(&started_probe);
+                async move {
+                    Ok(started_probe
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        .then_some(()))
+                }
+            })
+            .await
+            .context("tool never started")?;
+
+            let cancelled = control
+                .cancel_task(pb::CancelTaskRequest {
+                    task_id: root.task_id.clone(),
+                    reason: "deadline enforcement".into(),
+                    thread_id: String::new(),
+                })
+                .await
+                .context("cancel_task rpc")?
+                .into_inner();
+            assert!(
+                cancelled
+                    .cancelled_task_ids
+                    .contains(&awaiting.task_id.clone()),
+                "the approved tool task must be in the cancelled set, got {cancelled:?}",
+            );
+
+            // Give the tool's 1.5s side-effect timer ample time to
+            // have fired if the cancel had NOT reached the drive.
+            tokio::time::sleep(Duration::from_millis(2_500)).await;
+            assert!(
+                !landed.load(std::sync::atomic::Ordering::SeqCst),
+                "the tool's side effect must not land after its drive was cancelled",
+            );
+
+            let tasks = list_thread_tasks(&mut control, &thread_id, "post drive cancel").await?;
+            let tool_row = tasks
+                .iter()
+                .find(|task| task.task_id == awaiting.task_id)
+                .context("tool task listed")?;
+            assert_eq!(
+                tool_row.status,
+                pb::TaskStatus::Cancelled as i32,
+                "the approved tool task must end Cancelled, got {tool_row:?}",
+            );
+            Ok(())
+        }
+        .await;
+
+        daemon.stop().await?;
+        result
     }
 
     /// A blank `task_id` is rejected up front with `INVALID_ARGUMENT`.
