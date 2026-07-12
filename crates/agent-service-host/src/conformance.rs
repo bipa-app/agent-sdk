@@ -47,6 +47,7 @@ mod tests {
     use agent_sdk_foundation::audit::AuditProvenance;
     use agent_sdk_foundation::events::AgentEvent;
     use agent_sdk_foundation::{ThreadId, TokenUsage};
+    use agent_server::journal::checkpoint::CheckpointKind;
     use agent_server::journal::checkpoint_store::CheckpointStore;
     use agent_server::journal::commit::{CompletedTurnCommit, commit_completed_turn};
     use agent_server::journal::event_repository::EventRepository;
@@ -417,6 +418,7 @@ mod tests {
         };
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: tid.clone(),
                 task_id: root.id.clone(),
                 expected_turn: 1,
@@ -496,6 +498,7 @@ mod tests {
             })
             .await?;
         let params = CompletedTurnCommit {
+            checkpoint_kind: CheckpointKind::FullTurn,
             thread_id: thread_id(tid),
             task_id: root.id.clone(),
             expected_turn: 1,
@@ -669,6 +672,7 @@ mod tests {
             })
             .await?;
         let stale = CompletedTurnCommit {
+            checkpoint_kind: CheckpointKind::FullTurn,
             thread_id: thread_id("conformance-stale-typed"),
             task_id: root.id.clone(),
             expected_turn: 1,
@@ -3173,7 +3177,7 @@ mod tests {
     async fn conformance_postgres_fork_atomic_commits_full_state() -> Result<()> {
         use agent_sdk_foundation::events::AgentEvent;
         use agent_sdk_foundation::llm::Message;
-        use agent_server::journal::checkpoint::NewCheckpointParams;
+        use agent_server::journal::checkpoint::{CheckpointKind, NewCheckpointParams};
         use agent_server::journal::fork_transaction::{AtomicForkCommitter, ForkCommitParams};
 
         let Some((store, _guard)) = pg_test_store().await? else {
@@ -3211,6 +3215,7 @@ mod tests {
             cumulative_total_usage: TokenUsage::default(),
             messages: messages.clone(),
             checkpoint: Some(NewCheckpointParams {
+                kind: CheckpointKind::FullTurn,
                 thread_id: new_thread_id.clone(),
                 turn_number: 1,
                 task_id: source_task_id,
@@ -3262,7 +3267,7 @@ mod tests {
     async fn conformance_postgres_fork_atomic_rolls_back_on_failure() -> Result<()> {
         use agent_sdk_foundation::events::AgentEvent;
         use agent_sdk_foundation::llm::Message;
-        use agent_server::journal::checkpoint::NewCheckpointParams;
+        use agent_server::journal::checkpoint::{CheckpointKind, NewCheckpointParams};
         use agent_server::journal::fork_transaction::{AtomicForkCommitter, ForkCommitParams};
 
         let Some((store, _guard)) = pg_test_store().await? else {
@@ -3291,6 +3296,7 @@ mod tests {
         CheckpointStore::commit_checkpoint(
             &store,
             NewCheckpointParams {
+                kind: CheckpointKind::FullTurn,
                 thread_id: new_thread_id.clone(),
                 turn_number: 1,
                 task_id: pre_task_id,
@@ -3316,6 +3322,7 @@ mod tests {
             cumulative_total_usage: TokenUsage::default(),
             messages: fresh_messages.clone(),
             checkpoint: Some(NewCheckpointParams {
+                kind: CheckpointKind::FullTurn,
                 thread_id: new_thread_id.clone(),
                 turn_number: 1,
                 task_id: source_task_id,

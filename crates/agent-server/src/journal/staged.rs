@@ -403,6 +403,7 @@ impl StagedStores {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journal::checkpoint::CheckpointKind;
     use agent_sdk_foundation::TokenUsage;
 
     fn thread_a() -> ThreadId {
@@ -670,6 +671,7 @@ mod tests {
         ];
         let checkpoint = super::super::checkpoint::Checkpoint::new(
             super::super::checkpoint::NewCheckpointParams {
+                kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 turn_number: 1,
                 task_id: super::super::task::AgentTaskId::from_string("task_committed"),
@@ -725,6 +727,7 @@ mod tests {
         let snapshot = serde_json::to_value(AgentState::new(thread_a()))?;
         let checkpoint = super::super::checkpoint::Checkpoint::new(
             super::super::checkpoint::NewCheckpointParams {
+                kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 turn_number: 1,
                 task_id: super::super::task::AgentTaskId::from_string("task_precompact"),

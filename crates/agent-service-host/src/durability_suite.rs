@@ -59,6 +59,7 @@ mod tests {
     // `ThreadStore` / `CheckpointStore` / `EventRepository` traits with
     // fully-qualified syntax; the reopen-resume test goes through
     // `recover_thread`, which takes the stores as `&dyn`.
+    use agent_server::journal::checkpoint::CheckpointKind;
     #[cfg(feature = "failpoints")]
     use agent_server::journal::checkpoint_store::CheckpointStore;
     #[cfg(feature = "failpoints")]
@@ -312,6 +313,7 @@ mod tests {
             .context("open attempt for committed turn")?;
         commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread.clone(),
                 task_id: task_id.clone(),
                 // Every caller of this helper commits the thread's first

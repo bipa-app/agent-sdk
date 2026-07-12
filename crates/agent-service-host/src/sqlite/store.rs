@@ -26,7 +26,9 @@ use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
 use time::OffsetDateTime;
 
-use agent_server::journal::checkpoint::{Checkpoint, CheckpointId, NewCheckpointParams};
+use agent_server::journal::checkpoint::{
+    Checkpoint, CheckpointId, CheckpointKind, NewCheckpointParams,
+};
 use agent_server::journal::checkpoint_store::CheckpointStore;
 use agent_server::journal::commit::{
     CommitOutcome, CommitOwnerGuard, CompletedTurnCommit, DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
@@ -608,7 +610,7 @@ WHERE id = ?1
         let record = sqlx::query_as::<_, CheckpointRecord>(
             r"
 SELECT id, thread_id, turn_number, task_id, messages_json,
-       agent_state_snapshot, turn_input_tokens, turn_output_tokens, created_at
+       agent_state_snapshot, turn_input_tokens, turn_output_tokens, kind, created_at
 FROM agent_sdk_turn_checkpoints
 WHERE id = ?1
 ",
@@ -631,12 +633,13 @@ WHERE id = ?1
         let messages_json = json_to_value(&checkpoint.messages, "checkpoint messages")?;
         let turn_input_tokens = i64::from(checkpoint.turn_usage.input_tokens);
         let turn_output_tokens = i64::from(checkpoint.turn_usage.output_tokens);
+        let kind = checkpoint.kind.as_str();
         sqlx::query!(
             r"
 INSERT INTO agent_sdk_turn_checkpoints (
     id, thread_id, turn_number, task_id, messages_json,
-    agent_state_snapshot, turn_input_tokens, turn_output_tokens, created_at
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+    agent_state_snapshot, turn_input_tokens, turn_output_tokens, kind, created_at
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
 ",
             id,
             thread_id_key,
@@ -646,6 +649,7 @@ INSERT INTO agent_sdk_turn_checkpoints (
             checkpoint.agent_state_snapshot,
             turn_input_tokens,
             turn_output_tokens,
+            kind,
             checkpoint.created_at,
         )
         .execute(&mut **tx)
@@ -1887,6 +1891,7 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
         Self::upsert_message_head_tx(&mut tx, &updated_projection).await?;
 
         let checkpoint = Checkpoint::new(NewCheckpointParams {
+            kind: params.checkpoint_kind,
             thread_id: params.thread_id.clone(),
             turn_number: thread.committed_turns,
             task_id: params.task_id,
@@ -3711,7 +3716,7 @@ impl CheckpointStore for SqliteDurableStore {
         turn_number: u32,
     ) -> Result<Option<Checkpoint>> {
         let record = sqlx::query_as::<_, CheckpointRecord>(
-            r"SELECT id, thread_id, turn_number, task_id, messages_json, agent_state_snapshot, turn_input_tokens, turn_output_tokens, created_at FROM agent_sdk_turn_checkpoints WHERE thread_id = ?1 AND turn_number = ?2",
+            r"SELECT id, thread_id, turn_number, task_id, messages_json, agent_state_snapshot, turn_input_tokens, turn_output_tokens, kind, created_at FROM agent_sdk_turn_checkpoints WHERE thread_id = ?1 AND turn_number = ?2",
         )
         .bind(thread_key(thread_id))
         .bind(i64::from(turn_number))
@@ -3723,7 +3728,7 @@ impl CheckpointStore for SqliteDurableStore {
 
     async fn get_latest_by_thread(&self, thread_id: &ThreadId) -> Result<Option<Checkpoint>> {
         let record = sqlx::query_as::<_, CheckpointRecord>(
-            r"SELECT id, thread_id, turn_number, task_id, messages_json, agent_state_snapshot, turn_input_tokens, turn_output_tokens, created_at FROM agent_sdk_turn_checkpoints WHERE thread_id = ?1 ORDER BY turn_number DESC LIMIT 1",
+            r"SELECT id, thread_id, turn_number, task_id, messages_json, agent_state_snapshot, turn_input_tokens, turn_output_tokens, kind, created_at FROM agent_sdk_turn_checkpoints WHERE thread_id = ?1 ORDER BY turn_number DESC LIMIT 1",
         )
         .bind(thread_key(thread_id))
         .fetch_optional(&self.pool)
@@ -3734,7 +3739,7 @@ impl CheckpointStore for SqliteDurableStore {
 
     async fn list_by_thread(&self, thread_id: &ThreadId) -> Result<Vec<Checkpoint>> {
         let records = sqlx::query_as::<_, CheckpointRecord>(
-            r"SELECT id, thread_id, turn_number, task_id, messages_json, agent_state_snapshot, turn_input_tokens, turn_output_tokens, created_at FROM agent_sdk_turn_checkpoints WHERE thread_id = ?1 ORDER BY turn_number",
+            r"SELECT id, thread_id, turn_number, task_id, messages_json, agent_state_snapshot, turn_input_tokens, turn_output_tokens, kind, created_at FROM agent_sdk_turn_checkpoints WHERE thread_id = ?1 ORDER BY turn_number",
         )
         .bind(thread_key(thread_id))
         .fetch_all(&self.pool)
@@ -4766,6 +4771,7 @@ struct CheckpointRecord {
     agent_state_snapshot: serde_json::Value,
     turn_input_tokens: i64,
     turn_output_tokens: i64,
+    kind: String,
     created_at: OffsetDateTime,
 }
 
@@ -4784,6 +4790,8 @@ impl TryFrom<CheckpointRecord> for Checkpoint {
                 output_tokens: u32_from_i64(r.turn_output_tokens, "checkpoint turn_output_tokens")?,
                 ..Default::default()
             },
+            kind: CheckpointKind::parse(&r.kind)
+                .context("rehydrate checkpoint kind from sqlite row")?,
             created_at: r.created_at,
         };
         checkpoint
@@ -5909,6 +5917,7 @@ mod tests {
     async fn draft_messages_persist_until_atomic_commit_clears_them() -> Result<()> {
         use agent_sdk_foundation::llm;
         use agent_sdk_foundation::{TokenUsage, audit::AuditProvenance};
+        use agent_server::journal::checkpoint::CheckpointKind;
         use agent_server::journal::commit::CompletedTurnCommit;
         use agent_server::journal::completed_turn_transaction::AtomicCompletedTurnCommitter;
         use agent_server::journal::message_store::MessageProjectionStore;
@@ -5976,6 +5985,7 @@ mod tests {
         let commit = AtomicCompletedTurnCommitter::commit_completed_turn_atomic(
             &store,
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_id.clone(),
                 task_id,
                 expected_turn: 1,
@@ -6034,6 +6044,7 @@ mod tests {
         use agent_sdk_foundation::events::AgentEvent;
         use agent_sdk_foundation::llm;
         use agent_sdk_foundation::{TokenUsage, audit::AuditProvenance};
+        use agent_server::journal::checkpoint::CheckpointKind;
         use agent_server::journal::commit::CompletedTurnCommit;
         use agent_server::journal::completed_turn_transaction::AtomicCompletedTurnCommitter;
         use agent_server::journal::event_repository::EventRepository;
@@ -6083,6 +6094,7 @@ mod tests {
         let outcome = AtomicCompletedTurnCommitter::commit_completed_turn_atomic(
             &store,
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_id.clone(),
                 task_id,
                 expected_turn: 1,
@@ -6266,7 +6278,7 @@ mod tests {
     async fn fork_atomic_commits_full_state_in_one_transaction() -> Result<()> {
         use agent_sdk_foundation::events::AgentEvent;
         use agent_sdk_foundation::llm::Message;
-        use agent_server::journal::checkpoint::NewCheckpointParams;
+        use agent_server::journal::checkpoint::{CheckpointKind, NewCheckpointParams};
         use agent_server::journal::checkpoint_store::CheckpointStore;
         use agent_server::journal::event_repository::EventRepository;
         use agent_server::journal::fork_transaction::{AtomicForkCommitter, ForkCommitParams};
@@ -6309,6 +6321,7 @@ mod tests {
             cumulative_total_usage: agent_sdk_foundation::TokenUsage::default(),
             messages: messages.clone(),
             checkpoint: Some(NewCheckpointParams {
+                kind: CheckpointKind::FullTurn,
                 thread_id: new_thread_id.clone(),
                 turn_number: 1,
                 task_id: source_task_id,
@@ -6363,7 +6376,7 @@ mod tests {
     async fn fork_atomic_carries_cumulative_total_usage() -> Result<()> {
         use agent_sdk_foundation::TokenUsage;
         use agent_sdk_foundation::llm::Message;
-        use agent_server::journal::checkpoint::NewCheckpointParams;
+        use agent_server::journal::checkpoint::{CheckpointKind, NewCheckpointParams};
         use agent_server::journal::fork_transaction::{AtomicForkCommitter, ForkCommitParams};
         use agent_server::journal::store::AgentTaskStore;
         use agent_server::journal::task::AgentTask;
@@ -6393,6 +6406,7 @@ mod tests {
             cumulative_total_usage: cumulative.clone(),
             messages: messages.clone(),
             checkpoint: Some(NewCheckpointParams {
+                kind: CheckpointKind::FullTurn,
                 thread_id: new_thread_id.clone(),
                 turn_number: 3,
                 task_id: source_task_id,
@@ -6434,7 +6448,7 @@ mod tests {
     async fn fork_atomic_rolls_back_on_failure() -> Result<()> {
         use agent_sdk_foundation::events::AgentEvent;
         use agent_sdk_foundation::llm::Message;
-        use agent_server::journal::checkpoint::NewCheckpointParams;
+        use agent_server::journal::checkpoint::{CheckpointKind, NewCheckpointParams};
         use agent_server::journal::event_repository::EventRepository;
         use agent_server::journal::fork_transaction::{AtomicForkCommitter, ForkCommitParams};
         use agent_server::journal::message_store::MessageProjectionStore;
@@ -6470,6 +6484,7 @@ mod tests {
         agent_server::journal::checkpoint_store::CheckpointStore::commit_checkpoint(
             &store,
             NewCheckpointParams {
+                kind: CheckpointKind::FullTurn,
                 thread_id: new_thread_id.clone(),
                 turn_number: 1,
                 task_id: pre_task_id,
@@ -6497,6 +6512,7 @@ mod tests {
             cumulative_total_usage: agent_sdk_foundation::TokenUsage::default(),
             messages: fresh_messages.clone(),
             checkpoint: Some(NewCheckpointParams {
+                kind: CheckpointKind::FullTurn,
                 thread_id: new_thread_id.clone(),
                 turn_number: 1,
                 task_id: source_task_id,

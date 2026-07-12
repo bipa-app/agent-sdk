@@ -62,7 +62,7 @@ use time::{Duration, OffsetDateTime};
 
 use agent_sdk_foundation::events::AgentEvent;
 
-use super::checkpoint::{CheckpointId, NewCheckpointParams};
+use super::checkpoint::{CheckpointId, CheckpointKind, NewCheckpointParams};
 use super::checkpoint_store::CheckpointStore;
 use super::commit::{CompletedTurnCommit, commit_completed_turn};
 use super::event_repository::EventRepository;
@@ -976,6 +976,7 @@ async fn case_semantic_equality_on_roundtrip<S: JournalStore>(store: &S) -> Resu
     let committed = CheckpointStore::commit_checkpoint(
         store,
         NewCheckpointParams {
+            kind: CheckpointKind::FullTurn,
             thread_id: thread.clone(),
             turn_number: 1,
             task_id,
@@ -1082,6 +1083,7 @@ async fn case_safe_noop_delete_for_append_only<S: JournalStore>(store: &S) -> Re
         CheckpointStore::commit_checkpoint(
             store,
             NewCheckpointParams {
+                kind: CheckpointKind::FullTurn,
                 thread_id: thread.clone(),
                 turn_number: turn,
                 task_id: task_id.clone(),
@@ -1254,6 +1256,7 @@ async fn case_checkpoint_roundtrip<S: JournalStore>(store: &S) -> Result<()> {
     let committed = CheckpointStore::commit_checkpoint(
         store,
         NewCheckpointParams {
+            kind: CheckpointKind::FullTurn,
             thread_id: thread.clone(),
             turn_number: 1,
             task_id,
@@ -1278,6 +1281,37 @@ async fn case_checkpoint_roundtrip<S: JournalStore>(store: &S) -> Result<()> {
     assert_semantic_eq(&committed, &by_id, "checkpoint by id")?;
     assert_semantic_eq(&committed, &by_turn, "checkpoint by turn")?;
     ensure!(by_id.messages.len() == 2, "messages roundtrip");
+    ensure!(
+        by_id.kind == CheckpointKind::FullTurn,
+        "full-turn kind roundtrips"
+    );
+
+    // The non-default kind must be durably persisted, not defaulted on
+    // rehydration — `FullTurn` is the serde/back-compat default, so
+    // only a `CancelSalvage` row proves the column actually round-trips.
+    let salvage = CheckpointStore::commit_checkpoint(
+        store,
+        NewCheckpointParams {
+            kind: CheckpointKind::CancelSalvage,
+            thread_id: thread.clone(),
+            turn_number: 2,
+            task_id: by_id.task_id.clone(),
+            messages,
+            agent_state_snapshot: serde_json::json!({ "step": 2 }),
+            turn_usage: TokenUsage::default(),
+            now: t_plus(2),
+        },
+    )
+    .await?;
+    let salvage_by_turn = CheckpointStore::get_by_turn(store, &thread, 2)
+        .await?
+        .context("get salvage by turn")?;
+    ensure!(
+        salvage_by_turn.kind == CheckpointKind::CancelSalvage,
+        "cancel-salvage kind must survive rehydration, got {:?}",
+        salvage_by_turn.kind,
+    );
+    assert_semantic_eq(&salvage, &salvage_by_turn, "salvage checkpoint")?;
     Ok(())
 }
 
@@ -1290,6 +1324,7 @@ async fn case_list_reverse_chronological<S: JournalStore>(store: &S) -> Result<(
         CheckpointStore::commit_checkpoint(
             store,
             NewCheckpointParams {
+                kind: CheckpointKind::FullTurn,
                 thread_id: thread.clone(),
                 turn_number: turn,
                 task_id: task_id.clone(),
@@ -1341,6 +1376,7 @@ async fn case_latest_by_insertion_order_not_lexicographic_id<S: JournalStore + ?
     let first = CheckpointStore::commit_checkpoint(
         store,
         NewCheckpointParams {
+            kind: CheckpointKind::FullTurn,
             thread_id: thread.clone(),
             turn_number: 1,
             task_id: task_id.clone(),
@@ -1354,6 +1390,7 @@ async fn case_latest_by_insertion_order_not_lexicographic_id<S: JournalStore + ?
     let second = CheckpointStore::commit_checkpoint(
         store,
         NewCheckpointParams {
+            kind: CheckpointKind::FullTurn,
             thread_id: thread.clone(),
             turn_number: 2,
             task_id,
@@ -1516,6 +1553,7 @@ async fn commit_one_turn<S: JournalStore>(
 
     let outcome = commit_completed_turn(
         CompletedTurnCommit {
+            checkpoint_kind: CheckpointKind::FullTurn,
             thread_id: thread.clone(),
             task_id: task_id.clone(),
             expected_turn: turn_number,
@@ -1568,6 +1606,7 @@ async fn case_metadata_filter<S: JournalStore>(store: &S) -> Result<()> {
         CheckpointStore::commit_checkpoint(
             store,
             NewCheckpointParams {
+                kind: CheckpointKind::FullTurn,
                 thread_id: thread.clone(),
                 turn_number: turn,
                 task_id: task_id.clone(),
@@ -1706,6 +1745,7 @@ mod tests {
             let task_id = seed_root_task(&correct, &t).await?;
             for turn in 1..=2u32 {
                 let params = NewCheckpointParams {
+                    kind: CheckpointKind::FullTurn,
                     thread_id: t.clone(),
                     turn_number: turn,
                     task_id: task_id.clone(),

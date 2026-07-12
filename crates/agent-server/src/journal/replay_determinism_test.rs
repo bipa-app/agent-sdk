@@ -28,6 +28,7 @@
 //! function of its inputs plus store state. No wall clock, no RNG, no
 //! ordering nondeterminism.
 
+use crate::journal::checkpoint::CheckpointKind;
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::{ThreadId, TokenUsage, llm};
 use anyhow::{Context, Result};
@@ -121,6 +122,7 @@ impl ReplayStores {
             .await
             .context("open attempt for replay")?;
         Ok(CompletedTurnCommit {
+            checkpoint_kind: CheckpointKind::FullTurn,
             thread_id: thread(),
             task_id: turn.task_id.clone(),
             // History is replayed in order (attempt_number == i + 1), so

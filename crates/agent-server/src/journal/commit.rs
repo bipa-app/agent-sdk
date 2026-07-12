@@ -66,6 +66,7 @@ use anyhow::{Context, Result};
 use time::OffsetDateTime;
 
 use super::checkpoint::Checkpoint;
+use super::checkpoint::CheckpointKind;
 use super::checkpoint::NewCheckpointParams;
 use super::checkpoint_store::CheckpointStore;
 use super::committed_event::CommittedEvent;
@@ -111,6 +112,15 @@ pub struct CompletedTurnCommit {
     pub messages: Vec<llm::Message>,
     /// Token usage for this turn.
     pub turn_usage: TokenUsage,
+    /// Provenance recorded on the checkpoint row this commit creates.
+    ///
+    /// [`CheckpointKind::CancelSalvage`] is set **only** by the
+    /// cancellation seam-B salvage commit; every full-turn commit path
+    /// passes [`CheckpointKind::FullTurn`]. The worker's turn-slot-shift
+    /// retry keys its shift-eligibility decision off this durable
+    /// discriminator — never off token usage, which can legitimately be
+    /// all-zero on a real completion.
+    pub checkpoint_kind: CheckpointKind,
     /// Opaque agent-state snapshot for v1 recovery.
     pub agent_state_snapshot: serde_json::Value,
     /// Lifecycle events to commit atomically with the turn.
@@ -384,6 +394,7 @@ pub async fn commit_completed_turn(
             messages: updated_projection.messages,
             agent_state_snapshot: params.agent_state_snapshot,
             turn_usage: params.turn_usage,
+            kind: params.checkpoint_kind,
             now: params.now,
         })
         .await
@@ -550,6 +561,7 @@ mod tests {
 
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task_id.clone(),
                 expected_turn: 1,
@@ -613,6 +625,7 @@ mod tests {
         // Turn 1
         let o1 = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task1,
                 expected_turn: 1,
@@ -638,6 +651,7 @@ mod tests {
         // Turn 2
         let o2 = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task2,
                 expected_turn: 2,
@@ -705,6 +719,7 @@ mod tests {
         // Turn 1 commits cleanly; the thread now sits at committed_turns = 1.
         commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task1,
                 expected_turn: 1,
@@ -731,6 +746,7 @@ mod tests {
         // The guard rejects it before any projection advances.
         let err = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task2_stale,
                 expected_turn: 1,
@@ -765,6 +781,7 @@ mod tests {
         // The correct expected_turn for the next turn succeeds.
         let ok = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task2_ok,
                 expected_turn: 2,
@@ -805,6 +822,7 @@ mod tests {
 
         commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task_a,
                 expected_turn: 1,
@@ -829,6 +847,7 @@ mod tests {
 
         commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_b(),
                 task_id: task_b,
                 expected_turn: 1,
@@ -873,6 +892,7 @@ mod tests {
         let s = Stores::new();
         let err = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: AgentTaskId::from_string("task_x"),
                 expected_turn: 1,
@@ -928,6 +948,7 @@ mod tests {
         // Attempt to commit with the already-closed attempt.
         let err = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id,
                 expected_turn: 1,
@@ -973,6 +994,7 @@ mod tests {
         // Commit first turn then mark thread completed.
         commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task1,
                 expected_turn: 1,
@@ -1003,6 +1025,7 @@ mod tests {
         // Second commit should fail at thread aggregate step.
         let err = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task2,
                 expected_turn: 2,
@@ -1070,6 +1093,7 @@ mod tests {
 
         commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id,
                 expected_turn: 1,
@@ -1118,6 +1142,7 @@ mod tests {
 
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id,
                 expected_turn: 1,
@@ -1179,6 +1204,7 @@ mod tests {
 
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id,
                 expected_turn: 1,

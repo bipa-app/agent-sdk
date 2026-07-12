@@ -21,6 +21,7 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::journal::checkpoint::CheckpointKind;
     use crate::journal::checkpoint_store::{CheckpointStore, InMemoryCheckpointStore};
     use crate::journal::commit::{CompletedTurnCommit, commit_completed_turn};
     use crate::journal::event_repository::InMemoryEventRepository;
@@ -132,6 +133,7 @@ mod tests {
                 .saturating_add(1);
             commit_completed_turn(
                 CompletedTurnCommit {
+                    checkpoint_kind: CheckpointKind::FullTurn,
                     thread_id: thread_id.clone(),
                     task_id: task_id.clone(),
                     expected_turn,
@@ -365,6 +367,7 @@ mod tests {
         // Attempt the full commit — should fail at step 1.
         let err = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_id.clone(),
                 task_id: task,
                 // Fresh thread; the commit aborts at the attempt-close
@@ -1004,6 +1007,7 @@ mod tests {
         let attempt_id = s.open_attempt(&task2, 1).await?;
         let commit_err = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_id.clone(),
                 task_id: task2,
                 // The thread already has 1 committed turn, so the next

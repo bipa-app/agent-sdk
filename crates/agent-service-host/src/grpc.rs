@@ -745,6 +745,9 @@ impl GrpcControlService {
             cumulative_total_usage,
             messages: checkpoint.messages.clone(),
             checkpoint: Some(NewCheckpointParams {
+                // Forking copies the source checkpoint verbatim onto the
+                // new thread; its provenance travels with it.
+                kind: checkpoint.kind,
                 thread_id: new_thread_id.clone(),
                 turn_number: checkpoint.turn_number,
                 task_id: checkpoint.task_id.clone(),

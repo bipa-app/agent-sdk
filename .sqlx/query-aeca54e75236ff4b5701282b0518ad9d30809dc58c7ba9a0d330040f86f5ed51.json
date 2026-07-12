@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\nINSERT INTO agent_sdk_turn_checkpoints (\n    id, thread_id, turn_number, task_id, messages_json,\n    agent_state_snapshot, turn_input_tokens, turn_output_tokens, kind, created_at\n) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 10
+    },
+    "nullable": []
+  },
+  "hash": "aeca54e75236ff4b5701282b0518ad9d30809dc58c7ba9a0d330040f86f5ed51"
+}

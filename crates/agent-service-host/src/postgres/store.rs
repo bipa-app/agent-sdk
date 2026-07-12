@@ -26,7 +26,9 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 
-use agent_server::journal::checkpoint::{Checkpoint, CheckpointId, NewCheckpointParams};
+use agent_server::journal::checkpoint::{
+    Checkpoint, CheckpointId, CheckpointKind, NewCheckpointParams,
+};
 use agent_server::journal::checkpoint_store::CheckpointStore;
 use agent_server::journal::commit::{
     CommitOutcome, CommitOwnerGuard, CompletedTurnCommit, DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
@@ -699,6 +701,7 @@ SELECT
     agent_state_snapshot,
     turn_input_tokens,
     turn_output_tokens,
+    kind,
     created_at
 FROM agent_sdk_turn_checkpoints
 WHERE thread_id = $1
@@ -727,6 +730,7 @@ SELECT
     agent_state_snapshot,
     turn_input_tokens,
     turn_output_tokens,
+    kind,
     created_at
 FROM agent_sdk_turn_checkpoints
 WHERE id = $1
@@ -754,8 +758,9 @@ INSERT INTO agent_sdk_turn_checkpoints (
     agent_state_snapshot,
     turn_input_tokens,
     turn_output_tokens,
+    kind,
     created_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 ",
             checkpoint.id.as_str(),
             thread_key(&checkpoint.thread_id),
@@ -765,6 +770,7 @@ INSERT INTO agent_sdk_turn_checkpoints (
             checkpoint.agent_state_snapshot.clone(),
             i64::from(checkpoint.turn_usage.input_tokens),
             i64::from(checkpoint.turn_usage.output_tokens),
+            checkpoint.kind.as_str(),
             checkpoint.created_at,
         )
         .execute(&mut **tx)
@@ -2028,6 +2034,7 @@ FOR UPDATE
         maybe_inject_failure(fail_after, InjectedCommitFailure::MessageCommit)?;
 
         let checkpoint = Checkpoint::new(NewCheckpointParams {
+            kind: params.checkpoint_kind,
             thread_id: params.thread_id.clone(),
             turn_number: thread.committed_turns,
             task_id: params.task_id,
@@ -4199,6 +4206,7 @@ SELECT
     agent_state_snapshot,
     turn_input_tokens,
     turn_output_tokens,
+    kind,
     created_at
 FROM agent_sdk_turn_checkpoints
 WHERE thread_id = $1
@@ -4226,6 +4234,7 @@ SELECT
     agent_state_snapshot,
     turn_input_tokens,
     turn_output_tokens,
+    kind,
     created_at
 FROM agent_sdk_turn_checkpoints
 WHERE thread_id = $1
@@ -4253,6 +4262,7 @@ SELECT
     agent_state_snapshot,
     turn_input_tokens,
     turn_output_tokens,
+    kind,
     created_at
 FROM agent_sdk_turn_checkpoints
 WHERE thread_id = $1
@@ -5737,6 +5747,7 @@ struct CheckpointRecord {
     agent_state_snapshot: serde_json::Value,
     turn_input_tokens: i64,
     turn_output_tokens: i64,
+    kind: String,
     created_at: OffsetDateTime,
 }
 
@@ -5762,6 +5773,8 @@ impl TryFrom<CheckpointRecord> for Checkpoint {
                 )?,
                 ..Default::default()
             },
+            kind: CheckpointKind::parse(&record.kind)
+                .context("rehydrate checkpoint kind from postgres row")?,
             created_at: record.created_at,
         };
         checkpoint
@@ -6363,6 +6376,7 @@ mod tests {
         let err = store
             .commit_completed_turn_atomic_with_failure(
                 CompletedTurnCommit {
+                    checkpoint_kind: CheckpointKind::FullTurn,
                     thread_id: running.thread_id.clone(),
                     task_id: running.id.clone(),
                     expected_turn: 1,
@@ -6441,6 +6455,7 @@ mod tests {
 
         let thread_id = running.thread_id.clone();
         let commit_params = |now| CompletedTurnCommit {
+            checkpoint_kind: CheckpointKind::FullTurn,
             thread_id: thread_id.clone(),
             task_id: running.id.clone(),
             expected_turn: 1,
@@ -6529,6 +6544,7 @@ mod tests {
 
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: running.thread_id.clone(),
                 task_id: running.id.clone(),
                 expected_turn: 1,

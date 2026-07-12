@@ -314,6 +314,7 @@ mod tests {
     use super::super::turn_attempt::{OpenAttemptParams, TurnAttemptOutcome};
     use super::super::turn_attempt_store::{InMemoryTurnAttemptStore, TurnAttemptStore};
     use super::*;
+    use crate::journal::checkpoint::CheckpointKind;
     use agent_sdk_foundation::TokenUsage;
     use agent_sdk_foundation::audit::AuditProvenance;
     use anyhow::Context;
@@ -418,6 +419,7 @@ mod tests {
                 .saturating_add(1);
             commit_completed_turn(
                 CompletedTurnCommit {
+                    checkpoint_kind: CheckpointKind::FullTurn,
                     thread_id: thread_id.clone(),
                     task_id: task_id.clone(),
                     expected_turn,

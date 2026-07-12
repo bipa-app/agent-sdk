@@ -53,6 +53,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::definition::{AgentDefinition, ThinkingPolicy};
+use crate::journal::checkpoint::CheckpointKind;
 use crate::journal::checkpoint_store::CheckpointStore;
 use crate::journal::commit::{
     CommitOutcome, CommitOwnerGuard, CompletedTurnCommit, DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
@@ -848,6 +849,7 @@ pub(crate) async fn commit_partial_turn_on_cancel(
 
     let commit_result = commit_completed_turn(
         CompletedTurnCommit {
+            checkpoint_kind: CheckpointKind::CancelSalvage,
             thread_id: thread_id.clone(),
             task_id: task_id.clone(),
             expected_turn,
@@ -1497,6 +1499,7 @@ async fn commit_text_only_turn(
 
     let commit = commit_completed_turn_shifting_slot(
         CompletedTurnCommit {
+            checkpoint_kind: CheckpointKind::FullTurn,
             thread_id: thread_id.clone(),
             task_id: task_id.clone(),
             expected_turn: inputs.recovery_view.next_turn_number,
@@ -1664,9 +1667,11 @@ fn remap_turn_indexed_events(events: &mut [AgentEvent], turn: usize) {
 ///   `expected_turn` belongs to a *different* task AND this worker
 ///   still owns its live `Running` row (status + `(worker, lease)`
 ///   re-read). The turn's work is valid, only its slot number is
-///   stale: shift `expected_turn` to the thread's next turn, remap
-///   the turn-indexed lifecycle events, and retry (bounded by
-///   [`MAX_TURN_SLOT_SHIFTS`]).
+///   stale: shift `expected_turn` forward ONE slot, remap the
+///   turn-indexed lifecycle events, and retry (bounded by
+///   [`MAX_TURN_SLOT_SHIFTS`]). Single-stepping matters — if the
+///   thread advanced several turns, each intervening occupant is
+///   validated by its own shift round instead of being skipped.
 /// - **Same-task duplicate / lost ownership** — the occupying
 ///   checkpoint is this task's own commit (stale-lease double
 ///   commit), the task is no longer a live `Running` row this worker
@@ -1850,39 +1855,39 @@ async fn shifted_turn_slot(
         }
     }
     match occupant {
-        // Only a zero-usage foreign checkpoint is shift-eligible: the
-        // synthetic cancel-salvage commit is the sole production path
-        // that lands a foreign checkpoint with zero `turn_usage`, and
-        // zero usage is exactly what makes the shift state-compatible
-        // (our snapshot and `Done` totals, built before the collision,
-        // are still correct). A BILLED foreign commit means a live
-        // predecessor's full turn landed after we bootstrapped — our
+        // Only a foreign CANCEL-SALVAGE checkpoint is shift-eligible.
+        // The discriminator is the checkpoint's durable `kind`, never
+        // its token usage: providers may omit usage deltas, so a real
+        // completion can legitimately land an all-zero `turn_usage`,
+        // and mistaking it for salvage would overwrite its state with
+        // our stale snapshot. Salvage checkpoints carry zero aggregate
+        // usage by construction (see `commit_partial_turn_on_cancel`),
+        // which is what keeps the shift state-compatible: our snapshot
+        // and `Done` totals, built before the collision, remain
+        // correct. A FULL foreign turn in our slot means a live
+        // predecessor's completion landed after we bootstrapped — our
         // cumulative state lacks its usage/cost, so shifting would
         // durably drop it; refuse and let the collision surface (the
         // host retries the turn from the fresh committed head).
         Some(checkpoint)
             if checkpoint.task_id != params.task_id
-                && checkpoint.turn_usage == TokenUsage::default() => {}
-        // Billed foreign occupant, no checkpoint (thread advanced
+                && checkpoint.kind == CheckpointKind::CancelSalvage => {}
+        // Full-turn foreign occupant, no checkpoint (thread advanced
         // through a path we don't understand), or our own duplicate —
         // do not shift.
         _ => return None,
     }
 
-    // 3. Land on the thread's actual next turn.
-    let thread = match deps.thread_store.get(&params.thread_id).await {
-        Ok(Some(thread)) => thread,
-        Ok(None) => return None,
-        Err(error) => {
-            log::warn!(
-                "turn-slot shift: thread re-read for {} failed: {error:#}",
-                params.thread_id,
-            );
-            return None;
-        }
-    };
-    let next_turn = thread.committed_turns.saturating_add(1);
-    (next_turn > params.expected_turn).then_some(next_turn)
+    // 3. Advance exactly ONE slot. The thread may have advanced
+    //    further (two late commits can land back-to-back on the
+    //    non-atomic in-memory backend), but jumping straight to the
+    //    head would skip validating the intervening occupants — one of
+    //    them could be a billed full turn the shift must refuse.
+    //    Landing on the very next slot re-collides when it is also
+    //    occupied, and the retry loop re-enters this function to
+    //    validate THAT occupant, so every skipped slot is inspected
+    //    (bounded by `MAX_TURN_SLOT_SHIFTS`).
+    params.expected_turn.checked_add(1)
 }
 
 /// Project [`llm::Usage`] from a chat response into the SDK's
@@ -4477,6 +4482,7 @@ async fn commit_resumed_turn(
 
     let commit = commit_completed_turn_shifting_slot(
         CompletedTurnCommit {
+            checkpoint_kind: CheckpointKind::FullTurn,
             thread_id: thread_id.clone(),
             task_id: task_id.clone(),
             expected_turn: inputs.recovery_view.next_turn_number,

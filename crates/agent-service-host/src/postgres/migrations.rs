@@ -75,11 +75,15 @@ const TASK_OTEL_TRACEPARENT_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/postgres/0010_task_otel_traceparent.sql"
 ));
+const CHECKPOINT_KIND_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/postgres/0011_checkpoint_kind.sql"
+));
 
 /// `sqlx`-managed migration bundle for the Postgres durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/postgres");
 
-const MIGRATIONS: [PostgresMigration; 10] = [
+const MIGRATIONS: [PostgresMigration; 11] = [
     PostgresMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -129,6 +133,11 @@ const MIGRATIONS: [PostgresMigration; 10] = [
         version: "0010",
         summary: "per-task OTel traceparent for distributed-trace continuation",
         sql: TASK_OTEL_TRACEPARENT_SQL,
+    },
+    PostgresMigration {
+        version: "0011",
+        summary: "explicit checkpoint kind discriminating cancel-salvage from full turns",
+        sql: CHECKPOINT_KIND_SQL,
     },
 ];
 
@@ -206,6 +215,12 @@ pub const fn turn_attempt_otel_ids_migration() -> &'static str {
 #[must_use]
 pub const fn idempotency_migration() -> &'static str {
     IDEMPOTENCY_SQL
+}
+
+/// The reviewable checkpoint-kind migration SQL.
+#[must_use]
+pub const fn checkpoint_kind_migration() -> &'static str {
+    CHECKPOINT_KIND_SQL
 }
 
 #[cfg(test)]
