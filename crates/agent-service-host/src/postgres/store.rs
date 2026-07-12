@@ -3436,6 +3436,47 @@ WHERE kind = 'subagent'
         record.map(TryInto::try_into).transpose()
     }
 
+    async fn list_parked_subagent_invocations(&self) -> Result<Vec<AgentTask>> {
+        let records = sqlx::query_as!(
+            TaskRecord,
+            r"
+SELECT
+    id,
+    kind,
+    status,
+    parent_id,
+    root_id,
+    depth,
+    thread_id,
+    submitted_input_json,
+    caller_metadata_json,
+    worker_id,
+    lease_id,
+    lease_expires_at,
+    last_heartbeat_at,
+    state_json,
+    attempt,
+    max_attempts,
+    last_error,
+    pending_child_count,
+    spawn_index,
+    result_payload,
+    otel_traceparent,
+    created_at,
+    updated_at,
+    completed_at
+FROM agent_sdk_tasks
+WHERE kind = 'subagent'
+  AND status = 'waiting_on_children'
+ORDER BY created_at, id
+",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("list parked subagent invocations")?;
+        records.into_iter().map(TryInto::try_into).collect()
+    }
+
     async fn complete_task(
         &self,
         child_id: &AgentTaskId,

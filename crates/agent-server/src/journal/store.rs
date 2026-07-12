@@ -1147,6 +1147,24 @@ pub trait AgentTaskStore: Send + Sync {
         child_root_id: &AgentTaskId,
     ) -> Result<Option<AgentTask>>;
 
+    /// List every [`TaskKind::Subagent`] invocation currently parked in
+    /// [`TaskStatus::WaitingOnChildren`], ordered by `(created_at, id)`.
+    ///
+    /// This is the candidate feed for the host's subagent-deadline
+    /// sweep (issue #299): an invocation stays `WaitingOnChildren` for
+    /// its linked child root's whole lifetime, so this listing covers
+    /// every live child regardless of the child's own state. Compared
+    /// to `list_by_status(WaitingOnChildren)` + a client-side kind
+    /// filter, the kind predicate is pushed into the store so the
+    /// sweep never materializes unrelated parked parents (whose
+    /// `state_json` continuations dominate row size) — the SQL
+    /// backends serve this from the status index plus the kind
+    /// predicate.
+    ///
+    /// # Errors
+    /// Returns an error only for store-level read failures.
+    async fn list_parked_subagent_invocations(&self) -> Result<Vec<AgentTask>>;
+
     /// Transition a running child to [`TaskStatus::Completed`] and,
     /// under the same write lock, recompute the parent's
     /// `pending_child_count` from the live-children index so the
@@ -3358,6 +3376,24 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         });
         let result = if linked { invocation.cloned() } else { None };
         drop(inner);
+        Ok(result)
+    }
+
+    async fn list_parked_subagent_invocations(&self) -> Result<Vec<AgentTask>> {
+        let inner = self.inner.read().await;
+        let mut result: Vec<AgentTask> = inner
+            .by_status
+            .get(&TaskStatus::WaitingOnChildren)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| inner.by_id.get(id))
+            .filter(|task| task.kind == TaskKind::Subagent)
+            .cloned()
+            .collect();
+        drop(inner);
+        // `by_status` is hash-ordered; sort to the SQL backends'
+        // deterministic `(created_at, id)` order.
+        result.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
         Ok(result)
     }
 

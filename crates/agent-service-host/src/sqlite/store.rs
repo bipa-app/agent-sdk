@@ -2988,6 +2988,20 @@ impl AgentTaskStore for SqliteDurableStore {
         record.map(TryInto::try_into).transpose()
     }
 
+    async fn list_parked_subagent_invocations(&self) -> Result<Vec<AgentTask>> {
+        let records = sqlx::query_as::<_, TaskRecord>(concat!(
+            "SELECT ",
+            task_columns!(),
+            " FROM agent_sdk_tasks \
+             WHERE kind = 'subagent' AND status = 'waiting_on_children' \
+             ORDER BY created_at, id",
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .context("list parked subagent invocations")?;
+        records.into_iter().map(TryInto::try_into).collect()
+    }
+
     async fn complete_task(
         &self,
         child_id: &AgentTaskId,

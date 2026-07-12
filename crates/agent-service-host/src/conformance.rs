@@ -873,6 +873,74 @@ mod tests {
         Ok(())
     }
 
+    /// The deadline sweep's candidate feed (issue #299 round 3):
+    /// `list_parked_subagent_invocations` must return exactly the
+    /// parked `Subagent` invocations — a plain root parked on tool
+    /// children must NOT be materialized — and the window closes once
+    /// the linked child root goes terminal and wakes the invocation.
+    async fn test_list_parked_subagent_invocations(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
+    ) -> Result<()> {
+        // A plain root parked on a tool child: same status, wrong kind.
+        let tid = "conformance-parked-listing-plain";
+        let plain = fresh_root(tid, 1);
+        let plain_id = plain.id.clone();
+        task_store.submit_root_turn(plain).await?;
+        let worker = WorkerId::new();
+        let lease = LeaseId::new();
+        task_store
+            .try_acquire_task(
+                &plain_id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(600),
+                t_plus(2),
+            )
+            .await?
+            .context("plain parent must acquire before spawning children")?;
+        let (parked_plain, _children) = task_store
+            .spawn_tool_children(
+                &plain_id,
+                &worker,
+                &lease,
+                vec![ChildSpawnSpec { max_attempts: 3 }],
+                suspension_payload(tid),
+                None,
+                t_plus(3),
+            )
+            .await?;
+        assert_eq!(parked_plain.status, TaskStatus::WaitingOnChildren);
+
+        // A parked subagent invocation: the one row the sweep wants.
+        let (_parent, invocation, child_root) =
+            spawn_subagent_fixture(task_store, thread_store, "conformance-parked-listing").await?;
+
+        let parked = task_store.list_parked_subagent_invocations().await?;
+        assert_eq!(
+            parked.len(),
+            1,
+            "only the subagent invocation may be listed (no plain parked parents), got {parked:?}",
+        );
+        let listed = &parked[0];
+        assert_eq!(listed.id, invocation.id);
+        assert!(
+            listed.state.subagent_invocation().is_some(),
+            "the listed row must carry its durable spec linkage",
+        );
+
+        // Terminal child root wakes the invocation and closes the window.
+        task_store.cancel_tree(&child_root.id, t_plus(10)).await?;
+        assert!(
+            task_store
+                .list_parked_subagent_invocations()
+                .await?
+                .is_empty(),
+            "a woken invocation must no longer be listed",
+        );
+        Ok(())
+    }
+
     /// Mid-tree cancel must resume a parked parent OUTSIDE the
     /// cancelled subtree (issue #299, parked leg). The host's subagent
     /// deadline sweep cancels a parked root's hung tool children one
@@ -1654,6 +1722,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_list_parked_subagent_invocations() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_list_parked_subagent_invocations(s.task.as_ref(), s.thread.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_claim_idempotency_reserve_then_replay() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_claim_idempotency_reserve_then_replay(s.task.as_ref()).await
@@ -1852,6 +1926,13 @@ mod tests {
     async fn conformance_sqlite_cancel_tool_child_resumes_parked_parent() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_cancel_tool_child_resumes_parked_parent(&store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_list_parked_subagent_invocations() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_list_parked_subagent_invocations(&store, &store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -2309,6 +2390,15 @@ mod tests {
             return Ok(());
         };
         test_cancel_tool_child_resumes_parked_parent(&store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_list_parked_subagent_invocations() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_list_parked_subagent_invocations(&store, &store).await
     }
 
     #[cfg(feature = "postgres")]

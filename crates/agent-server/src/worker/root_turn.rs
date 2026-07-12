@@ -2048,6 +2048,23 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
         // Tag the error with the cancel marker so the caller that owns
         // the staged buffer commits the completed prefix (seam B).
         if deps.is_cancelled() {
+            // The current attempt row is OPEN but never started
+            // streaming (this fires on entry — e.g. a subagent
+            // deadline landing between `open_attempt` and the first
+            // poll — and between retries). Nothing streamed, so a
+            // zero-usage Cancelled close is honest, and no later path
+            // owns this row: the host's timeout fail deliberately
+            // leaves live-worker attempts open for THIS code to
+            // close, and the task is already terminal so the normal
+            // commit-path close never runs. Without this close the
+            // row would stay OPEN forever in the billing/audit trail.
+            close_attempt_with(
+                &attempt,
+                TurnAttemptOutcome::Cancelled,
+                deps.attempt_store,
+                OffsetDateTime::now_utc(),
+            )
+            .await;
             return Err(anyhow::Error::new(RootTurnCancelledMarker)
                 .context("root turn cancelled before LLM attempt"));
         }

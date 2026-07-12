@@ -2116,6 +2116,64 @@ async fn cancelled_root_turn_does_not_advance_projections() -> Result<()> {
     Ok(())
 }
 
+/// Issue #299 (round 3, addendum C): cancellation landing after
+/// `open_attempt` but before the stream owns the attempt — e.g. the
+/// host's subagent deadline firing between attempt open and the first
+/// poll — must not leak a permanently OPEN attempt row. The host's
+/// timeout fail deliberately leaves live-worker attempts open for the
+/// worker's own cancel paths to close, and the task is already
+/// terminal on the host side so the normal commit-path close never
+/// runs; the pre-stream cancel bail therefore closes its own attempt
+/// (`Cancelled`, zero usage — nothing streamed).
+#[tokio::test]
+async fn pre_stream_cancel_closes_the_open_attempt() -> Result<()> {
+    let stores = TestStores::new();
+    let provider = MockTextProvider::new("never reached");
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let bootstrap = sample_bootstrap(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    // The token is already tripped when the turn reaches the pre-call
+    // cancel check — after `open_attempt`, before any streaming.
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let mut deps = stores.deps();
+    deps.cancel = Some(&cancelled);
+
+    let result = execute_root_turn(inputs, "doomed prompt", &provider, &deps, t_plus(5)).await;
+    assert!(result.is_err(), "a pre-cancelled turn must not complete");
+
+    let attempts = stores.attempts.list_by_task(&task_id).await?;
+    let [attempt] = attempts.as_slice() else {
+        bail!("expected exactly one attempt, got {}", attempts.len());
+    };
+    assert!(
+        attempt.is_closed(),
+        "the pre-stream cancel bail must close its own open attempt",
+    );
+    assert_eq!(
+        attempt.outcome,
+        Some(TurnAttemptOutcome::Cancelled),
+        "nothing streamed, so the honest close is Cancelled",
+    );
+    assert_eq!(
+        attempt.output_tokens,
+        Some(0),
+        "a never-streamed attempt must close with zero usage",
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn cancel_suspended_turn_cancels_children() -> Result<()> {
     let stores = TestStores::new();
