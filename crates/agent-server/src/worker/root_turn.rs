@@ -1714,6 +1714,40 @@ fn remap_turn_indexed_events(events: &mut [AgentEvent], turn: usize) {
 /// slot — a shifted turn's journal reads `Start{N} … TurnComplete{N+1}
 /// / Done{N+1}`. Consumers must derive turn boundaries from event
 /// ORDER, not from the turn indices (see the `events.proto` contract).
+///
+/// # The shifted answer did not see the salvaged prefix — accepted
+///
+/// In this race the successor built its LLM request before the salvage
+/// landed, so the answer it commits never saw the cancelled turn's
+/// salvaged prefix. That gap is inherent to the RACE, not to the
+/// shift: in the mirror ordering — the successor's commit lands first —
+/// the losing salvage is dropped silently and the prefix never enters
+/// the transcript at all, with the very same one-answer visibility
+/// gap. Shifting is strictly more preserving than that (benign)
+/// ordering: the prefix survives at its own slot, attributed to the
+/// cancelled attempt, and the successor's checkpoint — rebuilt from
+/// the projection read fresh inside the commit — includes it for every
+/// future bootstrap. Only the single racing answer predates it.
+///
+/// The two rejected cures are worse than the disease: re-executing the
+/// successor against the salvaged head would duplicate every
+/// non-idempotent tool effect the turn already executed, and deferring
+/// successor execution until the salvage lands is unbounded (the
+/// cancelled worker may be gone; only the deadline sweep eventually
+/// reaps it).
+///
+/// # Cancelled state is audit, not lineage
+///
+/// The salvage checkpoint's agent-state snapshot (the cancelled turn's
+/// staged state: accumulated cost, metadata mutations, any parked
+/// continuation) is an audit artifact preserved at its own slot, not
+/// forward state lineage. Cancellation MEANS the turn's uncommitted
+/// state effects are discarded — its parked children were cancelled
+/// with it and must never be resumed — so the successor's snapshot
+/// superseding it as latest is the cancel semantics, not corruption.
+/// Billing truth is unaffected: the cancelled turn's real usage lives
+/// on its attempt rows and its `Cancelled` event, and the thread
+/// aggregate advanced by zero for the salvage by construction.
 async fn commit_completed_turn_shifting_slot(
     mut params: CompletedTurnCommit,
     worker_id: &WorkerId,
