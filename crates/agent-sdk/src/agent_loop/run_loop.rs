@@ -951,6 +951,29 @@ where
     outcome
 }
 
+/// The looping run's first [`TurnContext`], consuming the initialized
+/// state and carrying its ingestion-time `pre_llm_request` decision so
+/// the hook fires exactly once for the first LLM call.
+fn first_turn_context(
+    mut init: InitializedState,
+    thread_id: &ThreadId,
+    start_time: Instant,
+    #[cfg(feature = "otel")] input_kind: &'static str,
+) -> TurnContext {
+    let first_request_decision = init.first_request_decision.take();
+    let mut ctx = build_turn_context(
+        thread_id,
+        init.turn,
+        init.total_usage,
+        init.state,
+        start_time,
+        #[cfg(feature = "otel")]
+        input_kind,
+    );
+    ctx.pending_first_request = first_request_decision;
+    ctx
+}
+
 fn build_turn_context(
     thread_id: &ThreadId,
     turn: usize,
@@ -1087,6 +1110,35 @@ fn cancelled_turn_outcome(
         total_turns: 0,
         total_usage: TokenUsage::default(),
         summary: empty_turn_summary(thread_id, turn, provenance, turn_options),
+    }
+}
+
+/// Handle a looping run cancelled before any work started: emit the
+/// terminal `Cancelled` event (best-effort) so streaming consumers see a
+/// closing marker, and return the cancelled run state. Nothing was
+/// ingested and no hook ran — cancellation outranks the entry guards.
+async fn precheck_run_loop_cancelled<H>(
+    event_store: &Arc<dyn EventStore>,
+    thread_id: &ThreadId,
+    hooks: &Arc<H>,
+    authority: &Arc<dyn EventAuthority>,
+) -> AgentRunState
+where
+    H: AgentHooks,
+{
+    log::info!("Agent run cancelled before execution started");
+    let _ = send_event(
+        event_store,
+        thread_id,
+        0,
+        hooks,
+        authority,
+        AgentEvent::cancelled(0, TokenUsage::default()),
+    )
+    .await;
+    AgentRunState::Cancelled {
+        total_turns: 0,
+        total_usage: TokenUsage::default(),
     }
 }
 
@@ -2991,6 +3043,12 @@ where
     #[cfg(feature = "otel")]
     let input_kind = crate::observability::attrs::input_kind_str(&input);
 
+    // Cancellation outranks the entry guards: report Cancelled, not
+    // BudgetExceeded or a guardrail error, and evaluate no hooks.
+    if cancel_token.is_cancelled() {
+        return precheck_run_loop_cancelled(&event_store, &thread_id, &hooks, &authority).await;
+    }
+
     let mut init = match init_run_loop_with_entry_guard(GuardedInitParams {
         input,
         thread_id: &thread_id,
@@ -3036,19 +3094,13 @@ where
         return outcome;
     }
 
-    let first_request_decision = init.first_request_decision.take();
-    let mut ctx = build_turn_context(
+    let mut ctx = first_turn_context(
+        init,
         &thread_id,
-        init.turn,
-        init.total_usage,
-        init.state,
         start_time,
         #[cfg(feature = "otel")]
         input_kind,
     );
-    // Fresh-input runs already evaluated `pre_llm_request` at ingestion;
-    // hand the decision to the first turn so the hook fires exactly once.
-    ctx.pending_first_request = first_request_decision;
 
     let default_turn_options = TurnOptions::default();
 
