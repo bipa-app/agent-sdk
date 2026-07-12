@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-v0.11.8...agent-sdk-v0.12.0) - 2026-07-12
+
+### Added
+
+- *(agent-loop)* [**breaking**] usage/cost budgets, parallel-tool cap, guardrail-hook wiring, reminders, run_stream ([#312](https://github.com/bipa-app/agent-sdk/pull/312))
+- *(stores)* embedded SQLite session store + wire ObservingEventStore into CLI/examples ([#313](https://github.com/bipa-app/agent-sdk/pull/313))
+- *(mcp)* configurable request timeouts for stdio + http transports ([#314](https://github.com/bipa-app/agent-sdk/pull/314))
+
 ## [0.11.8](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-v0.11.7...agent-sdk-v0.11.8) - 2026-07-11
 
 ### Other

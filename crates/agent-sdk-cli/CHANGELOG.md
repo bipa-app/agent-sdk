@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-cli-v0.11.8...agent-sdk-cli-v0.12.0) - 2026-07-12
+
+### Added
+
+- *(stores)* embedded SQLite session store + wire ObservingEventStore into CLI/examples ([#313](https://github.com/bipa-app/agent-sdk/pull/313))
+
 ## [0.11.6](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-cli-v0.11.5...agent-sdk-cli-v0.11.6) - 2026-07-10
 
 ### Other
