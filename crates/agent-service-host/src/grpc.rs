@@ -472,7 +472,7 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
             // extra effect beyond stopping the ticker.
             task_cancel: heartbeat_cancel.clone(),
             // Not a subagent child-thread root — no wall-clock deadline.
-            deadline: None,
+            deadline: crate::host::SubagentDeadlineState::Exempt,
         },
     ));
 

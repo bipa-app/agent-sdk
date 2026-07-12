@@ -354,7 +354,46 @@ pub async fn fail_root_turn(
 ) -> Result<AgentTask> {
     // Best-effort close any open turn attempts for this task.
     best_effort_close_open_attempts(task_id, deps.attempt_store, now).await;
+    fail_root_turn_inner(task_id, worker_id, lease_id, thread_id, error, deps, now).await
+}
 
+/// [`fail_root_turn`] without the open-attempt pre-close, for callers
+/// that fail a root turn whose worker is still LIVE in this process —
+/// the host's subagent-timeout heartbeat path.
+///
+/// The pre-close would race the live worker: in the window between a
+/// successful stream and `commit_completed_turn`, closing its open
+/// attempt as `Cancelled` with zero tokens both clobbers the
+/// real-usage close (the billing source of truth on attempt rows) and
+/// makes the in-transaction close hit `AlreadyClosed`, aborting the
+/// whole commit. The live worker's own abort path (mid-stream cancel
+/// close, or its terminal commit) owns its attempts; this variant only
+/// performs the durable fail + error event.
+///
+/// # Errors
+///
+/// Same envelope as [`fail_root_turn`].
+pub async fn fail_root_turn_leaving_attempts_open(
+    task_id: &AgentTaskId,
+    worker_id: &WorkerId,
+    lease_id: &LeaseId,
+    thread_id: &agent_sdk_foundation::ThreadId,
+    error: &anyhow::Error,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<AgentTask> {
+    fail_root_turn_inner(task_id, worker_id, lease_id, thread_id, error, deps, now).await
+}
+
+async fn fail_root_turn_inner(
+    task_id: &AgentTaskId,
+    worker_id: &WorkerId,
+    lease_id: &LeaseId,
+    thread_id: &agent_sdk_foundation::ThreadId,
+    error: &anyhow::Error,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<AgentTask> {
     let error_msg = format!("{error:#}");
     let (failed_task, _parent) = deps
         .task_store

@@ -3581,6 +3581,26 @@ WHERE kind = 'subagent'
             Self::promote_next_queued_root_tx(&mut tx, thread_id, now).await?;
         }
 
+        // Mid-tree cancel: when the cancelled subtree hangs under a
+        // parent OUTSIDE the subtree (e.g. the host's subagent-deadline
+        // sweep cancelling a parked root's tool children), recompute
+        // that parked parent's pending_child_count so it resumes —
+        // mirroring the in-memory store, whose per-row cancel
+        // propagates every terminal transition to the row's parent.
+        // Only the subtree's TOP row can have an out-of-subtree parent
+        // (every deeper row's parent lies inside the subtree and is
+        // itself cancelled), so one propagation suffices. Taking the
+        // parent lock after the child updates preserves the
+        // child-then-parent lock order the deepest-first cancel loop
+        // establishes.
+        if transitioned.first().is_some_and(|id| id == root_id)
+            && let Some(cancelled_top) = Self::load_task_tx(&mut tx, root_id, false).await?
+            && cancelled_top.parent_id.is_some()
+        {
+            Self::propagate_terminal_to_parent_tx(&mut tx, &cancelled_top, now, "cancel_tree")
+                .await?;
+        }
+
         tx.commit().await.context("commit cancel_tree")?;
         Ok(transitioned)
     }

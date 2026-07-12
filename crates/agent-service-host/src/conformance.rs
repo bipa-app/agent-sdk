@@ -873,6 +873,81 @@ mod tests {
         Ok(())
     }
 
+    /// Mid-tree cancel must resume a parked parent OUTSIDE the
+    /// cancelled subtree (issue #299, parked leg). The host's subagent
+    /// deadline sweep cancels a parked root's hung tool children one
+    /// subtree at a time; when the last live child cancels, the parked
+    /// `WaitingOnChildren` parent must flip back to `Pending` — on
+    /// every backend. The in-memory store already propagated this
+    /// through its per-row cancel; the SQL backends previously only
+    /// handled parents INSIDE the cancelled subtree, leaving an
+    /// out-of-subtree parent parked forever.
+    async fn test_cancel_tool_child_resumes_parked_parent(
+        task_store: &dyn AgentTaskStore,
+    ) -> Result<()> {
+        let tid = "conformance-midtree-cancel";
+        let parent = fresh_root(tid, 1);
+        let parent_id = parent.id.clone();
+        task_store.submit_root_turn(parent).await?;
+        let worker = WorkerId::new();
+        let lease = LeaseId::new();
+        task_store
+            .try_acquire_task(
+                &parent_id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(600),
+                t_plus(2),
+            )
+            .await?
+            .context("parent must acquire before spawning children")?;
+        let (parked, children) = task_store
+            .spawn_tool_children(
+                &parent_id,
+                &worker,
+                &lease,
+                vec![
+                    ChildSpawnSpec { max_attempts: 3 },
+                    ChildSpawnSpec { max_attempts: 3 },
+                ],
+                suspension_payload(tid),
+                None,
+                t_plus(3),
+            )
+            .await?;
+        assert_eq!(parked.status, TaskStatus::WaitingOnChildren);
+        let [first, second] = children.as_slice() else {
+            anyhow::bail!("expected exactly two spawned children, got {children:?}");
+        };
+
+        // Cancelling one child leaves the parent parked on the other.
+        task_store.cancel_tree(&first.id, t_plus(4)).await?;
+        let still_parked = task_store
+            .get(&parent_id)
+            .await?
+            .context("parent exists after first child cancel")?;
+        assert_eq!(
+            still_parked.status,
+            TaskStatus::WaitingOnChildren,
+            "one live child must keep the parent parked",
+        );
+        assert_eq!(still_parked.pending_child_count, 1);
+
+        // Cancelling the LAST live child must resume the parked parent.
+        task_store.cancel_tree(&second.id, t_plus(5)).await?;
+        let resumed = task_store
+            .get(&parent_id)
+            .await?
+            .context("parent exists after last child cancel")?;
+        assert_eq!(
+            resumed.status,
+            TaskStatus::Pending,
+            "cancelling the last live child must flip the out-of-subtree parked parent to Pending",
+        );
+        assert_eq!(resumed.pending_child_count, 0);
+        Ok(())
+    }
+
     /// `claim_idempotency` is an atomic reservation (findings #3/#15):
     /// the first claim reserves the key (`Fresh`), a second claim before
     /// the result is recorded observes `Conflict` (reservation in-flight),
@@ -1573,6 +1648,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_cancel_tool_child_resumes_parked_parent() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_cancel_tool_child_resumes_parked_parent(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_claim_idempotency_reserve_then_replay() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_claim_idempotency_reserve_then_replay(s.task.as_ref()).await
@@ -1764,6 +1845,13 @@ mod tests {
     async fn conformance_sqlite_find_invocation_for_child_root() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_find_invocation_for_child_root(&store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_cancel_tool_child_resumes_parked_parent() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_cancel_tool_child_resumes_parked_parent(&store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -2212,6 +2300,15 @@ mod tests {
             return Ok(());
         };
         test_find_invocation_for_child_root(&store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_cancel_tool_child_resumes_parked_parent() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_cancel_tool_child_resumes_parked_parent(&store).await
     }
 
     #[cfg(feature = "postgres")]

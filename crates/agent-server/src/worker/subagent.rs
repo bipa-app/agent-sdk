@@ -534,13 +534,21 @@ pub struct EffectiveSubagentSpec {
     /// Enforced by the service host as a wall-clock deadline anchored
     /// at the child root task's `created_at` (issue #299): queue wait,
     /// retries, and re-acquisitions all consume the same budget,
-    /// matching the in-process SDK subagent semantics. The deadline is
-    /// checked once per worker heartbeat tick (default interval ~10s),
-    /// so enforcement carries up to one tick of slack past the nominal
-    /// deadline. On expiry the child root turn is transitioned to
-    /// FAILED with `subagent timed out after {timeout_ms}ms` — not
-    /// Cancelled — so the parent's fan-in resumes with a failed child
-    /// result the parent LLM can react to.
+    /// matching the in-process SDK subagent semantics. Enforcement
+    /// covers three legs: a RUNNING child root is checked once per
+    /// worker heartbeat tick (default interval ~10s); a PARKED child
+    /// root (suspended on its own tool children) is checked by the
+    /// host's periodic sweep (default interval ~5s), which cancels the
+    /// hung descendants before failing the root; and a child acquired
+    /// past its deadline fails up front without an LLM call. Each leg
+    /// carries up to one tick/sweep interval of slack past the nominal
+    /// deadline. Not covered: work already inside an in-flight tool
+    /// child between sweep ticks (bounded by the next sweep), and a
+    /// steering-resume exchange, which runs unbounded until the task's
+    /// next ordinary acquisition. On expiry the child root turn is
+    /// transitioned to FAILED with `subagent timed out after
+    /// {timeout_ms}ms` — not Cancelled — so the parent's fan-in
+    /// resumes with a failed child result the parent LLM can react to.
     pub timeout_ms: u64,
     /// Durable depth of this child within the subagent lineage.
     #[serde(default = "default_subagent_depth")]
