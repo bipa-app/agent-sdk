@@ -4761,7 +4761,7 @@ mod tests {
             &self,
             root_id: &AgentTaskId,
             now: OffsetDateTime,
-        ) -> Result<Vec<AgentTaskId>> {
+        ) -> Result<agent_server::journal::store::CancelTreeOutcome> {
             self.inner.cancel_tree(root_id, now).await
         }
         async fn resume_from_confirmation(
