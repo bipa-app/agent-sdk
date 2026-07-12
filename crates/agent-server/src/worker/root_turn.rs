@@ -932,12 +932,16 @@ fn staged_or_recovery_snapshot(inputs: &RootWorkerInputs) -> serde_json::Value {
 /// completed prefix of the cancelled turn from the in-memory staged
 /// buffer, then let the caller propagate the original cancel error.
 ///
-/// Guarded on a fresh re-read of the task row: only a task whose durable
-/// status is [`TaskStatus::Cancelled`] may consume this turn number. A
-/// lease-lost requeue (the row bounced back to `Pending` / was
-/// re-acquired) is left untouched so the new lease holder owns turn `N`.
-/// Every error is logged and swallowed — a partial-commit failure must
-/// never mask the cancellation the caller is about to surface.
+/// Guarded on a fresh re-read of the task row: only a task whose
+/// durable status is already terminal — [`TaskStatus::Cancelled`]
+/// (external `cancel_tree`) or [`TaskStatus::Failed`] (the host's
+/// subagent-timeout path fails the row durably, then trips the same
+/// per-task token) — may consume this turn number, because no future
+/// lease holder can exist for a terminal row. A lease-lost requeue
+/// (the row bounced back to `Pending` / was re-acquired) is left
+/// untouched so the new lease holder owns turn `N`. Every error is
+/// logged and swallowed — a partial-commit failure must never mask
+/// the cancellation the caller is about to surface.
 async fn commit_cancelled_partial_turn(
     inputs: &RootWorkerInputs,
     candidate: Vec<llm::Message>,
@@ -948,8 +952,8 @@ async fn commit_cancelled_partial_turn(
     let thread_id = &inputs.bootstrap.thread_id;
 
     match deps.task_store.get(task_id).await {
-        Ok(Some(task)) if task.status == TaskStatus::Cancelled => {}
-        // Not cancelled (lease-lost requeue), missing, or unreadable:
+        Ok(Some(task)) if matches!(task.status, TaskStatus::Cancelled | TaskStatus::Failed) => {}
+        // Not terminal (lease-lost requeue), missing, or unreadable:
         // do not partial-commit — a re-run will own turn N.
         Ok(_) => return,
         Err(error) => {

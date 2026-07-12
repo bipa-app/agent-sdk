@@ -3387,6 +3387,55 @@ FOR UPDATE SKIP LOCKED
         Ok((new_parent, prepared))
     }
 
+    async fn find_subagent_invocation_for_child_root(
+        &self,
+        child_root_id: &AgentTaskId,
+    ) -> Result<Option<AgentTask>> {
+        // Read-only counterpart of `resume_linked_subagent_invocation_tx`:
+        // same linkage predicate, no transition, no row lock.
+        let record = sqlx::query_as!(
+            TaskRecord,
+            r"
+SELECT
+    id,
+    kind,
+    status,
+    parent_id,
+    root_id,
+    depth,
+    thread_id,
+    submitted_input_json,
+    caller_metadata_json,
+    worker_id,
+    lease_id,
+    lease_expires_at,
+    last_heartbeat_at,
+    state_json,
+    attempt,
+    max_attempts,
+    last_error,
+    pending_child_count,
+    spawn_index,
+    result_payload,
+    otel_traceparent,
+    created_at,
+    updated_at,
+    completed_at
+FROM agent_sdk_tasks
+WHERE kind = 'subagent'
+  AND status = 'waiting_on_children'
+  AND state_json -> 'invocation' ->> 'child_root_task_id' = $1
+",
+            child_root_id.as_str(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| {
+            format!("find_subagent_invocation_for_child_root: lookup for {child_root_id}")
+        })?;
+        record.map(TryInto::try_into).transpose()
+    }
+
     async fn complete_task(
         &self,
         child_id: &AgentTaskId,

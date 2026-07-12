@@ -1120,6 +1120,33 @@ pub trait AgentTaskStore: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Vec<(AgentTask, AgentTask)>)>;
 
+    /// Find the parked [`TaskKind::Subagent`] invocation whose durable
+    /// [`crate::journal::TaskState::SubagentInvocation`] linkage points
+    /// at `child_root_id`.
+    ///
+    /// This is the read-only counterpart of the terminal-transition
+    /// wake path (`resume_linked_subagent_invocation` in each backend):
+    /// it returns the invocation row only while it is still
+    /// [`TaskStatus::WaitingOnChildren`] on that child root — exactly
+    /// the window in which the child-thread root can be live. Once the
+    /// child root reaches a terminal state and the invocation has been
+    /// woken, the linkage is consumed and this returns `None`.
+    ///
+    /// The service host uses this at child-root acquisition time to
+    /// read the resolved `spec.timeout_ms` off the invocation and
+    /// derive the child's wall-clock execution deadline without any
+    /// schema addition — a re-acquiring worker (crash, lease expiry)
+    /// re-resolves the same deadline from the same durable rows.
+    ///
+    /// # Errors
+    /// Returns an error only for store-level read failures. "No linked
+    /// invocation" (plain root turns, already-woken invocations) is
+    /// `Ok(None)`, not an error.
+    async fn find_subagent_invocation_for_child_root(
+        &self,
+        child_root_id: &AgentTaskId,
+    ) -> Result<Option<AgentTask>>;
+
     /// Transition a running child to [`TaskStatus::Completed`] and,
     /// under the same write lock, recompute the parent's
     /// `pending_child_count` from the live-children index so the
@@ -3304,6 +3331,34 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
 
         drop(inner);
         Ok((new_parent, prepared))
+    }
+
+    async fn find_subagent_invocation_for_child_root(
+        &self,
+        child_root_id: &AgentTaskId,
+    ) -> Result<Option<AgentTask>> {
+        let inner = self.inner.read().await;
+        // The Phase 7.6 reverse index is a hint; the row state is
+        // authoritative (same contract as
+        // `resume_linked_subagent_invocation`). Verify kind, parked
+        // status, and the linkage before returning the row so a stale
+        // index entry can never surface a woken or repurposed
+        // invocation.
+        let invocation = inner
+            .invocation_by_child_root
+            .get(child_root_id)
+            .and_then(|invocation_id| inner.by_id.get(invocation_id));
+        let linked = invocation.is_some_and(|invocation| {
+            invocation.kind == TaskKind::Subagent
+                && invocation.status == TaskStatus::WaitingOnChildren
+                && invocation
+                    .state
+                    .subagent_invocation()
+                    .is_some_and(|state| state.child_root_task_id == *child_root_id)
+        });
+        let result = if linked { invocation.cloned() } else { None };
+        drop(inner);
+        Ok(result)
     }
 
     async fn complete_task(

@@ -50,7 +50,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -973,6 +973,47 @@ async fn run_task_with_heartbeat(
         return;
     };
 
+    // Resolved once per acquisition (issue #299): a child-thread root
+    // linked to a durable subagent invocation inherits the invocation
+    // spec's wall-clock deadline. Crash-safe by construction — a
+    // re-acquiring worker recomputes the same deadline from the same
+    // durable rows (invocation spec + child root `created_at`).
+    let deadline = resolve_subagent_deadline(stores, &task).await;
+
+    // Already-expired on acquisition (sat queued too long, or
+    // re-acquired after a crash near the deadline): fail up front
+    // without dispatching any LLM call.
+    if let Some(deadline) = deadline
+        && time::OffsetDateTime::now_utc() >= deadline.expires_at
+    {
+        warn!(
+            %worker_id,
+            task_id = %task_id,
+            thread_id = %thread_id,
+            timeout_ms = deadline.timeout_ms,
+            "subagent child root acquired past its deadline; failing without execution",
+        );
+        if let Err(err) = fail_timed_out_subagent_root(
+            stores,
+            &task_id,
+            &thread_id,
+            worker_id,
+            &lease_id,
+            deadline.timeout_ms,
+            time::OffsetDateTime::now_utc(),
+        )
+        .await
+        {
+            warn!(
+                %worker_id,
+                task_id = %task_id,
+                error = %err,
+                "failed to fail expired subagent child root",
+            );
+        }
+        return;
+    }
+
     // Per-task cancellation token wired into the worker's `RootTurnDeps`
     // (seam B). The heartbeat loop trips it on a terminal lease rejection
     // — a `cancel_tree` drops the lease, so a running worker aborts the
@@ -991,6 +1032,7 @@ async fn run_task_with_heartbeat(
         heartbeat_interval,
         cancel: heartbeat_cancel.clone(),
         task_cancel: task_cancel.clone(),
+        deadline,
     }));
 
     let exec_result = Box::pin(execute_acquired_task(task, stores, runtime, &task_cancel)).await;
@@ -1010,6 +1052,23 @@ async fn run_task_with_heartbeat(
     }
 }
 
+/// Wall-clock execution deadline for a child-thread root task linked
+/// to a durable subagent invocation.
+///
+/// Anchored at the child root task's `created_at` plus the resolved
+/// `spec.timeout_ms` — "the child took too long since spawn" — matching
+/// the in-process SDK subagent semantics. Resolved once per acquisition
+/// by [`resolve_subagent_deadline`] and enforced by [`heartbeat_loop`]
+/// once per tick, so enforcement carries up to one heartbeat interval
+/// of slack past the nominal deadline.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SubagentExecutionDeadline {
+    /// Instant past which the child must be failed.
+    expires_at: time::OffsetDateTime,
+    /// The resolved spec timeout, kept for the failure message.
+    timeout_ms: u64,
+}
+
 pub(crate) struct HeartbeatLoopParams {
     pub(crate) stores: StoreRegistry,
     pub(crate) task_id: agent_server::journal::task::AgentTaskId,
@@ -1027,6 +1086,9 @@ pub(crate) struct HeartbeatLoopParams {
     /// partial-commit-on-cancel path (seam B) instead of only failing at
     /// the final commit CAS.
     pub(crate) task_cancel: CancellationToken,
+    /// Subagent wall-clock deadline for a linked child-thread root
+    /// (issue #299). `None` for every other task — no enforcement.
+    pub(crate) deadline: Option<SubagentExecutionDeadline>,
 }
 
 pub(crate) async fn heartbeat_loop(params: HeartbeatLoopParams) {
@@ -1040,6 +1102,7 @@ pub(crate) async fn heartbeat_loop(params: HeartbeatLoopParams) {
         heartbeat_interval,
         cancel,
         task_cancel,
+        deadline,
     } = params;
     let mut ticker = tokio::time::interval(heartbeat_interval);
     // Skip the immediate first tick — the lease was just set by
@@ -1054,6 +1117,45 @@ pub(crate) async fn heartbeat_loop(params: HeartbeatLoopParams) {
         }
 
         let now = time::OffsetDateTime::now_utc();
+
+        // Subagent timeout enforcement (issue #299): checked once per
+        // tick, before extending the lease. Unlike an external
+        // `cancel_tree` this worker still owns the lease, so the fail
+        // CAS lands first (waking the parent invocation with a failed
+        // child outcome), then the per-task token aborts the in-flight
+        // stream so seam B salvages the completed prefix.
+        if let Some(deadline) = deadline
+            && now >= deadline.expires_at
+        {
+            warn!(
+                %worker_id,
+                task_id = %task_id,
+                thread_id = %thread_id,
+                timeout_ms = deadline.timeout_ms,
+                "subagent child root exceeded its deadline; failing and aborting the turn",
+            );
+            if let Err(err) = fail_timed_out_subagent_root(
+                &stores,
+                &task_id,
+                &thread_id,
+                &worker_id,
+                &lease_id,
+                deadline.timeout_ms,
+                now,
+            )
+            .await
+            {
+                warn!(
+                    %worker_id,
+                    task_id = %task_id,
+                    error = %err,
+                    "failed to fail timed-out subagent child root",
+                );
+            }
+            task_cancel.cancel();
+            return;
+        }
+
         let new_expires_at = now + lease_duration;
         match stores
             .task_store
@@ -1500,6 +1602,47 @@ async fn fail_root_task(
     now: time::OffsetDateTime,
 ) -> Result<()> {
     let (worker_id, lease_id) = running_lease(task)?;
+    fail_root_task_if_owned(
+        stores,
+        OwnedRootTask {
+            task: &task.id,
+            thread: &task.thread_id,
+            worker: &worker_id,
+            lease: &lease_id,
+        },
+        error,
+        event_watermark,
+        now,
+    )
+    .await
+}
+
+/// Identity of a running root task this worker believes it owns.
+///
+/// Bundles the four coordinates the still-owned fail path needs so
+/// callers that only hold ids (the heartbeat loop) and callers that
+/// hold the full acquired row ([`fail_root_task`]) share one guarded
+/// transition.
+struct OwnedRootTask<'a> {
+    task: &'a agent_server::journal::task::AgentTaskId,
+    thread: &'a agent_sdk_foundation::ThreadId,
+    worker: &'a WorkerId,
+    lease: &'a LeaseId,
+}
+
+async fn fail_root_task_if_owned(
+    stores: &StoreRegistry,
+    owned: OwnedRootTask<'_>,
+    error: &anyhow::Error,
+    event_watermark: u64,
+    now: time::OffsetDateTime,
+) -> Result<()> {
+    let OwnedRootTask {
+        task: task_id,
+        thread: thread_id,
+        worker: worker_id,
+        lease: lease_id,
+    } = owned;
 
     // Re-read the row before transitioning. If the lease has moved on
     // — sweep requeued the row, another worker re-acquired, or the
@@ -1511,19 +1654,19 @@ async fn fail_root_task(
     // task's terminal state.
     let current = stores
         .task_store
-        .get(&task.id)
+        .get(task_id)
         .await
         .context("re-read task before fail")?;
     let still_owned = current.as_ref().is_some_and(|t| {
         t.status == TaskStatus::Running
-            && t.worker_id.as_ref() == Some(&worker_id)
-            && t.lease_id.as_ref() == Some(&lease_id)
+            && t.worker_id.as_ref() == Some(worker_id)
+            && t.lease_id.as_ref() == Some(lease_id)
     });
     if !still_owned {
         let observed_status = current.as_ref().map(|t| t.status);
         warn!(
-            task_id = %task.id,
-            thread_id = %task.thread_id,
+            task_id = %task_id,
+            thread_id = %thread_id,
             ?observed_status,
             "skip fail_root_task: lease no longer owned by this worker (sweep or re-acquire took over)",
         );
@@ -1531,10 +1674,10 @@ async fn fail_root_task(
     }
 
     fail_root_turn(
-        &task.id,
-        &worker_id,
-        &lease_id,
-        &task.thread_id,
+        task_id,
+        worker_id,
+        lease_id,
+        thread_id,
         error,
         &stores.root_turn_deps(),
         now,
@@ -1542,9 +1685,103 @@ async fn fail_root_task(
     .await
     .context("mark root task failed")?;
 
-    let new_events = newly_committed_events(stores, &task.thread_id, event_watermark).await?;
+    let new_events = newly_committed_events(stores, thread_id, event_watermark).await?;
     publish_events(stores, &new_events);
     Ok(())
+}
+
+/// Resolve the wall-clock execution deadline for an acquired task.
+///
+/// Returns `Some` only for a child-thread root turn that is durably
+/// linked to a parked [`TaskKind::Subagent`] invocation — every other
+/// task (plain roots, tool children, invocations) resolves to `None`
+/// and runs with today's unbounded-lease behavior. The deadline is
+/// anchored at the child root's `created_at` plus the invocation
+/// spec's resolved `timeout_ms`, mirroring the in-process SDK
+/// subagent semantics ("the child took too long since spawn"), and
+/// spans the child's whole durable execution: queue wait, retries,
+/// and re-acquisitions all consume the same budget.
+///
+/// A steering-resume wake is excluded: it is a short interim exchange
+/// on a parent whose own children are still running, and failing it
+/// would strand those children. Enforcement resumes on the next
+/// ordinary acquisition of the task.
+///
+/// Lookup failures are logged and treated as "no deadline" — timeout
+/// enforcement is a liveness protection and must not fail an
+/// otherwise healthy child on a transient store read error.
+async fn resolve_subagent_deadline(
+    stores: &StoreRegistry,
+    task: &AgentTask,
+) -> Option<SubagentExecutionDeadline> {
+    if task.kind != TaskKind::RootTurn || !task.is_root() || task.state.is_steering_resume() {
+        return None;
+    }
+    let invocation = match stores
+        .task_store
+        .find_subagent_invocation_for_child_root(&task.id)
+        .await
+    {
+        Ok(invocation) => invocation?,
+        Err(err) => {
+            warn!(
+                task_id = %task.id,
+                thread_id = %task.thread_id,
+                error = %err,
+                "subagent linkage lookup failed; running without a deadline",
+            );
+            return None;
+        }
+    };
+    let timeout_ms = invocation
+        .state
+        .subagent_invocation()
+        .map(|state| state.spec.timeout_ms)?;
+    let timeout = time::Duration::milliseconds(i64::try_from(timeout_ms).unwrap_or(i64::MAX));
+    let expires_at = task.created_at.checked_add(timeout)?;
+    Some(SubagentExecutionDeadline {
+        expires_at,
+        timeout_ms,
+    })
+}
+
+/// Fail a subagent child-thread root that exceeded its wall-clock
+/// deadline, routed through the same still-owned guard and
+/// [`fail_root_turn`] machinery as any other root-task failure.
+///
+/// The store-side `fail_task` transition wakes the linked invocation
+/// in the same write (the fan-in path a failed child already takes),
+/// so the parent resumes with a `success = false` child outcome
+/// carrying the timeout message — deliberately FAILED, not Cancelled,
+/// so the parent LLM sees an actionable error.
+async fn fail_timed_out_subagent_root(
+    stores: &StoreRegistry,
+    task_id: &agent_server::journal::task::AgentTaskId,
+    thread_id: &agent_sdk_foundation::ThreadId,
+    worker_id: &WorkerId,
+    lease_id: &LeaseId,
+    timeout_ms: u64,
+    now: time::OffsetDateTime,
+) -> Result<()> {
+    let event_watermark = stores
+        .event_repo
+        .next_sequence(thread_id)
+        .await
+        .context("reading timeout event watermark")?;
+    let error = anyhow!("subagent timed out after {timeout_ms}ms");
+    fail_root_task_if_owned(
+        stores,
+        OwnedRootTask {
+            task: task_id,
+            thread: thread_id,
+            worker: worker_id,
+            lease: lease_id,
+        },
+        &error,
+        event_watermark,
+        now,
+    )
+    .await
 }
 
 fn publish_events(stores: &StoreRegistry, events: &[CommittedEvent]) {
@@ -2143,6 +2380,7 @@ mod tests {
             heartbeat_interval: std::time::Duration::from_secs(1),
             cancel: cancel.clone(),
             task_cancel: CancellationToken::new(),
+            deadline: None,
         }));
 
         // Auto-advance the synthetic clock past two heartbeat ticks.
@@ -2209,6 +2447,7 @@ mod tests {
             heartbeat_interval: std::time::Duration::from_millis(100),
             cancel: cancel.clone(),
             task_cancel: task_cancel.clone(),
+            deadline: None,
         }));
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -3395,6 +3634,603 @@ mod tests {
 
         token.cancel();
         host_handle.await??;
+        Ok(())
+    }
+
+    // ── Subagent timeout enforcement (issue #299) ───────────────────
+    //
+    // The heartbeat loop enforces a wall-clock deadline (child root
+    // `created_at` + invocation `spec.timeout_ms`) on child-thread
+    // roots linked to a durable subagent invocation:
+    //   * a hung provider stream is aborted and the child fails with
+    //     `subagent timed out after {timeout_ms}ms` (never Cancelled),
+    //   * a child acquired past its deadline fails up front with zero
+    //     LLM dispatch, and
+    //   * either way the parent's fan-in resumes with the failed child
+    //     outcome visible to the parent LLM.
+
+    const HANG_CHILD_TASK: &str = "hang-child-task: stall the provider stream on purpose";
+    const FAST_CHILD_TASK: &str = "fast-child-task: reply instantly";
+    const HANG_CHILD_TIMEOUT_MS: u64 = 1_200;
+
+    /// Hand-built effective spec mirroring what `resolve_subagent_spec`
+    /// produces, parameterized on task text and timeout.
+    fn subagent_timeout_spec(
+        task: &str,
+        timeout_ms: u64,
+    ) -> agent_server::worker::EffectiveSubagentSpec {
+        use agent_server::worker::{
+            EffectiveSubagentCapabilities, EffectiveSubagentMcpPolicy, EffectiveSubagentSpec,
+            InheritedSubagentPolicy, SubagentCapabilityProfile, SubagentSandboxPolicy,
+        };
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let capabilities: BTreeSet<String> = BTreeSet::from(["read_file".to_owned()]);
+        EffectiveSubagentSpec {
+            task: task.to_owned(),
+            prompt: String::new(),
+            model: "mock-model".into(),
+            max_turns: 5,
+            timeout_ms,
+            depth: 1,
+            max_parallel_subagents: 1,
+            nickname: None,
+            sandbox: SubagentSandboxPolicy::read_only(),
+            mcp: EffectiveSubagentMcpPolicy::default(),
+            audit_provenance: None,
+            inherited_policy: InheritedSubagentPolicy {
+                default_model: "mock-model".into(),
+                allowed_models: BTreeSet::from(["mock-model".to_owned()]),
+                default_max_turns: 5,
+                max_turns: 5,
+                default_timeout_ms: timeout_ms,
+                max_timeout_ms: timeout_ms,
+                capability_profiles: BTreeMap::from([(
+                    "research".to_owned(),
+                    SubagentCapabilityProfile {
+                        capabilities: capabilities.clone(),
+                        sandbox: SubagentSandboxPolicy::read_only(),
+                        allowed_mcp_servers: BTreeSet::new(),
+                    },
+                )]),
+                allowed_capabilities: capabilities.clone(),
+                max_depth: 3,
+                max_parallel_subagents: 1,
+                sandbox: SubagentSandboxPolicy::read_only(),
+                allowed_mcp_servers: BTreeSet::new(),
+                audit_provider: "mock".into(),
+            },
+            capabilities: EffectiveSubagentCapabilities {
+                profile: "research".into(),
+                allowed: capabilities,
+            },
+        }
+    }
+
+    fn request_contains_tool_result(request: &ChatRequest) -> bool {
+        request
+            .messages
+            .iter()
+            .any(|message| match &message.content {
+                agent_sdk_foundation::llm::Content::Blocks(blocks) => blocks
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolResult { .. })),
+                agent_sdk_foundation::llm::Content::Text(_) => false,
+            })
+    }
+
+    fn request_flat_text(request: &ChatRequest) -> String {
+        let mut flat = String::new();
+        for message in &request.messages {
+            match &message.content {
+                agent_sdk_foundation::llm::Content::Text(text) => flat.push_str(text),
+                agent_sdk_foundation::llm::Content::Blocks(blocks) => {
+                    for block in blocks {
+                        match block {
+                            ContentBlock::Text { text } => flat.push_str(text),
+                            ContentBlock::ToolResult { content, .. } => flat.push_str(content),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            flat.push('\n');
+        }
+        flat
+    }
+
+    /// Scripted provider for the timeout tests, routed on request
+    /// content:
+    ///   * any `tool_result` block → the parent's fan-in resume: the
+    ///     flattened result text is recorded (so tests can assert what
+    ///     the parent LLM saw) and a text close is returned,
+    ///   * the hang-child task text → counts the dispatch, then hangs
+    ///     forever (a stalled provider stream),
+    ///   * the fast-child task text → an instant text reply,
+    ///   * anything else → the parent's fresh turn: a two-call
+    ///     subagent tool-use batch.
+    struct SubagentScriptProvider {
+        hang_child_calls: AtomicUsize,
+        resume_tool_results: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl SubagentScriptProvider {
+        fn new() -> Self {
+            Self {
+                hang_child_calls: AtomicUsize::new(0),
+                resume_tool_results: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn recorded_resume_text(&self) -> Result<String> {
+            let recorded = self
+                .resume_tool_results
+                .lock()
+                .map_err(|_| anyhow::anyhow!("resume_tool_results lock poisoned"))?;
+            Ok(recorded.join("\n"))
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for SubagentScriptProvider {
+        async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
+            if request_contains_tool_result(&request) {
+                let flat = request_flat_text(&request);
+                self.resume_tool_results
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("resume_tool_results lock poisoned"))?
+                    .push(flat);
+                return Ok(ChatOutcome::Success(text_response(
+                    "resp_parent_final",
+                    "children handled",
+                )));
+            }
+            let flat = request_flat_text(&request);
+            if flat.contains(HANG_CHILD_TASK) {
+                self.hang_child_calls.fetch_add(1, Ordering::SeqCst);
+                // Stalled provider stream: never yields. Only the
+                // host's deadline enforcement can unwedge this child.
+                return std::future::pending::<Result<ChatOutcome>>().await;
+            }
+            if flat.contains(FAST_CHILD_TASK) {
+                return Ok(ChatOutcome::Success(text_response(
+                    "resp_fast_child",
+                    "sibling done",
+                )));
+            }
+            let content = vec![
+                ContentBlock::ToolUse {
+                    id: "call_hang".into(),
+                    name: "subagent_hang".into(),
+                    input: serde_json::json!({ "task": HANG_CHILD_TASK }),
+                    thought_signature: None,
+                },
+                ContentBlock::ToolUse {
+                    id: "call_fast".into(),
+                    name: "subagent_fast".into(),
+                    input: serde_json::json!({ "task": FAST_CHILD_TASK }),
+                    thought_signature: None,
+                },
+            ];
+            Ok(ChatOutcome::Success(ChatResponse {
+                id: "resp_parent_spawn".into(),
+                content,
+                model: "mock-model".into(),
+                stop_reason: Some(StopReason::ToolUse),
+                usage: Usage {
+                    input_tokens: 12,
+                    output_tokens: 6,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                },
+            }))
+        }
+
+        fn model(&self) -> &'static str {
+            "mock-model"
+        }
+
+        fn provider(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    /// Routes `subagent_hang` / `subagent_fast` tool calls into durable
+    /// subagent invocations with deterministic child-thread ids (so a
+    /// retried attempt reuses the same rows and the test can find the
+    /// children without scanning).
+    struct DeadlineSpawnSelector;
+
+    #[async_trait]
+    impl agent_server::worker::SubagentSpawnSelector for DeadlineSpawnSelector {
+        async fn decide(
+            &self,
+            parent_thread_id: &agent_sdk_foundation::ThreadId,
+            tool_calls: &[agent_sdk_foundation::PendingToolCallInfo],
+        ) -> Result<Vec<agent_server::worker::SubagentSpawnDecision>> {
+            use agent_server::worker::SubagentSpawnDecision;
+            use agent_server::worker::subagent_spawn_selector::SubagentSpawnPlan;
+            use agent_server::worker::{SubagentCapabilityRequest, SubagentSpawnRequest};
+
+            Ok(tool_calls
+                .iter()
+                .map(|call| {
+                    let (task, timeout_ms, suffix) = match call.name.as_str() {
+                        "subagent_hang" => (HANG_CHILD_TASK, HANG_CHILD_TIMEOUT_MS, "hang"),
+                        "subagent_fast" => (FAST_CHILD_TASK, 600_000, "fast"),
+                        _ => return SubagentSpawnDecision::SpawnAsTool,
+                    };
+                    SubagentSpawnDecision::SpawnAsSubagent {
+                        plan: Box::new(SubagentSpawnPlan {
+                            request: SubagentSpawnRequest::new(
+                                task,
+                                SubagentCapabilityRequest::new("research"),
+                            ),
+                            spec: subagent_timeout_spec(task, timeout_ms),
+                            child_thread_id: agent_sdk_foundation::ThreadId::from_string(format!(
+                                "{parent_thread_id}-{suffix}"
+                            )),
+                            child_root_input: Vec::new(),
+                            child_caller_metadata: None,
+                        }),
+                    }
+                })
+                .collect())
+        }
+    }
+
+    fn subagent_timeout_runtime(
+        provider: Arc<SubagentScriptProvider>,
+    ) -> Result<Arc<ExecutionRuntime>> {
+        let resolver = Arc::new(StaticProviderResolver::new());
+        resolver.set_fallback(provider)?;
+        Ok(Arc::new(
+            ExecutionRuntime::new(
+                resolver,
+                Arc::new(NoopToolExecutor),
+                Arc::new(AllowAllConfirmationPolicy),
+            )
+            .with_subagent_spawn_selector(Arc::new(DeadlineSpawnSelector)),
+        ))
+    }
+
+    async fn wait_for_status(
+        stores: &StoreRegistry,
+        task_id: &agent_server::journal::task::AgentTaskId,
+        want: TaskStatus,
+        max_polls: usize,
+    ) -> Result<AgentTask> {
+        let mut last_seen: Option<TaskStatus> = None;
+        for _ in 0..max_polls {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let row = stores
+                .task_store
+                .get(task_id)
+                .await?
+                .context("polled task must still exist")?;
+            if row.status == want {
+                return Ok(row);
+            }
+            last_seen = Some(row.status);
+        }
+        bail!("task {task_id} never reached {want:?}; last observed {last_seen:?}");
+    }
+
+    /// Find the single root-turn task of `thread_id`.
+    async fn root_task_of_thread(
+        stores: &StoreRegistry,
+        thread_id: &agent_sdk_foundation::ThreadId,
+    ) -> Result<AgentTask> {
+        let tasks = stores.task_store.list_by_thread(thread_id).await?;
+        tasks
+            .into_iter()
+            .find(|task| task.kind == TaskKind::RootTurn)
+            .with_context(|| format!("thread {thread_id} has no root turn"))
+    }
+
+    #[tokio::test]
+    async fn timed_out_subagent_child_fails_and_parent_resumes() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+
+        let config = ServiceConfig {
+            worker: crate::config::WorkerConfig {
+                pool_size: 4,
+                heartbeat_interval_secs: 1,
+                acquisition_interval_secs: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let provider = Arc::new(SubagentScriptProvider::new());
+        let runtime = subagent_timeout_runtime(Arc::clone(&provider))?;
+        let host = ServiceHost::new(config, sample_registry(), runtime)?;
+        let stores = host.stores().clone();
+        let token = host.shutdown_token();
+
+        let parent_thread = ThreadId::from_string("t-subagent-timeout");
+        let parent = AgentTask::new_root_turn_with_input(
+            parent_thread.clone(),
+            vec![SubmittedInputItem::Text {
+                text: "coordinate the helpers".into(),
+            }],
+            time::OffsetDateTime::now_utc(),
+            3,
+        );
+        let parent_id = parent.id.clone();
+        stores.task_store.submit_root_turn(parent).await?;
+
+        let host_handle = tokio::spawn(async move { host.run().await });
+
+        // The hang child wedges its provider stream forever, so the
+        // ONLY way the parent completes is the heartbeat deadline
+        // failing that child and waking the fan-in with a failed
+        // outcome. 30 s budget for a ~3 s happy path.
+        wait_for_status(&stores, &parent_id, TaskStatus::Completed, 1_500).await?;
+
+        // The hang child: FAILED (not Cancelled) with the exact
+        // timeout message, after actually dispatching the LLM call.
+        let hang_thread = ThreadId::from_string("t-subagent-timeout-hang");
+        let hang_root = root_task_of_thread(&stores, &hang_thread).await?;
+        assert_eq!(
+            hang_root.status,
+            TaskStatus::Failed,
+            "a timed-out child must fail, not cancel",
+        );
+        let hang_error = hang_root.last_error.clone().unwrap_or_default();
+        assert!(
+            hang_error.contains("subagent timed out after 1200ms"),
+            "timed-out child must carry the timeout message, got {hang_error:?}",
+        );
+        assert!(
+            provider.hang_child_calls.load(Ordering::SeqCst) >= 1,
+            "the hang child must have dispatched its (stalled) LLM call — this exercises \
+             the mid-flight heartbeat path, not the acquisition-expiry path",
+        );
+
+        // Seam B salvage: aborting the in-flight turn commits the
+        // provider-valid prefix (here: the child's user prompt) even
+        // though the row went FAILED, so the transcript survives.
+        let salvaged = stores
+            .message_store
+            .get_history(&hang_thread)
+            .await?
+            .iter()
+            .any(|message| {
+                message
+                    .content
+                    .first_text()
+                    .is_some_and(|text| text.contains(HANG_CHILD_TASK))
+            });
+        assert!(
+            salvaged,
+            "seam B must salvage the timed-out child's committed prefix into its thread history",
+        );
+
+        // The generously-budgeted sibling ran to completion unaffected.
+        let fast_thread = ThreadId::from_string("t-subagent-timeout-fast");
+        let fast_root = root_task_of_thread(&stores, &fast_thread).await?;
+        assert_eq!(
+            fast_root.status,
+            TaskStatus::Completed,
+            "the sibling with an unelapsed timeout must complete normally",
+        );
+
+        // Both invocations reached Completed (the timed-out child is a
+        // materialized failed RESULT, not a failed invocation), and the
+        // parent LLM saw the timeout message in its fan-in results.
+        let invocations = stores.task_store.list_children(&parent_id).await?;
+        assert_eq!(invocations.len(), 2, "one invocation per spawned child");
+        for invocation in &invocations {
+            assert_eq!(
+                invocation.status,
+                TaskStatus::Completed,
+                "invocation {} must complete with a materialized result",
+                invocation.id,
+            );
+        }
+        let resume_text = provider.recorded_resume_text()?;
+        assert!(
+            resume_text.contains("subagent timed out after 1200ms"),
+            "the parent's resume request must carry the failed child's timeout message, got \
+             {resume_text:?}",
+        );
+
+        token.cancel();
+        host_handle.await??;
+        Ok(())
+    }
+
+    /// Manually persist a parent → invocation → child-root fixture at
+    /// timestamp `at`, with `timeout_ms` on the invocation spec and a
+    /// well-formed pending `subagent_hang` tool call on the parent's
+    /// suspension (so the invocation can materialize its result and
+    /// resume the parent later). Returns `(parent, invocation,
+    /// child_root)`.
+    async fn persist_subagent_fixture(
+        stores: &StoreRegistry,
+        parent_thread: &agent_sdk_foundation::ThreadId,
+        timeout_ms: u64,
+        at: time::OffsetDateTime,
+    ) -> Result<(AgentTask, AgentTask, AgentTask)> {
+        use agent_server::journal::SubagentInvocationSpawn;
+        use agent_server::journal::task::SuspensionPayload;
+
+        stores.thread_store.get_or_create(parent_thread, at).await?;
+        let parent = AgentTask::new_root_turn_with_input(
+            parent_thread.clone(),
+            vec![SubmittedInputItem::Text {
+                text: "coordinate the helpers".into(),
+            }],
+            at,
+            3,
+        );
+        let parent_id = parent.id.clone();
+        stores.task_store.submit_root_turn(parent).await?;
+        let worker = WorkerId::from_string("w-fixture");
+        let lease = LeaseId::new();
+        stores
+            .task_store
+            .try_acquire_task(
+                &parent_id,
+                worker.clone(),
+                lease.clone(),
+                time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+                at,
+            )
+            .await?
+            .context("fixture parent must acquire before spawning")?;
+
+        let child_thread =
+            agent_sdk_foundation::ThreadId::from_string(format!("{parent_thread}-hang"));
+        stores.thread_store.get_or_create(&child_thread, at).await?;
+
+        let payload = SuspensionPayload {
+            continuation: agent_sdk_foundation::ContinuationEnvelope::wrap(
+                agent_sdk_foundation::AgentContinuation {
+                    thread_id: parent_thread.clone(),
+                    turn: 1,
+                    total_usage: agent_sdk_foundation::TokenUsage::default(),
+                    turn_usage: agent_sdk_foundation::TokenUsage::default(),
+                    pending_tool_calls: vec![agent_sdk_foundation::PendingToolCallInfo {
+                        id: "call_hang".into(),
+                        name: "subagent_hang".into(),
+                        display_name: "subagent_hang".into(),
+                        tier: ToolTier::Confirm,
+                        input: serde_json::json!({ "task": HANG_CHILD_TASK }),
+                        effective_input: serde_json::json!({ "task": HANG_CHILD_TASK }),
+                        listen_context: None,
+                    }],
+                    awaiting_index: 0,
+                    completed_results: vec![],
+                    state: agent_sdk_foundation::AgentState::new(parent_thread.clone()),
+                    response_id: None,
+                    stop_reason: None,
+                    response_content: vec![],
+                },
+            ),
+            suspended_messages: vec![],
+        };
+
+        let (parent, invocation, child_root) = stores
+            .task_store
+            .spawn_subagent_invocation(
+                &parent_id,
+                &worker,
+                &lease,
+                SubagentInvocationSpawn {
+                    child_thread_id: child_thread,
+                    spec: subagent_timeout_spec(HANG_CHILD_TASK, timeout_ms),
+                    child_root_input: vec![SubmittedInputItem::Text {
+                        text: HANG_CHILD_TASK.into(),
+                    }],
+                    spawn_index: 0,
+                    child_caller_metadata: None,
+                    payload,
+                },
+                at,
+            )
+            .await
+            .context("persist fixture subagent invocation")?;
+        Ok((parent, invocation, child_root))
+    }
+
+    #[tokio::test]
+    async fn expired_subagent_child_fails_at_acquisition_without_llm_dispatch() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+
+        let config = ServiceConfig {
+            worker: crate::config::WorkerConfig {
+                pool_size: 2,
+                heartbeat_interval_secs: 1,
+                acquisition_interval_secs: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let provider = Arc::new(SubagentScriptProvider::new());
+        let runtime = subagent_timeout_runtime(Arc::clone(&provider))?;
+        let host = ServiceHost::new(config, sample_registry(), runtime)?;
+        let stores = host.stores().clone();
+        let token = host.shutdown_token();
+
+        // Backdate the whole fixture: the child root's deadline
+        // (created_at + 250ms) is long past before any worker sees it.
+        let backdated = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
+        let parent_thread = ThreadId::from_string("t-subagent-expired");
+        let (parent, invocation, child_root) =
+            persist_subagent_fixture(&stores, &parent_thread, 250, backdated).await?;
+
+        let host_handle = tokio::spawn(async move { host.run().await });
+
+        // The child must fail up front — before resolving a provider,
+        // before any LLM dispatch — and the failure must still flow
+        // through the invocation to resume and complete the parent.
+        let failed_child =
+            wait_for_status(&stores, &child_root.id, TaskStatus::Failed, 750).await?;
+        let child_error = failed_child.last_error.clone().unwrap_or_default();
+        assert!(
+            child_error.contains("subagent timed out after 250ms"),
+            "expired child must carry the timeout message, got {child_error:?}",
+        );
+        wait_for_status(&stores, &invocation.id, TaskStatus::Completed, 750).await?;
+        wait_for_status(&stores, &parent.id, TaskStatus::Completed, 750).await?;
+
+        assert_eq!(
+            provider.hang_child_calls.load(Ordering::SeqCst),
+            0,
+            "an already-expired child must never dispatch an LLM call",
+        );
+        let resume_text = provider.recorded_resume_text()?;
+        assert!(
+            resume_text.contains("subagent timed out after 250ms"),
+            "the parent's resume request must carry the expired child's timeout message, got \
+             {resume_text:?}",
+        );
+
+        token.cancel();
+        host_handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_subagent_deadline_only_for_linked_child_roots() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+
+        let config = ServiceConfig::default();
+        let provider = Arc::new(SubagentScriptProvider::new());
+        let runtime = subagent_timeout_runtime(provider)?;
+        let host = ServiceHost::new(config, sample_registry(), runtime)?;
+        let stores = host.stores().clone();
+
+        let at = time::OffsetDateTime::now_utc();
+        let parent_thread = ThreadId::from_string("t-subagent-resolve");
+        let (parent, _invocation, child_root) =
+            persist_subagent_fixture(&stores, &parent_thread, 250, at).await?;
+
+        // Linked child root: deadline anchored at created_at + timeout.
+        let deadline = resolve_subagent_deadline(&stores, &child_root)
+            .await
+            .context("linked child root must resolve a deadline")?;
+        assert_eq!(deadline.timeout_ms, 250);
+        assert_eq!(
+            deadline.expires_at,
+            child_root.created_at + time::Duration::milliseconds(250),
+            "deadline must anchor at the child root's creation time",
+        );
+
+        // The parent root (not a linked child root) resolves no deadline.
+        assert!(
+            resolve_subagent_deadline(&stores, &parent).await.is_none(),
+            "a non-child root must run without a deadline",
+        );
+
+        // A plain root on an unrelated thread resolves no deadline.
+        let plain = AgentTask::new_root_turn(ThreadId::from_string("t-plain-root"), at, 3);
+        let plain = stores.task_store.submit_root_turn(plain).await?;
+        assert!(
+            resolve_subagent_deadline(&stores, &plain).await.is_none(),
+            "a plain root must run without a deadline",
+        );
         Ok(())
     }
 }

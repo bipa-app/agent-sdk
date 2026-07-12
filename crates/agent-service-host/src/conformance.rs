@@ -820,6 +820,59 @@ mod tests {
         Ok(())
     }
 
+    /// Reverse linkage read (issue #299): while a subagent child-thread
+    /// root is live, `find_subagent_invocation_for_child_root` must
+    /// return the parked invocation carrying the resolved spec (the
+    /// host reads `spec.timeout_ms` off it to derive the child's
+    /// wall-clock deadline). Unlinked ids resolve to `None`, and the
+    /// window closes once the child root goes terminal and the
+    /// invocation has been woken — on every backend.
+    async fn test_find_invocation_for_child_root(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
+    ) -> Result<()> {
+        let (parent, invocation, child_root) =
+            spawn_subagent_fixture(task_store, thread_store, "conformance-subagent-linkage")
+                .await?;
+
+        let found = task_store
+            .find_subagent_invocation_for_child_root(&child_root.id)
+            .await?
+            .context("linkage lookup must find the parked invocation while the child is live")?;
+        assert_eq!(found.id, invocation.id);
+        let spec_timeout_ms = found
+            .state
+            .subagent_invocation()
+            .context("found invocation must carry the durable spec linkage")?
+            .spec
+            .timeout_ms;
+        assert_eq!(
+            spec_timeout_ms, 15_000,
+            "the resolved spec timeout must be readable through the linkage",
+        );
+
+        // The parent root is not a linked child root.
+        assert!(
+            task_store
+                .find_subagent_invocation_for_child_root(&parent.id)
+                .await?
+                .is_none(),
+            "unlinked task ids must resolve to None",
+        );
+
+        // Terminal child root wakes the invocation and consumes the
+        // linkage window.
+        task_store.cancel_tree(&child_root.id, t_plus(10)).await?;
+        assert!(
+            task_store
+                .find_subagent_invocation_for_child_root(&child_root.id)
+                .await?
+                .is_none(),
+            "the linkage window must close once the invocation has been woken",
+        );
+        Ok(())
+    }
+
     /// `claim_idempotency` is an atomic reservation (findings #3/#15):
     /// the first claim reserves the key (`Fresh`), a second claim before
     /// the result is recorded observes `Conflict` (reservation in-flight),
@@ -1514,6 +1567,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_find_invocation_for_child_root() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_find_invocation_for_child_root(s.task.as_ref(), s.thread.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_claim_idempotency_reserve_then_replay() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_claim_idempotency_reserve_then_replay(s.task.as_ref()).await
@@ -1698,6 +1757,13 @@ mod tests {
     async fn conformance_sqlite_fail_closed_child_root_wakes_invocation() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_fail_closed_child_root_wakes_invocation(&store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_find_invocation_for_child_root() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_find_invocation_for_child_root(&store, &store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -2137,6 +2203,15 @@ mod tests {
             return Ok(());
         };
         test_fail_closed_child_root_wakes_invocation(&store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_find_invocation_for_child_root() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_find_invocation_for_child_root(&store, &store).await
     }
 
     #[cfg(feature = "postgres")]

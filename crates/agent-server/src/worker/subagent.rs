@@ -67,6 +67,12 @@ pub struct SubagentSpawnRequest {
     pub max_turns: Option<u32>,
     /// Optional timeout budget requested by the caller, in
     /// milliseconds.
+    ///
+    /// `None` does not mean "unbounded": resolution substitutes the
+    /// inherited policy's `default_timeout_ms` and clamps to
+    /// `max_timeout_ms`, so the resolved
+    /// [`EffectiveSubagentSpec::timeout_ms`] is always concrete. See
+    /// that field for the enforcement semantics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
     /// Optional nested-subagent sibling budget requested by the
@@ -524,6 +530,17 @@ pub struct EffectiveSubagentSpec {
     /// Server-authoritative turn budget.
     pub max_turns: u32,
     /// Server-authoritative timeout, in milliseconds.
+    ///
+    /// Enforced by the service host as a wall-clock deadline anchored
+    /// at the child root task's `created_at` (issue #299): queue wait,
+    /// retries, and re-acquisitions all consume the same budget,
+    /// matching the in-process SDK subagent semantics. The deadline is
+    /// checked once per worker heartbeat tick (default interval ~10s),
+    /// so enforcement carries up to one tick of slack past the nominal
+    /// deadline. On expiry the child root turn is transitioned to
+    /// FAILED with `subagent timed out after {timeout_ms}ms` — not
+    /// Cancelled — so the parent's fan-in resumes with a failed child
+    /// result the parent LLM can react to.
     pub timeout_ms: u64,
     /// Durable depth of this child within the subagent lineage.
     #[serde(default = "default_subagent_depth")]

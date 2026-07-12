@@ -2965,6 +2965,29 @@ impl AgentTaskStore for SqliteDurableStore {
         Ok((new_parent, prepared))
     }
 
+    async fn find_subagent_invocation_for_child_root(
+        &self,
+        child_root_id: &AgentTaskId,
+    ) -> Result<Option<AgentTask>> {
+        // Read-only counterpart of `resume_linked_subagent_invocation_tx`:
+        // same linkage predicate, no transition, pool-level read.
+        let record = sqlx::query_as::<_, TaskRecord>(concat!(
+            "SELECT ",
+            task_columns!(),
+            " FROM agent_sdk_tasks \
+             WHERE kind = 'subagent' \
+               AND status = 'waiting_on_children' \
+               AND json_extract(state_json, '$.invocation.child_root_task_id') = ?1",
+        ))
+        .bind(child_root_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| {
+            format!("find_subagent_invocation_for_child_root: lookup for {child_root_id}")
+        })?;
+        record.map(TryInto::try_into).transpose()
+    }
+
     async fn complete_task(
         &self,
         child_id: &AgentTaskId,

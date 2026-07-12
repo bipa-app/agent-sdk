@@ -471,6 +471,8 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
             // reuse the heartbeat's own token so a lease rejection has no
             // extra effect beyond stopping the ticker.
             task_cancel: heartbeat_cancel.clone(),
+            // Not a subagent child-thread root — no wall-clock deadline.
+            deadline: None,
         },
     ));
 
