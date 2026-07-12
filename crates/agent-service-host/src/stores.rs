@@ -345,7 +345,13 @@ pub struct StoreRegistry {
 /// id.
 ///
 /// A drive registers its per-drive token (a child of the server
-/// shutdown token) before executing and deregisters on completion.
+/// shutdown token) before executing; the returned
+/// [`DriveRegistration`] scope guard deregisters on drop — including
+/// panic unwind of the detached drive task — so a wedged or panicked
+/// drive can neither leak its entry nor (thanks to the per-drive
+/// nonce) strip a successor drive that re-registered under the same
+/// task id after a requeue → re-approve cycle.
+///
 /// Enforcement paths that cancel the tool's task row out from under
 /// the drive — the subagent deadline sweep's `cancel_tree`, the
 /// external `CancelTask` RPC — call [`Self::cancel`] with every
@@ -356,7 +362,16 @@ pub struct StoreRegistry {
 /// heartbeat interval.
 #[derive(Default)]
 pub struct ConfirmDriveCancels {
-    inner: std::sync::Mutex<std::collections::HashMap<AgentTaskId, CancellationToken>>,
+    /// Monotonic registration nonce: ties each [`DriveRegistration`]
+    /// to the exact map entry it created.
+    next_nonce: std::sync::atomic::AtomicU64,
+    inner: std::sync::Mutex<std::collections::HashMap<AgentTaskId, DriveEntry>>,
+}
+
+/// One live drive's registry entry.
+struct DriveEntry {
+    nonce: u64,
+    token: CancellationToken,
 }
 
 impl ConfirmDriveCancels {
@@ -365,31 +380,74 @@ impl ConfirmDriveCancels {
     /// cancellation.
     fn lock(
         &self,
-    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<AgentTaskId, CancellationToken>> {
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<AgentTaskId, DriveEntry>> {
         match self.inner.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
     }
 
-    /// Register the live drive token for `task_id`.
-    pub fn register(&self, task_id: AgentTaskId, token: CancellationToken) {
-        self.lock().insert(task_id, token);
+    /// Register the live drive token for `task_id`, replacing any
+    /// stale predecessor entry. Hold the returned guard for the
+    /// drive's lifetime; dropping it deregisters this registration
+    /// (and only this one — see [`DriveRegistration`]).
+    #[must_use]
+    pub fn register(
+        self: &Arc<Self>,
+        task_id: AgentTaskId,
+        token: CancellationToken,
+    ) -> DriveRegistration {
+        let nonce = self
+            .next_nonce
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.lock()
+            .insert(task_id.clone(), DriveEntry { nonce, token });
+        DriveRegistration {
+            registry: Arc::clone(self),
+            task_id,
+            nonce,
+        }
     }
 
-    /// Drop the registration for a completed drive.
-    pub fn deregister(&self, task_id: &AgentTaskId) {
-        self.lock().remove(task_id);
+    /// Remove the entry for `task_id` only when it still belongs to
+    /// the registration identified by `nonce`. A wedged predecessor
+    /// drive deregistering late (post-grace, or during unwind) must
+    /// not strip a successor drive's live token.
+    fn deregister_if_current(&self, task_id: &AgentTaskId, nonce: u64) {
+        let mut map = self.lock();
+        if map.get(task_id).is_some_and(|entry| entry.nonce == nonce) {
+            map.remove(task_id);
+        }
     }
 
     /// Cancel (and deregister) the live drive for `task_id`, if any.
     /// Returns `true` when a live drive token was tripped.
     pub fn cancel(&self, task_id: &AgentTaskId) -> bool {
-        let Some(token) = self.lock().remove(task_id) else {
+        let Some(entry) = self.lock().remove(task_id) else {
             return false;
         };
-        token.cancel();
+        entry.token.cancel();
         true
+    }
+}
+
+/// Scope guard for one drive's registry entry.
+///
+/// Dropping it — on the drive's normal exit, an early return, or a
+/// panic unwinding the detached tokio task — deregisters the entry,
+/// but only when the entry still carries this registration's nonce:
+/// a successor drive that re-registered under the same task id keeps
+/// its live token.
+pub struct DriveRegistration {
+    registry: Arc<ConfirmDriveCancels>,
+    task_id: AgentTaskId,
+    nonce: u64,
+}
+
+impl Drop for DriveRegistration {
+    fn drop(&mut self) {
+        self.registry
+            .deregister_if_current(&self.task_id, self.nonce);
     }
 }
 
@@ -886,5 +944,61 @@ mod tests {
         let stores = StoreRegistry::in_memory(sample_registry());
         let cloned = stores.clone();
         assert!(Arc::ptr_eq(&stores.task_store, &cloned.task_store));
+    }
+
+    /// Issue #299 round 5 (item 2): a wedged predecessor drive's late
+    /// deregistration (its guard dropping post-grace) must not strip a
+    /// successor drive that re-registered under the same tool task id
+    /// after a requeue → re-approve cycle — the nonce ties each guard
+    /// to the exact entry it created.
+    #[test]
+    fn stale_drive_deregistration_leaves_successor_registered() {
+        let registry = Arc::new(ConfirmDriveCancels::default());
+        let task_id = AgentTaskId::from_string("task-drive-nonce");
+
+        let token_a = CancellationToken::new();
+        let guard_a = registry.register(task_id.clone(), token_a.clone());
+
+        // A successor drive re-registers under the same task id.
+        let token_b = CancellationToken::new();
+        let _guard_b = registry.register(task_id.clone(), token_b.clone());
+
+        // The stale predecessor deregisters late.
+        drop(guard_a);
+
+        assert!(
+            registry.cancel(&task_id),
+            "the successor's registration must survive the stale deregister",
+        );
+        assert!(
+            token_b.is_cancelled(),
+            "cancel must trip the successor's live token",
+        );
+        assert!(
+            !token_a.is_cancelled(),
+            "the predecessor's replaced token is not the live one",
+        );
+    }
+
+    /// Issue #299 round 5 (item 3): a drive that panics before its
+    /// happy-path exit must still deregister — the scope guard's Drop
+    /// runs during the detached task's unwind, so the registry cannot
+    /// leak entries.
+    #[tokio::test]
+    async fn drive_registration_deregisters_on_panic_unwind() {
+        let registry = Arc::new(ConfirmDriveCancels::default());
+        let task_id = AgentTaskId::from_string("task-drive-unwind");
+        let registration = registry.register(task_id.clone(), CancellationToken::new());
+
+        let handle = tokio::spawn(async move {
+            let _registration = registration;
+            panic!("drive blew up before deregistering");
+        });
+        assert!(handle.await.is_err(), "the drive task must have panicked");
+
+        assert!(
+            !registry.cancel(&task_id),
+            "the unwound drive's entry must have been deregistered",
+        );
     }
 }

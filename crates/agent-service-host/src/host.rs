@@ -1152,18 +1152,20 @@ pub(crate) const EXECUTION_ABORT_GRACE: std::time::Duration = std::time::Duratio
 
 /// Race the execution future against the per-task token.
 ///
-/// A timed-out turn blocked in a token-blind await (e.g.
+/// A turn blocked in a token-blind await (e.g.
 /// `ProviderResolver::resolve_provider`, which receives no token)
 /// would otherwise pin its worker-pool slot forever even though the
-/// durable state is already terminal — on a small pool the woken
+/// row no longer needs this worker — after a timeout fail the row is
+/// terminal; after a requeue-triggered lease rejection it is Pending
+/// or already re-owned by a successor. On a small pool the woken
 /// parent could never materialize. Cooperative paths get a bounded
 /// grace window after the token trips (the stream abort and seam-B
 /// salvage must finish); only a future still pending past the grace is
-/// dropped (`None`). Dropping is the same cancellation model the SDK
-/// applies to stream drops, and is safe here: every durable write on
-/// the execute path is a single transactional store call, so dropping
-/// between awaits is indistinguishable from a worker crash, which the
-/// journal already tolerates.
+/// dropped (`None`). Dropping is crash-equivalent, not
+/// terminal-guaranteed: every durable write on the execute path is a
+/// single transactional store call, so dropping between awaits is
+/// indistinguishable from a worker crash, which the journal already
+/// tolerates (a requeued row is simply re-run by its next owner).
 async fn execute_with_abort_grace(
     task: AgentTask,
     worker_id: &WorkerId,
@@ -1173,6 +1175,7 @@ async fn execute_with_abort_grace(
 ) -> Option<Result<()>> {
     let task_id = task.id.clone();
     let thread_id = task.thread_id.clone();
+    let lease_id = task.lease_id.clone();
     let mut exec_fut = Box::pin(execute_acquired_task(task, stores, runtime, task_cancel));
     let outcome = tokio::select! {
         biased;
@@ -1187,7 +1190,7 @@ async fn execute_with_abort_grace(
                         thread_id = %thread_id,
                         grace_secs = EXECUTION_ABORT_GRACE.as_secs(),
                         "execution future ignored cancellation past the grace window; \
-                         dropping it (durable task state is already terminal)",
+                         dropping it (crash-equivalent; the row is terminal or owned elsewhere)",
                     );
                     None
                 }
@@ -1196,22 +1199,86 @@ async fn execute_with_abort_grace(
     };
     if outcome.is_none() {
         drop(exec_fut);
-        // The drop killed the turn's live worker mid-flight, so the
-        // `LeaveOpenForLiveWorker` assumption behind the timeout fail
-        // no longer holds: if cancellation landed while execution was
-        // outside `call_llm_with_retry` (Start persistence,
-        // completed-turn persistence), that turn's OPEN attempt row
-        // would stay unsettled forever. Best-effort close it
-        // (Cancelled, zero usage) — by construction no live worker
-        // remains to clobber.
-        best_effort_close_open_attempts(
+        settle_attempts_after_force_drop(
+            stores,
             &task_id,
-            stores.attempt_store.as_ref(),
-            time::OffsetDateTime::now_utc(),
+            &thread_id,
+            worker_id,
+            lease_id.as_ref(),
         )
         .await;
     }
     outcome
+}
+
+/// Settle turn attempts orphaned by a force-drop — but only when it is
+/// provably safe to do so.
+///
+/// The drop killed this worker's execution mid-flight, so the
+/// `LeaveOpenForLiveWorker` assumption behind the timeout fail no
+/// longer holds: an attempt opened outside `call_llm_with_retry`
+/// (Start persistence, completed-turn persistence) would stay OPEN
+/// forever. But two of the three ways the per-task token trips mean
+/// ownership already moved on (a terminal heartbeat lease rejection
+/// after a sweep requeue; a `deadline_tick` clean-skip Stop) — and in
+/// the requeue case a SUCCESSOR worker may already be streaming with
+/// its own open attempt. Stamping that attempt Cancelled/zero would
+/// make the successor's in-transaction real-usage close hit
+/// `AlreadyClosed` and terminally fail a genuinely recovered turn.
+///
+/// So, mirroring [`fail_root_task_if_owned`]'s still-owned guard:
+/// re-read the row and close open attempts only when the row is
+/// terminal (no future worker can exist) or still `Running` under OUR
+/// `(worker, lease)` (the dropped execution was the row's only live
+/// worker). Anything else — requeued, re-owned, missing — belongs to
+/// its next owner, who settles its own attempts.
+async fn settle_attempts_after_force_drop(
+    stores: &StoreRegistry,
+    task_id: &agent_server::journal::task::AgentTaskId,
+    thread_id: &agent_sdk_foundation::ThreadId,
+    worker_id: &WorkerId,
+    lease_id: Option<&LeaseId>,
+) {
+    let current = match stores.task_store.get(task_id).await {
+        Ok(current) => current,
+        Err(err) => {
+            warn!(
+                %worker_id,
+                task_id = %task_id,
+                thread_id = %thread_id,
+                error = %err,
+                "could not re-read task after force-drop; skipping attempt settlement",
+            );
+            return;
+        }
+    };
+    let safe_to_close = match &current {
+        None => false,
+        Some(row) if row.status.is_terminal() => true,
+        Some(row) => {
+            row.status == TaskStatus::Running
+                && row.worker_id.as_ref() == Some(worker_id)
+                && row.lease_id.as_ref() == lease_id
+        }
+    };
+    if !safe_to_close {
+        let observed_status = current.as_ref().map(|row| row.status);
+        warn!(
+            %worker_id,
+            task_id = %task_id,
+            thread_id = %thread_id,
+            ?observed_status,
+            "skip force-drop attempt settlement: row requeued or re-owned \
+             (its next owner settles its own attempts)",
+        );
+        return;
+    }
+    best_effort_close_open_attempts(
+        task_id,
+        stores.attempt_store.as_ref(),
+        time::OffsetDateTime::now_utc(),
+    )
+    .await;
 }
 
 /// Wall-clock execution deadline for a child-thread root task linked
@@ -2330,14 +2397,18 @@ async fn enforce_subagent_deadlines(
         }
         match child_root.status {
             // ORDERING INVARIANT: skipping Running rows is only safe
-            // because `release_expired_leases` ran EARLIER in this same
+            // because the expired-lease drain ran EARLIER in this same
             // sweep tick — a ghost-leased row (dead worker, expired
             // lease) has already been requeued to `Pending` by that
             // pass, so any row still Running here holds a live lease
             // and its worker's heartbeat owns enforcement. If the
             // sweep's phases are ever reordered, ghost-leased rows
             // would be skipped here AND miss the expiry pass, stalling
-            // convergence by a full tick.
+            // convergence by a full tick. One bounded exception: the
+            // drain's `MAX_LEASE_SWEEP_ROUNDS` guard means a backlog
+            // beyond ~10k expired rows can still leave ghost-Running
+            // rows into THIS tick's pass — those are skipped here and
+            // converge on the next tick once the drain catches up.
             TaskStatus::Running => continue,
             // Terminal rows have already woken the invocation.
             status if status.is_terminal() => continue,
@@ -5305,6 +5376,7 @@ mod tests {
         find_stalls_remaining: AtomicUsize,
         fail_task_failures_remaining: AtomicUsize,
         fail_task_attempts: AtomicUsize,
+        heartbeat_rejections_remaining: AtomicUsize,
     }
 
     impl FlakyTaskStore {
@@ -5315,6 +5387,7 @@ mod tests {
                 find_stalls_remaining: AtomicUsize::new(0),
                 fail_task_failures_remaining: AtomicUsize::new(0),
                 fail_task_attempts: AtomicUsize::new(0),
+                heartbeat_rejections_remaining: AtomicUsize::new(0),
             }
         }
 
@@ -5330,6 +5403,16 @@ mod tests {
 
         fn failing_fail_tasks(self, count: usize) -> Self {
             self.fail_task_failures_remaining
+                .store(count, Ordering::SeqCst);
+            self
+        }
+
+        /// Reject the next `count` heartbeats with the canonical
+        /// terminal "heartbeat rejected" marker — simulating a lease
+        /// that was revoked out from under the worker (sweep requeue,
+        /// `cancel_tree`) even though the row itself was not updated.
+        fn rejecting_heartbeats(self, count: usize) -> Self {
+            self.heartbeat_rejections_remaining
                 .store(count, Ordering::SeqCst);
             self
         }
@@ -5451,6 +5534,9 @@ mod tests {
             expires_at: time::OffsetDateTime,
             now: time::OffsetDateTime,
         ) -> Result<AgentTask> {
+            if Self::take_injected_failure(&self.heartbeat_rejections_remaining) {
+                bail!("heartbeat rejected: injected terminal lease rejection");
+            }
             self.inner
                 .heartbeat_task(task_id, worker, lease, expires_at, now)
                 .await
@@ -6289,9 +6375,10 @@ mod tests {
         let tool_child = park_child_root_on_tool_child(&stores, &child_root, backdated).await?;
 
         // Stands in for a live `drive_approved_confirmation` executing
-        // the (already approved) tool child.
+        // the (already approved) tool child. The guard must stay alive
+        // through enforcement, like a real drive's.
         let drive_token = CancellationToken::new();
-        stores
+        let _drive_registration = stores
             .confirm_drive_cancels
             .register(tool_child.id.clone(), drive_token.clone());
 
@@ -6466,6 +6553,207 @@ mod tests {
                 "no ghost-Running rows may survive the drain",
             );
         }
+        Ok(())
+    }
+
+    /// Runtime whose FIRST provider resolve hangs forever (token
+    /// blind); later resolves delegate to `provider`.
+    fn hang_once_runtime(provider: &Arc<SubagentScriptProvider>) -> Result<Arc<ExecutionRuntime>> {
+        let static_resolver = Arc::new(StaticProviderResolver::new());
+        static_resolver.set_fallback(Arc::clone(provider) as Arc<dyn LlmProvider>)?;
+        Ok(Arc::new(
+            ExecutionRuntime::new(
+                Arc::new(HangOnceProviderResolver {
+                    inner: static_resolver,
+                    hung_once: std::sync::atomic::AtomicBool::new(false),
+                }),
+                Arc::new(NoopToolExecutor),
+                Arc::new(AllowAllConfirmationPolicy),
+            )
+            .with_subagent_spawn_selector(Arc::new(DeadlineSpawnSelector)),
+        ))
+    }
+
+    /// Open a bare test attempt row for `task_id`.
+    async fn open_test_attempt(
+        stores: &StoreRegistry,
+        task_id: &agent_server::journal::task::AgentTaskId,
+        attempt_number: u32,
+    ) -> Result<agent_server::journal::turn_attempt::TurnAttempt> {
+        use agent_sdk_foundation::audit::AuditProvenance;
+        use agent_server::journal::turn_attempt::OpenAttemptParams;
+
+        stores
+            .attempt_store
+            .open_attempt(OpenAttemptParams {
+                task_id: task_id.clone(),
+                attempt_number,
+                provenance: AuditProvenance::new("test", "test"),
+                request_blob: serde_json::json!({ "user_prompt": "test attempt" }),
+                now: time::OffsetDateTime::now_utc(),
+                otel_trace_id: None,
+                otel_span_id: None,
+            })
+            .await
+    }
+
+    /// Spawn a wedged OLD-worker run for `child_root_id`: acquired on
+    /// a short (200ms) lease, heartbeats injected to reject terminally
+    /// (the per-task token trips on the first ~50ms tick), execution
+    /// hung token-blind in the resolver. Returns the run's join
+    /// handle; it finishes once the abort grace expires and the
+    /// future is force-dropped.
+    async fn spawn_wedged_old_worker_run(
+        stores: &StoreRegistry,
+        runtime: Arc<ExecutionRuntime>,
+        child_root_id: &agent_server::journal::task::AgentTaskId,
+        old_worker: WorkerId,
+    ) -> Result<tokio::task::JoinHandle<()>> {
+        let now = time::OffsetDateTime::now_utc();
+        let acquired_old = stores
+            .task_store
+            .try_acquire_task(
+                child_root_id,
+                old_worker.clone(),
+                LeaseId::new(),
+                now + time::Duration::milliseconds(200),
+                now,
+            )
+            .await?
+            .context("old worker must acquire")?;
+        let flaky = Arc::new(
+            FlakyTaskStore::new(Arc::clone(&stores.task_store)).rejecting_heartbeats(1_000),
+        );
+        let mut flaky_stores = stores.clone();
+        flaky_stores.task_store = flaky as Arc<dyn AgentTaskStore>;
+        Ok(tokio::spawn(async move {
+            run_task_with_heartbeat(
+                acquired_old,
+                &old_worker,
+                &flaky_stores,
+                runtime,
+                &CancellationToken::new(),
+                time::Duration::milliseconds(300),
+                std::time::Duration::from_millis(50),
+            )
+            .await;
+        }))
+    }
+
+    /// Round 5 (MAJOR): the force-drop attempt settlement must be
+    /// guarded by the still-owned/terminal re-read. Double-fault
+    /// scenario: the OLD worker wedges token-blind, its lease is
+    /// revoked (terminal heartbeat rejection), the row requeues and a
+    /// SUCCESSOR worker acquires it and opens its own attempt while
+    /// the old worker is still inside its abort grace. The old
+    /// worker's force-drop must NOT stamp the successor's live attempt
+    /// Cancelled/zero — the successor closes it with real usage and
+    /// completes the turn.
+    #[tokio::test]
+    async fn force_drop_skips_attempts_owned_by_a_successor() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+        use agent_server::journal::turn_attempt::{CloseAttemptParams, TurnAttemptOutcome};
+
+        let config = ServiceConfig::default();
+        let provider = Arc::new(SubagentScriptProvider::new());
+        let runtime = hang_once_runtime(&provider)?;
+        let host = ServiceHost::new(config, sample_registry(), runtime.clone())?;
+        let stores = host.stores().clone();
+
+        // Generous budget — this test is about lease loss, not the
+        // deadline.
+        let now = time::OffsetDateTime::now_utc();
+        let parent_thread = ThreadId::from_string("t-force-drop-successor");
+        let (_parent, _invocation, child_root) =
+            persist_subagent_fixture(&stores, &parent_thread, 600_000, now).await?;
+
+        // OLD worker: short real lease, heartbeats injected to reject
+        // terminally (simulating the lease being revoked out from
+        // under it), execution wedged token-blind in the resolver.
+        let handle = spawn_wedged_old_worker_run(
+            &stores,
+            Arc::clone(&runtime),
+            &child_root.id,
+            WorkerId::from_string("w-old"),
+        )
+        .await?;
+
+        // Mid-grace: the old worker's first heartbeat (~50ms) was
+        // terminally rejected, tripping its per-task token; its 200ms
+        // lease expires unextended. Requeue the row and hand it to a
+        // successor, which opens its own attempt and starts working.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let swept = stores
+            .task_store
+            .release_expired_leases(time::OffsetDateTime::now_utc())
+            .await?;
+        assert!(
+            swept.iter().any(|record| record.id == child_root.id),
+            "the old worker's expired lease must have been requeued, got {swept:?}",
+        );
+        let new_worker = WorkerId::from_string("w-new");
+        let new_lease = LeaseId::new();
+        stores
+            .task_store
+            .try_acquire_task(
+                &child_root.id,
+                new_worker.clone(),
+                new_lease.clone(),
+                time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+                time::OffsetDateTime::now_utc(),
+            )
+            .await?
+            .context("successor worker must acquire the requeued row")?;
+        let successor_attempt = open_test_attempt(&stores, &child_root.id, 2).await?;
+
+        // The old worker's grace expires (~3s after its trip) and it
+        // force-drops; the guarded settlement must observe the row
+        // Running under the SUCCESSOR and leave its attempt alone.
+        handle.await?;
+        let attempts = stores.attempt_store.list_by_task(&child_root.id).await?;
+        let reread = attempts
+            .iter()
+            .find(|row| row.id == successor_attempt.id)
+            .context("successor attempt listed")?;
+        assert!(
+            !reread.is_closed(),
+            "the old worker's force-drop must not touch the successor's live attempt",
+        );
+
+        // The successor's real-usage close and completion land — a
+        // genuinely recovered turn is not failed terminally.
+        let closed = stores
+            .attempt_store
+            .close_attempt(
+                &successor_attempt.id,
+                CloseAttemptParams {
+                    response_blob: serde_json::json!({ "recovered": true }),
+                    response_id: None,
+                    response_model: None,
+                    stop_reason: None,
+                    outcome: TurnAttemptOutcome::Success,
+                    input_tokens: 111,
+                    output_tokens: 222,
+                    cached_input_tokens: 0,
+                },
+                time::OffsetDateTime::now_utc(),
+            )
+            .await
+            .context("successor real-usage close must not hit AlreadyClosed")?;
+        assert_eq!(closed.outcome, Some(TurnAttemptOutcome::Success));
+        assert_eq!(closed.input_tokens, Some(111));
+
+        let (completed, _parent_row) = stores
+            .task_store
+            .complete_task(
+                &child_root.id,
+                &new_worker,
+                &new_lease,
+                time::OffsetDateTime::now_utc(),
+            )
+            .await
+            .context("successor completes the recovered turn")?;
+        assert_eq!(completed.status, TaskStatus::Completed);
         Ok(())
     }
 }

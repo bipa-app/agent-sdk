@@ -458,8 +458,12 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
     // subagent deadline sweep, the `CancelTask` RPC — can abort the
     // in-flight tool IMMEDIATELY instead of letting its side effect
     // land after the parent already resumed with a timeout failure.
+    // The scope guard deregisters on every exit from this function —
+    // including a panic unwinding this detached task — and its nonce
+    // check guarantees a wedged predecessor's late drop never strips a
+    // successor drive that re-registered under the same task id.
     let drive_cancel = shutdown.child_token();
-    stores
+    let _drive_registration = stores
         .confirm_drive_cancels
         .register(task_id.clone(), drive_cancel.clone());
 
@@ -492,7 +496,6 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
     let outcome =
         resume_confirmed_tool_with_abort_grace(&stores, &runtime, bootstrap, &drive_cancel, now)
             .await;
-    stores.confirm_drive_cancels.deregister(&task_id);
 
     heartbeat_cancel.cancel();
     if let Err(join_err) = heartbeat_handle.await {
