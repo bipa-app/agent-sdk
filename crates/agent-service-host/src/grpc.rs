@@ -2138,6 +2138,12 @@ impl LocalDaemon {
     ///   `confirm_drive_cancels` for fresh instances and must not
     ///   substitute a registry assembled from a different backend:
     ///   return the registry that was passed in, with fields wrapped.
+    ///   Both handles are checked with debug assertions after
+    ///   `decorate` returns.
+    /// - `decorate` runs before [`StoreRegistry::initialize`], so
+    ///   decorators must not perform store I/O inside `decorate`
+    ///   itself — on Postgres the schema has not been migrated yet at
+    ///   that point.
     ///
     /// # Errors
     ///
@@ -2151,7 +2157,21 @@ impl LocalDaemon {
     ) -> Result<Self> {
         let stores = StoreRegistry::from_config(&config.storage, definition_registry)
             .context("creating daemon stores")?;
+        let event_notifier = Arc::clone(&stores.event_notifier);
+        let confirm_drive_cancels = Arc::clone(&stores.confirm_drive_cancels);
         let stores = decorate(stores);
+        // Two pointer comparisons catch both a forbidden wiring swap
+        // and a whole-registry substitution (e.g. returning a fresh
+        // `StoreRegistry::in_memory`). A violation is a decorator
+        // contract bug, not runtime input — hence debug assertions.
+        debug_assert!(
+            Arc::ptr_eq(&event_notifier, &stores.event_notifier),
+            "store decorator must not replace the registry's event_notifier",
+        );
+        debug_assert!(
+            Arc::ptr_eq(&confirm_drive_cancels, &stores.confirm_drive_cancels),
+            "store decorator must not replace the registry's confirm_drive_cancels",
+        );
         stores
             .initialize()
             .await
@@ -4467,15 +4487,16 @@ mod tests {
 
     // ── Store-decorator hook (issue #301) ──────────────────────────
 
-    /// [`AgentTaskStore`] decorator that counts completion calls and
-    /// delegates everything to the wrapped store — the shape an
-    /// embedding host uses with
+    /// [`AgentTaskStore`] decorator that counts completion and
+    /// admission calls and delegates everything to the wrapped store —
+    /// the shape an embedding host uses with
     /// [`LocalDaemon::start_with_store_decorator`] to intercept
     /// subagent results.
     struct CountingTaskStore {
         inner: Arc<dyn AgentTaskStore>,
         complete_calls: Arc<AtomicUsize>,
         complete_with_result_calls: Arc<AtomicUsize>,
+        submit_root_turn_idempotent_calls: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -4490,6 +4511,8 @@ mod tests {
             &self,
             params: SubmitRootTurnParams,
         ) -> std::result::Result<SubmitRootTurnOutcome, SubmitRootTurnError> {
+            self.submit_root_turn_idempotent_calls
+                .fetch_add(1, Ordering::SeqCst);
             self.inner.submit_root_turn_idempotent(params).await
         }
         async fn claim_idempotency(
@@ -4800,8 +4823,10 @@ mod tests {
 
         let complete_calls = Arc::new(AtomicUsize::new(0));
         let complete_with_result_calls = Arc::new(AtomicUsize::new(0));
+        let submit_root_turn_idempotent_calls = Arc::new(AtomicUsize::new(0));
         let decorator_complete_calls = Arc::clone(&complete_calls);
         let decorator_complete_with_result_calls = Arc::clone(&complete_with_result_calls);
+        let decorator_submit_calls = Arc::clone(&submit_root_turn_idempotent_calls);
         let daemon = LocalDaemon::start_with_store_decorator(
             ServiceConfig::default(),
             registry,
@@ -4811,6 +4836,7 @@ mod tests {
                     inner: Arc::clone(&stores.task_store),
                     complete_calls: decorator_complete_calls,
                     complete_with_result_calls: decorator_complete_with_result_calls,
+                    submit_root_turn_idempotent_calls: decorator_submit_calls,
                 });
                 stores
             },
@@ -4842,6 +4868,17 @@ mod tests {
                 complete_calls.load(Ordering::SeqCst),
                 1,
                 "decorator must observe the root turn's complete_task",
+            );
+            // gRPC-plane guard: the completion methods above are only
+            // ever called by host workers, so a regression that rebuilt
+            // `GrpcTransport` from an undecorated registry would still
+            // pass them. `submit_root_turn_idempotent` is called
+            // exactly once per `SubmitThreadWork`, and only by the
+            // gRPC transport — it proves that plane also runs through
+            // the decorated handles.
+            assert!(
+                submit_root_turn_idempotent_calls.load(Ordering::SeqCst) >= 1,
+                "decorator must observe the gRPC plane's submit_root_turn_idempotent",
             );
             Ok(())
         }
