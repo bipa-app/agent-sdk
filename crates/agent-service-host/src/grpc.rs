@@ -2105,8 +2105,53 @@ impl LocalDaemon {
         definition_registry: Arc<dyn AgentDefinitionRegistry>,
         runtime: Arc<ExecutionRuntime>,
     ) -> Result<Self> {
+        Self::start_with_store_decorator(config, definition_registry, runtime, |stores| stores)
+            .await
+    }
+
+    /// Start the daemon like [`Self::start`], but let the caller wrap the
+    /// assembled [`StoreRegistry`] before the daemon uses it.
+    ///
+    /// Embedding hosts use this to decorate individual store handles —
+    /// e.g. intercepting [`agent_server::journal::store::AgentTaskStore::complete_task_with_result`]
+    /// on `task_store` to post-process subagent results — without
+    /// mirroring the whole daemon assembly.
+    ///
+    /// # Contract
+    ///
+    /// - The registry handed to `decorate` is exactly the one
+    ///   [`StoreRegistry::from_config`] builds for `config.storage`,
+    ///   with all of its constructor-established wiring intact: the
+    ///   backend handle that [`StoreRegistry::initialize`] uses to run
+    ///   migrations, the process-wide `event_notifier`, and
+    ///   `confirm_drive_cancels`.
+    /// - The daemon uses the **returned** registry everywhere: store
+    ///   initialization, the [`ServiceHost`] worker pool and sweep
+    ///   tasks, and the gRPC transport. There is exactly one registry;
+    ///   both planes share the same decorated handles.
+    /// - Decorators should only replace the `pub` store fields they
+    ///   mean to intercept (e.g. `task_store`) by wrapping the existing
+    ///   handle, and must delegate every trait method they do not
+    ///   intercept to the wrapped store — the daemon's CAS/lease
+    ///   discipline runs through those methods.
+    /// - Decorators must not swap `event_notifier` or
+    ///   `confirm_drive_cancels` for fresh instances and must not
+    ///   substitute a registry assembled from a different backend:
+    ///   return the registry that was passed in, with fields wrapped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the durable stores, host runtime, or local gRPC
+    /// listener cannot be initialized.
+    pub async fn start_with_store_decorator(
+        config: ServiceConfig,
+        definition_registry: Arc<dyn AgentDefinitionRegistry>,
+        runtime: Arc<ExecutionRuntime>,
+        decorate: impl FnOnce(StoreRegistry) -> StoreRegistry + Send,
+    ) -> Result<Self> {
         let stores = StoreRegistry::from_config(&config.storage, definition_registry)
             .context("creating daemon stores")?;
+        let stores = decorate(stores);
         stores
             .initialize()
             .await
@@ -3056,6 +3101,7 @@ const fn terminal_close_reason(
 mod tests {
     use std::collections::VecDeque;
     use std::future::Future;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -3069,10 +3115,15 @@ mod tests {
     use agent_sdk_foundation::llm::{
         ChatOutcome, ChatRequest, ChatResponse, StopReason, Tool, Usage,
     };
-    use agent_sdk_foundation::{AgentContinuation, AgentState, ContinuationEnvelope};
+    use agent_sdk_foundation::{
+        AgentContinuation, AgentState, ContinuationEnvelope, ListenExecutionContext,
+    };
     use agent_sdk_providers::LlmProvider;
     #[cfg(feature = "postgres")]
     use agent_server::AgentTaskId;
+    use agent_server::journal::SubagentInvocationSpawn;
+    use agent_server::journal::recovery::RecoveryRecord;
+    use agent_server::journal::store::{AgentTaskStore, SubmitRootTurnOutcome};
     use agent_server::journal::task::{ChildSpawnSpec, SuspensionPayload};
     use agent_server::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
     use agent_server::worker::registry::InMemoryAgentDefinitionRegistry;
@@ -4405,6 +4456,392 @@ mod tests {
                     .iter()
                     .all(|task| task.status == pb::TaskStatus::Completed as i32),
                 "not every task completed after confirmation flow",
+            );
+            Ok(())
+        }
+        .await;
+
+        daemon.stop().await?;
+        result
+    }
+
+    // ── Store-decorator hook (issue #301) ──────────────────────────
+
+    /// [`AgentTaskStore`] decorator that counts completion calls and
+    /// delegates everything to the wrapped store — the shape an
+    /// embedding host uses with
+    /// [`LocalDaemon::start_with_store_decorator`] to intercept
+    /// subagent results.
+    struct CountingTaskStore {
+        inner: Arc<dyn AgentTaskStore>,
+        complete_calls: Arc<AtomicUsize>,
+        complete_with_result_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl AgentTaskStore for CountingTaskStore {
+        async fn insert(&self, task: AgentTask) -> Result<()> {
+            self.inner.insert(task).await
+        }
+        async fn submit_root_turn(&self, task: AgentTask) -> Result<AgentTask> {
+            self.inner.submit_root_turn(task).await
+        }
+        async fn submit_root_turn_idempotent(
+            &self,
+            params: SubmitRootTurnParams,
+        ) -> std::result::Result<SubmitRootTurnOutcome, SubmitRootTurnError> {
+            self.inner.submit_root_turn_idempotent(params).await
+        }
+        async fn claim_idempotency(
+            &self,
+            request_id: &str,
+            kind: IdempotencyKind,
+            fingerprint: &[u8],
+        ) -> Result<IdempotencyClaim> {
+            self.inner
+                .claim_idempotency(request_id, kind, fingerprint)
+                .await
+        }
+        async fn record_idempotency(&self, record: IdempotencyRecord) -> Result<()> {
+            self.inner.record_idempotency(record).await
+        }
+        async fn get(&self, id: &AgentTaskId) -> Result<Option<AgentTask>> {
+            self.inner.get(id).await
+        }
+        async fn update(&self, task: AgentTask) -> Result<()> {
+            self.inner.update(task).await
+        }
+        async fn list_by_thread(&self, thread_id: &ThreadId) -> Result<Vec<AgentTask>> {
+            self.inner.list_by_thread(thread_id).await
+        }
+        async fn list_children(&self, parent_id: &AgentTaskId) -> Result<Vec<AgentTask>> {
+            self.inner.list_children(parent_id).await
+        }
+        async fn list_by_status(&self, status: JournalTaskStatus) -> Result<Vec<AgentTask>> {
+            self.inner.list_by_status(status).await
+        }
+        async fn active_root_for_thread(&self, thread_id: &ThreadId) -> Result<Option<AgentTask>> {
+            self.inner.active_root_for_thread(thread_id).await
+        }
+        async fn list_queued_roots(&self, thread_id: &ThreadId) -> Result<Vec<AgentTask>> {
+            self.inner.list_queued_roots(thread_id).await
+        }
+        async fn promote_next_queued_root(
+            &self,
+            thread_id: &ThreadId,
+            now: OffsetDateTime,
+        ) -> Result<Option<AgentTask>> {
+            self.inner.promote_next_queued_root(thread_id, now).await
+        }
+        async fn try_acquire_task(
+            &self,
+            id: &AgentTaskId,
+            worker: WorkerId,
+            lease: LeaseId,
+            expires_at: OffsetDateTime,
+            now: OffsetDateTime,
+        ) -> Result<Option<AgentTask>> {
+            self.inner
+                .try_acquire_task(id, worker, lease, expires_at, now)
+                .await
+        }
+        async fn acquire_next_runnable(
+            &self,
+            worker: WorkerId,
+            lease: LeaseId,
+            expires_at: OffsetDateTime,
+            now: OffsetDateTime,
+        ) -> Result<Option<AgentTask>> {
+            self.inner
+                .acquire_next_runnable(worker, lease, expires_at, now)
+                .await
+        }
+        async fn heartbeat_task(
+            &self,
+            task_id: &AgentTaskId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+            expires_at: OffsetDateTime,
+            now: OffsetDateTime,
+        ) -> Result<AgentTask> {
+            self.inner
+                .heartbeat_task(task_id, worker, lease, expires_at, now)
+                .await
+        }
+        async fn release_expired_leases(&self, now: OffsetDateTime) -> Result<Vec<RecoveryRecord>> {
+            self.inner.release_expired_leases(now).await
+        }
+        async fn pause_on_children(
+            &self,
+            task_id: &AgentTaskId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+            child_count: u32,
+            payload: SuspensionPayload,
+            now: OffsetDateTime,
+        ) -> Result<AgentTask> {
+            self.inner
+                .pause_on_children(task_id, worker, lease, child_count, payload, now)
+                .await
+        }
+        async fn enqueue_steering_resume(
+            &self,
+            parent_id: &AgentTaskId,
+            steering: Vec<ContentBlock>,
+            now: OffsetDateTime,
+        ) -> Result<Option<AgentTask>> {
+            self.inner
+                .enqueue_steering_resume(parent_id, steering, now)
+                .await
+        }
+        async fn repark_after_steering(
+            &self,
+            parent_id: &AgentTaskId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+            payload: SuspensionPayload,
+            reattach: Vec<AgentTaskId>,
+            now: OffsetDateTime,
+        ) -> Result<AgentTask> {
+            self.inner
+                .repark_after_steering(parent_id, worker, lease, payload, reattach, now)
+                .await
+        }
+        async fn pause_on_confirmation(
+            &self,
+            task_id: &AgentTaskId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+            continuation: ContinuationEnvelope,
+            prepared_operation: Option<ListenExecutionContext>,
+            now: OffsetDateTime,
+        ) -> Result<AgentTask> {
+            self.inner
+                .pause_on_confirmation(
+                    task_id,
+                    worker,
+                    lease,
+                    continuation,
+                    prepared_operation,
+                    now,
+                )
+                .await
+        }
+        async fn spawn_tool_children(
+            &self,
+            parent_id: &AgentTaskId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+            specs: Vec<ChildSpawnSpec>,
+            payload: SuspensionPayload,
+            child_otel_traceparent: Option<String>,
+            now: OffsetDateTime,
+        ) -> Result<(AgentTask, Vec<AgentTask>)> {
+            self.inner
+                .spawn_tool_children(
+                    parent_id,
+                    worker,
+                    lease,
+                    specs,
+                    payload,
+                    child_otel_traceparent,
+                    now,
+                )
+                .await
+        }
+        async fn spawn_subagent_invocation(
+            &self,
+            parent_id: &AgentTaskId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+            spawn: SubagentInvocationSpawn,
+            now: OffsetDateTime,
+        ) -> Result<(AgentTask, AgentTask, AgentTask)> {
+            self.inner
+                .spawn_subagent_invocation(parent_id, worker, lease, spawn, now)
+                .await
+        }
+        async fn spawn_subagent_batch(
+            &self,
+            parent_id: &AgentTaskId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+            spawns: Vec<SubagentInvocationSpawn>,
+            payload: SuspensionPayload,
+            now: OffsetDateTime,
+        ) -> Result<(AgentTask, Vec<(AgentTask, AgentTask)>)> {
+            self.inner
+                .spawn_subagent_batch(parent_id, worker, lease, spawns, payload, now)
+                .await
+        }
+        async fn find_subagent_invocation_for_child_root(
+            &self,
+            child_root_id: &AgentTaskId,
+        ) -> Result<Option<AgentTask>> {
+            self.inner
+                .find_subagent_invocation_for_child_root(child_root_id)
+                .await
+        }
+        async fn list_parked_subagent_invocations(&self) -> Result<Vec<AgentTask>> {
+            self.inner.list_parked_subagent_invocations().await
+        }
+        async fn complete_task(
+            &self,
+            task_id: &AgentTaskId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+            now: OffsetDateTime,
+        ) -> Result<(AgentTask, Option<AgentTask>)> {
+            self.complete_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.complete_task(task_id, worker, lease, now).await
+        }
+        async fn complete_task_with_result(
+            &self,
+            task_id: &AgentTaskId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+            result: serde_json::Value,
+            now: OffsetDateTime,
+        ) -> Result<(AgentTask, Option<AgentTask>)> {
+            self.complete_with_result_calls
+                .fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .complete_task_with_result(task_id, worker, lease, result, now)
+                .await
+        }
+        async fn fail_task(
+            &self,
+            task_id: &AgentTaskId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+            error: String,
+            now: OffsetDateTime,
+        ) -> Result<(AgentTask, Option<AgentTask>)> {
+            self.inner
+                .fail_task(task_id, worker, lease, error, now)
+                .await
+        }
+        async fn cancel_tree(
+            &self,
+            root_id: &AgentTaskId,
+            now: OffsetDateTime,
+        ) -> Result<Vec<AgentTaskId>> {
+            self.inner.cancel_tree(root_id, now).await
+        }
+        async fn resume_from_confirmation(
+            &self,
+            task_id: &AgentTaskId,
+            now: OffsetDateTime,
+        ) -> Result<(AgentTask, Option<ListenExecutionContext>)> {
+            self.inner.resume_from_confirmation(task_id, now).await
+        }
+        async fn approve_confirmation_and_acquire(
+            &self,
+            task_id: &AgentTaskId,
+            worker: WorkerId,
+            lease: LeaseId,
+            expires_at: OffsetDateTime,
+            now: OffsetDateTime,
+        ) -> Result<(AgentTask, Option<ListenExecutionContext>)> {
+            self.inner
+                .approve_confirmation_and_acquire(task_id, worker, lease, expires_at, now)
+                .await
+        }
+        async fn reject_confirmation(
+            &self,
+            task_id: &AgentTaskId,
+            error: String,
+            now: OffsetDateTime,
+        ) -> Result<(AgentTask, Option<AgentTask>)> {
+            self.inner.reject_confirmation(task_id, error, now).await
+        }
+        async fn clear(&self) -> Result<()> {
+            self.inner.clear().await
+        }
+    }
+
+    /// Issue #301: `start_with_store_decorator` must run the whole
+    /// daemon — host workers and gRPC transport — through the
+    /// decorated task store. A tool-call turn drives both completion
+    /// paths: the tool child commits via `complete_task_with_result`
+    /// (the method bip intercepts for subagent rows) and the root turn
+    /// via `complete_task`, and the flow still completes normally.
+    #[tokio::test]
+    async fn local_daemon_store_decorator_observes_task_completions() -> Result<()> {
+        let lookup_tool = Tool {
+            name: "lookup".into(),
+            description: "Look something up".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "q": { "type": "string" } },
+                "required": ["q"]
+            }),
+            display_name: "Lookup".into(),
+            tier: ToolTier::Observe,
+        };
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(vec![
+            lookup_tool,
+        ])));
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(vec![
+                tool_use_response(
+                    "resp_decor_1",
+                    "tool_call_decor",
+                    "lookup",
+                    json!({"q": "x"}),
+                ),
+                text_response("resp_decor_2", "lookup done"),
+            ])),
+            Arc::new(ProgressToolExecutor {
+                result: ToolResult::success("lookup ok"),
+                emit_progress: false,
+            }),
+        )?;
+
+        let complete_calls = Arc::new(AtomicUsize::new(0));
+        let complete_with_result_calls = Arc::new(AtomicUsize::new(0));
+        let decorator_complete_calls = Arc::clone(&complete_calls);
+        let decorator_complete_with_result_calls = Arc::clone(&complete_with_result_calls);
+        let daemon = LocalDaemon::start_with_store_decorator(
+            ServiceConfig::default(),
+            registry,
+            runtime,
+            move |mut stores| {
+                stores.task_store = Arc::new(CountingTaskStore {
+                    inner: Arc::clone(&stores.task_store),
+                    complete_calls: decorator_complete_calls,
+                    complete_with_result_calls: decorator_complete_with_result_calls,
+                });
+                stores
+            },
+        )
+        .await?;
+
+        let result = async {
+            let (mut control, _events) = connect_clients(&daemon.endpoint()).await?;
+            let thread_id = create_thread(&mut control, "create-decorator-thread").await?;
+            let _task = submit_text_work(
+                &mut control,
+                "submit-decorator-turn",
+                &thread_id,
+                "lookup x",
+            )
+            .await?;
+
+            // Root turn + tool child both reach Completed through the
+            // decorated store (`wait_for_completed_tasks` polls the
+            // gRPC surface, which also reads through the wrapper).
+            wait_for_completed_tasks(&control, &thread_id).await?;
+
+            assert_eq!(
+                complete_with_result_calls.load(Ordering::SeqCst),
+                1,
+                "decorator must observe the tool child's complete_task_with_result",
+            );
+            assert_eq!(
+                complete_calls.load(Ordering::SeqCst),
+                1,
+                "decorator must observe the root turn's complete_task",
             );
             Ok(())
         }
