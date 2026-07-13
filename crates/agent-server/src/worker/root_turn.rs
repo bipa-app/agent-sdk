@@ -3948,6 +3948,111 @@ async fn spawn_multi_subagent_invocations(
     .context("spawn subagent batch invocations")
 }
 
+/// Materialize a `Mixed` routing verdict — subagent slots and tool
+/// slots in the same turn — into one durable
+/// [`spawn_mixed_children_invocations`](super::subagent::spawn_mixed_children_invocations)
+/// call.
+///
+/// `specs` is the full per-tool-call spec vector for the turn (one
+/// entry per pending tool call, in order); only the slots named by
+/// `tool_indices` become [`ChildSpawnSpec`]-backed tool children, the
+/// rest are claimed by the subagent plans.
+async fn spawn_mixed_batch_children(
+    inputs: &RootWorkerInputs,
+    deps: &RootTurnDeps<'_>,
+    routing: MixedRoutingInputs,
+    payload: SuspensionPayload,
+    now: OffsetDateTime,
+) -> Result<super::subagent::SpawnedMixedBatch> {
+    let MixedRoutingInputs {
+        plans,
+        tool_indices,
+        specs,
+    } = routing;
+
+    let mut subagents = Vec::with_capacity(plans.len());
+    for (spawn_index, plan) in plans {
+        let spawn_index_u32 =
+            u32::try_from(spawn_index).context("subagent spawn_index exceeds u32")?;
+        subagents.push(super::subagent::SubagentBatchEntry {
+            child_thread_id: plan.child_thread_id.clone(),
+            spec: plan.spec.clone(),
+            child_root_input: plan.child_root_input.clone(),
+            spawn_index: spawn_index_u32,
+            child_caller_metadata: plan.child_caller_metadata.clone(),
+        });
+    }
+
+    let mut tool_children = Vec::with_capacity(tool_indices.len());
+    for index in tool_indices {
+        let spec = *specs
+            .get(index)
+            .with_context(|| format!("tool spawn_index {index} has no child spawn spec"))?;
+        tool_children.push(crate::journal::store::ToolChildSpawn {
+            spawn_index: u32::try_from(index).context("tool spawn_index exceeds u32")?,
+            spec,
+        });
+    }
+
+    let invocation_deps = super::subagent::SubagentInvocationDeps {
+        task_store: deps.task_store,
+        thread_store: deps.thread_store,
+        event_repo: deps.event_repo,
+    };
+    // Box-pin the store call so the mixed arm does not inflate the
+    // enclosing root-turn future's state machine (same reason
+    // `execute_tool_task` boxes its inner future).
+    Box::pin(super::subagent::spawn_mixed_children_invocations(
+        &inputs.bootstrap.task_id,
+        &inputs.bootstrap.worker_id,
+        &inputs.bootstrap.lease_id,
+        super::subagent::MixedChildrenRequest {
+            subagents,
+            tool_children,
+            payload,
+            child_otel_traceparent: child_tool_traceparent(deps, &inputs.bootstrap.task_id).await,
+        },
+        &invocation_deps,
+        now,
+    ))
+    .await
+    .context("spawn mixed batch children")
+}
+
+/// The three collections a `Mixed` verdict needs to reach the store,
+/// bundled so [`spawn_mixed_batch_children`] keeps a flat signature.
+struct MixedRoutingInputs {
+    plans: Vec<(
+        usize,
+        Box<super::subagent_spawn_selector::SubagentSpawnPlan>,
+    )>,
+    tool_indices: Vec<usize>,
+    specs: Vec<ChildSpawnSpec>,
+}
+
+/// Trace parent for the turn's tool children: the turn's root
+/// `invoke_agent` span (loaded from the first attempt), so a child's
+/// `execute_tool` span nests under the turn root rather than under the
+/// inbound client span.
+async fn child_tool_traceparent(deps: &RootTurnDeps<'_>, task_id: &AgentTaskId) -> Option<String> {
+    #[cfg(feature = "otel")]
+    {
+        load_root_span_ids(deps.attempt_store, task_id)
+            .await
+            .and_then(|(trace, span)| {
+                agent_sdk::observability::loop_instrument::traceparent_from_ids(&trace, &span)
+            })
+    }
+    #[cfg(not(feature = "otel"))]
+    {
+        let _ = (deps, task_id);
+        // Without the otel feature there is no span to load, but both
+        // cfg bodies must satisfy the one async signature the call
+        // sites await.
+        std::future::ready(None).await
+    }
+}
+
 /// Drive the routing match arm common to both `suspend_at_tool_boundary`
 /// (initial suspend) and `suspend_resumed_turn` (post-resume re-suspend).
 ///
@@ -3958,13 +4063,14 @@ async fn spawn_multi_subagent_invocations(
 ///   → [`spawn_single_subagent_invocation`]
 /// * [`BatchRouting::MultiSubagent`](super::subagent_spawn_selector::BatchRouting::MultiSubagent)
 ///   → [`spawn_multi_subagent_invocations`]
+/// * [`BatchRouting::Mixed`](super::subagent_spawn_selector::BatchRouting::Mixed)
+///   → [`spawn_mixed_batch_children`]
 /// * [`BatchRouting::AllTools`](super::subagent_spawn_selector::BatchRouting::AllTools)
-///   and [`BatchRouting::UnsupportedMixedBatch`](super::subagent_spawn_selector::BatchRouting::UnsupportedMixedBatch)
 ///   → [`AgentTaskStore::spawn_tool_children`](crate::journal::store::AgentTaskStore::spawn_tool_children)
 ///
-/// Returns the parked parent task plus the materialized child tasks
-/// (one entry for the single/multi subagent paths, N entries for
-/// `spawn_tool_children`).
+/// Returns the parked parent task plus the materialized child tasks,
+/// ordered by `spawn_index` so the batch reads back in the same order
+/// the LLM emitted its tool-use blocks.
 ///
 /// `tool_children_context` distinguishes the original "spawn tool
 /// children" call site from the "re-spawn tool children on resume"
@@ -3996,20 +4102,33 @@ async fn apply_batch_routing(
                 .collect();
             (batch.parent_task, invocation_tasks)
         }
-        super::subagent_spawn_selector::BatchRouting::AllTools
-        | super::subagent_spawn_selector::BatchRouting::UnsupportedMixedBatch => {
-            // Stamp each child tool task with the turn's root
-            // `invoke_agent` span as its trace parent (loaded from the
-            // first attempt) so the child's `execute_tool` span nests
-            // under the turn root rather than the inbound client span.
-            #[cfg(feature = "otel")]
-            let child_otel_traceparent = load_root_span_ids(deps.attempt_store, task_id)
-                .await
-                .and_then(|(trace, span)| {
-                    agent_sdk::observability::loop_instrument::traceparent_from_ids(&trace, &span)
-                });
-            #[cfg(not(feature = "otel"))]
-            let child_otel_traceparent: Option<String> = None;
+        super::subagent_spawn_selector::BatchRouting::Mixed {
+            plans,
+            tool_indices,
+        } => {
+            let batch = spawn_mixed_batch_children(
+                inputs,
+                deps,
+                MixedRoutingInputs {
+                    plans,
+                    tool_indices,
+                    specs,
+                },
+                payload,
+                now,
+            )
+            .await?;
+            let mut children: Vec<AgentTask> = batch
+                .invocations
+                .into_iter()
+                .map(|inv| inv.invocation_task)
+                .collect();
+            children.extend(batch.tool_children);
+            children.sort_by_key(|child| child.spawn_index);
+            (batch.parent_task, children)
+        }
+        super::subagent_spawn_selector::BatchRouting::AllTools => {
+            let child_otel_traceparent = child_tool_traceparent(deps, task_id).await;
             deps.task_store
                 .spawn_tool_children(
                     task_id,

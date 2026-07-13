@@ -7103,3 +7103,410 @@ async fn lost_ownership_rejection_settles_the_open_attempt() -> Result<()> {
     assert_eq!(row.output_tokens, Some(33));
     Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Mixed batches — subagent spawns + tool children in the same turn
+// ─────────────────────────────────────────────────────────────────────
+
+/// Routes every `subagent_*` call to a durable spawn and everything else
+/// to the regular tool path — the shape a coordinator host wires when its
+/// LLM emits subagent calls alongside ordinary tools in one response.
+struct MixedSpawnSelector;
+
+impl MixedSpawnSelector {
+    fn plan(task: &str) -> super::subagent_spawn_selector::SubagentSpawnPlan {
+        use crate::worker::subagent::{
+            EffectiveSubagentCapabilities, EffectiveSubagentMcpPolicy, EffectiveSubagentSpec,
+            InheritedSubagentPolicy, SubagentCapabilityProfile, SubagentCapabilityRequest,
+            SubagentSandboxPolicy, SubagentSpawnRequest,
+        };
+        let capabilities: std::collections::BTreeSet<String> =
+            std::iter::once("read_file".to_owned()).collect();
+        let inherited_policy = InheritedSubagentPolicy {
+            default_model: "mock-model".to_owned(),
+            allowed_models: std::iter::once("mock-model".to_owned()).collect(),
+            default_max_turns: 5,
+            max_turns: 5,
+            default_timeout_ms: 30_000,
+            max_timeout_ms: 30_000,
+            capability_profiles: std::collections::BTreeMap::from([(
+                "research".to_owned(),
+                SubagentCapabilityProfile {
+                    capabilities: capabilities.clone(),
+                    sandbox: SubagentSandboxPolicy::read_only(),
+                    allowed_mcp_servers: std::collections::BTreeSet::new(),
+                },
+            )]),
+            allowed_capabilities: capabilities.clone(),
+            max_depth: 3,
+            max_parallel_subagents: 2,
+            sandbox: SubagentSandboxPolicy::read_only(),
+            allowed_mcp_servers: std::collections::BTreeSet::new(),
+            audit_provider: "mock".to_owned(),
+        };
+        super::subagent_spawn_selector::SubagentSpawnPlan {
+            request: SubagentSpawnRequest::new(task, SubagentCapabilityRequest::new("research")),
+            spec: EffectiveSubagentSpec {
+                task: task.to_owned(),
+                prompt: String::new(),
+                model: "mock-model".to_owned(),
+                max_turns: 5,
+                timeout_ms: 30_000,
+                depth: 1,
+                max_parallel_subagents: 0,
+                nickname: None,
+                sandbox: SubagentSandboxPolicy::read_only(),
+                mcp: EffectiveSubagentMcpPolicy::default(),
+                audit_provenance: None,
+                inherited_policy,
+                capabilities: EffectiveSubagentCapabilities {
+                    profile: "research".to_owned(),
+                    allowed: capabilities,
+                },
+            },
+            child_thread_id: ThreadId::new(),
+            child_root_input: Vec::new(),
+            child_caller_metadata: None,
+        }
+    }
+}
+
+#[async_trait]
+impl super::subagent_spawn_selector::SubagentSpawnSelector for MixedSpawnSelector {
+    async fn decide(
+        &self,
+        _parent_thread_id: &ThreadId,
+        tool_calls: &[agent_sdk_foundation::PendingToolCallInfo],
+    ) -> Result<Vec<super::subagent_spawn_selector::SubagentSpawnDecision>> {
+        Ok(tool_calls
+            .iter()
+            .map(|call| {
+                if call.name.starts_with("subagent_") {
+                    super::subagent_spawn_selector::SubagentSpawnDecision::SpawnAsSubagent {
+                        plan: Box::new(Self::plan(&call.name)),
+                    }
+                } else {
+                    super::subagent_spawn_selector::SubagentSpawnDecision::SpawnAsTool
+                }
+            })
+            .collect())
+    }
+}
+
+/// A definition exposing one Confirm-tier subagent tool (the spawn path
+/// requires Confirm tier) alongside the ordinary Observe-tier `bash`.
+fn sample_definition_with_subagent_tools() -> AgentDefinition {
+    AgentDefinition {
+        tools: vec![
+            Tool {
+                name: "subagent_explore".into(),
+                description: "Spawn an exploring subagent".into(),
+                input_schema: serde_json::json!({"type": "object", "properties": {"task": {"type": "string"}}}),
+                display_name: "Subagent: Explore".into(),
+                tier: agent_sdk_foundation::ToolTier::Confirm,
+            },
+            Tool {
+                name: "bash".into(),
+                description: "Run a shell command".into(),
+                input_schema: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
+                display_name: "Bash".into(),
+                tier: agent_sdk_foundation::ToolTier::Observe,
+            },
+        ],
+        ..sample_definition()
+    }
+}
+
+/// The two tool calls of a mixed turn, subagent first (slot 0) and the
+/// ordinary tool second (slot 1).
+fn subagent_then_tool_calls() -> Vec<(String, String, serde_json::Value)> {
+    vec![
+        (
+            "call_sub".into(),
+            "subagent_explore".into(),
+            serde_json::json!({"task": "map the crate"}),
+        ),
+        (
+            "call_bash".into(),
+            "bash".into(),
+            serde_json::json!({"command": "ls"}),
+        ),
+    ]
+}
+
+/// The same two calls interleaved the other way: the ordinary tool takes
+/// slot 0 and the subagent slot 1, so the batch's children are NOT
+/// grouped by kind in slot order.
+fn tool_then_subagent_calls() -> Vec<(String, String, serde_json::Value)> {
+    vec![
+        (
+            "call_bash".into(),
+            "bash".into(),
+            serde_json::json!({"command": "ls"}),
+        ),
+        (
+            "call_sub".into(),
+            "subagent_explore".into(),
+            serde_json::json!({"task": "map the crate"}),
+        ),
+    ]
+}
+
+/// Run one turn whose LLM response mixes a `subagent_explore` call with
+/// a `bash` call, routed through [`MixedSpawnSelector`]. Returns the
+/// parked parent and its children.
+async fn suspend_on_mixed_batch(
+    stores: &TestStores,
+    tool_calls: Vec<(String, String, serde_json::Value)>,
+) -> Result<(AgentTask, Vec<AgentTask>)> {
+    let provider = MockToolCallProvider::new(tool_calls);
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let mut bootstrap = sample_bootstrap_with_tools(task);
+    bootstrap.definition = sample_definition_with_subagent_tools();
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    let selector = MixedSpawnSelector;
+    let mut deps = stores.deps();
+    deps.subagent_spawn_selector = Some(&selector);
+
+    let outcome = execute_root_turn(inputs, "go", &provider, &deps, t_plus(5)).await?;
+    let RootTurnOutcome::Suspended {
+        parent_task,
+        child_tasks,
+        ..
+    } = outcome
+    else {
+        panic!("a mixed batch must suspend the parent on its children");
+    };
+    Ok((parent_task, child_tasks))
+}
+
+#[tokio::test]
+async fn mixed_batch_spawns_subagent_slot_and_tool_child_in_one_turn() -> Result<()> {
+    // A decision vector mixing SpawnAsSubagent with SpawnAsTool spawns
+    // the subagent slot AND routes the remaining call as a tool child in
+    // the same turn — no degradation to an all-tools batch, no retry
+    // round-trip.
+    let stores = TestStores::new();
+    let (parent_task, child_tasks) =
+        suspend_on_mixed_batch(&stores, subagent_then_tool_calls()).await?;
+
+    assert_eq!(parent_task.status, TaskStatus::WaitingOnChildren);
+    assert_eq!(parent_task.pending_child_count, 2);
+    assert_eq!(child_tasks.len(), 2);
+
+    // Children come back in tool-call order: the subagent invocation for
+    // slot 0, the tool-runtime child for slot 1.
+    let invocation = child_tasks
+        .first()
+        .context("mixed batch must persist the subagent invocation")?;
+    assert_eq!(invocation.kind, TaskKind::Subagent);
+    assert_eq!(invocation.spawn_index, Some(0));
+    let tool_child = child_tasks
+        .get(1)
+        .context("mixed batch must persist the tool child")?;
+    assert_eq!(tool_child.kind, TaskKind::ToolRuntime);
+    assert_eq!(tool_child.spawn_index, Some(1));
+    assert_eq!(tool_child.status, TaskStatus::Pending);
+    assert_eq!(tool_child.thread_id, thread_a());
+
+    // The subagent half is durably linked to a fresh child-thread root.
+    let linkage = invocation
+        .state
+        .subagent_invocation()
+        .context("invocation must carry durable linkage")?;
+    let child_root = stores
+        .tasks
+        .get(&linkage.child_root_task_id)
+        .await?
+        .context("child root must be persisted")?;
+    assert_eq!(child_root.kind, TaskKind::RootTurn);
+    assert_eq!(child_root.status, TaskStatus::Pending);
+    assert_eq!(child_root.thread_id, linkage.child_thread_id);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mixed_batch_tool_child_executes_and_fans_in() -> Result<()> {
+    // The tool half of a mixed batch is an ordinary runnable child: it
+    // executes in this turn and fans in, leaving the parent waiting only
+    // on the subagent it spawned alongside it.
+    let stores = TestStores::new();
+    let (parent_task, child_tasks) =
+        suspend_on_mixed_batch(&stores, subagent_then_tool_calls()).await?;
+    let tool_child = child_tasks
+        .get(1)
+        .context("mixed batch must persist the tool child")?;
+
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &tool_child.id,
+            WorkerId::from_string("w-tool"),
+            LeaseId::from_string("l-tool"),
+            t_plus(600),
+            t_plus(10),
+        )
+        .await?
+        .context("tool child must be runnable")?;
+    let ctx = crate::worker::tool_task::resolve_tool_bootstrap(acquired, &stores.tasks).await?;
+    assert_eq!(
+        ctx.tool_call.name, "bash",
+        "the tool child must resolve its own slot in the continuation",
+    );
+
+    let cancel = CancellationToken::new();
+    let executed = crate::worker::tool_task::execute_tool_task(
+        ctx,
+        &stores.tasks,
+        &stores.events,
+        &cancel,
+        |_call, _collector| async {
+            Ok(agent_sdk_foundation::ToolResult {
+                success: true,
+                output: "ok".to_owned(),
+                data: None,
+                documents: Vec::new(),
+                duration_ms: Some(1),
+            })
+        },
+        t_plus(11),
+    )
+    .await?;
+    let crate::worker::tool_task::ToolTaskOutcome::Completed { child, result, .. } = executed
+    else {
+        panic!("the tool child must run to completion in this turn");
+    };
+    assert_eq!(child.status, TaskStatus::Completed);
+    assert!(result.success);
+
+    let parent_after = stores
+        .tasks
+        .get(&parent_task.id)
+        .await?
+        .context("parent must still exist")?;
+    assert_eq!(parent_after.status, TaskStatus::WaitingOnChildren);
+    assert_eq!(
+        parent_after.pending_child_count, 1,
+        "the executed tool child must fan in, leaving only the subagent pending",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn interleaved_mixed_batch_survives_a_steering_revert_with_original_bindings() -> Result<()> {
+    // `repark_after_steering` re-derives every re-attached child's
+    // spawn_index from its POSITION in the parent's child-id vector. For
+    // an interleaved mixed batch (tool at slot 0, subagent at slot 1),
+    // a vector grouped by child kind would hand the subagent slot 0 and
+    // the tool child slot 1 — each would then resolve, execute against,
+    // and report a tool call that was never its own. The bindings must
+    // come back out of a revert exactly as they went in.
+    let stores = TestStores::new();
+    let (parent, children) =
+        Box::pin(suspend_on_mixed_batch(&stores, tool_then_subagent_calls())).await?;
+    assert_eq!(children.len(), 2);
+
+    let tool_child_id = children
+        .first()
+        .context("slot 0 is the tool child")?
+        .id
+        .clone();
+    let invocation_id = children
+        .get(1)
+        .context("slot 1 is the subagent invocation")?
+        .id
+        .clone();
+
+    // Wake the parent with a steering note, then acquire it.
+    stores
+        .tasks
+        .enqueue_steering_resume(
+            &parent.id,
+            vec![ContentBlock::Text {
+                text: "how is it going?".into(),
+            }],
+            t_plus(20),
+        )
+        .await?
+        .context("steering wake")?;
+    let worker = WorkerId::from_string("worker_test");
+    let lease = LeaseId::from_string("lease_test");
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent.id,
+            worker.clone(),
+            lease.clone(),
+            t_plus(900),
+            t_plus(21),
+        )
+        .await?
+        .context("acquire steering wake")?;
+    assert!(acquired.state.is_steering_resume());
+
+    // The bounded steering LLM round fails, so the wake reverts.
+    let error = anyhow::anyhow!("provider outage during steering exchange");
+    let reparked = revert_steering_wake(
+        &acquired,
+        &worker,
+        &lease,
+        &error,
+        &stores.deps(),
+        t_plus(25),
+    )
+    .await?;
+    assert_eq!(reparked.status, TaskStatus::WaitingOnChildren);
+    assert_eq!(reparked.pending_child_count, 2);
+
+    // Each child still resolves the tool call it was spawned for.
+    let tool_child = stores
+        .tasks
+        .get(&tool_child_id)
+        .await?
+        .context("tool child survives the revert")?;
+    assert_eq!(tool_child.kind, TaskKind::ToolRuntime);
+    assert_eq!(
+        tool_child.spawn_index,
+        Some(0),
+        "the tool child must stay bound to the bash call at slot 0",
+    );
+    let invocation = stores
+        .tasks
+        .get(&invocation_id)
+        .await?
+        .context("subagent invocation survives the revert")?;
+    assert_eq!(invocation.kind, TaskKind::Subagent);
+    assert_eq!(
+        invocation.spawn_index,
+        Some(1),
+        "the subagent invocation must stay bound to the subagent call at slot 1",
+    );
+
+    // The re-parked continuation still names the original calls in order.
+    match &reparked.state {
+        TaskState::WaitingOnChildren {
+            continuation,
+            child_ids,
+            ..
+        } => {
+            let pending = &continuation.payload.pending_tool_calls;
+            assert_eq!(pending[0].id, "call_bash");
+            assert_eq!(pending[1].id, "call_sub");
+            assert_eq!(child_ids, &vec![tool_child_id, invocation_id]);
+        }
+        other => panic!("expected WaitingOnChildren revert, got {other:?}"),
+    }
+
+    Ok(())
+}

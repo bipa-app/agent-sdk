@@ -139,12 +139,13 @@ pub use root_turn::{
 };
 pub use subagent::{
     EffectiveSubagentCapabilities, EffectiveSubagentMcpPolicy, EffectiveSubagentSpec,
-    InheritedSubagentConstraints, InheritedSubagentPolicy, ServerSubagentSpawnPolicy,
-    SpawnedSubagentBatch, SpawnedSubagentInvocation, SubagentBatchEntry, SubagentCapabilityProfile,
-    SubagentCapabilityRequest, SubagentInvocationDeps, SubagentMcpRequest, SubagentResult,
-    SubagentResultDeps, SubagentSandboxMode, SubagentSandboxPolicy, SubagentSpawnPolicy,
-    SubagentSpawnRequest, SubagentSummary, SubagentTaskBootstrap, SubagentTaskOutcome,
-    execute_subagent_task, resolve_subagent_bootstrap, resolve_subagent_spec,
+    InheritedSubagentConstraints, InheritedSubagentPolicy, MixedChildrenRequest,
+    ServerSubagentSpawnPolicy, SpawnedMixedBatch, SpawnedSubagentBatch, SpawnedSubagentInvocation,
+    SubagentBatchEntry, SubagentCapabilityProfile, SubagentCapabilityRequest,
+    SubagentInvocationDeps, SubagentMcpRequest, SubagentResult, SubagentResultDeps,
+    SubagentSandboxMode, SubagentSandboxPolicy, SubagentSpawnPolicy, SubagentSpawnRequest,
+    SubagentSummary, SubagentTaskBootstrap, SubagentTaskOutcome, execute_subagent_task,
+    resolve_subagent_bootstrap, resolve_subagent_spec, spawn_mixed_children_invocations,
     spawn_subagent_batch_invocations, spawn_subagent_invocation,
 };
 pub use subagent_spawn_selector::{

@@ -4850,6 +4850,18 @@ mod tests {
                 .spawn_subagent_batch(parent_id, worker, lease, spawns, payload, now)
                 .await
         }
+        async fn spawn_mixed_children(
+            &self,
+            parent_id: &AgentTaskId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+            spawn: agent_server::journal::MixedChildrenSpawn,
+            now: OffsetDateTime,
+        ) -> Result<agent_server::journal::SpawnedMixedChildren> {
+            self.inner
+                .spawn_mixed_children(parent_id, worker, lease, spawn, now)
+                .await
+        }
         async fn find_subagent_invocation_for_child_root(
             &self,
             child_root_id: &AgentTaskId,

@@ -41,8 +41,20 @@ mod tests {
                 .contains(&"concurrent_appends_serialize".to_owned()),
             "the concurrent-append case must run on every backend",
         );
+        for case in [
+            "mixed_batch_spawns_subagents_and_tools",
+            "mixed_batch_child_ids_follow_slot_order",
+            "mixed_batch_losing_cas_spawns_nothing",
+            "mixed_batch_rejects_cancelled_parent",
+            "mixed_batch_rejects_uncovered_slot",
+        ] {
+            assert!(
+                report.passed.contains(&case.to_owned()),
+                "the mixed-batch case {case} must run on every backend",
+            );
+        }
         assert!(
-            report.passed.len() >= 16,
+            report.passed.len() >= 21,
             "no mandatory conformance case may be silently skipped, got {:?}",
             report.passed,
         );

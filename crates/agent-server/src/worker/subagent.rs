@@ -41,8 +41,8 @@ use crate::journal::message_store::MessageProjectionStore;
 use crate::journal::task::SubmittedInputItem;
 use crate::journal::{
     AgentTask, AgentTaskId, AgentTaskStore, CommittedEvent, EventRepository, LeaseId,
-    SubagentInvocationSpawn, SuspensionPayload, TaskKind, TaskStatus, Thread, ThreadStore,
-    WorkerId,
+    MixedChildrenSpawn, SpawnedMixedChildren, SubagentInvocationSpawn, SuspensionPayload, TaskKind,
+    TaskStatus, Thread, ThreadStore, ToolChildSpawn, WorkerId, validate_mixed_slot_coverage,
 };
 
 /// Typed durable request to spawn a subagent.
@@ -1487,10 +1487,11 @@ pub struct SubagentBatchEntry {
 ///
 /// Returns an error if the input is empty, if any entry references an
 /// out-of-bounds `spawn_index`, if any of the targeted tool calls is
-/// not Confirm-tier, if child-thread materialization fails for any
-/// entry, if the store-side `spawn_subagent_batch` rejects the call
-/// (CAS, leaf-parent, duplicate child thread, duplicate invocation
-/// id), or if the durable linkage returned by the store is inconsistent.
+/// not Confirm-tier, if two entries collide on one `child_thread_id`,
+/// if child-thread materialization fails for any entry, if the
+/// store-side `spawn_subagent_batch` rejects the call (CAS, leaf-parent,
+/// duplicate child thread, duplicate invocation id), or if the durable
+/// linkage returned by the store is inconsistent.
 /// Validate every entry in a fan-out batch against the shared
 /// continuation envelope before materializing any child threads.
 ///
@@ -1498,8 +1499,13 @@ pub struct SubagentBatchEntry {
 /// downstream phases (event emission) can reuse it without re-indexing
 /// into the continuation each time.
 ///
-/// One bad `spawn_index` rejects the whole batch up front so we don't
-/// orphan child thread rows after partial materialization.
+/// Every rejection reachable from the entries alone — an out-of-bounds
+/// `spawn_index`, a non-Confirm-tier target, two entries colliding on
+/// one `child_thread_id` — is raised here, before
+/// [`materialize_batch_child_threads`] writes anything. The store
+/// rejects the same inputs, but only after those projections exist and
+/// outside the transaction that would roll them back, so a batch that
+/// was never going to spawn would leave empty threads behind.
 fn validate_batch_spawns(
     payload: &SuspensionPayload,
     entries: &[SubagentBatchEntry],
@@ -1507,12 +1513,19 @@ fn validate_batch_spawns(
     let pending_tool_count = payload.continuation.payload.pending_tool_calls.len();
     let mut pending_tools_by_entry: Vec<agent_sdk_foundation::PendingToolCallInfo> =
         Vec::with_capacity(entries.len());
+    let mut seen_thread_ids: std::collections::HashSet<&ThreadId> =
+        std::collections::HashSet::with_capacity(entries.len());
     for entry in entries {
         let spawn_index_usize =
             usize::try_from(entry.spawn_index).context("subagent spawn_index exceeds usize")?;
         ensure!(
             spawn_index_usize < pending_tool_count,
             "subagent spawn_index {spawn_index_usize} out of bounds for {pending_tool_count} pending tool calls",
+        );
+        ensure!(
+            seen_thread_ids.insert(&entry.child_thread_id),
+            "spawn rejected: duplicate child_thread_id {} in batch",
+            entry.child_thread_id,
         );
         let pending_tool =
             payload.continuation.payload.pending_tool_calls[spawn_index_usize].clone();
@@ -1526,6 +1539,28 @@ fn validate_batch_spawns(
 /// batch, defaulting empty `child_root_input` to the spec-derived
 /// shape so the child's first root turn always has at least one
 /// `SubmittedInputItem`.
+///
+/// # Write ordering
+///
+/// The child-thread projections are committed **before** the task
+/// store's spawn CAS, and outside its transaction — durable backends
+/// enforce a task → thread foreign key, so the thread rows must already
+/// exist when the invocation's child root is inserted. Two consequences
+/// follow from that ordering:
+///
+/// * On a **retryable** failure (lease expiry, a transient store error),
+///   the caller re-derives the same pre-allocated `child_thread_id` per
+///   entry, so the retry's `get_or_create` reclaims the existing
+///   projection instead of allocating a second one. Nothing accumulates
+///   across attempts.
+/// * On a **terminal** rejection (the parent was cancelled, another
+///   worker won the lease for good), the projections stay behind with no
+///   task referencing them. They are inert — no root turn, no children,
+///   no events — and are eligible for garbage collection.
+///
+/// A caller that can reject a batch on its own inputs must therefore
+/// validate those inputs before calling this, so a request that was
+/// never going to spawn does not leave projections behind.
 async fn materialize_batch_child_threads(
     entries: &mut [SubagentBatchEntry],
     deps: &SubagentInvocationDeps<'_>,
@@ -1738,6 +1773,174 @@ pub async fn spawn_subagent_batch_invocations(
     Ok(SpawnedSubagentBatch {
         parent_task,
         invocations,
+    })
+}
+
+/// Records returned by [`spawn_mixed_children_invocations`].
+#[derive(Debug)]
+pub struct SpawnedMixedBatch {
+    /// Parent task post-transition (`WaitingOnChildren`, with
+    /// `pending_child_count == invocations.len() + tool_children.len()`).
+    pub parent_task: AgentTask,
+    /// One persisted invocation + child thread per subagent entry, in
+    /// input order.
+    pub invocations: Vec<SpawnedSubagentInvocation>,
+    /// One persisted [`TaskKind::ToolRuntime`] child per tool entry, in
+    /// input order.
+    pub tool_children: Vec<AgentTask>,
+}
+
+/// Inputs for [`spawn_mixed_children_invocations`].
+///
+/// `subagents` and `tool_children` partition the shared suspension's
+/// `pending_tool_calls`: together their spawn indices must name every
+/// slot exactly once (the store enforces this before it writes a row).
+pub struct MixedChildrenRequest {
+    /// Durable subagent invocations to persist, in input order.
+    pub subagents: Vec<SubagentBatchEntry>,
+    /// Tool-runtime children to persist, in input order.
+    pub tool_children: Vec<ToolChildSpawn>,
+    /// The one parent suspension shared by every child in the batch.
+    pub payload: SuspensionPayload,
+    /// Trace parent stamped on the tool children so their
+    /// `execute_tool` spans nest under the turn's root span.
+    pub child_otel_traceparent: Option<String>,
+}
+
+/// Persist a mixed batch — N durable subagent invocations plus M
+/// tool-runtime children — atomically under one parent transition.
+///
+/// This is the routing primitive for the common coordinator turn that
+/// emits subagent calls alongside ordinary tool calls. Validation,
+/// child-thread materialization, and parent-progress emission for the
+/// subagent half match [`spawn_subagent_batch_invocations`] exactly;
+/// the tool half is persisted by the same store call, so the parent
+/// parks on `N + M` children in a single CAS and no partially-spawned
+/// batch is observable on any failure path.
+///
+/// Every entry's `child_thread_id` must be pre-allocated by the caller
+/// and reused across retries (same idempotency contract as
+/// [`spawn_subagent_invocation`]).
+///
+/// A malformed request is rejected before any child thread is created:
+/// thread projections live outside the store's transaction, so a batch
+/// that only failed once it reached the store would leave them behind
+/// as orphans.
+///
+/// # Errors
+///
+/// Returns an error if either half is empty (a batch with no subagents
+/// belongs on `spawn_tool_children`, one with no tool children on
+/// `spawn_subagent_batch_invocations`), if the two halves' spawn indices
+/// do not cover the shared continuation's `pending_tool_calls` exactly
+/// once each, if any targeted subagent tool call is not Confirm-tier, if
+/// two subagent entries collide on one `child_thread_id`, if
+/// child-thread materialization fails, if the store rejects the batch
+/// (CAS, leaf-parent, duplicate child thread, duplicate id), or if the
+/// durable linkage returned by the store is inconsistent.
+pub async fn spawn_mixed_children_invocations(
+    parent_id: &AgentTaskId,
+    worker: &WorkerId,
+    lease: &LeaseId,
+    request: MixedChildrenRequest,
+    deps: &SubagentInvocationDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<SpawnedMixedBatch> {
+    let MixedChildrenRequest {
+        mut subagents,
+        tool_children,
+        payload,
+        child_otel_traceparent,
+    } = request;
+
+    // Validate the WHOLE batch — both halves' slots, plus every subagent
+    // entry's tier — before materializing any child thread. The store's
+    // own validation runs inside its transaction, which rolls back only
+    // the rows it wrote: a child-thread projection created out here
+    // would survive a late rejection as an orphan.
+    let subagent_slots: Vec<u32> = subagents.iter().map(|entry| entry.spawn_index).collect();
+    let tool_slots: Vec<u32> = tool_children.iter().map(|tool| tool.spawn_index).collect();
+    validate_mixed_slot_coverage(
+        &subagent_slots,
+        &tool_slots,
+        payload.continuation.payload.pending_tool_calls.len(),
+    )?;
+    let pending_tools_by_entry = validate_batch_spawns(&payload, &subagents)?;
+
+    let child_threads = materialize_batch_child_threads(&mut subagents, deps, now).await?;
+
+    let spawns: Vec<SubagentInvocationSpawn> = subagents
+        .into_iter()
+        .map(|entry| SubagentInvocationSpawn {
+            child_thread_id: entry.child_thread_id,
+            spec: entry.spec,
+            child_root_input: entry.child_root_input,
+            spawn_index: entry.spawn_index,
+            child_caller_metadata: entry.child_caller_metadata,
+            payload: payload.clone(),
+        })
+        .collect();
+
+    let spawned = deps
+        .task_store
+        .spawn_mixed_children(
+            parent_id,
+            worker,
+            lease,
+            MixedChildrenSpawn {
+                subagents: spawns,
+                tool_children,
+                payload,
+                child_otel_traceparent,
+            },
+            now,
+        )
+        .await
+        .context("persist mixed batch children")?;
+
+    let SpawnedMixedChildren {
+        parent,
+        subagents: prepared,
+        tool_children,
+    } = spawned;
+
+    ensure!(
+        prepared.len() == child_threads.len(),
+        "spawn_mixed_children returned {} invocations for {} child threads",
+        prepared.len(),
+        child_threads.len(),
+    );
+    ensure!(
+        prepared.len() == pending_tools_by_entry.len(),
+        "spawn_mixed_children returned {} invocations for {} pending tools",
+        prepared.len(),
+        pending_tools_by_entry.len(),
+    );
+
+    let mut invocations = Vec::with_capacity(prepared.len());
+    for ((invocation_task, child_root_task), (child_thread, pending_tool)) in prepared
+        .into_iter()
+        .zip(child_threads.into_iter().zip(pending_tools_by_entry))
+    {
+        let assembled = build_batch_invocation(
+            BatchEntryAssembly {
+                parent_task: &parent,
+                invocation_task,
+                child_root_task,
+                child_thread,
+                pending_tool,
+            },
+            deps,
+            now,
+        )
+        .await?;
+        invocations.push(assembled);
+    }
+
+    Ok(SpawnedMixedBatch {
+        parent_task: parent,
+        invocations,
+        tool_children,
     })
 }
 
