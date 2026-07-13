@@ -671,15 +671,18 @@ pub struct CancelTreeOutcome {
 /// task-store write lock — a promoted successor cannot be acquired
 /// until that lock drops, so the marker's sequence always precedes
 /// the successor's `Start`. Exactly-once holds because the marker is
-/// derived from the rows this call actually transitioned — an
-/// idempotent retry sees a terminal tree and emits nothing.
+/// derived from the rows this call transitions — an idempotent retry
+/// sees a terminal tree and emits nothing.
 ///
-/// Two windows remain on this backend only (no cross-store
-/// transaction exists): dropping the in-flight `cancel_tree` future
-/// mid-await can lose markers after the transitions applied, and a
-/// sink error surfaces as `Err` after the transitions applied — both
-/// documented on `cancel_tree`; the durable backends are the
-/// crash-safety story.
+/// **A `Cancelled` row always has its marker in the journal.** No
+/// cross-store transaction exists here, so the ordering supplies the
+/// invariant instead: markers are committed BEFORE any row flips, and a
+/// sink failure aborts the call with nothing transitioned. A cancelled
+/// task therefore can never be left without the marker that closes its
+/// followers. The residual runs the other way and is benign — a caller
+/// that drops the in-flight future mid-await can leave a marker whose
+/// transitions never applied, and the still-running task closes its own
+/// stream. The durable backends remain the crash-safety story.
 ///
 /// A bare `InMemoryAgentTaskStore::new()` (no sink) emits no markers;
 /// composed deployments (the service host's in-memory registry, test
@@ -1736,6 +1739,10 @@ pub trait AgentTaskStore: Send + Sync {
     ///    committed: a crash cannot separate them, an idempotent retry
     ///    (terminal tree, nothing transitioned) emits nothing, and
     ///    cross-host followers are woken by the outbox relay. The
+    ///    in-memory backend has no cross-store transaction and gets the
+    ///    same guarantee from ordering — it journals the markers before
+    ///    applying any transition, so a cancelled row always has a
+    ///    marker (see [`CancellationMarkerSink`]). The
     ///    marker carries `turn = thread.committed_turns` and the
     ///    cumulative usage from the root's parked continuation when
     ///    present (falling back to the thread aggregate). Cancelling
@@ -1761,8 +1768,10 @@ pub trait AgentTaskStore: Send + Sync {
     /// - Schema errors from [`AgentTask::cancel`] or
     ///   [`AgentTask::validate`].
     /// - Marker commit failures (event journal / outbox / thread
-    ///   projection). On the durable backends these roll back the
-    ///   entire cancellation.
+    ///   projection). No cancellation survives one: the durable
+    ///   backends roll the transaction back, and the in-memory backend
+    ///   commits markers before it applies any transition, so it fails
+    ///   with the tree untouched and still cancellable.
     async fn cancel_tree(
         &self,
         root_id: &AgentTaskId,
@@ -4197,56 +4206,80 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         // this backend is immune to the stale-snapshot race the
         // Postgres path had to close with locked re-reads.
         let subtree = inner.collect_subtree(root_id);
-        let mut transitioned = Vec::with_capacity(subtree.len());
-        // Terminal-marker candidates, captured pre-transition (the
-        // cancel clears the typed state the usage payload prefers)
-        // and gated on the row actually transitioning under THIS
-        // lock — that is what makes the marker exactly-once: an
-        // idempotent retry transitions nothing and emits nothing.
+
+        // Decide, under this lock, exactly which rows will cancel and
+        // which of them are due a terminal marker. The predicate mirrors
+        // `cancel_row_in_place`'s gate (row present, not already
+        // terminal), and the marker payload is read here because the
+        // cancel clears the typed state it prefers.
+        //
+        // The decision is exact, not a guess: the write lock excludes
+        // every concurrent writer, and a row can only reach a terminal
+        // state through its OWN `cancel_row_in_place` below —
+        // `propagate_terminal_child_transition` recomputes a PARENT's
+        // pending-child count, it never settles a descendant. So each
+        // predicted row still transitions when the loop reaches it,
+        // which is what keeps markers exactly-once: an idempotent retry
+        // over a terminal tree predicts nothing and emits nothing.
+        let mut to_cancel = Vec::with_capacity(subtree.len());
         let mut marker_candidates: Vec<CancelMarkerCandidate> = Vec::new();
         for id in subtree {
-            let pre_cancel = inner.by_id.get(&id).cloned();
+            let Some(row) = inner.by_id.get(&id) else {
+                continue;
+            };
+            if row.status.is_terminal() {
+                continue;
+            }
+            if row.kind == TaskKind::RootTurn && row.is_root() && row.status.blocks_root_admission()
+            {
+                marker_candidates.push(CancelMarkerCandidate {
+                    thread_id: row.thread_id.clone(),
+                    task_id: row.id.clone(),
+                    continuation_usage: row
+                        .state
+                        .continuation()
+                        .map(|continuation| continuation.payload.total_usage.clone()),
+                });
+            }
+            to_cancel.push(id);
+        }
+
+        // Markers are journaled BEFORE any row flips, while STILL
+        // holding the task-store write lock.
+        //
+        // Ordering is the invariant, not an optimisation: a `Cancelled`
+        // row always has its marker in the journal. A sink failure
+        // returns here, before a single transition is applied, so the
+        // tree stays cancellable and the caller can retry — there is no
+        // state in which a follower sees a cancelled emitter with no
+        // marker to close it. (No rollback exists across separate
+        // stores, so the only way to get both-or-neither is to make the
+        // fallible half go first.) The reverse residual is benign: a
+        // caller that drops this future mid-await can leave a marker
+        // whose transitions never applied — the task keeps running and
+        // closes its own stream, and nothing reads it as cancelled.
+        //
+        // Holding the lock across the sink's awaits is what orders the
+        // marker ahead of anything a promoted successor emits: the
+        // successor cannot be acquired (so cannot commit its `Start`)
+        // until this lock drops — matching the SQL backends, where
+        // marker and cancellation share one transaction. The sink
+        // stores are in-process leaf stores that never call back into
+        // the task store, so holding the lock across them cannot
+        // deadlock.
+        let markers = self
+            .commit_cancellation_markers(marker_candidates, now)
+            .await?;
+
+        // The transitions: pure, synchronous, no await. Once the markers
+        // are durable nothing can interrupt the flips they describe.
+        let mut transitioned = Vec::with_capacity(to_cancel.len());
+        for id in to_cancel {
             if inner.cancel_row_in_place(&id, now)? {
-                if let Some(row) = pre_cancel
-                    && row.kind == TaskKind::RootTurn
-                    && row.is_root()
-                    && row.status.blocks_root_admission()
-                {
-                    marker_candidates.push(CancelMarkerCandidate {
-                        thread_id: row.thread_id.clone(),
-                        task_id: row.id.clone(),
-                        continuation_usage: row
-                            .state
-                            .continuation()
-                            .map(|continuation| continuation.payload.total_usage.clone()),
-                    });
-                }
                 transitioned.push(id);
             }
         }
 
-        // Commit the markers while STILL holding the
-        // task-store write lock. A promoted successor cannot be
-        // acquired (and so cannot commit its `Start`) until this lock
-        // drops, so the marker's journal sequence always precedes
-        // anything the successor emits — matching the SQL backends,
-        // where marker and cancellation share one transaction. The
-        // sink stores are in-process leaf stores that never call back
-        // into the task store, so holding the lock across their
-        // awaits cannot deadlock. Two windows remain, inherent to the
-        // non-atomic in-memory backend (the durable backends are the
-        // crash-safety story):
-        // - dropping this future mid-await (e.g. a disconnecting RPC
-        //   caller) can lose markers after the transitions applied —
-        //   the same class as every other non-atomic in-memory step;
-        // - a sink error surfaces as `Err` AFTER the transitions
-        //   applied (no rollback exists across separate stores). We
-        //   propagate rather than swallow so `Ok` always means "every
-        //   due marker is committed" — the half of the SQL contract
-        //   followers rely on.
-        let markers = self
-            .commit_cancellation_markers(marker_candidates, now)
-            .await?;
         drop(inner);
         Ok(CancelTreeOutcome {
             transitioned,
@@ -10711,6 +10744,167 @@ mod tests {
             .context("active")?
             .context("blocker still active")?;
         assert_eq!(active.id, blocker.id);
+        Ok(())
+    }
+
+    /// Journal that refuses to append the terminal marker, standing in
+    /// for any sink failure (event store, outbox, thread projection).
+    #[derive(Clone)]
+    struct RefusingMarkerEventRepo {
+        inner: crate::journal::event_repository::InMemoryEventRepository,
+    }
+
+    #[async_trait]
+    impl EventRepository for RefusingMarkerEventRepo {
+        async fn commit_event(
+            &self,
+            thread_id: &ThreadId,
+            event: AgentEvent,
+            now: OffsetDateTime,
+        ) -> Result<CommittedEvent> {
+            if matches!(event, AgentEvent::Cancelled { .. }) {
+                anyhow::bail!("injected marker-commit failure");
+            }
+            self.inner.commit_event(thread_id, event, now).await
+        }
+        async fn commit_event_batch(
+            &self,
+            thread_id: &ThreadId,
+            events: Vec<AgentEvent>,
+            now: OffsetDateTime,
+        ) -> Result<Vec<CommittedEvent>> {
+            self.inner.commit_event_batch(thread_id, events, now).await
+        }
+        async fn next_sequence(&self, thread_id: &ThreadId) -> Result<u64> {
+            self.inner.next_sequence(thread_id).await
+        }
+        async fn get_events(&self, thread_id: &ThreadId) -> Result<Vec<CommittedEvent>> {
+            self.inner.get_events(thread_id).await
+        }
+        async fn get_events_in_range(
+            &self,
+            thread_id: &ThreadId,
+            after: u64,
+            up_to: u64,
+        ) -> Result<Vec<CommittedEvent>> {
+            self.inner
+                .get_events_in_range(thread_id, after, up_to)
+                .await
+        }
+        async fn threads_with_events_before(
+            &self,
+            cutoff: OffsetDateTime,
+            limit: u32,
+        ) -> Result<Vec<ThreadId>> {
+            self.inner.threads_with_events_before(cutoff, limit).await
+        }
+        async fn max_sequence_before(
+            &self,
+            thread_id: &ThreadId,
+            cutoff: OffsetDateTime,
+        ) -> Result<Option<u64>> {
+            self.inner.max_sequence_before(thread_id, cutoff).await
+        }
+        async fn min_sequence_at_or_after(
+            &self,
+            thread_id: &ThreadId,
+            cutoff: OffsetDateTime,
+        ) -> Result<Option<u64>> {
+            self.inner.min_sequence_at_or_after(thread_id, cutoff).await
+        }
+    }
+
+    /// A `Cancelled` row always has its marker in the journal. The
+    /// in-memory backend has no cross-store transaction, so it gets that
+    /// invariant from ordering: the marker is journaled first, and a sink
+    /// failure aborts with the tree untouched.
+    ///
+    /// Without it a cancelled root could exist with no marker and no
+    /// successor — nothing would ever close its followers, because a
+    /// terminal frame from a cancelled emitter is deliberately suppressed
+    /// and the idempotent retry emits nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_marker_commit_leaves_the_tree_cancellable() -> Result<()> {
+        let events = crate::journal::event_repository::InMemoryEventRepository::new();
+        let threads = crate::journal::thread_store::InMemoryThreadStore::new();
+        let store =
+            InMemoryAgentTaskStore::new().with_cancellation_markers(CancellationMarkerSink {
+                event_repo: Arc::new(RefusingMarkerEventRepo {
+                    inner: events.clone(),
+                }),
+                outbox_store: Arc::new(crate::journal::outbox::InMemoryOutboxStore::new()),
+                thread_store: Arc::new(threads.clone()),
+            });
+
+        let root = fresh_root("t-marker-refused");
+        threads.get_or_create(&root.thread_id, t0()).await?;
+        store.submit_root_turn(root.clone()).await?;
+
+        let error = store
+            .cancel_tree(&root.id, t_plus(2))
+            .await
+            .expect_err("a marker-commit failure must fail the cancel");
+        assert!(
+            format!("{error:#}").contains("injected marker-commit failure"),
+            "{error:#}",
+        );
+
+        // Nothing transitioned: the row is still live, so no follower can
+        // read it as a cancelled emitter, and a retry can still cancel it.
+        let row = store.get(&root.id).await?.context("row")?;
+        assert_ne!(
+            row.status,
+            TaskStatus::Cancelled,
+            "a cancelled row without its marker would strand every follower",
+        );
+        assert!(
+            events.get_events(&root.thread_id).await?.is_empty(),
+            "the refused marker must not be journaled either",
+        );
+
+        // The active-root slot was never freed, so the thread is intact.
+        let active = store
+            .active_root_for_thread(&root.thread_id)
+            .await?
+            .context("the root must still hold its slot")?;
+        assert_eq!(active.id, root.id);
+        Ok(())
+    }
+
+    /// The healthy path still cancels and still journals the marker —
+    /// the ordering change must not turn markers off.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn successful_cancel_journals_its_marker_before_transitioning() -> Result<()> {
+        let events = crate::journal::event_repository::InMemoryEventRepository::new();
+        let threads = crate::journal::thread_store::InMemoryThreadStore::new();
+        let store =
+            InMemoryAgentTaskStore::new().with_cancellation_markers(CancellationMarkerSink {
+                event_repo: Arc::new(events.clone()),
+                outbox_store: Arc::new(crate::journal::outbox::InMemoryOutboxStore::new()),
+                thread_store: Arc::new(threads.clone()),
+            });
+
+        let root = fresh_root("t-marker-committed");
+        threads.get_or_create(&root.thread_id, t0()).await?;
+        store.submit_root_turn(root.clone()).await?;
+
+        let outcome = store.cancel_tree(&root.id, t_plus(2)).await?;
+        assert_eq!(outcome.transitioned, vec![root.id.clone()]);
+        assert_eq!(outcome.markers.len(), 1);
+
+        let row = store.get(&root.id).await?.context("row")?;
+        assert_eq!(row.status, TaskStatus::Cancelled);
+
+        let journal = events.get_events(&root.thread_id).await?;
+        let marker = journal
+            .iter()
+            .find(|committed| matches!(committed.event, AgentEvent::Cancelled { .. }))
+            .context("a cancelled root must journal its marker")?;
+        assert_eq!(
+            marker.event.emitter_task_id(),
+            Some(root.id.as_str()),
+            "the marker names the cancelled root",
+        );
         Ok(())
     }
 
