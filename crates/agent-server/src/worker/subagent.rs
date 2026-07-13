@@ -529,26 +529,43 @@ pub struct EffectiveSubagentSpec {
     pub model: String,
     /// Server-authoritative turn budget.
     pub max_turns: u32,
-    /// Server-authoritative timeout, in milliseconds.
+    /// Server-authoritative **stall** budget, in milliseconds.
     ///
-    /// Enforced by the service host as a wall-clock deadline anchored
-    /// at the child root task's `created_at` (issue #299): queue wait,
-    /// retries, and re-acquisitions all consume the same budget,
-    /// matching the in-process SDK subagent semantics. Enforcement
-    /// covers three legs: a RUNNING child root is checked once per
-    /// worker heartbeat tick (default interval ~10s); a PARKED child
-    /// root (suspended on its own tool children) is checked by the
-    /// host's periodic sweep (default interval ~5s), which cancels the
-    /// hung descendants before failing the root; and a child acquired
-    /// past its deadline fails up front without an LLM call. Each leg
-    /// carries up to one tick/sweep interval of slack past the nominal
-    /// deadline. Not covered: work already inside an in-flight tool
-    /// child between sweep ticks (bounded by the next sweep), and a
-    /// steering-resume exchange, which runs unbounded until the task's
-    /// next ordinary acquisition. On expiry the child root turn is
-    /// transitioned to FAILED with `subagent timed out after
-    /// {timeout_ms}ms` — not Cancelled — so the parent's fan-in
-    /// resumes with a failed child result the parent LLM can react to.
+    /// This is a budget of *silence*, not of work. A child is failed
+    /// only after going the whole budget with **no evidence of work** —
+    /// no event committed on its own thread. A child that keeps working
+    /// never expires, however long it runs: a six-hour build worker
+    /// that commits a frame every minute is as healthy as a six-second
+    /// one, and is left alone.
+    ///
+    /// Concretely, the service host fails the child only when **both**
+    /// hold: it has existed at least `timeout_ms` (so spawn counts as
+    /// the initial evidence of life, and a child that never starts is
+    /// still reaped), **and** its thread committed no event within the
+    /// last `timeout_ms`. Net effect: expiry lands roughly `timeout_ms`
+    /// after the last sign of life, and every frame pushes it out.
+    ///
+    /// Enforcement covers three legs: a RUNNING child root is checked
+    /// once per worker heartbeat tick (default interval ~10s); a PARKED
+    /// child root (suspended on its own tool children) is checked by
+    /// the host's periodic sweep (default interval ~5s), which cancels
+    /// the hung descendants before failing the root; and a child
+    /// acquired already stalled fails up front without an LLM call.
+    /// Each leg carries up to one tick/sweep interval of slack. Not
+    /// covered: a steering-resume exchange, which runs unbounded until
+    /// the task's next ordinary acquisition. On expiry the child root
+    /// turn is transitioned to FAILED with `subagent timed out after
+    /// {timeout_ms}ms` — not Cancelled — so the parent's fan-in resumes
+    /// with a failed child result the parent LLM can react to.
+    ///
+    /// # History
+    ///
+    /// This was originally a wall-clock deadline anchored at the child
+    /// root's `created_at` — "too long since spawn" (issues #299/#360).
+    /// That killed *productive* long-running children purely for being
+    /// old and threw away everything they had done. Age is not evidence
+    /// of being stuck; silence is. The field and its wire format are
+    /// unchanged — only the meaning of the budget.
     pub timeout_ms: u64,
     /// Durable depth of this child within the subagent lineage.
     #[serde(default = "default_subagent_depth")]
