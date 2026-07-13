@@ -110,7 +110,7 @@ pub use model_features::{
 #[cfg(feature = "model-discovery")]
 pub use model_catalog::{
     CatalogEntry, ModelCatalogSource, ModelRegistry, ModelsDevSource, OpenRouterSource,
-    ResolvedModel, ResolvedSource,
+    PricingTier, ResolvedModel, ResolvedSource, applicable_pricing,
 };
 
 // Search provider

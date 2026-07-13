@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::collections::HashMap;
 
-use super::{CatalogEntry, MODELS_DEV_URL, ModelCatalogSource, build_feed_client};
+use super::{CatalogEntry, MODELS_DEV_URL, ModelCatalogSource, PricingTier, build_feed_client};
 use crate::model_capabilities::{PricePoint, Pricing};
 
 #[derive(serde::Deserialize)]
@@ -13,6 +13,34 @@ struct ModelsDevCost {
     output: Option<f64>,
     #[serde(default)]
     cache_read: Option<f64>,
+    #[serde(default)]
+    cache_write: Option<f64>,
+    /// Long-context price bands. The feed publishes these for frontier models
+    /// (GPT-5.x above 272K input tokens, Gemini / Claude above 200K).
+    #[serde(default)]
+    tiers: Vec<ModelsDevTier>,
+}
+
+#[derive(serde::Deserialize)]
+struct ModelsDevTier {
+    #[serde(default)]
+    input: Option<f64>,
+    #[serde(default)]
+    output: Option<f64>,
+    #[serde(default)]
+    cache_read: Option<f64>,
+    #[serde(default)]
+    cache_write: Option<f64>,
+    tier: ModelsDevTierBound,
+}
+
+#[derive(serde::Deserialize)]
+struct ModelsDevTierBound {
+    /// The only bound the feed publishes today is `context`; a row bounded by
+    /// anything else cannot be priced from data this parser understands.
+    #[serde(rename = "type")]
+    bound_type: String,
+    size: u32,
 }
 
 #[derive(serde::Deserialize)]
@@ -56,20 +84,58 @@ fn modelsdev_price_per_million(usd_per_million_tokens: f64) -> Option<PricePoint
         .then(|| PricePoint::new(usd_per_million_tokens))
 }
 
-fn pricing_from_modelsdev_cost(cost: &ModelsDevCost) -> Option<Pricing> {
-    let input = cost.input.and_then(modelsdev_price_per_million);
-    let output = cost.output.and_then(modelsdev_price_per_million);
-    let cached_input = cost.cache_read.and_then(modelsdev_price_per_million);
+fn pricing_from_rates(
+    input: Option<f64>,
+    output: Option<f64>,
+    cache_read: Option<f64>,
+    cache_write: Option<f64>,
+) -> Option<Pricing> {
+    let input = input.and_then(modelsdev_price_per_million);
+    let output = output.and_then(modelsdev_price_per_million);
+    let cached_input = cache_read.and_then(modelsdev_price_per_million);
+    let cache_write = cache_write.and_then(modelsdev_price_per_million);
 
-    if input.is_none() && output.is_none() && cached_input.is_none() {
+    if input.is_none() && output.is_none() && cached_input.is_none() && cache_write.is_none() {
         return None;
     }
     Some(Pricing {
         input,
         output,
         cached_input,
+        cache_write,
         notes: None,
     })
+}
+
+fn pricing_from_modelsdev_cost(cost: &ModelsDevCost) -> Option<Pricing> {
+    pricing_from_rates(cost.input, cost.output, cost.cache_read, cost.cache_write)
+}
+
+/// The `context` tiers of a cost row, ascending.
+///
+/// `None` — meaning "do not price this model from this feed at all" — when the
+/// row carries a tier this parser cannot interpret: an unknown bound type, or
+/// a band with no usable rates. A tier exists precisely because the base rates
+/// stop applying above its threshold, so a tier that cannot be understood
+/// cannot be safely ignored — keeping the base rates would price every
+/// long-context call at a fraction of its true cost. Dropping the row instead
+/// lets pricing fall back to another source, or to the documented
+/// "cost unknown" fail-open.
+fn tiers_from_modelsdev_cost(cost: &ModelsDevCost) -> Option<Vec<PricingTier>> {
+    cost.tiers
+        .iter()
+        .map(|tier| {
+            if tier.tier.bound_type != "context" {
+                return None;
+            }
+            let pricing =
+                pricing_from_rates(tier.input, tier.output, tier.cache_read, tier.cache_write)?;
+            Some(PricingTier {
+                min_context_tokens: tier.tier.size,
+                pricing,
+            })
+        })
+        .collect()
 }
 
 /// Parse the models.dev `api.json` body into catalog entries.
@@ -84,7 +150,20 @@ pub fn parse_modelsdev(json: &str) -> Result<Vec<CatalogEntry>> {
     for (provider_key, provider_obj) in providers {
         let provider = map_modelsdev_provider(&provider_key);
         for model in provider_obj.models.into_values() {
-            let pricing = model.cost.as_ref().and_then(pricing_from_modelsdev_cost);
+            // An un-interpretable tier drops the row's pricing entirely: its
+            // base rates do not apply above the tier's threshold, so keeping
+            // them would under-price every long-context call.
+            let tiers = model
+                .cost
+                .as_ref()
+                .map_or_else(|| Some(Vec::new()), tiers_from_modelsdev_cost);
+            let (pricing, pricing_tiers) = match tiers {
+                Some(tiers) => (
+                    model.cost.as_ref().and_then(pricing_from_modelsdev_cost),
+                    tiers,
+                ),
+                None => (None, Vec::new()),
+            };
             let context_window = model.limit.as_ref().and_then(|limit| limit.context);
             let max_output_tokens = model.limit.and_then(|limit| limit.output);
             entries.push(CatalogEntry {
@@ -93,6 +172,7 @@ pub fn parse_modelsdev(json: &str) -> Result<Vec<CatalogEntry>> {
                 context_window,
                 max_output_tokens,
                 pricing,
+                pricing_tiers,
                 supports_thinking: model.reasoning,
             });
         }
@@ -270,6 +350,108 @@ mod tests {
         }
       }
     }"#;
+
+    /// Mirrors the live feed's shape for a tiered model (`cost.tiers[].tier =
+    /// { type: "context", size }`), plus a row whose tier is bounded by
+    /// something this parser does not understand.
+    const MODELSDEV_TIERS_FIXTURE: &str = r#"{
+      "openai": {
+        "id": "openai",
+        "name": "OpenAI",
+        "models": {
+          "gpt-5.4": {
+            "id": "gpt-5.4",
+            "cost": {
+              "input": 2.5,
+              "output": 15,
+              "cache_read": 0.25,
+              "tiers": [
+                {
+                  "input": 5,
+                  "output": 22.5,
+                  "cache_read": 0.5,
+                  "tier": { "type": "context", "size": 272000 }
+                }
+              ]
+            }
+          },
+          "unknown-tier-model": {
+            "id": "unknown-tier-model",
+            "cost": {
+              "input": 1,
+              "output": 2,
+              "tiers": [
+                {
+                  "input": 9,
+                  "output": 9,
+                  "tier": { "type": "throughput", "size": 100 }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "anthropic": {
+        "id": "anthropic",
+        "name": "Anthropic",
+        "models": {
+          "claude-haiku-4-5": {
+            "id": "claude-haiku-4-5",
+            "cost": { "input": 1, "output": 5, "cache_read": 0.1, "cache_write": 1.25 }
+          }
+        }
+      }
+    }"#;
+
+    #[test]
+    fn parse_modelsdev_reads_tiers_and_cache_write() -> Result<()> {
+        let entries = parse_modelsdev(MODELSDEV_TIERS_FIXTURE)?;
+
+        let tiered = find(&entries, "openai", "gpt-5.4")?;
+        let base = tiered.pricing.context("base pricing missing")?;
+        assert!((base.input.context("input")?.usd_per_million_tokens - 2.5).abs() < f64::EPSILON);
+        assert_eq!(tiered.pricing_tiers.len(), 1);
+        let tier = tiered.pricing_tiers[0];
+        assert_eq!(tier.min_context_tokens, 272_000);
+        assert!(
+            (tier
+                .pricing
+                .output
+                .context("tier output")?
+                .usd_per_million_tokens
+                - 22.5)
+                .abs()
+                < f64::EPSILON
+        );
+
+        // The cache-write rate is carried, so cache-creation tokens can be
+        // billed at the premium the provider actually charges.
+        let haiku = find(&entries, "anthropic", "claude-haiku-4-5")?;
+        let pricing = haiku.pricing.context("pricing missing")?;
+        assert!(
+            (pricing
+                .cache_write
+                .context("cache_write")?
+                .usd_per_million_tokens
+                - 1.25)
+                .abs()
+                < f64::EPSILON
+        );
+        Ok(())
+    }
+
+    /// A tier this parser cannot interpret means the base rates cannot be
+    /// trusted above *some* unknown threshold, so the row carries no pricing
+    /// at all rather than a base rate that would under-price long calls.
+    #[test]
+    fn parse_modelsdev_drops_a_row_with_an_uninterpretable_tier() -> Result<()> {
+        let entries = parse_modelsdev(MODELSDEV_TIERS_FIXTURE)?;
+
+        let unknown = find(&entries, "openai", "unknown-tier-model")?;
+        assert!(unknown.pricing.is_none());
+        assert!(unknown.pricing_tiers.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn parse_modelsdev_drops_zero_rates() -> Result<()> {

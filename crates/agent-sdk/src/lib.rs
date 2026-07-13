@@ -666,7 +666,7 @@ pub use pricing::CostEstimator;
 #[cfg(feature = "model-discovery")]
 pub use agent_sdk_providers::{
     CatalogEntry, ModelCatalogSource, ModelRegistry, ModelsDevSource, OpenRouterSource,
-    ResolvedModel, ResolvedSource,
+    PricingTier, ResolvedModel, ResolvedSource,
 };
 
 // Schema-validated structured output (Phase 13): the [`ResponseFormat`] request

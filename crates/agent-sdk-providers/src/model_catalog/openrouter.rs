@@ -12,6 +12,11 @@ struct OpenRouterPricing {
     completion: Option<String>,
     #[serde(default)]
     input_cache_read: Option<String>,
+    /// The default (5-minute) cache-write rate. The feed also publishes
+    /// `input_cache_write_1h` for Anthropic's extended TTL, which the SDK does
+    /// not request.
+    #[serde(default)]
+    input_cache_write: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -83,13 +88,22 @@ pub fn parse_openrouter(json: &str) -> Result<Vec<CatalogEntry>> {
                     .input_cache_read
                     .as_deref()
                     .and_then(openrouter_price_per_million);
-                if input.is_none() && output.is_none() && cached_input.is_none() {
+                let cache_write = p
+                    .input_cache_write
+                    .as_deref()
+                    .and_then(openrouter_price_per_million);
+                if input.is_none()
+                    && output.is_none()
+                    && cached_input.is_none()
+                    && cache_write.is_none()
+                {
                     None
                 } else {
                     Some(Pricing {
                         input,
                         output,
                         cached_input,
+                        cache_write,
                         notes: None,
                     })
                 }
@@ -101,6 +115,8 @@ pub fn parse_openrouter(json: &str) -> Result<Vec<CatalogEntry>> {
                 context_window: model.context_length,
                 max_output_tokens,
                 pricing,
+                // The feed prices each route at one flat rate.
+                pricing_tiers: Vec::new(),
                 supports_thinking: None,
             }
         })

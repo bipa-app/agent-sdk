@@ -72,6 +72,7 @@ mod tests {
                 context_window: None,
                 max_output_tokens: None,
                 pricing: Some(crate::model_capabilities::Pricing::flat(10.0, 20.0)),
+                pricing_tiers: Vec::new(),
                 supports_thinking: None,
             },
         );

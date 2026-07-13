@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use super::{CatalogEntry, ModelCatalogSource};
+use super::{CatalogEntry, ModelCatalogSource, PricingTier, applicable_pricing};
 use crate::model_capabilities::{Pricing, get_model_capabilities};
 use agent_sdk_foundation::llm::Usage;
 
@@ -26,8 +26,12 @@ pub struct ResolvedModel {
     pub context_window: Option<u32>,
     /// Maximum output tokens per response, if known.
     pub max_output_tokens: Option<u32>,
-    /// Pricing for cost estimation, if known.
+    /// Base pricing for cost estimation, if known. Applies to a call whose
+    /// context stays inside the base band — see [`pricing_tiers`](Self::pricing_tiers).
     pub pricing: Option<Pricing>,
+    /// Long-context price bands, when the source publishes them. Empty for a
+    /// model priced at one flat rate (every static-table row).
+    pub pricing_tiers: Vec<PricingTier>,
     /// Whether the model is a reasoning/thinking model, if known.
     pub supports_thinking: Option<bool>,
     /// Which layer satisfied the lookup.
@@ -116,6 +120,8 @@ impl ModelRegistry {
                 context_window: caps.context_window,
                 max_output_tokens: caps.max_output_tokens,
                 pricing: caps.pricing,
+                // The compiled-in table prices every model at one flat rate.
+                pricing_tiers: Vec::new(),
                 supports_thinking: Some(caps.supports_thinking),
                 source: ResolvedSource::Static,
             };
@@ -125,6 +131,7 @@ impl ModelRegistry {
             context_window: None,
             max_output_tokens: None,
             pricing: None,
+            pricing_tiers: Vec::new(),
             supports_thinking: None,
             source: ResolvedSource::Unknown,
         }
@@ -163,15 +170,19 @@ impl ModelRegistry {
     /// component with a nonzero token count (e.g. a feed row that lists an
     /// input rate but no output rate). A caller can then fall back to another
     /// pricing source instead of billing those tokens at zero.
+    ///
+    /// A call whose context exceeds a published tier threshold is billed at
+    /// that tier's rates, not the base rates.
     #[must_use]
     pub fn estimate_cost_usd(&self, provider: &str, model: &str, usage: &Usage) -> Option<f64> {
-        estimate_from_pricing(self.resolve(provider, model).pricing?, usage)
+        estimate_resolved(&self.resolve(provider, model), usage)
     }
 
     /// Estimate request cost in USD from the *dynamic* layers only (override →
     /// feed), never the static table. See [`resolve_dynamic`](Self::resolve_dynamic).
     ///
-    /// Declines partial pricing exactly as [`estimate_cost_usd`](Self::estimate_cost_usd) does.
+    /// Declines partial pricing, and selects the tier the call falls in,
+    /// exactly as [`estimate_cost_usd`](Self::estimate_cost_usd) does.
     #[must_use]
     pub fn estimate_dynamic_cost_usd(
         &self,
@@ -179,12 +190,18 @@ impl ModelRegistry {
         model: &str,
         usage: &Usage,
     ) -> Option<f64> {
-        estimate_from_pricing(self.resolve_dynamic(provider, model)?.pricing?, usage)
+        estimate_resolved(&self.resolve_dynamic(provider, model)?, usage)
     }
 }
 
-/// Price `usage` from `pricing`, declining when a billed component has no rate.
-fn estimate_from_pricing(pricing: Pricing, usage: &Usage) -> Option<f64> {
+/// Price `usage` from a resolved model: pick the band the call's context falls
+/// in, then decline if that band cannot price every component the call bills.
+fn estimate_resolved(resolved: &ResolvedModel, usage: &Usage) -> Option<f64> {
+    let pricing = applicable_pricing(
+        resolved.pricing?,
+        &resolved.pricing_tiers,
+        usage.input_tokens,
+    );
     if !prices_every_billed_component(&pricing, usage) {
         return None;
     }
@@ -201,25 +218,33 @@ fn estimate_from_pricing(pricing: Pricing, usage: &Usage) -> Option<f64> {
 /// the static capability table) recovers the true cost, whereas a partial
 /// estimate silently understates spend and delays or defeats a cost budget.
 ///
-/// Cached input tokens are considered priced by either a cache rate or the
-/// plain input rate, matching how [`Pricing::estimate_cost_usd`] bills them.
+/// Cache-read and cache-write tokens count as priced by their own rate *or* by
+/// the plain input rate, matching how [`Pricing::estimate_cost_usd`] bills
+/// them: both are input tokens, so the input rate is the approximation used
+/// when a source publishes no cache rate of its own. What no source may do is
+/// bill a component at zero.
 fn prices_every_billed_component(pricing: &Pricing, usage: &Usage) -> bool {
-    let cached_input_tokens = usage.cached_input_tokens.min(usage.input_tokens);
-    let uncached_input_tokens = usage.input_tokens.saturating_sub(cached_input_tokens);
+    let cache_read_tokens = usage.cached_input_tokens.min(usage.input_tokens);
+    let after_cache_read = usage.input_tokens.saturating_sub(cache_read_tokens);
+    let cache_write_tokens = usage.cache_creation_input_tokens.min(after_cache_read);
+    let plain_input_tokens = after_cache_read.saturating_sub(cache_write_tokens);
 
-    let input_priced = uncached_input_tokens == 0 || pricing.input.is_some();
-    let cached_priced =
-        cached_input_tokens == 0 || pricing.cached_input.is_some() || pricing.input.is_some();
+    let input_priced = plain_input_tokens == 0 || pricing.input.is_some();
+    let cache_read_priced =
+        cache_read_tokens == 0 || pricing.cached_input.is_some() || pricing.input.is_some();
+    let cache_write_priced =
+        cache_write_tokens == 0 || pricing.cache_write.is_some() || pricing.input.is_some();
     let output_priced = usage.output_tokens == 0 || pricing.output.is_some();
 
-    input_priced && cached_priced && output_priced
+    input_priced && cache_read_priced && cache_write_priced && output_priced
 }
 
-const fn resolved_from_entry(entry: &CatalogEntry, source: ResolvedSource) -> ResolvedModel {
+fn resolved_from_entry(entry: &CatalogEntry, source: ResolvedSource) -> ResolvedModel {
     ResolvedModel {
         context_window: entry.context_window,
         max_output_tokens: entry.max_output_tokens,
         pricing: entry.pricing,
+        pricing_tiers: entry.pricing_tiers.clone(),
         supports_thinking: entry.supports_thinking,
         source,
     }
@@ -294,6 +319,7 @@ mod tests {
                 context_window: Some(123),
                 max_output_tokens: Some(7),
                 pricing: Some(Pricing::flat(1.0, 2.0)),
+                pricing_tiers: Vec::new(),
                 supports_thinking: Some(false),
             },
         );
@@ -386,6 +412,130 @@ mod tests {
         Ok(())
     }
 
+    /// Cache-creation tokens are a component of `input_tokens`, and providers
+    /// charge a premium to write the cache (Anthropic: 1.25× input). Billing
+    /// them at the ordinary input rate under-reports every cache-warming call.
+    #[test]
+    fn cache_creation_tokens_bill_at_the_cache_write_rate() -> Result<()> {
+        let registry = ModelRegistry::new().with_override(
+            "anthropic",
+            "claude-haiku-4-5",
+            CatalogEntry {
+                provider: "anthropic".to_owned(),
+                model_id: "claude-haiku-4-5".to_owned(),
+                context_window: None,
+                max_output_tokens: None,
+                // models.dev: input 1, output 5, cache_read 0.1, cache_write 1.25.
+                pricing: Some(Pricing::flat_with_cached(1.0, 5.0, 0.1).with_cache_write(1.25)),
+                pricing_tiers: Vec::new(),
+                supports_thinking: None,
+            },
+        );
+
+        // 1M input tokens = 200K plain + 300K cache-read + 500K cache-write,
+        // plus 1M output.
+        // 0.2*1 + 0.3*0.1 + 0.5*1.25 + 1*5 = 0.2 + 0.03 + 0.625 + 5 = 5.855.
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cached_input_tokens: 300_000,
+            cache_creation_input_tokens: 500_000,
+        };
+        let cost = registry
+            .estimate_cost_usd("anthropic", "claude-haiku-4-5", &usage)
+            .context("cost estimate missing")?;
+        assert!((cost - 5.855).abs() < 1e-9, "unexpected cost: {cost}");
+        Ok(())
+    }
+
+    /// A source with no cache-write rate bills those tokens at the ordinary
+    /// input rate — the provider-agnostic approximation the compiled-in table
+    /// has always used — rather than declining or billing them at zero.
+    #[test]
+    fn cache_creation_falls_back_to_the_input_rate() -> Result<()> {
+        let registry = ModelRegistry::new().with_override(
+            "anthropic",
+            "no-write-rate",
+            CatalogEntry {
+                provider: "anthropic".to_owned(),
+                model_id: "no-write-rate".to_owned(),
+                context_window: None,
+                max_output_tokens: None,
+                pricing: Some(Pricing::flat(1.0, 5.0)),
+                pricing_tiers: Vec::new(),
+                supports_thinking: None,
+            },
+        );
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 500_000,
+        };
+        // Every input token at $1/M, cache-write included: $1.00.
+        let cost = registry
+            .estimate_cost_usd("anthropic", "no-write-rate", &usage)
+            .context("cost estimate missing")?;
+        assert!((cost - 1.0).abs() < 1e-9, "unexpected cost: {cost}");
+        Ok(())
+    }
+
+    /// Long-context calls are billed at the tier the call falls in. Frontier
+    /// models roughly double their rates above the threshold, so pricing an
+    /// over-threshold call at the base rates halves the estimate.
+    #[test]
+    fn long_context_calls_bill_at_the_tier_rate() -> Result<()> {
+        let registry = ModelRegistry::new().with_override(
+            "openai",
+            "gpt-5.4",
+            CatalogEntry {
+                provider: "openai".to_owned(),
+                model_id: "gpt-5.4".to_owned(),
+                context_window: None,
+                max_output_tokens: None,
+                // models.dev: base 2.5/15, tier above 272K context 5/22.5.
+                pricing: Some(Pricing::flat(2.5, 15.0)),
+                pricing_tiers: vec![PricingTier {
+                    min_context_tokens: 272_000,
+                    pricing: Pricing::flat(5.0, 22.5),
+                }],
+                supports_thinking: None,
+            },
+        );
+
+        // Inside the base band: 200K in + 100K out = 0.2*2.5 + 0.1*15 = 2.0.
+        let short = Usage {
+            input_tokens: 200_000,
+            output_tokens: 100_000,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        let short_cost = registry
+            .estimate_cost_usd("openai", "gpt-5.4", &short)
+            .context("cost estimate missing")?;
+        assert!(
+            (short_cost - 2.0).abs() < 1e-9,
+            "unexpected cost: {short_cost}"
+        );
+
+        // Past the threshold: 300K in + 100K out = 0.3*5 + 0.1*22.5 = 3.75,
+        // where the base rates would have said 0.3*2.5 + 0.1*15 = 2.25.
+        let long = Usage {
+            input_tokens: 300_000,
+            output_tokens: 100_000,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        let long_cost = registry
+            .estimate_cost_usd("openai", "gpt-5.4", &long)
+            .context("cost estimate missing")?;
+        assert!(
+            (long_cost - 3.75).abs() < 1e-9,
+            "unexpected cost: {long_cost}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn estimate_cost_usd_declines_a_row_missing_a_billed_rate() -> Result<()> {
         // A feed row that lists an input rate but no output rate: pricing the
@@ -402,8 +552,10 @@ mod tests {
                     input: Some(crate::model_capabilities::PricePoint::new(1.0)),
                     output: None,
                     cached_input: None,
+                    cache_write: None,
                     notes: None,
                 }),
+                pricing_tiers: Vec::new(),
                 supports_thinking: None,
             },
         );

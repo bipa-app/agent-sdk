@@ -78,7 +78,32 @@ fn catalog_candidates<'a>(
     provider: &'a str,
     model: &'a str,
 ) -> impl Iterator<Item = (&'a str, &'a str)> {
-    static_candidates(provider, model).chain(feed_slug_candidates(model))
+    std::iter::once((provider, model))
+        .chain(feed_service_keys(provider, model).map(move |service| (service, model)))
+        .chain(backend_aliases(provider, model).map(move |backend| (backend, model)))
+        .chain(feed_slug_candidates(model))
+}
+
+/// The names a feed files a *service* under, when the provider serves models
+/// through one rather than calling a vendor directly.
+///
+/// `VertexProvider` reports `vertex`, but models.dev keys Vertex under the
+/// service names Google uses: `google-vertex-anthropic` for the Claude SKUs it
+/// resells and `google-vertex` for the rest (both sections carry the
+/// `@`-suffixed Vertex model ids, which no direct-vendor section has). Only a
+/// raw `google` key is remapped by `map_modelsdev_provider`, so these arrive
+/// verbatim.
+///
+/// They come before the direct-vendor aliases (`anthropic` / `gemini`): a
+/// Vertex SKU is billed at Google's rate, so Google's rows answer first, and
+/// the vendor's own rows are the approximation behind them.
+fn feed_service_keys(provider: &str, model: &str) -> impl Iterator<Item = &'static str> {
+    let services: &'static [&'static str] = match provider {
+        "vertex" if model.starts_with("claude-") => &["google-vertex-anthropic", "google-vertex"],
+        "vertex" => &["google-vertex"],
+        _ => &[],
+    };
+    services.iter().copied()
 }
 
 /// The keys the feeds may file a vendor-slug model id (`z-ai/glm-5.1`) under,
@@ -134,6 +159,13 @@ fn static_candidates<'a>(
     provider: &'a str,
     model: &'a str,
 ) -> impl Iterator<Item = (&'a str, &'a str)> {
+    std::iter::once((provider, model))
+        .chain(backend_aliases(provider, model).map(move |backend| (backend, model)))
+}
+
+/// The canonical backend(s) a transport-specific provider name serves. See
+/// [`static_candidates`] for why each alias exists.
+fn backend_aliases(provider: &str, model: &str) -> impl Iterator<Item = &'static str> {
     let backends: &'static [&'static str] = match provider {
         "openai-responses" | "openai-codex" => &["openai"],
         "vertex" if model.starts_with("claude-") => &["anthropic"],
@@ -141,7 +173,7 @@ fn static_candidates<'a>(
         "cloudflare-ai-gateway" | "record-replay" => &["anthropic", "openai", "gemini"],
         _ => &[],
     };
-    std::iter::once((provider, model)).chain(backends.iter().map(move |backend| (*backend, model)))
+    backends.iter().copied()
 }
 
 /// Split a vendor-slug model id (`z-ai/glm-5.1`) into the vendor key a feed's
@@ -948,6 +980,102 @@ mod catalog_tests {
         let cost = estimate_cost_usd(Some(&registry), &provenance, &usage)
             .context("the models.dev route key must price this call")?;
         assert!((cost - 4.95).abs() < 1e-9, "unexpected cost: {cost}");
+        Ok(())
+    }
+
+    /// models.dev keys Vertex under Google's service names. A Vertex-only SKU
+    /// (the `@`-suffixed ids no direct-vendor section carries) is priced only
+    /// there, so without the service key it could never trip a budget.
+    #[tokio::test]
+    async fn vertex_sku_prices_from_the_google_vertex_feed_key() -> Result<()> {
+        const MODELSDEV_VERTEX_FIXTURE: &str = r#"{
+          "google-vertex-anthropic": {
+            "id": "google-vertex-anthropic",
+            "models": {
+              "claude-haiku-4-5@20251001": {
+                "id": "claude-haiku-4-5@20251001",
+                "cost": { "input": 1, "output": 5 }
+              }
+            }
+          }
+        }"#;
+
+        let registry = registry_from_entries(parse_modelsdev(MODELSDEV_VERTEX_FIXTURE)?).await?;
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+        let provenance = AuditProvenance::new("vertex", "claude-haiku-4-5@20251001");
+
+        // The static table has no Vertex-suffixed SKU, and the `anthropic`
+        // alias cannot reach one either.
+        assert!(estimate_cost_usd(None, &provenance, &usage).is_none());
+
+        // $1/M in + $5/M out over 1M each = $6.
+        let cost = estimate_cost_usd(Some(&registry), &provenance, &usage)
+            .context("the google-vertex-anthropic key must price this SKU")?;
+        assert!((cost - 6.0).abs() < 1e-9, "unexpected cost: {cost}");
+
+        let limits = UsageLimits {
+            max_cost_usd: Some(1.0),
+            ..Default::default()
+        };
+        let (limit, _) = status(Some(&limits), Some(&registry), &provenance, &usage, None)
+            .context("a Vertex SKU must be able to trip the cost limit")?;
+        assert_eq!(limit, BudgetLimitKind::CostUsd);
+        Ok(())
+    }
+
+    /// A long-context call is budgeted at the tier it falls in. At the base
+    /// rate the same call reads as roughly half its true cost — enough to sail
+    /// past a cap it has actually exceeded.
+    #[tokio::test]
+    async fn long_context_call_trips_the_budget_at_its_tier_rate() -> Result<()> {
+        const MODELSDEV_TIERED_FIXTURE: &str = r#"{
+          "openai": {
+            "id": "openai",
+            "models": {
+              "gpt-5.4": {
+                "id": "gpt-5.4",
+                "cost": {
+                  "input": 2.5,
+                  "output": 15,
+                  "tiers": [
+                    {
+                      "input": 5,
+                      "output": 22.5,
+                      "tier": { "type": "context", "size": 272000 }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }"#;
+
+        let registry = registry_from_entries(parse_modelsdev(MODELSDEV_TIERED_FIXTURE)?).await?;
+        let provenance = AuditProvenance::new("openai", "gpt-5.4");
+
+        // 400K input (past the 272K threshold) + 100K output.
+        // Tier: 0.4*5 + 0.1*22.5 = 4.25. Base would say 0.4*2.5 + 0.1*15 = 2.5.
+        let usage = TokenUsage {
+            input_tokens: 400_000,
+            output_tokens: 100_000,
+            ..Default::default()
+        };
+        let cost = estimate_cost_usd(Some(&registry), &provenance, &usage)
+            .context("the tiered feed row must price this call")?;
+        assert!((cost - 4.25).abs() < 1e-9, "unexpected cost: {cost}");
+
+        // A $3 cap sits between the two: the base rate would not trip it.
+        let limits = UsageLimits {
+            max_cost_usd: Some(3.0),
+            ..Default::default()
+        };
+        let (limit, _) = status(Some(&limits), Some(&registry), &provenance, &usage, None)
+            .context("the tier rate must trip the cost limit")?;
+        assert_eq!(limit, BudgetLimitKind::CostUsd);
         Ok(())
     }
 

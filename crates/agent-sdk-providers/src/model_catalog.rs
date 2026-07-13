@@ -33,6 +33,19 @@ pub use modelsdev::{ModelsDevSource, parse_modelsdev};
 pub use openrouter::{OpenRouterSource, parse_openrouter};
 pub use registry::{ModelRegistry, ResolvedModel, ResolvedSource};
 
+/// Select the rates that apply to a call of `input_tokens`: the highest tier
+/// whose threshold the call exceeds, or the base rates when it exceeds none.
+///
+/// `tiers` need not be sorted.
+#[must_use]
+pub fn applicable_pricing(base: Pricing, tiers: &[PricingTier], input_tokens: u32) -> Pricing {
+    tiers
+        .iter()
+        .filter(|tier| input_tokens > tier.min_context_tokens)
+        .max_by_key(|tier| tier.min_context_tokens)
+        .map_or(base, |tier| tier.pricing)
+}
+
 pub(crate) const MODELS_DEV_URL: &str = "https://models.dev/api.json";
 pub(crate) const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/models";
 const FEED_TIMEOUT_SECS: u64 = 30;
@@ -51,10 +64,29 @@ pub struct CatalogEntry {
     pub context_window: Option<u32>,
     /// Maximum output tokens per response, when the feed reports it.
     pub max_output_tokens: Option<u32>,
-    /// Pricing distilled from the feed, when present.
+    /// Base pricing distilled from the feed, when present. Applies to a call
+    /// whose context stays inside the base band — see [`pricing_tiers`](Self::pricing_tiers).
     pub pricing: Option<Pricing>,
+    /// Context-tiered pricing, ascending by threshold, when the feed publishes
+    /// it. Empty for a model priced at one flat rate.
+    pub pricing_tiers: Vec<PricingTier>,
     /// Whether the model is a reasoning/thinking model, when the feed reports it.
     pub supports_thinking: Option<bool>,
+}
+
+/// A long-context price band: above `min_context_tokens` input tokens, the
+/// provider bills the whole call at `pricing` instead of the base rates.
+///
+/// Frontier models price long context at a premium — GPT-5.x doubles its input
+/// rate above 272K tokens, Gemini and Claude above 200K — so a source that
+/// publishes tiers must be billed through them, or a long-context run is priced
+/// at a fraction of what it costs and sails past its budget.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PricingTier {
+    /// The tier applies once a call's input tokens exceed this threshold.
+    pub min_context_tokens: u32,
+    /// The rates that replace the base rates for such a call.
+    pub pricing: Pricing,
 }
 
 /// A third-party feed of [`CatalogEntry`] rows.
