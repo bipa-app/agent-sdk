@@ -220,7 +220,7 @@ use super::commit::DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS;
 use super::committed_event::CommittedEvent;
 use super::event_repository::EventRepository;
 use super::idempotency::{IdempotencyClaim, IdempotencyKind, IdempotencyRecord};
-use super::outbox::{NewOutboxRow, OutboxStore};
+use super::outbox::{NewOutboxRow, OutboxStatus, OutboxStore};
 use super::outbox_message::{OutboxMessage, OutboxMessageKind, ThreadEventsAvailablePayload};
 use super::recovery::{
     FailureReason, RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
@@ -2143,14 +2143,23 @@ impl InMemoryAgentTaskStore {
         Ok(())
     }
 
-    /// Write a reused marker's advisory only if it does not already have
-    /// one.
+    /// Give a reused marker an advisory the relay can still publish.
     ///
     /// [`OutboxStore::insert_batch`] is a plain insert with no dedup, so a
     /// blind re-insert would queue a second wake for the same marker. The
     /// advisory is therefore looked up by the marker's `event_id`, which
-    /// every `ThreadEventsAvailable` row carries, and written only when
-    /// absent — leaving exactly one advisory per marker.
+    /// every `ThreadEventsAvailable` row carries.
+    ///
+    /// An [`OutboxStatus::Expired`] row does NOT count: it exhausted its
+    /// relay attempts, and `claim_pending` only ever selects `Pending`
+    /// rows, so it will never be published — leaving it in place would
+    /// report a cancellation that no cross-host follower is ever woken
+    /// for. Expired is terminal with no path back (`reclaim_expired_claims`
+    /// deliberately skips terminal rows), so the repair is a FRESH row
+    /// with a fresh attempt budget; nothing keys the outbox by `event_id`,
+    /// so the expired row and its replacement coexist. `Delivered` and
+    /// `Claimed` rows DO count — the wake was published, or is in flight
+    /// and will be retried by the relay's own machinery.
     async fn ensure_marker_advisory(
         sink: &CancellationMarkerSink,
         committed: &CommittedEvent,
@@ -2169,6 +2178,7 @@ impl InMemoryAgentTaskStore {
         if existing.iter().any(|row| {
             row.kind == OutboxMessageKind::ThreadEventsAvailable
                 && row.event_id == Some(committed.event_id)
+                && row.status != OutboxStatus::Expired
         }) {
             return Ok(());
         }
@@ -11313,6 +11323,118 @@ mod tests {
             "the reused marker must end up announced exactly once",
         );
         Ok(())
+    }
+
+    /// An advisory whose relay attempts are exhausted is terminal and will
+    /// never be claimed, so it announces nothing. A retry that reuses the
+    /// marker must queue a FRESH advisory rather than count the dead one —
+    /// otherwise the cancel reports success while cross-host followers of
+    /// a parked root are never woken at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retry_replaces_an_expired_advisory_on_a_reused_marker() -> Result<()> {
+        let events = crate::journal::event_repository::InMemoryEventRepository::new();
+        let outbox = crate::journal::outbox::InMemoryOutboxStore::new();
+        let refusing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let child_thread = thread("t-expired-child");
+        let store =
+            InMemoryAgentTaskStore::new().with_cancellation_markers(CancellationMarkerSink {
+                event_repo: Arc::new(RefusingMarkerEventRepo {
+                    inner: events.clone(),
+                    refuse_on: Some(child_thread.clone()),
+                    refusing: Arc::clone(&refusing),
+                }),
+                outbox_store: Arc::new(outbox.clone()),
+                thread_store: Arc::new(crate::journal::thread_store::InMemoryThreadStore::new()),
+            });
+
+        // Attempt 1: the parent's marker AND its advisory land; the child's
+        // marker fails, so nothing flips and the parent stays live.
+        let (parent, _invocation, _child_root) =
+            spawn_subagent_fixture(&store, "t-expired").await?;
+        store
+            .cancel_tree(&parent.id, t_plus(10))
+            .await
+            .expect_err("the child root's marker must fail the cancel");
+        assert_eq!(marker_advisories(&outbox, &parent.thread_id).await?, 1);
+
+        // The relay exhausts that advisory: terminal, never claimable again.
+        expire_thread_advisories(&outbox, &parent.thread_id).await?;
+        assert!(
+            claimable_advisories(&outbox, &parent.thread_id)
+                .await?
+                .is_empty(),
+            "precondition: the advisory is dead",
+        );
+
+        // The retry reuses the marker — and must re-announce it.
+        refusing.store(false, std::sync::atomic::Ordering::SeqCst);
+        store.cancel_tree(&parent.id, t_plus(11)).await?;
+
+        assert_eq!(
+            store.get(&parent.id).await?.context("parent")?.status,
+            TaskStatus::Cancelled,
+        );
+        assert_eq!(
+            cancel_markers(&events, &parent.thread_id).await?,
+            1,
+            "still exactly one marker",
+        );
+        let claimable = claimable_advisories(&outbox, &parent.thread_id).await?;
+        assert_eq!(
+            claimable.len(),
+            1,
+            "the cancelled root must end up with a publishable wake",
+        );
+        Ok(())
+    }
+
+    /// Burn every pending advisory on a thread through its retry budget
+    /// until the relay marks it `Expired`.
+    async fn expire_thread_advisories(
+        outbox: &crate::journal::outbox::InMemoryOutboxStore,
+        thread_id: &ThreadId,
+    ) -> Result<()> {
+        use crate::journal::outbox::OutboxStore as _;
+        let worker = "relay-test";
+        // Later than every insert in these fixtures, so the rows are
+        // eligible for pickup (`claim_pending` gates on `next_attempt_at`).
+        let relay_now = t_plus(100);
+        for _ in 0..=DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS {
+            let claimed = outbox.claim_pending(worker, 16, relay_now).await?;
+            if claimed.is_empty() {
+                break;
+            }
+            for row in claimed {
+                outbox
+                    .mark_failed(&row.id, worker, "relay down", relay_now, relay_now)
+                    .await?;
+            }
+        }
+        let dead = outbox
+            .list_by_thread(thread_id)
+            .await?
+            .into_iter()
+            .filter(|row| row.kind == OutboxMessageKind::ThreadEventsAvailable)
+            .all(|row| row.status == OutboxStatus::Expired);
+        anyhow::ensure!(dead, "the advisories must be exhausted for this fixture");
+        Ok(())
+    }
+
+    /// Advisories the relay can still pick up.
+    async fn claimable_advisories(
+        outbox: &crate::journal::outbox::InMemoryOutboxStore,
+        thread_id: &ThreadId,
+    ) -> Result<Vec<crate::journal::outbox::OutboxRow>> {
+        use crate::journal::outbox::OutboxStore as _;
+        Ok(outbox
+            .list_by_thread(thread_id)
+            .await?
+            .into_iter()
+            .filter(|row| {
+                row.kind == OutboxMessageKind::ThreadEventsAvailable
+                    && row.status != OutboxStatus::Expired
+            })
+            .collect())
     }
 
     async fn marker_advisories(
