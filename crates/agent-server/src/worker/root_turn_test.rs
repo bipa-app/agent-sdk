@@ -9,7 +9,7 @@ use super::root_turn::{
     PartialCancelCommit, RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes, cancel_root_turn,
     commit_partial_turn_on_cancel, derive_reattach_tool_use_id, execute_root_turn, fail_root_turn,
     provider_valid_split, resume_for_steering, resume_from_children, resume_root_turn,
-    revert_steering_wake,
+    revert_steering_wake, settle_attempt_after_lost_ownership,
 };
 use crate::journal::checkpoint::CheckpointKind;
 use std::sync::Arc;
@@ -6999,5 +6999,139 @@ async fn shift_walks_across_consecutive_salvage_occupants() -> Result<()> {
         .context("successor checkpoint at turn 3")?;
     assert_eq!(successor_checkpoint.task_id, successor_id);
     assert_eq!(successor_checkpoint.kind, CheckpointKind::FullTurn);
+    Ok(())
+}
+
+/// Codex round-6: a leftover OPEN attempt from a predecessor execution
+/// (crash-requeue or collision-requeue rolled its in-transaction close
+/// back) is settled at the next execution's open-attempt step — under
+/// the lease that owns the row, where it cannot race a live worker.
+#[tokio::test]
+async fn next_execution_settles_a_leftover_open_attempt() -> Result<()> {
+    let stores = TestStores::new();
+    stores.threads.get_or_create(&thread_a(), t0()).await?;
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+
+    // The predecessor execution's attempt, left open by a rolled-back
+    // commit.
+    let leftover = stores
+        .attempts
+        .open_attempt(OpenAttemptParams {
+            task_id: task_id.clone(),
+            attempt_number: 1,
+            provenance: AuditProvenance::new("mock", "mock-model"),
+            request_blob: serde_json::json!({}),
+            now: t0(),
+            otel_trace_id: None,
+            otel_span_id: None,
+        })
+        .await?;
+
+    let bootstrap = sample_bootstrap(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let deps = stores.deps();
+    let provider = MockTextProvider::new("re-run answer");
+    let outcome = execute_root_turn(inputs, "re-run", &provider, &deps, t_plus(5))
+        .await
+        .context("re-driven execution")?;
+    let RootTurnOutcome::Completed { .. } = outcome else {
+        bail!("expected Completed");
+    };
+
+    let attempts = stores.attempts.list_by_task(&task_id).await?;
+    assert_eq!(attempts.len(), 2, "leftover + fresh attempt");
+    let settled = attempts
+        .iter()
+        .find(|attempt| attempt.id == leftover.id)
+        .context("leftover attempt")?;
+    assert!(
+        settled.is_closed(),
+        "the re-driven execution must settle the predecessor's open attempt",
+    );
+    assert!(
+        attempts.iter().all(TurnAttempt::is_closed),
+        "no attempt may stay open after a completed turn",
+    );
+    Ok(())
+}
+
+/// Codex round-6 P2: an owner-guard rejection
+/// (`LostCommitOwnership`) rolls the in-transaction attempt close
+/// back, and no later path owns that attempt — the shift wrapper
+/// settles it best-effort, preserving the REAL usage on the
+/// billing-source-of-truth attempt row under the `Cancelled` outcome.
+#[tokio::test]
+async fn lost_ownership_rejection_settles_the_open_attempt() -> Result<()> {
+    use crate::journal::commit::LostCommitOwnership;
+
+    let stores = TestStores::new();
+    stores.threads.get_or_create(&thread_a(), t0()).await?;
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let attempt = stores
+        .attempts
+        .open_attempt(OpenAttemptParams {
+            task_id: task_id.clone(),
+            attempt_number: 1,
+            provenance: AuditProvenance::new("mock", "mock-model"),
+            request_blob: serde_json::json!({}),
+            now: t0(),
+            otel_trace_id: None,
+            otel_span_id: None,
+        })
+        .await?;
+
+    let params = crate::journal::commit::CompletedTurnCommit {
+        checkpoint_kind: CheckpointKind::FullTurn,
+        thread_id: thread_a(),
+        task_id: task_id.clone(),
+        expected_turn: 1,
+        turn_attempt_id: attempt.id.clone(),
+        close_attempt_params: CloseAttemptParams {
+            response_blob: serde_json::json!({}),
+            response_id: None,
+            response_model: Some("mock-model".into()),
+            stop_reason: None,
+            outcome: TurnAttemptOutcome::Success,
+            input_tokens: 77,
+            output_tokens: 33,
+            cached_input_tokens: 0,
+        },
+        messages: vec![],
+        turn_usage: TokenUsage::default(),
+        agent_state_snapshot: serde_json::json!({}),
+        events: Vec::new(),
+        outbox_max_attempts: 3,
+        owner_guard: None,
+        now: t_plus(2),
+    };
+    let deps = stores.deps();
+
+    // A non-ownership error must NOT settle: the attempt stays open
+    // for whichever path owns the failure.
+    let unrelated = anyhow::anyhow!("provider exploded");
+    settle_attempt_after_lost_ownership(&unrelated, &params, &deps).await;
+    let row = stores.attempts.get(&attempt.id).await?.context("attempt")?;
+    assert!(!row.is_closed(), "unrelated errors must not settle");
+
+    // The owner-guard rejection settles with REAL usage + Cancelled.
+    let rejection = anyhow::Error::new(LostCommitOwnership {
+        task_id: task_id.clone(),
+    })
+    .context("commit completed turn");
+    settle_attempt_after_lost_ownership(&rejection, &params, &deps).await;
+    let row = stores.attempts.get(&attempt.id).await?.context("attempt")?;
+    assert!(row.is_closed());
+    assert_eq!(row.outcome, Some(TurnAttemptOutcome::Cancelled));
+    assert_eq!(row.input_tokens, Some(77));
+    assert_eq!(row.output_tokens, Some(33));
     Ok(())
 }

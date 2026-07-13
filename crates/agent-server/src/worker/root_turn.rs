@@ -1782,6 +1782,7 @@ async fn commit_completed_turn_shifting_slot(
         };
 
         if shifts >= MAX_TURN_SLOT_SHIFTS || !is_turn_slot_collision(&error) {
+            settle_attempt_after_lost_ownership(&error, &params, deps).await;
             return Err(error);
         }
         let Some(next_turn) = shifted_turn_slot(&params, worker_id, lease_id, deps).await else {
@@ -1804,6 +1805,52 @@ async fn commit_completed_turn_shifting_slot(
             lease_id: lease_id.clone(),
         });
         shifts += 1;
+    }
+}
+
+/// Best-effort settle of the in-flight attempt when the owner-guarded
+/// shifted retry is rejected with
+/// [`LostCommitOwnership`](crate::journal::commit::LostCommitOwnership)
+/// (codex round-6 P2).
+///
+/// The rejected durable commit rolled its in-transaction attempt close
+/// back, and no later path will close this attempt: the cancel seam's
+/// snapshot-scoped close ran while the task was still `Running` and
+/// deliberately left the live worker's attempt alone, and the host's
+/// failure path skips a row it no longer owns. Close it here — this
+/// worker opened the attempt, so the id cannot belong to a replacement
+/// worker — carrying the REAL token usage the commit would have
+/// recorded (attempt rows are the billing source of truth) under the
+/// `Cancelled` outcome, since the turn did not commit. A concurrent
+/// close (e.g. the cancel path racing this settle) makes the store
+/// reject `AlreadyClosed`, which is swallowed as usual for best-effort
+/// closes.
+pub(crate) async fn settle_attempt_after_lost_ownership(
+    error: &anyhow::Error,
+    params: &CompletedTurnCommit,
+    deps: &RootTurnDeps<'_>,
+) {
+    let lost_ownership = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::journal::commit::LostCommitOwnership>()
+            .is_some()
+    });
+    if !lost_ownership {
+        return;
+    }
+    let close = CloseAttemptParams {
+        outcome: TurnAttemptOutcome::Cancelled,
+        ..params.close_attempt_params.clone()
+    };
+    if let Err(close_error) = deps
+        .attempt_store
+        .close_attempt(&params.turn_attempt_id, close, params.now)
+        .await
+    {
+        log::warn!(
+            "settle after lost commit ownership: closing attempt {} failed: {close_error:#}",
+            params.turn_attempt_id,
+        );
     }
 }
 
@@ -1961,6 +2008,15 @@ async fn open_attempt(
         .list_by_task(task_id)
         .await
         .context("list existing attempts")?;
+    // Settle leftovers from a predecessor execution of this task — a
+    // crash-requeue or a turn-slot-collision requeue rolls its
+    // in-transaction attempt close back, leaving the row open. This
+    // worker holds the task's lease, so closing here cannot race a
+    // live owner (the stale-worker error path deliberately leaves its
+    // attempt open for exactly this reason). Closing also fences a
+    // stale predecessor's late commit: its in-transaction close hits
+    // `AlreadyClosed` and the whole duplicate commit rolls back.
+    best_effort_close_attempts(&existing, attempt_store, now).await;
     let attempt_number = u32::try_from(existing.len()).context("attempt count overflow")? + 1;
 
     let (otel_trace_id, otel_span_id) = match otel_ids {

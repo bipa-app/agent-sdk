@@ -1751,7 +1751,7 @@ async fn fail_or_revert_root_task(
         }
     }
     if is_turn_slot_collision_error(err) {
-        match requeue_collided_root_task(stores, task, now).await {
+        match requeue_collided_root_task(stores, task, err, now).await {
             Ok(true) => return Ok(()),
             Ok(false) => {
                 // Budget exhausted or no longer owned — fall through to
@@ -1805,21 +1805,59 @@ fn is_turn_slot_collision_error(err: &anyhow::Error) -> bool {
 /// retry budget applies via [`AgentTask::release_lease`]'s
 /// sweep-identical accounting).
 ///
+/// # Foreign occupants only
+///
+/// A `StaleTurnCommit` whose occupying checkpoint belongs to THIS task
+/// means the turn already committed — a stale-lease worker losing to
+/// its own replacement's (or its own earlier) landed commit. Requeueing
+/// that would re-run the submitted input on top of its own committed
+/// turn and durably duplicate the conversation turn, so the same-task
+/// case falls through to the ordinary terminal path (the pre-existing
+/// idempotency behavior). A missing occupant checkpoint is treated the
+/// same, conservatively — the worker's shift path already retried
+/// through the in-memory visibility gap before surfacing the error.
+///
+/// The rolled-back execution's attempt row is deliberately left open
+/// here: closing it from this (possibly stale) worker races a
+/// replacement worker's live attempt (codex round-6 P1). The next
+/// execution settles leftover open attempts at open-attempt time,
+/// under the lease that owns the row.
+///
 /// Returns `Ok(true)` when the row was requeued (the dispatcher will
-/// re-run it); `Ok(false)` when the store reports the row has no
-/// retry budget left or is no longer owned — the caller falls through
-/// to its terminal path.
+/// re-run it); `Ok(false)` when the collision is same-task, the store
+/// reports the row has no retry budget left, or the row is no longer
+/// owned — the caller falls through to its terminal path.
 async fn requeue_collided_root_task(
     stores: &StoreRegistry,
     task: &AgentTask,
+    err: &anyhow::Error,
     now: time::OffsetDateTime,
 ) -> Result<bool> {
     let (worker_id, lease_id) = running_lease(task)?;
-    // The failed commit rolled back its in-transaction attempt close,
-    // so the execution's attempt rows are still open. Close them
-    // before the row leaves this worker's ownership — nothing sweeps
-    // orphaned attempts, and the re-driven execution opens fresh ones.
-    best_effort_close_open_attempts(&task.id, stores.attempt_store.as_ref(), now).await;
+    let Some(stale) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<StaleTurnCommit>())
+    else {
+        return Ok(false);
+    };
+    let occupant = stores
+        .checkpoint_store
+        .get_by_turn(&task.thread_id, stale.expected_turn)
+        .await
+        .context("read occupant checkpoint for collision classification")?;
+    let foreign_occupant = occupant
+        .as_ref()
+        .is_some_and(|checkpoint| checkpoint.task_id != task.id);
+    if !foreign_occupant {
+        warn!(
+            task_id = %task.id,
+            thread_id = %task.thread_id,
+            expected_turn = stale.expected_turn,
+            occupant_task = ?occupant.map(|checkpoint| checkpoint.task_id),
+            "turn-slot collision: occupant is not a foreign commit;              keeping the terminal path instead of requeueing",
+        );
+        return Ok(false);
+    }
     let outcome = stores
         .task_store
         .requeue_owned_task(&task.id, &worker_id, &lease_id, now)
@@ -2991,6 +3029,11 @@ mod tests {
             .await?
             .context("acquire")?;
 
+        // The slot was consumed by a FOREIGN task's commit — the only
+        // occupant shape the requeue path may act on.
+        commit_occupant_checkpoint(&stores, &acquired.thread_id, 1, "task_foreign_predecessor")
+            .await?;
+
         let collision = anyhow::Error::new(agent_server::journal::commit::StaleTurnCommit {
             expected_turn: 1,
             committed_turns: 1,
@@ -3043,6 +3086,9 @@ mod tests {
             .await?
             .context("acquire")?;
 
+        commit_occupant_checkpoint(&stores, &acquired.thread_id, 1, "task_foreign_predecessor")
+            .await?;
+
         let collision = anyhow::Error::new(agent_server::journal::commit::StaleTurnCommit {
             expected_turn: 1,
             committed_turns: 1,
@@ -3059,6 +3105,85 @@ mod tests {
 
         let row = stores.task_store.get(&id).await?.context("row")?;
         assert_eq!(row.status, TaskStatus::Failed);
+        Ok(())
+    }
+
+    /// Codex round-6 P1: a collision whose occupant checkpoint belongs
+    /// to THIS task means the turn already committed (a stale-lease
+    /// worker losing to its own replacement's landed commit).
+    /// Requeueing would re-run the input on top of its own committed
+    /// turn and duplicate the conversation turn durably — the same-task
+    /// case must keep the terminal path.
+    #[tokio::test]
+    async fn same_task_slot_collision_is_not_requeued() -> Result<()> {
+        let config = ServiceConfig::default();
+        let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
+        let stores = host.stores().clone();
+
+        let thread = agent_sdk_foundation::ThreadId::from_string("t-collision-same-task");
+        let root = AgentTask::new_root_turn(thread, time::OffsetDateTime::now_utc(), 3);
+        let id = root.id.clone();
+        stores.task_store.submit_root_turn(root).await?;
+        let acquired = stores
+            .task_store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w-stale"),
+                LeaseId::from_string("l-stale"),
+                time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+                time::OffsetDateTime::now_utc(),
+            )
+            .await?
+            .context("acquire")?;
+
+        // The occupant is OUR OWN task's committed turn.
+        commit_occupant_checkpoint(&stores, &acquired.thread_id, 1, acquired.id.as_str()).await?;
+
+        let collision = anyhow::Error::new(agent_server::journal::commit::StaleTurnCommit {
+            expected_turn: 1,
+            committed_turns: 1,
+        })
+        .context("execute fresh root task");
+        fail_or_revert_root_task(
+            &stores,
+            &acquired,
+            &collision,
+            0,
+            time::OffsetDateTime::now_utc(),
+        )
+        .await?;
+
+        let row = stores.task_store.get(&id).await?.context("row")?;
+        assert_eq!(
+            row.status,
+            TaskStatus::Failed,
+            "a same-task collision must not requeue (it would duplicate the committed turn)",
+        );
+        Ok(())
+    }
+
+    /// Test-only: land a checkpoint at `turn` attributed to `task_id`
+    /// so the collision classifier has an occupant to inspect.
+    async fn commit_occupant_checkpoint(
+        stores: &StoreRegistry,
+        thread_id: &agent_sdk_foundation::ThreadId,
+        turn: u32,
+        task_id: &str,
+    ) -> Result<()> {
+        use agent_server::journal::checkpoint::{CheckpointKind, NewCheckpointParams};
+        stores
+            .checkpoint_store
+            .commit_checkpoint(NewCheckpointParams {
+                thread_id: thread_id.clone(),
+                turn_number: turn,
+                task_id: agent_server::journal::task::AgentTaskId::from_string(task_id),
+                messages: vec![],
+                agent_state_snapshot: serde_json::json!({}),
+                turn_usage: agent_sdk_foundation::TokenUsage::default(),
+                kind: CheckpointKind::FullTurn,
+                now: time::OffsetDateTime::now_utc(),
+            })
+            .await?;
         Ok(())
     }
 
