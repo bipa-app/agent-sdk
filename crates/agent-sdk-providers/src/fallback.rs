@@ -30,21 +30,19 @@ use crate::streaming::{StreamBox, StreamDelta};
 /// * **Commits** — anything the consumer can already see or will replay:
 ///   `TextDelta`, `ThinkingDelta`, `SignatureDelta`, `RedactedThinking`,
 ///   `OpaqueReasoning`, `ToolUseStart`, `ToolInputDelta`, and `Done` (a response
-///   the caller has, by definition, already received in full).
+///   the caller has, by definition, already received in full). Unknown
+///   (`#[non_exhaustive]`) variants commit with them: a delta this SDK version
+///   cannot classify might carry content, and duplicating output is a worse
+///   failure than missing a failover.
 /// * **Does not commit** — `Usage`, which is pure metadata: it never reaches the
 ///   user, it is folded into token counters, and a provider that reports usage
 ///   and *then* fails is exactly the case failover exists for. A provider that
-///   reports usage mid-stream before any content and then errors is therefore
-///   failed over now where it previously surfaced the error — deliberate: no
-///   visible output is duplicated, because usage is invisible.
+///   reports usage before any content and then errors is therefore failed over
+///   now where it previously surfaced the error — deliberate: nothing visible is
+///   duplicated, because usage is invisible.
 /// * **Not classified here** — `Error`, which the caller's own arm handles.
 ///
-/// Unknown (`#[non_exhaustive]`) variants commit. A delta this SDK version
-/// cannot classify might carry content, and duplicating output is a worse
-/// failure than missing a failover.
-/// Every variant is classified above; `Usage` is the only one that does not
-/// commit, so the catch-all — which also covers future `#[non_exhaustive]`
-/// variants — commits. The per-variant behaviour is pinned by
+/// The per-variant behaviour is pinned by
 /// `only_metadata_deltas_leave_the_chain_uncommitted`.
 const fn commits_stream(delta: &StreamDelta) -> bool {
     !matches!(delta, StreamDelta::Usage(_))
@@ -196,15 +194,18 @@ impl LlmProvider for FallbackProvider {
                             }
                             yield Ok(StreamDelta::Error { message, kind });
                         }
-                        Ok(StreamDelta::Usage(usage)) => {
-                            // Metadata: deliberately does NOT commit, so a
-                            // provider that reports usage before failing can
-                            // still be failed over.
-                            provider_usage = Some(usage.clone());
-                            yield Ok(StreamDelta::Usage(add_usage(carried_usage.as_ref(), &usage)));
-                        }
                         Ok(delta) => {
+                            // `commits_stream` is the single decision point:
+                            // metadata leaves the chain free to fail over, and
+                            // usage is additionally rewritten to the running
+                            // total so the abandoned provider's tokens survive.
                             committed = committed || commits_stream(&delta);
+                            let delta = if let StreamDelta::Usage(usage) = delta {
+                                provider_usage = Some(usage.clone());
+                                StreamDelta::Usage(add_usage(carried_usage.as_ref(), &usage))
+                            } else {
+                                delta
+                            };
                             yield Ok(delta);
                         }
                         Err(error) => {

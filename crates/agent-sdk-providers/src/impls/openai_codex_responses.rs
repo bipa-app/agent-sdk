@@ -789,10 +789,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                             // the status but is a transport condition, so it keeps
                                             // its immediate fallback.
                                             if is_websocket_quota_rejection(&error) {
-                                                let kind = websocket_error_kind(
-                                                    error.status,
-                                                    &error.message,
-                                                );
+                                                let kind = websocket_error_kind(&error);
                                                 end_websocket_turn(&mut websocket_session);
                                                 yield Ok(StreamDelta::Error {
                                                     message: error.message,
@@ -901,10 +898,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                 // rejection is surfaced with its delay; the
                                                 // connection-limit sentinel falls back at once.
                                                 if is_websocket_quota_rejection(&error) {
-                                                    let kind = websocket_error_kind(
-                                                        error.status,
-                                                        &error.message,
-                                                    );
+                                                    let kind = websocket_error_kind(&error);
                                                     end_websocket_turn(&mut websocket_session);
                                                     yield Ok(StreamDelta::Error {
                                                         message: error.message,
@@ -1127,7 +1121,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                     if let Some(error) = parse_wrapped_websocket_error_event(&text)
                                     {
                                         let kind =
-                                            websocket_error_kind(error.status, &error.message);
+                                            websocket_error_kind(&error);
                                         // A quota rejection carries the delay the service wants
                                         // observed, so it is surfaced (with its hint) for the
                                         // caller's retry loop rather than re-sent immediately.
@@ -1350,7 +1344,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                             parse_wrapped_websocket_error_event(&text)
                                         {
                                             let kind =
-                                                websocket_error_kind(error.status, &error.message);
+                                                websocket_error_kind(&error);
                                             // Same split as the text frame: a quota rejection is
                                             // surfaced with its delay; the connection-limit signal
                                             // keeps falling back to HTTP immediately.
@@ -2690,6 +2684,38 @@ struct WrappedWebsocketError {
     /// separately so the immediate HTTP fallback that resolves it is not
     /// confused with a quota rejection, which must be waited out.
     connection_limit: bool,
+    /// Delay the frame stated in a structured field, if any.
+    ///
+    /// Codex's `usage_limit_reached` frame carries its wait here and leaves the
+    /// message as fixed prose ("The usage limit has been reached"), so this is
+    /// the only hint that frame has — parsing the message would find nothing.
+    reset_after: Option<Duration>,
+}
+
+/// Read the wait a wrapped error frame states in a structured field.
+///
+/// `resets_in_seconds` is preferred: it is relative, so it needs no wall-clock
+/// arithmetic and cannot be skewed by clock drift. `resets_at` (Unix seconds) is
+/// the fallback, converted defensively — an instant at or before now yields
+/// `None` rather than a zero or negative wait. Either way the value passes
+/// through the same ceiling as every other hint source.
+fn websocket_reset_after(error: Option<&ApiWrappedWebsocketErrorBody>) -> Option<Duration> {
+    let error = error?;
+    if let Some(seconds) = error.resets_in_seconds {
+        return crate::retry_hints::bounded_delay(seconds);
+    }
+
+    // Absolute form: convert against the wall clock. Every step that could
+    // produce a nonsense wait yields `None` instead — a pre-epoch timestamp
+    // (`try_from`), an instant at or before now (`checked_sub`), or one so far
+    // out it cannot be a quota reset (`u32::try_from`, i.e. beyond ~136 years).
+    let resets_at = u64::try_from(error.resets_at?).ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let remaining = resets_at.checked_sub(now)?;
+    crate::retry_hints::bounded_delay(f64::from(u32::try_from(remaining).ok()?))
 }
 
 fn parse_wrapped_websocket_error_event(payload: &str) -> Option<WrappedWebsocketError> {
@@ -2697,6 +2723,8 @@ fn parse_wrapped_websocket_error_event(payload: &str) -> Option<WrappedWebsocket
     if event.kind != "error" {
         return None;
     }
+
+    let reset_after = websocket_reset_after(event.error.as_ref());
 
     if event.error.as_ref().and_then(|error| error.code.as_deref())
         == Some(OPENAI_CODEX_WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE)
@@ -2709,6 +2737,7 @@ fn parse_wrapped_websocket_error_event(payload: &str) -> Option<WrappedWebsocket
             status: StatusCode::TOO_MANY_REQUESTS,
             message,
             connection_limit: true,
+            reset_after,
         });
     }
 
@@ -2724,6 +2753,7 @@ fn parse_wrapped_websocket_error_event(payload: &str) -> Option<WrappedWebsocket
             status,
             message,
             connection_limit: false,
+            reset_after,
         })
     }
 }
@@ -2783,12 +2813,17 @@ struct CodexResponseFailure {
 
 /// Classify a wrapped websocket error event by the status it reports.
 ///
-/// The websocket frame carries no HTTP headers, so a rate limit's retry delay
-/// can only come from the error message itself ("Please try again in 20s").
-fn websocket_error_kind(status: StatusCode, message: &str) -> StreamErrorKind {
-    if status == StatusCode::TOO_MANY_REQUESTS {
-        StreamErrorKind::RateLimited(crate::retry_hints::openai_retry_delay(message))
-    } else if status.is_server_error() {
+/// The frame carries no HTTP headers, so a rate limit's delay comes from the
+/// frame itself: the structured reset field when the service sent one (Codex's
+/// `usage_limit_reached` frames do, and their message is fixed prose that says
+/// nothing about timing), otherwise the message ("Please try again in 20s").
+fn websocket_error_kind(error: &WrappedWebsocketError) -> StreamErrorKind {
+    if error.status == StatusCode::TOO_MANY_REQUESTS {
+        let delay = error
+            .reset_after
+            .or_else(|| crate::retry_hints::openai_retry_delay(&error.message));
+        StreamErrorKind::RateLimited(delay)
+    } else if error.status.is_server_error() {
         StreamErrorKind::ServerError
     } else {
         StreamErrorKind::InvalidRequest
@@ -3290,6 +3325,16 @@ struct ApiWrappedWebsocketErrorBody {
     code: Option<String>,
     #[serde(default)]
     message: Option<String>,
+    /// Seconds until the exhausted usage limit resets. Codex states its
+    /// standard `usage_limit_reached` delay here rather than in the message
+    /// (which is the fixed prose "The usage limit has been reached"), so it is
+    /// the only usable hint on that frame.
+    #[serde(default)]
+    resets_in_seconds: Option<f64>,
+    /// Absolute reset instant (Unix seconds), sent by some frames instead of
+    /// the relative field.
+    #[serde(default)]
+    resets_at: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -3330,12 +3375,25 @@ mod tests {
         )
         .context("expected a wrapped error")?;
         assert!(is_websocket_quota_rejection(&quota));
-        let kind = websocket_error_kind(quota.status, &quota.message);
+        let kind = websocket_error_kind(&quota);
         assert_eq!(
             kind,
             StreamErrorKind::RateLimited(Some(std::time::Duration::from_secs(45)))
         );
         assert!(kind.is_recoverable());
+
+        // The same warmup path carries a structured reset hint when the frame is
+        // Codex's standard usage-limit shape, whose prose states no timing.
+        let usage_limit = parse_wrapped_websocket_error_event(
+            r#"{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"The usage limit has been reached.","resets_in_seconds":900}}"#,
+        )
+        .context("expected a wrapped error")?;
+        assert!(is_websocket_quota_rejection(&usage_limit));
+        assert_eq!(
+            websocket_error_kind(&usage_limit),
+            StreamErrorKind::RateLimited(Some(std::time::Duration::from_mins(15))),
+            "the structured reset must reach the retry loop through the warmup path"
+        );
 
         let connection_limit = parse_wrapped_websocket_error_event(&format!(
             r#"{{"type":"error","status":429,"error":{{"code":"{OPENAI_CODEX_WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE}","message":"limit"}}}}"#,
@@ -3685,12 +3743,113 @@ mod tests {
             "a quota 429 must be surfaced rather than retried immediately"
         );
 
-        let kind = websocket_error_kind(parsed.status, &parsed.message);
+        let kind = websocket_error_kind(&parsed);
         assert_eq!(
             kind,
             StreamErrorKind::RateLimited(Some(std::time::Duration::from_secs(30)))
         );
         assert!(kind.is_recoverable());
+        Ok(())
+    }
+
+    /// Current Unix time in seconds, for building `resets_at` fixtures.
+    fn unix_now() -> i64 {
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_secs())
+                .unwrap_or_default(),
+        )
+        .unwrap_or_default()
+    }
+
+    #[test]
+    fn usage_limit_frame_carries_its_structured_reset() -> anyhow::Result<()> {
+        // Codex's standard usage-limit frame states the wait in a structured
+        // field and leaves the message as fixed prose with no timing in it, so
+        // the field is the only hint there is.
+        let parsed = parse_wrapped_websocket_error_event(
+            r#"{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"The usage limit has been reached.","resets_in_seconds":1800}}"#,
+        )
+        .context("expected a wrapped error")?;
+
+        assert_eq!(
+            websocket_error_kind(&parsed),
+            StreamErrorKind::RateLimited(Some(std::time::Duration::from_mins(30)))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn usage_limit_reset_falls_back_to_the_absolute_instant() -> anyhow::Result<()> {
+        let future = unix_now() + 600;
+        let parsed = parse_wrapped_websocket_error_event(&format!(
+            r#"{{"type":"error","status":429,"error":{{"type":"usage_limit_reached","message":"The usage limit has been reached.","resets_at":{future}}}}}"#,
+        ))
+        .context("expected a wrapped error")?;
+
+        let StreamErrorKind::RateLimited(Some(delay)) = websocket_error_kind(&parsed) else {
+            anyhow::bail!("a usage-limit frame must be a rate limit with a delay");
+        };
+        // Computed against the wall clock, so assert a window rather than an
+        // exact value.
+        assert!(
+            delay <= std::time::Duration::from_mins(10)
+                && delay >= std::time::Duration::from_secs(590),
+            "the absolute reset must convert to a ~600s wait, got {delay:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn usage_limit_reset_in_the_past_or_absent_reports_no_hint() -> anyhow::Result<()> {
+        // A reset instant that has already elapsed says nothing about how long to
+        // wait: it must not become a zero (retry-instantly) or negative delay.
+        let past = unix_now() - 60;
+        let elapsed = parse_wrapped_websocket_error_event(&format!(
+            r#"{{"type":"error","status":429,"error":{{"type":"usage_limit_reached","message":"The usage limit has been reached.","resets_at":{past}}}}}"#,
+        ))
+        .context("expected a wrapped error")?;
+        assert_eq!(
+            websocket_error_kind(&elapsed),
+            StreamErrorKind::RateLimited(None)
+        );
+
+        // No reset fields at all: unchanged behaviour — the message is the only
+        // source, and this prose carries no delay.
+        let bare = parse_wrapped_websocket_error_event(
+            r#"{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"The usage limit has been reached."}}"#,
+        )
+        .context("expected a wrapped error")?;
+        assert_eq!(
+            websocket_error_kind(&bare),
+            StreamErrorKind::RateLimited(None)
+        );
+
+        // A zero reset is not a delay either.
+        let zero = parse_wrapped_websocket_error_event(
+            r#"{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"The usage limit has been reached.","resets_in_seconds":0}}"#,
+        )
+        .context("expected a wrapped error")?;
+        assert_eq!(
+            websocket_error_kind(&zero),
+            StreamErrorKind::RateLimited(None)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn structured_reset_wins_over_the_message_prose() -> anyhow::Result<()> {
+        // Both present: the machine-readable field is authoritative.
+        let parsed = parse_wrapped_websocket_error_event(
+            r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded","message":"Please try again in 5s.","resets_in_seconds":120}}"#,
+        )
+        .context("expected a wrapped error")?;
+
+        assert_eq!(
+            websocket_error_kind(&parsed),
+            StreamErrorKind::RateLimited(Some(std::time::Duration::from_mins(2)))
+        );
         Ok(())
     }
 

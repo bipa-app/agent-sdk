@@ -177,6 +177,20 @@ fn duration_from_secs(seconds: f64) -> Option<Duration> {
         .map(|delay| delay.min(MAX_HINT))
 }
 
+/// Bound a delay a provider stated in a *structured* field (rather than in
+/// prose) through the same ceiling and sanity checks the parsers apply.
+///
+/// `None` for anything that is not a usable, positive delay — a negative or
+/// non-finite value, or a zero, which carries no information the caller's own
+/// backoff does not already have.
+#[cfg(feature = "openai-codex")]
+pub fn bounded_delay(seconds: f64) -> Option<Duration> {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return None;
+    }
+    duration_from_secs(seconds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
