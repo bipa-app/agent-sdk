@@ -2055,12 +2055,20 @@ impl InMemoryAgentTaskStore {
         let mut markers = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             if let Some(existing) = Self::journaled_marker_for(sink, &candidate).await? {
-                // Its advisory was written in the same iteration that
-                // wrote the marker, so it is already queued. The narrow
-                // exception — a prior attempt that failed ON that advisory
-                // insert — leaves the marker journaled with no relay wake;
-                // the root is still live, so its next event's advisory
-                // wakes cross-host followers onto the marker anyway.
+                // The advisory is written after the marker, so the attempt
+                // that journaled this one may have died in between —
+                // leaving a marker no relay would ever announce. Ensure it
+                // now, or a parked root that commits no further event
+                // would leave cross-host followers unwoken even though the
+                // cancel succeeded.
+                //
+                // The reused marker keeps the `turn` / `usage` payload the
+                // FIRST attempt computed. If the root committed a turn
+                // between the attempts (a cancel racing the unfenced
+                // finish line), the surviving marker understates both
+                // against the moment the cancel was honored; the task's
+                // own row is the authority on how it ended.
+                Self::ensure_marker_advisory(sink, &existing, now).await?;
                 markers.push(existing);
                 continue;
             }
@@ -2096,32 +2104,75 @@ impl InMemoryAgentTaskStore {
                         candidate.thread_id,
                     )
                 })?;
-            let payload_json = OutboxMessage::ThreadEventsAvailable(ThreadEventsAvailablePayload {
-                thread_id: committed.thread_id.clone(),
-                last_sequence: committed.sequence,
-            })
-            .to_payload_json()
-            .context("cancel_tree: serialise marker advisory payload")?;
-            sink.outbox_store
-                .insert_batch(vec![NewOutboxRow {
-                    kind: OutboxMessageKind::ThreadEventsAvailable,
-                    thread_id: committed.thread_id.clone(),
-                    event_id: Some(committed.event_id),
-                    sequence: Some(committed.sequence),
-                    payload_json,
-                    max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
-                    now,
-                }])
-                .await
-                .with_context(|| {
-                    format!(
-                        "cancel_tree: insert marker outbox advisory for thread {}",
-                        committed.thread_id,
-                    )
-                })?;
+            Self::insert_marker_advisory(sink, &committed, now).await?;
             markers.push(committed);
         }
         Ok(markers)
+    }
+
+    /// Write the `thread_events_available` advisory that wakes cross-host
+    /// followers of a journaled marker.
+    async fn insert_marker_advisory(
+        sink: &CancellationMarkerSink,
+        committed: &CommittedEvent,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let payload_json = OutboxMessage::ThreadEventsAvailable(ThreadEventsAvailablePayload {
+            thread_id: committed.thread_id.clone(),
+            last_sequence: committed.sequence,
+        })
+        .to_payload_json()
+        .context("cancel_tree: serialise marker advisory payload")?;
+        sink.outbox_store
+            .insert_batch(vec![NewOutboxRow {
+                kind: OutboxMessageKind::ThreadEventsAvailable,
+                thread_id: committed.thread_id.clone(),
+                event_id: Some(committed.event_id),
+                sequence: Some(committed.sequence),
+                payload_json,
+                max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+                now,
+            }])
+            .await
+            .with_context(|| {
+                format!(
+                    "cancel_tree: insert marker outbox advisory for thread {}",
+                    committed.thread_id,
+                )
+            })?;
+        Ok(())
+    }
+
+    /// Write a reused marker's advisory only if it does not already have
+    /// one.
+    ///
+    /// [`OutboxStore::insert_batch`] is a plain insert with no dedup, so a
+    /// blind re-insert would queue a second wake for the same marker. The
+    /// advisory is therefore looked up by the marker's `event_id`, which
+    /// every `ThreadEventsAvailable` row carries, and written only when
+    /// absent — leaving exactly one advisory per marker.
+    async fn ensure_marker_advisory(
+        sink: &CancellationMarkerSink,
+        committed: &CommittedEvent,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let existing = sink
+            .outbox_store
+            .list_by_thread(&committed.thread_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "cancel_tree: read outbox for thread {} to reuse a marker advisory",
+                    committed.thread_id,
+                )
+            })?;
+        if existing.iter().any(|row| {
+            row.kind == OutboxMessageKind::ThreadEventsAvailable
+                && row.event_id == Some(committed.event_id)
+        }) {
+            return Ok(());
+        }
+        Self::insert_marker_advisory(sink, committed, now).await
     }
 }
 
@@ -11031,6 +11082,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn partial_marker_failure_orphans_markers_but_keeps_the_tree_healable() -> Result<()> {
         let events = crate::journal::event_repository::InMemoryEventRepository::new();
+        let outbox = crate::journal::outbox::InMemoryOutboxStore::new();
         let refusing = Arc::new(std::sync::atomic::AtomicBool::new(true));
         // The cascade's second marker candidate is the child-thread root;
         // refuse only its thread, so the parent's marker commits first.
@@ -11042,7 +11094,7 @@ mod tests {
                     refuse_on: Some(child_thread.clone()),
                     refusing: Arc::clone(&refusing),
                 }),
-                outbox_store: Arc::new(crate::journal::outbox::InMemoryOutboxStore::new()),
+                outbox_store: Arc::new(outbox.clone()),
                 thread_store: Arc::new(crate::journal::thread_store::InMemoryThreadStore::new()),
             });
 
@@ -11110,7 +11162,170 @@ mod tests {
         // The reused marker is still handed back, so the caller's notifier
         // wakes same-process followers with it.
         assert_eq!(outcome.markers.len(), 2, "both markers are reported");
+
+        // The parent's advisory was queued by the FIRST attempt, so the
+        // reuse must not queue a second wake for the same marker.
+        assert_eq!(
+            marker_advisories(&outbox, &parent.thread_id).await?,
+            1,
+            "a reused marker must not be announced twice",
+        );
+        assert_eq!(marker_advisories(&outbox, &child_thread).await?, 1);
         Ok(())
+    }
+
+    /// Outbox that refuses to queue advisories, standing in for an
+    /// attempt that journaled its marker and then died before announcing
+    /// it.
+    #[derive(Clone)]
+    struct RefusingAdvisoryOutbox {
+        inner: crate::journal::outbox::InMemoryOutboxStore,
+        refusing: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl crate::journal::outbox::OutboxStore for RefusingAdvisoryOutbox {
+        async fn insert_batch(
+            &self,
+            rows: Vec<crate::journal::outbox::NewOutboxRow>,
+        ) -> Result<Vec<crate::journal::outbox::OutboxRow>> {
+            if self.refusing.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("injected advisory-insert failure");
+            }
+            self.inner.insert_batch(rows).await
+        }
+        async fn claim_pending(
+            &self,
+            worker_id: &str,
+            limit: u32,
+            now: OffsetDateTime,
+        ) -> Result<Vec<crate::journal::outbox::OutboxRow>> {
+            self.inner.claim_pending(worker_id, limit, now).await
+        }
+        async fn mark_delivered(
+            &self,
+            id: &crate::journal::outbox::OutboxRowId,
+            worker_id: &str,
+            now: OffsetDateTime,
+        ) -> Result<()> {
+            self.inner.mark_delivered(id, worker_id, now).await
+        }
+        async fn mark_failed(
+            &self,
+            id: &crate::journal::outbox::OutboxRowId,
+            worker_id: &str,
+            error: &str,
+            next_attempt_at: OffsetDateTime,
+            now: OffsetDateTime,
+        ) -> Result<()> {
+            self.inner
+                .mark_failed(id, worker_id, error, next_attempt_at, now)
+                .await
+        }
+        async fn reclaim_expired_claims(
+            &self,
+            now: OffsetDateTime,
+            claim_lease: Duration,
+        ) -> Result<u64> {
+            self.inner.reclaim_expired_claims(now, claim_lease).await
+        }
+        async fn get(
+            &self,
+            id: &crate::journal::outbox::OutboxRowId,
+        ) -> Result<Option<crate::journal::outbox::OutboxRow>> {
+            self.inner.get(id).await
+        }
+        async fn list_by_thread(
+            &self,
+            thread_id: &ThreadId,
+        ) -> Result<Vec<crate::journal::outbox::OutboxRow>> {
+            self.inner.list_by_thread(thread_id).await
+        }
+        async fn count_pending(&self, thread_id: &ThreadId) -> Result<u64> {
+            self.inner.count_pending(thread_id).await
+        }
+        async fn min_unpublished_sequence(&self, thread_id: &ThreadId) -> Result<Option<u64>> {
+            self.inner.min_unpublished_sequence(thread_id).await
+        }
+    }
+
+    /// A marker is journaled BEFORE its advisory, so an attempt can leave
+    /// a marker no relay would ever announce. The retry's reuse branch
+    /// must repair that: a parked root commits no further event, so
+    /// without the advisory its cross-host followers would never be woken
+    /// even though `cancel_tree` reported success.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retry_supplies_the_advisory_a_reused_marker_never_got() -> Result<()> {
+        let events = crate::journal::event_repository::InMemoryEventRepository::new();
+        let outbox = crate::journal::outbox::InMemoryOutboxStore::new();
+        let refusing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let store =
+            InMemoryAgentTaskStore::new().with_cancellation_markers(CancellationMarkerSink {
+                event_repo: Arc::new(events.clone()),
+                outbox_store: Arc::new(RefusingAdvisoryOutbox {
+                    inner: outbox.clone(),
+                    refusing: Arc::clone(&refusing),
+                }),
+                thread_store: Arc::new(crate::journal::thread_store::InMemoryThreadStore::new()),
+            });
+
+        let root = fresh_root("t-advisory-refused");
+        store.submit_root_turn(root.clone()).await?;
+
+        // Attempt 1: the marker lands, the advisory does not.
+        let error = store
+            .cancel_tree(&root.id, t_plus(2))
+            .await
+            .expect_err("a refused advisory must fail the cancel");
+        assert!(
+            format!("{error:#}").contains("injected advisory-insert failure"),
+            "{error:#}",
+        );
+        assert_eq!(cancel_markers(&events, &root.thread_id).await?, 1);
+        assert_eq!(
+            marker_advisories(&outbox, &root.thread_id).await?,
+            0,
+            "the advisory was refused",
+        );
+        assert_ne!(
+            store.get(&root.id).await?.context("row")?.status,
+            TaskStatus::Cancelled,
+            "nothing flips while the marker set is incomplete",
+        );
+
+        // Attempt 2 reuses the marker — and must supply the advisory it
+        // never got, exactly once.
+        refusing.store(false, std::sync::atomic::Ordering::SeqCst);
+        store.cancel_tree(&root.id, t_plus(3)).await?;
+
+        assert_eq!(
+            store.get(&root.id).await?.context("row")?.status,
+            TaskStatus::Cancelled,
+        );
+        assert_eq!(
+            cancel_markers(&events, &root.thread_id).await?,
+            1,
+            "still exactly one marker",
+        );
+        assert_eq!(
+            marker_advisories(&outbox, &root.thread_id).await?,
+            1,
+            "the reused marker must end up announced exactly once",
+        );
+        Ok(())
+    }
+
+    async fn marker_advisories(
+        outbox: &crate::journal::outbox::InMemoryOutboxStore,
+        thread_id: &ThreadId,
+    ) -> Result<usize> {
+        use crate::journal::outbox::OutboxStore as _;
+        Ok(outbox
+            .list_by_thread(thread_id)
+            .await?
+            .iter()
+            .filter(|row| row.kind == OutboxMessageKind::ThreadEventsAvailable)
+            .count())
     }
 
     async fn cancel_markers(

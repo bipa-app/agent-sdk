@@ -211,13 +211,17 @@ message ErrorEvent {
 // commit the marker set inside the cancellation transaction, and the
 // embedded in-memory backend journals the set before applying any
 // transition and reuses — never rewrites — a marker already on the
-// thread. The embedded backend's one residual, since it cannot span its
-// stores transactionally: a cancel whose marker write FAILS part-way
-// through a subagent cascade, and which the caller then abandons rather
-// than retries, leaves a marker on a root that was not cancelled and
-// keeps running. A follower closes on it and reaches that task's real
-// answer by reconnecting. The task's own row (`GetTask`) is the
-// authority on whether it ended.
+// thread. A reused marker keeps the `turn` and `usage` computed when it
+// was FIRST journaled, so if the root committed a turn between a failed
+// cancel attempt and its retry, the surviving marker understates both
+// against the moment the cancel was finally honored. The embedded
+// backend's one residual, since it cannot span its stores
+// transactionally: a cancel whose marker write FAILS part-way through a
+// subagent cascade, and which the caller then abandons rather than
+// retries, leaves a marker on a root that was not cancelled and keeps
+// running. A follower closes on it and reaches that task's real answer
+// by reconnecting. In every one of these cases the task's own row
+// (`GetTask`) is the authority on whether — and how — it ended.
 //
 // Post-terminal salvage: a RUNNING root's worker may keep appending
 // streaming deltas for up to one heartbeat after this marker — they
