@@ -1887,3 +1887,127 @@ async fn spawn_mixed_records_child_ids_in_slot_order_when_interleaved() -> Resul
 
     Ok(())
 }
+
+#[tokio::test]
+async fn spawn_batch_rejects_duplicate_child_thread_without_orphaning_projections() -> Result<()> {
+    // Two entries pointing at one child thread is a caller-detectable
+    // defect, so it must be caught before any projection is written: the
+    // store rejects it too, but only after `get_or_create` has already
+    // committed the thread row outside the store's transaction.
+    let task_store = InMemoryAgentTaskStore::new();
+    let thread_store = InMemoryThreadStore::new();
+    let event_repo = InMemoryEventRepository::new();
+    let (parent, worker, lease) = running_parent_root(&task_store).await?;
+    let tasks = vec!["explore A", "explore B"];
+    let payload = parent_suspension_payload_with_tools(&parent.thread_id, &tasks);
+
+    let shared_thread = agent_sdk_foundation::ThreadId::new();
+    let entries = vec![
+        SubagentBatchEntry {
+            child_thread_id: shared_thread.clone(),
+            spec: sample_spec("explore A"),
+            child_root_input: child_root_input("explore A"),
+            spawn_index: 0,
+            child_caller_metadata: None,
+        },
+        SubagentBatchEntry {
+            child_thread_id: shared_thread.clone(),
+            spec: sample_spec("explore B"),
+            child_root_input: child_root_input("explore B"),
+            spawn_index: 1,
+            child_caller_metadata: None,
+        },
+    ];
+
+    let err = spawn_subagent_batch_invocations(
+        &parent.id,
+        &worker,
+        &lease,
+        entries,
+        payload,
+        &SubagentInvocationDeps {
+            task_store: &task_store,
+            thread_store: &thread_store,
+            event_repo: &event_repo,
+        },
+        t_plus(2),
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow!("a duplicate child_thread_id must reject the batch"))?;
+    assert!(
+        error_text(&err).contains("duplicate child_thread_id"),
+        "unexpected error: {err:#}"
+    );
+
+    assert!(
+        thread_store.get(&shared_thread).await?.is_none(),
+        "a rejected batch must not leave a child-thread projection behind",
+    );
+    assert!(task_store.list_children(&parent.id).await?.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn spawn_mixed_rejects_duplicate_child_thread_without_orphaning_projections() -> Result<()> {
+    // Same contract on the mixed path: the duplicate is caller-detectable,
+    // so it is rejected before a projection exists.
+    let task_store = InMemoryAgentTaskStore::new();
+    let thread_store = InMemoryThreadStore::new();
+    let event_repo = InMemoryEventRepository::new();
+    let (parent, worker, lease) = running_parent_root(&task_store).await?;
+    let tasks = ["explore A", "explore B"];
+    let payload = mixed_suspension_payload(&parent.thread_id, &tasks, &["todo_write"]);
+
+    let shared_thread = agent_sdk_foundation::ThreadId::new();
+    let subagents = vec![
+        SubagentBatchEntry {
+            child_thread_id: shared_thread.clone(),
+            spec: sample_spec("explore A"),
+            child_root_input: child_root_input("explore A"),
+            spawn_index: 0,
+            child_caller_metadata: None,
+        },
+        SubagentBatchEntry {
+            child_thread_id: shared_thread.clone(),
+            spec: sample_spec("explore B"),
+            child_root_input: child_root_input("explore B"),
+            spawn_index: 1,
+            child_caller_metadata: None,
+        },
+    ];
+
+    let err = spawn_mixed_children_invocations(
+        &parent.id,
+        &worker,
+        &lease,
+        MixedChildrenRequest {
+            subagents,
+            tool_children: mixed_tool_children(tasks.len(), 3)?,
+            payload,
+            child_otel_traceparent: None,
+        },
+        &SubagentInvocationDeps {
+            task_store: &task_store,
+            thread_store: &thread_store,
+            event_repo: &event_repo,
+        },
+        t_plus(2),
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow!("a duplicate child_thread_id must reject the batch"))?;
+    assert!(
+        error_text(&err).contains("duplicate child_thread_id"),
+        "unexpected error: {err:#}"
+    );
+
+    assert!(
+        thread_store.get(&shared_thread).await?.is_none(),
+        "a rejected batch must not leave a child-thread projection behind",
+    );
+    assert!(task_store.list_children(&parent.id).await?.is_empty());
+
+    Ok(())
+}

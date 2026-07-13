@@ -1487,10 +1487,11 @@ pub struct SubagentBatchEntry {
 ///
 /// Returns an error if the input is empty, if any entry references an
 /// out-of-bounds `spawn_index`, if any of the targeted tool calls is
-/// not Confirm-tier, if child-thread materialization fails for any
-/// entry, if the store-side `spawn_subagent_batch` rejects the call
-/// (CAS, leaf-parent, duplicate child thread, duplicate invocation
-/// id), or if the durable linkage returned by the store is inconsistent.
+/// not Confirm-tier, if two entries collide on one `child_thread_id`,
+/// if child-thread materialization fails for any entry, if the
+/// store-side `spawn_subagent_batch` rejects the call (CAS, leaf-parent,
+/// duplicate child thread, duplicate invocation id), or if the durable
+/// linkage returned by the store is inconsistent.
 /// Validate every entry in a fan-out batch against the shared
 /// continuation envelope before materializing any child threads.
 ///
@@ -1498,8 +1499,13 @@ pub struct SubagentBatchEntry {
 /// downstream phases (event emission) can reuse it without re-indexing
 /// into the continuation each time.
 ///
-/// One bad `spawn_index` rejects the whole batch up front so we don't
-/// orphan child thread rows after partial materialization.
+/// Every rejection reachable from the entries alone — an out-of-bounds
+/// `spawn_index`, a non-Confirm-tier target, two entries colliding on
+/// one `child_thread_id` — is raised here, before
+/// [`materialize_batch_child_threads`] writes anything. The store
+/// rejects the same inputs, but only after those projections exist and
+/// outside the transaction that would roll them back, so a batch that
+/// was never going to spawn would leave empty threads behind.
 fn validate_batch_spawns(
     payload: &SuspensionPayload,
     entries: &[SubagentBatchEntry],
@@ -1507,12 +1513,19 @@ fn validate_batch_spawns(
     let pending_tool_count = payload.continuation.payload.pending_tool_calls.len();
     let mut pending_tools_by_entry: Vec<agent_sdk_foundation::PendingToolCallInfo> =
         Vec::with_capacity(entries.len());
+    let mut seen_thread_ids: std::collections::HashSet<&ThreadId> =
+        std::collections::HashSet::with_capacity(entries.len());
     for entry in entries {
         let spawn_index_usize =
             usize::try_from(entry.spawn_index).context("subagent spawn_index exceeds usize")?;
         ensure!(
             spawn_index_usize < pending_tool_count,
             "subagent spawn_index {spawn_index_usize} out of bounds for {pending_tool_count} pending tool calls",
+        );
+        ensure!(
+            seen_thread_ids.insert(&entry.child_thread_id),
+            "spawn rejected: duplicate child_thread_id {} in batch",
+            entry.child_thread_id,
         );
         let pending_tool =
             payload.continuation.payload.pending_tool_calls[spawn_index_usize].clone();
@@ -1821,6 +1834,7 @@ pub struct MixedChildrenRequest {
 /// `spawn_subagent_batch_invocations`), if the two halves' spawn indices
 /// do not cover the shared continuation's `pending_tool_calls` exactly
 /// once each, if any targeted subagent tool call is not Confirm-tier, if
+/// two subagent entries collide on one `child_thread_id`, if
 /// child-thread materialization fails, if the store rejects the batch
 /// (CAS, leaf-parent, duplicate child thread, duplicate id), or if the
 /// durable linkage returned by the store is inconsistent.
