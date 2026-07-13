@@ -606,7 +606,7 @@ async fn test_rate_limit_handling() -> anyhow::Result<()> {
 
     // Should have rate limit error after exhausting retries
     assert!(events.iter().any(|e| {
-        matches!(&e.event, AgentEvent::Error { message, recoverable: true } if message.contains("Rate limited"))
+        matches!(&e.event, AgentEvent::Error { message, recoverable: true, .. } if message.contains("Rate limited"))
     }));
 
     Ok(())
@@ -686,7 +686,7 @@ async fn test_server_error_handling() -> anyhow::Result<()> {
 
     // Should have server error after exhausting retries
     assert!(events.iter().any(|e| {
-        matches!(&e.event, AgentEvent::Error { message, recoverable: true } if message.contains("Server error"))
+        matches!(&e.event, AgentEvent::Error { message, recoverable: true, .. } if message.contains("Server error"))
     }));
 
     Ok(())

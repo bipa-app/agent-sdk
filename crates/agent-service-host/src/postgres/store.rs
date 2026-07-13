@@ -3899,9 +3899,14 @@ ORDER BY created_at, id
             let Some((thread_id, continuation_usage)) = marker_candidates.remove(&row.id) else {
                 continue;
             };
-            let committed =
-                Self::insert_cancelled_marker_tx(&mut tx, &thread_id, continuation_usage, now)
-                    .await?;
+            let committed = Self::insert_cancelled_marker_tx(
+                &mut tx,
+                &thread_id,
+                &row.id,
+                continuation_usage,
+                now,
+            )
+            .await?;
             markers.push(committed);
         }
 
@@ -4920,6 +4925,7 @@ VALUES ($1, 'task_wakeup', $2, NULL, NULL, 'pending', $3, $4, $4, 0, $5)
     async fn insert_cancelled_marker_tx(
         tx: &mut Transaction<'_, Postgres>,
         thread_id: &ThreadId,
+        task_id: &AgentTaskId,
         continuation_usage: Option<TokenUsage>,
         now: OffsetDateTime,
     ) -> Result<CommittedEvent> {
@@ -4937,7 +4943,7 @@ VALUES ($1, 'task_wakeup', $2, NULL, NULL, 'pending', $3, $4, $4, 0, $5)
         let mut committed = Self::insert_events_tx(
             tx,
             thread_id,
-            vec![AgentEvent::cancelled(turn, usage)],
+            vec![AgentEvent::cancelled(turn, usage).with_emitter_task_id(task_id.as_str())],
             start_seq,
             now,
         )
@@ -6623,10 +6629,7 @@ mod tests {
                 ..Default::default()
             },
             agent_state_snapshot: serde_json::json!({"turn": 1}),
-            events: vec![AgentEvent::Start {
-                thread_id: thread_id.clone(),
-                turn: 1,
-            }],
+            events: vec![AgentEvent::start(thread_id.clone(), 1)],
             outbox_max_attempts: 3,
             owner_guard: None,
             now,
@@ -6712,10 +6715,7 @@ mod tests {
                     ..Default::default()
                 },
                 agent_state_snapshot: serde_json::json!({"turn": 1}),
-                events: vec![AgentEvent::Start {
-                    thread_id: running.thread_id.clone(),
-                    turn: 1,
-                }],
+                events: vec![AgentEvent::start(running.thread_id.clone(), 1)],
                 outbox_max_attempts: 3,
                 owner_guard: None,
                 now: t_plus(2),

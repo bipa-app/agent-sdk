@@ -659,10 +659,7 @@ where
         turn,
         hooks,
         authority,
-        AgentEvent::TurnComplete {
-            turn,
-            usage: cont.turn_usage.clone(),
-        },
+        AgentEvent::turn_complete(turn, cont.turn_usage.clone()),
     )
     .await?;
 
@@ -1769,10 +1766,7 @@ where
         current_turn,
         hooks,
         authority,
-        AgentEvent::TurnComplete {
-            turn: ctx.turn,
-            usage: ctx.total_usage.clone(),
-        },
+        AgentEvent::turn_complete(ctx.turn, ctx.total_usage.clone()),
     )
     .await
     {

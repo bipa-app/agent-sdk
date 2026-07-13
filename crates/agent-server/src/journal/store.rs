@@ -699,6 +699,10 @@ pub struct CancellationMarkerSink {
 /// [`AgentTask::cancel`] clears its typed state.
 struct CancelMarkerCandidate {
     thread_id: ThreadId,
+    /// The cancelled root itself — the marker is attributed to the task
+    /// whose work the cancel ended, not to the successor promoted in the
+    /// same transaction.
+    task_id: AgentTaskId,
     /// Cumulative usage from the parked turn's durable continuation,
     /// when the root carried one. Preferred over the thread aggregate
     /// because it includes the suspended turn's already-billed calls.
@@ -1992,7 +1996,8 @@ impl InMemoryAgentTaskStore {
                 .event_repo
                 .commit_event(
                     &candidate.thread_id,
-                    AgentEvent::cancelled(turn, usage),
+                    AgentEvent::cancelled(turn, usage)
+                        .with_emitter_task_id(candidate.task_id.as_str()),
                     now,
                 )
                 .await
@@ -4209,6 +4214,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                 {
                     marker_candidates.push(CancelMarkerCandidate {
                         thread_id: row.thread_id.clone(),
+                        task_id: row.id.clone(),
                         continuation_usage: row
                             .state
                             .continuation()

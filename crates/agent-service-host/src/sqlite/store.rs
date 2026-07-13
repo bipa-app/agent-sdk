@@ -1669,6 +1669,7 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
     async fn insert_cancelled_marker_tx(
         tx: &mut Transaction<'_, Sqlite>,
         thread_id: &ThreadId,
+        task_id: &AgentTaskId,
         continuation_usage: Option<TokenUsage>,
         now: OffsetDateTime,
     ) -> Result<CommittedEvent> {
@@ -1683,7 +1684,7 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
         let mut committed = Self::insert_events_tx(
             tx,
             thread_id,
-            vec![AgentEvent::cancelled(turn, usage)],
+            vec![AgentEvent::cancelled(turn, usage).with_emitter_task_id(task_id.as_str())],
             start_seq,
             now,
         )
@@ -3351,9 +3352,14 @@ impl AgentTaskStore for SqliteDurableStore {
                     .state
                     .continuation()
                     .map(|continuation| continuation.payload.total_usage.clone());
-                let committed =
-                    Self::insert_cancelled_marker_tx(&mut tx, &thread_id, continuation_usage, now)
-                        .await?;
+                let committed = Self::insert_cancelled_marker_tx(
+                    &mut tx,
+                    &thread_id,
+                    &row.id,
+                    continuation_usage,
+                    now,
+                )
+                .await?;
                 markers.push(committed);
             }
             let cancelled = row

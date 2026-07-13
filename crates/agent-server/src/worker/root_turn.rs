@@ -406,7 +406,7 @@ async fn fail_root_turn_inner(
     // Best-effort: the task is durably Failed; event commit failure
     // must not override that outcome. Consistent with
     // best_effort_close_open_attempts.
-    let error_event = AgentEvent::error(error_msg, false);
+    let error_event = AgentEvent::error(error_msg, false).with_emitter_task_id(task_id.as_str());
     let _ = deps
         .event_repo
         .commit_event(thread_id, error_event, now)
@@ -661,7 +661,8 @@ pub async fn revert_steering_wake(
     // Surface the failure as a non-fatal error event (best-effort — the
     // durable re-park already succeeded; an event-commit failure must
     // not override that outcome).
-    let error_event = AgentEvent::error(format!("{error:#}"), false);
+    let error_event =
+        AgentEvent::error(format!("{error:#}"), false).with_emitter_task_id(parent.id.as_str());
     let _ = deps
         .event_repo
         .commit_event(&parent.thread_id, error_event, now)
@@ -1279,7 +1280,8 @@ async fn execute_root_turn_inner(
         .event_repo
         .commit_event(
             thread_id,
-            AgentEvent::start(thread_id.clone(), turn_number),
+            AgentEvent::start(thread_id.clone(), turn_number)
+                .with_emitter_task_id(inputs.bootstrap.task_id.as_str()),
             now,
         )
         .await
@@ -1487,15 +1489,16 @@ async fn commit_text_only_turn(
     // the journal.  This vec only carries the consolidated content
     // events plus the `TurnComplete` / `Done` lifecycle edges.
     let duration = (now - attempt.opened_at).unsigned_abs();
-    let lifecycle_events = build_turn_complete_events(
-        &response,
+    let lifecycle_events = build_turn_complete_events(TurnCompleteEventsParams {
+        response: &response,
         thread_id,
+        task_id: &inputs.bootstrap.task_id,
         turn_number,
-        &turn_usage,
-        &drained_state.total_usage,
+        turn_usage: &turn_usage,
+        total_usage: &drained_state.total_usage,
         duration,
-        &close_ctx.content_ids,
-    );
+        content_ids: &close_ctx.content_ids,
+    });
 
     let commit = commit_completed_turn_shifting_slot(
         CompletedTurnCommit {
@@ -3602,15 +3605,35 @@ fn build_content_events(response: &llm::ChatResponse, content_ids: &ContentIds) 
 ///
 /// Content events (`Thinking`, `Text`) are emitted first so replay
 /// observers see the model's output before the lifecycle edges.
-fn build_turn_complete_events(
-    response: &llm::ChatResponse,
-    thread_id: &agent_sdk_foundation::ThreadId,
+///
+/// `TurnComplete` and `Done` are attributed to `task_id` — the task
+/// whose execution produced this turn. A turn salvaged by a cancelled
+/// root therefore still names that root, never the successor that
+/// replaced it, which is what lets a follower tell a superseded
+/// terminal frame apart from the thread's live one.
+#[derive(Clone, Copy)]
+struct TurnCompleteEventsParams<'a> {
+    response: &'a llm::ChatResponse,
+    thread_id: &'a agent_sdk_foundation::ThreadId,
+    task_id: &'a AgentTaskId,
     turn_number: usize,
-    turn_usage: &TokenUsage,
-    total_usage: &TokenUsage,
+    turn_usage: &'a TokenUsage,
+    total_usage: &'a TokenUsage,
     duration: std::time::Duration,
-    content_ids: &ContentIds,
-) -> Vec<AgentEvent> {
+    content_ids: &'a ContentIds,
+}
+
+fn build_turn_complete_events(params: TurnCompleteEventsParams<'_>) -> Vec<AgentEvent> {
+    let TurnCompleteEventsParams {
+        response,
+        thread_id,
+        task_id,
+        turn_number,
+        turn_usage,
+        total_usage,
+        duration,
+        content_ids,
+    } = params;
     let mut events = build_content_events(response, content_ids);
     if response.stop_reason == Some(llm::StopReason::Refusal) {
         // The refusal text is the first text block, so reuse the id
@@ -3623,16 +3646,19 @@ fn build_turn_complete_events(
             response.first_text().map(str::to_owned),
         ));
     }
-    events.push(AgentEvent::TurnComplete {
-        turn: turn_number,
-        usage: turn_usage.clone(),
-    });
-    events.push(AgentEvent::done(
-        thread_id.clone(),
-        turn_number,
-        total_usage.clone(),
-        duration,
-    ));
+    events.push(
+        AgentEvent::turn_complete(turn_number, turn_usage.clone())
+            .with_emitter_task_id(task_id.as_str()),
+    );
+    events.push(
+        AgentEvent::done(
+            thread_id.clone(),
+            turn_number,
+            total_usage.clone(),
+            duration,
+        )
+        .with_emitter_task_id(task_id.as_str()),
+    );
     events
 }
 
@@ -4713,15 +4739,16 @@ async fn commit_resumed_turn(
 
     let turn_number = usize::try_from(inputs.recovery_view.next_turn_number).unwrap_or(0);
     let duration = (now - attempt.opened_at).unsigned_abs();
-    let lifecycle_events = build_turn_complete_events(
+    let lifecycle_events = build_turn_complete_events(TurnCompleteEventsParams {
         response,
         thread_id,
+        task_id,
         turn_number,
-        &turn_usage,
-        &total_usage,
+        turn_usage: &turn_usage,
+        total_usage: &total_usage,
         duration,
         content_ids,
-    );
+    });
 
     let commit = commit_completed_turn_shifting_slot(
         CompletedTurnCommit {

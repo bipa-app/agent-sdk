@@ -137,9 +137,12 @@ mod state_machine {
 
 #[test]
 fn agent_event_start_serializes_to_stable_shape() {
+    // An unstamped `Start` (the SDK-local shape) keeps the historical
+    // wire form byte-for-byte: `emitter_task_id` is omitted when `None`.
     let event = AgentEvent::Start {
         thread_id: ThreadId::from_string("thread-fixture-001"),
         turn: 1,
+        emitter_task_id: None,
     };
 
     insta::assert_json_snapshot!(event);

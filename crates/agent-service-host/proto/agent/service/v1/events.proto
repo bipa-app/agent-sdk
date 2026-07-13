@@ -49,6 +49,13 @@ enum StreamCloseReason {
 message StartEvent {
   string thread_id = 1;
   uint64 turn = 2;
+  // Durable id of the task whose execution committed this event.
+  // Unset on events journaled before the field existed and on
+  // embedded (non-server) runs. Attribution is always the emitter's
+  // own identity: a cancelled root's late salvage commit still names
+  // that root, so a reader can tell a superseded frame apart from the
+  // thread's live one.
+  optional string emitter_task_id = 3;
 }
 
 // The user prompt that opens a turn. Committed by the worker on
@@ -129,6 +136,13 @@ message ToolRequiresConfirmationEvent {
 message TurnCompleteEvent {
   uint64 turn = 1;
   TokenUsage usage = 2;
+  // Durable id of the task whose execution committed this event.
+  // Unset on events journaled before the field existed and on
+  // embedded (non-server) runs. Attribution is always the emitter's
+  // own identity: a cancelled root's late salvage commit still names
+  // that root, so a reader can tell a superseded frame apart from the
+  // thread's live one.
+  optional string emitter_task_id = 3;
 }
 
 // Why the run reached its terminal `done` frame. Older servers never set
@@ -154,11 +168,25 @@ message DoneEvent {
   // Estimated run cost in USD, when the provider/model has pricing
   // metadata.
   optional double estimated_cost_usd = 6;
+  // Durable id of the task whose execution committed this event.
+  // Unset on events journaled before the field existed and on
+  // embedded (non-server) runs. Attribution is always the emitter's
+  // own identity: a cancelled root's late salvage commit still names
+  // that root, so a reader can tell a superseded frame apart from the
+  // thread's live one.
+  optional string emitter_task_id = 7;
 }
 
 message ErrorEvent {
   string message = 1;
   bool recoverable = 2;
+  // Durable id of the task whose execution committed this event.
+  // Unset on events journaled before the field existed and on
+  // embedded (non-server) runs. Attribution is always the emitter's
+  // own identity: a cancelled root's late salvage commit still names
+  // that root, so a reader can tell a superseded frame apart from the
+  // thread's live one.
+  optional string emitter_task_id = 3;
 }
 
 // A root task (queued, parked, or running) was cancelled via the
@@ -198,6 +226,13 @@ message ErrorEvent {
 message CancelledEvent {
   uint64 turn = 1;
   TokenUsage usage = 2;
+  // Durable id of the task whose execution committed this event.
+  // Unset on events journaled before the field existed and on
+  // embedded (non-server) runs. Attribution is always the emitter's
+  // own identity: a cancelled root's late salvage commit still names
+  // that root, so a reader can tell a superseded frame apart from the
+  // thread's live one.
+  optional string emitter_task_id = 3;
 }
 
 message RefusalEvent {
