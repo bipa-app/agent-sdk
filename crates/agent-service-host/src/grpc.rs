@@ -1140,6 +1140,23 @@ impl AgentControlService for GrpcControlService {
             .map(map_submitted_input_item)
             .collect::<Result<Vec<_>, _>>()?;
 
+        // Opaque per-turn caller metadata (empty string = none). Parsed into a
+        // `serde_json::Value` here so a malformed payload is rejected up front
+        // with INVALID_ARGUMENT rather than corrupting the durable task record.
+        let caller_metadata = if request.caller_metadata.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_str::<serde_json::Value>(&request.caller_metadata).map_err(
+                    |error| {
+                        Status::invalid_argument(format!(
+                            "caller_metadata is not valid JSON: {error}"
+                        ))
+                    },
+                )?,
+            )
+        };
+
         let now = OffsetDateTime::now_utc();
         // Resolve the agent definition from a throwaway template. The
         // registry resolves on task identity (kind + thread), so the
@@ -1158,9 +1175,10 @@ impl AgentControlService for GrpcControlService {
             .map_err(internal_status(
                 "resolving root-turn definition for submission",
             ))?;
-        let mut task = AgentTask::new_root_turn_with_input(
+        let mut task = AgentTask::new_root_turn_with_optional_caller(
             thread_id.clone(),
             submitted_input,
+            caller_metadata,
             now,
             definition.policy.max_attempts,
         );
@@ -3338,6 +3356,7 @@ mod tests {
                 request_id: request_id.into(),
                 thread_id: thread_id.into(),
                 input: vec![text_input(text)],
+                caller_metadata: String::new(),
             })
             .await
             .context("submit_thread_work rpc")?
@@ -4821,6 +4840,7 @@ mod tests {
                     request_id: "idem-submit".into(),
                     thread_id: thread.clone(),
                     input: vec![text_input("hello")],
+                    caller_metadata: String::new(),
                 })
                 .await
                 .context("first submit")?
@@ -4834,6 +4854,7 @@ mod tests {
                     request_id: "idem-submit".into(),
                     thread_id: thread.clone(),
                     input: vec![text_input("hello")],
+                    caller_metadata: String::new(),
                 })
                 .await
                 .context("retry submit")?
@@ -4851,6 +4872,7 @@ mod tests {
                     request_id: "idem-submit".into(),
                     thread_id: thread.clone(),
                     input: vec![text_input("different")],
+                    caller_metadata: String::new(),
                 })
                 .await
                 .expect_err("payload change under same key must conflict");
@@ -4895,6 +4917,7 @@ mod tests {
                     request_id: "big-submit".into(),
                     thread_id: thread.clone(),
                     input: vec![text_input(&huge)],
+                    caller_metadata: String::new(),
                 })
                 .await
                 .expect_err("oversized input must reject");
@@ -4905,6 +4928,90 @@ mod tests {
 
         daemon.stop().await?;
         result
+    }
+
+    /// Caller metadata supplied on `SubmitThreadWork` is captured durably on
+    /// the admitted root turn, so it is readable when the definition resolves
+    /// per-turn tools (`AgentDefinition::resolve_tools`) at turn start. An
+    /// empty payload leaves the task's `caller_metadata` `None` (identical to
+    /// pre-field behavior), and a malformed JSON payload is rejected up front
+    /// with `INVALID_ARGUMENT` before any durable work.
+    #[tokio::test]
+    async fn submit_thread_work_captures_caller_metadata_on_task() -> Result<()> {
+        let shared = event_test_shared()?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+
+        let thread = service
+            .create_thread(Request::new(pb::CreateThreadRequest {
+                request_id: "meta-create".into(),
+            }))
+            .await?
+            .into_inner()
+            .thread
+            .and_then(|view| view.thread)
+            .context("create_thread missing snapshot")?
+            .thread_id;
+
+        // Present + valid → parsed and captured on the task verbatim.
+        let armed = service
+            .submit_thread_work(Request::new(pb::SubmitThreadWorkRequest {
+                request_id: "meta-armed".into(),
+                thread_id: thread.clone(),
+                input: vec![text_input("armed turn")],
+                caller_metadata: r#"{"plan_mode":true}"#.into(),
+            }))
+            .await?
+            .into_inner()
+            .task
+            .context("submit missing task")?;
+        let armed_task = shared
+            .stores
+            .task_store
+            .get(&AgentTaskId::from_string(armed.task_id.clone()))
+            .await?
+            .context("armed task not persisted")?;
+        assert_eq!(
+            armed_task.caller_metadata,
+            Some(serde_json::json!({ "plan_mode": true })),
+            "caller_metadata must round-trip onto the durable task"
+        );
+
+        // Absent (empty string) → task carries `None`, exactly as before the
+        // field existed; the definition's static tool list is used.
+        let plain = service
+            .submit_thread_work(Request::new(pb::SubmitThreadWorkRequest {
+                request_id: "meta-plain".into(),
+                thread_id: thread.clone(),
+                input: vec![text_input("plain turn")],
+                caller_metadata: String::new(),
+            }))
+            .await?
+            .into_inner()
+            .task
+            .context("submit missing task")?;
+        let plain_task = shared
+            .stores
+            .task_store
+            .get(&AgentTaskId::from_string(plain.task_id.clone()))
+            .await?
+            .context("plain task not persisted")?;
+        assert_eq!(plain_task.caller_metadata, None);
+
+        // Malformed JSON → rejected before admission (no durable task).
+        let err = service
+            .submit_thread_work(Request::new(pb::SubmitThreadWorkRequest {
+                request_id: "meta-bad".into(),
+                thread_id: thread.clone(),
+                input: vec![text_input("bad turn")],
+                caller_metadata: "{not json".into(),
+            }))
+            .await
+            .expect_err("malformed caller_metadata must reject");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+
+        Ok(())
     }
 
     /// Create a thread and admit one root turn through the in-process
@@ -4932,6 +5039,7 @@ mod tests {
                 request_id: format!("{label}-submit"),
                 thread_id: thread.clone(),
                 input: vec![text_input("do work")],
+                caller_metadata: String::new(),
             }))
             .await?
             .into_inner()
@@ -5311,6 +5419,7 @@ mod tests {
                 request_id: "cancel-queued-follow-second".into(),
                 thread_id: thread.clone(),
                 input: vec![text_input("queued work")],
+                caller_metadata: String::new(),
             }))
             .await?
             .into_inner()
