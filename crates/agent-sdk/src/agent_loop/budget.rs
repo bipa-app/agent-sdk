@@ -5,12 +5,18 @@
 //! [`check_budget`]) and stops the run before starting another turn once a
 //! configured [`UsageLimits`] threshold is crossed.
 //!
-//! Cost is estimated from the run's provider/model pricing, resolved through
-//! the optional [`CostEstimator`] the loop was built with (a dynamic catalog
-//! such as [`ModelRegistry`](agent_sdk_providers::ModelRegistry), whose feed
-//! pricing is fresher than anything compiled in) and then the static
-//! [`model_capabilities`](crate::model_capabilities) table. A model priced by
-//! neither reports `None` and never trips the cost limit.
+//! Cost is estimated from the run's provider/model pricing. Two sources can
+//! answer: the optional [`CostEstimator`] the loop was built with (a dynamic
+//! catalog such as [`ModelRegistry`](agent_sdk_providers::ModelRegistry),
+//! whose feed pricing is fresher than anything compiled in) and the static
+//! [`model_capabilities`](crate::model_capabilities) table.
+//!
+//! A provenance can be filed under several keys — provider aliases, and for a
+//! routed model the router's own key or the vendor's — and the sources do not
+//! agree on which. So the lookup is source-major: the estimator is asked about
+//! every key before the static table is asked about any (see
+//! [`estimate_cost_usd`]). A model priced by neither source reports `None` and
+//! never trips the cost limit.
 
 use crate::pricing::CostEstimator;
 use crate::types::{BudgetLimitKind, TokenUsage, UsageLimits};
@@ -19,8 +25,18 @@ use agent_sdk_foundation::llm::Usage;
 
 /// Estimate the USD cost of `usage` for the run's provider/model.
 ///
-/// Returns `None` when no pricing source knows the provider/model pair, so
-/// callers treat an un-priced model as "cost unknown" rather than free.
+/// The lookup is **source-major**, not key-major: the configured
+/// [`CostEstimator`] is offered *every* key the call could be filed under
+/// before the static [`model_capabilities`](crate::model_capabilities) table
+/// is offered any of them. A key-major walk would let the first key that
+/// happens to hit the compiled-in table short-circuit the search, which is
+/// exactly the case for the OpenRouter-slug models the static table already
+/// carries: their provenance pair resolves statically, and the fresher feed
+/// price filed under a derived key would never be reached — a run would keep
+/// budgeting at a stale rate long after the real one moved.
+///
+/// Returns `None` when no source prices the call, so callers treat an
+/// un-priced model as "cost unknown" rather than free.
 #[must_use]
 pub(super) fn estimate_cost_usd(
     pricing: Option<&dyn CostEstimator>,
@@ -33,34 +49,61 @@ pub(super) fn estimate_cost_usd(
         cached_input_tokens: usage.cached_input_tokens,
         cache_creation_input_tokens: usage.cache_creation_input_tokens,
     };
-    price_candidates(&provenance.provider, &provenance.model)
-        .find_map(|(provider, model)| price_call(pricing, provider, model, &usage))
+    let provider = provenance.provider.as_str();
+    let model = provenance.model.as_str();
+
+    if let Some(estimator) = pricing
+        && let Some(cost) = catalog_candidates(provider, model)
+            .find_map(|(provider, model)| estimator.estimate_cost_usd(provider, model, &usage))
+    {
+        return Some(cost);
+    }
+
+    static_candidates(provider, model).find_map(|(provider, model)| {
+        crate::model_capabilities::get_model_capabilities(provider, model)?
+            .estimate_cost_usd(&usage)
+    })
 }
 
-/// Price one call for a single provider/model key: the configured estimator
-/// first, the static capability table as the fallback.
+/// The keys a dynamic catalog may file this provenance under: everything the
+/// static table is keyed by, plus the keys the third-party feeds derive from a
+/// vendor-slug model id.
 ///
-/// An estimator that holds no pricing for the pair must not make the call
-/// look free, so a `None` from it falls through to the compiled-in table
-/// rather than short-circuiting the lookup.
-fn price_call(
-    pricing: Option<&dyn CostEstimator>,
-    provider: &str,
-    model: &str,
-    usage: &Usage,
-) -> Option<f64> {
-    pricing
-        .and_then(|estimator| estimator.estimate_cost_usd(provider, model, usage))
-        .or_else(|| {
-            crate::model_capabilities::get_model_capabilities(provider, model)?
-                .estimate_cost_usd(usage)
-        })
+/// The derived keys are offered to the catalog **only**. Probing them against
+/// the static table would change what an un-configured loop reports: an
+/// OpenRouter-routed `anthropic/claude-fable-5` would start pricing at
+/// Anthropic's direct-API rate, which is not what that run pays. Without a
+/// catalog the loop must price exactly as it always has.
+fn catalog_candidates<'a>(
+    provider: &'a str,
+    model: &'a str,
+) -> impl Iterator<Item = (&'a str, &'a str)> {
+    static_candidates(provider, model).chain(feed_slug_candidates(model))
 }
 
-/// The provider/model keys to price a provenance under, most specific first:
-/// the pair the provider reported, then the canonical backend(s) that
-/// provider name is known to serve, then — for a vendor-slug model id — the
-/// vendor split out of the id.
+/// The keys the feeds derive from a vendor-slug model id (`z-ai/glm-5.1`),
+/// route first.
+///
+/// The two feeds file a routed model differently. models.dev keeps the outer
+/// service key, so an `OpenRouter` route is stored whole:
+/// `("openrouter", "moonshotai/kimi-k2.6")`. The `OpenRouter` feed splits the
+/// slug (`split_openrouter_id`), so the same model lands under its vendor:
+/// `("moonshotai", "kimi-k2.6")` — which is *also* where a native (non-routed)
+/// row for that vendor lives, at the vendor's own price rather than the
+/// route's.
+///
+/// The route key therefore comes first: a run that pays a router's rate must
+/// be budgeted at that rate, and the vendor key is the approximation to fall
+/// back on. The vendor split mirrors `split_openrouter_id`, `google` remap
+/// included, so the halves match the keys that parser emits.
+fn feed_slug_candidates(model: &str) -> impl Iterator<Item = (&str, &str)> {
+    let route_key = model.contains('/').then_some(("openrouter", model));
+    route_key.into_iter().chain(vendor_slug_key(model))
+}
+
+/// The provider/model keys the static capability table may file this
+/// provenance under, most specific first: the pair the provider reported, then
+/// the canonical backend(s) that provider name is known to serve.
 ///
 /// Pricing sources key entries under the canonical provider names
 /// (`anthropic` / `openai` / `gemini`), but several [`crate::llm::LlmProvider`]
@@ -88,7 +131,7 @@ fn price_call(
 /// deterministically; pricing it identically is deliberate, so replayed
 /// runs exercise the same budget behavior the recording did — the
 /// provenance string does not distinguish the modes.
-fn price_candidates<'a>(
+fn static_candidates<'a>(
     provider: &'a str,
     model: &'a str,
 ) -> impl Iterator<Item = (&'a str, &'a str)> {
@@ -99,21 +142,17 @@ fn price_candidates<'a>(
         "cloudflare-ai-gateway" | "record-replay" => &["anthropic", "openai", "gemini"],
         _ => &[],
     };
-    std::iter::once((provider, model))
-        .chain(backends.iter().map(move |backend| (*backend, model)))
-        .chain(vendor_slug_key(model))
+    std::iter::once((provider, model)).chain(backends.iter().map(move |backend| (*backend, model)))
 }
 
-/// Split a vendor-slug model id (`z-ai/glm-5.1`) into the provider/model key
-/// the dynamic catalogs store it under (`z-ai` / `glm-5.1`).
+/// Split a vendor-slug model id (`z-ai/glm-5.1`) into the vendor key the
+/// `OpenRouter` feed stores it under (`z-ai` / `glm-5.1`).
 ///
 /// Open models (z.ai, Moonshot, `DeepSeek`, `MiniMax`, …) are served through
 /// `OpenAIProvider`, so their provenance is `openai` plus the full slug the
-/// caller passed. The feeds key the same model by its vendor: `OpenRouter`
-/// splits the slug (mirrored here, `google` included, so the halves match
-/// `split_openrouter_id`), and models.dev nests the model under the vendor's
-/// provider object. Without this key a feed-only slug model would price to
-/// `None` and never trip a cost budget.
+/// caller passed, and no feed files them under that pair. Mirrors
+/// `split_openrouter_id`, `google` remap included, so the halves match the
+/// keys that parser emits.
 fn vendor_slug_key(model: &str) -> Option<(&str, &str)> {
     let (vendor, model_id) = model.split_once('/')?;
     let provider = if vendor == "google" { "gemini" } else { vendor };
@@ -661,7 +700,7 @@ mod tests {
 #[cfg(all(test, feature = "model-discovery"))]
 mod catalog_tests {
     use super::*;
-    use agent_sdk_providers::model_catalog::parse_openrouter;
+    use agent_sdk_providers::model_catalog::{parse_modelsdev, parse_openrouter};
     use agent_sdk_providers::{CatalogEntry, ModelCatalogSource, ModelRegistry};
     use anyhow::{Context, Result};
     use async_trait::async_trait;
@@ -691,6 +730,43 @@ mod catalog_tests {
       ]
     }"#;
 
+    /// `z-ai/glm-5.1` is in the bundled static table at $0.98/M input and
+    /// $3.08/M output. This feed body reprices it 10× — the shape of a router
+    /// raising its rate after the SDK was compiled.
+    const OPENROUTER_REPRICED_FIXTURE: &str = r#"{
+      "data": [
+        {
+          "id": "z-ai/glm-5.1",
+          "context_length": 202752,
+          "pricing": { "prompt": "0.0000098", "completion": "0.0000308" }
+        }
+      ]
+    }"#;
+
+    /// models.dev keeps the outer service key, so an `OpenRouter` route is
+    /// stored whole under `openrouter`, while the same model's native vendor
+    /// row lives under `moonshotai` at a different (cheaper) price.
+    const MODELSDEV_ROUTE_FIXTURE: &str = r#"{
+      "openrouter": {
+        "id": "openrouter",
+        "models": {
+          "moonshotai/kimi-k2.6": {
+            "id": "moonshotai/kimi-k2.6",
+            "cost": { "input": 0.95, "output": 4.0 }
+          }
+        }
+      },
+      "moonshotai": {
+        "id": "moonshotai",
+        "models": {
+          "kimi-k2.6": {
+            "id": "kimi-k2.6",
+            "cost": { "input": 0.66, "output": 3.41 }
+          }
+        }
+      }
+    }"#;
+
     struct FixtureFeed(Vec<CatalogEntry>);
 
     #[async_trait]
@@ -698,6 +774,12 @@ mod catalog_tests {
         async fn fetch(&self) -> Result<Vec<CatalogEntry>> {
             Ok(self.0.clone())
         }
+    }
+
+    async fn registry_from_entries(entries: Vec<CatalogEntry>) -> Result<ModelRegistry> {
+        let registry = ModelRegistry::new();
+        registry.refresh(&FixtureFeed(entries)).await?;
+        Ok(registry)
     }
 
     async fn registry_from(fixture: &str) -> Result<ModelRegistry> {
@@ -756,5 +838,90 @@ mod catalog_tests {
         assert!((cost - statically_priced).abs() < 1e-12);
         assert!((cost - 0.0075).abs() < 1e-9, "unexpected cost: {cost}");
         Ok(())
+    }
+
+    /// The source-major property: for a slug model the static table already
+    /// carries, a repriced feed row still wins. A key-major walk would resolve
+    /// the provenance pair statically and never reach the feed's key.
+    #[tokio::test]
+    async fn feed_price_beats_a_stale_static_price_for_a_known_slug_model() -> Result<()> {
+        let registry = registry_from(OPENROUTER_REPRICED_FIXTURE).await?;
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+        let provenance = AuditProvenance::new("openai", "z-ai/glm-5.1");
+
+        // Compiled-in rate: $0.98/M in + $3.08/M out over 1M each = $4.06.
+        let stale = estimate_cost_usd(None, &provenance, &usage)
+            .context("the static table prices this slug model")?;
+        assert!(
+            (stale - 4.06).abs() < 1e-9,
+            "unexpected static cost: {stale}"
+        );
+
+        // Feed rate, 10× higher: $9.80/M in + $30.80/M out = $40.60.
+        let fresh = estimate_cost_usd(Some(&registry), &provenance, &usage)
+            .context("the feed prices this slug model")?;
+        assert!(
+            (fresh - 40.60).abs() < 1e-9,
+            "unexpected feed cost: {fresh}"
+        );
+
+        // A $5 cap is within the stale rate but well past the real one: the
+        // run must stop.
+        let limits = UsageLimits {
+            max_cost_usd: Some(5.0),
+            ..Default::default()
+        };
+        assert!(status(Some(&limits), None, &provenance, &usage, None).is_none());
+        let (limit, _) = status(Some(&limits), Some(&registry), &provenance, &usage, None)
+            .context("the fresh feed price must trip the cost limit")?;
+        assert_eq!(limit, BudgetLimitKind::CostUsd);
+        Ok(())
+    }
+
+    /// A routed model is budgeted at the route's price, not at the vendor's
+    /// native price for the same model.
+    #[tokio::test]
+    async fn openrouter_routed_model_prices_at_the_route_key() -> Result<()> {
+        let registry = registry_from_entries(parse_modelsdev(MODELSDEV_ROUTE_FIXTURE)?).await?;
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+        let provenance = AuditProvenance::new("openai", "moonshotai/kimi-k2.6");
+
+        // Route row: $0.95/M in + $4.00/M out = $4.95. The vendor's native row
+        // ($0.66 + $3.41 = $4.07) is the wrong answer here — the run pays the
+        // router.
+        let cost = estimate_cost_usd(Some(&registry), &provenance, &usage)
+            .context("the models.dev route key must price this call")?;
+        assert!((cost - 4.95).abs() < 1e-9, "unexpected cost: {cost}");
+        Ok(())
+    }
+
+    /// Without a catalog the derived keys must not be probed at all: an
+    /// OpenRouter-routed model the static table does not carry stays un-priced
+    /// instead of silently billing at the vendor's direct-API rate.
+    #[test]
+    fn no_catalog_leaves_a_routed_model_unpriced() {
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+        let routed = AuditProvenance::new("openai", "anthropic/claude-fable-5");
+        assert!(
+            estimate_cost_usd(None, &routed, &usage).is_none(),
+            "the static table must not answer for a vendor-split key",
+        );
+
+        // The direct-API pair for the same model is priced, which is what the
+        // derived key would have (wrongly) picked up.
+        let direct = AuditProvenance::new("anthropic", "claude-fable-5");
+        assert!(estimate_cost_usd(None, &direct, &usage).is_some());
     }
 }

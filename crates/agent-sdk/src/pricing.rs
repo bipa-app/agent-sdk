@@ -9,31 +9,35 @@
 //!
 //! A [`CostEstimator`] plugs a richer pricing source in front of that table.
 //! Wire one in with
-//! [`AgentLoopBuilder::cost_estimator`](crate::AgentLoopBuilder::cost_estimator);
-//! the loop consults it first for every priced call and falls back to the
-//! static table whenever the estimator has no price for the provider/model
-//! pair.
+//! [`AgentLoopBuilder::cost_estimator`](crate::AgentLoopBuilder::cost_estimator).
+//! The loop asks the estimator about every key the call could be filed under
+//! before it asks the static table about any of them, so a fresher feed price
+//! wins over a compiled-in rate even for a model both sources know.
 //!
 //! The `model-discovery` feature implements the trait for
-//! [`ModelRegistry`](agent_sdk_providers::ModelRegistry), the layered
-//! (override → third-party feed → static table) catalog, so a run can price —
-//! and budget — models whose pricing only ever appeared in the feed.
+//! [`ModelRegistry`](agent_sdk_providers::ModelRegistry), the layered catalog,
+//! so a run can price — and budget — models whose pricing only ever appeared
+//! in a feed.
 
 use crate::llm::Usage;
 
 /// A source of provider/model pricing for run-level cost budgeting.
 ///
 /// Implementations answer for a single provider/model pair at a time and
-/// report `None` when they hold no pricing for it, which lets the loop fall
-/// back to the static capability table rather than treating the call as free.
+/// report `None` when they hold no pricing of their own for it. The loop then
+/// keeps looking: at the other keys the pair may be filed under, and finally
+/// at the static capability table. So `None` must mean "I do not price this",
+/// never "this is free" — and an implementation should not answer on the
+/// static table's behalf, or the loop cannot tell the two sources apart.
 pub trait CostEstimator: Send + Sync {
     /// Estimate the USD cost of `usage` for `provider`/`model`.
     ///
-    /// `provider` is the canonical provider name (`anthropic`, `openai`,
-    /// `gemini`, …): the loop normalizes transport-specific provenance names
-    /// (`openai-responses`, `vertex`, `cloudflare-ai-gateway`, …) to the
-    /// backends they serve before calling this, so an implementation only
-    /// needs to key on canonical names.
+    /// The loop calls this once per key it believes the model could be filed
+    /// under: the provenance pair as reported, the canonical backend(s) a
+    /// transport-specific provider name serves (`openai-responses`, `vertex`,
+    /// `cloudflare-ai-gateway`, …), and — for a vendor-slug model id — the
+    /// route and vendor keys the third-party feeds use. An implementation only
+    /// needs to answer for the keys it actually holds.
     ///
     /// Returning `None` means "no pricing for this pair" — not "free".
     fn estimate_cost_usd(&self, provider: &str, model: &str, usage: &Usage) -> Option<f64>;
@@ -42,9 +46,12 @@ pub trait CostEstimator: Send + Sync {
 #[cfg(feature = "model-discovery")]
 impl CostEstimator for agent_sdk_providers::ModelRegistry {
     fn estimate_cost_usd(&self, provider: &str, model: &str, usage: &Usage) -> Option<f64> {
-        // Resolves override → feed → static table; the inherent method, not
-        // this trait method, so the layered lookup runs rather than recursing.
-        Self::estimate_cost_usd(self, provider, model, usage)
+        // The dynamic layers only (override → feed). The registry's layered
+        // `estimate_cost_usd` would also answer from the static table, and a
+        // static hit on the first key tried would then pre-empt the feed's
+        // price for a key derived later — the caller applies the static table
+        // itself, after this source has been offered every key.
+        Self::estimate_dynamic_cost_usd(self, provider, model, usage)
     }
 }
 

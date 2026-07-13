@@ -297,11 +297,15 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
     /// Set the pricing source for the run's cost budget
     /// ([`UsageLimits::max_cost_usd`](crate::types::UsageLimits::max_cost_usd)).
     ///
-    /// The loop asks the estimator to price every LLM call before consulting
-    /// the static [`model_capabilities`](crate::model_capabilities) table, so
-    /// a model priced only by a dynamic catalog still accrues cost and can
-    /// trip the limit; the static table remains the fallback whenever the
-    /// estimator has no price for the provider/model pair. Without an
+    /// The loop offers the estimator every key an LLM call could be filed
+    /// under — the provenance pair, the canonical backend of a
+    /// transport-specific provider name, and the route/vendor keys of a
+    /// vendor-slug model id — before it consults the static
+    /// [`model_capabilities`](crate::model_capabilities) table under any of
+    /// them. So a model priced only by a dynamic catalog accrues cost and can
+    /// trip the limit, and a catalog's fresher price wins over a compiled-in
+    /// rate even for a model both sources know. The static table remains the
+    /// fallback whenever the estimator prices none of the keys. Without an
     /// estimator (the default) pricing comes from the static table alone.
     ///
     /// The `model-discovery` feature implements

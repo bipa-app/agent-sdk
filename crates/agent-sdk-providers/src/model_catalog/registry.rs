@@ -107,16 +107,8 @@ impl ModelRegistry {
     /// Resolve a provider/model through the layers: override → feed → static.
     #[must_use]
     pub fn resolve(&self, provider: &str, model: &str) -> ResolvedModel {
-        let key = model_key(provider, model);
-
-        if let Some(entry) = self.overrides.get(&key) {
-            return resolved_from_entry(entry, ResolvedSource::Override);
-        }
-
-        if let Ok(cache) = self.feed_cache.read()
-            && let Some(entry) = cache.get(&key)
-        {
-            return resolved_from_entry(entry, ResolvedSource::Feed);
+        if let Some(resolved) = self.resolve_dynamic(provider, model) {
+            return resolved;
         }
 
         if let Some(caps) = get_model_capabilities(provider, model) {
@@ -138,7 +130,33 @@ impl ModelRegistry {
         }
     }
 
-    /// Estimate request cost in USD using the resolved pricing, if any.
+    /// Resolve through the *dynamic* layers only — user override → feed cache
+    /// — reporting `None` when neither carries the pair.
+    ///
+    /// Unlike [`resolve`](Self::resolve) this never falls back to the static
+    /// table, which lets a caller that owns its own static lookup keep the two
+    /// sources apart. That distinction matters when the key a model is filed
+    /// under differs per source: a caller can then ask this catalog about
+    /// *every* key the feeds might use before letting the static table answer
+    /// under the (narrower) set of keys it is built from, instead of having
+    /// the first key that happens to hit the static layer short-circuit the
+    /// search.
+    #[must_use]
+    pub fn resolve_dynamic(&self, provider: &str, model: &str) -> Option<ResolvedModel> {
+        let key = model_key(provider, model);
+
+        if let Some(entry) = self.overrides.get(&key) {
+            return Some(resolved_from_entry(entry, ResolvedSource::Override));
+        }
+
+        let cache = self.feed_cache.read().ok()?;
+        cache
+            .get(&key)
+            .map(|entry| resolved_from_entry(entry, ResolvedSource::Feed))
+    }
+
+    /// Estimate request cost in USD using the layered pricing (override → feed
+    /// → static), if any.
     ///
     /// Reports `None` — "this catalog cannot price the call" — rather than a
     /// partial figure when the resolved pricing is missing a rate for a usage
@@ -147,12 +165,30 @@ impl ModelRegistry {
     /// pricing source instead of billing those tokens at zero.
     #[must_use]
     pub fn estimate_cost_usd(&self, provider: &str, model: &str, usage: &Usage) -> Option<f64> {
-        let pricing = self.resolve(provider, model).pricing?;
-        if !prices_every_billed_component(&pricing, usage) {
-            return None;
-        }
-        pricing.estimate_cost_usd(usage)
+        estimate_from_pricing(self.resolve(provider, model).pricing?, usage)
     }
+
+    /// Estimate request cost in USD from the *dynamic* layers only (override →
+    /// feed), never the static table. See [`resolve_dynamic`](Self::resolve_dynamic).
+    ///
+    /// Declines partial pricing exactly as [`estimate_cost_usd`](Self::estimate_cost_usd) does.
+    #[must_use]
+    pub fn estimate_dynamic_cost_usd(
+        &self,
+        provider: &str,
+        model: &str,
+        usage: &Usage,
+    ) -> Option<f64> {
+        estimate_from_pricing(self.resolve_dynamic(provider, model)?.pricing?, usage)
+    }
+}
+
+/// Price `usage` from `pricing`, declining when a billed component has no rate.
+fn estimate_from_pricing(pricing: Pricing, usage: &Usage) -> Option<f64> {
+    if !prices_every_billed_component(&pricing, usage) {
+        return None;
+    }
+    pricing.estimate_cost_usd(usage)
 }
 
 /// Whether `pricing` carries a rate for every usage component with a nonzero
@@ -308,6 +344,45 @@ mod tests {
         // (1000/1e6*1.75) + (1000/1e6*0.175) + (1000/1e6*14)
         // = 0.00175 + 0.000175 + 0.014 = 0.015925
         assert!((cost - 0.015_925).abs() < 1e-9);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dynamic_lookups_never_answer_from_the_static_table() -> Result<()> {
+        let source = StaticSource(parse_modelsdev(MODELSDEV_FIXTURE)?);
+        let registry = ModelRegistry::new();
+        registry.refresh(&source).await?;
+
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+
+        // `gpt-4o` is in the static table and in neither dynamic layer.
+        assert!(registry.resolve("openai", "gpt-4o").pricing.is_some());
+        assert!(registry.resolve_dynamic("openai", "gpt-4o").is_none());
+        assert!(
+            registry
+                .estimate_dynamic_cost_usd("openai", "gpt-4o", &usage)
+                .is_none(),
+            "the dynamic estimate must not fall back to the static table",
+        );
+
+        // A model the feed carries is priced by both lookups.
+        assert_eq!(
+            registry
+                .resolve_dynamic("openai", "gpt-5.2")
+                .context("the feed carries gpt-5.2")?
+                .source,
+            ResolvedSource::Feed
+        );
+        assert!(
+            registry
+                .estimate_dynamic_cost_usd("openai", "gpt-5.2", &usage)
+                .is_some()
+        );
         Ok(())
     }
 
