@@ -1604,19 +1604,6 @@ async fn ensure_turn_not_already_committed(
     Ok(())
 }
 
-/// Bounded budget for cross-task turn-slot shifts in
-/// [`commit_completed_turn_shifting_slot`]. Each shift absorbs exactly
-/// one colliding commit from a *different* task (a cancelled
-/// predecessor's seam-B salvage); more than a couple in one turn means
-/// something other than the known cancel race is advancing the thread
-/// and the honest outcome is the CAS error.
-/// Occupancy-lookup retries across the in-memory committer's
-/// aggregate-then-checkpoint gap (the durable backends commit both in
-/// one transaction and resolve on the first read).
-const OCCUPANT_LOOKUP_RETRIES: usize = 5;
-/// Delay between occupancy-lookup retries.
-const OCCUPANT_LOOKUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
-
 const MAX_TURN_SLOT_SHIFTS: u32 = 3;
 
 /// Does this error carry the completed-turn slot CAS rejection?
@@ -1936,29 +1923,26 @@ async fn shifted_turn_slot(
     //    task. Our own task id there means this call is a duplicate of
     //    a commit that already landed — rejecting is the idempotency
     //    guarantee the CAS exists for.
-    // The in-memory committer advances the thread aggregate before the
-    // checkpoint row exists (separate store locks), so a collision
-    // observed in that gap reads `None` here. Retry briefly: if the
-    // aggregate really advanced, the occupying checkpoint appears within
-    // a few polls; a persistent `None` falls through to the conservative
-    // no-shift arm. The durable backends write both in one transaction
-    // and never take a retry.
-    let mut occupant = None;
-    for attempt in 0..OCCUPANT_LOOKUP_RETRIES {
+    //
+    // The read synchronizes on the sequential-commit lock when the
+    // backend exposes one (codex round-14): the in-memory committer
+    // holds that lock from the stale-turn pre-check through the
+    // checkpoint write, so acquiring it here guarantees any commit
+    // whose aggregate advance we lost to has finished writing its
+    // checkpoint — a `None` under the lock is authoritative, not a
+    // visibility gap. Durable backends return no lock; their atomic
+    // transaction gives the same read consistency.
+    let occupant = {
+        let _commit_guard = match deps.thread_store.sequential_commit_lock() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         match deps
             .checkpoint_store
             .get_by_turn(&params.thread_id, params.expected_turn)
             .await
         {
-            Ok(Some(checkpoint)) => {
-                occupant = Some(checkpoint);
-                break;
-            }
-            Ok(None) => {
-                if attempt + 1 < OCCUPANT_LOOKUP_RETRIES {
-                    tokio::time::sleep(OCCUPANT_LOOKUP_RETRY_DELAY).await;
-                }
-            }
+            Ok(occupant) => occupant,
             Err(error) => {
                 log::warn!(
                     "turn-slot shift: checkpoint lookup for turn {} on thread {} failed: {error:#}",
@@ -1968,7 +1952,7 @@ async fn shifted_turn_slot(
                 return None;
             }
         }
-    }
+    };
     match occupant {
         // Only a foreign CANCEL-SALVAGE checkpoint is shift-eligible.
         // The discriminator is the checkpoint's durable `kind`, never

@@ -1753,27 +1753,6 @@ async fn fail_or_revert_root_task(
     if is_turn_slot_collision_error(err) {
         match requeue_collided_root_task(stores, task, err, now).await {
             Ok(true) => {
-                // Boundary for the abandoned streamed attempt (codex
-                // round-13): the collided execution already persisted
-                // `Start` and streaming deltas, and the requeued re-run
-                // will emit a fresh `Start` + answer. Without a
-                // terminator between them, replay and live followers
-                // could attribute the discarded answer's deltas to the
-                // retry. A RECOVERABLE `Error` event marks the
-                // abandoned attempt closed without marking the task
-                // failed. Best-effort, like the terminal path's Error
-                // commit: the requeue is already durable and must not
-                // be overridden by an event-commit failure.
-                let boundary = agent_sdk_foundation::events::AgentEvent::error(
-                    format!(
-                        "turn-slot collision: retrying from the fresh committed head ({err:#})"
-                    ),
-                    true,
-                );
-                let _ = stores
-                    .event_repo
-                    .commit_event(&task.thread_id, boundary, now)
-                    .await;
                 let new_events =
                     newly_committed_events(stores, &task.thread_id, error_watermark).await?;
                 publish_events(stores, &new_events);
@@ -1902,6 +1881,36 @@ async fn requeue_collided_root_task(
             expected_turn = stale.expected_turn,
             occupant_task = ?occupant.map(|checkpoint| checkpoint.task_id),
             "turn-slot collision: occupant is not a foreign commit;              keeping the terminal path instead of requeueing",
+        );
+        return Ok(false);
+    }
+    // Boundary for the abandoned streamed attempt (codex rounds
+    // 13-14): the collided execution already persisted `Start` and
+    // streaming deltas, and the re-run will emit a fresh `Start` +
+    // answer. The RECOVERABLE `Error` event that terminates the
+    // abandoned attempt must be durable BEFORE the row becomes
+    // runnable — once `requeue_owned_task` lands, another worker can
+    // acquire immediately and append the retry's `Start`, and a
+    // boundary committed after that point (or dropped on a transient
+    // failure) recreates the very ambiguity it exists to prevent. If
+    // the boundary cannot be committed, fall through to the terminal
+    // path, which emits its own (non-recoverable) `Error`. We still
+    // own the Running row here, so nothing can race the ordering.
+    let boundary = agent_sdk_foundation::events::AgentEvent::error(
+        format!("turn-slot collision: retrying from the fresh committed head ({err:#})"),
+        true,
+    );
+    if let Err(commit_error) = stores
+        .event_repo
+        .commit_event(&task.thread_id, boundary, now)
+        .await
+    {
+        warn!(
+            task_id = %task.id,
+            thread_id = %task.thread_id,
+            error = %format!("{commit_error:#}"),
+            "turn-slot collision: retry-boundary event commit failed; \
+             keeping the terminal path instead of requeueing",
         );
         return Ok(false);
     }
