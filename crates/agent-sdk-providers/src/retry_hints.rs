@@ -59,10 +59,20 @@ pub fn google_retry_delay(body: &str) -> Option<Duration> {
 ///
 /// The delay is read from the JSON body's `error.message` when the body parses
 /// as an API error, and from the raw text otherwise (some gateways return the
-/// prose alone). Recognized units are `h`, `m`, `s`, and `ms`, optionally
-/// combined (`1m30s`) and optionally fractional (`1.5s`).
+/// prose alone). Two phrasings are accepted:
+///
+/// * unit fused to the value — `20s`, `250ms`, `1.5s`, `6m0s` (`OpenAI`);
+/// * unit as a separate word — `35 seconds`, `250 ms` (Azure `OpenAI`, which
+///   [`OpenAIProvider::with_base_url`](crate::OpenAIProvider::with_base_url)
+///   supports).
+///
+/// A value with no recognizable unit is rejected either way, so a bare number
+/// in the prose never becomes a delay.
 #[cfg(any(feature = "openai", feature = "openai-codex"))]
 pub fn openai_retry_delay(body: &str) -> Option<Duration> {
+    // Matched against a lowercased copy so a sentence-initial "Try again in"
+    // is found; ASCII lowering is length-preserving, so the offset still maps
+    // back onto the original string.
     const MARKER: &str = "try again in ";
 
     let message = serde_json::from_str::<serde_json::Value>(body)
@@ -77,13 +87,39 @@ pub fn openai_retry_delay(body: &str) -> Option<Duration> {
     let haystack = message.as_deref().unwrap_or(body);
 
     let start = haystack.to_ascii_lowercase().find(MARKER)? + MARKER.len();
-    let token: String = haystack[start..]
-        .chars()
-        .take_while(|c| !c.is_whitespace())
-        .collect();
     // The phrase usually ends a sentence ("… in 20s."); a fractional value keeps
     // its dot because trimming only ever removes trailing characters.
-    parse_unit_duration(token.trim_end_matches(['.', ',', ';', ')', '"', '\'']))
+    let mut words = haystack[start..].split_whitespace();
+    let value = trim_trailing_punctuation(words.next()?);
+
+    if let Some(delay) = parse_unit_duration(value) {
+        return Some(delay);
+    }
+
+    // The unit was not fused to the value, so accept it only as the very next
+    // word — a bare number followed by anything else stays unparsed.
+    let unit = trim_trailing_punctuation(words.next()?).to_ascii_lowercase();
+    let delay = duration_from_secs(parse_non_negative(value)? * unit_word_scale(&unit)?)?;
+    (delay > Duration::ZERO).then_some(delay)
+}
+
+/// Strip sentence punctuation that trails a value or unit word.
+#[cfg(any(feature = "openai", feature = "openai-codex"))]
+fn trim_trailing_punctuation(token: &str) -> &str {
+    token.trim_end_matches(['.', ',', ';', ':', ')', '"', '\''])
+}
+
+/// Seconds per unit for a spelled-out unit word, or `None` when the word is not
+/// a duration unit this parser recognizes.
+#[cfg(any(feature = "openai", feature = "openai-codex"))]
+fn unit_word_scale(unit: &str) -> Option<f64> {
+    match unit {
+        "ms" | "msec" | "msecs" | "millisecond" | "milliseconds" => Some(0.001),
+        "s" | "sec" | "secs" | "second" | "seconds" => Some(1.0),
+        "m" | "min" | "mins" | "minute" | "minutes" => Some(60.0),
+        "h" | "hr" | "hrs" | "hour" | "hours" => Some(3600.0),
+        _ => None,
+    }
 }
 
 /// Parse a proto-JSON duration: decimal seconds with a mandatory `s` suffix.
@@ -231,6 +267,48 @@ mod tests {
         assert_eq!(
             openai_retry_delay("Rate limited. Please try again in 2m30s"),
             Some(Duration::from_secs(150))
+        );
+    }
+
+    #[test]
+    #[cfg(any(feature = "openai", feature = "openai-codex"))]
+    fn openai_message_accepts_a_separated_unit_word() {
+        // Azure OpenAI spells the unit out as its own word, and starts the
+        // sentence with "Try" — the marker match is case-insensitive.
+        let azure = r#"{"error":{"code":"429","message":"Requests to the ChatCompletions_Create Operation under Azure OpenAI API version 2024-02-01 have exceeded token rate limit. Try again in 35 seconds."}}"#;
+        assert_eq!(openai_retry_delay(azure), Some(Duration::from_secs(35)));
+
+        assert_eq!(
+            openai_retry_delay(r#"{"error":{"message":"try again in 250 ms"}}"#),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            openai_retry_delay(r#"{"error":{"message":"Try again in 1 second."}}"#),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            openai_retry_delay(r#"{"error":{"message":"Try again in 2 minutes."}}"#),
+            Some(Duration::from_mins(2))
+        );
+    }
+
+    #[test]
+    #[cfg(any(feature = "openai", feature = "openai-codex"))]
+    fn openai_message_with_a_unitless_value_is_none() {
+        // A bare number with no unit — fused or separated — is still rejected.
+        assert_eq!(
+            openai_retry_delay(r#"{"error":{"message":"try again in 35"}}"#),
+            None
+        );
+        // The next word is not a unit, so the number stays unparsed.
+        assert_eq!(
+            openai_retry_delay(r#"{"error":{"message":"Try again in 35 requests from now."}}"#),
+            None
+        );
+        // A separated zero carries no information, like its fused counterpart.
+        assert_eq!(
+            openai_retry_delay(r#"{"error":{"message":"Try again in 0 seconds."}}"#),
+            None
         );
     }
 

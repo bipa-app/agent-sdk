@@ -772,17 +772,18 @@ impl LlmProvider for OpenAICodexResponsesProvider {
 
                                 match message {
                                     WebSocketMessage::Text(text) => {
-                                        if let Some((status, message)) =
+                                        if let Some(error) =
                                             parse_wrapped_websocket_error_event(&text)
                                         {
                                             log::warn!(
-                                                "OpenAI Codex websocket warmup wrapped error on attempt {} status={} message={message}",
+                                                "OpenAI Codex websocket warmup wrapped error on attempt {} status={} message={}",
                                                 attempt + 1,
-                                                status,
+                                                error.status,
+                                                error.message,
                                             );
-                                            if status == StatusCode::UNAUTHORIZED
-                                                || status == StatusCode::UPGRADE_REQUIRED
-                                                || status.is_client_error()
+                                            if error.status == StatusCode::UNAUTHORIZED
+                                                || error.status == StatusCode::UPGRADE_REQUIRED
+                                                || error.status.is_client_error()
                                             {
                                                 websocket_session.websocket_disabled = true;
                                             }
@@ -868,17 +869,18 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                 return;
                                             }
                                         };
-                                            if let Some((status, message)) =
+                                            if let Some(error) =
                                                 parse_wrapped_websocket_error_event(&text)
                                             {
                                                 log::warn!(
-                                                    "OpenAI Codex websocket warmup wrapped error on attempt {} status={} message={message}",
+                                                    "OpenAI Codex websocket warmup wrapped error on attempt {} status={} message={}",
                                                     attempt + 1,
-                                                    status,
+                                                    error.status,
+                                                    error.message,
                                                 );
-                                                if status == StatusCode::UNAUTHORIZED
-                                                    || status == StatusCode::UPGRADE_REQUIRED
-                                                    || status.is_client_error()
+                                                if error.status == StatusCode::UNAUTHORIZED
+                                                    || error.status == StatusCode::UPGRADE_REQUIRED
+                                                    || error.status.is_client_error()
                                                 {
                                                     websocket_session.websocket_disabled = true;
                                                 }
@@ -1088,21 +1090,26 @@ impl LlmProvider for OpenAICodexResponsesProvider {
 
                             match message {
                                 WebSocketMessage::Text(text) => {
-                                    if let Some((status, message)) =
-                                        parse_wrapped_websocket_error_event(&text)
+                                    if let Some(error) = parse_wrapped_websocket_error_event(&text)
                                     {
-                                        let kind = websocket_error_kind(status, &message);
-                                        if emitted_output {
+                                        let kind =
+                                            websocket_error_kind(error.status, &error.message);
+                                        // A quota rejection carries the delay the service wants
+                                        // observed, so it is surfaced (with its hint) for the
+                                        // caller's retry loop rather than re-sent immediately.
+                                        // The connection-limit signal shares the status but is a
+                                        // transport condition, so it still falls back at once.
+                                        if emitted_output || is_websocket_quota_rejection(&error) {
                                             reset_websocket_connection(&mut websocket_session);
                                             yield Ok(StreamDelta::Error {
-                                                message,
+                                                message: error.message,
                                                 kind,
                                             });
                                             return;
                                         }
-                                        if status == StatusCode::UNAUTHORIZED
-                                            || status == StatusCode::UPGRADE_REQUIRED
-                                            || status.is_client_error()
+                                        if error.status == StatusCode::UNAUTHORIZED
+                                            || error.status == StatusCode::UPGRADE_REQUIRED
+                                            || error.status.is_client_error()
                                         {
                                             websocket_session.websocket_disabled = true;
                                         }
@@ -1299,21 +1306,27 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                             return;
                                         }
                                     };
-                                        if let Some((status, message)) =
+                                        if let Some(error) =
                                             parse_wrapped_websocket_error_event(&text)
                                         {
-                                            let kind = websocket_error_kind(status, &message);
-                                            if emitted_output {
+                                            let kind =
+                                                websocket_error_kind(error.status, &error.message);
+                                            // Same split as the text frame: a quota rejection is
+                                            // surfaced with its delay; the connection-limit signal
+                                            // keeps falling back to HTTP immediately.
+                                            if emitted_output
+                                                || is_websocket_quota_rejection(&error)
+                                            {
                                                 reset_websocket_connection(&mut websocket_session);
                                                 yield Ok(StreamDelta::Error {
-                                                    message,
+                                                    message: error.message,
                                                     kind,
                                                 });
                                                 return;
                                             }
-                                            if status == StatusCode::UNAUTHORIZED
-                                                || status == StatusCode::UPGRADE_REQUIRED
-                                                || status.is_client_error()
+                                            if error.status == StatusCode::UNAUTHORIZED
+                                                || error.status == StatusCode::UPGRADE_REQUIRED
+                                                || error.status.is_client_error()
                                             {
                                                 websocket_session.websocket_disabled = true;
                                             }
@@ -2602,7 +2615,19 @@ fn evict_idle_sessions(sessions: &mut HashMap<String, Arc<Mutex<WebsocketSession
     }
 }
 
-fn parse_wrapped_websocket_error_event(payload: &str) -> Option<(StatusCode, String)> {
+/// A decoded wrapped websocket error frame.
+struct WrappedWebsocketError {
+    status: StatusCode,
+    message: String,
+    /// The frame is the websocket connection-limit signal, which the service
+    /// reports with a 429 even though no model quota was exhausted: it means
+    /// *this transport* is full, not that the request must wait. Tracked
+    /// separately so the immediate HTTP fallback that resolves it is not
+    /// confused with a quota rejection, which must be waited out.
+    connection_limit: bool,
+}
+
+fn parse_wrapped_websocket_error_event(payload: &str) -> Option<WrappedWebsocketError> {
     let event: ApiWrappedWebsocketErrorEvent = serde_json::from_str(payload).ok()?;
     if event.kind != "error" {
         return None;
@@ -2615,7 +2640,11 @@ fn parse_wrapped_websocket_error_event(payload: &str) -> Option<(StatusCode, Str
             .error
             .and_then(|error| error.message)
             .unwrap_or_else(|| "Responses websocket connection limit reached".to_string());
-        return Some((StatusCode::TOO_MANY_REQUESTS, message));
+        return Some(WrappedWebsocketError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message,
+            connection_limit: true,
+        });
     }
 
     let status = StatusCode::from_u16(event.status?).ok()?;
@@ -2626,8 +2655,22 @@ fn parse_wrapped_websocket_error_event(payload: &str) -> Option<(StatusCode, Str
     if status.is_success() {
         None
     } else {
-        Some((status, message))
+        Some(WrappedWebsocketError {
+            status,
+            message,
+            connection_limit: false,
+        })
     }
+}
+
+/// `true` when the frame is a model-quota rejection rather than the
+/// websocket connection-limit signal the service reports with the same status.
+///
+/// A quota rejection states how long to wait, so re-sending the request now —
+/// over a fresh socket or the HTTP fallback — would spend the attempt inside
+/// the window the service just asked us to sit out.
+fn is_websocket_quota_rejection(error: &WrappedWebsocketError) -> bool {
+    error.status == StatusCode::TOO_MANY_REQUESTS && !error.connection_limit
 }
 
 /// Resolve the message and kind of an in-band `response.failed` event.
@@ -3461,25 +3504,59 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_wrapped_websocket_error_event_maps_http_status() {
+    fn test_parse_wrapped_websocket_error_event_maps_http_status() -> anyhow::Result<()> {
         let payload = r#"{"type":"error","status":401,"error":{"message":"unauthorized"}}"#;
-        let parsed = parse_wrapped_websocket_error_event(payload);
-        assert_eq!(
-            parsed,
-            Some((StatusCode::UNAUTHORIZED, "unauthorized".to_string())),
-        );
+        let parsed =
+            parse_wrapped_websocket_error_event(payload).context("expected a wrapped error")?;
+
+        assert_eq!(parsed.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(parsed.message, "unauthorized");
+        assert!(!parsed.connection_limit);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_wrapped_websocket_error_event_maps_connection_limit() {
+    fn test_parse_wrapped_websocket_error_event_maps_connection_limit() -> anyhow::Result<()> {
         let payload = format!(
             r#"{{"type":"error","status":429,"error":{{"code":"{OPENAI_CODEX_WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE}","message":"limit"}}}}"#,
         );
-        let parsed = parse_wrapped_websocket_error_event(&payload);
-        assert_eq!(
-            parsed,
-            Some((StatusCode::TOO_MANY_REQUESTS, "limit".to_string())),
+        let parsed =
+            parse_wrapped_websocket_error_event(&payload).context("expected a wrapped error")?;
+
+        assert_eq!(parsed.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(parsed.message, "limit");
+        assert!(parsed.connection_limit);
+        // The connection limit is a transport condition, not a model quota: the
+        // stream must keep falling back to HTTP at once rather than waiting.
+        assert!(
+            !is_websocket_quota_rejection(&parsed),
+            "the connection-limit fallback must not be treated as a quota wait"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn pre_output_websocket_quota_rejection_surfaces_with_its_hint() -> anyhow::Result<()> {
+        // A quota 429 normally arrives before any output. It must be surfaced as
+        // a recoverable rate limit carrying the advertised delay — not swallowed
+        // into an immediate retry that re-sends inside the wait window.
+        let payload = r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded","message":"Rate limit reached. Please try again in 30s."}}"#;
+        let parsed =
+            parse_wrapped_websocket_error_event(payload).context("expected a wrapped error")?;
+
+        assert!(!parsed.connection_limit);
+        assert!(
+            is_websocket_quota_rejection(&parsed),
+            "a quota 429 must be surfaced rather than retried immediately"
+        );
+
+        let kind = websocket_error_kind(parsed.status, &parsed.message);
+        assert_eq!(
+            kind,
+            StreamErrorKind::RateLimited(Some(std::time::Duration::from_secs(30)))
+        );
+        assert!(kind.is_recoverable());
+        Ok(())
     }
 
     #[test]
