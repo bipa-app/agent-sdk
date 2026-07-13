@@ -1594,7 +1594,10 @@ impl GrpcEventService {
                 follow_mode,
             );
 
-            let last_replayed_terminal = replay_events.last().and_then(terminal_close_reason);
+            let last_replayed_terminal = match replay_events.last() {
+                Some(event) => confirmed_close_reason(&shared, &thread_id, event).await,
+                None => None,
+            };
             if let Some(reason) = post_replay_close_reason(follow_mode, last_replayed_terminal) {
                 yield closed_stream_response(&thread_id, reason, last_delivered_sequence);
                 return;
@@ -1700,7 +1703,9 @@ fn follow_live_events(
                                     continue;
                                 }
                                 last_delivered_sequence = Some(missed_event.sequence);
-                                let close_reason = terminal_close_reason(missed_event);
+                                let close_reason =
+                                    confirmed_close_reason(&shared, &thread_id, missed_event)
+                                        .await;
                                 yield event_stream_response(missed_event)?;
                                 if let Some(reason) = close_reason {
                                     yield closed_stream_response(
@@ -1713,7 +1718,8 @@ fn follow_live_events(
                             }
                         }
                         last_delivered_sequence = Some(event.sequence);
-                        let close_reason = terminal_close_reason(&event);
+                        let close_reason =
+                            confirmed_close_reason(&shared, &thread_id, &event).await;
                         yield event_stream_response(&event)?;
                         if let Some(reason) = close_reason {
                             yield closed_stream_response(
@@ -3142,6 +3148,48 @@ const fn terminal_close_reason(
         AgentEvent::Cancelled { .. } => Some(pb::StreamCloseReason::TurnCancelled),
         _ => None,
     }
+}
+
+/// [`terminal_close_reason`], confirmed against the task journal
+/// (codex round-16): a `ThreadCompleted` frame only closes the stream
+/// when the thread truly has no blocking root. A cancelled
+/// predecessor's late full-turn commit sequences its `Done` after the
+/// promoted successor's `Start` — closing on that foreign frame would
+/// cut the follower off before the successor's retry boundary and
+/// answer, which the requeue path explicitly promises to deliver.
+/// While a blocking root exists (`Running`, `Pending`, waiting), the
+/// frame belongs to a superseded attempt and the stream keeps
+/// following. `TurnCancelled` closes are NOT gated: `cancel_tree`
+/// promotes the queued successor in the same transaction as its
+/// marker, so an active root is the NORMAL state when the marker is
+/// delivered, and the marker's whole purpose is to release followers
+/// of the cancelled turn. A journal read failure keeps the historical
+/// close (never strand a client on a dead thread).
+async fn confirmed_close_reason(
+    shared: &GrpcShared,
+    thread_id: &ThreadId,
+    event: &agent_server::CommittedEvent,
+) -> Option<pb::StreamCloseReason> {
+    let reason = terminal_close_reason(event)?;
+    if matches!(reason, pb::StreamCloseReason::ThreadCompleted) {
+        match shared
+            .stores
+            .task_store
+            .active_root_for_thread(thread_id)
+            .await
+        {
+            Ok(Some(_)) => return None,
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    thread_id = %thread_id,
+                    error = %format!("{error:#}"),
+                    "terminal-close confirmation read failed; keeping the close",
+                );
+            }
+        }
+    }
+    Some(reason)
 }
 
 #[cfg(test)]
@@ -6331,6 +6379,72 @@ mod tests {
             }
             other => bail!("BudgetExceeded must map to a Done event, got {other:?}"),
         }
+        Ok(())
+    }
+
+    /// Codex round-16: a `Done` frame delivered while the thread still
+    /// has a blocking root (a cancelled predecessor's late full-turn
+    /// commit racing the promoted successor) must NOT close the
+    /// follower — the successor's retry boundary and answer are still
+    /// coming. With no blocking root the close proceeds as always, and
+    /// `Cancelled` markers close unconditionally (an active promoted
+    /// successor is their normal delivery state).
+    #[tokio::test]
+    async fn foreign_done_does_not_close_while_a_root_is_active() -> Result<()> {
+        let shared = event_test_shared()?;
+        let thread = ThreadId::from_string("t-foreign-done");
+        shared
+            .stores
+            .thread_store
+            .get_or_create(&thread, OffsetDateTime::UNIX_EPOCH)
+            .await?;
+
+        let done = agent_server::CommittedEvent {
+            event_id: uuid::Uuid::now_v7(),
+            thread_id: thread.clone(),
+            sequence: 9,
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+            event: AgentEvent::Done {
+                thread_id: thread.clone(),
+                total_turns: 1,
+                total_usage: agent_sdk_foundation::TokenUsage::default(),
+                duration: std::time::Duration::from_secs(1),
+                estimated_cost_usd: None,
+            },
+        };
+
+        // No blocking root: the close proceeds (historical behavior).
+        assert_eq!(
+            confirmed_close_reason(&shared, &thread, &done).await,
+            Some(pb::StreamCloseReason::ThreadCompleted),
+        );
+
+        // A blocking successor root exists: the foreign Done must not
+        // close the stream.
+        let successor = agent_server::journal::task::AgentTask::new_root_turn(
+            thread.clone(),
+            OffsetDateTime::UNIX_EPOCH,
+            3,
+        );
+        shared.stores.task_store.submit_root_turn(successor).await?;
+        assert_eq!(
+            confirmed_close_reason(&shared, &thread, &done).await,
+            None,
+            "a Done frame must not close a follower while a successor root is active",
+        );
+
+        // Cancelled markers are not gated.
+        let cancelled = agent_server::CommittedEvent {
+            event_id: uuid::Uuid::now_v7(),
+            thread_id: thread.clone(),
+            sequence: 10,
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+            event: AgentEvent::cancelled(1, agent_sdk_foundation::TokenUsage::default()),
+        };
+        assert_eq!(
+            confirmed_close_reason(&shared, &thread, &cancelled).await,
+            Some(pb::StreamCloseReason::TurnCancelled),
+        );
         Ok(())
     }
 

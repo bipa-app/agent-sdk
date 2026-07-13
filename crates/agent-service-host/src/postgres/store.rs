@@ -3078,6 +3078,23 @@ FOR UPDATE SKIP LOCKED
         now: OffsetDateTime,
     ) -> Result<RequeueOutcome> {
         let mut tx = self.begin().await?;
+        // Lock order (codex round-16): the global hierarchy is
+        // thread → task (cancel_tree locks thread rows in phase 1
+        // before re-reading tasks). When a boundary event is present
+        // this method needs BOTH locks, so it must not take the task
+        // lock first — read the row unlocked to learn the thread id,
+        // lock the thread, then lock and revalidate the task.
+        let Some(screened) = Self::load_task_tx(&mut tx, id, false).await? else {
+            return Ok(RequeueOutcome::NotOwned);
+        };
+        if boundary.is_some() {
+            Self::bootstrap_thread_row_tx(&mut tx, &screened.thread_id, now).await?;
+            Self::lock_thread_tx(&mut tx, &screened.thread_id)
+                .await?
+                .with_context(|| {
+                    format!("thread {} missing after bootstrap", screened.thread_id)
+                })?;
+        }
         let Some(old) = Self::load_task_tx(&mut tx, id, true).await? else {
             return Ok(RequeueOutcome::NotOwned);
         };
@@ -3093,7 +3110,9 @@ FOR UPDATE SKIP LOCKED
         // Boundary event + advisory in the SAME transaction as the
         // ownership CAS and the release (the cancel_tree marker
         // pattern): it lands iff this caller still owned the row, and
-        // it is durable before the row is acquirable.
+        // it is durable before the row is acquirable. The sequence
+        // allocation re-locks the thread row held above — no new lock
+        // edge.
         if let Some(event) = boundary {
             let start_seq = Self::next_event_sequence_tx(&mut tx, &old.thread_id).await?;
             let committed =
