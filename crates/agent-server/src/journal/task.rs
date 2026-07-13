@@ -591,6 +591,29 @@ pub struct AgentTask {
     #[serde(with = "time::serde::rfc3339::option")]
     pub last_heartbeat_at: Option<OffsetDateTime>,
 
+    /// Last durable **evidence of work** on this task.
+    ///
+    /// This is NOT `last_heartbeat_at`. The heartbeat renews unconditionally
+    /// while the task future is alive, so a child hung on a half-open
+    /// connection heartbeats forever — it proves the process is alive, not
+    /// that work is happening. This field only advances when the task
+    /// actually did something: a provider frame arrived, a tool emitted
+    /// progress, or an event was committed.
+    ///
+    /// It is written on the heartbeat path (which already holds the lease, so
+    /// only the owning worker can advance it) and it is deliberately **not**
+    /// an event: event retention cannot purge it, and it does not bloat the
+    /// journal.
+    ///
+    /// `None` means "nothing recorded yet" — a legacy row, or a child that
+    /// has not yet produced its first sign of life. Readers fall back to
+    /// [`Self::created_at`]: spawn is the initial evidence of life.
+    ///
+    /// Consumed by the subagent stall budget (`spec.timeout_ms`), which fails
+    /// a child only after a whole budget with no evidence of work.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub last_activity_at: Option<OffsetDateTime>,
+
     // ── typed durable state blob ────────────────────────────
     /// Strongly typed pause-state owned by the task kind.
     ///
@@ -702,6 +725,7 @@ impl AgentTask {
             lease_id: None,
             lease_expires_at: None,
             last_heartbeat_at: None,
+            last_activity_at: None,
             state: TaskState::None,
             attempt: 0,
             max_attempts,
@@ -807,6 +831,7 @@ impl AgentTask {
             lease_id: None,
             lease_expires_at: None,
             last_heartbeat_at: None,
+            last_activity_at: None,
             state: TaskState::None,
             attempt: 0,
             max_attempts,
@@ -863,6 +888,7 @@ impl AgentTask {
             lease_id: None,
             lease_expires_at: None,
             last_heartbeat_at: None,
+            last_activity_at: None,
             state: TaskState::SubagentInvocation {
                 invocation: Box::new(invocation),
             },
