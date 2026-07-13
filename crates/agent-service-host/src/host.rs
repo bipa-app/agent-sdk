@@ -1752,7 +1752,33 @@ async fn fail_or_revert_root_task(
     }
     if is_turn_slot_collision_error(err) {
         match requeue_collided_root_task(stores, task, err, now).await {
-            Ok(true) => return Ok(()),
+            Ok(true) => {
+                // Boundary for the abandoned streamed attempt (codex
+                // round-13): the collided execution already persisted
+                // `Start` and streaming deltas, and the requeued re-run
+                // will emit a fresh `Start` + answer. Without a
+                // terminator between them, replay and live followers
+                // could attribute the discarded answer's deltas to the
+                // retry. A RECOVERABLE `Error` event marks the
+                // abandoned attempt closed without marking the task
+                // failed. Best-effort, like the terminal path's Error
+                // commit: the requeue is already durable and must not
+                // be overridden by an event-commit failure.
+                let boundary = agent_sdk_foundation::events::AgentEvent::error(
+                    format!(
+                        "turn-slot collision: retrying from the fresh committed head ({err:#})"
+                    ),
+                    true,
+                );
+                let _ = stores
+                    .event_repo
+                    .commit_event(&task.thread_id, boundary, now)
+                    .await;
+                let new_events =
+                    newly_committed_events(stores, &task.thread_id, error_watermark).await?;
+                publish_events(stores, &new_events);
+                return Ok(());
+            }
             Ok(false) => {
                 // Budget exhausted or no longer owned — fall through to
                 // the ordinary terminal path, which re-checks ownership
@@ -3079,6 +3105,26 @@ mod tests {
             row.last_error,
         );
         assert!(row.worker_id.is_none() && row.lease_id.is_none());
+
+        // Codex round-13: the abandoned streamed attempt gets a
+        // RECOVERABLE Error boundary so replay never attributes its
+        // deltas to the re-run's fresh Start.
+        let events = stores.event_repo.get_events(&acquired.thread_id).await?;
+        let boundary = events
+            .iter()
+            .find_map(|committed| match &committed.event {
+                agent_sdk_foundation::events::AgentEvent::Error {
+                    message,
+                    recoverable,
+                } => Some((message.clone(), *recoverable)),
+                _ => None,
+            })
+            .context("requeue must commit an Error boundary event")?;
+        assert!(
+            boundary.1,
+            "the boundary must be recoverable — the task is retrying, not failed",
+        );
+        assert!(boundary.0.contains("turn-slot collision"));
         Ok(())
     }
 
