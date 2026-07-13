@@ -116,7 +116,7 @@ impl<T> JournalStore for T where
 /// underlying journals (each inner store is `Arc`-backed), so a clone
 /// handed to a spawned task observes the same state — exactly what the
 /// concurrent-append case needs.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct InMemoryJournalStore {
     task: super::store::InMemoryAgentTaskStore,
     thread: super::thread_store::InMemoryThreadStore,
@@ -128,9 +128,40 @@ pub struct InMemoryJournalStore {
 
 impl InMemoryJournalStore {
     /// Construct an empty in-memory journal bundle.
+    ///
+    /// The task store is wired with a
+    /// [`super::store::CancellationMarkerSink`] over the bundle's own
+    /// event, outbox, and thread stores — mirroring the production
+    /// registry, so `cancel_tree` through the bundle emits the same
+    /// `Cancelled` marker + advisory a real deployment persists.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        let thread = super::thread_store::InMemoryThreadStore::new();
+        let event = super::event_repository::InMemoryEventRepository::new();
+        // The sink's Arc owns the outbox; the bundle itself does not
+        // expose an OutboxStore surface, so no field is kept.
+        let outbox = super::outbox::InMemoryOutboxStore::new();
+        let task = super::store::InMemoryAgentTaskStore::new().with_cancellation_markers(
+            super::store::CancellationMarkerSink {
+                event_repo: std::sync::Arc::new(event.clone()),
+                outbox_store: std::sync::Arc::new(outbox),
+                thread_store: std::sync::Arc::new(thread.clone()),
+            },
+        );
+        Self {
+            task,
+            thread,
+            message: super::message_store::InMemoryMessageProjectionStore::new(),
+            attempt: super::turn_attempt_store::InMemoryTurnAttemptStore::new(),
+            checkpoint: super::checkpoint_store::InMemoryCheckpointStore::new(),
+            event,
+        }
+    }
+}
+
+impl Default for InMemoryJournalStore {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -455,6 +486,9 @@ mod in_memory_bundle {
 
     #[async_trait]
     impl ThreadStore for InMemoryJournalStore {
+        fn sequential_commit_lock(&self) -> Option<&tokio::sync::Mutex<()>> {
+            self.thread.sequential_commit_lock()
+        }
         async fn get_or_create(&self, thread_id: &ThreadId, now: OffsetDateTime) -> Result<Thread> {
             self.thread.get_or_create(thread_id, now).await
         }
@@ -1699,6 +1733,55 @@ async fn case_before_plus_limit_pagination<S: JournalStore>(store: &S) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Codex round-12: the bundle must forward the inner thread
+    /// store's sequential-commit lock — a `None` here silently
+    /// disables in-process commit serialization for every bundle
+    /// consumer.
+    #[tokio::test]
+    async fn bundle_forwards_the_sequential_commit_lock() {
+        let store = InMemoryJournalStore::new();
+        assert!(
+            ThreadStore::sequential_commit_lock(&store).is_some(),
+            "the bundle must expose the inner store's sequential-commit lock",
+        );
+    }
+
+    /// Codex round-12: cancelling through the bundle must emit the
+    /// durable `Cancelled` marker — the bundle's task store is wired
+    /// with a `CancellationMarkerSink` over its own event journal,
+    /// mirroring production. A bare task store would return no
+    /// markers and leave followers waiting forever.
+    #[tokio::test]
+    async fn bundle_cancel_tree_emits_cancellation_markers() -> Result<()> {
+        use crate::journal::task::AgentTask;
+
+        let store = InMemoryJournalStore::new();
+        let thread = tid("conf-bundle-cancel-markers");
+        ThreadStore::get_or_create(&store, &thread, t_plus(0)).await?;
+        let root = AgentTask::new_root_turn(thread.clone(), t_plus(1), 3);
+        let root_id = root.id.clone();
+        AgentTaskStore::submit_root_turn(&store, root).await?;
+
+        let outcome = AgentTaskStore::cancel_tree(&store, &root_id, t_plus(2)).await?;
+        ensure!(
+            !outcome.transitioned.is_empty(),
+            "root transitioned to Cancelled"
+        );
+        ensure!(
+            !outcome.markers.is_empty(),
+            "cancel_tree through the bundle must commit a Cancelled marker",
+        );
+        let events = EventRepository::get_events(&store, &thread).await?;
+        ensure!(
+            events.iter().any(|committed| matches!(
+                committed.event,
+                agent_sdk_foundation::events::AgentEvent::Cancelled { .. }
+            )),
+            "the marker must be readable back through the bundle's event journal",
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn in_memory_passes_full_battery() -> Result<()> {
