@@ -5435,6 +5435,79 @@ async fn streaming_retry_bills_the_failed_attempts_usage() -> anyhow::Result<()>
     Ok(())
 }
 
+// --- #9d: failover survives a usage delta, and bills both providers --
+
+#[tokio::test]
+async fn failover_after_usage_bills_both_providers() -> anyhow::Result<()> {
+    // The primary reports the tokens it burned and *then* rate-limits before any
+    // content. That usage delta must not commit the chain to the dead primary
+    // (it is metadata the user never sees), and the run must bill both the
+    // primary's partial spend and the secondary's full response.
+    let usage = |input: u32, output: u32| {
+        StreamDelta::Usage(Usage {
+            input_tokens: input,
+            output_tokens: output,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        })
+    };
+    let primary = std::sync::Arc::new(StreamScriptProvider::new(vec![StreamScriptStep::Frames(
+        vec![
+            usage(100, 50),
+            StreamDelta::Error {
+                message: "Rate limited".to_string(),
+                kind: StreamErrorKind::RateLimited(None),
+            },
+        ],
+    )]));
+    let secondary = std::sync::Arc::new(StreamScriptProvider::new(vec![StreamScriptStep::Frames(
+        vec![
+            StreamDelta::TextDelta {
+                delta: "from the secondary".to_string(),
+                block_index: 0,
+            },
+            usage(10, 5),
+            StreamDelta::Done {
+                stop_reason: Some(crate::llm::StopReason::EndTurn),
+            },
+        ],
+    )]));
+    let provider = agent_sdk_providers::FallbackProvider::new(primary).with_fallback(secondary);
+
+    let config = AgentConfig {
+        streaming: true,
+        // No retries: a failover that did not happen would surface the error
+        // rather than quietly retrying the primary.
+        retry: RetryConfig::no_retry(),
+        ..Default::default()
+    };
+    let agent = builder::<()>()
+        .provider(provider)
+        .config(config)
+        .event_store(new_event_store())
+        .build();
+
+    let outcome = Box::pin(agent.run_turn(
+        ThreadId::new(),
+        AgentInput::Text("hi".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+        TurnOptions::default(),
+    ))
+    .await;
+
+    let TurnOutcome::Done { summary, .. } = outcome else {
+        anyhow::bail!("the secondary must serve the turn, got {outcome:?}");
+    };
+    assert_eq!(
+        summary.total_usage.input_tokens + summary.total_usage.output_tokens,
+        165,
+        "both the abandoned primary (150) and the secondary (15) must be billed, got {:?}",
+        summary.total_usage,
+    );
+    Ok(())
+}
+
 // --- #9c: a cancelled stream still bills what it streamed ------------
 
 #[tokio::test(start_paused = true)]

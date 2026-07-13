@@ -14,13 +14,58 @@
 
 use std::sync::Arc;
 
-use agent_sdk_foundation::llm::{ChatOutcome, ChatRequest};
+use agent_sdk_foundation::llm::{ChatOutcome, ChatRequest, Usage};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
 
 use crate::provider::LlmProvider;
 use crate::streaming::{StreamBox, StreamDelta};
+
+/// Whether a delta commits the stream to the provider that produced it.
+///
+/// Failing over after a provider has emitted output would make the secondary
+/// re-emit it, so the classification is per-variant:
+///
+/// * **Commits** — anything the consumer can already see or will replay:
+///   `TextDelta`, `ThinkingDelta`, `SignatureDelta`, `RedactedThinking`,
+///   `OpaqueReasoning`, `ToolUseStart`, `ToolInputDelta`, and `Done` (a response
+///   the caller has, by definition, already received in full).
+/// * **Does not commit** — `Usage`, which is pure metadata: it never reaches the
+///   user, it is folded into token counters, and a provider that reports usage
+///   and *then* fails is exactly the case failover exists for. A provider that
+///   reports usage mid-stream before any content and then errors is therefore
+///   failed over now where it previously surfaced the error — deliberate: no
+///   visible output is duplicated, because usage is invisible.
+/// * **Not classified here** — `Error`, which the caller's own arm handles.
+///
+/// Unknown (`#[non_exhaustive]`) variants commit. A delta this SDK version
+/// cannot classify might carry content, and duplicating output is a worse
+/// failure than missing a failover.
+/// Every variant is classified above; `Usage` is the only one that does not
+/// commit, so the catch-all — which also covers future `#[non_exhaustive]`
+/// variants — commits. The per-variant behaviour is pinned by
+/// `only_metadata_deltas_leave_the_chain_uncommitted`.
+const fn commits_stream(delta: &StreamDelta) -> bool {
+    !matches!(delta, StreamDelta::Usage(_))
+}
+
+/// Sum two usage readings, saturating: token counters must never wrap.
+fn add_usage(carried: Option<&Usage>, usage: &Usage) -> Usage {
+    let Some(carried) = carried else {
+        return usage.clone();
+    };
+    Usage {
+        input_tokens: carried.input_tokens.saturating_add(usage.input_tokens),
+        output_tokens: carried.output_tokens.saturating_add(usage.output_tokens),
+        cached_input_tokens: carried
+            .cached_input_tokens
+            .saturating_add(usage.cached_input_tokens),
+        cache_creation_input_tokens: carried
+            .cache_creation_input_tokens
+            .saturating_add(usage.cache_creation_input_tokens),
+    }
+}
 
 /// An [`LlmProvider`] that fails over across an ordered list of backends.
 ///
@@ -119,14 +164,24 @@ impl LlmProvider for FallbackProvider {
         let providers = self.ordered();
         Box::pin(async_stream::stream! {
             let last = providers.len() - 1;
+            // Tokens billed by providers this chain abandoned. A provider that
+            // reports usage and only then fails still charged for what it
+            // generated, and [`StreamAccumulator`] keeps only the LAST usage
+            // delta it sees — so the surviving provider's usage is rewritten to
+            // include this carry, and the failover does not silently un-bill the
+            // abandoned attempt.
+            let mut carried_usage: Option<Usage> = None;
+
             for (idx, provider) in providers.iter().enumerate() {
                 let is_last = idx == last;
                 let mut stream = provider.chat_stream(request.clone());
-                // Whether this provider has emitted any non-error delta. Once it
-                // has, we are committed to it: failing over mid-stream would
-                // double-emit content, so a later error is surfaced as-is.
+                // Whether this provider has emitted a delta that commits the
+                // stream to it (see `commits_stream`). Once it has, failing over
+                // would double-emit output, so a later error is surfaced as-is.
                 let mut committed = false;
                 let mut failed_over = false;
+                // Usage reported by *this* provider, for the carry above.
+                let mut provider_usage: Option<Usage> = None;
 
                 while let Some(item) = stream.next().await {
                     match item {
@@ -141,8 +196,15 @@ impl LlmProvider for FallbackProvider {
                             }
                             yield Ok(StreamDelta::Error { message, kind });
                         }
+                        Ok(StreamDelta::Usage(usage)) => {
+                            // Metadata: deliberately does NOT commit, so a
+                            // provider that reports usage before failing can
+                            // still be failed over.
+                            provider_usage = Some(usage.clone());
+                            yield Ok(StreamDelta::Usage(add_usage(carried_usage.as_ref(), &usage)));
+                        }
                         Ok(delta) => {
-                            committed = true;
+                            committed = committed || commits_stream(&delta);
                             yield Ok(delta);
                         }
                         Err(error) => {
@@ -162,6 +224,9 @@ impl LlmProvider for FallbackProvider {
                 if !failed_over {
                     return;
                 }
+                carried_usage = provider_usage
+                    .map(|usage| add_usage(carried_usage.as_ref(), &usage))
+                    .or(carried_usage);
             }
         })
     }
@@ -189,7 +254,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use agent_sdk_foundation::llm::{ChatResponse, ContentBlock, StopReason, Usage};
-    use anyhow::anyhow;
+    use anyhow::{Context as _, anyhow};
 
     use crate::streaming::StreamErrorKind;
 
@@ -379,6 +444,126 @@ mod tests {
         // Discovery is served by the primary, not the default "unsupported".
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "primary-model");
+        Ok(())
+    }
+
+    #[test]
+    fn only_metadata_deltas_leave_the_chain_uncommitted() {
+        // Content — anything the consumer can see or replay — commits: failing
+        // over after it would make the secondary emit it a second time.
+        for delta in [
+            StreamDelta::TextDelta {
+                delta: "hi".to_owned(),
+                block_index: 0,
+            },
+            StreamDelta::ThinkingDelta {
+                delta: "hmm".to_owned(),
+                block_index: 0,
+            },
+            StreamDelta::ToolUseStart {
+                id: "t1".to_owned(),
+                name: "echo".to_owned(),
+                block_index: 0,
+                thought_signature: None,
+            },
+            StreamDelta::ToolInputDelta {
+                id: "t1".to_owned(),
+                delta: "{}".to_owned(),
+                block_index: 0,
+            },
+            StreamDelta::Done {
+                stop_reason: Some(StopReason::EndTurn),
+            },
+        ] {
+            assert!(
+                commits_stream(&delta),
+                "content/terminal deltas must commit the chain: {delta:?}"
+            );
+        }
+
+        // Usage is metadata the user never sees, so it must not strand the chain
+        // on a provider that reported its billing and then died.
+        assert!(!commits_stream(&StreamDelta::Usage(Usage {
+            input_tokens: 1,
+            output_tokens: 1,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        })));
+    }
+
+    #[tokio::test]
+    async fn stream_usage_before_an_error_does_not_suppress_failover() -> Result<()> {
+        // Providers now report the tokens a failing turn burned *before* the
+        // terminal error. That usage delta must not commit the chain to a dead
+        // primary — it is metadata the user never sees — and the tokens it
+        // reports must survive into the surviving provider's usage, because the
+        // accumulator keeps only the last usage delta.
+        let primary = ScriptedProvider::streaming(
+            "primary",
+            vec![
+                Ok(StreamDelta::Usage(Usage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                })),
+                Ok(StreamDelta::Error {
+                    message: "rate limited".to_owned(),
+                    kind: StreamErrorKind::RateLimited(None),
+                }),
+            ],
+        );
+        let secondary = ScriptedProvider::streaming(
+            "secondary",
+            vec![
+                Ok(StreamDelta::TextDelta {
+                    delta: "hello".to_owned(),
+                    block_index: 0,
+                }),
+                Ok(StreamDelta::Usage(Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                })),
+                Ok(StreamDelta::Done {
+                    stop_reason: Some(StopReason::EndTurn),
+                }),
+            ],
+        );
+        let fb = FallbackProvider::new(primary.clone()).with_fallback(secondary.clone());
+
+        let mut accumulator = crate::streaming::StreamAccumulator::new();
+        let mut stream = fb.chat_stream(request());
+        let mut saw_error = false;
+        let mut text = String::new();
+        while let Some(item) = stream.next().await {
+            let delta = item?;
+            if let StreamDelta::Error { .. } = &delta {
+                saw_error = true;
+            }
+            if let StreamDelta::TextDelta { delta, .. } = &delta {
+                text.push_str(delta);
+            }
+            accumulator.apply(&delta);
+        }
+        drop(stream);
+
+        assert!(
+            !saw_error,
+            "the usage delta must not commit us to the primary"
+        );
+        assert_eq!(text, "hello", "the secondary must serve the turn");
+        assert_eq!(primary.calls(), 1);
+        assert_eq!(secondary.calls(), 1);
+
+        // The primary genuinely billed 150 tokens before dying; the secondary
+        // billed 15. The consumer must end up accounting for both.
+        let usage = accumulator
+            .usage()
+            .context("the failover must still report usage")?;
+        assert_eq!(usage.input_tokens, 110);
+        assert_eq!(usage.output_tokens, 55);
         Ok(())
     }
 
