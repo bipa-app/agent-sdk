@@ -1788,8 +1788,8 @@ async fn fail_or_revert_root_task(
 /// `true` if `err`'s chain bottoms out in the completed-turn slot CAS
 /// rejection ([`StaleTurnCommit`]) — the one failure shape that means
 /// the turn's work was fine but its slot was consumed by another
-/// task's commit (issue #354). Every other failure keeps the ordinary
-/// terminal path.
+/// task's commit. Every other failure keeps the ordinary terminal
+/// path.
 fn is_turn_slot_collision_error(err: &anyhow::Error) -> bool {
     err.chain()
         .any(|cause| cause.downcast_ref::<StaleTurnCommit>().is_some())
@@ -1797,8 +1797,7 @@ fn is_turn_slot_collision_error(err: &anyhow::Error) -> bool {
 
 /// Requeue a promoted root whose completed-turn commit lost its slot
 /// to a foreign FULL-TURN checkpoint, so it re-runs from the fresh
-/// committed head instead of failing terminally (issue #354; codex
-/// round-5 finding).
+/// committed head instead of failing terminally (issue #354).
 ///
 /// The worker-side shift path already absorbs the benign salvage
 /// collision; the case that reaches here is a cancelled predecessor's
@@ -1824,15 +1823,15 @@ fn is_turn_slot_collision_error(err: &anyhow::Error) -> bool {
 ///
 /// The rolled-back execution's attempt row is deliberately left open
 /// here: closing it from this (possibly stale) worker races a
-/// replacement worker's live attempt (codex round-6 P1). The shift
+/// replacement worker's live attempt. The shift
 /// wrapper's collision exits already settled this execution's own
 /// attempt with its real usage before the error reached this handler.
 ///
 /// # Fresh-input tasks only
 ///
 /// A colliding task executing from a stored continuation
-/// (`TaskState::WaitingOnChildren` / `ReadyToResume`) is NOT requeued
-/// (codex round-9 P1): its continuation was captured before the
+/// (`TaskState::WaitingOnChildren` / `ReadyToResume`) is NOT
+/// requeued: its continuation was captured before the
 /// foreign turn landed, and the re-driven resume would overwrite the
 /// recovered head with that stale state — dropping the occupant's
 /// usage, cost, and metadata, the exact corruption the foreign-full-
@@ -1884,17 +1883,17 @@ async fn requeue_collided_root_task(
         );
         return Ok(false);
     }
-    // Boundary for the abandoned streamed attempt (codex rounds
-    // 13-15): the collided execution already persisted `Start` and
-    // streaming deltas, and the re-run will emit a fresh `Start` +
-    // answer. The RECOVERABLE `Error` event that terminates the
-    // abandoned attempt is committed by the store ATOMICALLY with the
-    // ownership CAS and the release — it lands iff this worker still
-    // owned the row, and it is durable before the row is acquirable —
-    // so it can neither trail a replacement's `Start` nor pollute a
-    // replacement's stream from a stale snapshot. On a commit failure
-    // the row stays Running under our lease and the task keeps the
-    // terminal path (which emits its own non-recoverable `Error`).
+    // Boundary for the abandoned streamed attempt: the collided
+    // execution already persisted `Start` and streaming deltas, and
+    // the re-run will emit a fresh `Start` + answer. The RECOVERABLE
+    // `Error` event that terminates the abandoned attempt is
+    // committed by the store ATOMICALLY with the ownership CAS and
+    // the release — it lands iff this worker still owned the row, and
+    // it is durable before the row is acquirable — so it can neither
+    // trail a replacement's `Start` nor pollute a replacement's
+    // stream from a stale snapshot. On a commit failure the row stays
+    // Running under our lease and the task keeps the terminal path
+    // (which emits its own non-recoverable `Error`).
     let boundary = agent_sdk_foundation::events::AgentEvent::error(
         format!("turn-slot collision: retrying from the fresh committed head ({err:#})"),
         true,
@@ -3041,11 +3040,11 @@ mod tests {
         Ok(())
     }
 
-    /// Issue #354 (codex round-5): a completed-turn slot collision the
-    /// shift refused must REQUEUE the promoted root — the cancellation
-    /// contract promises follow-up work completes, so re-running from
-    /// the fresh committed head (crash-equivalent semantics) replaces
-    /// the old terminal failure.
+    /// A completed-turn slot collision the shift refused must REQUEUE
+    /// the promoted root instead of failing it terminally — the
+    /// cancellation contract promises follow-up work completes, and
+    /// re-running from the fresh committed head has crash-equivalent
+    /// semantics.
     #[tokio::test]
     async fn turn_slot_collision_requeues_the_root_instead_of_failing() -> Result<()> {
         let config = ServiceConfig::default();
@@ -3100,9 +3099,9 @@ mod tests {
         );
         assert!(row.worker_id.is_none() && row.lease_id.is_none());
 
-        // Codex round-13: the abandoned streamed attempt gets a
-        // RECOVERABLE Error boundary so replay never attributes its
-        // deltas to the re-run's fresh Start.
+        // The abandoned streamed attempt gets a RECOVERABLE Error
+        // boundary so replay never attributes its deltas to the
+        // re-run's fresh Start.
         let events = stores.event_repo.get_events(&acquired.thread_id).await?;
         let boundary = events
             .iter()
@@ -3169,9 +3168,9 @@ mod tests {
         Ok(())
     }
 
-    /// Codex round-6 P1: a collision whose occupant checkpoint belongs
-    /// to THIS task means the turn already committed (a stale-lease
-    /// worker losing to its own replacement's landed commit).
+    /// A collision whose occupant checkpoint belongs to THIS task
+    /// means the turn already committed (a stale-lease worker losing
+    /// to its own replacement's landed commit).
     /// Requeueing would re-run the input on top of its own committed
     /// turn and duplicate the conversation turn durably — the same-task
     /// case must keep the terminal path.

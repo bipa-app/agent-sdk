@@ -612,8 +612,8 @@ mod tests {
         Ok((root, worker, lease, params))
     }
 
-    /// Round-2 escalated F4: an owner-guarded commit (the slot-shift
-    /// retry) must be rejected INSIDE the commit transaction when the
+    /// An owner-guarded commit (the slot-shift retry) must be
+    /// rejected INSIDE the commit transaction when the
     /// task row is no longer a `Running` row owned by the presenting
     /// `(worker, lease)` — here, a cancellation that landed between
     /// the caller's shift-eligibility re-read and the retried commit.
@@ -681,9 +681,9 @@ mod tests {
         Ok(())
     }
 
-    /// Round-2 escalated F4, positive arm: an owner-guarded commit
-    /// whose worker still owns the live `Running` row succeeds — the
-    /// guard only bites on lost ownership.
+    /// Owner-guard positive arm: an owner-guarded commit whose worker
+    /// still owns the live `Running` row succeeds — the guard only
+    /// bites on lost ownership.
     async fn test_owner_guarded_commit_succeeds_while_owned(
         task_store: &dyn AgentTaskStore,
         thread_store: &dyn ThreadStore,
@@ -717,8 +717,8 @@ mod tests {
         Ok(())
     }
 
-    /// Round-2 F5: the completed-turn slot CAS rejection carries the
-    /// typed [`StaleTurnCommit`] root cause on every backend, so the
+    /// The completed-turn slot CAS rejection carries the typed
+    /// [`StaleTurnCommit`] root cause on every backend, so the
     /// worker's slot-shift path can downcast instead of matching
     /// message strings (the `Display` text stays byte-identical to the
     /// historical message for logs).
@@ -1231,7 +1231,7 @@ mod tests {
         Ok(())
     }
 
-    /// Terminal-marker contract (issue #354), round-2 F1: two RACING
+    /// Terminal-marker contract (issue #354), race arm: two RACING
     /// `cancel_tree` calls on the same blocking root must produce
     /// exactly ONE durable marker, ONE outbox advisory, and report the
     /// transition exactly once across both outcomes. On Postgres the

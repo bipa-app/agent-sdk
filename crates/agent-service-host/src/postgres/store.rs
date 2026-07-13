@@ -1335,14 +1335,13 @@ FOR UPDATE
     }
 
     /// Enforce [`CompletedTurnCommit::owner_guard`] on the locked task
-    /// row inside the completed-turn transaction (issue #354, residual
-    /// 5 hardening): the slot-shift retry validates that the
-    /// presenting worker still owns a live `Running` row, so a
-    /// cancellation / lease loss that landed between the caller's
-    /// shift-eligibility check and the retry rejects here — inside the
-    /// transaction — instead of splicing a dead root's turn into the
-    /// shifted slot. A `None` guard (every first, non-shifted commit)
-    /// is a no-op.
+    /// row inside the completed-turn transaction: the slot-shift retry
+    /// validates that the presenting worker still owns a live `Running`
+    /// row, so a cancellation / lease loss that landed between the
+    /// caller's shift-eligibility check and the retry rejects here —
+    /// inside the transaction — instead of splicing a dead root's turn
+    /// into the shifted slot. A `None` guard (every first, non-shifted
+    /// commit) is a no-op.
     async fn enforce_commit_owner_guard_tx(
         tx: &mut Transaction<'_, Postgres>,
         task_id: &AgentTaskId,
@@ -1369,7 +1368,7 @@ FOR UPDATE
         Ok(())
     }
 
-    /// # WARNING: inverted lock order — do not extend (round-2 F6)
+    /// # WARNING: inverted lock order — do not extend
     ///
     /// This helper locks the TASK row first (`load_task_tx(.., true)`
     /// below) and only then, for root turns, the THREAD row — the
@@ -1991,10 +1990,9 @@ FOR UPDATE
             }));
         }
 
-        // Owner-guarded commit (issue #354, residual 5 hardening):
-        // called after the thread lock so the transaction's lock order
-        // stays thread→task, consistent with `submit_root_turn` and
-        // `cancel_tree`.
+        // Owner-guarded commit, enforced after the thread lock so the
+        // transaction's lock order stays thread→task, consistent with
+        // `submit_root_turn` and `cancel_tree`.
         Self::enforce_commit_owner_guard_tx(&mut tx, &params.task_id, params.owner_guard.as_ref())
             .await?;
         let thread = old_thread
@@ -3078,7 +3076,7 @@ FOR UPDATE SKIP LOCKED
         now: OffsetDateTime,
     ) -> Result<RequeueOutcome> {
         let mut tx = self.begin().await?;
-        // Lock order (codex round-16): the global hierarchy is
+        // Lock order: the global hierarchy is
         // thread → task (cancel_tree locks thread rows in phase 1
         // before re-reading tasks). When a boundary event is present
         // this method needs BOTH locks, so it must not take the task
@@ -3705,10 +3703,10 @@ ORDER BY created_at, id
         // under READ COMMITTED a concurrent cancel_tree / terminal CAS
         // can settle any of these rows between this read and our
         // UPDATEs, so every transition below is gated on a locked
-        // re-read instead (round-2 F1 — two racing cancels of the same
-        // root previously BOTH emitted a marker and both reported the
-        // transition, and a stale snapshot could clobber a
-        // concurrently-Completed root with Cancelled).
+        // re-read — otherwise two racing cancels of the same root
+        // could both emit a marker and both report the transition, and
+        // a stale snapshot could clobber a concurrently-Completed root
+        // with Cancelled.
         let all_tasks = Self::collect_subtree_tx(&mut tx, root_id).await?;
 
         // Phase 1 — thread-row locks, FIRST. Every thread that MIGHT
@@ -3800,7 +3798,7 @@ ORDER BY created_at, id
             .map(|task| task.id.clone())
             .collect();
 
-        // Phase 3 — terminal `Cancelled` markers (issue #354): exactly
+        // Phase 3 — terminal `Cancelled` markers: exactly
         // one per blocking root this call ACTUALLY transitioned (the
         // pre-cancel occupant of its thread's active-root slot), on
         // that root's OWN thread — cascade-cancelled child-thread
@@ -4823,7 +4821,7 @@ VALUES ($1, 'task_wakeup', $2, NULL, NULL, 'pending', $3, $4, $4, 0, $5)
     /// Commit the terminal `Cancelled` marker for one cancelled
     /// blocking root inside `cancel_tree`'s transaction: one committed
     /// event on the root's own thread plus its coalesced
-    /// `thread_events_available` outbox advisory (issue #354).
+    /// `thread_events_available` outbox advisory.
     ///
     /// Locks the thread row first (bootstrap + `FOR UPDATE` via the
     /// sequence allocator), which keeps the transaction's lock order —

@@ -93,8 +93,8 @@ pub trait ThreadStore: Send + Sync {
     /// holds it across the stale-turn pre-check and every projection
     /// step, so two in-process committers can never interleave — the
     /// loser is rejected by the pre-check BEFORE closing its attempt,
-    /// which is what keeps the slot-shift retry viable (codex rounds
-    /// 9-11). Durable backends return `None`: their atomic committer
+    /// which is what keeps the slot-shift retry viable. Durable
+    /// backends return `None`: their atomic committer
     /// hook bypasses the sequential path entirely, and transaction
     /// rollback already provides the same guarantee.
     fn sequential_commit_lock(&self) -> Option<&tokio::sync::Mutex<()>> {
@@ -120,7 +120,7 @@ pub trait ThreadStore: Send + Sync {
     ///    `expected_turn` — i.e. `committed_turns + 1 == expected_turn`
     ///    — **under the same lock/transaction** as the increment, so
     ///    two racing committers can never both pass the guard and land
-    ///    a double increment (codex round-9). On mismatch the call
+    ///    a double increment. On mismatch the call
     ///    fails with [`super::commit::StaleTurnCommit`] as the typed
     ///    root cause and mutates nothing.
     /// 3. Applies [`Thread::apply_committed_turn`] with the given

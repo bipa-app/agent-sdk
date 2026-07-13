@@ -1737,10 +1737,9 @@ async fn case_before_plus_limit_pagination<S: JournalStore>(store: &S) -> Result
 mod tests {
     use super::*;
 
-    /// Codex round-12: the bundle must forward the inner thread
-    /// store's sequential-commit lock — a `None` here silently
-    /// disables in-process commit serialization for every bundle
-    /// consumer.
+    /// The bundle must forward the inner thread store's
+    /// sequential-commit lock — a `None` here silently disables
+    /// in-process commit serialization for every bundle consumer.
     #[tokio::test]
     async fn bundle_forwards_the_sequential_commit_lock() {
         let store = InMemoryJournalStore::new();
@@ -1750,10 +1749,10 @@ mod tests {
         );
     }
 
-    /// Codex round-15: the requeue boundary event is atomic with the
-    /// ownership CAS — it lands (before the row is acquirable) on a
-    /// `Requeued` outcome, and a stale caller's `NotOwned` outcome
-    /// commits NOTHING into what is now the replacement's stream.
+    /// The requeue boundary event is atomic with the ownership CAS —
+    /// it lands (before the row is acquirable) on a `Requeued`
+    /// outcome, and a stale caller's `NotOwned` outcome commits
+    /// NOTHING into what is now the replacement's stream.
     #[tokio::test]
     async fn bundle_requeue_boundary_is_atomic_with_ownership() -> Result<()> {
         use crate::journal::store::RequeueOutcome;
@@ -1822,11 +1821,11 @@ mod tests {
         Ok(())
     }
 
-    /// Codex round-12: cancelling through the bundle must emit the
-    /// durable `Cancelled` marker — the bundle's task store is wired
-    /// with a `CancellationMarkerSink` over its own event journal,
-    /// mirroring production. A bare task store would return no
-    /// markers and leave followers waiting forever.
+    /// Cancelling through the bundle must emit the durable
+    /// `Cancelled` marker — the bundle's task store is wired with a
+    /// `CancellationMarkerSink` over its own event journal, mirroring
+    /// production. A bare task store would return no markers and
+    /// leave followers waiting forever.
     #[tokio::test]
     async fn bundle_cancel_tree_emits_cancellation_markers() -> Result<()> {
         use crate::journal::task::AgentTask;

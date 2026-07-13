@@ -147,7 +147,7 @@ pub struct CompletedTurnCommit {
     /// helper).
     pub outbox_max_attempts: u32,
     /// Optional task-row ownership validation performed **inside** the
-    /// commit transaction (issue #354, residual 5 hardening).
+    /// commit transaction.
     ///
     /// When set, the atomic durable committers re-read the task row
     /// (`FOR UPDATE` on Postgres; under `SQLite`'s exclusive write
@@ -341,7 +341,7 @@ pub async fn commit_completed_turn(
     let thread_id_for_events = params.thread_id.clone();
 
     // Stale turn double-commit guard. Two racing committers could both
-    // pass this read on the non-atomic path (codex round-9), so the
+    // pass this read on the non-atomic path, so the
     // whole sequential body runs under the store's sequential-commit
     // lock (acquired above): under it this pre-check is decisive, and
     // a rejected stale commit provably leaves no side effects — the
@@ -373,7 +373,7 @@ pub async fn commit_completed_turn(
     //    the commit before a single projection advances. The
     //    serialization guard above makes the CAS-loss-after-close
     //    window unreachable on this path, so no idempotent-close
-    //    tolerance is needed (codex rounds 10-11).
+    //    tolerance is needed.
     let closed_attempt = turn_attempt_store
         .close_attempt(
             &params.turn_attempt_id,
@@ -1003,12 +1003,12 @@ mod tests {
         Ok(())
     }
 
-    /// Codex rounds 9-11: two IN-PROCESS committers racing for the
-    /// same turn slot serialize on the store's sequential-commit lock.
-    /// Exactly one lands; the loser is rejected by the (now decisive)
-    /// pre-check with a typed `StaleTurnCommit` and — critically — its
-    /// attempt is STILL OPEN, so the slot-shift retry can close it on
-    /// the retried commit. The loser then lands cleanly on turn 2.
+    /// Two IN-PROCESS committers racing for the same turn slot
+    /// serialize on the store's sequential-commit lock. Exactly one
+    /// lands; the loser is rejected by the decisive pre-check with a
+    /// typed `StaleTurnCommit` and — critically — its attempt is
+    /// STILL OPEN, so the slot-shift retry can close it on the
+    /// retried commit. The loser then lands cleanly on turn 2.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn racing_commits_serialize_and_the_loser_keeps_its_attempt_open() -> Result<()> {
         let s = std::sync::Arc::new(Stores::new());

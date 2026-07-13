@@ -1793,14 +1793,13 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
     }
 
     /// Enforce [`CompletedTurnCommit::owner_guard`] on the task row
-    /// inside the completed-turn transaction (issue #354, residual 5
-    /// hardening): the slot-shift retry validates — under `SQLite`'s
-    /// exclusive write transaction — that the presenting worker still
-    /// owns a live `Running` row, so a cancellation / lease loss
-    /// between the caller's shift-eligibility check and the retry
-    /// rejects here instead of splicing a dead root's turn into the
-    /// shifted slot. A `None` guard (every first, non-shifted commit)
-    /// is a no-op.
+    /// inside the completed-turn transaction (issue #354): the
+    /// slot-shift retry validates — under `SQLite`'s exclusive write
+    /// transaction — that the presenting worker still owns a live
+    /// `Running` row, so a cancellation / lease loss between the
+    /// caller's shift-eligibility check and the retry rejects here
+    /// instead of splicing a dead root's turn into the shifted slot.
+    /// A `None` guard (every first, non-shifted commit) is a no-op.
     async fn enforce_commit_owner_guard_tx(
         tx: &mut Transaction<'_, Sqlite>,
         task_id: &AgentTaskId,
@@ -1857,7 +1856,6 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
             }));
         }
 
-        // Owner-guarded commit (issue #354, residual 5 hardening).
         Self::enforce_commit_owner_guard_tx(&mut tx, &params.task_id, params.owner_guard.as_ref())
             .await?;
         let thread = old_thread
@@ -3224,16 +3222,16 @@ impl AgentTaskStore for SqliteDurableStore {
         // cancelling in BFS order keeps the returned `transitioned` slice
         // identical to the in-memory reference store.
         //
-        // Round-2 F1 audit: unlike Postgres (READ COMMITTED row locks),
-        // `begin()` here takes the database write lock up front
-        // (`BEGIN IMMEDIATE`), so no concurrent writer can settle any
-        // of these rows between this snapshot and the UPDATEs below —
-        // the snapshot IS the transaction's consistent view. Two
-        // racing `cancel_tree` calls fully serialize: the loser's
-        // snapshot already sees terminal rows and it transitions /
-        // emits nothing. A Postgres-style locked re-read would re-read
-        // identical data, so this backend intentionally keeps
-        // snapshot-driven transitions (pinned by the
+        // Unlike Postgres (READ COMMITTED row locks), `begin()` here
+        // takes the database write lock up front (`BEGIN IMMEDIATE`),
+        // so no concurrent writer can settle any of these rows between
+        // this snapshot and the UPDATEs below — the snapshot IS the
+        // transaction's consistent view. Two racing `cancel_tree`
+        // calls fully serialize: the loser's snapshot already sees
+        // terminal rows and it transitions / emits nothing. A
+        // Postgres-style locked re-read would re-read identical data,
+        // so this backend intentionally uses snapshot-driven
+        // transitions (pinned by the
         // `conformance_sqlite_concurrent_cancels_single_marker` race
         // test).
         let all_tasks = Self::collect_subtree_tx(&mut tx, root_id).await?;
@@ -3243,9 +3241,9 @@ impl AgentTaskStore for SqliteDurableStore {
         // wake their linked invocations and promote queued successors.
         let mut cancelled_root_ids: Vec<AgentTaskId> = Vec::new();
         let mut cancelled_root_threads: Vec<ThreadId> = Vec::new();
-        // Terminal `Cancelled` markers (issue #354): one per blocking
-        // root this call transitions (pre-cancel occupant of its
-        // thread's active-root slot), on that root's OWN thread —
+        // Terminal `Cancelled` markers: one per blocking root this
+        // call transitions (pre-cancel occupant of its thread's
+        // active-root slot), on that root's OWN thread —
         // cascade-cancelled child-thread roots included, queued roots
         // never. Atomic with the cancel transitions: a crash can
         // neither lose the marker nor emit it without the

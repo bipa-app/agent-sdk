@@ -1635,7 +1635,7 @@ fn remap_turn_indexed_events(events: &mut [AgentEvent], turn: usize) {
 }
 
 /// Commit a completed turn, shifting past a **cross-task** turn-slot
-/// collision instead of failing the turn (issue #354, residual 5).
+/// collision instead of failing the turn (issue #354).
 ///
 /// The race: cancelling a `Running` root frees the thread's
 /// active-root slot and promotes a queued successor in the same store
@@ -1777,17 +1777,17 @@ pub(crate) async fn commit_completed_turn_shifting_slot(
             return Err(error);
         }
         if shifts >= MAX_TURN_SLOT_SHIFTS {
-            // Walk exhausted on a genuine collision (codex round-8
-            // P2): ownership may have been lost concurrently WITHOUT
-            // the error carrying `LostCommitOwnership` — the cancel
-            // seam leaves a live worker's attempt open and the host
-            // skips rows it no longer owns. Settle unconditionally,
-            // exactly like the no-shift exit below.
+            // Walk exhausted on a genuine collision: ownership may
+            // have been lost concurrently WITHOUT the error carrying
+            // `LostCommitOwnership` — the cancel seam leaves a live
+            // worker's attempt open and the host skips rows it no
+            // longer owns. Settle unconditionally, exactly like the
+            // no-shift exit below.
             settle_own_attempt(&params, deps).await;
             return Err(error);
         }
         let Some(next_turn) = shifted_turn_slot(&params, worker_id, lease_id, deps).await else {
-            // No-shift exit (codex round-7 P2): when the eligibility
+            // No-shift exit: when the eligibility
             // re-read found the row cancelled or requeued, no later
             // path owns this attempt — the cancel seam deliberately
             // left the live worker's attempt alone and the host skips
@@ -1813,7 +1813,7 @@ pub(crate) async fn commit_completed_turn_shifting_slot(
         // The snapshot's turn_count was built for the original slot;
         // recovery seeds staged state from the landed checkpoint, so a
         // stale count would leave every later turn one behind
-        // Thread::committed_turns and Done.total_turns (codex round-19).
+        // Thread::committed_turns and Done.total_turns.
         if let Some(turn_count) = params
             .agent_state_snapshot
             .get_mut("turn_count")
@@ -1834,8 +1834,7 @@ pub(crate) async fn commit_completed_turn_shifting_slot(
 
 /// Best-effort settle of the in-flight attempt when the owner-guarded
 /// shifted retry is rejected with
-/// [`LostCommitOwnership`](crate::journal::commit::LostCommitOwnership)
-/// (codex round-6 P2).
+/// [`LostCommitOwnership`](crate::journal::commit::LostCommitOwnership).
 ///
 /// The rejected durable commit rolled its in-transaction attempt close
 /// back, and no later path will close this attempt: the cancel seam's
@@ -1936,7 +1935,7 @@ async fn shifted_turn_slot(
     //    guarantee the CAS exists for.
     //
     // The read synchronizes on the sequential-commit lock when the
-    // backend exposes one (codex round-14): the in-memory committer
+    // backend exposes one: the in-memory committer
     // holds that lock from the stale-turn pre-check through the
     // checkpoint write, so acquiring it here guarantees any commit
     // whose aggregate advance we lost to has finished writing its
@@ -2038,7 +2037,7 @@ async fn open_attempt(
         .await
         .context("list existing attempts")?;
     // Leftover OPEN attempts from a predecessor execution are left
-    // alone (codex round-9 P2): after a lease expiry, the old worker
+    // alone: after a lease expiry, the old worker
     // may still be live — executing, unaware of its heartbeat
     // rejection — and closing its attempt here would permanently
     // record zero usage where the provider's real billed usage

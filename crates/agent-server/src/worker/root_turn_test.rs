@@ -5862,7 +5862,7 @@ async fn cancel_root_turn_commits_single_terminal_cancelled_event() -> Result<()
 
 /// Event repo that parks the first `Cancelled` commit on a [`Notify`]
 /// until the test releases it — forcing the exact interleaving the
-/// in-lock marker commit must exclude (round-2 F2).
+/// in-lock marker commit must exclude.
 #[derive(Clone)]
 struct StallingMarkerEventRepo {
     inner: InMemoryEventRepository,
@@ -5936,13 +5936,12 @@ impl EventRepository for StallingMarkerEventRepo {
     }
 }
 
-/// Round-2 F2: the in-memory sink commits markers while the task-store
-/// write lock is still held, so a promoted successor cannot be acquired
-/// — and thus cannot journal its first event — before the marker's
-/// sequence. The stalling repo parks the marker commit; if the lock had
-/// been dropped first (the old post-lock sink), the successor's acquire
-/// would succeed during the stall and its events would precede the
-/// marker.
+/// The in-memory sink commits markers while the task-store write lock
+/// is still held, so a promoted successor cannot be acquired — and thus
+/// cannot journal its first event — before the marker's sequence. The
+/// stalling repo parks the marker commit; if the lock were dropped
+/// before the sink commit, the successor's acquire would succeed during
+/// the stall and its events would precede the marker.
 #[tokio::test]
 async fn cancel_marker_sequence_precedes_promoted_successor_events() -> Result<()> {
     let threads = InMemoryThreadStore::new();
@@ -6335,7 +6334,7 @@ async fn running_abort_after_cancel_commits_single_cancelled_event() -> Result<(
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Issue #354 residual 5 — successor turn vs cancelled salvage slot race
+// Issue #354 — successor turn vs cancelled salvage slot race
 // ─────────────────────────────────────────────────────────────────────
 
 /// Minimal close params for the simulated salvage commit.
@@ -6459,11 +6458,11 @@ impl TurnAttemptStore for SalvageRacingAttemptStore {
     }
 }
 
-/// Issue #354, residual 5 (positive): a successor turn that loses its
-/// bootstrapped slot to a cancelled predecessor's salvage commit no
-/// longer fails terminally — the commit detects the cross-task
-/// collision, shifts to the next turn number, and completes, with the
-/// turn-indexed lifecycle events remapped to the landed turn.
+/// A successor turn that loses its bootstrapped slot to a cancelled
+/// predecessor's salvage commit must not fail terminally — the commit
+/// detects the cross-task collision, shifts to the next turn number,
+/// and completes, with the turn-indexed lifecycle events remapped to
+/// the landed turn.
 #[tokio::test]
 async fn successor_turn_shifts_past_cancelled_salvage_slot_collision() -> Result<()> {
     use agent_sdk_foundation::events::AgentEvent;
@@ -6523,9 +6522,9 @@ async fn successor_turn_shifts_past_cancelled_salvage_slot_collision() -> Result
         .await?
         .context("successor checkpoint at turn 2")?;
     assert_eq!(successor_checkpoint.task_id, successor_id);
-    // Codex round-19: the shifted checkpoint's state snapshot must
-    // carry the LANDED turn count — recovery seeds staged state from
-    // it, and a stale count leaves every later turn one behind.
+    // The shifted checkpoint's state snapshot must carry the LANDED
+    // turn count — recovery seeds staged state from it, and a stale
+    // count leaves every later turn one behind.
     assert_eq!(
         successor_checkpoint
             .agent_state_snapshot
@@ -6556,7 +6555,7 @@ async fn successor_turn_shifts_past_cancelled_salvage_slot_collision() -> Result
     Ok(())
 }
 
-/// Codex round-2 P1: a foreign FULL-TURN commit occupying the slot must
+/// A foreign FULL-TURN commit occupying the slot must
 /// refuse the shift — the successor's snapshot and `Done` totals were
 /// built before the predecessor's fully billed turn landed, so shifting
 /// would durably drop that usage/cost. The collision surfaces instead
@@ -6629,9 +6628,9 @@ async fn billed_foreign_commit_refuses_the_shift() -> Result<()> {
     Ok(())
 }
 
-/// Issue #354, residual 5 (negative): a root that was CANCELLED while
-/// running must not shift — its late full-turn commit loses to the
-/// successor's committed slot and propagates the collision error.
+/// A root that was CANCELLED while running must not shift — its late
+/// full-turn commit loses to the successor's committed slot and
+/// propagates the collision error.
 /// This test exercises the shift-eligibility guard (the caller-side
 /// re-read); the guard→retry pair is not atomic, so the authoritative
 /// enforcement on the durable backends is the `owner_guard` the
@@ -6701,7 +6700,7 @@ async fn cancelled_root_commit_never_shifts_past_a_successor() -> Result<()> {
         "the cancelled root must not have committed a shifted turn 2",
     );
 
-    // Codex round-7 P2: the dead root's no-shift exit must settle its
+    // The dead root's no-shift exit must settle its
     // own attempt — the cancel seam left the live worker's attempt
     // open and the host skips rows it no longer owns, so without the
     // settle it would leak open forever.
@@ -6714,7 +6713,7 @@ async fn cancelled_root_commit_never_shifts_past_a_successor() -> Result<()> {
     Ok(())
 }
 
-/// Codex round-3 P1a: token usage is NOT a salvage signature. A provider
+/// Token usage is NOT a salvage signature: a provider
 /// that omits its usage delta produces a real completion with all-zero
 /// counters; if that full turn occupies the slot, the shift must still
 /// refuse — the successor bootstrapped before it and would overwrite its
@@ -6780,7 +6779,7 @@ async fn zero_usage_full_turn_refuses_the_shift() -> Result<()> {
     Ok(())
 }
 
-/// Codex round-3 P1b: the shift advances ONE slot per round so every
+/// The shift advances ONE slot per collision so every
 /// intervening occupant is validated. Two late commits land back-to-back
 /// — turn 1 is shiftable salvage, but turn 2 is a BILLED full turn. A
 /// head-jumping shift would validate only turn 1 and splice the
@@ -6848,7 +6847,7 @@ async fn shift_refuses_when_an_intervening_occupant_is_a_full_turn() -> Result<(
     Ok(())
 }
 
-/// Codex round-8 P2: exhausting the shift budget on a genuine
+/// Exhausting the shift budget on a genuine
 /// collision must not leak the attempt — the max-shift exit settles it
 /// exactly like the no-shift exit (ownership may have been lost
 /// concurrently, and no later path owns the attempt then).
@@ -6964,7 +6963,7 @@ async fn shift_walks_across_consecutive_salvage_occupants() -> Result<()> {
     Ok(())
 }
 
-/// Codex round-9 P2: a leftover OPEN attempt from a predecessor
+/// A leftover OPEN attempt from a predecessor
 /// execution is LEFT OPEN by the next execution — the old worker may
 /// still be live after a lease expiry, and closing its attempt from
 /// here would permanently record zero usage where its real billed
@@ -7032,7 +7031,7 @@ async fn next_execution_leaves_a_leftover_open_attempt_alone() -> Result<()> {
     Ok(())
 }
 
-/// Codex round-6 P2: an owner-guard rejection
+/// An owner-guard rejection
 /// (`LostCommitOwnership`) rolls the in-transaction attempt close
 /// back, and no later path owns that attempt — the shift wrapper
 /// settles it best-effort, preserving the REAL usage on the

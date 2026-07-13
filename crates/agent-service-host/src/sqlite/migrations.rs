@@ -194,12 +194,12 @@ pub const fn checkpoint_kind_migration() -> &'static str {
 mod tests {
     use super::{DURABLE_CORE_MIGRATOR, durable_core_migrations};
 
-    /// Mirror of the Postgres finding-#20 guard (codex round-11): the
-    /// reviewable bundle silently omitted 0006/0007/0010/0011, so the
-    /// schema-contract checks that concatenate only the reviewable
-    /// bundle skipped those migrations' columns. Pin the reviewable
-    /// bundle to the executable migrator so a future migration can
-    /// never again drop out of the contract checks undetected.
+    /// Mirror of the Postgres finding-#20 guard: the schema-contract
+    /// checks concatenate only the reviewable bundle, so a migration
+    /// missing from it has its columns silently skipped by those
+    /// checks. Pin the reviewable bundle to the executable migrator so
+    /// a migration can never drop out of the contract checks
+    /// undetected.
     #[test]
     fn reviewable_bundle_covers_every_executable_migration() {
         let reviewable = durable_core_migrations().len();

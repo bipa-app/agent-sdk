@@ -934,7 +934,7 @@ pub trait AgentTaskStore: Send + Sync {
     /// write lock (via the wired [`CancellationMarkerSink`]) on the
     /// in-memory store, exactly like `cancel_tree`'s terminal markers.
     /// This is what makes the "abandoned streamed attempt" terminator
-    /// race-free (codex round-15): the event lands iff THIS caller
+    /// race-free: the event lands iff THIS caller
     /// still owned the row, and it is durable before the row becomes
     /// acquirable — so a replacement's `Start` can never precede it
     /// and a stale caller can never inject it into a replacement's
@@ -3830,7 +3830,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         // consistent for the duration of the sweep even though we
         // are holding a mutable borrow of `inner`.
         //
-        // Round-2 F1 audit: the snapshot, every transition, and the
+        // The snapshot, every transition, and the
         // marker gating all run under this one write lock, so no
         // concurrent writer can settle a row mid-sweep (and
         // `cancel_row_in_place` re-reads `by_id` for each id anyway) —
@@ -3864,7 +3864,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             }
         }
 
-        // Round-2 F2: commit the markers while STILL holding the
+        // Commit the markers while STILL holding the
         // task-store write lock. A promoted successor cannot be
         // acquired (and so cannot commit its `Start`) until this lock
         // drops, so the marker's journal sequence always precedes
@@ -7755,9 +7755,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn requeue_owned_task_returns_running_row_to_pending() -> Result<()> {
-        // Issue #354: the worker-initiated requeue twin of the sweep.
-        // A promoted successor whose commit lost its turn slot re-runs
-        // from the fresh head instead of failing terminally.
+        // The worker-initiated requeue twin of the sweep: a promoted
+        // successor whose commit lost its turn slot re-runs from the
+        // fresh head instead of failing terminally.
         let store = InMemoryAgentTaskStore::new();
         let root = AgentTask::new_root_turn(thread("t"), t0(), 3);
         let id = root.id.clone();
