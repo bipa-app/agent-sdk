@@ -25,23 +25,25 @@
 //! when the selector returns
 //! [`SubagentSpawnDecision::SpawnAsSubagent`].
 //!
-//! # Single-call vs fan-out
+//! # Single-call, fan-out, and mixed
 //!
-//! The selector supports two flavours of subagent routing:
+//! [`classify_batch`] sorts a decision vector into exactly one of three
+//! subagent-routing shapes (a vector with no `SpawnAsSubagent` at all
+//! stays on the plain `spawn_tool_children` path):
 //!
-//! * **Single-shot** — a batch containing exactly one
-//!   `SpawnAsSubagent` decision (alone or alongside `SpawnAsTool`s
-//!   ... see "mixed batches" below). Routes through
-//!   [`spawn_subagent_invocation`](super::subagent::spawn_subagent_invocation).
-//! * **Fan-out** — a batch where **every** decision is
-//!   `SpawnAsSubagent` (i.e. the LLM emitted only subagent tool calls
-//!   in this turn). Routes through
+//! * **Single-shot** — the batch is exactly one decision and it is
+//!   `SpawnAsSubagent` (the turn's only tool call is a subagent call).
+//!   Routes through
+//!   [`spawn_subagent_invocation`](super::subagent::spawn_subagent_invocation),
+//!   skipping the batch primitives' overhead.
+//! * **Fan-out** — **every** decision is `SpawnAsSubagent` and there are
+//!   at least two (the LLM emitted only subagent tool calls this turn).
+//!   Routes through
 //!   [`spawn_subagent_batch_invocations`](super::subagent::spawn_subagent_batch_invocations),
 //!   which performs one CAS on the parent and persists N
 //!   invocation + child-thread pairs atomically. The parent transitions
 //!   to `WaitingOnChildren { pending_child_count: N }` once and resumes
 //!   when the last child reports back.
-//!
 //! * **Mixed** — a batch carrying both `SpawnAsSubagent` and
 //!   `SpawnAsTool` decisions (an LLM coordinator routinely emits N
 //!   subagent calls plus a stray `todo_write` in one turn). Routes
@@ -138,10 +140,12 @@ pub struct SubagentSpawnPlan {
 /// tool-runtime spawn path.
 ///
 /// The selector is consulted once per turn for every batch of pending
-/// tool calls. Implementations receive the whole batch (so they can
-/// reject mixed batches up front) plus the parent thread id (for
-/// state lookups). The output is one decision per input slot, in
-/// the same order as the input.
+/// tool calls. Implementations receive the whole batch — a decision may
+/// depend on its siblings, e.g. a host that caps concurrent subagents
+/// must see every candidate at once to decide which slots get one —
+/// plus the parent thread id (for state lookups). The output is one
+/// decision per input slot, in the same order as the input; any mix of
+/// `SpawnAsSubagent` and `SpawnAsTool` is valid and routes atomically.
 ///
 /// Implementations must be deterministic with respect to their
 /// inputs: the worker may consult the selector on a fresh attempt
