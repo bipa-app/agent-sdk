@@ -83,12 +83,15 @@ pub struct CatalogEntry {
 /// publishes tiers must be billed through them, or a long-context run is priced
 /// at a fraction of what it costs and sails past its budget.
 ///
-/// The bound is **inclusive**, and the feeds express theirs differently: an
-/// `OpenRouter` override states the minimum prompt size it applies from
-/// (`min_prompt_tokens`), while a models.dev tier states the size it applies
-/// *above* (`tier.size`, the sibling of its `context_over_200k` field). A
-/// parser converts an exclusive bound exactly — `x > size` is `x >= size + 1`
-/// over integers — rather than leaving the two a token apart.
+/// The bound is **inclusive**, confirmed against each feed's documentation
+/// rather than inferred from a field name: `OpenRouter`'s provider docs state a
+/// tier "applies when input tokens meet or exceed the `min_context` value", and
+/// models.dev names its bound `context_over_<n>` (exclusive). The two are
+/// therefore expressed differently — an `OpenRouter` override gives the minimum
+/// prompt size it applies *from* (`min_prompt_tokens`, mapped straight across),
+/// a models.dev tier the size it applies *above* (`tier.size`, converted
+/// `x > size` ⇒ `x >= size + 1` over integers) — so a parser reconciles them
+/// exactly rather than leaving the two a token apart.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PricingTier {
     /// The tier applies to a call whose input tokens reach this count.

@@ -171,33 +171,70 @@ fn pricing_from_rates(
 /// An override that restates only *some* rates (six routes raise input, output
 /// and cache-read above the threshold while leaving cache-write unstated) keeps
 /// its base value for the rest — see [`merge_band_over_base`].
+///
+/// # Threshold and precedence
+///
+/// The bound is inclusive: `OpenRouter`'s provider docs state a tier "applies
+/// when input tokens meet or exceed the `min_context` value", so
+/// `min_prompt_tokens` maps directly to the inclusive
+/// [`PricingTier::min_input_tokens`] with no offset.
+///
+/// The docs define pricing only for the base band plus a single override tier;
+/// how *multiple* overrides compose is undocumented. `OpenRouter` applies the
+/// override list in source order, so this reads "later entry wins per price
+/// key": for a call, every override whose threshold the call meets is folded
+/// over the base in list order, a later entry's stated rates overriding an
+/// earlier one's. That fold is precomputed per distinct threshold here, so the
+/// highest-threshold [`PricingTier`] a call reaches already carries the
+/// resolved rates — matching what `applicable_pricing` selects. Ascending
+/// lists (every live route) are unaffected; only a non-monotonic list (which
+/// only a trimmed mirror could produce) changes, and there the source-order
+/// reading is the conservative one.
 fn tiers_from_openrouter_pricing(
     pricing: &OpenRouterPricing,
     base: Option<Pricing>,
 ) -> Option<Vec<PricingTier>> {
-    pricing
-        .overrides
-        .iter()
-        .map(|band| {
-            let rates = pricing_from_rates(
-                band.prompt.as_deref(),
-                band.completion.as_deref(),
-                band.input_cache_read.as_deref(),
-                band.input_cache_write.as_deref(),
-            )?;
-            // A band that bills only a cache component, with no input or output
-            // rate of its own, is not a price band this parser can stand behind.
-            if rates.input.is_none() || rates.output.is_none() {
-                return None;
-            }
-            Some(PricingTier {
-                // `min_prompt_tokens` is the smallest prompt the band applies
-                // to, so the bound is already inclusive.
-                min_input_tokens: band.min_prompt_tokens?,
-                pricing: merge_band_over_base(base, rates),
+    let mut bands: Vec<(u32, Pricing)> = Vec::with_capacity(pricing.overrides.len());
+    for band in &pricing.overrides {
+        let rates = pricing_from_rates(
+            band.prompt.as_deref(),
+            band.completion.as_deref(),
+            band.input_cache_read.as_deref(),
+            band.input_cache_write.as_deref(),
+        )?;
+        // A band that bills only a cache component, with no input or output
+        // rate of its own, is not a price band this parser can stand behind.
+        if rates.input.is_none() || rates.output.is_none() {
+            return None;
+        }
+        // `min_prompt_tokens` is the smallest prompt the band applies to, so
+        // the bound is already inclusive.
+        bands.push((band.min_prompt_tokens?, rates));
+    }
+
+    let mut thresholds: Vec<u32> = bands.iter().map(|(threshold, _)| *threshold).collect();
+    thresholds.sort_unstable();
+    thresholds.dedup();
+
+    Some(
+        thresholds
+            .into_iter()
+            .filter_map(|threshold| {
+                // Fold every override the call would satisfy at this threshold,
+                // in source order, each overriding the last per price key.
+                let mut pricing = base;
+                for (min, rates) in &bands {
+                    if *min <= threshold {
+                        pricing = Some(merge_band_over_base(pricing, *rates));
+                    }
+                }
+                pricing.map(|pricing| PricingTier {
+                    min_input_tokens: threshold,
+                    pricing,
+                })
             })
-        })
-        .collect()
+            .collect(),
+    )
 }
 
 /// An alternative public feed: <https://openrouter.ai/api/v1/models> (no key).
@@ -562,6 +599,65 @@ mod tests {
             .context("cost estimate missing")?;
         // Base: 0.3 * 1.25 = 0.375, not the override's 0.3 * 2.5 = 0.75.
         assert!((base - 0.375).abs() < 1e-9, "unexpected cost: {base}");
+        Ok(())
+    }
+
+    /// `OpenRouter` applies overrides in source order (later wins per key). A
+    /// non-monotonic list — a later entry at a *lower* threshold — must fold so
+    /// that entry wins where both apply, not the highest-threshold entry.
+    #[tokio::test]
+    async fn non_monotonic_overrides_fold_later_wins() -> Result<()> {
+        // Later entry (min 100K, prompt 3) is listed after the higher-threshold
+        // entry (min 200K, prompt 5). Only a trimmed mirror produces this.
+        const NON_MONOTONIC_FIXTURE: &str = r#"{
+          "data": [
+            {
+              "id": "vendor/model",
+              "pricing": {
+                "prompt": "0.000001",
+                "completion": "0.000001",
+                "overrides": [
+                  { "min_prompt_tokens": 200000, "prompt": "0.000005", "completion": "0.000005" },
+                  { "min_prompt_tokens": 100000, "prompt": "0.000003", "completion": "0.000003" }
+                ]
+              }
+            }
+          ]
+        }"#;
+
+        let entries = parse_openrouter(NON_MONOTONIC_FIXTURE)?;
+        let model = find(&entries, "openrouter", "vendor/model")?;
+        // Two distinct thresholds → two tiers.
+        assert_eq!(model.pricing_tiers.len(), 2);
+
+        let registry = ModelRegistry::new();
+        registry.refresh(&StaticSource(entries)).await?;
+        let out = |n: u32| Usage {
+            input_tokens: n,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+
+        // Below 100K: base $1/M.
+        let base = registry
+            .estimate_cost_usd("openrouter", "vendor/model", &out(50_000))
+            .context("cost estimate missing")?;
+        assert!((base - 0.05).abs() < 1e-9, "unexpected cost: {base}");
+
+        // 150K: only the min-100K entry applies → $3/M.
+        let mid = registry
+            .estimate_cost_usd("openrouter", "vendor/model", &out(150_000))
+            .context("cost estimate missing")?;
+        assert!((mid - 0.45).abs() < 1e-9, "unexpected cost: {mid}");
+
+        // 250K: both apply; source order folds the min-100K entry last, so it
+        // wins — $3/M, NOT the min-200K entry's $5/M that highest-threshold
+        // selection would have picked.
+        let high = registry
+            .estimate_cost_usd("openrouter", "vendor/model", &out(250_000))
+            .context("cost estimate missing")?;
+        assert!((high - 0.75).abs() < 1e-9, "unexpected cost: {high}");
         Ok(())
     }
 
