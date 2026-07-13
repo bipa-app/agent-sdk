@@ -434,6 +434,69 @@ async fn mid_stream_rate_limit_retries_then_succeeds() -> Result<()> {
 }
 
 #[tokio::test(start_paused = true)]
+async fn failed_attempt_usage_is_billed_and_folded_into_the_turn() -> Result<()> {
+    // Attempt 1 streams a text delta and its usage (100/50) and THEN hits a
+    // recoverable rate limit; attempt 2 succeeds with its own usage (100/50).
+    // The provider billed both, so:
+    //   * attempt 1's audit row must carry its real 100/50 (not zero),
+    //   * attempt 2's row bills only its own 100/50 (no double-count), and
+    //   * the committed turn total must be 200/100 (both attempts).
+    let stores = Stores::new();
+    // `text` appends Usage(DEFAULT_USAGE=100/50) then Done; failing after 2
+    // deltas injects the error right after that usage — the exact
+    // usage-before-error shape this PR made providers emit.
+    let first = TurnScript::text("partial").fail_after(
+        2,
+        StreamErrorKind::RateLimited(None),
+        "429 after usage was reported",
+    );
+    let second = TurnScript::text("after backoff");
+    let provider = StreamingScriptedProvider::new(vec![first, second]);
+
+    let outcome = run_turn(&stores, &provider).await?;
+    let RootTurnOutcome::Completed {
+        response_text,
+        commit,
+        ..
+    } = outcome
+    else {
+        panic!("expected Completed after rate-limit retry");
+    };
+    assert_eq!(response_text, "after backoff");
+
+    // Turn total (thread cumulative) includes BOTH attempts.
+    assert_eq!(
+        commit.thread.total_usage.input_tokens, 200,
+        "turn total must bill both attempts' input tokens",
+    );
+    assert_eq!(
+        commit.thread.total_usage.output_tokens, 100,
+        "turn total must bill both attempts' output tokens",
+    );
+
+    // Per-attempt audit rows: each bills its OWN tokens exactly once.
+    let attempts = stores
+        .attempts
+        .list_by_task(&acquire_existing_task_id(&stores).await?)
+        .await?;
+    assert_eq!(attempts.len(), 2, "one rate-limited attempt + one success");
+    assert_eq!(
+        attempts[0].input_tokens,
+        Some(100),
+        "the failed attempt's row must carry the tokens it streamed, not zero",
+    );
+    assert_eq!(attempts[0].output_tokens, Some(50));
+    assert_eq!(
+        attempts[1].input_tokens,
+        Some(100),
+        "the successful attempt's row bills only its own tokens (no fold)",
+    );
+    assert_eq!(attempts[1].output_tokens, Some(50));
+
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
 async fn mid_stream_rate_limit_waits_for_the_provider_hint() -> Result<()> {
     // The exponential schedule caps at 8s; a 30s server hint must win, so the
     // worker does not retry into a guaranteed second 429.

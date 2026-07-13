@@ -525,9 +525,10 @@ impl LlmProvider for OpenAICodexResponsesProvider {
         );
 
         if status == StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = retry_after.or_else(|| {
-                crate::retry_hints::openai_retry_delay(&String::from_utf8_lossy(&bytes))
-            });
+            let body = String::from_utf8_lossy(&bytes);
+            let retry_after = retry_after
+                .or_else(|| codex_http_reset_after(&body))
+                .or_else(|| crate::retry_hints::openai_retry_delay(&body));
             return Ok(ChatOutcome::RateLimited(retry_after));
         }
 
@@ -1652,7 +1653,9 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                 let body = response.text().await.unwrap_or_default();
                 let kind = if status == StatusCode::TOO_MANY_REQUESTS {
                     StreamErrorKind::RateLimited(
-                        header_hint.or_else(|| crate::retry_hints::openai_retry_delay(&body)),
+                        header_hint
+                            .or_else(|| codex_http_reset_after(&body))
+                            .or_else(|| crate::retry_hints::openai_retry_delay(&body)),
                     )
                 } else if status.is_server_error() {
                     StreamErrorKind::ServerError
@@ -2692,30 +2695,64 @@ struct WrappedWebsocketError {
     reset_after: Option<Duration>,
 }
 
-/// Read the wait a wrapped error frame states in a structured field.
+/// Resolve the wait a Codex quota error states in its structured reset fields.
 ///
 /// `resets_in_seconds` is preferred: it is relative, so it needs no wall-clock
 /// arithmetic and cannot be skewed by clock drift. `resets_at` (Unix seconds) is
-/// the fallback, converted defensively — an instant at or before now yields
-/// `None` rather than a zero or negative wait. Either way the value passes
-/// through the same ceiling as every other hint source.
-fn websocket_reset_after(error: Option<&ApiWrappedWebsocketErrorBody>) -> Option<Duration> {
-    let error = error?;
-    if let Some(seconds) = error.resets_in_seconds {
+/// the fallback, converted against the wall clock — an instant at or before now
+/// yields `None` rather than a zero or negative wait. Both are `f64`: the
+/// service sometimes encodes the timestamp as a JSON float, and rejecting that
+/// would fail the whole payload parse and lose the hint entirely. Either way the
+/// value passes through the same [`bounded_delay`](crate::retry_hints::bounded_delay)
+/// ceiling as every other hint source.
+fn codex_reset_after(resets_in_seconds: Option<f64>, resets_at: Option<f64>) -> Option<Duration> {
+    if let Some(seconds) = resets_in_seconds {
         return crate::retry_hints::bounded_delay(seconds);
     }
-
-    // Absolute form: convert against the wall clock. Every step that could
-    // produce a nonsense wait yields `None` instead — a pre-epoch timestamp
-    // (`try_from`), an instant at or before now (`checked_sub`), or one so far
-    // out it cannot be a quota reset (`u32::try_from`, i.e. beyond ~136 years).
-    let resets_at = u64::try_from(error.resets_at?).ok()?;
+    let resets_at = resets_at?;
+    if !resets_at.is_finite() {
+        return None;
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_secs();
-    let remaining = resets_at.checked_sub(now)?;
-    crate::retry_hints::bounded_delay(f64::from(u32::try_from(remaining).ok()?))
+    // `floor` drops sub-second precision a quota reset never needs; the
+    // `bounded_delay` sanity checks (finite, positive, ceiling) do the rest.
+    crate::retry_hints::bounded_delay(resets_at.floor() - f64::from(u32::try_from(now).ok()?))
+}
+
+/// Read the structured reset off a wrapped websocket error frame.
+fn websocket_reset_after(error: Option<&ApiWrappedWebsocketErrorBody>) -> Option<Duration> {
+    let error = error?;
+    codex_reset_after(error.resets_in_seconds, error.resets_at)
+}
+
+/// A Codex HTTP error body, read only for its structured quota reset.
+///
+/// The HTTP 429 responses carry no `Retry-After` header and a
+/// `usage_limit_reached` body whose message is timing-free prose, so the reset
+/// fields under `error` are the only usable hint there.
+#[derive(Deserialize)]
+struct ApiHttpErrorEnvelope {
+    #[serde(default)]
+    error: Option<ApiHttpErrorBody>,
+}
+
+#[derive(Deserialize)]
+struct ApiHttpErrorBody {
+    #[serde(default)]
+    resets_in_seconds: Option<f64>,
+    #[serde(default)]
+    resets_at: Option<f64>,
+}
+
+/// Resolve the wait a Codex HTTP 429 body states in its structured reset fields,
+/// or `None` when the body is not JSON or carries no reset.
+fn codex_http_reset_after(body: &str) -> Option<Duration> {
+    let envelope: ApiHttpErrorEnvelope = serde_json::from_str(body).ok()?;
+    let error = envelope.error?;
+    codex_reset_after(error.resets_in_seconds, error.resets_at)
 }
 
 fn parse_wrapped_websocket_error_event(payload: &str) -> Option<WrappedWebsocketError> {
@@ -3332,9 +3369,11 @@ struct ApiWrappedWebsocketErrorBody {
     #[serde(default)]
     resets_in_seconds: Option<f64>,
     /// Absolute reset instant (Unix seconds), sent by some frames instead of
-    /// the relative field.
+    /// the relative field. `f64` because the service sometimes encodes it as a
+    /// JSON float — an `i64` field would fail the whole frame parse on such a
+    /// value, losing the hint and the rate-limit classification with it.
     #[serde(default)]
-    resets_at: Option<i64>,
+    resets_at: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -3849,6 +3888,65 @@ mod tests {
         assert_eq!(
             websocket_error_kind(&parsed),
             StreamErrorKind::RateLimited(Some(std::time::Duration::from_mins(2)))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn float_encoded_resets_at_still_parses_and_classifies() -> anyhow::Result<()> {
+        // A float `resets_at` must not fail the whole frame parse: doing so would
+        // drop the frame entirely, losing both the hint and the rate-limit
+        // classification — strictly worse than ignoring the reset field.
+        let future = f64::from(u32::try_from(unix_now())?) + 600.5;
+        let parsed = parse_wrapped_websocket_error_event(&format!(
+            r#"{{"type":"error","status":429,"error":{{"type":"usage_limit_reached","message":"The usage limit has been reached.","resets_at":{future}}}}}"#,
+        ))
+        .context("a float resets_at must still parse as a wrapped error")?;
+
+        let StreamErrorKind::RateLimited(Some(delay)) = websocket_error_kind(&parsed) else {
+            anyhow::bail!("a usage-limit frame must classify as a rate limit with a delay");
+        };
+        assert!(
+            delay <= std::time::Duration::from_mins(10)
+                && delay >= std::time::Duration::from_secs(590),
+            "the float reset must convert to a ~600s wait, got {delay:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn codex_http_reset_after_reads_the_structured_body() -> anyhow::Result<()> {
+        // The HTTP 429 branches carry the reset in the body (no Retry-After
+        // header, timing-free prose), so this is the only hint there.
+        assert_eq!(
+            codex_http_reset_after(
+                r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached.","resets_in_seconds":900}}"#
+            ),
+            Some(std::time::Duration::from_mins(15))
+        );
+
+        // Float-encoded absolute reset — must not fail the parse (item-3 class).
+        let future = f64::from(u32::try_from(unix_now())?) + 300.0;
+        let delay = codex_http_reset_after(&format!(
+            r#"{{"error":{{"type":"usage_limit_reached","resets_at":{future}}}}}"#,
+        ))
+        .context("a float resets_at HTTP body must parse")?;
+        assert!(
+            delay <= std::time::Duration::from_mins(5)
+                && delay >= std::time::Duration::from_secs(290),
+            "got {delay:?}"
+        );
+
+        // Not JSON / no reset fields / past instant → no hint.
+        assert_eq!(codex_http_reset_after("429 Too Many Requests"), None);
+        assert_eq!(
+            codex_http_reset_after(r#"{"error":{"message":"slow down"}}"#),
+            None
+        );
+        let past = f64::from(u32::try_from(unix_now())?) - 60.0;
+        assert_eq!(
+            codex_http_reset_after(&format!(r#"{{"error":{{"resets_at":{past}}}}}"#)),
+            None
         );
         Ok(())
     }
@@ -4577,6 +4675,99 @@ mod tests {
 
     async fn spawn_http_only_server() -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         spawn_http_only_server_with_body(HTTP_SSE_BODY).await
+    }
+
+    /// An HTTP-only server that answers every non-upgrade request with a fixed
+    /// status line and body — used to drive the 429 quota branches.
+    async fn spawn_http_status_server(status_line: &'static str, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let head = read_http_head(&mut stream).await;
+                    if head.to_ascii_lowercase().contains("upgrade: websocket") {
+                        let _ = stream
+                            .write_all(
+                                b"HTTP/1.1 426 Upgrade Required\r\ncontent-length: 0\r\n\r\n",
+                            )
+                            .await;
+                        return;
+                    }
+                    let response = format!(
+                        "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}/backend-api")
+    }
+
+    #[tokio::test]
+    async fn http_chat_429_reads_the_structured_reset_body() -> anyhow::Result<()> {
+        // The non-streaming chat() 429 branch: no Retry-After header, a
+        // usage-limit body whose only usable hint is `resets_in_seconds`.
+        let base_url = spawn_http_status_server(
+            "429 Too Many Requests",
+            r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached.","resets_in_seconds":600}}"#,
+        )
+        .await;
+        let provider = OpenAICodexResponsesProvider::with_base_url(
+            oauth_token(),
+            MODEL_GPT53_CODEX.to_string(),
+            base_url,
+        );
+
+        let outcome = provider
+            .chat(ChatRequest::new(
+                "You are helpful.",
+                vec![Message::user("hi")],
+            ))
+            .await?;
+        assert!(
+            matches!(
+                outcome,
+                ChatOutcome::RateLimited(Some(delay)) if delay == std::time::Duration::from_mins(10)
+            ),
+            "the HTTP chat 429 must carry the structured reset, got {outcome:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_stream_429_reads_the_structured_reset_body() -> anyhow::Result<()> {
+        // The HTTP streaming branch (websockets disabled → HTTP SSE): a 429 at
+        // stream open must surface a rate limit carrying the body's reset.
+        let base_url = spawn_http_status_server(
+            "429 Too Many Requests",
+            r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached.","resets_in_seconds":600}}"#,
+        )
+        .await;
+        let provider = OpenAICodexResponsesProvider::with_base_url(
+            oauth_token(),
+            MODEL_GPT53_CODEX.to_string(),
+            base_url,
+        )
+        .with_websockets_disabled(true);
+
+        let mut stream = std::pin::pin!(provider.chat_stream(streaming_request("session-429")));
+        let mut kind = None;
+        while let Some(item) = stream.next().await {
+            if let StreamDelta::Error { kind: k, .. } = item? {
+                kind = Some(k);
+                break;
+            }
+        }
+        assert_eq!(
+            kind.context("the stream must surface an error")?,
+            StreamErrorKind::RateLimited(Some(std::time::Duration::from_mins(10)))
+        );
+        Ok(())
     }
 
     /// Drain a stream, returning whether it completed without a transport error.
