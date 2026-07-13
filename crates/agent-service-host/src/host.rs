@@ -57,6 +57,7 @@ use tracing::{info, warn};
 use agent_sdk_foundation::ToolTier;
 use agent_server::journal::commit::StaleTurnCommit;
 use agent_server::journal::committed_event::CommittedEvent;
+use agent_server::journal::event_repository::EventRepository;
 use agent_server::journal::execution_context::build_root_worker_inputs;
 use agent_server::journal::execution_intent::{GuardedExecutionDeps, classify_tool_effect};
 use agent_server::journal::store::RequeueOutcome;
@@ -1070,9 +1071,11 @@ async fn run_task_with_heartbeat(
     }));
 
     // Resolve the deadline under the heartbeat's lease protection, and
-    // fail an already-expired child (sat queued too long, or
-    // re-acquired after a crash near the deadline) up front without
-    // dispatching any LLM call. The spawned heartbeat holds its own
+    // fail an already-stalled child (never started, or re-acquired
+    // after a crash that left it silent past its budget) up front
+    // without dispatching any LLM call. A child that was still
+    // committing frames inside the budget is NOT stalled and runs
+    // normally, however old it is. The spawned heartbeat holds its own
     // copy of the state (`Unresolved` here) and independently
     // re-resolves each tick, so a transient failure of this lookup
     // still converges on enforcement; the cost is one extra indexed
@@ -1080,14 +1083,21 @@ async fn run_task_with_heartbeat(
     if matches!(initial_deadline, SubagentDeadlineState::Unresolved { .. })
         && let SubagentDeadlineState::Enforced(deadline) =
             resolve_subagent_deadline(stores, &task).await
-        && time::OffsetDateTime::now_utc() >= deadline.expires_at
+        && stall_expired(
+            stores.event_repo.as_ref(),
+            &thread_id,
+            deadline,
+            time::OffsetDateTime::now_utc(),
+        )
+        .await
     {
         warn!(
             %worker_id,
             task_id = %task_id,
             thread_id = %thread_id,
             timeout_ms = deadline.timeout_ms,
-            "subagent child root acquired past its deadline; failing without execution",
+            "subagent child root acquired after stalling out its whole budget; \
+             failing without execution",
         );
         // Stop the heartbeat first so its own deadline enforcement
         // cannot race this fail on the same lease; the fail helper
@@ -1283,25 +1293,106 @@ async fn settle_attempts_after_force_drop(
     .await;
 }
 
-/// Wall-clock execution deadline for a child-thread root task linked
-/// to a durable subagent invocation.
+/// **Stall** deadline for a child-thread root task linked to a durable
+/// subagent invocation.
 ///
-/// Anchored at the child root task's `created_at` plus the resolved
-/// `spec.timeout_ms` — "the child took too long since spawn" — matching
-/// the in-process SDK subagent semantics. Resolved once per acquisition
-/// by [`resolve_subagent_deadline`] and enforced by [`heartbeat_loop`]
-/// once per tick, so enforcement carries up to one heartbeat interval
-/// of slack past the nominal deadline. In a multi-node deployment,
-/// clock skew between the spawning node (which stamps `created_at`)
-/// and the enforcing node (which compares against its own
-/// `now_utc()`) shifts enforcement 1:1 with the skew — consistent
-/// with how wall-clock lease expiry is already handled.
+/// `spec.timeout_ms` is a budget of *silence*, not of work: a child is
+/// failed only after going the whole budget with **no evidence of
+/// work**. A child that keeps working never expires, however long it
+/// runs — a six-hour build worker that commits a frame every minute is
+/// as healthy as a six-second one.
+///
+/// This is a deliberate reversal of the original since-spawn semantics
+/// (issue #299 / #360), which failed *productive* children purely for
+/// being old and threw away everything they had done. Age is not
+/// evidence of being stuck.
+///
+/// ## The two conditions
+///
+/// [`stall_expired`] fails a child only when **both** hold:
+///
+/// 1. `now >= earliest_expiry_at` (`created_at + timeout_ms`) — spawn
+///    counts as the initial evidence of life, so a child younger than
+///    its own budget can never be stalled out. This also still reaps a
+///    child that never starts at all (wedged admission, hung before its
+///    first frame).
+/// 2. Its own thread committed **no event** at or after
+///    `now - timeout_ms` — nothing happened for a whole budget.
+///
+/// Together these mean "expires roughly `timeout_ms` after the last
+/// sign of life", with the spawn instant as the first such sign.
+///
+/// Enforced by [`heartbeat_loop`] once per tick, by the parked sweep,
+/// and once up front at acquisition, so enforcement carries up to one
+/// tick of slack past the nominal stall point. In a multi-node
+/// deployment, clock skew between the node stamping the durable
+/// timestamps and the enforcing node shifts enforcement 1:1 with the
+/// skew — consistent with how wall-clock lease expiry is already
+/// handled.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SubagentExecutionDeadline {
-    /// Instant past which the child must be failed.
-    expires_at: time::OffsetDateTime,
-    /// The resolved spec timeout, kept for the failure message.
+    /// Earliest instant the child *could* be failed — `created_at +
+    /// timeout_ms`. Reaching it is necessary but **not sufficient**:
+    /// the child must also have been silent for the whole budget. See
+    /// [`stall_expired`].
+    earliest_expiry_at: time::OffsetDateTime,
+    /// The resolved spec timeout. Doubles as the silence budget and as
+    /// the failure message's stated timeout.
     timeout_ms: u64,
+}
+
+/// Whether an enforced child has gone its entire `timeout_ms` budget
+/// without any evidence of work — the sole condition for failing it.
+///
+/// ## Why committed events are the progress signal
+///
+/// The child's own journal (`agent_sdk_committed_events`) is the only
+/// signal that binds to *"is this child actually doing something"*:
+/// every assistant frame, tool call, and tool result commits an event
+/// on the child's thread, and a wedged provider stream commits
+/// nothing.
+///
+/// The lease heartbeat is deliberately **not** used: it renews
+/// unconditionally while the task future is alive, so a child hung on
+/// a half-open connection heartbeats forever. That is precisely the
+/// failure this enforcement exists to catch — a heartbeat proves the
+/// process is alive, not that work is happening.
+///
+/// ## Fail-safe
+///
+/// A store error answers `false` (not expired). Never kill a child on
+/// *unknown* activity: the next tick or sweep retries, and a genuinely
+/// stalled child stays stalled.
+async fn stall_expired(
+    event_repo: &dyn EventRepository,
+    thread_id: &agent_sdk_foundation::ThreadId,
+    enforced: SubagentExecutionDeadline,
+    now: time::OffsetDateTime,
+) -> bool {
+    // Condition 1: spawn is the initial evidence of life.
+    if now < enforced.earliest_expiry_at {
+        return false;
+    }
+    let budget =
+        time::Duration::milliseconds(i64::try_from(enforced.timeout_ms).unwrap_or(i64::MAX));
+    let Some(cutoff) = now.checked_sub(budget) else {
+        // A budget too large to subtract can never elapse.
+        return false;
+    };
+    // Condition 2: did anything at all happen inside the budget?
+    match event_repo.min_sequence_at_or_after(thread_id, cutoff).await {
+        Ok(Some(_)) => false,
+        Ok(None) => true,
+        Err(err) => {
+            warn!(
+                thread_id = %thread_id,
+                error = %err,
+                "subagent activity probe failed; treating the child as active \
+                 (fail-safe: never time out on unknown activity)",
+            );
+            false
+        }
+    }
 }
 
 /// Per-acquisition resolution state for the subagent wall-clock
@@ -1331,17 +1422,22 @@ pub(crate) enum SubagentDeadlineState {
     Enforced(SubagentExecutionDeadline),
 }
 
-/// Build the deadline from durable anchors, or `None` when
+/// Build the stall deadline from durable anchors, or `None` when
 /// `created_at + timeout_ms` overflows the datetime range
 /// (practically unreachable; treated as "no deadline").
+///
+/// Only the *earliest* expiry is derived here. Whether the child is
+/// actually stalled at that point is [`stall_expired`]'s question, and
+/// it is re-asked on every tick — which is what lets a working child
+/// push its expiry out indefinitely.
 fn deadline_for(
     created_at: time::OffsetDateTime,
     timeout_ms: u64,
 ) -> Option<SubagentExecutionDeadline> {
     let timeout = time::Duration::milliseconds(i64::try_from(timeout_ms).unwrap_or(i64::MAX));
-    let expires_at = created_at.checked_add(timeout)?;
+    let earliest_expiry_at = created_at.checked_add(timeout)?;
     Some(SubagentExecutionDeadline {
-        expires_at,
+        earliest_expiry_at,
         timeout_ms,
     })
 }
@@ -1537,7 +1633,11 @@ async fn deadline_tick(
     let SubagentDeadlineState::Enforced(enforced) = deadline else {
         return DeadlineTick::Continue(deadline);
     };
-    if now < enforced.expires_at {
+    // Re-asked every tick, which is what makes the budget a STALL budget:
+    // a child that committed anything inside the last `timeout_ms` pushes
+    // its expiry out and keeps running, no matter how long it has been
+    // alive. Only sustained silence ends it.
+    if !stall_expired(stores.event_repo.as_ref(), owned.thread, enforced, now).await {
         return DeadlineTick::Continue(deadline);
     }
 
@@ -1546,7 +1646,7 @@ async fn deadline_tick(
         task_id = %owned.task,
         thread_id = %owned.thread,
         timeout_ms = enforced.timeout_ms,
-        "subagent child root exceeded its deadline; failing and aborting the turn",
+        "subagent child root stalled for its whole budget; failing and aborting the turn",
     );
     match fail_timed_out_subagent_root(
         stores,
@@ -2536,12 +2636,15 @@ async fn enforce_subagent_deadlines(
             continue;
         };
         // Cheap pre-filter on the invocation's own creation time: the
-        // child root is created in the same store transition, so its
-        // deadline can only be LATER than this bound. Skipping early
-        // avoids a per-candidate child-root read on every unexpired
-        // invocation; the authoritative check below re-derives the
-        // deadline from the child root's own `created_at`.
-        if now < deadline.expires_at {
+        // child root is created in the same store transition, so it can
+        // never expire BEFORE this bound (and under stall semantics it
+        // usually expires much later — every committed frame pushes it
+        // out). Skipping early avoids a per-candidate child-root read
+        // and an activity probe on every child that cannot possibly be
+        // stalled yet; the authoritative check below re-derives the
+        // bound from the child root's own `created_at` and then asks
+        // whether the child has actually gone silent.
+        if now < deadline.earliest_expiry_at {
             continue;
         }
         let child_root = match stores.task_store.get(&child_root_id).await {
@@ -2559,7 +2662,17 @@ async fn enforce_subagent_deadlines(
         let Some(deadline) = deadline_for(child_root.created_at, linkage.spec.timeout_ms) else {
             continue;
         };
-        if now < deadline.expires_at {
+        // A parked child whose own descendants are still committing work
+        // is making progress through them — only sustained silence on the
+        // child's thread ends it.
+        if !stall_expired(
+            stores.event_repo.as_ref(),
+            &child_root.thread_id,
+            deadline,
+            now,
+        )
+        .await
+        {
             continue;
         }
         match child_root.status {
@@ -5455,6 +5568,185 @@ mod tests {
         Ok(())
     }
 
+    /// The founder-facing property: a child that keeps working is never
+    /// timed out, no matter how old it gets.
+    ///
+    /// `timeout_ms` is a budget of silence, not of work. A worker that
+    /// has been running for ten hours but committed a frame a moment ago
+    /// is healthy — killing it would throw away ten hours of work, which
+    /// is exactly what the old since-spawn deadline did.
+    #[tokio::test]
+    async fn active_child_survives_arbitrarily_far_past_its_stall_budget() -> Result<()> {
+        use agent_sdk_foundation::{AgentEvent, ThreadId};
+
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            sample_registry(),
+            subagent_timeout_runtime(Arc::new(SubagentScriptProvider::new()))?,
+        )?;
+        let stores = host.stores().clone();
+
+        let spawned_at = time::OffsetDateTime::now_utc();
+        let budget_ms = 30 * 60 * 1_000; // 30 minutes, bip's default posture.
+        let (_parent, _invocation, child_root) = persist_subagent_fixture(
+            &stores,
+            &ThreadId::from_string("t-stall-active"),
+            budget_ms,
+            spawned_at,
+        )
+        .await?;
+        let SubagentDeadlineState::Enforced(deadline) =
+            resolve_subagent_deadline(&stores, &child_root).await
+        else {
+            bail!("linked child root must resolve an enforced deadline");
+        };
+
+        // Ten hours in — twenty budgets past the old since-spawn deadline —
+        // but the child committed a frame one minute ago.
+        let now = spawned_at + time::Duration::hours(10);
+        stores
+            .event_repo
+            .commit_event(
+                &child_root.thread_id,
+                AgentEvent::text("t1", "still working"),
+                now - time::Duration::minutes(1),
+            )
+            .await?;
+
+        assert!(
+            !stall_expired(
+                stores.event_repo.as_ref(),
+                &child_root.thread_id,
+                deadline,
+                now
+            )
+            .await,
+            "a child that committed work inside its budget must never time out, \
+             however long it has been alive",
+        );
+        Ok(())
+    }
+
+    /// The other half: silence still ends a child — one budget after its
+    /// last sign of life, not one budget after spawn.
+    #[tokio::test]
+    async fn silent_child_expires_one_budget_after_its_last_frame() -> Result<()> {
+        use agent_sdk_foundation::{AgentEvent, ThreadId};
+
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            sample_registry(),
+            subagent_timeout_runtime(Arc::new(SubagentScriptProvider::new()))?,
+        )?;
+        let stores = host.stores().clone();
+
+        let spawned_at = time::OffsetDateTime::now_utc();
+        let budget = time::Duration::minutes(30);
+        let (_parent, _invocation, child_root) = persist_subagent_fixture(
+            &stores,
+            &ThreadId::from_string("t-stall-silent"),
+            30 * 60 * 1_000,
+            spawned_at,
+        )
+        .await?;
+        let SubagentDeadlineState::Enforced(deadline) =
+            resolve_subagent_deadline(&stores, &child_root).await
+        else {
+            bail!("linked child root must resolve an enforced deadline");
+        };
+
+        // The child worked for two hours, then went silent.
+        let last_frame_at = spawned_at + time::Duration::hours(2);
+        stores
+            .event_repo
+            .commit_event(
+                &child_root.thread_id,
+                AgentEvent::text("t1", "last thing I did"),
+                last_frame_at,
+            )
+            .await?;
+
+        // One second short of a full budget of silence: still alive. Note
+        // this instant is already FOUR budgets past spawn — under the old
+        // since-spawn rule the child would have been dead long ago.
+        let still_alive_at = last_frame_at + budget - time::Duration::seconds(1);
+        assert!(
+            !stall_expired(
+                stores.event_repo.as_ref(),
+                &child_root.thread_id,
+                deadline,
+                still_alive_at,
+            )
+            .await,
+            "expiry must be measured from the last frame, not from spawn",
+        );
+
+        // A full budget of silence after that last frame: reaped.
+        let expired_at = last_frame_at + budget + time::Duration::seconds(1);
+        assert!(
+            stall_expired(
+                stores.event_repo.as_ref(),
+                &child_root.thread_id,
+                deadline,
+                expired_at,
+            )
+            .await,
+            "a child silent for its whole budget must still be timed out",
+        );
+        Ok(())
+    }
+
+    /// A child that never produces anything is still reaped: spawn is the
+    /// initial evidence of life, so the budget runs from `created_at` when
+    /// no frame ever lands (wedged admission, hung before the first token).
+    #[tokio::test]
+    async fn child_that_never_commits_anything_still_times_out() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            sample_registry(),
+            subagent_timeout_runtime(Arc::new(SubagentScriptProvider::new()))?,
+        )?;
+        let stores = host.stores().clone();
+
+        let spawned_at = time::OffsetDateTime::now_utc();
+        let (_parent, _invocation, child_root) = persist_subagent_fixture(
+            &stores,
+            &ThreadId::from_string("t-stall-never-starts"),
+            1_000,
+            spawned_at,
+        )
+        .await?;
+        let SubagentDeadlineState::Enforced(deadline) =
+            resolve_subagent_deadline(&stores, &child_root).await
+        else {
+            bail!("linked child root must resolve an enforced deadline");
+        };
+
+        assert!(
+            !stall_expired(
+                stores.event_repo.as_ref(),
+                &child_root.thread_id,
+                deadline,
+                spawned_at + time::Duration::milliseconds(500),
+            )
+            .await,
+            "a child younger than its own budget can never be stalled out",
+        );
+        assert!(
+            stall_expired(
+                stores.event_repo.as_ref(),
+                &child_root.thread_id,
+                deadline,
+                spawned_at + time::Duration::milliseconds(1_500),
+            )
+            .await,
+            "a child that never committed anything must still time out",
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn resolve_subagent_deadline_only_for_linked_child_roots() -> Result<()> {
         use agent_sdk_foundation::ThreadId;
@@ -5470,7 +5762,9 @@ mod tests {
         let (parent, _invocation, child_root) =
             persist_subagent_fixture(&stores, &parent_thread, 250, at).await?;
 
-        // Linked child root: deadline anchored at created_at + timeout.
+        // Linked child root: the EARLIEST possible expiry is anchored at
+        // created_at + timeout. Reaching it is necessary but not
+        // sufficient — `stall_expired` still has to find the child silent.
         let SubagentDeadlineState::Enforced(deadline) =
             resolve_subagent_deadline(&stores, &child_root).await
         else {
@@ -5478,9 +5772,9 @@ mod tests {
         };
         assert_eq!(deadline.timeout_ms, 250);
         assert_eq!(
-            deadline.expires_at,
+            deadline.earliest_expiry_at,
             child_root.created_at + time::Duration::milliseconds(250),
-            "deadline must anchor at the child root's creation time",
+            "the earliest-expiry floor must anchor at the child root's creation time",
         );
 
         // The parent root (not a linked child root) resolves no deadline.
