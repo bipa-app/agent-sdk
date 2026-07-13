@@ -81,21 +81,20 @@ fn catalog_candidates<'a>(
     static_candidates(provider, model).chain(feed_slug_candidates(model))
 }
 
-/// The keys the feeds derive from a vendor-slug model id (`z-ai/glm-5.1`),
+/// The keys the feeds may file a vendor-slug model id (`z-ai/glm-5.1`) under,
 /// route first.
 ///
-/// The two feeds file a routed model differently. models.dev keeps the outer
-/// service key, so an `OpenRouter` route is stored whole:
-/// `("openrouter", "moonshotai/kimi-k2.6")`. The `OpenRouter` feed splits the
-/// slug (`split_openrouter_id`), so the same model lands under its vendor:
-/// `("moonshotai", "kimi-k2.6")` — which is *also* where a native (non-routed)
-/// row for that vendor lives, at the vendor's own price rather than the
-/// route's.
+/// Both feeds file a *routed* row under the route, slug intact —
+/// `("openrouter", "moonshotai/kimi-k2.6")` — so that is the first key tried:
+/// a run that pays a router's rate must be budgeted at that rate.
 ///
-/// The route key therefore comes first: a run that pays a router's rate must
-/// be budgeted at that rate, and the vendor key is the approximation to fall
-/// back on. The vendor split mirrors `split_openrouter_id`, `google` remap
-/// included, so the halves match the keys that parser emits.
+/// The vendor key (`("moonshotai", "kimi-k2.6")`) is the fallback behind it,
+/// and reaches a *native* vendor row: models.dev also publishes the vendor's
+/// own section, where the same model sits at the vendor's direct price. That
+/// is an approximation of what a routed run pays — close, and far better than
+/// no estimate — so it is only consulted once the route key has missed. The
+/// `google` remap mirrors `map_modelsdev_provider`, so the halves match the
+/// keys that parser emits for a native section.
 fn feed_slug_candidates(model: &str) -> impl Iterator<Item = (&str, &str)> {
     let route_key = model.contains('/').then_some(("openrouter", model));
     route_key.into_iter().chain(vendor_slug_key(model))
@@ -145,14 +144,13 @@ fn static_candidates<'a>(
     std::iter::once((provider, model)).chain(backends.iter().map(move |backend| (*backend, model)))
 }
 
-/// Split a vendor-slug model id (`z-ai/glm-5.1`) into the vendor key the
-/// `OpenRouter` feed stores it under (`z-ai` / `glm-5.1`).
+/// Split a vendor-slug model id (`z-ai/glm-5.1`) into the vendor key a feed's
+/// native section stores it under (`z-ai` / `glm-5.1`).
 ///
 /// Open models (z.ai, Moonshot, `DeepSeek`, `MiniMax`, …) are served through
 /// `OpenAIProvider`, so their provenance is `openai` plus the full slug the
-/// caller passed, and no feed files them under that pair. Mirrors
-/// `split_openrouter_id`, `google` remap included, so the halves match the
-/// keys that parser emits.
+/// caller passed, and no feed files them under that pair. The `google` remap
+/// mirrors `map_modelsdev_provider`.
 fn vendor_slug_key(model: &str) -> Option<(&str, &str)> {
     let (vendor, model_id) = model.split_once('/')?;
     let provider = if vendor == "google" { "gemini" } else { vendor };
@@ -718,14 +716,29 @@ mod catalog_tests {
       ]
     }"#;
 
-    /// A feed row for a model the static table also prices (`openai/gpt-4o`),
-    /// but carrying only an input rate.
-    const OPENROUTER_PARTIAL_FIXTURE: &str = r#"{
+    /// A models.dev *native* row for a model the static table also prices
+    /// (`openai` / `gpt-4o`), carrying only an input rate.
+    const MODELSDEV_PARTIAL_FIXTURE: &str = r#"{
+      "openai": {
+        "id": "openai",
+        "models": {
+          "gpt-4o": {
+            "id": "gpt-4o",
+            "cost": { "input": 1000 }
+          }
+        }
+      }
+    }"#;
+
+    /// `OpenRouter`'s listing for models that are also callable directly. The
+    /// rates here are the router's, not the vendor's: `gpt-4o` at $15/M output
+    /// against the static direct rate of $5/M.
+    const OPENROUTER_DIRECT_MODELS_FIXTURE: &str = r#"{
       "data": [
         {
           "id": "openai/gpt-4o",
           "context_length": 128000,
-          "pricing": { "prompt": "0.001" }
+          "pricing": { "prompt": "0.00001", "completion": "0.000015" }
         }
       ]
     }"#;
@@ -820,7 +833,7 @@ mod catalog_tests {
 
     #[tokio::test]
     async fn partially_priced_feed_row_yields_to_the_static_table() -> Result<()> {
-        let registry = registry_from(OPENROUTER_PARTIAL_FIXTURE).await?;
+        let registry = registry_from_entries(parse_modelsdev(MODELSDEV_PARTIAL_FIXTURE)?).await?;
         let usage = TokenUsage {
             input_tokens: 2_000,
             output_tokens: 1_000,
@@ -837,6 +850,41 @@ mod catalog_tests {
             .context("gpt-4o is priced in the static table")?;
         assert!((cost - statically_priced).abs() < 1e-12);
         assert!((cost - 0.0075).abs() < 1e-9, "unexpected cost: {cost}");
+        Ok(())
+    }
+
+    /// A direct call must never be priced from the router's listing for the
+    /// same model. `OpenRouter` rows are keyed by route, so a direct
+    /// provenance derives no key that reaches them and falls through to the
+    /// static (direct) rate.
+    #[tokio::test]
+    async fn direct_call_is_not_priced_at_the_routers_rate() -> Result<()> {
+        let registry = registry_from(OPENROUTER_DIRECT_MODELS_FIXTURE).await?;
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+
+        // Direct: static rate ($1.25/M in + $5/M out = $6.25), never the
+        // router's ($10/M + $15/M = $25).
+        let direct = AuditProvenance::new("openai", "gpt-4o");
+        let cost = estimate_cost_usd(Some(&registry), &direct, &usage)
+            .context("gpt-4o is priced in the static table")?;
+        assert!((cost - 6.25).abs() < 1e-9, "unexpected direct cost: {cost}");
+        let uncatalogued = estimate_cost_usd(None, &direct, &usage)
+            .context("gpt-4o is priced in the static table")?;
+        assert!((cost - uncatalogued).abs() < 1e-12);
+
+        // The same model called THROUGH the router does pay the router's rate,
+        // reached by the route key.
+        let routed = AuditProvenance::new("openai", "openai/gpt-4o");
+        let routed_cost = estimate_cost_usd(Some(&registry), &routed, &usage)
+            .context("the route key must price a routed call")?;
+        assert!(
+            (routed_cost - 25.0).abs() < 1e-9,
+            "unexpected routed cost: {routed_cost}"
+        );
         Ok(())
     }
 

@@ -37,6 +37,10 @@ struct OpenRouterResponse {
     data: Vec<OpenRouterModel>,
 }
 
+/// The provider name every `OpenRouter` row is filed under: the route is what
+/// the caller pays, so the route is what the row is keyed by.
+const OPENROUTER_PROVIDER: &str = "openrouter";
+
 fn openrouter_price_per_million(value: &str) -> Option<PricePoint> {
     let per_token: f64 = value.trim().parse().ok()?;
     if !per_token.is_finite() || per_token <= 0.0 {
@@ -45,20 +49,19 @@ fn openrouter_price_per_million(value: &str) -> Option<PricePoint> {
     Some(PricePoint::new(per_token * 1_000_000.0))
 }
 
-fn split_openrouter_id(id: &str) -> (String, String) {
-    match id.split_once('/') {
-        Some((vendor, model)) => {
-            let provider = match vendor {
-                "google" => "gemini",
-                other => other,
-            };
-            (provider.to_owned(), model.to_owned())
-        }
-        None => (String::new(), id.to_owned()),
-    }
-}
-
 /// Parse the `OpenRouter` `/models` body into catalog entries.
+///
+/// Every row is filed under the route that serves it — provider `openrouter`,
+/// model id the full slug (`anthropic/claude-opus-4.8`) — never under the
+/// vendor half of the slug. The prices in this feed are `OpenRouter`'s own,
+/// and they are not the vendor's: splitting `openai/gpt-4o` into
+/// `("openai", "gpt-4o")` would file a router's rate under the exact key a
+/// *direct* `OpenAI` call resolves to, so a direct call would be priced at the
+/// router's rate. A caller that routes through `OpenRouter` reaches these rows
+/// by asking for the route key; a caller that does not, never sees them.
+///
+/// This matches how models.dev files the same rows (under its `openrouter`
+/// service key, slug intact).
 ///
 /// # Errors
 ///
@@ -70,7 +73,6 @@ pub fn parse_openrouter(json: &str) -> Result<Vec<CatalogEntry>> {
         .data
         .into_iter()
         .map(|model| {
-            let (provider, model_id) = split_openrouter_id(&model.id);
             let pricing = model.pricing.and_then(|p| {
                 let input = p.prompt.as_deref().and_then(openrouter_price_per_million);
                 let output = p
@@ -94,8 +96,8 @@ pub fn parse_openrouter(json: &str) -> Result<Vec<CatalogEntry>> {
             });
             let max_output_tokens = model.top_provider.and_then(|tp| tp.max_completion_tokens);
             CatalogEntry {
-                provider,
-                model_id,
+                provider: OPENROUTER_PROVIDER.to_owned(),
+                model_id: model.id,
                 context_window: model.context_length,
                 max_output_tokens,
                 pricing,
@@ -231,11 +233,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_openrouter_converts_per_token_to_per_million_and_splits_ids() -> Result<()> {
+    fn parse_openrouter_converts_per_token_to_per_million_and_keys_rows_by_route() -> Result<()> {
         let entries = parse_openrouter(OPENROUTER_FIXTURE)?;
         assert_eq!(entries.len(), 2);
 
-        let opus = find(&entries, "anthropic", "claude-opus-4.8")?;
+        // Rows are filed under the route, slug intact — never under the vendor
+        // half, which is where a DIRECT call to that vendor would look and
+        // would then find this router's price.
+        assert!(entries.iter().all(|e| e.provider == "openrouter"));
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.provider == "anthropic" || e.provider == "gemini"),
+        );
+
+        let opus = find(&entries, "openrouter", "anthropic/claude-opus-4.8")?;
         assert_eq!(opus.context_window, Some(1_000_000));
         assert_eq!(opus.max_output_tokens, Some(128_000));
         let pricing = opus.pricing.context("opus pricing missing")?;
@@ -256,8 +268,7 @@ mod tests {
                 < f64::EPSILON
         );
 
-        // `google/...` is split + remapped to our `gemini` provider name.
-        let gemini = find(&entries, "gemini", "gemini-2.5-pro")?;
+        let gemini = find(&entries, "openrouter", "google/gemini-2.5-pro")?;
         assert_eq!(gemini.context_window, Some(1_048_576));
         Ok(())
     }
@@ -267,7 +278,7 @@ mod tests {
         let entries = parse_openrouter(OPENROUTER_SENTINEL_FIXTURE)?;
         assert_eq!(entries.len(), 1);
 
-        let auto = find(&entries, "openrouter", "auto")?;
+        let auto = find(&entries, "openrouter", "openrouter/auto")?;
         assert!(
             auto.pricing.is_none(),
             "sentinel `-1` prices must yield None pricing, got {:?}",
@@ -284,7 +295,7 @@ mod tests {
             cache_creation_input_tokens: 0,
         };
         assert_eq!(
-            registry.estimate_cost_usd("openrouter", "auto", &usage),
+            registry.estimate_cost_usd("openrouter", "openrouter/auto", &usage),
             None
         );
         Ok(())
