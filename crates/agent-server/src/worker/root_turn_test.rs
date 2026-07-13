@@ -6809,6 +6809,17 @@ async fn cancelled_root_commit_never_shifts_past_a_successor() -> Result<()> {
             .is_none(),
         "the cancelled root must not have committed a shifted turn 2",
     );
+
+    // Codex round-7 P2: the dead root's no-shift exit must settle its
+    // own attempt — the cancel seam left the live worker's attempt
+    // open and the host skips rows it no longer owns, so without the
+    // settle it would leak open forever.
+    let attempts = stores.attempts.list_by_task(&doomed_id).await?;
+    assert!(!attempts.is_empty(), "the doomed turn opened an attempt");
+    assert!(
+        attempts.iter().all(TurnAttempt::is_closed),
+        "a cancelled root's collision exit must leave no attempt open",
+    );
     Ok(())
 }
 

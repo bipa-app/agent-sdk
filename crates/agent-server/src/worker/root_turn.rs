@@ -1786,6 +1786,18 @@ async fn commit_completed_turn_shifting_slot(
             return Err(error);
         }
         let Some(next_turn) = shifted_turn_slot(&params, worker_id, lease_id, deps).await else {
+            // No-shift exit (codex round-7 P2): when the eligibility
+            // re-read found the row cancelled or requeued, no later
+            // path owns this attempt — the cancel seam deliberately
+            // left the live worker's attempt alone and the host skips
+            // rows it no longer owns. Settle unconditionally: in the
+            // still-owned refusal cases the host's terminal path would
+            // close it as a zero-usage best-effort Cancelled anyway
+            // (this close carries the REAL usage, and the later
+            // best-effort close is swallowed as `AlreadyClosed`), and
+            // in the requeue case the next execution's leftover settle
+            // becomes a no-op.
+            settle_own_attempt(&params, deps).await;
             return Err(error);
         };
         log::info!(
@@ -1817,14 +1829,10 @@ async fn commit_completed_turn_shifting_slot(
 /// back, and no later path will close this attempt: the cancel seam's
 /// snapshot-scoped close ran while the task was still `Running` and
 /// deliberately left the live worker's attempt alone, and the host's
-/// failure path skips a row it no longer owns. Close it here — this
-/// worker opened the attempt, so the id cannot belong to a replacement
-/// worker — carrying the REAL token usage the commit would have
-/// recorded (attempt rows are the billing source of truth) under the
-/// `Cancelled` outcome, since the turn did not commit. A concurrent
-/// close (e.g. the cancel path racing this settle) makes the store
-/// reject `AlreadyClosed`, which is swallowed as usual for best-effort
-/// closes.
+/// failure path skips a row it no longer owns. Errors without an
+/// ownership rejection in their chain are left alone — the task is
+/// still owned there, and the host's terminal or requeue path owns
+/// the attempt's fate.
 pub(crate) async fn settle_attempt_after_lost_ownership(
     error: &anyhow::Error,
     params: &CompletedTurnCommit,
@@ -1838,6 +1846,18 @@ pub(crate) async fn settle_attempt_after_lost_ownership(
     if !lost_ownership {
         return;
     }
+    settle_own_attempt(params, deps).await;
+}
+
+/// Best-effort close of THIS execution's attempt — the id was opened
+/// by this worker, so it cannot belong to a replacement worker. The
+/// close carries the REAL token usage the commit would have recorded
+/// (attempt rows are the billing source of truth) under the
+/// `Cancelled` outcome, since the turn did not commit. A concurrent
+/// close (the cancel path, or the host's terminal envelope, racing
+/// this settle) makes the store reject `AlreadyClosed`, which is
+/// swallowed as usual for best-effort closes.
+pub(crate) async fn settle_own_attempt(params: &CompletedTurnCommit, deps: &RootTurnDeps<'_>) {
     let close = CloseAttemptParams {
         outcome: TurnAttemptOutcome::Cancelled,
         ..params.close_attempt_params.clone()
@@ -1848,7 +1868,7 @@ pub(crate) async fn settle_attempt_after_lost_ownership(
         .await
     {
         log::warn!(
-            "settle after lost commit ownership: closing attempt {} failed: {close_error:#}",
+            "settle own attempt after slot-collision exit: closing attempt {} failed: {close_error:#}",
             params.turn_attempt_id,
         );
     }
