@@ -741,22 +741,20 @@ impl LlmProvider for OpenAIResponsesProvider {
                             }
                             // ── Error ───────────────────────────────────
                             "error" | "response.failed" => {
-                                let message = event
+                                let (error_code, error_message) = event
                                     .response
                                     .and_then(|response| response.error)
-                                    .and_then(|error| error.message)
+                                    .map_or((None, None), |error| (error.code, error.message));
+                                let code = error_code.or(event.code);
+                                let message = error_message
                                     .or(event.message)
                                     .unwrap_or_else(|| data.to_owned());
-                                let is_server_error = event.r#type == "response.failed"
-                                    || event.code.as_deref() == Some("server_error")
-                                    || data.contains("server_error");
-                                let kind = if is_server_error {
-                                    log::warn!("Responses API server error (recoverable): {message}");
-                                    StreamErrorKind::ServerError
-                                } else {
-                                    log::error!("Responses API error event: {message}");
-                                    StreamErrorKind::InvalidRequest
-                                };
+                                let kind = responses_stream_error_kind(
+                                    &event.r#type,
+                                    code.as_deref(),
+                                    &message,
+                                    data,
+                                );
                                 yield Ok(StreamDelta::Error {
                                     message,
                                     kind,
@@ -1144,6 +1142,34 @@ fn output_contains_refusal(output: &[ApiOutputItem]) -> bool {
                     .any(|content| matches!(content, ApiOutputContent::Refusal { .. }))
         )
     })
+}
+
+/// Classify an in-band Responses SSE error event.
+///
+/// A stream that opened with HTTP 200 can still fail mid-flight, and a
+/// rate limit reported that way carries no HTTP status: the machine-readable
+/// `code` is the only reliable signal. The message is prose and is never used
+/// to decide the category — only to recover the retry delay `OpenAI` states in
+/// it, since these events carry no `Retry-After` header.
+fn responses_stream_error_kind(
+    event_type: &str,
+    code: Option<&str>,
+    message: &str,
+    raw: &str,
+) -> StreamErrorKind {
+    if matches!(code, Some("rate_limit_exceeded" | "rate_limit_error")) {
+        log::warn!("Responses API rate limited (recoverable): {message}");
+        return StreamErrorKind::RateLimited(crate::retry_hints::openai_retry_delay(message));
+    }
+    if event_type == "response.failed"
+        || code == Some("server_error")
+        || raw.contains("server_error")
+    {
+        log::warn!("Responses API server error (recoverable): {message}");
+        return StreamErrorKind::ServerError;
+    }
+    log::error!("Responses API error event: {message}");
+    StreamErrorKind::InvalidRequest
 }
 
 /// Classify a non-success HTTP status into an early [`ChatOutcome`].
@@ -1844,6 +1870,11 @@ struct ApiResponse {
 struct ApiResponseError {
     #[serde(default)]
     message: Option<String>,
+    /// Machine-readable error code (e.g. `rate_limit_exceeded`), used to
+    /// classify a failure the HTTP status cannot describe because the stream
+    /// already opened with 200.
+    #[serde(default)]
+    code: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2699,6 +2730,71 @@ mod tests {
         assert_eq!(json["mode"], "required");
         assert_eq!(json["tools"][0]["type"], "function");
         assert_eq!(json["tools"][0]["name"], "lookup");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_band_rate_limit_event_is_recoverable_and_keeps_its_hint() -> anyhow::Result<()> {
+        // The stream opened 200 and only then hit the quota, so the HTTP-status
+        // branch never runs: the delay exists solely in the event's message.
+        let body = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Hi\"}\n\n",
+            "data: {\"type\":\"error\",\"code\":\"rate_limit_exceeded\",\"message\":\"Rate limit reached for gpt-5.6 in organization org-x on tokens per min. Please try again in 20s.\"}\n\n",
+        );
+        let deltas = stream_deltas(body).await?;
+        let kind = deltas
+            .iter()
+            .find_map(|delta| match delta {
+                StreamDelta::Error { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .context("expected a stream error delta")?;
+
+        assert_eq!(
+            kind,
+            StreamErrorKind::RateLimited(Some(std::time::Duration::from_secs(20))),
+            "an in-band rate limit must be retriable and carry its parsed delay"
+        );
+        assert!(kind.is_recoverable());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_band_rate_limit_on_response_failed_is_not_a_server_error() -> anyhow::Result<()> {
+        // `response.failed` defaults to ServerError; a rate-limit code inside it
+        // must still classify as a rate limit so the hint is not discarded.
+        let body = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Please try again in 1.5s\"}}}\n\n";
+        let deltas = stream_deltas(body).await?;
+        let kind = deltas
+            .iter()
+            .find_map(|delta| match delta {
+                StreamDelta::Error { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .context("expected a stream error delta")?;
+
+        assert_eq!(
+            kind,
+            StreamErrorKind::RateLimited(Some(std::time::Duration::from_millis(1500)))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_band_non_rate_limit_error_keeps_its_previous_classification() -> anyhow::Result<()>
+    {
+        let body = "data: {\"type\":\"error\",\"code\":\"invalid_prompt\",\"message\":\"bad\"}\n\n";
+        let deltas = stream_deltas(body).await?;
+        let kind = deltas
+            .iter()
+            .find_map(|delta| match delta {
+                StreamDelta::Error { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .context("expected a stream error delta")?;
+
+        assert_eq!(kind, StreamErrorKind::InvalidRequest);
+        assert!(!kind.is_recoverable());
         Ok(())
     }
 

@@ -1274,16 +1274,11 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                 websocket_session.last_response_id = None;
                                                 websocket_session.last_response_items.clear();
                                                 websocket_session.prewarmed = false;
-                                                let message = event
-                                                    .response
-                                                    .and_then(|resp| resp.error)
-                                                    .and_then(|error| error.message)
-                                                    .unwrap_or_else(|| {
-                                                        "Codex response failed".to_string()
-                                                    });
+                                                let (message, kind) =
+                                                    codex_response_failed_error(event.response);
                                                 yield Ok(StreamDelta::Error {
                                                     message,
-                                                    kind: StreamErrorKind::ServerError,
+                                                    kind,
                                                 });
                                                 return;
                                             }
@@ -1507,16 +1502,11 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                     websocket_session.last_response_id = None;
                                                     websocket_session.last_response_items.clear();
                                                     websocket_session.prewarmed = false;
-                                                    let message = event
-                                                        .response
-                                                        .and_then(|resp| resp.error)
-                                                        .and_then(|error| error.message)
-                                                        .unwrap_or_else(|| {
-                                                            "Codex response failed".to_string()
-                                                        });
+                                                    let (message, kind) =
+                                                        codex_response_failed_error(event.response);
                                                     yield Ok(StreamDelta::Error {
                                                         message,
-                                                        kind: StreamErrorKind::ServerError,
+                                                        kind,
                                                     });
                                                     return;
                                                 }
@@ -1800,14 +1790,10 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                 };
                             }
                             "response.failed" => {
-                                let message = event
-                                    .response
-                                    .and_then(|resp| resp.error)
-                                    .and_then(|error| error.message)
-                                    .unwrap_or_else(|| "Codex response failed".to_string());
+                                let (message, kind) = codex_response_failed_error(event.response);
                                 yield Ok(StreamDelta::Error {
                                     message,
-                                    kind: StreamErrorKind::ServerError,
+                                    kind,
                                 });
                                 return;
                             }
@@ -2644,6 +2630,29 @@ fn parse_wrapped_websocket_error_event(payload: &str) -> Option<(StatusCode, Str
     }
 }
 
+/// Resolve the message and kind of an in-band `response.failed` event.
+///
+/// The stream already opened with HTTP 200, so a rate limit reported this way
+/// has neither a status nor a `Retry-After` header: the machine-readable code
+/// is the only classification signal, and the delay — when the service states
+/// one — is embedded in the message. Every other failure stays a (retriable)
+/// server error, as before.
+fn codex_response_failed_error(response: Option<ApiStreamResponse>) -> (String, StreamErrorKind) {
+    let (code, message) = response
+        .and_then(|resp| resp.error)
+        .map_or((None, None), |error| (error.code, error.message));
+    let message = message.unwrap_or_else(|| "Codex response failed".to_string());
+    let kind = if matches!(
+        code.as_deref(),
+        Some("rate_limit_exceeded" | "rate_limit_error")
+    ) {
+        StreamErrorKind::RateLimited(crate::retry_hints::openai_retry_delay(&message))
+    } else {
+        StreamErrorKind::ServerError
+    };
+    (message, kind)
+}
+
 /// Classify a wrapped websocket error event by the status it reports.
 ///
 /// The websocket frame carries no HTTP headers, so a rate limit's retry delay
@@ -3140,6 +3149,11 @@ struct ApiStreamResponse {
 struct ApiErrorBody {
     #[serde(default)]
     message: Option<String>,
+    /// Machine-readable error code (e.g. `rate_limit_exceeded`), used to
+    /// classify a failure the HTTP status cannot describe because the stream
+    /// already opened with 200.
+    #[serde(default)]
+    code: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3173,6 +3187,34 @@ mod tests {
         assert_eq!(MODEL_GPT54, "gpt-5.4");
         assert_eq!(MODEL_GPT53_CODEX, "gpt-5.3-codex");
         assert_eq!(MODEL_GPT52_CODEX, "gpt-5.2-codex");
+    }
+
+    #[test]
+    fn in_band_response_failed_rate_limit_keeps_its_hint() -> anyhow::Result<()> {
+        let event: ApiStreamEvent = serde_json::from_str(
+            r#"{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"Rate limit reached. Please try again in 20s."}}}"#,
+        )?;
+        let (message, kind) = codex_response_failed_error(event.response);
+
+        assert!(message.contains("try again in 20s"));
+        assert_eq!(
+            kind,
+            StreamErrorKind::RateLimited(Some(std::time::Duration::from_secs(20)))
+        );
+        assert!(kind.is_recoverable());
+        Ok(())
+    }
+
+    #[test]
+    fn in_band_response_failed_without_a_rate_limit_code_is_a_server_error() -> anyhow::Result<()> {
+        let event: ApiStreamEvent = serde_json::from_str(
+            r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"upstream blew up"}}}"#,
+        )?;
+        let (message, kind) = codex_response_failed_error(event.response);
+
+        assert_eq!(message, "upstream blew up");
+        assert_eq!(kind, StreamErrorKind::ServerError);
+        Ok(())
     }
 
     #[test]

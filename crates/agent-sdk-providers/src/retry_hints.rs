@@ -35,6 +35,7 @@ const MAX_HINT: Duration = Duration::from_hours(24);
 ///
 /// Returns `None` when the body is not JSON, carries no `RetryInfo` detail, or
 /// the `retryDelay` is not a proto-JSON duration.
+#[cfg(any(feature = "gemini", feature = "vertex"))]
 pub fn google_retry_delay(body: &str) -> Option<Duration> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let details = value.get("error")?.get("details")?.as_array()?;
@@ -58,6 +59,7 @@ pub fn google_retry_delay(body: &str) -> Option<Duration> {
 /// as an API error, and from the raw text otherwise (some gateways return the
 /// prose alone). Recognized units are `h`, `m`, `s`, and `ms`, optionally
 /// combined (`1m30s`) and optionally fractional (`1.5s`).
+#[cfg(any(feature = "openai", feature = "openai-codex"))]
 pub fn openai_retry_delay(body: &str) -> Option<Duration> {
     const MARKER: &str = "try again in ";
 
@@ -86,6 +88,7 @@ pub fn openai_retry_delay(body: &str) -> Option<Duration> {
 ///
 /// A zero delay is reported as absent: it carries no information the caller's
 /// own backoff does not already have, and honouring it would retry instantly.
+#[cfg(any(feature = "gemini", feature = "vertex"))]
 fn parse_proto_duration(value: &str) -> Option<Duration> {
     let seconds = value.trim().strip_suffix('s')?;
     let delay = duration_from_secs(parse_non_negative(seconds)?)?;
@@ -96,6 +99,7 @@ fn parse_proto_duration(value: &str) -> Option<Duration> {
 ///
 /// A bare number with no unit is rejected — without a unit the value is
 /// ambiguous, and accepting it would let unrelated digits become a delay.
+#[cfg(any(feature = "openai", feature = "openai-codex"))]
 fn parse_unit_duration(token: &str) -> Option<Duration> {
     let mut rest = token;
     let mut total = Duration::ZERO;
@@ -141,6 +145,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(any(feature = "gemini", feature = "vertex"))]
     fn google_retry_info_whole_and_fractional_seconds() {
         let body = r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[
             {"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaValue":"60"}]},
@@ -158,6 +163,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "gemini", feature = "vertex"))]
     fn google_retry_info_absent_or_malformed_is_none() {
         // No details array at all.
         assert_eq!(
@@ -192,6 +198,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "openai", feature = "openai-codex"))]
     fn openai_message_seconds_millis_and_fractions() {
         let body = r#"{"error":{"message":"Rate limit reached for gpt-5 in organization org-4bqm on requests per min (RPM): Limit 3, Used 3. Please try again in 20s.","type":"rate_limit_error","code":"rate_limit_exceeded"}}"#;
         assert_eq!(openai_retry_delay(body), Some(Duration::from_secs(20)));
@@ -217,6 +224,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "openai", feature = "openai-codex"))]
     fn openai_message_without_a_hint_is_none() {
         // Rate-limit prose, but no retry phrase — the limit numbers must not
         // be read as a delay.
@@ -250,13 +258,19 @@ mod tests {
     }
 
     #[test]
-    fn absurd_hints_are_bounded() {
+    #[cfg(any(feature = "gemini", feature = "vertex"))]
+    fn absurd_google_hints_are_bounded() {
         assert_eq!(
             google_retry_delay(
                 r#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"999999999999s"}]}}"#
             ),
             Some(MAX_HINT)
         );
+    }
+
+    #[test]
+    #[cfg(any(feature = "openai", feature = "openai-codex"))]
+    fn absurd_openai_hints_are_bounded() {
         assert_eq!(
             openai_retry_delay(r#"{"error":{"message":"Please try again in 999999h."}}"#),
             Some(MAX_HINT)
