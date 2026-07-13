@@ -3165,10 +3165,16 @@ const fn terminal_close_reason(
 /// follower delivering the `Done` in that gap sees the emitter still
 /// `Running` — suppressing there would leave the stream open forever
 /// (no later lifecycle event re-checks). The discriminator is the
-/// thread's LATEST CHECKPOINT committer: an active root that also
-/// committed the latest turn is the emitter mid-transition (close);
-/// an active root that did not is a genuine successor still working
-/// (keep following). No checkpoint reads as the emitter case,
+/// committer of the checkpoint at THE DELIVERED FRAME'S OWN turn
+/// (`total_turns`), not the thread's global latest (codex round-18):
+/// during replay or gap backfill an older foreign `Done` can be
+/// delivered after the successor has already committed its own
+/// checkpoint, and the global-latest comparison would misattribute
+/// the old frame to the successor and truncate its already-committed
+/// events. An active root that committed the frame's turn is the
+/// emitter mid-transition (close); one that did not is a genuine
+/// successor still working (keep following). A missing checkpoint at
+/// that turn (e.g. pruned by retention) reads as the emitter case,
 /// conservatively.
 ///
 /// `TurnCancelled` closes are NOT gated: `cancel_tree` promotes the
@@ -3189,15 +3195,25 @@ async fn confirmed_close_reason(
             .task_store
             .active_root_for_thread(thread_id)
             .await;
+        let frame_turn = match &event.event {
+            AgentEvent::Done { total_turns, .. }
+            | AgentEvent::BudgetExceeded { total_turns, .. } => u32::try_from(*total_turns).ok(),
+            _ => None,
+        };
         match active_root {
             Ok(Some(root)) => {
+                let Some(frame_turn) = frame_turn else {
+                    return Some(reason);
+                };
                 match shared
                     .stores
                     .checkpoint_store
-                    .get_latest_by_thread(thread_id)
+                    .get_by_turn(thread_id, frame_turn)
                     .await
                 {
-                    Ok(Some(latest)) if latest.task_id != root.id => return None,
+                    Ok(Some(frame_committer)) if frame_committer.task_id != root.id => {
+                        return None;
+                    }
                     Ok(_) => {}
                     Err(error) => {
                         warn!(
@@ -6482,11 +6498,12 @@ mod tests {
             "a Done frame must not close a follower while a successor root is active",
         );
 
-        // Codex round-17: the EMITTER mid-transition is not a
-        // successor. When the active root is also the latest turn's
-        // committer (its Done became visible before complete_task
-        // transitioned the row), the close must proceed — suppressing
-        // would strand the stream forever.
+        // Codex round-18: replay/backfill can deliver the predecessor's
+        // OLD Done after the successor has committed its own later
+        // checkpoint. The gate keys on the FRAME's turn (1, committed
+        // by the predecessor), not the thread's latest checkpoint —
+        // closing here would truncate the successor's already-committed
+        // events.
         shared
             .stores
             .checkpoint_store
@@ -6494,8 +6511,32 @@ mod tests {
             .await?;
         assert_eq!(
             confirmed_close_reason(&shared, &thread, &done).await,
+            None,
+            "an old foreign Done must not close after the successor committed its own turn",
+        );
+
+        // Codex round-17: the EMITTER mid-transition is not a
+        // successor. A Done whose own turn's checkpoint belongs to the
+        // active root (its Done became visible before complete_task
+        // transitioned the row) closes — suppressing would strand the
+        // stream forever.
+        let successor_done = agent_server::CommittedEvent {
+            event_id: uuid::Uuid::now_v7(),
+            thread_id: thread.clone(),
+            sequence: 11,
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+            event: AgentEvent::Done {
+                thread_id: thread.clone(),
+                total_turns: 2,
+                total_usage: agent_sdk_foundation::TokenUsage::default(),
+                duration: std::time::Duration::from_secs(1),
+                estimated_cost_usd: None,
+            },
+        };
+        assert_eq!(
+            confirmed_close_reason(&shared, &thread, &successor_done).await,
             Some(pb::StreamCloseReason::ThreadCompleted),
-            "an active root that committed the latest turn is the emitter, not a successor",
+            "an active root that committed the frame's own turn is the emitter, not a successor",
         );
 
         // Cancelled markers are not gated.
