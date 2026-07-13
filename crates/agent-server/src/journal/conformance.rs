@@ -464,10 +464,13 @@ mod in_memory_bundle {
         async fn commit_turn(
             &self,
             thread_id: &ThreadId,
+            expected_turn: u32,
             turn_usage: &TokenUsage,
             now: OffsetDateTime,
         ) -> Result<Thread> {
-            self.thread.commit_turn(thread_id, turn_usage, now).await
+            self.thread
+                .commit_turn(thread_id, expected_turn, turn_usage, now)
+                .await
         }
         async fn mark_completed(
             &self,

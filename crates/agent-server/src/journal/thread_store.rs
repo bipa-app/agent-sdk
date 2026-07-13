@@ -100,19 +100,29 @@ pub trait ThreadStore: Send + Sync {
     /// `total_usage`. A successful call atomically:
     ///
     /// 1. Loads or creates the thread row.
-    /// 2. Applies [`Thread::apply_committed_turn`] with the given
+    /// 2. Asserts the row is still positioned to produce
+    ///    `expected_turn` — i.e. `committed_turns + 1 == expected_turn`
+    ///    — **under the same lock/transaction** as the increment, so
+    ///    two racing committers can never both pass the guard and land
+    ///    a double increment (codex round-9). On mismatch the call
+    ///    fails with [`super::commit::StaleTurnCommit`] as the typed
+    ///    root cause and mutates nothing.
+    /// 3. Applies [`Thread::apply_committed_turn`] with the given
     ///    `turn_usage`.
-    /// 3. Persists the updated row.
+    /// 4. Persists the updated row.
     ///
     /// Returns the thread as persisted.
     ///
     /// # Errors
+    /// - [`super::commit::StaleTurnCommit`] if the thread is not
+    ///   positioned at `expected_turn - 1` committed turns.
     /// - [`super::thread::ThreadSchemaError::CommitOnCompletedThread`] if the thread
     ///   has already been completed.
     /// - Store-level write errors.
     async fn commit_turn(
         &self,
         thread_id: &ThreadId,
+        expected_turn: u32,
         turn_usage: &TokenUsage,
         now: OffsetDateTime,
     ) -> Result<Thread>;
@@ -185,6 +195,7 @@ impl ThreadStore for InMemoryThreadStore {
     async fn commit_turn(
         &self,
         thread_id: &ThreadId,
+        expected_turn: u32,
         turn_usage: &TokenUsage,
         now: OffsetDateTime,
     ) -> Result<Thread> {
@@ -193,6 +204,16 @@ impl ThreadStore for InMemoryThreadStore {
             .by_id
             .entry(thread_id.clone())
             .or_insert_with(|| Thread::new(thread_id.clone(), now));
+        if thread.committed_turns.saturating_add(1) != expected_turn {
+            let committed_turns = thread.committed_turns;
+            drop(inner);
+            return Err(anyhow::Error::new(
+                crate::journal::commit::StaleTurnCommit {
+                    expected_turn,
+                    committed_turns,
+                },
+            ));
+        }
         let updated = thread.clone().apply_committed_turn(turn_usage, now)?;
         *thread = updated.clone();
         drop(inner);
@@ -271,7 +292,7 @@ mod tests {
 
         // Commit a turn to change the row.
         store
-            .commit_turn(&thread_a(), &usage(10, 5), t_plus(1))
+            .commit_turn(&thread_a(), 1, &usage(10, 5), t_plus(1))
             .await
             .unwrap();
 
@@ -305,7 +326,7 @@ mod tests {
     async fn commit_turn_creates_thread_on_first_call() {
         let store = InMemoryThreadStore::new();
         let thread = store
-            .commit_turn(&thread_a(), &usage(100, 50), t0())
+            .commit_turn(&thread_a(), 1, &usage(100, 50), t0())
             .await
             .unwrap();
         assert_eq!(thread.committed_turns, 1);
@@ -316,15 +337,15 @@ mod tests {
     async fn commit_turn_accumulates_across_calls() {
         let store = InMemoryThreadStore::new();
         store
-            .commit_turn(&thread_a(), &usage(100, 50), t0())
+            .commit_turn(&thread_a(), 1, &usage(100, 50), t0())
             .await
             .unwrap();
         store
-            .commit_turn(&thread_a(), &usage(200, 80), t_plus(1))
+            .commit_turn(&thread_a(), 2, &usage(200, 80), t_plus(1))
             .await
             .unwrap();
         let thread = store
-            .commit_turn(&thread_a(), &usage(50, 20), t_plus(2))
+            .commit_turn(&thread_a(), 3, &usage(50, 20), t_plus(2))
             .await
             .unwrap();
         assert_eq!(thread.committed_turns, 3);
@@ -335,12 +356,12 @@ mod tests {
     async fn commit_turn_rejects_completed_thread() {
         let store = InMemoryThreadStore::new();
         store
-            .commit_turn(&thread_a(), &usage(10, 5), t0())
+            .commit_turn(&thread_a(), 1, &usage(10, 5), t0())
             .await
             .unwrap();
         store.mark_completed(&thread_a(), t_plus(1)).await.unwrap();
         let err = store
-            .commit_turn(&thread_a(), &usage(10, 5), t_plus(2))
+            .commit_turn(&thread_a(), 2, &usage(10, 5), t_plus(2))
             .await
             .unwrap_err();
         assert!(
@@ -353,11 +374,11 @@ mod tests {
     async fn commit_turn_isolates_threads() {
         let store = InMemoryThreadStore::new();
         store
-            .commit_turn(&thread_a(), &usage(100, 50), t0())
+            .commit_turn(&thread_a(), 1, &usage(100, 50), t0())
             .await
             .unwrap();
         store
-            .commit_turn(&thread_b(), &usage(200, 80), t0())
+            .commit_turn(&thread_b(), 1, &usage(200, 80), t0())
             .await
             .unwrap();
 
@@ -375,7 +396,7 @@ mod tests {
     async fn mark_completed_transitions_thread() {
         let store = InMemoryThreadStore::new();
         store
-            .commit_turn(&thread_a(), &usage(10, 5), t0())
+            .commit_turn(&thread_a(), 1, &usage(10, 5), t0())
             .await
             .unwrap();
         let thread = store.mark_completed(&thread_a(), t_plus(1)).await.unwrap();
@@ -396,7 +417,7 @@ mod tests {
     async fn mark_completed_rejects_already_completed() {
         let store = InMemoryThreadStore::new();
         store
-            .commit_turn(&thread_a(), &usage(10, 5), t0())
+            .commit_turn(&thread_a(), 1, &usage(10, 5), t0())
             .await
             .unwrap();
         store.mark_completed(&thread_a(), t_plus(1)).await.unwrap();
@@ -430,11 +451,11 @@ mod tests {
     async fn list_returns_all_threads() {
         let store = InMemoryThreadStore::new();
         store
-            .commit_turn(&thread_a(), &usage(10, 5), t0())
+            .commit_turn(&thread_a(), 1, &usage(10, 5), t0())
             .await
             .unwrap();
         store
-            .commit_turn(&thread_b(), &usage(20, 10), t0())
+            .commit_turn(&thread_b(), 1, &usage(20, 10), t0())
             .await
             .unwrap();
         let threads = store.list().await.unwrap();
@@ -462,9 +483,9 @@ mod tests {
         let store = InMemoryThreadStore::new();
         let mut prev_turns = 0;
         let mut prev_input = 0;
-        for i in 1..=5 {
+        for i in 1..=5u32 {
             let thread = store
-                .commit_turn(&thread_a(), &usage(10, 5), t_plus(i))
+                .commit_turn(&thread_a(), i, &usage(10, 5), t_plus(i64::from(i)))
                 .await
                 .unwrap();
             assert!(thread.committed_turns > prev_turns);
@@ -478,11 +499,11 @@ mod tests {
     async fn thread_identity_survives_multiple_commits() {
         let store = InMemoryThreadStore::new();
         let t1 = store
-            .commit_turn(&thread_a(), &usage(10, 5), t0())
+            .commit_turn(&thread_a(), 1, &usage(10, 5), t0())
             .await
             .unwrap();
         let t2 = store
-            .commit_turn(&thread_a(), &usage(20, 10), t_plus(1))
+            .commit_turn(&thread_a(), 2, &usage(20, 10), t_plus(1))
             .await
             .unwrap();
         // Identity fields are stable across commits.

@@ -200,7 +200,7 @@ mod tests {
         // This simulates crashing between step 2 (thread advance)
         // and step 4 (checkpoint creation) of commit_completed_turn.
         s.threads
-            .commit_turn(&thread_id, &usage(200, 80), t_plus(2))
+            .commit_turn(&thread_id, 2, &usage(200, 80), t_plus(2))
             .await
             .context("manual advance")?;
 

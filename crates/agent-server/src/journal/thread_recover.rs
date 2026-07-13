@@ -824,7 +824,7 @@ mod tests {
         // Manually advance the thread aggregate without creating a
         // checkpoint — simulates data corruption.
         s.threads
-            .commit_turn(&thread_a(), &usage(100, 50), t_plus(1))
+            .commit_turn(&thread_a(), 1, &usage(100, 50), t_plus(1))
             .await
             .context("advance")?;
 
@@ -868,7 +868,7 @@ mod tests {
         // Now manually advance the thread aggregate a third time
         // without creating the matching checkpoint.
         s.threads
-            .commit_turn(&thread_a(), &usage(100, 50), t_plus(3))
+            .commit_turn(&thread_a(), 3, &usage(100, 50), t_plus(3))
             .await
             .context("manual advance")?;
 

@@ -3517,6 +3517,7 @@ impl ThreadStore for SqliteDurableStore {
     async fn commit_turn(
         &self,
         thread_id: &ThreadId,
+        expected_turn: u32,
         turn_usage: &TokenUsage,
         now: OffsetDateTime,
     ) -> Result<Thread> {
@@ -3525,6 +3526,12 @@ impl ThreadStore for SqliteDurableStore {
         let old = Self::get_thread_tx(&mut tx, thread_id)
             .await?
             .context("thread missing after bootstrap")?;
+        if old.committed_turns.saturating_add(1) != expected_turn {
+            return Err(anyhow::Error::new(StaleTurnCommit {
+                expected_turn,
+                committed_turns: old.committed_turns,
+            }));
+        }
         let thread = old.apply_committed_turn(turn_usage, now)?;
         Self::upsert_thread_tx(&mut tx, &thread).await?;
         tx.commit().await.context("commit thread turn")?;

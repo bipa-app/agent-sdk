@@ -1819,14 +1819,27 @@ fn is_turn_slot_collision_error(err: &anyhow::Error) -> bool {
 ///
 /// The rolled-back execution's attempt row is deliberately left open
 /// here: closing it from this (possibly stale) worker races a
-/// replacement worker's live attempt (codex round-6 P1). The next
-/// execution settles leftover open attempts at open-attempt time,
-/// under the lease that owns the row.
+/// replacement worker's live attempt (codex round-6 P1). The shift
+/// wrapper's collision exits already settled this execution's own
+/// attempt with its real usage before the error reached this handler.
+///
+/// # Fresh-input tasks only
+///
+/// A colliding task executing from a stored continuation
+/// (`TaskState::WaitingOnChildren` / `ReadyToResume`) is NOT requeued
+/// (codex round-9 P1): its continuation was captured before the
+/// foreign turn landed, and the re-driven resume would overwrite the
+/// recovered head with that stale state — dropping the occupant's
+/// usage, cost, and metadata, the exact corruption the foreign-full-
+/// turn shift refusal exists to prevent. Fresh tasks re-run from the
+/// submitted input against the fresh head, which is the sound
+/// crash-recovery contract; stateful resumes keep the terminal path.
 ///
 /// Returns `Ok(true)` when the row was requeued (the dispatcher will
-/// re-run it); `Ok(false)` when the collision is same-task, the store
-/// reports the row has no retry budget left, or the row is no longer
-/// owned — the caller falls through to its terminal path.
+/// re-run it); `Ok(false)` when the collision is same-task, the task
+/// carries a continuation, the store reports the row has no retry
+/// budget left, or the row is no longer owned — the caller falls
+/// through to its terminal path.
 async fn requeue_collided_root_task(
     stores: &StoreRegistry,
     task: &AgentTask,
@@ -1834,6 +1847,14 @@ async fn requeue_collided_root_task(
     now: time::OffsetDateTime,
 ) -> Result<bool> {
     let (worker_id, lease_id) = running_lease(task)?;
+    if !matches!(task.state, TaskState::None) {
+        warn!(
+            task_id = %task.id,
+            thread_id = %task.thread_id,
+            "turn-slot collision: task carries a continuation;              keeping the terminal path instead of requeueing",
+        );
+        return Ok(false);
+    }
     let Some(stale) = err
         .chain()
         .find_map(|cause| cause.downcast_ref::<StaleTurnCommit>())

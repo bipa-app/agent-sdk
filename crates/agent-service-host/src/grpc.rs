@@ -810,7 +810,12 @@ impl GrpcControlService {
                 self.shared
                     .stores
                     .thread_store
-                    .commit_turn(&params.new_thread_id, usage_for_this_turn, params.now)
+                    .commit_turn(
+                        &params.new_thread_id,
+                        turn_index + 1,
+                        usage_for_this_turn,
+                        params.now,
+                    )
                     .await
                     .map_err(internal_status(
                         "mirroring source committed_turns onto fork",

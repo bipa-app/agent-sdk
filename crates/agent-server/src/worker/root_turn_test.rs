@@ -6091,7 +6091,7 @@ impl TurnAttemptStore for TurnStealingAttemptStore {
     async fn open_attempt(&self, params: OpenAttemptParams) -> Result<TurnAttempt> {
         if !self.fired.swap(true, Ordering::SeqCst) {
             self.threads
-                .commit_turn(&self.thread_id, &TokenUsage::default(), params.now)
+                .commit_turn(&self.thread_id, 1, &TokenUsage::default(), params.now)
                 .await
                 .context("steal the turn slot")?;
         }
@@ -7073,12 +7073,14 @@ async fn shift_walks_across_consecutive_salvage_occupants() -> Result<()> {
     Ok(())
 }
 
-/// Codex round-6: a leftover OPEN attempt from a predecessor execution
-/// (crash-requeue or collision-requeue rolled its in-transaction close
-/// back) is settled at the next execution's open-attempt step — under
-/// the lease that owns the row, where it cannot race a live worker.
+/// Codex round-9 P2: a leftover OPEN attempt from a predecessor
+/// execution is LEFT OPEN by the next execution — the old worker may
+/// still be live after a lease expiry, and closing its attempt from
+/// here would permanently record zero usage where its real billed
+/// usage belongs. The new execution numbers its own attempt past the
+/// leftover and completes normally.
 #[tokio::test]
-async fn next_execution_settles_a_leftover_open_attempt() -> Result<()> {
+async fn next_execution_leaves_a_leftover_open_attempt_alone() -> Result<()> {
     let stores = TestStores::new();
     stores.threads.get_or_create(&thread_a(), t0()).await?;
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
@@ -7119,17 +7121,22 @@ async fn next_execution_settles_a_leftover_open_attempt() -> Result<()> {
 
     let attempts = stores.attempts.list_by_task(&task_id).await?;
     assert_eq!(attempts.len(), 2, "leftover + fresh attempt");
-    let settled = attempts
+    let leftover_row = attempts
         .iter()
         .find(|attempt| attempt.id == leftover.id)
         .context("leftover attempt")?;
     assert!(
-        settled.is_closed(),
-        "the re-driven execution must settle the predecessor's open attempt",
+        !leftover_row.is_closed(),
+        "the predecessor's attempt must be left alone — its (possibly \
+         still live) owner settles it with real usage",
     );
+    let fresh = attempts
+        .iter()
+        .find(|attempt| attempt.id != leftover.id)
+        .context("fresh attempt")?;
     assert!(
-        attempts.iter().all(TurnAttempt::is_closed),
-        "no attempt may stay open after a completed turn",
+        fresh.is_closed(),
+        "the new execution's own attempt closes with its commit",
     );
     Ok(())
 }

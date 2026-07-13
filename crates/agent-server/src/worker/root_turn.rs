@@ -2042,15 +2042,18 @@ async fn open_attempt(
         .list_by_task(task_id)
         .await
         .context("list existing attempts")?;
-    // Settle leftovers from a predecessor execution of this task — a
-    // crash-requeue or a turn-slot-collision requeue rolls its
-    // in-transaction attempt close back, leaving the row open. This
-    // worker holds the task's lease, so closing here cannot race a
-    // live owner (the stale-worker error path deliberately leaves its
-    // attempt open for exactly this reason). Closing also fences a
-    // stale predecessor's late commit: its in-transaction close hits
-    // `AlreadyClosed` and the whole duplicate commit rolls back.
-    best_effort_close_attempts(&existing, attempt_store, now).await;
+    // Leftover OPEN attempts from a predecessor execution are left
+    // alone (codex round-9 P2): after a lease expiry, the old worker
+    // may still be live — executing, unaware of its heartbeat
+    // rejection — and closing its attempt here would permanently
+    // record zero usage where the provider's real billed usage
+    // belongs (its own close then loses to `AlreadyClosed`). The old
+    // worker's own exit paths settle the attempt with real usage; a
+    // hard-crashed worker's attempt stays open, the same pre-existing
+    // audit residual every crash-requeue has. Duplicate-commit
+    // protection does not depend on closing here: the expected-turn
+    // CAS inside `ThreadStore::commit_turn` rejects a stale late
+    // commit atomically on every backend.
     let attempt_number = u32::try_from(existing.len()).context("attempt count overflow")? + 1;
 
     let (otel_trace_id, otel_span_id) = match otel_ids {

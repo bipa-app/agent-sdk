@@ -340,14 +340,15 @@ pub async fn commit_completed_turn(
     let events = std::mem::take(&mut params.events);
     let thread_id_for_events = params.thread_id.clone();
 
-    // Stale turn double-commit guard. Re-read the thread row and assert
-    // it is still positioned to produce `expected_turn` before touching
-    // any projection. A stale-lease worker that lost the race to another
-    // worker (which already advanced the thread) fails here instead of
-    // durably double-committing the turn. Running the guard before the
-    // attempt close means a rejected stale commit leaves no side effects,
-    // mirroring the durable backends, where the in-transaction assertion
-    // rolls back the staged attempt close on mismatch.
+    // Stale turn double-commit pre-check. Running it before the attempt
+    // close means the COMMON stale case is rejected with no side
+    // effects, mirroring the durable backends. It is advisory, not the
+    // authority: two racing committers can both pass this read (codex
+    // round-9), so the authoritative expected-turn CAS lives INSIDE
+    // `ThreadStore::commit_turn`, under the same lock as the increment.
+    // A commit that loses the race there fails at step 2 with its
+    // attempt already closed (step 1) — the shift wrapper's exit
+    // settles swallow the resulting `AlreadyClosed` on any later close.
     let committed_turns_before = thread_store
         .get(&params.thread_id)
         .await
@@ -372,7 +373,12 @@ pub async fn commit_completed_turn(
 
     // 2. Commit the turn to the thread aggregate.
     let thread = thread_store
-        .commit_turn(&params.thread_id, &params.turn_usage, params.now)
+        .commit_turn(
+            &params.thread_id,
+            params.expected_turn,
+            &params.turn_usage,
+            params.now,
+        )
         .await
         .context("commit: advance thread aggregate")?;
 
