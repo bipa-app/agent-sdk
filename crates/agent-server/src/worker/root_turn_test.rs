@@ -6957,6 +6957,66 @@ async fn shift_refuses_when_an_intervening_occupant_is_a_full_turn() -> Result<(
     Ok(())
 }
 
+/// Codex round-8 P2: exhausting the shift budget on a genuine
+/// collision must not leak the attempt — the max-shift exit settles it
+/// exactly like the no-shift exit (ownership may have been lost
+/// concurrently, and no later path owns the attempt then).
+#[tokio::test]
+async fn exhausted_shift_budget_settles_the_attempt() -> Result<()> {
+    let stores = TestStores::new();
+    stores.threads.get_or_create(&thread_a(), t0()).await?;
+
+    let successor = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let successor_id = successor.id.clone();
+    let bootstrap = sample_bootstrap(successor);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    // Four back-to-back salvage occupants: the walk absorbs three
+    // shifts and gives up on the fourth collision.
+    let salvager_id = AgentTaskId::from_string("task_quad_salvager");
+    let racing = SalvageRacingAttemptStore {
+        inner: stores.attempts.clone(),
+        stores: stores.clone(),
+        salvager_task: salvager_id.clone(),
+        cancel_first: None,
+        racing_commits: vec![
+            (TokenUsage::default(), CheckpointKind::CancelSalvage),
+            (TokenUsage::default(), CheckpointKind::CancelSalvage),
+            (TokenUsage::default(), CheckpointKind::CancelSalvage),
+            (TokenUsage::default(), CheckpointKind::CancelSalvage),
+        ],
+        fired: AtomicBool::new(false),
+    };
+    let mut deps = stores.deps();
+    deps.attempt_store = &racing;
+
+    let provider = MockTextProvider::new("cannot land");
+    let error = execute_root_turn(inputs, "walk too far", &provider, &deps, t_plus(5))
+        .await
+        .err()
+        .context("a fourth collision must exhaust the walk")?;
+    assert!(
+        format!("{error:#}").contains("already committed"),
+        "expected the slot-collision rejection, got: {error:#}",
+    );
+
+    // The successor's own attempts are all settled; nothing leaks open.
+    let attempts = stores.attempts.list_by_task(&successor_id).await?;
+    assert!(!attempts.is_empty(), "the walk opened an attempt");
+    assert!(
+        attempts.iter().all(TurnAttempt::is_closed),
+        "the max-shift exit must leave no attempt open",
+    );
+    Ok(())
+}
+
 /// Positive counterpart of the single-step walk: when EVERY intervening
 /// occupant is shiftable salvage, the walk crosses them one slot at a
 /// time and the successor lands on the first free slot.

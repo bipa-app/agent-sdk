@@ -1781,8 +1781,22 @@ async fn commit_completed_turn_shifting_slot(
             Err(error) => error,
         };
 
-        if shifts >= MAX_TURN_SLOT_SHIFTS || !is_turn_slot_collision(&error) {
+        if !is_turn_slot_collision(&error) {
+            // Non-collision commit failure. An ownership rejection
+            // (`LostCommitOwnership`) settles here — no later path owns
+            // the attempt; every other failure leaves the row owned,
+            // and the host's terminal envelope closes the attempt.
             settle_attempt_after_lost_ownership(&error, &params, deps).await;
+            return Err(error);
+        }
+        if shifts >= MAX_TURN_SLOT_SHIFTS {
+            // Walk exhausted on a genuine collision (codex round-8
+            // P2): ownership may have been lost concurrently WITHOUT
+            // the error carrying `LostCommitOwnership` — the cancel
+            // seam leaves a live worker's attempt open and the host
+            // skips rows it no longer owns. Settle unconditionally,
+            // exactly like the no-shift exit below.
+            settle_own_attempt(&params, deps).await;
             return Err(error);
         }
         let Some(next_turn) = shifted_turn_slot(&params, worker_id, lease_id, deps).await else {
