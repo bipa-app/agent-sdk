@@ -17,6 +17,7 @@ use crate::context::{CompactionConfig, ContextCompactor};
 use crate::events::AgentEvent;
 use crate::hooks::AgentHooks;
 use crate::llm::{LlmProvider, Message, StopReason};
+use crate::pricing::CostEstimator;
 use crate::stores::{EventStore, MessageStore, StateStore, ToolExecutionStore};
 use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::{
@@ -958,6 +959,7 @@ fn first_turn_context(
     mut init: InitializedState,
     thread_id: &ThreadId,
     start_time: Instant,
+    cost_estimator: Option<Arc<dyn CostEstimator>>,
     #[cfg(feature = "otel")] input_kind: &'static str,
 ) -> TurnContext {
     let first_request_decision = init.first_request_decision.take();
@@ -967,6 +969,7 @@ fn first_turn_context(
         init.total_usage,
         init.state,
         start_time,
+        cost_estimator,
         #[cfg(feature = "otel")]
         input_kind,
     );
@@ -980,6 +983,7 @@ fn build_turn_context(
     total_usage: TokenUsage,
     state: AgentState,
     start_time: Instant,
+    cost_estimator: Option<Arc<dyn CostEstimator>>,
     #[cfg(feature = "otel")] input_kind: &'static str,
 ) -> TurnContext {
     TurnContext {
@@ -988,6 +992,7 @@ fn build_turn_context(
         total_usage,
         state,
         start_time,
+        cost_estimator,
         compaction_retries: 0,
         pending_reminder: None,
         pending_first_request: None,
@@ -1187,6 +1192,7 @@ fn done_run_state(ctx: &TurnContext, provenance: &AuditProvenance) -> AgentRunSt
         total_usage: ctx.total_usage.clone(),
         estimated_cost_usd: budget::run_cost_usd(
             ctx.state.accumulated_cost_usd,
+            ctx.cost_estimator.as_deref(),
             provenance,
             &ctx.total_usage,
         ),
@@ -1205,24 +1211,26 @@ fn done_run_state(ctx: &TurnContext, provenance: &AuditProvenance) -> AgentRunSt
 /// turn (`Resume` / `SubmitToolResults`, whose results must be recorded to
 /// keep the history balanced) and are covered by the pre-dispatch checks.
 async fn over_budget_entry_state<S>(
-    input: &AgentInput,
-    thread_id: &ThreadId,
-    state_store: &Arc<S>,
-    usage_limits: Option<&UsageLimits>,
-    provenance: &AuditProvenance,
+    params: &EntryBudgetParams<'_, impl AgentHooks, S>,
 ) -> Option<(AgentState, BudgetLimitKind, Option<f64>)>
 where
     S: StateStore,
 {
-    if !matches!(input, AgentInput::Text(_) | AgentInput::Message(_)) {
+    if !matches!(params.input, AgentInput::Text(_) | AgentInput::Message(_)) {
         return None;
     }
     // A load failure is deliberately not surfaced here: initialization
     // performs its own load and reports the error through the normal path.
-    let state = state_store.load(thread_id).await.ok().flatten()?;
+    let state = params
+        .state_store
+        .load(params.thread_id)
+        .await
+        .ok()
+        .flatten()?;
     let (limit, cost) = budget::status(
-        usage_limits,
-        provenance,
+        params.usage_limits,
+        params.cost_estimator.map(Arc::as_ref),
+        params.provenance,
         &state.total_usage,
         state.accumulated_cost_usd,
     )?;
@@ -1240,6 +1248,7 @@ struct EntryBudgetParams<'a, H, S> {
     authority: &'a Arc<dyn EventAuthority>,
     provenance: &'a AuditProvenance,
     usage_limits: Option<&'a UsageLimits>,
+    cost_estimator: Option<&'a Arc<dyn CostEstimator>>,
     start_time: Instant,
     #[cfg(feature = "otel")]
     input_kind: &'static str,
@@ -1255,20 +1264,14 @@ where
     H: AgentHooks,
     S: StateStore,
 {
-    let (state, limit, cost) = over_budget_entry_state(
-        params.input,
-        params.thread_id,
-        params.state_store,
-        params.usage_limits,
-        params.provenance,
-    )
-    .await?;
+    let (state, limit, cost) = over_budget_entry_state(&params).await?;
     let ctx = build_turn_context(
         params.thread_id,
         state.turn_count,
         state.total_usage.clone(),
         state,
         params.start_time,
+        params.cost_estimator.cloned(),
         #[cfg(feature = "otel")]
         params.input_kind,
     );
@@ -1295,20 +1298,14 @@ where
     H: AgentHooks,
     S: StateStore,
 {
-    let (state, limit, estimated_cost_usd) = over_budget_entry_state(
-        params.input,
-        params.thread_id,
-        params.state_store,
-        params.usage_limits,
-        params.provenance,
-    )
-    .await?;
+    let (state, limit, estimated_cost_usd) = over_budget_entry_state(&params).await?;
     let ctx = build_turn_context(
         params.thread_id,
         state.turn_count,
         state.total_usage.clone(),
         state,
         params.start_time,
+        params.cost_estimator.cloned(),
         #[cfg(feature = "otel")]
         params.input_kind,
     );
@@ -1349,7 +1346,7 @@ struct GuardedInitParams<'a, Ctx, P, H, M, S> {
     provider: &'a Arc<P>,
     tools: &'a Arc<ToolRegistry<Ctx>>,
     config: &'a AgentConfig,
-    usage_limits: Option<&'a UsageLimits>,
+    cost_estimator: Option<&'a Arc<dyn CostEstimator>>,
     start_time: Instant,
     #[cfg(feature = "otel")]
     input_kind: &'static str,
@@ -1366,7 +1363,8 @@ impl<Ctx, P, H, M, S> GuardedInitParams<'_, Ctx, P, H, M, S> {
             hooks: self.hooks,
             authority: self.authority,
             provenance: self.provenance,
-            usage_limits: self.usage_limits,
+            usage_limits: self.config.usage_limits.as_ref(),
+            cost_estimator: self.cost_estimator,
             start_time: self.start_time,
             #[cfg(feature = "otel")]
             input_kind: self.input_kind,
@@ -1926,6 +1924,7 @@ where
     // without answering it — consuming the caller's message for nothing.
     if let Some((limit, cost)) = budget::status(
         usage_limits,
+        ctx.cost_estimator.as_deref(),
         provenance,
         &ctx.total_usage,
         ctx.state.accumulated_cost_usd,
@@ -2345,8 +2344,12 @@ where
     }
 
     let duration = ctx.start_time.elapsed();
-    let estimated_cost_usd =
-        budget::run_cost_usd(ctx.state.accumulated_cost_usd, provenance, &ctx.total_usage);
+    let estimated_cost_usd = budget::run_cost_usd(
+        ctx.state.accumulated_cost_usd,
+        ctx.cost_estimator.as_deref(),
+        provenance,
+        &ctx.total_usage,
+    );
     if let Err(error) = send_event(
         event_store,
         &ctx.thread_id,
@@ -2466,6 +2469,7 @@ where
         // a completed resume, and every loop-back after a completed turn.
         if let Some((limit, cost)) = budget::status(
             config.usage_limits.as_ref(),
+            ctx.cost_estimator.as_deref(),
             provenance,
             &ctx.total_usage,
             ctx.state.accumulated_cost_usd,
@@ -2572,6 +2576,7 @@ pub(super) async fn handle_single_turn_resume<Ctx, H, M, S>(
         turn_options,
         start_time,
         usage_limits,
+        cost_estimator,
     }: SingleTurnResumeParams<Ctx, H, M, S>,
 ) -> TurnOutcome
 where
@@ -2627,6 +2632,7 @@ where
                 turn_options: &turn_options,
                 start_time,
                 usage_limits: usage_limits.as_ref(),
+                cost_estimator: cost_estimator.as_ref(),
             })
             .await
         }
@@ -2699,6 +2705,7 @@ struct ResumeCompletedParams<'a, H, S> {
     turn_options: &'a TurnOptions,
     start_time: Instant,
     usage_limits: Option<&'a UsageLimits>,
+    cost_estimator: Option<&'a Arc<dyn CostEstimator>>,
 }
 
 /// Build the outcome for a single-turn resume whose pending tool batch
@@ -2720,6 +2727,7 @@ async fn resume_completed_outcome<H, S>(
         turn_options,
         start_time,
         usage_limits,
+        cost_estimator,
     }: ResumeCompletedParams<'_, H, S>,
 ) -> TurnOutcome
 where
@@ -2755,9 +2763,13 @@ where
     // limits and yield the terminal outcome instead. The event is
     // keyed under `turn`, which is still open — the resume-state
     // wrapper finishes it after this returns.
-    if let Some((limit, estimated_cost_usd)) =
-        budget::status(usage_limits, provenance, &total_usage, accumulated_cost_usd)
-    {
+    if let Some((limit, estimated_cost_usd)) = budget::status(
+        usage_limits,
+        cost_estimator.map(Arc::as_ref),
+        provenance,
+        &total_usage,
+        accumulated_cost_usd,
+    ) {
         warn!("Run-level usage budget exceeded on resume (turn={turn}, limit={limit:?})");
         if let Err(error) = send_event(
             event_store,
@@ -3015,6 +3027,7 @@ async fn run_loop_inner<Ctx, P, H, M, S>(
         message_store,
         state_store,
         config,
+        cost_estimator,
         compaction_config,
         compactor,
         execution_store,
@@ -3063,7 +3076,7 @@ where
         provider: &provider,
         tools: &tools,
         config: &config,
-        usage_limits: config.usage_limits.as_ref(),
+        cost_estimator: cost_estimator.as_ref(),
         start_time,
         #[cfg(feature = "otel")]
         input_kind,
@@ -3098,6 +3111,7 @@ where
         init,
         &thread_id,
         start_time,
+        cost_estimator,
         #[cfg(feature = "otel")]
         input_kind,
     );
@@ -3262,6 +3276,7 @@ async fn run_single_turn_inner<Ctx, P, H, M, S>(
         message_store,
         state_store,
         config,
+        cost_estimator,
         compaction_config,
         compactor,
         execution_store,
@@ -3321,7 +3336,7 @@ where
             provider: &provider,
             tools: &tools,
             config: &config,
-            usage_limits: config.usage_limits.as_ref(),
+            cost_estimator: cost_estimator.as_ref(),
             start_time,
             #[cfg(feature = "otel")]
             input_kind,
@@ -3334,31 +3349,8 @@ where
         Err(outcome) => return outcome,
     };
 
-    if let Some(resume_data) = init.resume_data.take() {
-        return handle_single_turn_resume_state(SingleTurnResumeParams {
-            resume_data,
-            turn: init.turn,
-            total_usage: init.total_usage,
-            state: init.state,
-            thread_id: thread_id.clone(),
-            tool_context,
-            tools,
-            hooks,
-            event_store: Arc::clone(&event_store),
-            authority,
-            message_store,
-            state_store,
-            execution_store,
-            audit_sink,
-            provenance,
-            turn_options: turn_options.clone(),
-            start_time,
-            usage_limits: config.usage_limits.clone(),
-        })
-        .await;
-    }
-
-    run_single_turn_execute(SingleTurnExecuteParams {
+    let resume_data = init.resume_data.take();
+    let params = SingleTurnExecuteParams {
         event_store,
         authority,
         thread_id,
@@ -3369,6 +3361,7 @@ where
         message_store,
         state_store,
         config,
+        cost_estimator,
         compaction_config,
         compactor,
         execution_store,
@@ -3386,16 +3379,21 @@ where
         input_kind,
         #[cfg(feature = "otel")]
         observability_store,
-    })
-    .await
+    };
+
+    match resume_data {
+        Some(resume_data) => handle_single_turn_resume_state(params.into_resume(resume_data)).await,
+        None => run_single_turn_execute(params).await,
+    }
 }
 
 /// Parameters for the non-resume single-turn execution path.
 ///
 /// Split out of `run_single_turn_inner` so the top-level function stays
-/// under the clippy too-many-lines threshold. The resume path never
-/// hits this function — it branches earlier via
-/// `handle_single_turn_resume_state`.
+/// under the clippy too-many-lines threshold. A resume input reshapes these
+/// same values into [`SingleTurnResumeParams`] via
+/// [`SingleTurnExecuteParams::into_resume`] and branches to
+/// `handle_single_turn_resume_state` instead.
 struct SingleTurnExecuteParams<Ctx, P, H, M, S> {
     event_store: Arc<dyn EventStore>,
     authority: Arc<dyn EventAuthority>,
@@ -3407,6 +3405,7 @@ struct SingleTurnExecuteParams<Ctx, P, H, M, S> {
     message_store: Arc<M>,
     state_store: Arc<S>,
     config: AgentConfig,
+    cost_estimator: Option<Arc<dyn CostEstimator>>,
     compaction_config: Option<CompactionConfig>,
     compactor: Option<Arc<dyn ContextCompactor>>,
     execution_store: Option<Arc<dyn ToolExecutionStore>>,
@@ -3427,6 +3426,36 @@ struct SingleTurnExecuteParams<Ctx, P, H, M, S> {
     observability_store: Option<Arc<dyn crate::observability::ObservabilityStore>>,
 }
 
+impl<Ctx, P, H, M, S> SingleTurnExecuteParams<Ctx, P, H, M, S> {
+    /// Reshape the turn's inputs for the resume path, which answers an
+    /// already-open turn instead of dispatching a fresh LLM call: the
+    /// provider, compaction, reminder, and cancellation inputs a new call
+    /// would need are dropped, and the rest carries over unchanged.
+    fn into_resume(self, resume_data: ResumeData) -> SingleTurnResumeParams<Ctx, H, M, S> {
+        SingleTurnResumeParams {
+            resume_data,
+            turn: self.turn,
+            total_usage: self.total_usage,
+            state: self.state,
+            thread_id: self.thread_id,
+            tool_context: self.tool_context,
+            tools: self.tools,
+            hooks: self.hooks,
+            event_store: self.event_store,
+            authority: self.authority,
+            message_store: self.message_store,
+            state_store: self.state_store,
+            execution_store: self.execution_store,
+            audit_sink: self.audit_sink,
+            provenance: self.provenance,
+            turn_options: self.turn_options,
+            start_time: self.start_time,
+            usage_limits: self.config.usage_limits,
+            cost_estimator: self.cost_estimator,
+        }
+    }
+}
+
 async fn run_single_turn_execute<Ctx, P, H, M, S>(
     SingleTurnExecuteParams {
         event_store,
@@ -3439,6 +3468,7 @@ async fn run_single_turn_execute<Ctx, P, H, M, S>(
         message_store,
         state_store,
         config,
+        cost_estimator,
         compaction_config,
         compactor,
         execution_store,
@@ -3471,6 +3501,7 @@ where
         total_usage,
         state,
         start_time,
+        cost_estimator,
         #[cfg(feature = "otel")]
         input_kind,
     );
@@ -3486,6 +3517,7 @@ where
     // thread that already crossed a limit terminates without an LLM call.
     if let Some((limit, estimated_cost_usd)) = budget::status(
         config.usage_limits.as_ref(),
+        ctx.cost_estimator.as_deref(),
         &provenance,
         &ctx.total_usage,
         ctx.state.accumulated_cost_usd,
@@ -3764,8 +3796,12 @@ where
         warn!("Failed to save final state: {e}");
     }
     let duration = ctx.start_time.elapsed();
-    let estimated_cost_usd =
-        budget::run_cost_usd(ctx.state.accumulated_cost_usd, provenance, &ctx.total_usage);
+    let estimated_cost_usd = budget::run_cost_usd(
+        ctx.state.accumulated_cost_usd,
+        ctx.cost_estimator.as_deref(),
+        provenance,
+        &ctx.total_usage,
+    );
     if let Err(error) = send_event(
         event_store,
         thread_id,
@@ -3837,6 +3873,7 @@ async fn convert_continue_turn<H: AgentHooks, S: StateStore>(
     };
     if let Some((limit, estimated_cost_usd)) = budget::status(
         usage_limits,
+        ctx.cost_estimator.as_deref(),
         provenance,
         &ctx.total_usage,
         ctx.state.accumulated_cost_usd,

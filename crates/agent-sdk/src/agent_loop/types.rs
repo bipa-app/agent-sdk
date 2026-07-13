@@ -2,6 +2,7 @@ use crate::authority::EventAuthority;
 use crate::context::{CompactionConfig, ContextCompactor};
 use crate::hooks::ToolAuditSink;
 use crate::llm::StopReason;
+use crate::pricing::CostEstimator;
 use crate::stores::{EventStore, ToolExecutionStore};
 use crate::tools::{ToolContext, ToolRegistry};
 #[cfg(feature = "otel")]
@@ -95,6 +96,11 @@ pub(super) struct TurnContext {
     pub(super) total_usage: TokenUsage,
     pub(super) state: AgentState,
     pub(super) start_time: Instant,
+    /// Pricing source for run-level cost budgeting, when the loop was built
+    /// with one. Every cost estimate on the turn path reads it from here:
+    /// the dynamic catalog is consulted before the static capability table,
+    /// so a model the table has never heard of still accrues cost.
+    pub(super) cost_estimator: Option<Arc<dyn CostEstimator>>,
     /// Number of consecutive compaction retries for context overflow.
     pub(super) compaction_retries: usize,
     /// Optional system reminder to inject into the next LLM call.
@@ -360,6 +366,9 @@ pub(super) struct RunLoopParameters<Ctx, P, H, M, S> {
     pub(super) message_store: Arc<M>,
     pub(super) state_store: Arc<S>,
     pub(super) config: AgentConfig,
+    /// Pricing source for the run's cost budget; see
+    /// [`TurnContext::cost_estimator`].
+    pub(super) cost_estimator: Option<Arc<dyn CostEstimator>>,
     pub(super) compaction_config: Option<CompactionConfig>,
     pub(super) compactor: Option<Arc<dyn ContextCompactor>>,
     pub(super) execution_store: Option<Arc<dyn ToolExecutionStore>>,
@@ -504,6 +513,9 @@ pub(super) struct SingleTurnResumeParams<Ctx, H, M, S> {
     /// caller receives [`crate::types::TurnOutcome::BudgetExceeded`] instead
     /// of `NeedsMoreTurns` when the paused turn already crossed a limit.
     pub(super) usage_limits: Option<UsageLimits>,
+    /// Pricing source for that budget check; see
+    /// [`TurnContext::cost_estimator`].
+    pub(super) cost_estimator: Option<Arc<dyn CostEstimator>>,
 }
 
 pub(super) struct TurnParameters<Ctx, P, H, M, S> {
@@ -518,6 +530,9 @@ pub(super) struct TurnParameters<Ctx, P, H, M, S> {
     pub(super) message_store: Arc<M>,
     pub(super) state_store: Arc<S>,
     pub(super) config: AgentConfig,
+    /// Pricing source for the turn's cost budget; see
+    /// [`TurnContext::cost_estimator`].
+    pub(super) cost_estimator: Option<Arc<dyn CostEstimator>>,
     pub(super) compaction_config: Option<CompactionConfig>,
     pub(super) compactor: Option<Arc<dyn ContextCompactor>>,
     pub(super) execution_store: Option<Arc<dyn ToolExecutionStore>>,

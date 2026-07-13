@@ -3,34 +3,65 @@
 //! The agent loop reserves no budget up front; instead it checks the
 //! cumulative usage at every turn-continuation boundary (see
 //! [`check_budget`]) and stops the run before starting another turn once a
-//! configured [`UsageLimits`] threshold is crossed. Cost is estimated from
-//! the run's provider/model pricing metadata
-//! ([`agent_sdk_providers`](crate::model_capabilities)); models without
-//! pricing simply report `None` and never trip the cost limit.
+//! configured [`UsageLimits`] threshold is crossed.
+//!
+//! Cost is estimated from the run's provider/model pricing, resolved through
+//! the optional [`CostEstimator`] the loop was built with (a dynamic catalog
+//! such as [`ModelRegistry`](agent_sdk_providers::ModelRegistry), whose feed
+//! pricing is fresher than anything compiled in) and then the static
+//! [`model_capabilities`](crate::model_capabilities) table. A model priced by
+//! neither reports `None` and never trips the cost limit.
 
+use crate::pricing::CostEstimator;
 use crate::types::{BudgetLimitKind, TokenUsage, UsageLimits};
 use agent_sdk_foundation::audit::AuditProvenance;
 use agent_sdk_foundation::llm::Usage;
 
 /// Estimate the USD cost of `usage` for the run's provider/model.
 ///
-/// Returns `None` when the provider/model pair has no pricing metadata, so
+/// Returns `None` when no pricing source knows the provider/model pair, so
 /// callers treat an un-priced model as "cost unknown" rather than free.
 #[must_use]
-pub(super) fn estimate_cost_usd(provenance: &AuditProvenance, usage: &TokenUsage) -> Option<f64> {
-    let caps = lookup_capabilities(&provenance.provider, &provenance.model)?;
-    caps.estimate_cost_usd(&Usage {
+pub(super) fn estimate_cost_usd(
+    pricing: Option<&dyn CostEstimator>,
+    provenance: &AuditProvenance,
+    usage: &TokenUsage,
+) -> Option<f64> {
+    let usage = Usage {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         cached_input_tokens: usage.cached_input_tokens,
         cache_creation_input_tokens: usage.cache_creation_input_tokens,
-    })
+    };
+    provider_candidates(&provenance.provider, &provenance.model)
+        .find_map(|provider| price_call(pricing, provider, &provenance.model, &usage))
 }
 
-/// Resolve pricing metadata for a provenance provider/model pair,
-/// normalizing known provider aliases before giving up.
+/// Price one call for a single (already canonical) provider name: the
+/// configured estimator first, the static capability table as the fallback.
 ///
-/// The capability registry keys entries under the canonical provider names
+/// An estimator that holds no pricing for the pair must not make the call
+/// look free, so a `None` from it falls through to the compiled-in table
+/// rather than short-circuiting the lookup.
+fn price_call(
+    pricing: Option<&dyn CostEstimator>,
+    provider: &str,
+    model: &str,
+    usage: &Usage,
+) -> Option<f64> {
+    pricing
+        .and_then(|estimator| estimator.estimate_cost_usd(provider, model, usage))
+        .or_else(|| {
+            crate::model_capabilities::get_model_capabilities(provider, model)?
+                .estimate_cost_usd(usage)
+        })
+}
+
+/// The provider names to price a provenance under, most specific first: the
+/// name the provider reported, then the canonical backend(s) that name is
+/// known to serve.
+///
+/// Pricing sources key entries under the canonical provider names
 /// (`anthropic` / `openai` / `gemini`), but several [`crate::llm::LlmProvider`]
 /// implementations report a transport-specific name in their provenance:
 /// `openai-responses` and `openai-codex` serve `openai` models, `vertex`
@@ -56,23 +87,15 @@ pub(super) fn estimate_cost_usd(provenance: &AuditProvenance, usage: &TokenUsage
 /// deterministically; pricing it identically is deliberate, so replayed
 /// runs exercise the same budget behavior the recording did — the
 /// provenance string does not distinguish the modes.
-fn lookup_capabilities(
-    provider: &str,
-    model: &str,
-) -> Option<&'static crate::model_capabilities::ModelCapabilities> {
-    crate::model_capabilities::get_model_capabilities(provider, model).or_else(|| match provider {
-        "openai-responses" | "openai-codex" => {
-            crate::model_capabilities::get_model_capabilities("openai", model)
-        }
-        "vertex" if model.starts_with("claude-") => {
-            crate::model_capabilities::get_model_capabilities("anthropic", model)
-        }
-        "vertex" => crate::model_capabilities::get_model_capabilities("gemini", model),
-        "cloudflare-ai-gateway" | "record-replay" => ["anthropic", "openai", "gemini"]
-            .into_iter()
-            .find_map(|backend| crate::model_capabilities::get_model_capabilities(backend, model)),
-        _ => None,
-    })
+fn provider_candidates<'a>(provider: &'a str, model: &str) -> impl Iterator<Item = &'a str> {
+    let backends: &'static [&'static str] = match provider {
+        "openai-responses" | "openai-codex" => &["openai"],
+        "vertex" if model.starts_with("claude-") => &["anthropic"],
+        "vertex" => &["gemini"],
+        "cloudflare-ai-gateway" | "record-replay" => &["anthropic", "openai", "gemini"],
+        _ => &[],
+    };
+    std::iter::once(provider).chain(backends.iter().copied())
 }
 
 /// Whether a usage delta carries no tokens at all.
@@ -97,14 +120,15 @@ pub(super) const fn usage_is_zero(usage: &TokenUsage) -> bool {
 /// `Some` on their own.
 pub(super) fn accumulate_cost(
     state: &mut crate::types::AgentState,
+    pricing: Option<&dyn CostEstimator>,
     provenance: &AuditProvenance,
     pre_delta_total: &TokenUsage,
     delta: &TokenUsage,
 ) {
     if state.accumulated_cost_usd.is_none() && !usage_is_zero(pre_delta_total) {
-        state.accumulated_cost_usd = estimate_cost_usd(provenance, pre_delta_total);
+        state.accumulated_cost_usd = estimate_cost_usd(pricing, provenance, pre_delta_total);
     }
-    if let Some(delta_cost) = estimate_cost_usd(provenance, delta) {
+    if let Some(delta_cost) = estimate_cost_usd(pricing, provenance, delta) {
         state.accumulated_cost_usd = Some(state.accumulated_cost_usd.unwrap_or(0.0) + delta_cost);
     }
 }
@@ -116,10 +140,11 @@ pub(super) fn accumulate_cost(
 #[must_use]
 pub(super) fn run_cost_usd(
     accumulated: Option<f64>,
+    pricing: Option<&dyn CostEstimator>,
     provenance: &AuditProvenance,
     usage: &TokenUsage,
 ) -> Option<f64> {
-    accumulated.or_else(|| estimate_cost_usd(provenance, usage))
+    accumulated.or_else(|| estimate_cost_usd(pricing, provenance, usage))
 }
 
 /// Evaluate the run-level usage budget against the cumulative `usage`.
@@ -134,12 +159,13 @@ pub(super) fn run_cost_usd(
 #[must_use]
 pub(super) fn status(
     usage_limits: Option<&UsageLimits>,
+    pricing: Option<&dyn CostEstimator>,
     provenance: &AuditProvenance,
     usage: &TokenUsage,
     accumulated_cost_usd: Option<f64>,
 ) -> Option<(BudgetLimitKind, Option<f64>)> {
     let limits = usage_limits?;
-    let cost = run_cost_usd(accumulated_cost_usd, provenance, usage);
+    let cost = run_cost_usd(accumulated_cost_usd, pricing, provenance, usage);
     let limit = check_budget(limits, usage, cost)?;
     Some((limit, cost))
 }
@@ -182,6 +208,133 @@ pub(super) fn check_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{AgentState, ThreadId};
+
+    /// A model the static capability table has never heard of, priced at
+    /// $10 / 1M input and $20 / 1M output — the shape of a model that only
+    /// the dynamic catalog's feed carries.
+    const FEED_MODEL: &str = "feed-only-model";
+
+    /// Stands in for a dynamic catalog: prices exactly one canonical
+    /// provider/model pair and reports `None` for everything else.
+    struct FeedPricing;
+
+    impl CostEstimator for FeedPricing {
+        fn estimate_cost_usd(&self, provider: &str, model: &str, usage: &Usage) -> Option<f64> {
+            (provider == "openai" && model == FEED_MODEL).then(|| {
+                (f64::from(usage.input_tokens) / 1_000_000.0)
+                    .mul_add(10.0, f64::from(usage.output_tokens) / 1_000_000.0 * 20.0)
+            })
+        }
+    }
+
+    /// A catalog that knows nothing: every lookup must fall through to the
+    /// static table.
+    struct EmptyPricing;
+
+    impl CostEstimator for EmptyPricing {
+        fn estimate_cost_usd(&self, _provider: &str, _model: &str, _usage: &Usage) -> Option<f64> {
+            None
+        }
+    }
+
+    fn one_million_each() -> TokenUsage {
+        TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn feed_only_model_is_unpriced_without_a_cost_estimator() {
+        let provenance = AuditProvenance::new("openai", FEED_MODEL);
+        assert!(estimate_cost_usd(None, &provenance, &one_million_each()).is_none());
+    }
+
+    #[test]
+    fn feed_only_model_accrues_cost_through_the_estimator() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let provenance = AuditProvenance::new("openai", FEED_MODEL);
+        let cost = estimate_cost_usd(Some(&FeedPricing), &provenance, &one_million_each())
+            .context("the estimator prices this model")?;
+        assert!((cost - 30.0).abs() < 1e-9, "unexpected cost: {cost}");
+        Ok(())
+    }
+
+    #[test]
+    fn feed_only_model_trips_the_cost_limit() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let limits = UsageLimits {
+            max_cost_usd: Some(1.0),
+            ..Default::default()
+        };
+        let provenance = AuditProvenance::new("openai", FEED_MODEL);
+        let usage = one_million_each();
+
+        // Without a catalog the model is un-priced: documented fail-open.
+        assert!(status(Some(&limits), None, &provenance, &usage, None).is_none());
+
+        let (limit, cost) = status(Some(&limits), Some(&FeedPricing), &provenance, &usage, None)
+            .context("feed pricing must trip the cost limit")?;
+        assert_eq!(limit, BudgetLimitKind::CostUsd);
+        let cost = cost.context("the tripped limit carries the estimate")?;
+        assert!((cost - 30.0).abs() < 1e-9, "unexpected cost: {cost}");
+        Ok(())
+    }
+
+    #[test]
+    fn estimator_prices_an_aliased_provenance() -> anyhow::Result<()> {
+        use anyhow::Context;
+        // `openai-codex` serves `openai` models: the estimator is consulted
+        // under the canonical backend name, exactly like the static table.
+        let provenance = AuditProvenance::new("openai-codex", FEED_MODEL);
+        let cost = estimate_cost_usd(Some(&FeedPricing), &provenance, &one_million_each())
+            .context("the aliased provenance must resolve to the openai entry")?;
+        assert!((cost - 30.0).abs() < 1e-9, "unexpected cost: {cost}");
+        Ok(())
+    }
+
+    #[test]
+    fn static_table_still_prices_what_the_estimator_misses() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let provenance = AuditProvenance::new("openai", "gpt-4o");
+        let usage = TokenUsage {
+            input_tokens: 2_000,
+            output_tokens: 1_000,
+            ..Default::default()
+        };
+        let with_empty_catalog = estimate_cost_usd(Some(&EmptyPricing), &provenance, &usage)
+            .context("an estimator miss must fall back to the static table")?;
+        let statically_priced = estimate_cost_usd(None, &provenance, &usage)
+            .context("gpt-4o is priced in the static table")?;
+        assert!((with_empty_catalog - statically_priced).abs() < 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn accumulate_cost_uses_the_estimator_for_feed_priced_calls() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let provenance = AuditProvenance::new("openai", FEED_MODEL);
+        let mut state = AgentState::new(ThreadId::new());
+
+        accumulate_cost(
+            &mut state,
+            Some(&FeedPricing),
+            &provenance,
+            &TokenUsage::default(),
+            &one_million_each(),
+        );
+
+        let accumulated = state
+            .accumulated_cost_usd
+            .context("a feed-priced call must accumulate cost")?;
+        assert!(
+            (accumulated - 30.0).abs() < 1e-9,
+            "unexpected accumulated cost: {accumulated}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn estimate_cost_for_gpt_4o_matches_pricing() -> anyhow::Result<()> {
@@ -194,7 +347,7 @@ mod tests {
             output_tokens: 1_000,
             ..Default::default()
         };
-        let cost = estimate_cost_usd(&provenance, &usage).context("gpt-4o has pricing")?;
+        let cost = estimate_cost_usd(None, &provenance, &usage).context("gpt-4o has pricing")?;
         assert!((cost - 0.0075).abs() < 1e-9, "unexpected cost: {cost}");
         Ok(())
     }
@@ -207,11 +360,14 @@ mod tests {
             output_tokens: 1_000,
             ..Default::default()
         };
-        let canonical = estimate_cost_usd(&AuditProvenance::new("openai", "gpt-4o"), &usage)
+        let canonical = estimate_cost_usd(None, &AuditProvenance::new("openai", "gpt-4o"), &usage)
             .context("gpt-4o has pricing")?;
-        let aliased =
-            estimate_cost_usd(&AuditProvenance::new("openai-responses", "gpt-4o"), &usage)
-                .context("openai-responses must resolve to the openai catalog entry")?;
+        let aliased = estimate_cost_usd(
+            None,
+            &AuditProvenance::new("openai-responses", "gpt-4o"),
+            &usage,
+        )
+        .context("openai-responses must resolve to the openai catalog entry")?;
         assert!((aliased - canonical).abs() < 1e-12);
         Ok(())
     }
@@ -224,10 +380,14 @@ mod tests {
             output_tokens: 1_000,
             ..Default::default()
         };
-        let canonical = estimate_cost_usd(&AuditProvenance::new("openai", "gpt-4o"), &usage)
+        let canonical = estimate_cost_usd(None, &AuditProvenance::new("openai", "gpt-4o"), &usage)
             .context("gpt-4o has pricing")?;
-        let aliased = estimate_cost_usd(&AuditProvenance::new("openai-codex", "gpt-4o"), &usage)
-            .context("openai-codex must resolve to the openai catalog entry")?;
+        let aliased = estimate_cost_usd(
+            None,
+            &AuditProvenance::new("openai-codex", "gpt-4o"),
+            &usage,
+        )
+        .context("openai-codex must resolve to the openai catalog entry")?;
         assert!((aliased - canonical).abs() < 1e-12);
         Ok(())
     }
@@ -240,11 +400,18 @@ mod tests {
             output_tokens: 1_000,
             ..Default::default()
         };
-        let canonical =
-            estimate_cost_usd(&AuditProvenance::new("anthropic", "claude-fable-5"), &usage)
-                .context("claude-fable-5 has pricing")?;
-        let aliased = estimate_cost_usd(&AuditProvenance::new("vertex", "claude-fable-5"), &usage)
-            .context("vertex claude-* must resolve to the anthropic catalog entry")?;
+        let canonical = estimate_cost_usd(
+            None,
+            &AuditProvenance::new("anthropic", "claude-fable-5"),
+            &usage,
+        )
+        .context("claude-fable-5 has pricing")?;
+        let aliased = estimate_cost_usd(
+            None,
+            &AuditProvenance::new("vertex", "claude-fable-5"),
+            &usage,
+        )
+        .context("vertex claude-* must resolve to the anthropic catalog entry")?;
         assert!((aliased - canonical).abs() < 1e-12);
         Ok(())
     }
@@ -257,11 +424,18 @@ mod tests {
             output_tokens: 1_000,
             ..Default::default()
         };
-        let canonical =
-            estimate_cost_usd(&AuditProvenance::new("gemini", "gemini-3.1-pro"), &usage)
-                .context("gemini-3.1-pro has pricing")?;
-        let aliased = estimate_cost_usd(&AuditProvenance::new("vertex", "gemini-3.1-pro"), &usage)
-            .context("vertex non-claude must resolve to the gemini catalog entry")?;
+        let canonical = estimate_cost_usd(
+            None,
+            &AuditProvenance::new("gemini", "gemini-3.1-pro"),
+            &usage,
+        )
+        .context("gemini-3.1-pro has pricing")?;
+        let aliased = estimate_cost_usd(
+            None,
+            &AuditProvenance::new("vertex", "gemini-3.1-pro"),
+            &usage,
+        )
+        .context("vertex non-claude must resolve to the gemini catalog entry")?;
         assert!((aliased - canonical).abs() < 1e-12);
         Ok(())
     }
@@ -274,10 +448,14 @@ mod tests {
             output_tokens: 1_000,
             ..Default::default()
         };
-        let canonical =
-            estimate_cost_usd(&AuditProvenance::new("anthropic", "claude-fable-5"), &usage)
-                .context("claude-fable-5 has pricing")?;
+        let canonical = estimate_cost_usd(
+            None,
+            &AuditProvenance::new("anthropic", "claude-fable-5"),
+            &usage,
+        )
+        .context("claude-fable-5 has pricing")?;
         let aliased = estimate_cost_usd(
+            None,
             &AuditProvenance::new("cloudflare-ai-gateway", "claude-fable-5"),
             &usage,
         )
@@ -294,9 +472,10 @@ mod tests {
             output_tokens: 1_000,
             ..Default::default()
         };
-        let canonical = estimate_cost_usd(&AuditProvenance::new("openai", "gpt-4o"), &usage)
+        let canonical = estimate_cost_usd(None, &AuditProvenance::new("openai", "gpt-4o"), &usage)
             .context("gpt-4o has pricing")?;
         let aliased = estimate_cost_usd(
+            None,
             &AuditProvenance::new("cloudflare-ai-gateway", "gpt-4o"),
             &usage,
         )
@@ -313,10 +492,14 @@ mod tests {
             output_tokens: 1_000,
             ..Default::default()
         };
-        let canonical =
-            estimate_cost_usd(&AuditProvenance::new("anthropic", "claude-fable-5"), &usage)
-                .context("claude-fable-5 has pricing")?;
+        let canonical = estimate_cost_usd(
+            None,
+            &AuditProvenance::new("anthropic", "claude-fable-5"),
+            &usage,
+        )
+        .context("claude-fable-5 has pricing")?;
         let aliased = estimate_cost_usd(
+            None,
             &AuditProvenance::new("record-replay", "claude-fable-5"),
             &usage,
         )
@@ -333,10 +516,14 @@ mod tests {
             output_tokens: 1_000,
             ..Default::default()
         };
-        let canonical = estimate_cost_usd(&AuditProvenance::new("openai", "gpt-4o"), &usage)
+        let canonical = estimate_cost_usd(None, &AuditProvenance::new("openai", "gpt-4o"), &usage)
             .context("gpt-4o has pricing")?;
-        let aliased = estimate_cost_usd(&AuditProvenance::new("record-replay", "gpt-4o"), &usage)
-            .context("record-replay gpt-* must resolve to the openai catalog entry")?;
+        let aliased = estimate_cost_usd(
+            None,
+            &AuditProvenance::new("record-replay", "gpt-4o"),
+            &usage,
+        )
+        .context("record-replay gpt-* must resolve to the openai catalog entry")?;
         assert!((aliased - canonical).abs() < 1e-12);
         Ok(())
     }
@@ -349,10 +536,14 @@ mod tests {
             output_tokens: 1_000,
             ..Default::default()
         };
-        let canonical =
-            estimate_cost_usd(&AuditProvenance::new("gemini", "gemini-3.1-pro"), &usage)
-                .context("gemini-3.1-pro has pricing")?;
+        let canonical = estimate_cost_usd(
+            None,
+            &AuditProvenance::new("gemini", "gemini-3.1-pro"),
+            &usage,
+        )
+        .context("gemini-3.1-pro has pricing")?;
         let aliased = estimate_cost_usd(
+            None,
             &AuditProvenance::new("record-replay", "gemini-3.1-pro"),
             &usage,
         )
@@ -369,7 +560,7 @@ mod tests {
             output_tokens: 100,
             ..Default::default()
         };
-        assert!(estimate_cost_usd(&provenance, &usage).is_none());
+        assert!(estimate_cost_usd(None, &provenance, &usage).is_none());
     }
 
     #[test]

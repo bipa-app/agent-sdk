@@ -2,6 +2,7 @@ use crate::authority::EventAuthority;
 use crate::context::{CompactionConfig, ContextCompactor};
 use crate::hooks::{AgentHooks, DefaultHooks};
 use crate::llm::LlmProvider;
+use crate::pricing::CostEstimator;
 #[cfg(feature = "skills")]
 use crate::skills::Skill;
 use crate::stores::{EventStore, InMemoryStore, MessageStore, StateStore, ToolExecutionStore};
@@ -39,6 +40,7 @@ pub struct AgentLoopBuilder<Ctx, P, H, M, S> {
     event_store: Option<Arc<dyn EventStore>>,
     event_authority: Option<Arc<dyn EventAuthority>>,
     config: Option<AgentConfig>,
+    cost_estimator: Option<Arc<dyn CostEstimator>>,
     compaction_config: Option<CompactionConfig>,
     compactor: Option<Arc<dyn ContextCompactor>>,
     execution_store: Option<Arc<dyn ToolExecutionStore>>,
@@ -61,6 +63,7 @@ impl<Ctx> AgentLoopBuilder<Ctx, (), (), (), ()> {
             event_store: None,
             event_authority: None,
             config: None,
+            cost_estimator: None,
             compaction_config: None,
             compactor: None,
             execution_store: None,
@@ -91,6 +94,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             event_store: self.event_store,
             event_authority: self.event_authority,
             config: self.config,
+            cost_estimator: self.cost_estimator,
             compaction_config: self.compaction_config,
             compactor: self.compactor,
             execution_store: self.execution_store,
@@ -120,6 +124,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             event_store: self.event_store,
             event_authority: self.event_authority,
             config: self.config,
+            cost_estimator: self.cost_estimator,
             compaction_config: self.compaction_config,
             compactor: self.compactor,
             execution_store: self.execution_store,
@@ -145,6 +150,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             event_store: self.event_store,
             event_authority: self.event_authority,
             config: self.config,
+            cost_estimator: self.cost_estimator,
             compaction_config: self.compaction_config,
             compactor: self.compactor,
             execution_store: self.execution_store,
@@ -170,6 +176,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             event_store: self.event_store,
             event_authority: self.event_authority,
             config: self.config,
+            cost_estimator: self.cost_estimator,
             compaction_config: self.compaction_config,
             compactor: self.compactor,
             execution_store: self.execution_store,
@@ -284,6 +291,36 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
     #[must_use]
     pub fn config(mut self, config: AgentConfig) -> Self {
         self.config = Some(config);
+        self
+    }
+
+    /// Set the pricing source for the run's cost budget
+    /// ([`UsageLimits::max_cost_usd`](crate::types::UsageLimits::max_cost_usd)).
+    ///
+    /// The loop asks the estimator to price every LLM call before consulting
+    /// the static [`model_capabilities`](crate::model_capabilities) table, so
+    /// a model priced only by a dynamic catalog still accrues cost and can
+    /// trip the limit; the static table remains the fallback whenever the
+    /// estimator has no price for the provider/model pair. Without an
+    /// estimator (the default) pricing comes from the static table alone.
+    ///
+    /// The `model-discovery` feature implements
+    /// [`CostEstimator`](crate::pricing::CostEstimator) for
+    /// [`ModelRegistry`](agent_sdk_providers::ModelRegistry), so a
+    /// feed-refreshed catalog can be passed straight in:
+    ///
+    /// ```ignore
+    /// let catalog = Arc::new(ModelRegistry::new());
+    /// catalog.refresh(&ModelsDevSource::default()).await?;
+    ///
+    /// let agent = builder()
+    ///     .provider(provider)
+    ///     .cost_estimator(catalog)
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn cost_estimator(mut self, cost_estimator: Arc<dyn CostEstimator>) -> Self {
+        self.cost_estimator = Some(cost_estimator);
         self
     }
 
@@ -448,6 +485,7 @@ where
             event_store,
             event_authority: self.event_authority,
             config,
+            cost_estimator: self.cost_estimator,
             compaction_config: self.compaction_config,
             compactor: self.compactor,
             execution_store: self.execution_store,
@@ -497,6 +535,7 @@ where
             event_store,
             event_authority: self.event_authority,
             config,
+            cost_estimator: self.cost_estimator,
             compaction_config: self.compaction_config,
             compactor: self.compactor,
             execution_store: self.execution_store,

@@ -1279,7 +1279,13 @@ pub(super) fn fold_llm_usage(
     provenance: &AuditProvenance,
     delta: &TokenUsage,
 ) {
-    super::budget::accumulate_cost(&mut ctx.state, provenance, &ctx.total_usage, delta);
+    super::budget::accumulate_cost(
+        &mut ctx.state,
+        ctx.cost_estimator.as_deref(),
+        provenance,
+        &ctx.total_usage,
+        delta,
+    );
     ctx.total_usage.add(delta);
     ctx.state.total_usage = ctx.total_usage.clone();
 }
@@ -2098,6 +2104,7 @@ where
     // budget outcome instead of paying for emergency summarization first.
     if let Some((limit, cost)) = super::budget::status(
         usage_limits,
+        ctx.cost_estimator.as_deref(),
         provenance,
         &ctx.total_usage,
         ctx.state.accumulated_cost_usd,
@@ -2513,6 +2520,7 @@ where
     if !super::budget::usage_is_zero(compaction_usage)
         && let Some((limit, cost)) = super::budget::status(
             usage_limits,
+            ctx.cost_estimator.as_deref(),
             provenance,
             &ctx.total_usage,
             ctx.state.accumulated_cost_usd,

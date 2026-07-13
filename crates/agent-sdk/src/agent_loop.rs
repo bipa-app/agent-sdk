@@ -465,6 +465,10 @@ where
     pub(super) event_store: Arc<dyn EventStore>,
     pub(super) event_authority: Option<Arc<dyn EventAuthority>>,
     pub(super) config: AgentConfig,
+    /// Pricing source consulted before the static capability table when the
+    /// run's cost budget (`UsageLimits::max_cost_usd`) prices token usage.
+    /// `None` prices from the static table alone.
+    pub(super) cost_estimator: Option<Arc<dyn crate::pricing::CostEstimator>>,
     pub(super) compaction_config: Option<CompactionConfig>,
     pub(super) compactor: Option<Arc<dyn ContextCompactor>>,
     pub(super) execution_store: Option<Arc<dyn ToolExecutionStore>>,
@@ -508,6 +512,7 @@ where
             event_store,
             event_authority: None,
             config,
+            cost_estimator: None,
             compaction_config: None,
             compactor: None,
             execution_store: None,
@@ -542,6 +547,7 @@ where
             event_store,
             event_authority: None,
             config: agent_config,
+            cost_estimator: None,
             compaction_config: Some(compaction_config),
             compactor: None,
             execution_store: None,
@@ -836,6 +842,7 @@ where
         let message_store = Arc::clone(&self.message_store);
         let state_store = Arc::clone(&self.state_store);
         let config = self.config.clone();
+        let cost_estimator = self.cost_estimator.clone();
         let compaction_config = self.compaction_config.clone();
         let compactor = self.compactor.clone();
         let execution_store = self.execution_store.clone();
@@ -859,6 +866,7 @@ where
                 message_store,
                 state_store,
                 config,
+                cost_estimator,
                 compaction_config,
                 compactor,
                 execution_store,
@@ -1219,6 +1227,7 @@ where
             message_store: Arc::clone(&self.message_store),
             state_store: Arc::clone(&self.state_store),
             config: self.config.clone(),
+            cost_estimator: self.cost_estimator.clone(),
             compaction_config: self.compaction_config.clone(),
             compactor: self.compactor.clone(),
             execution_store: self.execution_store.clone(),

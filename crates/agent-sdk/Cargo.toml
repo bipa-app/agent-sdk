@@ -77,6 +77,14 @@ gemini = ["agent-sdk-providers/gemini"]
 vertex = ["agent-sdk-providers/vertex"]
 cloudflare = ["agent-sdk-providers/cloudflare"]
 
+# ── Model discovery (dynamic capability/pricing catalog) ───────────────
+# Third-party model feed (models.dev / OpenRouter) plus the layered
+# `ModelRegistry`. The registry implements `pricing::CostEstimator`, so a
+# feed-priced model can accrue cost against `UsageLimits::max_cost_usd`.
+# Off by default: the feed makes outbound HTTP to a third-party catalog, and
+# without it budgeting keeps pricing from the static table only.
+model-discovery = ["agent-sdk-providers/model-discovery"]
+
 # ── Tools (gate optional modules + their heavy deps) ───────────────────
 # Web search + fetch tools; `html2text` renders fetched pages.
 web = ["dep:html2text"]
