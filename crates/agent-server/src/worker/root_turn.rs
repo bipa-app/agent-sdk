@@ -1810,6 +1810,17 @@ pub(crate) async fn commit_completed_turn_shifting_slot(
         );
         params.expected_turn = next_turn;
         remap_turn_indexed_events(&mut params.events, usize::try_from(next_turn).unwrap_or(0));
+        // The snapshot's turn_count was built for the original slot;
+        // recovery seeds staged state from the landed checkpoint, so a
+        // stale count would leave every later turn one behind
+        // Thread::committed_turns and Done.total_turns (codex round-19).
+        if let Some(turn_count) = params
+            .agent_state_snapshot
+            .get_mut("turn_count")
+            .filter(|value| value.is_u64())
+        {
+            *turn_count = serde_json::json!(next_turn);
+        }
         // Every shifted retry is owner-guarded: the durable committers
         // re-validate (Running, worker, lease) on the task row inside
         // the commit transaction, closing the guard→retry TOCTOU.

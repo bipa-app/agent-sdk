@@ -3159,23 +3159,26 @@ const fn terminal_close_reason(
 /// the successor's retry boundary and answer, which the requeue path
 /// explicitly promises to deliver.
 ///
-/// The gate must NOT treat the frame's own emitter as a successor: a
-/// normally completing root commits its turn (and `Done`) in one
-/// transaction and transitions its task row in a second, so a
-/// follower delivering the `Done` in that gap sees the emitter still
-/// `Running` — suppressing there would leave the stream open forever
-/// (no later lifecycle event re-checks). The discriminator is the
-/// committer of the checkpoint at THE DELIVERED FRAME'S OWN turn
-/// (`total_turns`), not the thread's global latest (codex round-18):
-/// during replay or gap backfill an older foreign `Done` can be
-/// delivered after the successor has already committed its own
-/// checkpoint, and the global-latest comparison would misattribute
-/// the old frame to the successor and truncate its already-committed
-/// events. An active root that committed the frame's turn is the
-/// emitter mid-transition (close); one that did not is a genuine
-/// successor still working (keep following). A missing checkpoint at
-/// that turn (e.g. pruned by retention) reads as the emitter case,
-/// conservatively.
+/// Staleness is a property of the FRAME versus the thread's committed
+/// turns, never of task state alone (codex rounds 17-19):
+///
+/// 1. A frame whose `total_turns` is BEHIND the thread's latest
+///    checkpoint is stale outright — later turns were already durably
+///    committed (the collision successor's boundary/answer/`Done`, or
+///    simply newer turns during backfill), and closing at the stale
+///    frame would truncate their delivery. Suppressed with no task
+///    read at all; this covers the successor-still-running AND
+///    successor-already-completed orderings uniformly.
+/// 2. A frame AT the latest committed turn closes unless a blocking
+///    root exists that did NOT commit that turn — that root is a live
+///    collision successor whose retry has not landed yet (its
+///    boundary event is not yet committed), so the stream keeps
+///    following. The emitter itself mid-transition (turn committed,
+///    task row not yet transitioned) DOES close — suppressing there
+///    would strand the stream forever, since no later lifecycle event
+///    re-checks.
+/// 3. A missing checkpoint reads as the plain close, conservatively
+///    (never strand a client on a dead thread).
 ///
 /// `TurnCancelled` closes are NOT gated: `cancel_tree` promotes the
 /// queued successor in the same transaction as its marker, so an
@@ -3190,41 +3193,49 @@ async fn confirmed_close_reason(
 ) -> Option<pb::StreamCloseReason> {
     let reason = terminal_close_reason(event)?;
     if matches!(reason, pb::StreamCloseReason::ThreadCompleted) {
-        let active_root = shared
-            .stores
-            .task_store
-            .active_root_for_thread(thread_id)
-            .await;
         let frame_turn = match &event.event {
             AgentEvent::Done { total_turns, .. }
             | AgentEvent::BudgetExceeded { total_turns, .. } => u32::try_from(*total_turns).ok(),
             _ => None,
         };
-        match active_root {
-            Ok(Some(root)) => {
-                let Some(frame_turn) = frame_turn else {
-                    return Some(reason);
-                };
-                match shared
-                    .stores
-                    .checkpoint_store
-                    .get_by_turn(thread_id, frame_turn)
-                    .await
-                {
-                    Ok(Some(frame_committer)) if frame_committer.task_id != root.id => {
-                        return None;
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        warn!(
-                            thread_id = %thread_id,
-                            error = %format!("{error:#}"),
-                            "terminal-close checkpoint read failed; keeping the close",
-                        );
-                    }
-                }
+        let Some(frame_turn) = frame_turn else {
+            return Some(reason);
+        };
+        let latest = match shared
+            .stores
+            .checkpoint_store
+            .get_latest_by_thread(thread_id)
+            .await
+        {
+            Ok(latest) => latest,
+            Err(error) => {
+                warn!(
+                    thread_id = %thread_id,
+                    error = %format!("{error:#}"),
+                    "terminal-close checkpoint read failed; keeping the close",
+                );
+                return Some(reason);
             }
-            Ok(None) => {}
+        };
+        let Some(latest) = latest else {
+            return Some(reason);
+        };
+        // Arm 1: later turns already committed — the frame is stale.
+        if latest.turn_number > frame_turn {
+            return None;
+        }
+        // Arm 2: frame at the head — suppress only for a live
+        // collision successor that has not committed this turn.
+        let active_root = shared
+            .stores
+            .task_store
+            .active_root_for_thread(thread_id)
+            .await;
+        match active_root {
+            Ok(Some(root)) if latest.turn_number == frame_turn && latest.task_id != root.id => {
+                return None;
+            }
+            Ok(_) => {}
             Err(error) => {
                 warn!(
                     thread_id = %thread_id,
@@ -6427,64 +6438,78 @@ mod tests {
         Ok(())
     }
 
-    /// Codex round-16: a `Done` frame delivered while the thread still
-    /// has a blocking root (a cancelled predecessor's late full-turn
-    /// commit racing the promoted successor) must NOT close the
-    /// follower — the successor's retry boundary and answer are still
-    /// coming. With no blocking root the close proceeds as always, and
-    /// `Cancelled` markers close unconditionally (an active promoted
-    /// successor is their normal delivery state).
-    #[tokio::test]
-    async fn foreign_done_does_not_close_while_a_root_is_active() -> Result<()> {
+    /// Shared fixture for the terminal-close gate tests: a thread, a
+    /// predecessor `Done` frame for turn 1, and a checkpoint factory.
+    fn close_gate_fixture(
+        name: &str,
+    ) -> Result<(Arc<GrpcShared>, ThreadId, agent_server::CommittedEvent)> {
         let shared = event_test_shared()?;
-        let thread = ThreadId::from_string("t-foreign-done");
+        let thread = ThreadId::from_string(name);
+        let done = close_gate_done(&thread, 9, 1);
+        Ok((shared, thread, done))
+    }
+
+    fn close_gate_done(
+        thread: &ThreadId,
+        sequence: u64,
+        total_turns: usize,
+    ) -> agent_server::CommittedEvent {
+        agent_server::CommittedEvent {
+            event_id: uuid::Uuid::now_v7(),
+            thread_id: thread.clone(),
+            sequence,
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+            event: AgentEvent::Done {
+                thread_id: thread.clone(),
+                total_turns,
+                total_usage: agent_sdk_foundation::TokenUsage::default(),
+                duration: std::time::Duration::from_secs(1),
+                estimated_cost_usd: None,
+            },
+        }
+    }
+
+    fn close_gate_checkpoint(
+        thread: &ThreadId,
+        task_id: &str,
+        turn: u32,
+    ) -> agent_server::journal::checkpoint::NewCheckpointParams {
+        agent_server::journal::checkpoint::NewCheckpointParams {
+            thread_id: thread.clone(),
+            turn_number: turn,
+            task_id: agent_server::journal::task::AgentTaskId::from_string(task_id),
+            messages: vec![],
+            agent_state_snapshot: serde_json::json!({}),
+            turn_usage: agent_sdk_foundation::TokenUsage::default(),
+            kind: agent_server::journal::checkpoint::CheckpointKind::FullTurn,
+            now: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    /// Codex rounds 16-19, suppress arms: a foreign Done must not
+    /// close the follower while a live successor has not committed the
+    /// frame's turn, after the successor commits later turns, or even
+    /// after the successor is terminal — staleness is a property of
+    /// the frame versus the thread's committed turns, not task state.
+    #[tokio::test]
+    async fn foreign_done_never_closes_a_successors_stream() -> Result<()> {
+        let (shared, thread, done) = close_gate_fixture("t-foreign-done-suppress")?;
         shared
             .stores
             .thread_store
             .get_or_create(&thread, OffsetDateTime::UNIX_EPOCH)
             .await?;
-
-        let done = agent_server::CommittedEvent {
-            event_id: uuid::Uuid::now_v7(),
-            thread_id: thread.clone(),
-            sequence: 9,
-            timestamp: OffsetDateTime::UNIX_EPOCH,
-            event: AgentEvent::Done {
-                thread_id: thread.clone(),
-                total_turns: 1,
-                total_usage: agent_sdk_foundation::TokenUsage::default(),
-                duration: std::time::Duration::from_secs(1),
-                estimated_cost_usd: None,
-            },
-        };
-
-        // No blocking root: the close proceeds (historical behavior).
-        assert_eq!(
-            confirmed_close_reason(&shared, &thread, &done).await,
-            Some(pb::StreamCloseReason::ThreadCompleted),
-        );
-
-        // The thread's latest committed turn belongs to the (foreign,
-        // cancelled) predecessor that emitted this Done.
-        let checkpoint_for =
-            |task_id: &str, turn: u32| agent_server::journal::checkpoint::NewCheckpointParams {
-                thread_id: thread.clone(),
-                turn_number: turn,
-                task_id: agent_server::journal::task::AgentTaskId::from_string(task_id),
-                messages: vec![],
-                agent_state_snapshot: serde_json::json!({}),
-                turn_usage: agent_sdk_foundation::TokenUsage::default(),
-                kind: agent_server::journal::checkpoint::CheckpointKind::FullTurn,
-                now: OffsetDateTime::UNIX_EPOCH,
-            };
         shared
             .stores
             .checkpoint_store
-            .commit_checkpoint(checkpoint_for("task_foreign_predecessor", 1))
+            .commit_checkpoint(close_gate_checkpoint(
+                &thread,
+                "task_foreign_predecessor",
+                1,
+            ))
             .await?;
 
-        // A blocking successor root exists that did NOT commit the
-        // latest turn: the foreign Done must not close the stream.
+        // Live successor that has not committed the frame's turn.
         let successor = agent_server::journal::task::AgentTask::new_root_turn(
             thread.clone(),
             OffsetDateTime::UNIX_EPOCH,
@@ -6498,16 +6523,12 @@ mod tests {
             "a Done frame must not close a follower while a successor root is active",
         );
 
-        // Codex round-18: replay/backfill can deliver the predecessor's
-        // OLD Done after the successor has committed its own later
-        // checkpoint. The gate keys on the FRAME's turn (1, committed
-        // by the predecessor), not the thread's latest checkpoint —
-        // closing here would truncate the successor's already-committed
-        // events.
+        // Codex round-18: the successor committed its own LATER turn —
+        // the old frame stays stale (keyed on the frame, not latest).
         shared
             .stores
             .checkpoint_store
-            .commit_checkpoint(checkpoint_for(successor_id.as_str(), 2))
+            .commit_checkpoint(close_gate_checkpoint(&thread, successor_id.as_str(), 2))
             .await?;
         assert_eq!(
             confirmed_close_reason(&shared, &thread, &done).await,
@@ -6515,26 +6536,57 @@ mod tests {
             "an old foreign Done must not close after the successor committed its own turn",
         );
 
-        // Codex round-17: the EMITTER mid-transition is not a
-        // successor. A Done whose own turn's checkpoint belongs to the
-        // active root (its Done became visible before complete_task
-        // transitioned the row) closes — suppressing would strand the
-        // stream forever.
-        let successor_done = agent_server::CommittedEvent {
-            event_id: uuid::Uuid::now_v7(),
-            thread_id: thread.clone(),
-            sequence: 11,
-            timestamp: OffsetDateTime::UNIX_EPOCH,
-            event: AgentEvent::Done {
-                thread_id: thread.clone(),
-                total_turns: 2,
-                total_usage: agent_sdk_foundation::TokenUsage::default(),
-                duration: std::time::Duration::from_secs(1),
-                estimated_cost_usd: None,
-            },
-        };
+        // Codex round-19: still stale after the successor is TERMINAL
+        // (no blocking root remains to consult).
+        let outcome = shared
+            .stores
+            .task_store
+            .cancel_tree(&successor_id, OffsetDateTime::UNIX_EPOCH)
+            .await?;
+        assert!(!outcome.transitioned.is_empty(), "successor left the slot");
         assert_eq!(
-            confirmed_close_reason(&shared, &thread, &successor_done).await,
+            confirmed_close_reason(&shared, &thread, &done).await,
+            None,
+            "a stale foreign Done must not close even after the successor is terminal",
+        );
+        Ok(())
+    }
+
+    /// Close arms of the terminal-close gate: no blocking root closes,
+    /// the emitter mid-transition closes (codex round-17), and
+    /// Cancelled markers are never gated.
+    #[tokio::test]
+    async fn gate_closes_for_the_emitter_and_cancelled_markers() -> Result<()> {
+        let (shared, thread, done) = close_gate_fixture("t-foreign-done-close")?;
+        shared
+            .stores
+            .thread_store
+            .get_or_create(&thread, OffsetDateTime::UNIX_EPOCH)
+            .await?;
+
+        // No blocking root, no checkpoints: historical close.
+        assert_eq!(
+            confirmed_close_reason(&shared, &thread, &done).await,
+            Some(pb::StreamCloseReason::ThreadCompleted),
+        );
+
+        // The EMITTER mid-transition: its own frame's turn is the
+        // latest checkpoint it committed — close, or the stream would
+        // hang forever (complete_task emits no further event).
+        let emitter = agent_server::journal::task::AgentTask::new_root_turn(
+            thread.clone(),
+            OffsetDateTime::UNIX_EPOCH,
+            3,
+        );
+        let emitter_id = emitter.id.clone();
+        shared.stores.task_store.submit_root_turn(emitter).await?;
+        shared
+            .stores
+            .checkpoint_store
+            .commit_checkpoint(close_gate_checkpoint(&thread, emitter_id.as_str(), 1))
+            .await?;
+        assert_eq!(
+            confirmed_close_reason(&shared, &thread, &done).await,
             Some(pb::StreamCloseReason::ThreadCompleted),
             "an active root that committed the frame's own turn is the emitter, not a successor",
         );

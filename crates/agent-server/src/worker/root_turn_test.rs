@@ -6523,6 +6523,17 @@ async fn successor_turn_shifts_past_cancelled_salvage_slot_collision() -> Result
         .await?
         .context("successor checkpoint at turn 2")?;
     assert_eq!(successor_checkpoint.task_id, successor_id);
+    // Codex round-19: the shifted checkpoint's state snapshot must
+    // carry the LANDED turn count — recovery seeds staged state from
+    // it, and a stale count leaves every later turn one behind.
+    assert_eq!(
+        successor_checkpoint
+            .agent_state_snapshot
+            .get("turn_count")
+            .and_then(serde_json::Value::as_u64),
+        Some(2),
+        "shifted snapshot must carry the landed turn count",
+    );
 
     // Turn-indexed lifecycle events were remapped to the landed turn.
     let events = stores.events.get_events(&thread_a()).await?;
