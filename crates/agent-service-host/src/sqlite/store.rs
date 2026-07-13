@@ -6263,10 +6263,7 @@ mod tests {
                     ..Default::default()
                 },
                 agent_state_snapshot: serde_json::json!({"turn": 1}),
-                events: vec![AgentEvent::Start {
-                    thread_id: thread_id.clone(),
-                    turn: 1,
-                }],
+                events: vec![AgentEvent::start(thread_id.clone(), 1)],
                 outbox_max_attempts: 3,
                 owner_guard: None,
                 now: t_plus(3),

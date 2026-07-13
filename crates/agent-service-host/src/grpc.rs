@@ -3243,19 +3243,49 @@ const fn terminal_close_reason(
 /// race-free where inference over live state is not:
 ///
 /// - `Cancelled` is terminal/absorbing, so once it reads back it stays
-///   that way; there is no transient window to sample wrong. A cancel
-///   cannot land on an already-`Completed` task, so a cancelled emitter
-///   with a terminal frame necessarily committed that frame from inside
-///   the cancel window or after it — salvage of superseded work.
+///   that way; there is no transient window to sample wrong.
 /// - Reading anything else means the close is correct as of the read; a
 ///   cancel landing immediately after commits its own marker, which the
 ///   follower still receives — the same benign race that already exists
 ///   between a `Done` and the next submit.
 ///
-/// Suppression keeps the follower attached, which is exactly what the
-/// requeue path promises: it then receives the successor's retry
-/// boundary, fresh `Start`, and genuine `Done`, and closes on that.
-/// Every fallback (no id, row missing, read error) reproduces the
+/// A cancelled emitter's terminal frame is one of two things, and the
+/// gate deliberately does not try to tell them apart:
+///
+/// - **Late salvage** of superseded work — the cancelled root's turn
+///   commit landing after the cancel took its slot.
+/// - **A genuine, fully-billed final answer** whose task was cancelled
+///   at the finish line. Completed-turn commits are deliberately left
+///   unfenced against a concurrent cancel precisely so such an answer is
+///   never discarded, so this ordering is reachable by design.
+///
+/// Suppression is safe for both because the cancel transaction has
+/// ALREADY journaled the marker that closes the stream, and neither
+/// frame is dropped from the journal — the answer is still delivered,
+/// only its close reason shifts from `ThreadCompleted` (on the frame) to
+/// `TurnCancelled` (on the marker). Trying to distinguish them would
+/// mean inferring over exactly the mutable state this gate refuses to
+/// read.
+///
+/// Suppression keeps the follower attached, which is what the requeue
+/// path promises: it then receives the successor's retry boundary, fresh
+/// `Start`, and genuine `Done`, and closes on that.
+///
+/// # Cancels with no successor
+///
+/// When nothing was queued behind the cancelled root, no successor ever
+/// commits, so a follower positioned PAST the marker (a reconnect with a
+/// later cursor, or a replay whose tail is the suppressed frame rather
+/// than the marker) receives no further lifecycle close and idles until
+/// the client disconnects or a new turn is submitted. That is the
+/// documented salvage contract, not a defect: `CancelledEvent` in
+/// `events.proto` states that a cursor past the marker may observe
+/// trailing salvage "with no further lifecycle close", and names the
+/// marker the authoritative end of the cancelled turn. An idle follow is
+/// a legal follower state; a `ThreadCompleted` on a cancelled root's
+/// frame would be a lie about how the thread ended.
+///
+/// Every fallback (no emitter id, row missing, read error) reproduces the
 /// historical behavior, so no id-less frame — an old journal row, an
 /// embedded run — changes disposition in either direction.
 ///
@@ -7017,44 +7047,157 @@ mod tests {
     async fn collision_requeue_closes_only_on_the_successors_done() -> Result<()> {
         let shared = event_test_shared()?;
         let thread = ThreadId::from_string("t-collision-follower");
-        let now = OffsetDateTime::UNIX_EPOCH;
-        shared
-            .stores
-            .thread_store
-            .get_or_create(&thread, now)
-            .await?;
-
-        // Predecessor holds the active-root slot; the successor queues
-        // behind it and is promoted by the cancel transaction.
-        let predecessor = close_gate_emitter(&shared, &thread, 1).await?;
-        let successor =
-            agent_server::journal::task::AgentTask::new_root_turn(thread.clone(), now, 3);
-        let successor_id = successor.id.clone();
-        shared.stores.task_store.submit_root_turn(successor).await?;
-        shared
-            .stores
-            .task_store
-            .cancel_tree(&predecessor, now)
-            .await?;
+        let fixture = seed_cancelled_root_with_salvage(&shared, &thread, true).await?;
+        let successor_id = fixture.successor.context("the cancel must promote one")?;
 
         // The predecessor's late salvage `Done` lands at the checkpoint
         // head — the exact frame that used to close the follower.
-        let salvage = close_gate_done_from(&thread, 20, 1, &predecessor);
+        let salvage = journaled_terminal_frame(&shared, &thread).await?;
         assert_eq!(
             confirmed_close_reason(&shared, &thread, &salvage).await,
             None,
             "the follower must survive the predecessor's salvage",
         );
 
-        // The successor collides, and its requeue commits the recoverable
-        // boundary atomically with the ownership CAS.
+        run_successor_to_completion(&shared, &thread, &successor_id).await?;
+
+        // Everything the successor journaled is gated as a real row: the
+        // requeue boundary and the fresh `Start` are non-terminal, the
+        // predecessor's salvage stays suppressed now that the head has
+        // advanced (both arms agree), and only the successor's own `Done`
+        // closes.
+        let events = shared.stores.event_repo.get_events(&thread).await?;
+        let boundary = events
+            .iter()
+            .find(|committed| matches!(committed.event, AgentEvent::Error { .. }))
+            .context("the requeue must journal its boundary")?;
+        assert_eq!(
+            confirmed_close_reason(&shared, &thread, boundary).await,
+            None
+        );
+
+        let successor_start = events
+            .iter()
+            .rfind(|committed| matches!(committed.event, AgentEvent::Start { .. }))
+            .context("the retry must journal a fresh Start")?;
+        assert_eq!(
+            confirmed_close_reason(&shared, &thread, successor_start).await,
+            None,
+        );
+        assert_eq!(
+            confirmed_close_reason(&shared, &thread, &salvage).await,
+            None,
+        );
+
+        let answer = journaled_terminal_frame(&shared, &thread).await?;
+        assert_eq!(
+            confirmed_close_reason(&shared, &thread, &answer).await,
+            Some(pb::StreamCloseReason::ThreadCompleted),
+            "the successor's own Done closes the follower",
+        );
+        Ok(())
+    }
+
+    /// A thread whose active root committed its turn, was cancelled, and
+    /// whose late salvage `Done` then landed at the checkpoint head.
+    struct CancelledRootFixture {
+        successor: Option<agent_server::journal::task::AgentTaskId>,
+        /// The cancel marker's sequence — the cursor a follower
+        /// reconnects with after the marker released it.
+        marker_sequence: u64,
+    }
+
+    /// Seed that thread. The marker is committed by the real cancel
+    /// transaction (not hand-written), and with `queue_successor` a
+    /// queued root is promoted by that same transaction.
+    async fn seed_cancelled_root_with_salvage(
+        shared: &GrpcShared,
+        thread: &ThreadId,
+        queue_successor: bool,
+    ) -> Result<CancelledRootFixture> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        shared
+            .stores
+            .thread_store
+            .get_or_create(thread, now)
+            .await?;
+        let predecessor = close_gate_emitter(shared, thread, 1).await?;
+        commit_and_notify(
+            shared,
+            thread,
+            AgentEvent::start(thread.clone(), 1).with_emitter_task_id(predecessor.as_str()),
+        )
+        .await?;
+
+        let successor = if queue_successor {
+            let queued =
+                agent_server::journal::task::AgentTask::new_root_turn(thread.clone(), now, 3);
+            let id = queued.id.clone();
+            shared.stores.task_store.submit_root_turn(queued).await?;
+            Some(id)
+        } else {
+            None
+        };
+
+        let outcome = shared
+            .stores
+            .task_store
+            .cancel_tree(&predecessor, now)
+            .await?;
+        ensure!(
+            !outcome.transitioned.is_empty(),
+            "the root must actually cancel",
+        );
+        let marker_sequence = shared
+            .stores
+            .event_repo
+            .get_events(thread)
+            .await?
+            .iter()
+            .rev()
+            .find(|committed| matches!(committed.event, AgentEvent::Cancelled { .. }))
+            .context("the cancel transaction must journal a marker")?
+            .sequence;
+
+        // The cancelled root's worker commits its full turn anyway: a
+        // terminal frame AT the head, attributed to a task that is now
+        // Cancelled.
+        commit_and_notify(
+            shared,
+            thread,
+            AgentEvent::done(
+                thread.clone(),
+                1,
+                agent_sdk_foundation::TokenUsage::default(),
+                std::time::Duration::from_secs(1),
+            )
+            .with_emitter_task_id(predecessor.as_str()),
+        )
+        .await?;
+
+        Ok(CancelledRootFixture {
+            successor,
+            marker_sequence,
+        })
+    }
+
+    /// Drive the promoted successor through the collision it loses: the
+    /// requeue journals its boundary atomically with the ownership CAS,
+    /// then the retry commits a fresh `Start`, the turn-2 checkpoint, and
+    /// its own `Done`.
+    async fn run_successor_to_completion(
+        shared: &GrpcShared,
+        thread: &ThreadId,
+        successor: &agent_server::journal::task::AgentTaskId,
+    ) -> Result<()> {
+        let now = OffsetDateTime::UNIX_EPOCH;
         let worker = agent_server::WorkerId::from_string("w-successor");
         let lease = agent_server::LeaseId::from_string("l-successor");
         shared
             .stores
             .task_store
             .try_acquire_task(
-                &successor_id,
+                successor,
                 worker.clone(),
                 lease.clone(),
                 now + time::Duration::seconds(600),
@@ -7063,67 +7206,280 @@ mod tests {
             .await?
             .context("acquire the promoted successor")?;
         let boundary = AgentEvent::error("turn-slot collision: retrying", true)
-            .with_emitter_task_id(successor_id.as_str());
+            .with_emitter_task_id(successor.as_str());
         shared
             .stores
             .task_store
-            .requeue_owned_task(&successor_id, &worker, &lease, Some(boundary), now)
+            .requeue_owned_task(successor, &worker, &lease, Some(boundary), now)
             .await?;
 
-        // Its retry then runs the turn to completion.
-        let start = shared
-            .stores
-            .event_repo
-            .commit_event(
-                &thread,
-                AgentEvent::start(thread.clone(), 2).with_emitter_task_id(successor_id.as_str()),
-                now,
-            )
-            .await?;
+        commit_and_notify(
+            shared,
+            thread,
+            AgentEvent::start(thread.clone(), 2).with_emitter_task_id(successor.as_str()),
+        )
+        .await?;
         shared
             .stores
             .checkpoint_store
-            .commit_checkpoint(close_gate_checkpoint(&thread, successor_id.as_str(), 2))
+            .commit_checkpoint(close_gate_checkpoint(thread, successor.as_str(), 2))
             .await?;
-        let answer = shared
+        commit_and_notify(
+            shared,
+            thread,
+            AgentEvent::done(
+                thread.clone(),
+                2,
+                agent_sdk_foundation::TokenUsage::default(),
+                std::time::Duration::from_secs(1),
+            )
+            .with_emitter_task_id(successor.as_str()),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Commit an event and publish it to live followers, as the worker
+    /// does. The requeue boundary is deliberately NOT published this way:
+    /// the store journals it inside the ownership CAS, so live followers
+    /// reach it through the stream's gap backfill — the same path the
+    /// cross-host relay takes.
+    async fn commit_and_notify(
+        shared: &GrpcShared,
+        thread: &ThreadId,
+        event: AgentEvent,
+    ) -> Result<agent_server::CommittedEvent> {
+        let committed = shared
             .stores
             .event_repo
-            .commit_event(
-                &thread,
-                AgentEvent::done(
-                    thread.clone(),
-                    2,
-                    agent_sdk_foundation::TokenUsage::default(),
-                    std::time::Duration::from_secs(1),
-                )
-                .with_emitter_task_id(successor_id.as_str()),
-                now,
-            )
+            .commit_event(thread, event, OffsetDateTime::UNIX_EPOCH)
             .await?;
+        shared
+            .stores
+            .event_notifier
+            .notify(std::slice::from_ref(&committed));
+        Ok(committed)
+    }
 
-        // The boundary the store committed is non-terminal, so it never
-        // gates; the fresh Start does not either.
-        let events = shared.stores.event_repo.get_events(&thread).await?;
-        let committed_boundary = events
+    /// The thread's last journaled `Done` — a real row, sequence and all.
+    async fn journaled_terminal_frame(
+        shared: &GrpcShared,
+        thread: &ThreadId,
+    ) -> Result<agent_server::CommittedEvent> {
+        shared
+            .stores
+            .event_repo
+            .get_events(thread)
+            .await?
             .iter()
-            .find(|committed| matches!(committed.event, AgentEvent::Error { .. }))
-            .context("the requeue must journal its boundary")?;
-        assert_eq!(
-            confirmed_close_reason(&shared, &thread, committed_boundary).await,
-            None,
-        );
-        assert_eq!(confirmed_close_reason(&shared, &thread, &start).await, None);
+            .rev()
+            .find(|committed| matches!(committed.event, AgentEvent::Done { .. }))
+            .cloned()
+            .context("expected a journaled Done")
+    }
 
-        // The predecessor's salvage is STILL suppressed now that the
-        // successor has advanced the head — both gate arms agree.
-        assert_eq!(
-            confirmed_close_reason(&shared, &thread, &salvage).await,
-            None,
+    async fn open_inline_stream(
+        shared: &Arc<GrpcShared>,
+        thread: &ThreadId,
+        after_sequence: Option<u64>,
+    ) -> Result<EventStream> {
+        let events = GrpcEventService {
+            shared: Arc::clone(shared),
+        };
+        Ok(events
+            .stream_thread_events(Request::new(pb::StreamThreadEventsRequest {
+                thread_id: thread.to_string(),
+                after_sequence,
+                follow_mode: pb::FollowMode::ReplayAndFollow as i32,
+            }))
+            .await?
+            .into_inner())
+    }
+
+    fn frame_payload(frame: &pb::StreamThreadEventsResponse) -> Option<&EventPayload> {
+        match frame.item.as_ref() {
+            Some(StreamItem::Event(envelope)) => envelope.event.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The end-to-end promise, driven through the REAL follower stream:
+    /// a follower that reconnected past the cancel marker replays the
+    /// predecessor's salvaged `Done` WITHOUT closing, stays attached
+    /// through the requeue boundary and the successor's fresh `Start`,
+    /// and closes `ThreadCompleted` only on the successor's own `Done`.
+    /// On main this stream ended at the salvage, and the successor's
+    /// answer was reachable only by reconnecting.
+    #[tokio::test]
+    async fn follower_stream_past_the_marker_closes_on_the_successors_done() -> Result<()> {
+        let shared = event_test_shared()?;
+        let thread = ThreadId::from_string("t-stream-salvage");
+        let fixture = seed_cancelled_root_with_salvage(&shared, &thread, true).await?;
+        let successor_id = fixture.successor.clone().context("promoted successor")?;
+
+        let mut stream =
+            open_inline_stream(&shared, &thread, Some(fixture.marker_sequence)).await?;
+
+        let opened = next_inline_frame(&mut stream).await?;
+        ensure!(
+            matches!(opened.item, Some(StreamItem::ReplayOpened(_))),
+            "expected replay_opened, got {opened:?}",
         );
+
+        // The replay tail IS the suppressed frame.
+        let salvage = next_inline_frame(&mut stream).await?;
+        ensure!(
+            matches!(frame_payload(&salvage), Some(EventPayload::Done(_))),
+            "expected the salvaged Done, got {salvage:?}",
+        );
+
+        let catchup = next_inline_frame(&mut stream).await?;
+        ensure!(
+            matches!(catchup.item, Some(StreamItem::ReplayCatchupComplete(_))),
+            "expected replay_catchup_complete, got {catchup:?}",
+        );
+
+        // The post-replay gate runs when this frame is polled, while the
+        // successor has still committed NOTHING — the exact window the
+        // monotonic rule cannot see through, since the salvage sits AT the
+        // head. On main a `Closed(ThreadCompleted)` arrives here; the
+        // stream must instead stay open with no frame at all.
+        ensure!(
+            tokio::time::timeout(Duration::from_millis(250), stream.next())
+                .await
+                .is_err(),
+            "a cancelled emitter's salvage must not close the stream",
+        );
+
+        run_successor_to_completion(&shared, &thread, &successor_id).await?;
+
+        // The boundary reaches the follower through the gap backfill.
+        let boundary = next_inline_frame(&mut stream).await?;
+        ensure!(
+            matches!(frame_payload(&boundary), Some(EventPayload::Error(_))),
+            "expected the requeue boundary, got {boundary:?}",
+        );
+        let start = next_inline_frame(&mut stream).await?;
+        ensure!(
+            matches!(frame_payload(&start), Some(EventPayload::Start(_))),
+            "expected the successor's fresh Start, got {start:?}",
+        );
+        let answer = next_inline_frame(&mut stream).await?;
+        ensure!(
+            matches!(frame_payload(&answer), Some(EventPayload::Done(_))),
+            "expected the successor's Done, got {answer:?}",
+        );
+
+        let closed = next_inline_frame(&mut stream).await?;
+        let Some(StreamItem::Closed(closed)) = closed.item else {
+            bail!("expected a closed frame, got {closed:?}");
+        };
         assert_eq!(
-            confirmed_close_reason(&shared, &thread, &answer).await,
-            Some(pb::StreamCloseReason::ThreadCompleted),
-            "the successor's own Done closes the follower",
+            closed.reason,
+            pb::StreamCloseReason::ThreadCompleted as i32,
+            "{closed:?}",
+        );
+        Ok(())
+    }
+
+    /// The same journal replayed from 0 closes at its tail: the cancel
+    /// marker mid-replay is not the last event, so the successor's `Done`
+    /// is what the post-replay gate sees.
+    #[tokio::test]
+    async fn replay_from_zero_closes_on_the_successors_done() -> Result<()> {
+        let shared = event_test_shared()?;
+        let thread = ThreadId::from_string("t-stream-replay-tail");
+        let fixture = seed_cancelled_root_with_salvage(&shared, &thread, true).await?;
+        let successor_id = fixture.successor.clone().context("promoted successor")?;
+        run_successor_to_completion(&shared, &thread, &successor_id).await?;
+
+        let mut stream = open_inline_stream(&shared, &thread, None).await?;
+        let mut payloads = Vec::new();
+        let closed = loop {
+            let frame = next_inline_frame(&mut stream).await?;
+            if let Some(payload) = frame_payload(&frame) {
+                payloads.push(std::mem::discriminant(payload));
+            }
+            if let Some(StreamItem::Closed(closed)) = frame.item {
+                break closed;
+            }
+        };
+        assert_eq!(
+            closed.reason,
+            pb::StreamCloseReason::ThreadCompleted as i32,
+            "{closed:?}",
+        );
+        // The whole history was delivered before the close — the
+        // predecessor's salvage did not truncate it.
+        let expected = [
+            EventPayload::Start(pb::StartEvent::default()),
+            EventPayload::Cancelled(pb::CancelledEvent::default()),
+            EventPayload::Done(pb::DoneEvent::default()),
+            EventPayload::Error(pb::ErrorEvent::default()),
+            EventPayload::Start(pb::StartEvent::default()),
+            EventPayload::Done(pb::DoneEvent::default()),
+        ]
+        .iter()
+        .map(std::mem::discriminant)
+        .collect::<Vec<_>>();
+        assert_eq!(payloads, expected, "unexpected replayed history");
+        Ok(())
+    }
+
+    /// A cancel with NOTHING queued behind it: no successor ever commits,
+    /// so the suppressed salvage is the journal's tail and the follower
+    /// idles instead of closing. This is a deliberate behavior change —
+    /// main answered `ThreadCompleted` here, which is a lie about how the
+    /// thread ended; the cancel marker (already delivered to anyone
+    /// following from before it) is the authoritative close, and a cursor
+    /// past the marker sees trailing salvage with no further lifecycle
+    /// close, exactly as `CancelledEvent` documents.
+    #[tokio::test]
+    async fn cancelled_root_without_successor_leaves_the_follower_open() -> Result<()> {
+        let shared = event_test_shared()?;
+        let thread = ThreadId::from_string("t-stream-no-successor");
+        let fixture = seed_cancelled_root_with_salvage(&shared, &thread, false).await?;
+        assert!(fixture.successor.is_none(), "nothing was queued");
+
+        // Reconnected past the marker: the salvage is the replay tail.
+        let mut stream =
+            open_inline_stream(&shared, &thread, Some(fixture.marker_sequence)).await?;
+        let opened = next_inline_frame(&mut stream).await?;
+        ensure!(matches!(opened.item, Some(StreamItem::ReplayOpened(_))));
+        let salvage = next_inline_frame(&mut stream).await?;
+        ensure!(
+            matches!(frame_payload(&salvage), Some(EventPayload::Done(_))),
+            "expected the salvaged Done, got {salvage:?}",
+        );
+        let catchup = next_inline_frame(&mut stream).await?;
+        ensure!(
+            matches!(catchup.item, Some(StreamItem::ReplayCatchupComplete(_))),
+            "expected replay_catchup_complete, got {catchup:?}",
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), stream.next())
+                .await
+                .is_err(),
+            "the follower must idle open, not receive a ThreadCompleted close",
+        );
+
+        // Replaying from 0 reaches the same tail, with the same outcome.
+        let mut from_zero = open_inline_stream(&shared, &thread, None).await?;
+        loop {
+            let frame = next_inline_frame(&mut from_zero).await?;
+            if matches!(frame.item, Some(StreamItem::ReplayCatchupComplete(_))) {
+                break;
+            }
+            ensure!(
+                !matches!(frame.item, Some(StreamItem::Closed(_))),
+                "the replay must not close on the suppressed tail, got {frame:?}",
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), from_zero.next())
+                .await
+                .is_err(),
+            "a replay whose tail is the suppressed salvage must stay open too",
         );
         Ok(())
     }
