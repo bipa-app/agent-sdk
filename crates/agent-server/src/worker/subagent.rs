@@ -1526,6 +1526,28 @@ fn validate_batch_spawns(
 /// batch, defaulting empty `child_root_input` to the spec-derived
 /// shape so the child's first root turn always has at least one
 /// `SubmittedInputItem`.
+///
+/// # Write ordering
+///
+/// The child-thread projections are committed **before** the task
+/// store's spawn CAS, and outside its transaction — durable backends
+/// enforce a task → thread foreign key, so the thread rows must already
+/// exist when the invocation's child root is inserted. Two consequences
+/// follow from that ordering:
+///
+/// * On a **retryable** failure (lease expiry, a transient store error),
+///   the caller re-derives the same pre-allocated `child_thread_id` per
+///   entry, so the retry's `get_or_create` reclaims the existing
+///   projection instead of allocating a second one. Nothing accumulates
+///   across attempts.
+/// * On a **terminal** rejection (the parent was cancelled, another
+///   worker won the lease for good), the projections stay behind with no
+///   task referencing them. They are inert — no root turn, no children,
+///   no events — and are eligible for garbage collection.
+///
+/// A caller that can reject a batch on its own inputs must therefore
+/// validate those inputs before calling this, so a request that was
+/// never going to spawn does not leave projections behind.
 async fn materialize_batch_child_threads(
     entries: &mut [SubagentBatchEntry],
     deps: &SubagentInvocationDeps<'_>,
