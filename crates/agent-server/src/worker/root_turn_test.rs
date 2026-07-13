@@ -7217,11 +7217,10 @@ fn sample_definition_with_subagent_tools() -> AgentDefinition {
     }
 }
 
-/// Run one turn whose LLM response mixes a `subagent_explore` call with
-/// a `bash` call, routed through [`MixedSpawnSelector`]. Returns the
-/// parked parent and its children.
-async fn suspend_on_mixed_batch(stores: &TestStores) -> Result<(AgentTask, Vec<AgentTask>)> {
-    let provider = MockToolCallProvider::new(vec![
+/// The two tool calls of a mixed turn, subagent first (slot 0) and the
+/// ordinary tool second (slot 1).
+fn subagent_then_tool_calls() -> Vec<(String, String, serde_json::Value)> {
+    vec![
         (
             "call_sub".into(),
             "subagent_explore".into(),
@@ -7232,7 +7231,35 @@ async fn suspend_on_mixed_batch(stores: &TestStores) -> Result<(AgentTask, Vec<A
             "bash".into(),
             serde_json::json!({"command": "ls"}),
         ),
-    ]);
+    ]
+}
+
+/// The same two calls interleaved the other way: the ordinary tool takes
+/// slot 0 and the subagent slot 1, so the batch's children are NOT
+/// grouped by kind in slot order.
+fn tool_then_subagent_calls() -> Vec<(String, String, serde_json::Value)> {
+    vec![
+        (
+            "call_bash".into(),
+            "bash".into(),
+            serde_json::json!({"command": "ls"}),
+        ),
+        (
+            "call_sub".into(),
+            "subagent_explore".into(),
+            serde_json::json!({"task": "map the crate"}),
+        ),
+    ]
+}
+
+/// Run one turn whose LLM response mixes a `subagent_explore` call with
+/// a `bash` call, routed through [`MixedSpawnSelector`]. Returns the
+/// parked parent and its children.
+async fn suspend_on_mixed_batch(
+    stores: &TestStores,
+    tool_calls: Vec<(String, String, serde_json::Value)>,
+) -> Result<(AgentTask, Vec<AgentTask>)> {
+    let provider = MockToolCallProvider::new(tool_calls);
 
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let mut bootstrap = sample_bootstrap_with_tools(task);
@@ -7269,7 +7296,8 @@ async fn mixed_batch_spawns_subagent_slot_and_tool_child_in_one_turn() -> Result
     // the same turn — no degradation to an all-tools batch, no retry
     // round-trip.
     let stores = TestStores::new();
-    let (parent_task, child_tasks) = suspend_on_mixed_batch(&stores).await?;
+    let (parent_task, child_tasks) =
+        suspend_on_mixed_batch(&stores, subagent_then_tool_calls()).await?;
 
     assert_eq!(parent_task.status, TaskStatus::WaitingOnChildren);
     assert_eq!(parent_task.pending_child_count, 2);
@@ -7313,7 +7341,8 @@ async fn mixed_batch_tool_child_executes_and_fans_in() -> Result<()> {
     // executes in this turn and fans in, leaving the parent waiting only
     // on the subagent it spawned alongside it.
     let stores = TestStores::new();
-    let (parent_task, child_tasks) = suspend_on_mixed_batch(&stores).await?;
+    let (parent_task, child_tasks) =
+        suspend_on_mixed_batch(&stores, subagent_then_tool_calls()).await?;
     let tool_child = child_tasks
         .get(1)
         .context("mixed batch must persist the tool child")?;
@@ -7370,6 +7399,114 @@ async fn mixed_batch_tool_child_executes_and_fans_in() -> Result<()> {
         parent_after.pending_child_count, 1,
         "the executed tool child must fan in, leaving only the subagent pending",
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn interleaved_mixed_batch_survives_a_steering_revert_with_original_bindings() -> Result<()> {
+    // `repark_after_steering` re-derives every re-attached child's
+    // spawn_index from its POSITION in the parent's child-id vector. For
+    // an interleaved mixed batch (tool at slot 0, subagent at slot 1),
+    // a vector grouped by child kind would hand the subagent slot 0 and
+    // the tool child slot 1 — each would then resolve, execute against,
+    // and report a tool call that was never its own. The bindings must
+    // come back out of a revert exactly as they went in.
+    let stores = TestStores::new();
+    let (parent, children) =
+        Box::pin(suspend_on_mixed_batch(&stores, tool_then_subagent_calls())).await?;
+    assert_eq!(children.len(), 2);
+
+    let tool_child_id = children
+        .first()
+        .context("slot 0 is the tool child")?
+        .id
+        .clone();
+    let invocation_id = children
+        .get(1)
+        .context("slot 1 is the subagent invocation")?
+        .id
+        .clone();
+
+    // Wake the parent with a steering note, then acquire it.
+    stores
+        .tasks
+        .enqueue_steering_resume(
+            &parent.id,
+            vec![ContentBlock::Text {
+                text: "how is it going?".into(),
+            }],
+            t_plus(20),
+        )
+        .await?
+        .context("steering wake")?;
+    let worker = WorkerId::from_string("worker_test");
+    let lease = LeaseId::from_string("lease_test");
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent.id,
+            worker.clone(),
+            lease.clone(),
+            t_plus(900),
+            t_plus(21),
+        )
+        .await?
+        .context("acquire steering wake")?;
+    assert!(acquired.state.is_steering_resume());
+
+    // The bounded steering LLM round fails, so the wake reverts.
+    let error = anyhow::anyhow!("provider outage during steering exchange");
+    let reparked = revert_steering_wake(
+        &acquired,
+        &worker,
+        &lease,
+        &error,
+        &stores.deps(),
+        t_plus(25),
+    )
+    .await?;
+    assert_eq!(reparked.status, TaskStatus::WaitingOnChildren);
+    assert_eq!(reparked.pending_child_count, 2);
+
+    // Each child still resolves the tool call it was spawned for.
+    let tool_child = stores
+        .tasks
+        .get(&tool_child_id)
+        .await?
+        .context("tool child survives the revert")?;
+    assert_eq!(tool_child.kind, TaskKind::ToolRuntime);
+    assert_eq!(
+        tool_child.spawn_index,
+        Some(0),
+        "the tool child must stay bound to the bash call at slot 0",
+    );
+    let invocation = stores
+        .tasks
+        .get(&invocation_id)
+        .await?
+        .context("subagent invocation survives the revert")?;
+    assert_eq!(invocation.kind, TaskKind::Subagent);
+    assert_eq!(
+        invocation.spawn_index,
+        Some(1),
+        "the subagent invocation must stay bound to the subagent call at slot 1",
+    );
+
+    // The re-parked continuation still names the original calls in order.
+    match &reparked.state {
+        TaskState::WaitingOnChildren {
+            continuation,
+            child_ids,
+            ..
+        } => {
+            let pending = &continuation.payload.pending_tool_calls;
+            assert_eq!(pending[0].id, "call_bash");
+            assert_eq!(pending[1].id, "call_sub");
+            assert_eq!(child_ids, &vec![tool_child_id, invocation_id]);
+        }
+        other => panic!("expected WaitingOnChildren revert, got {other:?}"),
+    }
 
     Ok(())
 }

@@ -661,7 +661,8 @@ pub use staged::{StagedMessageStore, StagedStateStore, StagedStores};
 pub use store::{
     AgentTaskStore, CancelTreeOutcome, CancellationMarkerSink, InMemoryAgentTaskStore,
     MixedChildrenSpawn, SpawnedMixedChildren, SubagentInvocationSpawn, ToolChildSpawn,
-    new_mixed_tool_child, validate_mixed_children_spawn,
+    mixed_child_ids_in_slot_order, new_mixed_tool_child, validate_mixed_children_spawn,
+    validate_mixed_slot_coverage,
 };
 pub use task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskKind, TaskSchemaError,

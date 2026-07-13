@@ -324,26 +324,57 @@ pub struct SpawnedMixedChildren {
 /// - `spawn rejected: duplicate spawn_index ... in mixed batch`
 /// - `spawn rejected: mixed batch covers ... of ... pending tool calls`
 pub fn validate_mixed_children_spawn(spawn: &MixedChildrenSpawn) -> Result<()> {
-    if spawn.subagents.is_empty() {
+    let subagent_slots: Vec<u32> = spawn
+        .subagents
+        .iter()
+        .map(|entry| entry.spawn_index)
+        .collect();
+    let tool_slots: Vec<u32> = spawn
+        .tool_children
+        .iter()
+        .map(|child| child.spawn_index)
+        .collect();
+    validate_mixed_slot_coverage(
+        &subagent_slots,
+        &tool_slots,
+        spawn.payload.continuation.payload.pending_tool_calls.len(),
+    )
+}
+
+/// Validate the slot partition of a mixed batch on its own, before any
+/// row — task **or** child-thread projection — is materialized.
+///
+/// Split out from [`validate_mixed_children_spawn`] so a caller that
+/// creates child threads ahead of the store call can reject a bad batch
+/// before it writes anything: the store transaction rolls back its own
+/// rows, but a thread projection created outside it would survive as an
+/// orphan.
+///
+/// # Errors
+/// - `spawn rejected: mixed batch requires at least one subagent`
+/// - `spawn rejected: mixed batch requires at least one tool child`
+/// - `spawn rejected: spawn_index ... out of bounds ...`
+/// - `spawn rejected: duplicate spawn_index ... in mixed batch`
+/// - `spawn rejected: mixed batch covers ... of ... pending tool calls`
+pub fn validate_mixed_slot_coverage(
+    subagent_slots: &[u32],
+    tool_slots: &[u32],
+    pending_tool_calls: usize,
+) -> Result<()> {
+    if subagent_slots.is_empty() {
         return Err(anyhow!(
             "spawn rejected: mixed batch requires at least one subagent"
         ));
     }
-    if spawn.tool_children.is_empty() {
+    if tool_slots.is_empty() {
         return Err(anyhow!(
             "spawn rejected: mixed batch requires at least one tool child"
         ));
     }
 
-    let pending = spawn.payload.continuation.payload.pending_tool_calls.len();
-    let indices = spawn
-        .subagents
-        .iter()
-        .map(|entry| entry.spawn_index)
-        .chain(spawn.tool_children.iter().map(|child| child.spawn_index));
-
+    let pending = pending_tool_calls;
     let mut seen: BTreeSet<u32> = BTreeSet::new();
-    for index in indices {
+    for index in subagent_slots.iter().chain(tool_slots).copied() {
         let slot = usize::try_from(index).context("spawn rejected: spawn_index exceeds usize")?;
         if slot >= pending {
             return Err(anyhow!(
@@ -364,6 +395,43 @@ pub fn validate_mixed_children_spawn(spawn: &MixedChildrenSpawn) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Order a mixed batch's children by the `pending_tool_calls` slot each
+/// one resolves.
+///
+/// The parent's persisted child-id vector is **positional**:
+/// [`AgentTaskStore::repark_after_steering`] re-derives every child's
+/// `spawn_index` from that vector's index. Persisting a mixed batch's
+/// two halves grouped by kind would therefore rebind an interleaved
+/// batch's children to the wrong tool calls the first time a steering
+/// wake reverts — a child could execute or report against a tool call
+/// that was never its own. Sorting by slot keeps the vector position
+/// and the `spawn_index` identical, which is the identity mapping the
+/// re-park assumes.
+///
+/// # Errors
+/// Returns an error if any row is missing its `spawn_index`.
+pub fn mixed_child_ids_in_slot_order(
+    subagents: &[(AgentTask, AgentTask)],
+    tool_children: &[AgentTask],
+) -> Result<Vec<AgentTaskId>> {
+    let mut by_slot: Vec<(u32, AgentTaskId)> =
+        Vec::with_capacity(subagents.len() + tool_children.len());
+    for (invocation, _child_root) in subagents {
+        let slot = invocation
+            .spawn_index
+            .context("spawn rejected: subagent invocation missing spawn_index")?;
+        by_slot.push((slot, invocation.id.clone()));
+    }
+    for child in tool_children {
+        let slot = child
+            .spawn_index
+            .context("spawn rejected: tool child missing spawn_index")?;
+        by_slot.push((slot, child.id.clone()));
+    }
+    by_slot.sort_unstable_by_key(|(slot, _)| *slot);
+    Ok(by_slot.into_iter().map(|(_, id)| id).collect())
 }
 
 /// Build one [`TaskKind::ToolRuntime`] child row for a mixed batch.
@@ -3945,7 +4013,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         // Materialize every row — invocation pairs and tool children —
         // before touching a single index, so a schema error or an id
         // collision anywhere in the batch leaves the store untouched.
-        let (prepared, mut child_ids) =
+        let (prepared, _batch_child_ids) =
             inner.build_batch_invocation_pairs(&old_parent, subagents, now)?;
         let tool_rows = inner.build_mixed_tool_children(
             &old_parent,
@@ -3953,7 +4021,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             child_otel_traceparent.as_deref(),
             now,
         )?;
-        child_ids.extend(tool_rows.iter().map(|child| child.id.clone()));
+        let child_ids = mixed_child_ids_in_slot_order(&prepared, &tool_rows)?;
 
         let child_count =
             u32::try_from(child_ids.len()).context("spawn rejected: child count exceeds u32")?;

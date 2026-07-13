@@ -62,7 +62,8 @@ use agent_server::journal::retention::{RetentionCursor, RetentionStore};
 use agent_server::journal::store::{
     AgentTaskStore, CancelTreeOutcome, MixedChildrenSpawn, RequeueOutcome, SpawnedMixedChildren,
     SubagentInvocationSpawn, SubmitRootIdempotency, SubmitRootTurnError, SubmitRootTurnOutcome,
-    SubmitRootTurnParams, new_mixed_tool_child, validate_mixed_children_spawn,
+    SubmitRootTurnParams, mixed_child_ids_in_slot_order, new_mixed_tool_child,
+    validate_mixed_children_spawn,
 };
 use agent_server::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, SuspensionPayload,
@@ -3580,11 +3581,7 @@ FOR UPDATE SKIP LOCKED
             tool_rows.push(child);
         }
 
-        let mut child_ids: Vec<AgentTaskId> = prepared
-            .iter()
-            .map(|(invocation, _)| invocation.id.clone())
-            .collect();
-        child_ids.extend(tool_rows.iter().map(|child| child.id.clone()));
+        let child_ids = mixed_child_ids_in_slot_order(&prepared, &tool_rows)?;
 
         let child_count =
             u32::try_from(child_ids.len()).context("spawn rejected: child count exceeds u32")?;

@@ -43,6 +43,7 @@ mod tests {
         );
         for case in [
             "mixed_batch_spawns_subagents_and_tools",
+            "mixed_batch_child_ids_follow_slot_order",
             "mixed_batch_losing_cas_spawns_nothing",
             "mixed_batch_rejects_cancelled_parent",
             "mixed_batch_rejects_uncovered_slot",
@@ -53,7 +54,7 @@ mod tests {
             );
         }
         assert!(
-            report.passed.len() >= 20,
+            report.passed.len() >= 21,
             "no mandatory conformance case may be silently skipped, got {:?}",
             report.passed,
         );

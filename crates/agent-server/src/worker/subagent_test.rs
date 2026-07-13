@@ -1745,3 +1745,145 @@ async fn spawn_mixed_rejects_uncovered_pending_tool_call() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn spawn_mixed_rejects_bad_tool_slot_without_orphaning_child_threads() -> Result<()> {
+    // A tool child pointing at an out-of-range slot must be caught before
+    // any child thread is materialized: thread projections are written
+    // outside the store's transaction, so a batch that only failed once
+    // it reached the store would leave them behind with no task ever
+    // referencing them.
+    let task_store = InMemoryAgentTaskStore::new();
+    let thread_store = InMemoryThreadStore::new();
+    let event_repo = InMemoryEventRepository::new();
+    let (parent, worker, lease) = running_parent_root(&task_store).await?;
+    let tasks = ["explore A"];
+    // Two pending tool calls: slot 0 (subagent) + slot 1 (tool).
+    let payload = mixed_suspension_payload(&parent.thread_id, &tasks, &["todo_write"]);
+
+    let subagents = mixed_subagent_entries(&tasks)?;
+    let child_thread_ids: Vec<agent_sdk_foundation::ThreadId> = subagents
+        .iter()
+        .map(|entry| entry.child_thread_id.clone())
+        .collect();
+    let err = spawn_mixed_children_invocations(
+        &parent.id,
+        &worker,
+        &lease,
+        MixedChildrenRequest {
+            subagents,
+            tool_children: vec![ToolChildSpawn {
+                spawn_index: 7, // out of range — only 2 pending tool calls
+                spec: crate::journal::ChildSpawnSpec::new(3),
+            }],
+            payload,
+            child_otel_traceparent: None,
+        },
+        &SubagentInvocationDeps {
+            task_store: &task_store,
+            thread_store: &thread_store,
+            event_repo: &event_repo,
+        },
+        t_plus(2),
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow!("an out-of-range tool slot must reject the batch"))?;
+    assert!(
+        error_text(&err).contains("out of bounds"),
+        "unexpected error: {err:#}"
+    );
+
+    // Nothing was materialized anywhere: no tasks, and no orphan child
+    // thread projections.
+    let reloaded = task_store
+        .get(&parent.id)
+        .await?
+        .ok_or_else(|| anyhow!("parent must survive a rejected spawn"))?;
+    assert_eq!(reloaded.status, TaskStatus::Running);
+    assert!(task_store.list_children(&parent.id).await?.is_empty());
+    for child_thread_id in &child_thread_ids {
+        assert!(
+            thread_store.get(child_thread_id).await?.is_none(),
+            "a rejected mixed batch must not leave an orphan child thread behind",
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn spawn_mixed_records_child_ids_in_slot_order_when_interleaved() -> Result<()> {
+    // The parent's child-id vector is positional — a later
+    // `repark_after_steering` re-derives each child's spawn_index from
+    // its position in that vector. An interleaved batch (tool at slot 0,
+    // subagent at slot 1) must therefore persist its children ordered by
+    // slot, not grouped by kind.
+    let task_store = InMemoryAgentTaskStore::new();
+    let thread_store = InMemoryThreadStore::new();
+    let event_repo = InMemoryEventRepository::new();
+    let (parent, worker, lease) = running_parent_root(&task_store).await?;
+
+    // Slot 0 → tool call, slot 1 → subagent call.
+    let payload = mixed_suspension_payload(&parent.thread_id, &["explore A"], &["todo_write"]);
+    let mut payload = payload;
+    payload.continuation.payload.pending_tool_calls.swap(0, 1);
+
+    let subagents = vec![SubagentBatchEntry {
+        child_thread_id: agent_sdk_foundation::ThreadId::new(),
+        spec: sample_spec("explore A"),
+        child_root_input: child_root_input("explore A"),
+        spawn_index: 1,
+        child_caller_metadata: None,
+    }];
+    let batch = spawn_mixed_children_invocations(
+        &parent.id,
+        &worker,
+        &lease,
+        MixedChildrenRequest {
+            subagents,
+            tool_children: vec![ToolChildSpawn {
+                spawn_index: 0,
+                spec: crate::journal::ChildSpawnSpec::new(3),
+            }],
+            payload,
+            child_otel_traceparent: None,
+        },
+        &SubagentInvocationDeps {
+            task_store: &task_store,
+            thread_store: &thread_store,
+            event_repo: &event_repo,
+        },
+        t_plus(2),
+    )
+    .await?;
+
+    let child_ids = batch.parent_task.state.child_ids();
+    assert_eq!(child_ids.len(), 2);
+    for (position, child_id) in child_ids.iter().enumerate() {
+        let child = task_store
+            .get(child_id)
+            .await?
+            .ok_or_else(|| anyhow!("child {child_id} must be persisted"))?;
+        let expected = u32::try_from(position).map_err(|_| anyhow!("position exceeds u32"))?;
+        assert_eq!(
+            child.spawn_index,
+            Some(expected),
+            "the child at vector position {position} must resolve slot {position}",
+        );
+    }
+
+    // Position 0 is the tool child, position 1 the subagent invocation.
+    let first = task_store
+        .get(&child_ids[0])
+        .await?
+        .ok_or_else(|| anyhow!("first child"))?;
+    assert_eq!(first.kind, TaskKind::ToolRuntime);
+    let second = task_store
+        .get(&child_ids[1])
+        .await?
+        .ok_or_else(|| anyhow!("second child"))?;
+    assert_eq!(second.kind, TaskKind::Subagent);
+
+    Ok(())
+}

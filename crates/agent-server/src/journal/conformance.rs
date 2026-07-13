@@ -927,22 +927,28 @@ async fn mixed_batch_fixture<S: JournalStore>(
     })
 }
 
-/// Assemble a mixed batch: one subagent entry per child thread (taking
-/// the low slots) and one tool child per slot named in `tool_slots`.
+/// Assemble a mixed batch: one subagent entry per child thread — taking
+/// the slots named in `subagent_slots`, pairwise with the fixture's
+/// threads — and one tool child per slot named in `tool_slots`.
 fn mixed_batch_spawn(
     fixture: &MixedBatchFixture,
     payload: SuspensionPayload,
+    subagent_slots: &[u32],
     tool_slots: &[u32],
 ) -> Result<crate::journal::store::MixedChildrenSpawn> {
+    ensure!(
+        subagent_slots.len() == fixture.child_threads.len(),
+        "each subagent slot needs its own pre-materialized child thread",
+    );
     let mut subagents = Vec::with_capacity(fixture.child_threads.len());
-    for (idx, child_thread) in fixture.child_threads.iter().enumerate() {
+    for (slot, child_thread) in subagent_slots.iter().zip(&fixture.child_threads) {
         subagents.push(crate::journal::store::SubagentInvocationSpawn {
             child_thread_id: child_thread.clone(),
-            spec: mixed_batch_spec(&format!("explore-{idx}")),
+            spec: mixed_batch_spec(&format!("explore-{slot}")),
             child_root_input: vec![SubmittedInputItem::Text {
-                text: format!("explore-{idx}"),
+                text: format!("explore-{slot}"),
             }],
-            spawn_index: u32::try_from(idx).context("subagent slot exceeds u32")?,
+            spawn_index: *slot,
             payload: payload.clone(),
             child_caller_metadata: None,
         });
@@ -975,7 +981,7 @@ async fn case_mixed_batch_spawns_subagents_and_tools<S: JournalStore>(store: &S)
     let fixture = mixed_batch_fixture(store, &thread, 2).await?;
     // Slots 0,1 → subagents (fixture order); slots 2,3 → tool children.
     let payload = suspension_with_pending_tools(&thread, 4);
-    let spawn = mixed_batch_spawn(&fixture, payload, &[2, 3])?;
+    let spawn = mixed_batch_spawn(&fixture, payload, &[0, 1], &[2, 3])?;
 
     let spawned = AgentTaskStore::spawn_mixed_children(
         store,
@@ -1074,6 +1080,79 @@ async fn case_mixed_batch_spawns_subagents_and_tools<S: JournalStore>(store: &S)
     Ok(())
 }
 
+// ── mixed batch: the parent's child-id vector follows slot order ─────
+
+/// The parent's persisted child-id vector is positional:
+/// [`AgentTaskStore::repark_after_steering`] re-derives each child's
+/// `spawn_index` from that vector's index. So for an INTERLEAVED mixed
+/// batch — tool slots and subagent slots alternating — the vector must
+/// be ordered by slot, not grouped by child kind. Grouping would rebind
+/// each child to a different tool call the first time a steering wake
+/// reverts, and a child would execute or report against a call that was
+/// never its own.
+async fn case_mixed_batch_child_ids_follow_slot_order<S: JournalStore>(store: &S) -> Result<()> {
+    let thread = tid("conf-mixed-interleaved");
+    let fixture = mixed_batch_fixture(store, &thread, 2).await?;
+    // Interleaved: tools own slots 0 and 2, subagents own 1 and 3.
+    let payload = suspension_with_pending_tools(&thread, 4);
+    let spawn = mixed_batch_spawn(&fixture, payload, &[1, 3], &[0, 2])?;
+
+    let spawned = AgentTaskStore::spawn_mixed_children(
+        store,
+        &fixture.parent_id,
+        &fixture.worker,
+        &fixture.lease,
+        spawn,
+        t_plus(2),
+    )
+    .await
+    .context("interleaved mixed spawn must succeed")?;
+
+    let child_ids = spawned.parent.state.child_ids();
+    ensure!(
+        child_ids.len() == 4,
+        "the parent must record all 4 children, got {}",
+        child_ids.len()
+    );
+
+    // Position in the vector == the slot the child resolves.
+    for (position, child_id) in child_ids.iter().enumerate() {
+        let child = AgentTaskStore::get(store, child_id)
+            .await?
+            .with_context(|| format!("child {child_id} must be persisted"))?;
+        let slot = child
+            .spawn_index
+            .context("every mixed-batch child carries a spawn_index")?;
+        let expected = u32::try_from(position).context("position exceeds u32")?;
+        ensure!(
+            slot == expected,
+            "child at vector position {position} resolves slot {slot}: the parent's \
+             child-id vector must be ordered by slot",
+        );
+        let expected_kind = if position % 2 == 0 {
+            TaskKind::ToolRuntime
+        } else {
+            TaskKind::Subagent
+        };
+        ensure!(
+            child.kind == expected_kind,
+            "slot {slot} must be a {expected_kind:?}, got {:?}",
+            child.kind,
+        );
+    }
+
+    // The same ordering survives a reload (it is durable state, not an
+    // artifact of the in-flight return value).
+    let reloaded = AgentTaskStore::get(store, &fixture.parent_id)
+        .await?
+        .context("parent must be persisted")?;
+    ensure!(
+        reloaded.state.child_ids() == child_ids,
+        "the persisted child-id vector must match the returned one",
+    );
+    Ok(())
+}
+
 // ── mixed batch: a losing CAS spawns nothing ─────────────────────────
 
 /// A mixed spawn under a stale lease must be rejected whole: no
@@ -1085,7 +1164,7 @@ async fn case_mixed_batch_losing_cas_spawns_nothing<S: JournalStore>(store: &S) 
     let fixture = mixed_batch_fixture(store, &thread, 1).await?;
     let payload = suspension_with_pending_tools(&thread, 2);
     let stale_lease = LeaseId::new();
-    let spawn = mixed_batch_spawn(&fixture, payload, &[1])?;
+    let spawn = mixed_batch_spawn(&fixture, payload, &[0], &[1])?;
 
     let rejected = AgentTaskStore::spawn_mixed_children(
         store,
@@ -1136,7 +1215,7 @@ async fn case_mixed_batch_rejects_cancelled_parent<S: JournalStore>(store: &S) -
     let payload = suspension_with_pending_tools(&thread, 2);
     AgentTaskStore::cancel_tree(store, &fixture.parent_id, t_plus(2)).await?;
 
-    let spawn = mixed_batch_spawn(&fixture, payload, &[1])?;
+    let spawn = mixed_batch_spawn(&fixture, payload, &[0], &[1])?;
     let rejected = AgentTaskStore::spawn_mixed_children(
         store,
         &fixture.parent_id,
@@ -1180,7 +1259,7 @@ async fn case_mixed_batch_rejects_uncovered_slot<S: JournalStore>(store: &S) -> 
     // 3 pending tool calls, but the batch names only slots 0 (subagent)
     // and 1 (tool) — slot 2 would never resolve.
     let payload = suspension_with_pending_tools(&thread, 3);
-    let spawn = mixed_batch_spawn(&fixture, payload, &[1])?;
+    let spawn = mixed_batch_spawn(&fixture, payload, &[0], &[1])?;
 
     let rejected = AgentTaskStore::spawn_mixed_children(
         store,
@@ -1324,6 +1403,9 @@ pub async fn run_journal_store_conformance<S: JournalStore + Clone + 'static>(
 
     case_mixed_batch_spawns_subagents_and_tools(store).await?;
     report.passed("mixed_batch_spawns_subagents_and_tools");
+
+    case_mixed_batch_child_ids_follow_slot_order(store).await?;
+    report.passed("mixed_batch_child_ids_follow_slot_order");
 
     case_mixed_batch_losing_cas_spawns_nothing(store).await?;
     report.passed("mixed_batch_losing_cas_spawns_nothing");
@@ -2331,7 +2413,7 @@ mod tests {
             "the only skip is the genuinely-optional outbox committer",
         );
         assert!(
-            report.passed.len() >= 20,
+            report.passed.len() >= 21,
             "no mandatory case silently skipped"
         );
         Ok(())

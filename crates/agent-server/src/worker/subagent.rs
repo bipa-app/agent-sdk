@@ -42,7 +42,7 @@ use crate::journal::task::SubmittedInputItem;
 use crate::journal::{
     AgentTask, AgentTaskId, AgentTaskStore, CommittedEvent, EventRepository, LeaseId,
     MixedChildrenSpawn, SpawnedMixedChildren, SubagentInvocationSpawn, SuspensionPayload, TaskKind,
-    TaskStatus, Thread, ThreadStore, ToolChildSpawn, WorkerId,
+    TaskStatus, Thread, ThreadStore, ToolChildSpawn, WorkerId, validate_mixed_slot_coverage,
 };
 
 /// Typed durable request to spawn a subagent.
@@ -1787,13 +1787,18 @@ pub struct MixedChildrenRequest {
 /// and reused across retries (same idempotency contract as
 /// [`spawn_subagent_invocation`]).
 ///
+/// A malformed request is rejected before any child thread is created:
+/// thread projections live outside the store's transaction, so a batch
+/// that only failed once it reached the store would leave them behind
+/// as orphans.
+///
 /// # Errors
 ///
 /// Returns an error if either half is empty (a batch with no subagents
 /// belongs on `spawn_tool_children`, one with no tool children on
-/// `spawn_subagent_batch_invocations`), if the spawn indices do not
-/// cover the shared continuation's `pending_tool_calls` exactly once
-/// each, if any targeted subagent tool call is not Confirm-tier, if
+/// `spawn_subagent_batch_invocations`), if the two halves' spawn indices
+/// do not cover the shared continuation's `pending_tool_calls` exactly
+/// once each, if any targeted subagent tool call is not Confirm-tier, if
 /// child-thread materialization fails, if the store rejects the batch
 /// (CAS, leaf-parent, duplicate child thread, duplicate id), or if the
 /// durable linkage returned by the store is inconsistent.
@@ -1811,19 +1816,21 @@ pub async fn spawn_mixed_children_invocations(
         payload,
         child_otel_traceparent,
     } = request;
-    ensure!(
-        !subagents.is_empty(),
-        "mixed batch must carry at least one subagent"
-    );
-    ensure!(
-        !tool_children.is_empty(),
-        "mixed batch must carry at least one tool child"
-    );
 
-    // Validate every subagent entry against the shared continuation
-    // envelope before materializing any child thread — one bad
-    // spawn_index must reject the whole batch, not orphan N-1 threads.
+    // Validate the WHOLE batch — both halves' slots, plus every subagent
+    // entry's tier — before materializing any child thread. The store's
+    // own validation runs inside its transaction, which rolls back only
+    // the rows it wrote: a child-thread projection created out here
+    // would survive a late rejection as an orphan.
+    let subagent_slots: Vec<u32> = subagents.iter().map(|entry| entry.spawn_index).collect();
+    let tool_slots: Vec<u32> = tool_children.iter().map(|tool| tool.spawn_index).collect();
+    validate_mixed_slot_coverage(
+        &subagent_slots,
+        &tool_slots,
+        payload.continuation.payload.pending_tool_calls.len(),
+    )?;
     let pending_tools_by_entry = validate_batch_spawns(&payload, &subagents)?;
+
     let child_threads = materialize_batch_child_threads(&mut subagents, deps, now).await?;
 
     let spawns: Vec<SubagentInvocationSpawn> = subagents
