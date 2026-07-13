@@ -136,6 +136,14 @@ pub struct OpenAIProvider {
     thinking: Option<ThinkingConfig>,
     /// Extra headers applied to every request (e.g. for gateway authentication).
     extra_headers: Vec<(String, String)>,
+    /// Verbatim `reasoning.effort` value sent instead of the enum mapping.
+    ///
+    /// Effort vocabularies are model-specific and mutually incompatible
+    /// (GLM accepts `high|max|none`; o-series accept `low|medium|high`;
+    /// the enum's `xhigh` fits neither) — gateways fronting such models
+    /// set the exact string their model expects. `None` keeps the enum
+    /// mapping derived from the thinking config.
+    reasoning_effort_override: Option<String>,
 }
 
 impl OpenAIProvider {
@@ -152,7 +160,16 @@ impl OpenAIProvider {
             base_url: DEFAULT_BASE_URL.to_owned(),
             thinking: None,
             extra_headers: Vec::new(),
+            reasoning_effort_override: None,
         }
+    }
+
+    /// Send this exact string as `reasoning.effort` (verbatim; no enum
+    /// mapping). See `reasoning_effort_override` for why.
+    #[must_use]
+    pub fn with_reasoning_effort(mut self, effort: impl Into<String>) -> Self {
+        self.reasoning_effort_override = Some(effort.into());
+        self
     }
 
     /// Create a provider using GPT-5, reading the API key from the
@@ -194,6 +211,7 @@ impl OpenAIProvider {
             base_url: base_url.into(),
             thinking: None,
             extra_headers: Vec::new(),
+            reasoning_effort_override: None,
         }
     }
 
@@ -409,7 +427,10 @@ impl LlmProvider for OpenAIProvider {
         if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
             return Ok(ChatOutcome::InvalidRequest(error.to_string()));
         }
-        let reasoning = build_api_reasoning(thinking_config.as_ref());
+        let reasoning = build_api_reasoning(
+            thinking_config.as_ref(),
+            self.reasoning_effort_override.as_deref(),
+        );
         let messages = build_api_messages(&request);
         let tools: Option<Vec<ApiTool>> = request
             .tools
@@ -505,7 +526,10 @@ impl LlmProvider for OpenAIProvider {
                 });
                 return;
             }
-            let reasoning = build_api_reasoning(thinking_config.as_ref());
+            let reasoning = build_api_reasoning(
+            thinking_config.as_ref(),
+            self.reasoning_effort_override.as_deref(),
+        );
             let messages = build_api_messages(&request);
             let tools: Option<Vec<ApiTool>> = request
                 .tools
@@ -992,10 +1016,20 @@ fn map_finish_reason(finish_reason: &str) -> StopReason {
     }
 }
 
-fn build_api_reasoning(thinking: Option<&ThinkingConfig>) -> Option<ApiReasoning> {
+fn build_api_reasoning(
+    thinking: Option<&ThinkingConfig>,
+    verbatim_override: Option<&str>,
+) -> Option<ApiReasoning> {
+    if let Some(effort) = verbatim_override {
+        return Some(ApiReasoning {
+            effort: effort.to_owned(),
+        });
+    }
     thinking
         .and_then(resolve_reasoning_effort)
-        .map(|effort| ApiReasoning { effort })
+        .map(|effort| ApiReasoning {
+            effort: reasoning_effort_wire(effort).to_owned(),
+        })
 }
 
 const fn resolve_reasoning_effort(config: &ThinkingConfig) -> Option<ReasoningEffort> {
@@ -1366,7 +1400,18 @@ enum ReasoningEffort {
 
 #[derive(Serialize)]
 struct ApiReasoning {
-    effort: ReasoningEffort,
+    effort: String,
+}
+
+/// Wire string for the enum path (kept in lockstep with the old serde
+/// renames so existing behavior is byte-identical).
+const fn reasoning_effort_wire(effort: ReasoningEffort) -> &'static str {
+    match effort {
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::XHigh => "xhigh",
+    }
 }
 
 #[derive(Serialize)]
@@ -2810,21 +2855,50 @@ mod tests {
     }
 
     #[test]
+    fn test_reasoning_effort_override_is_sent_verbatim() {
+        // GLM-style vocabularies ("max") are not expressible via the enum
+        // (whose ceiling serializes as "xhigh") — the override must pass
+        // through untouched, and it wins over any thinking config.
+        let thinking = ThinkingConfig::new(50_000);
+        let reasoning =
+            build_api_reasoning(Some(&thinking), Some("max")).expect("override present");
+        assert_eq!(reasoning.effort, "max");
+        // Override also applies with no thinking config at all.
+        let reasoning = build_api_reasoning(None, Some("none")).expect("override present");
+        assert_eq!(reasoning.effort, "none");
+    }
+
+    #[test]
+    fn test_enum_path_wire_strings_are_unchanged() {
+        // The enum path must stay byte-identical to the old serde renames.
+        let thinking = ThinkingConfig::new(50_000);
+        let reasoning = build_api_reasoning(Some(&thinking), None).expect("enum path");
+        assert_eq!(reasoning.effort, "xhigh");
+        let thinking = ThinkingConfig::new(1_024);
+        let reasoning = build_api_reasoning(Some(&thinking), None).expect("enum path");
+        assert_eq!(reasoning.effort, "low");
+    }
+
+    #[test]
     fn test_build_api_reasoning_maps_enabled_budget_to_effort() {
-        let reasoning = build_api_reasoning(Some(&ThinkingConfig::new(40_000))).unwrap();
-        assert!(matches!(reasoning.effort, ReasoningEffort::XHigh));
+        let reasoning = build_api_reasoning(Some(&ThinkingConfig::new(40_000)), None).unwrap();
+        assert_eq!(reasoning.effort, "xhigh");
     }
 
     #[test]
     fn test_build_api_reasoning_uses_explicit_effort() {
         let reasoning =
-            build_api_reasoning(Some(&ThinkingConfig::adaptive_with_effort(Effort::High))).unwrap();
-        assert!(matches!(reasoning.effort, ReasoningEffort::High));
+            build_api_reasoning(
+            Some(&ThinkingConfig::adaptive_with_effort(Effort::High)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(reasoning.effort, "high");
     }
 
     #[test]
     fn test_build_api_reasoning_omits_adaptive_without_effort() {
-        assert!(build_api_reasoning(Some(&ThinkingConfig::adaptive())).is_none());
+        assert!(build_api_reasoning(Some(&ThinkingConfig::adaptive()), None).is_none());
     }
 
     #[test]
@@ -3045,7 +3119,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             reasoning: Some(ApiReasoning {
-                effort: ReasoningEffort::High,
+                effort: "high".to_owned(),
             }),
             response_format: None,
         };
