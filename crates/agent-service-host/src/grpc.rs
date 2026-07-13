@@ -3151,20 +3151,32 @@ const fn terminal_close_reason(
 }
 
 /// [`terminal_close_reason`], confirmed against the task journal
-/// (codex round-16): a `ThreadCompleted` frame only closes the stream
-/// when the thread truly has no blocking root. A cancelled
-/// predecessor's late full-turn commit sequences its `Done` after the
-/// promoted successor's `Start` — closing on that foreign frame would
-/// cut the follower off before the successor's retry boundary and
-/// answer, which the requeue path explicitly promises to deliver.
-/// While a blocking root exists (`Running`, `Pending`, waiting), the
-/// frame belongs to a superseded attempt and the stream keeps
-/// following. `TurnCancelled` closes are NOT gated: `cancel_tree`
-/// promotes the queued successor in the same transaction as its
-/// marker, so an active root is the NORMAL state when the marker is
-/// delivered, and the marker's whole purpose is to release followers
-/// of the cancelled turn. A journal read failure keeps the historical
-/// close (never strand a client on a dead thread).
+/// (codex rounds 16-17): a `ThreadCompleted` frame only closes the
+/// stream when it is the thread's own terminal frame, not a
+/// superseded attempt's. A cancelled predecessor's late full-turn
+/// commit sequences its `Done` after the promoted successor's `Start`
+/// — closing on that foreign frame would cut the follower off before
+/// the successor's retry boundary and answer, which the requeue path
+/// explicitly promises to deliver.
+///
+/// The gate must NOT treat the frame's own emitter as a successor: a
+/// normally completing root commits its turn (and `Done`) in one
+/// transaction and transitions its task row in a second, so a
+/// follower delivering the `Done` in that gap sees the emitter still
+/// `Running` — suppressing there would leave the stream open forever
+/// (no later lifecycle event re-checks). The discriminator is the
+/// thread's LATEST CHECKPOINT committer: an active root that also
+/// committed the latest turn is the emitter mid-transition (close);
+/// an active root that did not is a genuine successor still working
+/// (keep following). No checkpoint reads as the emitter case,
+/// conservatively.
+///
+/// `TurnCancelled` closes are NOT gated: `cancel_tree` promotes the
+/// queued successor in the same transaction as its marker, so an
+/// active root is the NORMAL state when the marker is delivered, and
+/// the marker's whole purpose is to release followers of the
+/// cancelled turn. A journal read failure keeps the historical close
+/// (never strand a client on a dead thread).
 async fn confirmed_close_reason(
     shared: &GrpcShared,
     thread_id: &ThreadId,
@@ -3172,13 +3184,30 @@ async fn confirmed_close_reason(
 ) -> Option<pb::StreamCloseReason> {
     let reason = terminal_close_reason(event)?;
     if matches!(reason, pb::StreamCloseReason::ThreadCompleted) {
-        match shared
+        let active_root = shared
             .stores
             .task_store
             .active_root_for_thread(thread_id)
-            .await
-        {
-            Ok(Some(_)) => return None,
+            .await;
+        match active_root {
+            Ok(Some(root)) => {
+                match shared
+                    .stores
+                    .checkpoint_store
+                    .get_latest_by_thread(thread_id)
+                    .await
+                {
+                    Ok(Some(latest)) if latest.task_id != root.id => return None,
+                    Ok(_) => {}
+                    Err(error) => {
+                        warn!(
+                            thread_id = %thread_id,
+                            error = %format!("{error:#}"),
+                            "terminal-close checkpoint read failed; keeping the close",
+                        );
+                    }
+                }
+            }
             Ok(None) => {}
             Err(error) => {
                 warn!(
@@ -6419,18 +6448,54 @@ mod tests {
             Some(pb::StreamCloseReason::ThreadCompleted),
         );
 
-        // A blocking successor root exists: the foreign Done must not
-        // close the stream.
+        // The thread's latest committed turn belongs to the (foreign,
+        // cancelled) predecessor that emitted this Done.
+        let checkpoint_for =
+            |task_id: &str, turn: u32| agent_server::journal::checkpoint::NewCheckpointParams {
+                thread_id: thread.clone(),
+                turn_number: turn,
+                task_id: agent_server::journal::task::AgentTaskId::from_string(task_id),
+                messages: vec![],
+                agent_state_snapshot: serde_json::json!({}),
+                turn_usage: agent_sdk_foundation::TokenUsage::default(),
+                kind: agent_server::journal::checkpoint::CheckpointKind::FullTurn,
+                now: OffsetDateTime::UNIX_EPOCH,
+            };
+        shared
+            .stores
+            .checkpoint_store
+            .commit_checkpoint(checkpoint_for("task_foreign_predecessor", 1))
+            .await?;
+
+        // A blocking successor root exists that did NOT commit the
+        // latest turn: the foreign Done must not close the stream.
         let successor = agent_server::journal::task::AgentTask::new_root_turn(
             thread.clone(),
             OffsetDateTime::UNIX_EPOCH,
             3,
         );
+        let successor_id = successor.id.clone();
         shared.stores.task_store.submit_root_turn(successor).await?;
         assert_eq!(
             confirmed_close_reason(&shared, &thread, &done).await,
             None,
             "a Done frame must not close a follower while a successor root is active",
+        );
+
+        // Codex round-17: the EMITTER mid-transition is not a
+        // successor. When the active root is also the latest turn's
+        // committer (its Done became visible before complete_task
+        // transitioned the row), the close must proceed — suppressing
+        // would strand the stream forever.
+        shared
+            .stores
+            .checkpoint_store
+            .commit_checkpoint(checkpoint_for(successor_id.as_str(), 2))
+            .await?;
+        assert_eq!(
+            confirmed_close_reason(&shared, &thread, &done).await,
+            Some(pb::StreamCloseReason::ThreadCompleted),
+            "an active root that committed the latest turn is the emitter, not a successor",
         );
 
         // Cancelled markers are not gated.
