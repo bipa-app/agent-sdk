@@ -684,29 +684,33 @@ pub struct CancelTreeOutcome {
 ///
 /// # Orphan markers (this backend only)
 ///
-/// The converse does NOT hold. The markers of a cascade are appended one
-/// per thread, so a sink failure PART-WAY through that set leaves the
-/// markers it already journaled behind while their roots stay live
-/// (nothing was flipped). Consequences, stated plainly:
+/// The converse holds only once the cancel actually settles. The markers
+/// of a cascade are appended one per thread, so a sink failure PART-WAY
+/// through that set leaves the markers it already journaled behind while
+/// their roots stay live (nothing was flipped). Marker closes are
+/// ungated, so a follower that reaches such an orphan marker closes
+/// `TurnCancelled` on a task that then keeps running and completes — its
+/// answer is still journaled, and the follower reaches it by
+/// reconnecting.
 ///
-/// - Marker closes are ungated, so a follower that reaches an orphan
-///   marker closes `TurnCancelled` on a task that then keeps running and
-///   completes. Its answer is still journaled; the follower reaches it
-///   only by reconnecting.
-/// - A retry re-predicts those same still-live roots and appends their
-///   markers AGAIN, so the thread can carry duplicate `Cancelled` events
-///   for one cancel. Replay shows both. The close gate is indifferent
-///   (it keys on the emitter's task row, not on marker count), but a
-///   consumer that sums the markers' `usage` double-counts.
+/// A retry does NOT compound that: the marker append is idempotent per
+/// candidate (keyed on the marker's emitter task id), so the retry reuses
+/// the markers already on the thread, writes only the missing ones, and
+/// flips the tree. Exactly one `Cancelled` marker per effective cancel
+/// survives, and the orphan is retroactively made honest — its root is
+/// now genuinely cancelled. The residual is therefore narrow and
+/// terminal: a marker on a live root, on a cancel the caller ABANDONS
+/// after a sink failure.
 ///
-/// Pairing each marker with its own row flip would close this, but the
-/// flip clears the typed state that carries `SubagentInvocation`
-/// linkage: a half-flipped cascade is no longer discoverable by
-/// `collect_subtree`, so a retry could never reach the child-thread root
-/// it stranded. Keeping the flips all-or-nothing preserves that
-/// reachability, which is the property a retry needs to heal anything at
-/// all. The durable backends have neither problem — marker set and
-/// cancellation share one transaction.
+/// Pairing each marker with its own row flip would avoid the orphan
+/// window entirely, but the flip clears the typed state that carries
+/// `SubagentInvocation` linkage: a half-flipped cascade is no longer
+/// discoverable by `collect_subtree`, so a retry could never reach the
+/// child-thread root it stranded, and that root would stay live forever.
+/// Keeping the flips all-or-nothing preserves the reachability a retry
+/// needs to heal anything at all. The durable backends have neither
+/// problem — marker set and cancellation share one transaction, so a
+/// partial set cannot exist.
 ///
 /// A bare `InMemoryAgentTaskStore::new()` (no sink) emits no markers;
 /// composed deployments (the service host's in-memory registry, test
@@ -1763,12 +1767,14 @@ pub trait AgentTaskStore: Send + Sync {
     ///    committed: a crash cannot separate them, an idempotent retry
     ///    (terminal tree, nothing transitioned) emits nothing, and
     ///    cross-host followers are woken by the outbox relay. The
-    ///    in-memory backend has no cross-store transaction and gets half
-    ///    that guarantee from ordering — it journals the markers before
-    ///    applying any transition, so a cancelled row always has a
-    ///    marker, but a sink failure part-way through a cascade's markers
-    ///    can leave orphan markers on roots that stay live, which a retry
-    ///    then duplicates (see [`CancellationMarkerSink`]). The
+    ///    in-memory backend has no cross-store transaction and gets the
+    ///    same guarantee from ordering plus an idempotent append — it
+    ///    journals the markers before applying any transition, so a
+    ///    cancelled row always has exactly one marker, and a retry after a
+    ///    partial sink failure reuses the markers already written instead
+    ///    of duplicating them. Its one residual is an orphan marker on a
+    ///    still-live root when the caller ABANDONS a failed cancel (see
+    ///    [`CancellationMarkerSink`]). The
     ///    marker carries `turn = thread.committed_turns` and the
     ///    cumulative usage from the root's parked continuation when
     ///    present (falling back to the thread aggregate). Cancelling
@@ -1996,10 +2002,48 @@ impl InMemoryAgentTaskStore {
         self
     }
 
+    /// The marker this candidate already carries on its thread, if any.
+    ///
+    /// Keyed on the marker's emitter — the cancelled root's own task id —
+    /// which is exact: a task is cancellable once (`Cancelled` is
+    /// absorbing), and a thread that is cancelled, resubmitted, and
+    /// cancelled again gets a NEW root with a new id, so its marker is
+    /// never mistaken for the old one.
+    async fn journaled_marker_for(
+        sink: &CancellationMarkerSink,
+        candidate: &CancelMarkerCandidate,
+    ) -> Result<Option<CommittedEvent>> {
+        Ok(sink
+            .event_repo
+            .get_events(&candidate.thread_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "cancel_tree: read thread {} for marker idempotency",
+                    candidate.thread_id
+                )
+            })?
+            .into_iter()
+            .find(|committed| {
+                matches!(committed.event, AgentEvent::Cancelled { .. })
+                    && committed.event.emitter_task_id() == Some(candidate.task_id.as_str())
+            }))
+    }
+
     /// Commit one terminal `Cancelled` marker (+ its
     /// `thread_events_available` outbox advisory) per candidate thread
-    /// through the wired sink. Called by `cancel_tree` after the task
-    /// transitions have been applied; a missing sink emits nothing.
+    /// through the wired sink. Called by `cancel_tree` before the task
+    /// transitions are applied; a missing sink emits nothing.
+    ///
+    /// The append is IDEMPOTENT per candidate. A previous attempt can
+    /// have journaled some of a cascade's markers before failing on a
+    /// later one — the flips are all-or-nothing, so those roots stayed
+    /// live and are candidates again on the retry. Re-appending would put
+    /// a second `Cancelled` event for one effective cancel on the thread,
+    /// which replay would show and a usage-summing consumer would
+    /// double-count, so an already-journaled marker is REUSED instead:
+    /// it is returned to the caller (whose notifier still wakes
+    /// same-process followers with it) and not written again.
     async fn commit_cancellation_markers(
         &self,
         candidates: Vec<CancelMarkerCandidate>,
@@ -2010,6 +2054,16 @@ impl InMemoryAgentTaskStore {
         };
         let mut markers = Vec::with_capacity(candidates.len());
         for candidate in candidates {
+            if let Some(existing) = Self::journaled_marker_for(sink, &candidate).await? {
+                // Its advisory was written in the same iteration that
+                // wrote the marker, so it is already queued. The narrow
+                // exception — a prior attempt that failed ON that advisory
+                // insert — leaves the marker journaled with no relay wake;
+                // the root is still live, so its next event's advisory
+                // wakes cross-host followers onto the marker anyway.
+                markers.push(existing);
+                continue;
+            }
             let (turn, thread_usage) = match sink
                 .thread_store
                 .get(&candidate.thread_id)
@@ -4284,19 +4338,16 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         // What this ordering does NOT buy — and the flips cannot be
         // paired per row to buy it, because a flip clears the typed state
         // carrying `SubagentInvocation` linkage, and a half-flipped
-        // cascade is unreachable to the `collect_subtree` a retry
-        // depends on:
-        // - a failure PART-WAY through a multi-thread cascade's markers
-        //   leaves the already-journaled ones behind on roots that stay
-        //   live. Marker closes are ungated, so a follower can close
-        //   `TurnCancelled` on a task that then completes;
-        // - the retry re-predicts those live roots and appends their
-        //   markers again, so a thread can carry duplicates for one
-        //   cancel. The close gate is indifferent (it reads the emitter's
-        //   task row, not marker count); replay and usage-summing
-        //   consumers are not.
-        // Both are `CancellationMarkerSink`'s documented in-memory
-        // residual; the SQL backends commit the set in one transaction.
+        // cascade is unreachable to the `collect_subtree` a retry depends
+        // on: a failure PART-WAY through a multi-thread cascade's markers
+        // leaves the already-journaled ones behind on roots that stay
+        // live, and marker closes are ungated, so a follower can close
+        // `TurnCancelled` on a task that then completes. The retry does
+        // not compound it — the append is idempotent per candidate, so
+        // one marker per effective cancel survives and the retry's flips
+        // make the orphan honest. See `CancellationMarkerSink`; the SQL
+        // backends commit the set in one transaction and have neither
+        // window.
         //
         // Holding the lock across the sink's awaits is what orders the
         // markers ahead of anything a promoted successor emits: the
@@ -10963,19 +11014,20 @@ mod tests {
         Ok(())
     }
 
-    /// The documented in-memory residual, pinned so it cannot drift
-    /// silently: a cascade whose SECOND marker fails leaves the FIRST
-    /// marker orphaned on a root that is still live, and the retry writes
-    /// that marker a second time.
+    /// A cascade whose SECOND marker fails leaves the FIRST marker
+    /// orphaned on a root that is still live — the documented residual,
+    /// pinned so it cannot drift silently. The retry then HEALS the tree
+    /// without duplicating that marker: the append is idempotent per
+    /// candidate, so exactly one `Cancelled` marker per effective cancel
+    /// survives a partial failure.
     ///
-    /// Both follow from keeping the flips all-or-nothing, which is the
-    /// property that lets the retry heal the tree at all: a flip clears
-    /// the typed state carrying `SubagentInvocation` linkage, so pairing
-    /// each marker with its own flip would leave a half-flipped cascade
-    /// whose child-thread root `collect_subtree` can no longer reach —
-    /// stranding it live forever. The invariant the close gate depends on
-    /// is the one that survives: no row is ever `Cancelled` without its
-    /// marker.
+    /// The all-or-nothing flips are what make the retry possible at all:
+    /// a flip clears the typed state carrying `SubagentInvocation`
+    /// linkage, so pairing each marker with its own flip would leave a
+    /// half-flipped cascade whose child-thread root `collect_subtree` can
+    /// no longer reach — stranding it live forever. The invariant the
+    /// close gate depends on holds throughout: no row is ever `Cancelled`
+    /// without its marker.
     #[tokio::test(flavor = "multi_thread")]
     async fn partial_marker_failure_orphans_markers_but_keeps_the_tree_healable() -> Result<()> {
         let events = crate::journal::event_repository::InMemoryEventRepository::new();
@@ -11041,15 +11093,23 @@ mod tests {
             );
         }
 
-        // ...and re-emits the marker it already wrote. Duplicates are
-        // visible in replay; the close gate is indifferent (it reads the
-        // emitter's task row, not marker count).
+        // ...reusing the marker it already wrote rather than writing a
+        // second one: exactly one marker per effective cancel, even
+        // across a partial failure and its retry.
         assert_eq!(
             cancel_markers(&events, &parent.thread_id).await?,
-            2,
-            "the retry duplicates the orphaned marker",
+            1,
+            "the retry must reuse the orphaned marker, not duplicate it",
         );
-        assert_eq!(cancel_markers(&events, &child_thread).await?, 1);
+        assert_eq!(
+            cancel_markers(&events, &child_thread).await?,
+            1,
+            "the child root's marker is written exactly once by the retry",
+        );
+
+        // The reused marker is still handed back, so the caller's notifier
+        // wakes same-process followers with it.
+        assert_eq!(outcome.markers.len(), 2, "both markers are reported");
         Ok(())
     }
 

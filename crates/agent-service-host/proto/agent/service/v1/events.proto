@@ -207,17 +207,17 @@ message ErrorEvent {
 // nothing, and a running worker's later abort commits salvaged content
 // but no second lifecycle marker.
 //
-// Exactly-once holds on the durable backends, where the marker set and
-// the cancellation share one transaction. The embedded in-memory
-// backend cannot span its stores transactionally: if the journal write
-// fails part-way through a multi-thread cascade's markers, the ones
-// already written stay behind on roots that were NOT cancelled, and the
-// caller's retry writes them a second time. A thread can therefore carry
-// a duplicate `cancelled` marker, and a follower can close on a marker
-// whose task then keeps running and completes. Treat this marker as
-// advisory-terminal rather than a billing key: read `usage` from the
-// LAST marker on a thread, not from a sum, and expect the cancelled
-// task's own row (`GetTask`) to be the authority on whether it ended.
+// One marker per effective cancel, on every backend: the durable ones
+// commit the marker set inside the cancellation transaction, and the
+// embedded in-memory backend journals the set before applying any
+// transition and reuses — never rewrites — a marker already on the
+// thread. The embedded backend's one residual, since it cannot span its
+// stores transactionally: a cancel whose marker write FAILS part-way
+// through a subagent cascade, and which the caller then abandons rather
+// than retries, leaves a marker on a root that was not cancelled and
+// keeps running. A follower closes on it and reaches that task's real
+// answer by reconnecting. The task's own row (`GetTask`) is the
+// authority on whether it ended.
 //
 // Post-terminal salvage: a RUNNING root's worker may keep appending
 // streaming deltas for up to one heartbeat after this marker — they
