@@ -230,16 +230,39 @@ fn backend_aliases(provider: &str, model: &str) -> impl Iterator<Item = &'static
 }
 
 /// Split a vendor-slug model id (`z-ai/glm-5.1`) into the vendor key a feed's
-/// native section stores it under (`z-ai` / `glm-5.1`).
+/// native section stores it under (`zai` / `glm-5.1`).
 ///
 /// Open models (z.ai, Moonshot, `DeepSeek`, `MiniMax`, …) are served through
 /// `OpenAIProvider`, so their provenance is `openai` plus the full slug the
-/// caller passed, and no feed files them under that pair. The `google` remap
-/// mirrors `map_modelsdev_provider`.
+/// caller passed, and no feed files them under that pair. The vendor half of an
+/// `OpenRouter`-style slug is spelled the router's way, which is not always how
+/// the vendor's own models.dev section is keyed; [`normalize_slug_vendor`]
+/// bridges the two.
 fn vendor_slug_key(model: &str) -> Option<(&str, &str)> {
     let (vendor, model_id) = model.split_once('/')?;
-    let provider = if vendor == "google" { "gemini" } else { vendor };
-    Some((provider, model_id))
+    Some((normalize_slug_vendor(vendor), model_id))
+}
+
+/// Map an `OpenRouter` route-slug vendor to the provider name its own
+/// (non-routed) models.dev section is filed under, when the two differ.
+///
+/// The pairs are verified against the live models.dev feed: `google`'s section
+/// is remapped to `gemini` by `map_modelsdev_provider`, and z.ai / x.ai /
+/// Mistral publish native sections spelled without the router's hyphen or `ai`
+/// suffix. A vendor already spelled the same in both feeds (`moonshotai`,
+/// `deepseek`, `minimax`, …) passes through untouched. Other route vendors
+/// whose section carries prefixed or differently-shaped model ids
+/// (`meta-llama`, `qwen`) are deliberately left alone: their model halves do
+/// not line up with the native section, so a name remap alone would not reach
+/// a correct row.
+fn normalize_slug_vendor(vendor: &str) -> &str {
+    match vendor {
+        "google" => "gemini",
+        "z-ai" => "zai",
+        "x-ai" => "xai",
+        "mistralai" => "mistral",
+        other => other,
+    }
 }
 
 /// Whether a usage delta carries no tokens at all.
@@ -251,8 +274,15 @@ pub(super) const fn usage_is_zero(usage: &TokenUsage) -> bool {
         && usage.cache_creation_input_tokens == 0
 }
 
-/// Fold one LLM call's cost into the state's accumulated total, priced at
-/// the provenance that served the call.
+/// Fold a usage delta's cost into the state's accumulated total, priced at
+/// the provenance that served it.
+///
+/// `delta_scope` is what `delta` describes: a single provider response
+/// ([`UsageScope::Call`], tier-aware) or a sum of several
+/// ([`UsageScope::Aggregate`], base rates). A compaction that retried a
+/// truncated summary bills two calls into one delta, and pricing that as one
+/// call could select a long-context tier neither call reached — so it must be
+/// folded as an aggregate.
 ///
 /// `pre_delta_total` is the thread's aggregate usage BEFORE `delta` was
 /// added; when the state predates cost accumulation (`accumulated_cost_usd`
@@ -268,12 +298,17 @@ pub(super) fn accumulate_cost(
     provenance: &AuditProvenance,
     pre_delta_total: &TokenUsage,
     delta: &TokenUsage,
+    delta_scope: UsageScope,
 ) {
     if state.accumulated_cost_usd.is_none() && !usage_is_zero(pre_delta_total) {
         state.accumulated_cost_usd =
             estimate_aggregate_cost_usd(pricing, provenance, pre_delta_total);
     }
-    if let Some(delta_cost) = estimate_cost_usd(pricing, provenance, delta) {
+    let delta_cost = match delta_scope {
+        UsageScope::Call => estimate_cost_usd(pricing, provenance, delta),
+        UsageScope::Aggregate => estimate_aggregate_cost_usd(pricing, provenance, delta),
+    };
+    if let Some(delta_cost) = delta_cost {
         state.accumulated_cost_usd = Some(state.accumulated_cost_usd.unwrap_or(0.0) + delta_cost);
     }
 }
@@ -439,7 +474,11 @@ mod tests {
 
     impl CostEstimator for SlugPricing {
         fn estimate_cost_usd(&self, provider: &str, model: &str, usage: &Usage) -> Option<f64> {
-            (provider == "z-ai" && model == "glm-9-turbo")
+            // `moonshotai` is spelled the same in a route slug and in its own
+            // models.dev section, so this exercises the plain vendor split; the
+            // spelling remap is covered by
+            // `catalog_tests::slug_vendor_spelling_reaches_the_native_section`.
+            (provider == "moonshotai" && model == "kimi-9-turbo")
                 .then(|| f64::from(usage.input_tokens) + f64::from(usage.output_tokens))
         }
     }
@@ -449,7 +488,7 @@ mod tests {
         use anyhow::Context;
         // Open models route through the OpenAI provider, so the provenance is
         // `openai` plus the full slug, while the feeds key the model by vendor.
-        let provenance = AuditProvenance::new("openai", "z-ai/glm-9-turbo");
+        let provenance = AuditProvenance::new("openai", "moonshotai/kimi-9-turbo");
         let usage = TokenUsage {
             input_tokens: 20,
             output_tokens: 10,
@@ -502,6 +541,7 @@ mod tests {
             &provenance,
             &TokenUsage::default(),
             &one_million_each(),
+            UsageScope::Call,
         );
 
         let accumulated = state
@@ -1042,6 +1082,45 @@ mod catalog_tests {
         Ok(())
     }
 
+    /// A route slug spells its vendor the router's way (`z-ai`), while the
+    /// vendor's own models.dev section is keyed differently (`zai`). When the
+    /// route row is absent — a trimmed mirror, or a native-only model — the
+    /// fallback must still reach the native row through the spelling remap.
+    #[tokio::test]
+    async fn slug_vendor_spelling_reaches_the_native_section() -> Result<()> {
+        // A models.dev NATIVE `zai` section, no `openrouter` route row for it.
+        const MODELSDEV_NATIVE_ZAI_FIXTURE: &str = r#"{
+          "zai": {
+            "id": "zai",
+            "models": {
+              "glm-5.1": {
+                "id": "glm-5.1",
+                "cost": { "input": 0.6, "output": 2.2 }
+              }
+            }
+          }
+        }"#;
+
+        let registry =
+            registry_from_entries(parse_modelsdev(MODELSDEV_NATIVE_ZAI_FIXTURE)?).await?;
+        // Open models route through OpenAIProvider, so the provenance is the
+        // full router slug under `openai`.
+        let provenance = AuditProvenance::new("openai", "z-ai/glm-5.1");
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+
+        // The route key `("openrouter", "z-ai/glm-5.1")` misses; the vendor
+        // split `("z-ai", …)` would miss too, but the `z-ai` → `zai` remap
+        // reaches the native row. $0.6/M in + $2.2/M out = $2.80.
+        let cost = estimate_cost_usd(Some(&registry), &provenance, &usage)
+            .context("the zai native section must price this slug model")?;
+        assert!((cost - 2.8).abs() < 1e-9, "unexpected cost: {cost}");
+        Ok(())
+    }
+
     /// models.dev keys Vertex under Google's service names. A Vertex-only SKU
     /// (the `@`-suffixed ids no direct-vendor section carries) is priced only
     /// there, so without the service key it could never trip a budget.
@@ -1136,6 +1215,7 @@ mod catalog_tests {
             &provenance,
             &TokenUsage::default(),
             &usage,
+            UsageScope::Call,
         );
         let accumulated = state
             .accumulated_cost_usd
@@ -1210,6 +1290,7 @@ mod catalog_tests {
             &provenance,
             &TokenUsage::default(),
             &usage,
+            UsageScope::Call,
         );
         let limits = UsageLimits {
             max_cost_usd: Some(2.0),
@@ -1289,6 +1370,65 @@ mod catalog_tests {
             )
             .is_none(),
             "a healthy thread must not be killed by a phantom long-context bill",
+        );
+        Ok(())
+    }
+
+    /// A compaction that retried a truncated summary bills two calls, summed
+    /// into one delta (see `LlmContextCompactor::summarize_with_usage`). Folded
+    /// as one call it would select a long-context tier neither call reached;
+    /// `accumulate_cost` with `UsageScope::Aggregate` prices it at base rates.
+    #[tokio::test]
+    async fn compaction_delta_is_priced_at_base_rates() -> Result<()> {
+        const MODELSDEV_TIERED_FIXTURE: &str = r#"{
+          "openai": {
+            "id": "openai",
+            "models": {
+              "gpt-5.4": {
+                "id": "gpt-5.4",
+                "cost": {
+                  "input": 2.5,
+                  "output": 15,
+                  "tiers": [
+                    {
+                      "input": 5,
+                      "output": 22.5,
+                      "tier": { "type": "context", "size": 272000 }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }"#;
+
+        let registry = registry_from_entries(parse_modelsdev(MODELSDEV_TIERED_FIXTURE)?).await?;
+        let provenance = AuditProvenance::new("openai", "gpt-5.4");
+
+        // Two 150K-prompt summarization calls, summed to 300K — over the 272K
+        // threshold, though neither call reached it.
+        let summed = TokenUsage {
+            input_tokens: 300_000,
+            output_tokens: 0,
+            ..Default::default()
+        };
+        let mut state = AgentState::new(ThreadId::new());
+        accumulate_cost(
+            &mut state,
+            Some(&registry),
+            &provenance,
+            &TokenUsage::default(),
+            &summed,
+            UsageScope::Aggregate,
+        );
+
+        // Base: 0.3 * $2.5 = $0.75, not the tier's 0.3 * $5 = $1.50.
+        let accumulated = state
+            .accumulated_cost_usd
+            .context("the compaction spend must accumulate")?;
+        assert!(
+            (accumulated - 0.75).abs() < 1e-9,
+            "compaction priced at the tier rate: {accumulated}"
         );
         Ok(())
     }
