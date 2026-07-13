@@ -482,7 +482,7 @@ fn accumulate_partial_buffer(
 /// Map a recorded streaming error into the structured-output error surface.
 fn stream_error_to_outcome(message: &str, kind: StreamErrorKind) -> StructuredOutputError {
     let label = match kind {
-        StreamErrorKind::RateLimited => "rate limited".to_owned(),
+        StreamErrorKind::RateLimited(_) => "rate limited".to_owned(),
         StreamErrorKind::InvalidRequest => format!("invalid request: {message}"),
         _ => format!("server error: {message}"),
     };

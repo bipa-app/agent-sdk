@@ -304,7 +304,13 @@ pub(super) struct ToolOutcomeContext<'a> {
 
 /// Error type for stream processing.
 pub(super) enum StreamError {
-    Recoverable(String),
+    Recoverable {
+        message: String,
+        /// Server-supplied retry delay carried by a rate-limited stream error
+        /// (`Retry-After`, or a hint parsed out of the error body). Overrides
+        /// the exponential backoff, exactly as on the non-streaming path.
+        retry_after: Option<std::time::Duration>,
+    },
     Fatal(String),
     /// The run's cancellation token fired while the stream was still
     /// being consumed. Terminal — not retried.

@@ -2239,6 +2239,15 @@ const STREAM_BASE_DELAY_MS: u64 = 500;
 /// blip and a daemon respawn share the same wall-clock vocabulary.
 const STREAM_MAX_DELAY_MS: u64 = 8_000;
 
+/// Upper bound on a *server-supplied* retry delay (a 429's `Retry-After`,
+/// or a hint parsed out of the error body).
+///
+/// A provider hint reflects a real quota window, so it is allowed to exceed
+/// the exponential ceiling — retrying before it elapses just burns an attempt
+/// on a guaranteed second 429.  It is still bounded, so a hostile or
+/// mis-encoded hint cannot park a worker slot indefinitely.
+const STREAM_MAX_RETRY_AFTER_MS: u64 = 60_000;
+
 /// Maximum time a freshly opened LLM stream may go without yielding its
 /// FIRST event before the attempt is treated as a stalled connection
 /// and retried through the normal [`StreamAttemptError::Recoverable`]
@@ -2564,7 +2573,9 @@ async fn handle_recoverable_stream_error(
         .await;
         bail!("{final_msg}");
     }
-    let delay = stream_backoff_delay(*retries);
+    let delay = kind
+        .retry_after()
+        .map_or_else(|| stream_backoff_delay(*retries), clamp_retry_after);
     let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
     log::warn!(
         "LLM stream {kind:?} on attempt {retries}/{STREAM_MAX_RETRIES} \
@@ -2715,6 +2726,14 @@ async fn try_recover_with_compaction(
 /// `agent_sdk::agent_loop::helpers::calculate_backoff_delay` but
 /// is duplicated here to avoid leaking a `pub(crate)` boundary across
 /// crates for a tiny pure helper.
+/// Clamp a provider-supplied retry delay to [`STREAM_MAX_RETRY_AFTER_MS`].
+fn clamp_retry_after(hint: Duration) -> Duration {
+    let ms = u64::try_from(hint.as_millis())
+        .unwrap_or(u64::MAX)
+        .min(STREAM_MAX_RETRY_AFTER_MS);
+    Duration::from_millis(ms)
+}
+
 fn stream_backoff_delay(attempt: u32) -> Duration {
     // Exponential: base, base*2, base*4, ...
     let base = STREAM_BASE_DELAY_MS.saturating_mul(1u64 << attempt.saturating_sub(1).min(20));
@@ -2928,7 +2947,7 @@ async fn call_llm_once_instrumented(
 #[cfg(feature = "otel")]
 const fn stream_error_kind_type(kind: StreamErrorKind) -> &'static str {
     match kind {
-        StreamErrorKind::RateLimited => "rate_limited",
+        StreamErrorKind::RateLimited(_) => "rate_limited",
         StreamErrorKind::ServerError => "server_error",
         StreamErrorKind::InvalidRequest => "invalid_request",
         // `StreamErrorKind` is #[non_exhaustive]; `Unknown` and any future
@@ -3239,7 +3258,7 @@ fn buffer_stream_delta(
             // validation rejection is recorded as `InvalidRequest` (not
             // `ServerError`).
             let outcome = match kind {
-                StreamErrorKind::RateLimited => TurnAttemptOutcome::RateLimited,
+                StreamErrorKind::RateLimited(_) => TurnAttemptOutcome::RateLimited,
                 StreamErrorKind::InvalidRequest => TurnAttemptOutcome::InvalidRequest,
                 // `StreamErrorKind::ServerError`, plus the
                 // `#[non_exhaustive]` catch-all (`Unknown` / future kinds):

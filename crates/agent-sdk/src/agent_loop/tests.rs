@@ -5268,6 +5268,124 @@ async fn streaming_retry_uses_fresh_message_id_per_attempt() -> anyhow::Result<(
     Ok(())
 }
 
+// --- #9: streaming rate limit honours the provider's Retry-After ------
+
+#[tokio::test(start_paused = true)]
+async fn streaming_rate_limit_retry_honours_the_provider_hint() -> anyhow::Result<()> {
+    // The exponential schedule here would wait 0ms; the provider asked for 5s,
+    // so the retry must wait 5s — the streaming path honours a server hint
+    // exactly like the non-streaming path.
+    let provider = StreamScriptProvider::new(vec![
+        StreamScriptStep::Frames(vec![StreamDelta::Error {
+            message: "Rate limited".to_string(),
+            kind: StreamErrorKind::RateLimited(Some(std::time::Duration::from_secs(5))),
+        }]),
+        StreamScriptStep::Frames(vec![
+            StreamDelta::TextDelta {
+                delta: "after the hint".to_string(),
+                block_index: 0,
+            },
+            StreamDelta::Done {
+                stop_reason: Some(crate::llm::StopReason::EndTurn),
+            },
+        ]),
+    ]);
+    let config = AgentConfig {
+        streaming: true,
+        retry: RetryConfig {
+            max_retries: 2,
+            base_delay_ms: 0,
+            max_delay_ms: 60_000,
+        },
+        ..Default::default()
+    };
+    let agent = builder::<()>()
+        .provider(provider)
+        .config(config)
+        .event_store(new_event_store())
+        .build();
+
+    let (state, events) = run_recorded(
+        &agent,
+        ThreadId::new(),
+        AgentInput::Text("hi".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(matches!(state, AgentRunState::Done { .. }));
+
+    let delays: Vec<u64> = events
+        .iter()
+        .filter_map(|e| match &e.event {
+            AgentEvent::AutoRetryStart { delay_ms, .. } => Some(*delay_ms),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        delays,
+        vec![5_000],
+        "the streamed Retry-After must drive the backoff, not the exponential schedule"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn streaming_rate_limit_without_a_hint_uses_exponential_backoff() -> anyhow::Result<()> {
+    // No server hint: the exponential schedule (base 250ms, first retry) applies.
+    let provider = StreamScriptProvider::new(vec![
+        StreamScriptStep::Frames(vec![StreamDelta::Error {
+            message: "Rate limited".to_string(),
+            kind: StreamErrorKind::RateLimited(None),
+        }]),
+        StreamScriptStep::Frames(vec![
+            StreamDelta::TextDelta {
+                delta: "after backoff".to_string(),
+                block_index: 0,
+            },
+            StreamDelta::Done {
+                stop_reason: Some(crate::llm::StopReason::EndTurn),
+            },
+        ]),
+    ]);
+    let config = AgentConfig {
+        streaming: true,
+        retry: RetryConfig {
+            max_retries: 2,
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+        },
+        ..Default::default()
+    };
+    let agent = builder::<()>()
+        .provider(provider)
+        .config(config)
+        .event_store(new_event_store())
+        .build();
+
+    let (state, events) = run_recorded(
+        &agent,
+        ThreadId::new(),
+        AgentInput::Text("hi".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(matches!(state, AgentRunState::Done { .. }));
+
+    let delays: Vec<u64> = events
+        .iter()
+        .filter_map(|e| match &e.event {
+            AgentEvent::AutoRetryStart { delay_ms, .. } => Some(*delay_ms),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        delays,
+        vec![0],
+        "a hintless rate limit must fall back to the configured backoff"
+    );
+    Ok(())
+}
+
 // --- #10: stalled stream surfaces an inactivity timeout ---------------
 
 #[tokio::test]

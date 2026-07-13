@@ -412,7 +412,7 @@ async fn mid_stream_rate_limit_retries_then_succeeds() -> Result<()> {
     let stores = Stores::new();
     let first = TurnScript::text("ignored").fail_after(
         0,
-        StreamErrorKind::RateLimited,
+        StreamErrorKind::RateLimited(None),
         "429 before any token",
     );
     let second = TurnScript::text("after backoff");
@@ -429,6 +429,35 @@ async fn mid_stream_rate_limit_retries_then_succeeds() -> Result<()> {
         .list_by_task(&acquire_existing_task_id(&stores).await?)
         .await?;
     assert_eq!(attempts.len(), 2, "one rate-limited attempt + one success");
+
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn mid_stream_rate_limit_waits_for_the_provider_hint() -> Result<()> {
+    // The exponential schedule caps at 8s; a 30s server hint must win, so the
+    // worker does not retry into a guaranteed second 429.
+    let stores = Stores::new();
+    let first = TurnScript::text("ignored").fail_after(
+        0,
+        StreamErrorKind::RateLimited(Some(std::time::Duration::from_secs(30))),
+        "429 with Retry-After: 30",
+    );
+    let second = TurnScript::text("after the hint");
+    let provider = StreamingScriptedProvider::new(vec![first, second]);
+
+    let started = tokio::time::Instant::now();
+    let outcome = run_turn(&stores, &provider).await?;
+    let waited = started.elapsed();
+
+    let RootTurnOutcome::Completed { response_text, .. } = outcome else {
+        panic!("expected Completed after rate-limit retry");
+    };
+    assert_eq!(response_text, "after the hint");
+    assert!(
+        waited >= std::time::Duration::from_secs(30),
+        "the retry must wait out the server's hint, waited {waited:?}"
+    );
 
     Ok(())
 }

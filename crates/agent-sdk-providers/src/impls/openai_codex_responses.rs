@@ -525,6 +525,9 @@ impl LlmProvider for OpenAICodexResponsesProvider {
         );
 
         if status == StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = retry_after.or_else(|| {
+                crate::retry_hints::openai_retry_delay(&String::from_utf8_lossy(&bytes))
+            });
             return Ok(ChatOutcome::RateLimited(retry_after));
         }
 
@@ -1088,13 +1091,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                     if let Some((status, message)) =
                                         parse_wrapped_websocket_error_event(&text)
                                     {
-                                        let kind = if status == StatusCode::TOO_MANY_REQUESTS {
-                                            StreamErrorKind::RateLimited
-                                        } else if status.is_server_error() {
-                                            StreamErrorKind::ServerError
-                                        } else {
-                                            StreamErrorKind::InvalidRequest
-                                        };
+                                        let kind = websocket_error_kind(status, &message);
                                         if emitted_output {
                                             reset_websocket_connection(&mut websocket_session);
                                             yield Ok(StreamDelta::Error {
@@ -1310,13 +1307,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                         if let Some((status, message)) =
                                             parse_wrapped_websocket_error_event(&text)
                                         {
-                                            let kind = if status == StatusCode::TOO_MANY_REQUESTS {
-                                                StreamErrorKind::RateLimited
-                                            } else if status.is_server_error() {
-                                                StreamErrorKind::ServerError
-                                            } else {
-                                                StreamErrorKind::InvalidRequest
-                                            };
+                                            let kind = websocket_error_kind(status, &message);
                                             if emitted_output {
                                                 reset_websocket_connection(&mut websocket_session);
                                                 yield Ok(StreamDelta::Error {
@@ -1612,9 +1603,13 @@ impl LlmProvider for OpenAICodexResponsesProvider {
 
             let status = response.status();
             if !status.is_success() {
+                // Headers are read before the body: `text()` consumes the response.
+                let header_hint = crate::http::retry_after_from_headers(response.headers());
                 let body = response.text().await.unwrap_or_default();
                 let kind = if status == StatusCode::TOO_MANY_REQUESTS {
-                    StreamErrorKind::RateLimited
+                    StreamErrorKind::RateLimited(
+                        header_hint.or_else(|| crate::retry_hints::openai_retry_delay(&body)),
+                    )
                 } else if status.is_server_error() {
                     StreamErrorKind::ServerError
                 } else {
@@ -2646,6 +2641,20 @@ fn parse_wrapped_websocket_error_event(payload: &str) -> Option<(StatusCode, Str
         None
     } else {
         Some((status, message))
+    }
+}
+
+/// Classify a wrapped websocket error event by the status it reports.
+///
+/// The websocket frame carries no HTTP headers, so a rate limit's retry delay
+/// can only come from the error message itself ("Please try again in 20s").
+fn websocket_error_kind(status: StatusCode, message: &str) -> StreamErrorKind {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        StreamErrorKind::RateLimited(crate::retry_hints::openai_retry_delay(message))
+    } else if status.is_server_error() {
+        StreamErrorKind::ServerError
+    } else {
+        StreamErrorKind::InvalidRequest
     }
 }
 

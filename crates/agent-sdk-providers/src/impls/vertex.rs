@@ -404,7 +404,11 @@ impl VertexProvider {
         );
 
         if status == StatusCode::TOO_MANY_REQUESTS {
-            return Ok(ChatOutcome::RateLimited(retry_after));
+            let body = String::from_utf8_lossy(&bytes);
+            return Ok(ChatOutcome::RateLimited(vertex_retry_delay(
+                retry_after,
+                &body,
+            )));
         }
 
         if status.is_server_error() {
@@ -564,9 +568,11 @@ impl VertexProvider {
 
         let status = response.status();
         if !status.is_success() {
+            // Headers are read before the body: `text()` consumes the response.
+            let header_hint = crate::http::retry_after_from_headers(response.headers());
             let body = response.text().await.unwrap_or_default();
             let kind = if status == StatusCode::TOO_MANY_REQUESTS {
-                StreamErrorKind::RateLimited
+                StreamErrorKind::RateLimited(vertex_retry_delay(header_hint, &body))
             } else if status.is_server_error() {
                 StreamErrorKind::ServerError
             } else {
@@ -581,6 +587,43 @@ impl VertexProvider {
 
         Ok(response)
     }
+}
+
+/// Resolve the retry delay a Vertex 429 carries: the `Retry-After` header
+/// first, then a `google.rpc.RetryInfo` detail in the error body.
+///
+/// Vertex quota rejections come from Google's front end for every model family,
+/// so a Claude 429 can carry the same `RetryInfo` detail a Gemini one does.
+fn vertex_retry_delay(
+    header_hint: Option<std::time::Duration>,
+    body: &str,
+) -> Option<std::time::Duration> {
+    header_hint.or_else(|| crate::retry_hints::google_retry_delay(body))
+}
+
+/// Classify a non-success status from the Vertex Claude endpoint into an early
+/// [`ChatOutcome`], or `None` when the body should be parsed as a response.
+fn classify_vertex_claude_status(
+    status: StatusCode,
+    bytes: &[u8],
+    header_hint: Option<std::time::Duration>,
+) -> Option<ChatOutcome> {
+    let body = String::from_utf8_lossy(bytes);
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return Some(ChatOutcome::RateLimited(vertex_retry_delay(
+            header_hint,
+            &body,
+        )));
+    }
+    if status.is_server_error() {
+        log::error!("Vertex AI (Claude) server error status={status} body={body}");
+        return Some(ChatOutcome::ServerError(body.into_owned()));
+    }
+    if status.is_client_error() {
+        log::warn!("Vertex AI (Claude) client error status={status} body={body}");
+        return Some(ChatOutcome::InvalidRequest(body.into_owned()));
+    }
+    None
 }
 
 /// Build the Gemini `system_instruction` content from the request system prompt,
@@ -701,20 +744,8 @@ impl VertexProvider {
             bytes.len()
         );
 
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            return Ok(ChatOutcome::RateLimited(retry_after));
-        }
-
-        if status.is_server_error() {
-            let body = String::from_utf8_lossy(&bytes);
-            log::error!("Vertex AI (Claude) server error status={status} body={body}");
-            return Ok(ChatOutcome::ServerError(body.into_owned()));
-        }
-
-        if status.is_client_error() {
-            let body = String::from_utf8_lossy(&bytes);
-            log::warn!("Vertex AI (Claude) client error status={status} body={body}");
-            return Ok(ChatOutcome::InvalidRequest(body.into_owned()));
+        if let Some(outcome) = classify_vertex_claude_status(status, &bytes, retry_after) {
+            return Ok(outcome);
         }
 
         let api_response: anthropic_data::ApiResponse = serde_json::from_slice(&bytes)
@@ -822,9 +853,13 @@ impl VertexProvider {
             let status = response.status();
 
             if status == StatusCode::TOO_MANY_REQUESTS {
+                // Headers are read before the body: `text()` consumes the response.
+                let header_hint = crate::http::retry_after_from_headers(response.headers());
+                let body = response.text().await.unwrap_or_default();
+                log::warn!("Vertex AI (Claude) rate limited status={status} body={body}");
                 yield Ok(StreamDelta::Error {
                     message: "Rate limited".to_string(),
-                    kind: StreamErrorKind::RateLimited,
+                    kind: StreamErrorKind::RateLimited(vertex_retry_delay(header_hint, &body)),
                 });
                 return;
             }

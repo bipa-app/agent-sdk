@@ -508,7 +508,10 @@ where
                 }
                 return (LlmOutcome::Response(response), attempt);
             }
-            Err(StreamError::Recoverable(msg)) => {
+            Err(StreamError::Recoverable {
+                message: msg,
+                retry_after,
+            }) => {
                 attempt += 1;
                 if attempt > max_retries {
                     error!("Streaming error after {max_retries} retries: {msg}");
@@ -520,7 +523,12 @@ where
                     }
                     return (LlmOutcome::Error(AgentError::new(err_msg, true)), attempt);
                 }
-                let delay = calculate_backoff_delay(attempt, &config.retry);
+                // A provider `Retry-After` hint wins over the exponential
+                // backoff, clamped so an oversized hint cannot stall the turn.
+                let delay = retry_after.map_or_else(
+                    || calculate_backoff_delay(attempt, &config.retry),
+                    |hint| clamp_to_max_delay(hint, config.retry.max_delay_ms),
+                );
                 warn!(
                     "Streaming error, retrying (attempt={attempt}, delay_ms={}, error={msg})",
                     delay.as_millis()
@@ -625,9 +633,10 @@ where
                     if let Some(observer) = span_observer.as_mut() {
                         observer.record_dropped("inactivity_timeout", delta_count, "stream_error");
                     }
-                    return Err(StreamError::Recoverable(
-                        "stream inactivity timeout: no frame within deadline".to_string(),
-                    ));
+                    return Err(StreamError::Recoverable {
+                        message: "stream inactivity timeout: no frame within deadline".to_string(),
+                        retry_after: None,
+                    });
                 }
             },
         };
@@ -644,7 +653,10 @@ where
                 if let Some(observer) = span_observer.as_mut() {
                     observer.record_dropped("recoverable_error", delta_count, "stream_error");
                 }
-                return Err(StreamError::Recoverable(format!("Stream error: {e}")));
+                return Err(StreamError::Recoverable {
+                    message: format!("Stream error: {e}"),
+                    retry_after: None,
+                });
             }
         };
 
@@ -855,7 +867,10 @@ where
                 observer.record_dropped(reason, delta_count, stream_error_kind_attr(*kind));
             }
             return Some(if recoverable {
-                StreamError::Recoverable(message.clone())
+                StreamError::Recoverable {
+                    message: message.clone(),
+                    retry_after: kind.retry_after(),
+                }
             } else {
                 StreamError::Fatal(message.clone())
             });
@@ -872,7 +887,7 @@ where
 #[cfg(feature = "otel")]
 const fn stream_error_kind_attr(kind: crate::llm::StreamErrorKind) -> &'static str {
     match kind {
-        crate::llm::StreamErrorKind::RateLimited => "rate_limited",
+        crate::llm::StreamErrorKind::RateLimited(_) => "rate_limited",
         crate::llm::StreamErrorKind::ServerError => "server_error",
         crate::llm::StreamErrorKind::InvalidRequest => "invalid_request",
         // `StreamErrorKind` is `#[non_exhaustive]`; `Unknown` and any future

@@ -498,9 +498,13 @@ impl LlmProvider for OpenAIResponsesProvider {
             let status = response.status();
 
             if !status.is_success() {
+                // Headers are read before the body: `text()` consumes the response.
+                let header_hint = crate::http::retry_after_from_headers(response.headers());
                 let body = response.text().await.unwrap_or_default();
                 let kind = if status == StatusCode::TOO_MANY_REQUESTS {
-                    StreamErrorKind::RateLimited
+                    StreamErrorKind::RateLimited(
+                        header_hint.or_else(|| crate::retry_hints::openai_retry_delay(&body)),
+                    )
                 } else if status.is_server_error() {
                     StreamErrorKind::ServerError
                 } else {
@@ -1152,6 +1156,8 @@ fn classify_responses_status(
     retry_after: Option<std::time::Duration>,
 ) -> Option<ChatOutcome> {
     if status == StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = retry_after
+            .or_else(|| crate::retry_hints::openai_retry_delay(&String::from_utf8_lossy(bytes)));
         return Some(ChatOutcome::RateLimited(retry_after));
     }
     if status.is_server_error() {

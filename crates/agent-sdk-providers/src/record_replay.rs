@@ -362,6 +362,13 @@ enum CassetteDelta {
     Error {
         message: String,
         kind: CassetteErrorKind,
+        /// Retry delay a rate-limited error carried, in millis.
+        ///
+        /// A separate optional field rather than a payload on
+        /// [`CassetteErrorKind::RateLimited`] so cassettes recorded before
+        /// retry hints were captured still deserialize.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_ms: Option<u64>,
     },
 }
 
@@ -420,6 +427,7 @@ impl CassetteDelta {
             StreamDelta::Error { message, kind } => Self::Error {
                 message: message.clone(),
                 kind: CassetteErrorKind::from_kind(*kind),
+                retry_after_ms: kind.retry_after().map(millis_from_duration),
             },
         }
     }
@@ -467,9 +475,13 @@ impl CassetteDelta {
             },
             Self::Usage(usage) => StreamDelta::Usage(usage),
             Self::Done { stop_reason } => StreamDelta::Done { stop_reason },
-            Self::Error { message, kind } => StreamDelta::Error {
+            Self::Error {
                 message,
-                kind: kind.into_kind(),
+                kind,
+                retry_after_ms,
+            } => StreamDelta::Error {
+                message,
+                kind: kind.into_kind(retry_after_ms.map(Duration::from_millis)),
             },
         }
     }
@@ -486,7 +498,7 @@ enum CassetteErrorKind {
 impl CassetteErrorKind {
     const fn from_kind(kind: StreamErrorKind) -> Self {
         match kind {
-            StreamErrorKind::RateLimited => Self::RateLimited,
+            StreamErrorKind::RateLimited(_) => Self::RateLimited,
             StreamErrorKind::ServerError => Self::ServerError,
             StreamErrorKind::InvalidRequest => Self::InvalidRequest,
             // `StreamErrorKind` is `#[non_exhaustive]`.
@@ -494,9 +506,9 @@ impl CassetteErrorKind {
         }
     }
 
-    const fn into_kind(self) -> StreamErrorKind {
+    const fn into_kind(self, retry_after: Option<Duration>) -> StreamErrorKind {
         match self {
-            Self::RateLimited => StreamErrorKind::RateLimited,
+            Self::RateLimited => StreamErrorKind::RateLimited(retry_after),
             Self::ServerError => StreamErrorKind::ServerError,
             Self::InvalidRequest => StreamErrorKind::InvalidRequest,
             Self::Unknown => StreamErrorKind::Unknown,
@@ -864,5 +876,43 @@ mod tests {
                     "encrypted_content": "ciphertext"
                 })
         ));
+    }
+
+    #[test]
+    fn cassette_delta_round_trips_the_rate_limit_retry_hint() -> Result<()> {
+        let delta = StreamDelta::Error {
+            message: "Rate limited".to_owned(),
+            kind: StreamErrorKind::RateLimited(Some(Duration::from_secs(30))),
+        };
+
+        let recorded = CassetteDelta::from_delta(&delta);
+        let json = serde_json::to_string(&recorded)?;
+        let replayed = serde_json::from_str::<CassetteDelta>(&json)?.into_delta();
+
+        assert!(matches!(
+            replayed,
+            StreamDelta::Error {
+                kind: StreamErrorKind::RateLimited(Some(delay)),
+                ..
+            } if delay == Duration::from_secs(30)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn cassette_error_without_a_recorded_hint_replays_as_hintless() -> Result<()> {
+        // Cassettes recorded before retry hints existed carry no
+        // `retry_after_ms`; they must still deserialize.
+        let json = r#"{"Error":{"message":"Rate limited","kind":"RateLimited"}}"#;
+        let replayed = serde_json::from_str::<CassetteDelta>(json)?.into_delta();
+
+        assert!(matches!(
+            replayed,
+            StreamDelta::Error {
+                kind: StreamErrorKind::RateLimited(None),
+                ..
+            }
+        ));
+        Ok(())
     }
 }

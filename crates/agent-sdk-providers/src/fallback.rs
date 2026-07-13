@@ -388,7 +388,7 @@ mod tests {
             "primary",
             vec![Ok(StreamDelta::Error {
                 message: "rate limited".to_owned(),
-                kind: StreamErrorKind::RateLimited,
+                kind: StreamErrorKind::RateLimited(None),
             })],
         );
         let secondary = ScriptedProvider::streaming(

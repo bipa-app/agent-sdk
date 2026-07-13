@@ -145,10 +145,10 @@ pub trait LlmProvider: Send + Sync {
                             stop_reason: response.stop_reason,
                         });
                     }
-                    ChatOutcome::RateLimited(_) => {
+                    ChatOutcome::RateLimited(retry_after) => {
                         yield Ok(StreamDelta::Error {
                             message: "Rate limited".to_string(),
-                            kind: StreamErrorKind::RateLimited,
+                            kind: StreamErrorKind::RateLimited(retry_after),
                         });
                     }
                     ChatOutcome::InvalidRequest(msg) => {
@@ -356,9 +356,10 @@ pub async fn collect_stream(mut stream: StreamBox<'_>, model: String) -> Result<
     // category at the construction site.
     if let Some((message, kind)) = last_error {
         return Ok(match kind {
-            // The streaming error channel does not carry a `Retry-After`, so
-            // the reconstructed outcome reports no server-supplied delay.
-            StreamErrorKind::RateLimited => ChatOutcome::RateLimited(None),
+            // The rate-limit kind carries whatever retry hint the provider gave
+            // (header or error body), so the reconstructed outcome honours the
+            // server exactly like the non-streaming `chat()` path does.
+            StreamErrorKind::RateLimited(retry_after) => ChatOutcome::RateLimited(retry_after),
             StreamErrorKind::InvalidRequest => ChatOutcome::InvalidRequest(message),
             // `StreamErrorKind::ServerError`, plus the `#[non_exhaustive]`
             // catch-all (`Unknown` / future kinds): an unclassified error is
@@ -549,5 +550,99 @@ mod tests {
     fn thinking_for_forced_tool_is_a_noop_when_thinking_absent() {
         let forced = ToolChoice::Tool("respond".to_owned());
         assert!(thinking_for_forced_tool(None, Some(&forced)).is_none());
+    }
+
+    fn stream_of(deltas: Vec<StreamDelta>) -> StreamBox<'static> {
+        Box::pin(futures::stream::iter(deltas.into_iter().map(Ok)))
+    }
+
+    #[tokio::test]
+    async fn collect_stream_preserves_the_rate_limit_retry_hint() -> Result<()> {
+        let hint = std::time::Duration::from_secs(30);
+        let outcome = collect_stream(
+            stream_of(vec![StreamDelta::Error {
+                message: "Rate limited".to_owned(),
+                kind: StreamErrorKind::RateLimited(Some(hint)),
+            }]),
+            "test-model".to_owned(),
+        )
+        .await?;
+
+        assert!(
+            matches!(outcome, ChatOutcome::RateLimited(Some(delay)) if delay == hint),
+            "streamed Retry-After must survive reconstruction, got {outcome:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn collect_stream_reports_no_hint_when_the_provider_gave_none() -> Result<()> {
+        let outcome = collect_stream(
+            stream_of(vec![StreamDelta::Error {
+                message: "Rate limited".to_owned(),
+                kind: StreamErrorKind::RateLimited(None),
+            }]),
+            "test-model".to_owned(),
+        )
+        .await?;
+
+        assert!(
+            matches!(outcome, ChatOutcome::RateLimited(None)),
+            "a hintless rate limit must not invent a delay, got {outcome:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn default_chat_stream_carries_the_chat_retry_hint_into_the_error_delta() -> Result<()> {
+        // A provider that only implements `chat()` gets its streaming from the
+        // trait's default adapter; a rate limit's hint must not be lost there.
+        struct RateLimitedStub {
+            model: &'static str,
+        }
+
+        #[async_trait]
+        impl LlmProvider for RateLimitedStub {
+            async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+                Ok(ChatOutcome::RateLimited(Some(
+                    std::time::Duration::from_secs(12),
+                )))
+            }
+            fn model(&self) -> &str {
+                self.model
+            }
+            fn provider(&self) -> &'static str {
+                "stub"
+            }
+        }
+
+        let stub = RateLimitedStub {
+            model: "stub-model",
+        };
+        let request = ChatRequest::new("", vec![agent_sdk_foundation::llm::Message::user("hi")]);
+        let outcome =
+            collect_stream(Box::pin(stub.chat_stream(request)), "stub-model".to_owned()).await?;
+
+        assert!(
+            matches!(outcome, ChatOutcome::RateLimited(Some(delay))
+                if delay == std::time::Duration::from_secs(12)),
+            "default chat_stream must forward chat()'s Retry-After, got {outcome:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn collect_stream_maps_other_kinds_without_a_hint() -> Result<()> {
+        let outcome = collect_stream(
+            stream_of(vec![StreamDelta::Error {
+                message: "boom".to_owned(),
+                kind: StreamErrorKind::ServerError,
+            }]),
+            "test-model".to_owned(),
+        )
+        .await?;
+
+        assert!(matches!(outcome, ChatOutcome::ServerError(msg) if msg == "boom"));
+        Ok(())
     }
 }

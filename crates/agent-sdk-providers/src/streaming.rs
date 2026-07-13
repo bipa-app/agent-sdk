@@ -10,6 +10,7 @@ use bytes::BytesMut;
 use futures::Stream;
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::time::Duration;
 
 /// Upper bound on the block index [`StreamAccumulator`] will materialize.
 ///
@@ -175,7 +176,14 @@ pub enum StreamDelta {
 #[non_exhaustive]
 pub enum StreamErrorKind {
     /// Provider returned HTTP 429 / explicit rate-limit signal.
-    RateLimited,
+    ///
+    /// Carries the server-supplied retry delay when the provider gave one —
+    /// a `Retry-After` header, or a hint embedded in the error body (Gemini's
+    /// `google.rpc.RetryInfo`, `OpenAI`'s "try again in 20s"). `None` when the
+    /// provider supplied no usable hint (mid-stream rate-limit events, for
+    /// instance, arrive with no headers), in which case the caller falls back
+    /// to its own backoff schedule.
+    RateLimited(Option<Duration>),
     /// Provider returned HTTP 5xx, the connection dropped mid-stream,
     /// or the provider reported a transient runtime failure.
     ServerError,
@@ -200,7 +208,18 @@ impl StreamErrorKind {
     /// invalid-request is not.
     #[must_use]
     pub const fn is_recoverable(self) -> bool {
-        matches!(self, Self::RateLimited | Self::ServerError)
+        matches!(self, Self::RateLimited(_) | Self::ServerError)
+    }
+
+    /// The server-supplied retry delay carried by a rate-limit error, if any.
+    ///
+    /// `None` for every other kind — only a rate limit comes with a hint.
+    #[must_use]
+    pub const fn retry_after(self) -> Option<Duration> {
+        match self {
+            Self::RateLimited(retry_after) => retry_after,
+            _ => None,
+        }
     }
 }
 
