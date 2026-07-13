@@ -159,6 +159,14 @@
 //!   observable because the transition, the inserts, and the
 //!   index updates all run inside a single
 //!   `inner.write().await` scope.
+//! - [`AgentTaskStore::spawn_mixed_children`] is the same atomic
+//!   entry point for a batch that mixes durable subagent invocations
+//!   with tool-runtime children (an LLM coordinator turn routinely
+//!   emits both). It CAS-checks the parent once, materializes every
+//!   invocation / child-thread root / tool-runtime row, and parks the
+//!   parent on `N + M` children under one write lock — the union of
+//!   the two pure paths, with no partially-spawned batch on any
+//!   failure path.
 //! - [`AgentTaskStore::complete_task`] and
 //!   [`AgentTaskStore::fail_task`] drive a running child to its
 //!   terminal state (`Completed` / `Failed`) and, under the same
@@ -242,6 +250,143 @@ pub struct SubagentInvocationSpawn {
     /// [`crate::worker::subagent_spawn_selector::SubagentSpawnPlan::child_caller_metadata`]).
     /// `None` = child root has no caller metadata (prior behavior).
     pub child_caller_metadata: Option<serde_json::Value>,
+}
+
+/// One tool-runtime child inside a mixed batch
+/// ([`AgentTaskStore::spawn_mixed_children`]).
+///
+/// Carries an explicit `spawn_index` because a mixed batch's tool
+/// children do **not** occupy contiguous slots: the subagent entries
+/// hold some positions of the parent's `pending_tool_calls`, so the
+/// tool children fill the gaps. (In
+/// [`AgentTaskStore::spawn_tool_children`] the index is implicit —
+/// every slot is a tool child, in input order.)
+#[derive(Clone, Debug)]
+pub struct ToolChildSpawn {
+    /// Index into the shared suspension's `pending_tool_calls` that
+    /// this child resolves.
+    pub spawn_index: u32,
+    /// Per-child retry budget, same contract as
+    /// [`AgentTaskStore::spawn_tool_children`].
+    pub spec: ChildSpawnSpec,
+}
+
+/// Input struct for [`AgentTaskStore::spawn_mixed_children`].
+///
+/// The subagent entries reuse [`SubagentInvocationSpawn`] so the
+/// invocation rows are byte-identical to the ones
+/// [`AgentTaskStore::spawn_subagent_batch`] persists; their per-entry
+/// `payload` field is ignored in favour of the shared [`Self::payload`]
+/// (one parent suspension covers the whole batch).
+#[derive(Clone, Debug)]
+pub struct MixedChildrenSpawn {
+    /// Durable subagent invocations to persist, in input order.
+    pub subagents: Vec<SubagentInvocationSpawn>,
+    /// Tool-runtime children to persist, in input order.
+    pub tool_children: Vec<ToolChildSpawn>,
+    /// The one parent suspension shared by every child in the batch.
+    pub payload: SuspensionPayload,
+    /// Trace parent stamped on the tool children (subagent invocations
+    /// inherit the parent's traceparent through
+    /// [`AgentTask::new_subagent_invocation`]).
+    pub child_otel_traceparent: Option<String>,
+}
+
+/// Rows persisted by a successful [`AgentTaskStore::spawn_mixed_children`].
+#[derive(Clone, Debug)]
+pub struct SpawnedMixedChildren {
+    /// Parent post-transition: `WaitingOnChildren` with
+    /// `pending_child_count == subagents.len() + tool_children.len()`.
+    pub parent: AgentTask,
+    /// `(invocation, child_root)` per subagent entry, in input order.
+    pub subagents: Vec<(AgentTask, AgentTask)>,
+    /// One [`TaskKind::ToolRuntime`] child per tool entry, in input order.
+    pub tool_children: Vec<AgentTask>,
+}
+
+/// Validate a mixed batch against the shared suspension envelope.
+///
+/// Every backend runs this before materializing a single row, so the
+/// in-memory, `SQLite`, and `PostgreSQL` implementations reject exactly
+/// the same inputs with the same message.
+///
+/// The slot-coverage rule is the load-bearing one: the resume path maps
+/// children back to tool calls positionally
+/// ([`crate::worker::aggregate_child_outcomes`]) and fails if any
+/// `pending_tool_calls` slot has no child. A mixed batch that left a
+/// slot uncovered — or double-covered it — would therefore park the
+/// parent on a fan-in it can never complete.
+///
+/// # Errors
+/// - `spawn rejected: mixed batch requires at least one subagent`
+/// - `spawn rejected: mixed batch requires at least one tool child`
+/// - `spawn rejected: spawn_index ... out of bounds ...`
+/// - `spawn rejected: duplicate spawn_index ... in mixed batch`
+/// - `spawn rejected: mixed batch covers ... of ... pending tool calls`
+pub fn validate_mixed_children_spawn(spawn: &MixedChildrenSpawn) -> Result<()> {
+    if spawn.subagents.is_empty() {
+        return Err(anyhow!(
+            "spawn rejected: mixed batch requires at least one subagent"
+        ));
+    }
+    if spawn.tool_children.is_empty() {
+        return Err(anyhow!(
+            "spawn rejected: mixed batch requires at least one tool child"
+        ));
+    }
+
+    let pending = spawn.payload.continuation.payload.pending_tool_calls.len();
+    let indices = spawn
+        .subagents
+        .iter()
+        .map(|entry| entry.spawn_index)
+        .chain(spawn.tool_children.iter().map(|child| child.spawn_index));
+
+    let mut seen: BTreeSet<u32> = BTreeSet::new();
+    for index in indices {
+        let slot = usize::try_from(index).context("spawn rejected: spawn_index exceeds usize")?;
+        if slot >= pending {
+            return Err(anyhow!(
+                "spawn rejected: spawn_index {slot} out of bounds for {pending} pending tool calls"
+            ));
+        }
+        if !seen.insert(index) {
+            return Err(anyhow!(
+                "spawn rejected: duplicate spawn_index {index} in mixed batch"
+            ));
+        }
+    }
+
+    if seen.len() != pending {
+        let covered = seen.len();
+        return Err(anyhow!(
+            "spawn rejected: mixed batch covers {covered} of {pending} pending tool calls"
+        ));
+    }
+    Ok(())
+}
+
+/// Build one [`TaskKind::ToolRuntime`] child row for a mixed batch.
+///
+/// Same shape [`AgentTaskStore::spawn_tool_children`] produces, except
+/// the `spawn_index` comes from the caller rather than the input
+/// position — see [`ToolChildSpawn`]. Shared by every backend so the
+/// three implementations cannot drift on child construction.
+///
+/// # Errors
+/// Schema errors from [`AgentTask::new_child`].
+pub fn new_mixed_tool_child(
+    parent: &AgentTask,
+    tool: &ToolChildSpawn,
+    child_otel_traceparent: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<AgentTask> {
+    let mut child =
+        AgentTask::new_child(parent, TaskKind::ToolRuntime, now, tool.spec.max_attempts)
+            .context("spawn rejected: new_child failed")?;
+    child.spawn_index = Some(tool.spawn_index);
+    child.otel_traceparent = child_otel_traceparent.map(ToOwned::to_owned);
+    Ok(child)
 }
 
 /// The idempotency key a [`AgentTaskStore::submit_root_turn_idempotent`]
@@ -1289,6 +1434,52 @@ pub trait AgentTaskStore: Send + Sync {
         payload: SuspensionPayload,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Vec<(AgentTask, AgentTask)>)>;
+
+    /// Atomically persist a **mixed** batch — N durable subagent
+    /// invocations plus M tool-runtime children — under one parent
+    /// transition.
+    ///
+    /// This is the primitive behind a coordinator turn that emits
+    /// subagent calls alongside ordinary tool calls (an LLM routinely
+    /// mixes both in one response). It is the union of
+    /// [`AgentTaskStore::spawn_subagent_batch`] and
+    /// [`AgentTaskStore::spawn_tool_children`], not a new contract:
+    ///
+    /// 1. CAS-checks the running parent against `(worker, lease)` —
+    ///    same envelope as both pure paths.
+    /// 2. Allocates one invocation task + one child-thread `root_turn`
+    ///    task per [`MixedChildrenSpawn::subagents`] entry, with the
+    ///    same durable linkage `spawn_subagent_batch` persists.
+    /// 3. Allocates one [`TaskKind::ToolRuntime`] child per
+    ///    [`MixedChildrenSpawn::tool_children`] entry, each stamped with
+    ///    its caller-supplied `spawn_index`.
+    /// 4. Transitions the parent to [`TaskStatus::WaitingOnChildren`]
+    ///    with `pending_child_count = N + M` and every invocation /
+    ///    tool-child id as its child-wait targets.
+    ///
+    /// Every row is committed in one store mutation: on any failure
+    /// path nothing is persisted, so a rejected mixed batch never
+    /// leaves half a fan-out behind.
+    ///
+    /// The spawn indices of the two groups must together cover the
+    /// shared suspension's `pending_tool_calls` exactly once each — see
+    /// [`validate_mixed_children_spawn`], which every backend runs first.
+    ///
+    /// Callers must materialize each subagent child thread before
+    /// invoking this method (same contract as `spawn_subagent_batch`).
+    ///
+    /// # Errors
+    /// Same CAS, leaf-parent, duplicate-child-thread, and duplicate-id
+    /// envelope as [`AgentTaskStore::spawn_subagent_batch`], plus every
+    /// [`validate_mixed_children_spawn`] rejection.
+    async fn spawn_mixed_children(
+        &self,
+        parent_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        spawn: MixedChildrenSpawn,
+        now: OffsetDateTime,
+    ) -> Result<SpawnedMixedChildren>;
 
     /// Find the parked [`TaskKind::Subagent`] invocation whose durable
     /// [`crate::journal::TaskState::SubagentInvocation`] linkage points
@@ -2444,6 +2635,33 @@ impl Inner {
             prepared.push((invocation, child_root));
         }
         Ok((prepared, child_ids))
+    }
+
+    /// Materialize the tool-runtime child row for every entry in a
+    /// mixed batch.
+    ///
+    /// Mutates **nothing** in `self` — same contract as
+    /// [`Self::build_batch_invocation_pairs`], so a collision on entry K
+    /// leaves the store untouched.
+    fn build_mixed_tool_children(
+        &self,
+        old_parent: &AgentTask,
+        tool_children: &[ToolChildSpawn],
+        child_otel_traceparent: Option<&str>,
+        now: OffsetDateTime,
+    ) -> Result<Vec<AgentTask>> {
+        let mut children: Vec<AgentTask> = Vec::with_capacity(tool_children.len());
+        for tool in tool_children {
+            let child = new_mixed_tool_child(old_parent, tool, child_otel_traceparent, now)?;
+            if self.by_id.contains_key(&child.id)
+                || children.iter().any(|existing| existing.id == child.id)
+            {
+                let id = &child.id;
+                return Err(anyhow!("spawn rejected: child id {id} already exists"));
+            }
+            children.push(child);
+        }
+        Ok(children)
     }
 }
 
@@ -3701,6 +3919,75 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
 
         drop(inner);
         Ok((new_parent, prepared))
+    }
+
+    async fn spawn_mixed_children(
+        &self,
+        parent_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        spawn: MixedChildrenSpawn,
+        now: OffsetDateTime,
+    ) -> Result<SpawnedMixedChildren> {
+        validate_mixed_children_spawn(&spawn)?;
+        let MixedChildrenSpawn {
+            subagents,
+            tool_children,
+            payload,
+            child_otel_traceparent,
+        } = spawn;
+
+        let mut inner = self.inner.write().await;
+
+        let old_parent = inner.validate_running_owned_non_leaf_parent(parent_id, worker, lease)?;
+        inner.validate_batch_thread_uniqueness(&subagents)?;
+
+        // Materialize every row — invocation pairs and tool children —
+        // before touching a single index, so a schema error or an id
+        // collision anywhere in the batch leaves the store untouched.
+        let (prepared, mut child_ids) =
+            inner.build_batch_invocation_pairs(&old_parent, subagents, now)?;
+        let tool_rows = inner.build_mixed_tool_children(
+            &old_parent,
+            &tool_children,
+            child_otel_traceparent.as_deref(),
+            now,
+        )?;
+        child_ids.extend(tool_rows.iter().map(|child| child.id.clone()));
+
+        let child_count =
+            u32::try_from(child_ids.len()).context("spawn rejected: child count exceeds u32")?;
+        let new_parent = old_parent
+            .clone()
+            .wait_on_children(child_count, payload, child_ids, now)
+            .context("spawn rejected: wait_on_children transition failed")?;
+
+        // All validation passed — apply mutations.
+        inner.rebalance_after_row_change(&old_parent, &new_parent);
+        inner
+            .by_id
+            .insert(new_parent.id.clone(), new_parent.clone());
+        for (invocation, child_root) in &prepared {
+            inner.add_to_indexes(invocation);
+            inner
+                .by_id
+                .insert(invocation.id.clone(), invocation.clone());
+            inner.add_to_indexes(child_root);
+            inner
+                .by_id
+                .insert(child_root.id.clone(), child_root.clone());
+        }
+        for child in &tool_rows {
+            inner.add_to_indexes(child);
+            inner.by_id.insert(child.id.clone(), child.clone());
+        }
+
+        drop(inner);
+        Ok(SpawnedMixedChildren {
+            parent: new_parent,
+            subagents: prepared,
+            tool_children: tool_rows,
+        })
     }
 
     async fn find_subagent_invocation_for_child_root(
@@ -8626,6 +8913,144 @@ mod tests {
             .await
             .context("get parent")?
             .context("parent exists")?;
+        assert_eq!(persisted.status, TaskStatus::Running);
+        assert!(store.list_children(&parent_id).await?.is_empty());
+
+        Ok(())
+    }
+
+    /// Continuation carrying `count` pending tool call slots — the
+    /// mixed primitive validates its spawn indices against this list.
+    fn continuation_with_slots(name: &str, count: usize) -> ContinuationEnvelope {
+        let mut continuation = sample_continuation(name);
+        continuation.payload.pending_tool_calls = (0..count)
+            .map(|idx| agent_sdk_foundation::PendingToolCallInfo {
+                id: format!("call_{idx}"),
+                name: format!("tool_{idx}"),
+                display_name: format!("Tool {idx}"),
+                tier: agent_sdk_foundation::ToolTier::Confirm,
+                input: serde_json::json!({}),
+                effective_input: serde_json::json!({}),
+                listen_context: None,
+            })
+            .collect();
+        continuation
+    }
+
+    fn mixed_spawn_for(
+        name: &str,
+        subagent_threads: Vec<ThreadId>,
+        tool_slots: &[u32],
+    ) -> MixedChildrenSpawn {
+        let slots = subagent_threads.len() + tool_slots.len();
+        let payload = SuspensionPayload {
+            continuation: continuation_with_slots(name, slots),
+            suspended_messages: Vec::new(),
+        };
+        let subagents = subagent_threads
+            .into_iter()
+            .enumerate()
+            .map(|(idx, child_thread_id)| SubagentInvocationSpawn {
+                child_thread_id,
+                spec: sample_subagent_spec(),
+                child_root_input: sample_subagent_input(),
+                spawn_index: u32::try_from(idx).unwrap_or_default(),
+                payload: payload.clone(),
+                child_caller_metadata: None,
+            })
+            .collect();
+        let tool_children = tool_slots
+            .iter()
+            .map(|slot| ToolChildSpawn {
+                spawn_index: *slot,
+                spec: ChildSpawnSpec::new(3),
+            })
+            .collect();
+        MixedChildrenSpawn {
+            subagents,
+            tool_children,
+            payload,
+            child_otel_traceparent: None,
+        }
+    }
+
+    /// The mixed primitive is not a substitute for the two pure paths: a
+    /// batch with no tool children belongs on `spawn_subagent_batch`, one
+    /// with no subagents on `spawn_tool_children`. Accepting either here
+    /// would silently duplicate a contract that already exists — and the
+    /// pure paths carry guarantees (e.g. `spawn_tool_children`'s implicit
+    /// contiguous indices) the mixed validation does not restate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_mixed_children_rejects_single_kind_batches() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-mixed-single-kind").await?;
+        let parent_id = parent.id.clone();
+
+        let mut subagents_only = mixed_spawn_for(
+            "t-mixed-single-kind",
+            vec![thread("t-mixed-single-kind-child")],
+            &[1],
+        );
+        subagents_only.tool_children.clear();
+        let err = store
+            .spawn_mixed_children(&parent_id, &worker, &lease, subagents_only, t_plus(2))
+            .await
+            .err()
+            .context("a subagent-only batch must be rejected")?;
+        assert!(
+            format!("{err:#}").contains("at least one tool child"),
+            "unexpected: {err:#}"
+        );
+
+        let mut tools_only =
+            mixed_spawn_for("t-mixed-single-kind", vec![thread("t-mixed-child-2")], &[1]);
+        tools_only.subagents.clear();
+        let err = store
+            .spawn_mixed_children(&parent_id, &worker, &lease, tools_only, t_plus(2))
+            .await
+            .err()
+            .context("a tool-only batch must be rejected")?;
+        assert!(
+            format!("{err:#}").contains("at least one subagent"),
+            "unexpected: {err:#}"
+        );
+
+        let persisted = store
+            .get(&parent_id)
+            .await?
+            .context("parent survives a rejected spawn")?;
+        assert_eq!(persisted.status, TaskStatus::Running);
+        assert!(store.list_children(&parent_id).await?.is_empty());
+
+        Ok(())
+    }
+
+    /// Two children claiming the same `pending_tool_calls` slot would
+    /// overwrite each other at fan-in time (the positional aggregation
+    /// keeps one result per slot), so the batch is rejected before any
+    /// row is written.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_mixed_children_rejects_duplicate_spawn_index() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-mixed-dup-slot").await?;
+        let parent_id = parent.id.clone();
+
+        // Subagent takes slot 0; the tool child claims slot 0 as well.
+        let spawn = mixed_spawn_for("t-mixed-dup-slot", vec![thread("t-mixed-dup-child")], &[0]);
+        let err = store
+            .spawn_mixed_children(&parent_id, &worker, &lease, spawn, t_plus(2))
+            .await
+            .err()
+            .context("a duplicated slot must be rejected")?;
+        assert!(
+            format!("{err:#}").contains("duplicate spawn_index"),
+            "unexpected: {err:#}"
+        );
+
+        let persisted = store
+            .get(&parent_id)
+            .await?
+            .context("parent survives a rejected spawn")?;
         assert_eq!(persisted.status, TaskStatus::Running);
         assert!(store.list_children(&parent_id).await?.is_empty());
 

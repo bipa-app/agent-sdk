@@ -60,8 +60,9 @@ use agent_server::journal::relay::{
 };
 use agent_server::journal::retention::{RetentionCursor, RetentionStore};
 use agent_server::journal::store::{
-    AgentTaskStore, CancelTreeOutcome, RequeueOutcome, SubagentInvocationSpawn,
-    SubmitRootIdempotency, SubmitRootTurnError, SubmitRootTurnOutcome, SubmitRootTurnParams,
+    AgentTaskStore, CancelTreeOutcome, MixedChildrenSpawn, RequeueOutcome, SpawnedMixedChildren,
+    SubagentInvocationSpawn, SubmitRootIdempotency, SubmitRootTurnError, SubmitRootTurnOutcome,
+    SubmitRootTurnParams, new_mixed_tool_child, validate_mixed_children_spawn,
 };
 use agent_server::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, SuspensionPayload,
@@ -2198,6 +2199,75 @@ async fn ensure_spawn_task_id_available_tx(
     Ok(())
 }
 
+/// Materialize the `(invocation, child_root)` pair for every subagent
+/// entry in a batch, validating cross-entry thread uniqueness and
+/// per-row availability inside the caller's transaction.
+///
+/// Shared by [`AgentTaskStore::spawn_subagent_batch`] and
+/// [`AgentTaskStore::spawn_mixed_children`] so the two paths cannot
+/// drift on invocation-row construction or on the lock order (parent
+/// task row first, then each child thread row).
+///
+/// Nothing is written here: the caller commits the rows only after the
+/// parent transition succeeds, so a rejection on entry K leaves the
+/// transaction free of partial fan-out.
+async fn prepare_subagent_batch_rows_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    old_parent: &AgentTask,
+    spawns: Vec<SubagentInvocationSpawn>,
+    now: OffsetDateTime,
+) -> Result<Vec<(AgentTask, AgentTask)>> {
+    let mut seen_thread_ids: std::collections::HashSet<&ThreadId> =
+        std::collections::HashSet::with_capacity(spawns.len());
+    for spawn in &spawns {
+        if !seen_thread_ids.insert(&spawn.child_thread_id) {
+            return Err(anyhow!(
+                "spawn rejected: duplicate child_thread_id {} in batch",
+                spawn.child_thread_id
+            ));
+        }
+    }
+
+    let mut prepared: Vec<(AgentTask, AgentTask)> = Vec::with_capacity(spawns.len());
+    for spawn in spawns {
+        let SubagentInvocationSpawn {
+            child_thread_id,
+            spec,
+            child_root_input,
+            payload: _per_entry_payload,
+            spawn_index,
+            child_caller_metadata,
+        } = spawn;
+        ensure_child_thread_available_for_spawn_tx(tx, &child_thread_id).await?;
+
+        let child_root = AgentTask::new_root_turn_with_optional_caller(
+            child_thread_id.clone(),
+            child_root_input,
+            child_caller_metadata,
+            now,
+            AgentTask::DEFAULT_MAX_ATTEMPTS,
+        );
+        ensure_spawn_task_id_available_tx(tx, &child_root.id, "child root").await?;
+
+        let invocation = AgentTask::new_subagent_invocation(
+            old_parent,
+            SubagentInvocationState {
+                spec,
+                child_thread_id,
+                child_root_task_id: child_root.id.clone(),
+            },
+            spawn_index,
+            now,
+            AgentTask::DEFAULT_MAX_ATTEMPTS,
+        )
+        .context("spawn rejected: new_subagent_invocation failed")?;
+        ensure_spawn_task_id_available_tx(tx, &invocation.id, "invocation").await?;
+
+        prepared.push((invocation, child_root));
+    }
+    Ok(prepared)
+}
+
 #[async_trait]
 impl AgentTaskStore for PostgresDurableStore {
     async fn insert(&self, task: AgentTask) -> Result<()> {
@@ -3453,57 +3523,11 @@ FOR UPDATE SKIP LOCKED
             .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
         validate_subagent_spawn_parent(&old_parent, parent_id, worker, lease)?;
 
-        // Cross-entry uniqueness — same rule as the SQLite + InMemory impls.
-        let mut seen_thread_ids: std::collections::HashSet<&ThreadId> =
-            std::collections::HashSet::with_capacity(spawns.len());
-        for spawn in &spawns {
-            if !seen_thread_ids.insert(&spawn.child_thread_id) {
-                return Err(anyhow!(
-                    "spawn rejected: duplicate child_thread_id {} in batch",
-                    spawn.child_thread_id
-                ));
-            }
-        }
-
-        let mut prepared: Vec<(AgentTask, AgentTask)> = Vec::with_capacity(spawns.len());
-        let mut child_ids: Vec<AgentTaskId> = Vec::with_capacity(spawns.len());
-        for spawn in spawns {
-            let SubagentInvocationSpawn {
-                child_thread_id,
-                spec,
-                child_root_input,
-                payload: _per_entry_payload,
-                spawn_index,
-                child_caller_metadata,
-            } = spawn;
-            ensure_child_thread_available_for_spawn_tx(&mut tx, &child_thread_id).await?;
-
-            let child_root = AgentTask::new_root_turn_with_optional_caller(
-                child_thread_id.clone(),
-                child_root_input,
-                child_caller_metadata,
-                now,
-                AgentTask::DEFAULT_MAX_ATTEMPTS,
-            );
-            ensure_spawn_task_id_available_tx(&mut tx, &child_root.id, "child root").await?;
-
-            let invocation = AgentTask::new_subagent_invocation(
-                &old_parent,
-                SubagentInvocationState {
-                    spec,
-                    child_thread_id,
-                    child_root_task_id: child_root.id.clone(),
-                },
-                spawn_index,
-                now,
-                AgentTask::DEFAULT_MAX_ATTEMPTS,
-            )
-            .context("spawn rejected: new_subagent_invocation failed")?;
-            ensure_spawn_task_id_available_tx(&mut tx, &invocation.id, "invocation").await?;
-
-            child_ids.push(invocation.id.clone());
-            prepared.push((invocation, child_root));
-        }
+        let prepared = prepare_subagent_batch_rows_tx(&mut tx, &old_parent, spawns, now).await?;
+        let child_ids: Vec<AgentTaskId> = prepared
+            .iter()
+            .map(|(invocation, _)| invocation.id.clone())
+            .collect();
 
         let child_count =
             u32::try_from(prepared.len()).context("spawn rejected: child count exceeds u32")?;
@@ -3518,6 +3542,70 @@ FOR UPDATE SKIP LOCKED
         }
         tx.commit().await.context("commit spawn_subagent_batch")?;
         Ok((new_parent, prepared))
+    }
+
+    async fn spawn_mixed_children(
+        &self,
+        parent_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        spawn: MixedChildrenSpawn,
+        now: OffsetDateTime,
+    ) -> Result<SpawnedMixedChildren> {
+        validate_mixed_children_spawn(&spawn)?;
+        let MixedChildrenSpawn {
+            subagents,
+            tool_children,
+            payload,
+            child_otel_traceparent,
+        } = spawn;
+
+        let mut tx = self.begin().await?;
+
+        // Lock order matches `spawn_subagent_batch`: the parent task row
+        // first, then each child thread row. Diverging here would let a
+        // mixed spawn and a pure fan-out deadlock against each other.
+        let old_parent = Self::load_task_tx(&mut tx, parent_id, true)
+            .await?
+            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
+        validate_subagent_spawn_parent(&old_parent, parent_id, worker, lease)?;
+
+        let prepared = prepare_subagent_batch_rows_tx(&mut tx, &old_parent, subagents, now).await?;
+
+        let mut tool_rows: Vec<AgentTask> = Vec::with_capacity(tool_children.len());
+        for tool in &tool_children {
+            let child =
+                new_mixed_tool_child(&old_parent, tool, child_otel_traceparent.as_deref(), now)?;
+            ensure_spawn_task_id_available_tx(&mut tx, &child.id, "child").await?;
+            tool_rows.push(child);
+        }
+
+        let mut child_ids: Vec<AgentTaskId> = prepared
+            .iter()
+            .map(|(invocation, _)| invocation.id.clone())
+            .collect();
+        child_ids.extend(tool_rows.iter().map(|child| child.id.clone()));
+
+        let child_count =
+            u32::try_from(child_ids.len()).context("spawn rejected: child count exceeds u32")?;
+        let new_parent = old_parent
+            .clone()
+            .wait_on_children(child_count, payload, child_ids, now)
+            .context("spawn rejected: wait_on_children transition failed")?;
+        Self::update_task_tx(&mut tx, &new_parent).await?;
+        for (invocation, child_root) in &prepared {
+            Self::insert_task_tx(&mut tx, invocation).await?;
+            Self::insert_task_tx(&mut tx, child_root).await?;
+        }
+        for child in &tool_rows {
+            Self::insert_task_tx(&mut tx, child).await?;
+        }
+        tx.commit().await.context("commit spawn_mixed_children")?;
+        Ok(SpawnedMixedChildren {
+            parent: new_parent,
+            subagents: prepared,
+            tool_children: tool_rows,
+        })
     }
 
     async fn find_subagent_invocation_for_child_root(

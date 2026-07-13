@@ -41,8 +41,8 @@ use crate::journal::message_store::MessageProjectionStore;
 use crate::journal::task::SubmittedInputItem;
 use crate::journal::{
     AgentTask, AgentTaskId, AgentTaskStore, CommittedEvent, EventRepository, LeaseId,
-    SubagentInvocationSpawn, SuspensionPayload, TaskKind, TaskStatus, Thread, ThreadStore,
-    WorkerId,
+    MixedChildrenSpawn, SpawnedMixedChildren, SubagentInvocationSpawn, SuspensionPayload, TaskKind,
+    TaskStatus, Thread, ThreadStore, ToolChildSpawn, WorkerId,
 };
 
 /// Typed durable request to spawn a subagent.
@@ -1738,6 +1738,166 @@ pub async fn spawn_subagent_batch_invocations(
     Ok(SpawnedSubagentBatch {
         parent_task,
         invocations,
+    })
+}
+
+/// Records returned by [`spawn_mixed_children_invocations`].
+#[derive(Debug)]
+pub struct SpawnedMixedBatch {
+    /// Parent task post-transition (`WaitingOnChildren`, with
+    /// `pending_child_count == invocations.len() + tool_children.len()`).
+    pub parent_task: AgentTask,
+    /// One persisted invocation + child thread per subagent entry, in
+    /// input order.
+    pub invocations: Vec<SpawnedSubagentInvocation>,
+    /// One persisted [`TaskKind::ToolRuntime`] child per tool entry, in
+    /// input order.
+    pub tool_children: Vec<AgentTask>,
+}
+
+/// Inputs for [`spawn_mixed_children_invocations`].
+///
+/// `subagents` and `tool_children` partition the shared suspension's
+/// `pending_tool_calls`: together their spawn indices must name every
+/// slot exactly once (the store enforces this before it writes a row).
+pub struct MixedChildrenRequest {
+    /// Durable subagent invocations to persist, in input order.
+    pub subagents: Vec<SubagentBatchEntry>,
+    /// Tool-runtime children to persist, in input order.
+    pub tool_children: Vec<ToolChildSpawn>,
+    /// The one parent suspension shared by every child in the batch.
+    pub payload: SuspensionPayload,
+    /// Trace parent stamped on the tool children so their
+    /// `execute_tool` spans nest under the turn's root span.
+    pub child_otel_traceparent: Option<String>,
+}
+
+/// Persist a mixed batch — N durable subagent invocations plus M
+/// tool-runtime children — atomically under one parent transition.
+///
+/// This is the routing primitive for the common coordinator turn that
+/// emits subagent calls alongside ordinary tool calls. Validation,
+/// child-thread materialization, and parent-progress emission for the
+/// subagent half match [`spawn_subagent_batch_invocations`] exactly;
+/// the tool half is persisted by the same store call, so the parent
+/// parks on `N + M` children in a single CAS and no partially-spawned
+/// batch is observable on any failure path.
+///
+/// Every entry's `child_thread_id` must be pre-allocated by the caller
+/// and reused across retries (same idempotency contract as
+/// [`spawn_subagent_invocation`]).
+///
+/// # Errors
+///
+/// Returns an error if either half is empty (a batch with no subagents
+/// belongs on `spawn_tool_children`, one with no tool children on
+/// `spawn_subagent_batch_invocations`), if the spawn indices do not
+/// cover the shared continuation's `pending_tool_calls` exactly once
+/// each, if any targeted subagent tool call is not Confirm-tier, if
+/// child-thread materialization fails, if the store rejects the batch
+/// (CAS, leaf-parent, duplicate child thread, duplicate id), or if the
+/// durable linkage returned by the store is inconsistent.
+pub async fn spawn_mixed_children_invocations(
+    parent_id: &AgentTaskId,
+    worker: &WorkerId,
+    lease: &LeaseId,
+    request: MixedChildrenRequest,
+    deps: &SubagentInvocationDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<SpawnedMixedBatch> {
+    let MixedChildrenRequest {
+        mut subagents,
+        tool_children,
+        payload,
+        child_otel_traceparent,
+    } = request;
+    ensure!(
+        !subagents.is_empty(),
+        "mixed batch must carry at least one subagent"
+    );
+    ensure!(
+        !tool_children.is_empty(),
+        "mixed batch must carry at least one tool child"
+    );
+
+    // Validate every subagent entry against the shared continuation
+    // envelope before materializing any child thread — one bad
+    // spawn_index must reject the whole batch, not orphan N-1 threads.
+    let pending_tools_by_entry = validate_batch_spawns(&payload, &subagents)?;
+    let child_threads = materialize_batch_child_threads(&mut subagents, deps, now).await?;
+
+    let spawns: Vec<SubagentInvocationSpawn> = subagents
+        .into_iter()
+        .map(|entry| SubagentInvocationSpawn {
+            child_thread_id: entry.child_thread_id,
+            spec: entry.spec,
+            child_root_input: entry.child_root_input,
+            spawn_index: entry.spawn_index,
+            child_caller_metadata: entry.child_caller_metadata,
+            payload: payload.clone(),
+        })
+        .collect();
+
+    let spawned = deps
+        .task_store
+        .spawn_mixed_children(
+            parent_id,
+            worker,
+            lease,
+            MixedChildrenSpawn {
+                subagents: spawns,
+                tool_children,
+                payload,
+                child_otel_traceparent,
+            },
+            now,
+        )
+        .await
+        .context("persist mixed batch children")?;
+
+    let SpawnedMixedChildren {
+        parent,
+        subagents: prepared,
+        tool_children,
+    } = spawned;
+
+    ensure!(
+        prepared.len() == child_threads.len(),
+        "spawn_mixed_children returned {} invocations for {} child threads",
+        prepared.len(),
+        child_threads.len(),
+    );
+    ensure!(
+        prepared.len() == pending_tools_by_entry.len(),
+        "spawn_mixed_children returned {} invocations for {} pending tools",
+        prepared.len(),
+        pending_tools_by_entry.len(),
+    );
+
+    let mut invocations = Vec::with_capacity(prepared.len());
+    for ((invocation_task, child_root_task), (child_thread, pending_tool)) in prepared
+        .into_iter()
+        .zip(child_threads.into_iter().zip(pending_tools_by_entry))
+    {
+        let assembled = build_batch_invocation(
+            BatchEntryAssembly {
+                parent_task: &parent,
+                invocation_task,
+                child_root_task,
+                child_thread,
+                pending_tool,
+            },
+            deps,
+            now,
+        )
+        .await?;
+        invocations.push(assembled);
+    }
+
+    Ok(SpawnedMixedBatch {
+        parent_task: parent,
+        invocations,
+        tool_children,
     })
 }
 

@@ -42,19 +42,19 @@
 //!   to `WaitingOnChildren { pending_child_count: N }` once and resumes
 //!   when the last child reports back.
 //!
-//! **Mixed batches** — batches that contain both `SpawnAsTool` and
-//! `SpawnAsSubagent` are routed as
-//! [`BatchRouting::UnsupportedMixedBatch`] and fall back to
-//! `spawn_tool_children`. The executor then handles the subagent
-//! tool calls as regular tools so the LLM still sees a result rather
-//! than a stuck turn. Splitting a mixed batch atomically (some children
-//! `ToolRuntime`, some `Subagent`, all under one parent suspension) is
-//! tracked as a future slice — it would need a new
-//! `spawn_mixed_children` store primitive.
+//! * **Mixed** — a batch carrying both `SpawnAsSubagent` and
+//!   `SpawnAsTool` decisions (an LLM coordinator routinely emits N
+//!   subagent calls plus a stray `todo_write` in one turn). Routes
+//!   through
+//!   [`spawn_mixed_children_invocations`](super::subagent::spawn_mixed_children_invocations),
+//!   which CASes the parent once and persists the subagent slots
+//!   **and** the tool-runtime children in a single store mutation. The
+//!   parent transitions to `WaitingOnChildren { pending_child_count: N + M }`
+//!   and resumes when the last child of either kind reports back.
 //!
-//! Selector implementations therefore must inspect the **whole**
-//! batch (`tool_calls`) before deciding any single call's fate, not
-//! just the call under inspection in isolation.
+//! Selectors still receive the **whole** batch (`tool_calls`) so a
+//! decision can depend on its siblings — e.g. a host that caps the
+//! number of concurrent subagents needs to see them all at once.
 //!
 //! # Default
 //!
@@ -79,12 +79,14 @@ pub enum SubagentSpawnDecision {
     SpawnAsTool,
 
     /// Treat the call as a durable subagent invocation. The worker
-    /// will route it through
+    /// routes it through
     /// [`spawn_subagent_invocation`](super::subagent::spawn_subagent_invocation)
-    /// (single-shot) or
+    /// (single-shot),
     /// [`spawn_subagent_batch_invocations`](super::subagent::spawn_subagent_batch_invocations)
-    /// (fan-out — when every other decision in the batch is also
-    /// `SpawnAsSubagent`) using the carried [`SubagentSpawnPlan`].
+    /// (pure fan-out), or
+    /// [`spawn_mixed_children_invocations`](super::subagent::spawn_mixed_children_invocations)
+    /// (alongside `SpawnAsTool` siblings) using the carried
+    /// [`SubagentSpawnPlan`].
     ///
     /// The plan is boxed because [`SubagentSpawnPlan`] embeds an
     /// [`EffectiveSubagentSpec`] (~700 bytes) and clippy's
@@ -92,14 +94,6 @@ pub enum SubagentSpawnDecision {
     /// for the much-more-common [`SubagentSpawnDecision::SpawnAsTool`]
     /// path. Boxing keeps the enum cheap to pass around without
     /// changing semantics.
-    ///
-    /// Mixed batches (`SpawnAsSubagent` alongside `SpawnAsTool`)
-    /// degrade to [`BatchRouting::UnsupportedMixedBatch`] — the
-    /// fan-out store primitive only takes pure subagent batches and
-    /// the parent suspension envelope can't atomically split into
-    /// `ToolRuntime` + `Subagent` children today. Selectors should
-    /// inspect the whole batch before returning `SpawnAsSubagent`
-    /// for any slot.
     SpawnAsSubagent { plan: Box<SubagentSpawnPlan> },
 }
 
@@ -202,7 +196,7 @@ impl SubagentSpawnSelector for NoopSubagentSpawnSelector {
 /// worker uses it to pick exactly one of four branches:
 ///
 /// 1. [`BatchRouting::AllTools`] — drop straight into the legacy
-///    `spawn_tool_children` path, identical to pre-PR behaviour.
+///    `spawn_tool_children` path, identical to pre-selector behaviour.
 /// 2. [`BatchRouting::SingleSubagent`] — route through
 ///    `spawn_subagent_invocation` for the carried index. The other
 ///    slots in the batch are guaranteed empty by the contract.
@@ -212,12 +206,11 @@ impl SubagentSpawnSelector for NoopSubagentSpawnSelector {
 ///    and persists N invocation + child-thread pairs atomically. The
 ///    parent transitions to `WaitingOnChildren { pending_child_count: N }`
 ///    in the same store mutation.
-/// 4. [`BatchRouting::UnsupportedMixedBatch`] — the selector asked
-///    for at least one subagent spawn but the batch is genuinely
-///    mixed (subagent calls alongside tool calls). Today this falls
-///    back to `spawn_tool_children` and the executor handles the
-///    subagent calls as regular tools so the LLM still sees a
-///    result. Atomic mixed splits are tracked as a future slice.
+/// 4. [`BatchRouting::Mixed`] — the batch carries both kinds. Routes
+///    through `spawn_mixed_children_invocations`, which CASes the
+///    parent once and persists the subagent slots **and** the
+///    tool-runtime children in the same store mutation
+///    (`pending_child_count = N + M`).
 #[derive(Debug)]
 pub enum BatchRouting {
     AllTools,
@@ -225,8 +218,7 @@ pub enum BatchRouting {
         spawn_index: usize,
         /// Boxed for the same `large_enum_variant` reason as
         /// [`SubagentSpawnDecision::SpawnAsSubagent`] — keeps the
-        /// `AllTools` and `UnsupportedMixedBatch` arms (the common
-        /// case) cheap to pass around.
+        /// `AllTools` arm (the common case) cheap to pass around.
         plan: Box<SubagentSpawnPlan>,
     },
     /// Pure-subagent batch with N >= 2 entries. Carries every
@@ -241,7 +233,21 @@ pub enum BatchRouting {
     MultiSubagent {
         plans: Vec<(usize, Box<SubagentSpawnPlan>)>,
     },
-    UnsupportedMixedBatch,
+    /// Batch mixing at least one `SpawnAsSubagent` with at least one
+    /// `SpawnAsTool`.
+    ///
+    /// `plans` and `tool_indices` partition the batch: together they
+    /// name every slot of the turn's `pending_tool_calls` exactly once,
+    /// which is what the resume-time positional fan-in
+    /// ([`aggregate_child_outcomes`](super::root_turn::aggregate_child_outcomes))
+    /// requires.
+    Mixed {
+        /// `(spawn_index, plan)` for every subagent slot, in input order.
+        plans: Vec<(usize, Box<SubagentSpawnPlan>)>,
+        /// Index of every slot that stays an ordinary tool child, in
+        /// input order.
+        tool_indices: Vec<usize>,
+    },
 }
 
 /// Classify a per-call decision vector into a single
@@ -260,22 +266,11 @@ pub fn classify_batch(decisions: Vec<SubagentSpawnDecision>) -> BatchRouting {
     if subagent_count == 0 {
         return BatchRouting::AllTools;
     }
-    if subagent_count != total {
-        // Genuine mix: at least one tool call alongside at least one
-        // subagent. The store primitive can't atomically split a
-        // batch into ToolRuntime + Subagent children today, so we
-        // degrade to AllTools at the call site (executor handles
-        // the subagent tool calls as regular tools so the LLM still
-        // sees a result).
-        return BatchRouting::UnsupportedMixedBatch;
-    }
-    // Pure-subagent batch — single-shot (1 entry) collapses to
-    // SingleSubagent so single spawns don't pay the batch primitive's
-    // overhead, while N>=2 produces MultiSubagent for the fan-out
-    // store path.
-    if total == 1 {
+    // Pure-subagent single-shot collapses to SingleSubagent so one
+    // spawn doesn't pay the batch primitive's overhead.
+    if subagent_count == total && total == 1 {
         let mut decisions = decisions;
-        match decisions.swap_remove(0) {
+        return match decisions.swap_remove(0) {
             SubagentSpawnDecision::SpawnAsSubagent { plan } => BatchRouting::SingleSubagent {
                 spawn_index: 0,
                 plan,
@@ -286,17 +281,25 @@ pub fn classify_batch(decisions: Vec<SubagentSpawnDecision>) -> BatchRouting {
                 // panicking.
                 BatchRouting::AllTools
             }
+        };
+    }
+
+    let mut plans: Vec<(usize, Box<SubagentSpawnPlan>)> = Vec::with_capacity(subagent_count);
+    let mut tool_indices: Vec<usize> = Vec::with_capacity(total - subagent_count);
+    for (idx, decision) in decisions.into_iter().enumerate() {
+        match decision {
+            SubagentSpawnDecision::SpawnAsSubagent { plan } => plans.push((idx, plan)),
+            SubagentSpawnDecision::SpawnAsTool => tool_indices.push(idx),
         }
-    } else {
-        let plans: Vec<(usize, Box<SubagentSpawnPlan>)> = decisions
-            .into_iter()
-            .enumerate()
-            .filter_map(|(idx, decision)| match decision {
-                SubagentSpawnDecision::SpawnAsSubagent { plan } => Some((idx, plan)),
-                SubagentSpawnDecision::SpawnAsTool => None,
-            })
-            .collect();
+    }
+
+    if tool_indices.is_empty() {
         BatchRouting::MultiSubagent { plans }
+    } else {
+        BatchRouting::Mixed {
+            plans,
+            tool_indices,
+        }
     }
 }
 
@@ -427,22 +430,62 @@ mod tests {
     }
 
     #[test]
-    fn classify_batch_subagent_plus_tool_is_unsupported() {
+    fn classify_batch_subagent_plus_tool_is_mixed() {
         let routing = classify_batch(vec![
             SubagentSpawnDecision::SpawnAsSubagent {
                 plan: Box::new(dummy_plan("explore")),
             },
             SubagentSpawnDecision::SpawnAsTool,
         ]);
-        assert!(matches!(routing, BatchRouting::UnsupportedMixedBatch));
+        match routing {
+            BatchRouting::Mixed {
+                plans,
+                tool_indices,
+            } => {
+                assert_eq!(plans.len(), 1);
+                assert_eq!(plans[0].0, 0);
+                assert_eq!(plans[0].1.request.task, "explore");
+                assert_eq!(tool_indices, vec![1]);
+            }
+            other => panic!("expected Mixed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_batch_mixed_partitions_every_slot_exactly_once() {
+        // The positional fan-in at resume time requires the union of
+        // subagent slots and tool slots to cover pending_tool_calls
+        // exactly once each.
+        let routing = classify_batch(vec![
+            SubagentSpawnDecision::SpawnAsTool,
+            SubagentSpawnDecision::SpawnAsSubagent {
+                plan: Box::new(dummy_plan("explore-a")),
+            },
+            SubagentSpawnDecision::SpawnAsTool,
+            SubagentSpawnDecision::SpawnAsSubagent {
+                plan: Box::new(dummy_plan("explore-b")),
+            },
+        ]);
+        match routing {
+            BatchRouting::Mixed {
+                plans,
+                tool_indices,
+            } => {
+                let subagent_slots: Vec<usize> = plans.iter().map(|(idx, _)| *idx).collect();
+                assert_eq!(subagent_slots, vec![1, 3]);
+                assert_eq!(tool_indices, vec![0, 2]);
+                assert_eq!(plans[0].1.request.task, "explore-a");
+                assert_eq!(plans[1].1.request.task, "explore-b");
+            }
+            other => panic!("expected Mixed, got {other:?}"),
+        }
     }
 
     #[test]
     fn classify_batch_two_subagents_is_multi_subagent() {
         // Pure-subagent batch with N>=2 routes through the fan-out
-        // path (MultiSubagent), not the single-shot one. Tool calls
-        // mixed with subagents still degrade to UnsupportedMixedBatch
-        // — see classify_batch_subagent_plus_tool_is_unsupported.
+        // path (MultiSubagent), not the single-shot one, and not the
+        // mixed one — see classify_batch_subagent_plus_tool_is_mixed.
         let routing = classify_batch(vec![
             SubagentSpawnDecision::SpawnAsSubagent {
                 plan: Box::new(dummy_plan("explore-a")),

@@ -68,7 +68,10 @@ use super::commit::{CompletedTurnCommit, commit_completed_turn};
 use super::event_repository::EventRepository;
 use super::message_store::MessageProjectionStore;
 use super::store::AgentTaskStore;
-use super::task::{AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, WorkerId};
+use super::task::{
+    AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, SuspensionPayload,
+    TaskKind, TaskStatus, WorkerId,
+};
 use super::thread_store::ThreadStore;
 use super::turn_attempt::{CloseAttemptParams, OpenAttemptParams, TurnAttemptOutcome};
 use super::turn_attempt_store::TurnAttemptStore;
@@ -184,7 +187,8 @@ mod in_memory_bundle {
     use crate::journal::message::MessageProjection;
     use crate::journal::recovery::RecoveryRecord;
     use crate::journal::store::{
-        SubagentInvocationSpawn, SubmitRootTurnError, SubmitRootTurnOutcome, SubmitRootTurnParams,
+        MixedChildrenSpawn, SpawnedMixedChildren, SubagentInvocationSpawn, SubmitRootTurnError,
+        SubmitRootTurnOutcome, SubmitRootTurnParams,
     };
     use crate::journal::task::{ChildSpawnSpec, SuspensionPayload, TaskStatus};
     use crate::journal::thread::Thread;
@@ -402,6 +406,18 @@ mod in_memory_bundle {
         ) -> Result<(AgentTask, Vec<(AgentTask, AgentTask)>)> {
             self.task
                 .spawn_subagent_batch(parent_id, worker, lease, spawns, payload, now)
+                .await
+        }
+        async fn spawn_mixed_children(
+            &self,
+            parent_id: &AgentTaskId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+            spawn: MixedChildrenSpawn,
+            now: OffsetDateTime,
+        ) -> Result<SpawnedMixedChildren> {
+            self.task
+                .spawn_mixed_children(parent_id, worker, lease, spawn, now)
                 .await
         }
         async fn find_subagent_invocation_for_child_root(
@@ -787,6 +803,417 @@ fn empty_suspension(thread: &ThreadId) -> SuspensionPayload {
     }
 }
 
+/// Build a [`SuspensionPayload`] whose continuation carries `count`
+/// pending tool calls, all Confirm-tier.
+///
+/// The mixed-batch primitive validates the batch's spawn indices
+/// against this list (every slot covered exactly once), so the
+/// mixed-batch cases need a payload with real slots rather than the
+/// empty continuation [`empty_suspension`] produces.
+fn suspension_with_pending_tools(thread: &ThreadId, count: usize) -> SuspensionPayload {
+    let pending_tool_calls: Vec<agent_sdk_foundation::PendingToolCallInfo> = (0..count)
+        .map(|idx| agent_sdk_foundation::PendingToolCallInfo {
+            id: format!("call_{idx}"),
+            name: format!("tool_{idx}"),
+            display_name: format!("Tool {idx}"),
+            tier: agent_sdk_foundation::ToolTier::Confirm,
+            input: serde_json::json!({ "slot": idx }),
+            effective_input: serde_json::json!({ "slot": idx }),
+            listen_context: None,
+        })
+        .collect();
+    let mut payload = empty_suspension(thread);
+    payload.continuation.payload.pending_tool_calls = pending_tool_calls;
+    payload
+}
+
+/// Minimal resolved subagent spec for the mixed-batch cases.
+///
+/// The store persists this verbatim on the invocation's durable
+/// linkage; it does not interpret any field, so a single fixture
+/// suffices for every backend.
+fn mixed_batch_spec(task: &str) -> crate::worker::subagent::EffectiveSubagentSpec {
+    use crate::worker::subagent::{
+        EffectiveSubagentCapabilities, EffectiveSubagentMcpPolicy, EffectiveSubagentSpec,
+        InheritedSubagentPolicy, SubagentCapabilityProfile, SubagentSandboxPolicy,
+    };
+    let capabilities: std::collections::BTreeSet<String> =
+        std::iter::once("read_file".to_owned()).collect();
+    EffectiveSubagentSpec {
+        task: task.to_owned(),
+        prompt: "Stay in read-only mode.".to_owned(),
+        model: "claude-sonnet-4-5-20250929".to_owned(),
+        max_turns: 5,
+        timeout_ms: 15_000,
+        depth: 1,
+        max_parallel_subagents: 1,
+        nickname: None,
+        sandbox: SubagentSandboxPolicy::read_only(),
+        mcp: EffectiveSubagentMcpPolicy::default(),
+        audit_provenance: None,
+        inherited_policy: InheritedSubagentPolicy {
+            default_model: "claude-sonnet-4-5-20250929".to_owned(),
+            allowed_models: std::iter::once("claude-sonnet-4-5-20250929".to_owned()).collect(),
+            default_max_turns: 5,
+            max_turns: 5,
+            default_timeout_ms: 15_000,
+            max_timeout_ms: 15_000,
+            capability_profiles: std::collections::BTreeMap::from([(
+                "research".to_owned(),
+                SubagentCapabilityProfile {
+                    capabilities: capabilities.clone(),
+                    sandbox: SubagentSandboxPolicy::read_only(),
+                    allowed_mcp_servers: std::collections::BTreeSet::new(),
+                },
+            )]),
+            allowed_capabilities: capabilities.clone(),
+            max_depth: 3,
+            max_parallel_subagents: 1,
+            sandbox: SubagentSandboxPolicy::read_only(),
+            allowed_mcp_servers: std::collections::BTreeSet::new(),
+            audit_provider: "anthropic".to_owned(),
+        },
+        capabilities: EffectiveSubagentCapabilities {
+            profile: "research".to_owned(),
+            allowed: capabilities,
+        },
+    }
+}
+
+/// Everything a mixed-batch case needs after the parent is running:
+/// the parent's id, its lease identity, and the child threads the
+/// subagent entries will spawn onto.
+struct MixedBatchFixture {
+    parent_id: AgentTaskId,
+    worker: WorkerId,
+    lease: LeaseId,
+    child_threads: Vec<ThreadId>,
+}
+
+/// Submit + acquire a root turn on `thread`, and materialize `subagents`
+/// child-thread rows (durable backends enforce a task → thread FK, so
+/// the rows must exist before the spawn call).
+async fn mixed_batch_fixture<S: JournalStore>(
+    store: &S,
+    thread: &ThreadId,
+    subagents: usize,
+) -> Result<MixedBatchFixture> {
+    ensure_thread(store, thread).await?;
+    let parent_id = seed_root_task(store, thread).await?;
+    let worker = WorkerId::new();
+    let lease = LeaseId::new();
+    AgentTaskStore::try_acquire_task(
+        store,
+        &parent_id,
+        worker.clone(),
+        lease.clone(),
+        t_plus(600),
+        t_plus(1),
+    )
+    .await?
+    .context("parent root must acquire before a mixed spawn")?;
+
+    let mut child_threads = Vec::with_capacity(subagents);
+    for idx in 0..subagents {
+        let child = tid(&format!("{thread}-child-{idx}"));
+        ThreadStore::get_or_create(store, &child, t_plus(1)).await?;
+        child_threads.push(child);
+    }
+    Ok(MixedBatchFixture {
+        parent_id,
+        worker,
+        lease,
+        child_threads,
+    })
+}
+
+/// Assemble a mixed batch: one subagent entry per child thread (taking
+/// the low slots) and one tool child per slot named in `tool_slots`.
+fn mixed_batch_spawn(
+    fixture: &MixedBatchFixture,
+    payload: SuspensionPayload,
+    tool_slots: &[u32],
+) -> Result<crate::journal::store::MixedChildrenSpawn> {
+    let mut subagents = Vec::with_capacity(fixture.child_threads.len());
+    for (idx, child_thread) in fixture.child_threads.iter().enumerate() {
+        subagents.push(crate::journal::store::SubagentInvocationSpawn {
+            child_thread_id: child_thread.clone(),
+            spec: mixed_batch_spec(&format!("explore-{idx}")),
+            child_root_input: vec![SubmittedInputItem::Text {
+                text: format!("explore-{idx}"),
+            }],
+            spawn_index: u32::try_from(idx).context("subagent slot exceeds u32")?,
+            payload: payload.clone(),
+            child_caller_metadata: None,
+        });
+    }
+    let tool_children = tool_slots
+        .iter()
+        .map(|slot| crate::journal::store::ToolChildSpawn {
+            spawn_index: *slot,
+            spec: ChildSpawnSpec::new(3),
+        })
+        .collect();
+    Ok(crate::journal::store::MixedChildrenSpawn {
+        subagents,
+        tool_children,
+        payload,
+        child_otel_traceparent: None,
+    })
+}
+
+// ── mixed batch: subagents + tools spawn atomically ──────────────────
+
+/// A decision vector mixing subagent spawns with ordinary tool calls
+/// must persist BOTH kinds under one parent transition: the parent parks
+/// on `N + M` children, each invocation carries its durable linkage plus
+/// a fresh child-thread root, each tool child is a `ToolRuntime` leaf,
+/// and every `pending_tool_calls` slot is claimed exactly once (the
+/// positional fan-in at resume time depends on it).
+async fn case_mixed_batch_spawns_subagents_and_tools<S: JournalStore>(store: &S) -> Result<()> {
+    let thread = tid("conf-mixed-happy");
+    let fixture = mixed_batch_fixture(store, &thread, 2).await?;
+    // Slots 0,1 → subagents (fixture order); slots 2,3 → tool children.
+    let payload = suspension_with_pending_tools(&thread, 4);
+    let spawn = mixed_batch_spawn(&fixture, payload, &[2, 3])?;
+
+    let spawned = AgentTaskStore::spawn_mixed_children(
+        store,
+        &fixture.parent_id,
+        &fixture.worker,
+        &fixture.lease,
+        spawn,
+        t_plus(2),
+    )
+    .await
+    .context("mixed spawn must succeed under a valid lease")?;
+
+    ensure!(
+        spawned.parent.status == TaskStatus::WaitingOnChildren,
+        "parent must park on its children"
+    );
+    ensure!(
+        spawned.parent.pending_child_count == 4,
+        "parent must wait on all 4 children (2 subagents + 2 tools), got {}",
+        spawned.parent.pending_child_count,
+    );
+    ensure!(
+        spawned.subagents.len() == 2 && spawned.tool_children.len() == 2,
+        "both halves of the batch must be persisted"
+    );
+
+    // The parent's child-wait targets and the live children agree.
+    let children = AgentTaskStore::list_children(store, &fixture.parent_id).await?;
+    ensure!(
+        children.len() == 4,
+        "parent must have 4 live children, got {}",
+        children.len()
+    );
+    let mut slots: Vec<u32> = children.iter().filter_map(|c| c.spawn_index).collect();
+    slots.sort_unstable();
+    ensure!(
+        slots == vec![0, 1, 2, 3],
+        "children must cover every pending tool call slot exactly once, got {slots:?}",
+    );
+    let subagent_kinds = children
+        .iter()
+        .filter(|c| c.kind == TaskKind::Subagent)
+        .count();
+    let tool_kinds = children
+        .iter()
+        .filter(|c| c.kind == TaskKind::ToolRuntime)
+        .count();
+    ensure!(
+        subagent_kinds == 2 && tool_kinds == 2,
+        "the batch must mix 2 Subagent + 2 ToolRuntime children, got {subagent_kinds} + {tool_kinds}",
+    );
+
+    // Each invocation carries durable linkage to a real child-thread root.
+    for ((invocation, child_root), child_thread) in
+        spawned.subagents.iter().zip(&fixture.child_threads)
+    {
+        let linkage = invocation
+            .state
+            .subagent_invocation()
+            .context("invocation must carry durable linkage")?;
+        ensure!(
+            linkage.child_root_task_id == child_root.id,
+            "linkage must point at the persisted child root"
+        );
+        ensure!(
+            linkage.child_thread_id == *child_thread,
+            "linkage must point at the pre-allocated child thread"
+        );
+        let persisted = AgentTaskStore::get(store, &child_root.id)
+            .await?
+            .context("child root must be persisted")?;
+        ensure!(
+            persisted.status == TaskStatus::Pending,
+            "child root must be runnable"
+        );
+        ensure!(
+            persisted.thread_id == *child_thread,
+            "child root must live on the child thread"
+        );
+    }
+
+    // Tool children are runnable leaves on the parent's own thread.
+    for tool_child in &spawned.tool_children {
+        let persisted = AgentTaskStore::get(store, &tool_child.id)
+            .await?
+            .context("tool child must be persisted")?;
+        ensure!(
+            persisted.status == TaskStatus::Pending,
+            "tool child must be runnable"
+        );
+        ensure!(
+            persisted.thread_id == thread,
+            "tool child must stay on the parent thread"
+        );
+    }
+    Ok(())
+}
+
+// ── mixed batch: a losing CAS spawns nothing ─────────────────────────
+
+/// A mixed spawn under a stale lease must be rejected whole: no
+/// invocation, no child root, no tool child, and the parent still
+/// `Running` under the winning lease. A partial batch here would park a
+/// parent on children it can never fan in.
+async fn case_mixed_batch_losing_cas_spawns_nothing<S: JournalStore>(store: &S) -> Result<()> {
+    let thread = tid("conf-mixed-cas");
+    let fixture = mixed_batch_fixture(store, &thread, 1).await?;
+    let payload = suspension_with_pending_tools(&thread, 2);
+    let stale_lease = LeaseId::new();
+    let spawn = mixed_batch_spawn(&fixture, payload, &[1])?;
+
+    let rejected = AgentTaskStore::spawn_mixed_children(
+        store,
+        &fixture.parent_id,
+        &fixture.worker,
+        &stale_lease,
+        spawn,
+        t_plus(2),
+    )
+    .await;
+    ensure!(
+        rejected.is_err(),
+        "a mixed spawn under a stale lease must be rejected"
+    );
+
+    let parent = AgentTaskStore::get(store, &fixture.parent_id)
+        .await?
+        .context("parent must survive a rejected spawn")?;
+    ensure!(
+        parent.status == TaskStatus::Running,
+        "a rejected spawn must not transition the parent, got {:?}",
+        parent.status,
+    );
+    let children = AgentTaskStore::list_children(store, &fixture.parent_id).await?;
+    ensure!(
+        children.is_empty(),
+        "a rejected spawn must leave no children behind, got {}",
+        children.len(),
+    );
+    for child_thread in &fixture.child_threads {
+        let tasks = AgentTaskStore::list_by_thread(store, child_thread).await?;
+        ensure!(
+            tasks.is_empty(),
+            "a rejected spawn must not materialize a child-thread root",
+        );
+    }
+    Ok(())
+}
+
+// ── mixed batch: a cancelled parent spawns nothing ───────────────────
+
+/// Cancellation wins the race against a mixed spawn: once the parent is
+/// no longer `Running`, the store rejects the batch outright rather than
+/// resurrecting a cancelled tree with fresh children.
+async fn case_mixed_batch_rejects_cancelled_parent<S: JournalStore>(store: &S) -> Result<()> {
+    let thread = tid("conf-mixed-cancelled");
+    let fixture = mixed_batch_fixture(store, &thread, 1).await?;
+    let payload = suspension_with_pending_tools(&thread, 2);
+    AgentTaskStore::cancel_tree(store, &fixture.parent_id, t_plus(2)).await?;
+
+    let spawn = mixed_batch_spawn(&fixture, payload, &[1])?;
+    let rejected = AgentTaskStore::spawn_mixed_children(
+        store,
+        &fixture.parent_id,
+        &fixture.worker,
+        &fixture.lease,
+        spawn,
+        t_plus(3),
+    )
+    .await;
+    ensure!(
+        rejected.is_err(),
+        "a mixed spawn on a cancelled parent must be rejected"
+    );
+
+    let children = AgentTaskStore::list_children(store, &fixture.parent_id).await?;
+    ensure!(
+        children.is_empty(),
+        "a cancelled parent must not acquire children"
+    );
+    for child_thread in &fixture.child_threads {
+        let tasks = AgentTaskStore::list_by_thread(store, child_thread).await?;
+        ensure!(
+            tasks.is_empty(),
+            "a cancelled parent must not materialize a child-thread root",
+        );
+    }
+    Ok(())
+}
+
+// ── mixed batch: slot coverage is enforced before any write ──────────
+
+/// The spawn indices of the two halves must cover the parent's
+/// `pending_tool_calls` exactly once each. An uncovered slot would park
+/// the parent on a fan-in that can never complete
+/// ([`crate::worker::aggregate_child_outcomes`] fails on a missing
+/// slot), so the store rejects such a batch — atomically, with nothing
+/// persisted.
+async fn case_mixed_batch_rejects_uncovered_slot<S: JournalStore>(store: &S) -> Result<()> {
+    let thread = tid("conf-mixed-coverage");
+    let fixture = mixed_batch_fixture(store, &thread, 1).await?;
+    // 3 pending tool calls, but the batch names only slots 0 (subagent)
+    // and 1 (tool) — slot 2 would never resolve.
+    let payload = suspension_with_pending_tools(&thread, 3);
+    let spawn = mixed_batch_spawn(&fixture, payload, &[1])?;
+
+    let rejected = AgentTaskStore::spawn_mixed_children(
+        store,
+        &fixture.parent_id,
+        &fixture.worker,
+        &fixture.lease,
+        spawn,
+        t_plus(2),
+    )
+    .await;
+    let Err(error) = rejected else {
+        anyhow::bail!("a mixed batch leaving a pending tool call uncovered must be rejected");
+    };
+    ensure!(
+        format!("{error:#}").contains("pending tool calls"),
+        "expected a slot-coverage rejection, got: {error:#}",
+    );
+
+    let parent = AgentTaskStore::get(store, &fixture.parent_id)
+        .await?
+        .context("parent must survive a rejected spawn")?;
+    ensure!(
+        parent.status == TaskStatus::Running,
+        "a rejected spawn must not transition the parent"
+    );
+    let children = AgentTaskStore::list_children(store, &fixture.parent_id).await?;
+    ensure!(
+        children.is_empty(),
+        "a rejected spawn must leave no children behind"
+    );
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Report
 // ─────────────────────────────────────────────────────────────────────
@@ -894,6 +1321,18 @@ pub async fn run_journal_store_conformance<S: JournalStore + Clone + 'static>(
 
     case_before_plus_limit_pagination(store).await?;
     report.passed("before_plus_limit_pagination");
+
+    case_mixed_batch_spawns_subagents_and_tools(store).await?;
+    report.passed("mixed_batch_spawns_subagents_and_tools");
+
+    case_mixed_batch_losing_cas_spawns_nothing(store).await?;
+    report.passed("mixed_batch_losing_cas_spawns_nothing");
+
+    case_mixed_batch_rejects_cancelled_parent(store).await?;
+    report.passed("mixed_batch_rejects_cancelled_parent");
+
+    case_mixed_batch_rejects_uncovered_slot(store).await?;
+    report.passed("mixed_batch_rejects_uncovered_slot");
 
     Ok(report)
 }
@@ -1877,6 +2316,12 @@ mod tests {
                 .contains(&"concurrent_appends_serialize".to_owned()),
             "the concurrent-append case must run",
         );
+        assert!(
+            report
+                .passed
+                .contains(&"mixed_batch_spawns_subagents_and_tools".to_owned()),
+            "the mixed-batch atomicity case must run",
+        );
         assert_eq!(
             report.skipped,
             vec![(
@@ -1886,7 +2331,7 @@ mod tests {
             "the only skip is the genuinely-optional outbox committer",
         );
         assert!(
-            report.passed.len() >= 16,
+            report.passed.len() >= 20,
             "no mandatory case silently skipped"
         );
         Ok(())
