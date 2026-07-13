@@ -793,7 +793,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                         let event = match decode_stream_event(&text) {
                                             Ok(event) => event,
                                             Err(error) => {
-                                                reset_websocket_connection(
+                                                end_websocket_turn(
                                                     &mut websocket_session,
                                                 );
                                                 yield Ok(StreamDelta::Error {
@@ -808,7 +808,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                     let item = match decode_output_item(event.item) {
                                                         Ok(item) => item,
                                                         Err(error) => {
-                                                            reset_websocket_connection(
+                                                            end_websocket_turn(
                                                                 &mut websocket_session,
                                                             );
                                                             yield Ok(StreamDelta::Error {
@@ -857,7 +857,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                         let text = match String::from_utf8(bytes.to_vec()) {
                                             Ok(text) => text,
                                             Err(error) => {
-                                                reset_websocket_connection(
+                                                end_websocket_turn(
                                                     &mut websocket_session,
                                                 );
                                                 yield Ok(StreamDelta::Error {
@@ -891,7 +891,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                             let event = match decode_stream_event(&text) {
                                                 Ok(event) => event,
                                                 Err(error) => {
-                                                    reset_websocket_connection(
+                                                    end_websocket_turn(
                                                         &mut websocket_session,
                                                     );
                                                     yield Ok(StreamDelta::Error {
@@ -906,7 +906,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                         let item = match decode_output_item(event.item) {
                                                             Ok(item) => item,
                                                             Err(error) => {
-                                                                reset_websocket_connection(
+                                                                end_websocket_turn(
                                                                     &mut websocket_session,
                                                                 );
                                                                 yield Ok(StreamDelta::Error {
@@ -1052,7 +1052,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                             };
                             let Some(message_result) = message_result else {
                                 if emitted_output {
-                                    reset_websocket_connection(&mut websocket_session);
+                                    end_websocket_turn(&mut websocket_session);
                                     yield Ok(StreamDelta::Error {
                                         message: "websocket closed before response.completed"
                                             .to_string(),
@@ -1072,7 +1072,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                 Ok(message) => message,
                                 Err(error) => {
                                     if emitted_output {
-                                        reset_websocket_connection(&mut websocket_session);
+                                        end_websocket_turn(&mut websocket_session);
                                         yield Ok(StreamDelta::Error {
                                             message: format!("websocket error: {error}"),
                                             kind: StreamErrorKind::ServerError,
@@ -1100,7 +1100,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                         // The connection-limit signal shares the status but is a
                                         // transport condition, so it still falls back at once.
                                         if emitted_output || is_websocket_quota_rejection(&error) {
-                                            reset_websocket_connection(&mut websocket_session);
+                                            end_websocket_turn(&mut websocket_session);
                                             yield Ok(StreamDelta::Error {
                                                 message: error.message,
                                                 kind,
@@ -1119,7 +1119,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                     let event = match decode_stream_event(&text) {
                                         Ok(event) => event,
                                         Err(error) => {
-                                            reset_websocket_connection(&mut websocket_session);
+                                            end_websocket_turn(&mut websocket_session);
                                             yield Ok(StreamDelta::Error {
                                                 message: error.to_string(),
                                                 kind: StreamErrorKind::ServerError,
@@ -1187,7 +1187,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                 let item = match decode_output_item(event.item) {
                                                     Ok(item) => item,
                                                     Err(error) => {
-                                                        reset_websocket_connection(
+                                                        end_websocket_turn(
                                                             &mut websocket_session,
                                                         );
                                                         yield Ok(StreamDelta::Error {
@@ -1281,6 +1281,9 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                 websocket_session.last_response_id = None;
                                                 websocket_session.last_response_items.clear();
                                                 websocket_session.prewarmed = false;
+                                                // The turn ends here, so the session must stop
+                                                // counting as in-flight or it can never be evicted.
+                                                websocket_session.in_flight = false;
                                                 let (message, kind) =
                                                     codex_response_failed_error(event.response);
                                                 yield Ok(StreamDelta::Error {
@@ -1296,7 +1299,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                     let text = match String::from_utf8(bytes.to_vec()) {
                                         Ok(text) => text,
                                         Err(error) => {
-                                            reset_websocket_connection(&mut websocket_session);
+                                            end_websocket_turn(&mut websocket_session);
                                             yield Ok(StreamDelta::Error {
                                                 message: format!(
                                                     "invalid OpenAI Codex websocket UTF-8: {error}"
@@ -1317,7 +1320,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                             if emitted_output
                                                 || is_websocket_quota_rejection(&error)
                                             {
-                                                reset_websocket_connection(&mut websocket_session);
+                                                end_websocket_turn(&mut websocket_session);
                                                 yield Ok(StreamDelta::Error {
                                                     message: error.message,
                                                     kind,
@@ -1337,7 +1340,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                         let event = match decode_stream_event(&text) {
                                             Ok(event) => event,
                                             Err(error) => {
-                                                reset_websocket_connection(
+                                                end_websocket_turn(
                                                     &mut websocket_session,
                                                 );
                                                 yield Ok(StreamDelta::Error {
@@ -1411,7 +1414,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                         match decode_output_item(event.item) {
                                                             Ok(item) => item,
                                                             Err(error) => {
-                                                                reset_websocket_connection(
+                                                                end_websocket_turn(
                                                                     &mut websocket_session,
                                                                 );
                                                                 yield Ok(StreamDelta::Error {
@@ -1515,6 +1518,10 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                     websocket_session.last_response_id = None;
                                                     websocket_session.last_response_items.clear();
                                                     websocket_session.prewarmed = false;
+                                                    // The turn ends here, so the session must stop
+                                                    // counting as in-flight or it can never be
+                                                    // evicted.
+                                                    websocket_session.in_flight = false;
                                                     let (message, kind) =
                                                         codex_response_failed_error(event.response);
                                                     yield Ok(StreamDelta::Error {
@@ -1533,7 +1540,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                             .await
                                     {
                                         if emitted_output {
-                                            reset_websocket_connection(&mut websocket_session);
+                                            end_websocket_turn(&mut websocket_session);
                                             yield Ok(StreamDelta::Error {
                                                 message: format!("websocket pong failed: {error}"),
                                                 kind: StreamErrorKind::ServerError,
@@ -1551,7 +1558,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                 WebSocketMessage::Pong(_) | WebSocketMessage::Frame(_) => {}
                                 WebSocketMessage::Close(_) => {
                                     if emitted_output {
-                                        reset_websocket_connection(&mut websocket_session);
+                                        end_websocket_turn(&mut websocket_session);
                                         yield Ok(StreamDelta::Error {
                                             message: "websocket closed before response.completed"
                                                 .to_string(),
@@ -2590,6 +2597,21 @@ fn reset_websocket_connection(session: &mut WebsocketSessionState) {
         session.last_response_items.clear();
     }
     session.prewarmed = false;
+}
+
+/// Reset the connection *and* end the turn, for a stream that is about to yield
+/// a terminal error and stop.
+///
+/// `in_flight` stays set when a stream is merely *dropped* — that is how the
+/// next turn for the session learns its state is stale. A stream that finishes
+/// by reporting an error has no such successor to warn: the turn is over and
+/// the state is already reset here, so the marker must be cleared. Leaving it
+/// set makes [`evict_idle_sessions`] skip the entry forever, and the bounded
+/// session map then grows without limit — one stranded entry per distinct
+/// session id that ever hit a terminal stream error.
+fn end_websocket_turn(session: &mut WebsocketSessionState) {
+    reset_websocket_connection(session);
+    session.in_flight = false;
 }
 
 /// Bound the websocket-session map by evicting idle (not in-flight) sessions,

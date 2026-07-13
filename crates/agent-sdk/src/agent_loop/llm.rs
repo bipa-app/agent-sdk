@@ -481,6 +481,11 @@ where
 {
     let max_retries = config.retry.max_retries;
     let mut attempt = 0u32;
+    // Usage billed by attempts that died before completing. The provider
+    // charges for the tokens it produced whether or not the stream survived,
+    // so it rides along and is folded into the surviving response — the single
+    // point where usage is committed to the run totals.
+    let mut abandoned_usage = ZERO_USAGE;
 
     loop {
         // Each attempt streams under the *current* ids. On a recoverable
@@ -502,16 +507,19 @@ where
         .await;
 
         match result {
-            Ok(response) => {
+            Ok(mut response) => {
                 if attempt > 0 {
                     send_auto_retry_end_event(event_ctx, attempt, true, None).await;
                 }
+                add_usage(&mut response.usage, &abandoned_usage);
                 return (LlmOutcome::Response(response), attempt);
             }
             Err(StreamError::Recoverable {
                 message: msg,
                 retry_after,
+                usage,
             }) => {
+                add_usage(&mut abandoned_usage, &usage);
                 attempt += 1;
                 if attempt > max_retries {
                     error!("Streaming error after {max_retries} retries: {msg}");
@@ -636,6 +644,7 @@ where
                     return Err(StreamError::Recoverable {
                         message: "stream inactivity timeout: no frame within deadline".to_string(),
                         retry_after: None,
+                        usage: accumulated_usage(&accumulator),
                     });
                 }
             },
@@ -656,6 +665,7 @@ where
                 return Err(StreamError::Recoverable {
                     message: format!("Stream error: {e}"),
                     retry_after: None,
+                    usage: accumulated_usage(&accumulator),
                 });
             }
         };
@@ -683,7 +693,10 @@ where
         )
         .await
         {
-            return Err(stream_err);
+            // A provider can report usage and only then fail. The tokens are
+            // billed regardless, so the dying attempt hands its usage to the
+            // retry loop instead of taking it down with the accumulator.
+            return Err(stream_err.with_accumulated_usage(accumulated_usage(&accumulator)));
         }
     }
 
@@ -757,6 +770,31 @@ impl StreamChunkTiming {
     }
 }
 
+/// A zero-token [`Usage`], used as the identity when folding attempts together.
+const ZERO_USAGE: Usage = Usage {
+    input_tokens: 0,
+    output_tokens: 0,
+    cached_input_tokens: 0,
+    cache_creation_input_tokens: 0,
+};
+
+/// Usage the stream has reported so far, or zero when it reported none yet.
+fn accumulated_usage(accumulator: &StreamAccumulator) -> Usage {
+    accumulator.usage().cloned().unwrap_or(ZERO_USAGE)
+}
+
+/// Fold `delta` into `total`. Saturating: token counters must never wrap.
+const fn add_usage(total: &mut Usage, delta: &Usage) {
+    total.input_tokens = total.input_tokens.saturating_add(delta.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(delta.output_tokens);
+    total.cached_input_tokens = total
+        .cached_input_tokens
+        .saturating_add(delta.cached_input_tokens);
+    total.cache_creation_input_tokens = total
+        .cache_creation_input_tokens
+        .saturating_add(delta.cache_creation_input_tokens);
+}
+
 /// Assemble the final [`ChatResponse`] from a fully-consumed stream
 /// accumulator. Extracted from [`process_stream`] to keep it under the
 /// clippy line ceiling.
@@ -765,12 +803,7 @@ fn finalize_stream_response(
     model: &str,
     delta_count: u64,
 ) -> ChatResponse {
-    let usage = accumulator.usage().cloned().unwrap_or(Usage {
-        input_tokens: 0,
-        output_tokens: 0,
-        cached_input_tokens: 0,
-        cache_creation_input_tokens: 0,
-    });
+    let usage = accumulated_usage(&accumulator);
     let stop_reason = accumulator.stop_reason().copied();
     let content_blocks = accumulator.into_content_blocks();
 
@@ -870,6 +903,8 @@ where
                 StreamError::Recoverable {
                     message: message.clone(),
                     retry_after: kind.retry_after(),
+                    // Filled in by the caller, which owns the accumulator.
+                    usage: ZERO_USAGE,
                 }
             } else {
                 StreamError::Fatal(message.clone())

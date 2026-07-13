@@ -1204,6 +1204,12 @@ fn step_completion_stream(
                     }]),
                 };
             }
+            SseProcessResult::Error { message, kind } => {
+                return SseLineOutcome {
+                    immediate,
+                    terminal: Some(vec![StreamDelta::Error { message, kind }]),
+                };
+            }
             SseProcessResult::Sentinel => {
                 let sr = stop_reason.unwrap_or_else(|| fallback_stream_stop_reason(tool_calls));
                 let terminal = build_stream_end_deltas(tool_calls, usage.take(), sr);
@@ -1284,8 +1290,37 @@ enum SseProcessResult {
     Done(StopReason),
     /// The provider emitted a malformed JSON event.
     Malformed(String),
+    /// The provider reported a failure in-band, on an HTTP-200 stream.
+    Error {
+        message: String,
+        kind: StreamErrorKind,
+    },
     /// Stream sentinel [DONE] was received.
     Sentinel,
+}
+
+/// Classify an in-band Chat Completions error object.
+///
+/// The stream already answered 200, so the status line says nothing about this
+/// failure: the error object's own code is the only classification signal. The
+/// message is prose — read only to recover a retry delay, never to decide the
+/// category. An unrecognized code is treated as a transient server error, the
+/// same conservative default a truncated stream gets.
+fn completion_error_kind(code: Option<&serde_json::Value>, message: &str) -> StreamErrorKind {
+    let http_code = code.and_then(serde_json::Value::as_u64);
+    let symbolic = code.and_then(serde_json::Value::as_str);
+
+    if http_code == Some(429)
+        || matches!(symbolic, Some("rate_limit_exceeded" | "rate_limit_error"))
+    {
+        return StreamErrorKind::RateLimited(crate::retry_hints::openai_retry_delay(message));
+    }
+    // A non-429 client error is the caller's fault and will fail identically on
+    // a retry; everything else (5xx, unknown, absent) stays retriable.
+    if http_code.is_some_and(|code| (400..500).contains(&code)) {
+        return StreamErrorKind::InvalidRequest;
+    }
+    StreamErrorKind::ServerError
 }
 
 /// Process an SSE data line and return results to apply.
@@ -1302,6 +1337,18 @@ fn process_sse_data(data: &str) -> Vec<SseProcessResult> {
             ))];
         }
     };
+
+    // An in-band error ends the stream: the accompanying choice carries no
+    // content (`finish_reason: "error"`), so it is reported instead of being
+    // folded in as if the turn had produced output.
+    if let Some(error) = chunk.error {
+        let message = error
+            .message
+            .unwrap_or_else(|| "OpenAI-compatible stream reported an error".to_owned());
+        let kind = completion_error_kind(error.code.as_ref(), &message);
+        log::warn!("OpenAI in-band stream error kind={kind:?} message={message}");
+        return vec![SseProcessResult::Error { message, kind }];
+    }
 
     let mut results = Vec::new();
 
@@ -2197,6 +2244,22 @@ struct SseChunk {
     choices: Vec<SseChoice>,
     #[serde(default)]
     usage: Option<SseUsage>,
+    /// In-band failure. `OpenAI`-compatible routes (`OpenRouter` among them)
+    /// answer 200 and report the failure as a chunk carrying this object, so
+    /// the HTTP status never sees it.
+    #[serde(default)]
+    error: Option<SseError>,
+}
+
+#[derive(Deserialize)]
+struct SseError {
+    #[serde(default)]
+    message: Option<String>,
+    /// Spelled as an HTTP number by some routes (`429`) and as a symbolic
+    /// string by others (`"rate_limit_exceeded"`), so it is kept raw and
+    /// interpreted in [`completion_error_kind`].
+    #[serde(default)]
+    code: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -3417,6 +3480,76 @@ mod tests {
         let usage: ApiUsage = serde_json::from_str(json).unwrap();
         assert_eq!(usage.prompt_tokens, 42);
         assert_eq!(usage.completion_tokens, 7);
+    }
+
+    #[test]
+    fn test_process_sse_data_maps_in_band_rate_limit_error_chunk() -> anyhow::Result<()> {
+        // OpenRouter answers 200 and reports the failure as a chunk: the HTTP
+        // status branch never runs, so the error object must be decoded here.
+        let results = process_sse_data(
+            r#"{"id":"gen-1","choices":[{"delta":{},"finish_reason":"error","index":0}],"error":{"code":429,"message":"Rate limited by upstream. Please try again in 12s."}}"#,
+        );
+
+        let kind = results
+            .iter()
+            .find_map(|result| match result {
+                SseProcessResult::Error { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .context("expected an in-band error result")?;
+
+        assert_eq!(
+            kind,
+            StreamErrorKind::RateLimited(Some(std::time::Duration::from_secs(12))),
+            "an in-band 429 must be retriable and keep its parsed delay"
+        );
+        assert!(kind.is_recoverable());
+        Ok(())
+    }
+
+    #[test]
+    fn test_process_sse_data_maps_in_band_symbolic_and_server_error_chunks() -> anyhow::Result<()> {
+        // Symbolic code (OpenAI-style) rather than an HTTP number.
+        let symbolic = process_sse_data(
+            r#"{"choices":[],"error":{"code":"rate_limit_exceeded","message":"Please try again in 250ms."}}"#,
+        );
+        let kind = symbolic
+            .iter()
+            .find_map(|result| match result {
+                SseProcessResult::Error { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .context("expected an in-band error result")?;
+        assert_eq!(
+            kind,
+            StreamErrorKind::RateLimited(Some(std::time::Duration::from_millis(250)))
+        );
+
+        // An upstream 5xx stays retriable; a 4xx that is not a rate limit does not.
+        let server = process_sse_data(
+            r#"{"choices":[],"error":{"code":502,"message":"upstream unavailable"}}"#,
+        );
+        let server_kind = server
+            .iter()
+            .find_map(|result| match result {
+                SseProcessResult::Error { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .context("expected an in-band error result")?;
+        assert_eq!(server_kind, StreamErrorKind::ServerError);
+
+        let invalid =
+            process_sse_data(r#"{"choices":[],"error":{"code":400,"message":"bad request"}}"#);
+        let invalid_kind = invalid
+            .iter()
+            .find_map(|result| match result {
+                SseProcessResult::Error { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .context("expected an in-band error result")?;
+        assert_eq!(invalid_kind, StreamErrorKind::InvalidRequest);
+        assert!(!invalid_kind.is_recoverable());
+        Ok(())
     }
 
     #[test]

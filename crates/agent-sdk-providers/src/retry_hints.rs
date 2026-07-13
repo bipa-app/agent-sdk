@@ -75,15 +75,14 @@ pub fn openai_retry_delay(body: &str) -> Option<Duration> {
     // back onto the original string.
     const MARKER: &str = "try again in ";
 
-    let message = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("error")?
-                .get("message")?
-                .as_str()
-                .map(str::to_owned)
-        });
+    // Only a body that is not JSON at all is scanned as prose. A valid JSON
+    // body whose `error.message` is missing (or is not a string) yields no
+    // hint: scanning the serialized object instead would let an unrelated
+    // field that happens to read "try again in 6h" manufacture a delay.
+    let message = match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(value) => Some(value.get("error")?.get("message")?.as_str()?.to_owned()),
+        Err(_) => None,
+    };
     let haystack = message.as_deref().unwrap_or(body);
 
     let start = haystack.to_ascii_lowercase().find(MARKER)? + MARKER.len();
@@ -289,6 +288,35 @@ mod tests {
         assert_eq!(
             openai_retry_delay(r#"{"error":{"message":"Try again in 2 minutes."}}"#),
             Some(Duration::from_mins(2))
+        );
+    }
+
+    #[test]
+    #[cfg(any(feature = "openai", feature = "openai-codex"))]
+    fn openai_valid_json_without_an_error_message_is_none() {
+        // The prose scan is only for bodies that are not JSON. A JSON body whose
+        // `error.message` is absent must not have its other fields scanned — the
+        // phrase can appear in documentation links, metadata, or provider echoes.
+        assert_eq!(
+            openai_retry_delay(
+                r#"{"error":{"code":"rate_limit_exceeded","metadata":{"raw":"upstream said: try again in 6h"}}}"#
+            ),
+            None
+        );
+        // `error.message` present but not a string — same rule.
+        assert_eq!(
+            openai_retry_delay(r#"{"error":{"message":{"text":"try again in 6h"}}}"#),
+            None
+        );
+        // No `error` object at all.
+        assert_eq!(
+            openai_retry_delay(r#"{"detail":"please try again in 6h"}"#),
+            None
+        );
+        // Not JSON: the prose scan still applies, which is what it exists for.
+        assert_eq!(
+            openai_retry_delay("Rate limited. Please try again in 6s."),
+            Some(Duration::from_secs(6))
         );
     }
 

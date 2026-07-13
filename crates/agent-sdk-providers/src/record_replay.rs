@@ -180,10 +180,30 @@ impl LlmProvider for RecordReplayProvider {
                     while let Some(item) = stream.next().await {
                         match item {
                             Ok(delta) => {
+                                let terminal_error = matches!(delta, StreamDelta::Error { .. });
                                 captured.push(CassetteDelta::from_delta(&delta));
+                                if terminal_error {
+                                    // A caller stops reading at a terminal error and drops the
+                                    // stream, so this generator is never resumed past the yield
+                                    // below and the end-of-stream write would never run. Persist
+                                    // the cassette while control is still here, or every recorded
+                                    // failure interaction is lost.
+                                    if let Err(error) =
+                                        self.record_stream(key, std::mem::take(&mut captured))
+                                    {
+                                        log::warn!(
+                                            "record/replay: failed to persist stream cassette: {error}"
+                                        );
+                                    }
+                                    yield Ok(delta);
+                                    return;
+                                }
                                 yield Ok(delta);
                             }
                             Err(error) => {
+                                // A transport failure produced no terminal delta, so there is no
+                                // faithful interaction to record: replaying the captured prefix
+                                // would end the stream cleanly and hide the failure.
                                 yield Err(error);
                                 return;
                             }
@@ -876,6 +896,61 @@ mod tests {
                     "encrypted_content": "ciphertext"
                 })
         ));
+    }
+
+    #[tokio::test]
+    async fn error_stream_is_recorded_even_though_the_caller_drops_it() -> Result<()> {
+        // The real lifecycle: a consumer stops at the terminal error and drops
+        // the stream, so the generator never reaches end-of-stream. The cassette
+        // (with the rate-limit hint) must still be on disk afterwards.
+        let path = temp_cassette_path();
+        let inner = Arc::new(InnerProvider {
+            model: "inner-model",
+            chat_outcome: success_outcome("unused"),
+            deltas: vec![
+                StreamDelta::TextDelta {
+                    delta: "partial".to_owned(),
+                    block_index: 0,
+                },
+                StreamDelta::Error {
+                    message: "Rate limited".to_owned(),
+                    kind: StreamErrorKind::RateLimited(Some(Duration::from_secs(30))),
+                },
+            ],
+        });
+
+        let recorder = RecordReplayProvider::record(inner, &path);
+        {
+            let mut stream = recorder.chat_stream(request());
+            while let Some(item) = stream.next().await {
+                if matches!(item?, StreamDelta::Error { .. }) {
+                    break;
+                }
+            }
+            // Dropped here, mid-stream, exactly as the agent loop drops it.
+        }
+
+        let player = RecordReplayProvider::replay(&path)?;
+        let mut replayed = Vec::new();
+        let mut stream = player.chat_stream(request());
+        while let Some(item) = stream.next().await {
+            replayed.push(item?);
+        }
+        drop(stream);
+
+        assert!(
+            replayed.iter().any(|delta| matches!(
+                delta,
+                StreamDelta::Error {
+                    kind: StreamErrorKind::RateLimited(Some(delay)),
+                    ..
+                } if *delay == Duration::from_secs(30)
+            )),
+            "the recorded error delta and its retry hint must survive the drop, got {replayed:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 
     #[test]

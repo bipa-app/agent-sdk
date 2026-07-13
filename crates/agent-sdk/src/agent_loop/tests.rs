@@ -5329,6 +5329,112 @@ async fn streaming_rate_limit_retry_honours_the_provider_hint() -> anyhow::Resul
     Ok(())
 }
 
+// --- #9b: a failed streaming attempt's usage is still billed --------
+
+#[tokio::test]
+async fn streaming_retry_bills_the_failed_attempts_usage() -> anyhow::Result<()> {
+    // The provider reports usage and only THEN fails: those tokens are billed
+    // whether or not the stream survived. Attempt 1 (150 tokens) is abandoned,
+    // attempt 2 (150 tokens) succeeds with a tool call. Cumulative usage must
+    // count both — 300 — which trips the 200-token budget before turn 2. If the
+    // abandoned attempt's usage were dropped, the run would see only 150 and
+    // sail past the limit.
+    let usage = |input: u32, output: u32| {
+        StreamDelta::Usage(Usage {
+            input_tokens: input,
+            output_tokens: output,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        })
+    };
+    let provider = StreamScriptProvider::new(vec![
+        StreamScriptStep::Frames(vec![
+            usage(100, 50),
+            StreamDelta::Error {
+                message: "Rate limited".to_string(),
+                kind: StreamErrorKind::RateLimited(None),
+            },
+        ]),
+        StreamScriptStep::Frames(vec![
+            StreamDelta::ToolUseStart {
+                id: "tool_1".to_string(),
+                name: "echo".to_string(),
+                block_index: 0,
+                thought_signature: None,
+            },
+            StreamDelta::ToolInputDelta {
+                id: "tool_1".to_string(),
+                delta: json!({"message": "hi"}).to_string(),
+                block_index: 0,
+            },
+            usage(100, 50),
+            StreamDelta::Done {
+                stop_reason: Some(crate::llm::StopReason::ToolUse),
+            },
+        ]),
+        StreamScriptStep::Frames(vec![
+            StreamDelta::TextDelta {
+                delta: "should never run".to_string(),
+                block_index: 0,
+            },
+            usage(10, 5),
+            StreamDelta::Done {
+                stop_reason: Some(crate::llm::StopReason::EndTurn),
+            },
+        ]),
+    ]);
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let config = AgentConfig {
+        streaming: true,
+        max_turns: None,
+        retry: RetryConfig {
+            max_retries: 2,
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+        },
+        usage_limits: Some(UsageLimits {
+            max_total_tokens: Some(200),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .config(config)
+        .event_store(new_event_store())
+        .build();
+
+    let (state, _events) = run_recorded(
+        &agent,
+        ThreadId::new(),
+        AgentInput::Text("hi".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    match state {
+        AgentRunState::BudgetExceeded {
+            limit, total_usage, ..
+        } => {
+            assert_eq!(limit, BudgetLimitKind::TotalTokens);
+            assert_eq!(
+                total_usage.input_tokens + total_usage.output_tokens,
+                300,
+                "both the abandoned and the surviving attempt must be billed, got {total_usage:?}",
+            );
+        }
+        other => anyhow::bail!(
+            "dropping the failed attempt's usage let the run slip past its budget, got {other:?}",
+        ),
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn streaming_rate_limit_without_a_hint_uses_exponential_backoff() -> anyhow::Result<()> {
     // No server hint: the exponential schedule (base 250ms, first retry) applies.
