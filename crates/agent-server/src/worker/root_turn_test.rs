@@ -7213,3 +7213,212 @@ async fn lost_ownership_rejection_settles_the_open_attempt() -> Result<()> {
     assert_eq!(row.output_tokens, Some(33));
     Ok(())
 }
+
+/// Thread store that reproduces the in-lock CAS loss deterministically
+/// (codex round-10 P1): on the commit path's ADVISORY pre-check read,
+/// it returns the stale row but lands a cancelled predecessor's
+/// salvage commit before returning — so the pre-check passes on stale
+/// state and the authoritative CAS inside `commit_turn` is the guard
+/// that fires. The commit must reach that CAS with NO side effects
+/// applied (attempt still open) or the slot-shift retry dies on
+/// `AlreadyClosed` instead of shifting.
+struct CasRacingThreadStore {
+    inner: InMemoryThreadStore,
+    stores: TestStores,
+    salvager_task: AgentTaskId,
+    /// Number of `get` calls to serve verbatim before the racing
+    /// salvage fires (the shift wrapper's own precheck reads first).
+    gets_before_fire: AtomicUsize,
+}
+
+impl CasRacingThreadStore {
+    async fn land_racing_salvage(&self) -> Result<()> {
+        let attempt = self
+            .stores
+            .attempts
+            .open_attempt(OpenAttemptParams {
+                task_id: self.salvager_task.clone(),
+                attempt_number: 1,
+                provenance: AuditProvenance::new("mock", "mock-model"),
+                request_blob: serde_json::json!({}),
+                now: t_plus(1),
+                otel_trace_id: None,
+                otel_span_id: None,
+            })
+            .await?;
+        crate::journal::commit::commit_completed_turn(
+            crate::journal::commit::CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::CancelSalvage,
+                thread_id: thread_a(),
+                task_id: self.salvager_task.clone(),
+                expected_turn: 1,
+                turn_attempt_id: attempt.id,
+                close_attempt_params: salvage_close_params(),
+                messages: vec![agent_sdk_foundation::llm::Message::assistant(
+                    "salvaged prefix",
+                )],
+                turn_usage: TokenUsage::default(),
+                agent_state_snapshot: serde_json::json!({}),
+                events: Vec::new(),
+                outbox_max_attempts: 3,
+                owner_guard: None,
+                now: t_plus(1),
+            },
+            // The racing commit goes through the INNER store directly
+            // so its own reads do not consume the fire counter.
+            &self.inner,
+            &self.stores.messages,
+            &self.stores.attempts,
+            &self.stores.checkpoints,
+            &self.stores.events,
+        )
+        .await
+        .context("racing salvage commit")?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl crate::journal::thread_store::ThreadStore for CasRacingThreadStore {
+    async fn get_or_create(
+        &self,
+        thread_id: &ThreadId,
+        now: time::OffsetDateTime,
+    ) -> Result<crate::journal::thread::Thread> {
+        self.inner.get_or_create(thread_id, now).await
+    }
+    async fn get(&self, thread_id: &ThreadId) -> Result<Option<crate::journal::thread::Thread>> {
+        let stale = self.inner.get(thread_id).await?;
+        if self
+            .gets_before_fire
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok_and(|prev| prev == 1)
+        {
+            self.land_racing_salvage().await?;
+        }
+        Ok(stale)
+    }
+    async fn commit_turn(
+        &self,
+        thread_id: &ThreadId,
+        expected_turn: u32,
+        turn_usage: &TokenUsage,
+        now: time::OffsetDateTime,
+    ) -> Result<crate::journal::thread::Thread> {
+        self.inner
+            .commit_turn(thread_id, expected_turn, turn_usage, now)
+            .await
+    }
+    async fn mark_completed(
+        &self,
+        thread_id: &ThreadId,
+        now: time::OffsetDateTime,
+    ) -> Result<crate::journal::thread::Thread> {
+        self.inner.mark_completed(thread_id, now).await
+    }
+    async fn list(&self) -> Result<Vec<crate::journal::thread::Thread>> {
+        self.inner.list().await
+    }
+}
+
+/// Codex round-10 P1: a successor that loses the AUTHORITATIVE in-lock
+/// CAS (both racers passed the advisory pre-check) must still shift —
+/// which requires the CAS rejection to leave its attempt open for the
+/// retried commit. Fires the salvage exactly between the pre-check
+/// read and `commit_turn`.
+#[tokio::test]
+async fn cas_loss_after_advisory_precheck_still_shifts() -> Result<()> {
+    use super::root_turn::commit_completed_turn_shifting_slot;
+    use crate::journal::commit::{CommitOutcome, CompletedTurnCommit};
+
+    let stores = TestStores::new();
+    stores.threads.get_or_create(&thread_a(), t0()).await?;
+    let successor = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let successor_id = successor.id.clone();
+    let worker_id = successor.worker_id.clone().context("worker")?;
+    let lease_id = successor.lease_id.clone().context("lease")?;
+
+    let attempt = stores
+        .attempts
+        .open_attempt(OpenAttemptParams {
+            task_id: successor_id.clone(),
+            attempt_number: 1,
+            provenance: AuditProvenance::new("mock", "mock-model"),
+            request_blob: serde_json::json!({}),
+            now: t0(),
+            otel_trace_id: None,
+            otel_span_id: None,
+        })
+        .await?;
+
+    // Fire on the SECOND get: the shift wrapper's own precheck reads
+    // first (must see the genuinely stale row), the commit's advisory
+    // pre-check reads second (returns stale, salvage lands underneath),
+    // and the in-lock CAS then rejects.
+    let racing = CasRacingThreadStore {
+        inner: stores.threads.clone(),
+        stores: stores.clone(),
+        salvager_task: AgentTaskId::from_string("task_cas_salvager"),
+        gets_before_fire: AtomicUsize::new(2),
+    };
+    let mut deps = stores.deps();
+    deps.thread_store = &racing;
+
+    let commit = commit_completed_turn_shifting_slot(
+        CompletedTurnCommit {
+            checkpoint_kind: CheckpointKind::FullTurn,
+            thread_id: thread_a(),
+            task_id: successor_id.clone(),
+            expected_turn: 1,
+            turn_attempt_id: attempt.id.clone(),
+            close_attempt_params: CloseAttemptParams {
+                response_blob: serde_json::json!({}),
+                response_id: None,
+                response_model: Some("mock-model".into()),
+                stop_reason: None,
+                outcome: TurnAttemptOutcome::Success,
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_input_tokens: 0,
+            },
+            messages: vec![agent_sdk_foundation::llm::Message::assistant(
+                "successor answer",
+            )],
+            turn_usage: TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            },
+            agent_state_snapshot: serde_json::json!({}),
+            events: Vec::new(),
+            outbox_max_attempts: 3,
+            owner_guard: None,
+            now: t_plus(2),
+        },
+        &worker_id,
+        &lease_id,
+        &deps,
+    )
+    .await
+    .context("the CAS loss must shift, not fail on AlreadyClosed")?;
+    let CommitOutcome { thread, .. } = commit;
+    assert_eq!(thread.committed_turns, 2, "successor landed on turn 2");
+
+    let salvage = stores
+        .checkpoints
+        .get_by_turn(&thread_a(), 1)
+        .await?
+        .context("salvage kept turn 1")?;
+    assert_eq!(salvage.kind, CheckpointKind::CancelSalvage);
+    let landed = stores
+        .checkpoints
+        .get_by_turn(&thread_a(), 2)
+        .await?
+        .context("successor checkpoint at turn 2")?;
+    assert_eq!(landed.task_id, successor_id);
+    let closed = stores.attempts.get(&attempt.id).await?.context("attempt")?;
+    assert_eq!(closed.outcome, Some(TurnAttemptOutcome::Success));
+    Ok(())
+}

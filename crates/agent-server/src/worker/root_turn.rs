@@ -1748,7 +1748,7 @@ fn remap_turn_indexed_events(events: &mut [AgentEvent], turn: usize) {
 /// Billing truth is unaffected: the cancelled turn's real usage lives
 /// on its attempt rows and its `Cancelled` event, and the thread
 /// aggregate advanced by zero for the salvage by construction.
-async fn commit_completed_turn_shifting_slot(
+pub(crate) async fn commit_completed_turn_shifting_slot(
     mut params: CompletedTurnCommit,
     worker_id: &WorkerId,
     lease_id: &LeaseId,
