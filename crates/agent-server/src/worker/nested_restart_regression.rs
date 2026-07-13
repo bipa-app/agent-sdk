@@ -44,6 +44,7 @@
 //! (`SQLite`, `Postgres`) reuse the same `AgentTaskStore` contract
 //! and are covered by the conformance suite for the transitional
 //! primitives; the composite restart flow is the focus here.
+use crate::worker::activity::ActivityBeacon;
 use std::sync::Arc;
 
 use std::collections::BTreeSet;
@@ -283,6 +284,7 @@ impl TestStores {
             compaction_provider: None,
             cancel: None,
             wakeup: None,
+            activity: None,
         }
     }
 
@@ -599,7 +601,8 @@ async fn drive_child_to_completion(
         )
         .await?
         .context("claim child tool task")?;
-    let tool_bootstrap = resolve_tool_bootstrap(tool_running, &stores.tasks).await?;
+    let tool_bootstrap =
+        resolve_tool_bootstrap(tool_running, &stores.tasks, ActivityBeacon::default()).await?;
     clock += Duration::seconds(1);
     let tool_outcome = execute_tool_task(
         tool_bootstrap,
@@ -834,7 +837,8 @@ async fn run_tool_task_to_completion(
         "claim child tool task",
     )
     .await?;
-    let tool_bootstrap = resolve_tool_bootstrap(tool_running, &stores.tasks).await?;
+    let tool_bootstrap =
+        resolve_tool_bootstrap(tool_running, &stores.tasks, ActivityBeacon::default()).await?;
     let tool_outcome = execute_tool_task(
         tool_bootstrap,
         &stores.tasks,

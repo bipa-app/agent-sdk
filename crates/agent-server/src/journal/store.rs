@@ -1085,6 +1085,22 @@ pub trait AgentTaskStore: Send + Sync {
     /// expiry is how workers hold their lease open across a long-running
     /// tool call.
     ///
+    /// # Activity
+    ///
+    /// `activity` is the newest **evidence of work** the running task has
+    /// produced (a provider frame, a tool progress emission, an event
+    /// commit), or `None` if it produced none since the last beat. It
+    /// rides the heartbeat because the heartbeat already holds the
+    /// `(worker, lease)` CAS and already writes this row — so activity is
+    /// persisted once per tick instead of once per provider frame.
+    ///
+    /// It only ever moves `last_activity_at` **forward**; a beat carrying
+    /// `None` leaves the column untouched. Note this is emphatically NOT
+    /// `last_heartbeat_at`: the heartbeat renews unconditionally while the
+    /// task future is alive, so a child wedged on a half-open connection
+    /// beats forever. A beat proves the process is alive; `activity`
+    /// proves work happened. The subagent stall budget reads the latter.
+    ///
     /// Returns the refreshed row on success.
     ///
     /// # Errors
@@ -1102,6 +1118,7 @@ pub trait AgentTaskStore: Send + Sync {
         worker: &WorkerId,
         lease: &LeaseId,
         expires_at: OffsetDateTime,
+        activity: Option<OffsetDateTime>,
         now: OffsetDateTime,
     ) -> Result<AgentTask>;
 
@@ -3487,6 +3504,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         worker: &WorkerId,
         lease: &LeaseId,
         expires_at: OffsetDateTime,
+        activity: Option<OffsetDateTime>,
         now: OffsetDateTime,
     ) -> Result<AgentTask> {
         let mut inner = self.inner.write().await;
@@ -3498,10 +3516,11 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
 
         // Drive the row through the pure transition helper: it enforces
         // `status == Running`, the worker CAS, and the lease CAS, and
-        // bumps `last_heartbeat_at` / `lease_expires_at` together.
+        // bumps `last_heartbeat_at` / `lease_expires_at` together, moving
+        // `last_activity_at` forward only when this beat carried work.
         let mut refreshed = old.clone();
         refreshed
-            .touch_heartbeat(worker, lease, expires_at, now)
+            .touch_heartbeat(worker, lease, expires_at, activity, now)
             .context("heartbeat rejected")?;
 
         inner.rebalance_after_row_change(&old, &refreshed);
@@ -6704,6 +6723,7 @@ mod tests {
                 &WorkerId::from_string("w1"),
                 &LeaseId::from_string("l1"),
                 t_plus(180),
+                None,
                 t_plus(30),
             )
             .await
@@ -6746,6 +6766,7 @@ mod tests {
                 &WorkerId::from_string("w-imposter"),
                 &LeaseId::from_string("l1"),
                 t_plus(120),
+                None,
                 t_plus(10),
             )
             .await
@@ -6769,6 +6790,7 @@ mod tests {
                 &WorkerId::from_string("w1"),
                 &LeaseId::from_string("l-stale"),
                 t_plus(120),
+                None,
                 t_plus(10),
             )
             .await
@@ -6797,6 +6819,7 @@ mod tests {
                 &WorkerId::from_string("w1"),
                 &LeaseId::from_string("l1"),
                 t_plus(120),
+                None,
                 t_plus(10),
             )
             .await
@@ -6814,6 +6837,7 @@ mod tests {
                 &WorkerId::from_string("w1"),
                 &LeaseId::from_string("l1"),
                 t_plus(120),
+                None,
                 t_plus(10),
             )
             .await
@@ -7033,6 +7057,7 @@ mod tests {
                 &WorkerId::from_string("w-dead"),
                 &LeaseId::from_string("l-dead"),
                 t_plus(300),
+                None,
                 t_plus(21),
             )
             .await
@@ -7070,6 +7095,7 @@ mod tests {
                 &WorkerId::from_string("w1"),
                 &LeaseId::from_string("l1"),
                 t_plus(100),
+                None,
                 t_plus(5),
             )
             .await
@@ -7167,6 +7193,7 @@ mod tests {
                 &WorkerId::from_string("w-tool"),
                 &LeaseId::from_string("l-tool"),
                 t_plus(200),
+                None,
                 t_plus(6),
             )
             .await
@@ -8285,6 +8312,7 @@ mod tests {
                 &WorkerId::from_string("w-dead"),
                 &LeaseId::from_string("l-dead"),
                 t_plus(300),
+                None,
                 t_plus(30),
             )
             .await
@@ -8340,7 +8368,7 @@ mod tests {
         assert_eq!(reacquired.status, TaskStatus::Running);
         assert!(
             store
-                .heartbeat_task(&id, &worker, &lease, t_plus(60), t_plus(4))
+                .heartbeat_task(&id, &worker, &lease, t_plus(60), None, t_plus(4))
                 .await
                 .is_err(),
             "the requeued-then-reacquired row must reject the old lease",
@@ -8459,6 +8487,7 @@ mod tests {
                 &WorkerId::from_string("w-dead"),
                 &LeaseId::from_string("l-dead"),
                 t_plus(300),
+                None,
                 t_plus(30),
             )
             .await
@@ -10750,6 +10779,7 @@ mod tests {
                 &WorkerId::from_string("w-live"),
                 &LeaseId::from_string("l-live"),
                 t_plus(60),
+                None,
                 t_plus(5),
             )
             .await
@@ -11731,6 +11761,7 @@ mod tests {
                 &WorkerId::from_string("w-child"),
                 &LeaseId::from_string("l-child"),
                 t_plus(120),
+                None,
                 t_plus(11),
             )
             .await
@@ -12536,7 +12567,7 @@ mod tests {
             .await
             .context("sweep")?;
         let err = store
-            .heartbeat_task(&task_id, &old_w, &old_l, t_plus(60), t_plus(11))
+            .heartbeat_task(&task_id, &old_w, &old_l, t_plus(60), None, t_plus(11))
             .await
             .unwrap_err();
         let msg = format!("{err:#}");
@@ -12607,7 +12638,7 @@ mod tests {
         let hb_w = wid.clone();
         let hb_l = lid.clone();
         let hb_handle = tokio::spawn(async move {
-            st1.heartbeat_task(&id1, &hb_w, &hb_l, t_plus(120), t_plus(10))
+            st1.heartbeat_task(&id1, &hb_w, &hb_l, t_plus(120), None, t_plus(10))
                 .await
         });
         let sweep_handle =
@@ -12677,6 +12708,7 @@ mod tests {
                 &WorkerId::from_string("w-ce"),
                 &LeaseId::from_string("l-ce"),
                 t_plus(60),
+                None,
                 t_plus(11),
             )
             .await

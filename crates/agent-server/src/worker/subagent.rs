@@ -532,25 +532,28 @@ pub struct EffectiveSubagentSpec {
     /// Server-authoritative **stall** budget, in milliseconds.
     ///
     /// This is a budget of *silence*, not of work. A child is failed
-    /// only after going the whole budget with **no evidence of work** —
-    /// no event committed on its own thread. A child that keeps working
-    /// never expires, however long it runs: a six-hour build worker
-    /// that commits a frame every minute is as healthy as a six-second
+    /// only after going the whole budget with **no evidence of work**
+    /// anywhere in its subtree — no provider frame, no tool progress, no
+    /// committed event on the child or any descendant. A child that keeps
+    /// working never expires, however long it runs: a six-hour build worker
+    /// that reports progress every minute is as healthy as a six-second
     /// one, and is left alone.
     ///
     /// Concretely, the service host fails the child only when **both**
-    /// hold: it has existed at least `timeout_ms` (so spawn counts as
-    /// the initial evidence of life, and a child that never starts is
-    /// still reaped), **and** its thread committed no event within the
-    /// last `timeout_ms`. Net effect: expiry lands roughly `timeout_ms`
-    /// after the last sign of life, and every frame pushes it out.
+    /// hold: it has existed at least `timeout_ms` (so spawn counts as the
+    /// initial evidence of life, and a child that never starts is still
+    /// reaped), **and** nothing in its subtree showed any sign of work
+    /// within the last `timeout_ms`. Net effect: expiry lands roughly
+    /// `timeout_ms` after the last sign of life, and every frame pushes it
+    /// out.
     ///
-    /// Enforcement covers three legs: a RUNNING child root is checked
+    /// Enforcement covers two legs: a RUNNING child root is checked
     /// once per worker heartbeat tick (default interval ~10s); a PARKED
     /// child root (suspended on its own tool children) is checked by
     /// the host's periodic sweep (default interval ~5s), which cancels
-    /// the hung descendants before failing the root; and a child
-    /// acquired already stalled fails up front without an LLM call.
+    /// the hung descendants before failing the root. Acquisition itself
+    /// counts as evidence of work, so a re-acquired child is never reaped
+    /// before it runs — however long it queued or sat stranded.
     /// Each leg carries up to one tick/sweep interval of slack. Not
     /// covered: a steering-resume exchange, which runs unbounded until
     /// the task's next ordinary acquisition. On expiry the child root

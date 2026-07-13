@@ -1,4 +1,5 @@
 //! End-to-end durable subagent execution tests.
+use crate::worker::activity::ActivityBeacon;
 use std::sync::Arc;
 
 use super::root_turn::{RootTurnDeps, RootTurnOutcome, execute_root_turn, resume_from_children};
@@ -231,6 +232,7 @@ impl TestStores {
             compaction_provider: None,
             cancel: None,
             wakeup: None,
+            activity: None,
         }
     }
 
@@ -493,7 +495,8 @@ async fn run_child_until_ready_to_resume(
         )
         .await?
         .context("claim child tool")?;
-    let tool_bootstrap = resolve_tool_bootstrap(tool_running, &stores.tasks).await?;
+    let tool_bootstrap =
+        resolve_tool_bootstrap(tool_running, &stores.tasks, ActivityBeacon::default()).await?;
     let tool_outcome = execute_tool_task(
         tool_bootstrap,
         &stores.tasks,

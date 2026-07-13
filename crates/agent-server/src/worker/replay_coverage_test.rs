@@ -5,6 +5,7 @@
 //! (`ToolProgress`), and lifecycle edges — is durably committed and
 //! replays in the correct order across interleaved root and tool
 //! task activity on the same thread.
+use crate::worker::activity::ActivityBeacon;
 use std::sync::Arc;
 
 use super::root_turn::{RootTurnDeps, RootTurnOutcome, execute_root_turn, resume_from_children};
@@ -120,6 +121,7 @@ impl TestStores {
             compaction_provider: None,
             cancel: None,
             wakeup: None,
+            activity: None,
         }
     }
 }
@@ -461,7 +463,8 @@ async fn tool_progress_events_are_durable() -> Result<()> {
         )
         .await?
         .context("acquire child")?;
-    let child_bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let child_bootstrap =
+        resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
 
     let cancel = CancellationToken::new();
     let tool_outcome = execute_tool_task(
@@ -560,7 +563,8 @@ async fn execute_child_and_resume(
         )
         .await?
         .context("acquire child")?;
-    let child_bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let child_bootstrap =
+        resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let cancel = CancellationToken::new();
     execute_tool_task(
         child_bootstrap,
@@ -789,7 +793,7 @@ async fn multiple_tool_tasks_interleave_correctly() -> Result<()> {
             )
             .await?
             .context("acquire child")?;
-        let cb = resolve_tool_bootstrap(child, &stores.tasks).await?;
+        let cb = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
         let cancel = CancellationToken::new();
         execute_tool_task(
             cb,
@@ -873,7 +877,7 @@ async fn empty_collector_adds_no_events() -> Result<()> {
         )
         .await?
         .context("acquire")?;
-    let cb = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let cb = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let cancel = CancellationToken::new();
 
     let tool_outcome = execute_tool_task(

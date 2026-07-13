@@ -21,7 +21,7 @@ use agent_server::journal::task::{
 };
 use agent_server::journal::task_state::TaskState;
 use agent_server::worker::{
-    AgentDefinitionRegistry, ConfirmationDecision, ConfirmationResumeOutcome,
+    ActivityBeacon, AgentDefinitionRegistry, ConfirmationDecision, ConfirmationResumeOutcome,
     apply_confirmation_decision, resolve_tool_bootstrap, resume_confirmed_tool,
 };
 use anyhow::{Context, Result};
@@ -356,9 +356,18 @@ impl GrpcShared {
             .await
             .context("capturing approved confirmation watermark")?;
 
-        let bootstrap = resolve_tool_bootstrap(acquired, self.stores.task_store.as_ref())
-            .await
-            .context("bootstrapping approved confirmation task")?;
+        // A Confirm-tier tool runs on its own detached heartbeat (see
+        // `drive_approved_confirmation`), so it gets its own beacon. The
+        // heartbeat there beats for `bootstrap.task_id` — the same row the
+        // collector's emissions describe — which is what makes persisting
+        // this beacon on that row correct.
+        let bootstrap = resolve_tool_bootstrap(
+            acquired,
+            self.stores.task_store.as_ref(),
+            ActivityBeacon::new(),
+        )
+        .await
+        .context("bootstrapping approved confirmation task")?;
 
         // Decouple the side-effecting tool from the RPC lifetime. A
         // Confirm-tier tool can run longer than one lease, so driving it
@@ -487,8 +496,12 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
             // paths that never consult the drive registry — they still
             // converge within one heartbeat interval.
             task_cancel: drive_cancel.clone(),
-            // Not a subagent child-thread root — no wall-clock deadline.
+            // Not a subagent child-thread root — no stall budget of its
+            // own. It still persists activity: this tool's progress is what
+            // keeps a PARKED subagent ancestor alive, and that ancestor's
+            // stall probe reads this row.
             deadline: crate::host::SubagentDeadlineState::Exempt,
+            activity: bootstrap.activity.clone(),
         },
     ));
 
@@ -4888,10 +4901,11 @@ mod tests {
             worker: &WorkerId,
             lease: &LeaseId,
             expires_at: OffsetDateTime,
+            activity: Option<OffsetDateTime>,
             now: OffsetDateTime,
         ) -> Result<AgentTask> {
             self.inner
-                .heartbeat_task(task_id, worker, lease, expires_at, now)
+                .heartbeat_task(task_id, worker, lease, expires_at, activity, now)
                 .await
         }
         async fn release_expired_leases(&self, now: OffsetDateTime) -> Result<Vec<RecoveryRecord>> {

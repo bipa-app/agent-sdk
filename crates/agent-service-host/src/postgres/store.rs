@@ -819,7 +819,8 @@ SELECT
     otel_traceparent,
     created_at,
     updated_at,
-    completed_at
+    completed_at,
+    last_activity_at
 FROM agent_sdk_tasks
 WHERE id = $1
 FOR UPDATE
@@ -856,7 +857,8 @@ SELECT
     otel_traceparent,
     created_at,
     updated_at,
-    completed_at
+    completed_at,
+    last_activity_at
 FROM agent_sdk_tasks
 WHERE id = $1
 ",
@@ -897,7 +899,8 @@ SELECT
     otel_traceparent,
     created_at,
     updated_at,
-    completed_at
+    completed_at,
+    last_activity_at
 FROM agent_sdk_tasks
 WHERE id = $1
 ",
@@ -941,7 +944,8 @@ SELECT
     otel_traceparent,
     created_at,
     updated_at,
-    completed_at
+    completed_at,
+    last_activity_at
 FROM agent_sdk_tasks
 WHERE id = $1
 ",
@@ -1138,10 +1142,11 @@ INSERT INTO agent_sdk_tasks (
     otel_traceparent,
     created_at,
     updated_at,
-    completed_at
+    completed_at,
+    last_activity_at
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-    $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24
+    $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25
 )
 ",
             task.id.as_str(),
@@ -1168,6 +1173,7 @@ INSERT INTO agent_sdk_tasks (
             task.created_at,
             task.updated_at,
             task.completed_at,
+            task.last_activity_at,
         )
         .execute(&mut **tx)
         .await
@@ -1202,7 +1208,8 @@ SET
     updated_at = $21,
     completed_at = $22,
     caller_metadata_json = $23,
-    otel_traceparent = $24
+    otel_traceparent = $24,
+    last_activity_at = $25
 WHERE id = $1
 ",
             task.id.as_str(),
@@ -1229,6 +1236,7 @@ WHERE id = $1
             task.completed_at,
             task.caller_metadata.clone(),
             task.otel_traceparent.clone(),
+            task.last_activity_at,
         )
         .execute(&mut **tx)
         .await
@@ -1689,7 +1697,8 @@ SELECT
     otel_traceparent,
     created_at,
     updated_at,
-    completed_at
+    completed_at,
+    last_activity_at
 FROM agent_sdk_tasks
 WHERE kind = 'subagent'
   AND status = 'waiting_on_children'
@@ -1777,7 +1786,8 @@ SELECT
     otel_traceparent,
     created_at,
     updated_at,
-    completed_at
+    completed_at,
+    last_activity_at
 FROM agent_sdk_tasks
 WHERE thread_id = $1
   AND kind = 'root_turn'
@@ -2607,7 +2617,8 @@ SELECT
     otel_traceparent,
     created_at,
     updated_at,
-    completed_at
+    completed_at,
+    last_activity_at
 FROM agent_sdk_tasks
 WHERE thread_id = $1
 ORDER BY created_at, id
@@ -2648,7 +2659,8 @@ SELECT
     otel_traceparent,
     created_at,
     updated_at,
-    completed_at
+    completed_at,
+    last_activity_at
 FROM agent_sdk_tasks
 WHERE parent_id = $1
 ORDER BY created_at, id
@@ -2690,7 +2702,8 @@ SELECT
     otel_traceparent,
     created_at,
     updated_at,
-    completed_at
+    completed_at,
+    last_activity_at
 FROM agent_sdk_tasks
 WHERE status = $1
 ORDER BY created_at, id
@@ -2731,7 +2744,8 @@ SELECT
     otel_traceparent,
     created_at,
     updated_at,
-    completed_at
+    completed_at,
+    last_activity_at
 FROM agent_sdk_tasks
 WHERE thread_id = $1
   AND kind = 'root_turn'
@@ -2775,7 +2789,8 @@ SELECT
     otel_traceparent,
     created_at,
     updated_at,
-    completed_at
+    completed_at,
+    last_activity_at
 FROM agent_sdk_tasks
 WHERE thread_id = $1
   AND kind = 'root_turn'
@@ -2898,7 +2913,8 @@ SELECT
     otel_traceparent,
     created_at,
     updated_at,
-    completed_at
+    completed_at,
+    last_activity_at
 FROM agent_sdk_tasks
 WHERE status = 'pending'
 ORDER BY created_at, id
@@ -2975,18 +2991,28 @@ FOR UPDATE SKIP LOCKED
         worker: &WorkerId,
         lease: &LeaseId,
         expires_at: OffsetDateTime,
+        activity: Option<OffsetDateTime>,
         now: OffsetDateTime,
     ) -> Result<AgentTask> {
         let mut tx = self.begin().await?;
         // Single guarded UPDATE of only the lease columns — never reload
-        // (FOR UPDATE) and rewrite the whole 24-column row (re-serialising
+        // (FOR UPDATE) and rewrite the whole 25-column row (re-serialising
         // submitted_input / state JSON blobs) on a per-tick heartbeat.
         // `RETURNING` hands back the refreshed row in one round trip.
+        //
+        // `GREATEST` is the "advance only" guard for the activity column:
+        // it ignores NULLs (yielding NULL only when BOTH are NULL), so a
+        // beat that carried no work ($6 IS NULL) leaves the column exactly
+        // as it was, and a stale or clock-skewed observation can never
+        // retire a newer one.
         let updated = sqlx::query_as!(
             TaskRecord,
             r"
 UPDATE agent_sdk_tasks
-SET lease_expires_at = $4, last_heartbeat_at = $5, updated_at = $5
+SET lease_expires_at = $4,
+    last_heartbeat_at = $5,
+    updated_at = $5,
+    last_activity_at = GREATEST(last_activity_at, $6)
 WHERE id = $1 AND status = 'running' AND worker_id = $2 AND lease_id = $3
 RETURNING
     id,
@@ -3012,13 +3038,15 @@ RETURNING
     otel_traceparent,
     created_at,
     updated_at,
-    completed_at
+    completed_at,
+    last_activity_at
 ",
             id.as_str(),
             worker.as_str(),
             lease.as_str(),
             expires_at,
             now,
+            activity,
         )
         .fetch_optional(&mut *tx)
         .await
@@ -3075,7 +3103,8 @@ SELECT
     otel_traceparent,
     created_at,
     updated_at,
-    completed_at
+    completed_at,
+    last_activity_at
 FROM agent_sdk_tasks
 WHERE status = 'running'
   AND lease_expires_at <= $1
@@ -3638,7 +3667,8 @@ SELECT
     otel_traceparent,
     created_at,
     updated_at,
-    completed_at
+    completed_at,
+    last_activity_at
 FROM agent_sdk_tasks
 WHERE kind = 'subagent'
   AND status = 'waiting_on_children'
@@ -3682,7 +3712,8 @@ SELECT
     otel_traceparent,
     created_at,
     updated_at,
-    completed_at
+    completed_at,
+    last_activity_at
 FROM agent_sdk_tasks
 WHERE kind = 'subagent'
   AND status = 'waiting_on_children'
@@ -5712,6 +5743,7 @@ struct TaskRecord {
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
     completed_at: Option<OffsetDateTime>,
+    last_activity_at: Option<OffsetDateTime>,
 }
 
 impl TryFrom<TaskRecord> for AgentTask {
@@ -5735,6 +5767,7 @@ impl TryFrom<TaskRecord> for AgentTask {
             lease_id: record.lease_id.map(LeaseId::from_string),
             lease_expires_at: record.lease_expires_at,
             last_heartbeat_at: record.last_heartbeat_at,
+            last_activity_at: record.last_activity_at,
             state: json_from_value(record.state_json, "task state")?,
             attempt: u32_from_i64(record.attempt, "task attempt")?,
             max_attempts: u32_from_i64(record.max_attempts, "task max_attempts")?,

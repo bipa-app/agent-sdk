@@ -200,6 +200,7 @@ impl Fixtures {
             compaction_provider: Some(provider),
             cancel: None,
             wakeup: None,
+            activity: None,
         }
     }
 }
@@ -528,6 +529,7 @@ async fn prompt_too_long_without_config_still_goes_fatal() -> Result<()> {
         compaction_provider: None,
         cancel: None,
         wakeup: None,
+        activity: None,
     };
 
     let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;

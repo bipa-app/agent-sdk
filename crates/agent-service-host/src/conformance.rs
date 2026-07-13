@@ -350,7 +350,7 @@ mod tests {
             .await?;
 
         let refreshed = task_store
-            .heartbeat_task(&root.id, &worker, &lease, t_plus(60), t_plus(35))
+            .heartbeat_task(&root.id, &worker, &lease, t_plus(60), None, t_plus(35))
             .await?;
         assert_eq!(refreshed.lease_expires_at, Some(t_plus(60)));
         Ok(())

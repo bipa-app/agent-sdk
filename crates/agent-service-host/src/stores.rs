@@ -684,6 +684,7 @@ impl StoreRegistry {
             compaction_provider: None,
             cancel: None,
             wakeup: None,
+            activity: None,
         }
     }
 

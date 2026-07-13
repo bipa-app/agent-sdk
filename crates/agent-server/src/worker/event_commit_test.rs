@@ -7,6 +7,7 @@
 use super::root_turn::{
     RootTurnDeps, RootTurnOutcome, execute_root_turn, fail_root_turn, resume_from_children,
 };
+use crate::worker::activity::ActivityBeacon;
 use std::sync::Arc;
 
 use super::tool_task::{ToolTaskOutcome, execute_tool_task, resolve_tool_bootstrap};
@@ -129,6 +130,7 @@ impl TestStores {
             compaction_provider: None,
             cancel: None,
             wakeup: None,
+            activity: None,
         }
     }
 }
@@ -462,7 +464,8 @@ async fn tool_completion_emits_tool_call_end() -> Result<()> {
         )
         .await?
         .context("child task should be acquirable")?;
-    let child_bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let child_bootstrap =
+        resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
 
     // Execute the tool.
     let cancel = CancellationToken::new();
@@ -538,7 +541,8 @@ async fn tool_failure_emits_tool_call_end_with_error() -> Result<()> {
         )
         .await?
         .context("child task should be acquirable")?;
-    let child_bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let child_bootstrap =
+        resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
 
     let cancel = CancellationToken::new();
     let tool_outcome = execute_tool_task(
@@ -620,7 +624,8 @@ async fn execute_child_and_resume(
         )
         .await?
         .context("child task should be acquirable")?;
-    let child_bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let child_bootstrap =
+        resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let cancel = CancellationToken::new();
     execute_tool_task(
         child_bootstrap,

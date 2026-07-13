@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\nUPDATE agent_sdk_tasks SET\n    kind = ?2, status = ?3, parent_id = ?4, root_id = ?5,\n    depth = ?6, thread_id = ?7, submitted_input_json = ?8,\n    worker_id = ?9, lease_id = ?10, lease_expires_at = ?11,\n    last_heartbeat_at = ?12, state_json = ?13, attempt = ?14,\n    max_attempts = ?15, last_error = ?16, pending_child_count = ?17,\n    spawn_index = ?18, result_payload = ?19,\n    created_at = ?20, updated_at = ?21, completed_at = ?22,\n    caller_metadata_json = ?23,\n    otel_traceparent = ?24,\n    last_activity_at = ?25\nWHERE id = ?1\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 25
+    },
+    "nullable": []
+  },
+  "hash": "42ef150711a98d69416477d28b8fda0c4cc1f74a64d7e6ab185f0f86d5d000cb"
+}

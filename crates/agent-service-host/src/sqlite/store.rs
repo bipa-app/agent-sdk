@@ -197,7 +197,7 @@ macro_rules! task_columns {
          submitted_input_json, caller_metadata_json, worker_id, lease_id, \
          lease_expires_at, last_heartbeat_at, state_json, attempt, max_attempts, \
          last_error, pending_child_count, spawn_index, result_payload, \
-         otel_traceparent, created_at, updated_at, completed_at"
+         otel_traceparent, created_at, updated_at, completed_at, last_activity_at"
     };
 }
 
@@ -885,10 +885,10 @@ INSERT INTO agent_sdk_tasks (
     submitted_input_json, caller_metadata_json, worker_id, lease_id, lease_expires_at,
     last_heartbeat_at, state_json, attempt, max_attempts, last_error,
     pending_child_count, spawn_index, result_payload,
-    created_at, updated_at, completed_at, otel_traceparent
+    created_at, updated_at, completed_at, otel_traceparent, last_activity_at
 ) VALUES (
     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
+    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
 )
 ",
             id,
@@ -915,6 +915,7 @@ INSERT INTO agent_sdk_tasks (
             task.updated_at,
             task.completed_at,
             task.otel_traceparent,
+            task.last_activity_at,
         )
         .execute(&mut **tx)
         .await
@@ -950,7 +951,8 @@ UPDATE agent_sdk_tasks SET
     spawn_index = ?18, result_payload = ?19,
     created_at = ?20, updated_at = ?21, completed_at = ?22,
     caller_metadata_json = ?23,
-    otel_traceparent = ?24
+    otel_traceparent = ?24,
+    last_activity_at = ?25
 WHERE id = ?1
 ",
             id,
@@ -977,6 +979,7 @@ WHERE id = ?1
             task.completed_at,
             caller_metadata_json,
             task.otel_traceparent,
+            task.last_activity_at,
         )
         .execute(&mut **tx)
         .await
@@ -2585,18 +2588,31 @@ impl AgentTaskStore for SqliteDurableStore {
         worker: &WorkerId,
         lease: &LeaseId,
         expires_at: OffsetDateTime,
+        activity: Option<OffsetDateTime>,
         now: OffsetDateTime,
     ) -> Result<AgentTask> {
         let mut tx = self.begin().await?;
         // Single guarded UPDATE of only the lease columns — never reload
-        // and rewrite the whole 24-column row (re-serialising the
+        // and rewrite the whole 25-column row (re-serialising the
         // submitted_input / state JSON blobs) on a per-tick heartbeat.
         // `RETURNING` hands back the refreshed row in one round trip.
+        //
+        // The activity column advances but never retreats. SQLite's scalar
+        // `MAX` returns NULL if ANY argument is NULL, so each side is
+        // COALESCEd to the other first: that yields the surviving value
+        // when exactly one is NULL, NULL when both are, and the true
+        // maximum when neither is — i.e. a beat carrying no work (?6 IS
+        // NULL) leaves the column untouched. The comparison is on the TEXT
+        // encoding, whose lexicographic order is chronological for this
+        // schema's timestamps — the same property the lease-expiry sweep
+        // already relies on (`WHERE lease_expires_at <= ?1`).
         let worker_str = worker.as_str();
         let lease_str = lease.as_str();
         let updated = sqlx::query_as::<_, TaskRecord>(concat!(
             "UPDATE agent_sdk_tasks \
-             SET lease_expires_at = ?4, last_heartbeat_at = ?5, updated_at = ?5 \
+             SET lease_expires_at = ?4, last_heartbeat_at = ?5, updated_at = ?5, \
+                 last_activity_at = MAX( \
+                     COALESCE(last_activity_at, ?6), COALESCE(?6, last_activity_at)) \
              WHERE id = ?1 AND status = 'running' AND worker_id = ?2 AND lease_id = ?3 \
              RETURNING ",
             task_columns!(),
@@ -2606,6 +2622,7 @@ impl AgentTaskStore for SqliteDurableStore {
         .bind(lease_str)
         .bind(expires_at)
         .bind(now)
+        .bind(activity)
         .fetch_optional(&mut *tx)
         .await
         .with_context(|| format!("heartbeat update for {id}"))?;
@@ -4732,6 +4749,7 @@ struct TaskRecord {
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
     completed_at: Option<OffsetDateTime>,
+    last_activity_at: Option<OffsetDateTime>,
 }
 
 impl TryFrom<TaskRecord> for AgentTask {
@@ -4751,6 +4769,7 @@ impl TryFrom<TaskRecord> for AgentTask {
             lease_id: r.lease_id.map(LeaseId::from_string),
             lease_expires_at: r.lease_expires_at,
             last_heartbeat_at: r.last_heartbeat_at,
+            last_activity_at: r.last_activity_at,
             state: json_from_value(r.state_json, "task state")?,
             attempt: u32_from_i64(r.attempt, "task attempt")?,
             max_attempts: u32_from_i64(r.max_attempts, "task max_attempts")?,

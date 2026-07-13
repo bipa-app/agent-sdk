@@ -591,6 +591,29 @@ pub struct AgentTask {
     #[serde(with = "time::serde::rfc3339::option")]
     pub last_heartbeat_at: Option<OffsetDateTime>,
 
+    /// Last durable **evidence of work** on this task.
+    ///
+    /// This is NOT `last_heartbeat_at`. The heartbeat renews unconditionally
+    /// while the task future is alive, so a child hung on a half-open
+    /// connection heartbeats forever — it proves the process is alive, not
+    /// that work is happening. This field only advances when the task
+    /// actually did something: a provider frame arrived, a tool emitted
+    /// progress, or an event was committed.
+    ///
+    /// It is written on the heartbeat path (which already holds the lease, so
+    /// only the owning worker can advance it) and it is deliberately **not**
+    /// an event: event retention cannot purge it, and it does not bloat the
+    /// journal.
+    ///
+    /// `None` means "nothing recorded yet" — a legacy row, or a child that
+    /// has not yet produced its first sign of life. Readers fall back to
+    /// [`Self::created_at`]: spawn is the initial evidence of life.
+    ///
+    /// Consumed by the subagent stall budget (`spec.timeout_ms`), which fails
+    /// a child only after a whole budget with no evidence of work.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub last_activity_at: Option<OffsetDateTime>,
+
     // ── typed durable state blob ────────────────────────────
     /// Strongly typed pause-state owned by the task kind.
     ///
@@ -702,6 +725,7 @@ impl AgentTask {
             lease_id: None,
             lease_expires_at: None,
             last_heartbeat_at: None,
+            last_activity_at: None,
             state: TaskState::None,
             attempt: 0,
             max_attempts,
@@ -807,6 +831,7 @@ impl AgentTask {
             lease_id: None,
             lease_expires_at: None,
             last_heartbeat_at: None,
+            last_activity_at: None,
             state: TaskState::None,
             attempt: 0,
             max_attempts,
@@ -863,6 +888,7 @@ impl AgentTask {
             lease_id: None,
             lease_expires_at: None,
             last_heartbeat_at: None,
+            last_activity_at: None,
             state: TaskState::SubagentInvocation {
                 invocation: Box::new(invocation),
             },
@@ -1211,6 +1237,19 @@ impl AgentTask {
         self.lease_id = Some(lease);
         self.lease_expires_at = Some(expires_at);
         self.last_heartbeat_at = Some(now);
+        // Acquisition into Running is itself evidence of work — the fourth
+        // stall-budget refresh point, and the one that makes re-acquisition
+        // survivable. A child (re)acquired after a crash or outage longer
+        // than its budget carries a stale `last_activity_at` from before
+        // the gap; without this it would be reaped on its very first tick,
+        // throwing away a child that was about to resume productively. A
+        // fresh stamp gives it a full budget to prove itself, at the
+        // bounded cost of a genuinely wedged re-acquired child dying one
+        // budget later instead of at once (retries stay capped by
+        // `max_attempts`). A child that never starts is never acquired, so
+        // it never gets this stamp and is still reaped off its `created_at`
+        // floor by the parked sweep.
+        self.last_activity_at = Some(now);
         self.updated_at = now;
         self.validate()?;
         Ok(self)
@@ -1792,11 +1831,18 @@ impl AgentTask {
     ///   argument does not match the current lease holder.
     /// - [`TaskSchemaError::HeartbeatLeaseMismatch`] if the `lease`
     ///   argument does not match the current `lease_id`.
+    ///
+    /// `activity` carries the newest sign of work observed by the running
+    /// task since the last beat (`None` when it produced none). It only
+    /// ever moves [`Self::last_activity_at`] forward: a beat that saw no
+    /// work leaves the field untouched rather than clearing it, so a
+    /// task's evidence of life survives its idle beats.
     pub fn touch_heartbeat(
         &mut self,
         worker: &WorkerId,
         lease: &LeaseId,
         expires_at: OffsetDateTime,
+        activity: Option<OffsetDateTime>,
         now: OffsetDateTime,
     ) -> Result<(), TaskSchemaError> {
         if self.status != TaskStatus::Running {
@@ -1815,6 +1861,13 @@ impl AgentTask {
         }
         self.last_heartbeat_at = Some(now);
         self.lease_expires_at = Some(expires_at);
+        if let Some(activity) = activity
+            && self
+                .last_activity_at
+                .is_none_or(|current| activity > current)
+        {
+            self.last_activity_at = Some(activity);
+        }
         self.updated_at = now;
         self.validate()?;
         Ok(())
@@ -2857,6 +2910,7 @@ mod tests {
                 &WorkerId::from_string("w1"),
                 &LeaseId::from_string("l1"),
                 t_plus(60),
+                None,
                 t_plus(1),
             )
             .unwrap_err();
@@ -2876,6 +2930,7 @@ mod tests {
                 &WorkerId::from_string("other"),
                 &LeaseId::from_string("l1"),
                 t_plus(120),
+                None,
                 t_plus(2),
             )
             .unwrap_err();
@@ -2887,6 +2942,7 @@ mod tests {
                 &WorkerId::from_string("w1"),
                 &LeaseId::from_string("l-stale"),
                 t_plus(120),
+                None,
                 t_plus(2),
             )
             .unwrap_err();
@@ -2899,6 +2955,7 @@ mod tests {
                 &WorkerId::from_string("w1"),
                 &LeaseId::from_string("l1"),
                 t_plus(180),
+                None,
                 t_plus(3),
             )
             .context("heartbeat ok")?;

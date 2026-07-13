@@ -118,6 +118,7 @@ impl Stores {
             compaction_provider: None,
             cancel: None,
             wakeup: None,
+            activity: None,
         }
     }
 }
