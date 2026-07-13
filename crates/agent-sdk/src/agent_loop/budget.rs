@@ -1163,6 +1163,70 @@ mod catalog_tests {
         Ok(())
     }
 
+    /// A long-context call routed through `OpenRouter` is budgeted at the
+    /// override rate the route actually charges, reached through the route key.
+    #[tokio::test]
+    async fn openrouter_long_context_override_trips_the_budget() -> Result<()> {
+        const OPENROUTER_OVERRIDE_FIXTURE: &str = r#"{
+          "data": [
+            {
+              "id": "google/gemini-2.5-pro",
+              "context_length": 1048576,
+              "pricing": {
+                "prompt": "0.00000125",
+                "completion": "0.00001",
+                "overrides": [
+                  {
+                    "min_prompt_tokens": 200000,
+                    "prompt": "0.0000025",
+                    "completion": "0.000015"
+                  }
+                ]
+              }
+            }
+          ]
+        }"#;
+
+        let registry = registry_from(OPENROUTER_OVERRIDE_FIXTURE).await?;
+        let provenance = AuditProvenance::new("openai", "google/gemini-2.5-pro");
+
+        // 400K prompt (past the 200K override bound) + 100K output.
+        // Override: 0.4*2.5 + 0.1*15 = 2.50. Base would say 0.4*1.25 + 0.1*10 = 1.50.
+        let usage = TokenUsage {
+            input_tokens: 400_000,
+            output_tokens: 100_000,
+            ..Default::default()
+        };
+        let cost = estimate_cost_usd(Some(&registry), &provenance, &usage)
+            .context("the override must price this call")?;
+        assert!((cost - 2.5).abs() < 1e-9, "unexpected cost: {cost}");
+
+        // The loop folds the call per-call, so the accumulator carries the
+        // override rate; a $2 cap sits between it and the base rate.
+        let mut state = AgentState::new(ThreadId::new());
+        accumulate_cost(
+            &mut state,
+            Some(&registry),
+            &provenance,
+            &TokenUsage::default(),
+            &usage,
+        );
+        let limits = UsageLimits {
+            max_cost_usd: Some(2.0),
+            ..Default::default()
+        };
+        let (limit, _) = status(
+            Some(&limits),
+            Some(&registry),
+            &provenance,
+            &usage,
+            state.accumulated_cost_usd,
+        )
+        .context("the override rate must trip the cost limit")?;
+        assert_eq!(limit, BudgetLimitKind::CostUsd);
+        Ok(())
+    }
+
     /// Repricing a thread's SUMMED usage (the legacy-snapshot seed and the
     /// `run_cost_usd` fallback) must not read the sum as a context size: three
     /// 100K calls sum past a 272K threshold no single call ever reached, and

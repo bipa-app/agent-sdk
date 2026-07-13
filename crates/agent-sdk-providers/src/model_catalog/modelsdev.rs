@@ -2,7 +2,10 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::collections::HashMap;
 
-use super::{CatalogEntry, MODELS_DEV_URL, ModelCatalogSource, PricingTier, build_feed_client};
+use super::{
+    CatalogEntry, MODELS_DEV_URL, ModelCatalogSource, PricingTier, build_feed_client,
+    merge_band_over_base,
+};
 use crate::model_capabilities::{PricePoint, Pricing};
 
 #[derive(serde::Deserialize)]
@@ -130,6 +133,7 @@ fn pricing_from_modelsdev_cost(cost: &ModelsDevCost) -> Option<Pricing> {
 /// lets pricing fall back to another source, or to the documented
 /// "cost unknown" fail-open.
 fn tiers_from_modelsdev_cost(cost: &ModelsDevCost) -> Option<Vec<PricingTier>> {
+    let base = pricing_from_modelsdev_cost(cost);
     cost.tiers
         .iter()
         .map(|tier| {
@@ -137,11 +141,14 @@ fn tiers_from_modelsdev_cost(cost: &ModelsDevCost) -> Option<Vec<PricingTier>> {
             if bound.bound_type.as_deref() != Some("context") {
                 return None;
             }
-            let pricing =
+            let band =
                 pricing_from_rates(tier.input, tier.output, tier.cache_read, tier.cache_write)?;
             Some(PricingTier {
-                min_context_tokens: bound.size?,
-                pricing,
+                // The feed's bound is exclusive — its sibling field is literally
+                // `context_over_200k` — so the first call the band covers is one
+                // token past it.
+                min_input_tokens: bound.size?.saturating_add(1),
+                pricing: merge_band_over_base(base, band),
             })
         })
         .collect()
@@ -421,7 +428,9 @@ mod tests {
         assert!((base.input.context("input")?.usd_per_million_tokens - 2.5).abs() < f64::EPSILON);
         assert_eq!(tiered.pricing_tiers.len(), 1);
         let tier = tiered.pricing_tiers[0];
-        assert_eq!(tier.min_context_tokens, 272_000);
+        // The feed's bound is exclusive ("context over 272K"); the tier's is
+        // inclusive, so it starts one token later.
+        assert_eq!(tier.min_input_tokens, 272_001);
         assert!(
             (tier
                 .pricing

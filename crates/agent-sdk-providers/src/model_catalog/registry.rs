@@ -534,7 +534,9 @@ mod tests {
                 // models.dev: base 2.5/15, tier above 272K context 5/22.5.
                 pricing: Some(Pricing::flat(2.5, 15.0)),
                 pricing_tiers: vec![PricingTier {
-                    min_context_tokens: 272_000,
+                    // Inclusive bound: models.dev's "above 272K" band starts at
+                    // the first token past 272K.
+                    min_input_tokens: 272_001,
                     pricing: Pricing::flat(5.0, 22.5),
                 }],
                 supports_thinking: None,
@@ -659,7 +661,9 @@ mod tests {
                 max_output_tokens: None,
                 pricing: Some(Pricing::flat(2.5, 15.0)),
                 pricing_tiers: vec![PricingTier {
-                    min_context_tokens: 272_000,
+                    // Inclusive bound: models.dev's "above 272K" band starts at
+                    // the first token past 272K.
+                    min_input_tokens: 272_001,
                     pricing: Pricing::flat(5.0, 22.5),
                 }],
                 supports_thinking: None,

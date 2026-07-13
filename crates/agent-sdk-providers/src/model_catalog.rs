@@ -34,15 +34,16 @@ pub use openrouter::{OpenRouterSource, parse_openrouter};
 pub use registry::{ModelRegistry, ResolvedModel, ResolvedSource};
 
 /// Select the rates that apply to a call of `input_tokens`: the highest tier
-/// whose threshold the call exceeds, or the base rates when it exceeds none.
+/// the call reaches, or the base rates when it reaches none.
 ///
-/// `tiers` need not be sorted.
+/// The bound is inclusive — see [`PricingTier::min_input_tokens`]. `tiers` need
+/// not be sorted.
 #[must_use]
 pub fn applicable_pricing(base: Pricing, tiers: &[PricingTier], input_tokens: u32) -> Pricing {
     tiers
         .iter()
-        .filter(|tier| input_tokens > tier.min_context_tokens)
-        .max_by_key(|tier| tier.min_context_tokens)
+        .filter(|tier| input_tokens >= tier.min_input_tokens)
+        .max_by_key(|tier| tier.min_input_tokens)
         .map_or(base, |tier| tier.pricing)
 }
 
@@ -74,19 +75,53 @@ pub struct CatalogEntry {
     pub supports_thinking: Option<bool>,
 }
 
-/// A long-context price band: above `min_context_tokens` input tokens, the
-/// provider bills the whole call at `pricing` instead of the base rates.
+/// A long-context price band: from `min_input_tokens` upwards, the provider
+/// bills the whole call at `pricing` instead of the base rates.
 ///
 /// Frontier models price long context at a premium — GPT-5.x doubles its input
 /// rate above 272K tokens, Gemini and Claude above 200K — so a source that
 /// publishes tiers must be billed through them, or a long-context run is priced
 /// at a fraction of what it costs and sails past its budget.
+///
+/// The bound is **inclusive**, and the feeds express theirs differently: an
+/// `OpenRouter` override states the minimum prompt size it applies from
+/// (`min_prompt_tokens`), while a models.dev tier states the size it applies
+/// *above* (`tier.size`, the sibling of its `context_over_200k` field). A
+/// parser converts an exclusive bound exactly — `x > size` is `x >= size + 1`
+/// over integers — rather than leaving the two a token apart.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PricingTier {
-    /// The tier applies once a call's input tokens exceed this threshold.
-    pub min_context_tokens: u32,
-    /// The rates that replace the base rates for such a call.
+    /// The tier applies to a call whose input tokens reach this count.
+    pub min_input_tokens: u32,
+    /// The rates that replace the base rates for such a call. A source that
+    /// restates only some rates for the band leaves the rest inheriting the
+    /// base row, so this is the band's *effective* pricing, already merged.
     pub pricing: Pricing,
+}
+
+/// Merge a band's stated rates over the base row: a rate the band restates
+/// wins, one it omits keeps its base value.
+///
+/// Both feeds publish partial bands — `OpenRouter`'s Gemini 2.5 Pro override
+/// raises `prompt`, `completion` and `input_cache_read` above 200K but says
+/// nothing about `input_cache_write`, and models.dev's tier for the same model
+/// omits `cache_write` too. Two independent feeds mirroring the vendor's table
+/// with the same omission is the vendor not restating that rate for the band,
+/// not the rate vanishing: the base value still applies. Inheriting it is
+/// therefore what the data means, and it is also the only reading that cannot
+/// silently under-bill a component.
+#[must_use]
+pub fn merge_band_over_base(base: Option<Pricing>, band: Pricing) -> Pricing {
+    let Some(base) = base else {
+        return band;
+    };
+    Pricing {
+        input: band.input.or(base.input),
+        output: band.output.or(base.output),
+        cached_input: band.cached_input.or(base.cached_input),
+        cache_write: band.cache_write.or(base.cache_write),
+        notes: band.notes.or(base.notes),
+    }
 }
 
 /// A third-party feed of [`CatalogEntry`] rows.

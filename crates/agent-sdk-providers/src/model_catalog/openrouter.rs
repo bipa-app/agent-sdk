@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 
-use super::{CatalogEntry, ModelCatalogSource, OPENROUTER_URL, build_feed_client};
+use super::{
+    CatalogEntry, ModelCatalogSource, OPENROUTER_URL, PricingTier, build_feed_client,
+    merge_band_over_base,
+};
 use crate::model_capabilities::{PricePoint, Pricing};
 
 #[derive(serde::Deserialize)]
@@ -15,6 +18,27 @@ struct OpenRouterPricing {
     /// The default (5-minute) cache-write rate. The feed also publishes
     /// `input_cache_write_1h` for Anthropic's extended TTL, which the SDK does
     /// not request.
+    #[serde(default)]
+    input_cache_write: Option<String>,
+    /// Long-context price bands: from `min_prompt_tokens` upwards the route
+    /// bills at these rates instead. Gemini 2.5 Pro doubles its input rate
+    /// above 200K tokens this way, GPT-5.x above 272K.
+    #[serde(default)]
+    overrides: Vec<OpenRouterPricingOverride>,
+}
+
+/// Every field is optional: a drifted override must cost its own row's pricing,
+/// never the parse of the whole feed body. See [`tiers_from_openrouter_pricing`].
+#[derive(serde::Deserialize)]
+struct OpenRouterPricingOverride {
+    #[serde(default)]
+    min_prompt_tokens: Option<u32>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    completion: Option<String>,
+    #[serde(default)]
+    input_cache_read: Option<String>,
     #[serde(default)]
     input_cache_write: Option<String>,
 }
@@ -78,36 +102,16 @@ pub fn parse_openrouter(json: &str) -> Result<Vec<CatalogEntry>> {
         .data
         .into_iter()
         .map(|model| {
-            let pricing = model.pricing.and_then(|p| {
-                let input = p.prompt.as_deref().and_then(openrouter_price_per_million);
-                let output = p
-                    .completion
-                    .as_deref()
-                    .and_then(openrouter_price_per_million);
-                let cached_input = p
-                    .input_cache_read
-                    .as_deref()
-                    .and_then(openrouter_price_per_million);
-                let cache_write = p
-                    .input_cache_write
-                    .as_deref()
-                    .and_then(openrouter_price_per_million);
-                if input.is_none()
-                    && output.is_none()
-                    && cached_input.is_none()
-                    && cache_write.is_none()
-                {
-                    None
-                } else {
-                    Some(Pricing {
-                        input,
-                        output,
-                        cached_input,
-                        cache_write,
-                        notes: None,
-                    })
-                }
-            });
+            let base = model.pricing.as_ref().and_then(base_pricing);
+            // An un-interpretable override drops the row's pricing entirely:
+            // its base rates stop applying somewhere the parser cannot locate,
+            // so keeping them would under-price every long-context call.
+            let tiers = model.pricing.as_ref().map_or_else(
+                || Some(Vec::new()),
+                |p| tiers_from_openrouter_pricing(p, base),
+            );
+            let (pricing, pricing_tiers) =
+                tiers.map_or_else(|| (None, Vec::new()), |tiers| (base, tiers));
             let max_output_tokens = model.top_provider.and_then(|tp| tp.max_completion_tokens);
             CatalogEntry {
                 provider: OPENROUTER_PROVIDER.to_owned(),
@@ -115,12 +119,85 @@ pub fn parse_openrouter(json: &str) -> Result<Vec<CatalogEntry>> {
                 context_window: model.context_length,
                 max_output_tokens,
                 pricing,
-                // The feed prices each route at one flat rate.
-                pricing_tiers: Vec::new(),
+                pricing_tiers,
                 supports_thinking: None,
             }
         })
         .collect())
+}
+
+/// The route's rates for a call inside the base band.
+fn base_pricing(pricing: &OpenRouterPricing) -> Option<Pricing> {
+    pricing_from_rates(
+        pricing.prompt.as_deref(),
+        pricing.completion.as_deref(),
+        pricing.input_cache_read.as_deref(),
+        pricing.input_cache_write.as_deref(),
+    )
+}
+
+fn pricing_from_rates(
+    prompt: Option<&str>,
+    completion: Option<&str>,
+    input_cache_read: Option<&str>,
+    input_cache_write: Option<&str>,
+) -> Option<Pricing> {
+    let input = prompt.and_then(openrouter_price_per_million);
+    let output = completion.and_then(openrouter_price_per_million);
+    let cached_input = input_cache_read.and_then(openrouter_price_per_million);
+    let cache_write = input_cache_write.and_then(openrouter_price_per_million);
+
+    if input.is_none() && output.is_none() && cached_input.is_none() && cache_write.is_none() {
+        return None;
+    }
+    Some(Pricing {
+        input,
+        output,
+        cached_input,
+        cache_write,
+        notes: None,
+    })
+}
+
+/// The route's long-context bands, ascending.
+///
+/// `None` — "do not price this route from this feed at all" — when an override
+/// cannot be interpreted: no `min_prompt_tokens` to locate the band, or no
+/// input/output rate to bill it with. An override exists precisely because the
+/// base rates stop applying above its threshold, so one that cannot be read
+/// cannot be ignored: keeping the base rates would price every long-context
+/// call at a fraction of its true cost.
+///
+/// An override that restates only *some* rates (six routes raise input, output
+/// and cache-read above the threshold while leaving cache-write unstated) keeps
+/// its base value for the rest — see [`merge_band_over_base`].
+fn tiers_from_openrouter_pricing(
+    pricing: &OpenRouterPricing,
+    base: Option<Pricing>,
+) -> Option<Vec<PricingTier>> {
+    pricing
+        .overrides
+        .iter()
+        .map(|band| {
+            let rates = pricing_from_rates(
+                band.prompt.as_deref(),
+                band.completion.as_deref(),
+                band.input_cache_read.as_deref(),
+                band.input_cache_write.as_deref(),
+            )?;
+            // A band that bills only a cache component, with no input or output
+            // rate of its own, is not a price band this parser can stand behind.
+            if rates.input.is_none() || rates.output.is_none() {
+                return None;
+            }
+            Some(PricingTier {
+                // `min_prompt_tokens` is the smallest prompt the band applies
+                // to, so the bound is already inclusive.
+                min_input_tokens: band.min_prompt_tokens?,
+                pricing: merge_band_over_base(base, rates),
+            })
+        })
+        .collect()
 }
 
 /// An alternative public feed: <https://openrouter.ai/api/v1/models> (no key).
@@ -314,6 +391,227 @@ mod tests {
             registry.estimate_cost_usd("openrouter", "openrouter/auto", &usage),
             None
         );
+        Ok(())
+    }
+
+    /// Mirrors the live feed: `google/gemini-2.5-pro` raises prompt, completion
+    /// and cache-read above 200K prompt tokens but leaves cache-write unstated,
+    /// while `openai/gpt-5.6-luna` restates every rate above 272K.
+    const OPENROUTER_OVERRIDES_FIXTURE: &str = r#"{
+      "data": [
+        {
+          "id": "google/gemini-2.5-pro",
+          "context_length": 1048576,
+          "pricing": {
+            "prompt": "0.00000125",
+            "completion": "0.00001",
+            "input_cache_read": "0.000000125",
+            "input_cache_write": "0.000000375",
+            "overrides": [
+              {
+                "min_prompt_tokens": 200000,
+                "prompt": "0.0000025",
+                "completion": "0.000015",
+                "input_cache_read": "0.00000025"
+              }
+            ]
+          }
+        },
+        {
+          "id": "openai/gpt-5.6-luna",
+          "context_length": 400000,
+          "pricing": {
+            "prompt": "0.000001",
+            "completion": "0.000006",
+            "input_cache_read": "0.0000001",
+            "input_cache_write": "0.00000125",
+            "overrides": [
+              {
+                "min_prompt_tokens": 272000,
+                "prompt": "0.000002",
+                "completion": "0.000009",
+                "input_cache_read": "0.0000002",
+                "input_cache_write": "0.0000025"
+              }
+            ]
+          }
+        }
+      ]
+    }"#;
+
+    #[test]
+    fn parse_openrouter_reads_long_context_overrides() -> Result<()> {
+        let entries = parse_openrouter(OPENROUTER_OVERRIDES_FIXTURE)?;
+
+        let gemini = find(&entries, "openrouter", "google/gemini-2.5-pro")?;
+        assert_eq!(gemini.pricing_tiers.len(), 1);
+        let band = gemini.pricing_tiers[0];
+        // `min_prompt_tokens` is already an inclusive lower bound.
+        assert_eq!(band.min_input_tokens, 200_000);
+        assert!(
+            (band.pricing.input.context("input")?.usd_per_million_tokens - 2.5).abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (band
+                .pricing
+                .output
+                .context("output")?
+                .usd_per_million_tokens
+                - 15.0)
+                .abs()
+                < f64::EPSILON
+        );
+        // The override says nothing about cache-write, so the band keeps the
+        // base rate for it rather than dropping it or re-billing it at input.
+        assert!(
+            (band
+                .pricing
+                .cache_write
+                .context("cache_write inherited from base")?
+                .usd_per_million_tokens
+                - 0.375)
+                .abs()
+                < f64::EPSILON
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn long_context_route_bills_at_the_override_rate() -> Result<()> {
+        let registry = ModelRegistry::new();
+        registry
+            .refresh(&StaticSource(parse_openrouter(
+                OPENROUTER_OVERRIDES_FIXTURE,
+            )?))
+            .await?;
+
+        // Inside the base band: 100K in + 100K out = 0.1*1.25 + 0.1*10 = 1.125.
+        let short = Usage {
+            input_tokens: 100_000,
+            output_tokens: 100_000,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        let short_cost = registry
+            .estimate_cost_usd("openrouter", "google/gemini-2.5-pro", &short)
+            .context("cost estimate missing")?;
+        assert!(
+            (short_cost - 1.125).abs() < 1e-9,
+            "unexpected cost: {short_cost}"
+        );
+
+        // At the threshold — the bound is inclusive — and past it: the override
+        // rates apply to the whole call. 200K in + 100K out =
+        // 0.2*2.5 + 0.1*15 = 2.0, where the base rates would say 1.25.
+        for input_tokens in [200_000, 300_000] {
+            let long = Usage {
+                input_tokens,
+                output_tokens: 100_000,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            };
+            let cost = registry
+                .estimate_cost_usd("openrouter", "google/gemini-2.5-pro", &long)
+                .context("cost estimate missing")?;
+            let expected = (f64::from(input_tokens) / 1_000_000.0).mul_add(2.5, 1.5);
+            assert!(
+                (cost - expected).abs() < 1e-9,
+                "unexpected cost at {input_tokens}: {cost}"
+            );
+        }
+
+        // One token below the threshold still pays base rates.
+        let just_under = Usage {
+            input_tokens: 199_999,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        let under_cost = registry
+            .estimate_cost_usd("openrouter", "google/gemini-2.5-pro", &just_under)
+            .context("cost estimate missing")?;
+        assert!(
+            (under_cost - 0.249_998_75).abs() < 1e-9,
+            "unexpected cost: {under_cost}"
+        );
+        Ok(())
+    }
+
+    /// A summed usage is not a prompt size: the base band must price it, or a
+    /// thread of short calls gets re-billed at a long-context rate it never
+    /// paid. The tier machinery is shared, so this holds for both feeds.
+    #[tokio::test]
+    async fn aggregate_repricing_ignores_openrouter_overrides() -> Result<()> {
+        let registry = ModelRegistry::new();
+        registry
+            .refresh(&StaticSource(parse_openrouter(
+                OPENROUTER_OVERRIDES_FIXTURE,
+            )?))
+            .await?;
+
+        // Three 100K-prompt calls: 300K summed, no call near the 200K bound.
+        let aggregate = Usage {
+            input_tokens: 300_000,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        let base = registry
+            .estimate_dynamic_base_cost_usd("openrouter", "google/gemini-2.5-pro", &aggregate)
+            .context("cost estimate missing")?;
+        // Base: 0.3 * 1.25 = 0.375, not the override's 0.3 * 2.5 = 0.75.
+        assert!((base - 0.375).abs() < 1e-9, "unexpected cost: {base}");
+        Ok(())
+    }
+
+    /// A drifted override costs its own row's pricing, never the feed parse.
+    #[test]
+    fn parse_openrouter_survives_a_drifted_override() -> Result<()> {
+        const DRIFTED_FIXTURE: &str = r#"{
+          "data": [
+            {
+              "id": "vendor/healthy",
+              "pricing": { "prompt": "0.000001", "completion": "0.000002" }
+            },
+            {
+              "id": "vendor/no-threshold",
+              "pricing": {
+                "prompt": "0.000001",
+                "completion": "0.000002",
+                "overrides": [{ "prompt": "0.000009", "completion": "0.000009" }]
+              }
+            },
+            {
+              "id": "vendor/no-rates",
+              "pricing": {
+                "prompt": "0.000001",
+                "completion": "0.000002",
+                "overrides": [{ "min_prompt_tokens": 200000, "input_cache_read": "0.0000001" }]
+              }
+            }
+          ]
+        }"#;
+
+        let entries = parse_openrouter(DRIFTED_FIXTURE)?;
+        assert_eq!(
+            entries.len(),
+            3,
+            "the parse must not abort on a drifted row"
+        );
+
+        let healthy = find(&entries, "openrouter", "vendor/healthy")?;
+        assert!(healthy.pricing.is_some());
+        assert!(healthy.pricing_tiers.is_empty());
+
+        // An override with no threshold cannot be located, and one with no
+        // input/output rate cannot be billed: either way the base rates provably
+        // stop applying somewhere unknown, so the row carries no pricing at all.
+        for model in ["vendor/no-threshold", "vendor/no-rates"] {
+            let drifted = find(&entries, "openrouter", model)?;
+            assert!(drifted.pricing.is_none(), "{model} must drop its pricing");
+            assert!(drifted.pricing_tiers.is_empty());
+        }
         Ok(())
     }
 }
