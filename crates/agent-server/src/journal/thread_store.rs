@@ -85,6 +85,22 @@ pub trait ThreadStore: Send + Sync {
     /// Returns an error if the underlying store cannot be written.
     async fn get_or_create(&self, thread_id: &ThreadId, now: OffsetDateTime) -> Result<Thread>;
 
+    /// Optional process-wide serialization lock for the NON-ATOMIC
+    /// sequential commit path in [`super::commit::commit_completed_turn`].
+    ///
+    /// A backend with no atomic completed-turn transaction (the
+    /// in-memory store) returns its lock here; the sequential path
+    /// holds it across the stale-turn pre-check and every projection
+    /// step, so two in-process committers can never interleave — the
+    /// loser is rejected by the pre-check BEFORE closing its attempt,
+    /// which is what keeps the slot-shift retry viable (codex rounds
+    /// 9-11). Durable backends return `None`: their atomic committer
+    /// hook bypasses the sequential path entirely, and transaction
+    /// rollback already provides the same guarantee.
+    fn sequential_commit_lock(&self) -> Option<&tokio::sync::Mutex<()>> {
+        None
+    }
+
     /// Look up a thread by id.
     ///
     /// Returns `None` if the thread has never been created.
@@ -162,6 +178,9 @@ struct Inner {
 #[derive(Clone, Default)]
 pub struct InMemoryThreadStore {
     inner: Arc<RwLock<Inner>>,
+    /// See [`ThreadStore::sequential_commit_lock`]. Shared across
+    /// clones so every handle serializes against the same lock.
+    sequential_commit_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl InMemoryThreadStore {
@@ -174,6 +193,10 @@ impl InMemoryThreadStore {
 
 #[async_trait]
 impl ThreadStore for InMemoryThreadStore {
+    fn sequential_commit_lock(&self) -> Option<&tokio::sync::Mutex<()>> {
+        Some(&self.sequential_commit_lock)
+    }
+
     async fn get_or_create(&self, thread_id: &ThreadId, now: OffsetDateTime) -> Result<Thread> {
         let mut inner = self.inner.write().await;
         let thread = inner

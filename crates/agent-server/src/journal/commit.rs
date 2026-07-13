@@ -340,15 +340,23 @@ pub async fn commit_completed_turn(
     let events = std::mem::take(&mut params.events);
     let thread_id_for_events = params.thread_id.clone();
 
-    // Stale turn double-commit pre-check. It is advisory, not the
-    // authority: two racing committers can both pass this read (codex
-    // round-9), so the authoritative expected-turn CAS lives INSIDE
-    // `ThreadStore::commit_turn` (step 2), under the same lock as the
-    // increment. A commit that loses the in-lock race has already
-    // closed its attempt at step 1 (on the non-atomic in-memory path);
-    // the slot-shift retry recovers through step 1's idempotent-close
-    // arm, which accepts our own identical close from the rejected
-    // iteration.
+    // Stale turn double-commit guard. Two racing committers could both
+    // pass this read on the non-atomic path (codex round-9), so the
+    // whole sequential body runs under the store's sequential-commit
+    // lock (acquired above): under it this pre-check is decisive, and
+    // a rejected stale commit provably leaves no side effects — the
+    // attempt is still open for the caller's slot-shift retry. The
+    // expected-turn CAS inside `ThreadStore::commit_turn` (step 2)
+    // remains as defense in depth.
+    // Serialize the entire non-atomic commit body when the backend
+    // provides a sequential-commit lock (the in-memory store does; the
+    // durable backends get equivalent atomicity from their
+    // transactions and never reach this path). This is what makes the
+    // pre-check + close + aggregate sequence race-free in-process.
+    let _sequential_guard = match thread_store.sequential_commit_lock() {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
     let committed_turns_before = thread_store
         .get(&params.thread_id)
         .await
@@ -361,59 +369,25 @@ pub async fn commit_completed_turn(
         }));
     }
 
-    // 1. Close the turn attempt. The close is IDEMPOTENT for the
-    //    slot-shift retry (codex round-10 P1): when a commit passes
-    //    the advisory pre-check but loses the authoritative in-lock
-    //    CAS at step 2, this close has already landed — the durable
-    //    committers roll it back with their transaction, but the
-    //    non-atomic in-memory path cannot. The retried commit then
-    //    hits `AlreadyClosed` here; if the existing row was closed
-    //    with EXACTLY the terms this commit is requesting, that is
-    //    our own step-1 close from the rejected iteration and the
-    //    commit proceeds with it. Any other already-closed shape
-    //    (a different closer, different usage) still fails loudly.
-    //    Running the close before the aggregate advance keeps the
-    //    converse property: a close failure aborts BEFORE the thread
-    //    advances, so a stolen-lease enforcement racing a live commit
-    //    can never leave a phantom committed turn with no checkpoint.
-    let close_result = turn_attempt_store
+    // 1. Close the turn attempt. Strict: any already-closed row fails
+    //    the commit before a single projection advances. The
+    //    serialization guard above makes the CAS-loss-after-close
+    //    window unreachable on this path, so no idempotent-close
+    //    tolerance is needed (codex rounds 10-11).
+    let closed_attempt = turn_attempt_store
         .close_attempt(
             &params.turn_attempt_id,
-            params.close_attempt_params.clone(),
+            params.close_attempt_params,
             params.now,
         )
-        .await;
-    let closed_attempt = match close_result {
-        Ok(attempt) => attempt,
-        Err(error) => {
-            let already_closed = error.chain().any(|cause| {
-                cause.downcast_ref::<super::turn_attempt::TurnAttemptSchemaError>()
-                    == Some(&super::turn_attempt::TurnAttemptSchemaError::AlreadyClosed)
-            });
-            if !already_closed {
-                return Err(error.context("commit: close turn attempt"));
-            }
-            let existing = turn_attempt_store
-                .get(&params.turn_attempt_id)
-                .await
-                .context("commit: re-read already-closed attempt")?
-                .context("commit: already-closed attempt row missing")?;
-            let close = &params.close_attempt_params;
-            let identical = existing.outcome.as_ref() == Some(&close.outcome)
-                && existing.input_tokens == Some(close.input_tokens)
-                && existing.output_tokens == Some(close.output_tokens)
-                && existing.cached_input_tokens == Some(close.cached_input_tokens)
-                && existing.response_id == close.response_id;
-            if !identical {
-                return Err(error.context("commit: attempt already closed with different terms"));
-            }
-            existing
-        }
-    };
+        .await
+        .context("commit: close turn attempt")?;
 
     // 2. Commit the turn to the thread aggregate. This carries the
     //    AUTHORITATIVE expected-turn CAS (inside the store's write
-    //    lock/transaction on every backend).
+    //    lock/transaction on every backend) — under the sequential
+    //    lock it is defense in depth; for the durable backends' trait
+    //    method it protects standalone callers like the fork mirror.
     let thread = thread_store
         .commit_turn(
             &params.thread_id,
@@ -979,24 +953,17 @@ mod tests {
         );
     }
 
-    // ── Failure: already-closed attempt (different terms) ─────────
+    // ── Failure: already-closed attempt ──────────────────────────
 
     #[tokio::test]
-    async fn commit_fails_if_attempt_already_closed_with_different_terms() -> Result<()> {
+    async fn commit_fails_if_attempt_already_closed() -> Result<()> {
         let s = Stores::new();
         let task_id = AgentTaskId::from_string("task_closed");
         let attempt_id = s.open_attempt(&task_id, 1).await;
 
-        // Close the attempt manually first — with DIFFERENT terms than
-        // the commit will request (another closer, other usage).
-        let foreign_close = CloseAttemptParams {
-            outcome: TurnAttemptOutcome::Cancelled,
-            input_tokens: 1,
-            output_tokens: 1,
-            ..sample_close_params()
-        };
+        // Close the attempt manually first.
         s.attempts
-            .close_attempt(&attempt_id, foreign_close, t_plus(1))
+            .close_attempt(&attempt_id, sample_close_params(), t_plus(1))
             .await
             .context("manual close")?;
 
@@ -1027,8 +994,8 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            err.to_string().contains("different terms"),
-            "expected different-terms rejection, got: {err}",
+            err.to_string().contains("close turn attempt"),
+            "expected close error, got: {err}",
         );
 
         // No projections advanced.
@@ -1036,38 +1003,97 @@ mod tests {
         Ok(())
     }
 
-    /// Codex round-10 P1 companion: an attempt already closed with
-    /// EXACTLY the terms the commit requests is our own step-1 close
-    /// from a CAS-rejected iteration — the commit accepts it and
-    /// proceeds, which is what lets the slot-shift retry work on the
-    /// non-atomic in-memory backend.
-    #[tokio::test]
-    async fn commit_accepts_an_identical_own_preclose() -> Result<()> {
-        let s = Stores::new();
-        let task_id = AgentTaskId::from_string("task_preclosed");
-        let attempt_id = s.open_attempt(&task_id, 1).await;
+    /// Codex rounds 9-11: two IN-PROCESS committers racing for the
+    /// same turn slot serialize on the store's sequential-commit lock.
+    /// Exactly one lands; the loser is rejected by the (now decisive)
+    /// pre-check with a typed `StaleTurnCommit` and — critically — its
+    /// attempt is STILL OPEN, so the slot-shift retry can close it on
+    /// the retried commit. The loser then lands cleanly on turn 2.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_commits_serialize_and_the_loser_keeps_its_attempt_open() -> Result<()> {
+        let s = std::sync::Arc::new(Stores::new());
+        let task_a = AgentTaskId::from_string("task_racer_a");
+        let task_b = AgentTaskId::from_string("task_racer_b");
+        let attempt_a = s.open_attempt(&task_a, 1).await;
+        let attempt_b = s.open_attempt(&task_b, 1).await;
 
-        s.attempts
-            .close_attempt(&attempt_id, sample_close_params(), t_plus(1))
+        let commit_for = |task_id: AgentTaskId,
+                          attempt_id: crate::journal::turn_attempt::TurnAttemptId,
+                          expected_turn: u32| CompletedTurnCommit {
+            checkpoint_kind: CheckpointKind::FullTurn,
+            thread_id: thread_a(),
+            task_id,
+            expected_turn,
+            turn_attempt_id: attempt_id,
+            close_attempt_params: sample_close_params(),
+            messages: sample_messages(),
+            turn_usage: usage(100, 50),
+            agent_state_snapshot: serde_json::json!({}),
+            events: Vec::new(),
+            outbox_max_attempts: 3,
+            owner_guard: None,
+            now: t_plus(2),
+        };
+
+        let run = |params: CompletedTurnCommit, stores: std::sync::Arc<Stores>| async move {
+            commit_completed_turn(
+                params,
+                &stores.threads,
+                &stores.messages,
+                &stores.attempts,
+                &stores.checkpoints,
+                &stores.events,
+            )
             .await
-            .context("own prior close")?;
+        };
 
-        let outcome = commit_completed_turn(
-            CompletedTurnCommit {
-                checkpoint_kind: CheckpointKind::FullTurn,
-                thread_id: thread_a(),
-                task_id,
-                expected_turn: 1,
-                turn_attempt_id: attempt_id,
-                close_attempt_params: sample_close_params(),
-                messages: sample_messages(),
-                turn_usage: usage(100, 50),
-                agent_state_snapshot: serde_json::json!({}),
-                events: Vec::new(),
-                outbox_max_attempts: 3,
-                owner_guard: None,
-                now: t_plus(2),
-            },
+        let first = tokio::spawn(run(
+            commit_for(task_a.clone(), attempt_a.clone(), 1),
+            std::sync::Arc::clone(&s),
+        ));
+        let second = tokio::spawn(run(
+            commit_for(task_b.clone(), attempt_b.clone(), 1),
+            std::sync::Arc::clone(&s),
+        ));
+        let (first, second) = (first.await?, second.await?);
+
+        let (winner_task, loser_task, loser_attempt, loser_err) = match (first, second) {
+            (Ok(_), Err(err)) => (task_a, task_b, attempt_b, err),
+            (Err(err), Ok(_)) => (task_b, task_a, attempt_a, err),
+            (Ok(_), Ok(_)) => anyhow::bail!("both racers committed turn 1 — CAS is broken"),
+            (Err(e1), Err(e2)) => anyhow::bail!("both racers failed: {e1:#} / {e2:#}"),
+        };
+
+        // The loser's rejection is the typed slot collision…
+        assert!(
+            loser_err
+                .chain()
+                .any(|cause| cause.downcast_ref::<StaleTurnCommit>().is_some()),
+            "expected StaleTurnCommit, got: {loser_err:#}",
+        );
+        // …and its attempt is untouched, which is what the slot-shift
+        // retry depends on.
+        let open_attempt = s
+            .attempts
+            .get(&loser_attempt)
+            .await?
+            .context("loser attempt")?;
+        assert!(
+            !open_attempt.is_closed(),
+            "the losing commit must leave its attempt open",
+        );
+        let thread = s.threads.get(&thread_a()).await?.context("thread")?;
+        assert_eq!(thread.committed_turns, 1);
+        let occupant = s
+            .checkpoints
+            .get_by_turn(&thread_a(), 1)
+            .await?
+            .context("winner checkpoint")?;
+        assert_eq!(occupant.task_id, winner_task);
+
+        // The loser retries at the next slot and lands cleanly.
+        let retried = commit_completed_turn(
+            commit_for(loser_task.clone(), loser_attempt, 2),
             &s.threads,
             &s.messages,
             &s.attempts,
@@ -1075,13 +1101,9 @@ mod tests {
             &s.events,
         )
         .await
-        .context("identical pre-close must not block the commit")?;
-
-        assert_eq!(outcome.thread.committed_turns, 1);
-        assert_eq!(
-            outcome.closed_attempt.outcome,
-            Some(TurnAttemptOutcome::Success)
-        );
+        .context("the loser's retried commit must land on turn 2")?;
+        assert_eq!(retried.thread.committed_turns, 2);
+        assert_eq!(retried.checkpoint.task_id, loser_task);
         Ok(())
     }
 

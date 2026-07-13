@@ -40,6 +40,14 @@ const OUTBOX_MESSAGE_KIND_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/sqlite/0005_outbox_message_kind.sql"
 ));
+const TASK_CALLER_METADATA_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/sqlite/0006_task_caller_metadata.sql"
+));
+const MESSAGE_HEAD_DRAFTS_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/sqlite/0007_message_head_drafts.sql"
+));
 const TURN_ATTEMPT_OTEL_IDS_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/sqlite/0008_turn_attempt_otel_ids.sql"
@@ -48,11 +56,19 @@ const IDEMPOTENCY_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/sqlite/0009_idempotency.sql"
 ));
+const TASK_OTEL_TRACEPARENT_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/sqlite/0010_task_otel_traceparent.sql"
+));
+const CHECKPOINT_KIND_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/sqlite/0011_checkpoint_kind.sql"
+));
 
 /// `sqlx`-managed migration bundle for the `SQLite` durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/sqlite");
 
-const MIGRATIONS: [SqliteMigration; 7] = [
+const MIGRATIONS: [SqliteMigration; 11] = [
     SqliteMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -79,6 +95,16 @@ const MIGRATIONS: [SqliteMigration; 7] = [
         sql: OUTBOX_MESSAGE_KIND_SQL,
     },
     SqliteMigration {
+        version: "0006",
+        summary: "per-turn caller metadata captured on tasks at submission time",
+        sql: TASK_CALLER_METADATA_SQL,
+    },
+    SqliteMigration {
+        version: "0007",
+        summary: "in-flight draft message slots on message heads for resume-buffer surfacing",
+        sql: MESSAGE_HEAD_DRAFTS_SQL,
+    },
+    SqliteMigration {
         version: "0008",
         summary: "Phase 9 A7 turn attempt OTel trace + span ids for replay-link emission",
         sql: TURN_ATTEMPT_OTEL_IDS_SQL,
@@ -87,6 +113,16 @@ const MIGRATIONS: [SqliteMigration; 7] = [
         version: "0009",
         summary: "Phase 10 E durable at-least-once idempotency records",
         sql: IDEMPOTENCY_SQL,
+    },
+    SqliteMigration {
+        version: "0010",
+        summary: "per-task OTel traceparent for distributed-trace continuation",
+        sql: TASK_OTEL_TRACEPARENT_SQL,
+    },
+    SqliteMigration {
+        version: "0011",
+        summary: "explicit checkpoint kind discriminating cancel-salvage from full turns",
+        sql: CHECKPOINT_KIND_SQL,
     },
 ];
 
@@ -146,4 +182,48 @@ pub const fn turn_attempt_otel_ids_migration() -> &'static str {
 #[must_use]
 pub const fn idempotency_migration() -> &'static str {
     IDEMPOTENCY_SQL
+}
+
+/// The reviewable checkpoint-kind migration SQL.
+#[must_use]
+pub const fn checkpoint_kind_migration() -> &'static str {
+    CHECKPOINT_KIND_SQL
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DURABLE_CORE_MIGRATOR, durable_core_migrations};
+
+    /// Mirror of the Postgres finding-#20 guard (codex round-11): the
+    /// reviewable bundle silently omitted 0006/0007/0010/0011, so the
+    /// schema-contract checks that concatenate only the reviewable
+    /// bundle skipped those migrations' columns. Pin the reviewable
+    /// bundle to the executable migrator so a future migration can
+    /// never again drop out of the contract checks undetected.
+    #[test]
+    fn reviewable_bundle_covers_every_executable_migration() {
+        let reviewable = durable_core_migrations().len();
+        let executable = DURABLE_CORE_MIGRATOR.migrations.len();
+        assert_eq!(
+            reviewable, executable,
+            "reviewable MIGRATIONS array ({reviewable}) must list every executable migration \
+             ({executable}); a missing entry hides that migration's schema from the contract tests",
+        );
+    }
+
+    /// The reviewable bundle's declared versions must match the
+    /// executable migrator's versions one-for-one and in order.
+    #[test]
+    fn reviewable_versions_match_executable_versions_in_order() {
+        let reviewable: Vec<String> = durable_core_migrations()
+            .iter()
+            .map(|migration| migration.version.to_owned())
+            .collect();
+        let executable: Vec<String> = DURABLE_CORE_MIGRATOR
+            .migrations
+            .iter()
+            .map(|migration| format!("{:04}", migration.version))
+            .collect();
+        assert_eq!(reviewable, executable);
+    }
 }
