@@ -180,6 +180,7 @@ mod tests {
     use super::super::turn_attempt::{OpenAttemptParams, TurnAttemptOutcome};
     use super::super::turn_attempt_store::{InMemoryTurnAttemptStore, TurnAttemptStore};
     use super::*;
+    use crate::journal::checkpoint::CheckpointKind;
     use crate::worker::definition::{RuntimePolicy, ThinkingPolicy};
     use agent_sdk_foundation::audit::AuditProvenance;
     use agent_sdk_foundation::{TokenUsage, llm};
@@ -303,6 +304,7 @@ mod tests {
                 .saturating_add(1);
             commit_completed_turn(
                 CompletedTurnCommit {
+                    checkpoint_kind: CheckpointKind::FullTurn,
                     thread_id: thread_id.clone(),
                     task_id: task_id.clone(),
                     expected_turn,
@@ -313,6 +315,7 @@ mod tests {
                     agent_state_snapshot: state_snapshot,
                     events: Vec::new(),
                     outbox_max_attempts: 3,
+                    owner_guard: None,
                     now: at,
                 },
                 &self.threads,

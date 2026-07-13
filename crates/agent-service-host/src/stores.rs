@@ -34,7 +34,9 @@ use agent_server::journal::message_store::{
 };
 use agent_server::journal::outbox::{InMemoryOutboxStore, OutboxStore};
 use agent_server::journal::retention::{InMemoryRetentionStore, RetentionStore};
-use agent_server::journal::store::{AgentTaskStore, InMemoryAgentTaskStore};
+use agent_server::journal::store::{
+    AgentTaskStore, CancellationMarkerSink, InMemoryAgentTaskStore,
+};
 use agent_server::journal::task::AgentTaskId;
 use agent_server::journal::thread_store::{InMemoryThreadStore, ThreadStore};
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
@@ -545,16 +547,29 @@ impl StoreRegistry {
     /// empty instance.
     #[must_use]
     pub fn in_memory(definition_registry: Arc<dyn AgentDefinitionRegistry>) -> Self {
+        // The task store's `cancel_tree` commits terminal `Cancelled`
+        // markers (+ outbox advisories) through these shared stores —
+        // the in-memory analogue of the durable backends committing
+        // the marker inside the cancellation transaction (issue #354).
+        let thread_store: Arc<InMemoryThreadStore> = Arc::new(InMemoryThreadStore::new());
+        let event_repo: Arc<InMemoryEventRepository> = Arc::new(InMemoryEventRepository::new());
+        let outbox_store: Arc<InMemoryOutboxStore> = Arc::new(InMemoryOutboxStore::new());
+        let task_store =
+            InMemoryAgentTaskStore::new().with_cancellation_markers(CancellationMarkerSink {
+                event_repo: event_repo.clone(),
+                outbox_store: outbox_store.clone(),
+                thread_store: thread_store.clone(),
+            });
         Self {
-            task_store: Arc::new(InMemoryAgentTaskStore::new()),
-            thread_store: Arc::new(InMemoryThreadStore::new()),
+            task_store: Arc::new(task_store),
+            thread_store,
             message_store: Arc::new(InMemoryMessageProjectionStore::new()),
             attempt_store: Arc::new(InMemoryTurnAttemptStore::new()),
             checkpoint_store: Arc::new(InMemoryCheckpointStore::new()),
-            event_repo: Arc::new(InMemoryEventRepository::new()),
+            event_repo,
             execution_intent_store: Arc::new(InMemoryExecutionIntentStore::new()),
             tool_audit_store: Arc::new(InMemoryToolAuditEventStore::new()),
-            outbox_store: Arc::new(InMemoryOutboxStore::new()),
+            outbox_store,
             retention_store: Arc::new(InMemoryRetentionStore::new()),
             definition_registry,
             event_notifier: Arc::new(EventNotifier::new()),

@@ -793,7 +793,8 @@ async fn cancelled_child_thread_does_not_count_unexecuted_tool_tasks() -> Result
     let transitioned = stores
         .tasks
         .cancel_tree(&spawned.child_root_task.id, t_plus(5))
-        .await?;
+        .await?
+        .transitioned;
     assert!(transitioned.contains(&spawned.child_root_task.id));
     assert!(transitioned.contains(&tool_tasks[0].id));
 

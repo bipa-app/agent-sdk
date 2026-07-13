@@ -201,13 +201,19 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use agent_sdk_foundation::{ContinuationEnvelope, ListenExecutionContext, ThreadId};
+use agent_sdk_foundation::events::AgentEvent;
+use agent_sdk_foundation::{ContinuationEnvelope, ListenExecutionContext, ThreadId, TokenUsage};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
 
+use super::commit::DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS;
+use super::committed_event::CommittedEvent;
+use super::event_repository::EventRepository;
 use super::idempotency::{IdempotencyClaim, IdempotencyKind, IdempotencyRecord};
+use super::outbox::{NewOutboxRow, OutboxStore};
+use super::outbox_message::{OutboxMessage, OutboxMessageKind, ThreadEventsAvailablePayload};
 use super::recovery::{
     FailureReason, RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
 };
@@ -216,6 +222,7 @@ use super::task::{
     TaskKind, TaskStatus, WorkerId,
 };
 use super::task_state::SubagentInvocationState;
+use super::thread_store::ThreadStore;
 use crate::worker::definition::RuntimePolicy;
 use crate::worker::subagent::EffectiveSubagentSpec;
 
@@ -286,6 +293,28 @@ pub struct SubmitRootTurnOutcome {
     /// (excludes the active/blocking root). Surfaced to the caller so
     /// at-least-once clients can observe back-pressure.
     pub queued_depth: u32,
+}
+
+/// Outcome of [`AgentTaskStore::requeue_owned_task`].
+#[derive(Clone, Debug)]
+pub enum RequeueOutcome {
+    /// The row was returned to [`TaskStatus::Pending`] with the lease
+    /// cleared; the dispatcher will re-acquire it and re-run the turn
+    /// from the fresh committed head. Boxed so the enum's unit
+    /// variants do not pay the full row's size.
+    Requeued(Box<AgentTask>),
+    /// The row has no retry budget left (`attempt == max_attempts`);
+    /// NO transition was applied and the row is still `Running` under
+    /// the caller's lease. The caller owns routing it through its full
+    /// terminal-failure envelope (attempt close, `Error` event,
+    /// successor promotion) — the store must not fail it silently.
+    BudgetExhausted,
+    /// The row is no longer a `Running` row owned by the caller
+    /// (cancelled, swept, or re-acquired); NO transition was applied.
+    /// Whichever path took the row over owns its terminal state — the
+    /// caller must skip cleanly, exactly like the fail path's
+    /// still-owned guard.
+    NotOwned,
 }
 
 /// Typed failure modes for
@@ -394,6 +423,73 @@ pub fn submit_record_task_id(record: &IdempotencyRecord) -> Result<AgentTaskId> 
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow!("submit idempotency record missing task_id reference"))?;
     Ok(AgentTaskId::from_string(task_id))
+}
+
+/// Outcome of [`AgentTaskStore::cancel_tree`].
+#[derive(Clone, Debug, Default)]
+pub struct CancelTreeOutcome {
+    /// Task ids actually transitioned to [`TaskStatus::Cancelled`], in
+    /// BFS (root-first) order. Rows that were already terminal are not
+    /// included.
+    pub transitioned: Vec<AgentTaskId>,
+    /// Terminal [`AgentEvent::Cancelled`] markers committed by this
+    /// call — exactly one per *blocking* root turn transitioned (the
+    /// pre-cancel occupant of its thread's active-root slot, per
+    /// [`TaskStatus::blocks_root_admission`]), each on that root's own
+    /// thread. Queued-behind-active cancels and non-root rows emit
+    /// nothing. Callers should forward these to the in-process
+    /// [`EventNotifier`](super::event_notifier::EventNotifier) for
+    /// same-process live-tail latency; cross-process followers are
+    /// covered by the `thread_events_available` outbox advisory
+    /// committed alongside each marker.
+    pub markers: Vec<CommittedEvent>,
+}
+
+/// Store handles the in-memory [`AgentTaskStore`] uses to commit the
+/// terminal `Cancelled` marker (and its outbox advisory) as part of
+/// [`AgentTaskStore::cancel_tree`].
+///
+/// The durable SQL backends commit the marker inside `cancel_tree`'s
+/// own transaction — task transitions, marker event, and outbox row
+/// are all-or-nothing. The in-memory backend keeps tasks, events, and
+/// outbox in separate stores, so it takes this sink at construction
+/// ([`InMemoryAgentTaskStore::with_cancellation_markers`]) and commits
+/// the marker in the same `cancel_tree` call, while still holding the
+/// task-store write lock — a promoted successor cannot be acquired
+/// until that lock drops, so the marker's sequence always precedes
+/// the successor's `Start`. Exactly-once holds because the marker is
+/// derived from the rows this call actually transitioned — an
+/// idempotent retry sees a terminal tree and emits nothing.
+///
+/// Two windows remain on this backend only (no cross-store
+/// transaction exists): dropping the in-flight `cancel_tree` future
+/// mid-await can lose markers after the transitions applied, and a
+/// sink error surfaces as `Err` after the transitions applied — both
+/// documented on `cancel_tree`; the durable backends are the
+/// crash-safety story.
+///
+/// A bare `InMemoryAgentTaskStore::new()` (no sink) emits no markers;
+/// composed deployments (the service host's in-memory registry, test
+/// fixtures that assert on markers) must wire the sink.
+#[derive(Clone)]
+pub struct CancellationMarkerSink {
+    /// Committed-event journal the marker is appended to.
+    pub event_repo: Arc<dyn EventRepository>,
+    /// Outbox the `thread_events_available` advisory row is written to.
+    pub outbox_store: Arc<dyn OutboxStore>,
+    /// Thread projection consulted for the marker's `turn` /
+    /// fallback `usage` payload.
+    pub thread_store: Arc<dyn ThreadStore>,
+}
+
+/// Marker candidate captured while cancelling a blocking root, before
+/// [`AgentTask::cancel`] clears its typed state.
+struct CancelMarkerCandidate {
+    thread_id: ThreadId,
+    /// Cumulative usage from the parked turn's durable continuation,
+    /// when the root carried one. Preferred over the thread aggregate
+    /// because it includes the suspended turn's already-billed calls.
+    continuation_usage: Option<TokenUsage>,
 }
 
 /// Persistent store for [`AgentTask`] rows.
@@ -804,6 +900,63 @@ pub trait AgentTaskStore: Send + Sync {
     /// Returns an error if a release or fail-closed transition, or
     /// the underlying store write, fails.
     async fn release_expired_leases(&self, now: OffsetDateTime) -> Result<Vec<RecoveryRecord>>;
+
+    /// Return a `Running` row this worker still owns to the runnable
+    /// queue — the worker-initiated twin of the expiry sweep's requeue
+    /// arm (issue #354).
+    ///
+    /// The one production caller is the host's completed-turn
+    /// collision handler: a promoted successor whose commit lost its
+    /// turn slot to a foreign FULL-TURN checkpoint must not shift past
+    /// it (its snapshot lacks the occupant's billed usage) and must
+    /// not fail terminally either — the cancellation contract promises
+    /// follow-up work completes. Requeueing re-runs the turn from the
+    /// fresh committed head with crash-equivalent semantics: the turn
+    /// never committed, so re-execution is exactly what the durable
+    /// journal already promises after a worker crash, and the same
+    /// retry budget applies.
+    ///
+    /// A successful call CAS-checks that the row exists, is
+    /// [`TaskStatus::Running`], and is owned by exactly
+    /// `(worker, lease)`, then applies [`AgentTask::release_lease`] —
+    /// the identical transition (and identical budget accounting) the
+    /// expiry sweep uses — and persists the row. The three non-error
+    /// outcomes are reported as [`RequeueOutcome`] variants rather
+    /// than errors because each has a distinct correct caller
+    /// reaction; see the variant docs.
+    ///
+    /// # Boundary event
+    ///
+    /// `boundary`, when supplied, is committed to the task's thread
+    /// journal (with its `thread_events_available` outbox advisory)
+    /// ATOMICALLY with the ownership CAS and the release — inside the
+    /// same transaction on the durable backends, under the same task
+    /// write lock (via the wired [`CancellationMarkerSink`]) on the
+    /// in-memory store, exactly like `cancel_tree`'s terminal markers.
+    /// This is what makes the "abandoned streamed attempt" terminator
+    /// race-free: the event lands iff THIS caller
+    /// still owned the row, and it is durable before the row becomes
+    /// acquirable — so a replacement's `Start` can never precede it
+    /// and a stale caller can never inject it into a replacement's
+    /// stream. `NotOwned` / `BudgetExhausted` commit nothing. An
+    /// in-memory store with no sink wired requeues without the event
+    /// (bare test-support stores only; production wiring and the
+    /// journal bundle always carry the sink).
+    ///
+    /// # Errors
+    /// Returns an error only for store I/O failures, a boundary-event
+    /// commit failure, or an invalid release transition; ownership and
+    /// budget conditions are reported through the outcome enum. On the
+    /// non-atomic in-memory path a boundary error leaves the row still
+    /// `Running` under the caller's lease (nothing was released).
+    async fn requeue_owned_task(
+        &self,
+        id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        boundary: Option<AgentEvent>,
+        now: OffsetDateTime,
+    ) -> Result<RequeueOutcome>;
 
     /// Pause a running task on outstanding child work, dropping the
     /// lease atomically with the typed-state mutation.
@@ -1308,6 +1461,23 @@ pub trait AgentTaskStore: Send + Sync {
     ///    invariant holds.
     /// 3. Skips rows that are already terminal, so repeated calls on
     ///    the same subtree are idempotent.
+    /// 4. For every transitioned root turn that occupied its thread's
+    ///    active-root slot pre-cancel
+    ///    ([`TaskStatus::blocks_root_admission`]), commits one terminal
+    ///    [`AgentEvent::Cancelled`] marker on that root's **own**
+    ///    thread — including child-thread roots reached across
+    ///    `SubagentInvocation` linkage — together with a
+    ///    `thread_events_available` outbox advisory row. On the
+    ///    durable SQL backends both writes share `cancel_tree`'s
+    ///    transaction, so the marker exists iff the cancellation
+    ///    committed: a crash cannot separate them, an idempotent retry
+    ///    (terminal tree, nothing transitioned) emits nothing, and
+    ///    cross-host followers are woken by the outbox relay. The
+    ///    marker carries `turn = thread.committed_turns` and the
+    ///    cumulative usage from the root's parked continuation when
+    ///    present (falling back to the thread aggregate). Cancelling
+    ///    a QUEUED root behind a live active root never emits a
+    ///    marker — the active root's followers stay open.
     ///
     /// Because every transition is a pure in-memory state change
     /// running under the store's write lock, cancellation is
@@ -1317,20 +1487,24 @@ pub trait AgentTaskStore: Send + Sync {
     /// `(worker_id, lease_id)` CAS on its next heartbeat / complete
     /// / fail attempt.
     ///
-    /// Returns the ids that were actually transitioned, in
-    /// transition order. Rows that were already terminal before the
-    /// call are not included in the result.
+    /// Returns a [`CancelTreeOutcome`]: the ids actually transitioned
+    /// (in transition order, already-terminal rows omitted) plus the
+    /// committed `Cancelled` markers so callers can wake same-process
+    /// followers through the event notifier.
     ///
     /// # Errors
     /// - `cancel_tree rejected: task ... does not exist` — no row
     ///   with the supplied id.
     /// - Schema errors from [`AgentTask::cancel`] or
     ///   [`AgentTask::validate`].
+    /// - Marker commit failures (event journal / outbox / thread
+    ///   projection). On the durable backends these roll back the
+    ///   entire cancellation.
     async fn cancel_tree(
         &self,
         root_id: &AgentTaskId,
         now: OffsetDateTime,
-    ) -> Result<Vec<AgentTaskId>>;
+    ) -> Result<CancelTreeOutcome>;
 
     /// Resume a [`TaskStatus::AwaitingConfirmation`] task back to
     /// [`TaskStatus::Pending`], atomically extracting the prepared
@@ -1500,6 +1674,12 @@ struct Inner {
 #[derive(Clone, Default)]
 pub struct InMemoryAgentTaskStore {
     inner: Arc<RwLock<Inner>>,
+    /// Optional sink for the terminal `Cancelled` markers
+    /// [`AgentTaskStore::cancel_tree`] commits per cancelled blocking
+    /// root. `None` (bare stores in unit tests) emits no markers; the
+    /// composed in-memory backend wires it via
+    /// [`Self::with_cancellation_markers`].
+    marker_sink: Option<Arc<CancellationMarkerSink>>,
 }
 
 impl InMemoryAgentTaskStore {
@@ -1507,6 +1687,88 @@ impl InMemoryAgentTaskStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Wire the event / outbox / thread stores `cancel_tree` commits
+    /// its terminal `Cancelled` markers through (see
+    /// [`CancellationMarkerSink`]).
+    #[must_use]
+    pub fn with_cancellation_markers(mut self, sink: CancellationMarkerSink) -> Self {
+        self.marker_sink = Some(Arc::new(sink));
+        self
+    }
+
+    /// Commit one terminal `Cancelled` marker (+ its
+    /// `thread_events_available` outbox advisory) per candidate thread
+    /// through the wired sink. Called by `cancel_tree` after the task
+    /// transitions have been applied; a missing sink emits nothing.
+    async fn commit_cancellation_markers(
+        &self,
+        candidates: Vec<CancelMarkerCandidate>,
+        now: OffsetDateTime,
+    ) -> Result<Vec<CommittedEvent>> {
+        let Some(sink) = &self.marker_sink else {
+            return Ok(Vec::new());
+        };
+        let mut markers = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let (turn, thread_usage) = match sink
+                .thread_store
+                .get(&candidate.thread_id)
+                .await
+                .with_context(|| {
+                    format!(
+                        "cancel_tree: read thread {} for marker",
+                        candidate.thread_id
+                    )
+                })? {
+                Some(thread) => (
+                    usize::try_from(thread.committed_turns).unwrap_or(0),
+                    thread.total_usage,
+                ),
+                None => (0, TokenUsage::default()),
+            };
+            let usage = candidate.continuation_usage.unwrap_or(thread_usage);
+            let committed = sink
+                .event_repo
+                .commit_event(
+                    &candidate.thread_id,
+                    AgentEvent::cancelled(turn, usage),
+                    now,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "cancel_tree: commit cancelled marker on thread {}",
+                        candidate.thread_id,
+                    )
+                })?;
+            let payload_json = OutboxMessage::ThreadEventsAvailable(ThreadEventsAvailablePayload {
+                thread_id: committed.thread_id.clone(),
+                last_sequence: committed.sequence,
+            })
+            .to_payload_json()
+            .context("cancel_tree: serialise marker advisory payload")?;
+            sink.outbox_store
+                .insert_batch(vec![NewOutboxRow {
+                    kind: OutboxMessageKind::ThreadEventsAvailable,
+                    thread_id: committed.thread_id.clone(),
+                    event_id: Some(committed.event_id),
+                    sequence: Some(committed.sequence),
+                    payload_json,
+                    max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+                    now,
+                }])
+                .await
+                .with_context(|| {
+                    format!(
+                        "cancel_tree: insert marker outbox advisory for thread {}",
+                        committed.thread_id,
+                    )
+                })?;
+            markers.push(committed);
+        }
+        Ok(markers)
     }
 }
 
@@ -2884,6 +3146,75 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         Ok(released)
     }
 
+    async fn requeue_owned_task(
+        &self,
+        id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        boundary: Option<AgentEvent>,
+        now: OffsetDateTime,
+    ) -> Result<RequeueOutcome> {
+        let mut inner = self.inner.write().await;
+        let Some(old) = inner.by_id.get(id).cloned() else {
+            return Ok(RequeueOutcome::NotOwned);
+        };
+        let still_owned = old.status == TaskStatus::Running
+            && old.worker_id.as_ref() == Some(worker)
+            && old.lease_id.as_ref() == Some(lease);
+        if !still_owned {
+            return Ok(RequeueOutcome::NotOwned);
+        }
+        if old.is_budget_exhausted() {
+            return Ok(RequeueOutcome::BudgetExhausted);
+        }
+        // Boundary first, while STILL holding the write lock (the
+        // cancel_tree marker pattern): no acquire can interleave until
+        // the lock drops, so the event provably precedes anything a
+        // successor emits, and a failure here leaves the row Running
+        // under the caller's lease (nothing released yet).
+        if let Some(event) = boundary {
+            if let Some(sink) = &self.marker_sink {
+                let committed = sink
+                    .event_repo
+                    .commit_event(&old.thread_id, event, now)
+                    .await
+                    .context("requeue_owned_task: commit boundary event")?;
+                let payload_json =
+                    OutboxMessage::ThreadEventsAvailable(ThreadEventsAvailablePayload {
+                        thread_id: committed.thread_id.clone(),
+                        last_sequence: committed.sequence,
+                    })
+                    .to_payload_json()
+                    .context("requeue_owned_task: serialise boundary advisory payload")?;
+                sink.outbox_store
+                    .insert_batch(vec![NewOutboxRow {
+                        kind: OutboxMessageKind::ThreadEventsAvailable,
+                        thread_id: committed.thread_id.clone(),
+                        event_id: Some(committed.event_id),
+                        sequence: Some(committed.sequence),
+                        payload_json,
+                        max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+                        now,
+                    }])
+                    .await
+                    .context("requeue_owned_task: insert boundary outbox advisory")?;
+            } else {
+                log::warn!(
+                    "requeue_owned_task: no marker sink wired; requeueing task {id} \
+                     without its boundary event (test-support store)",
+                );
+            }
+        }
+        let released_row = old
+            .clone()
+            .release_lease(now)
+            .context("requeue_owned_task: release transition failed")?;
+        inner.rebalance_after_row_change(&old, &released_row);
+        inner.by_id.insert(id.clone(), released_row.clone());
+        drop(inner);
+        Ok(RequeueOutcome::Requeued(Box::new(released_row)))
+    }
+
     async fn pause_on_children(
         &self,
         id: &AgentTaskId,
@@ -3484,7 +3815,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         &self,
         root_id: &AgentTaskId,
         now: OffsetDateTime,
-    ) -> Result<Vec<AgentTaskId>> {
+    ) -> Result<CancelTreeOutcome> {
         let mut inner = self.inner.write().await;
 
         if !inner.by_id.contains_key(root_id) {
@@ -3498,16 +3829,68 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         // does not mutate `by_parent`, so the snapshot stays
         // consistent for the duration of the sweep even though we
         // are holding a mutable borrow of `inner`.
+        //
+        // The snapshot, every transition, and the
+        // marker gating all run under this one write lock, so no
+        // concurrent writer can settle a row mid-sweep (and
+        // `cancel_row_in_place` re-reads `by_id` for each id anyway) —
+        // this backend is immune to the stale-snapshot race the
+        // Postgres path had to close with locked re-reads.
         let subtree = inner.collect_subtree(root_id);
         let mut transitioned = Vec::with_capacity(subtree.len());
+        // Terminal-marker candidates, captured pre-transition (the
+        // cancel clears the typed state the usage payload prefers)
+        // and gated on the row actually transitioning under THIS
+        // lock — that is what makes the marker exactly-once: an
+        // idempotent retry transitions nothing and emits nothing.
+        let mut marker_candidates: Vec<CancelMarkerCandidate> = Vec::new();
         for id in subtree {
+            let pre_cancel = inner.by_id.get(&id).cloned();
             if inner.cancel_row_in_place(&id, now)? {
+                if let Some(row) = pre_cancel
+                    && row.kind == TaskKind::RootTurn
+                    && row.is_root()
+                    && row.status.blocks_root_admission()
+                {
+                    marker_candidates.push(CancelMarkerCandidate {
+                        thread_id: row.thread_id.clone(),
+                        continuation_usage: row
+                            .state
+                            .continuation()
+                            .map(|continuation| continuation.payload.total_usage.clone()),
+                    });
+                }
                 transitioned.push(id);
             }
         }
 
+        // Commit the markers while STILL holding the
+        // task-store write lock. A promoted successor cannot be
+        // acquired (and so cannot commit its `Start`) until this lock
+        // drops, so the marker's journal sequence always precedes
+        // anything the successor emits — matching the SQL backends,
+        // where marker and cancellation share one transaction. The
+        // sink stores are in-process leaf stores that never call back
+        // into the task store, so holding the lock across their
+        // awaits cannot deadlock. Two windows remain, inherent to the
+        // non-atomic in-memory backend (the durable backends are the
+        // crash-safety story):
+        // - dropping this future mid-await (e.g. a disconnecting RPC
+        //   caller) can lose markers after the transitions applied —
+        //   the same class as every other non-atomic in-memory step;
+        // - a sink error surfaces as `Err` AFTER the transitions
+        //   applied (no rollback exists across separate stores). We
+        //   propagate rather than swallow so `Ok` always means "every
+        //   due marker is committed" — the half of the SQL contract
+        //   followers rely on.
+        let markers = self
+            .commit_cancellation_markers(marker_candidates, now)
+            .await?;
         drop(inner);
-        Ok(transitioned)
+        Ok(CancelTreeOutcome {
+            transitioned,
+            markers,
+        })
     }
 
     async fn resume_from_confirmation(
@@ -4502,7 +4885,8 @@ mod tests {
         let cancelled = store
             .cancel_tree(&first.id, t_plus(10))
             .await
-            .context("cancel_tree")?;
+            .context("cancel_tree")?
+            .transitioned;
         assert_eq!(cancelled, vec![first.id.clone()]);
 
         // The queued successor must already be Pending and hold the slot.
@@ -7370,6 +7754,130 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn requeue_owned_task_returns_running_row_to_pending() -> Result<()> {
+        // The worker-initiated requeue twin of the sweep: a promoted
+        // successor whose commit lost its turn slot re-runs from the
+        // fresh head instead of failing terminally.
+        let store = InMemoryAgentTaskStore::new();
+        let root = AgentTask::new_root_turn(thread("t"), t0(), 3);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+        let worker = WorkerId::from_string("w-collided");
+        let lease = LeaseId::from_string("l-collided");
+        store
+            .try_acquire_task(&id, worker.clone(), lease.clone(), t_plus(10), t_plus(1))
+            .await
+            .context("acquire")?
+            .context("claimed")?;
+
+        let outcome = store
+            .requeue_owned_task(&id, &worker, &lease, None, t_plus(2))
+            .await
+            .context("requeue")?;
+        let RequeueOutcome::Requeued(row) = outcome else {
+            anyhow::bail!("expected Requeued, got {outcome:?}");
+        };
+        assert_eq!(row.status, TaskStatus::Pending);
+        assert!(row.worker_id.is_none() && row.lease_id.is_none());
+
+        // The row is genuinely runnable again: a fresh worker can
+        // re-acquire it, and the old lease can no longer heartbeat.
+        let reacquired = store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w-fresh"),
+                LeaseId::from_string("l-fresh"),
+                t_plus(30),
+                t_plus(3),
+            )
+            .await
+            .context("re-acquire")?
+            .context("re-claimed")?;
+        assert_eq!(reacquired.status, TaskStatus::Running);
+        assert!(
+            store
+                .heartbeat_task(&id, &worker, &lease, t_plus(60), t_plus(4))
+                .await
+                .is_err(),
+            "the requeued-then-reacquired row must reject the old lease",
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn requeue_owned_task_reports_not_owned_without_touching_the_row() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let root = AgentTask::new_root_turn(thread("t"), t0(), 3);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+        let worker = WorkerId::from_string("w-owner");
+        let lease = LeaseId::from_string("l-owner");
+        store
+            .try_acquire_task(&id, worker.clone(), lease.clone(), t_plus(10), t_plus(1))
+            .await
+            .context("acquire")?
+            .context("claimed")?;
+
+        // Wrong lease: NotOwned, row untouched.
+        let outcome = store
+            .requeue_owned_task(
+                &id,
+                &worker,
+                &LeaseId::from_string("l-stale"),
+                None,
+                t_plus(2),
+            )
+            .await
+            .context("requeue with stale lease")?;
+        assert!(matches!(outcome, RequeueOutcome::NotOwned));
+        let row = store.get(&id).await?.context("row")?;
+        assert_eq!(row.status, TaskStatus::Running);
+        assert_eq!(row.lease_id.as_ref(), Some(&lease));
+
+        // Cancelled row: NotOwned even with the right lease — the
+        // cancel owns the terminal state and a requeue must never
+        // resurrect it.
+        store.cancel_tree(&id, t_plus(3)).await.context("cancel")?;
+        let outcome = store
+            .requeue_owned_task(&id, &worker, &lease, None, t_plus(4))
+            .await
+            .context("requeue after cancel")?;
+        assert!(matches!(outcome, RequeueOutcome::NotOwned));
+        let row = store.get(&id).await?.context("row")?;
+        assert_eq!(row.status, TaskStatus::Cancelled);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn requeue_owned_task_reports_budget_exhausted_leaving_row_owned() -> Result<()> {
+        // A budget-1 root that collides has nothing left to spend on a
+        // re-run; the store reports it WITHOUT transitioning so the
+        // caller can route it through its full terminal-failure
+        // envelope (which CAS-checks ownership itself).
+        let store = InMemoryAgentTaskStore::new();
+        let root = AgentTask::new_root_turn(thread("t"), t0(), 1);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+        let worker = WorkerId::from_string("w-last");
+        let lease = LeaseId::from_string("l-last");
+        store
+            .try_acquire_task(&id, worker.clone(), lease.clone(), t_plus(10), t_plus(1))
+            .await
+            .context("acquire")?
+            .context("claimed")?;
+
+        let outcome = store
+            .requeue_owned_task(&id, &worker, &lease, None, t_plus(2))
+            .await
+            .context("requeue")?;
+        assert!(matches!(outcome, RequeueOutcome::BudgetExhausted));
+        let row = store.get(&id).await?.context("row")?;
+        assert_eq!(row.status, TaskStatus::Running);
+        assert_eq!(row.worker_id.as_ref(), Some(&worker));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn failed_closed_row_rejects_heartbeat_and_reacquire() -> Result<()> {
         // Phase 2.5 regression: an old worker whose row was
         // failed-closed by the sweep must not be able to heartbeat
@@ -8319,7 +8827,10 @@ mod tests {
         let (_parent, invocation, child_root) =
             spawn_subagent_fixture(&store, "t-subagent-cancel").await?;
 
-        let transitioned = store.cancel_tree(&child_root.id, t_plus(3)).await?;
+        let transitioned = store
+            .cancel_tree(&child_root.id, t_plus(3))
+            .await?
+            .transitioned;
         assert_eq!(transitioned, vec![child_root.id.clone()]);
 
         let resumed_invocation = store
@@ -9378,7 +9889,8 @@ mod tests {
         let cancelled_ids = store
             .cancel_tree(&parent.id, t_plus(4))
             .await
-            .context("cancel tree")?;
+            .context("cancel tree")?
+            .transitioned;
         assert!(cancelled_ids.contains(&parent.id));
         assert!(cancelled_ids.contains(&child.id));
 
@@ -9443,7 +9955,8 @@ mod tests {
         let transitioned = store
             .cancel_tree(&parent.id, t_plus(3))
             .await
-            .context("cancel tree")?;
+            .context("cancel tree")?
+            .transitioned;
         // Root first, then every child.
         assert_eq!(transitioned.len(), 4);
         assert_eq!(transitioned[0], parent.id);
@@ -9533,7 +10046,8 @@ mod tests {
         let transitioned = store
             .cancel_tree(&parent.id, t_plus(4))
             .await
-            .context("cancel tree")?;
+            .context("cancel tree")?
+            .transitioned;
         assert_eq!(transitioned.len(), 3);
 
         // The leased child is now Cancelled with no lease.
@@ -9604,13 +10118,15 @@ mod tests {
         let first = store
             .cancel_tree(&parent.id, t_plus(3))
             .await
-            .context("cancel first")?;
+            .context("cancel first")?
+            .transitioned;
         assert_eq!(first.len(), 3);
 
         let second = store
             .cancel_tree(&parent.id, t_plus(4))
             .await
-            .context("cancel second")?;
+            .context("cancel second")?
+            .transitioned;
         assert!(
             second.is_empty(),
             "second cancel_tree must be a no-op on terminal rows"
@@ -9767,7 +10283,10 @@ mod tests {
         let (parent, invocation, child_root) =
             spawn_subagent_fixture(&store, "t-cascade-parent").await?;
 
-        let transitioned = store.cancel_tree(&parent.id, t_plus(10)).await?;
+        let transitioned = store
+            .cancel_tree(&parent.id, t_plus(10))
+            .await?
+            .transitioned;
 
         // All three tasks must have been transitioned.
         assert!(
@@ -9856,7 +10375,10 @@ mod tests {
         assert_eq!(child1_waiting.status, TaskStatus::WaitingOnChildren);
 
         // Now cancel the entire tree from the grandparent.
-        let transitioned = store.cancel_tree(&grandparent.id, t_plus(20)).await?;
+        let transitioned = store
+            .cancel_tree(&grandparent.id, t_plus(20))
+            .await?
+            .transitioned;
 
         // All five tasks must be cancelled.
         assert_eq!(
@@ -9896,11 +10418,17 @@ mod tests {
             spawn_subagent_fixture(&store, "t-cascade-idempotent").await?;
 
         // First cancel.
-        let first = store.cancel_tree(&parent.id, t_plus(10)).await?;
+        let first = store
+            .cancel_tree(&parent.id, t_plus(10))
+            .await?
+            .transitioned;
         assert_eq!(first.len(), 3);
 
         // Second cancel — all tasks are already terminal.
-        let second = store.cancel_tree(&parent.id, t_plus(11)).await?;
+        let second = store
+            .cancel_tree(&parent.id, t_plus(11))
+            .await?
+            .transitioned;
         assert!(
             second.is_empty(),
             "second cancel must be a no-op on terminal rows"
@@ -10038,7 +10566,10 @@ mod tests {
             spawn_subagent_fixture(&store, "t-cancel-map").await?;
 
         // Cancel only the child root (simulating a timeout cancellation).
-        let transitioned = store.cancel_tree(&child_root.id, t_plus(5)).await?;
+        let transitioned = store
+            .cancel_tree(&child_root.id, t_plus(5))
+            .await?
+            .transitioned;
         assert_eq!(transitioned, vec![child_root.id.clone()]);
 
         // Invocation should wake up (Pending, SubagentInvocation state preserved).

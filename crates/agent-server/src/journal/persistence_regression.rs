@@ -21,6 +21,7 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::journal::checkpoint::CheckpointKind;
     use crate::journal::checkpoint_store::{CheckpointStore, InMemoryCheckpointStore};
     use crate::journal::commit::{CompletedTurnCommit, commit_completed_turn};
     use crate::journal::event_repository::InMemoryEventRepository;
@@ -132,6 +133,7 @@ mod tests {
                 .saturating_add(1);
             commit_completed_turn(
                 CompletedTurnCommit {
+                    checkpoint_kind: CheckpointKind::FullTurn,
                     thread_id: thread_id.clone(),
                     task_id: task_id.clone(),
                     expected_turn,
@@ -142,6 +144,7 @@ mod tests {
                     agent_state_snapshot: state_snapshot,
                     events: Vec::new(),
                     outbox_max_attempts: 3,
+                    owner_guard: None,
                     now: at,
                 },
                 &self.threads,
@@ -197,7 +200,7 @@ mod tests {
         // This simulates crashing between step 2 (thread advance)
         // and step 4 (checkpoint creation) of commit_completed_turn.
         s.threads
-            .commit_turn(&thread_id, &usage(200, 80), t_plus(2))
+            .commit_turn(&thread_id, 2, &usage(200, 80), t_plus(2))
             .await
             .context("manual advance")?;
 
@@ -364,6 +367,7 @@ mod tests {
         // Attempt the full commit — should fail at step 1.
         let err = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_id.clone(),
                 task_id: task,
                 // Fresh thread; the commit aborts at the attempt-close
@@ -376,6 +380,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(2),
             },
             &s.threads,
@@ -1002,6 +1007,7 @@ mod tests {
         let attempt_id = s.open_attempt(&task2, 1).await?;
         let commit_err = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_id.clone(),
                 task_id: task2,
                 // The thread already has 1 committed turn, so the next
@@ -1015,6 +1021,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(3),
             },
             &s.threads,

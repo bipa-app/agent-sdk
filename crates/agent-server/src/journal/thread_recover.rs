@@ -314,6 +314,7 @@ mod tests {
     use super::super::turn_attempt::{OpenAttemptParams, TurnAttemptOutcome};
     use super::super::turn_attempt_store::{InMemoryTurnAttemptStore, TurnAttemptStore};
     use super::*;
+    use crate::journal::checkpoint::CheckpointKind;
     use agent_sdk_foundation::TokenUsage;
     use agent_sdk_foundation::audit::AuditProvenance;
     use anyhow::Context;
@@ -418,6 +419,7 @@ mod tests {
                 .saturating_add(1);
             commit_completed_turn(
                 CompletedTurnCommit {
+                    checkpoint_kind: CheckpointKind::FullTurn,
                     thread_id: thread_id.clone(),
                     task_id: task_id.clone(),
                     expected_turn,
@@ -428,6 +430,7 @@ mod tests {
                     agent_state_snapshot: state_snapshot,
                     events: Vec::new(),
                     outbox_max_attempts: 3,
+                    owner_guard: None,
                     now: at,
                 },
                 &self.threads,
@@ -821,7 +824,7 @@ mod tests {
         // Manually advance the thread aggregate without creating a
         // checkpoint — simulates data corruption.
         s.threads
-            .commit_turn(&thread_a(), &usage(100, 50), t_plus(1))
+            .commit_turn(&thread_a(), 1, &usage(100, 50), t_plus(1))
             .await
             .context("advance")?;
 
@@ -865,7 +868,7 @@ mod tests {
         // Now manually advance the thread aggregate a third time
         // without creating the matching checkpoint.
         s.threads
-            .commit_turn(&thread_a(), &usage(100, 50), t_plus(3))
+            .commit_turn(&thread_a(), 3, &usage(100, 50), t_plus(3))
             .await
             .context("manual advance")?;
 

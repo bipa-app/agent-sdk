@@ -79,6 +79,60 @@ impl fmt::Display for CheckpointId {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Kind
+// ─────────────────────────────────────────────────────────────────────
+
+/// Provenance of a checkpoint row.
+///
+/// The slot-shift commit path ([`super::commit`]) must distinguish a
+/// synthetic cancel-salvage checkpoint (whose slot a racing successor
+/// may legitimately shift past) from a fully executed turn (whose slot
+/// it must never shift past). The discriminator is explicit because
+/// token usage cannot be trusted for this: providers may omit usage
+/// deltas and report all-zero counters on a real completion.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointKind {
+    /// A fully executed turn committed through the normal path.
+    #[default]
+    FullTurn,
+    /// A synthetic checkpoint committed by the cancellation path to
+    /// salvage partial turn state (seam-B salvage).
+    CancelSalvage,
+}
+
+impl CheckpointKind {
+    /// Stable string form persisted by the durable stores.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FullTurn => "full_turn",
+            Self::CancelSalvage => "cancel_salvage",
+        }
+    }
+
+    /// Parse the stable string form written by [`Self::as_str`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the unrecognized value so a corrupted
+    /// row fails loudly instead of being misread as a full turn.
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "full_turn" => Ok(Self::FullTurn),
+            "cancel_salvage" => Ok(Self::CancelSalvage),
+            other => anyhow::bail!("unrecognized checkpoint kind: {other}"),
+        }
+    }
+}
+
+impl fmt::Display for CheckpointKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Errors
 // ─────────────────────────────────────────────────────────────────────
 
@@ -143,6 +197,12 @@ pub struct Checkpoint {
     /// Token usage for this specific turn.
     pub turn_usage: TokenUsage,
 
+    /// Whether this row captured a full turn or a cancel-salvage
+    /// commit. Defaults to [`CheckpointKind::FullTurn`] when absent so
+    /// rows serialized before the discriminator existed stay valid.
+    #[serde(default)]
+    pub kind: CheckpointKind,
+
     /// When this checkpoint was created.
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -164,6 +224,7 @@ impl Checkpoint {
             messages: params.messages,
             agent_state_snapshot: params.agent_state_snapshot,
             turn_usage: params.turn_usage,
+            kind: params.kind,
             created_at: params.now,
         };
         checkpoint.validate()?;
@@ -208,6 +269,8 @@ pub struct NewCheckpointParams {
     pub agent_state_snapshot: serde_json::Value,
     /// Token usage for this specific turn.
     pub turn_usage: TokenUsage,
+    /// Whether this checkpoint captures a full turn or cancel-salvage.
+    pub kind: CheckpointKind,
     /// Current wall-clock time.
     pub now: OffsetDateTime,
 }
@@ -241,6 +304,7 @@ mod tests {
                 output_tokens: 50,
                 ..Default::default()
             },
+            kind: CheckpointKind::FullTurn,
             now: t0(),
         }
     }

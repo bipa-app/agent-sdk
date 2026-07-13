@@ -324,6 +324,7 @@ impl CheckpointStore for InMemoryCheckpointStore {
 
 #[cfg(test)]
 mod tests {
+    use super::super::checkpoint::CheckpointKind;
     use super::super::task::AgentTaskId;
     use super::*;
     use agent_sdk_foundation::{TokenUsage, llm};
@@ -356,6 +357,7 @@ mod tests {
 
     fn sample_params(thread_id: ThreadId, turn: u32) -> NewCheckpointParams {
         NewCheckpointParams {
+            kind: CheckpointKind::FullTurn,
             thread_id,
             turn_number: turn,
             task_id: AgentTaskId::from_string(format!("task_turn-{turn}")),
@@ -602,6 +604,7 @@ mod tests {
     async fn checkpoint_preserves_messages_and_snapshot() -> Result<()> {
         let store = InMemoryCheckpointStore::new();
         let params = NewCheckpointParams {
+            kind: CheckpointKind::FullTurn,
             messages: vec![
                 llm::Message::user("hello"),
                 llm::Message::assistant("hi there"),
@@ -633,6 +636,7 @@ mod tests {
     async fn checkpoint_records_created_at() -> Result<()> {
         let store = InMemoryCheckpointStore::new();
         let params = NewCheckpointParams {
+            kind: CheckpointKind::FullTurn,
             now: t_plus(42),
             ..sample_params(thread_a(), 1)
         };

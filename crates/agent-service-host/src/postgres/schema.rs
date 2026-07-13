@@ -682,6 +682,12 @@ const AGENT_SDK_TURN_CHECKPOINT_COLUMNS: &[ColumnContract] = &[
         notes: "Per-turn output usage.",
     },
     ColumnContract {
+        name: "kind",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Checkpoint provenance (`full_turn` | `cancel_salvage`); drives turn-slot-shift eligibility.",
+    },
+    ColumnContract {
         name: "created_at",
         sql_type: "TIMESTAMPTZ",
         nullable: false,

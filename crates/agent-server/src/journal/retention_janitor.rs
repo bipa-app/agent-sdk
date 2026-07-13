@@ -257,6 +257,7 @@ pub async fn run_janitor_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journal::checkpoint::CheckpointKind;
     use crate::journal::checkpoint_store::InMemoryCheckpointStore;
     use crate::journal::event_repository::InMemoryEventRepository;
     use crate::journal::outbox::InMemoryOutboxStore;
@@ -459,6 +460,7 @@ mod tests {
                 .await?;
             checkpoint_store
                 .commit_checkpoint(NewCheckpointParams {
+                    kind: CheckpointKind::FullTurn,
                     thread_id: thread_a(),
                     turn_number: i,
                     task_id: AgentTaskId::from_string(format!("task-{i}")),
@@ -508,6 +510,7 @@ mod tests {
             .await?;
         checkpoint_store
             .commit_checkpoint(NewCheckpointParams {
+                kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 turn_number: 1,
                 task_id: AgentTaskId::from_string("task-1"),
@@ -620,6 +623,7 @@ mod tests {
         for i in 1..=3u32 {
             checkpoint_store
                 .commit_checkpoint(NewCheckpointParams {
+                    kind: CheckpointKind::FullTurn,
                     thread_id: thread_b(),
                     turn_number: i,
                     task_id: AgentTaskId::from_string(format!("task-b-{i}")),
@@ -804,6 +808,7 @@ mod tests {
         for i in 1..=3u32 {
             checkpoint_store
                 .commit_checkpoint(NewCheckpointParams {
+                    kind: CheckpointKind::FullTurn,
                     thread_id: thread_b(),
                     turn_number: i,
                     task_id: AgentTaskId::from_string(format!("task-b-{i}")),
@@ -860,6 +865,7 @@ mod tests {
         for i in 1..=5u32 {
             checkpoint_store
                 .commit_checkpoint(NewCheckpointParams {
+                    kind: CheckpointKind::FullTurn,
                     thread_id: thread_a(),
                     turn_number: i,
                     task_id: AgentTaskId::from_string(format!("task-{i}")),

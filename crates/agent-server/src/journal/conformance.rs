@@ -62,7 +62,7 @@ use time::{Duration, OffsetDateTime};
 
 use agent_sdk_foundation::events::AgentEvent;
 
-use super::checkpoint::{CheckpointId, NewCheckpointParams};
+use super::checkpoint::{CheckpointId, CheckpointKind, NewCheckpointParams};
 use super::checkpoint_store::CheckpointStore;
 use super::commit::{CompletedTurnCommit, commit_completed_turn};
 use super::event_repository::EventRepository;
@@ -116,7 +116,7 @@ impl<T> JournalStore for T where
 /// underlying journals (each inner store is `Arc`-backed), so a clone
 /// handed to a spawned task observes the same state — exactly what the
 /// concurrent-append case needs.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct InMemoryJournalStore {
     task: super::store::InMemoryAgentTaskStore,
     thread: super::thread_store::InMemoryThreadStore,
@@ -128,9 +128,40 @@ pub struct InMemoryJournalStore {
 
 impl InMemoryJournalStore {
     /// Construct an empty in-memory journal bundle.
+    ///
+    /// The task store is wired with a
+    /// [`super::store::CancellationMarkerSink`] over the bundle's own
+    /// event, outbox, and thread stores — mirroring the production
+    /// registry, so `cancel_tree` through the bundle emits the same
+    /// `Cancelled` marker + advisory a real deployment persists.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        let thread = super::thread_store::InMemoryThreadStore::new();
+        let event = super::event_repository::InMemoryEventRepository::new();
+        // The sink's Arc owns the outbox; the bundle itself does not
+        // expose an OutboxStore surface, so no field is kept.
+        let outbox = super::outbox::InMemoryOutboxStore::new();
+        let task = super::store::InMemoryAgentTaskStore::new().with_cancellation_markers(
+            super::store::CancellationMarkerSink {
+                event_repo: std::sync::Arc::new(event.clone()),
+                outbox_store: std::sync::Arc::new(outbox),
+                thread_store: std::sync::Arc::new(thread.clone()),
+            },
+        );
+        Self {
+            task,
+            thread,
+            message: super::message_store::InMemoryMessageProjectionStore::new(),
+            attempt: super::turn_attempt_store::InMemoryTurnAttemptStore::new(),
+            checkpoint: super::checkpoint_store::InMemoryCheckpointStore::new(),
+            event,
+        }
+    }
+}
+
+impl Default for InMemoryJournalStore {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -218,6 +249,18 @@ mod in_memory_bundle {
             now: OffsetDateTime,
         ) -> Result<Option<AgentTask>> {
             self.task.promote_next_queued_root(thread_id, now).await
+        }
+        async fn requeue_owned_task(
+            &self,
+            id: &AgentTaskId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+            boundary: Option<AgentEvent>,
+            now: OffsetDateTime,
+        ) -> Result<crate::journal::store::RequeueOutcome> {
+            self.task
+                .requeue_owned_task(id, worker, lease, boundary, now)
+                .await
         }
         async fn try_acquire_task(
             &self,
@@ -409,7 +452,7 @@ mod in_memory_bundle {
             &self,
             root_id: &AgentTaskId,
             now: OffsetDateTime,
-        ) -> Result<Vec<AgentTaskId>> {
+        ) -> Result<crate::journal::store::CancelTreeOutcome> {
             self.task.cancel_tree(root_id, now).await
         }
         async fn resume_from_confirmation(
@@ -446,6 +489,9 @@ mod in_memory_bundle {
 
     #[async_trait]
     impl ThreadStore for InMemoryJournalStore {
+        fn sequential_commit_lock(&self) -> Option<&tokio::sync::Mutex<()>> {
+            self.thread.sequential_commit_lock()
+        }
         async fn get_or_create(&self, thread_id: &ThreadId, now: OffsetDateTime) -> Result<Thread> {
             self.thread.get_or_create(thread_id, now).await
         }
@@ -455,10 +501,13 @@ mod in_memory_bundle {
         async fn commit_turn(
             &self,
             thread_id: &ThreadId,
+            expected_turn: u32,
             turn_usage: &TokenUsage,
             now: OffsetDateTime,
         ) -> Result<Thread> {
-            self.thread.commit_turn(thread_id, turn_usage, now).await
+            self.thread
+                .commit_turn(thread_id, expected_turn, turn_usage, now)
+                .await
         }
         async fn mark_completed(
             &self,
@@ -976,6 +1025,7 @@ async fn case_semantic_equality_on_roundtrip<S: JournalStore>(store: &S) -> Resu
     let committed = CheckpointStore::commit_checkpoint(
         store,
         NewCheckpointParams {
+            kind: CheckpointKind::FullTurn,
             thread_id: thread.clone(),
             turn_number: 1,
             task_id,
@@ -1082,6 +1132,7 @@ async fn case_safe_noop_delete_for_append_only<S: JournalStore>(store: &S) -> Re
         CheckpointStore::commit_checkpoint(
             store,
             NewCheckpointParams {
+                kind: CheckpointKind::FullTurn,
                 thread_id: thread.clone(),
                 turn_number: turn,
                 task_id: task_id.clone(),
@@ -1254,6 +1305,7 @@ async fn case_checkpoint_roundtrip<S: JournalStore>(store: &S) -> Result<()> {
     let committed = CheckpointStore::commit_checkpoint(
         store,
         NewCheckpointParams {
+            kind: CheckpointKind::FullTurn,
             thread_id: thread.clone(),
             turn_number: 1,
             task_id,
@@ -1278,6 +1330,37 @@ async fn case_checkpoint_roundtrip<S: JournalStore>(store: &S) -> Result<()> {
     assert_semantic_eq(&committed, &by_id, "checkpoint by id")?;
     assert_semantic_eq(&committed, &by_turn, "checkpoint by turn")?;
     ensure!(by_id.messages.len() == 2, "messages roundtrip");
+    ensure!(
+        by_id.kind == CheckpointKind::FullTurn,
+        "full-turn kind roundtrips"
+    );
+
+    // The non-default kind must be durably persisted, not defaulted on
+    // rehydration — `FullTurn` is the serde/back-compat default, so
+    // only a `CancelSalvage` row proves the column actually round-trips.
+    let salvage = CheckpointStore::commit_checkpoint(
+        store,
+        NewCheckpointParams {
+            kind: CheckpointKind::CancelSalvage,
+            thread_id: thread.clone(),
+            turn_number: 2,
+            task_id: by_id.task_id.clone(),
+            messages,
+            agent_state_snapshot: serde_json::json!({ "step": 2 }),
+            turn_usage: TokenUsage::default(),
+            now: t_plus(2),
+        },
+    )
+    .await?;
+    let salvage_by_turn = CheckpointStore::get_by_turn(store, &thread, 2)
+        .await?
+        .context("get salvage by turn")?;
+    ensure!(
+        salvage_by_turn.kind == CheckpointKind::CancelSalvage,
+        "cancel-salvage kind must survive rehydration, got {:?}",
+        salvage_by_turn.kind,
+    );
+    assert_semantic_eq(&salvage, &salvage_by_turn, "salvage checkpoint")?;
     Ok(())
 }
 
@@ -1290,6 +1373,7 @@ async fn case_list_reverse_chronological<S: JournalStore>(store: &S) -> Result<(
         CheckpointStore::commit_checkpoint(
             store,
             NewCheckpointParams {
+                kind: CheckpointKind::FullTurn,
                 thread_id: thread.clone(),
                 turn_number: turn,
                 task_id: task_id.clone(),
@@ -1341,6 +1425,7 @@ async fn case_latest_by_insertion_order_not_lexicographic_id<S: JournalStore + ?
     let first = CheckpointStore::commit_checkpoint(
         store,
         NewCheckpointParams {
+            kind: CheckpointKind::FullTurn,
             thread_id: thread.clone(),
             turn_number: 1,
             task_id: task_id.clone(),
@@ -1354,6 +1439,7 @@ async fn case_latest_by_insertion_order_not_lexicographic_id<S: JournalStore + ?
     let second = CheckpointStore::commit_checkpoint(
         store,
         NewCheckpointParams {
+            kind: CheckpointKind::FullTurn,
             thread_id: thread.clone(),
             turn_number: 2,
             task_id,
@@ -1516,6 +1602,7 @@ async fn commit_one_turn<S: JournalStore>(
 
     let outcome = commit_completed_turn(
         CompletedTurnCommit {
+            checkpoint_kind: CheckpointKind::FullTurn,
             thread_id: thread.clone(),
             task_id: task_id.clone(),
             expected_turn: turn_number,
@@ -1541,6 +1628,7 @@ async fn commit_one_turn<S: JournalStore>(
             agent_state_snapshot: serde_json::json!({ "turn": turn_number }),
             events: vec![],
             outbox_max_attempts: 3,
+            owner_guard: None,
             now,
         },
         store,
@@ -1567,6 +1655,7 @@ async fn case_metadata_filter<S: JournalStore>(store: &S) -> Result<()> {
         CheckpointStore::commit_checkpoint(
             store,
             NewCheckpointParams {
+                kind: CheckpointKind::FullTurn,
                 thread_id: thread.clone(),
                 turn_number: turn,
                 task_id: task_id.clone(),
@@ -1648,6 +1737,126 @@ async fn case_before_plus_limit_pagination<S: JournalStore>(store: &S) -> Result
 mod tests {
     use super::*;
 
+    /// The bundle must forward the inner thread store's
+    /// sequential-commit lock — a `None` here silently disables
+    /// in-process commit serialization for every bundle consumer.
+    #[tokio::test]
+    async fn bundle_forwards_the_sequential_commit_lock() {
+        let store = InMemoryJournalStore::new();
+        assert!(
+            ThreadStore::sequential_commit_lock(&store).is_some(),
+            "the bundle must expose the inner store's sequential-commit lock",
+        );
+    }
+
+    /// The requeue boundary event is atomic with the ownership CAS —
+    /// it lands (before the row is acquirable) on a `Requeued`
+    /// outcome, and a stale caller's `NotOwned` outcome commits
+    /// NOTHING into what is now the replacement's stream.
+    #[tokio::test]
+    async fn bundle_requeue_boundary_is_atomic_with_ownership() -> Result<()> {
+        use crate::journal::store::RequeueOutcome;
+        use crate::journal::task::{AgentTask, LeaseId, WorkerId};
+
+        let store = InMemoryJournalStore::new();
+        let thread = tid("conf-bundle-requeue-boundary");
+        ThreadStore::get_or_create(&store, &thread, t_plus(0)).await?;
+        let root = AgentTask::new_root_turn(thread.clone(), t_plus(1), 3);
+        let id = root.id.clone();
+        AgentTaskStore::submit_root_turn(&store, root).await?;
+        let worker = WorkerId::from_string("w-owner");
+        let lease = LeaseId::from_string("l-owner");
+        AgentTaskStore::try_acquire_task(
+            &store,
+            &id,
+            worker.clone(),
+            lease.clone(),
+            t_plus(60),
+            t_plus(2),
+        )
+        .await?
+        .context("acquired")?;
+
+        let boundary = || agent_sdk_foundation::events::AgentEvent::error("retrying", true);
+
+        // Stale lease: NotOwned, and the journal stays empty.
+        let stale = AgentTaskStore::requeue_owned_task(
+            &store,
+            &id,
+            &worker,
+            &LeaseId::from_string("l-stale"),
+            Some(boundary()),
+            t_plus(3),
+        )
+        .await?;
+        ensure!(matches!(stale, RequeueOutcome::NotOwned));
+        let events = EventRepository::get_events(&store, &thread).await?;
+        ensure!(
+            events.is_empty(),
+            "a NotOwned requeue must not commit its boundary",
+        );
+
+        // Owned: Requeued, and the boundary is durably in the journal.
+        let outcome = AgentTaskStore::requeue_owned_task(
+            &store,
+            &id,
+            &worker,
+            &lease,
+            Some(boundary()),
+            t_plus(4),
+        )
+        .await?;
+        ensure!(matches!(outcome, RequeueOutcome::Requeued(_)));
+        let events = EventRepository::get_events(&store, &thread).await?;
+        ensure!(
+            events.iter().any(|committed| matches!(
+                &committed.event,
+                agent_sdk_foundation::events::AgentEvent::Error {
+                    recoverable: true,
+                    ..
+                }
+            )),
+            "a Requeued outcome must commit the boundary event",
+        );
+        Ok(())
+    }
+
+    /// Cancelling through the bundle must emit the durable
+    /// `Cancelled` marker — the bundle's task store is wired with a
+    /// `CancellationMarkerSink` over its own event journal, mirroring
+    /// production. A bare task store would return no markers and
+    /// leave followers waiting forever.
+    #[tokio::test]
+    async fn bundle_cancel_tree_emits_cancellation_markers() -> Result<()> {
+        use crate::journal::task::AgentTask;
+
+        let store = InMemoryJournalStore::new();
+        let thread = tid("conf-bundle-cancel-markers");
+        ThreadStore::get_or_create(&store, &thread, t_plus(0)).await?;
+        let root = AgentTask::new_root_turn(thread.clone(), t_plus(1), 3);
+        let root_id = root.id.clone();
+        AgentTaskStore::submit_root_turn(&store, root).await?;
+
+        let outcome = AgentTaskStore::cancel_tree(&store, &root_id, t_plus(2)).await?;
+        ensure!(
+            !outcome.transitioned.is_empty(),
+            "root transitioned to Cancelled"
+        );
+        ensure!(
+            !outcome.markers.is_empty(),
+            "cancel_tree through the bundle must commit a Cancelled marker",
+        );
+        let events = EventRepository::get_events(&store, &thread).await?;
+        ensure!(
+            events.iter().any(|committed| matches!(
+                committed.event,
+                agent_sdk_foundation::events::AgentEvent::Cancelled { .. }
+            )),
+            "the marker must be readable back through the bundle's event journal",
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn in_memory_passes_full_battery() -> Result<()> {
         let store = InMemoryJournalStore::new();
@@ -1705,6 +1914,7 @@ mod tests {
             let task_id = seed_root_task(&correct, &t).await?;
             for turn in 1..=2u32 {
                 let params = NewCheckpointParams {
+                    kind: CheckpointKind::FullTurn,
                     thread_id: t.clone(),
                     turn_number: turn,
                     task_id: task_id.clone(),

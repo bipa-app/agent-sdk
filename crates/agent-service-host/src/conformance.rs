@@ -45,7 +45,9 @@ mod tests {
     use time::{Duration, OffsetDateTime};
 
     use agent_sdk_foundation::audit::AuditProvenance;
+    use agent_sdk_foundation::events::AgentEvent;
     use agent_sdk_foundation::{ThreadId, TokenUsage};
+    use agent_server::journal::checkpoint::CheckpointKind;
     use agent_server::journal::checkpoint_store::CheckpointStore;
     use agent_server::journal::commit::{CompletedTurnCommit, commit_completed_turn};
     use agent_server::journal::event_repository::EventRepository;
@@ -56,6 +58,8 @@ mod tests {
         IdempotencyClaim, IdempotencyKind, IdempotencyRecord,
     };
     use agent_server::journal::message_store::MessageProjectionStore;
+    use agent_server::journal::outbox::OutboxStore;
+    use agent_server::journal::outbox_message::OutboxMessageKind;
     use agent_server::journal::recovery::RecoveryAction;
     use agent_server::journal::store::{AgentTaskStore, SubagentInvocationSpawn};
     use agent_server::journal::task::{
@@ -377,6 +381,94 @@ mod tests {
         Ok(())
     }
 
+    /// Worker-initiated requeue of an owned Running row (issue #354):
+    /// the collision path's twin of the expiry sweep. Owned rows
+    /// return to `Pending` with the lease cleared; a stale lease or a
+    /// cancelled row reports `NotOwned` without touching the row; a
+    /// budget-exhausted row reports `BudgetExhausted` leaving the row
+    /// owned so the caller can run its terminal envelope.
+    async fn test_requeue_owned_task(task_store: &dyn AgentTaskStore) -> Result<()> {
+        use agent_server::journal::store::RequeueOutcome;
+
+        let root = fresh_root("conformance-requeue", 20);
+        let _ = task_store.submit_root_turn(root.clone()).await?;
+        let worker = WorkerId::new();
+        let lease = LeaseId::new();
+        let _ = task_store
+            .try_acquire_task(
+                &root.id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(50),
+                t_plus(21),
+            )
+            .await?;
+
+        // Stale lease: NotOwned, row untouched.
+        let stale = task_store
+            .requeue_owned_task(&root.id, &worker, &LeaseId::new(), None, t_plus(22))
+            .await?;
+        assert!(matches!(stale, RequeueOutcome::NotOwned));
+        let row = task_store.get(&root.id).await?.context("row")?;
+        assert_eq!(row.status, TaskStatus::Running);
+
+        // Owned: requeued to Pending, lease cleared, re-acquirable.
+        let outcome = task_store
+            .requeue_owned_task(&root.id, &worker, &lease, None, t_plus(23))
+            .await?;
+        let RequeueOutcome::Requeued(row) = outcome else {
+            anyhow::bail!("expected Requeued, got {outcome:?}");
+        };
+        assert_eq!(row.status, TaskStatus::Pending);
+        assert!(row.worker_id.is_none() && row.lease_id.is_none());
+        let reacquired = task_store
+            .try_acquire_task(
+                &root.id,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(80),
+                t_plus(24),
+            )
+            .await?;
+        assert!(reacquired.is_some(), "requeued row must be re-acquirable");
+
+        // Budget-exhausted (max_attempts = 1, attempt consumed at
+        // acquire): reported without transitioning.
+        let capped =
+            AgentTask::new_root_turn(thread_id("conformance-requeue-capped"), t_plus(30), 1);
+        let _ = task_store.submit_root_turn(capped.clone()).await?;
+        let cw = WorkerId::new();
+        let cl = LeaseId::new();
+        let _ = task_store
+            .try_acquire_task(&capped.id, cw.clone(), cl.clone(), t_plus(60), t_plus(31))
+            .await?;
+        let outcome = task_store
+            .requeue_owned_task(&capped.id, &cw, &cl, None, t_plus(32))
+            .await?;
+        assert!(matches!(outcome, RequeueOutcome::BudgetExhausted));
+        let row = task_store.get(&capped.id).await?.context("capped row")?;
+        assert_eq!(row.status, TaskStatus::Running);
+        assert_eq!(row.worker_id, Some(cw));
+
+        // Cancelled row: NotOwned even with the original lease — a
+        // requeue must never resurrect a cancelled task.
+        let doomed = fresh_root("conformance-requeue-cancelled", 40);
+        let _ = task_store.submit_root_turn(doomed.clone()).await?;
+        let dw = WorkerId::new();
+        let dl = LeaseId::new();
+        let _ = task_store
+            .try_acquire_task(&doomed.id, dw.clone(), dl.clone(), t_plus(90), t_plus(41))
+            .await?;
+        let _ = task_store.cancel_tree(&doomed.id, t_plus(42)).await?;
+        let outcome = task_store
+            .requeue_owned_task(&doomed.id, &dw, &dl, None, t_plus(43))
+            .await?;
+        assert!(matches!(outcome, RequeueOutcome::NotOwned));
+        let row = task_store.get(&doomed.id).await?.context("doomed row")?;
+        assert_eq!(row.status, TaskStatus::Cancelled);
+        Ok(())
+    }
+
     /// Completed-turn commit creates a checkpoint.
     async fn test_completed_turn_commit(
         task_store: &dyn AgentTaskStore,
@@ -414,6 +506,7 @@ mod tests {
         };
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: tid.clone(),
                 task_id: root.id.clone(),
                 expected_turn: 1,
@@ -435,6 +528,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({}),
                 events: vec![],
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(55),
             },
             thread_store,
@@ -453,6 +547,262 @@ mod tests {
             .await?
             .context("latest checkpoint missing")?;
         assert_eq!(latest.turn_number, 1);
+        Ok(())
+    }
+
+    /// Shared plumbing for the owner-guard / typed-stale-commit
+    /// conformance cases: submit + acquire a root under a fresh
+    /// `(worker, lease)`, open its first attempt, and return a
+    /// ready-to-commit [`CompletedTurnCommit`] for turn 1.
+    async fn guarded_commit_fixture(
+        task_store: &dyn AgentTaskStore,
+        attempt_store: &dyn TurnAttemptStore,
+        tid: &str,
+        base_secs: i64,
+    ) -> Result<(AgentTask, WorkerId, LeaseId, CompletedTurnCommit)> {
+        let root = AgentTask::new_root_turn(thread_id(tid), t_plus(base_secs), 3);
+        let _ = task_store.submit_root_turn(root.clone()).await?;
+        let worker = WorkerId::new();
+        let lease = LeaseId::new();
+        let _ = task_store
+            .try_acquire_task(
+                &root.id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(base_secs + 60),
+                t_plus(base_secs + 1),
+            )
+            .await?
+            .context("acquire root for guarded commit")?;
+        let attempt = attempt_store
+            .open_attempt(OpenAttemptParams {
+                task_id: root.id.clone(),
+                attempt_number: 1,
+                provenance: AuditProvenance::new("anthropic", "claude-sonnet-4-5-20250929"),
+                request_blob: serde_json::json!({"messages": []}),
+                now: t_plus(base_secs + 2),
+                otel_trace_id: None,
+                otel_span_id: None,
+            })
+            .await?;
+        let params = CompletedTurnCommit {
+            checkpoint_kind: CheckpointKind::FullTurn,
+            thread_id: thread_id(tid),
+            task_id: root.id.clone(),
+            expected_turn: 1,
+            turn_attempt_id: attempt.id,
+            close_attempt_params: CloseAttemptParams {
+                response_blob: serde_json::json!({"id": "msg_guard"}),
+                response_id: Some("msg_guard".into()),
+                response_model: Some("claude-sonnet-4-5-20250929".into()),
+                stop_reason: Some(agent_sdk_foundation::llm::StopReason::EndTurn),
+                outcome: TurnAttemptOutcome::Success,
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_input_tokens: 0,
+            },
+            messages: vec![agent_sdk_foundation::llm::Message::assistant("guarded")],
+            turn_usage: TokenUsage::default(),
+            agent_state_snapshot: serde_json::json!({}),
+            events: vec![],
+            outbox_max_attempts: 3,
+            owner_guard: None,
+            now: t_plus(base_secs + 3),
+        };
+        Ok((root, worker, lease, params))
+    }
+
+    /// An owner-guarded commit (the slot-shift retry) must be
+    /// rejected INSIDE the commit transaction when the
+    /// task row is no longer a `Running` row owned by the presenting
+    /// `(worker, lease)` — here, a cancellation that landed between
+    /// the caller's shift-eligibility re-read and the retried commit.
+    /// Nothing may be written (no thread advance, no checkpoint), and
+    /// the rejection carries the typed [`LostCommitOwnership`] root
+    /// cause so the shift loop treats it as terminal instead of
+    /// shifting again. Durable backends only: the non-atomic
+    /// in-memory backend has no cross-store transaction to enforce
+    /// the guard in (documented on `CompletedTurnCommit::owner_guard`).
+    async fn test_owner_guarded_commit_rejects_lost_ownership(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
+        message_store: &dyn MessageProjectionStore,
+        attempt_store: &dyn TurnAttemptStore,
+        checkpoint_store: &dyn CheckpointStore,
+        event_repo: &dyn EventRepository,
+    ) -> Result<()> {
+        use agent_server::journal::commit::{CommitOwnerGuard, LostCommitOwnership};
+
+        let (root, worker, lease, mut params) =
+            guarded_commit_fixture(task_store, attempt_store, "conformance-owner-guard", 500)
+                .await?;
+        params.owner_guard = Some(CommitOwnerGuard {
+            worker_id: worker.clone(),
+            lease_id: lease.clone(),
+        });
+
+        // The cancel lands between the caller's eligibility check and
+        // the retried commit.
+        let cancelled = task_store.cancel_tree(&root.id, t_plus(504)).await?;
+        assert_eq!(cancelled.transitioned, vec![root.id.clone()]);
+
+        let error = commit_completed_turn(
+            params,
+            thread_store,
+            message_store,
+            attempt_store,
+            checkpoint_store,
+            event_repo,
+        )
+        .await
+        .err()
+        .context("owner-guarded commit against a cancelled row must be rejected")?;
+        assert!(
+            error.downcast_ref::<LostCommitOwnership>().is_some(),
+            "expected the typed LostCommitOwnership root cause, got: {error:#}",
+        );
+
+        // The rejected transaction wrote nothing.
+        let thread = thread_store
+            .get(&thread_id("conformance-owner-guard"))
+            .await?;
+        assert_eq!(
+            thread.map_or(0, |thread| thread.committed_turns),
+            0,
+            "rejected owner-guarded commit must not advance the thread",
+        );
+        assert!(
+            checkpoint_store
+                .get_by_turn(&thread_id("conformance-owner-guard"), 1)
+                .await?
+                .is_none(),
+            "rejected owner-guarded commit must not write a checkpoint",
+        );
+        Ok(())
+    }
+
+    /// Owner-guard positive arm: an owner-guarded commit whose worker
+    /// still owns the live `Running` row succeeds — the guard only
+    /// bites on lost ownership.
+    async fn test_owner_guarded_commit_succeeds_while_owned(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
+        message_store: &dyn MessageProjectionStore,
+        attempt_store: &dyn TurnAttemptStore,
+        checkpoint_store: &dyn CheckpointStore,
+        event_repo: &dyn EventRepository,
+    ) -> Result<()> {
+        use agent_server::journal::commit::CommitOwnerGuard;
+
+        let (_root, worker, lease, mut params) =
+            guarded_commit_fixture(task_store, attempt_store, "conformance-owner-guard-ok", 520)
+                .await?;
+        params.owner_guard = Some(CommitOwnerGuard {
+            worker_id: worker,
+            lease_id: lease,
+        });
+
+        let outcome = commit_completed_turn(
+            params,
+            thread_store,
+            message_store,
+            attempt_store,
+            checkpoint_store,
+            event_repo,
+        )
+        .await
+        .context("owner-guarded commit while still owned")?;
+        assert_eq!(outcome.thread.committed_turns, 1);
+        assert_eq!(outcome.checkpoint.turn_number, 1);
+        Ok(())
+    }
+
+    /// The completed-turn slot CAS rejection carries the typed
+    /// [`StaleTurnCommit`] root cause on every backend, so the
+    /// worker's slot-shift path can downcast instead of matching
+    /// message strings (the `Display` text stays byte-identical to the
+    /// historical message for logs).
+    async fn test_stale_turn_commit_rejection_is_typed(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
+        message_store: &dyn MessageProjectionStore,
+        attempt_store: &dyn TurnAttemptStore,
+        checkpoint_store: &dyn CheckpointStore,
+        event_repo: &dyn EventRepository,
+    ) -> Result<()> {
+        use agent_server::journal::commit::StaleTurnCommit;
+
+        let (root, _worker, _lease, params) =
+            guarded_commit_fixture(task_store, attempt_store, "conformance-stale-typed", 540)
+                .await?;
+        commit_completed_turn(
+            params,
+            thread_store,
+            message_store,
+            attempt_store,
+            checkpoint_store,
+            event_repo,
+        )
+        .await
+        .context("first commit of turn 1")?;
+
+        // A second commit of the SAME expected turn (fresh attempt,
+        // same slot) must fail the CAS with the typed root cause.
+        let attempt = attempt_store
+            .open_attempt(OpenAttemptParams {
+                task_id: root.id.clone(),
+                attempt_number: 2,
+                provenance: AuditProvenance::new("anthropic", "claude-sonnet-4-5-20250929"),
+                request_blob: serde_json::json!({"messages": []}),
+                now: t_plus(546),
+                otel_trace_id: None,
+                otel_span_id: None,
+            })
+            .await?;
+        let stale = CompletedTurnCommit {
+            checkpoint_kind: CheckpointKind::FullTurn,
+            thread_id: thread_id("conformance-stale-typed"),
+            task_id: root.id.clone(),
+            expected_turn: 1,
+            turn_attempt_id: attempt.id,
+            close_attempt_params: CloseAttemptParams {
+                response_blob: serde_json::json!({"id": "msg_stale"}),
+                response_id: Some("msg_stale".into()),
+                response_model: Some("claude-sonnet-4-5-20250929".into()),
+                stop_reason: Some(agent_sdk_foundation::llm::StopReason::EndTurn),
+                outcome: TurnAttemptOutcome::Success,
+                input_tokens: 1,
+                output_tokens: 1,
+                cached_input_tokens: 0,
+            },
+            messages: vec![agent_sdk_foundation::llm::Message::assistant("stale")],
+            turn_usage: TokenUsage::default(),
+            agent_state_snapshot: serde_json::json!({}),
+            events: vec![],
+            outbox_max_attempts: 3,
+            owner_guard: None,
+            now: t_plus(547),
+        };
+        let error = commit_completed_turn(
+            stale,
+            thread_store,
+            message_store,
+            attempt_store,
+            checkpoint_store,
+            event_repo,
+        )
+        .await
+        .err()
+        .context("second commit of the same slot must be rejected")?;
+        let typed = error
+            .downcast_ref::<StaleTurnCommit>()
+            .context("rejection must carry the typed StaleTurnCommit root cause")?;
+        assert_eq!(typed.expected_turn, 1);
+        assert_eq!(typed.committed_turns, 1);
+        assert!(
+            format!("{error:#}").contains("stale turn commit"),
+            "Display text must stay stable, got: {error:#}",
+        );
         Ok(())
     }
 
@@ -686,7 +1036,10 @@ mod tests {
         assert_eq!(parent.status, TaskStatus::WaitingOnChildren);
         assert_eq!(children.len(), 2);
 
-        let cancelled = task_store.cancel_tree(&root.id, t_plus(73)).await?;
+        let cancelled = task_store
+            .cancel_tree(&root.id, t_plus(73))
+            .await?
+            .transitioned;
         // Root + both children must all be transitioned.
         assert_eq!(
             cancelled.len(),
@@ -734,7 +1087,10 @@ mod tests {
             spawn_subagent_fixture(task_store, thread_store, "conformance-subagent-cascade")
                 .await?;
 
-        let cancelled = task_store.cancel_tree(&parent.id, t_plus(10)).await?;
+        let cancelled = task_store
+            .cancel_tree(&parent.id, t_plus(10))
+            .await?
+            .transitioned;
         assert_eq!(
             cancelled.len(),
             3,
@@ -751,6 +1107,258 @@ mod tests {
         Ok(())
     }
 
+    /// Count the `AgentEvent::Cancelled` markers committed on `thread`.
+    async fn cancelled_marker_count(
+        event_repo: &dyn EventRepository,
+        thread: &ThreadId,
+    ) -> Result<usize> {
+        Ok(event_repo
+            .get_events(thread)
+            .await?
+            .iter()
+            .filter(|committed| matches!(committed.event, AgentEvent::Cancelled { .. }))
+            .count())
+    }
+
+    /// Terminal-marker contract (issue #354), part 1: cancelling the
+    /// thread's blocking root commits exactly ONE durable `Cancelled`
+    /// marker plus its `thread_events_available` outbox advisory,
+    /// atomically with the cancellation — and a crash-retry (the
+    /// caller "dies" right after `cancel_tree` commits, then retries)
+    /// finds the marker already durable and emits nothing new.
+    async fn test_cancel_marker_exactly_once_and_crash_retry_idempotent(
+        task_store: &dyn AgentTaskStore,
+        event_repo: &dyn EventRepository,
+        outbox_store: &dyn OutboxStore,
+    ) -> Result<()> {
+        let tid = "conformance-cancel-marker";
+        let root = fresh_root(tid, 300);
+        let _ = task_store.submit_root_turn(root.clone()).await?;
+
+        let outcome = task_store.cancel_tree(&root.id, t_plus(301)).await?;
+        assert_eq!(outcome.transitioned, vec![root.id.clone()]);
+        assert_eq!(
+            outcome.markers.len(),
+            1,
+            "one marker for the cancelled blocking root",
+        );
+        let marker = &outcome.markers[0];
+        assert_eq!(marker.thread_id, thread_id(tid));
+        assert!(
+            matches!(marker.event, AgentEvent::Cancelled { .. }),
+            "marker must be a Cancelled event, got {:?}",
+            marker.event,
+        );
+
+        // Durable in the committed-event journal (a follower replaying
+        // the thread sees the closing frame even if every process died
+        // the instant `cancel_tree` returned).
+        assert_eq!(
+            cancelled_marker_count(event_repo, &thread_id(tid)).await?,
+            1
+        );
+
+        // The advisory outbox row committed with the marker (cross-host
+        // followers are woken through the relay, not a process-local
+        // notifier).
+        let claimed = outbox_store
+            .claim_pending("conformance-marker-relay", 32, t_plus(302))
+            .await?;
+        let advisories: Vec<_> = claimed
+            .iter()
+            .filter(|row| {
+                row.kind == OutboxMessageKind::ThreadEventsAvailable
+                    && row.thread_id == thread_id(tid)
+            })
+            .collect();
+        assert_eq!(
+            advisories.len(),
+            1,
+            "exactly one thread_events_available advisory for the marker",
+        );
+        assert_eq!(advisories[0].sequence, Some(marker.sequence));
+
+        // Crash-retry: the retry sees a terminal tree — nothing
+        // transitions, no duplicate marker, no second advisory.
+        let retry = task_store.cancel_tree(&root.id, t_plus(303)).await?;
+        assert!(retry.transitioned.is_empty(), "retry must be a no-op");
+        assert!(retry.markers.is_empty(), "retry must not re-emit markers");
+        assert_eq!(
+            cancelled_marker_count(event_repo, &thread_id(tid)).await?,
+            1
+        );
+        let re_claimed = outbox_store
+            .claim_pending("conformance-marker-relay", 32, t_plus(304))
+            .await?;
+        assert!(
+            re_claimed
+                .iter()
+                .all(|row| row.kind != OutboxMessageKind::ThreadEventsAvailable),
+            "retry must not write a second advisory, got {re_claimed:?}",
+        );
+        Ok(())
+    }
+
+    /// Terminal-marker contract (issue #354), part 2: a cancel that
+    /// cascades across `SubagentInvocation` linkage commits one marker
+    /// per affected thread — the parent root's thread AND the
+    /// child-thread root's own thread (whose followers previously hung
+    /// forever). The invocation task itself (kind `subagent`, parent
+    /// thread) adds no extra marker.
+    async fn test_cancel_marker_covers_child_threads(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
+        event_repo: &dyn EventRepository,
+    ) -> Result<()> {
+        let (parent, _invocation, child_root) =
+            spawn_subagent_fixture(task_store, thread_store, "conformance-marker-cascade").await?;
+
+        let outcome = task_store.cancel_tree(&parent.id, t_plus(10)).await?;
+        assert_eq!(outcome.transitioned.len(), 3);
+        assert_eq!(
+            outcome.markers.len(),
+            2,
+            "parent root and child-thread root each get a marker, got {:?}",
+            outcome.markers,
+        );
+        for thread in [&parent.thread_id, &child_root.thread_id] {
+            assert_eq!(
+                cancelled_marker_count(event_repo, thread).await?,
+                1,
+                "exactly one marker on thread {thread}",
+            );
+        }
+        Ok(())
+    }
+
+    /// Terminal-marker contract (issue #354), race arm: two RACING
+    /// `cancel_tree` calls on the same blocking root must produce
+    /// exactly ONE durable marker, ONE outbox advisory, and report the
+    /// transition exactly once across both outcomes. On Postgres the
+    /// transition must be gated on a locked re-read (not the
+    /// non-locking snapshot), otherwise both racers emit markers and
+    /// both report `transitioned = 1`. The two calls run on separate
+    /// spawned tasks (separate pool connections on the SQL backends)
+    /// released by a barrier, repeated across rounds to give the
+    /// interleave a real chance to bite.
+    async fn test_concurrent_cancels_emit_single_marker(
+        task_store: std::sync::Arc<dyn AgentTaskStore>,
+        event_repo: &dyn EventRepository,
+        outbox_store: &dyn OutboxStore,
+    ) -> Result<()> {
+        for round in 0..12i64 {
+            let tid = format!("conformance-cancel-race-{round}");
+            let root = AgentTask::new_root_turn(thread_id(&tid), t_plus(400 + round * 4), 3);
+            let _ = task_store.submit_root_turn(root.clone()).await?;
+
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+            let spawn_cancel = |store: std::sync::Arc<dyn AgentTaskStore>,
+                                id: AgentTaskId,
+                                gate: std::sync::Arc<tokio::sync::Barrier>,
+                                at: OffsetDateTime| {
+                tokio::spawn(async move {
+                    gate.wait().await;
+                    store.cancel_tree(&id, at).await
+                })
+            };
+            let first = spawn_cancel(
+                std::sync::Arc::clone(&task_store),
+                root.id.clone(),
+                std::sync::Arc::clone(&barrier),
+                t_plus(401 + round * 4),
+            );
+            let second = spawn_cancel(
+                std::sync::Arc::clone(&task_store),
+                root.id.clone(),
+                barrier,
+                t_plus(401 + round * 4),
+            );
+            let first = first.await.context("join first racing cancel")??;
+            let second = second.await.context("join second racing cancel")??;
+
+            assert_eq!(
+                first.transitioned.len() + second.transitioned.len(),
+                1,
+                "round {round}: exactly one racer may report the transition, got {:?} / {:?}",
+                first.transitioned,
+                second.transitioned,
+            );
+            assert_eq!(
+                first.markers.len() + second.markers.len(),
+                1,
+                "round {round}: exactly one marker across both racers",
+            );
+            assert_eq!(
+                cancelled_marker_count(event_repo, &thread_id(&tid)).await?,
+                1,
+                "round {round}: exactly one durable Cancelled marker",
+            );
+            let claimed = outbox_store
+                .claim_pending("conformance-race-relay", 64, t_plus(403 + round * 4))
+                .await?;
+            let advisories = claimed
+                .iter()
+                .filter(|row| {
+                    row.kind == OutboxMessageKind::ThreadEventsAvailable
+                        && row.thread_id == thread_id(&tid)
+                })
+                .count();
+            assert_eq!(
+                advisories, 1,
+                "round {round}: exactly one thread_events_available advisory",
+            );
+        }
+        Ok(())
+    }
+
+    /// Terminal-marker contract (issue #354), part 3: cancelling a
+    /// QUEUED root parked behind a live active root emits NO marker
+    /// and no advisory — a thread-terminal frame would close the
+    /// active root's followers mid-stream.
+    async fn test_queued_root_cancel_emits_no_marker(
+        task_store: &dyn AgentTaskStore,
+        event_repo: &dyn EventRepository,
+        outbox_store: &dyn OutboxStore,
+    ) -> Result<()> {
+        let tid = "conformance-queued-no-marker";
+        let active = fresh_root(tid, 320);
+        let active_admitted = task_store.submit_root_turn(active).await?;
+        assert_eq!(active_admitted.status, TaskStatus::Pending);
+        let queued = fresh_root(tid, 321);
+        let queued_admitted = task_store.submit_root_turn(queued).await?;
+        assert_eq!(queued_admitted.status, TaskStatus::Queued);
+
+        let outcome = task_store
+            .cancel_tree(&queued_admitted.id, t_plus(322))
+            .await?;
+        assert_eq!(outcome.transitioned, vec![queued_admitted.id.clone()]);
+        assert!(
+            outcome.markers.is_empty(),
+            "queued-behind-active cancel must not emit a thread-terminal marker",
+        );
+        assert_eq!(
+            cancelled_marker_count(event_repo, &thread_id(tid)).await?,
+            0
+        );
+        let claimed = outbox_store
+            .claim_pending("conformance-queued-relay", 32, t_plus(323))
+            .await?;
+        assert!(
+            claimed
+                .iter()
+                .all(|row| row.kind != OutboxMessageKind::ThreadEventsAvailable),
+            "no thread_events_available advisory may exist for a queued cancel, got {claimed:?}",
+        );
+
+        // The active root is untouched.
+        let active_after = task_store
+            .get(&active_admitted.id)
+            .await?
+            .context("active root exists")?;
+        assert_eq!(active_after.status, TaskStatus::Pending);
+        Ok(())
+    }
+
     /// Cancelling a child-thread root must **wake** its linked parent
     /// subagent invocation (finding #7). Cancelling only the child root
     /// resumes the invocation to `Pending` with no pending children, so the
@@ -762,7 +1370,10 @@ mod tests {
         let (_parent, invocation, child_root) =
             spawn_subagent_fixture(task_store, thread_store, "conformance-subagent-wake").await?;
 
-        let cancelled = task_store.cancel_tree(&child_root.id, t_plus(10)).await?;
+        let cancelled = task_store
+            .cancel_tree(&child_root.id, t_plus(10))
+            .await?
+            .transitioned;
         assert_eq!(cancelled, vec![child_root.id.clone()]);
 
         let woken = task_store
@@ -1612,9 +2223,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_requeue_owned_task() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_requeue_owned_task(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_completed_turn() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_completed_turn_commit(
+            s.task.as_ref(),
+            s.thread.as_ref(),
+            s.message.as_ref(),
+            s.attempt.as_ref(),
+            s.checkpoint.as_ref(),
+            s.event.as_ref(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_stale_turn_commit_is_typed() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_stale_turn_commit_rejection_is_typed(
             s.task.as_ref(),
             s.thread.as_ref(),
             s.message.as_ref(),
@@ -1698,6 +2329,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_cancel_marker_exactly_once_and_crash_retry() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_cancel_marker_exactly_once_and_crash_retry_idempotent(
+            s.task.as_ref(),
+            s.event.as_ref(),
+            s.outbox.as_ref(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_cancel_marker_covers_child_threads() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_cancel_marker_covers_child_threads(
+            s.task.as_ref(),
+            s.thread.as_ref(),
+            s.event.as_ref(),
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_in_memory_concurrent_cancels_single_marker() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_concurrent_cancels_emit_single_marker(
+            std::sync::Arc::clone(&s.task),
+            s.event.as_ref(),
+            s.outbox.as_ref(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_queued_root_cancel_emits_no_marker() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_queued_root_cancel_emits_no_marker(
+            s.task.as_ref(),
+            s.event.as_ref(),
+            s.outbox.as_ref(),
+        )
+        .await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_cancel_child_root_wakes_invocation() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_cancel_child_root_wakes_invocation(s.task.as_ref(), s.thread.as_ref()).await
@@ -1752,23 +2427,43 @@ mod tests {
         attempt: std::sync::Arc<dyn TurnAttemptStore>,
         checkpoint: std::sync::Arc<dyn CheckpointStore>,
         event: std::sync::Arc<dyn EventRepository>,
+        outbox: std::sync::Arc<dyn OutboxStore>,
     }
 
     fn fresh_in_memory_stores() -> InMemoryStores {
         use agent_server::journal::checkpoint_store::InMemoryCheckpointStore;
         use agent_server::journal::event_repository::InMemoryEventRepository;
         use agent_server::journal::message_store::InMemoryMessageProjectionStore;
-        use agent_server::journal::store::InMemoryAgentTaskStore;
+        use agent_server::journal::outbox::InMemoryOutboxStore;
+        use agent_server::journal::store::{CancellationMarkerSink, InMemoryAgentTaskStore};
         use agent_server::journal::thread_store::InMemoryThreadStore;
         use agent_server::journal::turn_attempt_store::InMemoryTurnAttemptStore;
 
+        // Mirror `StoreRegistry::in_memory`: the task store commits its
+        // terminal `Cancelled` markers through the shared event /
+        // outbox / thread stores (issue #354), so the marker
+        // conformance battery runs on the same wiring production uses.
+        let thread: std::sync::Arc<InMemoryThreadStore> =
+            std::sync::Arc::new(InMemoryThreadStore::new());
+        let event: std::sync::Arc<InMemoryEventRepository> =
+            std::sync::Arc::new(InMemoryEventRepository::new());
+        let outbox: std::sync::Arc<InMemoryOutboxStore> =
+            std::sync::Arc::new(InMemoryOutboxStore::new());
+        let task =
+            InMemoryAgentTaskStore::new().with_cancellation_markers(CancellationMarkerSink {
+                event_repo: event.clone(),
+                outbox_store: outbox.clone(),
+                thread_store: thread.clone(),
+            });
+
         InMemoryStores {
-            task: std::sync::Arc::new(InMemoryAgentTaskStore::new()),
-            thread: std::sync::Arc::new(InMemoryThreadStore::new()),
+            task: std::sync::Arc::new(task),
+            thread,
             message: std::sync::Arc::new(InMemoryMessageProjectionStore::new()),
             attempt: std::sync::Arc::new(InMemoryTurnAttemptStore::new()),
             checkpoint: std::sync::Arc::new(InMemoryCheckpointStore::new()),
-            event: std::sync::Arc::new(InMemoryEventRepository::new()),
+            event,
+            outbox,
         }
     }
 
@@ -1811,9 +2506,44 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
+    async fn conformance_sqlite_requeue_owned_task() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_requeue_owned_task(&store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
     async fn conformance_sqlite_completed_turn() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_completed_turn_commit(&store, &store, &store, &store, &store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_stale_turn_commit_is_typed() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_stale_turn_commit_rejection_is_typed(&store, &store, &store, &store, &store, &store)
+            .await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_owner_guarded_commit_rejects_lost_ownership() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_owner_guarded_commit_rejects_lost_ownership(
+            &store, &store, &store, &store, &store, &store,
+        )
+        .await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_owner_guarded_commit_succeeds_while_owned() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_owner_guarded_commit_succeeds_while_owned(
+            &store, &store, &store, &store, &store, &store,
+        )
+        .await
     }
 
     #[cfg(feature = "sqlite")]
@@ -1898,6 +2628,41 @@ mod tests {
     async fn conformance_sqlite_cancel_subagent_cascade() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_cancel_tree_cascades_through_subagent(&store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_cancel_marker_exactly_once_and_crash_retry() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_cancel_marker_exactly_once_and_crash_retry_idempotent(&store, &store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_cancel_marker_covers_child_threads() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_cancel_marker_covers_child_threads(&store, &store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_sqlite_concurrent_cancels_single_marker() -> Result<()> {
+        let store = std::sync::Arc::new(
+            crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?,
+        );
+        test_concurrent_cancels_emit_single_marker(
+            std::sync::Arc::clone(&store) as std::sync::Arc<dyn AgentTaskStore>,
+            store.as_ref(),
+            store.as_ref(),
+        )
+        .await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_queued_root_cancel_emits_no_marker() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_queued_root_cancel_emits_no_marker(&store, &store, &store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -2241,11 +3006,54 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_requeue_owned_task() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_requeue_owned_task(&store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn conformance_postgres_completed_turn() -> Result<()> {
         let Some((store, _guard)) = pg_test_store().await? else {
             return Ok(());
         };
         test_completed_turn_commit(&store, &store, &store, &store, &store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_stale_turn_commit_is_typed() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_stale_turn_commit_rejection_is_typed(&store, &store, &store, &store, &store, &store)
+            .await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_owner_guarded_commit_rejects_lost_ownership() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_owner_guarded_commit_rejects_lost_ownership(
+            &store, &store, &store, &store, &store, &store,
+        )
+        .await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_owner_guarded_commit_succeeds_while_owned() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_owner_guarded_commit_succeeds_while_owned(
+            &store, &store, &store, &store, &store, &store,
+        )
+        .await
     }
 
     #[cfg(feature = "postgres")]
@@ -2358,6 +3166,48 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_cancel_marker_exactly_once_and_crash_retry() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_cancel_marker_exactly_once_and_crash_retry_idempotent(&store, &store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_cancel_marker_covers_child_threads() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_cancel_marker_covers_child_threads(&store, &store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_concurrent_cancels_single_marker() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let store = std::sync::Arc::new(store);
+        test_concurrent_cancels_emit_single_marker(
+            std::sync::Arc::clone(&store) as std::sync::Arc<dyn AgentTaskStore>,
+            store.as_ref(),
+            store.as_ref(),
+        )
+        .await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_queued_root_cancel_emits_no_marker() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_queued_root_cancel_emits_no_marker(&store, &store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn conformance_postgres_cancel_child_root_wakes_invocation() -> Result<()> {
         let Some((store, _guard)) = pg_test_store().await? else {
             return Ok(());
@@ -2437,7 +3287,7 @@ mod tests {
     async fn conformance_postgres_fork_atomic_commits_full_state() -> Result<()> {
         use agent_sdk_foundation::events::AgentEvent;
         use agent_sdk_foundation::llm::Message;
-        use agent_server::journal::checkpoint::NewCheckpointParams;
+        use agent_server::journal::checkpoint::{CheckpointKind, NewCheckpointParams};
         use agent_server::journal::fork_transaction::{AtomicForkCommitter, ForkCommitParams};
 
         let Some((store, _guard)) = pg_test_store().await? else {
@@ -2475,6 +3325,7 @@ mod tests {
             cumulative_total_usage: TokenUsage::default(),
             messages: messages.clone(),
             checkpoint: Some(NewCheckpointParams {
+                kind: CheckpointKind::FullTurn,
                 thread_id: new_thread_id.clone(),
                 turn_number: 1,
                 task_id: source_task_id,
@@ -2526,7 +3377,7 @@ mod tests {
     async fn conformance_postgres_fork_atomic_rolls_back_on_failure() -> Result<()> {
         use agent_sdk_foundation::events::AgentEvent;
         use agent_sdk_foundation::llm::Message;
-        use agent_server::journal::checkpoint::NewCheckpointParams;
+        use agent_server::journal::checkpoint::{CheckpointKind, NewCheckpointParams};
         use agent_server::journal::fork_transaction::{AtomicForkCommitter, ForkCommitParams};
 
         let Some((store, _guard)) = pg_test_store().await? else {
@@ -2555,6 +3406,7 @@ mod tests {
         CheckpointStore::commit_checkpoint(
             &store,
             NewCheckpointParams {
+                kind: CheckpointKind::FullTurn,
                 thread_id: new_thread_id.clone(),
                 turn_number: 1,
                 task_id: pre_task_id,
@@ -2580,6 +3432,7 @@ mod tests {
             cumulative_total_usage: TokenUsage::default(),
             messages: fresh_messages.clone(),
             checkpoint: Some(NewCheckpointParams {
+                kind: CheckpointKind::FullTurn,
                 thread_id: new_thread_id.clone(),
                 turn_number: 1,
                 task_id: source_task_id,

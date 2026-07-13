@@ -62,16 +62,17 @@
 
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::{ThreadId, TokenUsage, llm};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use time::OffsetDateTime;
 
 use super::checkpoint::Checkpoint;
+use super::checkpoint::CheckpointKind;
 use super::checkpoint::NewCheckpointParams;
 use super::checkpoint_store::CheckpointStore;
 use super::committed_event::CommittedEvent;
 use super::event_repository::EventRepository;
 use super::message_store::MessageProjectionStore;
-use super::task::AgentTaskId;
+use super::task::{AgentTaskId, LeaseId, WorkerId};
 use super::thread::Thread;
 use super::thread_store::ThreadStore;
 use super::turn_attempt::{CloseAttemptParams, TurnAttempt, TurnAttemptId};
@@ -111,6 +112,15 @@ pub struct CompletedTurnCommit {
     pub messages: Vec<llm::Message>,
     /// Token usage for this turn.
     pub turn_usage: TokenUsage,
+    /// Provenance recorded on the checkpoint row this commit creates.
+    ///
+    /// [`CheckpointKind::CancelSalvage`] is set **only** by the
+    /// cancellation seam-B salvage commit; every full-turn commit path
+    /// passes [`CheckpointKind::FullTurn`]. The worker's turn-slot-shift
+    /// retry keys its shift-eligibility decision off this durable
+    /// discriminator — never off token usage, which can legitimately be
+    /// all-zero on a real completion.
+    pub checkpoint_kind: CheckpointKind,
     /// Opaque agent-state snapshot for v1 recovery.
     pub agent_state_snapshot: serde_json::Value,
     /// Lifecycle events to commit atomically with the turn.
@@ -136,8 +146,37 @@ pub struct CompletedTurnCommit {
     /// committer (the in-memory path writes no outbox row from this
     /// helper).
     pub outbox_max_attempts: u32,
+    /// Optional task-row ownership validation performed **inside** the
+    /// commit transaction.
+    ///
+    /// When set, the atomic durable committers re-read the task row
+    /// (`FOR UPDATE` on Postgres; under `SQLite`'s exclusive write
+    /// transaction) and reject the commit with [`LostCommitOwnership`]
+    /// unless the row is still `Running` and owned by exactly this
+    /// `(worker, lease)` pair — closing the window where a
+    /// cancellation or lease loss lands between a caller-side
+    /// ownership check and the commit. Used only by the worker's
+    /// turn-slot-shift retry; the first (non-shifted) commit attempt
+    /// passes `None` so the normal path is unchanged.
+    ///
+    /// The non-atomic in-memory path cannot enforce this (it has no
+    /// handle on the task journal and no cross-store transaction);
+    /// there the worker's shift path re-validates ownership
+    /// immediately before the retry, accepting the same in-process
+    /// race window every other non-atomic in-memory step already has.
+    pub owner_guard: Option<CommitOwnerGuard>,
     /// Current wall-clock time.
     pub now: OffsetDateTime,
+}
+
+/// The `(worker, lease)` pair a guarded commit must still own — see
+/// [`CompletedTurnCommit::owner_guard`].
+#[derive(Clone, Debug)]
+pub struct CommitOwnerGuard {
+    /// Worker that believes it owns the task row.
+    pub worker_id: WorkerId,
+    /// Lease under which the worker acquired the row.
+    pub lease_id: LeaseId,
 }
 
 /// Default relay attempt budget for the coalesced `thread_events_available`
@@ -146,6 +185,64 @@ pub struct CompletedTurnCommit {
 /// Matches the long-standing 3-attempt default used elsewhere for the
 /// event outbox; production callers may override per [`CompletedTurnCommit`].
 pub const DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS: u32 = 3;
+
+/// Typed root cause for the completed-turn slot CAS rejection.
+///
+/// Every committer — the in-memory guard in [`commit_completed_turn`],
+/// the Postgres / `SQLite` atomic committers, and the worker's
+/// pre-commit idempotency check — returns this as the error's root
+/// cause when `expected_turn` no longer matches the thread's committed
+/// turn count, so callers (e.g. the worker's turn-slot-shift path) can
+/// `downcast_ref::<StaleTurnCommit>()` instead of matching message
+/// strings. The `Display` text is kept byte-identical to the
+/// historical message
+/// (`"stale turn commit: expected {expected}, thread at {committed}"`)
+/// for logs and existing assertions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StaleTurnCommit {
+    /// The turn number the rejected commit expected to produce.
+    pub expected_turn: u32,
+    /// The thread's committed turn count observed at rejection time.
+    pub committed_turns: u32,
+}
+
+impl std::fmt::Display for StaleTurnCommit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "stale turn commit: expected {}, thread at {}",
+            self.expected_turn, self.committed_turns,
+        )
+    }
+}
+
+impl std::error::Error for StaleTurnCommit {}
+
+/// Typed root cause for a rejected owner-guarded commit.
+///
+/// Returned when the task row is no longer a `Running` row owned by
+/// the presenting `(worker, lease)` — see
+/// [`CompletedTurnCommit::owner_guard`]. Deliberately distinct from
+/// [`StaleTurnCommit`]: the slot-shift path retries on the latter but
+/// must treat this as terminal (the cancel / timeout / requeue owner
+/// has the row).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LostCommitOwnership {
+    /// The task whose ownership validation failed.
+    pub task_id: AgentTaskId,
+}
+
+impl std::fmt::Display for LostCommitOwnership {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "commit ownership lost: task {} is no longer a Running row owned by the presenting lease",
+            self.task_id,
+        )
+    }
+}
+
+impl std::error::Error for LostCommitOwnership {}
 
 // ─────────────────────────────────────────────────────────────────────
 // Outcome
@@ -243,27 +340,40 @@ pub async fn commit_completed_turn(
     let events = std::mem::take(&mut params.events);
     let thread_id_for_events = params.thread_id.clone();
 
-    // Stale turn double-commit guard. Re-read the thread row and assert
-    // it is still positioned to produce `expected_turn` before touching
-    // any projection. A stale-lease worker that lost the race to another
-    // worker (which already advanced the thread) fails here instead of
-    // durably double-committing the turn. Running the guard before the
-    // attempt close means a rejected stale commit leaves no side effects,
-    // mirroring the durable backends, where the in-transaction assertion
-    // rolls back the staged attempt close on mismatch.
+    // Stale turn double-commit guard. Two racing committers could both
+    // pass this read on the non-atomic path, so the
+    // whole sequential body runs under the store's sequential-commit
+    // lock (acquired above): under it this pre-check is decisive, and
+    // a rejected stale commit provably leaves no side effects — the
+    // attempt is still open for the caller's slot-shift retry. The
+    // expected-turn CAS inside `ThreadStore::commit_turn` (step 2)
+    // remains as defense in depth.
+    // Serialize the entire non-atomic commit body when the backend
+    // provides a sequential-commit lock (the in-memory store does; the
+    // durable backends get equivalent atomicity from their
+    // transactions and never reach this path). This is what makes the
+    // pre-check + close + aggregate sequence race-free in-process.
+    let _sequential_guard = match thread_store.sequential_commit_lock() {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
     let committed_turns_before = thread_store
         .get(&params.thread_id)
         .await
         .context("commit: re-read thread for stale-turn guard")?
         .map_or(0, |thread| thread.committed_turns);
-    ensure!(
-        committed_turns_before.saturating_add(1) == params.expected_turn,
-        "stale turn commit: expected {}, thread at {}",
-        params.expected_turn,
-        committed_turns_before,
-    );
+    if committed_turns_before.saturating_add(1) != params.expected_turn {
+        return Err(anyhow::Error::new(StaleTurnCommit {
+            expected_turn: params.expected_turn,
+            committed_turns: committed_turns_before,
+        }));
+    }
 
-    // 1. Close the turn attempt.
+    // 1. Close the turn attempt. Strict: any already-closed row fails
+    //    the commit before a single projection advances. The
+    //    serialization guard above makes the CAS-loss-after-close
+    //    window unreachable on this path, so no idempotent-close
+    //    tolerance is needed.
     let closed_attempt = turn_attempt_store
         .close_attempt(
             &params.turn_attempt_id,
@@ -273,9 +383,18 @@ pub async fn commit_completed_turn(
         .await
         .context("commit: close turn attempt")?;
 
-    // 2. Commit the turn to the thread aggregate.
+    // 2. Commit the turn to the thread aggregate. This carries the
+    //    AUTHORITATIVE expected-turn CAS (inside the store's write
+    //    lock/transaction on every backend) — under the sequential
+    //    lock it is defense in depth; for the durable backends' trait
+    //    method it protects standalone callers like the fork mirror.
     let thread = thread_store
-        .commit_turn(&params.thread_id, &params.turn_usage, params.now)
+        .commit_turn(
+            &params.thread_id,
+            params.expected_turn,
+            &params.turn_usage,
+            params.now,
+        )
         .await
         .context("commit: advance thread aggregate")?;
 
@@ -297,6 +416,7 @@ pub async fn commit_completed_turn(
             messages: updated_projection.messages,
             agent_state_snapshot: params.agent_state_snapshot,
             turn_usage: params.turn_usage,
+            kind: params.checkpoint_kind,
             now: params.now,
         })
         .await
@@ -463,6 +583,7 @@ mod tests {
 
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task_id.clone(),
                 expected_turn: 1,
@@ -473,6 +594,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({"turn": 1}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(5),
             },
             &s.threads,
@@ -525,6 +647,7 @@ mod tests {
         // Turn 1
         let o1 = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task1,
                 expected_turn: 1,
@@ -535,6 +658,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({"turn": 1}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(1),
             },
             &s.threads,
@@ -549,6 +673,7 @@ mod tests {
         // Turn 2
         let o2 = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task2,
                 expected_turn: 2,
@@ -559,6 +684,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({"turn": 2}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(2),
             },
             &s.threads,
@@ -615,6 +741,7 @@ mod tests {
         // Turn 1 commits cleanly; the thread now sits at committed_turns = 1.
         commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task1,
                 expected_turn: 1,
@@ -625,6 +752,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({"turn": 1}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(1),
             },
             &s.threads,
@@ -640,6 +768,7 @@ mod tests {
         // The guard rejects it before any projection advances.
         let err = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task2_stale,
                 expected_turn: 1,
@@ -650,6 +779,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({"turn": 2}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(2),
             },
             &s.threads,
@@ -673,6 +803,7 @@ mod tests {
         // The correct expected_turn for the next turn succeeds.
         let ok = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task2_ok,
                 expected_turn: 2,
@@ -683,6 +814,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({"turn": 2}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(3),
             },
             &s.threads,
@@ -712,6 +844,7 @@ mod tests {
 
         commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task_a,
                 expected_turn: 1,
@@ -722,6 +855,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(1),
             },
             &s.threads,
@@ -735,6 +869,7 @@ mod tests {
 
         commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_b(),
                 task_id: task_b,
                 expected_turn: 1,
@@ -745,6 +880,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(2),
             },
             &s.threads,
@@ -778,6 +914,7 @@ mod tests {
         let s = Stores::new();
         let err = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: AgentTaskId::from_string("task_x"),
                 expected_turn: 1,
@@ -788,6 +925,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(1),
             },
             &s.threads,
@@ -832,6 +970,7 @@ mod tests {
         // Attempt to commit with the already-closed attempt.
         let err = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id,
                 expected_turn: 1,
@@ -842,6 +981,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(2),
             },
             &s.threads,
@@ -863,6 +1003,110 @@ mod tests {
         Ok(())
     }
 
+    /// Two IN-PROCESS committers racing for the same turn slot
+    /// serialize on the store's sequential-commit lock. Exactly one
+    /// lands; the loser is rejected by the decisive pre-check with a
+    /// typed `StaleTurnCommit` and — critically — its attempt is
+    /// STILL OPEN, so the slot-shift retry can close it on the
+    /// retried commit. The loser then lands cleanly on turn 2.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_commits_serialize_and_the_loser_keeps_its_attempt_open() -> Result<()> {
+        let s = std::sync::Arc::new(Stores::new());
+        let task_a = AgentTaskId::from_string("task_racer_a");
+        let task_b = AgentTaskId::from_string("task_racer_b");
+        let attempt_a = s.open_attempt(&task_a, 1).await;
+        let attempt_b = s.open_attempt(&task_b, 1).await;
+
+        let commit_for = |task_id: AgentTaskId,
+                          attempt_id: crate::journal::turn_attempt::TurnAttemptId,
+                          expected_turn: u32| CompletedTurnCommit {
+            checkpoint_kind: CheckpointKind::FullTurn,
+            thread_id: thread_a(),
+            task_id,
+            expected_turn,
+            turn_attempt_id: attempt_id,
+            close_attempt_params: sample_close_params(),
+            messages: sample_messages(),
+            turn_usage: usage(100, 50),
+            agent_state_snapshot: serde_json::json!({}),
+            events: Vec::new(),
+            outbox_max_attempts: 3,
+            owner_guard: None,
+            now: t_plus(2),
+        };
+
+        let run = |params: CompletedTurnCommit, stores: std::sync::Arc<Stores>| async move {
+            commit_completed_turn(
+                params,
+                &stores.threads,
+                &stores.messages,
+                &stores.attempts,
+                &stores.checkpoints,
+                &stores.events,
+            )
+            .await
+        };
+
+        let first = tokio::spawn(run(
+            commit_for(task_a.clone(), attempt_a.clone(), 1),
+            std::sync::Arc::clone(&s),
+        ));
+        let second = tokio::spawn(run(
+            commit_for(task_b.clone(), attempt_b.clone(), 1),
+            std::sync::Arc::clone(&s),
+        ));
+        let (first, second) = (first.await?, second.await?);
+
+        let (winner_task, loser_task, loser_attempt, loser_err) = match (first, second) {
+            (Ok(_), Err(err)) => (task_a, task_b, attempt_b, err),
+            (Err(err), Ok(_)) => (task_b, task_a, attempt_a, err),
+            (Ok(_), Ok(_)) => anyhow::bail!("both racers committed turn 1 — CAS is broken"),
+            (Err(e1), Err(e2)) => anyhow::bail!("both racers failed: {e1:#} / {e2:#}"),
+        };
+
+        // The loser's rejection is the typed slot collision…
+        assert!(
+            loser_err
+                .chain()
+                .any(|cause| cause.downcast_ref::<StaleTurnCommit>().is_some()),
+            "expected StaleTurnCommit, got: {loser_err:#}",
+        );
+        // …and its attempt is untouched, which is what the slot-shift
+        // retry depends on.
+        let open_attempt = s
+            .attempts
+            .get(&loser_attempt)
+            .await?
+            .context("loser attempt")?;
+        assert!(
+            !open_attempt.is_closed(),
+            "the losing commit must leave its attempt open",
+        );
+        let thread = s.threads.get(&thread_a()).await?.context("thread")?;
+        assert_eq!(thread.committed_turns, 1);
+        let occupant = s
+            .checkpoints
+            .get_by_turn(&thread_a(), 1)
+            .await?
+            .context("winner checkpoint")?;
+        assert_eq!(occupant.task_id, winner_task);
+
+        // The loser retries at the next slot and lands cleanly.
+        let retried = commit_completed_turn(
+            commit_for(loser_task.clone(), loser_attempt, 2),
+            &s.threads,
+            &s.messages,
+            &s.attempts,
+            &s.checkpoints,
+            &s.events,
+        )
+        .await
+        .context("the loser's retried commit must land on turn 2")?;
+        assert_eq!(retried.thread.committed_turns, 2);
+        assert_eq!(retried.checkpoint.task_id, loser_task);
+        Ok(())
+    }
+
     // ── Failure: completed thread rejects further commits ────────
 
     #[tokio::test]
@@ -876,6 +1120,7 @@ mod tests {
         // Commit first turn then mark thread completed.
         commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task1,
                 expected_turn: 1,
@@ -886,6 +1131,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(1),
             },
             &s.threads,
@@ -905,6 +1151,7 @@ mod tests {
         // Second commit should fail at thread aggregate step.
         let err = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task2,
                 expected_turn: 2,
@@ -915,6 +1162,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(3),
             },
             &s.threads,
@@ -971,6 +1219,7 @@ mod tests {
 
         commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id,
                 expected_turn: 1,
@@ -981,6 +1230,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({"turn": 1}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(5),
             },
             &s.threads,
@@ -1018,6 +1268,7 @@ mod tests {
 
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id,
                 expected_turn: 1,
@@ -1028,6 +1279,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(1),
             },
             &s.threads,
@@ -1078,6 +1330,7 @@ mod tests {
 
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id,
                 expected_turn: 1,
@@ -1088,6 +1341,7 @@ mod tests {
                 agent_state_snapshot: snapshot.clone(),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(5),
             },
             &s.threads,

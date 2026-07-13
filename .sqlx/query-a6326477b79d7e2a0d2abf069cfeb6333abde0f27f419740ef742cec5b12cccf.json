@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\nSELECT\n    id,\n    thread_id,\n    turn_number,\n    task_id,\n    messages_json,\n    agent_state_snapshot,\n    turn_input_tokens,\n    turn_output_tokens,\n    created_at\nFROM agent_sdk_turn_checkpoints\nWHERE thread_id = $1\nORDER BY turn_number DESC\nLIMIT 1\n",
+  "query": "\nSELECT\n    id,\n    thread_id,\n    turn_number,\n    task_id,\n    messages_json,\n    agent_state_snapshot,\n    turn_input_tokens,\n    turn_output_tokens,\n    kind,\n    created_at\nFROM agent_sdk_turn_checkpoints\nWHERE thread_id = $1\nORDER BY turn_number\n",
   "describe": {
     "columns": [
       {
@@ -93,6 +93,17 @@
       },
       {
         "ordinal": 8,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_checkpoints",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -117,8 +128,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "5892197e63f59752b727728dfd03ec8aeecb989ec24f0742f2dcde5f717c44e0"
+  "hash": "a6326477b79d7e2a0d2abf069cfeb6333abde0f27f419740ef742cec5b12cccf"
 }

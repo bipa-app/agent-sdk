@@ -26,9 +26,14 @@ use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
 use time::OffsetDateTime;
 
-use agent_server::journal::checkpoint::{Checkpoint, CheckpointId, NewCheckpointParams};
+use agent_server::journal::checkpoint::{
+    Checkpoint, CheckpointId, CheckpointKind, NewCheckpointParams,
+};
 use agent_server::journal::checkpoint_store::CheckpointStore;
-use agent_server::journal::commit::{CommitOutcome, CompletedTurnCommit};
+use agent_server::journal::commit::{
+    CommitOutcome, CommitOwnerGuard, CompletedTurnCommit, DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+    LostCommitOwnership, StaleTurnCommit,
+};
 use agent_server::journal::committed_event::CommittedEvent;
 use agent_server::journal::completed_turn_transaction::AtomicCompletedTurnCommitter;
 use agent_server::journal::event_outbox_transaction::{
@@ -54,8 +59,8 @@ use agent_server::journal::relay::{
 };
 use agent_server::journal::retention::{RetentionCursor, RetentionStore};
 use agent_server::journal::store::{
-    AgentTaskStore, SubagentInvocationSpawn, SubmitRootTurnError, SubmitRootTurnOutcome,
-    SubmitRootTurnParams,
+    AgentTaskStore, CancelTreeOutcome, RequeueOutcome, SubagentInvocationSpawn,
+    SubmitRootTurnError, SubmitRootTurnOutcome, SubmitRootTurnParams,
 };
 use agent_server::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskKind, TaskStatus,
@@ -605,7 +610,7 @@ WHERE id = ?1
         let record = sqlx::query_as::<_, CheckpointRecord>(
             r"
 SELECT id, thread_id, turn_number, task_id, messages_json,
-       agent_state_snapshot, turn_input_tokens, turn_output_tokens, created_at
+       agent_state_snapshot, turn_input_tokens, turn_output_tokens, kind, created_at
 FROM agent_sdk_turn_checkpoints
 WHERE id = ?1
 ",
@@ -628,12 +633,13 @@ WHERE id = ?1
         let messages_json = json_to_value(&checkpoint.messages, "checkpoint messages")?;
         let turn_input_tokens = i64::from(checkpoint.turn_usage.input_tokens);
         let turn_output_tokens = i64::from(checkpoint.turn_usage.output_tokens);
+        let kind = checkpoint.kind.as_str();
         sqlx::query!(
             r"
 INSERT INTO agent_sdk_turn_checkpoints (
     id, thread_id, turn_number, task_id, messages_json,
-    agent_state_snapshot, turn_input_tokens, turn_output_tokens, created_at
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+    agent_state_snapshot, turn_input_tokens, turn_output_tokens, kind, created_at
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
 ",
             id,
             thread_id_key,
@@ -643,6 +649,7 @@ INSERT INTO agent_sdk_turn_checkpoints (
             checkpoint.agent_state_snapshot,
             turn_input_tokens,
             turn_output_tokens,
+            kind,
             checkpoint.created_at,
         )
         .execute(&mut **tx)
@@ -1652,6 +1659,44 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
         Ok(id)
     }
 
+    /// Commit the terminal `Cancelled` marker for one cancelled
+    /// blocking root inside `cancel_tree`'s transaction: one committed
+    /// event on the root's own thread plus its coalesced
+    /// `thread_events_available` outbox advisory (issue #354). See the
+    /// Postgres analogue for the full contract; `SQLite` serializes
+    /// writers via `BEGIN IMMEDIATE`, so no lock ordering applies.
+    async fn insert_cancelled_marker_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        thread_id: &ThreadId,
+        continuation_usage: Option<TokenUsage>,
+        now: OffsetDateTime,
+    ) -> Result<CommittedEvent> {
+        Self::bootstrap_thread_row_tx(tx, thread_id, now).await?;
+        let start_seq = Self::next_event_sequence_tx(tx, thread_id).await?;
+        let thread = Self::get_thread_tx(tx, thread_id)
+            .await?
+            .with_context(|| format!("thread {thread_id} missing after bootstrap"))?;
+
+        let turn = usize::try_from(thread.committed_turns).unwrap_or(0);
+        let usage = continuation_usage.unwrap_or(thread.total_usage);
+        let mut committed = Self::insert_events_tx(
+            tx,
+            thread_id,
+            vec![AgentEvent::cancelled(turn, usage)],
+            start_seq,
+            now,
+        )
+        .await?;
+        Self::insert_thread_events_outbox_row_tx(
+            tx,
+            &committed,
+            DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+            now,
+        )
+        .await?;
+        committed.pop().context("cancelled marker batch was empty")
+    }
+
     /// Atomic fork transaction for `SQLite`.
     ///
     /// Wraps the entire write set the fork RPC handler hands us
@@ -1747,6 +1792,38 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
         Ok(())
     }
 
+    /// Enforce [`CompletedTurnCommit::owner_guard`] on the task row
+    /// inside the completed-turn transaction (issue #354): the
+    /// slot-shift retry validates — under `SQLite`'s exclusive write
+    /// transaction — that the presenting worker still owns a live
+    /// `Running` row, so a cancellation / lease loss between the
+    /// caller's shift-eligibility check and the retry rejects here
+    /// instead of splicing a dead root's turn into the shifted slot.
+    /// A `None` guard (every first, non-shifted commit) is a no-op.
+    async fn enforce_commit_owner_guard_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        task_id: &AgentTaskId,
+        owner_guard: Option<&CommitOwnerGuard>,
+    ) -> Result<()> {
+        let Some(guard) = owner_guard else {
+            return Ok(());
+        };
+        let current = Self::load_task_tx(tx, task_id).await?.ok_or_else(|| {
+            anyhow::Error::new(LostCommitOwnership {
+                task_id: task_id.clone(),
+            })
+        })?;
+        if current.status != TaskStatus::Running
+            || current.worker_id.as_ref() != Some(&guard.worker_id)
+            || current.lease_id.as_ref() != Some(&guard.lease_id)
+        {
+            return Err(anyhow::Error::new(LostCommitOwnership {
+                task_id: task_id.clone(),
+            }));
+        }
+        Ok(())
+    }
+
     /// Atomic completed-turn transaction for `SQLite`.
     async fn commit_completed_turn_atomic_inner(
         &self,
@@ -1772,12 +1849,15 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
         // worker that lost the race to another worker fails here instead
         // of durably double-committing the turn (pure in-Rust comparison
         // on the already-loaded row — no extra query).
-        ensure!(
-            old_thread.committed_turns.saturating_add(1) == params.expected_turn,
-            "stale turn commit: expected {}, thread at {}",
-            params.expected_turn,
-            old_thread.committed_turns,
-        );
+        if old_thread.committed_turns.saturating_add(1) != params.expected_turn {
+            return Err(anyhow::Error::new(StaleTurnCommit {
+                expected_turn: params.expected_turn,
+                committed_turns: old_thread.committed_turns,
+            }));
+        }
+
+        Self::enforce_commit_owner_guard_tx(&mut tx, &params.task_id, params.owner_guard.as_ref())
+            .await?;
         let thread = old_thread
             .apply_committed_turn(&params.turn_usage, params.now)
             .context("advance thread aggregate inside sqlite completed-turn transaction")?;
@@ -1809,6 +1889,7 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
         Self::upsert_message_head_tx(&mut tx, &updated_projection).await?;
 
         let checkpoint = Checkpoint::new(NewCheckpointParams {
+            kind: params.checkpoint_kind,
             thread_id: params.thread_id.clone(),
             turn_number: thread.committed_turns,
             task_id: params.task_id,
@@ -2517,6 +2598,52 @@ impl AgentTaskStore for SqliteDurableStore {
         Ok(released)
     }
 
+    async fn requeue_owned_task(
+        &self,
+        id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        boundary: Option<AgentEvent>,
+        now: OffsetDateTime,
+    ) -> Result<RequeueOutcome> {
+        let mut tx = self.begin().await?;
+        let Some(old) = Self::load_task_tx(&mut tx, id).await? else {
+            return Ok(RequeueOutcome::NotOwned);
+        };
+        let still_owned = old.status == TaskStatus::Running
+            && old.worker_id.as_ref() == Some(worker)
+            && old.lease_id.as_ref() == Some(lease);
+        if !still_owned {
+            return Ok(RequeueOutcome::NotOwned);
+        }
+        if old.is_budget_exhausted() {
+            return Ok(RequeueOutcome::BudgetExhausted);
+        }
+        // Boundary event + advisory in the SAME transaction as the
+        // ownership CAS and the release (the cancel_tree marker
+        // pattern): it lands iff this caller still owned the row, and
+        // it is durable before the row is acquirable.
+        if let Some(event) = boundary {
+            let start_seq = Self::next_event_sequence_tx(&mut tx, &old.thread_id).await?;
+            let committed =
+                Self::insert_events_tx(&mut tx, &old.thread_id, vec![event], start_seq, now)
+                    .await?;
+            Self::insert_thread_events_outbox_row_tx(
+                &mut tx,
+                &committed,
+                DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+                now,
+            )
+            .await?;
+        }
+        let released_row = old
+            .release_lease(now)
+            .context("requeue_owned_task: release transition failed")?;
+        Self::update_task_tx(&mut tx, &released_row).await?;
+        tx.commit().await.context("commit requeue_owned_task")?;
+        Ok(RequeueOutcome::Requeued(Box::new(released_row)))
+    }
+
     async fn pause_on_children(
         &self,
         id: &AgentTaskId,
@@ -3078,7 +3205,7 @@ impl AgentTaskStore for SqliteDurableStore {
         &self,
         root_id: &AgentTaskId,
         now: OffsetDateTime,
-    ) -> Result<Vec<AgentTaskId>> {
+    ) -> Result<CancelTreeOutcome> {
         let mut tx = self.begin().await?;
         let Some(_) = Self::load_task_tx(&mut tx, root_id).await? else {
             return Err(anyhow!(
@@ -3094,6 +3221,19 @@ impl AgentTaskStore for SqliteDurableStore {
         // BEGIN IMMEDIATE, so there is no lock-order deadlock to avoid;
         // cancelling in BFS order keeps the returned `transitioned` slice
         // identical to the in-memory reference store.
+        //
+        // Unlike Postgres (READ COMMITTED row locks), `begin()` here
+        // takes the database write lock up front (`BEGIN IMMEDIATE`),
+        // so no concurrent writer can settle any of these rows between
+        // this snapshot and the UPDATEs below — the snapshot IS the
+        // transaction's consistent view. Two racing `cancel_tree`
+        // calls fully serialize: the loser's snapshot already sees
+        // terminal rows and it transitions / emits nothing. A
+        // Postgres-style locked re-read would re-read identical data,
+        // so this backend intentionally uses snapshot-driven
+        // transitions (pinned by the
+        // `conformance_sqlite_concurrent_cancels_single_marker` race
+        // test).
         let all_tasks = Self::collect_subtree_tx(&mut tx, root_id).await?;
 
         let mut transitioned = Vec::with_capacity(all_tasks.len());
@@ -3101,12 +3241,31 @@ impl AgentTaskStore for SqliteDurableStore {
         // wake their linked invocations and promote queued successors.
         let mut cancelled_root_ids: Vec<AgentTaskId> = Vec::new();
         let mut cancelled_root_threads: Vec<ThreadId> = Vec::new();
+        // Terminal `Cancelled` markers: one per blocking root this
+        // call transitions (pre-cancel occupant of its thread's
+        // active-root slot), on that root's OWN thread —
+        // cascade-cancelled child-thread roots included, queued roots
+        // never. Atomic with the cancel transitions: a crash can
+        // neither lose the marker nor emit it without the
+        // cancellation, and an idempotent retry (terminal tree) emits
+        // nothing.
+        let mut markers: Vec<CommittedEvent> = Vec::new();
         for row in all_tasks {
             if row.status.is_terminal() {
                 continue;
             }
             let is_root_turn_root = row.kind == TaskKind::RootTurn && row.is_root();
             let thread_id = row.thread_id.clone();
+            if is_root_turn_root && row.status.blocks_root_admission() {
+                let continuation_usage = row
+                    .state
+                    .continuation()
+                    .map(|continuation| continuation.payload.total_usage.clone());
+                let committed =
+                    Self::insert_cancelled_marker_tx(&mut tx, &thread_id, continuation_usage, now)
+                        .await?;
+                markers.push(committed);
+            }
             let cancelled = row
                 .cancel(now)
                 .context("cancel_tree: cancel transition failed")?;
@@ -3153,7 +3312,10 @@ impl AgentTaskStore for SqliteDurableStore {
         }
 
         tx.commit().await.context("commit cancel_tree")?;
-        Ok(transitioned)
+        Ok(CancelTreeOutcome {
+            transitioned,
+            markers,
+        })
     }
 
     async fn resume_from_confirmation(
@@ -3371,6 +3533,7 @@ impl ThreadStore for SqliteDurableStore {
     async fn commit_turn(
         &self,
         thread_id: &ThreadId,
+        expected_turn: u32,
         turn_usage: &TokenUsage,
         now: OffsetDateTime,
     ) -> Result<Thread> {
@@ -3379,6 +3542,12 @@ impl ThreadStore for SqliteDurableStore {
         let old = Self::get_thread_tx(&mut tx, thread_id)
             .await?
             .context("thread missing after bootstrap")?;
+        if old.committed_turns.saturating_add(1) != expected_turn {
+            return Err(anyhow::Error::new(StaleTurnCommit {
+                expected_turn,
+                committed_turns: old.committed_turns,
+            }));
+        }
         let thread = old.apply_committed_turn(turn_usage, now)?;
         Self::upsert_thread_tx(&mut tx, &thread).await?;
         tx.commit().await.context("commit thread turn")?;
@@ -3598,7 +3767,7 @@ impl CheckpointStore for SqliteDurableStore {
         turn_number: u32,
     ) -> Result<Option<Checkpoint>> {
         let record = sqlx::query_as::<_, CheckpointRecord>(
-            r"SELECT id, thread_id, turn_number, task_id, messages_json, agent_state_snapshot, turn_input_tokens, turn_output_tokens, created_at FROM agent_sdk_turn_checkpoints WHERE thread_id = ?1 AND turn_number = ?2",
+            r"SELECT id, thread_id, turn_number, task_id, messages_json, agent_state_snapshot, turn_input_tokens, turn_output_tokens, kind, created_at FROM agent_sdk_turn_checkpoints WHERE thread_id = ?1 AND turn_number = ?2",
         )
         .bind(thread_key(thread_id))
         .bind(i64::from(turn_number))
@@ -3610,7 +3779,7 @@ impl CheckpointStore for SqliteDurableStore {
 
     async fn get_latest_by_thread(&self, thread_id: &ThreadId) -> Result<Option<Checkpoint>> {
         let record = sqlx::query_as::<_, CheckpointRecord>(
-            r"SELECT id, thread_id, turn_number, task_id, messages_json, agent_state_snapshot, turn_input_tokens, turn_output_tokens, created_at FROM agent_sdk_turn_checkpoints WHERE thread_id = ?1 ORDER BY turn_number DESC LIMIT 1",
+            r"SELECT id, thread_id, turn_number, task_id, messages_json, agent_state_snapshot, turn_input_tokens, turn_output_tokens, kind, created_at FROM agent_sdk_turn_checkpoints WHERE thread_id = ?1 ORDER BY turn_number DESC LIMIT 1",
         )
         .bind(thread_key(thread_id))
         .fetch_optional(&self.pool)
@@ -3621,7 +3790,7 @@ impl CheckpointStore for SqliteDurableStore {
 
     async fn list_by_thread(&self, thread_id: &ThreadId) -> Result<Vec<Checkpoint>> {
         let records = sqlx::query_as::<_, CheckpointRecord>(
-            r"SELECT id, thread_id, turn_number, task_id, messages_json, agent_state_snapshot, turn_input_tokens, turn_output_tokens, created_at FROM agent_sdk_turn_checkpoints WHERE thread_id = ?1 ORDER BY turn_number",
+            r"SELECT id, thread_id, turn_number, task_id, messages_json, agent_state_snapshot, turn_input_tokens, turn_output_tokens, kind, created_at FROM agent_sdk_turn_checkpoints WHERE thread_id = ?1 ORDER BY turn_number",
         )
         .bind(thread_key(thread_id))
         .fetch_all(&self.pool)
@@ -4653,6 +4822,7 @@ struct CheckpointRecord {
     agent_state_snapshot: serde_json::Value,
     turn_input_tokens: i64,
     turn_output_tokens: i64,
+    kind: String,
     created_at: OffsetDateTime,
 }
 
@@ -4671,6 +4841,8 @@ impl TryFrom<CheckpointRecord> for Checkpoint {
                 output_tokens: u32_from_i64(r.turn_output_tokens, "checkpoint turn_output_tokens")?,
                 ..Default::default()
             },
+            kind: CheckpointKind::parse(&r.kind)
+                .context("rehydrate checkpoint kind from sqlite row")?,
             created_at: r.created_at,
         };
         checkpoint
@@ -5796,6 +5968,7 @@ mod tests {
     async fn draft_messages_persist_until_atomic_commit_clears_them() -> Result<()> {
         use agent_sdk_foundation::llm;
         use agent_sdk_foundation::{TokenUsage, audit::AuditProvenance};
+        use agent_server::journal::checkpoint::CheckpointKind;
         use agent_server::journal::commit::CompletedTurnCommit;
         use agent_server::journal::completed_turn_transaction::AtomicCompletedTurnCommitter;
         use agent_server::journal::message_store::MessageProjectionStore;
@@ -5863,6 +6036,7 @@ mod tests {
         let commit = AtomicCompletedTurnCommitter::commit_completed_turn_atomic(
             &store,
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_id.clone(),
                 task_id,
                 expected_turn: 1,
@@ -5886,6 +6060,7 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({"turn": 1}),
                 events: Vec::new(),
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(3),
             },
         )
@@ -5920,6 +6095,7 @@ mod tests {
         use agent_sdk_foundation::events::AgentEvent;
         use agent_sdk_foundation::llm;
         use agent_sdk_foundation::{TokenUsage, audit::AuditProvenance};
+        use agent_server::journal::checkpoint::CheckpointKind;
         use agent_server::journal::commit::CompletedTurnCommit;
         use agent_server::journal::completed_turn_transaction::AtomicCompletedTurnCommitter;
         use agent_server::journal::event_repository::EventRepository;
@@ -5969,6 +6145,7 @@ mod tests {
         let outcome = AtomicCompletedTurnCommitter::commit_completed_turn_atomic(
             &store,
             CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_id.clone(),
                 task_id,
                 expected_turn: 1,
@@ -5995,6 +6172,7 @@ mod tests {
                     turn: 1,
                 }],
                 outbox_max_attempts: 3,
+                owner_guard: None,
                 now: t_plus(3),
             },
         )
@@ -6151,7 +6329,7 @@ mod tests {
     async fn fork_atomic_commits_full_state_in_one_transaction() -> Result<()> {
         use agent_sdk_foundation::events::AgentEvent;
         use agent_sdk_foundation::llm::Message;
-        use agent_server::journal::checkpoint::NewCheckpointParams;
+        use agent_server::journal::checkpoint::{CheckpointKind, NewCheckpointParams};
         use agent_server::journal::checkpoint_store::CheckpointStore;
         use agent_server::journal::event_repository::EventRepository;
         use agent_server::journal::fork_transaction::{AtomicForkCommitter, ForkCommitParams};
@@ -6194,6 +6372,7 @@ mod tests {
             cumulative_total_usage: agent_sdk_foundation::TokenUsage::default(),
             messages: messages.clone(),
             checkpoint: Some(NewCheckpointParams {
+                kind: CheckpointKind::FullTurn,
                 thread_id: new_thread_id.clone(),
                 turn_number: 1,
                 task_id: source_task_id,
@@ -6248,7 +6427,7 @@ mod tests {
     async fn fork_atomic_carries_cumulative_total_usage() -> Result<()> {
         use agent_sdk_foundation::TokenUsage;
         use agent_sdk_foundation::llm::Message;
-        use agent_server::journal::checkpoint::NewCheckpointParams;
+        use agent_server::journal::checkpoint::{CheckpointKind, NewCheckpointParams};
         use agent_server::journal::fork_transaction::{AtomicForkCommitter, ForkCommitParams};
         use agent_server::journal::store::AgentTaskStore;
         use agent_server::journal::task::AgentTask;
@@ -6278,6 +6457,7 @@ mod tests {
             cumulative_total_usage: cumulative.clone(),
             messages: messages.clone(),
             checkpoint: Some(NewCheckpointParams {
+                kind: CheckpointKind::FullTurn,
                 thread_id: new_thread_id.clone(),
                 turn_number: 3,
                 task_id: source_task_id,
@@ -6319,7 +6499,7 @@ mod tests {
     async fn fork_atomic_rolls_back_on_failure() -> Result<()> {
         use agent_sdk_foundation::events::AgentEvent;
         use agent_sdk_foundation::llm::Message;
-        use agent_server::journal::checkpoint::NewCheckpointParams;
+        use agent_server::journal::checkpoint::{CheckpointKind, NewCheckpointParams};
         use agent_server::journal::event_repository::EventRepository;
         use agent_server::journal::fork_transaction::{AtomicForkCommitter, ForkCommitParams};
         use agent_server::journal::message_store::MessageProjectionStore;
@@ -6355,6 +6535,7 @@ mod tests {
         agent_server::journal::checkpoint_store::CheckpointStore::commit_checkpoint(
             &store,
             NewCheckpointParams {
+                kind: CheckpointKind::FullTurn,
                 thread_id: new_thread_id.clone(),
                 turn_number: 1,
                 task_id: pre_task_id,
@@ -6382,6 +6563,7 @@ mod tests {
             cumulative_total_usage: agent_sdk_foundation::TokenUsage::default(),
             messages: fresh_messages.clone(),
             checkpoint: Some(NewCheckpointParams {
+                kind: CheckpointKind::FullTurn,
                 thread_id: new_thread_id.clone(),
                 turn_number: 1,
                 task_id: source_task_id,

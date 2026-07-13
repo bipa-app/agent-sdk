@@ -34,6 +34,18 @@ enum StreamCloseReason {
   STREAM_CLOSE_REASON_TURN_CANCELLED = 4;
 }
 
+// Opens a turn. `turn` is the slot number the worker BOOTSTRAPPED
+// with, committed before streaming begins — and in one rare race it is
+// not the slot the turn finally lands on: a successor turn that loses
+// its bootstrapped slot to a cancelled predecessor's salvage commit
+// shifts forward, so its journal reads
+// `start{turn: N} … turn_complete{turn: N+1} / done{total_turns: N+1}`.
+// Derive turn boundaries from event ORDER (`start` … terminal frame),
+// never by pairing `start.turn` against `turn_complete.turn` /
+// `done.total_turns`; the completion-side indices are authoritative
+// (they always match the thread's committed turn count and the
+// checkpoint numbering). `user_input` pairs with its `start` by
+// adjacency (committed immediately before it), not by turn index.
 message StartEvent {
   string thread_id = 1;
   uint64 turn = 2;
@@ -107,6 +119,13 @@ message ToolRequiresConfirmationEvent {
   string description = 5;
 }
 
+// `turn` is the slot the turn actually COMMITTED on — after a
+// slot-shifted commit (see `StartEvent`) it can be one higher than the
+// preceding `start.turn`. A shifted successor's durable message
+// history also splices the cancelled predecessor's salvaged prefix
+// (its partial transcript, committed as the prior turn) before the
+// successor's own messages; the next turn's bootstrap reads the full
+// projection, so the history self-heals from then on.
 message TurnCompleteEvent {
   uint64 turn = 1;
   TokenUsage usage = 2;
@@ -147,24 +166,26 @@ message ErrorEvent {
 //
 // Terminal for the cancelled work: streams treat it like `done` and
 // close with `STREAM_CLOSE_REASON_TURN_CANCELLED`, so followers never
-// hang waiting for a `done` that will not come. Committed at most once
-// per effective cancel, and only when the cancelled root actually
-// occupied its thread's active-root slot — cancelling a QUEUED root
-// behind a live active root emits no marker (the active root's stream
-// continues; observe the queued cancel via `GetTask` /
-// `cancelled_task_ids`). Idempotent cancel retries emit nothing, and a
-// running worker's later abort commits salvaged content but no second
-// lifecycle marker.
+// hang waiting for a `done` that will not come. Committed INSIDE the
+// cancellation transaction, exactly once per effective cancel of a
+// root that occupied its thread's active-root slot — including
+// child-thread roots cancelled through a subagent cascade, each on
+// their own thread — together with a `thread_events_available` outbox
+// advisory so cross-host followers are woken through the relay. A
+// crash cannot separate the marker from the cancellation it reports.
+// Cancelling a QUEUED root behind a live active root emits no marker
+// (the active root's stream continues; observe the queued cancel via
+// `GetTask` / `cancelled_task_ids`). Idempotent cancel retries emit
+// nothing, and a running worker's later abort commits salvaged content
+// but no second lifecycle marker.
 //
-// Best-effort caveats (store-level follow-up: commit the marker inside
-// the cancellation transaction on every backend):
-// * A crash between the durable cancel and this marker loses the
-//   marker; a retried cancel sees a terminal tree and stays silent.
-// * A RUNNING root's worker may append salvaged deltas for up to one
-//   heartbeat after the marker; replay cursors past the marker's
-//   sequence can still observe them.
-// * Child-thread roots cancelled through a subagent cascade emit no
-//   marker on their own threads.
+// Post-terminal salvage: a RUNNING root's worker may keep appending
+// streaming deltas for up to one heartbeat after this marker — they
+// land at sequences strictly after it. Followers that closed on the
+// marker miss only that salvage; a replay cursor positioned past the
+// marker may observe the trailing deltas with no further lifecycle
+// close. Treat this marker as the authoritative end of the cancelled
+// turn.
 //
 // `turn` is the thread's committed turn count when the cancel was
 // honored. `usage` is the cumulative usage accumulated on the thread

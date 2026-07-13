@@ -53,9 +53,11 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::definition::{AgentDefinition, ThinkingPolicy};
+use crate::journal::checkpoint::CheckpointKind;
 use crate::journal::checkpoint_store::CheckpointStore;
 use crate::journal::commit::{
-    CommitOutcome, CompletedTurnCommit, DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS, commit_completed_turn,
+    CommitOutcome, CommitOwnerGuard, CompletedTurnCommit, DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+    StaleTurnCommit, commit_completed_turn,
 };
 use crate::journal::committed_event::CommittedEvent;
 use crate::journal::event_notifier::EventNotifier;
@@ -453,39 +455,48 @@ async fn fail_root_turn_inner(
 /// `assistant + tool_use`) is closed by the next turn's
 /// `backfill_orphaned_tool_results`.
 ///
-/// After a successful `cancel_tree` that transitioned at least one row,
-/// this commits a terminal [`AgentEvent::Cancelled`] to the thread
-/// journal and wakes the event notifier — but only when the cancelled
-/// root occupied the thread's active-root slot
-/// ([`TaskStatus::blocks_root_admission`]): event-stream followers get
-/// a closing frame instead of waiting forever for a `Done` that will
-/// never come, while cancelling a QUEUED root behind a live active
-/// root stays silent so the active root's followers are not closed
-/// mid-stream. Idempotent cancel retries emit nothing, and the running
-/// worker's abort path (seam B) commits no lifecycle events, so the
-/// marker lands at most once per effective cancel. The marker is
-/// best-effort and post-transaction: a crash between `cancel_tree` and
-/// the commit loses it, and cascade-cancelled child-thread roots emit
-/// no marker on their own threads — committing markers inside the
-/// cancellation transaction per affected thread is the store-level
-/// follow-up.
+/// The terminal [`AgentEvent::Cancelled`] marker is committed by
+/// [`AgentTaskStore::cancel_tree`] itself, atomically with the
+/// cancellation (same transaction on the durable backends): one marker
+/// per transitioned *blocking* root
+/// ([`TaskStatus::blocks_root_admission`]) on that root's **own**
+/// thread — including child-thread roots cancelled across
+/// `SubagentInvocation` links — each with a `thread_events_available`
+/// outbox advisory for cross-host followers. Event-stream followers
+/// get a closing frame instead of waiting forever for a `Done` that
+/// will never come; cancelling a QUEUED root behind a live active root
+/// stays silent so the active root's followers are not closed
+/// mid-stream. Idempotent cancel retries transition nothing and emit
+/// nothing, and the running worker's abort path (seam B) commits no
+/// lifecycle events, so the marker lands exactly once per effective
+/// cancel — a crash after `cancel_tree` commits can no longer lose it.
+/// This function forwards the returned markers to the in-process event
+/// notifier for same-process live-tail latency.
 ///
-/// # Known race: cancelled `Running` root vs the successor turn
+/// # Post-marker salvage ordering (cancelled `Running` root)
+///
+/// A cancelled `Running` root's worker only notices on its next
+/// rejected heartbeat, so for up to one heartbeat interval it may keep
+/// committing streaming delta events — which now land at sequences
+/// strictly **after** the marker — and then its seam-B salvage commits
+/// state projections (messages / checkpoint / thread aggregate) with
+/// no lifecycle events at all. Followers that closed on the marker
+/// miss only that post-terminal salvage; a follower that reconnects
+/// with a cursor past the marker may replay trailing salvage deltas
+/// and then wait (no further lifecycle close arrives until a successor
+/// turn commits). Treat the marker as the authoritative close for the
+/// cancelled turn.
+///
+/// # Cancelled `Running` root vs the successor turn
 ///
 /// `cancel_tree` frees the thread's active-root slot and promotes a
-/// queued successor in the same store transaction, but a cancelled
-/// `Running` root's worker only notices on its next rejected heartbeat
-/// — and its seam-B salvage commits into the turn slot it bootstrapped
-/// with (`recovery_view.next_turn_number`). A successor that bootstraps
-/// before that salvage lands pins the **same** slot, and the
-/// `expected_turn` CAS makes whichever commit lands second fail: the
-/// salvage loses silently (dropped prefix, benign), but a losing
-/// successor turn fails terminally. Closing this fully needs a
-/// store-level change (defer promotion until the cancelled root's
-/// lease is released, or teach the commit layer to distinguish
-/// cross-task slot collisions from same-task duplicate commits);
-/// callers that need the successor safe should delay follow-up work by
-/// one heartbeat interval after cancelling a `Running` root.
+/// queued successor in the same store transaction, while the cancelled
+/// worker's seam-B salvage may still commit into the turn slot it
+/// bootstrapped with. The `expected_turn` CAS makes whichever commit
+/// lands second fail: a losing salvage is dropped silently (benign),
+/// and a successor that loses to the salvage no longer fails — its
+/// commit detects the cross-task slot collision and shifts to the next
+/// turn number (see `commit_completed_turn_shifting_slot`).
 ///
 /// # Returns
 ///
@@ -542,74 +553,21 @@ pub async fn cancel_root_turn(
         best_effort_close_attempts(&attempts_snapshot, deps.attempt_store, now).await;
     }
 
-    let cancelled = deps
+    let outcome = deps
         .task_store
         .cancel_tree(task_id, now)
         .await
         .context("cancel root turn tree")?;
+    let cancelled = outcome.transitioned;
 
-    // Durable terminal marker for event-stream followers. A cancelled
-    // turn otherwise commits no lifecycle event at all — seam B
-    // deliberately emits none — so a REPLAY_AND_FOLLOW subscriber would
-    // wait forever for a `Done` that never comes. Committed once per
-    // effective cancel of the thread's ACTIVE occupant: idempotent
-    // retries (empty `cancelled`) stay silent, and the worker's abort
-    // path adds no second marker.
-    //
-    // Gated on `blocks_root_admission` (the pre-cancel snapshot): a
-    // QUEUED root cancelled behind a live active root never owned the
-    // thread's current work, and a thread-terminal marker would close
-    // every follower mid-stream while the active root keeps producing
-    // events — queued-cancel outcomes are observable via `GetTask` /
-    // the returned ids instead. (A queued root promoted between the
-    // snapshot and `cancel_tree` misses its marker — the same
-    // best-effort class as the marker commit itself: a crash between
-    // `cancel_tree` and this commit also loses the marker, and the
-    // retry sees a terminal tree and stays silent. Making the marker
-    // crash-safe means committing it inside `cancel_tree`'s terminal
-    // transaction on every backend — a store-level follow-up. The same
-    // follow-up covers cascade-cancelled child-thread roots, which
-    // currently emit no marker on their own threads.)
-    if !cancelled.is_empty()
-        && let Some(task) = task
-            .as_ref()
-            .filter(|task| task.status.blocks_root_admission())
-    {
-        // `turn` / `usage` mirror the SDK's own `Cancelled` emission
-        // (`emit_cancelled_event` passes the turn reached and
-        // `ctx.total_usage` — the usage accumulated so far, monotonic
-        // across the thread). A parked row's durable continuation
-        // carries the freshest cumulative total (it includes the
-        // suspended turn's already-billed calls); otherwise the thread
-        // aggregate covers every committed turn. Zero only when neither
-        // exists (fresh thread that never ran). A running turn's
-        // in-flight usage lives with its worker and is not included —
-        // it lands on the turn-attempt audit rows instead.
-        let (turn, thread_usage) = match deps.thread_store.get(&task.thread_id).await {
-            Ok(Some(thread)) => (
-                usize::try_from(thread.committed_turns).unwrap_or(0),
-                thread.total_usage,
-            ),
-            _ => (0, TokenUsage::default()),
-        };
-        let usage = task
-            .state
-            .continuation()
-            .map_or(thread_usage, |continuation| {
-                continuation.payload.total_usage.clone()
-            });
-        let event = AgentEvent::cancelled(turn, usage);
-        match deps
-            .event_repo
-            .commit_event(&task.thread_id, event, now)
-            .await
-        {
-            Ok(committed) => deps.event_notifier.notify(std::slice::from_ref(&committed)),
-            Err(error) => log::warn!(
-                "cancel: terminal cancelled-event commit failed on thread {}: {error:#}",
-                task.thread_id,
-            ),
-        }
+    // The store committed the terminal `Cancelled` marker(s) durably
+    // (atomically with the cancellation, one per affected thread, with
+    // an outbox advisory for cross-host followers). Forward them to
+    // the in-process notifier so same-process live followers — on the
+    // root's thread AND on cascade-cancelled child threads — close
+    // immediately instead of waiting on the outbox relay.
+    if !outcome.markers.is_empty() {
+        deps.event_notifier.notify(&outcome.markers);
     }
 
     // Finalize the root `invoke_agent` span with the cancelled outcome
@@ -891,6 +849,7 @@ pub(crate) async fn commit_partial_turn_on_cancel(
 
     let commit_result = commit_completed_turn(
         CompletedTurnCommit {
+            checkpoint_kind: CheckpointKind::CancelSalvage,
             thread_id: thread_id.clone(),
             task_id: task_id.clone(),
             expected_turn,
@@ -929,6 +888,7 @@ pub(crate) async fn commit_partial_turn_on_cancel(
             // turn as completed to every downstream consumer.
             events: Vec::new(),
             outbox_max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+            owner_guard: None,
             now,
         },
         deps.thread_store,
@@ -1504,13 +1464,6 @@ async fn commit_text_only_turn(
     .await
     .context("buffer staged messages")?;
 
-    ensure_turn_not_already_committed(
-        deps.thread_store,
-        thread_id,
-        inputs.recovery_view.next_turn_number,
-    )
-    .await?;
-
     let turn_number = usize::try_from(inputs.recovery_view.next_turn_number).unwrap_or(0);
     let close_params = build_close_params(&response, &attempt);
     let turn_usage = response_token_usage(&response);
@@ -1544,8 +1497,9 @@ async fn commit_text_only_turn(
         &close_ctx.content_ids,
     );
 
-    let commit = commit_completed_turn(
+    let commit = commit_completed_turn_shifting_slot(
         CompletedTurnCommit {
+            checkpoint_kind: CheckpointKind::FullTurn,
             thread_id: thread_id.clone(),
             task_id: task_id.clone(),
             expected_turn: inputs.recovery_view.next_turn_number,
@@ -1556,13 +1510,12 @@ async fn commit_text_only_turn(
             agent_state_snapshot,
             events: lifecycle_events,
             outbox_max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+            owner_guard: None,
             now,
         },
-        deps.thread_store,
-        deps.message_store,
-        deps.attempt_store,
-        deps.checkpoint_store,
-        deps.event_repo,
+        &inputs.bootstrap.worker_id,
+        &inputs.bootstrap.lease_id,
+        deps,
     )
     .await
     .context("commit completed turn")?;
@@ -1636,15 +1589,417 @@ async fn ensure_turn_not_already_committed(
         .context("re-read thread for idempotency check")?
         .context("thread disappeared during turn execution")?;
 
-    ensure!(
-        current_thread.committed_turns < expected_turn,
-        "turn {expected_turn} was already committed on thread {} \
-         (committed_turns={}); skipping duplicate commit",
-        thread_id,
-        current_thread.committed_turns,
-    );
+    if current_thread.committed_turns >= expected_turn {
+        return Err(anyhow::Error::new(StaleTurnCommit {
+            expected_turn,
+            committed_turns: current_thread.committed_turns,
+        })
+        .context(format!(
+            "turn {expected_turn} was already committed on thread {thread_id} \
+             (committed_turns={}); skipping duplicate commit",
+            current_thread.committed_turns,
+        )));
+    }
 
     Ok(())
+}
+
+const MAX_TURN_SLOT_SHIFTS: u32 = 3;
+
+/// Does this error carry the completed-turn slot CAS rejection?
+///
+/// All three backends (and the [`ensure_turn_not_already_committed`]
+/// pre-check) attach a typed [`StaleTurnCommit`] root cause, so this is
+/// a downcast instead of message-string matching. A
+/// [`LostCommitOwnership`](crate::journal::commit::LostCommitOwnership)
+/// rejection from an owner-guarded retry is deliberately NOT a
+/// collision: the cancel / timeout / requeue owner has the row, and
+/// the shift loop must propagate it as terminal.
+fn is_turn_slot_collision(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<StaleTurnCommit>().is_some()
+}
+
+/// Rewrite the turn index carried by the batch's turn-boundary
+/// lifecycle events after a slot shift, so `TurnComplete` / `Done`
+/// agree with the turn number the commit actually lands on.
+fn remap_turn_indexed_events(events: &mut [AgentEvent], turn: usize) {
+    for event in events {
+        match event {
+            AgentEvent::TurnComplete {
+                turn: event_turn, ..
+            } => *event_turn = turn,
+            AgentEvent::Done { total_turns, .. } => *total_turns = turn,
+            _ => {}
+        }
+    }
+}
+
+/// Commit a completed turn, shifting past a **cross-task** turn-slot
+/// collision instead of failing the turn (issue #354).
+///
+/// The race: cancelling a `Running` root frees the thread's
+/// active-root slot and promotes a queued successor in the same store
+/// transaction, but the cancelled worker's seam-B salvage still
+/// commits into the turn slot it bootstrapped with. A successor that
+/// bootstrapped before that salvage landed pins the **same**
+/// `expected_turn`, and the commit CAS fails whichever lands second.
+/// The losing salvage is already dropped silently (benign); before
+/// this wrapper, a losing successor failed **terminally** and had to
+/// be resubmitted.
+///
+/// On a slot-CAS rejection this wrapper distinguishes the two cases
+/// the CAS conflates:
+///
+/// - **Cross-task collision** — the checkpoint occupying
+///   `expected_turn` belongs to a *different* task AND this worker
+///   still owns its live `Running` row (status + `(worker, lease)`
+///   re-read). The turn's work is valid, only its slot number is
+///   stale: shift `expected_turn` forward ONE slot, remap the
+///   turn-indexed lifecycle events, and retry (bounded by
+///   [`MAX_TURN_SLOT_SHIFTS`]). Single-stepping matters — if the
+///   thread advanced several turns, each intervening occupant is
+///   validated by its own shift round instead of being skipped.
+/// - **Same-task duplicate / lost ownership** — the occupying
+///   checkpoint is this task's own commit (stale-lease double
+///   commit), the task is no longer a live `Running` row this worker
+///   owns (e.g. it was cancelled — its salvage must never re-land as
+///   a full turn), or the collided slot has no checkpoint to inspect.
+///   The original CAS error propagates unchanged.
+///
+/// The retry is safe because a rejected commit leaves no side effects
+/// on any backend: the in-memory guard runs before the first
+/// projection write, and the durable committers roll the whole
+/// transaction back (the attempt row stays open for the retry to
+/// close).
+///
+/// # Ownership is re-validated INSIDE the retried commit
+///
+/// The eligibility re-read in [`shifted_turn_slot`] and the retried
+/// commit are not atomic — a cancellation or lease loss can land
+/// between them. The retry therefore carries
+/// [`CompletedTurnCommit::owner_guard`]: the durable committers
+/// re-read the task row inside the commit transaction (`FOR UPDATE`
+/// on Postgres) and reject with
+/// [`LostCommitOwnership`](crate::journal::commit::LostCommitOwnership)
+/// unless the row is still `Running` under this `(worker, lease)` —
+/// so a shifted commit can never splice a dead root's turn into the
+/// slot on a durable backend. The non-atomic in-memory backend cannot
+/// enforce the guard transactionally (no cross-store transaction);
+/// there the pre-retry re-read is the strongest available check and a
+/// residual in-process window remains — the same class as every other
+/// non-atomic in-memory commit step. Closing that generally (CAS task
+/// ownership inside every completed-turn commit) is a store-level
+/// follow-up; it was deliberately scoped to the shifted retry here
+/// because unconditional fencing would discard fully-billed answers
+/// on benign cancel-after-completion races.
+///
+/// # Event turn indices after a shift
+///
+/// The turn's `Start` (and any streamed deltas) were durably committed
+/// BEFORE the collision was detected, carrying the original slot
+/// number, while the remapped `TurnComplete` / `Done` carry the landed
+/// slot — a shifted turn's journal reads `Start{N} … TurnComplete{N+1}
+/// / Done{N+1}`. Consumers must derive turn boundaries from event
+/// ORDER, not from the turn indices (see the `events.proto` contract).
+///
+/// # The shifted answer did not see the salvaged prefix — accepted
+///
+/// In this race the successor built its LLM request before the salvage
+/// landed, so the answer it commits never saw the cancelled turn's
+/// salvaged prefix. That gap is inherent to the RACE, not to the
+/// shift: in the mirror ordering — the successor's commit lands first —
+/// the losing salvage is dropped silently and the prefix never enters
+/// the transcript at all, with the very same one-answer visibility
+/// gap. Shifting is strictly more preserving than that (benign)
+/// ordering: the prefix survives at its own slot, attributed to the
+/// cancelled attempt, and the successor's checkpoint — rebuilt from
+/// the projection read fresh inside the commit — includes it for every
+/// future bootstrap. Only the single racing answer predates it.
+///
+/// The two rejected cures are worse than the disease: re-executing the
+/// successor against the salvaged head would duplicate every
+/// non-idempotent tool effect the turn already executed, and deferring
+/// successor execution until the salvage lands is unbounded (the
+/// cancelled worker may be gone; only the deadline sweep eventually
+/// reaps it).
+///
+/// # Cancelled state is audit, not lineage
+///
+/// The salvage checkpoint's agent-state snapshot (the cancelled turn's
+/// staged state: accumulated cost, metadata mutations, any parked
+/// continuation) is an audit artifact preserved at its own slot, not
+/// forward state lineage. Cancellation MEANS the turn's uncommitted
+/// state effects are discarded — its parked children were cancelled
+/// with it and must never be resumed — so the successor's snapshot
+/// superseding it as latest is the cancel semantics, not corruption.
+/// Billing truth is unaffected: the cancelled turn's real usage lives
+/// on its attempt rows and its `Cancelled` event, and the thread
+/// aggregate advanced by zero for the salvage by construction.
+pub(crate) async fn commit_completed_turn_shifting_slot(
+    mut params: CompletedTurnCommit,
+    worker_id: &WorkerId,
+    lease_id: &LeaseId,
+    deps: &RootTurnDeps<'_>,
+) -> Result<CommitOutcome> {
+    let mut shifts = 0u32;
+    loop {
+        let precheck = ensure_turn_not_already_committed(
+            deps.thread_store,
+            &params.thread_id,
+            params.expected_turn,
+        )
+        .await;
+        let error = match precheck {
+            Ok(()) => {
+                match commit_completed_turn(
+                    params.clone(),
+                    deps.thread_store,
+                    deps.message_store,
+                    deps.attempt_store,
+                    deps.checkpoint_store,
+                    deps.event_repo,
+                )
+                .await
+                {
+                    Ok(outcome) => return Ok(outcome),
+                    Err(error) => error,
+                }
+            }
+            Err(error) => error,
+        };
+
+        if !is_turn_slot_collision(&error) {
+            // Non-collision commit failure. An ownership rejection
+            // (`LostCommitOwnership`) settles here — no later path owns
+            // the attempt; every other failure leaves the row owned,
+            // and the host's terminal envelope closes the attempt.
+            settle_attempt_after_lost_ownership(&error, &params, deps).await;
+            return Err(error);
+        }
+        if shifts >= MAX_TURN_SLOT_SHIFTS {
+            // Walk exhausted on a genuine collision: ownership may
+            // have been lost concurrently WITHOUT the error carrying
+            // `LostCommitOwnership` — the cancel seam leaves a live
+            // worker's attempt open and the host skips rows it no
+            // longer owns. Settle unconditionally, exactly like the
+            // no-shift exit below.
+            settle_own_attempt(&params, deps).await;
+            return Err(error);
+        }
+        let Some(next_turn) = shifted_turn_slot(&params, worker_id, lease_id, deps).await else {
+            // No-shift exit: when the eligibility
+            // re-read found the row cancelled or requeued, no later
+            // path owns this attempt — the cancel seam deliberately
+            // left the live worker's attempt alone and the host skips
+            // rows it no longer owns. Settle unconditionally: in the
+            // still-owned refusal cases the host's terminal path would
+            // close it as a zero-usage best-effort Cancelled anyway
+            // (this close carries the REAL usage, and the later
+            // best-effort close is swallowed as `AlreadyClosed`), and
+            // in the requeue case the next execution's leftover settle
+            // becomes a no-op.
+            settle_own_attempt(&params, deps).await;
+            return Err(error);
+        };
+        log::info!(
+            "turn-slot collision on thread {}: turn {} was consumed by another task's \
+             commit; shifting task {} to turn {next_turn}",
+            params.thread_id,
+            params.expected_turn,
+            params.task_id,
+        );
+        params.expected_turn = next_turn;
+        remap_turn_indexed_events(&mut params.events, usize::try_from(next_turn).unwrap_or(0));
+        // The snapshot's turn_count was built for the original slot;
+        // recovery seeds staged state from the landed checkpoint, so a
+        // stale count would leave every later turn one behind
+        // Thread::committed_turns and Done.total_turns.
+        if let Some(turn_count) = params
+            .agent_state_snapshot
+            .get_mut("turn_count")
+            .filter(|value| value.is_u64())
+        {
+            *turn_count = serde_json::json!(next_turn);
+        }
+        // Every shifted retry is owner-guarded: the durable committers
+        // re-validate (Running, worker, lease) on the task row inside
+        // the commit transaction, closing the guard→retry TOCTOU.
+        params.owner_guard = Some(CommitOwnerGuard {
+            worker_id: worker_id.clone(),
+            lease_id: lease_id.clone(),
+        });
+        shifts += 1;
+    }
+}
+
+/// Best-effort settle of the in-flight attempt when the owner-guarded
+/// shifted retry is rejected with
+/// [`LostCommitOwnership`](crate::journal::commit::LostCommitOwnership).
+///
+/// The rejected durable commit rolled its in-transaction attempt close
+/// back, and no later path will close this attempt: the cancel seam's
+/// snapshot-scoped close ran while the task was still `Running` and
+/// deliberately left the live worker's attempt alone, and the host's
+/// failure path skips a row it no longer owns. Errors without an
+/// ownership rejection in their chain are left alone — the task is
+/// still owned there, and the host's terminal or requeue path owns
+/// the attempt's fate.
+pub(crate) async fn settle_attempt_after_lost_ownership(
+    error: &anyhow::Error,
+    params: &CompletedTurnCommit,
+    deps: &RootTurnDeps<'_>,
+) {
+    let lost_ownership = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::journal::commit::LostCommitOwnership>()
+            .is_some()
+    });
+    if !lost_ownership {
+        return;
+    }
+    settle_own_attempt(params, deps).await;
+}
+
+/// Best-effort close of THIS execution's attempt — the id was opened
+/// by this worker, so it cannot belong to a replacement worker. The
+/// close carries the REAL token usage the commit would have recorded
+/// (attempt rows are the billing source of truth) under the
+/// `Cancelled` outcome, since the turn did not commit. A concurrent
+/// close (the cancel path, or the host's terminal envelope, racing
+/// this settle) makes the store reject `AlreadyClosed`, which is
+/// swallowed as usual for best-effort closes.
+pub(crate) async fn settle_own_attempt(params: &CompletedTurnCommit, deps: &RootTurnDeps<'_>) {
+    let close = CloseAttemptParams {
+        outcome: TurnAttemptOutcome::Cancelled,
+        ..params.close_attempt_params.clone()
+    };
+    if let Err(close_error) = deps
+        .attempt_store
+        .close_attempt(&params.turn_attempt_id, close, params.now)
+        .await
+    {
+        log::warn!(
+            "settle own attempt after slot-collision exit: closing attempt {} failed: {close_error:#}",
+            params.turn_attempt_id,
+        );
+    }
+}
+
+/// Decide whether a slot-CAS rejection is a shiftable cross-task
+/// collision, and if so return the turn number to retry on.
+///
+/// Returns `None` — "do not shift, propagate the original error" — on
+/// any read failure or when the eligibility conditions fail (see
+/// [`commit_completed_turn_shifting_slot`]). Read errors are logged:
+/// the caller still surfaces the original CAS error, which is the
+/// meaningful one.
+async fn shifted_turn_slot(
+    params: &CompletedTurnCommit,
+    worker_id: &WorkerId,
+    lease_id: &LeaseId,
+    deps: &RootTurnDeps<'_>,
+) -> Option<u32> {
+    // 1. This worker must still own a live `Running` row. A cancelled
+    //    or requeued task must never shift: its in-flight work lost
+    //    the thread the moment it lost the row, and re-landing it
+    //    after the collision would splice a dead root's turn into a
+    //    successor's history. This re-read is only the ELIGIBILITY
+    //    check — it is not atomic with the retried commit. The
+    //    authoritative enforcement is the `owner_guard` the retry
+    //    carries: the durable committers re-validate (Running, worker,
+    //    lease) on the task row INSIDE the commit transaction. On the
+    //    non-atomic in-memory backend this re-read is the strongest
+    //    available check (documented residual window).
+    let own_row = match deps.task_store.get(&params.task_id).await {
+        Ok(row) => row,
+        Err(error) => {
+            log::warn!(
+                "turn-slot shift: re-read of task {} failed: {error:#}",
+                params.task_id,
+            );
+            return None;
+        }
+    };
+    let still_owned = own_row.as_ref().is_some_and(|row| {
+        row.status == TaskStatus::Running
+            && row.worker_id.as_ref() == Some(worker_id)
+            && row.lease_id.as_ref() == Some(lease_id)
+    });
+    if !still_owned {
+        return None;
+    }
+
+    // 2. The commit occupying our slot must belong to a DIFFERENT
+    //    task. Our own task id there means this call is a duplicate of
+    //    a commit that already landed — rejecting is the idempotency
+    //    guarantee the CAS exists for.
+    //
+    // The read synchronizes on the sequential-commit lock when the
+    // backend exposes one: the in-memory committer
+    // holds that lock from the stale-turn pre-check through the
+    // checkpoint write, so acquiring it here guarantees any commit
+    // whose aggregate advance we lost to has finished writing its
+    // checkpoint — a `None` under the lock is authoritative, not a
+    // visibility gap. Durable backends return no lock; their atomic
+    // transaction gives the same read consistency.
+    let occupant = {
+        let _commit_guard = match deps.thread_store.sequential_commit_lock() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        match deps
+            .checkpoint_store
+            .get_by_turn(&params.thread_id, params.expected_turn)
+            .await
+        {
+            Ok(occupant) => occupant,
+            Err(error) => {
+                log::warn!(
+                    "turn-slot shift: checkpoint lookup for turn {} on thread {} failed: {error:#}",
+                    params.expected_turn,
+                    params.thread_id,
+                );
+                return None;
+            }
+        }
+    };
+    match occupant {
+        // Only a foreign CANCEL-SALVAGE checkpoint is shift-eligible.
+        // The discriminator is the checkpoint's durable `kind`, never
+        // its token usage: providers may omit usage deltas, so a real
+        // completion can legitimately land an all-zero `turn_usage`,
+        // and mistaking it for salvage would overwrite its state with
+        // our stale snapshot. Salvage checkpoints carry zero aggregate
+        // usage by construction (see `commit_partial_turn_on_cancel`),
+        // which is what keeps the shift state-compatible: our snapshot
+        // and `Done` totals, built before the collision, remain
+        // correct. A FULL foreign turn in our slot means a live
+        // predecessor's completion landed after we bootstrapped — our
+        // cumulative state lacks its usage/cost, so shifting would
+        // durably drop it; refuse and let the collision surface. The
+        // host's collision handler requeues the refused task (via
+        // `AgentTaskStore::requeue_owned_task`, sweep-identical budget
+        // accounting) so it re-runs from the fresh committed head
+        // instead of failing terminally.
+        Some(checkpoint)
+            if checkpoint.task_id != params.task_id
+                && checkpoint.kind == CheckpointKind::CancelSalvage => {}
+        // Full-turn foreign occupant, no checkpoint (thread advanced
+        // through a path we don't understand), or our own duplicate —
+        // do not shift.
+        _ => return None,
+    }
+
+    // 3. Advance exactly ONE slot. The thread may have advanced
+    //    further (two late commits can land back-to-back on the
+    //    non-atomic in-memory backend), but jumping straight to the
+    //    head would skip validating the intervening occupants — one of
+    //    them could be a billed full turn the shift must refuse.
+    //    Landing on the very next slot re-collides when it is also
+    //    occupied, and the retry loop re-enters this function to
+    //    validate THAT occupant, so every skipped slot is inspected
+    //    (bounded by `MAX_TURN_SLOT_SHIFTS`).
+    params.expected_turn.checked_add(1)
 }
 
 /// Project [`llm::Usage`] from a chat response into the SDK's
@@ -1681,6 +2036,18 @@ async fn open_attempt(
         .list_by_task(task_id)
         .await
         .context("list existing attempts")?;
+    // Leftover OPEN attempts from a predecessor execution are left
+    // alone: after a lease expiry, the old worker
+    // may still be live — executing, unaware of its heartbeat
+    // rejection — and closing its attempt here would permanently
+    // record zero usage where the provider's real billed usage
+    // belongs (its own close then loses to `AlreadyClosed`). The old
+    // worker's own exit paths settle the attempt with real usage; a
+    // hard-crashed worker's attempt stays open, the same pre-existing
+    // audit residual every crash-requeue has. Duplicate-commit
+    // protection does not depend on closing here: the expected-turn
+    // CAS inside `ThreadStore::commit_turn` rejects a stale late
+    // commit atomically on every backend.
     let attempt_number = u32::try_from(existing.len()).context("attempt count overflow")? + 1;
 
     let (otel_trace_id, otel_span_id) = match otel_ids {
@@ -4220,14 +4587,6 @@ async fn commit_resumed_turn(
 
     buffer_resumed_assistant(&inputs, continuation, response).await?;
 
-    ensure_turn_not_already_committed(
-        deps.thread_store,
-        thread_id,
-        inputs.recovery_view.next_turn_number,
-    )
-    .await
-    .context("resume idempotency check")?;
-
     let close_params = build_close_params(response, attempt);
     let turn_usage = merged_turn_usage(&continuation.turn_usage, response);
 
@@ -4245,8 +4604,9 @@ async fn commit_resumed_turn(
         content_ids,
     );
 
-    let commit = commit_completed_turn(
+    let commit = commit_completed_turn_shifting_slot(
         CompletedTurnCommit {
+            checkpoint_kind: CheckpointKind::FullTurn,
             thread_id: thread_id.clone(),
             task_id: task_id.clone(),
             expected_turn: inputs.recovery_view.next_turn_number,
@@ -4257,13 +4617,12 @@ async fn commit_resumed_turn(
             agent_state_snapshot,
             events: lifecycle_events,
             outbox_max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+            owner_guard: None,
             now,
         },
-        deps.thread_store,
-        deps.message_store,
-        deps.attempt_store,
-        deps.checkpoint_store,
-        deps.event_repo,
+        &inputs.bootstrap.worker_id,
+        &inputs.bootstrap.lease_id,
+        deps,
     )
     .await
     .context("commit resumed turn")?;
