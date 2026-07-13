@@ -3248,6 +3248,10 @@ const fn terminal_close_reason(
 ///   cancel landing immediately after commits its own marker, which the
 ///   follower still receives — the same benign race that already exists
 ///   between a `Done` and the next submit.
+/// - The cancelled row must belong to the thread being followed. A fork
+///   inherits the source's frames verbatim, emitter ids included, so a
+///   cancel on the SOURCE thread must not suppress a close on the
+///   independent destination (see [`emitter_was_cancelled`]).
 ///
 /// A cancelled emitter's terminal frame is one of two things, and the
 /// gate deliberately does not try to tell them apart:
@@ -3307,7 +3311,7 @@ async fn confirmed_close_reason(
     if frame_is_behind_committed_head(shared, thread_id, event).await {
         return None;
     }
-    if emitter_was_cancelled(shared, event).await {
+    if emitter_was_cancelled(shared, thread_id, event).await {
         return None;
     }
     Some(reason)
@@ -3353,17 +3357,36 @@ async fn frame_is_behind_committed_head(
     latest.is_some_and(|latest| latest.turn_number > frame_turn)
 }
 
-/// Did the task that committed this frame get cancelled? Only a row
-/// that reads back `Cancelled` suppresses the close; an unstamped
-/// frame, a missing row, and a read failure all report `false` and
-/// leave the historical disposition intact.
-async fn emitter_was_cancelled(shared: &GrpcShared, event: &agent_server::CommittedEvent) -> bool {
+/// Did the task that committed this frame get cancelled ON THE THREAD
+/// BEING FOLLOWED? Only a row that reads back `Cancelled` and is bound
+/// to `thread_id` suppresses the close; an unstamped frame, a missing
+/// row, a foreign-thread emitter, and a read failure all report `false`
+/// and leave the historical disposition intact.
+///
+/// The thread check is what keeps forks correct. `ForkThread` re-commits
+/// the source's terminal frames verbatim onto the destination — their
+/// provenance, emitter id included, travels with them by design — so a
+/// forked `Done` names a task that never ran on the thread being
+/// followed. Cancelling that source task supersedes work on the SOURCE
+/// thread and says nothing about the fork, which has its own independent
+/// history (no marker, no successor); suppressing there would idle a
+/// follower that must close. A task's thread binding is immutable, so
+/// this comparison reads no mutable state and leaves the absorbing-status
+/// argument intact.
+async fn emitter_was_cancelled(
+    shared: &GrpcShared,
+    thread_id: &ThreadId,
+    event: &agent_server::CommittedEvent,
+) -> bool {
     let Some(emitter) = event.event.emitter_task_id() else {
         return false;
     };
     let emitter = agent_server::journal::task::AgentTaskId::from_string(emitter);
     match shared.stores.task_store.get(&emitter).await {
-        Ok(Some(task)) => task.status == agent_server::journal::task::TaskStatus::Cancelled,
+        Ok(Some(task)) => {
+            task.thread_id == *thread_id
+                && task.status == agent_server::journal::task::TaskStatus::Cancelled
+        }
         Ok(None) => false,
         Err(error) => {
             warn!(
@@ -6952,6 +6975,167 @@ mod tests {
             confirmed_close_reason(&shared, &thread, &id_less).await,
             Some(pb::StreamCloseReason::ThreadCompleted),
             "id-less frames keep the historical behavior",
+        );
+        Ok(())
+    }
+
+    /// Suppression is scoped to the followed thread. A fork re-commits
+    /// the source's frames verbatim, so the copy names a task that never
+    /// ran on the destination; cancelling that source task supersedes
+    /// work on the SOURCE thread only. Honouring it here would idle a
+    /// follower of an independent thread that has no marker and no
+    /// successor to close it.
+    #[tokio::test]
+    async fn cancelled_emitter_on_a_foreign_thread_still_closes() -> Result<()> {
+        let shared = event_test_shared()?;
+        let now = OffsetDateTime::UNIX_EPOCH;
+
+        let source = ThreadId::from_string("t-foreign-source");
+        shared
+            .stores
+            .thread_store
+            .get_or_create(&source, now)
+            .await?;
+        let source_root = close_gate_emitter(&shared, &source, 1).await?;
+
+        // The destination has its own head at the same turn — only the
+        // emitter's thread binding distinguishes the two.
+        let forked = ThreadId::from_string("t-foreign-fork");
+        shared
+            .stores
+            .thread_store
+            .get_or_create(&forked, now)
+            .await?;
+        shared
+            .stores
+            .checkpoint_store
+            .commit_checkpoint(close_gate_checkpoint(&forked, source_root.as_str(), 1))
+            .await?;
+
+        let outcome = shared
+            .stores
+            .task_store
+            .cancel_tree(&source_root, now)
+            .await?;
+        assert!(!outcome.transitioned.is_empty(), "the source root cancels");
+
+        // Same frame, same cancelled emitter, two threads: suppressed on
+        // the thread the emitter ran on, closing on the one it did not.
+        assert_eq!(
+            confirmed_close_reason(
+                &shared,
+                &source,
+                &close_gate_done_from(&source, 9, 1, &source_root)
+            )
+            .await,
+            None,
+        );
+        assert_eq!(
+            confirmed_close_reason(
+                &shared,
+                &forked,
+                &close_gate_done_from(&forked, 9, 1, &source_root)
+            )
+            .await,
+            Some(pb::StreamCloseReason::ThreadCompleted),
+            "a cancel on the source thread must not suppress the fork's close",
+        );
+        Ok(())
+    }
+
+    /// The same leak through the REAL fork path: fork a thread, then
+    /// cancel the source root, then follow the fork. `ForkThread` copied
+    /// the source's `Done` (emitter id and all), and the fork has no
+    /// marker and no successor — it must close `ThreadCompleted` on that
+    /// copied frame rather than idle forever.
+    #[tokio::test]
+    async fn forked_thread_closes_even_after_its_source_root_is_cancelled() -> Result<()> {
+        let shared = event_test_shared()?;
+        let control = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let source = ThreadId::from_string("t-fork-source");
+
+        // A source thread with one committed turn: checkpoint, aggregate,
+        // and the turn's lifecycle events attributed to its root.
+        shared
+            .stores
+            .thread_store
+            .get_or_create(&source, now)
+            .await?;
+        let source_root = close_gate_emitter(&shared, &source, 1).await?;
+        shared
+            .stores
+            .thread_store
+            .commit_turn(
+                &source,
+                1,
+                &agent_sdk_foundation::TokenUsage::default(),
+                now,
+            )
+            .await?;
+        commit_and_notify(
+            &shared,
+            &source,
+            AgentEvent::start(source.clone(), 1).with_emitter_task_id(source_root.as_str()),
+        )
+        .await?;
+        commit_and_notify(
+            &shared,
+            &source,
+            AgentEvent::done(
+                source.clone(),
+                1,
+                agent_sdk_foundation::TokenUsage::default(),
+                std::time::Duration::from_secs(1),
+            )
+            .with_emitter_task_id(source_root.as_str()),
+        )
+        .await?;
+
+        let forked = control
+            .fork_thread(Request::new(pb::ForkThreadRequest {
+                request_id: "fork-emitter-leak".into(),
+                source_thread_id: source.to_string(),
+                fork_after_committed_turns: 1,
+            }))
+            .await?
+            .into_inner()
+            .thread
+            .and_then(|view| view.thread)
+            .context("fork_thread missing snapshot")?
+            .thread_id;
+        let forked = ThreadId::from_string(forked);
+
+        // The copy kept the SOURCE root's emitter id...
+        let copied = journaled_terminal_frame(&shared, &forked).await?;
+        assert_eq!(
+            copied.event.emitter_task_id(),
+            Some(source_root.as_str()),
+            "the fork inherits the source's provenance verbatim",
+        );
+
+        // ...and the source root is cancelled AFTER the fork snapshotted
+        // it — the interleaving that leaks across threads.
+        let outcome = shared
+            .stores
+            .task_store
+            .cancel_tree(&source_root, now)
+            .await?;
+        assert!(!outcome.transitioned.is_empty(), "the source root cancels");
+
+        let mut stream = open_inline_stream(&shared, &forked, None).await?;
+        let closed = loop {
+            let frame = next_inline_frame(&mut stream).await?;
+            if let Some(StreamItem::Closed(closed)) = frame.item {
+                break closed;
+            }
+        };
+        assert_eq!(
+            closed.reason,
+            pb::StreamCloseReason::ThreadCompleted as i32,
+            "the fork's follower must close on its own copied Done, not idle: {closed:?}",
         );
         Ok(())
     }
