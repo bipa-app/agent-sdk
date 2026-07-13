@@ -925,15 +925,36 @@ pub trait AgentTaskStore: Send + Sync {
     /// than errors because each has a distinct correct caller
     /// reaction; see the variant docs.
     ///
+    /// # Boundary event
+    ///
+    /// `boundary`, when supplied, is committed to the task's thread
+    /// journal (with its `thread_events_available` outbox advisory)
+    /// ATOMICALLY with the ownership CAS and the release — inside the
+    /// same transaction on the durable backends, under the same task
+    /// write lock (via the wired [`CancellationMarkerSink`]) on the
+    /// in-memory store, exactly like `cancel_tree`'s terminal markers.
+    /// This is what makes the "abandoned streamed attempt" terminator
+    /// race-free (codex round-15): the event lands iff THIS caller
+    /// still owned the row, and it is durable before the row becomes
+    /// acquirable — so a replacement's `Start` can never precede it
+    /// and a stale caller can never inject it into a replacement's
+    /// stream. `NotOwned` / `BudgetExhausted` commit nothing. An
+    /// in-memory store with no sink wired requeues without the event
+    /// (bare test-support stores only; production wiring and the
+    /// journal bundle always carry the sink).
+    ///
     /// # Errors
-    /// Returns an error only for store I/O failures or an invalid
-    /// release transition (an internal invariant bug); ownership and
-    /// budget conditions are reported through the outcome enum.
+    /// Returns an error only for store I/O failures, a boundary-event
+    /// commit failure, or an invalid release transition; ownership and
+    /// budget conditions are reported through the outcome enum. On the
+    /// non-atomic in-memory path a boundary error leaves the row still
+    /// `Running` under the caller's lease (nothing was released).
     async fn requeue_owned_task(
         &self,
         id: &AgentTaskId,
         worker: &WorkerId,
         lease: &LeaseId,
+        boundary: Option<AgentEvent>,
         now: OffsetDateTime,
     ) -> Result<RequeueOutcome>;
 
@@ -3130,6 +3151,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         id: &AgentTaskId,
         worker: &WorkerId,
         lease: &LeaseId,
+        boundary: Option<AgentEvent>,
         now: OffsetDateTime,
     ) -> Result<RequeueOutcome> {
         let mut inner = self.inner.write().await;
@@ -3144,6 +3166,44 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         }
         if old.is_budget_exhausted() {
             return Ok(RequeueOutcome::BudgetExhausted);
+        }
+        // Boundary first, while STILL holding the write lock (the
+        // cancel_tree marker pattern): no acquire can interleave until
+        // the lock drops, so the event provably precedes anything a
+        // successor emits, and a failure here leaves the row Running
+        // under the caller's lease (nothing released yet).
+        if let Some(event) = boundary {
+            if let Some(sink) = &self.marker_sink {
+                let committed = sink
+                    .event_repo
+                    .commit_event(&old.thread_id, event, now)
+                    .await
+                    .context("requeue_owned_task: commit boundary event")?;
+                let payload_json =
+                    OutboxMessage::ThreadEventsAvailable(ThreadEventsAvailablePayload {
+                        thread_id: committed.thread_id.clone(),
+                        last_sequence: committed.sequence,
+                    })
+                    .to_payload_json()
+                    .context("requeue_owned_task: serialise boundary advisory payload")?;
+                sink.outbox_store
+                    .insert_batch(vec![NewOutboxRow {
+                        kind: OutboxMessageKind::ThreadEventsAvailable,
+                        thread_id: committed.thread_id.clone(),
+                        event_id: Some(committed.event_id),
+                        sequence: Some(committed.sequence),
+                        payload_json,
+                        max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+                        now,
+                    }])
+                    .await
+                    .context("requeue_owned_task: insert boundary outbox advisory")?;
+            } else {
+                log::warn!(
+                    "requeue_owned_task: no marker sink wired; requeueing task {id} \
+                     without its boundary event (test-support store)",
+                );
+            }
         }
         let released_row = old
             .clone()
@@ -7711,7 +7771,7 @@ mod tests {
             .context("claimed")?;
 
         let outcome = store
-            .requeue_owned_task(&id, &worker, &lease, t_plus(2))
+            .requeue_owned_task(&id, &worker, &lease, None, t_plus(2))
             .await
             .context("requeue")?;
         let RequeueOutcome::Requeued(row) = outcome else {
@@ -7760,7 +7820,13 @@ mod tests {
 
         // Wrong lease: NotOwned, row untouched.
         let outcome = store
-            .requeue_owned_task(&id, &worker, &LeaseId::from_string("l-stale"), t_plus(2))
+            .requeue_owned_task(
+                &id,
+                &worker,
+                &LeaseId::from_string("l-stale"),
+                None,
+                t_plus(2),
+            )
             .await
             .context("requeue with stale lease")?;
         assert!(matches!(outcome, RequeueOutcome::NotOwned));
@@ -7773,7 +7839,7 @@ mod tests {
         // resurrect it.
         store.cancel_tree(&id, t_plus(3)).await.context("cancel")?;
         let outcome = store
-            .requeue_owned_task(&id, &worker, &lease, t_plus(4))
+            .requeue_owned_task(&id, &worker, &lease, None, t_plus(4))
             .await
             .context("requeue after cancel")?;
         assert!(matches!(outcome, RequeueOutcome::NotOwned));
@@ -7801,7 +7867,7 @@ mod tests {
             .context("claimed")?;
 
         let outcome = store
-            .requeue_owned_task(&id, &worker, &lease, t_plus(2))
+            .requeue_owned_task(&id, &worker, &lease, None, t_plus(2))
             .await
             .context("requeue")?;
         assert!(matches!(outcome, RequeueOutcome::BudgetExhausted));

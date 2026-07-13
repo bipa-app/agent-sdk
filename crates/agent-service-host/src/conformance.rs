@@ -406,7 +406,7 @@ mod tests {
 
         // Stale lease: NotOwned, row untouched.
         let stale = task_store
-            .requeue_owned_task(&root.id, &worker, &LeaseId::new(), t_plus(22))
+            .requeue_owned_task(&root.id, &worker, &LeaseId::new(), None, t_plus(22))
             .await?;
         assert!(matches!(stale, RequeueOutcome::NotOwned));
         let row = task_store.get(&root.id).await?.context("row")?;
@@ -414,7 +414,7 @@ mod tests {
 
         // Owned: requeued to Pending, lease cleared, re-acquirable.
         let outcome = task_store
-            .requeue_owned_task(&root.id, &worker, &lease, t_plus(23))
+            .requeue_owned_task(&root.id, &worker, &lease, None, t_plus(23))
             .await?;
         let RequeueOutcome::Requeued(row) = outcome else {
             anyhow::bail!("expected Requeued, got {outcome:?}");
@@ -443,7 +443,7 @@ mod tests {
             .try_acquire_task(&capped.id, cw.clone(), cl.clone(), t_plus(60), t_plus(31))
             .await?;
         let outcome = task_store
-            .requeue_owned_task(&capped.id, &cw, &cl, t_plus(32))
+            .requeue_owned_task(&capped.id, &cw, &cl, None, t_plus(32))
             .await?;
         assert!(matches!(outcome, RequeueOutcome::BudgetExhausted));
         let row = task_store.get(&capped.id).await?.context("capped row")?;
@@ -461,7 +461,7 @@ mod tests {
             .await?;
         let _ = task_store.cancel_tree(&doomed.id, t_plus(42)).await?;
         let outcome = task_store
-            .requeue_owned_task(&doomed.id, &dw, &dl, t_plus(43))
+            .requeue_owned_task(&doomed.id, &dw, &dl, None, t_plus(43))
             .await?;
         assert!(matches!(outcome, RequeueOutcome::NotOwned));
         let row = task_store.get(&doomed.id).await?.context("doomed row")?;

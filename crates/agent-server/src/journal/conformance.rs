@@ -255,9 +255,12 @@ mod in_memory_bundle {
             id: &AgentTaskId,
             worker: &WorkerId,
             lease: &LeaseId,
+            boundary: Option<AgentEvent>,
             now: OffsetDateTime,
         ) -> Result<crate::journal::store::RequeueOutcome> {
-            self.task.requeue_owned_task(id, worker, lease, now).await
+            self.task
+                .requeue_owned_task(id, worker, lease, boundary, now)
+                .await
         }
         async fn try_acquire_task(
             &self,
@@ -1745,6 +1748,78 @@ mod tests {
             ThreadStore::sequential_commit_lock(&store).is_some(),
             "the bundle must expose the inner store's sequential-commit lock",
         );
+    }
+
+    /// Codex round-15: the requeue boundary event is atomic with the
+    /// ownership CAS — it lands (before the row is acquirable) on a
+    /// `Requeued` outcome, and a stale caller's `NotOwned` outcome
+    /// commits NOTHING into what is now the replacement's stream.
+    #[tokio::test]
+    async fn bundle_requeue_boundary_is_atomic_with_ownership() -> Result<()> {
+        use crate::journal::store::RequeueOutcome;
+        use crate::journal::task::{AgentTask, LeaseId, WorkerId};
+
+        let store = InMemoryJournalStore::new();
+        let thread = tid("conf-bundle-requeue-boundary");
+        ThreadStore::get_or_create(&store, &thread, t_plus(0)).await?;
+        let root = AgentTask::new_root_turn(thread.clone(), t_plus(1), 3);
+        let id = root.id.clone();
+        AgentTaskStore::submit_root_turn(&store, root).await?;
+        let worker = WorkerId::from_string("w-owner");
+        let lease = LeaseId::from_string("l-owner");
+        AgentTaskStore::try_acquire_task(
+            &store,
+            &id,
+            worker.clone(),
+            lease.clone(),
+            t_plus(60),
+            t_plus(2),
+        )
+        .await?
+        .context("acquired")?;
+
+        let boundary = || agent_sdk_foundation::events::AgentEvent::error("retrying", true);
+
+        // Stale lease: NotOwned, and the journal stays empty.
+        let stale = AgentTaskStore::requeue_owned_task(
+            &store,
+            &id,
+            &worker,
+            &LeaseId::from_string("l-stale"),
+            Some(boundary()),
+            t_plus(3),
+        )
+        .await?;
+        ensure!(matches!(stale, RequeueOutcome::NotOwned));
+        let events = EventRepository::get_events(&store, &thread).await?;
+        ensure!(
+            events.is_empty(),
+            "a NotOwned requeue must not commit its boundary",
+        );
+
+        // Owned: Requeued, and the boundary is durably in the journal.
+        let outcome = AgentTaskStore::requeue_owned_task(
+            &store,
+            &id,
+            &worker,
+            &lease,
+            Some(boundary()),
+            t_plus(4),
+        )
+        .await?;
+        ensure!(matches!(outcome, RequeueOutcome::Requeued(_)));
+        let events = EventRepository::get_events(&store, &thread).await?;
+        ensure!(
+            events.iter().any(|committed| matches!(
+                &committed.event,
+                agent_sdk_foundation::events::AgentEvent::Error {
+                    recoverable: true,
+                    ..
+                }
+            )),
+            "a Requeued outcome must commit the boundary event",
+        );
+        Ok(())
     }
 
     /// Codex round-12: cancelling through the bundle must emit the

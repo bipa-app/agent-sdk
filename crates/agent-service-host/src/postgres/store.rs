@@ -3074,6 +3074,7 @@ FOR UPDATE SKIP LOCKED
         id: &AgentTaskId,
         worker: &WorkerId,
         lease: &LeaseId,
+        boundary: Option<AgentEvent>,
         now: OffsetDateTime,
     ) -> Result<RequeueOutcome> {
         let mut tx = self.begin().await?;
@@ -3088,6 +3089,23 @@ FOR UPDATE SKIP LOCKED
         }
         if old.is_budget_exhausted() {
             return Ok(RequeueOutcome::BudgetExhausted);
+        }
+        // Boundary event + advisory in the SAME transaction as the
+        // ownership CAS and the release (the cancel_tree marker
+        // pattern): it lands iff this caller still owned the row, and
+        // it is durable before the row is acquirable.
+        if let Some(event) = boundary {
+            let start_seq = Self::next_event_sequence_tx(&mut tx, &old.thread_id).await?;
+            let committed =
+                Self::insert_events_tx(&mut tx, &old.thread_id, vec![event], start_seq, now)
+                    .await?;
+            Self::insert_thread_events_outbox_row_tx(
+                &mut tx,
+                &committed,
+                DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+                now,
+            )
+            .await?;
         }
         let released_row = old
             .release_lease(now)

@@ -1885,38 +1885,23 @@ async fn requeue_collided_root_task(
         return Ok(false);
     }
     // Boundary for the abandoned streamed attempt (codex rounds
-    // 13-14): the collided execution already persisted `Start` and
+    // 13-15): the collided execution already persisted `Start` and
     // streaming deltas, and the re-run will emit a fresh `Start` +
     // answer. The RECOVERABLE `Error` event that terminates the
-    // abandoned attempt must be durable BEFORE the row becomes
-    // runnable — once `requeue_owned_task` lands, another worker can
-    // acquire immediately and append the retry's `Start`, and a
-    // boundary committed after that point (or dropped on a transient
-    // failure) recreates the very ambiguity it exists to prevent. If
-    // the boundary cannot be committed, fall through to the terminal
-    // path, which emits its own (non-recoverable) `Error`. We still
-    // own the Running row here, so nothing can race the ordering.
+    // abandoned attempt is committed by the store ATOMICALLY with the
+    // ownership CAS and the release — it lands iff this worker still
+    // owned the row, and it is durable before the row is acquirable —
+    // so it can neither trail a replacement's `Start` nor pollute a
+    // replacement's stream from a stale snapshot. On a commit failure
+    // the row stays Running under our lease and the task keeps the
+    // terminal path (which emits its own non-recoverable `Error`).
     let boundary = agent_sdk_foundation::events::AgentEvent::error(
         format!("turn-slot collision: retrying from the fresh committed head ({err:#})"),
         true,
     );
-    if let Err(commit_error) = stores
-        .event_repo
-        .commit_event(&task.thread_id, boundary, now)
-        .await
-    {
-        warn!(
-            task_id = %task.id,
-            thread_id = %task.thread_id,
-            error = %format!("{commit_error:#}"),
-            "turn-slot collision: retry-boundary event commit failed; \
-             keeping the terminal path instead of requeueing",
-        );
-        return Ok(false);
-    }
     let outcome = stores
         .task_store
-        .requeue_owned_task(&task.id, &worker_id, &lease_id, now)
+        .requeue_owned_task(&task.id, &worker_id, &lease_id, Some(boundary), now)
         .await
         .context("requeue collided root task")?;
     match outcome {
@@ -5940,9 +5925,12 @@ mod tests {
             id: &agent_server::AgentTaskId,
             worker: &agent_server::WorkerId,
             lease: &agent_server::LeaseId,
+            boundary: Option<agent_sdk_foundation::events::AgentEvent>,
             now: time::OffsetDateTime,
         ) -> Result<RequeueOutcome> {
-            self.inner.requeue_owned_task(id, worker, lease, now).await
+            self.inner
+                .requeue_owned_task(id, worker, lease, boundary, now)
+                .await
         }
         async fn promote_next_queued_root(
             &self,

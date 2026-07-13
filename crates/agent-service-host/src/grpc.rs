@@ -4581,9 +4581,12 @@ mod tests {
             id: &agent_server::AgentTaskId,
             worker: &agent_server::WorkerId,
             lease: &agent_server::LeaseId,
+            boundary: Option<agent_sdk_foundation::events::AgentEvent>,
             now: time::OffsetDateTime,
         ) -> Result<agent_server::journal::store::RequeueOutcome> {
-            self.inner.requeue_owned_task(id, worker, lease, now).await
+            self.inner
+                .requeue_owned_task(id, worker, lease, boundary, now)
+                .await
         }
         async fn promote_next_queued_root(
             &self,
