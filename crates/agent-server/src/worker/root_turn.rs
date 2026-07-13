@@ -2722,10 +2722,6 @@ async fn try_recover_with_compaction(
     Ok(Some(next_attempt))
 }
 
-/// Exponential backoff with bounded jitter.  Mirrors
-/// `agent_sdk::agent_loop::helpers::calculate_backoff_delay` but
-/// is duplicated here to avoid leaking a `pub(crate)` boundary across
-/// crates for a tiny pure helper.
 /// Clamp a provider-supplied retry delay to [`STREAM_MAX_RETRY_AFTER_MS`].
 fn clamp_retry_after(hint: Duration) -> Duration {
     let ms = u64::try_from(hint.as_millis())
@@ -2734,6 +2730,10 @@ fn clamp_retry_after(hint: Duration) -> Duration {
     Duration::from_millis(ms)
 }
 
+/// Exponential backoff with bounded jitter.  Mirrors
+/// `agent_sdk::agent_loop::helpers::calculate_backoff_delay` but
+/// is duplicated here to avoid leaking a `pub(crate)` boundary across
+/// crates for a tiny pure helper.
 fn stream_backoff_delay(attempt: u32) -> Duration {
     // Exponential: base, base*2, base*4, ...
     let base = STREAM_BASE_DELAY_MS.saturating_mul(1u64 << attempt.saturating_sub(1).min(20));

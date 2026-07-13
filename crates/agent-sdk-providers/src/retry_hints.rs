@@ -19,8 +19,10 @@ use std::time::Duration;
 /// Longest delay these parsers will report.
 ///
 /// Callers clamp the hint against their own retry ceiling anyway; this bound
-/// only keeps an absurd or hostile body (`"retryDelay": "1e18s"`) from
-/// producing a `Duration` that overflows later arithmetic.
+/// only keeps an absurd or hostile body (`"retryDelay": "999999999999s"`) from
+/// producing a `Duration` that overflows later arithmetic. Exponent notation
+/// (`"1e18s"`) never reaches the clamp — the digits-and-dot check in
+/// [`parse_non_negative`] rejects it outright.
 const MAX_HINT: Duration = Duration::from_hours(24);
 
 /// Parse `google.rpc.RetryInfo.retryDelay` out of a Google API error body.
@@ -189,6 +191,15 @@ mod tests {
         assert_eq!(
             google_retry_delay(
                 r#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"30"}]}}"#
+            ),
+            None
+        );
+        // Exponent notation is rejected outright rather than clamped: it is not
+        // a proto duration, and accepting it would make the value's magnitude
+        // depend on float parsing.
+        assert_eq!(
+            google_retry_delay(
+                r#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1e18s"}]}}"#
             ),
             None
         );
