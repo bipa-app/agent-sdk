@@ -33,12 +33,12 @@ pub(super) fn estimate_cost_usd(
         cached_input_tokens: usage.cached_input_tokens,
         cache_creation_input_tokens: usage.cache_creation_input_tokens,
     };
-    provider_candidates(&provenance.provider, &provenance.model)
-        .find_map(|provider| price_call(pricing, provider, &provenance.model, &usage))
+    price_candidates(&provenance.provider, &provenance.model)
+        .find_map(|(provider, model)| price_call(pricing, provider, model, &usage))
 }
 
-/// Price one call for a single (already canonical) provider name: the
-/// configured estimator first, the static capability table as the fallback.
+/// Price one call for a single provider/model key: the configured estimator
+/// first, the static capability table as the fallback.
 ///
 /// An estimator that holds no pricing for the pair must not make the call
 /// look free, so a `None` from it falls through to the compiled-in table
@@ -57,9 +57,10 @@ fn price_call(
         })
 }
 
-/// The provider names to price a provenance under, most specific first: the
-/// name the provider reported, then the canonical backend(s) that name is
-/// known to serve.
+/// The provider/model keys to price a provenance under, most specific first:
+/// the pair the provider reported, then the canonical backend(s) that
+/// provider name is known to serve, then — for a vendor-slug model id — the
+/// vendor split out of the id.
 ///
 /// Pricing sources key entries under the canonical provider names
 /// (`anthropic` / `openai` / `gemini`), but several [`crate::llm::LlmProvider`]
@@ -87,7 +88,10 @@ fn price_call(
 /// deterministically; pricing it identically is deliberate, so replayed
 /// runs exercise the same budget behavior the recording did — the
 /// provenance string does not distinguish the modes.
-fn provider_candidates<'a>(provider: &'a str, model: &str) -> impl Iterator<Item = &'a str> {
+fn price_candidates<'a>(
+    provider: &'a str,
+    model: &'a str,
+) -> impl Iterator<Item = (&'a str, &'a str)> {
     let backends: &'static [&'static str] = match provider {
         "openai-responses" | "openai-codex" => &["openai"],
         "vertex" if model.starts_with("claude-") => &["anthropic"],
@@ -95,7 +99,25 @@ fn provider_candidates<'a>(provider: &'a str, model: &str) -> impl Iterator<Item
         "cloudflare-ai-gateway" | "record-replay" => &["anthropic", "openai", "gemini"],
         _ => &[],
     };
-    std::iter::once(provider).chain(backends.iter().copied())
+    std::iter::once((provider, model))
+        .chain(backends.iter().map(move |backend| (*backend, model)))
+        .chain(vendor_slug_key(model))
+}
+
+/// Split a vendor-slug model id (`z-ai/glm-5.1`) into the provider/model key
+/// the dynamic catalogs store it under (`z-ai` / `glm-5.1`).
+///
+/// Open models (z.ai, Moonshot, `DeepSeek`, `MiniMax`, …) are served through
+/// `OpenAIProvider`, so their provenance is `openai` plus the full slug the
+/// caller passed. The feeds key the same model by its vendor: `OpenRouter`
+/// splits the slug (mirrored here, `google` included, so the halves match
+/// `split_openrouter_id`), and models.dev nests the model under the vendor's
+/// provider object. Without this key a feed-only slug model would price to
+/// `None` and never trip a cost budget.
+fn vendor_slug_key(model: &str) -> Option<(&str, &str)> {
+    let (vendor, model_id) = model.split_once('/')?;
+    let provider = if vendor == "google" { "gemini" } else { vendor };
+    Some((provider, model_id))
 }
 
 /// Whether a usage delta carries no tokens at all.
@@ -279,6 +301,35 @@ mod tests {
             .context("feed pricing must trip the cost limit")?;
         assert_eq!(limit, BudgetLimitKind::CostUsd);
         let cost = cost.context("the tripped limit carries the estimate")?;
+        assert!((cost - 30.0).abs() < 1e-9, "unexpected cost: {cost}");
+        Ok(())
+    }
+
+    /// Stands in for a catalog carrying a vendor-slug open model under the
+    /// key the feeds use: the vendor as the provider, the rest of the slug as
+    /// the model id. Prices every token at $1.
+    struct SlugPricing;
+
+    impl CostEstimator for SlugPricing {
+        fn estimate_cost_usd(&self, provider: &str, model: &str, usage: &Usage) -> Option<f64> {
+            (provider == "z-ai" && model == "glm-9-turbo")
+                .then(|| f64::from(usage.input_tokens) + f64::from(usage.output_tokens))
+        }
+    }
+
+    #[test]
+    fn estimator_prices_a_vendor_slug_model_under_its_feed_key() -> anyhow::Result<()> {
+        use anyhow::Context;
+        // Open models route through the OpenAI provider, so the provenance is
+        // `openai` plus the full slug, while the feeds key the model by vendor.
+        let provenance = AuditProvenance::new("openai", "z-ai/glm-9-turbo");
+        let usage = TokenUsage {
+            input_tokens: 20,
+            output_tokens: 10,
+            ..Default::default()
+        };
+        let cost = estimate_cost_usd(Some(&SlugPricing), &provenance, &usage)
+            .context("the slug must resolve to the catalog's vendor/model key")?;
         assert!((cost - 30.0).abs() < 1e-9, "unexpected cost: {cost}");
         Ok(())
     }
@@ -601,5 +652,109 @@ mod tests {
         );
         // Unknown cost (None) never trips the cost limit.
         assert!(check_budget(&limits, &usage, None).is_none());
+    }
+}
+
+/// Budget pricing driven by a real [`ModelRegistry`] loaded from a feed body,
+/// so the provider/model keys under test are the ones the feed parsers
+/// actually produce.
+#[cfg(all(test, feature = "model-discovery"))]
+mod catalog_tests {
+    use super::*;
+    use agent_sdk_providers::model_catalog::parse_openrouter;
+    use agent_sdk_providers::{CatalogEntry, ModelCatalogSource, ModelRegistry};
+    use anyhow::{Context, Result};
+    use async_trait::async_trait;
+
+    /// A vendor-slug open model, priced only by the feed: `OpenAIProvider`
+    /// serves it, so the run's provenance is `openai` / `z-ai/glm-9-turbo`,
+    /// while the feed keys it as `z-ai` / `glm-9-turbo`.
+    const OPENROUTER_SLUG_FIXTURE: &str = r#"{
+      "data": [
+        {
+          "id": "z-ai/glm-9-turbo",
+          "context_length": 200000,
+          "pricing": { "prompt": "0.000001", "completion": "0.000002" }
+        }
+      ]
+    }"#;
+
+    /// A feed row for a model the static table also prices (`openai/gpt-4o`),
+    /// but carrying only an input rate.
+    const OPENROUTER_PARTIAL_FIXTURE: &str = r#"{
+      "data": [
+        {
+          "id": "openai/gpt-4o",
+          "context_length": 128000,
+          "pricing": { "prompt": "0.001" }
+        }
+      ]
+    }"#;
+
+    struct FixtureFeed(Vec<CatalogEntry>);
+
+    #[async_trait]
+    impl ModelCatalogSource for FixtureFeed {
+        async fn fetch(&self) -> Result<Vec<CatalogEntry>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    async fn registry_from(fixture: &str) -> Result<ModelRegistry> {
+        let registry = ModelRegistry::new();
+        registry
+            .refresh(&FixtureFeed(parse_openrouter(fixture)?))
+            .await?;
+        Ok(registry)
+    }
+
+    #[tokio::test]
+    async fn feed_only_slug_model_accrues_cost_and_trips_the_budget() -> Result<()> {
+        let registry = registry_from(OPENROUTER_SLUG_FIXTURE).await?;
+        // $1 / 1M input and $2 / 1M output, over 1M tokens each: $3.
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+        let provenance = AuditProvenance::new("openai", "z-ai/glm-9-turbo");
+
+        // The static table has never heard of this model.
+        assert!(estimate_cost_usd(None, &provenance, &usage).is_none());
+
+        let cost = estimate_cost_usd(Some(&registry), &provenance, &usage)
+            .context("the feed prices this slug model")?;
+        assert!((cost - 3.0).abs() < 1e-9, "unexpected cost: {cost}");
+
+        let limits = UsageLimits {
+            max_cost_usd: Some(1.0),
+            ..Default::default()
+        };
+        let (limit, _) = status(Some(&limits), Some(&registry), &provenance, &usage, None)
+            .context("feed pricing must trip the cost limit")?;
+        assert_eq!(limit, BudgetLimitKind::CostUsd);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partially_priced_feed_row_yields_to_the_static_table() -> Result<()> {
+        let registry = registry_from(OPENROUTER_PARTIAL_FIXTURE).await?;
+        let usage = TokenUsage {
+            input_tokens: 2_000,
+            output_tokens: 1_000,
+            ..Default::default()
+        };
+        let provenance = AuditProvenance::new("openai", "gpt-4o");
+
+        // The feed row prices input at $1000/1M and says nothing about
+        // output; pricing from it would bill 1000 output tokens at zero. The
+        // catalog declines, so the fully-priced static row prices the call.
+        let cost = estimate_cost_usd(Some(&registry), &provenance, &usage)
+            .context("the static table prices gpt-4o")?;
+        let statically_priced = estimate_cost_usd(None, &provenance, &usage)
+            .context("gpt-4o is priced in the static table")?;
+        assert!((cost - statically_priced).abs() < 1e-12);
+        assert!((cost - 0.0075).abs() < 1e-9, "unexpected cost: {cost}");
+        Ok(())
     }
 }

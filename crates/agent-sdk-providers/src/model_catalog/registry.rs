@@ -139,12 +139,44 @@ impl ModelRegistry {
     }
 
     /// Estimate request cost in USD using the resolved pricing, if any.
+    ///
+    /// Reports `None` — "this catalog cannot price the call" — rather than a
+    /// partial figure when the resolved pricing is missing a rate for a usage
+    /// component with a nonzero token count (e.g. a feed row that lists an
+    /// input rate but no output rate). A caller can then fall back to another
+    /// pricing source instead of billing those tokens at zero.
     #[must_use]
     pub fn estimate_cost_usd(&self, provider: &str, model: &str, usage: &Usage) -> Option<f64> {
-        self.resolve(provider, model)
-            .pricing
-            .and_then(|pricing| pricing.estimate_cost_usd(usage))
+        let pricing = self.resolve(provider, model).pricing?;
+        if !prices_every_billed_component(&pricing, usage) {
+            return None;
+        }
+        pricing.estimate_cost_usd(usage)
     }
+}
+
+/// Whether `pricing` carries a rate for every usage component with a nonzero
+/// token count.
+///
+/// Feed rows are not guaranteed to be complete: a row that lists an input
+/// rate but no output rate would otherwise price a call's output tokens —
+/// typically the majority of its cost — at zero. Under-reporting is worse
+/// than declining: a caller that falls back to another pricing source (e.g.
+/// the static capability table) recovers the true cost, whereas a partial
+/// estimate silently understates spend and delays or defeats a cost budget.
+///
+/// Cached input tokens are considered priced by either a cache rate or the
+/// plain input rate, matching how [`Pricing::estimate_cost_usd`] bills them.
+fn prices_every_billed_component(pricing: &Pricing, usage: &Usage) -> bool {
+    let cached_input_tokens = usage.cached_input_tokens.min(usage.input_tokens);
+    let uncached_input_tokens = usage.input_tokens.saturating_sub(cached_input_tokens);
+
+    let input_priced = uncached_input_tokens == 0 || pricing.input.is_some();
+    let cached_priced =
+        cached_input_tokens == 0 || pricing.cached_input.is_some() || pricing.input.is_some();
+    let output_priced = usage.output_tokens == 0 || pricing.output.is_some();
+
+    input_priced && cached_priced && output_priced
 }
 
 const fn resolved_from_entry(entry: &CatalogEntry, source: ResolvedSource) -> ResolvedModel {
@@ -276,6 +308,55 @@ mod tests {
         // (1000/1e6*1.75) + (1000/1e6*0.175) + (1000/1e6*14)
         // = 0.00175 + 0.000175 + 0.014 = 0.015925
         assert!((cost - 0.015_925).abs() < 1e-9);
+        Ok(())
+    }
+
+    #[test]
+    fn estimate_cost_usd_declines_a_row_missing_a_billed_rate() -> Result<()> {
+        // A feed row that lists an input rate but no output rate: pricing the
+        // call from it would bill the output tokens at zero.
+        let registry = ModelRegistry::new().with_override(
+            "openai",
+            "gpt-4o",
+            CatalogEntry {
+                provider: "openai".to_owned(),
+                model_id: "gpt-4o".to_owned(),
+                context_window: None,
+                max_output_tokens: None,
+                pricing: Some(Pricing {
+                    input: Some(crate::model_capabilities::PricePoint::new(1.0)),
+                    output: None,
+                    cached_input: None,
+                    notes: None,
+                }),
+                supports_thinking: None,
+            },
+        );
+
+        let with_output = Usage {
+            input_tokens: 2_000,
+            output_tokens: 1_000,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        assert!(
+            registry
+                .estimate_cost_usd("openai", "gpt-4o", &with_output)
+                .is_none(),
+            "a row with no output rate must decline a call that bills output tokens",
+        );
+
+        // The same row still prices a call that bills no output tokens.
+        let input_only = Usage {
+            input_tokens: 2_000,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        let cost = registry
+            .estimate_cost_usd("openai", "gpt-4o", &input_only)
+            .context("input-only usage is fully priced by an input rate")?;
+        assert!((cost - 0.002).abs() < 1e-9, "unexpected cost: {cost}");
         Ok(())
     }
 }

@@ -47,14 +47,27 @@ fn map_modelsdev_provider(key: &str) -> String {
     }
 }
 
+/// A models.dev rate (USD per 1M tokens) is only usable when it is a finite
+/// positive number: the feed reports `0` both for genuinely free models and
+/// for rows whose price it does not know, and either way a zero rate would
+/// price the component as free. Mirrors the `OpenRouter` parser's guard.
+fn modelsdev_price_per_million(usd_per_million_tokens: f64) -> Option<PricePoint> {
+    (usd_per_million_tokens.is_finite() && usd_per_million_tokens > 0.0)
+        .then(|| PricePoint::new(usd_per_million_tokens))
+}
+
 fn pricing_from_modelsdev_cost(cost: &ModelsDevCost) -> Option<Pricing> {
-    if cost.input.is_none() && cost.output.is_none() && cost.cache_read.is_none() {
+    let input = cost.input.and_then(modelsdev_price_per_million);
+    let output = cost.output.and_then(modelsdev_price_per_million);
+    let cached_input = cost.cache_read.and_then(modelsdev_price_per_million);
+
+    if input.is_none() && output.is_none() && cached_input.is_none() {
         return None;
     }
     Some(Pricing {
-        input: cost.input.map(PricePoint::new),
-        output: cost.output.map(PricePoint::new),
-        cached_input: cost.cache_read.map(PricePoint::new),
+        input,
+        output,
+        cached_input,
         notes: None,
     })
 }
@@ -238,6 +251,43 @@ mod tests {
 
         // No model is keyed under the raw `google` provider name.
         assert!(!entries.iter().any(|e| e.provider == "google"));
+        Ok(())
+    }
+
+    const ZERO_COST_FIXTURE: &str = r#"{
+      "openai": {
+        "id": "openai",
+        "name": "OpenAI",
+        "models": {
+          "free-model": {
+            "id": "free-model",
+            "cost": { "input": 0, "output": 0 }
+          },
+          "half-priced-model": {
+            "id": "half-priced-model",
+            "cost": { "input": 2, "output": 0 }
+          }
+        }
+      }
+    }"#;
+
+    #[test]
+    fn parse_modelsdev_drops_zero_rates() -> Result<()> {
+        let entries = parse_modelsdev(ZERO_COST_FIXTURE)?;
+
+        // Every rate is zero: the row carries no pricing at all, so it cannot
+        // shadow another source with a real price.
+        let free = find(&entries, "openai", "free-model")?;
+        assert!(free.pricing.is_none());
+
+        // A zero output rate is dropped while the real input rate is kept;
+        // the registry declines such a row for any call that bills output.
+        let half = find(&entries, "openai", "half-priced-model")?;
+        let pricing = half.pricing.context("input rate must survive")?;
+        assert!(
+            (pricing.input.context("input")?.usd_per_million_tokens - 2.0).abs() < f64::EPSILON
+        );
+        assert!(pricing.output.is_none());
         Ok(())
     }
 }
