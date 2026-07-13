@@ -5435,6 +5435,71 @@ async fn streaming_retry_bills_the_failed_attempts_usage() -> anyhow::Result<()>
     Ok(())
 }
 
+// --- #9c: a cancelled stream still bills what it streamed ------------
+
+#[tokio::test(start_paused = true)]
+async fn cancelled_stream_bills_the_usage_it_already_streamed() -> anyhow::Result<()> {
+    // The stream reports usage, then stalls; the run is cancelled while it
+    // hangs. The provider billed those tokens, so `Cancelled.total_usage` must
+    // report them rather than zero.
+    //
+    // Deterministic by construction: the scripted frames are consumed the moment
+    // the stream is polled, and only then does the runtime go idle and the
+    // paused clock advance to the earliest timer. The cancel is armed strictly
+    // inside `LLM_STREAM_INACTIVITY_TIMEOUT` (20ms under `cfg(test)`), so it
+    // always fires first and the stall never times out.
+    let provider = StreamScriptProvider::new(vec![StreamScriptStep::FramesThenStall(vec![
+        StreamDelta::TextDelta {
+            delta: "partial".to_string(),
+            block_index: 0,
+        },
+        StreamDelta::Usage(Usage {
+            input_tokens: 90,
+            output_tokens: 10,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        }),
+    ])]);
+    let config = AgentConfig {
+        streaming: true,
+        retry: RetryConfig::no_retry(),
+        ..Default::default()
+    };
+    let agent = builder::<()>()
+        .provider(provider)
+        .config(config)
+        .event_store(new_event_store())
+        .build();
+
+    let cancel = CancellationToken::new();
+    let cancel_trigger = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        cancel_trigger.cancel();
+    });
+
+    let state = agent
+        .run(
+            ThreadId::new(),
+            AgentInput::Text("hi".to_string()),
+            ToolContext::new(()),
+            cancel,
+        )
+        .await?;
+
+    match state {
+        AgentRunState::Cancelled { total_usage, .. } => {
+            assert_eq!(
+                total_usage.input_tokens + total_usage.output_tokens,
+                100,
+                "a cancelled run must still report the tokens the provider billed, got {total_usage:?}",
+            );
+        }
+        other => anyhow::bail!("expected Cancelled, got {other:?}"),
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn streaming_rate_limit_without_a_hint_uses_exponential_backoff() -> anyhow::Result<()> {
     // No server hint: the exponential schedule (base 250ms, first retry) applies.

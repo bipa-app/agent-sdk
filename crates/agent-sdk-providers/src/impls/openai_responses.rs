@@ -741,9 +741,18 @@ impl LlmProvider for OpenAIResponsesProvider {
                             }
                             // ── Error ───────────────────────────────────
                             "error" | "response.failed" => {
-                                let (error_code, error_message) = event
+                                // A failed response still reports the tokens it
+                                // burned, so the usage is emitted before the error
+                                // that ends the stream — the caller's accumulator
+                                // only ever sees deltas that were yielded.
+                                let (failed_usage, response_error) = event
                                     .response
-                                    .and_then(|response| response.error)
+                                    .map_or((None, None), |response| {
+                                        (response.usage, response.error)
+                                    });
+                                let failed_usage =
+                                    failed_usage.map(|usage| map_usage(Some(usage)));
+                                let (error_code, error_message) = response_error
                                     .map_or((None, None), |error| (error.code, error.message));
                                 let code = error_code.or(event.code);
                                 let message = error_message
@@ -755,6 +764,9 @@ impl LlmProvider for OpenAIResponsesProvider {
                                     &message,
                                     data,
                                 );
+                                if let Some(usage) = failed_usage {
+                                    yield Ok(StreamDelta::Usage(usage));
+                                }
                                 yield Ok(StreamDelta::Error {
                                     message,
                                     kind,
@@ -2777,6 +2789,35 @@ mod tests {
             kind,
             StreamErrorKind::RateLimited(Some(std::time::Duration::from_millis(1500)))
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_band_failed_event_keeps_the_usage_it_reported() -> anyhow::Result<()> {
+        // The failed response reports the tokens it burned. They are billed, so
+        // they must reach the accumulator — which only sees yielded deltas —
+        // before the error that ends the stream.
+        let body = "data: {\"type\":\"response.failed\",\"response\":{\"usage\":{\"input_tokens\":140,\"output_tokens\":20},\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Please try again in 12s.\"}}}\n\n";
+        let deltas = stream_deltas(body).await?;
+
+        let usage_at = deltas
+            .iter()
+            .position(|delta| matches!(delta, StreamDelta::Usage(_)))
+            .context("the failed event's usage must not be dropped")?;
+        let error_at = deltas
+            .iter()
+            .position(|delta| matches!(delta, StreamDelta::Error { .. }))
+            .context("expected a stream error delta")?;
+        assert!(
+            usage_at < error_at,
+            "usage must be emitted before the terminal error, got {deltas:?}"
+        );
+
+        let StreamDelta::Usage(usage) = &deltas[usage_at] else {
+            bail!("expected a usage delta");
+        };
+        assert_eq!(usage.input_tokens, 140);
+        assert_eq!(usage.output_tokens, 20);
         Ok(())
     }
 

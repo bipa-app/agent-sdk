@@ -322,7 +322,11 @@ pub(super) enum StreamError {
     Fatal(String),
     /// The run's cancellation token fired while the stream was still
     /// being consumed. Terminal — not retried.
-    Cancelled,
+    ///
+    /// Carries the usage the cancelled attempt had already accumulated: the
+    /// provider billed whatever it streamed before the cancel arrived, and a
+    /// cancelled run still reports its cumulative usage.
+    Cancelled(Usage),
 }
 
 impl StreamError {
@@ -355,7 +359,10 @@ impl StreamError {
 /// generic [`InternalTurnResult::Error`].
 pub(super) enum LlmOutcome {
     Response(crate::llm::ChatResponse),
-    Cancelled,
+    /// The call was cancelled, carrying the usage the provider had already
+    /// billed for the streamed prefix (zero on the non-streaming path, which
+    /// cancels before any usage is reported).
+    Cancelled(Usage),
     Error(AgentError),
 }
 

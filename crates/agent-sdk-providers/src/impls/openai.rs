@@ -1198,16 +1198,17 @@ fn step_completion_stream(
             SseProcessResult::Malformed(message) => {
                 return SseLineOutcome {
                     immediate,
-                    terminal: Some(vec![StreamDelta::Error {
+                    terminal: Some(terminal_error_deltas(
+                        usage.take(),
                         message,
-                        kind: StreamErrorKind::ServerError,
-                    }]),
+                        StreamErrorKind::ServerError,
+                    )),
                 };
             }
             SseProcessResult::Error { message, kind } => {
                 return SseLineOutcome {
                     immediate,
-                    terminal: Some(vec![StreamDelta::Error { message, kind }]),
+                    terminal: Some(terminal_error_deltas(usage.take(), message, kind)),
                 };
             }
             SseProcessResult::Sentinel => {
@@ -1299,6 +1300,25 @@ enum SseProcessResult {
     Sentinel,
 }
 
+/// Terminal deltas for a stream that ends in an error, emitting any usage the
+/// stream reported first.
+///
+/// The provider bills the tokens it generated even when the turn then fails, so
+/// the usage must reach the consumer's accumulator — which only ever sees
+/// yielded deltas — ahead of the error that stops the stream.
+fn terminal_error_deltas(
+    usage: Option<Usage>,
+    message: String,
+    kind: StreamErrorKind,
+) -> Vec<StreamDelta> {
+    let mut deltas = Vec::new();
+    if let Some(usage) = usage {
+        deltas.push(StreamDelta::Usage(usage));
+    }
+    deltas.push(StreamDelta::Error { message, kind });
+    deltas
+}
+
 /// Classify an in-band Chat Completions error object.
 ///
 /// The stream already answered 200, so the status line says nothing about this
@@ -1338,21 +1358,11 @@ fn process_sse_data(data: &str) -> Vec<SseProcessResult> {
         }
     };
 
-    // An in-band error ends the stream: the accompanying choice carries no
-    // content (`finish_reason: "error"`), so it is reported instead of being
-    // folded in as if the turn had produced output.
-    if let Some(error) = chunk.error {
-        let message = error
-            .message
-            .unwrap_or_else(|| "OpenAI-compatible stream reported an error".to_owned());
-        let kind = completion_error_kind(error.code.as_ref(), &message);
-        log::warn!("OpenAI in-band stream error kind={kind:?} message={message}");
-        return vec![SseProcessResult::Error { message, kind }];
-    }
-
     let mut results = Vec::new();
 
-    // Extract usage if present
+    // Usage is extracted before anything that can end the stream: a terminal
+    // chunk may carry the billed usage *and* the failure together, and those
+    // tokens are billed whether or not the turn survives.
     if let Some(u) = chunk.usage {
         results.push(SseProcessResult::Usage(Usage {
             input_tokens: u.prompt_tokens,
@@ -1366,6 +1376,19 @@ fn process_sse_data(data: &str) -> Vec<SseProcessResult> {
                 .as_ref()
                 .map_or(0, |details| details.cache_write_tokens),
         }));
+    }
+
+    // An in-band error ends the stream: the accompanying choice carries no
+    // content (`finish_reason: "error"`), so it is reported instead of being
+    // folded in as if the turn had produced output.
+    if let Some(error) = chunk.error {
+        let message = error
+            .message
+            .unwrap_or_else(|| "OpenAI-compatible stream reported an error".to_owned());
+        let kind = completion_error_kind(error.code.as_ref(), &message);
+        log::warn!("OpenAI in-band stream error kind={kind:?} message={message}");
+        results.push(SseProcessResult::Error { message, kind });
+        return results;
     }
 
     // Process choices
@@ -3504,6 +3527,63 @@ mod tests {
             "an in-band 429 must be retriable and keep its parsed delay"
         );
         assert!(kind.is_recoverable());
+        Ok(())
+    }
+
+    #[test]
+    fn test_process_sse_data_keeps_usage_carried_by_an_error_chunk() -> anyhow::Result<()> {
+        // OpenRouter's terminal chunk reports the billed usage *and* the failure
+        // together. The tokens were billed, so they must survive the error —
+        // and they must be emitted before it, since the error ends the stream.
+        let results = process_sse_data(
+            r#"{"choices":[{"delta":{},"finish_reason":"error","index":0}],"usage":{"prompt_tokens":140,"completion_tokens":20},"error":{"code":429,"message":"Rate limited. Please try again in 12s."}}"#,
+        );
+
+        let usage_at = results
+            .iter()
+            .position(|result| matches!(result, SseProcessResult::Usage(_)))
+            .context("the error chunk's usage must not be dropped")?;
+        let error_at = results
+            .iter()
+            .position(|result| matches!(result, SseProcessResult::Error { .. }))
+            .context("expected an in-band error result")?;
+        assert!(
+            usage_at < error_at,
+            "usage must be emitted before the terminal error"
+        );
+
+        let usage = results
+            .iter()
+            .find_map(|result| match result {
+                SseProcessResult::Usage(usage) => Some(usage),
+                _ => None,
+            })
+            .context("expected a usage result")?;
+        assert_eq!(usage.input_tokens, 140);
+        assert_eq!(usage.output_tokens, 20);
+
+        // And the terminal deltas the stream hands over preserve that order.
+        let mut tool_calls = HashMap::new();
+        let mut stream_usage = None;
+        let mut stop_reason = None;
+        let outcome = step_completion_stream(
+            r#"{"choices":[{"delta":{},"finish_reason":"error","index":0}],"usage":{"prompt_tokens":140,"completion_tokens":20},"error":{"code":429,"message":"Rate limited. Please try again in 12s."}}"#,
+            &mut tool_calls,
+            &mut stream_usage,
+            &mut stop_reason,
+        );
+        let terminal = outcome.terminal.context("the error must be terminal")?;
+        assert!(
+            matches!(terminal.first(), Some(StreamDelta::Usage(usage)) if usage.input_tokens == 140),
+            "the usage delta must lead the terminal sequence, got {terminal:?}"
+        );
+        assert!(matches!(
+            terminal.last(),
+            Some(StreamDelta::Error {
+                kind: StreamErrorKind::RateLimited(Some(_)),
+                ..
+            })
+        ));
         Ok(())
     }
 

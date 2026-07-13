@@ -781,6 +781,25 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                 error.status,
                                                 error.message,
                                             );
+                                            // A quota rejection applies to the request, not to
+                                            // this socket: reconnecting or falling back to HTTP
+                                            // would spend another request inside the window the
+                                            // service asked us to sit out. Surface it with its
+                                            // delay instead. The connection-limit sentinel shares
+                                            // the status but is a transport condition, so it keeps
+                                            // its immediate fallback.
+                                            if is_websocket_quota_rejection(&error) {
+                                                let kind = websocket_error_kind(
+                                                    error.status,
+                                                    &error.message,
+                                                );
+                                                end_websocket_turn(&mut websocket_session);
+                                                yield Ok(StreamDelta::Error {
+                                                    message: error.message,
+                                                    kind,
+                                                });
+                                                return;
+                                            }
                                             if error.status == StatusCode::UNAUTHORIZED
                                                 || error.status == StatusCode::UPGRADE_REQUIRED
                                                 || error.status.is_client_error()
@@ -878,6 +897,21 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                     error.status,
                                                     error.message,
                                                 );
+                                                // Same split as the text warmup frame: a quota
+                                                // rejection is surfaced with its delay; the
+                                                // connection-limit sentinel falls back at once.
+                                                if is_websocket_quota_rejection(&error) {
+                                                    let kind = websocket_error_kind(
+                                                        error.status,
+                                                        &error.message,
+                                                    );
+                                                    end_websocket_turn(&mut websocket_session);
+                                                    yield Ok(StreamDelta::Error {
+                                                        message: error.message,
+                                                        kind,
+                                                    });
+                                                    return;
+                                                }
                                                 if error.status == StatusCode::UNAUTHORIZED
                                                     || error.status == StatusCode::UPGRADE_REQUIRED
                                                     || error.status.is_client_error()
@@ -1284,11 +1318,14 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                 // The turn ends here, so the session must stop
                                                 // counting as in-flight or it can never be evicted.
                                                 websocket_session.in_flight = false;
-                                                let (message, kind) =
+                                                let failure =
                                                     codex_response_failed_error(event.response);
+                                                if let Some(usage) = failure.usage {
+                                                    yield Ok(StreamDelta::Usage(usage));
+                                                }
                                                 yield Ok(StreamDelta::Error {
-                                                    message,
-                                                    kind,
+                                                    message: failure.message,
+                                                    kind: failure.kind,
                                                 });
                                                 return;
                                             }
@@ -1522,11 +1559,14 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                     // counting as in-flight or it can never be
                                                     // evicted.
                                                     websocket_session.in_flight = false;
-                                                    let (message, kind) =
+                                                    let failure =
                                                         codex_response_failed_error(event.response);
+                                                    if let Some(usage) = failure.usage {
+                                                        yield Ok(StreamDelta::Usage(usage));
+                                                    }
                                                     yield Ok(StreamDelta::Error {
-                                                        message,
-                                                        kind,
+                                                        message: failure.message,
+                                                        kind: failure.kind,
                                                     });
                                                     return;
                                                 }
@@ -1810,10 +1850,13 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                 };
                             }
                             "response.failed" => {
-                                let (message, kind) = codex_response_failed_error(event.response);
+                                let failure = codex_response_failed_error(event.response);
+                                if let Some(usage) = failure.usage {
+                                    yield Ok(StreamDelta::Usage(usage));
+                                }
                                 yield Ok(StreamDelta::Error {
-                                    message,
-                                    kind,
+                                    message: failure.message,
+                                    kind: failure.kind,
                                 });
                                 return;
                             }
@@ -2702,7 +2745,15 @@ fn is_websocket_quota_rejection(error: &WrappedWebsocketError) -> bool {
 /// is the only classification signal, and the delay — when the service states
 /// one — is embedded in the message. Every other failure stays a (retriable)
 /// server error, as before.
-fn codex_response_failed_error(response: Option<ApiStreamResponse>) -> (String, StreamErrorKind) {
+fn codex_response_failed_error(response: Option<ApiStreamResponse>) -> CodexResponseFailure {
+    // A failed response still reports the tokens it burned. They are returned
+    // alongside the error so the caller can yield them *before* the terminal
+    // error delta: the consumer's accumulator only sees deltas it was handed,
+    // and those tokens are billed whether or not the turn survived.
+    let usage = response
+        .as_ref()
+        .and_then(|resp| resp.usage.as_ref())
+        .map(usage_from_api_usage);
     let (code, message) = response
         .and_then(|resp| resp.error)
         .map_or((None, None), |error| (error.code, error.message));
@@ -2715,7 +2766,19 @@ fn codex_response_failed_error(response: Option<ApiStreamResponse>) -> (String, 
     } else {
         StreamErrorKind::ServerError
     };
-    (message, kind)
+    CodexResponseFailure {
+        message,
+        kind,
+        usage,
+    }
+}
+
+/// A `response.failed` event decoded into what the stream must emit for it.
+struct CodexResponseFailure {
+    message: String,
+    kind: StreamErrorKind,
+    /// Usage the failed response reported, if any — emitted before the error.
+    usage: Option<Usage>,
 }
 
 /// Classify a wrapped websocket error event by the status it reports.
@@ -3255,18 +3318,49 @@ mod tests {
     }
 
     #[test]
+    fn warmup_quota_rejection_is_surfaced_while_connection_limit_still_falls_back()
+    -> anyhow::Result<()> {
+        // The warmup (`generate=false`) branches route on the same discriminator
+        // as the in-flight ones: a quota rejection must be surfaced with its
+        // delay rather than immediately re-sent inside the wait window, while
+        // the connection-limit sentinel — reported with the same synthetic 429 —
+        // must keep falling back to HTTP at once.
+        let quota = parse_wrapped_websocket_error_event(
+            r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded","message":"Rate limit reached. Please try again in 45s."}}"#,
+        )
+        .context("expected a wrapped error")?;
+        assert!(is_websocket_quota_rejection(&quota));
+        let kind = websocket_error_kind(quota.status, &quota.message);
+        assert_eq!(
+            kind,
+            StreamErrorKind::RateLimited(Some(std::time::Duration::from_secs(45)))
+        );
+        assert!(kind.is_recoverable());
+
+        let connection_limit = parse_wrapped_websocket_error_event(&format!(
+            r#"{{"type":"error","status":429,"error":{{"code":"{OPENAI_CODEX_WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE}","message":"limit"}}}}"#,
+        ))
+        .context("expected a wrapped error")?;
+        assert!(
+            !is_websocket_quota_rejection(&connection_limit),
+            "the connection-limit sentinel must keep its immediate fallback"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn in_band_response_failed_rate_limit_keeps_its_hint() -> anyhow::Result<()> {
         let event: ApiStreamEvent = serde_json::from_str(
             r#"{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"Rate limit reached. Please try again in 20s."}}}"#,
         )?;
-        let (message, kind) = codex_response_failed_error(event.response);
+        let failure = codex_response_failed_error(event.response);
 
-        assert!(message.contains("try again in 20s"));
+        assert!(failure.message.contains("try again in 20s"));
         assert_eq!(
-            kind,
+            failure.kind,
             StreamErrorKind::RateLimited(Some(std::time::Duration::from_secs(20)))
         );
-        assert!(kind.is_recoverable());
+        assert!(failure.kind.is_recoverable());
         Ok(())
     }
 
@@ -3275,10 +3369,29 @@ mod tests {
         let event: ApiStreamEvent = serde_json::from_str(
             r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"upstream blew up"}}}"#,
         )?;
-        let (message, kind) = codex_response_failed_error(event.response);
+        let failure = codex_response_failed_error(event.response);
 
-        assert_eq!(message, "upstream blew up");
-        assert_eq!(kind, StreamErrorKind::ServerError);
+        assert_eq!(failure.message, "upstream blew up");
+        assert_eq!(failure.kind, StreamErrorKind::ServerError);
+        Ok(())
+    }
+
+    #[test]
+    fn in_band_response_failed_keeps_the_usage_it_reported() -> anyhow::Result<()> {
+        // The failed response still burned tokens; they must reach the stream so
+        // the caller bills them, not vanish with the error.
+        let event: ApiStreamEvent = serde_json::from_str(
+            r#"{"type":"response.failed","response":{"usage":{"input_tokens":120,"output_tokens":34},"error":{"code":"rate_limit_exceeded","message":"Please try again in 20s."}}}"#,
+        )?;
+        let failure = codex_response_failed_error(event.response);
+
+        let usage = failure.usage.context("failed response must report usage")?;
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 34);
+        assert_eq!(
+            failure.kind,
+            StreamErrorKind::RateLimited(Some(std::time::Duration::from_secs(20)))
+        );
         Ok(())
     }
 

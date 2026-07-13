@@ -281,7 +281,7 @@ where
     loop {
         let outcome = match chat_or_cancel(provider, &request, event_ctx).await {
             ProviderCall::Outcome(outcome) => outcome,
-            ProviderCall::Cancelled => return (LlmOutcome::Cancelled, attempt),
+            ProviderCall::Cancelled => return (LlmOutcome::Cancelled(ZERO_USAGE), attempt),
             ProviderCall::Error(error) => return (LlmOutcome::Error(error), attempt),
         };
 
@@ -345,7 +345,7 @@ where
         .await
         {
             RetryStep::Retry => {}
-            RetryStep::Cancelled => return (LlmOutcome::Cancelled, attempt),
+            RetryStep::Cancelled => return (LlmOutcome::Cancelled(ZERO_USAGE), attempt),
             RetryStep::GiveUp(outcome) => return (outcome, attempt),
         }
     }
@@ -553,7 +553,7 @@ where
                     .await
                     .is_break()
                 {
-                    return (LlmOutcome::Cancelled, attempt);
+                    return (LlmOutcome::Cancelled(abandoned_usage), attempt);
                 }
                 // Fresh ids for the retry attempt so its deltas land under a
                 // distinct message_id. Consumers concatenating TextDelta by
@@ -569,11 +569,14 @@ where
                     attempt,
                 );
             }
-            Err(StreamError::Cancelled) => {
+            Err(StreamError::Cancelled(usage)) => {
                 // A cancel raced the stream — terminal, not retried.
                 // No `llm.error` event: the cancellation surfaces as the
-                // run-level `Cancelled` terminal event instead.
-                return (LlmOutcome::Cancelled, attempt);
+                // run-level `Cancelled` terminal event instead. The tokens the
+                // cancelled attempt (and any attempt abandoned before it) had
+                // already streamed were billed, so they travel with it.
+                add_usage(&mut abandoned_usage, &usage);
+                return (LlmOutcome::Cancelled(abandoned_usage), attempt);
             }
         }
     }
@@ -623,7 +626,7 @@ where
                 if let Some(observer) = span_observer.as_mut() {
                     observer.record_dropped("cancelled", delta_count, "cancelled");
                 }
-                return Err(StreamError::Cancelled);
+                return Err(StreamError::Cancelled(accumulated_usage(&accumulator)));
             }
             next = tokio::time::timeout(LLM_STREAM_INACTIVITY_TIMEOUT, stream.next()) => match next {
                 Ok(Some(result)) => result,
