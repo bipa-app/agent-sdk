@@ -31,16 +31,24 @@ struct ModelsDevTier {
     cache_read: Option<f64>,
     #[serde(default)]
     cache_write: Option<f64>,
-    tier: ModelsDevTierBound,
+    #[serde(default)]
+    tier: Option<ModelsDevTierBound>,
 }
 
+/// Every field is optional so that a feed row whose shape has drifted cannot
+/// abort the parse of the whole document: one required field missing anywhere
+/// in a 3MB body would fail `serde_json::from_str` outright, leaving the
+/// catalog empty and every feed-priced model unpriced on the next refresh.
+/// A bound that does not arrive intact is simply un-interpretable, and the row
+/// carrying it drops its pricing (see [`tiers_from_modelsdev_cost`]).
 #[derive(serde::Deserialize)]
 struct ModelsDevTierBound {
     /// The only bound the feed publishes today is `context`; a row bounded by
     /// anything else cannot be priced from data this parser understands.
-    #[serde(rename = "type")]
-    bound_type: String,
-    size: u32,
+    #[serde(rename = "type", default)]
+    bound_type: Option<String>,
+    #[serde(default)]
+    size: Option<u32>,
 }
 
 #[derive(serde::Deserialize)]
@@ -125,13 +133,14 @@ fn tiers_from_modelsdev_cost(cost: &ModelsDevCost) -> Option<Vec<PricingTier>> {
     cost.tiers
         .iter()
         .map(|tier| {
-            if tier.tier.bound_type != "context" {
+            let bound = tier.tier.as_ref()?;
+            if bound.bound_type.as_deref() != Some("context") {
                 return None;
             }
             let pricing =
                 pricing_from_rates(tier.input, tier.output, tier.cache_read, tier.cache_write)?;
             Some(PricingTier {
-                min_context_tokens: tier.tier.size,
+                min_context_tokens: bound.size?,
                 pricing,
             })
         })
@@ -450,6 +459,63 @@ mod tests {
         let unknown = find(&entries, "openai", "unknown-tier-model")?;
         assert!(unknown.pricing.is_none());
         assert!(unknown.pricing_tiers.is_empty());
+        Ok(())
+    }
+
+    /// A drifted tier row must cost that row its pricing — not the whole feed.
+    /// A missing field anywhere in a 3MB body would otherwise fail the parse
+    /// outright, empty the catalog, and leave every feed-priced model unpriced.
+    #[test]
+    fn parse_modelsdev_survives_a_tier_with_a_missing_bound() -> Result<()> {
+        const DRIFTED_FIXTURE: &str = r#"{
+          "openai": {
+            "id": "openai",
+            "models": {
+              "healthy-model": {
+                "id": "healthy-model",
+                "cost": { "input": 1, "output": 2 }
+              },
+              "drifted-tier-model": {
+                "id": "drifted-tier-model",
+                "cost": {
+                  "input": 1,
+                  "output": 2,
+                  "tiers": [
+                    { "input": 9, "output": 9, "tier": { "type": "context" } }
+                  ]
+                }
+              },
+              "bound-less-tier-model": {
+                "id": "bound-less-tier-model",
+                "cost": {
+                  "input": 1,
+                  "output": 2,
+                  "tiers": [{ "input": 9, "output": 9 }]
+                }
+              }
+            }
+          }
+        }"#;
+
+        let entries = parse_modelsdev(DRIFTED_FIXTURE)?;
+        assert_eq!(
+            entries.len(),
+            3,
+            "the parse must not abort on a drifted row"
+        );
+
+        // The healthy row is priced as usual.
+        let healthy = find(&entries, "openai", "healthy-model")?;
+        assert!(healthy.pricing.is_some());
+
+        // A tier with no `size`, and a tier with no bound at all, are both
+        // un-interpretable: their rows drop their pricing rather than keeping
+        // base rates that stop applying above an unknown threshold.
+        for model in ["drifted-tier-model", "bound-less-tier-model"] {
+            let drifted = find(&entries, "openai", model)?;
+            assert!(drifted.pricing.is_none(), "{model} must drop its pricing");
+            assert!(drifted.pricing_tiers.is_empty());
+        }
         Ok(())
     }
 

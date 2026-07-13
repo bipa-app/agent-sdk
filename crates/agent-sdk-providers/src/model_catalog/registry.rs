@@ -175,7 +175,7 @@ impl ModelRegistry {
     /// that tier's rates, not the base rates.
     #[must_use]
     pub fn estimate_cost_usd(&self, provider: &str, model: &str, usage: &Usage) -> Option<f64> {
-        estimate_resolved(&self.resolve(provider, model), usage)
+        estimate_resolved(&self.resolve(provider, model), usage, TierMode::Apply)
     }
 
     /// Estimate request cost in USD from the *dynamic* layers only (override →
@@ -183,6 +183,10 @@ impl ModelRegistry {
     ///
     /// Declines partial pricing, and selects the tier the call falls in,
     /// exactly as [`estimate_cost_usd`](Self::estimate_cost_usd) does.
+    ///
+    /// `usage` must describe a SINGLE provider call: tier selection reads its
+    /// input-token count as the call's context size. To price a summed usage,
+    /// use [`estimate_dynamic_base_cost_usd`](Self::estimate_dynamic_base_cost_usd).
     #[must_use]
     pub fn estimate_dynamic_cost_usd(
         &self,
@@ -190,18 +194,52 @@ impl ModelRegistry {
         model: &str,
         usage: &Usage,
     ) -> Option<f64> {
-        estimate_resolved(&self.resolve_dynamic(provider, model)?, usage)
+        estimate_resolved(
+            &self.resolve_dynamic(provider, model)?,
+            usage,
+            TierMode::Apply,
+        )
+    }
+
+    /// Estimate cost from the *dynamic* layers at the BASE band, ignoring any
+    /// long-context tiers.
+    ///
+    /// For a summed usage — a thread's cumulative tokens, not one call — the
+    /// input-token count is not a context size: ten 50K-token calls sum to 500K
+    /// without any single call ever reaching a 272K threshold. Selecting a tier
+    /// from that sum would reprice the whole history at long-context rates a
+    /// call never paid, so aggregate repricing stays on the base band.
+    #[must_use]
+    pub fn estimate_dynamic_base_cost_usd(
+        &self,
+        provider: &str,
+        model: &str,
+        usage: &Usage,
+    ) -> Option<f64> {
+        estimate_resolved(
+            &self.resolve_dynamic(provider, model)?,
+            usage,
+            TierMode::Base,
+        )
     }
 }
 
-/// Price `usage` from a resolved model: pick the band the call's context falls
-/// in, then decline if that band cannot price every component the call bills.
-fn estimate_resolved(resolved: &ResolvedModel, usage: &Usage) -> Option<f64> {
-    let pricing = applicable_pricing(
-        resolved.pricing?,
-        &resolved.pricing_tiers,
-        usage.input_tokens,
-    );
+/// Whether a price lookup may select a long-context tier — only valid when the
+/// usage describes one provider call.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TierMode {
+    Apply,
+    Base,
+}
+
+/// Price `usage` from a resolved model: pick the band that applies, then
+/// decline if that band cannot price every component the usage bills.
+fn estimate_resolved(resolved: &ResolvedModel, usage: &Usage, tiers: TierMode) -> Option<f64> {
+    let base = resolved.pricing?;
+    let pricing = match tiers {
+        TierMode::Apply => applicable_pricing(base, &resolved.pricing_tiers, usage.input_tokens),
+        TierMode::Base => base,
+    };
     if !prices_every_billed_component(&pricing, usage) {
         return None;
     }
@@ -534,6 +572,99 @@ mod tests {
             "unexpected cost: {long_cost}"
         );
         Ok(())
+    }
+
+    /// The threshold is exclusive: a call *at* the tier size still pays base
+    /// rates, and only the token past it moves the call into the tier.
+    #[test]
+    fn tier_selection_is_exclusive_at_the_threshold() -> Result<()> {
+        let registry = tiered_registry();
+
+        let at_threshold = Usage {
+            input_tokens: 272_000,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        let base_cost = registry
+            .estimate_cost_usd("openai", "gpt-5.4", &at_threshold)
+            .context("cost estimate missing")?;
+        // 272_000 / 1e6 * 2.5 = 0.68.
+        assert!(
+            (base_cost - 0.68).abs() < 1e-9,
+            "unexpected cost: {base_cost}"
+        );
+
+        let past_threshold = Usage {
+            input_tokens: 272_001,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        let tier_cost = registry
+            .estimate_cost_usd("openai", "gpt-5.4", &past_threshold)
+            .context("cost estimate missing")?;
+        // 272_001 / 1e6 * 5.0 = 1.360005.
+        assert!(
+            (tier_cost - 1.360_005).abs() < 1e-9,
+            "unexpected cost: {tier_cost}"
+        );
+        Ok(())
+    }
+
+    /// A summed usage is not a context size. Repricing a thread's aggregate
+    /// must stay on base rates, or ten short calls that each paid base rates
+    /// would be re-billed at the long-context tier they never reached — and a
+    /// healthy thread would be killed by a phantom `BudgetExceeded`.
+    #[test]
+    fn aggregate_repricing_never_selects_a_tier() -> Result<()> {
+        let registry = tiered_registry();
+
+        // Three 100K-token calls: 300K summed, but no call ever crossed 272K.
+        let aggregate = Usage {
+            input_tokens: 300_000,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+
+        let base = registry
+            .estimate_dynamic_base_cost_usd("openai", "gpt-5.4", &aggregate)
+            .context("cost estimate missing")?;
+        // Base: 0.3 * 2.5 = 0.75, not the tier's 0.3 * 5 = 1.50.
+        assert!(
+            (base - 0.75).abs() < 1e-9,
+            "unexpected aggregate cost: {base}"
+        );
+
+        let per_call = registry
+            .estimate_dynamic_cost_usd("openai", "gpt-5.4", &aggregate)
+            .context("cost estimate missing")?;
+        assert!(
+            (per_call - 1.5).abs() < 1e-9,
+            "a single 300K call does pay the tier rate: {per_call}"
+        );
+        Ok(())
+    }
+
+    /// models.dev's gpt-5.4: base 2.5/15, tier above 272K context 5/22.5.
+    fn tiered_registry() -> ModelRegistry {
+        ModelRegistry::new().with_override(
+            "openai",
+            "gpt-5.4",
+            CatalogEntry {
+                provider: "openai".to_owned(),
+                model_id: "gpt-5.4".to_owned(),
+                context_window: None,
+                max_output_tokens: None,
+                pricing: Some(Pricing::flat(2.5, 15.0)),
+                pricing_tiers: vec![PricingTier {
+                    min_context_tokens: 272_000,
+                    pricing: Pricing::flat(5.0, 22.5),
+                }],
+                supports_thinking: None,
+            },
+        )
     }
 
     #[test]

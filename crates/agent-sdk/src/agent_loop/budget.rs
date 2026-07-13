@@ -23,7 +23,23 @@ use crate::types::{BudgetLimitKind, TokenUsage, UsageLimits};
 use agent_sdk_foundation::audit::AuditProvenance;
 use agent_sdk_foundation::llm::Usage;
 
-/// Estimate the USD cost of `usage` for the run's provider/model.
+/// What a [`TokenUsage`] being priced describes.
+///
+/// A source with context-dependent rates reads a single call's input-token
+/// count as that call's context size. A thread's summed usage is not a context
+/// size — ten 50K-token calls sum to 500K without any one call approaching a
+/// 272K long-context threshold — so the two must be priced differently, or
+/// repricing a healthy thread's history invents a long-context bill it never
+/// paid and trips its budget.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum UsageScope {
+    /// One provider call, priced at the rates that call actually paid.
+    Call,
+    /// A summed usage (a thread's cumulative tokens), priced at base rates.
+    Aggregate,
+}
+
+/// Estimate the USD cost of ONE provider call's `usage`.
 ///
 /// The lookup is **source-major**, not key-major: the configured
 /// [`CostEstimator`] is offered *every* key the call could be filed under
@@ -43,6 +59,28 @@ pub(super) fn estimate_cost_usd(
     provenance: &AuditProvenance,
     usage: &TokenUsage,
 ) -> Option<f64> {
+    estimate_scoped(pricing, provenance, usage, UsageScope::Call)
+}
+
+/// Estimate the USD cost of a SUMMED `usage` — a thread's cumulative tokens.
+///
+/// See [`UsageScope`]: a sum is not a context size, so this never selects a
+/// long-context tier from it.
+#[must_use]
+pub(super) fn estimate_aggregate_cost_usd(
+    pricing: Option<&dyn CostEstimator>,
+    provenance: &AuditProvenance,
+    usage: &TokenUsage,
+) -> Option<f64> {
+    estimate_scoped(pricing, provenance, usage, UsageScope::Aggregate)
+}
+
+fn estimate_scoped(
+    pricing: Option<&dyn CostEstimator>,
+    provenance: &AuditProvenance,
+    usage: &TokenUsage,
+    scope: UsageScope,
+) -> Option<f64> {
     let usage = Usage {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
@@ -53,12 +91,19 @@ pub(super) fn estimate_cost_usd(
     let model = provenance.model.as_str();
 
     if let Some(estimator) = pricing
-        && let Some(cost) = catalog_candidates(provider, model)
-            .find_map(|(provider, model)| estimator.estimate_cost_usd(provider, model, &usage))
+        && let Some(cost) =
+            catalog_candidates(provider, model).find_map(|(provider, model)| match scope {
+                UsageScope::Call => estimator.estimate_cost_usd(provider, model, &usage),
+                UsageScope::Aggregate => {
+                    estimator.estimate_aggregate_cost_usd(provider, model, &usage)
+                }
+            })
     {
         return Some(cost);
     }
 
+    // The compiled-in table prices every model at one flat rate, so the scope
+    // does not change what it answers.
     static_candidates(provider, model).find_map(|(provider, model)| {
         crate::model_capabilities::get_model_capabilities(provider, model)?
             .estimate_cost_usd(&usage)
@@ -120,6 +165,14 @@ fn feed_service_keys(provider: &str, model: &str) -> impl Iterator<Item = &'stat
 /// no estimate — so it is only consulted once the route key has missed. The
 /// `google` remap mirrors `map_modelsdev_provider`, so the halves match the
 /// keys that parser emits for a native section.
+///
+/// The limit of this inference: a slash in a model id is read as a route, but
+/// only the provider knows whether it is one. A custom `base_url` pointing at
+/// another OpenAI-compatible host that happens to use slash-qualified ids
+/// (Groq's `openai/gpt-oss-120b`, say) resolves to the `openrouter` key and is
+/// then priced at `OpenRouter`'s rate for that model rather than the host's. The
+/// provenance carries nothing that could distinguish the two; only a pricing
+/// key supplied by the provider can.
 fn feed_slug_candidates(model: &str) -> impl Iterator<Item = (&str, &str)> {
     let route_key = model.contains('/').then_some(("openrouter", model));
     route_key.into_iter().chain(vendor_slug_key(model))
@@ -217,7 +270,8 @@ pub(super) fn accumulate_cost(
     delta: &TokenUsage,
 ) {
     if state.accumulated_cost_usd.is_none() && !usage_is_zero(pre_delta_total) {
-        state.accumulated_cost_usd = estimate_cost_usd(pricing, provenance, pre_delta_total);
+        state.accumulated_cost_usd =
+            estimate_aggregate_cost_usd(pricing, provenance, pre_delta_total);
     }
     if let Some(delta_cost) = estimate_cost_usd(pricing, provenance, delta) {
         state.accumulated_cost_usd = Some(state.accumulated_cost_usd.unwrap_or(0.0) + delta_cost);
@@ -228,6 +282,10 @@ pub(super) fn accumulate_cost(
 /// tracked, falling back to repricing the aggregate usage at the current
 /// provenance (legacy snapshots / states that never saw a priced call —
 /// best-effort, may misprice history across model rotations).
+///
+/// The fallback prices a SUM, not a call, so it stays on base rates: the
+/// accumulated total is the only figure that reflects the tier each individual
+/// call actually paid.
 #[must_use]
 pub(super) fn run_cost_usd(
     accumulated: Option<f64>,
@@ -235,7 +293,7 @@ pub(super) fn run_cost_usd(
     provenance: &AuditProvenance,
     usage: &TokenUsage,
 ) -> Option<f64> {
-    accumulated.or_else(|| estimate_cost_usd(pricing, provenance, usage))
+    accumulated.or_else(|| estimate_aggregate_cost_usd(pricing, provenance, usage))
 }
 
 /// Evaluate the run-level usage budget against the cumulative `usage`.
@@ -730,6 +788,7 @@ mod tests {
 #[cfg(all(test, feature = "model-discovery"))]
 mod catalog_tests {
     use super::*;
+    use crate::types::{AgentState, ThreadId};
     use agent_sdk_providers::model_catalog::{parse_modelsdev, parse_openrouter};
     use agent_sdk_providers::{CatalogEntry, ModelCatalogSource, ModelRegistry};
     use anyhow::{Context, Result};
@@ -1068,14 +1127,105 @@ mod catalog_tests {
             .context("the tiered feed row must price this call")?;
         assert!((cost - 4.25).abs() < 1e-9, "unexpected cost: {cost}");
 
-        // A $3 cap sits between the two: the base rate would not trip it.
+        // The loop folds each call through `accumulate_cost`, which prices it
+        // as a call — so the accumulator carries the tier rate the call paid.
+        let mut state = AgentState::new(ThreadId::new());
+        accumulate_cost(
+            &mut state,
+            Some(&registry),
+            &provenance,
+            &TokenUsage::default(),
+            &usage,
+        );
+        let accumulated = state
+            .accumulated_cost_usd
+            .context("the call must accumulate cost")?;
+        assert!(
+            (accumulated - 4.25).abs() < 1e-9,
+            "unexpected accumulated cost: {accumulated}"
+        );
+
+        // A $3 cap sits between the tier rate ($4.25) and the base rate
+        // ($2.50): only pricing the call at its tier trips it.
         let limits = UsageLimits {
             max_cost_usd: Some(3.0),
             ..Default::default()
         };
-        let (limit, _) = status(Some(&limits), Some(&registry), &provenance, &usage, None)
-            .context("the tier rate must trip the cost limit")?;
+        let (limit, _) = status(
+            Some(&limits),
+            Some(&registry),
+            &provenance,
+            &usage,
+            state.accumulated_cost_usd,
+        )
+        .context("the tier rate must trip the cost limit")?;
         assert_eq!(limit, BudgetLimitKind::CostUsd);
+        Ok(())
+    }
+
+    /// Repricing a thread's SUMMED usage (the legacy-snapshot seed and the
+    /// `run_cost_usd` fallback) must not read the sum as a context size: three
+    /// 100K calls sum past a 272K threshold no single call ever reached, and
+    /// tier-pricing that sum would invent a long-context bill the thread never
+    /// paid — enough to trip a budget it is nowhere near.
+    #[tokio::test]
+    async fn aggregate_repricing_stays_on_the_base_band() -> Result<()> {
+        const MODELSDEV_TIERED_FIXTURE: &str = r#"{
+          "openai": {
+            "id": "openai",
+            "models": {
+              "gpt-5.4": {
+                "id": "gpt-5.4",
+                "cost": {
+                  "input": 2.5,
+                  "output": 15,
+                  "tiers": [
+                    {
+                      "input": 5,
+                      "output": 22.5,
+                      "tier": { "type": "context", "size": 272000 }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }"#;
+
+        let registry = registry_from_entries(parse_modelsdev(MODELSDEV_TIERED_FIXTURE)?).await?;
+        let provenance = AuditProvenance::new("openai", "gpt-5.4");
+
+        // A thread's cumulative usage: three 100K-input calls, no output.
+        let aggregate = TokenUsage {
+            input_tokens: 300_000,
+            output_tokens: 0,
+            ..Default::default()
+        };
+
+        // Base band: 0.3 * $2.5 = $0.75. The tier would say $1.50.
+        let cost = run_cost_usd(None, Some(&registry), &provenance, &aggregate)
+            .context("the feed prices this model")?;
+        assert!(
+            (cost - 0.75).abs() < 1e-9,
+            "unexpected aggregate cost: {cost}"
+        );
+
+        // A $1 cap sits between the two: repricing at the tier would trip it.
+        let limits = UsageLimits {
+            max_cost_usd: Some(1.0),
+            ..Default::default()
+        };
+        assert!(
+            status(
+                Some(&limits),
+                Some(&registry),
+                &provenance,
+                &aggregate,
+                None
+            )
+            .is_none(),
+            "a healthy thread must not be killed by a phantom long-context bill",
+        );
         Ok(())
     }
 

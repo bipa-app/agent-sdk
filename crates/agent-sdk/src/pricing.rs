@@ -40,7 +40,30 @@ pub trait CostEstimator: Send + Sync {
     /// needs to answer for the keys it actually holds.
     ///
     /// Returning `None` means "no pricing for this pair" — not "free".
+    ///
+    /// `usage` describes ONE provider call, so an implementation may read its
+    /// input-token count as that call's context size (e.g. to select a
+    /// long-context price tier). For a summed usage the loop calls
+    /// [`estimate_aggregate_cost_usd`](Self::estimate_aggregate_cost_usd)
+    /// instead.
     fn estimate_cost_usd(&self, provider: &str, model: &str, usage: &Usage) -> Option<f64>;
+
+    /// Estimate the USD cost of a *summed* `usage` — a thread's cumulative
+    /// tokens rather than one call.
+    ///
+    /// The distinction matters to any source with context-dependent rates: ten
+    /// 50K-token calls sum to 500K input tokens without a single call ever
+    /// reaching a 272K long-context threshold, so a sum must not be read as a
+    /// context size. An implementation with no such rates can ignore the
+    /// distinction, which is what the default does.
+    fn estimate_aggregate_cost_usd(
+        &self,
+        provider: &str,
+        model: &str,
+        usage: &Usage,
+    ) -> Option<f64> {
+        self.estimate_cost_usd(provider, model, usage)
+    }
 }
 
 #[cfg(feature = "model-discovery")]
@@ -52,6 +75,15 @@ impl CostEstimator for agent_sdk_providers::ModelRegistry {
         // price for a key derived later — the caller applies the static table
         // itself, after this source has been offered every key.
         Self::estimate_dynamic_cost_usd(self, provider, model, usage)
+    }
+
+    fn estimate_aggregate_cost_usd(
+        &self,
+        provider: &str,
+        model: &str,
+        usage: &Usage,
+    ) -> Option<f64> {
+        Self::estimate_dynamic_base_cost_usd(self, provider, model, usage)
     }
 }
 
