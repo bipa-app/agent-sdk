@@ -31,8 +31,40 @@ impl PricePoint {
 pub struct Pricing {
     pub input: Option<PricePoint>,
     pub output: Option<PricePoint>,
+    /// Rate for input tokens served from cache (`cache_read`).
     pub cached_input: Option<PricePoint>,
+    /// Rate for input tokens written INTO the cache (`cache_write`).
+    ///
+    /// Providers charge a premium for a cache write — Anthropic's is 1.25× the
+    /// ordinary input rate — so a source that publishes one prices those
+    /// tokens with it. `None` means the source does not publish one, and
+    /// cache-creation tokens then bill at the ordinary input rate, which is a
+    /// bounded under-estimate of what the provider actually charges.
+    pub cache_write: Option<PricePoint>,
     pub notes: Option<&'static str>,
+}
+
+/// The three bands an input-token count splits into for billing, given a
+/// [`Usage`]. Cache-creation and cache-read counts are components of
+/// `input_tokens` for every provider the SDK supports, so the plain band is
+/// what is left after both are taken out.
+struct InputBands {
+    plain: u32,
+    cache_read: u32,
+    cache_write: u32,
+}
+
+impl InputBands {
+    fn split(usage: &Usage) -> Self {
+        let cache_read = usage.cached_input_tokens.min(usage.input_tokens);
+        let remaining = usage.input_tokens.saturating_sub(cache_read);
+        let cache_write = usage.cache_creation_input_tokens.min(remaining);
+        Self {
+            plain: remaining.saturating_sub(cache_write),
+            cache_read,
+            cache_write,
+        }
+    }
 }
 
 impl Pricing {
@@ -42,6 +74,7 @@ impl Pricing {
             input: Some(PricePoint::new(input)),
             output: Some(PricePoint::new(output)),
             cached_input: None,
+            cache_write: None,
             notes: None,
         }
     }
@@ -52,8 +85,16 @@ impl Pricing {
             input: Some(PricePoint::new(input)),
             output: Some(PricePoint::new(output)),
             cached_input: Some(PricePoint::new(cached_input)),
+            cache_write: None,
             notes: None,
         }
+    }
+
+    /// Builder-style: attach the cache-write (`cache_write`) rate.
+    #[must_use]
+    pub const fn with_cache_write(mut self, cache_write: f64) -> Self {
+        self.cache_write = Some(PricePoint::new(cache_write));
+        self
     }
 
     #[must_use]
@@ -62,24 +103,49 @@ impl Pricing {
         self
     }
 
+    /// The rate each input band is billed at, falling back to the ordinary
+    /// input rate for a band whose own rate this source does not publish.
+    ///
+    /// A cache read or a cache write is still an input token: pricing it at
+    /// the plain input rate is the provider-agnostic approximation, and it is
+    /// what the compiled-in table (which carries no cache rates for most
+    /// models) has always done.
+    const fn band_rate(&self, band: Option<PricePoint>) -> Option<PricePoint> {
+        match band {
+            Some(rate) => Some(rate),
+            None => self.input,
+        }
+    }
+
     #[must_use]
     pub fn estimate_cost_usd(&self, usage: &Usage) -> Option<f64> {
-        let cached_input_tokens = usage.cached_input_tokens.min(usage.input_tokens);
-        let uncached_input_tokens = usage.input_tokens.saturating_sub(cached_input_tokens);
+        let bands = InputBands::split(usage);
 
-        let input = match (self.input, self.cached_input) {
-            (Some(input), Some(cached_input)) => Some(
-                input.estimate_cost_usd(uncached_input_tokens)
-                    + cached_input.estimate_cost_usd(cached_input_tokens),
-            ),
-            (Some(input), None) => Some(input.estimate_cost_usd(usage.input_tokens)),
-            (None, Some(cached_input)) => Some(cached_input.estimate_cost_usd(cached_input_tokens)),
-            (None, None) => None,
+        let mut input_cost: Option<f64> = None;
+        let mut add = |rate: Option<PricePoint>, tokens: u32| {
+            if let Some(rate) = rate {
+                *input_cost.get_or_insert(0.0) += rate.estimate_cost_usd(tokens);
+            }
         };
+        add(self.input, bands.plain);
+        add(self.band_rate(self.cached_input), bands.cache_read);
+        add(self.band_rate(self.cache_write), bands.cache_write);
+
+        // Every output token bills at the output rate, including any reasoning
+        // tokens. A few routes publish a distinct (lower) reasoning rate — and
+        // reasoning tokens ride inside the completion count — but `Usage` has no
+        // component that splits them out, so they cannot be billed separately.
+        // Pricing them at the completion rate is therefore a bounded
+        // OVER-estimate for those routes (never an under-estimate), which is the
+        // safe direction for a spend cap; the true over-count is bounded by the
+        // completion-minus-reasoning rate delta. Declining these rows instead
+        // would drop the whole model's budget enforcement — strictly worse.
+        // Billing reasoning exactly needs a reasoning-token component on
+        // `Usage`; see the PR residual.
         let output = self
             .output
             .map(|p| p.estimate_cost_usd(usage.output_tokens));
-        match (input, output) {
+        match (input_cost, output) {
             (Some(input), Some(output)) => Some(input + output),
             (Some(input), None) => Some(input),
             (None, Some(output)) => Some(output),

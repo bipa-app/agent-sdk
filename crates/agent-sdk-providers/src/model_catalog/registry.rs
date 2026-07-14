@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use super::{CatalogEntry, ModelCatalogSource};
+use super::{CatalogEntry, ModelCatalogSource, PricingTier, applicable_pricing};
 use crate::model_capabilities::{Pricing, get_model_capabilities};
 use agent_sdk_foundation::llm::Usage;
 
@@ -26,8 +26,12 @@ pub struct ResolvedModel {
     pub context_window: Option<u32>,
     /// Maximum output tokens per response, if known.
     pub max_output_tokens: Option<u32>,
-    /// Pricing for cost estimation, if known.
+    /// Base pricing for cost estimation, if known. Applies to a call whose
+    /// context stays inside the base band — see [`pricing_tiers`](Self::pricing_tiers).
     pub pricing: Option<Pricing>,
+    /// Long-context price bands, when the source publishes them. Empty for a
+    /// model priced at one flat rate (every static-table row).
+    pub pricing_tiers: Vec<PricingTier>,
     /// Whether the model is a reasoning/thinking model, if known.
     pub supports_thinking: Option<bool>,
     /// Which layer satisfied the lookup.
@@ -107,16 +111,8 @@ impl ModelRegistry {
     /// Resolve a provider/model through the layers: override → feed → static.
     #[must_use]
     pub fn resolve(&self, provider: &str, model: &str) -> ResolvedModel {
-        let key = model_key(provider, model);
-
-        if let Some(entry) = self.overrides.get(&key) {
-            return resolved_from_entry(entry, ResolvedSource::Override);
-        }
-
-        if let Ok(cache) = self.feed_cache.read()
-            && let Some(entry) = cache.get(&key)
-        {
-            return resolved_from_entry(entry, ResolvedSource::Feed);
+        if let Some(resolved) = self.resolve_dynamic(provider, model) {
+            return resolved;
         }
 
         if let Some(caps) = get_model_capabilities(provider, model) {
@@ -124,6 +120,8 @@ impl ModelRegistry {
                 context_window: caps.context_window,
                 max_output_tokens: caps.max_output_tokens,
                 pricing: caps.pricing,
+                // The compiled-in table prices every model at one flat rate.
+                pricing_tiers: Vec::new(),
                 supports_thinking: Some(caps.supports_thinking),
                 source: ResolvedSource::Static,
             };
@@ -133,25 +131,158 @@ impl ModelRegistry {
             context_window: None,
             max_output_tokens: None,
             pricing: None,
+            pricing_tiers: Vec::new(),
             supports_thinking: None,
             source: ResolvedSource::Unknown,
         }
     }
 
-    /// Estimate request cost in USD using the resolved pricing, if any.
+    /// Resolve through the *dynamic* layers only — user override → feed cache
+    /// — reporting `None` when neither carries the pair.
+    ///
+    /// Unlike [`resolve`](Self::resolve) this never falls back to the static
+    /// table, which lets a caller that owns its own static lookup keep the two
+    /// sources apart. That distinction matters when the key a model is filed
+    /// under differs per source: a caller can then ask this catalog about
+    /// *every* key the feeds might use before letting the static table answer
+    /// under the (narrower) set of keys it is built from, instead of having
+    /// the first key that happens to hit the static layer short-circuit the
+    /// search.
+    #[must_use]
+    pub fn resolve_dynamic(&self, provider: &str, model: &str) -> Option<ResolvedModel> {
+        let key = model_key(provider, model);
+
+        if let Some(entry) = self.overrides.get(&key) {
+            return Some(resolved_from_entry(entry, ResolvedSource::Override));
+        }
+
+        let cache = self.feed_cache.read().ok()?;
+        cache
+            .get(&key)
+            .map(|entry| resolved_from_entry(entry, ResolvedSource::Feed))
+    }
+
+    /// Estimate request cost in USD using the layered pricing (override → feed
+    /// → static), if any.
+    ///
+    /// Reports `None` — "this catalog cannot price the call" — rather than a
+    /// partial figure when the resolved pricing is missing a rate for a usage
+    /// component with a nonzero token count (e.g. a feed row that lists an
+    /// input rate but no output rate). A caller can then fall back to another
+    /// pricing source instead of billing those tokens at zero.
+    ///
+    /// A call whose context exceeds a published tier threshold is billed at
+    /// that tier's rates, not the base rates.
     #[must_use]
     pub fn estimate_cost_usd(&self, provider: &str, model: &str, usage: &Usage) -> Option<f64> {
-        self.resolve(provider, model)
-            .pricing
-            .and_then(|pricing| pricing.estimate_cost_usd(usage))
+        estimate_resolved(&self.resolve(provider, model), usage, TierMode::Apply)
+    }
+
+    /// Estimate request cost in USD from the *dynamic* layers only (override →
+    /// feed), never the static table. See [`resolve_dynamic`](Self::resolve_dynamic).
+    ///
+    /// Declines partial pricing, and selects the tier the call falls in,
+    /// exactly as [`estimate_cost_usd`](Self::estimate_cost_usd) does.
+    ///
+    /// `usage` must describe a SINGLE provider call: tier selection reads its
+    /// input-token count as the call's context size. To price a summed usage,
+    /// use [`estimate_dynamic_base_cost_usd`](Self::estimate_dynamic_base_cost_usd).
+    #[must_use]
+    pub fn estimate_dynamic_cost_usd(
+        &self,
+        provider: &str,
+        model: &str,
+        usage: &Usage,
+    ) -> Option<f64> {
+        estimate_resolved(
+            &self.resolve_dynamic(provider, model)?,
+            usage,
+            TierMode::Apply,
+        )
+    }
+
+    /// Estimate cost from the *dynamic* layers at the BASE band, ignoring any
+    /// long-context tiers.
+    ///
+    /// For a summed usage — a thread's cumulative tokens, not one call — the
+    /// input-token count is not a context size: ten 50K-token calls sum to 500K
+    /// without any single call ever reaching a 272K threshold. Selecting a tier
+    /// from that sum would reprice the whole history at long-context rates a
+    /// call never paid, so aggregate repricing stays on the base band.
+    #[must_use]
+    pub fn estimate_dynamic_base_cost_usd(
+        &self,
+        provider: &str,
+        model: &str,
+        usage: &Usage,
+    ) -> Option<f64> {
+        estimate_resolved(
+            &self.resolve_dynamic(provider, model)?,
+            usage,
+            TierMode::Base,
+        )
     }
 }
 
-const fn resolved_from_entry(entry: &CatalogEntry, source: ResolvedSource) -> ResolvedModel {
+/// Whether a price lookup may select a long-context tier — only valid when the
+/// usage describes one provider call.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TierMode {
+    Apply,
+    Base,
+}
+
+/// Price `usage` from a resolved model: pick the band that applies, then
+/// decline if that band cannot price every component the usage bills.
+fn estimate_resolved(resolved: &ResolvedModel, usage: &Usage, tiers: TierMode) -> Option<f64> {
+    let base = resolved.pricing?;
+    let pricing = match tiers {
+        TierMode::Apply => applicable_pricing(base, &resolved.pricing_tiers, usage.input_tokens),
+        TierMode::Base => base,
+    };
+    if !prices_every_billed_component(&pricing, usage) {
+        return None;
+    }
+    pricing.estimate_cost_usd(usage)
+}
+
+/// Whether `pricing` carries a rate for every usage component with a nonzero
+/// token count.
+///
+/// Feed rows are not guaranteed to be complete: a row that lists an input
+/// rate but no output rate would otherwise price a call's output tokens —
+/// typically the majority of its cost — at zero. Under-reporting is worse
+/// than declining: a caller that falls back to another pricing source (e.g.
+/// the static capability table) recovers the true cost, whereas a partial
+/// estimate silently understates spend and delays or defeats a cost budget.
+///
+/// Cache-read and cache-write tokens count as priced by their own rate *or* by
+/// the plain input rate, matching how [`Pricing::estimate_cost_usd`] bills
+/// them: both are input tokens, so the input rate is the approximation used
+/// when a source publishes no cache rate of its own. What no source may do is
+/// bill a component at zero.
+fn prices_every_billed_component(pricing: &Pricing, usage: &Usage) -> bool {
+    let cache_read_tokens = usage.cached_input_tokens.min(usage.input_tokens);
+    let after_cache_read = usage.input_tokens.saturating_sub(cache_read_tokens);
+    let cache_write_tokens = usage.cache_creation_input_tokens.min(after_cache_read);
+    let plain_input_tokens = after_cache_read.saturating_sub(cache_write_tokens);
+
+    let input_priced = plain_input_tokens == 0 || pricing.input.is_some();
+    let cache_read_priced =
+        cache_read_tokens == 0 || pricing.cached_input.is_some() || pricing.input.is_some();
+    let cache_write_priced =
+        cache_write_tokens == 0 || pricing.cache_write.is_some() || pricing.input.is_some();
+    let output_priced = usage.output_tokens == 0 || pricing.output.is_some();
+
+    input_priced && cache_read_priced && cache_write_priced && output_priced
+}
+
+fn resolved_from_entry(entry: &CatalogEntry, source: ResolvedSource) -> ResolvedModel {
     ResolvedModel {
         context_window: entry.context_window,
         max_output_tokens: entry.max_output_tokens,
         pricing: entry.pricing,
+        pricing_tiers: entry.pricing_tiers.clone(),
         supports_thinking: entry.supports_thinking,
         source,
     }
@@ -226,6 +357,7 @@ mod tests {
                 context_window: Some(123),
                 max_output_tokens: Some(7),
                 pricing: Some(Pricing::flat(1.0, 2.0)),
+                pricing_tiers: Vec::new(),
                 supports_thinking: Some(false),
             },
         );
@@ -276,6 +408,315 @@ mod tests {
         // (1000/1e6*1.75) + (1000/1e6*0.175) + (1000/1e6*14)
         // = 0.00175 + 0.000175 + 0.014 = 0.015925
         assert!((cost - 0.015_925).abs() < 1e-9);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dynamic_lookups_never_answer_from_the_static_table() -> Result<()> {
+        let source = StaticSource(parse_modelsdev(MODELSDEV_FIXTURE)?);
+        let registry = ModelRegistry::new();
+        registry.refresh(&source).await?;
+
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+
+        // `gpt-4o` is in the static table and in neither dynamic layer.
+        assert!(registry.resolve("openai", "gpt-4o").pricing.is_some());
+        assert!(registry.resolve_dynamic("openai", "gpt-4o").is_none());
+        assert!(
+            registry
+                .estimate_dynamic_cost_usd("openai", "gpt-4o", &usage)
+                .is_none(),
+            "the dynamic estimate must not fall back to the static table",
+        );
+
+        // A model the feed carries is priced by both lookups.
+        assert_eq!(
+            registry
+                .resolve_dynamic("openai", "gpt-5.2")
+                .context("the feed carries gpt-5.2")?
+                .source,
+            ResolvedSource::Feed
+        );
+        assert!(
+            registry
+                .estimate_dynamic_cost_usd("openai", "gpt-5.2", &usage)
+                .is_some()
+        );
+        Ok(())
+    }
+
+    /// Cache-creation tokens are a component of `input_tokens`, and providers
+    /// charge a premium to write the cache (Anthropic: 1.25× input). Billing
+    /// them at the ordinary input rate under-reports every cache-warming call.
+    #[test]
+    fn cache_creation_tokens_bill_at_the_cache_write_rate() -> Result<()> {
+        let registry = ModelRegistry::new().with_override(
+            "anthropic",
+            "claude-haiku-4-5",
+            CatalogEntry {
+                provider: "anthropic".to_owned(),
+                model_id: "claude-haiku-4-5".to_owned(),
+                context_window: None,
+                max_output_tokens: None,
+                // models.dev: input 1, output 5, cache_read 0.1, cache_write 1.25.
+                pricing: Some(Pricing::flat_with_cached(1.0, 5.0, 0.1).with_cache_write(1.25)),
+                pricing_tiers: Vec::new(),
+                supports_thinking: None,
+            },
+        );
+
+        // 1M input tokens = 200K plain + 300K cache-read + 500K cache-write,
+        // plus 1M output.
+        // 0.2*1 + 0.3*0.1 + 0.5*1.25 + 1*5 = 0.2 + 0.03 + 0.625 + 5 = 5.855.
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cached_input_tokens: 300_000,
+            cache_creation_input_tokens: 500_000,
+        };
+        let cost = registry
+            .estimate_cost_usd("anthropic", "claude-haiku-4-5", &usage)
+            .context("cost estimate missing")?;
+        assert!((cost - 5.855).abs() < 1e-9, "unexpected cost: {cost}");
+        Ok(())
+    }
+
+    /// A source with no cache-write rate bills those tokens at the ordinary
+    /// input rate — the provider-agnostic approximation the compiled-in table
+    /// has always used — rather than declining or billing them at zero.
+    #[test]
+    fn cache_creation_falls_back_to_the_input_rate() -> Result<()> {
+        let registry = ModelRegistry::new().with_override(
+            "anthropic",
+            "no-write-rate",
+            CatalogEntry {
+                provider: "anthropic".to_owned(),
+                model_id: "no-write-rate".to_owned(),
+                context_window: None,
+                max_output_tokens: None,
+                pricing: Some(Pricing::flat(1.0, 5.0)),
+                pricing_tiers: Vec::new(),
+                supports_thinking: None,
+            },
+        );
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 500_000,
+        };
+        // Every input token at $1/M, cache-write included: $1.00.
+        let cost = registry
+            .estimate_cost_usd("anthropic", "no-write-rate", &usage)
+            .context("cost estimate missing")?;
+        assert!((cost - 1.0).abs() < 1e-9, "unexpected cost: {cost}");
+        Ok(())
+    }
+
+    /// Long-context calls are billed at the tier the call falls in. Frontier
+    /// models roughly double their rates above the threshold, so pricing an
+    /// over-threshold call at the base rates halves the estimate.
+    #[test]
+    fn long_context_calls_bill_at_the_tier_rate() -> Result<()> {
+        let registry = ModelRegistry::new().with_override(
+            "openai",
+            "gpt-5.4",
+            CatalogEntry {
+                provider: "openai".to_owned(),
+                model_id: "gpt-5.4".to_owned(),
+                context_window: None,
+                max_output_tokens: None,
+                // models.dev: base 2.5/15, tier from 272K context 5/22.5.
+                pricing: Some(Pricing::flat(2.5, 15.0)),
+                pricing_tiers: vec![PricingTier {
+                    // Inclusive bound: the tier applies from 272K upward.
+                    min_input_tokens: 272_000,
+                    pricing: Pricing::flat(5.0, 22.5),
+                }],
+                supports_thinking: None,
+            },
+        );
+
+        // Inside the base band: 200K in + 100K out = 0.2*2.5 + 0.1*15 = 2.0.
+        let short = Usage {
+            input_tokens: 200_000,
+            output_tokens: 100_000,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        let short_cost = registry
+            .estimate_cost_usd("openai", "gpt-5.4", &short)
+            .context("cost estimate missing")?;
+        assert!(
+            (short_cost - 2.0).abs() < 1e-9,
+            "unexpected cost: {short_cost}"
+        );
+
+        // Past the threshold: 300K in + 100K out = 0.3*5 + 0.1*22.5 = 3.75,
+        // where the base rates would have said 0.3*2.5 + 0.1*15 = 2.25.
+        let long = Usage {
+            input_tokens: 300_000,
+            output_tokens: 100_000,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        let long_cost = registry
+            .estimate_cost_usd("openai", "gpt-5.4", &long)
+            .context("cost estimate missing")?;
+        assert!(
+            (long_cost - 3.75).abs() < 1e-9,
+            "unexpected cost: {long_cost}"
+        );
+        Ok(())
+    }
+
+    /// The threshold is inclusive: a call *at* the tier size already pays the
+    /// tier rate, and one token below it still pays base.
+    #[test]
+    fn tier_selection_is_inclusive_at_the_threshold() -> Result<()> {
+        let registry = tiered_registry();
+
+        let just_below = Usage {
+            input_tokens: 271_999,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        let base_cost = registry
+            .estimate_cost_usd("openai", "gpt-5.4", &just_below)
+            .context("cost estimate missing")?;
+        // 271_999 / 1e6 * 2.5 = 0.6799975.
+        assert!(
+            (base_cost - 0.679_997_5).abs() < 1e-9,
+            "unexpected cost: {base_cost}"
+        );
+
+        let at_threshold = Usage {
+            input_tokens: 272_000,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        let tier_cost = registry
+            .estimate_cost_usd("openai", "gpt-5.4", &at_threshold)
+            .context("cost estimate missing")?;
+        // 272_000 / 1e6 * 5.0 = 1.36.
+        assert!(
+            (tier_cost - 1.36).abs() < 1e-9,
+            "unexpected cost: {tier_cost}"
+        );
+        Ok(())
+    }
+
+    /// A summed usage is not a context size. Repricing a thread's aggregate
+    /// must stay on base rates, or ten short calls that each paid base rates
+    /// would be re-billed at the long-context tier they never reached — and a
+    /// healthy thread would be killed by a phantom `BudgetExceeded`.
+    #[test]
+    fn aggregate_repricing_never_selects_a_tier() -> Result<()> {
+        let registry = tiered_registry();
+
+        // Three 100K-token calls: 300K summed, but no call ever crossed 272K.
+        let aggregate = Usage {
+            input_tokens: 300_000,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+
+        let base = registry
+            .estimate_dynamic_base_cost_usd("openai", "gpt-5.4", &aggregate)
+            .context("cost estimate missing")?;
+        // Base: 0.3 * 2.5 = 0.75, not the tier's 0.3 * 5 = 1.50.
+        assert!(
+            (base - 0.75).abs() < 1e-9,
+            "unexpected aggregate cost: {base}"
+        );
+
+        let per_call = registry
+            .estimate_dynamic_cost_usd("openai", "gpt-5.4", &aggregate)
+            .context("cost estimate missing")?;
+        assert!(
+            (per_call - 1.5).abs() < 1e-9,
+            "a single 300K call does pay the tier rate: {per_call}"
+        );
+        Ok(())
+    }
+
+    /// models.dev's gpt-5.4: base 2.5/15, tier from 272K context 5/22.5.
+    fn tiered_registry() -> ModelRegistry {
+        ModelRegistry::new().with_override(
+            "openai",
+            "gpt-5.4",
+            CatalogEntry {
+                provider: "openai".to_owned(),
+                model_id: "gpt-5.4".to_owned(),
+                context_window: None,
+                max_output_tokens: None,
+                pricing: Some(Pricing::flat(2.5, 15.0)),
+                pricing_tiers: vec![PricingTier {
+                    // Inclusive bound: the tier applies from 272K upward.
+                    min_input_tokens: 272_000,
+                    pricing: Pricing::flat(5.0, 22.5),
+                }],
+                supports_thinking: None,
+            },
+        )
+    }
+
+    #[test]
+    fn estimate_cost_usd_declines_a_row_missing_a_billed_rate() -> Result<()> {
+        // A feed row that lists an input rate but no output rate: pricing the
+        // call from it would bill the output tokens at zero.
+        let registry = ModelRegistry::new().with_override(
+            "openai",
+            "gpt-4o",
+            CatalogEntry {
+                provider: "openai".to_owned(),
+                model_id: "gpt-4o".to_owned(),
+                context_window: None,
+                max_output_tokens: None,
+                pricing: Some(Pricing {
+                    input: Some(crate::model_capabilities::PricePoint::new(1.0)),
+                    output: None,
+                    cached_input: None,
+                    cache_write: None,
+                    notes: None,
+                }),
+                pricing_tiers: Vec::new(),
+                supports_thinking: None,
+            },
+        );
+
+        let with_output = Usage {
+            input_tokens: 2_000,
+            output_tokens: 1_000,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        assert!(
+            registry
+                .estimate_cost_usd("openai", "gpt-4o", &with_output)
+                .is_none(),
+            "a row with no output rate must decline a call that bills output tokens",
+        );
+
+        // The same row still prices a call that bills no output tokens.
+        let input_only = Usage {
+            input_tokens: 2_000,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        let cost = registry
+            .estimate_cost_usd("openai", "gpt-4o", &input_only)
+            .context("input-only usage is fully priced by an input rate")?;
+        assert!((cost - 0.002).abs() < 1e-9, "unexpected cost: {cost}");
         Ok(())
     }
 }

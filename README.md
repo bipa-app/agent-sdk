@@ -78,6 +78,7 @@ or YAML deps it does not use:
 | `gemini` | Google Gemini provider |
 | `vertex` | Google Vertex AI provider |
 | `cloudflare` | Cloudflare Workers AI provider |
+| `model-discovery` | Dynamic model capability/pricing catalog (models.dev / OpenRouter feeds + `ModelRegistry`); wire it into a run's cost budget with `AgentLoopBuilder::cost_estimator` |
 | `web` | Web search + URL fetch tools (pulls in `html2text`) |
 | `mcp` | Model Context Protocol client |
 | `skills` | Skill/command loading from markdown (pulls in `serde_yaml_ng`) |

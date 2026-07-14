@@ -460,6 +460,7 @@ mod events;
 mod hooks;
 pub mod llm;
 pub mod model_capabilities;
+pub mod pricing;
 pub mod providers;
 mod seed;
 mod stores;
@@ -652,6 +653,20 @@ pub use llm::{ContentBlock, ContentSource, Effort, LlmProvider, ThinkingConfig, 
 pub use model_capabilities::{
     ModelCapabilities, PricePoint, Pricing, SourceStatus, get_model_capabilities,
     supported_model_capabilities,
+};
+
+// Run-level cost budgeting: the pricing seam the loop consults ahead of the
+// static capability table.
+pub use pricing::CostEstimator;
+
+// Dynamic model discovery: the third-party capability/pricing feed and the
+// layered registry that resolves override → feed → static table. The registry
+// implements [`CostEstimator`], so it can be handed to
+// [`AgentLoopBuilder::cost_estimator`] to price runs from feed data.
+#[cfg(feature = "model-discovery")]
+pub use agent_sdk_providers::{
+    CatalogEntry, ModelCatalogSource, ModelRegistry, ModelsDevSource, OpenRouterSource,
+    PricingTier, ResolvedModel, ResolvedSource,
 };
 
 // Schema-validated structured output (Phase 13): the [`ResponseFormat`] request

@@ -298,6 +298,22 @@ fn model_capabilities_accessible() {
     fn _assert(_mc: ModelCapabilities, _pp: PricePoint, _pr: Pricing, _ss: SourceStatus) {}
 }
 
+#[test]
+fn cost_estimator_accessible() {
+    use agent_sdk::{CostEstimator, llm::Usage};
+
+    struct FlatRate;
+
+    impl CostEstimator for FlatRate {
+        fn estimate_cost_usd(&self, _provider: &str, _model: &str, usage: &Usage) -> Option<f64> {
+            Some(f64::from(usage.output_tokens))
+        }
+    }
+
+    fn _assert(_e: std::sync::Arc<dyn CostEstimator>) {}
+    let _rate: std::sync::Arc<dyn CostEstimator> = std::sync::Arc::new(FlatRate);
+}
+
 // ── Structured output (Phase 13 · A) ─────────────────────────────────
 
 #[test]

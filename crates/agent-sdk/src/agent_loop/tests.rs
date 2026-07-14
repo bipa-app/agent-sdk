@@ -1591,6 +1591,7 @@ async fn test_multi_tool_results_batched_into_single_message() -> anyhow::Result
         event_store: new_event_store(),
         event_authority: None,
         config: AgentConfig::default(),
+        cost_estimator: None,
         compaction_config: None,
         compactor: None,
         execution_store: None,
@@ -5652,6 +5653,123 @@ async fn test_under_budget_done_reports_estimated_cost() -> anyhow::Result<()> {
         _ => None,
     });
     assert_eq!(done_cost, Some(Some(0.0075)));
+
+    Ok(())
+}
+
+/// Stands in for a dynamic catalog whose feed carries a model the static
+/// capability table does not: [`MockProvider`]'s `mock` / `mock-model` pair
+/// has no compiled-in pricing. Prices every token at $1.
+struct MockModelPricing;
+
+impl crate::pricing::CostEstimator for MockModelPricing {
+    fn estimate_cost_usd(&self, provider: &str, model: &str, usage: &Usage) -> Option<f64> {
+        (provider == "mock" && model == "mock-model")
+            .then(|| f64::from(usage.input_tokens) + f64::from(usage.output_tokens))
+    }
+}
+
+/// The first (tool-use) turn accrues 30 tokens, which the injected catalog
+/// prices at $30 — over the $1 limit, so the run stops at the continuation
+/// boundary instead of paying for the next turn.
+#[tokio::test]
+async fn test_cost_budget_trips_on_catalog_priced_model() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("call_1", "echo", json!({"message": "x"})),
+        MockProvider::text_response("should not be reached"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .config(AgentConfig {
+            usage_limits: Some(UsageLimits {
+                max_cost_usd: Some(1.0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .cost_estimator(Arc::new(MockModelPricing))
+        .event_store(new_event_store())
+        .build();
+
+    let thread_id = ThreadId::new();
+    let (state, events) = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    match state {
+        AgentRunState::BudgetExceeded {
+            limit,
+            estimated_cost_usd,
+            ..
+        } => {
+            assert_eq!(limit, BudgetLimitKind::CostUsd);
+            assert_eq!(estimated_cost_usd, Some(30.0));
+        }
+        other => anyhow::bail!("expected BudgetExceeded, got {other:?}"),
+    }
+
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.event,
+            AgentEvent::BudgetExceeded {
+                limit: BudgetLimitKind::CostUsd,
+                ..
+            }
+        )),
+        "a BudgetExceeded event must be emitted",
+    );
+
+    Ok(())
+}
+
+/// The same run without a catalog: the static table has no pricing for the
+/// model, so the cost stays unknown and the cost limit cannot trip — the
+/// documented fail-open behavior for un-priced models.
+#[tokio::test]
+async fn test_cost_budget_without_catalog_leaves_model_unpriced() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("call_1", "echo", json!({"message": "x"})),
+        MockProvider::text_response("done"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .config(AgentConfig {
+            usage_limits: Some(UsageLimits {
+                max_cost_usd: Some(1.0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .event_store(new_event_store())
+        .build();
+
+    let thread_id = ThreadId::new();
+    let (state, _events) = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    match state {
+        AgentRunState::Done {
+            estimated_cost_usd, ..
+        } => assert_eq!(estimated_cost_usd, None),
+        other => anyhow::bail!("expected Done with no cost estimate, got {other:?}"),
+    }
 
     Ok(())
 }

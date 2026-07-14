@@ -1279,7 +1279,40 @@ pub(super) fn fold_llm_usage(
     provenance: &AuditProvenance,
     delta: &TokenUsage,
 ) {
-    super::budget::accumulate_cost(&mut ctx.state, provenance, &ctx.total_usage, delta);
+    fold_scoped_usage(ctx, provenance, delta, super::budget::UsageScope::Call);
+}
+
+/// Fold a compaction's summarization spend into the run totals and cost.
+///
+/// Distinct from [`fold_llm_usage`] because a compaction may bill two
+/// summarization calls, summed into one delta when a truncated summary is
+/// retried (see [`crate::context::CompactionResult::llm_usage`]). Pricing that
+/// sum as a single call could select a long-context tier neither call reached,
+/// so it is priced at base rates.
+pub(super) fn fold_compaction_usage(
+    ctx: &mut TurnContext,
+    provenance: &AuditProvenance,
+    delta: &TokenUsage,
+) {
+    fold_scoped_usage(ctx, provenance, delta, super::budget::UsageScope::Aggregate);
+}
+
+/// The single anchor where usage is committed: fold `delta` into the run
+/// totals and the state's accumulated cost, priced according to `scope`.
+fn fold_scoped_usage(
+    ctx: &mut TurnContext,
+    provenance: &AuditProvenance,
+    delta: &TokenUsage,
+    scope: super::budget::UsageScope,
+) {
+    super::budget::accumulate_cost(
+        &mut ctx.state,
+        ctx.cost_estimator.as_deref(),
+        provenance,
+        &ctx.total_usage,
+        delta,
+        scope,
+    );
     ctx.total_usage.add(delta);
     ctx.state.total_usage = ctx.total_usage.clone();
 }
@@ -2095,6 +2128,7 @@ where
     // budget outcome instead of paying for emergency summarization first.
     if let Some((limit, cost)) = super::budget::status(
         usage_limits,
+        ctx.cost_estimator.as_deref(),
         provenance,
         &ctx.total_usage,
         ctx.state.accumulated_cost_usd,
@@ -2143,15 +2177,15 @@ where
         .await
         {
             OverflowCompaction::Done(compaction_usage) => {
-                fold_llm_usage(ctx, provenance, &compaction_usage);
+                fold_compaction_usage(ctx, provenance, &compaction_usage);
             }
             OverflowCompaction::Cancelled(compaction_usage) => {
-                fold_llm_usage(ctx, provenance, &compaction_usage);
+                fold_compaction_usage(ctx, provenance, &compaction_usage);
                 return InternalTurnResult::Cancelled { turn_usage };
             }
             OverflowCompaction::Failed { error, llm_usage } => {
                 // Billed-but-wasted summarization spend still counts.
-                fold_llm_usage(ctx, provenance, &llm_usage);
+                fold_compaction_usage(ctx, provenance, &llm_usage);
                 return InternalTurnResult::Error(error);
             }
         }
@@ -2235,17 +2269,17 @@ where
         .await
         {
             OverflowCompaction::Done(compaction_usage) => {
-                fold_llm_usage(ctx, provenance, &compaction_usage);
+                fold_compaction_usage(ctx, provenance, &compaction_usage);
             }
             OverflowCompaction::Cancelled(compaction_usage) => {
-                fold_llm_usage(ctx, provenance, &compaction_usage);
+                fold_compaction_usage(ctx, provenance, &compaction_usage);
                 return Some(InternalTurnResult::Cancelled {
                     turn_usage: TokenUsage::default(),
                 });
             }
             OverflowCompaction::Failed { error, llm_usage } => {
                 // Billed-but-wasted summarization spend still counts.
-                fold_llm_usage(ctx, provenance, &llm_usage);
+                fold_compaction_usage(ctx, provenance, &llm_usage);
                 return Some(InternalTurnResult::Error(error));
             }
         }
@@ -2506,10 +2540,11 @@ async fn fold_compaction_spend<H>(
 where
     H: AgentHooks,
 {
-    fold_llm_usage(ctx, provenance, compaction_usage);
+    fold_compaction_usage(ctx, provenance, compaction_usage);
     if !super::budget::usage_is_zero(compaction_usage)
         && let Some((limit, cost)) = super::budget::status(
             usage_limits,
+            ctx.cost_estimator.as_deref(),
             provenance,
             &ctx.total_usage,
             ctx.state.accumulated_cost_usd,
@@ -2577,7 +2612,7 @@ where
         Ok(LoadedMessages::Cancelled { compaction_usage }) => {
             // A summarization that completed before the cancel won was
             // still billed: account it even though the turn is closing.
-            fold_llm_usage(ctx, provenance, &compaction_usage);
+            fold_compaction_usage(ctx, provenance, &compaction_usage);
             Err(InternalTurnResult::Cancelled {
                 turn_usage: TokenUsage::default(),
             })
@@ -2587,7 +2622,7 @@ where
             // the ContextCompacted event append failed AFTER summarization
             // and replace_history succeeded): fold it before surfacing the
             // error so the totals include every billed call.
-            fold_llm_usage(ctx, provenance, &failure.compaction_usage);
+            fold_compaction_usage(ctx, provenance, &failure.compaction_usage);
             Err(InternalTurnResult::Error(failure.error))
         }
     }
