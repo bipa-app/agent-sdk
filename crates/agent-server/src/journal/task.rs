@@ -1193,6 +1193,23 @@ impl AgentTask {
         Ok(self)
     }
 
+    /// Move [`Self::last_activity_at`] forward to `at`, never backward.
+    ///
+    /// The stall-budget's evidence-of-work timestamp is **monotonic by
+    /// contract**: no transition may rewind it. This is the single setter
+    /// every activity write goes through, so the invariant cannot be broken
+    /// by a current or future call site — in particular a terminal
+    /// transition stamped with an instant captured *before* a long
+    /// execution can never overwrite newer heartbeat-persisted activity
+    /// (which would let a parked ancestor read the subtree as silent the
+    /// moment a long child completes). The SQL backends enforce the same
+    /// monotonicity on the heartbeat write with `GREATEST` / `MAX`.
+    fn advance_last_activity_at(&mut self, at: OffsetDateTime) {
+        if self.last_activity_at.is_none_or(|current| at > current) {
+            self.last_activity_at = Some(at);
+        }
+    }
+
     /// Transition from [`TaskStatus::Pending`] to [`TaskStatus::Running`]
     /// and stamp the lease fields.
     ///
@@ -1249,7 +1266,7 @@ impl AgentTask {
         // `max_attempts`). A child that never starts is never acquired, so
         // it never gets this stamp and is still reaped off its `created_at`
         // floor by the parked sweep.
-        self.last_activity_at = Some(now);
+        self.advance_last_activity_at(now);
         self.updated_at = now;
         self.validate()?;
         Ok(self)
@@ -1704,8 +1721,11 @@ impl AgentTask {
         // heartbeatable — a later beacon-driven heartbeat write would be
         // CAS-rejected. Keeping it here lets a parent's stall probe see a
         // just-completed child as a fresh sign of life even after the
-        // child's completion event has aged out of the journal.
-        self.last_activity_at = Some(now);
+        // child's completion event has aged out of the journal. `now` must
+        // be the actual completion instant (never one captured before a
+        // long execution); the monotonic setter is a second line of
+        // defence so even a stale `now` cannot rewind newer activity.
+        self.advance_last_activity_at(now);
         self.updated_at = now;
         self.validate()?;
         Ok(self)
@@ -1759,8 +1779,8 @@ impl AgentTask {
         // Reaching a terminal outcome is itself a state change the parent
         // fan-in will act on; record it on the transition so a parent
         // parked on sibling work sees this child as a fresh sign of life
-        // (see [`Self::complete`]).
-        self.last_activity_at = Some(now);
+        // (see [`Self::complete`]). Monotonic: never rewinds newer activity.
+        self.advance_last_activity_at(now);
         self.updated_at = now;
         self.validate()?;
         Ok(self)
@@ -1873,12 +1893,8 @@ impl AgentTask {
         }
         self.last_heartbeat_at = Some(now);
         self.lease_expires_at = Some(expires_at);
-        if let Some(activity) = activity
-            && self
-                .last_activity_at
-                .is_none_or(|current| activity > current)
-        {
-            self.last_activity_at = Some(activity);
+        if let Some(activity) = activity {
+            self.advance_last_activity_at(activity);
         }
         self.updated_at = now;
         self.validate()?;
@@ -3217,6 +3233,37 @@ mod tests {
             failed.last_activity_at,
             Some(t_plus(20)),
             "failure must stamp last_activity_at",
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_transition_never_rewinds_last_activity_at() -> Result<()> {
+        // A long child accrues fresh heartbeat-persisted activity (t+100),
+        // then completes with an instant captured BEFORE the run (t+50).
+        // The monotonic setter must keep the newer value, so a parked
+        // ancestor cannot read the subtree as silent the moment it finishes.
+        let running = AgentTask::new_root_turn(thread(), t0(), 3).mark_running(
+            WorkerId::from_string("w1"),
+            LeaseId::from_string("l1"),
+            t_plus(200),
+            t_plus(100),
+        )?;
+        assert_eq!(running.last_activity_at, Some(t_plus(100)));
+
+        let completed = running.clone().complete(t_plus(50))?;
+        assert_eq!(
+            completed.last_activity_at,
+            Some(t_plus(100)),
+            "a stale completion instant must never rewind newer activity",
+        );
+
+        let failed = running.fail("boom".into(), t_plus(50))?;
+        assert_eq!(
+            failed.last_activity_at,
+            Some(t_plus(100)),
+            "a stale failure instant must never rewind newer activity",
         );
 
         Ok(())

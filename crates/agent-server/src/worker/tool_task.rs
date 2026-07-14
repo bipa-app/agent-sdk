@@ -385,7 +385,10 @@ async fn execute_tool_task_inner<F, Fut>(
     event_repo: &dyn EventRepository,
     cancel: &CancellationToken,
     executor: F,
-    now: OffsetDateTime,
+    // The instant the task was acquired, kept only for signature symmetry;
+    // the terminal transition and its events are stamped with the ACTUAL
+    // completion instant captured after the tool returns (below).
+    _entry_now: OffsetDateTime,
 ) -> anyhow::Result<ToolTaskOutcome>
 where
     F: FnOnce(PendingToolCallInfo, ToolEventCollector) -> Fut,
@@ -411,6 +414,14 @@ where
     // than a stall budget can prove it is alive while it runs.
     let collector = ToolEventCollector::with_activity(bootstrap.activity.clone());
     let tool_result = executor(bootstrap.tool_call.clone(), collector.clone()).await;
+
+    // The tool may have run for a long time. Drive the terminal transition
+    // and its committed events with the ACTUAL completion instant, not the
+    // entry time captured before the await — otherwise a long child would
+    // stamp a stale `last_activity_at` that a parent's stall probe reads as
+    // silence the moment the child finishes. (`AgentTask`'s monotonic setter
+    // is the backstop against a rewind; the correct instant belongs here.)
+    let now = OffsetDateTime::now_utc();
 
     // NOTE: No post-execution cancellation check here. Once the
     // executor has returned, side effects have already been applied
