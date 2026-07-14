@@ -3281,11 +3281,7 @@ async fn poll_stream_item(
         usage,
         now,
     } = params;
-    let stall_budget = if received_first_item {
-        STREAM_INTER_EVENT_TIMEOUT
-    } else {
-        STREAM_FIRST_EVENT_TIMEOUT
-    };
+    let stall_budget = stream_stall_budget(received_first_item);
     let polled = match deps.cancel {
         Some(cancel) => {
             tokio::select! {

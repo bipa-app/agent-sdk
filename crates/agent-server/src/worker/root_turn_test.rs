@@ -7462,7 +7462,12 @@ async fn mixed_batch_tool_child_executes_and_fans_in() -> Result<()> {
         )
         .await?
         .context("tool child must be runnable")?;
-    let ctx = crate::worker::tool_task::resolve_tool_bootstrap(acquired, &stores.tasks).await?;
+    let ctx = crate::worker::tool_task::resolve_tool_bootstrap(
+        acquired,
+        &stores.tasks,
+        crate::worker::activity::ActivityBeacon::default(),
+    )
+    .await?;
     assert_eq!(
         ctx.tool_call.name, "bash",
         "the tool child must resolve its own slot in the continuation",
