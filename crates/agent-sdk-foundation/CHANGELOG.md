@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-foundation-v0.12.0...agent-sdk-foundation-v0.13.0) - 2026-07-14
+
+### Added
+
+- *(foundation,host)* [**breaking**] stamp emitter task identity on lifecycle events; causal follower close gate ([#363](https://github.com/bipa-app/agent-sdk/pull/363)) ([#369](https://github.com/bipa-app/agent-sdk/pull/369))
+
 ## [0.12.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-foundation-v0.11.8...agent-sdk-foundation-v0.12.0) - 2026-07-12
 
 ### Added
