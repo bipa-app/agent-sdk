@@ -109,6 +109,12 @@ fn estimate_scoped(
                     estimator.estimate_aggregate_cost_usd(&provider, &model, &usage)
                 }
             })
+            // A non-finite estimate (an estimator returning NaN, or a NaN
+            // override rate) must not enter the max: `f64::total_cmp` ranks NaN
+            // above every finite value, so an unfiltered NaN would win the max
+            // and then compare false against `max_cost_usd`, silently disabling
+            // the cap while valid candidates existed.
+            .filter(|cost| cost.is_finite())
             .max_by(f64::total_cmp);
         if let Some(cost) = best {
             return Some(cost);
@@ -483,12 +489,59 @@ mod tests {
         }
     }
 
+    /// Prices one candidate key `NaN` and another finitely, to prove a
+    /// non-finite estimate cannot poison the max.
+    struct NanThenFinitePricing;
+
+    impl CostEstimator for NanThenFinitePricing {
+        fn estimate_cost_usd(&self, provider: &str, _model: &str, _usage: &Usage) -> Option<f64> {
+            match provider {
+                // The preferred (route) candidate returns NaN.
+                "openrouter" => Some(f64::NAN),
+                // The vendor split returns a finite estimate.
+                "vendor" => Some(2.5),
+                _ => None,
+            }
+        }
+    }
+
     fn one_million_each() -> TokenUsage {
         TokenUsage {
             input_tokens: 1_000_000,
             output_tokens: 1_000_000,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn non_finite_estimate_does_not_poison_the_max() -> anyhow::Result<()> {
+        use anyhow::Context;
+        // A slug provenance so the candidate set spans several keys: the route
+        // key resolves to NaN, the vendor split to a finite 2.5.
+        let provenance = AuditProvenance::new("openai", "vendor/model");
+        let usage = one_million_each();
+
+        let cost = estimate_cost_usd(Some(&NanThenFinitePricing), &provenance, &usage)
+            .context("a finite candidate must price the call")?;
+        assert!(cost.is_finite(), "NaN leaked into the estimate: {cost}");
+        assert!((cost - 2.5).abs() < 1e-9, "unexpected cost: {cost}");
+
+        // The cap must still fire — an unfiltered NaN would win the max and
+        // then compare false against the limit, silently disabling it.
+        let limits = UsageLimits {
+            max_cost_usd: Some(1.0),
+            ..Default::default()
+        };
+        let (limit, _) = status(
+            Some(&limits),
+            Some(&NanThenFinitePricing),
+            &provenance,
+            &usage,
+            None,
+        )
+        .context("the finite estimate must trip the cost limit")?;
+        assert_eq!(limit, BudgetLimitKind::CostUsd);
+        Ok(())
     }
 
     #[test]

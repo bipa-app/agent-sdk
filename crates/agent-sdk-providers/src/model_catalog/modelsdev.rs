@@ -37,6 +37,8 @@ struct ModelsDevTier {
     #[serde(default)]
     cache_write: Option<f64>,
     #[serde(default)]
+    reasoning: Option<f64>,
+    #[serde(default)]
     tier: Option<ModelsDevTierBound>,
 }
 
@@ -157,15 +159,15 @@ fn tiers_from_modelsdev_cost(cost: &ModelsDevCost) -> Option<Vec<PricingTier>> {
             if bound.bound_type.as_deref() != Some("context") {
                 return None;
             }
-            // A context tier restates rate-per-token bands; the feed does not
-            // publish a per-tier reasoning rate, so the base row's carries over
-            // through `merge_band_over_base`.
+            // A models.dev tier is a full cost row (`CostTier extends Cost`),
+            // so it may restate the reasoning rate; when it does not, the base
+            // row's carries over through `merge_band_over_base`.
             let band = pricing_from_rates(
                 tier.input,
                 tier.output,
                 tier.cache_read,
                 tier.cache_write,
-                None,
+                tier.reasoning,
             )?;
             Some(PricingTier {
                 // The bound is inclusive: the models.dev SDK schema documents
@@ -515,6 +517,71 @@ mod tests {
                 .abs()
                 < f64::EPSILON
         );
+        Ok(())
+    }
+
+    /// A models.dev tier is a full cost row, so it may restate `reasoning` at a
+    /// different rate than the base. That rate must reach the tier's band, not
+    /// be dropped in favour of the inherited base rate.
+    #[test]
+    fn parse_modelsdev_reads_tier_reasoning_rate() -> Result<()> {
+        use agent_sdk_foundation::llm::Usage;
+
+        const TIER_REASONING_FIXTURE: &str = r#"{
+          "openai": {
+            "id": "openai",
+            "models": {
+              "reasoner": {
+                "id": "reasoner",
+                "cost": {
+                  "input": 1,
+                  "output": 2,
+                  "reasoning": 3,
+                  "tiers": [
+                    {
+                      "input": 2,
+                      "output": 4,
+                      "reasoning": 9,
+                      "tier": { "type": "context", "size": 200000 }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }"#;
+
+        let entries = parse_modelsdev(TIER_REASONING_FIXTURE)?;
+        let row = find(&entries, "openai", "reasoner")?;
+        assert_eq!(row.pricing_tiers.len(), 1);
+        let tier = row.pricing_tiers[0];
+        assert!(
+            (tier
+                .pricing
+                .reasoning
+                .context("tier reasoning")?
+                .usd_per_million_tokens
+                - 9.0)
+                .abs()
+                < f64::EPSILON,
+            "the tier's own reasoning rate must win over the base's",
+        );
+
+        // And it bills: a call in the tier band prices output at
+        // max(tier output 4, tier reasoning 9) = 9. 300K in + 100K out =
+        // 0.3*2 + 0.1*9 = 1.5, where the base tier output rate would say
+        // 0.3*2 + 0.1*4 = 1.0.
+        let usage = Usage {
+            input_tokens: 300_000,
+            output_tokens: 100_000,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        let cost = tier
+            .pricing
+            .estimate_cost_usd(&usage)
+            .context("tier prices the call")?;
+        assert!((cost - 1.5).abs() < 1e-9, "unexpected cost: {cost}");
         Ok(())
     }
 

@@ -45,6 +45,11 @@ struct OpenRouterPricingOverride {
     input_cache_read: Option<String>,
     #[serde(default)]
     input_cache_write: Option<String>,
+    /// No live override restates a reasoning rate, but an override is
+    /// structurally a pricing subset, so it is read symmetrically with the base
+    /// row rather than silently inheriting the base reasoning rate.
+    #[serde(default)]
+    internal_reasoning: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -209,14 +214,14 @@ fn tiers_from_openrouter_pricing(
 ) -> Option<Vec<PricingTier>> {
     let mut bands: Vec<(u32, Pricing)> = Vec::with_capacity(pricing.overrides.len());
     for band in &pricing.overrides {
-        // Overrides do not restate a reasoning rate, so the base row's carries
-        // over through `merge_band_over_base`.
+        // An override that restates a reasoning rate uses its own; otherwise
+        // the base row's carries over through `merge_band_over_base`.
         let rates = pricing_from_rates(
             band.prompt.as_deref(),
             band.completion.as_deref(),
             band.input_cache_read.as_deref(),
             band.input_cache_write.as_deref(),
-            None,
+            band.internal_reasoning.as_deref(),
         )?;
         // A band that bills only a cache component, with no input or output
         // rate of its own, is not a price band this parser can stand behind.
