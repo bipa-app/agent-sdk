@@ -5630,41 +5630,6 @@ async fn streaming_rate_limit_without_a_hint_uses_exponential_backoff() -> anyho
     Ok(())
 }
 
-// --- #10: stalled stream surfaces an inactivity timeout ---------------
-
-#[tokio::test]
-async fn stalled_stream_times_out_and_errors() -> anyhow::Result<()> {
-    // A stream that never yields a frame must not hang the run forever; the
-    // per-frame inactivity timeout (reduced to 20ms under cfg(test)) surfaces a
-    // recoverable error, and with no retries the run ends in error rather than
-    // stalling. The stall is permanent, so the timeout firing is deterministic.
-    let provider = StreamScriptProvider::new(vec![StreamScriptStep::FramesThenStall(vec![])]);
-    let config = AgentConfig {
-        streaming: true,
-        retry: RetryConfig::no_retry(),
-        ..Default::default()
-    };
-    let agent = builder::<()>()
-        .provider(provider)
-        .config(config)
-        .event_store(new_event_store())
-        .build();
-
-    let state = agent
-        .run(
-            ThreadId::new(),
-            AgentInput::Text("go".to_string()),
-            ToolContext::new(()),
-            CancellationToken::new(),
-        )
-        .await?;
-    assert!(
-        matches!(state, AgentRunState::Error(_)),
-        "a stalled stream must end the run in error, got {state:?}"
-    );
-    Ok(())
-}
-
 // --- #1 / #11: run_persistent behavioral coverage ---------------------
 
 #[tokio::test]
@@ -9752,5 +9717,302 @@ async fn test_run_stream_ends_despite_actively_appending_leaked_clone() -> anyho
     let state = run_stream.final_state.await?;
     assert!(matches!(state, AgentRunState::Done { .. }));
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn connectivity_wait_does_not_consume_transient_retry_budget() -> anyhow::Result<()> {
+    let offline = || {
+        StreamScriptStep::Frames(vec![StreamDelta::Error {
+            message: "offline".to_owned(),
+            kind: StreamErrorKind::Connectivity,
+        }])
+    };
+    let provider = StreamScriptProvider::new(vec![
+        offline(),
+        offline(),
+        offline(),
+        StreamScriptStep::Frames(vec![StreamDelta::Error {
+            message: "provider 503".to_owned(),
+            kind: StreamErrorKind::ServerError,
+        }]),
+        StreamScriptStep::Frames(vec![
+            StreamDelta::TextDelta {
+                delta: "recovered".to_owned(),
+                block_index: 0,
+            },
+            StreamDelta::Done {
+                stop_reason: Some(crate::llm::StopReason::EndTurn),
+            },
+        ]),
+    ]);
+    let config = AgentConfig {
+        streaming: true,
+        retry: RetryConfig {
+            max_retries: 1,
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+        },
+        ..Default::default()
+    };
+    let agent = builder::<()>()
+        .provider(provider)
+        .config(config)
+        .event_store(new_event_store())
+        .build();
+
+    let thread_id = ThreadId::new();
+    let state = agent
+        .run(
+            thread_id.clone(),
+            AgentInput::Text("go".to_owned()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "the post-reconnect 503 must retain its configured retry: {state:?}"
+    );
+    let events = agent.event_store.get_events(&thread_id).await?;
+    let retry_attempts: Vec<u32> = events
+        .iter()
+        .filter_map(|committed| match committed.event {
+            AgentEvent::AutoRetryStart { attempt, .. } => Some(attempt),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(retry_attempts, vec![1, 4]);
+    assert!(events.iter().any(|committed| matches!(
+        committed.event,
+        AgentEvent::AutoRetryEnd {
+            attempt: 4,
+            success: true,
+            ..
+        }
+    )));
+    Ok(())
+}
+
+#[tokio::test]
+async fn each_connectivity_streak_opens_its_own_retry_envelope() -> anyhow::Result<()> {
+    // Two offline streaks separated by a server error. Every streak must
+    // surface its own AutoRetryStart — a consumer watching the second outage
+    // must not be left staring at the stale server-error envelope — and the
+    // failing AutoRetryEnd must pair with the last emitted start.
+    let error = |kind| {
+        StreamScriptStep::Frames(vec![StreamDelta::Error {
+            message: "retry".to_owned(),
+            kind,
+        }])
+    };
+    let provider = StreamScriptProvider::new(vec![
+        error(StreamErrorKind::Connectivity),
+        error(StreamErrorKind::ServerError),
+        error(StreamErrorKind::Connectivity),
+        error(StreamErrorKind::ServerError),
+    ]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .config(AgentConfig {
+            streaming: true,
+            retry: RetryConfig {
+                max_retries: 1,
+                base_delay_ms: 0,
+                max_delay_ms: 0,
+            },
+            ..Default::default()
+        })
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+    let state = agent
+        .run(
+            thread_id.clone(),
+            AgentInput::Text("go".to_owned()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert!(matches!(state, AgentRunState::Error(_)));
+    let events = agent.event_store.get_events(&thread_id).await?;
+    let starts: Vec<u32> = events
+        .iter()
+        .filter_map(|event| match event.event {
+            AgentEvent::AutoRetryStart { attempt, .. } => Some(attempt),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(starts, vec![1, 2, 3]);
+    assert!(events.iter().any(|event| matches!(
+        event.event,
+        AgentEvent::AutoRetryEnd {
+            attempt: 3,
+            success: false,
+            ..
+        }
+    )));
+    Ok(())
+}
+
+#[tokio::test]
+async fn reachable_connectivity_deaths_exhaust_the_circuit_breaker() -> anyhow::Result<()> {
+    // Probes keep reporting reachable (the default), yet every dispatched
+    // stream dies with a connectivity error — a broken path, not an outage.
+    // The run must fail after the reachable-death bound instead of billing a
+    // fresh attempt per backoff forever, and independently of the (generous)
+    // transient budget.
+    let offline = || {
+        StreamScriptStep::Frames(vec![StreamDelta::Error {
+            message: "connection reset by peer".to_owned(),
+            kind: StreamErrorKind::ConnectionLost,
+        }])
+    };
+    let provider = StreamScriptProvider::new(vec![offline(), offline(), offline(), offline()]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .config(AgentConfig {
+            streaming: true,
+            retry: RetryConfig {
+                max_retries: 5,
+                base_delay_ms: 0,
+                max_delay_ms: 0,
+            },
+            ..Default::default()
+        })
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+    let state = agent
+        .run(
+            thread_id.clone(),
+            AgentInput::Text("go".to_owned()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert!(
+        matches!(state, AgentRunState::Error(_)),
+        "a reachable provider whose streams keep dying must fail, got {state:?}"
+    );
+    let events = agent.event_store.get_events(&thread_id).await?;
+    assert!(events.iter().any(|event| matches!(
+        event.event,
+        AgentEvent::AutoRetryEnd {
+            attempt: 1,
+            success: false,
+            ..
+        }
+    )));
+    Ok(())
+}
+
+#[tokio::test]
+async fn offline_probe_failures_reset_the_reachable_death_budget() -> anyhow::Result<()> {
+    // Five consecutive dispatched failures would trip the reachable-death
+    // circuit breaker — but each one is followed by an unreachable probe
+    // (genuine outage), which forgives it. The run must wait through all
+    // five and succeed, proving offline time never fails the turn.
+    let offline = || {
+        StreamScriptStep::Frames(vec![StreamDelta::Error {
+            message: "network is unreachable".to_owned(),
+            kind: StreamErrorKind::Connectivity,
+        }])
+    };
+    let provider = StreamScriptProvider::new(vec![
+        offline(),
+        offline(),
+        offline(),
+        offline(),
+        offline(),
+        StreamScriptStep::Frames(vec![
+            StreamDelta::TextDelta {
+                delta: "reconnected".to_owned(),
+                block_index: 0,
+            },
+            StreamDelta::Done {
+                stop_reason: Some(crate::llm::StopReason::EndTurn),
+            },
+        ]),
+    ])
+    .with_probe_script(vec![
+        false, true, false, true, false, true, false, true, false, true,
+    ]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .config(AgentConfig {
+            streaming: true,
+            retry: RetryConfig::no_retry(),
+            ..Default::default()
+        })
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+    let state = agent
+        .run(
+            thread_id.clone(),
+            AgentInput::Text("go".to_owned()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "an offline wait must outlive the reachable-death bound, got {state:?}"
+    );
+    let events = agent.event_store.get_events(&thread_id).await?;
+    let starts: Vec<u32> = events
+        .iter()
+        .filter_map(|event| match event.event {
+            AgentEvent::AutoRetryStart { attempt, .. } => Some(attempt),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        starts,
+        vec![1],
+        "one uninterrupted offline streak emits exactly one envelope"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event.event,
+        AgentEvent::AutoRetryEnd {
+            attempt: 1,
+            success: true,
+            ..
+        }
+    )));
+    Ok(())
+}
+
+#[tokio::test]
+async fn stalled_stream_retries_even_with_zero_transient_budget() -> anyhow::Result<()> {
+    // A stream that never yields a frame must not hang one socket forever. The
+    // per-frame inactivity timeout (reduced to 20ms under cfg(test)) opens a
+    // fresh stream and waits for connectivity independently of the ordinary
+    // transient retry budget. The scripted second stream completes.
+    let provider = StreamScriptProvider::new(vec![StreamScriptStep::FramesThenStall(vec![])]);
+    let config = AgentConfig {
+        streaming: true,
+        retry: RetryConfig::no_retry(),
+        ..Default::default()
+    };
+    let agent = builder::<()>()
+        .provider(provider)
+        .config(config)
+        .event_store(new_event_store())
+        .build();
+
+    let state = agent
+        .run(
+            ThreadId::new(),
+            AgentInput::Text("go".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "a stalled connection must recover on a fresh stream, got {state:?}"
+    );
     Ok(())
 }

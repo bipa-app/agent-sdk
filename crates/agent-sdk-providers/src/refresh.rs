@@ -279,6 +279,10 @@ where
         self.snapshot().await.list_models().await
     }
 
+    async fn probe_connectivity(&self) -> bool {
+        self.snapshot().await.probe_connectivity().await
+    }
+
     fn model(&self) -> &str {
         &self.model
     }

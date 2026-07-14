@@ -175,17 +175,23 @@ pub enum StreamDelta {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum StreamErrorKind {
+    /// The request could not establish a provider connection because DNS,
+    /// routing, or the network is unavailable. Callers may wait indefinitely
+    /// for connectivity, provided cancellation remains cooperative.
+    Connectivity,
+    /// An established provider response stream lost its underlying network
+    /// connection. It has the same wait policy as [`Self::Connectivity`], but
+    /// durable runtimes must close that provider call's audit attempt before
+    /// retrying it.
+    ConnectionLost,
     /// Provider returned HTTP 429 / explicit rate-limit signal.
     ///
     /// Carries the server-supplied retry delay when the provider gave one —
     /// a `Retry-After` header, or a hint embedded in the error body (Gemini's
     /// `google.rpc.RetryInfo`, `OpenAI`'s "try again in 20s"). `None` when the
-    /// provider supplied no usable hint (mid-stream rate-limit events, for
-    /// instance, arrive with no headers), in which case the caller falls back
-    /// to its own backoff schedule.
+    /// provider supplied no usable hint, in which case callers use backoff.
     RateLimited(Option<Duration>),
-    /// Provider returned HTTP 5xx, the connection dropped mid-stream,
-    /// or the provider reported a transient runtime failure.
+    /// Provider returned HTTP 5xx or reported a transient runtime failure.
     ServerError,
     /// Caller-side error: validation failure before dispatch, HTTP
     /// 4xx other than 429, or a non-retriable provider rejection.
@@ -204,22 +210,133 @@ pub enum StreamErrorKind {
 
 impl StreamErrorKind {
     /// `true` when the error is potentially transient and the caller
-    /// may retry.  Rate-limit and server errors are recoverable;
-    /// invalid-request is not.
+    /// may retry. Connectivity, rate-limit, and server errors are
+    /// recoverable; invalid-request is not.
     #[must_use]
     pub const fn is_recoverable(self) -> bool {
-        matches!(self, Self::RateLimited(_) | Self::ServerError)
+        matches!(
+            self,
+            Self::Connectivity | Self::ConnectionLost | Self::RateLimited(_) | Self::ServerError
+        )
     }
 
     /// The server-supplied retry delay carried by a rate-limit error, if any.
-    ///
-    /// `None` for every other kind — only a rate limit comes with a hint.
     #[must_use]
     pub const fn retry_after(self) -> Option<Duration> {
         match self {
             Self::RateLimited(retry_after) => retry_after,
             _ => None,
         }
+    }
+
+    /// `true` for failures governed by the unbounded, cancellable offline wait.
+    #[must_use]
+    pub const fn is_connectivity(self) -> bool {
+        matches!(self, Self::Connectivity | Self::ConnectionLost)
+    }
+}
+
+/// Classify a typed HTTP client failure without relying on display text.
+#[must_use]
+pub fn classify_reqwest_error(error: &reqwest::Error) -> StreamErrorKind {
+    if is_proxy_tunnel_rejection(error) || is_tls_rejection(error) {
+        StreamErrorKind::ServerError
+    } else if error.is_connect() {
+        StreamErrorKind::Connectivity
+    } else if error.is_timeout() || has_connectivity_io_source(error) {
+        StreamErrorKind::ConnectionLost
+    } else {
+        StreamErrorKind::ServerError
+    }
+}
+
+fn is_proxy_tunnel_rejection(error: &reqwest::Error) -> bool {
+    if error.status() == Some(reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED) {
+        return true;
+    }
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        let message = cause.to_string();
+        if message.contains("tunnel error: unsuccessful")
+            || message.contains("proxy authorization required")
+        {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
+}
+
+/// `true` when a TLS peer answered the handshake and rejected the session
+/// (certificate validation, hostname mismatch, protocol or cipher
+/// negotiation, an interception proxy presenting the wrong identity, …).
+///
+/// A peer that speaks TLS at us is reachable, so these are bounded server
+/// errors, never connectivity waits: retrying cannot fix a policy or
+/// configuration rejection, and misreading one as "offline" would park the
+/// caller in an indefinite wait on a failure that is deterministic. The one
+/// exception is a TLS-wrapped *transport* death — a socket that EOFs or
+/// resets mid-handshake — which stays on the connectivity path.
+fn is_tls_rejection(error: &reqwest::Error) -> bool {
+    if has_connectivity_io_source(error) {
+        return false;
+    }
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        if cause.downcast_ref::<native_tls::Error>().is_some() {
+            let message = cause.to_string().to_ascii_lowercase();
+            let transport_death = ["eof", "close", "reset", "broken pipe", "timed out"]
+                .iter()
+                .any(|marker| message.contains(marker));
+            return !transport_death;
+        }
+        source = cause.source();
+    }
+    false
+}
+
+fn has_connectivity_io_source(error: &reqwest::Error) -> bool {
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        if let Some(io_error) = cause.downcast_ref::<std::io::Error>()
+            && matches!(
+                io_error.kind(),
+                std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::NetworkDown
+                    | std::io::ErrorKind::NetworkUnreachable
+                    | std::io::ErrorKind::HostUnreachable
+            )
+        {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
+}
+
+#[must_use]
+pub fn reqwest_error_delta(context: &str, error: &reqwest::Error) -> StreamDelta {
+    StreamDelta::Error {
+        message: format!("{context}: {error}"),
+        kind: classify_reqwest_error(error),
+    }
+}
+
+#[must_use]
+pub fn reqwest_body_error_delta(context: &str, error: &reqwest::Error) -> StreamDelta {
+    let kind = match classify_reqwest_error(error) {
+        StreamErrorKind::Connectivity => StreamErrorKind::ConnectionLost,
+        other => other,
+    };
+    StreamDelta::Error {
+        message: format!("{context}: {error}"),
+        kind,
     }
 }
 
@@ -803,6 +920,187 @@ mod tests {
         let blocks = acc.into_content_blocks();
         assert_eq!(blocks.len(), 1);
         assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "ok"));
+    }
+
+    #[tokio::test]
+    async fn classifies_typed_connect_failure_as_connectivity() -> anyhow::Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        drop(listener);
+
+        let result = reqwest::Client::new()
+            .get(format!("http://{address}"))
+            .send()
+            .await;
+        let Err(error) = result else {
+            anyhow::bail!("closed local port unexpectedly accepted a connection")
+        };
+        assert_eq!(
+            classify_reqwest_error(&error),
+            StreamErrorKind::Connectivity
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn proxy_tunnel_rejection_is_not_connectivity() -> anyhow::Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            socket
+                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                .await?;
+            anyhow::Ok(())
+        });
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{address}"))?)
+            .build()?;
+        let Err(error) = client.get("https://example.invalid").send().await else {
+            anyhow::bail!("rejected proxy tunnel unexpectedly succeeded")
+        };
+        assert_eq!(classify_reqwest_error(&error), StreamErrorKind::ServerError);
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tls_handshake_transport_drop_is_connectivity() -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await?;
+            drop(socket);
+            anyhow::Ok(())
+        });
+        let client = reqwest::Client::builder().no_proxy().build()?;
+        let Err(error) = client.get(format!("https://{address}")).send().await else {
+            anyhow::bail!("dropped TLS handshake unexpectedly succeeded")
+        };
+        assert_eq!(
+            classify_reqwest_error(&error),
+            StreamErrorKind::Connectivity
+        );
+        server.await??;
+        Ok(())
+    }
+
+    /// A live TLS peer that fails certificate validation is a policy
+    /// rejection, not an outage — waiting for connectivity cannot fix it, so
+    /// it must stay on the bounded path. The server presents a self-signed
+    /// certificate the client refuses; the assertion also pins the
+    /// `native_tls::Error` downcast in `is_tls_rejection` against a version
+    /// drift between reqwest's native-tls and the workspace's.
+    #[tokio::test]
+    async fn tls_certificate_rejection_is_bounded_server_error() -> anyhow::Result<()> {
+        const SELF_SIGNED_CERT_PEM: &[u8] = b"-----BEGIN CERTIFICATE-----
+MIIDJzCCAg+gAwIBAgIUPiG3JI6c72crNdzYks8mo1pmHMEwDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDcxNDE4NDYzMloYDzIxMjYw
+NjIwMTg0NjMyWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwggEiMA0GCSqGSIb3DQEB
+AQUAA4IBDwAwggEKAoIBAQCtBOh4EAP48fjE59F+L9qNEp/yUlOJXYJbm6m4nzTg
+00RNc+dqsfrObIWJDuAaiKimunkGrSy77ELNAHlJmtOSkq8hu1C5/k6LW0GvPHuC
+faPFEevCmxbERVZnt1f9IQ2e77oZz752cNzDlUIKyy5v3LpGaL8vT1bLAFuHT9z/
+3mlqEwyK7mQlS3LZvwJQ6NfL2lgr5uVDFdsvfAY4mhbV8uRjKj+IZnOV1WYqQ62o
+xbjC/NKXbvqKBigOhbo+idk1sjKbkjm2uvyjmUszRpfh7YX2wkk3UqZgN1+zsRDK
+MBMyuZkkr7Vb/8ed07SN8Ma64fwCrrQba4l/R8TJmQpXAgMBAAGjbzBtMB0GA1Ud
+DgQWBBT8LxETkCZh4h6qjMlLJMooNHTgkTAfBgNVHSMEGDAWgBT8LxETkCZh4h6q
+jMlLJMooNHTgkTAPBgNVHRMBAf8EBTADAQH/MBoGA1UdEQQTMBGCCWxvY2FsaG9z
+dIcEfwAAATANBgkqhkiG9w0BAQsFAAOCAQEACjZ8oqjFooFxjS3BnbhrNrF29/Jv
+PbX32Tg3+3qUkS5+XnO64mLm+pQzUGs16+TyqdEkck//51KkyvzrnnGRYGc5eHEQ
+zorkR1zlE+c8sjKcenvVkkLEKWaWNtEvpb+U0Ps6rP2Y1Jo4/AxTuxXrYxQ+XSTy
+V4HyKriK6utlmhGpKUZhTZPTiTC/GaAwimCFgfw4wDuWGow92z3AnR9Q3KFpgrTP
+B5z+i0oiNv6GpalGq3oe1ucKt+fduYWsC2Vea/PObZowciqbsA0mv3oHlyT9jPFT
+hY9YjeYgUtEnf0BlrUrgbpd9DnVd5TNU0nDbPC7bv/yu8nF1nKUFWa2nsw==
+-----END CERTIFICATE-----";
+        const SELF_SIGNED_KEY_PEM: &[u8] = b"-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCtBOh4EAP48fjE
+59F+L9qNEp/yUlOJXYJbm6m4nzTg00RNc+dqsfrObIWJDuAaiKimunkGrSy77ELN
+AHlJmtOSkq8hu1C5/k6LW0GvPHuCfaPFEevCmxbERVZnt1f9IQ2e77oZz752cNzD
+lUIKyy5v3LpGaL8vT1bLAFuHT9z/3mlqEwyK7mQlS3LZvwJQ6NfL2lgr5uVDFdsv
+fAY4mhbV8uRjKj+IZnOV1WYqQ62oxbjC/NKXbvqKBigOhbo+idk1sjKbkjm2uvyj
+mUszRpfh7YX2wkk3UqZgN1+zsRDKMBMyuZkkr7Vb/8ed07SN8Ma64fwCrrQba4l/
+R8TJmQpXAgMBAAECggEAAk8G9RctnmRIMARx4K+tyGUfukGL+NDFHQjSNnL1Zyya
+hDgQNfXDBX8gNwh6SBBbw8HIPKUR7D4GVCr181v8B8AqUxZnSNwSWzyv/zEc6sxX
+Y5lOHo4oOx07vm2NYITQ5DaJsq95eKYf5AI5W+CDMZ3t5GOgbXavD01la0RPDCD7
+d+H9WI7RiKlCaiD174FQfSSwcAHpesrUcopPxMfZzpjxYClGdmMp7/RTmSVg8jex
+eGceJvZujmjTnYczIce0Ibtozbq91qbwro32U2wbkvNpbU8GTG+st6nRlNRGmHeF
+AJnOw+CiY9x7KaG4ZhsEY4VRk8YRJo/cLrPcx87JwQKBgQDv76cDYUgFzFXKWH+1
+hc+oTLuUcn+X6E3ljvMKk9P4nQDgTRDxx5bBm6lHVv3IZoszi60Hvzblqr2HIO5S
+Gl9KVBkHCLaYc8ny4rYQKVjKLA2/TnDE8Y8FhFnZTpBeEWhb2axQE5zb8WA6Ku6L
+gEl04OSHjMlqAWt2Va5PZnFQQQKBgQC4mlfFFkfu92RKkYfhXkXUd5psSL4/1C1S
+wYnqyL7rmAMmKO+y2MdnS1SAwSFGtmexibEcpDu8OASPQoovy4O5De+p/wL7v7aJ
++X2J9zaM2ggQN3tYz/HWCdCSpZJy+ufHtLwW9ESu0wW2G0ESRUxtEKvmBB/b/nrO
+pK7VWxW0lwKBgQCWPG1LRIKgfs3JIZj1xI++Ri2+SeNy7ta3wsaT/PRhW43M5PST
+L/JJ0HoyXVoTPYI0CGWT0DtDm6GJFymi5zh7hiUVrnMHCpmNKD/v5rPeA6+n9inO
+Z6KyRaks1HC5NhUuTiIDEgTKA13JjlBHsVBNivQNnC4R3km3kvbOaMrTAQKBgAoR
+6U3H/F6NwjvLGoVxtg90Asl7Yl1q/pnwEszq7Hc/kJRpUUIJTz9UPaTUZDNOSfPG
+VhIA531J9P23nIAk8ueKWhOE5K3E9HksUevPv3sJfb0cua7LkR6i5GzLeWSqSTB8
+rHH4GzMKMdqQPAl6HEQqz6W5fd9rT1msZBkhYdq7AoGBAJFTgwSK84D707FxGASw
+SyuZBVIVd3iF341tsgX48Q1SVq70Uu6AQ0qPJHyxk6pe8aCiermlvVX26nqSQqr7
+RrpkOaRQNnAfmLmSHvHWZmErDzlsl7pKdIByHK5nx1ccE8xspPEfHsg00E/SWWD+
+CQR0IwmxMNda1bOi/AL4rcN3
+-----END PRIVATE KEY-----";
+
+        use anyhow::Context as _;
+
+        let identity = native_tls::Identity::from_pkcs8(SELF_SIGNED_CERT_PEM, SELF_SIGNED_KEY_PEM)?;
+        let acceptor = native_tls::TlsAcceptor::new(identity)?;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let server = std::thread::spawn(move || {
+            if let Ok((socket, _)) = listener.accept() {
+                // The client aborts after rejecting the certificate, so the
+                // server-side handshake result is an expected error.
+                drop(acceptor.accept(socket));
+            }
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build()?;
+        let result = client
+            .get(format!("https://localhost:{}", address.port()))
+            .send()
+            .await;
+        let Err(error) = result else {
+            anyhow::bail!("self-signed certificate unexpectedly accepted")
+        };
+        assert_eq!(classify_reqwest_error(&error), StreamErrorKind::ServerError);
+        server
+            .join()
+            .ok()
+            .context("TLS test server thread panicked")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn classifies_premature_http_eof_as_connection_lost() -> anyhow::Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nx")
+                .await?;
+            anyhow::Ok(())
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}"))
+            .send()
+            .await?;
+        let Err(error) = response.bytes().await else {
+            anyhow::bail!("truncated HTTP body unexpectedly completed")
+        };
+        let StreamDelta::Error { kind, .. } = reqwest_body_error_delta("stream error", &error)
+        else {
+            anyhow::bail!("body error helper did not return an error delta")
+        };
+        assert_eq!(kind, StreamErrorKind::ConnectionLost);
+        server.await??;
+        Ok(())
     }
 
     #[cfg(any(feature = "openai", feature = "openai-codex"))]

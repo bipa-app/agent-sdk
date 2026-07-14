@@ -111,6 +111,7 @@ dependencies = [
  "futures",
  "jsonschema",
  "log",
+ "native-tls",
  "reqwest",
  "serde",
  "serde_json",

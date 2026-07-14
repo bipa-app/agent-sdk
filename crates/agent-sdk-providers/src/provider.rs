@@ -78,6 +78,24 @@ pub trait LlmProvider: Send + Sync {
         ))
     }
 
+    /// Cheaply check whether the provider's endpoint is currently reachable,
+    /// without dispatching a billable request.
+    ///
+    /// Durable runtimes poll this to wait out connectivity loss: after a
+    /// transport-classified stream failure
+    /// ([`StreamErrorKind::is_connectivity`]) they probe until reachability
+    /// returns, then re-dispatch the real call. Only an unreachable answer
+    /// keeps that wait free of charge, so implementations should answer from
+    /// a cheap endpoint — [`probe_http_reachability`] against the API host —
+    /// never a model call.
+    ///
+    /// The default returns `true` ("reachable, or unknown"): a provider that
+    /// cannot observe reachability keeps its callers on the bounded retry
+    /// path instead of parking them in an offline wait it can never end.
+    async fn probe_connectivity(&self) -> bool {
+        true
+    }
+
     /// Streaming chat completion.
     ///
     /// Returns a stream of [`StreamDelta`] events. The default implementation
@@ -296,6 +314,25 @@ pub trait LlmProvider: Send + Sync {
             _ => StructuredOutputSupport::ToolForcing,
         }
     }
+}
+
+/// Timeout for [`probe_http_reachability`]: long enough for a slow TLS
+/// handshake, short enough that a half-open network cannot stall the
+/// connectivity-wait loop it drives.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `true` when an HTTP response arrives from `url` over a fully-established
+/// (and, for HTTPS, certificate-validated) connection.
+///
+/// The status code is deliberately ignored — a 4xx from the provider's edge
+/// proves the network path exactly as well as a 200 does, and needs no
+/// credentials. Every transport failure (DNS, connect, TLS, timeout) reports
+/// unreachable: this feeds offline-wait loops, where the fail-safe direction
+/// is to keep waiting. A captive portal that hijacks the hostname fails
+/// certificate validation and therefore stays unreachable until the real
+/// endpoint is back.
+pub async fn probe_http_reachability(client: &reqwest::Client, url: &str) -> bool {
+    client.head(url).timeout(PROBE_TIMEOUT).send().await.is_ok()
 }
 
 /// Drop extended thinking when the request forces a specific tool.

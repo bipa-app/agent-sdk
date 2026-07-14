@@ -8,8 +8,8 @@
 use super::root_turn::{
     PartialCancelCommit, RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes, cancel_root_turn,
     commit_partial_turn_on_cancel, derive_reattach_tool_use_id, execute_root_turn, fail_root_turn,
-    provider_valid_split, resume_for_steering, resume_from_children, resume_root_turn,
-    revert_steering_wake, settle_attempt_after_lost_ownership,
+    is_root_turn_cancelled, provider_valid_split, resume_for_steering, resume_from_children,
+    resume_root_turn, revert_steering_wake, settle_attempt_after_lost_ownership,
 };
 use crate::journal::checkpoint::CheckpointKind;
 use std::sync::Arc;
@@ -43,7 +43,7 @@ use agent_sdk_foundation::{
     AgentContinuation, AgentState, ContinuationEnvelope, ThreadId, TokenUsage,
 };
 use agent_sdk_providers::LlmProvider;
-use agent_sdk_providers::streaming::{StreamBox, StreamDelta};
+use agent_sdk_providers::streaming::{StreamBox, StreamDelta, StreamErrorKind};
 use agent_sdk_tools::stores::MessageStore;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -3687,6 +3687,138 @@ impl LlmProvider for FlakyProvider {
     }
 }
 
+/// Provider that goes offline for a scripted number of reachability probes,
+/// then recovers. The first `chat_stream` call fails with a pre-connect
+/// connectivity error; the worker then holds the attempt open and polls
+/// `probe_connectivity`, which reports unreachable `offline_probes` times —
+/// each unreachable answer forgiving the reachable-death circuit breaker —
+/// before the endpoint comes back. Later calls optionally fail with server
+/// errors first, proving the transient budget survives the wait untouched.
+struct OfflineThenSuccessProvider {
+    offline_probes: usize,
+    server_failures_after_online: usize,
+    call_count: AtomicUsize,
+    probe_count: AtomicUsize,
+}
+
+impl OfflineThenSuccessProvider {
+    fn new(offline_probes: usize) -> Self {
+        Self {
+            offline_probes,
+            server_failures_after_online: 0,
+            call_count: AtomicUsize::new(0),
+            probe_count: AtomicUsize::new(0),
+        }
+    }
+
+    const fn with_server_failures(mut self, failures: usize) -> Self {
+        self.server_failures_after_online = failures;
+        self
+    }
+
+    fn calls(&self) -> usize {
+        self.call_count.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl LlmProvider for OfflineThenSuccessProvider {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        bail!("chat is not used by this streaming provider")
+    }
+
+    async fn probe_connectivity(&self) -> bool {
+        let probe = self.probe_count.fetch_add(1, Ordering::SeqCst);
+        probe >= self.offline_probes
+    }
+
+    fn chat_stream(&self, _request: ChatRequest) -> StreamBox<'_> {
+        let call = self.call_count.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async_stream::stream! {
+            if call == 0 {
+                yield Ok(StreamDelta::Error {
+                    message: "network is unreachable".to_owned(),
+                    kind: StreamErrorKind::Connectivity,
+                });
+                return;
+            }
+            if call <= self.server_failures_after_online {
+                yield Ok(StreamDelta::Error {
+                    message: "provider 503".to_owned(),
+                    kind: StreamErrorKind::ServerError,
+                });
+                return;
+            }
+            yield Ok(StreamDelta::TextDelta {
+                delta: "continued after reconnect".to_owned(),
+                block_index: 0,
+            });
+            yield Ok(StreamDelta::Usage(Usage {
+                input_tokens: 10,
+                output_tokens: 3,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            }));
+            yield Ok(StreamDelta::Done {
+                stop_reason: Some(StopReason::EndTurn),
+            });
+        })
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
+/// Provider whose dispatched streams always die mid-transport while its
+/// probe keeps reporting reachable — the broken-path pathology (a proxy or
+/// load balancer killing every response) that the reachable-death circuit
+/// breaker exists to bound.
+struct ReachableButDyingProvider {
+    call_count: AtomicUsize,
+}
+
+impl ReachableButDyingProvider {
+    const fn new() -> Self {
+        Self {
+            call_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.call_count.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl LlmProvider for ReachableButDyingProvider {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        bail!("chat is not used by this streaming provider")
+    }
+
+    fn chat_stream(&self, _request: ChatRequest) -> StreamBox<'_> {
+        self.call_count.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async_stream::stream! {
+            yield Ok(StreamDelta::Error {
+                message: "connection reset by peer".to_owned(),
+                kind: StreamErrorKind::ConnectionLost,
+            });
+        })
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
 /// Provider that always returns `InvalidRequest` — exercises the
 /// fatal (no-retry) branch of `call_llm_with_retry`.
 struct InvalidRequestProvider;
@@ -3732,6 +3864,185 @@ async fn collected_event_kinds(events: &InMemoryEventRepository) -> Vec<String> 
         })
         .map(str::to_owned)
         .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn connectivity_wait_outlives_normal_retry_budget() -> Result<()> {
+    let stores = TestStores::new();
+    let provider = OfflineThenSuccessProvider::new(6);
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let bootstrap = sample_bootstrap(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    let outcome = execute_root_turn(inputs, "ping", &provider, &stores.deps(), t_plus(1)).await?;
+    let RootTurnOutcome::Completed { response_text, .. } = outcome else {
+        bail!("expected completion after connectivity recovered")
+    };
+    assert_eq!(response_text, "continued after reconnect");
+    assert_eq!(
+        provider.calls(),
+        2,
+        "an offline wait must probe for free, not re-dispatch billable calls"
+    );
+    assert_eq!(
+        stores.attempts.list_by_task(&task_id).await?.len(),
+        1,
+        "offline probes must not manufacture zero-usage audit attempts"
+    );
+    let events = stores.events.get_events(&thread_a()).await?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event.event,
+                agent_sdk_foundation::events::AgentEvent::AutoRetryStart { .. }
+            ))
+            .count(),
+        1,
+        "an unbounded connectivity wait must use one durable retry envelope"
+    );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn connectivity_wait_does_not_consume_server_retry_budget() -> Result<()> {
+    let stores = TestStores::new();
+    let provider = OfflineThenSuccessProvider::new(6).with_server_failures(1);
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let bootstrap = sample_bootstrap(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    let outcome = execute_root_turn(inputs, "ping", &provider, &stores.deps(), t_plus(1)).await?;
+    let RootTurnOutcome::Completed { response_text, .. } = outcome else {
+        bail!("expected completion after connectivity and server retries")
+    };
+    assert_eq!(response_text, "continued after reconnect");
+    assert_eq!(provider.calls(), 3);
+
+    let events = stores.events.get_events(&thread_a()).await?;
+    let retry_attempts: Vec<u32> = events
+        .iter()
+        .filter_map(|committed| match committed.event {
+            agent_sdk_foundation::events::AgentEvent::AutoRetryStart { attempt, .. } => {
+                Some(attempt)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(retry_attempts, vec![1, 2]);
+    assert!(events.iter().any(|committed| matches!(
+        committed.event,
+        agent_sdk_foundation::events::AgentEvent::AutoRetryEnd {
+            attempt: 2,
+            success: true,
+            ..
+        }
+    )));
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn reachable_connection_deaths_trip_the_circuit_breaker() -> Result<()> {
+    // Probes keep reporting reachable, yet every dispatched stream dies in
+    // transit — a broken path, not an outage. The turn must fail after the
+    // reachable-death bound instead of billing an attempt per backoff
+    // forever, and every audit row must be settled.
+    let stores = TestStores::new();
+    let provider = ReachableButDyingProvider::new();
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let bootstrap = sample_bootstrap(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    let result = execute_root_turn(inputs, "ping", &provider, &stores.deps(), t_plus(1)).await;
+    let Err(error) = result else {
+        bail!("a reachable provider whose streams keep dying must fail the turn")
+    };
+    assert!(
+        format!("{error:#}").contains("stayed reachable"),
+        "the failure must name the circuit breaker: {error:#}"
+    );
+    assert_eq!(
+        provider.calls(),
+        4,
+        "initial dispatch plus the three forgivable reachable deaths"
+    );
+    let attempts = stores.attempts.list_by_task(&task_id).await?;
+    assert_eq!(attempts.len(), 4, "one audit row per dispatched call");
+    assert!(
+        attempts.iter().all(|attempt| !attempt.is_open()),
+        "every dispatched attempt must be settled"
+    );
+    let events = stores.events.get_events(&thread_a()).await?;
+    assert!(events.iter().any(|committed| matches!(
+        committed.event,
+        agent_sdk_foundation::events::AgentEvent::AutoRetryEnd { success: false, .. }
+    )));
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn connectivity_wait_stops_promptly_on_cancel() -> Result<()> {
+    let stores = TestStores::new();
+    let provider = OfflineThenSuccessProvider::new(usize::MAX);
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let bootstrap = sample_bootstrap(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let cancel = CancellationToken::new();
+    let mut deps = stores.deps();
+    deps.cancel = Some(&cancel);
+
+    let run = execute_root_turn(inputs, "ping", &provider, &deps, t_plus(1));
+    let trip_cancel = async {
+        while provider.calls() == 0 {
+            tokio::task::yield_now().await;
+        }
+        cancel.cancel();
+    };
+    let (result, ()) = tokio::join!(run, trip_cancel);
+    let Err(error) = result else {
+        bail!("cancelled connectivity wait unexpectedly completed")
+    };
+    assert!(is_root_turn_cancelled(&error));
+
+    let attempts = stores.attempts.list_by_task(&task_id).await?;
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(
+        attempts[0].outcome,
+        Some(TurnAttemptOutcome::Cancelled),
+        "cancellation must close the held offline attempt"
+    );
+    Ok(())
 }
 
 #[tokio::test]

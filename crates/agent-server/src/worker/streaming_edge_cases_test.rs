@@ -539,9 +539,9 @@ async fn mid_stream_rate_limit_waits_for_the_provider_hint() -> Result<()> {
 #[tokio::test(start_paused = true)]
 async fn first_event_stall_is_retried_then_succeeds() -> Result<()> {
     let stores = Stores::new();
-    // Attempt 1: the script sleeps 400s (virtual) before its first
-    // delta — past the 330s first-event stall budget, so nothing is
-    // ever delivered. Attempt 2: clean success.
+    // Request 1 sleeps 400s (virtual) before its first delta — past the
+    // 330s first-event stall budget, so nothing is delivered. Request 2
+    // succeeds under a fresh attempt because request 1 was dispatched.
     let first = TurnScript::text("never delivered").with_delay(std::time::Duration::from_secs(400));
     let second = TurnScript::text("recovered answer");
     let provider = StreamingScriptedProvider::new(vec![first, second]);
@@ -556,7 +556,12 @@ async fn first_event_stall_is_retried_then_succeeds() -> Result<()> {
         .attempts
         .list_by_task(&acquire_existing_task_id(&stores).await?)
         .await?;
-    assert_eq!(attempts.len(), 2, "one stalled attempt + one success");
+    assert_eq!(
+        attempts.len(),
+        2,
+        "a dispatched stream must have one audit attempt per provider call"
+    );
+    assert!(attempts.iter().all(|attempt| !attempt.is_open()));
 
     // The stall rides the standard recoverable path: an auto-retry
     // envelope lands in the journal (this commit is also what keeps
@@ -574,11 +579,11 @@ async fn first_event_stall_is_retried_then_succeeds() -> Result<()> {
 #[tokio::test(start_paused = true)]
 async fn mid_stream_stall_is_retried_then_succeeds() -> Result<()> {
     let stores = Stores::new();
-    // Attempt 1: every delta is gated behind a uniform 200s delay. The
-    // first delta lands (200s < 330s first-event budget) and latches
-    // the tighter inter-event budget; the gap before the second delta
-    // (another 200s > 120s) then trips the mid-stream stall. Attempt 2:
-    // clean success.
+    // Request 1 gates every delta behind a uniform 200s delay. The first
+    // delta lands (200s < 330s first-event budget) and latches the tighter
+    // inter-event budget; the next gap (200s > 120s) trips the mid-stream
+    // stall. Request 2 succeeds under a fresh audit attempt because the first
+    // provider call emitted output and may have incurred usage.
     let first = TurnScript::from_deltas(vec![
         StreamDelta::TextDelta {
             delta: "partial".into(),
@@ -606,7 +611,15 @@ async fn mid_stream_stall_is_retried_then_succeeds() -> Result<()> {
         .attempts
         .list_by_task(&acquire_existing_task_id(&stores).await?)
         .await?;
-    assert_eq!(attempts.len(), 2, "one stalled attempt + one success");
+    assert_eq!(
+        attempts.len(),
+        2,
+        "a mid-stream disconnect must close its provider-call attempt"
+    );
+    assert!(
+        attempts.iter().all(|attempt| !attempt.is_open()),
+        "neither the disconnected nor successful attempt may remain open"
+    );
 
     Ok(())
 }

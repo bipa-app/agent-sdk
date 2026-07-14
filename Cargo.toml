@@ -82,6 +82,12 @@ time = { version = "0.3", features = ["serde", "std", "formatting", "parsing"] }
 # Reqwest's `default-tls` selects AWS-LC in 0.13, adding a large native build
 # even for SQLite-only service hosts.
 reqwest = { version = "0.13.2", features = ["gzip", "json", "query", "native-tls", "stream", "http2"], default-features = false }
+# Exists solely so provider error classification can `downcast_ref` into
+# reqwest's error chain; the downcast only matches while this resolves to the
+# same semver-compatible native-tls release reqwest links. If the versions
+# ever diverge, TLS policy rejections stop classifying as bounded errors
+# (`tls_certificate_rejection_is_bounded_server_error` pins this).
+native-tls = "0.2"
 async-stream = "0.3"
 bytes = "1"
 log = { version = "0.4", features = ["kv_std"] }

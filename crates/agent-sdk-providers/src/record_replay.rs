@@ -243,6 +243,15 @@ impl LlmProvider for RecordReplayProvider {
         }
     }
 
+    /// Record mode asks the real provider; replay mode has no network at all,
+    /// so it stays on the default "reachable" answer and never offline-waits.
+    async fn probe_connectivity(&self) -> bool {
+        match &self.inner {
+            Some(inner) => inner.probe_connectivity().await,
+            None => true,
+        }
+    }
+
     fn model(&self) -> &str {
         &self.model
     }
@@ -509,6 +518,8 @@ impl CassetteDelta {
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
 enum CassetteErrorKind {
+    Connectivity,
+    ConnectionLost,
     RateLimited,
     ServerError,
     InvalidRequest,
@@ -518,6 +529,8 @@ enum CassetteErrorKind {
 impl CassetteErrorKind {
     const fn from_kind(kind: StreamErrorKind) -> Self {
         match kind {
+            StreamErrorKind::Connectivity => Self::Connectivity,
+            StreamErrorKind::ConnectionLost => Self::ConnectionLost,
             StreamErrorKind::RateLimited(_) => Self::RateLimited,
             StreamErrorKind::ServerError => Self::ServerError,
             StreamErrorKind::InvalidRequest => Self::InvalidRequest,
@@ -528,6 +541,8 @@ impl CassetteErrorKind {
 
     const fn into_kind(self, retry_after: Option<Duration>) -> StreamErrorKind {
         match self {
+            Self::Connectivity => StreamErrorKind::Connectivity,
+            Self::ConnectionLost => StreamErrorKind::ConnectionLost,
             Self::RateLimited => StreamErrorKind::RateLimited(retry_after),
             Self::ServerError => StreamErrorKind::ServerError,
             Self::InvalidRequest => StreamErrorKind::InvalidRequest,

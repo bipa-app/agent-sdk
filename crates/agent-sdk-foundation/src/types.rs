@@ -176,6 +176,14 @@ pub enum BudgetLimitKind {
 }
 
 /// Configuration for retry behavior on transient errors.
+///
+/// Connectivity loss is handled outside this budget: when a streaming call
+/// fails at the transport layer and the provider's reachability probe
+/// reports it unreachable, the runtime waits — probing for free, without
+/// dispatching billable calls — until connectivity returns or the run is
+/// cancelled, however long that takes. `max_retries` only bounds failures
+/// that happen while the provider stays reachable (rate limits, server
+/// errors, and repeated mid-stream deaths on a reachable path).
 #[derive(Clone, Debug)]
 pub struct RetryConfig {
     /// Maximum number of retry attempts

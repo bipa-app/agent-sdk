@@ -71,7 +71,9 @@ pub mod structured;
 
 // Convenience re-exports — provider trait and streaming
 pub use fallback::FallbackProvider;
-pub use provider::{LlmProvider, ModelInfo, StructuredOutputSupport, collect_stream};
+pub use provider::{
+    LlmProvider, ModelInfo, StructuredOutputSupport, collect_stream, probe_http_reachability,
+};
 #[cfg(feature = "record-replay")]
 pub use record_replay::{RecordReplayMode, RecordReplayProvider};
 pub use refresh::{RefreshingProvider, is_unauthorized_error};

@@ -215,6 +215,17 @@ impl LlmProvider for FallbackProvider {
         self.primary.list_models().await
     }
 
+    /// Reachable when any provider in the chain is reachable — the chain can
+    /// serve a request as long as one backend can be dialled.
+    async fn probe_connectivity(&self) -> bool {
+        for provider in self.ordered() {
+            if provider.probe_connectivity().await {
+                return true;
+            }
+        }
+        false
+    }
+
     fn model(&self) -> &str {
         self.primary.model()
     }

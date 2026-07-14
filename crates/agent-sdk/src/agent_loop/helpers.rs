@@ -78,9 +78,8 @@ pub(super) fn millis_to_u64(millis: u128) -> u64 {
 /// capped at the maximum delay. Jitter (0-1000ms) helps avoid thundering herd.
 pub(super) fn calculate_backoff_delay(attempt: u32, config: &RetryConfig) -> Duration {
     // Exponential backoff: base, base*2, base*4, base*8, ...
-    let base_delay = config
-        .base_delay_ms
-        .saturating_mul(1u64 << (attempt.saturating_sub(1)));
+    let exponent = attempt.saturating_sub(1).min(63);
+    let base_delay = config.base_delay_ms.saturating_mul(1u64 << exponent);
 
     // Add jitter (0-1000ms or 10% of base, whichever is smaller) to avoid thundering herd.
     // Uses RandomState for per-process randomness instead of system clock.
@@ -267,6 +266,19 @@ mod tests {
     use super::*;
     use crate::llm::{ChatResponse, ContentBlock, Usage};
     use serde_json::json;
+
+    #[test]
+    fn backoff_caps_extreme_attempt_without_shift_overflow() {
+        let config = RetryConfig {
+            max_retries: 3,
+            base_delay_ms: 500,
+            max_delay_ms: 8_000,
+        };
+        assert_eq!(
+            calculate_backoff_delay(u32::MAX, &config),
+            Duration::from_secs(8)
+        );
+    }
 
     #[test]
     fn test_extract_content_text_only() {
