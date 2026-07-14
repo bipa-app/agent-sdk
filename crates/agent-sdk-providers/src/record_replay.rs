@@ -243,6 +243,15 @@ impl LlmProvider for RecordReplayProvider {
         }
     }
 
+    /// Record mode asks the real provider; replay mode has no network at all,
+    /// so it stays on the default "reachable" answer and never offline-waits.
+    async fn probe_connectivity(&self) -> bool {
+        match &self.inner {
+            Some(inner) => inner.probe_connectivity().await,
+            None => true,
+        }
+    }
+
     fn model(&self) -> &str {
         &self.model
     }

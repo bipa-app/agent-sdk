@@ -1,7 +1,7 @@
 use super::helpers::{calculate_backoff_delay, send_event};
 use super::types::{
-    LLM_CALL_TOTAL_TIMEOUT, LLM_STREAM_INACTIVITY_TIMEOUT, LlmEventContext, LlmOutcome,
-    LlmStreamIds, StreamError,
+    CONNECTIVITY_PROBE_MIN_DELAY, LLM_CALL_TOTAL_TIMEOUT, LLM_STREAM_INACTIVITY_TIMEOUT,
+    LlmEventContext, LlmOutcome, LlmStreamIds, MAX_REACHABLE_CONNECTIVITY_FAILURES, StreamError,
 };
 use crate::events::AgentEvent;
 use crate::hooks::{AgentHooks, RequestDecision, ResponseDecision};
@@ -336,8 +336,6 @@ where
             settled_event_attempt: attempt.saturating_sub(1),
             max_retries,
             event_max_retries: max_retries,
-            emit_event: true,
-            minimum_delay: std::time::Duration::ZERO,
             error_kind: kind,
             retry_reason,
             failure_message,
@@ -418,6 +416,33 @@ fn transient_retry_context(
     (failure, event_max)
 }
 
+/// Terminal failure of a retry loop: settle the auto-retry envelope with
+/// `success: false`, surface the `llm.error` event, and build the outcome the
+/// run ends with. Shared by the exhausted transient budget and the
+/// reachable-connectivity circuit breaker so both fail identically.
+async fn give_up_retrying<H>(
+    event_ctx: &LlmEventContext<'_, H>,
+    settled_event_attempt: u32,
+    failure_message: String,
+    error_kind: &'static str,
+) -> LlmOutcome
+where
+    H: AgentHooks,
+{
+    error!("LLM {error_kind} exhausted retries: {failure_message}");
+    send_auto_retry_end_event(
+        event_ctx,
+        settled_event_attempt,
+        false,
+        Some(failure_message.clone()),
+    )
+    .await;
+    if let Err(error) = send_llm_error_event(event_ctx, &failure_message).await {
+        return LlmOutcome::Error(error);
+    }
+    LlmOutcome::Error(AgentError::new(failure_message, true))
+}
+
 struct RetryBackoff<'a, 'o, H> {
     event_ctx: &'a LlmEventContext<'a, H>,
     config: &'a AgentConfig,
@@ -426,8 +451,6 @@ struct RetryBackoff<'a, 'o, H> {
     settled_event_attempt: u32,
     max_retries: u32,
     event_max_retries: u32,
-    emit_event: bool,
-    minimum_delay: std::time::Duration,
     /// Stable `error.type` label, e.g. `rate_limited` / `server_error`.
     error_kind: &'static str,
     /// Human-readable reason shown on the `AutoRetryStart` event.
@@ -459,8 +482,6 @@ where
         settled_event_attempt,
         max_retries,
         event_max_retries,
-        emit_event,
-        minimum_delay,
         error_kind,
         retry_reason,
         failure_message,
@@ -472,29 +493,24 @@ where
     } = params;
 
     if attempt > max_retries {
-        error!("LLM {error_kind} exhausted retries: {failure_message}");
-        send_auto_retry_end_event(
-            event_ctx,
-            settled_event_attempt,
-            false,
-            Some(failure_message.clone()),
-        )
-        .await;
-        if let Err(error) = send_llm_error_event(event_ctx, &failure_message).await {
-            return RetryStep::GiveUp(LlmOutcome::Error(error));
-        }
-        return RetryStep::GiveUp(LlmOutcome::Error(AgentError::new(failure_message, true)));
+        return RetryStep::GiveUp(
+            give_up_retrying(
+                event_ctx,
+                settled_event_attempt,
+                failure_message,
+                error_kind,
+            )
+            .await,
+        );
     }
 
     // A provider `Retry-After` hint wins over the exponential backoff, but is
     // clamped to the configured ceiling so a hostile/oversized header cannot
     // stall the turn. The attempt still counts against `max_retries`.
-    let delay = override_delay
-        .map_or_else(
-            || calculate_backoff_delay(attempt, &config.retry),
-            |hint| clamp_to_max_delay(hint, config.retry.max_delay_ms),
-        )
-        .max(minimum_delay);
+    let delay = override_delay.map_or_else(
+        || calculate_backoff_delay(attempt, &config.retry),
+        |hint| clamp_to_max_delay(hint, config.retry.max_delay_ms),
+    );
     let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
     warn!(
         "LLM {error_kind}, retrying (retry={event_attempt}, class_attempt={attempt}, delay_ms={delay_ms})"
@@ -503,16 +519,14 @@ where
     if let Some(observer) = span_observer {
         observer.record_retry(event_attempt, event_max_retries, delay_ms, error_kind);
     }
-    if emit_event {
-        send_auto_retry_start_event(
-            event_ctx,
-            event_attempt,
-            event_max_retries,
-            delay_ms,
-            &retry_reason,
-        )
-        .await;
-    }
+    send_auto_retry_start_event(
+        event_ctx,
+        event_attempt,
+        event_max_retries,
+        delay_ms,
+        &retry_reason,
+    )
+    .await;
     if sleep_or_cancel(delay, event_ctx.cancel_token)
         .await
         .is_break()
@@ -548,8 +562,18 @@ async fn sleep_or_cancel(
 
 struct StreamingRetryState {
     total: u32,
-    connectivity: u32,
     transient: u32,
+    /// Consecutive connectivity-class failures whose surrounding probes kept
+    /// reporting the provider reachable. Any unreachable probe resets it —
+    /// direct evidence of a genuine outage forgives earlier deaths.
+    reachable_connectivity_deaths: u32,
+    /// Whether the previous recorded failure was connectivity-class. A streak
+    /// emits one `AutoRetryStart` envelope, on its first failure.
+    in_connectivity_streak: bool,
+    /// Whether any connectivity failure occurred during this call; later
+    /// transient retry events then advertise the indefinite-wait sentinel so
+    /// their attempt number can exceed the transient budget.
+    had_connectivity: bool,
     last_emitted: u32,
     /// Usage billed by attempts that died before completing.
     abandoned_usage: Usage,
@@ -559,26 +583,143 @@ impl StreamingRetryState {
     const fn new() -> Self {
         Self {
             total: 0,
-            connectivity: 0,
             transient: 0,
+            reachable_connectivity_deaths: 0,
+            in_connectivity_streak: false,
+            had_connectivity: false,
             last_emitted: 0,
             abandoned_usage: ZERO_USAGE,
         }
     }
 
+    /// Record a connectivity-class failure. Returns `true` when it opens a
+    /// new streak, i.e. when the caller must emit the streak's
+    /// `AutoRetryStart`.
     const fn record_connectivity_failure(&mut self, usage: &Usage) -> bool {
         add_usage(&mut self.abandoned_usage, usage);
-        self.connectivity = self.connectivity.saturating_add(1);
         self.total = self.total.saturating_add(1);
-        self.connectivity == 1
+        self.reachable_connectivity_deaths = self.reachable_connectivity_deaths.saturating_add(1);
+        self.had_connectivity = true;
+        let starts_streak = !self.in_connectivity_streak;
+        self.in_connectivity_streak = true;
+        starts_streak
     }
 
     const fn record_transient_failure(&mut self, usage: &Usage, max_retries: u32) -> bool {
         add_usage(&mut self.abandoned_usage, usage);
         self.transient = self.transient.saturating_add(1);
         self.total = self.total.saturating_add(1);
+        self.in_connectivity_streak = false;
         self.transient <= max_retries
     }
+}
+
+/// Delay before connectivity probe `probe_round` (1-based): the configured
+/// exponential backoff with a floor, so a zero-delay retry config cannot turn
+/// the offline wait into a hot loop.
+fn connectivity_probe_delay(probe_round: u32, config: &AgentConfig) -> std::time::Duration {
+    calculate_backoff_delay(probe_round, &config.retry).max(CONNECTIVITY_PROBE_MIN_DELAY)
+}
+
+/// Park until the provider probe reports reachable again, sleeping the
+/// per-round backoff between probes and racing every wait against
+/// cancellation. Probes are free — no billable request is dispatched until
+/// this returns.
+///
+/// An unreachable probe is direct evidence of a genuine outage, so it resets
+/// the reachable-death circuit breaker: offline time, however long, never
+/// fails the turn.
+async fn wait_for_connectivity<P, H>(
+    provider: &Arc<P>,
+    config: &AgentConfig,
+    event_ctx: &LlmEventContext<'_, H>,
+    retry: &mut StreamingRetryState,
+) -> std::ops::ControlFlow<()>
+where
+    P: LlmProvider,
+    H: AgentHooks,
+{
+    let mut probe_round: u32 = 0;
+    loop {
+        probe_round = probe_round.saturating_add(1);
+        let delay = connectivity_probe_delay(probe_round, config);
+        if sleep_or_cancel(delay, event_ctx.cancel_token)
+            .await
+            .is_break()
+        {
+            return std::ops::ControlFlow::Break(());
+        }
+        let reachable = tokio::select! {
+            biased;
+            () = event_ctx.cancel_token.cancelled() => return std::ops::ControlFlow::Break(()),
+            reachable = provider.probe_connectivity() => reachable,
+        };
+        if reachable {
+            return std::ops::ControlFlow::Continue(());
+        }
+        retry.reachable_connectivity_deaths = 0;
+    }
+}
+
+/// Handle one connectivity-class stream failure: trip the reachable-death
+/// circuit breaker, open the streak's retry envelope when this failure
+/// starts one, and park until the provider answers probes again.
+///
+/// Returns the terminal outcome when the wait ended the call (circuit
+/// breaker or cancellation); `None` means connectivity returned and the
+/// caller should re-dispatch under fresh stream ids.
+async fn handle_connectivity_loss<P, H>(
+    provider: &Arc<P>,
+    config: &AgentConfig,
+    event_ctx: &LlmEventContext<'_, H>,
+    retry: &mut StreamingRetryState,
+    message: &str,
+    usage: &Usage,
+    #[cfg(feature = "otel")] span_observer: Option<&mut LlmSpanObserver<'_>>,
+) -> Option<(LlmOutcome, u32)>
+where
+    P: LlmProvider,
+    H: AgentHooks,
+{
+    let starts_streak = retry.record_connectivity_failure(usage);
+    if retry.reachable_connectivity_deaths > MAX_REACHABLE_CONNECTIVITY_FAILURES {
+        // The endpoint answers probes yet every dispatched stream dies in
+        // transit: a broken path, not an outage. Billing a fresh attempt per
+        // backoff forever is the one thing the offline wait must not do, so
+        // this fails like an exhausted transient budget.
+        let failure = format!(
+            "Streaming connection died {} consecutive times while the provider \
+             stayed reachable: {message}",
+            retry.reachable_connectivity_deaths
+        );
+        let outcome =
+            give_up_retrying(event_ctx, retry.last_emitted, failure, "connectivity").await;
+        return Some((outcome, retry.total));
+    }
+    let delay_ms =
+        u64::try_from(connectivity_probe_delay(1, config).as_millis()).unwrap_or(u64::MAX);
+    warn!(
+        "LLM connectivity loss, waiting for reachability (failure={}, reachable_deaths={}): {message}",
+        retry.total, retry.reachable_connectivity_deaths
+    );
+    #[cfg(feature = "otel")]
+    if let Some(observer) = span_observer {
+        observer.record_retry(retry.total, u32::MAX, delay_ms, "connectivity");
+    }
+    if starts_streak {
+        retry.last_emitted = retry.total;
+        send_auto_retry_start_event(event_ctx, retry.total, u32::MAX, delay_ms, message).await;
+    }
+    if wait_for_connectivity(provider, config, event_ctx, retry)
+        .await
+        .is_break()
+    {
+        return Some((
+            LlmOutcome::Cancelled(retry.abandoned_usage.clone()),
+            retry.total,
+        ));
+    }
+    None
 }
 
 /// Call the LLM with streaming, emitting deltas as they arrive.
@@ -626,31 +767,18 @@ where
                 return (LlmOutcome::Response(response), retry.total);
             }
             Err(StreamError::Connectivity { message, usage }) => {
-                let emit_event = retry.record_connectivity_failure(&usage);
-                mark_retry_emitted(&mut retry.last_emitted, retry.total, emit_event);
-                let step = handle_retry_backoff(RetryBackoff {
-                    event_ctx,
+                let terminal = handle_connectivity_loss(
+                    provider,
                     config,
-                    attempt: retry.connectivity,
-                    event_attempt: retry.total,
-                    settled_event_attempt: retry.last_emitted,
-                    max_retries: u32::MAX,
-                    event_max_retries: u32::MAX,
-                    emit_event,
-                    minimum_delay: std::time::Duration::from_millis(250),
-                    error_kind: "connectivity",
-                    retry_reason: message.clone(),
-                    failure_message: message,
-                    override_delay: None,
+                    event_ctx,
+                    &mut retry,
+                    &message,
+                    &usage,
                     #[cfg(feature = "otel")]
-                    span_observer: span_observer.as_mut(),
-                    #[cfg(not(feature = "otel"))]
-                    _observer: std::marker::PhantomData,
-                })
+                    span_observer.as_mut(),
+                )
                 .await;
-                if let Some(outcome) =
-                    terminal_retry_outcome(step, retry.total, &retry.abandoned_usage)
-                {
+                if let Some(outcome) = terminal {
                     return outcome;
                 }
                 renew_stream_ids(message_id, thinking_id);
@@ -663,7 +791,7 @@ where
                 let emits_transient = retry.record_transient_failure(&usage, max_retries);
                 mark_retry_emitted(&mut retry.last_emitted, retry.total, emits_transient);
                 let (failure_message, event_max_retries) =
-                    transient_retry_context(&message, max_retries, retry.connectivity > 0);
+                    transient_retry_context(&message, max_retries, retry.had_connectivity);
                 let step = handle_retry_backoff(RetryBackoff {
                     event_ctx,
                     config,
@@ -672,8 +800,6 @@ where
                     settled_event_attempt: retry.last_emitted,
                     max_retries,
                     event_max_retries,
-                    emit_event: true,
-                    minimum_delay: std::time::Duration::ZERO,
                     error_kind: "stream_error",
                     retry_reason: message,
                     failure_message,

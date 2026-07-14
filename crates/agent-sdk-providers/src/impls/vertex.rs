@@ -130,16 +130,21 @@ impl VertexProvider {
         self.model.starts_with("claude-")
     }
 
-    /// Build the base URL for the given publisher and model.
+    /// The API domain for this provider's location.
     ///
     /// For the `global` location the domain is `aiplatform.googleapis.com`
     /// (no region prefix). Regional locations use `{region}-aiplatform.googleapis.com`.
-    fn base_url(&self, publisher: &str) -> String {
-        let domain = if self.region == "global" {
+    fn endpoint_domain(&self) -> String {
+        if self.region == "global" {
             "aiplatform.googleapis.com".to_owned()
         } else {
             format!("{}-aiplatform.googleapis.com", self.region)
-        };
+        }
+    }
+
+    /// Build the base URL for the given publisher and model.
+    fn base_url(&self, publisher: &str) -> String {
+        let domain = self.endpoint_domain();
         format!(
             "https://{domain}/v1/projects/{project}/locations/{region}/publishers/{publisher}/models/{model}",
             domain = domain,
@@ -278,6 +283,11 @@ impl LlmProvider for VertexProvider {
         }
 
         Ok(())
+    }
+
+    async fn probe_connectivity(&self) -> bool {
+        let url = format!("https://{}/", self.endpoint_domain());
+        crate::provider::probe_http_reachability(&self.client, &url).await
     }
 
     fn model(&self) -> &str {

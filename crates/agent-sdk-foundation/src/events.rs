@@ -238,15 +238,26 @@ pub enum AgentEvent {
         emitter_task_id: Option<String>,
     },
 
-    /// Auto-retry was initiated for a transient LLM error (rate
-    /// limit, server error, etc.). The `delay_ms` field gives the
-    /// runtime's chosen backoff before re-attempting; consumers
-    /// can render a "Retrying X/N in Ys…" indicator and clear it
-    /// on the matching `AutoRetryEnd`.
+    /// Auto-retry was initiated for a recoverable LLM error (rate
+    /// limit, server error, connectivity loss). The `delay_ms` field
+    /// gives the runtime's chosen backoff before re-attempting;
+    /// consumers can render a "Retrying X/N in Ys…" indicator and
+    /// clear it on the matching `AutoRetryEnd`.
     AutoRetryStart {
-        /// 1-based retry attempt number (first retry = 1).
+        /// 1-based failure ordinal within the turn (first failure = 1).
+        ///
+        /// Not necessarily contiguous across events: a connectivity
+        /// streak emits one `AutoRetryStart` (on its first failure)
+        /// while later failures in the streak still consume ordinals,
+        /// so consecutive events can read e.g. `1, 2, 4`.
         attempt: u32,
         /// Maximum retry attempts configured for this run.
+        ///
+        /// `u32::MAX` is a sentinel: the runtime is waiting for
+        /// provider connectivity to return and will retry until it
+        /// does (or the run is cancelled). Render it as an indefinite
+        /// "waiting for connection…" state, never as a literal
+        /// `X/4294967295` counter.
         max_attempts: u32,
         /// Backoff before the next attempt in milliseconds.
         delay_ms: u64,
@@ -258,8 +269,9 @@ pub enum AgentEvent {
     /// attempt succeeded; `success = false` means the retry budget
     /// was exhausted and `final_error` carries the last error.
     AutoRetryEnd {
-        /// Total attempts performed (matches the last
-        /// `AutoRetryStart`'s `attempt`).
+        /// The `attempt` of the last emitted `AutoRetryStart`, so the
+        /// envelope pairs even when later failures were folded into an
+        /// already-open connectivity streak.
         attempt: u32,
         /// Whether a follow-up attempt eventually succeeded.
         success: bool,

@@ -1896,6 +1896,10 @@ impl LlmProvider for OpenAICodexResponsesProvider {
         })
     }
 
+    async fn probe_connectivity(&self) -> bool {
+        crate::provider::probe_http_reachability(&self.client, &self.base_url).await
+    }
+
     fn model(&self) -> &str {
         &self.model
     }

@@ -3687,21 +3687,27 @@ impl LlmProvider for FlakyProvider {
     }
 }
 
-/// Provider that stays offline longer than the ordinary retry budget, then
-/// returns a complete response. Connectivity errors use their dedicated kind
-/// so the worker waits until recovery instead of failing the task.
+/// Provider that goes offline for a scripted number of reachability probes,
+/// then recovers. The first `chat_stream` call fails with a pre-connect
+/// connectivity error; the worker then holds the attempt open and polls
+/// `probe_connectivity`, which reports unreachable `offline_probes` times —
+/// each unreachable answer forgiving the reachable-death circuit breaker —
+/// before the endpoint comes back. Later calls optionally fail with server
+/// errors first, proving the transient budget survives the wait untouched.
 struct OfflineThenSuccessProvider {
-    failures_before_online: usize,
+    offline_probes: usize,
     server_failures_after_online: usize,
     call_count: AtomicUsize,
+    probe_count: AtomicUsize,
 }
 
 impl OfflineThenSuccessProvider {
-    fn new(failures_before_online: usize) -> Self {
+    fn new(offline_probes: usize) -> Self {
         Self {
-            failures_before_online,
+            offline_probes,
             server_failures_after_online: 0,
             call_count: AtomicUsize::new(0),
+            probe_count: AtomicUsize::new(0),
         }
     }
 
@@ -3721,20 +3727,22 @@ impl LlmProvider for OfflineThenSuccessProvider {
         bail!("chat is not used by this streaming provider")
     }
 
+    async fn probe_connectivity(&self) -> bool {
+        let probe = self.probe_count.fetch_add(1, Ordering::SeqCst);
+        probe >= self.offline_probes
+    }
+
     fn chat_stream(&self, _request: ChatRequest) -> StreamBox<'_> {
         let call = self.call_count.fetch_add(1, Ordering::SeqCst);
         Box::pin(async_stream::stream! {
-            if call < self.failures_before_online {
+            if call == 0 {
                 yield Ok(StreamDelta::Error {
                     message: "network is unreachable".to_owned(),
                     kind: StreamErrorKind::Connectivity,
                 });
                 return;
             }
-            if call < self
-                .failures_before_online
-                .saturating_add(self.server_failures_after_online)
-            {
+            if call <= self.server_failures_after_online {
                 yield Ok(StreamDelta::Error {
                     message: "provider 503".to_owned(),
                     kind: StreamErrorKind::ServerError,
@@ -3753,6 +3761,51 @@ impl LlmProvider for OfflineThenSuccessProvider {
             }));
             yield Ok(StreamDelta::Done {
                 stop_reason: Some(StopReason::EndTurn),
+            });
+        })
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
+/// Provider whose dispatched streams always die mid-transport while its
+/// probe keeps reporting reachable — the broken-path pathology (a proxy or
+/// load balancer killing every response) that the reachable-death circuit
+/// breaker exists to bound.
+struct ReachableButDyingProvider {
+    call_count: AtomicUsize,
+}
+
+impl ReachableButDyingProvider {
+    const fn new() -> Self {
+        Self {
+            call_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.call_count.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl LlmProvider for ReachableButDyingProvider {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        bail!("chat is not used by this streaming provider")
+    }
+
+    fn chat_stream(&self, _request: ChatRequest) -> StreamBox<'_> {
+        self.call_count.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async_stream::stream! {
+            yield Ok(StreamDelta::Error {
+                message: "connection reset by peer".to_owned(),
+                kind: StreamErrorKind::ConnectionLost,
             });
         })
     }
@@ -3834,7 +3887,11 @@ async fn connectivity_wait_outlives_normal_retry_budget() -> Result<()> {
         bail!("expected completion after connectivity recovered")
     };
     assert_eq!(response_text, "continued after reconnect");
-    assert_eq!(provider.calls(), 7);
+    assert_eq!(
+        provider.calls(),
+        2,
+        "an offline wait must probe for free, not re-dispatch billable calls"
+    );
     assert_eq!(
         stores.attempts.list_by_task(&task_id).await?.len(),
         1,
@@ -3875,7 +3932,7 @@ async fn connectivity_wait_does_not_consume_server_retry_budget() -> Result<()> 
         bail!("expected completion after connectivity and server retries")
     };
     assert_eq!(response_text, "continued after reconnect");
-    assert_eq!(provider.calls(), 8);
+    assert_eq!(provider.calls(), 3);
 
     let events = stores.events.get_events(&thread_a()).await?;
     let retry_attempts: Vec<u32> = events
@@ -3887,14 +3944,61 @@ async fn connectivity_wait_does_not_consume_server_retry_budget() -> Result<()> 
             _ => None,
         })
         .collect();
-    assert_eq!(retry_attempts, vec![1, 7]);
+    assert_eq!(retry_attempts, vec![1, 2]);
     assert!(events.iter().any(|committed| matches!(
         committed.event,
         agent_sdk_foundation::events::AgentEvent::AutoRetryEnd {
-            attempt: 7,
+            attempt: 2,
             success: true,
             ..
         }
+    )));
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn reachable_connection_deaths_trip_the_circuit_breaker() -> Result<()> {
+    // Probes keep reporting reachable, yet every dispatched stream dies in
+    // transit — a broken path, not an outage. The turn must fail after the
+    // reachable-death bound instead of billing an attempt per backoff
+    // forever, and every audit row must be settled.
+    let stores = TestStores::new();
+    let provider = ReachableButDyingProvider::new();
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let bootstrap = sample_bootstrap(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    let result = execute_root_turn(inputs, "ping", &provider, &stores.deps(), t_plus(1)).await;
+    let Err(error) = result else {
+        bail!("a reachable provider whose streams keep dying must fail the turn")
+    };
+    assert!(
+        format!("{error:#}").contains("stayed reachable"),
+        "the failure must name the circuit breaker: {error:#}"
+    );
+    assert_eq!(
+        provider.calls(),
+        4,
+        "initial dispatch plus the three forgivable reachable deaths"
+    );
+    let attempts = stores.attempts.list_by_task(&task_id).await?;
+    assert_eq!(attempts.len(), 4, "one audit row per dispatched call");
+    assert!(
+        attempts.iter().all(|attempt| !attempt.is_open()),
+        "every dispatched attempt must be settled"
+    );
+    let events = stores.events.get_events(&thread_a()).await?;
+    assert!(events.iter().any(|committed| matches!(
+        committed.event,
+        agent_sdk_foundation::events::AgentEvent::AutoRetryEnd { success: false, .. }
     )));
     Ok(())
 }

@@ -229,6 +229,30 @@ pub(super) const LLM_STREAM_INACTIVITY_TIMEOUT: Duration = Duration::from_millis
 /// `LISTEN_TOTAL_TIMEOUT`.
 pub(super) const LLM_CALL_TOTAL_TIMEOUT: Duration = Duration::from_mins(5);
 
+/// Consecutive connectivity-class stream failures tolerated while the
+/// provider probe keeps reporting reachable, before the turn fails with a
+/// bounded error.
+///
+/// A genuine outage never exhausts this: while offline,
+/// `LlmProvider::probe_connectivity` reports unreachable and the wait loop
+/// resets the count, so offline time — however long — cannot fail the turn.
+/// Only a path that answers probes yet kills every dispatched stream (a
+/// proxy or load balancer with a response limit, a provider dying
+/// mid-response on this payload) can trip it, and that path must not be
+/// re-dispatched — and billed — forever.
+pub(super) const MAX_REACHABLE_CONNECTIVITY_FAILURES: u32 = 3;
+
+/// Floor for the delay between connectivity probes, so a zero-delay retry
+/// config cannot turn the offline wait into a hot loop.
+///
+/// Reduced under `cfg(test)` for the same reason as
+/// [`LLM_STREAM_INACTIVITY_TIMEOUT`]: offline-wait tests probe several times
+/// and must not sleep the production floor for real.
+#[cfg(not(test))]
+pub(super) const CONNECTIVITY_PROBE_MIN_DELAY: Duration = Duration::from_millis(250);
+#[cfg(test)]
+pub(super) const CONNECTIVITY_PROBE_MIN_DELAY: Duration = Duration::from_millis(10);
+
 pub(super) struct ListenReady {
     pub(super) operation_id: String,
     pub(super) revision: u64,

@@ -177,6 +177,7 @@ pub enum StreamScriptStep {
 pub struct StreamScriptProvider {
     steps: RwLock<Vec<StreamScriptStep>>,
     call_count: AtomicUsize,
+    probe_results: RwLock<std::collections::VecDeque<bool>>,
 }
 
 impl StreamScriptProvider {
@@ -184,7 +185,19 @@ impl StreamScriptProvider {
         Self {
             steps: RwLock::new(steps),
             call_count: AtomicUsize::new(0),
+            probe_results: RwLock::new(std::collections::VecDeque::new()),
         }
+    }
+
+    /// Script the answers `probe_connectivity` returns, in order. Once the
+    /// script is exhausted (or when none is set) probes report reachable, so
+    /// scripts only need to spell out the offline stretch.
+    #[must_use]
+    pub fn with_probe_script(self, probes: Vec<bool>) -> Self {
+        if let Ok(mut scripted) = self.probe_results.write() {
+            scripted.extend(probes);
+        }
+        self
     }
 }
 
@@ -194,6 +207,14 @@ impl crate::llm::LlmProvider for StreamScriptProvider {
         // Streaming tests set `config.streaming = true`, so `chat` is only a
         // fallback (e.g. if a non-streaming path is reached unexpectedly).
         Ok(MockProvider::text_response("Done"))
+    }
+
+    async fn probe_connectivity(&self) -> bool {
+        self.probe_results
+            .write()
+            .ok()
+            .and_then(|mut probes| probes.pop_front())
+            .unwrap_or(true)
     }
 
     fn chat_stream(&self, _request: ChatRequest) -> StreamBox<'_> {
