@@ -3795,25 +3795,51 @@ mod tests {
             last_used: None,
         };
 
-        end_websocket_turn(&mut session);
-
-        // The baseline is gone, so a retry that reuses this idle session builds
-        // a FULL request on its fresh socket — no `previous_response_id` that a
-        // new connection would reject.
-        assert!(session.last_request.is_none());
-        assert!(session.last_response_id.is_none());
-        assert!(session.last_response_items.is_empty());
-        assert!(!session.in_flight, "the ended turn must be evictable");
-
-        // The follow-up request the retry would send: full input, no incremental id.
+        // The retry's request EXTENDS the baseline (`[first, answer]`) with a
+        // follow-up, so an intact baseline would let `prepare_websocket_request`
+        // emit `previous_response_id` + only the delta. This makes the assertions
+        // below a true differential: they flip on the baseline clear, not merely
+        // on a shape mismatch.
         let retry_request = ApiStreamingRequest {
-            input: vec![ApiInputItem::Message(ApiMessage {
-                role: ApiRole::User,
-                content: ApiMessageContent::Text("follow up".to_string()),
-                phase: None,
-            })],
+            input: vec![
+                ApiInputItem::Message(ApiMessage {
+                    role: ApiRole::User,
+                    content: ApiMessageContent::Text("first".to_string()),
+                    phase: None,
+                }),
+                ApiInputItem::Message(ApiMessage {
+                    role: ApiRole::Assistant,
+                    content: ApiMessageContent::Parts(vec![ApiInputContent::OutputText {
+                        text: "answer".to_string(),
+                    }]),
+                    phase: Some("final_answer".to_owned()),
+                }),
+                ApiInputItem::Message(ApiMessage {
+                    role: ApiRole::User,
+                    content: ApiMessageContent::Text("follow up".to_string()),
+                    phase: None,
+                }),
+            ],
             ..previous_request
         };
+
+        // Sanity: with the baseline still present, this same request WOULD build
+        // an incremental one — so the assertions after the clear are meaningful.
+        let incremental = prepare_websocket_request(&retry_request, &session, false);
+        assert_eq!(
+            incremental.previous_response_id.as_deref(),
+            Some("resp_prev"),
+            "precondition: an intact baseline yields an incremental request",
+        );
+        assert_eq!(incremental.input.len(), 1);
+
+        end_websocket_turn(&mut session);
+
+        // End-to-end family (checked first so it is a standalone differential,
+        // not shadowed by the field asserts): the baseline is gone, so the same
+        // retry request now builds a FULL request on the fresh socket — no
+        // `previous_response_id` a new connection would reject, and the whole
+        // input rather than an incremental delta.
         let websocket_request = prepare_websocket_request(&retry_request, &session, false);
         assert!(
             websocket_request.previous_response_id.is_none(),
@@ -3821,9 +3847,16 @@ mod tests {
         );
         assert_eq!(
             websocket_request.input.len(),
-            1,
+            3,
             "the retry must send the full input, not an incremental delta",
         );
+
+        // Field family: the baseline fields themselves are cleared, and the
+        // session is evictable.
+        assert!(session.last_request.is_none());
+        assert!(session.last_response_id.is_none());
+        assert!(session.last_response_items.is_empty());
+        assert!(!session.in_flight, "the ended turn must be evictable");
     }
 
     #[test]
