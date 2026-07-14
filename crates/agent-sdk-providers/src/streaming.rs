@@ -226,6 +226,69 @@ impl StreamErrorKind {
 /// Type alias for a boxed stream of stream deltas.
 pub type StreamBox<'a> = Pin<Box<dyn Stream<Item = anyhow::Result<StreamDelta>> + Send + 'a>>;
 
+/// Sum two usage readings, saturating so token counters never wrap.
+fn add_usage(carried: Option<&Usage>, usage: &Usage) -> Usage {
+    let Some(carried) = carried else {
+        return usage.clone();
+    };
+    Usage {
+        input_tokens: carried.input_tokens.saturating_add(usage.input_tokens),
+        output_tokens: carried.output_tokens.saturating_add(usage.output_tokens),
+        cached_input_tokens: carried
+            .cached_input_tokens
+            .saturating_add(usage.cached_input_tokens),
+        cache_creation_input_tokens: carried
+            .cache_creation_input_tokens
+            .saturating_add(usage.cache_creation_input_tokens),
+    }
+}
+
+/// Preserves usage across a stream-splicing wrapper's attempt boundary.
+///
+/// A wrapper that abandons one inner stream and splices in another (failover,
+/// credential refresh) has a hazard: [`StreamAccumulator`] keeps only the LAST
+/// `Usage` delta it sees, so the retried stream's usage would erase the
+/// abandoned one — silently un-billing tokens the provider already charged for.
+///
+/// The carry closes that: on every outgoing `Usage` delta, the wrapper calls
+/// [`running_total`](Self::running_total) to rewrite it to the sum of all
+/// abandoned attempts plus this stream's latest reading; when it abandons a
+/// stream to retry, it calls [`abandon`](Self::abandon) to fold that stream's
+/// usage into the carry. The final delta the consumer sees — the only one the
+/// accumulator keeps — is therefore the true total across every attempt.
+#[derive(Default)]
+pub(crate) struct UsageCarry {
+    /// Usage billed by abandoned attempts.
+    carried: Option<Usage>,
+    /// The current attempt's latest usage reading (last-wins within an attempt).
+    current: Option<Usage>,
+}
+
+impl UsageCarry {
+    pub(crate) const fn new() -> Self {
+        Self {
+            carried: None,
+            current: None,
+        }
+    }
+
+    /// Record `usage` as the current attempt's reading and return the running
+    /// total (abandoned attempts + this reading) to yield in its place.
+    pub(crate) fn running_total(&mut self, usage: Usage) -> Usage {
+        let total = add_usage(self.carried.as_ref(), &usage);
+        self.current = Some(usage);
+        total
+    }
+
+    /// Fold the current attempt's usage into the carry because its stream is
+    /// being abandoned for a retry.
+    pub(crate) fn abandon(&mut self) {
+        if let Some(current) = self.current.take() {
+            self.carried = Some(add_usage(self.carried.as_ref(), &current));
+        }
+    }
+}
+
 /// Helper to accumulate streamed content into a final response.
 ///
 /// This struct collects [`StreamDelta`] events and can convert them

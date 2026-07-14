@@ -1027,6 +1027,13 @@ impl LlmProvider for OpenAIProvider {
                 let chunk = match chunk_result {
                     Ok(chunk) => chunk,
                     Err(error) => {
+                        // A trailing usage-only chunk may have been recorded but
+                        // not yet finalized (finalization waits for [DONE]). The
+                        // provider billed those tokens, so surface the usage
+                        // before the transport error ends the stream.
+                        if let Some(usage) = usage.take() {
+                            yield Ok(StreamDelta::Usage(usage));
+                        }
                         yield Err(anyhow::anyhow!("stream error: {error}"));
                         return;
                     }
@@ -1056,6 +1063,13 @@ impl LlmProvider for OpenAIProvider {
             // EOF before that sentinel is transport truncation, even if a
             // finish_reason happened to arrive first; synthesizing Done would
             // let callers commit a partial response as a successful turn.
+            //
+            // Still surface any usage the truncated stream reported first: the
+            // provider billed it, and finalization (which would have yielded it)
+            // never ran because [DONE] never arrived.
+            if let Some(usage) = usage.take() {
+                yield Ok(StreamDelta::Usage(usage));
+            }
             yield Err(anyhow::anyhow!("OpenAI stream ended before [DONE] sentinel"));
         })
     }
@@ -4874,6 +4888,55 @@ mod tests {
             anyhow::bail!("truncated stream did not end with an error");
         };
         assert!(error.to_string().contains("before [DONE] sentinel"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_usage_before_eof_is_surfaced_ahead_of_the_error() -> anyhow::Result<()> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A trailing usage-only chunk (choices: []) arrives, then the stream
+        // ends before [DONE] — transport truncation. The provider billed those
+        // tokens, so the Usage must be surfaced before the transport error.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"stop\"}]}\n\n\
+                         data: {\"choices\":[],\"usage\":{\"prompt_tokens\":140,\"completion_tokens\":20}}\n\n",
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAIProvider::with_base_url("test-key", MODEL_GPT4O, server.uri());
+        let request = ChatRequest::new(
+            String::new(),
+            vec![agent_sdk_foundation::llm::Message::user("hello")],
+        );
+        let items = provider.chat_stream(request).collect::<Vec<_>>().await;
+
+        let usage_at = items
+            .iter()
+            .position(|item| matches!(item, Ok(StreamDelta::Usage(_))))
+            .context("the truncated stream's usage must not be dropped")?;
+        let error_at = items
+            .iter()
+            .position(Result::is_err)
+            .context("a truncated stream must end with an error")?;
+        assert!(
+            usage_at < error_at,
+            "usage must be surfaced before the transport error, got {items:?}"
+        );
+        let Ok(StreamDelta::Usage(usage)) = &items[usage_at] else {
+            anyhow::bail!("expected a usage delta");
+        };
+        assert_eq!(usage.input_tokens, 140);
+        assert_eq!(usage.output_tokens, 20);
         Ok(())
     }
 }

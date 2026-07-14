@@ -14,13 +14,13 @@
 
 use std::sync::Arc;
 
-use agent_sdk_foundation::llm::{ChatOutcome, ChatRequest, Usage};
+use agent_sdk_foundation::llm::{ChatOutcome, ChatRequest};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
 
 use crate::provider::LlmProvider;
-use crate::streaming::{StreamBox, StreamDelta};
+use crate::streaming::{StreamBox, StreamDelta, UsageCarry};
 
 /// Whether a delta commits the stream to the provider that produced it.
 ///
@@ -46,23 +46,6 @@ use crate::streaming::{StreamBox, StreamDelta};
 /// `only_metadata_deltas_leave_the_chain_uncommitted`.
 const fn commits_stream(delta: &StreamDelta) -> bool {
     !matches!(delta, StreamDelta::Usage(_))
-}
-
-/// Sum two usage readings, saturating: token counters must never wrap.
-fn add_usage(carried: Option<&Usage>, usage: &Usage) -> Usage {
-    let Some(carried) = carried else {
-        return usage.clone();
-    };
-    Usage {
-        input_tokens: carried.input_tokens.saturating_add(usage.input_tokens),
-        output_tokens: carried.output_tokens.saturating_add(usage.output_tokens),
-        cached_input_tokens: carried
-            .cached_input_tokens
-            .saturating_add(usage.cached_input_tokens),
-        cache_creation_input_tokens: carried
-            .cache_creation_input_tokens
-            .saturating_add(usage.cache_creation_input_tokens),
-    }
 }
 
 /// An [`LlmProvider`] that fails over across an ordered list of backends.
@@ -162,13 +145,11 @@ impl LlmProvider for FallbackProvider {
         let providers = self.ordered();
         Box::pin(async_stream::stream! {
             let last = providers.len() - 1;
-            // Tokens billed by providers this chain abandoned. A provider that
-            // reports usage and only then fails still charged for what it
-            // generated, and [`StreamAccumulator`] keeps only the LAST usage
-            // delta it sees — so the surviving provider's usage is rewritten to
-            // include this carry, and the failover does not silently un-bill the
-            // abandoned attempt.
-            let mut carried_usage: Option<Usage> = None;
+            // Preserves the tokens billed by providers this chain abandoned, so
+            // the surviving provider's usage delta reports the running total
+            // rather than erasing the abandoned attempt's usage (last-wins
+            // accumulator). See `UsageCarry`.
+            let mut usage_carry = UsageCarry::new();
 
             for (idx, provider) in providers.iter().enumerate() {
                 let is_last = idx == last;
@@ -178,8 +159,6 @@ impl LlmProvider for FallbackProvider {
                 // would double-emit output, so a later error is surfaced as-is.
                 let mut committed = false;
                 let mut failed_over = false;
-                // Usage reported by *this* provider, for the carry above.
-                let mut provider_usage: Option<Usage> = None;
 
                 while let Some(item) = stream.next().await {
                     match item {
@@ -200,11 +179,11 @@ impl LlmProvider for FallbackProvider {
                             // usage is additionally rewritten to the running
                             // total so the abandoned provider's tokens survive.
                             committed = committed || commits_stream(&delta);
-                            let delta = if let StreamDelta::Usage(usage) = delta {
-                                provider_usage = Some(usage.clone());
-                                StreamDelta::Usage(add_usage(carried_usage.as_ref(), &usage))
-                            } else {
-                                delta
+                            let delta = match delta {
+                                StreamDelta::Usage(usage) => {
+                                    StreamDelta::Usage(usage_carry.running_total(usage))
+                                }
+                                other => other,
                             };
                             yield Ok(delta);
                         }
@@ -225,9 +204,7 @@ impl LlmProvider for FallbackProvider {
                 if !failed_over {
                     return;
                 }
-                carried_usage = provider_usage
-                    .map(|usage| add_usage(carried_usage.as_ref(), &usage))
-                    .or(carried_usage);
+                usage_carry.abandon();
             }
         })
     }
