@@ -1897,7 +1897,8 @@ async fn requeue_collided_root_task(
     let boundary = agent_sdk_foundation::events::AgentEvent::error(
         format!("turn-slot collision: retrying from the fresh committed head ({err:#})"),
         true,
-    );
+    )
+    .with_emitter_task_id(task.id.as_str());
     let outcome = stores
         .task_store
         .requeue_owned_task(&task.id, &worker_id, &lease_id, Some(boundary), now)
@@ -3109,15 +3110,24 @@ mod tests {
                 agent_sdk_foundation::events::AgentEvent::Error {
                     message,
                     recoverable,
-                } => Some((message.clone(), *recoverable)),
+                    ..
+                } => Some((committed, message.clone(), *recoverable)),
                 _ => None,
             })
             .context("requeue must commit an Error boundary event")?;
         assert!(
-            boundary.1,
+            boundary.2,
             "the boundary must be recoverable — the task is retrying, not failed",
         );
-        assert!(boundary.0.contains("turn-slot collision"));
+        assert!(boundary.1.contains("turn-slot collision"));
+        // The boundary names the REQUEUED task, so a follower can
+        // attribute the retry edge to the run it is following instead of
+        // guessing which attempt abandoned the stream.
+        assert_eq!(
+            boundary.0.event.emitter_task_id(),
+            Some(id.as_str()),
+            "the requeue boundary must be attributed to the requeued task",
+        );
         Ok(())
     }
 

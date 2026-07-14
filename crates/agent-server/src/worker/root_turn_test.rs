@@ -5825,7 +5825,7 @@ async fn cancel_root_turn_commits_single_terminal_cancelled_event() -> Result<()
         .await
         .context("timed out waiting for the notified cancelled event")?
         .context("notifier channel closed")?;
-    let AgentEvent::Cancelled { turn, usage } = &delivered.event else {
+    let AgentEvent::Cancelled { turn, usage, .. } = &delivered.event else {
         bail!(
             "live followers must receive the terminal marker, got {:?}",
             delivered.event,
@@ -6552,6 +6552,24 @@ async fn successor_turn_shifts_past_cancelled_salvage_slot_collision() -> Result
         })
         .context("Done event")?;
     assert_eq!(done_turns, 2, "Done must carry the landed turn");
+
+    // The shift rewrites turn indices only: emitter attribution names
+    // the task that actually executed the turn, which the slot number it
+    // landed on cannot change.
+    for committed in &events {
+        let stamped = matches!(
+            committed.event,
+            AgentEvent::Start { .. } | AgentEvent::TurnComplete { .. } | AgentEvent::Done { .. }
+        );
+        if stamped {
+            assert_eq!(
+                committed.event.emitter_task_id(),
+                Some(successor_id.as_str()),
+                "the shifted turn's lifecycle events must stay attributed to their emitter: {:?}",
+                committed.event,
+            );
+        }
+    }
     Ok(())
 }
 

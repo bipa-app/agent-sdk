@@ -150,7 +150,7 @@ impl AgentHooks for CustomHooks {
             AgentEvent::Start { turn, .. } => {
                 println!("[Hooks] Event: Turn {turn} starting");
             }
-            AgentEvent::TurnComplete { turn, usage } => {
+            AgentEvent::TurnComplete { turn, usage, .. } => {
                 println!(
                     "[Hooks] Event: Turn {turn} complete (tokens: {} in, {} out)",
                     usage.input_tokens, usage.output_tokens

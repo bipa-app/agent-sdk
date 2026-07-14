@@ -547,10 +547,7 @@ mod tests {
 
     #[test]
     fn trace_output_skipped_for_internal_events() {
-        let start = AgentEvent::Start {
-            thread_id: ThreadId::from_string("t"),
-            turn: 1,
-        };
+        let start = AgentEvent::start(ThreadId::from_string("t"), 1);
         assert!(langfuse_trace_output(&start).is_none());
         let delta = AgentEvent::text_delta("m", "x");
         assert!(langfuse_trace_output(&delta).is_none());

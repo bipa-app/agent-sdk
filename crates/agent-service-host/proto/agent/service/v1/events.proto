@@ -49,6 +49,13 @@ enum StreamCloseReason {
 message StartEvent {
   string thread_id = 1;
   uint64 turn = 2;
+  // Durable id of the task whose execution committed this event.
+  // Unset on events journaled before the field existed and on
+  // embedded (non-server) runs. Attribution is always the emitter's
+  // own identity: a cancelled root's late salvage commit still names
+  // that root, so a reader can tell a superseded frame apart from the
+  // thread's live one.
+  optional string emitter_task_id = 3;
 }
 
 // The user prompt that opens a turn. Committed by the worker on
@@ -129,6 +136,13 @@ message ToolRequiresConfirmationEvent {
 message TurnCompleteEvent {
   uint64 turn = 1;
   TokenUsage usage = 2;
+  // Durable id of the task whose execution committed this event.
+  // Unset on events journaled before the field existed and on
+  // embedded (non-server) runs. Attribution is always the emitter's
+  // own identity: a cancelled root's late salvage commit still names
+  // that root, so a reader can tell a superseded frame apart from the
+  // thread's live one.
+  optional string emitter_task_id = 3;
 }
 
 // Why the run reached its terminal `done` frame. Older servers never set
@@ -154,11 +168,25 @@ message DoneEvent {
   // Estimated run cost in USD, when the provider/model has pricing
   // metadata.
   optional double estimated_cost_usd = 6;
+  // Durable id of the task whose execution committed this event.
+  // Unset on events journaled before the field existed and on
+  // embedded (non-server) runs. Attribution is always the emitter's
+  // own identity: a cancelled root's late salvage commit still names
+  // that root, so a reader can tell a superseded frame apart from the
+  // thread's live one.
+  optional string emitter_task_id = 7;
 }
 
 message ErrorEvent {
   string message = 1;
   bool recoverable = 2;
+  // Durable id of the task whose execution committed this event.
+  // Unset on events journaled before the field existed and on
+  // embedded (non-server) runs. Attribution is always the emitter's
+  // own identity: a cancelled root's late salvage commit still names
+  // that root, so a reader can tell a superseded frame apart from the
+  // thread's live one.
+  optional string emitter_task_id = 3;
 }
 
 // A root task (queued, parked, or running) was cancelled via the
@@ -179,6 +207,22 @@ message ErrorEvent {
 // nothing, and a running worker's later abort commits salvaged content
 // but no second lifecycle marker.
 //
+// One marker per effective cancel, on every backend: the durable ones
+// commit the marker set inside the cancellation transaction, and the
+// embedded in-memory backend journals the set before applying any
+// transition and reuses — never rewrites — a marker already on the
+// thread. A reused marker keeps the `turn` and `usage` computed when it
+// was FIRST journaled, so if the root committed a turn between a failed
+// cancel attempt and its retry, the surviving marker understates both
+// against the moment the cancel was finally honored. The embedded
+// backend's one residual, since it cannot span its stores
+// transactionally: a cancel whose marker write FAILS part-way through a
+// subagent cascade, and which the caller then abandons rather than
+// retries, leaves a marker on a root that was not cancelled and keeps
+// running. A follower closes on it and reaches that task's real answer
+// by reconnecting. In every one of these cases the task's own row
+// (`GetTask`) is the authority on whether — and how — it ended.
+//
 // Post-terminal salvage: a RUNNING root's worker may keep appending
 // streaming deltas for up to one heartbeat after this marker — they
 // land at sequences strictly after it. Followers that closed on the
@@ -198,6 +242,13 @@ message ErrorEvent {
 message CancelledEvent {
   uint64 turn = 1;
   TokenUsage usage = 2;
+  // Durable id of the task whose execution committed this event.
+  // Unset on events journaled before the field existed and on
+  // embedded (non-server) runs. Attribution is always the emitter's
+  // own identity: a cancelled root's late salvage commit still names
+  // that root, so a reader can tell a superseded frame apart from the
+  // thread's live one.
+  optional string emitter_task_id = 3;
 }
 
 message RefusalEvent {

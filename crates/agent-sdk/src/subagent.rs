@@ -1864,10 +1864,7 @@ mod tests {
             .append(
                 &thread_id,
                 1,
-                authority.wrap(AgentEvent::Error {
-                    message: "subagent boom".to_string(),
-                    recoverable: false,
-                }),
+                authority.wrap(AgentEvent::error("subagent boom", false)),
             )
             .await?;
         event_store

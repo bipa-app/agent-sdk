@@ -1760,10 +1760,7 @@ where
         turn,
         hooks,
         authority,
-        AgentEvent::TurnComplete {
-            turn,
-            usage: turn_usage.clone(),
-        },
+        AgentEvent::turn_complete(turn, turn_usage.clone()),
     )
     .await?;
     Ok(())
@@ -2980,10 +2977,7 @@ where
                 ctx.turn,
                 hooks,
                 authority,
-                AgentEvent::TurnComplete {
-                    turn: ctx.turn,
-                    usage: turn_usage,
-                },
+                AgentEvent::turn_complete(ctx.turn, turn_usage),
             )
             .await;
             Err(guardrail_block_result(
@@ -3025,10 +3019,7 @@ where
                     ctx.turn,
                     hooks,
                     authority,
-                    AgentEvent::TurnComplete {
-                        turn: ctx.turn,
-                        usage: turn_usage.clone(),
-                    },
+                    AgentEvent::turn_complete(ctx.turn, turn_usage.clone()),
                 )
                 .await;
                 return Err(guardrail_retry_cap_result(
@@ -3259,10 +3250,7 @@ where
         turn,
         hooks,
         authority,
-        AgentEvent::TurnComplete {
-            turn,
-            usage: turn_usage.clone(),
-        },
+        AgentEvent::turn_complete(turn, turn_usage.clone()),
     )
     .await
     {

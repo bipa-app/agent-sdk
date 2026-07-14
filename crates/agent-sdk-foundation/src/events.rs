@@ -70,7 +70,14 @@ mod duration_ms_serde {
 #[non_exhaustive]
 pub enum AgentEvent {
     /// Agent loop has started
-    Start { thread_id: ThreadId, turn: usize },
+    Start {
+        thread_id: ThreadId,
+        turn: usize,
+        /// Durable task that committed this event. See
+        /// [`AgentEvent::with_emitter_task_id`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emitter_task_id: Option<String>,
+    },
 
     /// The user prompt that opens a turn.
     ///
@@ -158,7 +165,14 @@ pub enum AgentEvent {
     },
 
     /// Agent turn completed (one LLM round-trip)
-    TurnComplete { turn: usize, usage: TokenUsage },
+    TurnComplete {
+        turn: usize,
+        usage: TokenUsage,
+        /// Durable task that committed this event. See
+        /// [`AgentEvent::with_emitter_task_id`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emitter_task_id: Option<String>,
+    },
 
     /// Agent loop completed successfully
     Done {
@@ -180,6 +194,10 @@ pub enum AgentEvent {
         /// predate cost accounting.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         estimated_cost_usd: Option<f64>,
+        /// Durable task that committed this event. See
+        /// [`AgentEvent::with_emitter_task_id`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emitter_task_id: Option<String>,
     },
 
     /// The run was stopped because a run-level usage budget was exceeded.
@@ -204,10 +222,21 @@ pub enum AgentEvent {
         estimated_cost_usd: Option<f64>,
         /// Which budget limit was exceeded.
         limit: BudgetLimitKind,
+        /// Durable task that committed this event. See
+        /// [`AgentEvent::with_emitter_task_id`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emitter_task_id: Option<String>,
     },
 
     /// An error occurred during execution
-    Error { message: String, recoverable: bool },
+    Error {
+        message: String,
+        recoverable: bool,
+        /// Durable task that committed this event. See
+        /// [`AgentEvent::with_emitter_task_id`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emitter_task_id: Option<String>,
+    },
 
     /// Auto-retry was initiated for a transient LLM error (rate
     /// limit, server error, etc.). The `delay_ms` field gives the
@@ -259,7 +288,15 @@ pub enum AgentEvent {
     /// and `usage` is the partial token usage accumulated so far.
     ///
     /// [`CancellationToken`]: https://docs.rs/tokio-util/latest/tokio_util/sync/struct.CancellationToken.html
-    Cancelled { turn: usize, usage: TokenUsage },
+    Cancelled {
+        turn: usize,
+        usage: TokenUsage,
+        /// Durable task that committed this event — the cancelled
+        /// root, not the promoted successor. See
+        /// [`AgentEvent::with_emitter_task_id`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emitter_task_id: Option<String>,
+    },
 
     /// Context was compacted to reduce size
     ContextCompacted {
@@ -311,7 +348,80 @@ pub enum AgentEvent {
 impl AgentEvent {
     #[must_use]
     pub const fn start(thread_id: ThreadId, turn: usize) -> Self {
-        Self::Start { thread_id, turn }
+        Self::Start {
+            thread_id,
+            turn,
+            emitter_task_id: None,
+        }
+    }
+
+    /// Attribute a lifecycle event to the durable task whose execution
+    /// committed it (the task id in its string form).
+    ///
+    /// Only the lifecycle variants (`Start`, `TurnComplete`, `Done`,
+    /// `BudgetExceeded`, `Error`, `Cancelled`) carry the attribution;
+    /// every other variant is returned unchanged. Attribution is
+    /// therefore always the emitter's own identity, never a successor's:
+    /// a cancelled root's late salvage commit still names the cancelled
+    /// root, which is what lets a reader tell a superseded frame apart
+    /// from the thread's live one.
+    ///
+    /// Runs without a durable task behind them (the embedded SDK loop)
+    /// leave the field `None`, as do events journaled before the field
+    /// existed.
+    #[must_use]
+    pub fn with_emitter_task_id(mut self, task_id: impl Into<String>) -> Self {
+        let task_id = task_id.into();
+        match &mut self {
+            Self::Start {
+                emitter_task_id, ..
+            }
+            | Self::TurnComplete {
+                emitter_task_id, ..
+            }
+            | Self::Done {
+                emitter_task_id, ..
+            }
+            | Self::BudgetExceeded {
+                emitter_task_id, ..
+            }
+            | Self::Error {
+                emitter_task_id, ..
+            }
+            | Self::Cancelled {
+                emitter_task_id, ..
+            } => *emitter_task_id = Some(task_id),
+            _ => {}
+        }
+        self
+    }
+
+    /// The durable task that committed this event, when the event is a
+    /// lifecycle variant that was stamped. See
+    /// [`AgentEvent::with_emitter_task_id`].
+    #[must_use]
+    pub fn emitter_task_id(&self) -> Option<&str> {
+        match self {
+            Self::Start {
+                emitter_task_id, ..
+            }
+            | Self::TurnComplete {
+                emitter_task_id, ..
+            }
+            | Self::Done {
+                emitter_task_id, ..
+            }
+            | Self::BudgetExceeded {
+                emitter_task_id, ..
+            }
+            | Self::Error {
+                emitter_task_id, ..
+            }
+            | Self::Cancelled {
+                emitter_task_id, ..
+            } => emitter_task_id.as_deref(),
+            _ => None,
+        }
     }
 
     #[must_use]
@@ -420,6 +530,15 @@ impl AgentEvent {
     }
 
     #[must_use]
+    pub const fn turn_complete(turn: usize, usage: TokenUsage) -> Self {
+        Self::TurnComplete {
+            turn,
+            usage,
+            emitter_task_id: None,
+        }
+    }
+
+    #[must_use]
     pub const fn done(
         thread_id: ThreadId,
         total_turns: usize,
@@ -432,6 +551,7 @@ impl AgentEvent {
             total_usage,
             duration,
             estimated_cost_usd: None,
+            emitter_task_id: None,
         }
     }
 
@@ -449,6 +569,7 @@ impl AgentEvent {
             total_usage,
             duration,
             estimated_cost_usd,
+            emitter_task_id: None,
         }
     }
 
@@ -468,6 +589,7 @@ impl AgentEvent {
             duration,
             estimated_cost_usd,
             limit,
+            emitter_task_id: None,
         }
     }
 
@@ -476,6 +598,7 @@ impl AgentEvent {
         Self::Error {
             message: message.into(),
             recoverable,
+            emitter_task_id: None,
         }
     }
 
@@ -489,7 +612,11 @@ impl AgentEvent {
 
     #[must_use]
     pub const fn cancelled(turn: usize, usage: TokenUsage) -> Self {
-        Self::Cancelled { turn, usage }
+        Self::Cancelled {
+            turn,
+            usage,
+            emitter_task_id: None,
+        }
     }
 
     #[must_use]
@@ -1021,6 +1148,7 @@ mod tests {
             AgentEvent::Start {
                 thread_id: thread.clone(),
                 turn: 1,
+                emitter_task_id: Some("task-start".into()),
             },
             AgentEvent::UserInput {
                 thread_id: thread.clone(),
@@ -1092,6 +1220,7 @@ mod tests {
             AgentEvent::TurnComplete {
                 turn: 1,
                 usage: usage.clone(),
+                emitter_task_id: Some("task-turn-complete".into()),
             },
             AgentEvent::Done {
                 thread_id: thread.clone(),
@@ -1099,6 +1228,7 @@ mod tests {
                 total_usage: usage.clone(),
                 duration: Duration::from_millis(1500),
                 estimated_cost_usd: Some(0.0123),
+                emitter_task_id: Some("task-done".into()),
             },
         ]
     }
@@ -1109,6 +1239,7 @@ mod tests {
             AgentEvent::Error {
                 message: "e".into(),
                 recoverable: true,
+                emitter_task_id: Some("task-error".into()),
             },
             AgentEvent::AutoRetryStart {
                 attempt: 1,
@@ -1135,6 +1266,7 @@ mod tests {
             AgentEvent::Cancelled {
                 turn: 1,
                 usage: usage.clone(),
+                emitter_task_id: Some("task-cancelled".into()),
             },
             AgentEvent::BudgetExceeded {
                 thread_id: ThreadId::from_string("thread-1"),
@@ -1143,6 +1275,7 @@ mod tests {
                 duration: Duration::from_millis(750),
                 estimated_cost_usd: Some(0.5),
                 limit: BudgetLimitKind::CostUsd,
+                emitter_task_id: Some("task-budget".into()),
             },
             AgentEvent::ContextCompacted {
                 original_count: 10,
@@ -1168,6 +1301,95 @@ mod tests {
                 total_tokens: 0,
             },
         ]
+    }
+
+    // ===================
+    // Emitter task identity
+    // ===================
+
+    #[test]
+    fn emitter_task_id_is_absent_from_journal_rows_written_before_the_field()
+    -> serde_json::Result<()> {
+        // Durable rows predating the field carry no `emitter_task_id`
+        // key; they must decode (as `None`), not fail the whole thread's
+        // replay.
+        let legacy = serde_json::json!({
+            "type": "done",
+            "thread_id": "t-legacy",
+            "total_turns": 2,
+            "total_usage": TokenUsage::default(),
+            "duration_ms": 1000,
+        });
+        let event: AgentEvent = serde_json::from_value(legacy)?;
+        assert_eq!(event.emitter_task_id(), None);
+
+        // And an unstamped event never writes the key, so the wire form
+        // stays byte-identical for consumers that predate it.
+        let json = serde_json::to_value(&event)?;
+        assert!(
+            json.get("emitter_task_id").is_none(),
+            "unstamped events must omit the key: {json}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_emitter_task_id_stamps_every_lifecycle_variant() -> serde_json::Result<()> {
+        let thread = ThreadId::from_string("t");
+        let usage = TokenUsage::default();
+        let lifecycle = vec![
+            AgentEvent::start(thread.clone(), 1),
+            AgentEvent::TurnComplete {
+                turn: 1,
+                usage: usage.clone(),
+                emitter_task_id: None,
+            },
+            AgentEvent::done(thread.clone(), 1, usage.clone(), Duration::from_secs(1)),
+            AgentEvent::budget_exceeded(
+                thread,
+                1,
+                usage.clone(),
+                Duration::from_secs(1),
+                None,
+                BudgetLimitKind::TotalTokens,
+            ),
+            AgentEvent::error("boom", false),
+            AgentEvent::cancelled(1, usage),
+        ];
+        for event in lifecycle {
+            let label = format!("{event:?}");
+            assert_eq!(event.emitter_task_id(), None, "{label}: starts unstamped");
+
+            let stamped = event.with_emitter_task_id("task-42");
+            assert_eq!(stamped.emitter_task_id(), Some("task-42"), "{label}");
+
+            let json = serde_json::to_value(&stamped)?;
+            assert_eq!(
+                json.get("emitter_task_id")
+                    .and_then(serde_json::Value::as_str),
+                Some("task-42"),
+                "{label}: stamped events carry the key: {json}"
+            );
+            let restored: AgentEvent = serde_json::from_value(json)?;
+            assert_eq!(restored.emitter_task_id(), Some("task-42"), "{label}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn with_emitter_task_id_leaves_non_lifecycle_variants_untouched() -> serde_json::Result<()> {
+        // Attribution is a lifecycle-only contract: content and tool
+        // frames pair with the surrounding `Start` by adjacency and
+        // carry no id of their own.
+        let text = AgentEvent::text("m", "hi").with_emitter_task_id("task-42");
+        assert_eq!(text.emitter_task_id(), None);
+
+        let json = serde_json::to_value(&text)?;
+        assert!(
+            json.get("emitter_task_id").is_none(),
+            "non-lifecycle variants must not grow the key: {json}"
+        );
+        Ok(())
     }
 
     #[test]
