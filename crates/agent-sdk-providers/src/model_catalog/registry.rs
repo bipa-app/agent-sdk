@@ -207,6 +207,45 @@ impl ModelRegistry {
         )
     }
 
+    /// Resolve through the *feed* layer only — the refreshable cache — skipping
+    /// both the override and the static table. `None` when the feed has none.
+    ///
+    /// A caller that scopes override authority by candidate specificity needs
+    /// the feed price at a key *independently* of any override on the same key,
+    /// which the layered lookups (which let an override shadow the feed) cannot
+    /// give it.
+    #[must_use]
+    pub fn resolve_feed(&self, provider: &str, model: &str) -> Option<ResolvedModel> {
+        let cache = self.feed_cache.read().ok()?;
+        cache
+            .get(&model_key(provider, model))
+            .map(|entry| resolved_from_entry(entry, ResolvedSource::Feed))
+    }
+
+    /// Estimate cost from the *feed* layer only (never override or static), with
+    /// tier selection. `None` when the feed has no row for the pair.
+    #[must_use]
+    pub fn estimate_feed_cost_usd(
+        &self,
+        provider: &str,
+        model: &str,
+        usage: &Usage,
+    ) -> Option<f64> {
+        estimate_resolved(&self.resolve_feed(provider, model)?, usage, TierMode::Apply)
+    }
+
+    /// Estimate cost from the *feed* layer only, at the base band (a summed
+    /// usage). `None` when the feed has no row for the pair.
+    #[must_use]
+    pub fn estimate_feed_base_cost_usd(
+        &self,
+        provider: &str,
+        model: &str,
+        usage: &Usage,
+    ) -> Option<f64> {
+        estimate_resolved(&self.resolve_feed(provider, model)?, usage, TierMode::Base)
+    }
+
     /// Estimate request cost in USD using the layered pricing (override → feed
     /// → static), if any.
     ///

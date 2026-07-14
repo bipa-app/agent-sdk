@@ -92,29 +92,53 @@ fn estimate_scoped(
     let model = provenance.model.as_str();
 
     if let Some(estimator) = pricing {
-        // Override authority is absolute. A user-registered override is a price
-        // the user set on purpose (a negotiated or free rate), so if ANY
-        // candidate resolves through the override layer it is used outright,
-        // skipping the max — otherwise a higher feed row under a derived key
-        // would out-max it and trip the user's cap early on data they overrode
-        // away, violating the registry's override-before-feed precedence. The
-        // first usable override (in candidate-preference order) wins.
-        let override_cost = catalog_candidates(provider, model)
-            .filter_map(|(provider, model)| match scope {
-                UsageScope::Call => estimator.estimate_override_cost_usd(&provider, &model, &usage),
-                UsageScope::Aggregate => {
-                    estimator.estimate_override_aggregate_cost_usd(&provider, &model, &usage)
-                }
-            })
-            .find(|cost| is_usable_estimate(*cost));
-        if let Some(cost) = override_cost {
-            return Some(cost);
+        let candidates: Vec<(Cow<'_, str>, Cow<'_, str>)> =
+            catalog_candidates(provider, model).collect();
+        let override_estimate = |provider: &str, model: &str| match scope {
+            UsageScope::Call => estimator.estimate_override_cost_usd(provider, model, &usage),
+            UsageScope::Aggregate => {
+                estimator.estimate_override_aggregate_cost_usd(provider, model, &usage)
+            }
+        };
+        let feed_estimate = |provider: &str, model: &str| match scope {
+            UsageScope::Call => estimator.estimate_feed_cost_usd(provider, model, &usage),
+            UsageScope::Aggregate => {
+                estimator.estimate_feed_aggregate_cost_usd(provider, model, &usage)
+            }
+        };
+
+        // Override authority is POSITION-SCOPED: an override has absolute
+        // authority only down to its own key's specificity — it never displaces
+        // a more-specific live feed price. Candidates are most-specific-first
+        // (provenance → gateway → service → aliases → route → vendor-split), so
+        // for the first override at index `k`, if no candidate BEFORE `k` has a
+        // live feed row the override is the most specific price and wins
+        // outright; but if an earlier candidate does, that override belongs to a
+        // less-specific fallback context (e.g. a negotiated *direct*-vendor rate
+        // reached via a gateway call's vendor-split alias) and must not pre-empt
+        // the real price the call actually pays.
+        let first_override =
+            candidates
+                .iter()
+                .enumerate()
+                .find_map(|(index, (provider, model))| {
+                    override_estimate(provider, model)
+                        .filter(|cost| is_usable_estimate(*cost))
+                        .map(|cost| (index, cost))
+                });
+        if let Some((index, override_cost)) = first_override {
+            let more_specific_feed = candidates[..index].iter().any(|(provider, model)| {
+                feed_estimate(provider, model).is_some_and(is_usable_estimate)
+            });
+            if !more_specific_feed {
+                return Some(override_cost);
+            }
         }
 
-        // Otherwise the MAX of every feed-level candidate estimate, not the
-        // first that resolves. A preferred candidate (route key, gateway key)
-        // can carry a flat row where a later candidate — the vendor's own —
-        // publishes the tier a long call falls in: models.dev's
+        // Otherwise the MAX of every FEED candidate estimate (overrides
+        // excluded), not the first that resolves. A preferred candidate (route
+        // key, gateway key) can carry a flat row where a later candidate — the
+        // vendor's own — publishes the tier a long call falls in: models.dev's
         // `openrouter/google/gemini-2.5-pro` route row is flat while its native
         // `gemini-2.5-pro` carries the ≥200K band. First-Some would take the
         // flat route estimate and under-bill the long call. Each estimate is
@@ -122,13 +146,9 @@ fn estimate_scoped(
         // larger never bills below the best evidence in the candidate set, and
         // the route/service price still wins whenever it is genuinely the higher
         // one (see [`catalog_candidates`]).
-        let best = catalog_candidates(provider, model)
-            .filter_map(|(provider, model)| match scope {
-                UsageScope::Call => estimator.estimate_cost_usd(&provider, &model, &usage),
-                UsageScope::Aggregate => {
-                    estimator.estimate_aggregate_cost_usd(&provider, &model, &usage)
-                }
-            })
+        let best = candidates
+            .iter()
+            .filter_map(|(provider, model)| feed_estimate(provider, model))
             .filter(|cost| is_usable_estimate(*cost))
             .max_by(f64::total_cmp);
         if let Some(cost) = best {
@@ -1310,6 +1330,124 @@ mod catalog_tests {
             status(Some(&limits), Some(&registry), &provenance, &usage, None).is_none(),
             "an overridden price must not trip a cap it is under",
         );
+        Ok(())
+    }
+
+    /// Override authority is position-scoped: a later, less-specific override
+    /// must NOT displace an earlier candidate's genuine feed row. A negotiated
+    /// *direct*-vendor override is reached, on a gateway call, only through the
+    /// less-specific vendor-split alias — but the gateway has its own feed row
+    /// at a more specific candidate, and the call actually pays the gateway
+    /// rate, so the override must not leak in.
+    #[tokio::test]
+    async fn a_later_override_does_not_displace_an_earlier_feed_row() -> Result<()> {
+        use crate::model_capabilities::Pricing;
+
+        // A cheap/free DIRECT override on the vendor key (reached last, via the
+        // vendor-split alias): $0/M.
+        let registry = ModelRegistry::new().with_override(
+            "anthropic",
+            "claude-sonnet-4",
+            CatalogEntry {
+                provider: "anthropic".to_owned(),
+                model_id: "claude-sonnet-4".to_owned(),
+                context_window: None,
+                max_output_tokens: None,
+                pricing: Some(Pricing::flat(0.0, 0.0)),
+                pricing_tiers: Vec::new(),
+                supports_thinking: None,
+            },
+        );
+        // A real gateway feed row at the more-specific gateway candidate.
+        registry
+            .refresh(&FixtureFeed(vec![CatalogEntry {
+                provider: "cloudflare-ai-gateway".to_owned(),
+                model_id: "anthropic/claude-sonnet-4".to_owned(),
+                context_window: None,
+                max_output_tokens: None,
+                pricing: Some(Pricing::flat(4.0, 20.0)),
+                pricing_tiers: Vec::new(),
+                supports_thinking: None,
+            }]))
+            .await?;
+
+        let provenance = AuditProvenance::new("cloudflare-ai-gateway", "claude-sonnet-4");
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+
+        // The gateway feed ($4 + $20 = $24) prices the call — NOT the $0 direct
+        // override reached via the vendor-split alias.
+        let cost = estimate_cost_usd(Some(&registry), &provenance, &usage)
+            .context("the gateway feed row must price the call")?;
+        assert!((cost - 24.0).abs() < 1e-9, "unexpected cost: {cost}");
+
+        // The cap counts the real gateway price; the free override must not
+        // disable it.
+        let limits = UsageLimits {
+            max_cost_usd: Some(1.0),
+            ..Default::default()
+        };
+        let (limit, _) = status(Some(&limits), Some(&registry), &provenance, &usage, None)
+            .context("the gateway price must trip the cap")?;
+        assert_eq!(limit, BudgetLimitKind::CostUsd);
+        Ok(())
+    }
+
+    /// The SAME direct-vendor override, on a DIRECT call, wins — it is the
+    /// provenance key itself (the most-specific candidate), so no earlier feed
+    /// can out-specific it.
+    #[tokio::test]
+    async fn a_direct_override_wins_on_a_direct_call() -> Result<()> {
+        use crate::model_capabilities::Pricing;
+
+        let registry = ModelRegistry::new().with_override(
+            "anthropic",
+            "claude-sonnet-4",
+            CatalogEntry {
+                provider: "anthropic".to_owned(),
+                model_id: "claude-sonnet-4".to_owned(),
+                context_window: None,
+                max_output_tokens: None,
+                pricing: Some(Pricing::flat(0.0, 0.0)),
+                pricing_tiers: Vec::new(),
+                supports_thinking: None,
+            },
+        );
+        // A feed row exists for the direct key too, at a real price.
+        registry
+            .refresh(&FixtureFeed(vec![CatalogEntry {
+                provider: "anthropic".to_owned(),
+                model_id: "claude-sonnet-4".to_owned(),
+                context_window: None,
+                max_output_tokens: None,
+                pricing: Some(Pricing::flat(3.0, 15.0)),
+                pricing_tiers: Vec::new(),
+                supports_thinking: None,
+            }]))
+            .await?;
+
+        let provenance = AuditProvenance::new("anthropic", "claude-sonnet-4");
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+
+        // The override IS the provenance key — the most specific candidate — so
+        // it wins outright: $0, not the $18 feed row.
+        let cost = estimate_cost_usd(Some(&registry), &provenance, &usage)
+            .context("the override must price the direct call")?;
+        assert!(cost.abs() < 1e-9, "unexpected cost: {cost}");
+
+        // A $1 cap does not trip on the free direct price.
+        let limits = UsageLimits {
+            max_cost_usd: Some(1.0),
+            ..Default::default()
+        };
+        assert!(status(Some(&limits), Some(&registry), &provenance, &usage, None).is_none());
         Ok(())
     }
 
