@@ -20,7 +20,33 @@ use async_trait::async_trait;
 use futures::StreamExt;
 
 use crate::provider::LlmProvider;
-use crate::streaming::{StreamBox, StreamDelta};
+use crate::streaming::{StreamBox, StreamDelta, UsageCarry};
+
+/// Whether a delta commits the stream to the provider that produced it.
+///
+/// Failing over after a provider has emitted output would make the secondary
+/// re-emit it, so the classification is per-variant:
+///
+/// * **Commits** — anything the consumer can already see or will replay:
+///   `TextDelta`, `ThinkingDelta`, `SignatureDelta`, `RedactedThinking`,
+///   `OpaqueReasoning`, `ToolUseStart`, `ToolInputDelta`, and `Done` (a response
+///   the caller has, by definition, already received in full). Unknown
+///   (`#[non_exhaustive]`) variants commit with them: a delta this SDK version
+///   cannot classify might carry content, and duplicating output is a worse
+///   failure than missing a failover.
+/// * **Does not commit** — `Usage`, which is pure metadata: it never reaches the
+///   user, it is folded into token counters, and a provider that reports usage
+///   and *then* fails is exactly the case failover exists for. A provider that
+///   reports usage before any content and then errors is therefore failed over
+///   now where it previously surfaced the error — deliberate: nothing visible is
+///   duplicated, because usage is invisible.
+/// * **Not classified here** — `Error`, which the caller's own arm handles.
+///
+/// The per-variant behaviour is pinned by
+/// `only_metadata_deltas_leave_the_chain_uncommitted`.
+const fn commits_stream(delta: &StreamDelta) -> bool {
+    !matches!(delta, StreamDelta::Usage(_))
+}
 
 /// An [`LlmProvider`] that fails over across an ordered list of backends.
 ///
@@ -119,12 +145,18 @@ impl LlmProvider for FallbackProvider {
         let providers = self.ordered();
         Box::pin(async_stream::stream! {
             let last = providers.len() - 1;
+            // Preserves the tokens billed by providers this chain abandoned, so
+            // the surviving provider's usage delta reports the running total
+            // rather than erasing the abandoned attempt's usage (last-wins
+            // accumulator). See `UsageCarry`.
+            let mut usage_carry = UsageCarry::new();
+
             for (idx, provider) in providers.iter().enumerate() {
                 let is_last = idx == last;
                 let mut stream = provider.chat_stream(request.clone());
-                // Whether this provider has emitted any non-error delta. Once it
-                // has, we are committed to it: failing over mid-stream would
-                // double-emit content, so a later error is surfaced as-is.
+                // Whether this provider has emitted a delta that commits the
+                // stream to it (see `commits_stream`). Once it has, failing over
+                // would double-emit output, so a later error is surfaced as-is.
                 let mut committed = false;
                 let mut failed_over = false;
 
@@ -142,7 +174,17 @@ impl LlmProvider for FallbackProvider {
                             yield Ok(StreamDelta::Error { message, kind });
                         }
                         Ok(delta) => {
-                            committed = true;
+                            // `commits_stream` is the single decision point:
+                            // metadata leaves the chain free to fail over, and
+                            // usage is additionally rewritten to the running
+                            // total so the abandoned provider's tokens survive.
+                            committed = committed || commits_stream(&delta);
+                            let delta = match delta {
+                                StreamDelta::Usage(usage) => {
+                                    StreamDelta::Usage(usage_carry.running_total(usage))
+                                }
+                                other => other,
+                            };
                             yield Ok(delta);
                         }
                         Err(error) => {
@@ -162,6 +204,7 @@ impl LlmProvider for FallbackProvider {
                 if !failed_over {
                     return;
                 }
+                usage_carry.abandon();
             }
         })
     }
@@ -189,7 +232,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use agent_sdk_foundation::llm::{ChatResponse, ContentBlock, StopReason, Usage};
-    use anyhow::anyhow;
+    use anyhow::{Context as _, anyhow};
 
     use crate::streaming::StreamErrorKind;
 
@@ -382,13 +425,133 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn only_metadata_deltas_leave_the_chain_uncommitted() {
+        // Content — anything the consumer can see or replay — commits: failing
+        // over after it would make the secondary emit it a second time.
+        for delta in [
+            StreamDelta::TextDelta {
+                delta: "hi".to_owned(),
+                block_index: 0,
+            },
+            StreamDelta::ThinkingDelta {
+                delta: "hmm".to_owned(),
+                block_index: 0,
+            },
+            StreamDelta::ToolUseStart {
+                id: "t1".to_owned(),
+                name: "echo".to_owned(),
+                block_index: 0,
+                thought_signature: None,
+            },
+            StreamDelta::ToolInputDelta {
+                id: "t1".to_owned(),
+                delta: "{}".to_owned(),
+                block_index: 0,
+            },
+            StreamDelta::Done {
+                stop_reason: Some(StopReason::EndTurn),
+            },
+        ] {
+            assert!(
+                commits_stream(&delta),
+                "content/terminal deltas must commit the chain: {delta:?}"
+            );
+        }
+
+        // Usage is metadata the user never sees, so it must not strand the chain
+        // on a provider that reported its billing and then died.
+        assert!(!commits_stream(&StreamDelta::Usage(Usage {
+            input_tokens: 1,
+            output_tokens: 1,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        })));
+    }
+
+    #[tokio::test]
+    async fn stream_usage_before_an_error_does_not_suppress_failover() -> Result<()> {
+        // Providers now report the tokens a failing turn burned *before* the
+        // terminal error. That usage delta must not commit the chain to a dead
+        // primary — it is metadata the user never sees — and the tokens it
+        // reports must survive into the surviving provider's usage, because the
+        // accumulator keeps only the last usage delta.
+        let primary = ScriptedProvider::streaming(
+            "primary",
+            vec![
+                Ok(StreamDelta::Usage(Usage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                })),
+                Ok(StreamDelta::Error {
+                    message: "rate limited".to_owned(),
+                    kind: StreamErrorKind::RateLimited(None),
+                }),
+            ],
+        );
+        let secondary = ScriptedProvider::streaming(
+            "secondary",
+            vec![
+                Ok(StreamDelta::TextDelta {
+                    delta: "hello".to_owned(),
+                    block_index: 0,
+                }),
+                Ok(StreamDelta::Usage(Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                })),
+                Ok(StreamDelta::Done {
+                    stop_reason: Some(StopReason::EndTurn),
+                }),
+            ],
+        );
+        let fb = FallbackProvider::new(primary.clone()).with_fallback(secondary.clone());
+
+        let mut accumulator = crate::streaming::StreamAccumulator::new();
+        let mut stream = fb.chat_stream(request());
+        let mut saw_error = false;
+        let mut text = String::new();
+        while let Some(item) = stream.next().await {
+            let delta = item?;
+            if let StreamDelta::Error { .. } = &delta {
+                saw_error = true;
+            }
+            if let StreamDelta::TextDelta { delta, .. } = &delta {
+                text.push_str(delta);
+            }
+            accumulator.apply(&delta);
+        }
+        drop(stream);
+
+        assert!(
+            !saw_error,
+            "the usage delta must not commit us to the primary"
+        );
+        assert_eq!(text, "hello", "the secondary must serve the turn");
+        assert_eq!(primary.calls(), 1);
+        assert_eq!(secondary.calls(), 1);
+
+        // The primary genuinely billed 150 tokens before dying; the secondary
+        // billed 15. The consumer must end up accounting for both.
+        let usage = accumulator
+            .usage()
+            .context("the failover must still report usage")?;
+        assert_eq!(usage.input_tokens, 110);
+        assert_eq!(usage.output_tokens, 55);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn stream_fails_over_on_recoverable_first_error() -> Result<()> {
         let primary = ScriptedProvider::streaming(
             "primary",
             vec![Ok(StreamDelta::Error {
                 message: "rate limited".to_owned(),
-                kind: StreamErrorKind::RateLimited,
+                kind: StreamErrorKind::RateLimited(None),
             })],
         );
         let secondary = ScriptedProvider::streaming(

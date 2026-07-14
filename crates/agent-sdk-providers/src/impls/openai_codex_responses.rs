@@ -525,6 +525,10 @@ impl LlmProvider for OpenAICodexResponsesProvider {
         );
 
         if status == StatusCode::TOO_MANY_REQUESTS {
+            let body = String::from_utf8_lossy(&bytes);
+            let retry_after = retry_after
+                .or_else(|| codex_http_reset_after(&body))
+                .or_else(|| crate::retry_hints::openai_retry_delay(&body));
             return Ok(ChatOutcome::RateLimited(retry_after));
         }
 
@@ -769,17 +773,34 @@ impl LlmProvider for OpenAICodexResponsesProvider {
 
                                 match message {
                                     WebSocketMessage::Text(text) => {
-                                        if let Some((status, message)) =
+                                        if let Some(error) =
                                             parse_wrapped_websocket_error_event(&text)
                                         {
                                             log::warn!(
-                                                "OpenAI Codex websocket warmup wrapped error on attempt {} status={} message={message}",
+                                                "OpenAI Codex websocket warmup wrapped error on attempt {} status={} message={}",
                                                 attempt + 1,
-                                                status,
+                                                error.status,
+                                                error.message,
                                             );
-                                            if status == StatusCode::UNAUTHORIZED
-                                                || status == StatusCode::UPGRADE_REQUIRED
-                                                || status.is_client_error()
+                                            // A quota rejection applies to the request, not to
+                                            // this socket: reconnecting or falling back to HTTP
+                                            // would spend another request inside the window the
+                                            // service asked us to sit out. Surface it with its
+                                            // delay instead. The connection-limit sentinel shares
+                                            // the status but is a transport condition, so it keeps
+                                            // its immediate fallback.
+                                            if is_websocket_quota_rejection(&error) {
+                                                let kind = websocket_error_kind(&error);
+                                                end_websocket_turn(&mut websocket_session);
+                                                yield Ok(StreamDelta::Error {
+                                                    message: error.message,
+                                                    kind,
+                                                });
+                                                return;
+                                            }
+                                            if error.status == StatusCode::UNAUTHORIZED
+                                                || error.status == StatusCode::UPGRADE_REQUIRED
+                                                || error.status.is_client_error()
                                             {
                                                 websocket_session.websocket_disabled = true;
                                             }
@@ -789,7 +810,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                         let event = match decode_stream_event(&text) {
                                             Ok(event) => event,
                                             Err(error) => {
-                                                reset_websocket_connection(
+                                                end_websocket_turn(
                                                     &mut websocket_session,
                                                 );
                                                 yield Ok(StreamDelta::Error {
@@ -804,7 +825,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                     let item = match decode_output_item(event.item) {
                                                         Ok(item) => item,
                                                         Err(error) => {
-                                                            reset_websocket_connection(
+                                                            end_websocket_turn(
                                                                 &mut websocket_session,
                                                             );
                                                             yield Ok(StreamDelta::Error {
@@ -853,7 +874,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                         let text = match String::from_utf8(bytes.to_vec()) {
                                             Ok(text) => text,
                                             Err(error) => {
-                                                reset_websocket_connection(
+                                                end_websocket_turn(
                                                     &mut websocket_session,
                                                 );
                                                 yield Ok(StreamDelta::Error {
@@ -865,17 +886,30 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                 return;
                                             }
                                         };
-                                            if let Some((status, message)) =
+                                            if let Some(error) =
                                                 parse_wrapped_websocket_error_event(&text)
                                             {
                                                 log::warn!(
-                                                    "OpenAI Codex websocket warmup wrapped error on attempt {} status={} message={message}",
+                                                    "OpenAI Codex websocket warmup wrapped error on attempt {} status={} message={}",
                                                     attempt + 1,
-                                                    status,
+                                                    error.status,
+                                                    error.message,
                                                 );
-                                                if status == StatusCode::UNAUTHORIZED
-                                                    || status == StatusCode::UPGRADE_REQUIRED
-                                                    || status.is_client_error()
+                                                // Same split as the text warmup frame: a quota
+                                                // rejection is surfaced with its delay; the
+                                                // connection-limit sentinel falls back at once.
+                                                if is_websocket_quota_rejection(&error) {
+                                                    let kind = websocket_error_kind(&error);
+                                                    end_websocket_turn(&mut websocket_session);
+                                                    yield Ok(StreamDelta::Error {
+                                                        message: error.message,
+                                                        kind,
+                                                    });
+                                                    return;
+                                                }
+                                                if error.status == StatusCode::UNAUTHORIZED
+                                                    || error.status == StatusCode::UPGRADE_REQUIRED
+                                                    || error.status.is_client_error()
                                                 {
                                                     websocket_session.websocket_disabled = true;
                                                 }
@@ -886,7 +920,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                             let event = match decode_stream_event(&text) {
                                                 Ok(event) => event,
                                                 Err(error) => {
-                                                    reset_websocket_connection(
+                                                    end_websocket_turn(
                                                         &mut websocket_session,
                                                     );
                                                     yield Ok(StreamDelta::Error {
@@ -901,7 +935,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                         let item = match decode_output_item(event.item) {
                                                             Ok(item) => item,
                                                             Err(error) => {
-                                                                reset_websocket_connection(
+                                                                end_websocket_turn(
                                                                     &mut websocket_session,
                                                                 );
                                                                 yield Ok(StreamDelta::Error {
@@ -1047,7 +1081,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                             };
                             let Some(message_result) = message_result else {
                                 if emitted_output {
-                                    reset_websocket_connection(&mut websocket_session);
+                                    end_websocket_turn(&mut websocket_session);
                                     yield Ok(StreamDelta::Error {
                                         message: "websocket closed before response.completed"
                                             .to_string(),
@@ -1067,7 +1101,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                 Ok(message) => message,
                                 Err(error) => {
                                     if emitted_output {
-                                        reset_websocket_connection(&mut websocket_session);
+                                        end_websocket_turn(&mut websocket_session);
                                         yield Ok(StreamDelta::Error {
                                             message: format!("websocket error: {error}"),
                                             kind: StreamErrorKind::ServerError,
@@ -1085,27 +1119,26 @@ impl LlmProvider for OpenAICodexResponsesProvider {
 
                             match message {
                                 WebSocketMessage::Text(text) => {
-                                    if let Some((status, message)) =
-                                        parse_wrapped_websocket_error_event(&text)
+                                    if let Some(error) = parse_wrapped_websocket_error_event(&text)
                                     {
-                                        let kind = if status == StatusCode::TOO_MANY_REQUESTS {
-                                            StreamErrorKind::RateLimited
-                                        } else if status.is_server_error() {
-                                            StreamErrorKind::ServerError
-                                        } else {
-                                            StreamErrorKind::InvalidRequest
-                                        };
-                                        if emitted_output {
-                                            reset_websocket_connection(&mut websocket_session);
+                                        let kind =
+                                            websocket_error_kind(&error);
+                                        // A quota rejection carries the delay the service wants
+                                        // observed, so it is surfaced (with its hint) for the
+                                        // caller's retry loop rather than re-sent immediately.
+                                        // The connection-limit signal shares the status but is a
+                                        // transport condition, so it still falls back at once.
+                                        if emitted_output || is_websocket_quota_rejection(&error) {
+                                            end_websocket_turn(&mut websocket_session);
                                             yield Ok(StreamDelta::Error {
-                                                message,
+                                                message: error.message,
                                                 kind,
                                             });
                                             return;
                                         }
-                                        if status == StatusCode::UNAUTHORIZED
-                                            || status == StatusCode::UPGRADE_REQUIRED
-                                            || status.is_client_error()
+                                        if error.status == StatusCode::UNAUTHORIZED
+                                            || error.status == StatusCode::UPGRADE_REQUIRED
+                                            || error.status.is_client_error()
                                         {
                                             websocket_session.websocket_disabled = true;
                                         }
@@ -1115,7 +1148,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                     let event = match decode_stream_event(&text) {
                                         Ok(event) => event,
                                         Err(error) => {
-                                            reset_websocket_connection(&mut websocket_session);
+                                            end_websocket_turn(&mut websocket_session);
                                             yield Ok(StreamDelta::Error {
                                                 message: error.to_string(),
                                                 kind: StreamErrorKind::ServerError,
@@ -1183,7 +1216,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                 let item = match decode_output_item(event.item) {
                                                     Ok(item) => item,
                                                     Err(error) => {
-                                                        reset_websocket_connection(
+                                                        end_websocket_turn(
                                                             &mut websocket_session,
                                                         );
                                                         yield Ok(StreamDelta::Error {
@@ -1277,16 +1310,17 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                 websocket_session.last_response_id = None;
                                                 websocket_session.last_response_items.clear();
                                                 websocket_session.prewarmed = false;
-                                                let message = event
-                                                    .response
-                                                    .and_then(|resp| resp.error)
-                                                    .and_then(|error| error.message)
-                                                    .unwrap_or_else(|| {
-                                                        "Codex response failed".to_string()
-                                                    });
+                                                // The turn ends here, so the session must stop
+                                                // counting as in-flight or it can never be evicted.
+                                                websocket_session.in_flight = false;
+                                                let failure =
+                                                    codex_response_failed_error(event.response);
+                                                if let Some(usage) = failure.usage {
+                                                    yield Ok(StreamDelta::Usage(usage));
+                                                }
                                                 yield Ok(StreamDelta::Error {
-                                                    message,
-                                                    kind: StreamErrorKind::ServerError,
+                                                    message: failure.message,
+                                                    kind: failure.kind,
                                                 });
                                                 return;
                                             }
@@ -1297,7 +1331,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                     let text = match String::from_utf8(bytes.to_vec()) {
                                         Ok(text) => text,
                                         Err(error) => {
-                                            reset_websocket_connection(&mut websocket_session);
+                                            end_websocket_turn(&mut websocket_session);
                                             yield Ok(StreamDelta::Error {
                                                 message: format!(
                                                     "invalid OpenAI Codex websocket UTF-8: {error}"
@@ -1307,27 +1341,27 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                             return;
                                         }
                                     };
-                                        if let Some((status, message)) =
+                                        if let Some(error) =
                                             parse_wrapped_websocket_error_event(&text)
                                         {
-                                            let kind = if status == StatusCode::TOO_MANY_REQUESTS {
-                                                StreamErrorKind::RateLimited
-                                            } else if status.is_server_error() {
-                                                StreamErrorKind::ServerError
-                                            } else {
-                                                StreamErrorKind::InvalidRequest
-                                            };
-                                            if emitted_output {
-                                                reset_websocket_connection(&mut websocket_session);
+                                            let kind =
+                                                websocket_error_kind(&error);
+                                            // Same split as the text frame: a quota rejection is
+                                            // surfaced with its delay; the connection-limit signal
+                                            // keeps falling back to HTTP immediately.
+                                            if emitted_output
+                                                || is_websocket_quota_rejection(&error)
+                                            {
+                                                end_websocket_turn(&mut websocket_session);
                                                 yield Ok(StreamDelta::Error {
-                                                    message,
+                                                    message: error.message,
                                                     kind,
                                                 });
                                                 return;
                                             }
-                                            if status == StatusCode::UNAUTHORIZED
-                                                || status == StatusCode::UPGRADE_REQUIRED
-                                                || status.is_client_error()
+                                            if error.status == StatusCode::UNAUTHORIZED
+                                                || error.status == StatusCode::UPGRADE_REQUIRED
+                                                || error.status.is_client_error()
                                             {
                                                 websocket_session.websocket_disabled = true;
                                             }
@@ -1338,7 +1372,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                         let event = match decode_stream_event(&text) {
                                             Ok(event) => event,
                                             Err(error) => {
-                                                reset_websocket_connection(
+                                                end_websocket_turn(
                                                     &mut websocket_session,
                                                 );
                                                 yield Ok(StreamDelta::Error {
@@ -1412,7 +1446,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                         match decode_output_item(event.item) {
                                                             Ok(item) => item,
                                                             Err(error) => {
-                                                                reset_websocket_connection(
+                                                                end_websocket_turn(
                                                                     &mut websocket_session,
                                                                 );
                                                                 yield Ok(StreamDelta::Error {
@@ -1516,16 +1550,18 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                     websocket_session.last_response_id = None;
                                                     websocket_session.last_response_items.clear();
                                                     websocket_session.prewarmed = false;
-                                                    let message = event
-                                                        .response
-                                                        .and_then(|resp| resp.error)
-                                                        .and_then(|error| error.message)
-                                                        .unwrap_or_else(|| {
-                                                            "Codex response failed".to_string()
-                                                        });
+                                                    // The turn ends here, so the session must stop
+                                                    // counting as in-flight or it can never be
+                                                    // evicted.
+                                                    websocket_session.in_flight = false;
+                                                    let failure =
+                                                        codex_response_failed_error(event.response);
+                                                    if let Some(usage) = failure.usage {
+                                                        yield Ok(StreamDelta::Usage(usage));
+                                                    }
                                                     yield Ok(StreamDelta::Error {
-                                                        message,
-                                                        kind: StreamErrorKind::ServerError,
+                                                        message: failure.message,
+                                                        kind: failure.kind,
                                                     });
                                                     return;
                                                 }
@@ -1539,7 +1575,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                             .await
                                     {
                                         if emitted_output {
-                                            reset_websocket_connection(&mut websocket_session);
+                                            end_websocket_turn(&mut websocket_session);
                                             yield Ok(StreamDelta::Error {
                                                 message: format!("websocket pong failed: {error}"),
                                                 kind: StreamErrorKind::ServerError,
@@ -1557,7 +1593,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                 WebSocketMessage::Pong(_) | WebSocketMessage::Frame(_) => {}
                                 WebSocketMessage::Close(_) => {
                                     if emitted_output {
-                                        reset_websocket_connection(&mut websocket_session);
+                                        end_websocket_turn(&mut websocket_session);
                                         yield Ok(StreamDelta::Error {
                                             message: "websocket closed before response.completed"
                                                 .to_string(),
@@ -1612,9 +1648,15 @@ impl LlmProvider for OpenAICodexResponsesProvider {
 
             let status = response.status();
             if !status.is_success() {
+                // Headers are read before the body: `text()` consumes the response.
+                let header_hint = crate::http::retry_after_from_headers(response.headers());
                 let body = response.text().await.unwrap_or_default();
                 let kind = if status == StatusCode::TOO_MANY_REQUESTS {
-                    StreamErrorKind::RateLimited
+                    StreamErrorKind::RateLimited(
+                        header_hint
+                            .or_else(|| codex_http_reset_after(&body))
+                            .or_else(|| crate::retry_hints::openai_retry_delay(&body)),
+                    )
                 } else if status.is_server_error() {
                     StreamErrorKind::ServerError
                 } else {
@@ -1805,14 +1847,13 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                 };
                             }
                             "response.failed" => {
-                                let message = event
-                                    .response
-                                    .and_then(|resp| resp.error)
-                                    .and_then(|error| error.message)
-                                    .unwrap_or_else(|| "Codex response failed".to_string());
+                                let failure = codex_response_failed_error(event.response);
+                                if let Some(usage) = failure.usage {
+                                    yield Ok(StreamDelta::Usage(usage));
+                                }
                                 yield Ok(StreamDelta::Error {
-                                    message,
-                                    kind: StreamErrorKind::ServerError,
+                                    message: failure.message,
+                                    kind: failure.kind,
                                 });
                                 return;
                             }
@@ -2598,6 +2639,34 @@ fn reset_websocket_connection(session: &mut WebsocketSessionState) {
     session.prewarmed = false;
 }
 
+/// Reset the connection *and* end the turn, for a stream that is about to yield
+/// a terminal error and stop.
+///
+/// `in_flight` stays set when a stream is merely *dropped* — that is how the
+/// next turn for the session learns its state is stale and runs the
+/// abandoned-turn cleanup on lock acquisition. A stream that finishes by
+/// reporting an error has no such successor to warn: the turn is over and the
+/// state is cleared here, so the marker is cleared. Leaving it set makes
+/// [`evict_idle_sessions`] skip the entry forever, and the bounded session map
+/// then grows without limit — one stranded entry per session id that ever hit a
+/// terminal stream error.
+///
+/// Because clearing `in_flight` bypasses that abandoned-turn cleanup, this must
+/// itself clear the incremental baseline (`last_request` / `last_response_id` /
+/// `last_response_items`). The baseline is a `previous_response_id` valid only
+/// on the socket that produced it; this turn ended in a terminal error on a
+/// now-discarded socket, so a retry reusing this idle session must send a FULL
+/// request on its fresh socket rather than a stale id the new connection
+/// rejects. (`reset_websocket_connection` clears the baseline only for a
+/// prewarmed session; a real turn is not prewarmed, so it is cleared here.)
+fn end_websocket_turn(session: &mut WebsocketSessionState) {
+    reset_websocket_connection(session);
+    session.last_request = None;
+    session.last_response_id = None;
+    session.last_response_items.clear();
+    session.in_flight = false;
+}
+
 /// Bound the websocket-session map by evicting idle (not in-flight) sessions,
 /// oldest-first by last use. The map exists for cross-turn reuse, so completed
 /// sessions retain a cached baseline indefinitely; without eviction a host
@@ -2621,11 +2690,91 @@ fn evict_idle_sessions(sessions: &mut HashMap<String, Arc<Mutex<WebsocketSession
     }
 }
 
-fn parse_wrapped_websocket_error_event(payload: &str) -> Option<(StatusCode, String)> {
+/// A decoded wrapped websocket error frame.
+struct WrappedWebsocketError {
+    status: StatusCode,
+    message: String,
+    /// The frame is the websocket connection-limit signal, which the service
+    /// reports with a 429 even though no model quota was exhausted: it means
+    /// *this transport* is full, not that the request must wait. Tracked
+    /// separately so the immediate HTTP fallback that resolves it is not
+    /// confused with a quota rejection, which must be waited out.
+    connection_limit: bool,
+    /// Delay the frame stated in a structured field, if any.
+    ///
+    /// Codex's `usage_limit_reached` frame carries its wait here and leaves the
+    /// message as fixed prose ("The usage limit has been reached"), so this is
+    /// the only hint that frame has — parsing the message would find nothing.
+    reset_after: Option<Duration>,
+}
+
+/// Resolve the wait a Codex quota error states in its structured reset fields.
+///
+/// `resets_in_seconds` is preferred: it is relative, so it needs no wall-clock
+/// arithmetic and cannot be skewed by clock drift. `resets_at` (Unix seconds) is
+/// the fallback, converted against the wall clock — an instant at or before now
+/// yields `None` rather than a zero or negative wait. Both are `f64`: the
+/// service sometimes encodes the timestamp as a JSON float, and rejecting that
+/// would fail the whole payload parse and lose the hint entirely. Either way the
+/// value passes through the same [`bounded_delay`](crate::retry_hints::bounded_delay)
+/// ceiling as every other hint source.
+fn codex_reset_after(resets_in_seconds: Option<f64>, resets_at: Option<f64>) -> Option<Duration> {
+    if let Some(seconds) = resets_in_seconds {
+        return crate::retry_hints::bounded_delay(seconds);
+    }
+    let resets_at = resets_at?;
+    if !resets_at.is_finite() {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    // `floor` drops sub-second precision a quota reset never needs; the
+    // `bounded_delay` sanity checks (finite, positive, ceiling) do the rest.
+    crate::retry_hints::bounded_delay(resets_at.floor() - f64::from(u32::try_from(now).ok()?))
+}
+
+/// Read the structured reset off a wrapped websocket error frame.
+fn websocket_reset_after(error: Option<&ApiWrappedWebsocketErrorBody>) -> Option<Duration> {
+    let error = error?;
+    codex_reset_after(error.resets_in_seconds, error.resets_at)
+}
+
+/// A Codex HTTP error body, read only for its structured quota reset.
+///
+/// The HTTP 429 responses carry no `Retry-After` header and a
+/// `usage_limit_reached` body whose message is timing-free prose, so the reset
+/// fields under `error` are the only usable hint there.
+#[derive(Deserialize)]
+struct ApiHttpErrorEnvelope {
+    #[serde(default)]
+    error: Option<ApiHttpErrorBody>,
+}
+
+#[derive(Deserialize)]
+struct ApiHttpErrorBody {
+    #[serde(default)]
+    resets_in_seconds: Option<f64>,
+    #[serde(default)]
+    resets_at: Option<f64>,
+}
+
+/// Resolve the wait a Codex HTTP 429 body states in its structured reset fields,
+/// or `None` when the body is not JSON or carries no reset.
+fn codex_http_reset_after(body: &str) -> Option<Duration> {
+    let envelope: ApiHttpErrorEnvelope = serde_json::from_str(body).ok()?;
+    let error = envelope.error?;
+    codex_reset_after(error.resets_in_seconds, error.resets_at)
+}
+
+fn parse_wrapped_websocket_error_event(payload: &str) -> Option<WrappedWebsocketError> {
     let event: ApiWrappedWebsocketErrorEvent = serde_json::from_str(payload).ok()?;
     if event.kind != "error" {
         return None;
     }
+
+    let reset_after = websocket_reset_after(event.error.as_ref());
 
     if event.error.as_ref().and_then(|error| error.code.as_deref())
         == Some(OPENAI_CODEX_WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE)
@@ -2634,7 +2783,12 @@ fn parse_wrapped_websocket_error_event(payload: &str) -> Option<(StatusCode, Str
             .error
             .and_then(|error| error.message)
             .unwrap_or_else(|| "Responses websocket connection limit reached".to_string());
-        return Some((StatusCode::TOO_MANY_REQUESTS, message));
+        return Some(WrappedWebsocketError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message,
+            connection_limit: true,
+            reset_after,
+        });
     }
 
     let status = StatusCode::from_u16(event.status?).ok()?;
@@ -2645,7 +2799,84 @@ fn parse_wrapped_websocket_error_event(payload: &str) -> Option<(StatusCode, Str
     if status.is_success() {
         None
     } else {
-        Some((status, message))
+        Some(WrappedWebsocketError {
+            status,
+            message,
+            connection_limit: false,
+            reset_after,
+        })
+    }
+}
+
+/// `true` when the frame is a model-quota rejection rather than the
+/// websocket connection-limit signal the service reports with the same status.
+///
+/// A quota rejection states how long to wait, so re-sending the request now —
+/// over a fresh socket or the HTTP fallback — would spend the attempt inside
+/// the window the service just asked us to sit out.
+fn is_websocket_quota_rejection(error: &WrappedWebsocketError) -> bool {
+    error.status == StatusCode::TOO_MANY_REQUESTS && !error.connection_limit
+}
+
+/// Resolve the message and kind of an in-band `response.failed` event.
+///
+/// The stream already opened with HTTP 200, so a rate limit reported this way
+/// has neither a status nor a `Retry-After` header: the machine-readable code
+/// is the only classification signal, and the delay — when the service states
+/// one — is embedded in the message. Every other failure stays a (retriable)
+/// server error, as before.
+fn codex_response_failed_error(response: Option<ApiStreamResponse>) -> CodexResponseFailure {
+    // A failed response still reports the tokens it burned. They are returned
+    // alongside the error so the caller can yield them *before* the terminal
+    // error delta: the consumer's accumulator only sees deltas it was handed,
+    // and those tokens are billed whether or not the turn survived.
+    let usage = response
+        .as_ref()
+        .and_then(|resp| resp.usage.as_ref())
+        .map(usage_from_api_usage);
+    let (code, message) = response
+        .and_then(|resp| resp.error)
+        .map_or((None, None), |error| (error.code, error.message));
+    let message = message.unwrap_or_else(|| "Codex response failed".to_string());
+    let kind = if matches!(
+        code.as_deref(),
+        Some("rate_limit_exceeded" | "rate_limit_error")
+    ) {
+        StreamErrorKind::RateLimited(crate::retry_hints::openai_retry_delay(&message))
+    } else {
+        StreamErrorKind::ServerError
+    };
+    CodexResponseFailure {
+        message,
+        kind,
+        usage,
+    }
+}
+
+/// A `response.failed` event decoded into what the stream must emit for it.
+struct CodexResponseFailure {
+    message: String,
+    kind: StreamErrorKind,
+    /// Usage the failed response reported, if any — emitted before the error.
+    usage: Option<Usage>,
+}
+
+/// Classify a wrapped websocket error event by the status it reports.
+///
+/// The frame carries no HTTP headers, so a rate limit's delay comes from the
+/// frame itself: the structured reset field when the service sent one (Codex's
+/// `usage_limit_reached` frames do, and their message is fixed prose that says
+/// nothing about timing), otherwise the message ("Please try again in 20s").
+fn websocket_error_kind(error: &WrappedWebsocketError) -> StreamErrorKind {
+    if error.status == StatusCode::TOO_MANY_REQUESTS {
+        let delay = error
+            .reset_after
+            .or_else(|| crate::retry_hints::openai_retry_delay(&error.message));
+        StreamErrorKind::RateLimited(delay)
+    } else if error.status.is_server_error() {
+        StreamErrorKind::ServerError
+    } else {
+        StreamErrorKind::InvalidRequest
     }
 }
 
@@ -3131,6 +3362,11 @@ struct ApiStreamResponse {
 struct ApiErrorBody {
     #[serde(default)]
     message: Option<String>,
+    /// Machine-readable error code (e.g. `rate_limit_exceeded`), used to
+    /// classify a failure the HTTP status cannot describe because the stream
+    /// already opened with 200.
+    #[serde(default)]
+    code: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3139,6 +3375,18 @@ struct ApiWrappedWebsocketErrorBody {
     code: Option<String>,
     #[serde(default)]
     message: Option<String>,
+    /// Seconds until the exhausted usage limit resets. Codex states its
+    /// standard `usage_limit_reached` delay here rather than in the message
+    /// (which is the fixed prose "The usage limit has been reached"), so it is
+    /// the only usable hint on that frame.
+    #[serde(default)]
+    resets_in_seconds: Option<f64>,
+    /// Absolute reset instant (Unix seconds), sent by some frames instead of
+    /// the relative field. `f64` because the service sometimes encodes it as a
+    /// JSON float — an `i64` field would fail the whole frame parse on such a
+    /// value, losing the hint and the rate-limit classification with it.
+    #[serde(default)]
+    resets_at: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -3164,6 +3412,97 @@ mod tests {
         assert_eq!(MODEL_GPT54, "gpt-5.4");
         assert_eq!(MODEL_GPT53_CODEX, "gpt-5.3-codex");
         assert_eq!(MODEL_GPT52_CODEX, "gpt-5.2-codex");
+    }
+
+    #[test]
+    fn warmup_quota_rejection_is_surfaced_while_connection_limit_still_falls_back()
+    -> anyhow::Result<()> {
+        // The warmup (`generate=false`) branches route on the same discriminator
+        // as the in-flight ones: a quota rejection must be surfaced with its
+        // delay rather than immediately re-sent inside the wait window, while
+        // the connection-limit sentinel — reported with the same synthetic 429 —
+        // must keep falling back to HTTP at once.
+        let quota = parse_wrapped_websocket_error_event(
+            r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded","message":"Rate limit reached. Please try again in 45s."}}"#,
+        )
+        .context("expected a wrapped error")?;
+        assert!(is_websocket_quota_rejection(&quota));
+        let kind = websocket_error_kind(&quota);
+        assert_eq!(
+            kind,
+            StreamErrorKind::RateLimited(Some(std::time::Duration::from_secs(45)))
+        );
+        assert!(kind.is_recoverable());
+
+        // The same warmup path carries a structured reset hint when the frame is
+        // Codex's standard usage-limit shape, whose prose states no timing.
+        let usage_limit = parse_wrapped_websocket_error_event(
+            r#"{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"The usage limit has been reached.","resets_in_seconds":900}}"#,
+        )
+        .context("expected a wrapped error")?;
+        assert!(is_websocket_quota_rejection(&usage_limit));
+        assert_eq!(
+            websocket_error_kind(&usage_limit),
+            StreamErrorKind::RateLimited(Some(std::time::Duration::from_mins(15))),
+            "the structured reset must reach the retry loop through the warmup path"
+        );
+
+        let connection_limit = parse_wrapped_websocket_error_event(&format!(
+            r#"{{"type":"error","status":429,"error":{{"code":"{OPENAI_CODEX_WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE}","message":"limit"}}}}"#,
+        ))
+        .context("expected a wrapped error")?;
+        assert!(
+            !is_websocket_quota_rejection(&connection_limit),
+            "the connection-limit sentinel must keep its immediate fallback"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn in_band_response_failed_rate_limit_keeps_its_hint() -> anyhow::Result<()> {
+        let event: ApiStreamEvent = serde_json::from_str(
+            r#"{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"Rate limit reached. Please try again in 20s."}}}"#,
+        )?;
+        let failure = codex_response_failed_error(event.response);
+
+        assert!(failure.message.contains("try again in 20s"));
+        assert_eq!(
+            failure.kind,
+            StreamErrorKind::RateLimited(Some(std::time::Duration::from_secs(20)))
+        );
+        assert!(failure.kind.is_recoverable());
+        Ok(())
+    }
+
+    #[test]
+    fn in_band_response_failed_without_a_rate_limit_code_is_a_server_error() -> anyhow::Result<()> {
+        let event: ApiStreamEvent = serde_json::from_str(
+            r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"upstream blew up"}}}"#,
+        )?;
+        let failure = codex_response_failed_error(event.response);
+
+        assert_eq!(failure.message, "upstream blew up");
+        assert_eq!(failure.kind, StreamErrorKind::ServerError);
+        Ok(())
+    }
+
+    #[test]
+    fn in_band_response_failed_keeps_the_usage_it_reported() -> anyhow::Result<()> {
+        // The failed response still burned tokens; they must reach the stream so
+        // the caller bills them, not vanish with the error.
+        let event: ApiStreamEvent = serde_json::from_str(
+            r#"{"type":"response.failed","response":{"usage":{"input_tokens":120,"output_tokens":34},"error":{"code":"rate_limit_exceeded","message":"Please try again in 20s."}}}"#,
+        )?;
+        let failure = codex_response_failed_error(event.response);
+
+        let usage = failure.usage.context("failed response must report usage")?;
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 34);
+        assert_eq!(
+            failure.kind,
+            StreamErrorKind::RateLimited(Some(std::time::Duration::from_secs(20)))
+        );
+        Ok(())
     }
 
     #[test]
@@ -3410,25 +3749,330 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_wrapped_websocket_error_event_maps_http_status() {
-        let payload = r#"{"type":"error","status":401,"error":{"message":"unauthorized"}}"#;
-        let parsed = parse_wrapped_websocket_error_event(payload);
+    fn end_websocket_turn_clears_the_incremental_baseline_for_the_retry() {
+        // A reused session with an established baseline (turn 1 succeeded, so it
+        // carries `previous_response_id` + its input prefix). Turn 2 then hits a
+        // terminal websocket error and ends via `end_websocket_turn`.
+        let previous_request = ApiStreamingRequest {
+            model: MODEL_GPT53_CODEX.to_string(),
+            instructions: "system".to_string(),
+            input: vec![ApiInputItem::Message(ApiMessage {
+                role: ApiRole::User,
+                content: ApiMessageContent::Text("first".to_string()),
+                phase: None,
+            })],
+            tools: None,
+            max_output_tokens: None,
+            reasoning: None,
+            tool_choice: Some(ApiToolChoice::Mode("auto")),
+            parallel_tool_calls: None,
+            store: false,
+            text: Some(ApiTextSettings {
+                verbosity: "medium",
+                format: None,
+            }),
+            include: None,
+            prompt_cache_key: Some("thread-1".to_string()),
+            stream: true,
+        };
+        let mut session = WebsocketSessionState {
+            connection: None,
+            last_request: Some(previous_request.clone()),
+            last_response_id: Some("resp_prev".to_string()),
+            last_response_items: vec![ApiInputItem::Message(ApiMessage {
+                role: ApiRole::Assistant,
+                content: ApiMessageContent::Parts(vec![ApiInputContent::OutputText {
+                    text: "answer".to_string(),
+                }]),
+                phase: Some("final_answer".to_owned()),
+            })],
+            turn_state: None,
+            // A real turn established the baseline, so it is not prewarmed —
+            // the case where `reset_websocket_connection` would NOT clear it.
+            prewarmed: false,
+            websocket_disabled: false,
+            in_flight: true,
+            last_used: None,
+        };
+
+        // The retry's request EXTENDS the baseline (`[first, answer]`) with a
+        // follow-up, so an intact baseline would let `prepare_websocket_request`
+        // emit `previous_response_id` + only the delta. This makes the assertions
+        // below a true differential: they flip on the baseline clear, not merely
+        // on a shape mismatch.
+        let retry_request = ApiStreamingRequest {
+            input: vec![
+                ApiInputItem::Message(ApiMessage {
+                    role: ApiRole::User,
+                    content: ApiMessageContent::Text("first".to_string()),
+                    phase: None,
+                }),
+                ApiInputItem::Message(ApiMessage {
+                    role: ApiRole::Assistant,
+                    content: ApiMessageContent::Parts(vec![ApiInputContent::OutputText {
+                        text: "answer".to_string(),
+                    }]),
+                    phase: Some("final_answer".to_owned()),
+                }),
+                ApiInputItem::Message(ApiMessage {
+                    role: ApiRole::User,
+                    content: ApiMessageContent::Text("follow up".to_string()),
+                    phase: None,
+                }),
+            ],
+            ..previous_request
+        };
+
+        // Sanity: with the baseline still present, this same request WOULD build
+        // an incremental one — so the assertions after the clear are meaningful.
+        let incremental = prepare_websocket_request(&retry_request, &session, false);
         assert_eq!(
-            parsed,
-            Some((StatusCode::UNAUTHORIZED, "unauthorized".to_string())),
+            incremental.previous_response_id.as_deref(),
+            Some("resp_prev"),
+            "precondition: an intact baseline yields an incremental request",
         );
+        assert_eq!(incremental.input.len(), 1);
+
+        end_websocket_turn(&mut session);
+
+        // End-to-end family (checked first so it is a standalone differential,
+        // not shadowed by the field asserts): the baseline is gone, so the same
+        // retry request now builds a FULL request on the fresh socket — no
+        // `previous_response_id` a new connection would reject, and the whole
+        // input rather than an incremental delta.
+        let websocket_request = prepare_websocket_request(&retry_request, &session, false);
+        assert!(
+            websocket_request.previous_response_id.is_none(),
+            "a retry after a terminal WS error must not reuse the dead socket's response id",
+        );
+        assert_eq!(
+            websocket_request.input.len(),
+            3,
+            "the retry must send the full input, not an incremental delta",
+        );
+
+        // Field family: the baseline fields themselves are cleared, and the
+        // session is evictable.
+        assert!(session.last_request.is_none());
+        assert!(session.last_response_id.is_none());
+        assert!(session.last_response_items.is_empty());
+        assert!(!session.in_flight, "the ended turn must be evictable");
     }
 
     #[test]
-    fn test_parse_wrapped_websocket_error_event_maps_connection_limit() {
+    fn test_parse_wrapped_websocket_error_event_maps_http_status() -> anyhow::Result<()> {
+        let payload = r#"{"type":"error","status":401,"error":{"message":"unauthorized"}}"#;
+        let parsed =
+            parse_wrapped_websocket_error_event(payload).context("expected a wrapped error")?;
+
+        assert_eq!(parsed.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(parsed.message, "unauthorized");
+        assert!(!parsed.connection_limit);
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_wrapped_websocket_error_event_maps_connection_limit() -> anyhow::Result<()> {
         let payload = format!(
             r#"{{"type":"error","status":429,"error":{{"code":"{OPENAI_CODEX_WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE}","message":"limit"}}}}"#,
         );
-        let parsed = parse_wrapped_websocket_error_event(&payload);
-        assert_eq!(
-            parsed,
-            Some((StatusCode::TOO_MANY_REQUESTS, "limit".to_string())),
+        let parsed =
+            parse_wrapped_websocket_error_event(&payload).context("expected a wrapped error")?;
+
+        assert_eq!(parsed.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(parsed.message, "limit");
+        assert!(parsed.connection_limit);
+        // The connection limit is a transport condition, not a model quota: the
+        // stream must keep falling back to HTTP at once rather than waiting.
+        assert!(
+            !is_websocket_quota_rejection(&parsed),
+            "the connection-limit fallback must not be treated as a quota wait"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn pre_output_websocket_quota_rejection_surfaces_with_its_hint() -> anyhow::Result<()> {
+        // A quota 429 normally arrives before any output. It must be surfaced as
+        // a recoverable rate limit carrying the advertised delay — not swallowed
+        // into an immediate retry that re-sends inside the wait window.
+        let payload = r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded","message":"Rate limit reached. Please try again in 30s."}}"#;
+        let parsed =
+            parse_wrapped_websocket_error_event(payload).context("expected a wrapped error")?;
+
+        assert!(!parsed.connection_limit);
+        assert!(
+            is_websocket_quota_rejection(&parsed),
+            "a quota 429 must be surfaced rather than retried immediately"
+        );
+
+        let kind = websocket_error_kind(&parsed);
+        assert_eq!(
+            kind,
+            StreamErrorKind::RateLimited(Some(std::time::Duration::from_secs(30)))
+        );
+        assert!(kind.is_recoverable());
+        Ok(())
+    }
+
+    /// Current Unix time in seconds, for building `resets_at` fixtures.
+    fn unix_now() -> i64 {
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_secs())
+                .unwrap_or_default(),
+        )
+        .unwrap_or_default()
+    }
+
+    #[test]
+    fn usage_limit_frame_carries_its_structured_reset() -> anyhow::Result<()> {
+        // Codex's standard usage-limit frame states the wait in a structured
+        // field and leaves the message as fixed prose with no timing in it, so
+        // the field is the only hint there is.
+        let parsed = parse_wrapped_websocket_error_event(
+            r#"{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"The usage limit has been reached.","resets_in_seconds":1800}}"#,
+        )
+        .context("expected a wrapped error")?;
+
+        assert_eq!(
+            websocket_error_kind(&parsed),
+            StreamErrorKind::RateLimited(Some(std::time::Duration::from_mins(30)))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn usage_limit_reset_falls_back_to_the_absolute_instant() -> anyhow::Result<()> {
+        let future = unix_now() + 600;
+        let parsed = parse_wrapped_websocket_error_event(&format!(
+            r#"{{"type":"error","status":429,"error":{{"type":"usage_limit_reached","message":"The usage limit has been reached.","resets_at":{future}}}}}"#,
+        ))
+        .context("expected a wrapped error")?;
+
+        let StreamErrorKind::RateLimited(Some(delay)) = websocket_error_kind(&parsed) else {
+            anyhow::bail!("a usage-limit frame must be a rate limit with a delay");
+        };
+        // Computed against the wall clock, so assert a window rather than an
+        // exact value.
+        assert!(
+            delay <= std::time::Duration::from_mins(10)
+                && delay >= std::time::Duration::from_secs(590),
+            "the absolute reset must convert to a ~600s wait, got {delay:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn usage_limit_reset_in_the_past_or_absent_reports_no_hint() -> anyhow::Result<()> {
+        // A reset instant that has already elapsed says nothing about how long to
+        // wait: it must not become a zero (retry-instantly) or negative delay.
+        let past = unix_now() - 60;
+        let elapsed = parse_wrapped_websocket_error_event(&format!(
+            r#"{{"type":"error","status":429,"error":{{"type":"usage_limit_reached","message":"The usage limit has been reached.","resets_at":{past}}}}}"#,
+        ))
+        .context("expected a wrapped error")?;
+        assert_eq!(
+            websocket_error_kind(&elapsed),
+            StreamErrorKind::RateLimited(None)
+        );
+
+        // No reset fields at all: unchanged behaviour — the message is the only
+        // source, and this prose carries no delay.
+        let bare = parse_wrapped_websocket_error_event(
+            r#"{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"The usage limit has been reached."}}"#,
+        )
+        .context("expected a wrapped error")?;
+        assert_eq!(
+            websocket_error_kind(&bare),
+            StreamErrorKind::RateLimited(None)
+        );
+
+        // A zero reset is not a delay either.
+        let zero = parse_wrapped_websocket_error_event(
+            r#"{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"The usage limit has been reached.","resets_in_seconds":0}}"#,
+        )
+        .context("expected a wrapped error")?;
+        assert_eq!(
+            websocket_error_kind(&zero),
+            StreamErrorKind::RateLimited(None)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn structured_reset_wins_over_the_message_prose() -> anyhow::Result<()> {
+        // Both present: the machine-readable field is authoritative.
+        let parsed = parse_wrapped_websocket_error_event(
+            r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded","message":"Please try again in 5s.","resets_in_seconds":120}}"#,
+        )
+        .context("expected a wrapped error")?;
+
+        assert_eq!(
+            websocket_error_kind(&parsed),
+            StreamErrorKind::RateLimited(Some(std::time::Duration::from_mins(2)))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn float_encoded_resets_at_still_parses_and_classifies() -> anyhow::Result<()> {
+        // A float `resets_at` must not fail the whole frame parse: doing so would
+        // drop the frame entirely, losing both the hint and the rate-limit
+        // classification — strictly worse than ignoring the reset field.
+        let future = f64::from(u32::try_from(unix_now())?) + 600.5;
+        let parsed = parse_wrapped_websocket_error_event(&format!(
+            r#"{{"type":"error","status":429,"error":{{"type":"usage_limit_reached","message":"The usage limit has been reached.","resets_at":{future}}}}}"#,
+        ))
+        .context("a float resets_at must still parse as a wrapped error")?;
+
+        let StreamErrorKind::RateLimited(Some(delay)) = websocket_error_kind(&parsed) else {
+            anyhow::bail!("a usage-limit frame must classify as a rate limit with a delay");
+        };
+        assert!(
+            delay <= std::time::Duration::from_mins(10)
+                && delay >= std::time::Duration::from_secs(590),
+            "the float reset must convert to a ~600s wait, got {delay:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn codex_http_reset_after_reads_the_structured_body() -> anyhow::Result<()> {
+        // The HTTP 429 branches carry the reset in the body (no Retry-After
+        // header, timing-free prose), so this is the only hint there.
+        assert_eq!(
+            codex_http_reset_after(
+                r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached.","resets_in_seconds":900}}"#
+            ),
+            Some(std::time::Duration::from_mins(15))
+        );
+
+        // Float-encoded absolute reset — must not fail the parse (item-3 class).
+        let future = f64::from(u32::try_from(unix_now())?) + 300.0;
+        let delay = codex_http_reset_after(&format!(
+            r#"{{"error":{{"type":"usage_limit_reached","resets_at":{future}}}}}"#,
+        ))
+        .context("a float resets_at HTTP body must parse")?;
+        assert!(
+            delay <= std::time::Duration::from_mins(5)
+                && delay >= std::time::Duration::from_secs(290),
+            "got {delay:?}"
+        );
+
+        // Not JSON / no reset fields / past instant → no hint.
+        assert_eq!(codex_http_reset_after("429 Too Many Requests"), None);
+        assert_eq!(
+            codex_http_reset_after(r#"{"error":{"message":"slow down"}}"#),
+            None
+        );
+        let past = f64::from(u32::try_from(unix_now())?) - 60.0;
+        assert_eq!(
+            codex_http_reset_after(&format!(r#"{{"error":{{"resets_at":{past}}}}}"#)),
+            None
+        );
+        Ok(())
     }
 
     #[test]
@@ -4155,6 +4799,99 @@ mod tests {
 
     async fn spawn_http_only_server() -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         spawn_http_only_server_with_body(HTTP_SSE_BODY).await
+    }
+
+    /// An HTTP-only server that answers every non-upgrade request with a fixed
+    /// status line and body — used to drive the 429 quota branches.
+    async fn spawn_http_status_server(status_line: &'static str, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let head = read_http_head(&mut stream).await;
+                    if head.to_ascii_lowercase().contains("upgrade: websocket") {
+                        let _ = stream
+                            .write_all(
+                                b"HTTP/1.1 426 Upgrade Required\r\ncontent-length: 0\r\n\r\n",
+                            )
+                            .await;
+                        return;
+                    }
+                    let response = format!(
+                        "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}/backend-api")
+    }
+
+    #[tokio::test]
+    async fn http_chat_429_reads_the_structured_reset_body() -> anyhow::Result<()> {
+        // The non-streaming chat() 429 branch: no Retry-After header, a
+        // usage-limit body whose only usable hint is `resets_in_seconds`.
+        let base_url = spawn_http_status_server(
+            "429 Too Many Requests",
+            r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached.","resets_in_seconds":600}}"#,
+        )
+        .await;
+        let provider = OpenAICodexResponsesProvider::with_base_url(
+            oauth_token(),
+            MODEL_GPT53_CODEX.to_string(),
+            base_url,
+        );
+
+        let outcome = provider
+            .chat(ChatRequest::new(
+                "You are helpful.",
+                vec![Message::user("hi")],
+            ))
+            .await?;
+        assert!(
+            matches!(
+                outcome,
+                ChatOutcome::RateLimited(Some(delay)) if delay == std::time::Duration::from_mins(10)
+            ),
+            "the HTTP chat 429 must carry the structured reset, got {outcome:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_stream_429_reads_the_structured_reset_body() -> anyhow::Result<()> {
+        // The HTTP streaming branch (websockets disabled → HTTP SSE): a 429 at
+        // stream open must surface a rate limit carrying the body's reset.
+        let base_url = spawn_http_status_server(
+            "429 Too Many Requests",
+            r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached.","resets_in_seconds":600}}"#,
+        )
+        .await;
+        let provider = OpenAICodexResponsesProvider::with_base_url(
+            oauth_token(),
+            MODEL_GPT53_CODEX.to_string(),
+            base_url,
+        )
+        .with_websockets_disabled(true);
+
+        let mut stream = std::pin::pin!(provider.chat_stream(streaming_request("session-429")));
+        let mut kind = None;
+        while let Some(item) = stream.next().await {
+            if let StreamDelta::Error { kind: k, .. } = item? {
+                kind = Some(k);
+                break;
+            }
+        }
+        assert_eq!(
+            kind.context("the stream must surface an error")?,
+            StreamErrorKind::RateLimited(Some(std::time::Duration::from_mins(10)))
+        );
+        Ok(())
     }
 
     /// Drain a stream, returning whether it completed without a transport error.

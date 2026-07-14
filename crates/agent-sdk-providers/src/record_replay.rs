@@ -180,10 +180,30 @@ impl LlmProvider for RecordReplayProvider {
                     while let Some(item) = stream.next().await {
                         match item {
                             Ok(delta) => {
+                                let terminal_error = matches!(delta, StreamDelta::Error { .. });
                                 captured.push(CassetteDelta::from_delta(&delta));
+                                if terminal_error {
+                                    // A caller stops reading at a terminal error and drops the
+                                    // stream, so this generator is never resumed past the yield
+                                    // below and the end-of-stream write would never run. Persist
+                                    // the cassette while control is still here, or every recorded
+                                    // failure interaction is lost.
+                                    if let Err(error) =
+                                        self.record_stream(key, std::mem::take(&mut captured))
+                                    {
+                                        log::warn!(
+                                            "record/replay: failed to persist stream cassette: {error}"
+                                        );
+                                    }
+                                    yield Ok(delta);
+                                    return;
+                                }
                                 yield Ok(delta);
                             }
                             Err(error) => {
+                                // A transport failure produced no terminal delta, so there is no
+                                // faithful interaction to record: replaying the captured prefix
+                                // would end the stream cleanly and hide the failure.
                                 yield Err(error);
                                 return;
                             }
@@ -362,6 +382,13 @@ enum CassetteDelta {
     Error {
         message: String,
         kind: CassetteErrorKind,
+        /// Retry delay a rate-limited error carried, in millis.
+        ///
+        /// A separate optional field rather than a payload on
+        /// [`CassetteErrorKind::RateLimited`] so cassettes recorded before
+        /// retry hints were captured still deserialize.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_ms: Option<u64>,
     },
 }
 
@@ -420,6 +447,7 @@ impl CassetteDelta {
             StreamDelta::Error { message, kind } => Self::Error {
                 message: message.clone(),
                 kind: CassetteErrorKind::from_kind(*kind),
+                retry_after_ms: kind.retry_after().map(millis_from_duration),
             },
         }
     }
@@ -467,9 +495,13 @@ impl CassetteDelta {
             },
             Self::Usage(usage) => StreamDelta::Usage(usage),
             Self::Done { stop_reason } => StreamDelta::Done { stop_reason },
-            Self::Error { message, kind } => StreamDelta::Error {
+            Self::Error {
                 message,
-                kind: kind.into_kind(),
+                kind,
+                retry_after_ms,
+            } => StreamDelta::Error {
+                message,
+                kind: kind.into_kind(retry_after_ms.map(Duration::from_millis)),
             },
         }
     }
@@ -486,7 +518,7 @@ enum CassetteErrorKind {
 impl CassetteErrorKind {
     const fn from_kind(kind: StreamErrorKind) -> Self {
         match kind {
-            StreamErrorKind::RateLimited => Self::RateLimited,
+            StreamErrorKind::RateLimited(_) => Self::RateLimited,
             StreamErrorKind::ServerError => Self::ServerError,
             StreamErrorKind::InvalidRequest => Self::InvalidRequest,
             // `StreamErrorKind` is `#[non_exhaustive]`.
@@ -494,9 +526,9 @@ impl CassetteErrorKind {
         }
     }
 
-    const fn into_kind(self) -> StreamErrorKind {
+    const fn into_kind(self, retry_after: Option<Duration>) -> StreamErrorKind {
         match self {
-            Self::RateLimited => StreamErrorKind::RateLimited,
+            Self::RateLimited => StreamErrorKind::RateLimited(retry_after),
             Self::ServerError => StreamErrorKind::ServerError,
             Self::InvalidRequest => StreamErrorKind::InvalidRequest,
             Self::Unknown => StreamErrorKind::Unknown,
@@ -864,5 +896,98 @@ mod tests {
                     "encrypted_content": "ciphertext"
                 })
         ));
+    }
+
+    #[tokio::test]
+    async fn error_stream_is_recorded_even_though_the_caller_drops_it() -> Result<()> {
+        // The real lifecycle: a consumer stops at the terminal error and drops
+        // the stream, so the generator never reaches end-of-stream. The cassette
+        // (with the rate-limit hint) must still be on disk afterwards.
+        let path = temp_cassette_path();
+        let inner = Arc::new(InnerProvider {
+            model: "inner-model",
+            chat_outcome: success_outcome("unused"),
+            deltas: vec![
+                StreamDelta::TextDelta {
+                    delta: "partial".to_owned(),
+                    block_index: 0,
+                },
+                StreamDelta::Error {
+                    message: "Rate limited".to_owned(),
+                    kind: StreamErrorKind::RateLimited(Some(Duration::from_secs(30))),
+                },
+            ],
+        });
+
+        let recorder = RecordReplayProvider::record(inner, &path);
+        {
+            let mut stream = recorder.chat_stream(request());
+            while let Some(item) = stream.next().await {
+                if matches!(item?, StreamDelta::Error { .. }) {
+                    break;
+                }
+            }
+            // Dropped here, mid-stream, exactly as the agent loop drops it.
+        }
+
+        let player = RecordReplayProvider::replay(&path)?;
+        let mut replayed = Vec::new();
+        let mut stream = player.chat_stream(request());
+        while let Some(item) = stream.next().await {
+            replayed.push(item?);
+        }
+        drop(stream);
+
+        assert!(
+            replayed.iter().any(|delta| matches!(
+                delta,
+                StreamDelta::Error {
+                    kind: StreamErrorKind::RateLimited(Some(delay)),
+                    ..
+                } if *delay == Duration::from_secs(30)
+            )),
+            "the recorded error delta and its retry hint must survive the drop, got {replayed:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn cassette_delta_round_trips_the_rate_limit_retry_hint() -> Result<()> {
+        let delta = StreamDelta::Error {
+            message: "Rate limited".to_owned(),
+            kind: StreamErrorKind::RateLimited(Some(Duration::from_secs(30))),
+        };
+
+        let recorded = CassetteDelta::from_delta(&delta);
+        let json = serde_json::to_string(&recorded)?;
+        let replayed = serde_json::from_str::<CassetteDelta>(&json)?.into_delta();
+
+        assert!(matches!(
+            replayed,
+            StreamDelta::Error {
+                kind: StreamErrorKind::RateLimited(Some(delay)),
+                ..
+            } if delay == Duration::from_secs(30)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn cassette_error_without_a_recorded_hint_replays_as_hintless() -> Result<()> {
+        // Cassettes recorded before retry hints existed carry no
+        // `retry_after_ms`; they must still deserialize.
+        let json = r#"{"Error":{"message":"Rate limited","kind":"RateLimited"}}"#;
+        let replayed = serde_json::from_str::<CassetteDelta>(json)?.into_delta();
+
+        assert!(matches!(
+            replayed,
+            StreamDelta::Error {
+                kind: StreamErrorKind::RateLimited(None),
+                ..
+            }
+        ));
+        Ok(())
     }
 }

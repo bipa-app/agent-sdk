@@ -27,6 +27,7 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use agent_sdk_providers::streaming::{StreamAccumulator, StreamDelta, StreamErrorKind};
 use agent_sdk_providers::{AnthropicProvider, LlmProvider};
@@ -319,8 +320,38 @@ async fn tier_b_rate_limit_surfaces_recoverable_stream_error() {
     let err = drain(&provider, sample_request())
         .await
         .expect_err("429 must surface as a stream error");
-    assert_eq!(err.0, StreamErrorKind::RateLimited);
+    // No `Retry-After` on the response, so the stream error carries no hint
+    // and the caller falls back to its own backoff.
+    assert_eq!(err.0, StreamErrorKind::RateLimited(None));
     assert!(err.0.is_recoverable());
+}
+
+#[tokio::test]
+async fn tier_b_rate_limit_stream_error_carries_retry_after_header() {
+    // The `Retry-After` on a streaming 429 must survive the stream error
+    // channel, so the streaming retry path honours the server's delay
+    // exactly like the non-streaming `chat()` path does.
+    let server = MockServer::start().await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "30")
+                .set_body_string("slow down"),
+        )
+        .mount(&server)
+        .await;
+    let provider =
+        AnthropicProvider::new("test-key-not-a-secret", "claude-test").with_base_url(server.uri());
+
+    let err = drain(&provider, sample_request())
+        .await
+        .expect_err("429 must surface as a stream error");
+    assert_eq!(
+        err.0,
+        StreamErrorKind::RateLimited(Some(Duration::from_secs(30)))
+    );
+    assert_eq!(err.0.retry_after(), Some(Duration::from_secs(30)));
 }
 
 #[tokio::test]

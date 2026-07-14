@@ -498,9 +498,13 @@ impl LlmProvider for OpenAIResponsesProvider {
             let status = response.status();
 
             if !status.is_success() {
+                // Headers are read before the body: `text()` consumes the response.
+                let header_hint = crate::http::retry_after_from_headers(response.headers());
                 let body = response.text().await.unwrap_or_default();
                 let kind = if status == StatusCode::TOO_MANY_REQUESTS {
-                    StreamErrorKind::RateLimited
+                    StreamErrorKind::RateLimited(
+                        header_hint.or_else(|| crate::retry_hints::openai_retry_delay(&body)),
+                    )
                 } else if status.is_server_error() {
                     StreamErrorKind::ServerError
                 } else {
@@ -737,22 +741,32 @@ impl LlmProvider for OpenAIResponsesProvider {
                             }
                             // ── Error ───────────────────────────────────
                             "error" | "response.failed" => {
-                                let message = event
+                                // A failed response still reports the tokens it
+                                // burned, so the usage is emitted before the error
+                                // that ends the stream — the caller's accumulator
+                                // only ever sees deltas that were yielded.
+                                let (failed_usage, response_error) = event
                                     .response
-                                    .and_then(|response| response.error)
-                                    .and_then(|error| error.message)
+                                    .map_or((None, None), |response| {
+                                        (response.usage, response.error)
+                                    });
+                                let failed_usage =
+                                    failed_usage.map(|usage| map_usage(Some(usage)));
+                                let (error_code, error_message) = response_error
+                                    .map_or((None, None), |error| (error.code, error.message));
+                                let code = error_code.or(event.code);
+                                let message = error_message
                                     .or(event.message)
                                     .unwrap_or_else(|| data.to_owned());
-                                let is_server_error = event.r#type == "response.failed"
-                                    || event.code.as_deref() == Some("server_error")
-                                    || data.contains("server_error");
-                                let kind = if is_server_error {
-                                    log::warn!("Responses API server error (recoverable): {message}");
-                                    StreamErrorKind::ServerError
-                                } else {
-                                    log::error!("Responses API error event: {message}");
-                                    StreamErrorKind::InvalidRequest
-                                };
+                                let kind = responses_stream_error_kind(
+                                    &event.r#type,
+                                    code.as_deref(),
+                                    &message,
+                                    data,
+                                );
+                                if let Some(usage) = failed_usage {
+                                    yield Ok(StreamDelta::Usage(usage));
+                                }
                                 yield Ok(StreamDelta::Error {
                                     message,
                                     kind,
@@ -1142,6 +1156,34 @@ fn output_contains_refusal(output: &[ApiOutputItem]) -> bool {
     })
 }
 
+/// Classify an in-band Responses SSE error event.
+///
+/// A stream that opened with HTTP 200 can still fail mid-flight, and a
+/// rate limit reported that way carries no HTTP status: the machine-readable
+/// `code` is the only reliable signal. The message is prose and is never used
+/// to decide the category — only to recover the retry delay `OpenAI` states in
+/// it, since these events carry no `Retry-After` header.
+fn responses_stream_error_kind(
+    event_type: &str,
+    code: Option<&str>,
+    message: &str,
+    raw: &str,
+) -> StreamErrorKind {
+    if matches!(code, Some("rate_limit_exceeded" | "rate_limit_error")) {
+        log::warn!("Responses API rate limited (recoverable): {message}");
+        return StreamErrorKind::RateLimited(crate::retry_hints::openai_retry_delay(message));
+    }
+    if event_type == "response.failed"
+        || code == Some("server_error")
+        || raw.contains("server_error")
+    {
+        log::warn!("Responses API server error (recoverable): {message}");
+        return StreamErrorKind::ServerError;
+    }
+    log::error!("Responses API error event: {message}");
+    StreamErrorKind::InvalidRequest
+}
+
 /// Classify a non-success HTTP status into an early [`ChatOutcome`].
 ///
 /// Returns `None` when the status is a success and the body should instead be
@@ -1152,6 +1194,8 @@ fn classify_responses_status(
     retry_after: Option<std::time::Duration>,
 ) -> Option<ChatOutcome> {
     if status == StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = retry_after
+            .or_else(|| crate::retry_hints::openai_retry_delay(&String::from_utf8_lossy(bytes)));
         return Some(ChatOutcome::RateLimited(retry_after));
     }
     if status.is_server_error() {
@@ -1838,6 +1882,11 @@ struct ApiResponse {
 struct ApiResponseError {
     #[serde(default)]
     message: Option<String>,
+    /// Machine-readable error code (e.g. `rate_limit_exceeded`), used to
+    /// classify a failure the HTTP status cannot describe because the stream
+    /// already opened with 200.
+    #[serde(default)]
+    code: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2693,6 +2742,100 @@ mod tests {
         assert_eq!(json["mode"], "required");
         assert_eq!(json["tools"][0]["type"], "function");
         assert_eq!(json["tools"][0]["name"], "lookup");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_band_rate_limit_event_is_recoverable_and_keeps_its_hint() -> anyhow::Result<()> {
+        // The stream opened 200 and only then hit the quota, so the HTTP-status
+        // branch never runs: the delay exists solely in the event's message.
+        let body = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Hi\"}\n\n",
+            "data: {\"type\":\"error\",\"code\":\"rate_limit_exceeded\",\"message\":\"Rate limit reached for gpt-5.6 in organization org-x on tokens per min. Please try again in 20s.\"}\n\n",
+        );
+        let deltas = stream_deltas(body).await?;
+        let kind = deltas
+            .iter()
+            .find_map(|delta| match delta {
+                StreamDelta::Error { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .context("expected a stream error delta")?;
+
+        assert_eq!(
+            kind,
+            StreamErrorKind::RateLimited(Some(std::time::Duration::from_secs(20))),
+            "an in-band rate limit must be retriable and carry its parsed delay"
+        );
+        assert!(kind.is_recoverable());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_band_rate_limit_on_response_failed_is_not_a_server_error() -> anyhow::Result<()> {
+        // `response.failed` defaults to ServerError; a rate-limit code inside it
+        // must still classify as a rate limit so the hint is not discarded.
+        let body = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Please try again in 1.5s\"}}}\n\n";
+        let deltas = stream_deltas(body).await?;
+        let kind = deltas
+            .iter()
+            .find_map(|delta| match delta {
+                StreamDelta::Error { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .context("expected a stream error delta")?;
+
+        assert_eq!(
+            kind,
+            StreamErrorKind::RateLimited(Some(std::time::Duration::from_millis(1500)))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_band_failed_event_keeps_the_usage_it_reported() -> anyhow::Result<()> {
+        // The failed response reports the tokens it burned. They are billed, so
+        // they must reach the accumulator — which only sees yielded deltas —
+        // before the error that ends the stream.
+        let body = "data: {\"type\":\"response.failed\",\"response\":{\"usage\":{\"input_tokens\":140,\"output_tokens\":20},\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Please try again in 12s.\"}}}\n\n";
+        let deltas = stream_deltas(body).await?;
+
+        let usage_at = deltas
+            .iter()
+            .position(|delta| matches!(delta, StreamDelta::Usage(_)))
+            .context("the failed event's usage must not be dropped")?;
+        let error_at = deltas
+            .iter()
+            .position(|delta| matches!(delta, StreamDelta::Error { .. }))
+            .context("expected a stream error delta")?;
+        assert!(
+            usage_at < error_at,
+            "usage must be emitted before the terminal error, got {deltas:?}"
+        );
+
+        let StreamDelta::Usage(usage) = &deltas[usage_at] else {
+            bail!("expected a usage delta");
+        };
+        assert_eq!(usage.input_tokens, 140);
+        assert_eq!(usage.output_tokens, 20);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_band_non_rate_limit_error_keeps_its_previous_classification() -> anyhow::Result<()>
+    {
+        let body = "data: {\"type\":\"error\",\"code\":\"invalid_prompt\",\"message\":\"bad\"}\n\n";
+        let deltas = stream_deltas(body).await?;
+        let kind = deltas
+            .iter()
+            .find_map(|delta| match delta {
+                StreamDelta::Error { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .context("expected a stream error delta")?;
+
+        assert_eq!(kind, StreamErrorKind::InvalidRequest);
+        assert!(!kind.is_recoverable());
         Ok(())
     }
 

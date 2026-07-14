@@ -665,14 +665,26 @@ fn preview_gemini_sse_data(data: &str) -> String {
 /// Gemini can interleave an error object into the SSE stream (e.g. quota
 /// exhaustion, internal failure) instead of a normal candidate. Returns the
 /// human-readable message when the payload is such an error, otherwise `None`.
-fn gemini_stream_error_message(data: &str) -> Option<String> {
+fn gemini_stream_error(data: &str) -> Option<(String, StreamErrorKind)> {
     let value: serde_json::Value = serde_json::from_str(data).ok()?;
     let error = value.get("error")?;
     let message = error
         .get("message")
         .and_then(serde_json::Value::as_str)
         .map_or_else(|| error.to_string(), str::to_owned);
-    Some(message)
+
+    // An in-band error arrives after the response headers, so a rate limit
+    // reported this way states its delay only in the payload's
+    // `google.rpc.RetryInfo` detail. Anything other than a quota rejection
+    // stays a (retriable) server error.
+    let code = error.get("code").and_then(serde_json::Value::as_i64);
+    let status = error.get("status").and_then(serde_json::Value::as_str);
+    let kind = if code == Some(429) || status == Some("RESOURCE_EXHAUSTED") {
+        StreamErrorKind::RateLimited(crate::retry_hints::google_retry_delay(data))
+    } else {
+        StreamErrorKind::ServerError
+    };
+    Some((message, kind))
 }
 
 /// Classification of a single Gemini SSE line.
@@ -681,8 +693,11 @@ enum GeminiLineParse {
     Skip,
     /// A well-formed `generateContent` chunk.
     Response(ApiGenerateContentResponse),
-    /// A mid-stream `{"error": ...}` payload.
-    Error(String),
+    /// A mid-stream `{"error": ...}` payload, classified by its error code.
+    Error {
+        message: String,
+        kind: StreamErrorKind,
+    },
     /// A `data:` line whose JSON could not be parsed.
     ParseFailed { error: String, preview: String },
 }
@@ -699,12 +714,12 @@ fn parse_gemini_sse_line(line: &str) -> GeminiLineParse {
     };
     serde_json::from_str::<ApiGenerateContentResponse>(data).map_or_else(
         |error| {
-            gemini_stream_error_message(data).map_or_else(
+            gemini_stream_error(data).map_or_else(
                 || GeminiLineParse::ParseFailed {
                     error: error.to_string(),
                     preview: preview_gemini_sse_data(data),
                 },
-                GeminiLineParse::Error,
+                |(message, kind)| GeminiLineParse::Error { message, kind },
             )
         },
         GeminiLineParse::Response,
@@ -859,11 +874,11 @@ pub fn stream_gemini_response(response: reqwest::Response) -> StreamBox<'static>
                             "Failed to parse Gemini SSE event error={error} data_preview={preview}"
                         );
                     }
-                    GeminiLineParse::Error(message) => {
+                    GeminiLineParse::Error { message, kind } => {
                         log::warn!("Gemini stream returned an error payload: {message}");
                         yield Ok(StreamDelta::Error {
                             message,
-                            kind: StreamErrorKind::ServerError,
+                            kind,
                         });
                         return;
                     }
@@ -1455,7 +1470,42 @@ mod tests {
         // skipped (which previously let a failed stream look successful).
         let line = r#"data: {"error":{"code":429,"message":"quota exceeded","status":"RESOURCE_EXHAUSTED"}}"#;
         match parse_gemini_sse_line(line) {
-            GeminiLineParse::Error(message) => assert_eq!(message, "quota exceeded"),
+            GeminiLineParse::Error { message, kind } => {
+                assert_eq!(message, "quota exceeded");
+                // A 429 with no `RetryInfo` detail is a rate limit with no hint.
+                assert_eq!(kind, StreamErrorKind::RateLimited(None));
+            }
+            _ => panic!("expected Error"),
+        }
+    }
+
+    #[test]
+    fn test_parse_gemini_sse_line_reads_in_band_retry_info() {
+        // The stream opened with HTTP 200, so the 429's delay is only in the
+        // payload: the decoder must classify it as a rate limit and keep the
+        // `RetryInfo` delay instead of flattening it to a server error.
+        let line = r#"data: {"error":{"code":429,"message":"quota exceeded","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"27s"}]}}"#;
+        match parse_gemini_sse_line(line) {
+            GeminiLineParse::Error { message, kind } => {
+                assert_eq!(message, "quota exceeded");
+                assert_eq!(
+                    kind,
+                    StreamErrorKind::RateLimited(Some(std::time::Duration::from_secs(27)))
+                );
+                assert!(kind.is_recoverable());
+            }
+            _ => panic!("expected Error"),
+        }
+    }
+
+    #[test]
+    fn test_parse_gemini_sse_line_non_quota_error_stays_a_server_error() {
+        let line = r#"data: {"error":{"code":500,"message":"internal","status":"INTERNAL"}}"#;
+        match parse_gemini_sse_line(line) {
+            GeminiLineParse::Error { message, kind } => {
+                assert_eq!(message, "internal");
+                assert_eq!(kind, StreamErrorKind::ServerError);
+            }
             _ => panic!("expected Error"),
         }
     }
@@ -1473,12 +1523,12 @@ mod tests {
     }
 
     #[test]
-    fn test_gemini_stream_error_message_extracts_message() {
+    fn test_gemini_stream_error_extracts_message_and_kind() {
         assert_eq!(
-            gemini_stream_error_message(r#"{"error":{"message":"boom"}}"#),
-            Some("boom".to_string())
+            gemini_stream_error(r#"{"error":{"message":"boom"}}"#),
+            Some(("boom".to_string(), StreamErrorKind::ServerError))
         );
-        assert_eq!(gemini_stream_error_message(r#"{"candidates":[]}"#), None);
+        assert_eq!(gemini_stream_error(r#"{"candidates":[]}"#), None);
     }
 
     #[test]

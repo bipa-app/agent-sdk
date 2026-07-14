@@ -797,7 +797,10 @@ fn parse_stream_error_event(data: &str) -> (String, StreamErrorKind) {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("Anthropic streamed an error event");
     let kind = match error_type {
-        "overloaded_error" | "rate_limit_error" => StreamErrorKind::RateLimited,
+        // A mid-stream error event arrives after the response headers, so no
+        // `Retry-After` is available and Anthropic embeds no delay in the
+        // event payload: the caller falls back to its own backoff.
+        "overloaded_error" | "rate_limit_error" => StreamErrorKind::RateLimited(None),
         "invalid_request_error"
         | "authentication_error"
         | "permission_error"
@@ -1629,7 +1632,7 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}
         let delta = parse_error_event(event);
         match delta {
             Some(StreamDelta::Error { message, kind }) => {
-                assert_eq!(kind, StreamErrorKind::RateLimited);
+                assert_eq!(kind, StreamErrorKind::RateLimited(None));
                 assert!(message.contains("overloaded_error"));
                 assert!(message.contains("Overloaded"));
             }

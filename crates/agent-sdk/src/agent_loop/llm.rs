@@ -281,7 +281,7 @@ where
     loop {
         let outcome = match chat_or_cancel(provider, &request, event_ctx).await {
             ProviderCall::Outcome(outcome) => outcome,
-            ProviderCall::Cancelled => return (LlmOutcome::Cancelled, attempt),
+            ProviderCall::Cancelled => return (LlmOutcome::Cancelled(ZERO_USAGE), attempt),
             ProviderCall::Error(error) => return (LlmOutcome::Error(error), attempt),
         };
 
@@ -345,7 +345,7 @@ where
         .await
         {
             RetryStep::Retry => {}
-            RetryStep::Cancelled => return (LlmOutcome::Cancelled, attempt),
+            RetryStep::Cancelled => return (LlmOutcome::Cancelled(ZERO_USAGE), attempt),
             RetryStep::GiveUp(outcome) => return (outcome, attempt),
         }
     }
@@ -481,6 +481,11 @@ where
 {
     let max_retries = config.retry.max_retries;
     let mut attempt = 0u32;
+    // Usage billed by attempts that died before completing. The provider
+    // charges for the tokens it produced whether or not the stream survived,
+    // so it rides along and is folded into the surviving response — the single
+    // point where usage is committed to the run totals.
+    let mut abandoned_usage = ZERO_USAGE;
 
     loop {
         // Each attempt streams under the *current* ids. On a recoverable
@@ -502,13 +507,19 @@ where
         .await;
 
         match result {
-            Ok(response) => {
+            Ok(mut response) => {
                 if attempt > 0 {
                     send_auto_retry_end_event(event_ctx, attempt, true, None).await;
                 }
+                add_usage(&mut response.usage, &abandoned_usage);
                 return (LlmOutcome::Response(response), attempt);
             }
-            Err(StreamError::Recoverable(msg)) => {
+            Err(StreamError::Recoverable {
+                message: msg,
+                retry_after,
+                usage,
+            }) => {
+                add_usage(&mut abandoned_usage, &usage);
                 attempt += 1;
                 if attempt > max_retries {
                     error!("Streaming error after {max_retries} retries: {msg}");
@@ -520,7 +531,12 @@ where
                     }
                     return (LlmOutcome::Error(AgentError::new(err_msg, true)), attempt);
                 }
-                let delay = calculate_backoff_delay(attempt, &config.retry);
+                // A provider `Retry-After` hint wins over the exponential
+                // backoff, clamped so an oversized hint cannot stall the turn.
+                let delay = retry_after.map_or_else(
+                    || calculate_backoff_delay(attempt, &config.retry),
+                    |hint| clamp_to_max_delay(hint, config.retry.max_delay_ms),
+                );
                 warn!(
                     "Streaming error, retrying (attempt={attempt}, delay_ms={}, error={msg})",
                     delay.as_millis()
@@ -537,7 +553,7 @@ where
                     .await
                     .is_break()
                 {
-                    return (LlmOutcome::Cancelled, attempt);
+                    return (LlmOutcome::Cancelled(abandoned_usage), attempt);
                 }
                 // Fresh ids for the retry attempt so its deltas land under a
                 // distinct message_id. Consumers concatenating TextDelta by
@@ -553,11 +569,14 @@ where
                     attempt,
                 );
             }
-            Err(StreamError::Cancelled) => {
+            Err(StreamError::Cancelled(usage)) => {
                 // A cancel raced the stream — terminal, not retried.
                 // No `llm.error` event: the cancellation surfaces as the
-                // run-level `Cancelled` terminal event instead.
-                return (LlmOutcome::Cancelled, attempt);
+                // run-level `Cancelled` terminal event instead. The tokens the
+                // cancelled attempt (and any attempt abandoned before it) had
+                // already streamed were billed, so they travel with it.
+                add_usage(&mut abandoned_usage, &usage);
+                return (LlmOutcome::Cancelled(abandoned_usage), attempt);
             }
         }
     }
@@ -607,7 +626,7 @@ where
                 if let Some(observer) = span_observer.as_mut() {
                     observer.record_dropped("cancelled", delta_count, "cancelled");
                 }
-                return Err(StreamError::Cancelled);
+                return Err(StreamError::Cancelled(accumulated_usage(&accumulator)));
             }
             next = tokio::time::timeout(LLM_STREAM_INACTIVITY_TIMEOUT, stream.next()) => match next {
                 Ok(Some(result)) => result,
@@ -625,9 +644,11 @@ where
                     if let Some(observer) = span_observer.as_mut() {
                         observer.record_dropped("inactivity_timeout", delta_count, "stream_error");
                     }
-                    return Err(StreamError::Recoverable(
-                        "stream inactivity timeout: no frame within deadline".to_string(),
-                    ));
+                    return Err(StreamError::Recoverable {
+                        message: "stream inactivity timeout: no frame within deadline".to_string(),
+                        retry_after: None,
+                        usage: accumulated_usage(&accumulator),
+                    });
                 }
             },
         };
@@ -644,7 +665,11 @@ where
                 if let Some(observer) = span_observer.as_mut() {
                     observer.record_dropped("recoverable_error", delta_count, "stream_error");
                 }
-                return Err(StreamError::Recoverable(format!("Stream error: {e}")));
+                return Err(StreamError::Recoverable {
+                    message: format!("Stream error: {e}"),
+                    retry_after: None,
+                    usage: accumulated_usage(&accumulator),
+                });
             }
         };
 
@@ -671,7 +696,10 @@ where
         )
         .await
         {
-            return Err(stream_err);
+            // A provider can report usage and only then fail. The tokens are
+            // billed regardless, so the dying attempt hands its usage to the
+            // retry loop instead of taking it down with the accumulator.
+            return Err(stream_err.with_accumulated_usage(accumulated_usage(&accumulator)));
         }
     }
 
@@ -745,6 +773,31 @@ impl StreamChunkTiming {
     }
 }
 
+/// A zero-token [`Usage`], used as the identity when folding attempts together.
+const ZERO_USAGE: Usage = Usage {
+    input_tokens: 0,
+    output_tokens: 0,
+    cached_input_tokens: 0,
+    cache_creation_input_tokens: 0,
+};
+
+/// Usage the stream has reported so far, or zero when it reported none yet.
+fn accumulated_usage(accumulator: &StreamAccumulator) -> Usage {
+    accumulator.usage().cloned().unwrap_or(ZERO_USAGE)
+}
+
+/// Fold `delta` into `total`. Saturating: token counters must never wrap.
+const fn add_usage(total: &mut Usage, delta: &Usage) {
+    total.input_tokens = total.input_tokens.saturating_add(delta.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(delta.output_tokens);
+    total.cached_input_tokens = total
+        .cached_input_tokens
+        .saturating_add(delta.cached_input_tokens);
+    total.cache_creation_input_tokens = total
+        .cache_creation_input_tokens
+        .saturating_add(delta.cache_creation_input_tokens);
+}
+
 /// Assemble the final [`ChatResponse`] from a fully-consumed stream
 /// accumulator. Extracted from [`process_stream`] to keep it under the
 /// clippy line ceiling.
@@ -753,12 +806,7 @@ fn finalize_stream_response(
     model: &str,
     delta_count: u64,
 ) -> ChatResponse {
-    let usage = accumulator.usage().cloned().unwrap_or(Usage {
-        input_tokens: 0,
-        output_tokens: 0,
-        cached_input_tokens: 0,
-        cache_creation_input_tokens: 0,
-    });
+    let usage = accumulated_usage(&accumulator);
     let stop_reason = accumulator.stop_reason().copied();
     let content_blocks = accumulator.into_content_blocks();
 
@@ -855,7 +903,12 @@ where
                 observer.record_dropped(reason, delta_count, stream_error_kind_attr(*kind));
             }
             return Some(if recoverable {
-                StreamError::Recoverable(message.clone())
+                StreamError::Recoverable {
+                    message: message.clone(),
+                    retry_after: kind.retry_after(),
+                    // Filled in by the caller, which owns the accumulator.
+                    usage: ZERO_USAGE,
+                }
             } else {
                 StreamError::Fatal(message.clone())
             });
@@ -872,7 +925,7 @@ where
 #[cfg(feature = "otel")]
 const fn stream_error_kind_attr(kind: crate::llm::StreamErrorKind) -> &'static str {
     match kind {
-        crate::llm::StreamErrorKind::RateLimited => "rate_limited",
+        crate::llm::StreamErrorKind::RateLimited(_) => "rate_limited",
         crate::llm::StreamErrorKind::ServerError => "server_error",
         crate::llm::StreamErrorKind::InvalidRequest => "invalid_request",
         // `StreamErrorKind` is `#[non_exhaustive]`; `Unknown` and any future

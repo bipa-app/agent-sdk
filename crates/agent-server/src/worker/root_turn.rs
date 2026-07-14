@@ -42,7 +42,7 @@ use agent_sdk_foundation::{
     ToolResult, ToolTier,
 };
 use agent_sdk_providers::LlmProvider;
-use agent_sdk_providers::streaming::{StreamAccumulator, StreamDelta, StreamErrorKind};
+use agent_sdk_providers::streaming::{StreamAccumulator, StreamBox, StreamDelta, StreamErrorKind};
 use agent_sdk_tools::stores::{MessageStore, StateStore};
 use anyhow::{Context, Result, bail, ensure};
 use futures::StreamExt;
@@ -257,9 +257,17 @@ struct OnceOutcome {
 /// the *successful* attempt for the audit close in the
 /// commit/suspension paths, not the one they passed in.
 struct StreamedTurn {
+    /// `response.usage` carries the *turn* total: the successful attempt's
+    /// tokens plus those billed by earlier recoverably-failed attempts. Every
+    /// turn-level and cumulative usage sink derives from it via
+    /// [`response_token_usage`], so folding here bills the whole turn once.
     response: llm::ChatResponse,
     content_ids: ContentIds,
     attempt: TurnAttempt,
+    /// The successful attempt's *own* usage, for its audit row. Kept separate
+    /// from the folded `response.usage` so a failed attempt's tokens are not
+    /// double-billed across two attempt rows.
+    success_usage: llm::Usage,
 }
 
 /// Bundle of context needed to commit / suspend a root turn after
@@ -277,6 +285,9 @@ struct TurnCloseContext {
     /// inputs that do not surface a prompt to clients.
     user_input_committed: Option<CommittedEvent>,
     start_committed: CommittedEvent,
+    /// The successful attempt's own usage, for its audit row — distinct from
+    /// the turn-total `response.usage` when earlier attempts failed recoverably.
+    success_usage: llm::Usage,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -703,7 +714,14 @@ async fn best_effort_close_attempts(
 ) {
     for attempt in attempts {
         if !attempt.is_closed() {
-            close_attempt_with(attempt, TurnAttemptOutcome::Cancelled, attempt_store, now).await;
+            close_attempt_with(
+                attempt,
+                TurnAttemptOutcome::Cancelled,
+                &ZERO_ATTEMPT_USAGE,
+                attempt_store,
+                now,
+            )
+            .await;
         }
     }
 }
@@ -912,6 +930,7 @@ pub(crate) async fn commit_partial_turn_on_cancel(
         close_attempt_with(
             &synthetic,
             TurnAttemptOutcome::Cancelled,
+            &ZERO_ATTEMPT_USAGE,
             deps.attempt_store,
             now,
         )
@@ -1371,6 +1390,7 @@ async fn execute_root_turn_inner(
         response,
         content_ids,
         attempt,
+        success_usage,
     } = match streamed {
         Ok(streamed) => streamed,
         Err(error) => {
@@ -1404,6 +1424,7 @@ async fn execute_root_turn_inner(
         content_ids,
         user_input_committed,
         start_committed,
+        success_usage,
     };
 
     // 4. Branch: authorized tool handoff → suspend; otherwise commit.
@@ -1467,7 +1488,7 @@ async fn commit_text_only_turn(
     .context("buffer staged messages")?;
 
     let turn_number = usize::try_from(inputs.recovery_view.next_turn_number).unwrap_or(0);
-    let close_params = build_close_params(&response, &attempt);
+    let close_params = build_close_params(&response, &close_ctx.success_usage, &attempt);
     let turn_usage = response_token_usage(&response);
 
     let drained_messages = inputs
@@ -2239,6 +2260,15 @@ const STREAM_BASE_DELAY_MS: u64 = 500;
 /// blip and a daemon respawn share the same wall-clock vocabulary.
 const STREAM_MAX_DELAY_MS: u64 = 8_000;
 
+/// Upper bound on a *server-supplied* retry delay (a 429's `Retry-After`,
+/// or a hint parsed out of the error body).
+///
+/// A provider hint reflects a real quota window, so it is allowed to exceed
+/// the exponential ceiling — retrying before it elapses just burns an attempt
+/// on a guaranteed second 429.  It is still bounded, so a hostile or
+/// mis-encoded hint cannot park a worker slot indefinitely.
+const STREAM_MAX_RETRY_AFTER_MS: u64 = 60_000;
+
 /// Maximum time a freshly opened LLM stream may go without yielding its
 /// FIRST event before the attempt is treated as a stalled connection
 /// and retried through the normal [`StreamAttemptError::Recoverable`]
@@ -2289,6 +2319,14 @@ enum StreamAttemptError {
     Recoverable {
         kind: StreamErrorKind,
         message: String,
+        /// Usage the failed attempt had already streamed. The provider
+        /// billed those tokens whether or not the turn survived, so they
+        /// travel to the retry wrapper and are folded into the eventual
+        /// successful response's turn usage — the same seam the in-process
+        /// loop uses. The failed attempt's own audit row bills this
+        /// separately (see [`close_attempt_with`]); the two ledgers do not
+        /// overlap, so there is no double-count.
+        usage: llm::Usage,
     },
     /// Provider returned `InvalidRequest` (caller-side error) — no
     /// retry will help.  The turn attempt was already closed with
@@ -2299,6 +2337,76 @@ enum StreamAttemptError {
     /// closed with `Cancelled`; the retry wrapper bails immediately,
     /// skipping both retry/backoff and the commit path.
     Cancelled { message: String },
+}
+
+impl StreamAttemptError {
+    /// Record the usage the failed attempt had streamed.
+    ///
+    /// Only a recoverable error is retried, so only it can strand usage a later
+    /// attempt must carry; the terminal variants end the turn and are returned
+    /// unchanged.
+    fn with_usage(self, usage: llm::Usage) -> Self {
+        match self {
+            Self::Recoverable { kind, message, .. } => Self::Recoverable {
+                kind,
+                message,
+                usage,
+            },
+            other => other,
+        }
+    }
+}
+
+/// Assemble the [`StreamedTurn`] from a successful attempt, splitting usage
+/// between the attempt's own audit row and the whole-turn total.
+///
+/// The successful attempt's own usage bills its audit row; the turn total
+/// (`response.usage`, read by every turn/cumulative sink) additionally absorbs
+/// the tokens billed by earlier recoverably-failed attempts. Keeping the two
+/// apart bills each attempt's row once and the turn once, with no cross-row
+/// double-count.
+fn finalize_streamed_turn(
+    outcome: OnceOutcome,
+    attempt: TurnAttempt,
+    abandoned_usage: &llm::Usage,
+) -> StreamedTurn {
+    let OnceOutcome {
+        mut response,
+        content_ids,
+    } = outcome;
+    let success_usage = response.usage.clone();
+    add_attempt_usage(&mut response.usage, abandoned_usage);
+    StreamedTurn {
+        response,
+        content_ids,
+        attempt,
+        success_usage,
+    }
+}
+
+/// A zero-token [`llm::Usage`] — `Usage` has no `Default`.
+const ZERO_ATTEMPT_USAGE: llm::Usage = llm::Usage {
+    input_tokens: 0,
+    output_tokens: 0,
+    cached_input_tokens: 0,
+    cache_creation_input_tokens: 0,
+};
+
+/// Usage the stream has accumulated so far, or zero when it reported none.
+fn attempt_usage(accumulator: &StreamAccumulator) -> llm::Usage {
+    accumulator.usage().cloned().unwrap_or(ZERO_ATTEMPT_USAGE)
+}
+
+/// Fold `delta` into `total`, saturating so token counters never wrap.
+const fn add_attempt_usage(total: &mut llm::Usage, delta: &llm::Usage) {
+    total.input_tokens = total.input_tokens.saturating_add(delta.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(delta.output_tokens);
+    total.cached_input_tokens = total
+        .cached_input_tokens
+        .saturating_add(delta.cached_input_tokens);
+    total.cache_creation_input_tokens = total
+        .cache_creation_input_tokens
+        .saturating_add(delta.cache_creation_input_tokens);
 }
 
 /// Bundle of context [`call_llm_with_retry`] needs to drive the
@@ -2416,6 +2524,12 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
     // bug behind unlimited retries. Mirrors
     // `agent_sdk::agent_loop::types::MAX_COMPACTION_RETRIES`.
     let mut compaction_retries: u32 = 0;
+    // Usage billed by attempts that failed recoverably before this turn
+    // eventually succeeded. Each such attempt's audit row bills its own tokens
+    // (row-level ledger); this carries the same tokens to the turn-level ledger,
+    // which is derived solely from the successful response — so folding here
+    // includes both attempts without double-counting against the rows.
+    let mut abandoned_usage = ZERO_ATTEMPT_USAGE;
 
     loop {
         // Cooperative cancellation: bail before opening a (billed) LLM
@@ -2436,6 +2550,7 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
             close_attempt_with(
                 &attempt,
                 TurnAttemptOutcome::Cancelled,
+                &ZERO_ATTEMPT_USAGE,
                 deps.attempt_store,
                 OffsetDateTime::now_utc(),
             )
@@ -2458,20 +2573,18 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
         )
         .await
         {
-            Ok(OnceOutcome {
-                response,
-                content_ids,
-            }) => {
+            Ok(outcome) => {
                 if retries > 0 {
                     emit_auto_retry_end(deps, thread_id, retries, true, None).await;
                 }
-                return Ok(StreamedTurn {
-                    response,
-                    content_ids,
-                    attempt,
-                });
+                return Ok(finalize_streamed_turn(outcome, attempt, &abandoned_usage));
             }
-            Err(StreamAttemptError::Recoverable { kind, message }) => {
+            Err(StreamAttemptError::Recoverable {
+                kind,
+                message,
+                usage,
+            }) => {
+                add_attempt_usage(&mut abandoned_usage, &usage);
                 attempt = handle_recoverable_stream_error(RecoverableRetryParams {
                     kind,
                     message: &message,
@@ -2564,7 +2677,9 @@ async fn handle_recoverable_stream_error(
         .await;
         bail!("{final_msg}");
     }
-    let delay = stream_backoff_delay(*retries);
+    let delay = kind
+        .retry_after()
+        .map_or_else(|| stream_backoff_delay(*retries), clamp_retry_after);
     let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
     log::warn!(
         "LLM stream {kind:?} on attempt {retries}/{STREAM_MAX_RETRIES} \
@@ -2709,6 +2824,14 @@ async fn try_recover_with_compaction(
     .context("open retry turn attempt after emergency compaction")?;
 
     Ok(Some(next_attempt))
+}
+
+/// Clamp a provider-supplied retry delay to [`STREAM_MAX_RETRY_AFTER_MS`].
+fn clamp_retry_after(hint: Duration) -> Duration {
+    let ms = u64::try_from(hint.as_millis())
+        .unwrap_or(u64::MAX)
+        .min(STREAM_MAX_RETRY_AFTER_MS);
+    Duration::from_millis(ms)
 }
 
 /// Exponential backoff with bounded jitter.  Mirrors
@@ -2901,7 +3024,7 @@ async fn call_llm_once_instrumented(
         }
         Err(error) => {
             let (error_type, message) = match error {
-                StreamAttemptError::Recoverable { kind, message } => {
+                StreamAttemptError::Recoverable { kind, message, .. } => {
                     (stream_error_kind_type(*kind), message.as_str())
                 }
                 StreamAttemptError::Fatal { message } => ("invalid_request", message.as_str()),
@@ -2928,7 +3051,7 @@ async fn call_llm_once_instrumented(
 #[cfg(feature = "otel")]
 const fn stream_error_kind_type(kind: StreamErrorKind) -> &'static str {
     match kind {
-        StreamErrorKind::RateLimited => "rate_limited",
+        StreamErrorKind::RateLimited(_) => "rate_limited",
         StreamErrorKind::ServerError => "server_error",
         StreamErrorKind::InvalidRequest => "invalid_request",
         // `StreamErrorKind` is #[non_exhaustive]; `Unknown` and any future
@@ -2966,6 +3089,8 @@ struct StalledAttemptParams<'a, 'deps> {
     attempt: &'a TurnAttempt,
     received_first_item: bool,
     stall_budget: Duration,
+    /// Usage the stalled attempt streamed before going silent.
+    usage: llm::Usage,
     now: OffsetDateTime,
 }
 
@@ -2983,6 +3108,7 @@ async fn close_stalled_attempt(params: StalledAttemptParams<'_, '_>) -> StreamAt
         attempt,
         received_first_item,
         stall_budget,
+        usage,
         now,
     } = params;
     let stage = if received_first_item {
@@ -2996,6 +3122,7 @@ async fn close_stalled_attempt(params: StalledAttemptParams<'_, '_>) -> StreamAt
         pending_deltas,
         attempt,
         TurnAttemptOutcome::ServerError,
+        &usage,
         now,
     )
     .await;
@@ -3005,6 +3132,35 @@ async fn close_stalled_attempt(params: StalledAttemptParams<'_, '_>) -> StreamAt
             "LLM stream stalled {stage}: no events for {}s — treating the connection as dead",
             stall_budget.as_secs(),
         ),
+        usage,
+    }
+}
+
+/// Flush the pending deltas, close the attempt with its streamed usage as a
+/// server error, and build the matching recoverable error carrying that usage.
+async fn close_recoverable_server_error(
+    deps: &RootTurnDeps<'_>,
+    thread_id: &agent_sdk_foundation::ThreadId,
+    pending_deltas: &mut Vec<AgentEvent>,
+    attempt: &TurnAttempt,
+    usage: llm::Usage,
+    message: String,
+    now: OffsetDateTime,
+) -> StreamAttemptError {
+    flush_and_close(
+        deps,
+        thread_id,
+        pending_deltas,
+        attempt,
+        TurnAttemptOutcome::ServerError,
+        &usage,
+        now,
+    )
+    .await;
+    StreamAttemptError::Recoverable {
+        kind: StreamErrorKind::ServerError,
+        message,
+        usage,
     }
 }
 
@@ -3016,6 +3172,7 @@ async fn close_cancelled_attempt(
     thread_id: &agent_sdk_foundation::ThreadId,
     pending_deltas: &mut Vec<AgentEvent>,
     attempt: &TurnAttempt,
+    usage: &llm::Usage,
     now: OffsetDateTime,
 ) -> StreamAttemptError {
     flush_and_close(
@@ -3024,6 +3181,7 @@ async fn close_cancelled_attempt(
         pending_deltas,
         attempt,
         TurnAttemptOutcome::Cancelled,
+        usage,
         now,
     )
     .await;
@@ -3037,6 +3195,75 @@ async fn close_cancelled_attempt(
 /// honouring cooperative cancellation, and requiring a completion
 /// marker before treating the turn as successful. The `chat {model}`
 /// span lives in the [`call_llm_once`] wrapper.
+/// Context [`poll_stream_item`] needs to close the attempt when the poll races
+/// a cancel or a stall. `usage` is the tokens streamed so far, billed onto the
+/// closed row.
+struct StreamPollParams<'a, 'deps> {
+    deps: &'a RootTurnDeps<'deps>,
+    thread_id: &'a agent_sdk_foundation::ThreadId,
+    pending_deltas: &'a mut Vec<AgentEvent>,
+    attempt: &'a TurnAttempt,
+    received_first_item: bool,
+    usage: llm::Usage,
+    now: OffsetDateTime,
+}
+
+/// Poll the next stream item, racing it against cancellation (stop consuming a
+/// billed stream promptly on cancel) and the stall budget (retry a silent
+/// half-open connection instead of hanging until a watchdog kills the task).
+///
+/// `Ok(Some(item))` is the next stream result; `Ok(None)` means the stream
+/// ended cleanly; `Err(..)` means the attempt was already closed and the turn
+/// must return that error.
+async fn poll_stream_item(
+    stream: &mut StreamBox<'_>,
+    params: StreamPollParams<'_, '_>,
+) -> Result<Option<Result<StreamDelta>>, StreamAttemptError> {
+    let StreamPollParams {
+        deps,
+        thread_id,
+        pending_deltas,
+        attempt,
+        received_first_item,
+        usage,
+        now,
+    } = params;
+    let stall_budget = if received_first_item {
+        STREAM_INTER_EVENT_TIMEOUT
+    } else {
+        STREAM_FIRST_EVENT_TIMEOUT
+    };
+    let polled = match deps.cancel {
+        Some(cancel) => {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    return Err(close_cancelled_attempt(
+                        deps, thread_id, pending_deltas, attempt, &usage, now,
+                    )
+                    .await);
+                }
+                polled = tokio::time::timeout(stall_budget, stream.next()) => polled,
+            }
+        }
+        None => tokio::time::timeout(stall_budget, stream.next()).await,
+    };
+    match polled {
+        Ok(next) => Ok(next),
+        Err(_elapsed) => Err(close_stalled_attempt(StalledAttemptParams {
+            deps,
+            thread_id,
+            pending_deltas,
+            attempt,
+            received_first_item,
+            stall_budget,
+            usage,
+            now,
+        })
+        .await),
+    }
+}
+
 async fn call_llm_once_inner(
     provider: &dyn LlmProvider,
     request: ChatRequest,
@@ -3045,7 +3272,9 @@ async fn call_llm_once_inner(
     thread_id: &agent_sdk_foundation::ThreadId,
     now: OffsetDateTime,
 ) -> Result<OnceOutcome, StreamAttemptError> {
-    let mut stream = std::pin::pin!(provider.chat_stream(request));
+    // `StreamBox` is `Pin<Box<…>>` and therefore `Unpin`, so it is polled
+    // directly without an outer `pin!`.
+    let mut stream = provider.chat_stream(request);
     let mut accumulator = StreamAccumulator::new();
     let mut content_ids = ContentIds::default();
     // Buffered `TextDelta` / `ThinkingDelta` events awaiting a batched
@@ -3060,52 +3289,22 @@ async fn call_llm_once_inner(
     let mut received_first_item = false;
 
     loop {
-        let stall_budget = if received_first_item {
-            STREAM_INTER_EVENT_TIMEOUT
-        } else {
-            STREAM_FIRST_EVENT_TIMEOUT
+        let Some(result) = poll_stream_item(
+            &mut stream,
+            StreamPollParams {
+                deps,
+                thread_id,
+                pending_deltas: &mut pending_deltas,
+                attempt,
+                received_first_item,
+                usage: attempt_usage(&accumulator),
+                now,
+            },
+        )
+        .await?
+        else {
+            break;
         };
-        // Poll the next stream item, racing it against the cancellation
-        // token (so a cancelled root turn stops consuming the (billed)
-        // stream promptly instead of draining it to completion) and the
-        // stall budget (so a silent stream — e.g. a request written to
-        // a half-open connection — is retried instead of hanging until
-        // an external watchdog kills the whole task tree).
-        let polled = match deps.cancel {
-            Some(cancel) => {
-                tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => {
-                        return Err(close_cancelled_attempt(
-                            deps,
-                            thread_id,
-                            &mut pending_deltas,
-                            attempt,
-                            now,
-                        )
-                        .await);
-                    }
-                    polled = tokio::time::timeout(stall_budget, stream.next()) => polled,
-                }
-            }
-            None => tokio::time::timeout(stall_budget, stream.next()).await,
-        };
-        let next = match polled {
-            Ok(next) => next,
-            Err(_elapsed) => {
-                return Err(close_stalled_attempt(StalledAttemptParams {
-                    deps,
-                    thread_id,
-                    pending_deltas: &mut pending_deltas,
-                    attempt,
-                    received_first_item,
-                    stall_budget,
-                    now,
-                })
-                .await);
-            }
-        };
-        let Some(result) = next else { break };
         received_first_item = true;
 
         let delta = match result {
@@ -3116,19 +3315,16 @@ async fn call_llm_once_inner(
                 // they're the most common shape of "Anthropic SSE
                 // stream died mid-flight" and almost always succeed
                 // on retry.
-                flush_and_close(
+                return Err(close_recoverable_server_error(
                     deps,
                     thread_id,
                     &mut pending_deltas,
                     attempt,
-                    TurnAttemptOutcome::ServerError,
+                    attempt_usage(&accumulator),
+                    format!("LLM stream iteration error: {error:#}"),
                     now,
                 )
-                .await;
-                return Err(StreamAttemptError::Recoverable {
-                    kind: StreamErrorKind::ServerError,
-                    message: format!("LLM stream iteration error: {error:#}"),
-                });
+                .await);
             }
         };
 
@@ -3138,8 +3334,21 @@ async fn call_llm_once_inner(
             DeltaStep::Skip => continue,
             DeltaStep::Buffered => {}
             DeltaStep::Fail(outcome, error) => {
-                flush_and_close(deps, thread_id, &mut pending_deltas, attempt, outcome, now).await;
-                return Err(error);
+                // A rate-limit / server-error delta may arrive *after* the
+                // provider reported usage, so the row bills those tokens and
+                // the recoverable error carries them to the retry wrapper.
+                let usage = attempt_usage(&accumulator);
+                flush_and_close(
+                    deps,
+                    thread_id,
+                    &mut pending_deltas,
+                    attempt,
+                    outcome,
+                    &usage,
+                    now,
+                )
+                .await;
+                return Err(error.with_usage(usage));
             }
         }
 
@@ -3158,19 +3367,20 @@ async fn call_llm_once_inner(
     // tool children with empty inputs. Treat it as a recoverable error
     // so `call_llm_with_retry` re-attempts instead.
     if accumulator.stop_reason().is_none() {
-        close_attempt_with(
+        // Deltas were already flushed above, so `pending_deltas` is empty here;
+        // the helper just closes the row and builds the recoverable error.
+        return Err(close_recoverable_server_error(
+            deps,
+            thread_id,
+            &mut pending_deltas,
             attempt,
-            TurnAttemptOutcome::ServerError,
-            deps.attempt_store,
+            attempt_usage(&accumulator),
+            "LLM stream ended without a completion marker (stop_reason); \
+             treating as a truncated response"
+                .to_owned(),
             now,
         )
-        .await;
-        return Err(StreamAttemptError::Recoverable {
-            kind: StreamErrorKind::ServerError,
-            message: "LLM stream ended without a completion marker (stop_reason); \
-                      treating as a truncated response"
-                .to_owned(),
-        });
+        .await);
     }
 
     let response = synthesize_response(accumulator, provider, thread_id);
@@ -3239,7 +3449,7 @@ fn buffer_stream_delta(
             // validation rejection is recorded as `InvalidRequest` (not
             // `ServerError`).
             let outcome = match kind {
-                StreamErrorKind::RateLimited => TurnAttemptOutcome::RateLimited,
+                StreamErrorKind::RateLimited(_) => TurnAttemptOutcome::RateLimited,
                 StreamErrorKind::InvalidRequest => TurnAttemptOutcome::InvalidRequest,
                 // `StreamErrorKind::ServerError`, plus the
                 // `#[non_exhaustive]` catch-all (`Unknown` / future kinds):
@@ -3250,7 +3460,13 @@ fn buffer_stream_delta(
             let kind = *kind;
             let message = message.clone();
             let error = if kind.is_recoverable() {
-                StreamAttemptError::Recoverable { kind, message }
+                // The accumulated usage is filled in by `call_llm_once_inner`,
+                // which owns the accumulator, via `StreamAttemptError::with_usage`.
+                StreamAttemptError::Recoverable {
+                    kind,
+                    message,
+                    usage: ZERO_ATTEMPT_USAGE,
+                }
             } else {
                 StreamAttemptError::Fatal {
                     message: format!("LLM stream error (kind={kind:?}): {message}"),
@@ -3362,6 +3578,7 @@ async fn flush_streaming_deltas(
 async fn close_attempt_with(
     attempt: &TurnAttempt,
     outcome: TurnAttemptOutcome,
+    usage: &llm::Usage,
     attempt_store: &dyn TurnAttemptStore,
     now: OffsetDateTime,
 ) {
@@ -3371,9 +3588,11 @@ async fn close_attempt_with(
         response_model: None,
         stop_reason: None,
         outcome,
-        input_tokens: 0,
-        output_tokens: 0,
-        cached_input_tokens: 0,
+        // A failed/cancelled attempt still bills the tokens it streamed before
+        // dying, so its audit row records them rather than a misleading zero.
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cached_input_tokens: usage.cached_input_tokens,
     };
     // Best-effort: if closing fails, the primary error is more important.
     let _ = attempt_store.close_attempt(&attempt.id, params, now).await;
@@ -3389,10 +3608,11 @@ async fn flush_and_close(
     pending_deltas: &mut Vec<AgentEvent>,
     attempt: &TurnAttempt,
     outcome: TurnAttemptOutcome,
+    usage: &llm::Usage,
     now: OffsetDateTime,
 ) {
     flush_streaming_deltas(deps, thread_id, pending_deltas).await;
-    close_attempt_with(attempt, outcome, deps.attempt_store, now).await;
+    close_attempt_with(attempt, outcome, usage, deps.attempt_store, now).await;
 }
 
 /// Coalesce: flush buffered deltas once the count or time bound trips, so
@@ -3537,7 +3757,14 @@ fn sanitized_response_id(response: &llm::ChatResponse) -> Option<String> {
     Some(response.id.clone()).filter(|s| !s.is_empty())
 }
 
-fn build_close_params(response: &llm::ChatResponse, _attempt: &TurnAttempt) -> CloseAttemptParams {
+/// `usage` is the *attempt's own* token spend, which may differ from
+/// `response.usage` when the latter carries the whole turn's total (successful
+/// attempt + earlier failed attempts). The audit row bills only this attempt.
+fn build_close_params(
+    response: &llm::ChatResponse,
+    usage: &llm::Usage,
+    _attempt: &TurnAttempt,
+) -> CloseAttemptParams {
     let response_id = sanitized_response_id(response);
 
     // The audit blob mirrors the typed `response_id` column so the two
@@ -3555,9 +3782,9 @@ fn build_close_params(response: &llm::ChatResponse, _attempt: &TurnAttempt) -> C
         response_model: Some(response.model.clone()),
         stop_reason: response.stop_reason,
         outcome: TurnAttemptOutcome::Success,
-        input_tokens: response.usage.input_tokens,
-        output_tokens: response.usage.output_tokens,
-        cached_input_tokens: response.usage.cached_input_tokens,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cached_input_tokens: usage.cached_input_tokens,
     }
 }
 
@@ -3703,11 +3930,17 @@ async fn suspend_at_tool_boundary(
         .context("task disappeared during suspension")?;
 
     if current_task.status == TaskStatus::WaitingOnChildren {
-        // Close the attempt opened at the start of execute_root_turn so
-        // it doesn't remain permanently unclosed in the audit trail.
+        // Close the attempt opened at the start of execute_root_turn so it
+        // doesn't remain permanently unclosed in the audit trail. Unlike the
+        // pre-stream synthetic closes (which bill zero because nothing
+        // streamed), this fires AFTER a real LLM call the provider already
+        // billed, so the row records that attempt's own usage — the winning
+        // worker's separate call committed the turn, but this loser's tokens
+        // were billed too and belong on its audit row.
         close_attempt_with(
             &attempt,
             TurnAttemptOutcome::Cancelled,
+            &close_ctx.success_usage,
             deps.attempt_store,
             now,
         )
@@ -3722,6 +3955,7 @@ async fn suspend_at_tool_boundary(
     close_attempt_or_propagate_already_closed(
         &attempt,
         &response,
+        &close_ctx.success_usage,
         deps,
         "close attempt on tool suspension",
         now,
@@ -4190,11 +4424,12 @@ async fn apply_batch_routing(
 async fn close_attempt_or_propagate_already_closed(
     attempt: &TurnAttempt,
     response: &llm::ChatResponse,
+    usage: &llm::Usage,
     deps: &RootTurnDeps<'_>,
     error_context: &'static str,
     now: OffsetDateTime,
 ) -> Result<()> {
-    let params = build_close_params(response, attempt);
+    let params = build_close_params(response, usage, attempt);
     match deps
         .attempt_store
         .close_attempt(&attempt.id, params, now)
@@ -4588,6 +4823,7 @@ pub async fn resume_root_turn(
         response,
         content_ids,
         attempt,
+        success_usage,
     } = match streamed {
         Ok(streamed) => streamed,
         Err(error) => {
@@ -4620,9 +4856,12 @@ pub async fn resume_root_turn(
             },
             response,
             attempt,
+            ResumeCloseContext {
+                content_ids: &content_ids,
+                success_usage: &success_usage,
+            },
             deps,
             commit_now,
-            &content_ids,
         )
         .await;
     }
@@ -4632,9 +4871,12 @@ pub async fn resume_root_turn(
         &continuation,
         &response,
         &attempt,
+        ResumeCloseContext {
+            content_ids: &content_ids,
+            success_usage: &success_usage,
+        },
         deps,
         commit_now,
-        &content_ids,
     )
     .await
 }
@@ -4716,14 +4958,22 @@ fn drain_resumed_turn_state(
 /// Buffers the final assistant message, updates agent state, runs
 /// the idempotency guard, drains staged stores, commits, and
 /// advances the task to `Completed`.
+/// Per-block ids plus the successful attempt's own usage, bundled so the
+/// resume-commit functions stay within the argument budget.
+struct ResumeCloseContext<'a> {
+    content_ids: &'a ContentIds,
+    /// The successful attempt's own usage, for its audit row.
+    success_usage: &'a llm::Usage,
+}
+
 async fn commit_resumed_turn(
     inputs: RootWorkerInputs,
     continuation: &AgentContinuation,
     response: &llm::ChatResponse,
     attempt: &TurnAttempt,
+    close: ResumeCloseContext<'_>,
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
-    content_ids: &ContentIds,
 ) -> Result<RootTurnOutcome> {
     let thread_id = &inputs.bootstrap.thread_id;
     let task_id = &inputs.bootstrap.task_id;
@@ -4732,7 +4982,7 @@ async fn commit_resumed_turn(
 
     buffer_resumed_assistant(&inputs, continuation, response).await?;
 
-    let close_params = build_close_params(response, attempt);
+    let close_params = build_close_params(response, close.success_usage, attempt);
     let turn_usage = merged_turn_usage(&continuation.turn_usage, response);
 
     let (drained_messages, agent_state_snapshot, total_usage) = drain_resumed_turn_state(&inputs)?;
@@ -4747,7 +4997,7 @@ async fn commit_resumed_turn(
         turn_usage: &turn_usage,
         total_usage: &total_usage,
         duration,
-        content_ids,
+        content_ids: close.content_ids,
     });
 
     let commit = commit_completed_turn_shifting_slot(
@@ -4893,9 +5143,9 @@ async fn suspend_resumed_turn(
     prior: ResumeSuspension<'_>,
     response: llm::ChatResponse,
     attempt: TurnAttempt,
+    close: ResumeCloseContext<'_>,
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
-    content_ids: &ContentIds,
 ) -> Result<RootTurnOutcome> {
     let task_id = &inputs.bootstrap.task_id;
 
@@ -4903,6 +5153,7 @@ async fn suspend_resumed_turn(
     close_attempt_or_propagate_already_closed(
         &attempt,
         &response,
+        close.success_usage,
         deps,
         "close attempt on resumed tool suspension",
         now,
@@ -4930,7 +5181,7 @@ async fn suspend_resumed_turn(
     let specs = child_spawn_specs_for_response(&response, &inputs);
 
     // Build content events (Thinking) from the resume response.
-    let content_events = build_content_events(&response, content_ids);
+    let content_events = build_content_events(&response, close.content_ids);
 
     // Build ToolCallStart events before continuation is moved.
     let tool_call_events = build_tool_call_start_events(&new_continuation);
@@ -5598,6 +5849,7 @@ async fn run_steering_exchange(
         response,
         content_ids,
         attempt,
+        success_usage,
     } = stage_and_call_steering_llm(
         &inputs,
         deps,
@@ -5633,9 +5885,12 @@ async fn run_steering_exchange(
                 },
                 response,
                 attempt,
+                ResumeCloseContext {
+                    content_ids: &content_ids,
+                    success_usage: &success_usage,
+                },
                 deps,
                 commit_now,
-                &content_ids,
             )
             .await;
         }
@@ -5647,9 +5902,12 @@ async fn run_steering_exchange(
             &continuation,
             &response,
             &attempt,
+            ResumeCloseContext {
+                content_ids: &content_ids,
+                success_usage: &success_usage,
+            },
             deps,
             commit_now,
-            &content_ids,
         )
         .await;
     }
@@ -5666,6 +5924,7 @@ async fn run_steering_exchange(
             response,
             content_ids,
             attempt,
+            success_usage,
         },
         commit_now,
     )
@@ -5805,6 +6064,8 @@ struct SteeringRepark {
     response: llm::ChatResponse,
     content_ids: ContentIds,
     attempt: TurnAttempt,
+    /// The successful attempt's own usage, for its audit row.
+    success_usage: llm::Usage,
 }
 
 /// Re-park a running steering exchange on the still-running children:
@@ -5826,6 +6087,7 @@ async fn repark_after_steering_exchange(
         response,
         content_ids,
         attempt,
+        success_usage,
     } = repark;
     let thread_id = &inputs.bootstrap.thread_id;
 
@@ -5841,6 +6103,7 @@ async fn repark_after_steering_exchange(
     close_attempt_or_propagate_already_closed(
         &attempt,
         &response,
+        &success_usage,
         deps,
         "close attempt on steering re-park",
         now,

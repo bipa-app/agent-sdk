@@ -5268,6 +5268,368 @@ async fn streaming_retry_uses_fresh_message_id_per_attempt() -> anyhow::Result<(
     Ok(())
 }
 
+// --- #9: streaming rate limit honours the provider's Retry-After ------
+
+#[tokio::test(start_paused = true)]
+async fn streaming_rate_limit_retry_honours_the_provider_hint() -> anyhow::Result<()> {
+    // The exponential schedule here would wait 0ms; the provider asked for 5s,
+    // so the retry must wait 5s — the streaming path honours a server hint
+    // exactly like the non-streaming path.
+    let provider = StreamScriptProvider::new(vec![
+        StreamScriptStep::Frames(vec![StreamDelta::Error {
+            message: "Rate limited".to_string(),
+            kind: StreamErrorKind::RateLimited(Some(std::time::Duration::from_secs(5))),
+        }]),
+        StreamScriptStep::Frames(vec![
+            StreamDelta::TextDelta {
+                delta: "after the hint".to_string(),
+                block_index: 0,
+            },
+            StreamDelta::Done {
+                stop_reason: Some(crate::llm::StopReason::EndTurn),
+            },
+        ]),
+    ]);
+    let config = AgentConfig {
+        streaming: true,
+        retry: RetryConfig {
+            max_retries: 2,
+            base_delay_ms: 0,
+            max_delay_ms: 60_000,
+        },
+        ..Default::default()
+    };
+    let agent = builder::<()>()
+        .provider(provider)
+        .config(config)
+        .event_store(new_event_store())
+        .build();
+
+    let (state, events) = run_recorded(
+        &agent,
+        ThreadId::new(),
+        AgentInput::Text("hi".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(matches!(state, AgentRunState::Done { .. }));
+
+    let delays: Vec<u64> = events
+        .iter()
+        .filter_map(|e| match &e.event {
+            AgentEvent::AutoRetryStart { delay_ms, .. } => Some(*delay_ms),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        delays,
+        vec![5_000],
+        "the streamed Retry-After must drive the backoff, not the exponential schedule"
+    );
+    Ok(())
+}
+
+// --- #9b: a failed streaming attempt's usage is still billed --------
+
+#[tokio::test]
+async fn streaming_retry_bills_the_failed_attempts_usage() -> anyhow::Result<()> {
+    // The provider reports usage and only THEN fails: those tokens are billed
+    // whether or not the stream survived. Attempt 1 (150 tokens) is abandoned,
+    // attempt 2 (150 tokens) succeeds with a tool call. Cumulative usage must
+    // count both — 300 — which trips the 200-token budget before turn 2. If the
+    // abandoned attempt's usage were dropped, the run would see only 150 and
+    // sail past the limit.
+    let usage = |input: u32, output: u32| {
+        StreamDelta::Usage(Usage {
+            input_tokens: input,
+            output_tokens: output,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        })
+    };
+    let provider = StreamScriptProvider::new(vec![
+        StreamScriptStep::Frames(vec![
+            usage(100, 50),
+            StreamDelta::Error {
+                message: "Rate limited".to_string(),
+                kind: StreamErrorKind::RateLimited(None),
+            },
+        ]),
+        StreamScriptStep::Frames(vec![
+            StreamDelta::ToolUseStart {
+                id: "tool_1".to_string(),
+                name: "echo".to_string(),
+                block_index: 0,
+                thought_signature: None,
+            },
+            StreamDelta::ToolInputDelta {
+                id: "tool_1".to_string(),
+                delta: json!({"message": "hi"}).to_string(),
+                block_index: 0,
+            },
+            usage(100, 50),
+            StreamDelta::Done {
+                stop_reason: Some(crate::llm::StopReason::ToolUse),
+            },
+        ]),
+        StreamScriptStep::Frames(vec![
+            StreamDelta::TextDelta {
+                delta: "should never run".to_string(),
+                block_index: 0,
+            },
+            usage(10, 5),
+            StreamDelta::Done {
+                stop_reason: Some(crate::llm::StopReason::EndTurn),
+            },
+        ]),
+    ]);
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let config = AgentConfig {
+        streaming: true,
+        max_turns: None,
+        retry: RetryConfig {
+            max_retries: 2,
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+        },
+        usage_limits: Some(UsageLimits {
+            max_total_tokens: Some(200),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .config(config)
+        .event_store(new_event_store())
+        .build();
+
+    let (state, _events) = run_recorded(
+        &agent,
+        ThreadId::new(),
+        AgentInput::Text("hi".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    match state {
+        AgentRunState::BudgetExceeded {
+            limit, total_usage, ..
+        } => {
+            assert_eq!(limit, BudgetLimitKind::TotalTokens);
+            assert_eq!(
+                total_usage.input_tokens + total_usage.output_tokens,
+                300,
+                "both the abandoned and the surviving attempt must be billed, got {total_usage:?}",
+            );
+        }
+        other => anyhow::bail!(
+            "dropping the failed attempt's usage let the run slip past its budget, got {other:?}",
+        ),
+    }
+    Ok(())
+}
+
+// --- #9d: failover survives a usage delta, and bills both providers --
+
+#[tokio::test]
+async fn failover_after_usage_bills_both_providers() -> anyhow::Result<()> {
+    // The primary reports the tokens it burned and *then* rate-limits before any
+    // content. That usage delta must not commit the chain to the dead primary
+    // (it is metadata the user never sees), and the run must bill both the
+    // primary's partial spend and the secondary's full response.
+    let usage = |input: u32, output: u32| {
+        StreamDelta::Usage(Usage {
+            input_tokens: input,
+            output_tokens: output,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        })
+    };
+    let primary = std::sync::Arc::new(StreamScriptProvider::new(vec![StreamScriptStep::Frames(
+        vec![
+            usage(100, 50),
+            StreamDelta::Error {
+                message: "Rate limited".to_string(),
+                kind: StreamErrorKind::RateLimited(None),
+            },
+        ],
+    )]));
+    let secondary = std::sync::Arc::new(StreamScriptProvider::new(vec![StreamScriptStep::Frames(
+        vec![
+            StreamDelta::TextDelta {
+                delta: "from the secondary".to_string(),
+                block_index: 0,
+            },
+            usage(10, 5),
+            StreamDelta::Done {
+                stop_reason: Some(crate::llm::StopReason::EndTurn),
+            },
+        ],
+    )]));
+    let provider = agent_sdk_providers::FallbackProvider::new(primary).with_fallback(secondary);
+
+    let config = AgentConfig {
+        streaming: true,
+        // No retries: a failover that did not happen would surface the error
+        // rather than quietly retrying the primary.
+        retry: RetryConfig::no_retry(),
+        ..Default::default()
+    };
+    let agent = builder::<()>()
+        .provider(provider)
+        .config(config)
+        .event_store(new_event_store())
+        .build();
+
+    let outcome = Box::pin(agent.run_turn(
+        ThreadId::new(),
+        AgentInput::Text("hi".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+        TurnOptions::default(),
+    ))
+    .await;
+
+    let TurnOutcome::Done { summary, .. } = outcome else {
+        anyhow::bail!("the secondary must serve the turn, got {outcome:?}");
+    };
+    assert_eq!(
+        summary.total_usage.input_tokens + summary.total_usage.output_tokens,
+        165,
+        "both the abandoned primary (150) and the secondary (15) must be billed, got {:?}",
+        summary.total_usage,
+    );
+    Ok(())
+}
+
+// --- #9c: a cancelled stream still bills what it streamed ------------
+
+#[tokio::test(start_paused = true)]
+async fn cancelled_stream_bills_the_usage_it_already_streamed() -> anyhow::Result<()> {
+    // The stream reports usage, then stalls; the run is cancelled while it
+    // hangs. The provider billed those tokens, so `Cancelled.total_usage` must
+    // report them rather than zero.
+    //
+    // Deterministic by construction: the scripted frames are consumed the moment
+    // the stream is polled, and only then does the runtime go idle and the
+    // paused clock advance to the earliest timer. The cancel is armed strictly
+    // inside `LLM_STREAM_INACTIVITY_TIMEOUT` (20ms under `cfg(test)`), so it
+    // always fires first and the stall never times out.
+    let provider = StreamScriptProvider::new(vec![StreamScriptStep::FramesThenStall(vec![
+        StreamDelta::TextDelta {
+            delta: "partial".to_string(),
+            block_index: 0,
+        },
+        StreamDelta::Usage(Usage {
+            input_tokens: 90,
+            output_tokens: 10,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        }),
+    ])]);
+    let config = AgentConfig {
+        streaming: true,
+        retry: RetryConfig::no_retry(),
+        ..Default::default()
+    };
+    let agent = builder::<()>()
+        .provider(provider)
+        .config(config)
+        .event_store(new_event_store())
+        .build();
+
+    let cancel = CancellationToken::new();
+    let cancel_trigger = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        cancel_trigger.cancel();
+    });
+
+    let state = agent
+        .run(
+            ThreadId::new(),
+            AgentInput::Text("hi".to_string()),
+            ToolContext::new(()),
+            cancel,
+        )
+        .await?;
+
+    match state {
+        AgentRunState::Cancelled { total_usage, .. } => {
+            assert_eq!(
+                total_usage.input_tokens + total_usage.output_tokens,
+                100,
+                "a cancelled run must still report the tokens the provider billed, got {total_usage:?}",
+            );
+        }
+        other => anyhow::bail!("expected Cancelled, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn streaming_rate_limit_without_a_hint_uses_exponential_backoff() -> anyhow::Result<()> {
+    // No server hint: the exponential schedule (base 250ms, first retry) applies.
+    let provider = StreamScriptProvider::new(vec![
+        StreamScriptStep::Frames(vec![StreamDelta::Error {
+            message: "Rate limited".to_string(),
+            kind: StreamErrorKind::RateLimited(None),
+        }]),
+        StreamScriptStep::Frames(vec![
+            StreamDelta::TextDelta {
+                delta: "after backoff".to_string(),
+                block_index: 0,
+            },
+            StreamDelta::Done {
+                stop_reason: Some(crate::llm::StopReason::EndTurn),
+            },
+        ]),
+    ]);
+    let config = AgentConfig {
+        streaming: true,
+        retry: RetryConfig {
+            max_retries: 2,
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+        },
+        ..Default::default()
+    };
+    let agent = builder::<()>()
+        .provider(provider)
+        .config(config)
+        .event_store(new_event_store())
+        .build();
+
+    let (state, events) = run_recorded(
+        &agent,
+        ThreadId::new(),
+        AgentInput::Text("hi".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(matches!(state, AgentRunState::Done { .. }));
+
+    let delays: Vec<u64> = events
+        .iter()
+        .filter_map(|e| match &e.event {
+            AgentEvent::AutoRetryStart { delay_ms, .. } => Some(*delay_ms),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        delays,
+        vec![0],
+        "a hintless rate limit must fall back to the configured backoff"
+    );
+    Ok(())
+}
+
 // --- #10: stalled stream surfaces an inactivity timeout ---------------
 
 #[tokio::test]

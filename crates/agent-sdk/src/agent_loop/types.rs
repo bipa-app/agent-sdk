@@ -1,7 +1,7 @@
 use crate::authority::EventAuthority;
 use crate::context::{CompactionConfig, ContextCompactor};
 use crate::hooks::ToolAuditSink;
-use crate::llm::StopReason;
+use crate::llm::{StopReason, Usage};
 use crate::pricing::CostEstimator;
 use crate::stores::{EventStore, ToolExecutionStore};
 use crate::tools::{ToolContext, ToolRegistry};
@@ -304,11 +304,51 @@ pub(super) struct ToolOutcomeContext<'a> {
 
 /// Error type for stream processing.
 pub(super) enum StreamError {
-    Recoverable(String),
+    Recoverable {
+        message: String,
+        /// Server-supplied retry delay carried by a rate-limited stream error
+        /// (`Retry-After`, or a hint parsed out of the error body). Overrides
+        /// the exponential backoff, exactly as on the non-streaming path.
+        retry_after: Option<std::time::Duration>,
+        /// Usage the failed attempt had already accumulated when it died.
+        ///
+        /// A stream can report usage and *then* fail (the provider bills the
+        /// tokens it generated either way), so the abandoned attempt's usage
+        /// travels with the error and is folded into the surviving response.
+        /// Dropping it would underreport billed tokens and let a run slip past
+        /// its [`UsageLimits`](crate::UsageLimits).
+        usage: Usage,
+    },
     Fatal(String),
     /// The run's cancellation token fired while the stream was still
     /// being consumed. Terminal — not retried.
-    Cancelled,
+    ///
+    /// Carries the usage the cancelled attempt had already accumulated: the
+    /// provider billed whatever it streamed before the cancel arrived, and a
+    /// cancelled run still reports its cumulative usage.
+    Cancelled(Usage),
+}
+
+impl StreamError {
+    /// Record the usage the dying attempt had accumulated.
+    ///
+    /// Only a recoverable error is retried, so only it can strand usage that a
+    /// later attempt must carry; the terminal variants end the run and are
+    /// returned unchanged.
+    pub(super) fn with_accumulated_usage(self, usage: Usage) -> Self {
+        match self {
+            Self::Recoverable {
+                message,
+                retry_after,
+                ..
+            } => Self::Recoverable {
+                message,
+                retry_after,
+                usage,
+            },
+            other => other,
+        }
+    }
 }
 
 /// Three-state outcome of an LLM call (streaming or non-streaming).
@@ -319,7 +359,10 @@ pub(super) enum StreamError {
 /// generic [`InternalTurnResult::Error`].
 pub(super) enum LlmOutcome {
     Response(crate::llm::ChatResponse),
-    Cancelled,
+    /// The call was cancelled, carrying the usage the provider had already
+    /// billed for the streamed prefix (zero on the non-streaming path, which
+    /// cancels before any usage is reported).
+    Cancelled(Usage),
     Error(AgentError),
 }
 

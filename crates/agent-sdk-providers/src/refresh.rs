@@ -59,7 +59,7 @@ use tokio::sync::Mutex;
 
 use crate::model_capabilities::ModelCapabilities;
 use crate::provider::{LlmProvider, StructuredOutputSupport};
-use crate::streaming::{StreamBox, StreamDelta};
+use crate::streaming::{StreamBox, StreamDelta, UsageCarry};
 
 /// Wraps a provider with host-driven credential refresh on 401.
 ///
@@ -184,6 +184,12 @@ where
         let this = self.clone();
         Box::pin(async_stream::stream! {
             let mut refreshed = false;
+            // The abandoned (pre-refresh) stream may have reported usage before
+            // its 401 — providers now emit usage before a terminal error — and
+            // [`StreamAccumulator`] keeps only the last usage delta. Carry the
+            // abandoned stream's usage forward and rewrite the retried stream's
+            // usage to the running total so those tokens are not un-billed.
+            let mut usage_carry = UsageCarry::new();
             'attempts: loop {
                 let provider = this.snapshot().await;
                 let mut stream = provider.chat_stream(request.clone());
@@ -199,6 +205,7 @@ where
                             match this.run_refresh().await {
                                 Ok(()) => {
                                     refreshed = true;
+                                    usage_carry.abandon();
                                     continue 'attempts;
                                 }
                                 Err(error) => {
@@ -224,6 +231,12 @@ where
                                 saw_output = true;
                             }
                             let done = matches!(delta, StreamDelta::Done { .. });
+                            let delta = match delta {
+                                StreamDelta::Usage(usage) => {
+                                    StreamDelta::Usage(usage_carry.running_total(usage))
+                                }
+                                other => other,
+                            };
                             yield Ok(delta);
                             if done {
                                 return;
@@ -237,6 +250,7 @@ where
                             match this.run_refresh().await {
                                 Ok(()) => {
                                     refreshed = true;
+                                    usage_carry.abandon();
                                     continue 'attempts;
                                 }
                                 Err(refresh_error) => {
@@ -682,6 +696,127 @@ mod tests {
         ));
         assert_eq!(refresh_count.load(Ordering::SeqCst), 1);
         assert_eq!(mock.stream_call_count(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stacked_refresh_inside_fallback_does_not_double_add_usage() -> Result<()> {
+        // Composition: FallbackProvider[ RefreshingProvider(mock_a), mock_b ].
+        // Each wrapper's `UsageCarry` sums only across ITS OWN abandoned
+        // boundary (refresh vs failover), which are disjoint, so no token is
+        // counted twice.
+        //
+        // mock_a stream 1: Usage(100/50) then a 401 -> Refreshing refreshes.
+        // mock_a stream 2 (retried): Usage(10/5) then a recoverable rate limit.
+        //   Refreshing carries 100/50, rewrites stream-2 usage to 110/55, and
+        //   forwards the (non-401) rate-limit error unchanged.
+        // Fallback sees Usage(110/55) + a recoverable error -> fails over.
+        // mock_b: Usage(20/10) + Done -> Fallback rewrites to 130/65.
+        // Real tokens billed: 100/50 + 10/5 + 20/10 = 130/65. No double-add.
+        let mock_a = MockProvider::new();
+        let usage = |i, o| {
+            MockStreamItem::Ok(StreamDelta::Usage(Usage {
+                input_tokens: i,
+                output_tokens: o,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            }))
+        };
+        mock_a.queue_stream(vec![
+            usage(100, 50),
+            MockStreamItem::Ok(StreamDelta::Error {
+                message: "status=401 Unauthorized".into(),
+                kind: StreamErrorKind::InvalidRequest,
+            }),
+        ])?;
+        mock_a.queue_stream(vec![
+            usage(10, 5),
+            MockStreamItem::Ok(StreamDelta::Error {
+                message: "rate limited".into(),
+                kind: StreamErrorKind::RateLimited(None),
+            }),
+        ])?;
+
+        let mock_b = MockProvider::new();
+        mock_b.queue_stream(vec![
+            MockStreamItem::Ok(StreamDelta::TextDelta {
+                delta: "from secondary".into(),
+                block_index: 0,
+            }),
+            usage(20, 10),
+            MockStreamItem::Ok(StreamDelta::Done {
+                stop_reason: Some(StopReason::EndTurn),
+            }),
+        ])?;
+
+        let refresh_count = Arc::new(AtomicUsize::new(0));
+        let refreshing = wrap_success(&mock_a, &refresh_count);
+        let fallback = crate::fallback::FallbackProvider::new(Arc::new(refreshing))
+            .with_fallback(Arc::new(mock_b));
+
+        let deltas = drain(fallback.chat_stream(empty_request())).await;
+        let mut accumulator = crate::streaming::StreamAccumulator::new();
+        for delta in deltas.iter().flatten() {
+            accumulator.apply(delta);
+        }
+        let total = accumulator
+            .usage()
+            .context("the stacked stream must report usage")?;
+        assert_eq!(total.input_tokens, 130, "100 + 10 + 20, each counted once");
+        assert_eq!(total.output_tokens, 65, "50 + 5 + 10, each counted once");
+        assert_eq!(refresh_count.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chat_stream_carries_failed_attempt_usage_across_refresh() -> Result<()> {
+        // The pre-refresh stream reports usage (billed) and then a 401. After
+        // the refresh, the retried stream's usage must not erase the abandoned
+        // attempt's — the accumulator keeps only the last usage delta, so the
+        // wrapper rewrites the retried usage to the running total.
+        let mock = MockProvider::new();
+        mock.queue_stream(vec![
+            MockStreamItem::Ok(StreamDelta::Usage(Usage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })),
+            MockStreamItem::Ok(StreamDelta::Error {
+                message: "status=401 Unauthorized".into(),
+                kind: StreamErrorKind::InvalidRequest,
+            }),
+        ])?;
+        mock.queue_stream(vec![
+            MockStreamItem::Ok(StreamDelta::TextDelta {
+                delta: "retried".into(),
+                block_index: 0,
+            }),
+            MockStreamItem::Ok(StreamDelta::Usage(Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })),
+            MockStreamItem::Ok(StreamDelta::Done {
+                stop_reason: Some(StopReason::EndTurn),
+            }),
+        ])?;
+
+        let refresh_count = Arc::new(AtomicUsize::new(0));
+        let wrapped = wrap_success(&mock, &refresh_count);
+
+        let deltas = drain(wrapped.chat_stream(empty_request())).await;
+        let mut accumulator = crate::streaming::StreamAccumulator::new();
+        for delta in deltas.iter().flatten() {
+            accumulator.apply(delta);
+        }
+        let usage = accumulator
+            .usage()
+            .context("the refreshed stream must still report usage")?;
+        assert_eq!(usage.input_tokens, 110, "100 abandoned + 10 retried");
+        assert_eq!(usage.output_tokens, 55, "50 abandoned + 5 retried");
+        assert_eq!(refresh_count.load(Ordering::SeqCst), 1);
         Ok(())
     }
 

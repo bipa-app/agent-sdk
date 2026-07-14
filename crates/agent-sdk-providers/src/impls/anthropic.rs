@@ -908,9 +908,10 @@ impl LlmProvider for AnthropicProvider {
             let status = response.status();
 
             if status == StatusCode::TOO_MANY_REQUESTS {
+                let retry_after = crate::http::retry_after_from_headers(response.headers());
                 yield Ok(StreamDelta::Error {
                     message: "Rate limited".to_string(),
-                    kind: StreamErrorKind::RateLimited,
+                    kind: StreamErrorKind::RateLimited(retry_after),
                 });
                 return;
             }

@@ -787,6 +787,91 @@ async fn tool_suspension_end_to_end() -> Result<()> {
 }
 
 #[tokio::test]
+async fn duplicate_suspension_loser_bills_its_own_attempt_row() -> Result<()> {
+    // The duplicate-suspension race: two workers both run the same fresh
+    // tool-dispatch turn. Worker A wins and suspends the task to
+    // WaitingOnChildren; worker B's LLM call has already completed (and been
+    // billed) when it reaches the idempotency guard, which bails. B's attempt
+    // row must still record the tokens its call was billed for — not zero.
+    let stores = TestStores::new();
+    let provider =
+        MockToolCallProvider::single("call_1", "bash", serde_json::json!({"command": "ls"}));
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+
+    // Both workers build their inputs while the task is still Running, so both
+    // see a fresh tool-dispatch turn — the state the race requires.
+    let inputs_winner = build_root_worker_inputs(
+        sample_bootstrap_with_tools(task.clone()),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let inputs_loser = build_root_worker_inputs(
+        sample_bootstrap_with_tools(task),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    // Worker A wins: suspends the task and closes its own attempt with 120/60.
+    let winner = execute_root_turn(
+        inputs_winner,
+        "List files",
+        &provider,
+        &stores.deps(),
+        t_plus(5),
+    )
+    .await?;
+    assert!(
+        matches!(winner, RootTurnOutcome::Suspended { .. }),
+        "the winning worker must suspend",
+    );
+
+    // Worker B loses: its stream completes (billed), then the guard sees
+    // WaitingOnChildren and bails.
+    let loser_error = execute_root_turn(
+        inputs_loser,
+        "List files",
+        &provider,
+        &stores.deps(),
+        t_plus(6),
+    )
+    .await
+    .expect_err("the duplicate suspension must bail");
+    assert!(
+        loser_error.to_string().contains("duplicate suspension"),
+        "expected the idempotency-guard bail, got {loser_error:#}",
+    );
+
+    let mut attempts = stores.attempts.list_by_task(&task_id).await?;
+    attempts.sort_by_key(|a| a.opened_at);
+    assert_eq!(attempts.len(), 2, "one winner attempt + one loser attempt");
+
+    // Winner row: unchanged, billed its own call.
+    assert_eq!(attempts[0].outcome, Some(TurnAttemptOutcome::Success));
+    assert_eq!(attempts[0].input_tokens, Some(120));
+    assert_eq!(attempts[0].output_tokens, Some(60));
+
+    // Loser row: closed by the guard, but still billed the tokens its completed
+    // call was charged for — the fix (was zero before).
+    assert_eq!(attempts[1].outcome, Some(TurnAttemptOutcome::Cancelled));
+    assert_eq!(
+        attempts[1].input_tokens,
+        Some(120),
+        "the losing worker's completed call was billed; its row must not be zero",
+    );
+    assert_eq!(attempts[1].output_tokens, Some(60));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn tool_suspension_multiple_tool_calls() -> Result<()> {
     let stores = TestStores::new();
     let provider = MockToolCallProvider::new(vec![
@@ -1136,7 +1221,7 @@ async fn resume_text_only_end_to_end() -> Result<()> {
 
     // Resume with text-only response.
     let resume_provider = MockTextProvider::new("Here are your files: file1.txt, file2.txt");
-    let outcome = resume_root_turn(
+    let outcome = Box::pin(resume_root_turn(
         inputs,
         continuation,
         suspended_messages,
@@ -1144,7 +1229,7 @@ async fn resume_text_only_end_to_end() -> Result<()> {
         &resume_provider,
         &stores.deps(),
         t_plus(25),
-    )
+    ))
     .await
     .context("resume_root_turn")?;
 
@@ -1243,7 +1328,7 @@ async fn resume_checkpoint_contains_correct_agent_state() -> Result<()> {
     .await?;
 
     let resume_provider = MockTextProvider::new("completed");
-    resume_root_turn(
+    Box::pin(resume_root_turn(
         inputs,
         continuation.clone(),
         suspended_messages,
@@ -1251,7 +1336,7 @@ async fn resume_checkpoint_contains_correct_agent_state() -> Result<()> {
         &resume_provider,
         &stores.deps(),
         t_plus(25),
-    )
+    ))
     .await?;
 
     // Verify checkpoint agent state.
@@ -1331,7 +1416,7 @@ async fn resume_with_tool_calls_re_suspends() -> Result<()> {
         "bash",
         serde_json::json!({"command": "cat file1.txt"}),
     );
-    let outcome = resume_root_turn(
+    let outcome = Box::pin(resume_root_turn(
         inputs,
         continuation,
         suspended_messages,
@@ -1339,7 +1424,7 @@ async fn resume_with_tool_calls_re_suspends() -> Result<()> {
         &resume_provider,
         &stores.deps(),
         t_plus(25),
-    )
+    ))
     .await
     .context("resume_root_turn")?;
 
@@ -1439,7 +1524,7 @@ async fn resume_with_failed_tool_result() -> Result<()> {
     .await?;
 
     let resume_provider = MockTextProvider::new("The command failed with permission denied.");
-    let outcome = resume_root_turn(
+    let outcome = Box::pin(resume_root_turn(
         inputs,
         continuation,
         suspended_messages,
@@ -1447,7 +1532,7 @@ async fn resume_with_failed_tool_result() -> Result<()> {
         &resume_provider,
         &stores.deps(),
         t_plus(25),
-    )
+    ))
     .await?;
 
     let RootTurnOutcome::Completed { response_text, .. } = outcome else {
@@ -1527,7 +1612,7 @@ async fn resume_multiple_tool_results() -> Result<()> {
 
     let resume_provider =
         MockTextProvider::new("You are in /home/user, file contains: contents of /x");
-    let outcome = resume_root_turn(
+    let outcome = Box::pin(resume_root_turn(
         inputs,
         continuation,
         suspended_messages,
@@ -1535,7 +1620,7 @@ async fn resume_multiple_tool_results() -> Result<()> {
         &resume_provider,
         &stores.deps(),
         t_plus(25),
-    )
+    ))
     .await?;
 
     let RootTurnOutcome::Completed {
@@ -1848,7 +1933,7 @@ async fn failed_resumed_turn_does_not_leak_continuation() -> Result<()> {
     .await?;
 
     // Resume fails (LLM error).
-    let err = resume_root_turn(
+    let err = Box::pin(resume_root_turn(
         inputs,
         continuation,
         suspended_messages,
@@ -1856,7 +1941,7 @@ async fn failed_resumed_turn_does_not_leak_continuation() -> Result<()> {
         &ErrorProvider,
         &stores.deps(),
         t_plus(25),
-    )
+    ))
     .await
     .unwrap_err();
 
@@ -2003,7 +2088,7 @@ async fn failed_resumed_turn_preserves_in_flight_history_via_draft() -> Result<(
 
     // Resume LLM call errors out — same shape as the production
     // "Stream ended unexpectedly" cascade that motivated this fix.
-    let err = resume_root_turn(
+    let err = Box::pin(resume_root_turn(
         inputs,
         continuation,
         suspended_messages.clone(),
@@ -2011,7 +2096,7 @@ async fn failed_resumed_turn_preserves_in_flight_history_via_draft() -> Result<(
         &ErrorProvider,
         &stores.deps(),
         t_plus(25),
-    )
+    ))
     .await
     .unwrap_err();
 
@@ -2390,7 +2475,7 @@ async fn regression_tool_suspension_and_resume_completion() -> Result<()> {
     .await?;
 
     let resume_provider = MockTextProvider::new("Output: hello world");
-    let outcome = resume_root_turn(
+    let outcome = Box::pin(resume_root_turn(
         inputs,
         continuation,
         suspended_messages,
@@ -2398,7 +2483,7 @@ async fn regression_tool_suspension_and_resume_completion() -> Result<()> {
         &resume_provider,
         &stores.deps(),
         t_plus(25),
-    )
+    ))
     .await?;
 
     let RootTurnOutcome::Completed {
@@ -2478,7 +2563,7 @@ async fn regression_re_suspension_child_retry_budget() -> Result<()> {
     // Resume with more tool calls → re-suspend.
     let resume_provider =
         MockToolCallProvider::single("call_2", "bash", serde_json::json!({"command": "cat file"}));
-    let outcome = resume_root_turn(
+    let outcome = Box::pin(resume_root_turn(
         inputs,
         continuation,
         suspended_messages,
@@ -2486,7 +2571,7 @@ async fn regression_re_suspension_child_retry_budget() -> Result<()> {
         &resume_provider,
         &stores.deps(),
         t_plus(25),
-    )
+    ))
     .await?;
 
     let RootTurnOutcome::Suspended { child_tasks, .. } = outcome else {
@@ -2556,7 +2641,7 @@ async fn resume_llm_error_does_not_leak_staged_writes() -> Result<()> {
     .await?;
 
     // Resume with error provider.
-    let err = resume_root_turn(
+    let err = Box::pin(resume_root_turn(
         inputs,
         continuation,
         suspended_messages,
@@ -2564,7 +2649,7 @@ async fn resume_llm_error_does_not_leak_staged_writes() -> Result<()> {
         &ErrorProvider,
         &stores.deps(),
         t_plus(25),
-    )
+    ))
     .await;
     assert!(err.is_err(), "resume should fail on LLM error");
 
@@ -5518,7 +5603,7 @@ async fn resume_mid_stream_cancel_commits_tool_results_and_clears_draft() -> Res
     let mut deps = stores.deps();
     deps.cancel = Some(&cancel);
 
-    let result = resume_root_turn(
+    let result = Box::pin(resume_root_turn(
         inputs,
         continuation,
         suspended_messages,
@@ -5526,7 +5611,7 @@ async fn resume_mid_stream_cancel_commits_tool_results_and_clears_draft() -> Res
         &provider,
         &deps,
         t_plus(25),
-    )
+    ))
     .await;
     assert!(result.is_err(), "a cancelled resume must return Err");
 

@@ -54,6 +54,16 @@ pub mod provider;
 #[cfg(feature = "record-replay")]
 pub mod record_replay;
 pub mod refresh;
+// Body-embedded `Retry-After` fallbacks (Gemini `RetryInfo`, OpenAI error
+// prose). Gated like `http` above: only provider impls call it, so it is dead
+// code in a `--no-default-features` build.
+#[cfg(any(
+    feature = "openai",
+    feature = "openai-codex",
+    feature = "gemini",
+    feature = "vertex",
+))]
+pub(crate) mod retry_hints;
 pub mod router;
 pub mod search;
 pub mod streaming;

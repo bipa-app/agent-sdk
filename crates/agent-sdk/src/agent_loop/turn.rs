@@ -848,7 +848,7 @@ where
         LlmOutcome::Response(response) => {
             Some(super::llm::apply_on_llm_response(hooks, response).await)
         }
-        LlmOutcome::Cancelled | LlmOutcome::Error(_) => None,
+        LlmOutcome::Cancelled(_) | LlmOutcome::Error(_) => None,
     }
 }
 
@@ -938,7 +938,7 @@ where
     #[cfg(feature = "otel")]
     let span_result: Result<ChatResponse, AgentError> = match &result {
         LlmOutcome::Response(response) => Ok(response.clone()),
-        LlmOutcome::Cancelled => Err(AgentError::new("LLM call cancelled", false)),
+        LlmOutcome::Cancelled(_) => Err(AgentError::new("LLM call cancelled", false)),
         LlmOutcome::Error(error) => Err(error.clone()),
     };
 
@@ -2882,14 +2882,24 @@ where
     .await;
     let response = match llm_outcome {
         LlmOutcome::Response(response) => response,
-        LlmOutcome::Cancelled => {
+        LlmOutcome::Cancelled(usage) => {
             // The cancel was honored before any assistant message was
             // persisted, so there is no orphan `tool_use` to balance —
             // history is already consistent. Surface a partial-usage
             // `Cancelled` so the run closes with the terminal event.
-            return Err(InternalTurnResult::Cancelled {
-                turn_usage: TokenUsage::default(),
-            });
+            //
+            // The provider billed whatever it streamed before the cancel (and
+            // any attempt abandoned by a retry before it), so those tokens are
+            // committed at the same anchor a completed turn uses — a cancelled
+            // run still reports what it spent.
+            let turn_usage = TokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cached_input_tokens: usage.cached_input_tokens,
+                cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            };
+            fold_llm_usage(ctx, provenance, &turn_usage);
+            return Err(InternalTurnResult::Cancelled { turn_usage });
         }
         LlmOutcome::Error(error) => {
             if let Some(result) = try_recover_prompt_too_long(

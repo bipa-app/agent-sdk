@@ -10,6 +10,7 @@ use bytes::BytesMut;
 use futures::Stream;
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::time::Duration;
 
 /// Upper bound on the block index [`StreamAccumulator`] will materialize.
 ///
@@ -175,7 +176,14 @@ pub enum StreamDelta {
 #[non_exhaustive]
 pub enum StreamErrorKind {
     /// Provider returned HTTP 429 / explicit rate-limit signal.
-    RateLimited,
+    ///
+    /// Carries the server-supplied retry delay when the provider gave one —
+    /// a `Retry-After` header, or a hint embedded in the error body (Gemini's
+    /// `google.rpc.RetryInfo`, `OpenAI`'s "try again in 20s"). `None` when the
+    /// provider supplied no usable hint (mid-stream rate-limit events, for
+    /// instance, arrive with no headers), in which case the caller falls back
+    /// to its own backoff schedule.
+    RateLimited(Option<Duration>),
     /// Provider returned HTTP 5xx, the connection dropped mid-stream,
     /// or the provider reported a transient runtime failure.
     ServerError,
@@ -200,12 +208,86 @@ impl StreamErrorKind {
     /// invalid-request is not.
     #[must_use]
     pub const fn is_recoverable(self) -> bool {
-        matches!(self, Self::RateLimited | Self::ServerError)
+        matches!(self, Self::RateLimited(_) | Self::ServerError)
+    }
+
+    /// The server-supplied retry delay carried by a rate-limit error, if any.
+    ///
+    /// `None` for every other kind — only a rate limit comes with a hint.
+    #[must_use]
+    pub const fn retry_after(self) -> Option<Duration> {
+        match self {
+            Self::RateLimited(retry_after) => retry_after,
+            _ => None,
+        }
     }
 }
 
 /// Type alias for a boxed stream of stream deltas.
 pub type StreamBox<'a> = Pin<Box<dyn Stream<Item = anyhow::Result<StreamDelta>> + Send + 'a>>;
+
+/// Sum two usage readings, saturating so token counters never wrap.
+fn add_usage(carried: Option<&Usage>, usage: &Usage) -> Usage {
+    let Some(carried) = carried else {
+        return usage.clone();
+    };
+    Usage {
+        input_tokens: carried.input_tokens.saturating_add(usage.input_tokens),
+        output_tokens: carried.output_tokens.saturating_add(usage.output_tokens),
+        cached_input_tokens: carried
+            .cached_input_tokens
+            .saturating_add(usage.cached_input_tokens),
+        cache_creation_input_tokens: carried
+            .cache_creation_input_tokens
+            .saturating_add(usage.cache_creation_input_tokens),
+    }
+}
+
+/// Preserves usage across a stream-splicing wrapper's attempt boundary.
+///
+/// A wrapper that abandons one inner stream and splices in another (failover,
+/// credential refresh) has a hazard: [`StreamAccumulator`] keeps only the LAST
+/// `Usage` delta it sees, so the retried stream's usage would erase the
+/// abandoned one — silently un-billing tokens the provider already charged for.
+///
+/// The carry closes that: on every outgoing `Usage` delta, the wrapper calls
+/// [`running_total`](Self::running_total) to rewrite it to the sum of all
+/// abandoned attempts plus this stream's latest reading; when it abandons a
+/// stream to retry, it calls [`abandon`](Self::abandon) to fold that stream's
+/// usage into the carry. The final delta the consumer sees — the only one the
+/// accumulator keeps — is therefore the true total across every attempt.
+#[derive(Default)]
+pub(crate) struct UsageCarry {
+    /// Usage billed by abandoned attempts.
+    carried: Option<Usage>,
+    /// The current attempt's latest usage reading (last-wins within an attempt).
+    current: Option<Usage>,
+}
+
+impl UsageCarry {
+    pub(crate) const fn new() -> Self {
+        Self {
+            carried: None,
+            current: None,
+        }
+    }
+
+    /// Record `usage` as the current attempt's reading and return the running
+    /// total (abandoned attempts + this reading) to yield in its place.
+    pub(crate) fn running_total(&mut self, usage: Usage) -> Usage {
+        let total = add_usage(self.carried.as_ref(), &usage);
+        self.current = Some(usage);
+        total
+    }
+
+    /// Fold the current attempt's usage into the carry because its stream is
+    /// being abandoned for a retry.
+    pub(crate) fn abandon(&mut self) {
+        if let Some(current) = self.current.take() {
+            self.carried = Some(add_usage(self.carried.as_ref(), &current));
+        }
+    }
+}
 
 /// Helper to accumulate streamed content into a final response.
 ///

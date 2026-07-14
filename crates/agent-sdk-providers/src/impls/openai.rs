@@ -994,9 +994,13 @@ impl LlmProvider for OpenAIProvider {
             let status = response.status();
 
             if !status.is_success() {
+                // Headers are read before the body: `text()` consumes the response.
+                let header_hint = crate::http::retry_after_from_headers(response.headers());
                 let body = response.text().await.unwrap_or_default();
                 let (kind, level) = if status == StatusCode::TOO_MANY_REQUESTS {
-                    (StreamErrorKind::RateLimited, "rate_limit")
+                    let retry_after = header_hint
+                        .or_else(|| crate::retry_hints::openai_retry_delay(&body));
+                    (StreamErrorKind::RateLimited(retry_after), "rate_limit")
                 } else if status.is_server_error() {
                     (StreamErrorKind::ServerError, "server_error")
                 } else {
@@ -1023,6 +1027,13 @@ impl LlmProvider for OpenAIProvider {
                 let chunk = match chunk_result {
                     Ok(chunk) => chunk,
                     Err(error) => {
+                        // A trailing usage-only chunk may have been recorded but
+                        // not yet finalized (finalization waits for [DONE]). The
+                        // provider billed those tokens, so surface the usage
+                        // before the transport error ends the stream.
+                        if let Some(usage) = usage.take() {
+                            yield Ok(StreamDelta::Usage(usage));
+                        }
                         yield Err(anyhow::anyhow!("stream error: {error}"));
                         return;
                     }
@@ -1052,6 +1063,13 @@ impl LlmProvider for OpenAIProvider {
             // EOF before that sentinel is transport truncation, even if a
             // finish_reason happened to arrive first; synthesizing Done would
             // let callers commit a partial response as a successful turn.
+            //
+            // Still surface any usage the truncated stream reported first: the
+            // provider billed it, and finalization (which would have yielded it)
+            // never ran because [DONE] never arrived.
+            if let Some(usage) = usage.take() {
+                yield Ok(StreamDelta::Usage(usage));
+            }
             yield Err(anyhow::anyhow!("OpenAI stream ended before [DONE] sentinel"));
         })
     }
@@ -1194,10 +1212,17 @@ fn step_completion_stream(
             SseProcessResult::Malformed(message) => {
                 return SseLineOutcome {
                     immediate,
-                    terminal: Some(vec![StreamDelta::Error {
+                    terminal: Some(terminal_error_deltas(
+                        usage.take(),
                         message,
-                        kind: StreamErrorKind::ServerError,
-                    }]),
+                        StreamErrorKind::ServerError,
+                    )),
+                };
+            }
+            SseProcessResult::Error { message, kind } => {
+                return SseLineOutcome {
+                    immediate,
+                    terminal: Some(terminal_error_deltas(usage.take(), message, kind)),
                 };
             }
             SseProcessResult::Sentinel => {
@@ -1280,8 +1305,56 @@ enum SseProcessResult {
     Done(StopReason),
     /// The provider emitted a malformed JSON event.
     Malformed(String),
+    /// The provider reported a failure in-band, on an HTTP-200 stream.
+    Error {
+        message: String,
+        kind: StreamErrorKind,
+    },
     /// Stream sentinel [DONE] was received.
     Sentinel,
+}
+
+/// Terminal deltas for a stream that ends in an error, emitting any usage the
+/// stream reported first.
+///
+/// The provider bills the tokens it generated even when the turn then fails, so
+/// the usage must reach the consumer's accumulator — which only ever sees
+/// yielded deltas — ahead of the error that stops the stream.
+fn terminal_error_deltas(
+    usage: Option<Usage>,
+    message: String,
+    kind: StreamErrorKind,
+) -> Vec<StreamDelta> {
+    let mut deltas = Vec::new();
+    if let Some(usage) = usage {
+        deltas.push(StreamDelta::Usage(usage));
+    }
+    deltas.push(StreamDelta::Error { message, kind });
+    deltas
+}
+
+/// Classify an in-band Chat Completions error object.
+///
+/// The stream already answered 200, so the status line says nothing about this
+/// failure: the error object's own code is the only classification signal. The
+/// message is prose — read only to recover a retry delay, never to decide the
+/// category. An unrecognized code is treated as a transient server error, the
+/// same conservative default a truncated stream gets.
+fn completion_error_kind(code: Option<&serde_json::Value>, message: &str) -> StreamErrorKind {
+    let http_code = code.and_then(serde_json::Value::as_u64);
+    let symbolic = code.and_then(serde_json::Value::as_str);
+
+    if http_code == Some(429)
+        || matches!(symbolic, Some("rate_limit_exceeded" | "rate_limit_error"))
+    {
+        return StreamErrorKind::RateLimited(crate::retry_hints::openai_retry_delay(message));
+    }
+    // A non-429 client error is the caller's fault and will fail identically on
+    // a retry; everything else (5xx, unknown, absent) stays retriable.
+    if http_code.is_some_and(|code| (400..500).contains(&code)) {
+        return StreamErrorKind::InvalidRequest;
+    }
+    StreamErrorKind::ServerError
 }
 
 /// Process an SSE data line and return results to apply.
@@ -1301,7 +1374,9 @@ fn process_sse_data(data: &str) -> Vec<SseProcessResult> {
 
     let mut results = Vec::new();
 
-    // Extract usage if present
+    // Usage is extracted before anything that can end the stream: a terminal
+    // chunk may carry the billed usage *and* the failure together, and those
+    // tokens are billed whether or not the turn survives.
     if let Some(u) = chunk.usage {
         results.push(SseProcessResult::Usage(Usage {
             input_tokens: u.prompt_tokens,
@@ -1315,6 +1390,19 @@ fn process_sse_data(data: &str) -> Vec<SseProcessResult> {
                 .as_ref()
                 .map_or(0, |details| details.cache_write_tokens),
         }));
+    }
+
+    // An in-band error ends the stream: the accompanying choice carries no
+    // content (`finish_reason: "error"`), so it is reported instead of being
+    // folded in as if the turn had produced output.
+    if let Some(error) = chunk.error {
+        let message = error
+            .message
+            .unwrap_or_else(|| "OpenAI-compatible stream reported an error".to_owned());
+        let kind = completion_error_kind(error.code.as_ref(), &message);
+        log::warn!("OpenAI in-band stream error kind={kind:?} message={message}");
+        results.push(SseProcessResult::Error { message, kind });
+        return results;
     }
 
     // Process choices
@@ -1401,6 +1489,8 @@ fn decode_chat_response(
     retry_after: Option<std::time::Duration>,
 ) -> Result<ChatOutcome> {
     if status == StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = retry_after
+            .or_else(|| crate::retry_hints::openai_retry_delay(&String::from_utf8_lossy(bytes)));
         return Ok(ChatOutcome::RateLimited(retry_after));
     }
 
@@ -2191,6 +2281,22 @@ struct SseChunk {
     choices: Vec<SseChoice>,
     #[serde(default)]
     usage: Option<SseUsage>,
+    /// In-band failure. `OpenAI`-compatible routes (`OpenRouter` among them)
+    /// answer 200 and report the failure as a chunk carrying this object, so
+    /// the HTTP status never sees it.
+    #[serde(default)]
+    error: Option<SseError>,
+}
+
+#[derive(Deserialize)]
+struct SseError {
+    #[serde(default)]
+    message: Option<String>,
+    /// Spelled as an HTTP number by some routes (`429`) and as a symbolic
+    /// string by others (`"rate_limit_exceeded"`), so it is kept raw and
+    /// interpreted in [`completion_error_kind`].
+    #[serde(default)]
+    code: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -3411,6 +3517,133 @@ mod tests {
         let usage: ApiUsage = serde_json::from_str(json).unwrap();
         assert_eq!(usage.prompt_tokens, 42);
         assert_eq!(usage.completion_tokens, 7);
+    }
+
+    #[test]
+    fn test_process_sse_data_maps_in_band_rate_limit_error_chunk() -> anyhow::Result<()> {
+        // OpenRouter answers 200 and reports the failure as a chunk: the HTTP
+        // status branch never runs, so the error object must be decoded here.
+        let results = process_sse_data(
+            r#"{"id":"gen-1","choices":[{"delta":{},"finish_reason":"error","index":0}],"error":{"code":429,"message":"Rate limited by upstream. Please try again in 12s."}}"#,
+        );
+
+        let kind = results
+            .iter()
+            .find_map(|result| match result {
+                SseProcessResult::Error { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .context("expected an in-band error result")?;
+
+        assert_eq!(
+            kind,
+            StreamErrorKind::RateLimited(Some(std::time::Duration::from_secs(12))),
+            "an in-band 429 must be retriable and keep its parsed delay"
+        );
+        assert!(kind.is_recoverable());
+        Ok(())
+    }
+
+    #[test]
+    fn test_process_sse_data_keeps_usage_carried_by_an_error_chunk() -> anyhow::Result<()> {
+        // OpenRouter's terminal chunk reports the billed usage *and* the failure
+        // together. The tokens were billed, so they must survive the error —
+        // and they must be emitted before it, since the error ends the stream.
+        let results = process_sse_data(
+            r#"{"choices":[{"delta":{},"finish_reason":"error","index":0}],"usage":{"prompt_tokens":140,"completion_tokens":20},"error":{"code":429,"message":"Rate limited. Please try again in 12s."}}"#,
+        );
+
+        let usage_at = results
+            .iter()
+            .position(|result| matches!(result, SseProcessResult::Usage(_)))
+            .context("the error chunk's usage must not be dropped")?;
+        let error_at = results
+            .iter()
+            .position(|result| matches!(result, SseProcessResult::Error { .. }))
+            .context("expected an in-band error result")?;
+        assert!(
+            usage_at < error_at,
+            "usage must be emitted before the terminal error"
+        );
+
+        let usage = results
+            .iter()
+            .find_map(|result| match result {
+                SseProcessResult::Usage(usage) => Some(usage),
+                _ => None,
+            })
+            .context("expected a usage result")?;
+        assert_eq!(usage.input_tokens, 140);
+        assert_eq!(usage.output_tokens, 20);
+
+        // And the terminal deltas the stream hands over preserve that order.
+        let mut tool_calls = HashMap::new();
+        let mut stream_usage = None;
+        let mut stop_reason = None;
+        let outcome = step_completion_stream(
+            r#"{"choices":[{"delta":{},"finish_reason":"error","index":0}],"usage":{"prompt_tokens":140,"completion_tokens":20},"error":{"code":429,"message":"Rate limited. Please try again in 12s."}}"#,
+            &mut tool_calls,
+            &mut stream_usage,
+            &mut stop_reason,
+        );
+        let terminal = outcome.terminal.context("the error must be terminal")?;
+        assert!(
+            matches!(terminal.first(), Some(StreamDelta::Usage(usage)) if usage.input_tokens == 140),
+            "the usage delta must lead the terminal sequence, got {terminal:?}"
+        );
+        assert!(matches!(
+            terminal.last(),
+            Some(StreamDelta::Error {
+                kind: StreamErrorKind::RateLimited(Some(_)),
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_process_sse_data_maps_in_band_symbolic_and_server_error_chunks() -> anyhow::Result<()> {
+        // Symbolic code (OpenAI-style) rather than an HTTP number.
+        let symbolic = process_sse_data(
+            r#"{"choices":[],"error":{"code":"rate_limit_exceeded","message":"Please try again in 250ms."}}"#,
+        );
+        let kind = symbolic
+            .iter()
+            .find_map(|result| match result {
+                SseProcessResult::Error { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .context("expected an in-band error result")?;
+        assert_eq!(
+            kind,
+            StreamErrorKind::RateLimited(Some(std::time::Duration::from_millis(250)))
+        );
+
+        // An upstream 5xx stays retriable; a 4xx that is not a rate limit does not.
+        let server = process_sse_data(
+            r#"{"choices":[],"error":{"code":502,"message":"upstream unavailable"}}"#,
+        );
+        let server_kind = server
+            .iter()
+            .find_map(|result| match result {
+                SseProcessResult::Error { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .context("expected an in-band error result")?;
+        assert_eq!(server_kind, StreamErrorKind::ServerError);
+
+        let invalid =
+            process_sse_data(r#"{"choices":[],"error":{"code":400,"message":"bad request"}}"#);
+        let invalid_kind = invalid
+            .iter()
+            .find_map(|result| match result {
+                SseProcessResult::Error { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .context("expected an in-band error result")?;
+        assert_eq!(invalid_kind, StreamErrorKind::InvalidRequest);
+        assert!(!invalid_kind.is_recoverable());
+        Ok(())
     }
 
     #[test]
@@ -4655,6 +4888,55 @@ mod tests {
             anyhow::bail!("truncated stream did not end with an error");
         };
         assert!(error.to_string().contains("before [DONE] sentinel"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_usage_before_eof_is_surfaced_ahead_of_the_error() -> anyhow::Result<()> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A trailing usage-only chunk (choices: []) arrives, then the stream
+        // ends before [DONE] — transport truncation. The provider billed those
+        // tokens, so the Usage must be surfaced before the transport error.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"stop\"}]}\n\n\
+                         data: {\"choices\":[],\"usage\":{\"prompt_tokens\":140,\"completion_tokens\":20}}\n\n",
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAIProvider::with_base_url("test-key", MODEL_GPT4O, server.uri());
+        let request = ChatRequest::new(
+            String::new(),
+            vec![agent_sdk_foundation::llm::Message::user("hello")],
+        );
+        let items = provider.chat_stream(request).collect::<Vec<_>>().await;
+
+        let usage_at = items
+            .iter()
+            .position(|item| matches!(item, Ok(StreamDelta::Usage(_))))
+            .context("the truncated stream's usage must not be dropped")?;
+        let error_at = items
+            .iter()
+            .position(Result::is_err)
+            .context("a truncated stream must end with an error")?;
+        assert!(
+            usage_at < error_at,
+            "usage must be surfaced before the transport error, got {items:?}"
+        );
+        let Ok(StreamDelta::Usage(usage)) = &items[usage_at] else {
+            anyhow::bail!("expected a usage delta");
+        };
+        assert_eq!(usage.input_tokens, 140);
+        assert_eq!(usage.output_tokens, 20);
         Ok(())
     }
 }
