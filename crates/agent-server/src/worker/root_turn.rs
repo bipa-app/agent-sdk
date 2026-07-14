@@ -3930,12 +3930,17 @@ async fn suspend_at_tool_boundary(
         .context("task disappeared during suspension")?;
 
     if current_task.status == TaskStatus::WaitingOnChildren {
-        // Close the attempt opened at the start of execute_root_turn so
-        // it doesn't remain permanently unclosed in the audit trail.
+        // Close the attempt opened at the start of execute_root_turn so it
+        // doesn't remain permanently unclosed in the audit trail. Unlike the
+        // pre-stream synthetic closes (which bill zero because nothing
+        // streamed), this fires AFTER a real LLM call the provider already
+        // billed, so the row records that attempt's own usage — the winning
+        // worker's separate call committed the turn, but this loser's tokens
+        // were billed too and belong on its audit row.
         close_attempt_with(
             &attempt,
             TurnAttemptOutcome::Cancelled,
-            &ZERO_ATTEMPT_USAGE,
+            &close_ctx.success_usage,
             deps.attempt_store,
             now,
         )
