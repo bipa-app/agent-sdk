@@ -162,6 +162,51 @@ impl ModelRegistry {
             .map(|entry| resolved_from_entry(entry, ResolvedSource::Feed))
     }
 
+    /// Resolve through the *override* layer only — a user-registered override —
+    /// reporting `None` when the pair has none.
+    ///
+    /// An override is authoritative: the caller uses it in preference to any
+    /// feed row, so it is probed on its own. See
+    /// [`estimate_override_cost_usd`](Self::estimate_override_cost_usd).
+    #[must_use]
+    pub fn resolve_override(&self, provider: &str, model: &str) -> Option<ResolvedModel> {
+        self.overrides
+            .get(&model_key(provider, model))
+            .map(|entry| resolved_from_entry(entry, ResolvedSource::Override))
+    }
+
+    /// Estimate cost from the *override* layer only (never feed or static),
+    /// with tier selection. `None` when the pair has no override.
+    #[must_use]
+    pub fn estimate_override_cost_usd(
+        &self,
+        provider: &str,
+        model: &str,
+        usage: &Usage,
+    ) -> Option<f64> {
+        estimate_resolved(
+            &self.resolve_override(provider, model)?,
+            usage,
+            TierMode::Apply,
+        )
+    }
+
+    /// Estimate cost from the *override* layer only, at the base band (a summed
+    /// usage). `None` when the pair has no override.
+    #[must_use]
+    pub fn estimate_override_base_cost_usd(
+        &self,
+        provider: &str,
+        model: &str,
+        usage: &Usage,
+    ) -> Option<f64> {
+        estimate_resolved(
+            &self.resolve_override(provider, model)?,
+            usage,
+            TierMode::Base,
+        )
+    }
+
     /// Estimate request cost in USD using the layered pricing (override → feed
     /// → static), if any.
     ///

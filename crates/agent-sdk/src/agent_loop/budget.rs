@@ -92,16 +92,36 @@ fn estimate_scoped(
     let model = provenance.model.as_str();
 
     if let Some(estimator) = pricing {
-        // The MAX of every candidate estimate, not the first that resolves. A
-        // preferred candidate (route key, gateway key) can carry a flat row
-        // where a later candidate — the vendor's own — publishes the tier a
-        // long call falls in: models.dev's `openrouter/google/gemini-2.5-pro`
-        // route row is flat while its native `gemini-2.5-pro` carries the ≥200K
-        // band. First-Some would take the flat route estimate and under-bill
-        // the long call. Each estimate is computed WHOLLY from one row, so no
-        // rates are blended; taking the larger never bills below the best
-        // evidence in the candidate set, and the route/service price still wins
-        // whenever it is genuinely the higher one (see [`catalog_candidates`]).
+        // Override authority is absolute. A user-registered override is a price
+        // the user set on purpose (a negotiated or free rate), so if ANY
+        // candidate resolves through the override layer it is used outright,
+        // skipping the max — otherwise a higher feed row under a derived key
+        // would out-max it and trip the user's cap early on data they overrode
+        // away, violating the registry's override-before-feed precedence. The
+        // first usable override (in candidate-preference order) wins.
+        let override_cost = catalog_candidates(provider, model)
+            .filter_map(|(provider, model)| match scope {
+                UsageScope::Call => estimator.estimate_override_cost_usd(&provider, &model, &usage),
+                UsageScope::Aggregate => {
+                    estimator.estimate_override_aggregate_cost_usd(&provider, &model, &usage)
+                }
+            })
+            .find(|cost| is_usable_estimate(*cost));
+        if let Some(cost) = override_cost {
+            return Some(cost);
+        }
+
+        // Otherwise the MAX of every feed-level candidate estimate, not the
+        // first that resolves. A preferred candidate (route key, gateway key)
+        // can carry a flat row where a later candidate — the vendor's own —
+        // publishes the tier a long call falls in: models.dev's
+        // `openrouter/google/gemini-2.5-pro` route row is flat while its native
+        // `gemini-2.5-pro` carries the ≥200K band. First-Some would take the
+        // flat route estimate and under-bill the long call. Each estimate is
+        // computed WHOLLY from one row, so no rates are blended; taking the
+        // larger never bills below the best evidence in the candidate set, and
+        // the route/service price still wins whenever it is genuinely the higher
+        // one (see [`catalog_candidates`]).
         let best = catalog_candidates(provider, model)
             .filter_map(|(provider, model)| match scope {
                 UsageScope::Call => estimator.estimate_cost_usd(&provider, &model, &usage),
@@ -109,16 +129,7 @@ fn estimate_scoped(
                     estimator.estimate_aggregate_cost_usd(&provider, &model, &usage)
                 }
             })
-            // Reject NaN and −∞; keep +∞. `f64::total_cmp` ranks NaN above every
-            // finite value, so an unfiltered NaN would win the max and then
-            // compare false against `max_cost_usd`, silently disabling the cap
-            // while valid candidates existed. −∞ is a nonsensical price that can
-            // only win an empty field, and would then poison the accumulator and
-            // compare false against the cap — same fail-open. +∞ is DIFFERENT: a
-            // legitimate unbounded over-estimate (a custom estimator, or a
-            // rate×tokens overflow), and it must trip any finite cap, so it stays
-            // in the max.
-            .filter(|cost| !cost.is_nan() && *cost != f64::NEG_INFINITY)
+            .filter(|cost| is_usable_estimate(*cost))
             .max_by(f64::total_cmp);
         if let Some(cost) = best {
             return Some(cost);
@@ -131,6 +142,34 @@ fn estimate_scoped(
         crate::model_capabilities::get_model_capabilities(provider, model)?
             .estimate_cost_usd(&usage)
     })
+}
+
+/// Whether a candidate estimate may be used or entered into the max.
+///
+/// Rejects NaN and −∞; keeps +∞. `f64::total_cmp` ranks NaN above every finite
+/// value, so an unfiltered NaN would win the max and then compare false against
+/// `max_cost_usd`, silently disabling the cap while valid candidates existed.
+/// −∞ is a nonsensical price that can only win an empty field, and would then
+/// poison the accumulator and compare false against the cap — the same
+/// fail-open. +∞ is DIFFERENT: a legitimate unbounded over-estimate (a custom
+/// estimator, or a rate×tokens overflow), and it must trip any finite cap, so
+/// it is kept.
+fn is_usable_estimate(cost: f64) -> bool {
+    !cost.is_nan() && cost != f64::NEG_INFINITY
+}
+
+/// The value a cost is stored as, so a durable accumulator survives a
+/// serialize/restore round trip.
+///
+/// `serde_json` writes a non-finite float as `null`, which on reload looks like
+/// "cost unknown" and loses a budget trip. A `+∞` estimate (a legitimate
+/// unbounded over-estimate) therefore clamps to `f64::MAX`: finite, survives
+/// JSON, still exceeds any real cap so the trip is preserved, and saturates
+/// under further addition (`f64::MAX + x` re-clamps back to `f64::MAX`). NaN and
+/// −∞ never reach a stored accumulator — [`is_usable_estimate`] drops them
+/// before they can be folded — so only the `+∞` case bites.
+pub(super) const fn durable_cost(cost: f64) -> f64 {
+    cost.min(f64::MAX)
 }
 
 /// The keys a dynamic catalog may file this provenance under: everything the
@@ -373,14 +412,18 @@ pub(super) fn accumulate_cost(
 ) {
     if state.accumulated_cost_usd.is_none() && !usage_is_zero(pre_delta_total) {
         state.accumulated_cost_usd =
-            estimate_aggregate_cost_usd(pricing, provenance, pre_delta_total);
+            estimate_aggregate_cost_usd(pricing, provenance, pre_delta_total).map(durable_cost);
     }
     let delta_cost = match delta_scope {
         UsageScope::Call => estimate_cost_usd(pricing, provenance, delta),
         UsageScope::Aggregate => estimate_aggregate_cost_usd(pricing, provenance, delta),
     };
     if let Some(delta_cost) = delta_cost {
-        state.accumulated_cost_usd = Some(state.accumulated_cost_usd.unwrap_or(0.0) + delta_cost);
+        // Clamp AFTER the addition so the stored accumulator is always finite:
+        // `f64::MAX + delta` can round to `+∞`, which serde would then drop.
+        state.accumulated_cost_usd = Some(durable_cost(
+            state.accumulated_cost_usd.unwrap_or(0.0) + delta_cost,
+        ));
     }
 }
 
@@ -392,6 +435,10 @@ pub(super) fn accumulate_cost(
 /// The fallback prices a SUM, not a call, so it stays on base rates: the
 /// accumulated total is the only figure that reflects the tier each individual
 /// call actually paid.
+///
+/// The reported figure is clamped to a finite value ([`durable_cost`]): a
+/// `+∞` fallback estimate would otherwise serialize to `null` on the terminal
+/// state / event, reading as "cost unknown" instead of "over the cap".
 #[must_use]
 pub(super) fn run_cost_usd(
     accumulated: Option<f64>,
@@ -399,7 +446,9 @@ pub(super) fn run_cost_usd(
     provenance: &AuditProvenance,
     usage: &TokenUsage,
 ) -> Option<f64> {
-    accumulated.or_else(|| estimate_aggregate_cost_usd(pricing, provenance, usage))
+    accumulated
+        .or_else(|| estimate_aggregate_cost_usd(pricing, provenance, usage))
+        .map(durable_cost)
 }
 
 /// Evaluate the run-level usage budget against the cumulative `usage`.
@@ -601,8 +650,8 @@ mod tests {
         .context("+inf must trip a finite cost cap")?;
         assert_eq!(limit, BudgetLimitKind::CostUsd);
 
-        // And a +∞ accumulator, folded from a +∞ delta, still trips on a later
-        // turn (the fold is `0.0 + ∞ = ∞`, and `∞ > cap` stays true).
+        // A +∞ delta folds into the accumulator clamped to `f64::MAX` — finite,
+        // so it survives a serde round trip, and still over any real cap.
         let mut state = AgentState::new(ThreadId::new());
         accumulate_cost(
             &mut state,
@@ -615,15 +664,26 @@ mod tests {
         let accumulated = state
             .accumulated_cost_usd
             .context("the +inf delta must accumulate")?;
-        assert!(accumulated.is_infinite() && accumulated > 0.0);
+        assert!(
+            accumulated.is_finite(),
+            "accumulator not clamped: {accumulated}"
+        );
+        assert!((accumulated - f64::MAX).abs() < f64::EPSILON);
+
+        // The clamped accumulator survives a serialize/restore (a bare +∞ would
+        // become `null`), and keeps tripping on the restored state.
+        let json = serde_json::to_string(&state).context("serialize state")?;
+        let restored: crate::types::AgentState =
+            serde_json::from_str(&json).context("deserialize state")?;
+        assert_eq!(restored.accumulated_cost_usd, Some(f64::MAX));
         let (limit, _) = status(
             Some(&limits),
             Some(&NanThenPosInfPricing),
             &provenance,
             &usage,
-            state.accumulated_cost_usd,
+            restored.accumulated_cost_usd,
         )
-        .context("a +inf accumulator must keep tripping")?;
+        .context("the restored accumulator must keep tripping")?;
         assert_eq!(limit, BudgetLimitKind::CostUsd);
         Ok(())
     }
@@ -1192,12 +1252,74 @@ mod catalog_tests {
         Ok(())
     }
 
+    /// A user override is authoritative: it wins over a HIGHER feed row under a
+    /// derived candidate key, rather than being out-maxed. A user who set a
+    /// negotiated/free price must not have their cap tripped on feed data they
+    /// overrode away.
+    #[tokio::test]
+    async fn override_authority_beats_a_higher_feed_row() -> Result<()> {
+        use crate::model_capabilities::Pricing;
+
+        // Override on the route key: $0.05/M in + $0.05/M out.
+        let registry = ModelRegistry::new().with_override(
+            "openrouter",
+            "vendor/model",
+            CatalogEntry {
+                provider: "openrouter".to_owned(),
+                model_id: "vendor/model".to_owned(),
+                context_window: None,
+                max_output_tokens: None,
+                pricing: Some(Pricing::flat(0.05, 0.05)),
+                pricing_tiers: Vec::new(),
+                supports_thinking: None,
+            },
+        );
+        // Feed row on the vendor alias: $2.50/M each — far higher.
+        registry
+            .refresh(&FixtureFeed(vec![CatalogEntry {
+                provider: "vendor".to_owned(),
+                model_id: "model".to_owned(),
+                context_window: None,
+                max_output_tokens: None,
+                pricing: Some(Pricing::flat(2.5, 2.5)),
+                pricing_tiers: Vec::new(),
+                supports_thinking: None,
+            }]))
+            .await?;
+
+        let provenance = AuditProvenance::new("openai", "vendor/model");
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+
+        // The override wins outright: 1M*0.05 + 1M*0.05 = $0.10, NOT the feed's
+        // $5.00 that a plain max over candidates would pick.
+        let cost = estimate_cost_usd(Some(&registry), &provenance, &usage)
+            .context("the override must price this call")?;
+        assert!((cost - 0.10).abs() < 1e-9, "unexpected cost: {cost}");
+
+        // A $1 cap must NOT trip on the overridden price (it would on the $5
+        // feed row).
+        let limits = UsageLimits {
+            max_cost_usd: Some(1.0),
+            ..Default::default()
+        };
+        assert!(
+            status(Some(&limits), Some(&registry), &provenance, &usage, None).is_none(),
+            "an overridden price must not trip a cap it is under",
+        );
+        Ok(())
+    }
+
     /// A preferred candidate's flat row must not shadow a later candidate's
     /// tiered row for a long call. `models.dev` files the `OpenRouter` route row
     /// for `google/gemini-2.5-pro` flat, while the native `gemini-2.5-pro` row
     /// carries the ≥200K band; a routed call reaches both, and the max of the
     /// two complete estimates bills the tier for a long call while a short call
-    /// stays on the flat route rate.
+    /// stays on the flat route rate. (No override exists here, so the max
+    /// applies — the same-authority path.)
     #[tokio::test]
     async fn tiered_sibling_is_not_shadowed_by_a_flat_route_row() -> Result<()> {
         // The `openrouter` service section files the route flat (no tiers); the
