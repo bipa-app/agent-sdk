@@ -109,12 +109,16 @@ fn estimate_scoped(
                     estimator.estimate_aggregate_cost_usd(&provider, &model, &usage)
                 }
             })
-            // A non-finite estimate (an estimator returning NaN, or a NaN
-            // override rate) must not enter the max: `f64::total_cmp` ranks NaN
-            // above every finite value, so an unfiltered NaN would win the max
-            // and then compare false against `max_cost_usd`, silently disabling
-            // the cap while valid candidates existed.
-            .filter(|cost| cost.is_finite())
+            // Reject NaN and −∞; keep +∞. `f64::total_cmp` ranks NaN above every
+            // finite value, so an unfiltered NaN would win the max and then
+            // compare false against `max_cost_usd`, silently disabling the cap
+            // while valid candidates existed. −∞ is a nonsensical price that can
+            // only win an empty field, and would then poison the accumulator and
+            // compare false against the cap — same fail-open. +∞ is DIFFERENT: a
+            // legitimate unbounded over-estimate (a custom estimator, or a
+            // rate×tokens overflow), and it must trip any finite cap, so it stays
+            // in the max.
+            .filter(|cost| !cost.is_nan() && *cost != f64::NEG_INFINITY)
             .max_by(f64::total_cmp);
         if let Some(cost) = best {
             return Some(cost);
@@ -505,6 +509,30 @@ mod tests {
         }
     }
 
+    /// Prices one candidate key `NaN` and another `+∞` — a legitimate unbounded
+    /// over-estimate that must survive the filter and trip any finite cap.
+    struct NanThenPosInfPricing;
+
+    impl CostEstimator for NanThenPosInfPricing {
+        fn estimate_cost_usd(&self, provider: &str, _model: &str, _usage: &Usage) -> Option<f64> {
+            match provider {
+                "openrouter" => Some(f64::NAN),
+                "vendor" => Some(f64::INFINITY),
+                _ => None,
+            }
+        }
+    }
+
+    /// Prices its only resolvable candidate `−∞` — a nonsensical price that must
+    /// be dropped, leaving the call un-priced rather than poisoned.
+    struct NegInfOnlyPricing;
+
+    impl CostEstimator for NegInfOnlyPricing {
+        fn estimate_cost_usd(&self, provider: &str, _model: &str, _usage: &Usage) -> Option<f64> {
+            (provider == "vendor").then_some(f64::NEG_INFINITY)
+        }
+    }
+
     fn one_million_each() -> TokenUsage {
         TokenUsage {
             input_tokens: 1_000_000,
@@ -542,6 +570,72 @@ mod tests {
         .context("the finite estimate must trip the cost limit")?;
         assert_eq!(limit, BudgetLimitKind::CostUsd);
         Ok(())
+    }
+
+    #[test]
+    fn positive_infinity_estimate_survives_and_trips_the_cap() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let provenance = AuditProvenance::new("openai", "vendor/model");
+        let usage = one_million_each();
+
+        // NaN is dropped; +∞ survives the filter as the max.
+        let cost = estimate_cost_usd(Some(&NanThenPosInfPricing), &provenance, &usage)
+            .context("+inf must survive as the estimate")?;
+        assert!(
+            cost.is_infinite() && cost > 0.0,
+            "expected +inf, got {cost}"
+        );
+
+        // +∞ trips any finite cap immediately.
+        let limits = UsageLimits {
+            max_cost_usd: Some(1_000_000.0),
+            ..Default::default()
+        };
+        let (limit, _) = status(
+            Some(&limits),
+            Some(&NanThenPosInfPricing),
+            &provenance,
+            &usage,
+            None,
+        )
+        .context("+inf must trip a finite cost cap")?;
+        assert_eq!(limit, BudgetLimitKind::CostUsd);
+
+        // And a +∞ accumulator, folded from a +∞ delta, still trips on a later
+        // turn (the fold is `0.0 + ∞ = ∞`, and `∞ > cap` stays true).
+        let mut state = AgentState::new(ThreadId::new());
+        accumulate_cost(
+            &mut state,
+            Some(&NanThenPosInfPricing),
+            &provenance,
+            &TokenUsage::default(),
+            &usage,
+            UsageScope::Call,
+        );
+        let accumulated = state
+            .accumulated_cost_usd
+            .context("the +inf delta must accumulate")?;
+        assert!(accumulated.is_infinite() && accumulated > 0.0);
+        let (limit, _) = status(
+            Some(&limits),
+            Some(&NanThenPosInfPricing),
+            &provenance,
+            &usage,
+            state.accumulated_cost_usd,
+        )
+        .context("a +inf accumulator must keep tripping")?;
+        assert_eq!(limit, BudgetLimitKind::CostUsd);
+        Ok(())
+    }
+
+    #[test]
+    fn negative_infinity_estimate_is_dropped() {
+        let provenance = AuditProvenance::new("openai", "vendor/model");
+        let usage = one_million_each();
+        // −∞ is the only candidate estimate; filtering it leaves the catalog
+        // with nothing, and the static table has no such model — so the call is
+        // un-priced rather than billed at a poisoned −∞.
+        assert!(estimate_cost_usd(Some(&NegInfOnlyPricing), &provenance, &usage).is_none());
     }
 
     #[test]
