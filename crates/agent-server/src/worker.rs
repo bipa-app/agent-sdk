@@ -89,6 +89,7 @@ pub mod activity;
 pub mod bootstrap;
 pub mod compaction;
 pub mod confirmation;
+pub mod connectivity;
 pub mod definition;
 pub mod registry;
 pub mod root_turn;
@@ -132,6 +133,7 @@ mod tool_task_test;
 
 pub use activity::{ActivityBeacon, ActivityTrackingEventRepo};
 pub use bootstrap::{WorkerBootstrapContext, resolve_bootstrap_context};
+pub use connectivity::{ConnectivityWait, ConnectivityWaitGuard, ConnectivityWaitRegistry};
 pub use definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
 pub use registry::{AgentDefinitionRegistry, InMemoryAgentDefinitionRegistry};
 pub use root_turn::{

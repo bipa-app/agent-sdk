@@ -2181,6 +2181,7 @@ async fn execute_root_task(
             deps.cancel = Some(cancel);
             deps.wakeup = runtime.wakeup_signal();
             deps.wire_activity(activity, &tracked_event_repo);
+            deps.connectivity_waits = Some(runtime.connectivity_waits());
             resume_for_steering(inputs, &task, provider.as_ref(), &deps, now)
                 .await
                 .context("resume parked root task for steering wake")
@@ -2194,6 +2195,7 @@ async fn execute_root_task(
             deps.cancel = Some(cancel);
             deps.wakeup = runtime.wakeup_signal();
             deps.wire_activity(activity, &tracked_event_repo);
+            deps.connectivity_waits = Some(runtime.connectivity_waits());
             resume_from_children(inputs, &task, provider.as_ref(), &deps, now)
                 .await
                 .context("resume root task from durable child results")
@@ -2208,6 +2210,7 @@ async fn execute_root_task(
             deps.cancel = Some(cancel);
             deps.wakeup = runtime.wakeup_signal();
             deps.wire_activity(activity, &tracked_event_repo);
+            deps.connectivity_waits = Some(runtime.connectivity_waits());
             agent_server::worker::execute_root_turn(
                 inputs,
                 user_input,

@@ -685,6 +685,7 @@ impl StoreRegistry {
             cancel: None,
             wakeup: None,
             activity: None,
+            connectivity_waits: None,
         }
     }
 

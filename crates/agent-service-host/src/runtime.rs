@@ -76,6 +76,12 @@ pub struct ExecutionRuntime {
     /// library consumer that never runs the service host, which
     /// preserves the poll-only behaviour unchanged.
     wakeup_signal: OnceLock<Arc<WakeupSignal>>,
+    /// Live registry of connectivity-parked threads (see
+    /// [`agent_server::worker::ConnectivityWaitRegistry`]). Created with
+    /// the runtime and handed to every root-turn execution; hosts clone
+    /// the handle for their sweeps and status RPCs. All runtime clones
+    /// share one underlying map.
+    connectivity_waits: agent_server::worker::ConnectivityWaitRegistry,
 }
 
 impl ExecutionRuntime {
@@ -92,6 +98,7 @@ impl ExecutionRuntime {
             subagent_spawn_selector: Arc::new(NoopSubagentSpawnSelector),
             compaction_config: None,
             wakeup_signal: OnceLock::new(),
+            connectivity_waits: agent_server::worker::ConnectivityWaitRegistry::new(),
         }
     }
 
@@ -134,6 +141,14 @@ impl ExecutionRuntime {
     pub const fn with_compaction(mut self, config: CompactionConfig) -> Self {
         self.compaction_config = Some(config);
         self
+    }
+
+    /// The live connectivity-wait registry shared by every execution this
+    /// runtime drives. Hosts clone the handle to observe which threads are
+    /// parked waiting out an offline provider.
+    #[must_use]
+    pub const fn connectivity_waits(&self) -> &agent_server::worker::ConnectivityWaitRegistry {
+        &self.connectivity_waits
     }
 
     #[must_use]
