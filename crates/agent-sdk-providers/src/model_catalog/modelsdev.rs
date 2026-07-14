@@ -18,6 +18,8 @@ struct ModelsDevCost {
     cache_read: Option<f64>,
     #[serde(default)]
     cache_write: Option<f64>,
+    #[serde(default)]
+    reasoning: Option<f64>,
     /// Long-context price bands. The feed publishes these for frontier models
     /// (GPT-5.x above 272K input tokens, Gemini / Claude above 200K).
     #[serde(default)]
@@ -100,13 +102,20 @@ fn pricing_from_rates(
     output: Option<f64>,
     cache_read: Option<f64>,
     cache_write: Option<f64>,
+    reasoning: Option<f64>,
 ) -> Option<Pricing> {
     let input = input.and_then(modelsdev_price_per_million);
     let output = output.and_then(modelsdev_price_per_million);
     let cached_input = cache_read.and_then(modelsdev_price_per_million);
     let cache_write = cache_write.and_then(modelsdev_price_per_million);
+    let reasoning = reasoning.and_then(modelsdev_price_per_million);
 
-    if input.is_none() && output.is_none() && cached_input.is_none() && cache_write.is_none() {
+    if input.is_none()
+        && output.is_none()
+        && cached_input.is_none()
+        && cache_write.is_none()
+        && reasoning.is_none()
+    {
         return None;
     }
     Some(Pricing {
@@ -114,12 +123,19 @@ fn pricing_from_rates(
         output,
         cached_input,
         cache_write,
+        reasoning,
         notes: None,
     })
 }
 
 fn pricing_from_modelsdev_cost(cost: &ModelsDevCost) -> Option<Pricing> {
-    pricing_from_rates(cost.input, cost.output, cost.cache_read, cost.cache_write)
+    pricing_from_rates(
+        cost.input,
+        cost.output,
+        cost.cache_read,
+        cost.cache_write,
+        cost.reasoning,
+    )
 }
 
 /// The `context` tiers of a cost row, ascending.
@@ -141,8 +157,16 @@ fn tiers_from_modelsdev_cost(cost: &ModelsDevCost) -> Option<Vec<PricingTier>> {
             if bound.bound_type.as_deref() != Some("context") {
                 return None;
             }
-            let band =
-                pricing_from_rates(tier.input, tier.output, tier.cache_read, tier.cache_write)?;
+            // A context tier restates rate-per-token bands; the feed does not
+            // publish a per-tier reasoning rate, so the base row's carries over
+            // through `merge_band_over_base`.
+            let band = pricing_from_rates(
+                tier.input,
+                tier.output,
+                tier.cache_read,
+                tier.cache_write,
+                None,
+            )?;
             Some(PricingTier {
                 // The bound is inclusive: the models.dev SDK schema documents
                 // `tier.size` as "Context size (in tokens) at which this tier
@@ -456,6 +480,38 @@ mod tests {
                 .context("cache_write")?
                 .usd_per_million_tokens
                 - 1.25)
+                .abs()
+                < f64::EPSILON
+        );
+        Ok(())
+    }
+
+    /// The feed's `cost.reasoning` rate is parsed onto `Pricing`. Live rows
+    /// price reasoning above output (`alibaba/qwen3-32b`: output 2.8, reasoning
+    /// 8.4), which the output band's `max(output, reasoning)` must reach.
+    #[test]
+    fn parse_modelsdev_reads_reasoning_rate() -> Result<()> {
+        const REASONING_FIXTURE: &str = r#"{
+          "alibaba": {
+            "id": "alibaba",
+            "models": {
+              "qwen3-32b": {
+                "id": "qwen3-32b",
+                "cost": { "input": 0.7, "output": 2.8, "reasoning": 8.4 }
+              }
+            }
+          }
+        }"#;
+
+        let entries = parse_modelsdev(REASONING_FIXTURE)?;
+        let row = find(&entries, "alibaba", "qwen3-32b")?;
+        let pricing = row.pricing.context("pricing missing")?;
+        assert!(
+            (pricing
+                .reasoning
+                .context("reasoning")?
+                .usd_per_million_tokens
+                - 8.4)
                 .abs()
                 < f64::EPSILON
         );

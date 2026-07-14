@@ -686,6 +686,7 @@ mod tests {
                     output: None,
                     cached_input: None,
                     cache_write: None,
+                    reasoning: None,
                     notes: None,
                 }),
                 pricing_tiers: Vec::new(),

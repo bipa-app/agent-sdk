@@ -20,6 +20,10 @@ struct OpenRouterPricing {
     /// not request.
     #[serde(default)]
     input_cache_write: Option<String>,
+    /// Reasoning-token rate, when the route prices reasoning apart from
+    /// completion. Billed as the output band's rate via `max(output, reasoning)`.
+    #[serde(default)]
+    internal_reasoning: Option<String>,
     /// Long-context price bands: from `min_prompt_tokens` upwards the route
     /// bills at these rates instead. Gemini 2.5 Pro doubles its input rate
     /// above 200K tokens this way, GPT-5.x above 272K.
@@ -133,6 +137,7 @@ fn base_pricing(pricing: &OpenRouterPricing) -> Option<Pricing> {
         pricing.completion.as_deref(),
         pricing.input_cache_read.as_deref(),
         pricing.input_cache_write.as_deref(),
+        pricing.internal_reasoning.as_deref(),
     )
 }
 
@@ -141,13 +146,20 @@ fn pricing_from_rates(
     completion: Option<&str>,
     input_cache_read: Option<&str>,
     input_cache_write: Option<&str>,
+    internal_reasoning: Option<&str>,
 ) -> Option<Pricing> {
     let input = prompt.and_then(openrouter_price_per_million);
     let output = completion.and_then(openrouter_price_per_million);
     let cached_input = input_cache_read.and_then(openrouter_price_per_million);
     let cache_write = input_cache_write.and_then(openrouter_price_per_million);
+    let reasoning = internal_reasoning.and_then(openrouter_price_per_million);
 
-    if input.is_none() && output.is_none() && cached_input.is_none() && cache_write.is_none() {
+    if input.is_none()
+        && output.is_none()
+        && cached_input.is_none()
+        && cache_write.is_none()
+        && reasoning.is_none()
+    {
         return None;
     }
     Some(Pricing {
@@ -155,6 +167,7 @@ fn pricing_from_rates(
         output,
         cached_input,
         cache_write,
+        reasoning,
         notes: None,
     })
 }
@@ -196,11 +209,14 @@ fn tiers_from_openrouter_pricing(
 ) -> Option<Vec<PricingTier>> {
     let mut bands: Vec<(u32, Pricing)> = Vec::with_capacity(pricing.overrides.len());
     for band in &pricing.overrides {
+        // Overrides do not restate a reasoning rate, so the base row's carries
+        // over through `merge_band_over_base`.
         let rates = pricing_from_rates(
             band.prompt.as_deref(),
             band.completion.as_deref(),
             band.input_cache_read.as_deref(),
             band.input_cache_write.as_deref(),
+            None,
         )?;
         // A band that bills only a cache component, with no input or output
         // rate of its own, is not a price band this parser can stand behind.

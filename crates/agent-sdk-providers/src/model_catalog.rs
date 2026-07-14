@@ -124,6 +124,7 @@ pub fn merge_band_over_base(base: Option<Pricing>, band: Pricing) -> Pricing {
         output: band.output.or(base.output),
         cached_input: band.cached_input.or(base.cached_input),
         cache_write: band.cache_write.or(base.cache_write),
+        reasoning: band.reasoning.or(base.reasoning),
         notes: band.notes.or(base.notes),
     }
 }

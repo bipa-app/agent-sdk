@@ -91,16 +91,28 @@ fn estimate_scoped(
     let provider = provenance.provider.as_str();
     let model = provenance.model.as_str();
 
-    if let Some(estimator) = pricing
-        && let Some(cost) =
-            catalog_candidates(provider, model).find_map(|(provider, model)| match scope {
+    if let Some(estimator) = pricing {
+        // The MAX of every candidate estimate, not the first that resolves. A
+        // preferred candidate (route key, gateway key) can carry a flat row
+        // where a later candidate — the vendor's own — publishes the tier a
+        // long call falls in: models.dev's `openrouter/google/gemini-2.5-pro`
+        // route row is flat while its native `gemini-2.5-pro` carries the ≥200K
+        // band. First-Some would take the flat route estimate and under-bill
+        // the long call. Each estimate is computed WHOLLY from one row, so no
+        // rates are blended; taking the larger never bills below the best
+        // evidence in the candidate set, and the route/service price still wins
+        // whenever it is genuinely the higher one (see [`catalog_candidates`]).
+        let best = catalog_candidates(provider, model)
+            .filter_map(|(provider, model)| match scope {
                 UsageScope::Call => estimator.estimate_cost_usd(&provider, &model, &usage),
                 UsageScope::Aggregate => {
                     estimator.estimate_aggregate_cost_usd(&provider, &model, &usage)
                 }
             })
-    {
-        return Some(cost);
+            .max_by(f64::total_cmp);
+        if let Some(cost) = best {
+            return Some(cost);
+        }
     }
 
     // The compiled-in table prices every model at one flat rate, so the scope
@@ -120,6 +132,12 @@ fn estimate_scoped(
 /// OpenRouter-routed `anthropic/claude-fable-5` would start pricing at
 /// Anthropic's direct-API rate, which is not what that run pays. Without a
 /// catalog the loop must price exactly as it always has.
+///
+/// The order still matters even though the caller takes the **max** estimate
+/// across these keys rather than the first that resolves (see
+/// [`estimate_cost_usd`]): the max is what keeps a route/service row that lacks
+/// a tier from shadowing the vendor's tiered row for a long call, while the
+/// route/service price still wins whenever it is genuinely the higher one.
 ///
 /// Items are [`Cow`] because most keys borrow the provenance, but a gateway
 /// service key owns a freshly prefixed model id (see
@@ -1024,6 +1042,85 @@ mod catalog_tests {
             .context("gpt-4o is priced in the static table")?;
         assert!((cost - statically_priced).abs() < 1e-12);
         assert!((cost - 0.0075).abs() < 1e-9, "unexpected cost: {cost}");
+        Ok(())
+    }
+
+    /// A preferred candidate's flat row must not shadow a later candidate's
+    /// tiered row for a long call. `models.dev` files the `OpenRouter` route row
+    /// for `google/gemini-2.5-pro` flat, while the native `gemini-2.5-pro` row
+    /// carries the ≥200K band; a routed call reaches both, and the max of the
+    /// two complete estimates bills the tier for a long call while a short call
+    /// stays on the flat route rate.
+    #[tokio::test]
+    async fn tiered_sibling_is_not_shadowed_by_a_flat_route_row() -> Result<()> {
+        // The `openrouter` service section files the route flat (no tiers); the
+        // `google` native section (remapped to `gemini`) carries the tier.
+        const MODELSDEV_ROUTE_AND_NATIVE_FIXTURE: &str = r#"{
+          "openrouter": {
+            "id": "openrouter",
+            "models": {
+              "google/gemini-2.5-pro": {
+                "id": "google/gemini-2.5-pro",
+                "cost": { "input": 1.25, "output": 10 }
+              }
+            }
+          },
+          "google": {
+            "id": "google",
+            "models": {
+              "gemini-2.5-pro": {
+                "id": "gemini-2.5-pro",
+                "cost": {
+                  "input": 1.25,
+                  "output": 10,
+                  "tiers": [
+                    {
+                      "input": 2.5,
+                      "output": 15,
+                      "tier": { "type": "context", "size": 200000 }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }"#;
+
+        let registry =
+            registry_from_entries(parse_modelsdev(MODELSDEV_ROUTE_AND_NATIVE_FIXTURE)?).await?;
+        // Open models route through OpenAIProvider: provenance is the router
+        // slug under `openai`.
+        let provenance = AuditProvenance::new("openai", "google/gemini-2.5-pro");
+
+        // Below the 200K band: route flat and native base agree — 100K in +
+        // 100K out = 0.1*1.25 + 0.1*10 = 1.125.
+        let short = TokenUsage {
+            input_tokens: 100_000,
+            output_tokens: 100_000,
+            ..Default::default()
+        };
+        let short_cost = estimate_cost_usd(Some(&registry), &provenance, &short)
+            .context("the route row prices a short call")?;
+        assert!(
+            (short_cost - 1.125).abs() < 1e-9,
+            "unexpected short cost: {short_cost}"
+        );
+
+        // 300K in + 100K out: the native tier ($2.5/$15) says
+        // 0.3*2.5 + 0.1*15 = 2.25, the flat route ($1.25/$10) only
+        // 0.3*1.25 + 0.1*10 = 1.375. The max bills the tier — the route row
+        // must not shadow it.
+        let long = TokenUsage {
+            input_tokens: 300_000,
+            output_tokens: 100_000,
+            ..Default::default()
+        };
+        let long_cost = estimate_cost_usd(Some(&registry), &provenance, &long)
+            .context("the tiered native row must price a long call")?;
+        assert!(
+            (long_cost - 2.25).abs() < 1e-9,
+            "unexpected long cost: {long_cost}"
+        );
         Ok(())
     }
 
