@@ -740,44 +740,6 @@ struct CancelMarkerCandidate {
     continuation_usage: Option<TokenUsage>,
 }
 
-/// Persistent store for [`AgentTask`] rows.
-///
-/// Implementations are required to expose the index surface documented on
-/// the [`super`] module. The reference in-memory implementation below is
-/// used in tests and also acts as the semantic spec for any future SQL- or
-/// Redis-backed store.
-///
-/// # CAS discipline (Phase 2.7)
-///
-/// Every **state transition** a worker drives goes through a CAS-guarded
-/// method on this trait. The `(worker_id, lease_id)` tuple on every
-/// `Running` row is the ownership token — no mutation reaches the row
-/// unless the caller proves it holds the current lease.
-///
-/// **Structural primitives** (`insert`, `update`, `clear`) exist for
-/// store rehydration, test scaffolding, and internal batch plumbing.
-/// Worker code must never use them to drive lifecycle transitions —
-/// use the CAS helpers below instead.
-///
-/// ## Worker-visible CAS entry points
-///
-/// | Method | Transition | Guards |
-/// |--------|------------|--------|
-/// | [`submit_root_turn`](Self::submit_root_turn) | → `Pending` / `Queued` | kind, status, root invariants |
-/// | [`promote_next_queued_root`](Self::promote_next_queued_root) | `Queued` → `Pending` | active-root slot free |
-/// | [`try_acquire_task`](Self::try_acquire_task) / [`acquire_next_runnable`](Self::acquire_next_runnable) | `Pending` → `Running` | status CAS, retry budget |
-/// | [`heartbeat_task`](Self::heartbeat_task) | `Running` → `Running` | `(worker, lease)` CAS |
-/// | [`pause_on_children`](Self::pause_on_children) | `Running` → `WaitingOnChildren` | `(worker, lease)` CAS |
-/// | [`pause_on_confirmation`](Self::pause_on_confirmation) | `Running` → `AwaitingConfirmation` | `(worker, lease)` CAS |
-/// | [`spawn_tool_children`](Self::spawn_tool_children) | parent `Running` → `WaitingOnChildren` + children `Pending` | `(worker, lease)` CAS, non-leaf |
-/// | [`spawn_subagent_invocation`](Self::spawn_subagent_invocation) | parent `Running` → `WaitingOnChildren` + invocation `WaitingOnChildren` + child root `Pending` | `(worker, lease)` CAS, non-leaf |
-/// | [`complete_task`](Self::complete_task) | `Running` → `Completed` + parent recompute | `(worker, lease)` CAS |
-/// | [`fail_task`](Self::fail_task) | `Running` → `Failed` + parent recompute | `(worker, lease)` CAS |
-/// | [`resume_from_confirmation`](Self::resume_from_confirmation) | `AwaitingConfirmation` → `Pending` | status CAS |
-/// | [`approve_confirmation_and_acquire`](Self::approve_confirmation_and_acquire) | `AwaitingConfirmation` → `Running` | status CAS, retry budget |
-/// | [`reject_confirmation`](Self::reject_confirmation) | `AwaitingConfirmation` → `Failed` + parent recompute | status CAS |
-/// | [`cancel_tree`](Self::cancel_tree) | subtree → `Cancelled` | existence check |
-/// | [`release_expired_leases`](Self::release_expired_leases) | `Running` → `Pending` / `Failed` | lease-expiry CAS, recovery matrix |
 /// The bounded result of [`AgentTaskStore::probe_children`].
 #[derive(Debug, Default, Clone)]
 pub struct ChildProbe {
@@ -822,6 +784,45 @@ impl ChildProbe {
         out
     }
 }
+
+/// Persistent store for [`AgentTask`] rows.
+///
+/// Implementations are required to expose the index surface documented on
+/// the [`super`] module. The reference in-memory implementation below is
+/// used in tests and also acts as the semantic spec for any future SQL- or
+/// Redis-backed store.
+///
+/// # CAS discipline (Phase 2.7)
+///
+/// Every **state transition** a worker drives goes through a CAS-guarded
+/// method on this trait. The `(worker_id, lease_id)` tuple on every
+/// `Running` row is the ownership token — no mutation reaches the row
+/// unless the caller proves it holds the current lease.
+///
+/// **Structural primitives** (`insert`, `update`, `clear`) exist for
+/// store rehydration, test scaffolding, and internal batch plumbing.
+/// Worker code must never use them to drive lifecycle transitions —
+/// use the CAS helpers below instead.
+///
+/// ## Worker-visible CAS entry points
+///
+/// | Method | Transition | Guards |
+/// |--------|------------|--------|
+/// | [`submit_root_turn`](Self::submit_root_turn) | → `Pending` / `Queued` | kind, status, root invariants |
+/// | [`promote_next_queued_root`](Self::promote_next_queued_root) | `Queued` → `Pending` | active-root slot free |
+/// | [`try_acquire_task`](Self::try_acquire_task) / [`acquire_next_runnable`](Self::acquire_next_runnable) | `Pending` → `Running` | status CAS, retry budget |
+/// | [`heartbeat_task`](Self::heartbeat_task) | `Running` → `Running` | `(worker, lease)` CAS |
+/// | [`pause_on_children`](Self::pause_on_children) | `Running` → `WaitingOnChildren` | `(worker, lease)` CAS |
+/// | [`pause_on_confirmation`](Self::pause_on_confirmation) | `Running` → `AwaitingConfirmation` | `(worker, lease)` CAS |
+/// | [`spawn_tool_children`](Self::spawn_tool_children) | parent `Running` → `WaitingOnChildren` + children `Pending` | `(worker, lease)` CAS, non-leaf |
+/// | [`spawn_subagent_invocation`](Self::spawn_subagent_invocation) | parent `Running` → `WaitingOnChildren` + invocation `WaitingOnChildren` + child root `Pending` | `(worker, lease)` CAS, non-leaf |
+/// | [`complete_task`](Self::complete_task) | `Running` → `Completed` + parent recompute | `(worker, lease)` CAS |
+/// | [`fail_task`](Self::fail_task) | `Running` → `Failed` + parent recompute | `(worker, lease)` CAS |
+/// | [`resume_from_confirmation`](Self::resume_from_confirmation) | `AwaitingConfirmation` → `Pending` | status CAS |
+/// | [`approve_confirmation_and_acquire`](Self::approve_confirmation_and_acquire) | `AwaitingConfirmation` → `Running` | status CAS, retry budget |
+/// | [`reject_confirmation`](Self::reject_confirmation) | `AwaitingConfirmation` → `Failed` + parent recompute | status CAS |
+/// | [`cancel_tree`](Self::cancel_tree) | subtree → `Cancelled` | existence check |
+/// | [`release_expired_leases`](Self::release_expired_leases) | `Running` → `Pending` / `Failed` | lease-expiry CAS, recovery matrix |
 
 #[async_trait]
 pub trait AgentTaskStore: Send + Sync {
