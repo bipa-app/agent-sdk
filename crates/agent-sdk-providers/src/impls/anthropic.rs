@@ -8,7 +8,9 @@ pub(crate) mod data;
 
 use crate::attachments::validate_request_attachments;
 use crate::provider::{LlmProvider, thinking_for_forced_tool};
-use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind};
+use crate::streaming::{
+    StreamBox, StreamDelta, StreamErrorKind, reqwest_body_error_delta, reqwest_error_delta,
+};
 use agent_sdk_foundation::llm::{
     CacheTtl, ChatOutcome, ChatRequest, ChatResponse, ContentBlock, ThinkingConfig, ThinkingMode,
     Usage,
@@ -888,8 +890,8 @@ impl LlmProvider for AnthropicProvider {
             let send = self.apply_auth(builder).json(&api_request).send();
             let response = match tokio::time::timeout(headers_timeout, send).await {
                 Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
-                    yield Err(anyhow::anyhow!("request failed: {e}"));
+                Ok(Err(error)) => {
+                    yield Ok(reqwest_error_delta("request failed", &error));
                     return;
                 }
                 Err(_elapsed) => {
@@ -897,10 +899,13 @@ impl LlmProvider for AnthropicProvider {
                         "Anthropic streaming request timed out awaiting response headers after {}s — stalled connection",
                         headers_timeout.as_secs()
                     );
-                    yield Err(anyhow::anyhow!(
-                        "request timed out awaiting response headers after {}s — treating as a stalled connection",
-                        headers_timeout.as_secs()
-                    ));
+                    yield Ok(StreamDelta::Error {
+                        message: format!(
+                            "request timed out awaiting response headers after {}s",
+                            headers_timeout.as_secs()
+                        ),
+                        kind: StreamErrorKind::ConnectionLost,
+                    });
                     return;
                 }
             };
@@ -992,19 +997,22 @@ impl LlmProvider for AnthropicProvider {
                             "SSE stream timed out: no bytes for {}s chunk_count={chunk_count} total_bytes={total_bytes} — stalled connection",
                             byte_idle_timeout.as_secs()
                         );
-                        yield Err(anyhow::anyhow!(
-                            "SSE stream timed out: no bytes for {}s — treating as a stalled connection",
-                            byte_idle_timeout.as_secs()
-                        ));
+                        yield Ok(StreamDelta::Error {
+                            message: format!(
+                                "SSE stream timed out: no bytes for {}s",
+                                byte_idle_timeout.as_secs()
+                            ),
+                            kind: StreamErrorKind::ConnectionLost,
+                        });
                         return;
                     }
                 };
                 let Some(chunk_result) = next else { break };
                 let chunk = match chunk_result {
                     Ok(c) => c,
-                    Err(e) => {
-                        log::error!("Stream error while reading chunk error={e} chunk_count={chunk_count} total_bytes={total_bytes}");
-                        yield Err(anyhow::anyhow!("stream error: {e}"));
+                    Err(error) => {
+                        log::error!("Stream error while reading chunk error={error} chunk_count={chunk_count} total_bytes={total_bytes}");
+                        yield Ok(reqwest_body_error_delta("stream error", &error));
                         return;
                     }
                 };
@@ -1780,7 +1788,7 @@ mod tests {
     /// must surface a retryable "timed out" error instead of hanging
     /// until an external watchdog kills the caller.
     #[tokio::test]
-    async fn streaming_headers_stall_yields_timeout_error() {
+    async fn streaming_headers_stall_yields_connection_lost_error() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1804,13 +1812,13 @@ mod tests {
             .await;
 
         assert_eq!(items.len(), 1, "a stalled send yields exactly one item");
-        let err = items[0]
-            .as_ref()
-            .expect_err("headers stall must surface as Err");
+        let Some(Ok(StreamDelta::Error { message, kind })) = items.first() else {
+            panic!("headers stall must surface as a classified error: {items:?}")
+        };
+        assert_eq!(*kind, StreamErrorKind::ConnectionLost);
         assert!(
-            err.to_string()
-                .contains("timed out awaiting response headers"),
-            "message must name the headers stall: {err}"
+            message.contains("timed out awaiting response headers"),
+            "message must name the headers stall: {message}"
         );
     }
 
@@ -1819,7 +1827,7 @@ mod tests {
     /// "timed out" error. Hand-rolled server: wiremock cannot hold a
     /// connection open mid-body.
     #[tokio::test]
-    async fn sse_byte_stall_yields_timeout_error() {
+    async fn sse_byte_stall_yields_connectivity_error() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1857,11 +1865,13 @@ mod tests {
             .collect()
             .await;
 
-        let last = items.last().expect("at least the stall error");
-        let err = last.as_ref().expect_err("byte stall must surface as Err");
+        let Some(Ok(StreamDelta::Error { message, kind })) = items.last() else {
+            panic!("byte stall must surface as a classified error: {items:?}")
+        };
+        assert_eq!(*kind, StreamErrorKind::ConnectionLost);
         assert!(
-            err.to_string().contains("no bytes for"),
-            "message must name the byte stall: {err}"
+            message.contains("no bytes for"),
+            "message must name the byte stall: {message}"
         );
         server.abort();
     }

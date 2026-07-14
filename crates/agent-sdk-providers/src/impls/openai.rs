@@ -25,7 +25,10 @@
 use crate::attachments::request_has_attachments;
 use crate::model_features::{ModelApiSurface, get_model_features};
 use crate::provider::LlmProvider;
-use crate::streaming::{SseLineBuffer, StreamBox, StreamDelta, StreamErrorKind};
+use crate::streaming::{
+    SseLineBuffer, StreamBox, StreamDelta, StreamErrorKind, reqwest_body_error_delta,
+    reqwest_error_delta,
+};
 use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, StopReason, ThinkingConfig,
     ToolChoice, Usage,
@@ -981,14 +984,17 @@ impl LlmProvider for OpenAIProvider {
             let stream_builder = self.client
                 .post(format!("{}/chat/completions", self.base_url))
                 .header("Content-Type", "application/json");
-            let Ok(response) = self
+            let response = match self
                 .apply_headers(stream_builder)
                 .json(&api_request)
                 .send()
                 .await
-            else {
-                yield Err(anyhow::anyhow!("request failed"));
-                return;
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    yield Ok(reqwest_error_delta("request failed", &error));
+                    return;
+                }
             };
 
             let status = response.status();
@@ -1027,14 +1033,11 @@ impl LlmProvider for OpenAIProvider {
                 let chunk = match chunk_result {
                     Ok(chunk) => chunk,
                     Err(error) => {
-                        // A trailing usage-only chunk may have been recorded but
-                        // not yet finalized (finalization waits for [DONE]). The
-                        // provider billed those tokens, so surface the usage
-                        // before the transport error ends the stream.
+                        // Usage can precede the transport failure and remains billable.
                         if let Some(usage) = usage.take() {
                             yield Ok(StreamDelta::Usage(usage));
                         }
-                        yield Err(anyhow::anyhow!("stream error: {error}"));
+                        yield Ok(reqwest_body_error_delta("stream error", &error));
                         return;
                     }
                 };

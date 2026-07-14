@@ -332,7 +332,12 @@ where
             event_ctx,
             config,
             attempt,
+            event_attempt: attempt,
+            settled_event_attempt: attempt.saturating_sub(1),
             max_retries,
+            event_max_retries: max_retries,
+            emit_event: true,
+            minimum_delay: std::time::Duration::ZERO,
             error_kind: kind,
             retry_reason,
             failure_message,
@@ -359,11 +364,70 @@ enum RetryStep {
     GiveUp(LlmOutcome),
 }
 
+fn fatal_stream_outcome(message: &str) -> LlmOutcome {
+    error!("Streaming error (non-recoverable): {message}");
+    LlmOutcome::Error(AgentError::new(
+        format!("Streaming error: {message}"),
+        false,
+    ))
+}
+
+fn terminal_retry_outcome(
+    step: RetryStep,
+    retries: u32,
+    usage: &Usage,
+) -> Option<(LlmOutcome, u32)> {
+    match step {
+        RetryStep::Retry => None,
+        RetryStep::Cancelled => Some((LlmOutcome::Cancelled(usage.clone()), retries)),
+        RetryStep::GiveUp(outcome) => Some((outcome, retries)),
+    }
+}
+
+const fn mark_retry_emitted(last_attempt: &mut u32, attempt: u32, emitted: bool) {
+    if emitted {
+        *last_attempt = attempt;
+    }
+}
+
+fn renew_stream_ids(message_id: &mut String, thinking_id: &mut String) {
+    *message_id = uuid::Uuid::new_v4().to_string();
+    *thinking_id = uuid::Uuid::new_v4().to_string();
+}
+
+async fn finish_retry_events<H>(event_ctx: &LlmEventContext<'_, H>, last_attempt: u32)
+where
+    H: AgentHooks,
+{
+    if last_attempt > 0 {
+        send_auto_retry_end_event(event_ctx, last_attempt, true, None).await;
+    }
+}
+
+fn transient_retry_context(
+    message: &str,
+    max_retries: u32,
+    waited_for_connectivity: bool,
+) -> (String, u32) {
+    let failure = format!("Streaming error after {max_retries} retries: {message}");
+    let event_max = if waited_for_connectivity {
+        u32::MAX
+    } else {
+        max_retries
+    };
+    (failure, event_max)
+}
+
 struct RetryBackoff<'a, 'o, H> {
     event_ctx: &'a LlmEventContext<'a, H>,
     config: &'a AgentConfig,
     attempt: u32,
+    event_attempt: u32,
+    settled_event_attempt: u32,
     max_retries: u32,
+    event_max_retries: u32,
+    emit_event: bool,
+    minimum_delay: std::time::Duration,
     /// Stable `error.type` label, e.g. `rate_limited` / `server_error`.
     error_kind: &'static str,
     /// Human-readable reason shown on the `AutoRetryStart` event.
@@ -391,7 +455,12 @@ where
         event_ctx,
         config,
         attempt,
+        event_attempt,
+        settled_event_attempt,
         max_retries,
+        event_max_retries,
+        emit_event,
+        minimum_delay,
         error_kind,
         retry_reason,
         failure_message,
@@ -404,8 +473,13 @@ where
 
     if attempt > max_retries {
         error!("LLM {error_kind} exhausted retries: {failure_message}");
-        send_auto_retry_end_event(event_ctx, attempt - 1, false, Some(failure_message.clone()))
-            .await;
+        send_auto_retry_end_event(
+            event_ctx,
+            settled_event_attempt,
+            false,
+            Some(failure_message.clone()),
+        )
+        .await;
         if let Err(error) = send_llm_error_event(event_ctx, &failure_message).await {
             return RetryStep::GiveUp(LlmOutcome::Error(error));
         }
@@ -415,17 +489,30 @@ where
     // A provider `Retry-After` hint wins over the exponential backoff, but is
     // clamped to the configured ceiling so a hostile/oversized header cannot
     // stall the turn. The attempt still counts against `max_retries`.
-    let delay = override_delay.map_or_else(
-        || calculate_backoff_delay(attempt, &config.retry),
-        |hint| clamp_to_max_delay(hint, config.retry.max_delay_ms),
-    );
+    let delay = override_delay
+        .map_or_else(
+            || calculate_backoff_delay(attempt, &config.retry),
+            |hint| clamp_to_max_delay(hint, config.retry.max_delay_ms),
+        )
+        .max(minimum_delay);
     let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
-    warn!("LLM {error_kind}, retrying (attempt={attempt}, delay_ms={delay_ms})");
+    warn!(
+        "LLM {error_kind}, retrying (retry={event_attempt}, class_attempt={attempt}, delay_ms={delay_ms})"
+    );
     #[cfg(feature = "otel")]
     if let Some(observer) = span_observer {
-        observer.record_retry(attempt, max_retries, delay_ms, error_kind);
+        observer.record_retry(event_attempt, event_max_retries, delay_ms, error_kind);
     }
-    send_auto_retry_start_event(event_ctx, attempt, max_retries, delay_ms, &retry_reason).await;
+    if emit_event {
+        send_auto_retry_start_event(
+            event_ctx,
+            event_attempt,
+            event_max_retries,
+            delay_ms,
+            &retry_reason,
+        )
+        .await;
+    }
     if sleep_or_cancel(delay, event_ctx.cancel_token)
         .await
         .is_break()
@@ -459,6 +546,41 @@ async fn sleep_or_cancel(
     }
 }
 
+struct StreamingRetryState {
+    total: u32,
+    connectivity: u32,
+    transient: u32,
+    last_emitted: u32,
+    /// Usage billed by attempts that died before completing.
+    abandoned_usage: Usage,
+}
+
+impl StreamingRetryState {
+    const fn new() -> Self {
+        Self {
+            total: 0,
+            connectivity: 0,
+            transient: 0,
+            last_emitted: 0,
+            abandoned_usage: ZERO_USAGE,
+        }
+    }
+
+    const fn record_connectivity_failure(&mut self, usage: &Usage) -> bool {
+        add_usage(&mut self.abandoned_usage, usage);
+        self.connectivity = self.connectivity.saturating_add(1);
+        self.total = self.total.saturating_add(1);
+        self.connectivity == 1
+    }
+
+    const fn record_transient_failure(&mut self, usage: &Usage, max_retries: u32) -> bool {
+        add_usage(&mut self.abandoned_usage, usage);
+        self.transient = self.transient.saturating_add(1);
+        self.total = self.total.saturating_add(1);
+        self.transient <= max_retries
+    }
+}
+
 /// Call the LLM with streaming, emitting deltas as they arrive.
 ///
 /// This function handles streaming responses from the LLM, emitting `TextDelta`
@@ -480,18 +602,9 @@ where
     H: AgentHooks,
 {
     let max_retries = config.retry.max_retries;
-    let mut attempt = 0u32;
-    // Usage billed by attempts that died before completing. The provider
-    // charges for the tokens it produced whether or not the stream survived,
-    // so it rides along and is folded into the surviving response — the single
-    // point where usage is committed to the run totals.
-    let mut abandoned_usage = ZERO_USAGE;
+    let mut retry = StreamingRetryState::new();
 
     loop {
-        // Each attempt streams under the *current* ids. On a recoverable
-        // retry below we regenerate them, so the just-failed attempt's
-        // partial deltas stay isolated under their own (abandoned) id rather
-        // than being duplicated under one id with the successful attempt.
         let stream_ids = LlmStreamIds {
             message_id: message_id.as_str(),
             thinking_id: thinking_id.as_str(),
@@ -508,75 +621,82 @@ where
 
         match result {
             Ok(mut response) => {
-                if attempt > 0 {
-                    send_auto_retry_end_event(event_ctx, attempt, true, None).await;
+                finish_retry_events(event_ctx, retry.last_emitted).await;
+                add_usage(&mut response.usage, &retry.abandoned_usage);
+                return (LlmOutcome::Response(response), retry.total);
+            }
+            Err(StreamError::Connectivity { message, usage }) => {
+                let emit_event = retry.record_connectivity_failure(&usage);
+                mark_retry_emitted(&mut retry.last_emitted, retry.total, emit_event);
+                let step = handle_retry_backoff(RetryBackoff {
+                    event_ctx,
+                    config,
+                    attempt: retry.connectivity,
+                    event_attempt: retry.total,
+                    settled_event_attempt: retry.last_emitted,
+                    max_retries: u32::MAX,
+                    event_max_retries: u32::MAX,
+                    emit_event,
+                    minimum_delay: std::time::Duration::from_millis(250),
+                    error_kind: "connectivity",
+                    retry_reason: message.clone(),
+                    failure_message: message,
+                    override_delay: None,
+                    #[cfg(feature = "otel")]
+                    span_observer: span_observer.as_mut(),
+                    #[cfg(not(feature = "otel"))]
+                    _observer: std::marker::PhantomData,
+                })
+                .await;
+                if let Some(outcome) =
+                    terminal_retry_outcome(step, retry.total, &retry.abandoned_usage)
+                {
+                    return outcome;
                 }
-                add_usage(&mut response.usage, &abandoned_usage);
-                return (LlmOutcome::Response(response), attempt);
+                renew_stream_ids(message_id, thinking_id);
             }
             Err(StreamError::Recoverable {
-                message: msg,
+                message,
                 retry_after,
                 usage,
             }) => {
-                add_usage(&mut abandoned_usage, &usage);
-                attempt += 1;
-                if attempt > max_retries {
-                    error!("Streaming error after {max_retries} retries: {msg}");
-                    let err_msg = format!("Streaming error after {max_retries} retries: {msg}");
-                    send_auto_retry_end_event(event_ctx, attempt - 1, false, Some(err_msg.clone()))
-                        .await;
-                    if let Err(error) = send_llm_error_event(event_ctx, &err_msg).await {
-                        return (LlmOutcome::Error(error), attempt);
-                    }
-                    return (LlmOutcome::Error(AgentError::new(err_msg, true)), attempt);
-                }
-                // A provider `Retry-After` hint wins over the exponential
-                // backoff, clamped so an oversized hint cannot stall the turn.
-                let delay = retry_after.map_or_else(
-                    || calculate_backoff_delay(attempt, &config.retry),
-                    |hint| clamp_to_max_delay(hint, config.retry.max_delay_ms),
-                );
-                warn!(
-                    "Streaming error, retrying (attempt={attempt}, delay_ms={}, error={msg})",
-                    delay.as_millis()
-                );
-
-                let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
-                #[cfg(feature = "otel")]
-                if let Some(observer) = span_observer.as_mut() {
-                    observer.record_retry(attempt, max_retries, delay_ms, "stream_error");
-                }
-
-                send_auto_retry_start_event(event_ctx, attempt, max_retries, delay_ms, &msg).await;
-                if sleep_or_cancel(delay, event_ctx.cancel_token)
-                    .await
-                    .is_break()
+                let emits_transient = retry.record_transient_failure(&usage, max_retries);
+                mark_retry_emitted(&mut retry.last_emitted, retry.total, emits_transient);
+                let (failure_message, event_max_retries) =
+                    transient_retry_context(&message, max_retries, retry.connectivity > 0);
+                let step = handle_retry_backoff(RetryBackoff {
+                    event_ctx,
+                    config,
+                    attempt: retry.transient,
+                    event_attempt: retry.total,
+                    settled_event_attempt: retry.last_emitted,
+                    max_retries,
+                    event_max_retries,
+                    emit_event: true,
+                    minimum_delay: std::time::Duration::ZERO,
+                    error_kind: "stream_error",
+                    retry_reason: message,
+                    failure_message,
+                    override_delay: retry_after,
+                    #[cfg(feature = "otel")]
+                    span_observer: span_observer.as_mut(),
+                    #[cfg(not(feature = "otel"))]
+                    _observer: std::marker::PhantomData,
+                })
+                .await;
+                if let Some(outcome) =
+                    terminal_retry_outcome(step, retry.total, &retry.abandoned_usage)
                 {
-                    return (LlmOutcome::Cancelled(abandoned_usage), attempt);
+                    return outcome;
                 }
-                // Fresh ids for the retry attempt so its deltas land under a
-                // distinct message_id. Consumers concatenating TextDelta by
-                // message_id therefore never see the failed attempt's prefix
-                // duplicated into the surviving message.
-                *message_id = uuid::Uuid::new_v4().to_string();
-                *thinking_id = uuid::Uuid::new_v4().to_string();
+                renew_stream_ids(message_id, thinking_id);
             }
-            Err(StreamError::Fatal(msg)) => {
-                error!("Streaming error (non-recoverable): {msg}");
-                return (
-                    LlmOutcome::Error(AgentError::new(format!("Streaming error: {msg}"), false)),
-                    attempt,
-                );
+            Err(StreamError::Fatal(message)) => {
+                return (fatal_stream_outcome(&message), retry.total);
             }
             Err(StreamError::Cancelled(usage)) => {
-                // A cancel raced the stream — terminal, not retried.
-                // No `llm.error` event: the cancellation surfaces as the
-                // run-level `Cancelled` terminal event instead. The tokens the
-                // cancelled attempt (and any attempt abandoned before it) had
-                // already streamed were billed, so they travel with it.
-                add_usage(&mut abandoned_usage, &usage);
-                return (LlmOutcome::Cancelled(abandoned_usage), attempt);
+                add_usage(&mut retry.abandoned_usage, &usage);
+                return (LlmOutcome::Cancelled(retry.abandoned_usage), retry.total);
             }
         }
     }
@@ -644,9 +764,8 @@ where
                     if let Some(observer) = span_observer.as_mut() {
                         observer.record_dropped("inactivity_timeout", delta_count, "stream_error");
                     }
-                    return Err(StreamError::Recoverable {
+                    return Err(StreamError::Connectivity {
                         message: "stream inactivity timeout: no frame within deadline".to_string(),
-                        retry_after: None,
                         usage: accumulated_usage(&accumulator),
                     });
                 }
@@ -902,11 +1021,16 @@ where
                 };
                 observer.record_dropped(reason, delta_count, stream_error_kind_attr(*kind));
             }
-            return Some(if recoverable {
+            return Some(if kind.is_connectivity() {
+                StreamError::Connectivity {
+                    message: message.clone(),
+                    // Filled by the accumulator-owning caller.
+                    usage: ZERO_USAGE,
+                }
+            } else if recoverable {
                 StreamError::Recoverable {
                     message: message.clone(),
                     retry_after: kind.retry_after(),
-                    // Filled in by the caller, which owns the accumulator.
                     usage: ZERO_USAGE,
                 }
             } else {
@@ -925,6 +1049,8 @@ where
 #[cfg(feature = "otel")]
 const fn stream_error_kind_attr(kind: crate::llm::StreamErrorKind) -> &'static str {
     match kind {
+        crate::llm::StreamErrorKind::Connectivity => "connectivity",
+        crate::llm::StreamErrorKind::ConnectionLost => "connection_lost",
         crate::llm::StreamErrorKind::RateLimited(_) => "rate_limited",
         crate::llm::StreamErrorKind::ServerError => "server_error",
         crate::llm::StreamErrorKind::InvalidRequest => "invalid_request",

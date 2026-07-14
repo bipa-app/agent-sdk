@@ -20,7 +20,9 @@ use crate::impls::gemini::data::{
     stream_gemini_response,
 };
 use crate::provider::{LlmProvider, thinking_for_forced_tool};
-use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind};
+use crate::streaming::{
+    StreamBox, StreamDelta, StreamErrorKind, reqwest_body_error_delta, reqwest_error_delta,
+};
 use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ResponseFormat, ThinkingConfig, ThinkingMode, Usage,
 };
@@ -544,8 +546,8 @@ impl VertexProvider {
     /// success or a ready-to-`yield` stream item describing the failure.
     ///
     /// The `Err` payload is the exact `StreamBox` item to `yield`: an
-    /// `anyhow::Error` for a transport failure, or a classified
-    /// [`StreamDelta::Error`] for a non-success HTTP status. This keeps the
+    /// classified [`StreamDelta::Error`] for a transport failure or a
+    /// non-success HTTP status. This keeps the
     /// generator's failure handling to a single `yield`.
     async fn send_gemini_stream_request(
         &self,
@@ -562,8 +564,7 @@ impl VertexProvider {
             .await
         {
             Ok(response) => response,
-            // Include the cause so 401 detection / diagnostics survive.
-            Err(e) => return Err(Err(anyhow::anyhow!("request failed: {e}"))),
+            Err(error) => return Err(Ok(reqwest_error_delta("request failed", &error))),
         };
 
         let status = response.status();
@@ -844,8 +845,8 @@ impl VertexProvider {
                 .await
             {
                 Ok(r) => r,
-                Err(e) => {
-                    yield Err(anyhow::anyhow!("request failed: {e}"));
+                Err(error) => {
+                    yield Ok(reqwest_error_delta("request failed", &error));
                     return;
                 }
             };
@@ -899,9 +900,8 @@ impl VertexProvider {
             while let Some(chunk_result) = stream.next().await {
                 let chunk = match chunk_result {
                     Ok(c) => c,
-                    Err(e) => {
-                        // Include the cause so 401 detection / diagnostics survive.
-                        yield Err(anyhow::anyhow!("stream error: {e}"));
+                    Err(error) => {
+                        yield Ok(reqwest_body_error_delta("stream error", &error));
                         return;
                     }
                 };

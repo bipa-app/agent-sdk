@@ -304,6 +304,12 @@ pub(super) struct ToolOutcomeContext<'a> {
 
 /// Error type for stream processing.
 pub(super) enum StreamError {
+    /// The provider endpoint is unreachable or an established connection was
+    /// lost. Retried until connectivity returns or cancellation fires.
+    Connectivity {
+        message: String,
+        usage: Usage,
+    },
     Recoverable {
         message: String,
         /// Server-supplied retry delay carried by a rate-limited stream error
@@ -337,6 +343,7 @@ impl StreamError {
     /// returned unchanged.
     pub(super) fn with_accumulated_usage(self, usage: Usage) -> Self {
         match self {
+            Self::Connectivity { message, .. } => Self::Connectivity { message, usage },
             Self::Recoverable {
                 message,
                 retry_after,

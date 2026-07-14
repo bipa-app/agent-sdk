@@ -2294,6 +2294,11 @@ async fn backfill_orphaned_tool_results(
 /// poisoned turn.
 const STREAM_MAX_RETRIES: u32 = 3;
 
+/// `AutoRetryStart.max_attempts` value used for connectivity waits. Existing
+/// event consumers require a numeric ceiling; `u32::MAX` communicates an
+/// effectively unbounded, cancellation-only wait without changing the wire.
+const CONNECTIVITY_WAIT_MAX_ATTEMPTS: u32 = u32::MAX;
+
 /// Base backoff for the exponential retry schedule (`base * 2^(n-1)`
 /// with jitter, capped at [`STREAM_MAX_DELAY_MS`]).
 const STREAM_BASE_DELAY_MS: u64 = 500;
@@ -2555,6 +2560,24 @@ pub(crate) struct LlmRetryParams<'a> {
 /// distinguish "previous attempt's partial deltas" from "current
 /// attempt's full content" via the surrounding
 /// `AutoRetryStart`/`AutoRetryEnd` envelope.
+async fn ensure_retry_not_cancelled(deps: &RootTurnDeps<'_>, attempt: &TurnAttempt) -> Result<()> {
+    if !deps.is_cancelled() {
+        return Ok(());
+    }
+    // The attempt is open but has not begun another billed stream. No later
+    // path owns this row once the task is terminal, so close it here.
+    close_attempt_with(
+        attempt,
+        TurnAttemptOutcome::Cancelled,
+        &ZERO_ATTEMPT_USAGE,
+        deps.attempt_store,
+        OffsetDateTime::now_utc(),
+    )
+    .await;
+    Err(anyhow::Error::new(RootTurnCancelledMarker)
+        .context("root turn cancelled before LLM attempt"))
+}
+
 async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn> {
     let LlmRetryParams {
         inputs,
@@ -2570,7 +2593,10 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
     } = params;
 
     let mut attempt = initial_attempt;
-    let mut retries: u32 = 0;
+    let mut transient_retries: u32 = 0;
+    let mut connectivity_retries: u32 = 0;
+    let mut event_retries: u32 = 0;
+    let mut last_retry_attempt: u32 = 0;
     // Separate budget for compaction-driven retries so transient
     // network blips can't burn through it before a real overflow
     // arrives, and a runaway compaction loop can't hide a genuine
@@ -2585,36 +2611,13 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
     let mut abandoned_usage = ZERO_ATTEMPT_USAGE;
 
     loop {
-        // Cooperative cancellation: bail before opening a (billed) LLM
-        // attempt when the root turn has been cancelled between retries.
-        // Tag the error with the cancel marker so the caller that owns
-        // the staged buffer commits the completed prefix (seam B).
-        if deps.is_cancelled() {
-            // The current attempt row is OPEN but never started
-            // streaming (this fires on entry — e.g. a subagent
-            // deadline landing between `open_attempt` and the first
-            // poll — and between retries). Nothing streamed, so a
-            // zero-usage Cancelled close is honest, and no later path
-            // owns this row: the host's timeout fail deliberately
-            // leaves live-worker attempts open for THIS code to
-            // close, and the task is already terminal so the normal
-            // commit-path close never runs. Without this close the
-            // row would stay OPEN forever in the billing/audit trail.
-            close_attempt_with(
-                &attempt,
-                TurnAttemptOutcome::Cancelled,
-                &ZERO_ATTEMPT_USAGE,
-                deps.attempt_store,
-                OffsetDateTime::now_utc(),
-            )
-            .await;
-            return Err(anyhow::Error::new(RootTurnCancelledMarker)
-                .context("root turn cancelled before LLM attempt"));
-        }
-        let attempt_now = if retries == 0 && compaction_retries == 0 {
-            now
-        } else {
+        ensure_retry_not_cancelled(deps, &attempt).await?;
+        let was_retried =
+            transient_retries > 0 || connectivity_retries > 0 || compaction_retries > 0;
+        let attempt_now = if was_retried {
             OffsetDateTime::now_utc()
+        } else {
+            now
         };
         match call_llm_once(
             provider,
@@ -2627,8 +2630,8 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
         .await
         {
             Ok(outcome) => {
-                if retries > 0 {
-                    emit_auto_retry_end(deps, thread_id, retries, true, None).await;
+                if last_retry_attempt > 0 {
+                    emit_auto_retry_end(deps, thread_id, last_retry_attempt, true, None).await;
                 }
                 return Ok(finalize_streamed_turn(outcome, attempt, &abandoned_usage));
             }
@@ -2641,7 +2644,11 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
                 attempt = handle_recoverable_stream_error(RecoverableRetryParams {
                     kind,
                     message: &message,
-                    retries: &mut retries,
+                    current_attempt: &attempt,
+                    transient_retries: &mut transient_retries,
+                    connectivity_retries: &mut connectivity_retries,
+                    event_retries: &mut event_retries,
+                    last_retry_attempt: &mut last_retry_attempt,
                     inputs,
                     definition,
                     attempt_audit_prompt,
@@ -2688,12 +2695,32 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
 struct RecoverableRetryParams<'a> {
     kind: StreamErrorKind,
     message: &'a str,
-    retries: &'a mut u32,
+    current_attempt: &'a TurnAttempt,
+    transient_retries: &'a mut u32,
+    connectivity_retries: &'a mut u32,
+    event_retries: &'a mut u32,
+    last_retry_attempt: &'a mut u32,
     inputs: &'a RootWorkerInputs,
     definition: &'a AgentDefinition,
     attempt_audit_prompt: &'a str,
     deps: &'a RootTurnDeps<'a>,
     thread_id: &'a agent_sdk_foundation::ThreadId,
+}
+
+const fn should_emit_retry(waiting_for_connectivity: bool, class_retries: u32) -> bool {
+    if waiting_for_connectivity {
+        class_retries == 1
+    } else {
+        class_retries <= STREAM_MAX_RETRIES
+    }
+}
+
+const fn retry_max_attempts(had_connectivity: bool, waits_for_connectivity: bool) -> u32 {
+    if had_connectivity || waits_for_connectivity {
+        CONNECTIVITY_WAIT_MAX_ATTEMPTS
+    } else {
+        STREAM_MAX_RETRIES
+    }
 }
 
 /// Handle a recoverable streaming failure: bump the retry counter,
@@ -2707,7 +2734,11 @@ async fn handle_recoverable_stream_error(
     let RecoverableRetryParams {
         kind,
         message,
-        retries,
+        current_attempt,
+        transient_retries,
+        connectivity_retries,
+        event_retries,
+        last_retry_attempt,
         inputs,
         definition,
         attempt_audit_prompt,
@@ -2715,15 +2746,27 @@ async fn handle_recoverable_stream_error(
         thread_id,
     } = params;
 
+    let waits_for_connectivity = kind.is_connectivity();
+    let had_connectivity = *connectivity_retries > 0;
+    let retries = if waits_for_connectivity {
+        connectivity_retries
+    } else {
+        transient_retries
+    };
     *retries = retries.saturating_add(1);
-    if *retries > STREAM_MAX_RETRIES {
+    *event_retries = event_retries.saturating_add(1);
+    let emit_event = should_emit_retry(waits_for_connectivity, *retries);
+    if emit_event {
+        *last_retry_attempt = *event_retries;
+    }
+    if !waits_for_connectivity && *retries > STREAM_MAX_RETRIES {
         let final_msg = format!(
             "LLM stream error after {STREAM_MAX_RETRIES} retries (kind={kind:?}): {message}"
         );
         emit_auto_retry_end(
             deps,
             thread_id,
-            retries.saturating_sub(1),
+            *last_retry_attempt,
             false,
             Some(final_msg.clone()),
         )
@@ -2734,19 +2777,22 @@ async fn handle_recoverable_stream_error(
         .retry_after()
         .map_or_else(|| stream_backoff_delay(*retries), clamp_retry_after);
     let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+    let max_attempts = retry_max_attempts(had_connectivity, waits_for_connectivity);
     log::warn!(
-        "LLM stream {kind:?} on attempt {retries}/{STREAM_MAX_RETRIES} \
+        "LLM stream {kind:?} on retry {event_retries} (class attempt {retries}/{max_attempts}) \
          for thread {thread_id}; retrying in {delay_ms} ms — {message}",
     );
-    emit_auto_retry_start(
-        deps,
-        thread_id,
-        *retries,
-        STREAM_MAX_RETRIES,
-        delay_ms,
-        message,
-    )
-    .await;
+    if emit_event {
+        emit_auto_retry_start(
+            deps,
+            thread_id,
+            *event_retries,
+            max_attempts,
+            delay_ms,
+            message,
+        )
+        .await;
+    }
     // Cooperative cancellation: abort the backoff promptly instead of
     // sleeping out the full (up to 8s) delay on an already-cancelled
     // turn.
@@ -2754,22 +2800,40 @@ async fn handle_recoverable_stream_error(
         Some(cancel) => {
             tokio::select! {
                 biased;
-                () = cancel.cancelled() => bail!("root turn cancelled during retry backoff"),
+                () = cancel.cancelled() => {
+                    close_attempt_with(
+                        current_attempt,
+                        TurnAttemptOutcome::Cancelled,
+                        &ZERO_ATTEMPT_USAGE,
+                        deps.attempt_store,
+                        OffsetDateTime::now_utc(),
+                    )
+                    .await;
+                    return Err(anyhow::Error::new(RootTurnCancelledMarker)
+                        .context("root turn cancelled during retry backoff"));
+                },
                 () = tokio::time::sleep(delay) => {}
             }
         }
         None => tokio::time::sleep(delay).await,
     }
-    open_attempt(
-        inputs,
-        definition,
-        attempt_audit_prompt,
-        deps.attempt_store,
-        OffsetDateTime::now_utc(),
-        None,
-    )
-    .await
-    .context("open retry turn attempt")
+    if kind == StreamErrorKind::Connectivity {
+        // A pre-response connectivity miss never reached the provider and
+        // carries no billable usage. Keep the same audit attempt open while
+        // waiting so a long offline period does not create hundreds of rows.
+        Ok(current_attempt.clone())
+    } else {
+        open_attempt(
+            inputs,
+            definition,
+            attempt_audit_prompt,
+            deps.attempt_store,
+            OffsetDateTime::now_utc(),
+            None,
+        )
+        .await
+        .context("open retry turn attempt")
+    }
 }
 
 /// Parameters for [`try_recover_with_compaction`]. Bundled because
@@ -3104,6 +3168,8 @@ async fn call_llm_once_instrumented(
 #[cfg(feature = "otel")]
 const fn stream_error_kind_type(kind: StreamErrorKind) -> &'static str {
     match kind {
+        StreamErrorKind::Connectivity => "connectivity",
+        StreamErrorKind::ConnectionLost => "connection_lost",
         StreamErrorKind::RateLimited(_) => "rate_limited",
         StreamErrorKind::ServerError => "server_error",
         StreamErrorKind::InvalidRequest => "invalid_request",
@@ -3169,6 +3235,9 @@ async fn close_stalled_attempt(params: StalledAttemptParams<'_, '_>) -> StreamAt
     } else {
         "before its first event"
     };
+    // The provider already returned a stream, so the request may have been
+    // accepted even if no item arrived. Settle this provider-call row before
+    // retrying on a fresh attempt.
     flush_and_close(
         deps,
         thread_id,
@@ -3180,7 +3249,7 @@ async fn close_stalled_attempt(params: StalledAttemptParams<'_, '_>) -> StreamAt
     )
     .await;
     StreamAttemptError::Recoverable {
-        kind: StreamErrorKind::ServerError,
+        kind: StreamErrorKind::ConnectionLost,
         message: format!(
             "LLM stream stalled {stage}: no events for {}s — treating the connection as dead",
             stall_budget.as_secs(),
@@ -3217,6 +3286,55 @@ async fn close_recoverable_server_error(
     }
 }
 
+struct FailedStreamAttemptParams<'a, 'deps> {
+    deps: &'a RootTurnDeps<'deps>,
+    thread_id: &'a agent_sdk_foundation::ThreadId,
+    pending_deltas: &'a mut Vec<AgentEvent>,
+    attempt: &'a TurnAttempt,
+    outcome: TurnAttemptOutcome,
+    error: StreamAttemptError,
+    usage: llm::Usage,
+    now: OffsetDateTime,
+}
+
+async fn finish_failed_stream_attempt(
+    params: FailedStreamAttemptParams<'_, '_>,
+) -> StreamAttemptError {
+    let FailedStreamAttemptParams {
+        deps,
+        thread_id,
+        pending_deltas,
+        attempt,
+        outcome,
+        error,
+        usage,
+        now,
+    } = params;
+    if matches!(
+        &error,
+        StreamAttemptError::Recoverable {
+            kind: StreamErrorKind::Connectivity,
+            ..
+        }
+    ) {
+        // The request never reached a usable provider response. Leave this
+        // attempt open so offline probes do not manufacture audit rows.
+        flush_streaming_deltas(deps, thread_id, pending_deltas).await;
+    } else {
+        flush_and_close(
+            deps,
+            thread_id,
+            pending_deltas,
+            attempt,
+            outcome,
+            &usage,
+            now,
+        )
+        .await;
+    }
+    error.with_usage(usage)
+}
+
 /// Close an attempt whose root turn was cancelled mid-stream via the
 /// [`RootTurnDeps::cancel`] token and build the matching non-retryable
 /// error (see [`StreamAttemptError::Cancelled`]).
@@ -3240,6 +3358,29 @@ async fn close_cancelled_attempt(
     .await;
     StreamAttemptError::Cancelled {
         message: "root turn cancelled mid-stream".to_owned(),
+    }
+}
+
+async fn close_truncated_stream(
+    attempt: &TurnAttempt,
+    deps: &RootTurnDeps<'_>,
+    usage: llm::Usage,
+    now: OffsetDateTime,
+) -> StreamAttemptError {
+    close_attempt_with(
+        attempt,
+        TurnAttemptOutcome::ServerError,
+        &usage,
+        deps.attempt_store,
+        now,
+    )
+    .await;
+    StreamAttemptError::Recoverable {
+        kind: StreamErrorKind::ServerError,
+        message: "LLM stream ended without a completion marker (stop_reason); \
+                  treating as a truncated response"
+            .to_owned(),
+        usage,
     }
 }
 
@@ -3386,21 +3527,17 @@ async fn call_llm_once_inner(
             DeltaStep::Skip => continue,
             DeltaStep::Buffered => {}
             DeltaStep::Fail(outcome, error) => {
-                // A rate-limit / server-error delta may arrive *after* the
-                // provider reported usage, so the row bills those tokens and
-                // the recoverable error carries them to the retry wrapper.
-                let usage = attempt_usage(&accumulator);
-                flush_and_close(
+                return Err(finish_failed_stream_attempt(FailedStreamAttemptParams {
                     deps,
                     thread_id,
-                    &mut pending_deltas,
+                    pending_deltas: &mut pending_deltas,
                     attempt,
                     outcome,
-                    &usage,
+                    error,
+                    usage: attempt_usage(&accumulator),
                     now,
-                )
-                .await;
-                return Err(error.with_usage(usage));
+                })
+                .await);
             }
         }
 
@@ -3419,20 +3556,7 @@ async fn call_llm_once_inner(
     // tool children with empty inputs. Treat it as a recoverable error
     // so `call_llm_with_retry` re-attempts instead.
     if accumulator.stop_reason().is_none() {
-        // Deltas were already flushed above, so `pending_deltas` is empty here;
-        // the helper just closes the row and builds the recoverable error.
-        return Err(close_recoverable_server_error(
-            deps,
-            thread_id,
-            &mut pending_deltas,
-            attempt,
-            attempt_usage(&accumulator),
-            "LLM stream ended without a completion marker (stop_reason); \
-             treating as a truncated response"
-                .to_owned(),
-            now,
-        )
-        .await);
+        return Err(close_truncated_stream(attempt, deps, attempt_usage(&accumulator), now).await);
     }
 
     let response = synthesize_response(accumulator, provider, thread_id);

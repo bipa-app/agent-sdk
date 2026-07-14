@@ -6,7 +6,10 @@
 
 use crate::attachments::validate_request_attachments;
 use crate::provider::LlmProvider;
-use crate::streaming::{SseLineBuffer, StreamBox, StreamDelta, StreamErrorKind};
+use crate::streaming::{
+    SseLineBuffer, StreamBox, StreamDelta, StreamErrorKind, reqwest_body_error_delta,
+    reqwest_error_delta,
+};
 use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Effort, ResponseFormat,
     StopReason, ThinkingConfig, ThinkingMode, ToolChoice, Usage,
@@ -1085,7 +1088,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                     yield Ok(StreamDelta::Error {
                                         message: "websocket closed before response.completed"
                                             .to_string(),
-                                        kind: StreamErrorKind::ServerError,
+                                        kind: StreamErrorKind::ConnectionLost,
                                     });
                                     return;
                                 }
@@ -1104,7 +1107,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                         end_websocket_turn(&mut websocket_session);
                                         yield Ok(StreamDelta::Error {
                                             message: format!("websocket error: {error}"),
-                                            kind: StreamErrorKind::ServerError,
+                                            kind: websocket_transport_error_kind(&error),
                                         });
                                         return;
                                     }
@@ -1121,8 +1124,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                 WebSocketMessage::Text(text) => {
                                     if let Some(error) = parse_wrapped_websocket_error_event(&text)
                                     {
-                                        let kind =
-                                            websocket_error_kind(&error);
+                                        let kind = websocket_error_kind(&error);
                                         // A quota rejection carries the delay the service wants
                                         // observed, so it is surfaced (with its hint) for the
                                         // caller's retry loop rather than re-sent immediately.
@@ -1344,8 +1346,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                         if let Some(error) =
                                             parse_wrapped_websocket_error_event(&text)
                                         {
-                                            let kind =
-                                                websocket_error_kind(&error);
+                                            let kind = websocket_error_kind(&error);
                                             // Same split as the text frame: a quota rejection is
                                             // surfaced with its delay; the connection-limit signal
                                             // keeps falling back to HTTP immediately.
@@ -1578,7 +1579,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                             end_websocket_turn(&mut websocket_session);
                                             yield Ok(StreamDelta::Error {
                                                 message: format!("websocket pong failed: {error}"),
-                                                kind: StreamErrorKind::ServerError,
+                                                kind: websocket_transport_error_kind(&error),
                                             });
                                             return;
                                         }
@@ -1635,15 +1636,19 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                 }
             };
 
-            let Ok(response) = self.client
+            let response = match self
+                .client
                 .post(codex_url(&self.base_url))
                 .headers(headers)
                 .json(&api_request)
                 .send()
                 .await
-            else {
-                yield Err(anyhow::anyhow!("request failed"));
-                return;
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    yield Ok(reqwest_error_delta("request failed", &error));
+                    return;
+                }
             };
 
             let status = response.status();
@@ -1690,9 +1695,12 @@ impl LlmProvider for OpenAICodexResponsesProvider {
             let mut incomplete_reason: Option<String> = None;
 
             while let Some(chunk_result) = stream.next().await {
-                let Ok(chunk) = chunk_result else {
-                    yield Err(anyhow::anyhow!("stream error"));
-                    return;
+                let chunk = match chunk_result {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        yield Ok(reqwest_body_error_delta("stream error", &error));
+                        return;
+                    }
                 };
                 sse.extend(&chunk);
 
@@ -2626,6 +2634,25 @@ fn incomplete_stop_reason(reason: &str) -> StopReason {
         "content_filter" => StopReason::Refusal,
         "model_context_window_exceeded" => StopReason::ModelContextWindowExceeded,
         _ => StopReason::Unknown,
+    }
+}
+
+const fn websocket_transport_error_kind(
+    error: &tokio_tungstenite::tungstenite::Error,
+) -> StreamErrorKind {
+    match error {
+        tokio_tungstenite::tungstenite::Error::ConnectionClosed
+        | tokio_tungstenite::tungstenite::Error::Io(_) => StreamErrorKind::ConnectionLost,
+        tokio_tungstenite::tungstenite::Error::AlreadyClosed
+        | tokio_tungstenite::tungstenite::Error::Tls(_)
+        | tokio_tungstenite::tungstenite::Error::Capacity(_)
+        | tokio_tungstenite::tungstenite::Error::Protocol(_)
+        | tokio_tungstenite::tungstenite::Error::WriteBufferFull(_)
+        | tokio_tungstenite::tungstenite::Error::Utf8(_)
+        | tokio_tungstenite::tungstenite::Error::AttackAttempt
+        | tokio_tungstenite::tungstenite::Error::Url(_)
+        | tokio_tungstenite::tungstenite::Error::Http(_)
+        | tokio_tungstenite::tungstenite::Error::HttpFormat(_) => StreamErrorKind::ServerError,
     }
 }
 
@@ -3826,6 +3853,7 @@ mod tests {
         // Sanity: with the baseline still present, this same request WOULD build
         // an incremental one — so the assertions after the clear are meaningful.
         let incremental = prepare_websocket_request(&retry_request, &session, false);
+
         assert_eq!(
             incremental.previous_response_id.as_deref(),
             Some("resp_prev"),
@@ -3857,6 +3885,31 @@ mod tests {
         assert!(session.last_response_id.is_none());
         assert!(session.last_response_items.is_empty());
         assert!(!session.in_flight, "the ended turn must be evictable");
+    }
+
+    #[test]
+    fn websocket_error_classification_is_network_specific() {
+        use tokio_tungstenite::tungstenite::Error as WebSocketError;
+
+        assert_eq!(
+            websocket_transport_error_kind(&WebSocketError::ConnectionClosed),
+            StreamErrorKind::ConnectionLost
+        );
+        assert_eq!(
+            websocket_transport_error_kind(&WebSocketError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset",
+            ))),
+            StreamErrorKind::ConnectionLost
+        );
+        assert_eq!(
+            websocket_transport_error_kind(&WebSocketError::AlreadyClosed),
+            StreamErrorKind::ServerError
+        );
+        assert_eq!(
+            websocket_transport_error_kind(&WebSocketError::Utf8("invalid".to_owned())),
+            StreamErrorKind::ServerError
+        );
     }
 
     #[test]

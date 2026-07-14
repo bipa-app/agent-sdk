@@ -509,6 +509,8 @@ impl CassetteDelta {
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
 enum CassetteErrorKind {
+    Connectivity,
+    ConnectionLost,
     RateLimited,
     ServerError,
     InvalidRequest,
@@ -518,6 +520,8 @@ enum CassetteErrorKind {
 impl CassetteErrorKind {
     const fn from_kind(kind: StreamErrorKind) -> Self {
         match kind {
+            StreamErrorKind::Connectivity => Self::Connectivity,
+            StreamErrorKind::ConnectionLost => Self::ConnectionLost,
             StreamErrorKind::RateLimited(_) => Self::RateLimited,
             StreamErrorKind::ServerError => Self::ServerError,
             StreamErrorKind::InvalidRequest => Self::InvalidRequest,
@@ -528,6 +532,8 @@ impl CassetteErrorKind {
 
     const fn into_kind(self, retry_after: Option<Duration>) -> StreamErrorKind {
         match self {
+            Self::Connectivity => StreamErrorKind::Connectivity,
+            Self::ConnectionLost => StreamErrorKind::ConnectionLost,
             Self::RateLimited => StreamErrorKind::RateLimited(retry_after),
             Self::ServerError => StreamErrorKind::ServerError,
             Self::InvalidRequest => StreamErrorKind::InvalidRequest,

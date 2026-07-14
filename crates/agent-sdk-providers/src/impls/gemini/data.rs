@@ -3,7 +3,7 @@
 //! Used by both the `GeminiProvider` (API key auth) and `VertexProvider` (`OAuth2` Bearer auth)
 //! since they share the same request/response format.
 
-use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind};
+use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind, reqwest_body_error_delta};
 use agent_sdk_foundation::llm::{Content, ContentBlock, StopReason, Usage};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -846,10 +846,8 @@ pub fn stream_gemini_response(response: reqwest::Response) -> StreamBox<'static>
                     buffer.push_str(&String::from_utf8_lossy(&chunk));
                     false
                 }
-                Some(Err(e)) => {
-                    // Include the underlying cause so RefreshingProvider's 401
-                    // detection (and operators) can see the real failure.
-                    yield Err(anyhow::anyhow!("stream error: {e}"));
+                Some(Err(error)) => {
+                    yield Ok(reqwest_body_error_delta("stream error", &error));
                     return;
                 }
                 None => true,

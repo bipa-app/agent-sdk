@@ -6,7 +6,10 @@
 
 use crate::attachments::validate_request_attachments;
 use crate::provider::LlmProvider;
-use crate::streaming::{SseLineBuffer, StreamBox, StreamDelta, StreamErrorKind};
+use crate::streaming::{
+    SseLineBuffer, StreamBox, StreamDelta, StreamErrorKind, reqwest_body_error_delta,
+    reqwest_error_delta,
+};
 use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, ResponseFormat, StopReason,
     ThinkingConfig, ToolChoice, Usage,
@@ -485,14 +488,17 @@ impl LlmProvider for OpenAIResponsesProvider {
             let stream_builder = self.client
                 .post(format!("{}/responses", self.base_url))
                 .header("Content-Type", "application/json");
-            let Ok(response) = self
+            let response = match self
                 .apply_headers(stream_builder)
                 .json(&api_request)
                 .send()
                 .await
-            else {
-                yield Err(anyhow::anyhow!("request failed"));
-                return;
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    yield Ok(reqwest_error_delta("request failed", &error));
+                    return;
+                }
             };
 
             let status = response.status();
@@ -524,9 +530,12 @@ impl LlmProvider for OpenAIResponsesProvider {
             let mut refused = false;
 
             while let Some(chunk_result) = stream.next().await {
-                let Ok(chunk) = chunk_result else {
-                    yield Err(anyhow::anyhow!("stream error"));
-                    return;
+                let chunk = match chunk_result {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        yield Ok(reqwest_body_error_delta("stream error", &error));
+                        return;
+                    }
                 };
                 sse.extend(&chunk);
 

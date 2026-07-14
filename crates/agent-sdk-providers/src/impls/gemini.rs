@@ -7,7 +7,7 @@ pub(crate) mod data;
 
 use crate::attachments::validate_request_attachments;
 use crate::provider::LlmProvider;
-use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind};
+use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind, reqwest_error_delta};
 use agent_sdk_foundation::llm::{ChatOutcome, ChatRequest, ChatResponse, ThinkingConfig};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -461,9 +461,8 @@ impl LlmProvider for GeminiProvider {
                 .await
             {
                 Ok(r) => r,
-                Err(e) => {
-                    // Include the cause so 401 detection / diagnostics survive.
-                    yield Err(anyhow::anyhow!("request failed: {e}"));
+                Err(error) => {
+                    yield Ok(reqwest_error_delta("request failed", &error));
                     return;
                 }
             };
