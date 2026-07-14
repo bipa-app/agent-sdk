@@ -343,6 +343,7 @@ impl TestStores {
             cancel: None,
             wakeup: None,
             activity: None,
+            connectivity_waits: None,
         }
     }
 }
@@ -4041,6 +4042,111 @@ async fn connectivity_wait_stops_promptly_on_cancel() -> Result<()> {
         attempts[0].outcome,
         Some(TurnAttemptOutcome::Cancelled),
         "cancellation must close the held offline attempt"
+    );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn connectivity_wait_registry_tracks_the_park_and_cancel_clears_it() -> Result<()> {
+    // While the worker is parked on reachability probes, the registry
+    // must expose the wait — keyed by thread, carrying the failure
+    // message and the journal sequence of the streak's AutoRetryStart —
+    // and cancellation must retract the entry through the guard.
+    let stores = TestStores::new();
+    let provider = OfflineThenSuccessProvider::new(usize::MAX);
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let bootstrap = sample_bootstrap(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let cancel = CancellationToken::new();
+    let registry = super::connectivity::ConnectivityWaitRegistry::new();
+    let mut deps = stores.deps();
+    deps.cancel = Some(&cancel);
+    deps.connectivity_waits = Some(&registry);
+
+    let run = execute_root_turn(inputs, "ping", &provider, &deps, t_plus(1));
+    let observe_then_cancel = async {
+        while !registry.is_waiting(&thread_a()) {
+            tokio::task::yield_now().await;
+        }
+        let wait = registry
+            .get(&thread_a())
+            .context("registry entry must exist while parked")?;
+        assert_eq!(wait.error_message, "network is unreachable");
+        let events = stores.events.get_events(&thread_a()).await?;
+        let retry_start_sequence = events
+            .iter()
+            .find(|committed| {
+                matches!(
+                    committed.event,
+                    agent_sdk_foundation::events::AgentEvent::AutoRetryStart { .. }
+                )
+            })
+            .map(|committed| committed.sequence)
+            .context("streak AutoRetryStart must be committed before the park")?;
+        assert_eq!(
+            wait.sequence, retry_start_sequence,
+            "the registry snapshot must be orderable against the journal"
+        );
+        cancel.cancel();
+        anyhow::Ok(())
+    };
+    let (result, observed) = tokio::join!(run, observe_then_cancel);
+    observed?;
+    let Err(error) = result else {
+        bail!("cancelled connectivity wait unexpectedly completed")
+    };
+    assert!(is_root_turn_cancelled(&error));
+    assert!(
+        !registry.is_waiting(&thread_a()),
+        "the guard must retract the entry when cancellation unwinds the wait"
+    );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn connectivity_wait_registry_clears_on_recovery() -> Result<()> {
+    // Connectivity returns after a few probes: the run completes and the
+    // registry no longer lists the thread — recovery exits through the
+    // same guard as cancellation.
+    let stores = TestStores::new();
+    let provider = OfflineThenSuccessProvider::new(3);
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let bootstrap = sample_bootstrap(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let registry = super::connectivity::ConnectivityWaitRegistry::new();
+    let mut deps = stores.deps();
+    deps.connectivity_waits = Some(&registry);
+
+    let run = execute_root_turn(inputs, "ping", &provider, &deps, t_plus(1));
+    let observe = async {
+        while !registry.is_waiting(&thread_a()) {
+            tokio::task::yield_now().await;
+        }
+        anyhow::Ok(())
+    };
+    let (outcome, observed) = tokio::join!(run, observe);
+    observed?;
+    let RootTurnOutcome::Completed { response_text, .. } = outcome? else {
+        bail!("expected completion after connectivity recovered")
+    };
+    assert_eq!(response_text, "continued after reconnect");
+    assert!(
+        !registry.is_waiting(&thread_a()),
+        "a recovered wait must leave no registry entry behind"
     );
     Ok(())
 }

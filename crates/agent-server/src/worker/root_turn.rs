@@ -53,6 +53,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::activity::{ActivityBeacon, ActivityTrackingEventRepo};
+use super::connectivity::ConnectivityWaitRegistry;
 use super::definition::{AgentDefinition, ThinkingPolicy};
 use crate::journal::checkpoint::CheckpointKind;
 use crate::journal::checkpoint_store::CheckpointStore;
@@ -173,6 +174,15 @@ pub struct RootTurnDeps<'a> {
     /// which is the case for every host that does not enforce a subagent
     /// timeout.
     pub activity: Option<&'a ActivityBeacon>,
+    /// Optional live registry of connectivity-parked threads.
+    ///
+    /// While a streaming call is parked in `wait_for_provider_reachability`
+    /// the wait is announced here (guard-scoped, so every exit — recovery,
+    /// cancellation, error, or the task future being dropped — retracts
+    /// it). Hosts hand the same registry to their stall sweeps and status
+    /// RPCs so deliberate offline silence is never (mis)read as a wedged
+    /// task. `None` (the default) means nobody is observing waits.
+    pub connectivity_waits: Option<&'a ConnectivityWaitRegistry>,
 }
 
 impl RootTurnDeps<'_> {
@@ -2594,6 +2604,11 @@ struct WorkerRetryState {
     /// `attempt` of the last emitted `AutoRetryStart`, so the settling
     /// `AutoRetryEnd` pairs with it.
     last_emitted: u32,
+    /// Journal sequence of the connectivity streak's `AutoRetryStart`
+    /// (`0` until a streak opens, or when its commit failed). Stamped on
+    /// every wait this streak parks in, so registry observers can order
+    /// a snapshot against live journal events.
+    streak_sequence: u64,
 }
 
 impl WorkerRetryState {
@@ -2605,6 +2620,7 @@ impl WorkerRetryState {
             in_connectivity_streak: false,
             event_retries: 0,
             last_emitted: 0,
+            streak_sequence: 0,
         }
     }
 
@@ -2928,7 +2944,7 @@ async fn wait_out_connectivity_loss(params: RecoverableRetryParams<'_>) -> Resul
     );
     if starts_streak {
         retry.last_emitted = retry.event_retries;
-        emit_auto_retry_start(
+        retry.streak_sequence = emit_auto_retry_start(
             deps,
             thread_id,
             retry.event_retries,
@@ -2936,9 +2952,19 @@ async fn wait_out_connectivity_loss(params: RecoverableRetryParams<'_>) -> Resul
             delay_ms,
             message,
         )
-        .await;
+        .await
+        .unwrap_or(0);
     }
-    wait_for_provider_reachability(provider, deps, current_attempt, retry).await?;
+    // Announce the park for the wait's exact duration. The guard retracts
+    // the entry on EVERY exit — recovery, cancellation (the `?` below), or
+    // the whole task future being dropped — so outside observers (stall
+    // sweeps, watchdogs, status RPCs) never see a stale "waiting" entry.
+    let wait_guard = deps.connectivity_waits.map(|registry| {
+        registry.enter(thread_id.clone(), retry.streak_sequence, message.to_owned())
+    });
+    let waited = wait_for_provider_reachability(provider, deps, current_attempt, retry).await;
+    drop(wait_guard);
+    waited?;
     if kind == StreamErrorKind::Connectivity {
         // A pre-connect miss never reached the provider and carries no
         // billable usage. Keep the same audit attempt open across the
@@ -3183,7 +3209,7 @@ async fn emit_auto_retry_start(
     max_attempts: u32,
     delay_ms: u64,
     error_message: &str,
-) {
+) -> Option<u64> {
     let event = AgentEvent::AutoRetryStart {
         attempt,
         max_attempts,
@@ -3196,10 +3222,13 @@ async fn emit_auto_retry_start(
         .await
     {
         Ok(committed) => {
+            let sequence = committed.sequence;
             deps.event_notifier.notify(std::slice::from_ref(&committed));
+            Some(sequence)
         }
         Err(error) => {
             log::warn!("failed to commit auto_retry_start event for thread {thread_id}: {error:#}");
+            None
         }
     }
 }

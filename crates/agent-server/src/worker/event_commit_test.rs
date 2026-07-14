@@ -131,6 +131,7 @@ impl TestStores {
             cancel: None,
             wakeup: None,
             activity: None,
+            connectivity_waits: None,
         }
     }
 }

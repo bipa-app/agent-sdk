@@ -201,6 +201,7 @@ impl Fixtures {
             cancel: None,
             wakeup: None,
             activity: None,
+            connectivity_waits: None,
         }
     }
 }
@@ -530,6 +531,7 @@ async fn prompt_too_long_without_config_still_goes_fatal() -> Result<()> {
         cancel: None,
         wakeup: None,
         activity: None,
+        connectivity_waits: None,
     };
 
     let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
