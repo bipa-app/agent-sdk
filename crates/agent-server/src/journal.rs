@@ -659,7 +659,7 @@ pub use retention_janitor::{
 };
 pub use staged::{StagedMessageStore, StagedStateStore, StagedStores};
 pub use store::{
-    AgentTaskStore, CancelTreeOutcome, CancellationMarkerSink, InMemoryAgentTaskStore,
+    AgentTaskStore, CancelTreeOutcome, CancellationMarkerSink, ChildProbe, InMemoryAgentTaskStore,
     MixedChildrenSpawn, SpawnedMixedChildren, SubagentInvocationSpawn, ToolChildSpawn,
     mixed_child_ids_in_slot_order, new_mixed_tool_child, validate_mixed_children_spawn,
     validate_mixed_slot_coverage,

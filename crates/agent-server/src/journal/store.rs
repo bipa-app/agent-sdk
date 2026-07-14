@@ -778,6 +778,51 @@ struct CancelMarkerCandidate {
 /// | [`reject_confirmation`](Self::reject_confirmation) | `AwaitingConfirmation` → `Failed` + parent recompute | status CAS |
 /// | [`cancel_tree`](Self::cancel_tree) | subtree → `Cancelled` | existence check |
 /// | [`release_expired_leases`](Self::release_expired_leases) | `Running` → `Pending` / `Failed` | lease-expiry CAS, recovery matrix |
+/// The bounded result of [`AgentTaskStore::probe_children`].
+#[derive(Debug, Default, Clone)]
+pub struct ChildProbe {
+    /// At most `live_limit` NON-TERMINAL children — the frontier the stall
+    /// walk will expand.
+    pub live: Vec<AgentTask>,
+    /// Whether ANY child of the parent — terminal or live — showed a sign of
+    /// life at or after the cutoff.
+    pub fresh_activity: bool,
+}
+
+impl ChildProbe {
+    /// A task row's effective activity: `last_activity_at ?? created_at`
+    /// (ADR-0003 I1).
+    ///
+    /// A row carries no `last_activity_at` until it is first acquired, and
+    /// rows predating migration 0012 carry none at all. Its creation is still
+    /// its initial evidence of life — treating `None` as "stale forever" reaps
+    /// parents that parked on children they had just spawned.
+    ///
+    /// This is the single definition every backend's `probe_children` must
+    /// agree with, in Rust or in SQL.
+    #[must_use]
+    pub fn effective_activity(task: &AgentTask) -> OffsetDateTime {
+        task.last_activity_at.unwrap_or(task.created_at)
+    }
+
+    /// Fold a full child list into the bounded shape. Used by the default
+    /// (unbounded) implementation and by the in-memory store, and it is the
+    /// reference semantics the SQL backends' bounded queries must match.
+    #[must_use]
+    pub fn from_rows(children: Vec<AgentTask>, cutoff: OffsetDateTime, live_limit: usize) -> Self {
+        let mut out = Self::default();
+        for child in children {
+            if Self::effective_activity(&child) >= cutoff {
+                out.fresh_activity = true;
+            }
+            if !child.status.is_terminal() && out.live.len() < live_limit {
+                out.live.push(child);
+            }
+        }
+        out
+    }
+}
+
 #[async_trait]
 pub trait AgentTaskStore: Send + Sync {
     /// Insert a new task row. **Not a mutation API** — see the
@@ -927,6 +972,50 @@ pub trait AgentTaskStore: Send + Sync {
     /// # Errors
     /// Returns an error if the store cannot be queried.
     async fn list_children(&self, parent_id: &AgentTaskId) -> Result<Vec<AgentTask>>;
+
+    /// The direct children of `parent_id`, read for the subagent stall probe
+    /// with the READ ITSELF BOUNDED (ADR-0003 I5).
+    ///
+    /// Returns at most `live_limit` **non-terminal** children — the live
+    /// frontier the walk will expand — plus a single flag: whether **any**
+    /// child, terminal or not, has effective activity
+    /// (`last_activity_at ?? created_at`, per I1) at or after `cutoff`.
+    ///
+    /// ## Why not just `list_children`
+    ///
+    /// The probe used to read every child and filter terminal rows in memory.
+    /// Terminal task rows are RETAINED, so a parent that has run thousands of
+    /// tool calls materializes thousands of rows on **every** probe of **every**
+    /// parked ancestor. Past a few thousand, the probe cannot finish inside its
+    /// timeout (I5) — and a probe that times out is treated as *alive*. The
+    /// result is the exact inverse failure: unbounded database work, and a
+    /// genuinely wedged child that can never be reaped because its probe never
+    /// completes. Bounding the read is what keeps enforcement able to converge.
+    ///
+    /// Terminal children are folded into `fresh_activity` rather than returned:
+    /// their activity stamp IS their terminal instant (every terminal
+    /// transition stamps it, per I3), which is at or after any event they
+    /// committed — and they share their parent's `thread_id` (`new_child`
+    /// inherits it), so they contribute no thread the walk has not already
+    /// collected. A nested subagent root, which DOES live on its own thread, is
+    /// a root task reached by the invocation-linkage hop, never by this call.
+    ///
+    /// The default implementation derives the answer from [`Self::list_children`]
+    /// and is therefore **unbounded** — correct, but only appropriate for
+    /// in-memory and decorator stores. Durable backends must override it with
+    /// bounded queries.
+    ///
+    /// # Errors
+    /// Returns an error if the store cannot be queried.
+    async fn probe_children(
+        &self,
+        parent_id: &AgentTaskId,
+        cutoff: OffsetDateTime,
+        live_limit: usize,
+    ) -> Result<ChildProbe> {
+        let children = self.list_children(parent_id).await?;
+        Ok(ChildProbe::from_rows(children, cutoff, live_limit))
+    }
 
     /// List every task currently in the given status.
     ///

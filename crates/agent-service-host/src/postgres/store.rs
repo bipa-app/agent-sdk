@@ -60,10 +60,10 @@ use agent_server::journal::relay::{
 };
 use agent_server::journal::retention::{RetentionCursor, RetentionStore};
 use agent_server::journal::store::{
-    AgentTaskStore, CancelTreeOutcome, MixedChildrenSpawn, RequeueOutcome, SpawnedMixedChildren,
-    SubagentInvocationSpawn, SubmitRootIdempotency, SubmitRootTurnError, SubmitRootTurnOutcome,
-    SubmitRootTurnParams, mixed_child_ids_in_slot_order, new_mixed_tool_child,
-    validate_mixed_children_spawn,
+    AgentTaskStore, CancelTreeOutcome, ChildProbe, MixedChildrenSpawn, RequeueOutcome,
+    SpawnedMixedChildren, SubagentInvocationSpawn, SubmitRootIdempotency, SubmitRootTurnError,
+    SubmitRootTurnOutcome, SubmitRootTurnParams, mixed_child_ids_in_slot_order,
+    new_mixed_tool_child, validate_mixed_children_spawn,
 };
 use agent_server::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, SuspensionPayload,
@@ -2671,6 +2671,64 @@ ORDER BY created_at, id
         .await
         .with_context(|| format!("list children for {parent_id}"))?;
         records.into_iter().map(TryInto::try_into).collect()
+    }
+
+    /// ADR-0003 I5 — bounded. Two indexed reads on `parent_id`, neither of
+    /// which grows with retained terminal history: an `EXISTS` for a fresh sign
+    /// of life across ALL children, and at most `live_limit` NON-terminal rows
+    /// for the walk to expand.
+    ///
+    /// `last_activity_at` is `timestamptz`, so the comparison is chronological
+    /// natively (unlike the `SQLite` backend's TEXT column). It is `COALESCE`d to
+    /// `created_at`: a never-acquired child carries no activity stamp, and its
+    /// creation is its initial evidence of life (I1).
+    async fn probe_children(
+        &self,
+        parent_id: &AgentTaskId,
+        cutoff: OffsetDateTime,
+        live_limit: usize,
+    ) -> Result<ChildProbe> {
+        let fresh_activity: bool = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM agent_sdk_tasks \
+                 WHERE parent_id = $1 \
+                   AND COALESCE(last_activity_at, created_at) >= $2)",
+        )
+        .bind(parent_id.as_str())
+        .bind(cutoff)
+        .fetch_one(&self.pool)
+        .await
+        .with_context(|| format!("probe child activity for {parent_id}"))?;
+
+        let limit = i64::try_from(live_limit).unwrap_or(i64::MAX);
+        let records = sqlx::query_as::<_, TaskRecord>(
+            r"
+SELECT
+    id, kind, status, parent_id, root_id, depth, thread_id,
+    submitted_input_json, caller_metadata_json, worker_id, lease_id,
+    lease_expires_at, last_heartbeat_at, state_json, attempt, max_attempts,
+    last_error, pending_child_count, spawn_index, result_payload,
+    otel_traceparent, created_at, updated_at, completed_at, last_activity_at
+FROM agent_sdk_tasks
+WHERE parent_id = $1 AND status NOT IN ('completed', 'failed', 'cancelled')
+ORDER BY created_at, id
+LIMIT $2
+",
+        )
+        .bind(parent_id.as_str())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("probe live children for {parent_id}"))?;
+        let live: Vec<AgentTask> = records
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<_>>()?;
+
+        Ok(ChildProbe {
+            live,
+            fresh_activity,
+        })
     }
 
     async fn list_by_status(&self, status: TaskStatus) -> Result<Vec<AgentTask>> {

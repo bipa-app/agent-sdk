@@ -515,10 +515,19 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
         },
     ));
 
-    let now = OffsetDateTime::now_utc();
-    let outcome =
-        resume_confirmed_tool_with_abort_grace(&stores, &runtime, bootstrap, &drive_cancel, now)
-            .await;
+    // The instant the tool STARTS. Deliberately not called `now`: a
+    // Confirm-tier tool is detached precisely because it can run longer than a
+    // lease, so by the time it returns this value is stale by the whole
+    // execution. It must never be reused as a transition instant (ADR-0003 I3).
+    let started_at = OffsetDateTime::now_utc();
+    let outcome = resume_confirmed_tool_with_abort_grace(
+        &stores,
+        &runtime,
+        bootstrap,
+        &drive_cancel,
+        started_at,
+    )
+    .await;
 
     heartbeat_cancel.cancel();
     if let Err(join_err) = heartbeat_handle.await {
@@ -531,9 +540,18 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
     // already terminal, and failing it here would only CAS-reject.
     if let Some(Err(error)) = outcome {
         warn!(?error, task_id = %task_id, "approved confirmation resume failed");
+        // ADR-0003 I3: the terminal instant is captured HERE, at the
+        // transition — not `started_at`, which predates the whole tool run.
+        let failed_at = OffsetDateTime::now_utc();
         if let Err(fail_err) = stores
             .task_store
-            .fail_task(&task_id, &worker_id, &lease_id, format!("{error:#}"), now)
+            .fail_task(
+                &task_id,
+                &worker_id,
+                &lease_id,
+                format!("{error:#}"),
+                failed_at,
+            )
             .await
         {
             warn!(

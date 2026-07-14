@@ -135,6 +135,18 @@ simpler and strictly stronger: every beacon bump was observed *during* the
 execution that is now ending, so `now ≥ beacon.latest()` always. The
 transition instant dominates.
 
+> **The transition instant must be captured AT the transition.** The pure
+> helpers stamp whatever `now` they are handed — so a caller that bound one
+> `now` at task *entry* and reused it after a long execution backdates the
+> row by the whole run. `execute_tool_task`, `execute_subagent_task_entry`
+> and the detached Confirm-tier drive all did this, and the Confirm-tier
+> drive is *designed* to outlive its lease. The monotonic setter (I2) stops
+> it rewinding below heartbeat-persisted activity, but for a task whose
+> beacon never fired it stamps the row hours in the past — and `completed_at`
+> with it. The helpers stay pure (the determinism the rest of these tests
+> depend on); the discipline is at the caller, and the entry binding is
+> named `started_at` so reusing it reads as wrong.
+
 The transitions, and why each does or does not stamp — this table is the
 contract, and a new transition must be added to it:
 
@@ -226,7 +238,21 @@ below half the freshly-renewed lease closes that window.
 | acquisition | *deleted* — acquisition is evidence of work (I3), so a freshly-acquired child is never stalled at dispatch |
 
 Both bounds are fail-safe: a timeout is `false` (not expired), logged, and
-retried next tick/sweep.
+retried next tick/sweep. Both are **parameters**, not constants read in
+place, so both fail-safes are provable without a sleep.
+
+**A timeout is not enough — the READS must be bounded too.** A fail-safe
+that fires is not free: a probe that can never finish makes a wedged child
+**immortal**, because every timeout answers *alive*. The walk expands only
+non-terminal rows, but it used to *read* every child (`list_children`) and
+discard the terminal ones in memory — and terminal task rows are retained.
+A parent with thousands of finished tool calls therefore materialized
+thousands of rows on **every** probe of **every** parked ancestor, until no
+probe could finish inside its bound. `AgentTaskStore::probe_children`
+replaces that with two bounded, indexed reads — an `EXISTS` for a fresh
+sign of life across all children, and a **capped** live frontier — so the
+cost of a probe is independent of how much history the parent has
+accumulated, and enforcement can actually converge.
 
 ---
 
@@ -241,6 +267,43 @@ event, and is reaped off its `created_at` floor by the parked sweep.
 
 ---
 
+## The commit path — refresh point (c), enumerated
+
+An event commit is evidence of work (refresh point (c)). The beacon is the
+*retention-proof* half of that signal: the committed-event probe can be
+defeated by `event_ttl_secs < timeout_ms`, and only the durable
+`last_activity_at` survives a purge. So **every** commit must bump.
+
+It didn't. The bump lived at call sites, and only one call site had it:
+
+| Commit site | Bumped before? |
+|---|---|
+| streaming-delta flush (`flush_streaming_deltas`) | **yes** |
+| `emit_auto_retry_start` / `emit_auto_retry_end` | no |
+| `compaction::apply_compaction` | no |
+| turn-start / user-input commits | no |
+| suspension + content batches | no |
+| tool-result batch (`commit_tool_events`) | no — but covered twice over, by `ToolEventCollector::emit` and by the terminal stamp (I3) |
+
+A child in retry backoff, or finishing a compaction, commits real work,
+has it purged, and is reaped as silent.
+
+The fix is a **mechanism, not a rule**:
+`ActivityTrackingEventRepo` decorates the `EventRepository`, so a commit
+that does not record activity is unrepresentable on this path — including
+for call sites that do not exist yet. `RootTurnDeps::wire_activity` sets
+the beacon and the decorated repository **together**, because wiring one
+without the other is precisely the bug.
+
+**Known boundary:** `EventRepository::atomic_event_outbox_committer` hands
+out a raw committer that writes events *without* passing through
+`commit_event`. It is delegated unchanged (no production commit path uses
+it today, and suppressing it would drop the backends' atomic event+outbox
+unit of work). A commit path that adopts that hook must bump the beacon
+itself.
+
+---
+
 ## Consequences
 
 * A new transition that drops a lease must be added to the I3 table and
@@ -249,5 +312,19 @@ event, and is reaped off its `created_at` floor by the parked sweep.
   cadence (I4), or the floor must be re-derived.
 * A new storage backend must guard its activity write with a
   **chronological** comparison (I2) — the in-memory setter's `>` is the
-  reference semantics; text order is not a substitute.
+  reference semantics; text order is not a substitute. Its
+  `probe_children` must likewise be **bounded** and must agree with
+  `ChildProbe::from_rows`.
 * Any new probe leg must be bounded and fail-safe (I5).
+* A commit path that bypasses `EventRepository::commit_event*` (i.e. uses
+  the atomic outbox committer) must bump the beacon itself.
+* **Anything the probe cannot read is `truncated`, never "no activity".**
+  A missing row, a store error, a capped walk — all mean *alive*. The
+  failure this closes: a dangling subagent linkage, or a subtree root that
+  vanished, returned an empty-but-successful walk that read as total
+  silence and killed a live ancestor. "Absent" and "unreadable" are not the
+  same answer.
+* **Bounded reads cut both ways.** An unbounded read is not just slow: past
+  its timeout the probe is treated as alive, so a wedged child becomes
+  *immortal*. Enforcement can only converge if every read the probe makes
+  is bounded independently of retained history.

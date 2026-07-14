@@ -59,9 +59,10 @@ use agent_server::journal::relay::{
 };
 use agent_server::journal::retention::{RetentionCursor, RetentionStore};
 use agent_server::journal::store::{
-    AgentTaskStore, CancelTreeOutcome, MixedChildrenSpawn, RequeueOutcome, SpawnedMixedChildren,
-    SubagentInvocationSpawn, SubmitRootTurnError, SubmitRootTurnOutcome, SubmitRootTurnParams,
-    mixed_child_ids_in_slot_order, new_mixed_tool_child, validate_mixed_children_spawn,
+    AgentTaskStore, CancelTreeOutcome, ChildProbe, MixedChildrenSpawn, RequeueOutcome,
+    SpawnedMixedChildren, SubagentInvocationSpawn, SubmitRootTurnError, SubmitRootTurnOutcome,
+    SubmitRootTurnParams, mixed_child_ids_in_slot_order, new_mixed_tool_child,
+    validate_mixed_children_spawn,
 };
 use agent_server::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskKind, TaskStatus,
@@ -2406,6 +2407,60 @@ impl AgentTaskStore for SqliteDurableStore {
         .await
         .with_context(|| format!("list children for {parent_id}"))?;
         records.into_iter().map(TryInto::try_into).collect()
+    }
+
+    /// ADR-0003 I5 — bounded. Two indexed reads on `parent_id`, neither of
+    /// which can grow with retained terminal history:
+    ///
+    /// 1. an `EXISTS` over ALL children for a fresh sign of life, and
+    /// 2. at most `live_limit` NON-terminal rows for the walk to expand.
+    ///
+    /// The freshness test is `julianday(...)`, not a text comparison: this
+    /// column is variable-precision RFC3339 TEXT, whose lexical order is NOT
+    /// chronological (see `heartbeat_task`). It is also `COALESCE`d to
+    /// `created_at` — a never-acquired child carries no activity stamp, and its
+    /// creation is its initial evidence of life (I1).
+    async fn probe_children(
+        &self,
+        parent_id: &AgentTaskId,
+        cutoff: OffsetDateTime,
+        live_limit: usize,
+    ) -> Result<ChildProbe> {
+        let fresh_activity: bool = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM agent_sdk_tasks \
+                 WHERE parent_id = ?1 \
+                   AND julianday(COALESCE(last_activity_at, created_at)) >= julianday(?2))",
+        )
+        .bind(parent_id.as_str())
+        .bind(cutoff)
+        .fetch_one(&self.pool)
+        .await
+        .with_context(|| format!("probe child activity for {parent_id}"))?
+            != 0;
+
+        let limit = i64::try_from(live_limit).unwrap_or(i64::MAX);
+        let records = sqlx::query_as::<_, TaskRecord>(concat!(
+            "SELECT ",
+            task_columns!(),
+            " FROM agent_sdk_tasks \
+             WHERE parent_id = ?1 AND status NOT IN ('completed', 'failed', 'cancelled') \
+             ORDER BY created_at, id LIMIT ?2",
+        ))
+        .bind(parent_id.as_str())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("probe live children for {parent_id}"))?;
+        let live: Vec<AgentTask> = records
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<_>>()?;
+
+        Ok(ChildProbe {
+            live,
+            fresh_activity,
+        })
     }
 
     async fn list_by_status(&self, status: TaskStatus) -> Result<Vec<AgentTask>> {
@@ -6731,6 +6786,112 @@ mod tests {
             committed.is_empty(),
             "rolled-back fork must not leave events on the destination"
         );
+
+        Ok(())
+    }
+
+    /// ADR-0003 I5 — the stall probe's child read must be BOUNDED, and its SQL
+    /// must agree with the Rust reference semantics.
+    ///
+    /// The probe used to `list_children` and filter terminal rows in memory.
+    /// Terminal task rows are RETAINED, so a parent that has run thousands of
+    /// tool calls materialized thousands of rows on every probe of every parked
+    /// ancestor — until the probe could no longer finish inside its timeout,
+    /// and a timed-out probe is treated as ALIVE. That is the inverse failure:
+    /// unbounded database work AND a wedged child that can never be reaped.
+    ///
+    /// This pins all three properties the bounded query has to hold:
+    ///   * the live frontier is capped and contains no terminal rows;
+    ///   * a TERMINAL child's freshness is still seen (it is what keeps a
+    ///     parked parent alive the moment a long tool finishes);
+    ///   * the SQL agrees with [`ChildProbe::from_rows`], including the I1
+    ///     `COALESCE(last_activity_at, created_at)` fallback and the I2
+    ///     `julianday` (NOT lexical) comparison.
+    #[tokio::test]
+    async fn probe_children_is_bounded_and_matches_the_reference_semantics() -> Result<()> {
+        use agent_server::journal::store::ChildProbe;
+        use agent_server::journal::task::{AgentTask, LeaseId, TaskKind, WorkerId};
+        use agent_server::journal::thread_store::ThreadStore;
+
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+        let thread_id = ThreadId::from_string("t-probe-children");
+        let base = t0();
+        ThreadStore::get_or_create(&store, &thread_id, base).await?;
+
+        let parent = AgentTask::new_root_turn(thread_id.clone(), base, 3);
+        let parent_id = parent.id.clone();
+        AgentTaskStore::submit_root_turn(&store, parent.clone()).await?;
+        let parent = AgentTaskStore::get(&store, &parent_id)
+            .await?
+            .context("parent")?;
+
+        // 40 RETAINED TERMINAL children, all long finished.
+        for _ in 0..40 {
+            let child = AgentTask::new_child(&parent, TaskKind::ToolRuntime, base, 3)?;
+            let id = child.id.clone();
+            AgentTaskStore::insert(&store, child).await?;
+            let claimed = AgentTaskStore::get(&store, &id).await?.context("child")?;
+            let done = claimed
+                .mark_running(
+                    WorkerId::from_string("w"),
+                    LeaseId::new(),
+                    base + Duration::seconds(60),
+                    base,
+                )?
+                .complete(base + Duration::seconds(1))?;
+            AgentTaskStore::update(&store, done).await?;
+        }
+        // 5 LIVE children, never acquired (so `last_activity_at` is NULL —
+        // the I1 fallback must read their `created_at`).
+        for _ in 0..5 {
+            let child = AgentTask::new_child(&parent, TaskKind::ToolRuntime, base, 3)?;
+            AgentTaskStore::insert(&store, child).await?;
+        }
+
+        // Cutoff AFTER everything: nothing is fresh, and the live frontier is
+        // capped below the live count.
+        let cutoff = base + Duration::seconds(600);
+        let probe = AgentTaskStore::probe_children(&store, &parent_id, cutoff, 3).await?;
+        assert_eq!(probe.live.len(), 3, "the live frontier must honour the cap");
+        assert!(
+            probe.live.iter().all(|t| !t.status.is_terminal()),
+            "retained TERMINAL rows must never enter the frontier",
+        );
+        assert!(
+            !probe.fresh_activity,
+            "with every row older than the cutoff, nothing is fresh",
+        );
+
+        // Cutoff BEFORE the terminal children settled: a just-finished child is
+        // a fresh sign of life for its parked parent, even though it is
+        // terminal and therefore never returned in `live`.
+        let probe = AgentTaskStore::probe_children(&store, &parent_id, base, 3).await?;
+        assert!(
+            probe.fresh_activity,
+            "a TERMINAL child that settled inside the window must still count as life",
+        );
+
+        // The SQL must agree with the Rust reference on the SAME rows —
+        // including the `COALESCE(last_activity_at, created_at)` fallback for
+        // the never-acquired live children and the chronological comparison.
+        for cutoff in [
+            base,
+            base + Duration::seconds(1),
+            base + Duration::seconds(600),
+        ] {
+            let all = AgentTaskStore::list_children(&store, &parent_id).await?;
+            let reference = ChildProbe::from_rows(all, cutoff, 3);
+            let actual = AgentTaskStore::probe_children(&store, &parent_id, cutoff, 3).await?;
+            assert_eq!(
+                actual.fresh_activity, reference.fresh_activity,
+                "SQL and the Rust reference must agree on freshness at cutoff {cutoff}",
+            );
+            assert_eq!(
+                actual.live.len(),
+                reference.live.len(),
+                "SQL and the Rust reference must agree on the live frontier at cutoff {cutoff}",
+            );
+        }
 
         Ok(())
     }

@@ -1395,6 +1395,69 @@ struct SubtreeActivity {
 /// verdict instead of a perpetual "truncated → active" — while a
 /// just-completed child is still seen (as a direct child of its still-live
 /// parent) and counts as a fresh sign of life for a parked parent.
+/// What reading one ROOT-ish row told the walk. A "root-ish" row is one the
+/// walk must fetch by id rather than receive from a child listing: the subtree
+/// root itself, and every nested subagent child root reached by the invocation
+/// linkage.
+enum RootRead {
+    /// Decisive — stop the walk and answer with `out` as it stands. Either a
+    /// fresh sign of life was found, or the row was unreadable and the verdict
+    /// is inconclusive.
+    Stop,
+    /// The row was read and is not fresh. `Some` if it is non-terminal and the
+    /// walk should expand it. Boxed: `AgentTask` dwarfs the unit variant.
+    Expand(Option<Box<AgentTask>>),
+}
+
+/// Read one root-ish row and fold it into the walk.
+///
+/// **This is the single home of "unreadable means alive"** (ADR-0003's
+/// never-kill-on-unknown bias). Both callers — the subtree root and the nested
+/// linkage hop — had their own copy of this decision, and the nested one got it
+/// wrong: it silently skipped a missing row, so a DANGLING LINKAGE let the walk
+/// conclude "silent" while an entire live nested subagent went unexamined, and
+/// the ancestor was killed. A missing row is *unreadable* evidence, not *absent*
+/// evidence; the two must never collapse into the same answer.
+async fn read_probe_root(
+    task_store: &dyn AgentTaskStore,
+    id: &AgentTaskId,
+    cutoff: time::OffsetDateTime,
+    out: &mut SubtreeActivity,
+) -> RootRead {
+    match task_store.get(id).await {
+        Ok(Some(task)) => {
+            if note_row_activity(&task, cutoff, out) {
+                return RootRead::Stop;
+            }
+            if task.status.is_terminal() {
+                RootRead::Expand(None)
+            } else {
+                RootRead::Expand(Some(Box::new(task)))
+            }
+        }
+        Ok(None) => {
+            warn!(
+                task_id = %id,
+                "subagent activity probe found no row for a subtree root (vanished, or a \
+                 dangling subagent linkage); treating the child as active (fail-safe: a \
+                 missing row is UNKNOWN activity, never silence)",
+            );
+            out.truncated = true;
+            RootRead::Stop
+        }
+        Err(err) => {
+            warn!(
+                task_id = %id,
+                error = %err,
+                "subagent activity probe could not read a subtree root; treating the child \
+                 as active (fail-safe)",
+            );
+            out.truncated = true;
+            RootRead::Stop
+        }
+    }
+}
+
 async fn collect_subtree_activity(
     task_store: &dyn AgentTaskStore,
     root: &AgentTaskId,
@@ -1408,28 +1471,13 @@ async fn collect_subtree_activity(
 
     // The root — and any linkage-hopped nested root — is a genuine root task
     // not returned by a `list_children`, so it needs its own read.
-    match task_store.get(root).await {
-        Ok(Some(task)) => {
-            if note_row_activity(&task, cutoff, &mut out) {
-                return out;
-            }
-            if !task.status.is_terminal() {
-                expanded.insert(task.id.clone());
-                frontier.push_back(task);
-            }
+    match read_probe_root(task_store, root, cutoff, &mut out).await {
+        RootRead::Stop => return out,
+        RootRead::Expand(Some(task)) => {
+            expanded.insert(task.id.clone());
+            frontier.push_back(*task);
         }
-        // A root that vanished is not evidence of silence.
-        Ok(None) => return out,
-        Err(err) => {
-            warn!(
-                task_id = %root,
-                error = %err,
-                "subagent activity probe could not read the subtree root; treating the child \
-                 as active (fail-safe)",
-            );
-            out.truncated = true;
-            return out;
-        }
+        RootRead::Expand(None) => {}
     }
 
     while let Some(task) = frontier.pop_front() {
@@ -1449,41 +1497,40 @@ async fn collect_subtree_activity(
         if let Some(invocation) = task.state.subagent_invocation() {
             let nested = invocation.child_root_task_id.clone();
             if expanded.insert(nested.clone()) {
-                match task_store.get(&nested).await {
-                    Ok(Some(nested_root)) => {
-                        if note_row_activity(&nested_root, cutoff, &mut out) {
-                            return out;
-                        }
-                        if !nested_root.status.is_terminal() {
-                            frontier.push_back(nested_root);
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        warn!(
-                            task_id = %nested,
-                            error = %err,
-                            "subagent activity probe could not read a nested child root; \
-                             treating the child as active (fail-safe)",
-                        );
-                        out.truncated = true;
-                        return out;
-                    }
+                match read_probe_root(task_store, &nested, cutoff, &mut out).await {
+                    RootRead::Stop => return out,
+                    RootRead::Expand(Some(nested_root)) => frontier.push_back(*nested_root),
+                    RootRead::Expand(None) => {}
                 }
             }
         }
 
-        // Direct children come back as full rows: inspect every child's
-        // activity inline (so a just-completed TERMINAL child still counts
-        // as a fresh sign of life for its parked parent), but enqueue only
-        // NON-terminal children for expansion.
-        match task_store.list_children(&task.id).await {
-            Ok(children) => {
-                for child in children {
+        // Direct children, read with the READ ITSELF BOUNDED (ADR-0003 I5).
+        //
+        // Terminal task rows are RETAINED, so reading every child and filtering
+        // in memory made each probe materialize the parent's entire tool
+        // history — on every probe, for every parked ancestor. Past a few
+        // thousand rows the probe cannot finish inside its timeout, and a
+        // timed-out probe is treated as alive: unbounded DB work AND a wedged
+        // child that can never be reaped. `probe_children` answers the two
+        // questions the walk actually has, both bounded: "did ANY child show a
+        // sign of life?" (an indexed EXISTS across terminal and live alike, so
+        // a just-completed child still keeps its parked parent alive) and "give
+        // me the live frontier" (capped).
+        match task_store
+            .probe_children(&task.id, cutoff, MAX_ACTIVITY_SUBTREE_NODES)
+            .await
+        {
+            Ok(probe) => {
+                if probe.fresh_activity {
+                    out.found_fresh = true;
+                    return out;
+                }
+                for child in probe.live {
                     if note_row_activity(&child, cutoff, &mut out) {
                         return out;
                     }
-                    if !child.status.is_terminal() && expanded.insert(child.id.clone()) {
+                    if expanded.insert(child.id.clone()) {
                         frontier.push_back(child);
                     }
                 }
@@ -2088,6 +2135,16 @@ async fn execute_root_task(
         .await
         .context("reading root-task event watermark")?;
 
+    // ADR-0003 refresh point (c): route this task's event commits through the
+    // beacon. Installed once here and handed to every branch via
+    // `wire_activity`, so no execution path can journal work without recording
+    // it — including paths that commit outside the streaming loop (auto-retry,
+    // compaction, turn-start, suspension batches).
+    let tracked_event_repo = agent_server::worker::ActivityTrackingEventRepo::new(
+        stores.event_repo.as_ref(),
+        activity.clone(),
+    );
+
     let outcome = Box::pin(async {
         let bootstrap =
             resolve_bootstrap_context(task.clone(), stores.definition_registry.as_ref())
@@ -2123,7 +2180,7 @@ async fn execute_root_task(
             );
             deps.cancel = Some(cancel);
             deps.wakeup = runtime.wakeup_signal();
-            deps.activity = Some(activity);
+            deps.wire_activity(activity, &tracked_event_repo);
             resume_for_steering(inputs, &task, provider.as_ref(), &deps, now)
                 .await
                 .context("resume parked root task for steering wake")
@@ -2136,7 +2193,7 @@ async fn execute_root_task(
             );
             deps.cancel = Some(cancel);
             deps.wakeup = runtime.wakeup_signal();
-            deps.activity = Some(activity);
+            deps.wire_activity(activity, &tracked_event_repo);
             resume_from_children(inputs, &task, provider.as_ref(), &deps, now)
                 .await
                 .context("resume root task from durable child results")
@@ -2150,7 +2207,7 @@ async fn execute_root_task(
             );
             deps.cancel = Some(cancel);
             deps.wakeup = runtime.wakeup_signal();
-            deps.activity = Some(activity);
+            deps.wire_activity(activity, &tracked_event_repo);
             agent_server::worker::execute_root_turn(
                 inputs,
                 user_input,
@@ -2553,9 +2610,22 @@ async fn execute_tool_task(
         }
         Ok(ToolTaskOutcome::Cancelled) => Ok(()),
         Err(err) => {
+            // ADR-0003 I3: the terminal instant is captured AT the transition,
+            // never inherited from a `now` bound at task entry. The tool above
+            // may have run for 40 minutes; stamping the entry instant would
+            // backdate this row's `completed_at` AND its `last_activity_at` by
+            // the whole execution, so a parent parked on sibling work reads a
+            // just-failed child as long-silent.
+            let failed_at = time::OffsetDateTime::now_utc();
             stores
                 .task_store
-                .fail_task(&task.id, &worker_id, &lease_id, format!("{err:#}"), now)
+                .fail_task(
+                    &task.id,
+                    &worker_id,
+                    &lease_id,
+                    format!("{err:#}"),
+                    failed_at,
+                )
                 .await
                 .context("fail tool task after guarded execution error")?;
             Ok(())
@@ -2606,9 +2676,19 @@ async fn execute_subagent_task_entry(
             Ok(())
         }
         Err(err) => {
+            // ADR-0003 I3: capture the terminal instant AT the transition —
+            // `now` was bound before `execute_subagent_task` ran, which can be
+            // an entire subagent lifetime ago.
+            let failed_at = time::OffsetDateTime::now_utc();
             stores
                 .task_store
-                .fail_task(&task.id, &worker_id, &lease_id, format!("{err:#}"), now)
+                .fail_task(
+                    &task.id,
+                    &worker_id,
+                    &lease_id,
+                    format!("{err:#}"),
+                    failed_at,
+                )
                 .await
                 .context("fail subagent task after materialization error")?;
             Ok(())
@@ -5833,6 +5913,18 @@ mod tests {
         thread: &agent_sdk_foundation::ThreadId,
         tool_name: &str,
     ) -> agent_server::journal::task::SuspensionPayload {
+        pending_call_suspension_with_tier(thread, tool_name, ToolTier::Confirm)
+    }
+
+    /// Like [`pending_call_suspension`] but with an explicit tier. A `Confirm`
+    /// tool PAUSES instead of executing (`execute_tool_task` gates on the
+    /// tier), so a test that needs the tool to actually run must ask for
+    /// `Observe`.
+    fn pending_call_suspension_with_tier(
+        thread: &agent_sdk_foundation::ThreadId,
+        tool_name: &str,
+        tier: ToolTier,
+    ) -> agent_server::journal::task::SuspensionPayload {
         agent_server::journal::task::SuspensionPayload {
             continuation: agent_sdk_foundation::ContinuationEnvelope::wrap(
                 agent_sdk_foundation::AgentContinuation {
@@ -5844,7 +5936,7 @@ mod tests {
                         id: format!("call_{tool_name}"),
                         name: tool_name.to_owned(),
                         display_name: tool_name.to_owned(),
-                        tier: ToolTier::Confirm,
+                        tier,
                         input: serde_json::json!({ "task": HANG_CHILD_TASK }),
                         effective_input: serde_json::json!({ "task": HANG_CHILD_TASK }),
                         listen_context: None,
@@ -6297,6 +6389,272 @@ mod tests {
             !stall_expired(&stores, &child_root.id, deadline, None, now).await,
             "a descendant SPAWNED inside the budget is evidence the parent worked, even \
              though it has not been acquired and so carries no last_activity_at",
+        );
+        Ok(())
+    }
+
+    /// A tool executor that stamps the instant it actually ran, then fails.
+    /// The stamp is the causal fence the transition-instant test needs.
+    struct FailingStampingToolExecutor {
+        executed_at: Arc<std::sync::Mutex<Option<time::OffsetDateTime>>>,
+    }
+
+    #[async_trait]
+    impl crate::runtime::ToolCallExecutor for FailingStampingToolExecutor {
+        async fn execute_tool_call(
+            &self,
+            _bootstrap: &agent_server::worker::ToolTaskBootstrap,
+            _collector: agent_server::worker::ToolEventCollector,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<agent_sdk_foundation::ToolResult> {
+            let ran_at = time::OffsetDateTime::now_utc();
+            if let Ok(mut slot) = self.executed_at.lock() {
+                *slot = Some(ran_at);
+            }
+            // Stand in for a long-running tool, WITHOUT a sleep: spin until the
+            // wall clock strictly advances past `ran_at`. This is what makes the
+            // test's causal fence strict rather than "greater-or-equal" — at
+            // sub-microsecond granularity an entry-bound `now` and `ran_at` can
+            // otherwise read as the SAME instant, and the assertion would pass
+            // against the very bug it exists to catch. Terminates in one clock
+            // tick.
+            while time::OffsetDateTime::now_utc() <= ran_at {
+                std::hint::spin_loop();
+            }
+            bail!("tool blew up after running for a long time")
+        }
+    }
+
+    /// ADR-0003 I3 — the terminal instant is captured AT the transition, never
+    /// inherited from a `now` bound at task ENTRY.
+    ///
+    /// `execute_tool_task` bound one `now` at the top and reused it to
+    /// `fail_task` *after* the tool had run. A tool can run for 40 minutes (a
+    /// detached Confirm-tier tool is designed to outlive its lease), so the
+    /// terminal row was stamped with an instant from before the work — which
+    /// backdates BOTH `completed_at` and `last_activity_at`, and makes a parent
+    /// parked on sibling work read a just-failed child as long-silent.
+    ///
+    /// Deterministic with no sleeps: the assertion is a CAUSAL ordering. The
+    /// executor stamps the wall clock at the moment it runs; the terminal
+    /// instant must be at or after that stamp. An entry-bound `now` is captured
+    /// strictly before the executor is ever invoked, so it cannot satisfy this
+    /// no matter how fast the machine is.
+    #[tokio::test]
+    async fn terminal_instant_is_captured_at_the_transition_not_at_task_entry() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+
+        let executed_at = Arc::new(std::sync::Mutex::new(None));
+        let runtime = subagent_timeout_runtime_with_executor(
+            Arc::new(SubagentScriptProvider::new()),
+            Arc::new(FailingStampingToolExecutor {
+                executed_at: Arc::clone(&executed_at),
+            }),
+        )?;
+        // `probe_definition` so the spawned tool ("probe", tier Observe) is a
+        // KNOWN tool and executes instead of pausing for confirmation.
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(probe_definition()));
+        let host = ServiceHost::new(ServiceConfig::default(), registry, runtime.clone())?;
+        let stores = host.stores().clone();
+
+        let at = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
+        let (_parent, _invocation, child_root) = persist_subagent_fixture(
+            &stores,
+            &ThreadId::from_string("t-terminal-instant"),
+            30 * 60 * 1_000,
+            at,
+        )
+        .await?;
+
+        // Park the child root on an OBSERVE-tier tool child: a Confirm-tier
+        // tool would pause instead of executing, and this test needs the tool
+        // to actually run and then fail.
+        let worker = WorkerId::from_string("w-park-observe");
+        let lease = LeaseId::new();
+        stores
+            .task_store
+            .try_acquire_task(
+                &child_root.id,
+                worker.clone(),
+                lease.clone(),
+                time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+                at,
+            )
+            .await?
+            .context("child root must acquire before parking")?;
+        let (_parked, children) = stores
+            .task_store
+            .spawn_tool_children(
+                &child_root.id,
+                &worker,
+                &lease,
+                vec![agent_server::journal::task::ChildSpawnSpec { max_attempts: 3 }],
+                pending_call_suspension_with_tier(
+                    &child_root.thread_id,
+                    "probe",
+                    ToolTier::Observe,
+                ),
+                None,
+                at,
+            )
+            .await?;
+        let tool_child = children.into_iter().next().context("one tool child")?;
+
+        // Acquire the tool child so `execute_tool_task` sees a Running lease.
+        let acquired = stores
+            .task_store
+            .try_acquire_task(
+                &tool_child.id,
+                WorkerId::from_string("w-terminal-instant"),
+                LeaseId::new(),
+                time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+                time::OffsetDateTime::now_utc(),
+            )
+            .await?
+            .context("tool child must acquire")?;
+
+        // Fail the FIRST `fail_task` — the one `guarded_tool_execution` makes to
+        // settle the tool's own terminal row (that instant is already captured
+        // post-execution and is correct). The injected error propagates out of
+        // guarded execution as `Err`, which drives `execute_tool_task`'s own
+        // fail arm — the site under test. `recorded_fail_now` therefore ends up
+        // holding the instant THAT arm stamped.
+        let recording =
+            Arc::new(FlakyTaskStore::new(Arc::clone(&stores.task_store)).failing_fail_tasks(1));
+        let mut recording_stores = stores.clone();
+        recording_stores.task_store = Arc::clone(&recording) as Arc<dyn AgentTaskStore>;
+
+        execute_tool_task(
+            acquired,
+            &recording_stores,
+            runtime,
+            &CancellationToken::new(),
+            &ActivityBeacon::new(),
+        )
+        .await?;
+
+        let ran_at = executed_at
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
+            .context("the tool executor must have run")?;
+        let failed_at = recording
+            .recorded_fail_now()
+            .context("the tool task must have been failed")?;
+
+        assert!(
+            failed_at > ran_at,
+            "the terminal instant ({failed_at}) must be captured AT the transition, strictly \
+             after the tool actually ran ({ran_at}) — a `now` bound at task entry predates \
+             the executor and backdates the row by the whole execution",
+        );
+        Ok(())
+    }
+
+    /// ADR-0003 never-kill-on-unknown — a row that is NOT THERE is unknown
+    /// activity, not silence.
+    ///
+    /// `collect_subtree_activity` used to return the default `SubtreeActivity`
+    /// when a row was missing: no fresh activity, and no threads to probe. That
+    /// falls straight through `stall_expired` to "expired" — so a subtree root
+    /// that vanished, or a subagent linkage pointing at a child root that is no
+    /// longer there, would KILL a live ancestor. The old comment even claimed
+    /// "a root that vanished is not evidence of silence" while returning a
+    /// value that was read as exactly that.
+    ///
+    /// Both missing-row paths are covered: the subtree root itself, and the
+    /// nested-root hop.
+    #[tokio::test]
+    async fn a_missing_row_is_inconclusive_never_silence() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+        use agent_server::journal::SubagentInvocationSpawn;
+
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            sample_registry(),
+            subagent_timeout_runtime(Arc::new(SubagentScriptProvider::new()))?,
+        )?;
+        let stores = host.stores().clone();
+
+        let budget_ms: u64 = 30 * 60 * 1_000;
+        let now = time::OffsetDateTime::now_utc();
+        let spawned_at = now - time::Duration::hours(2);
+        let parent_thread = ThreadId::from_string("t-dangling");
+        let (_parent, _invocation, child_root) =
+            persist_subagent_fixture(&stores, &parent_thread, budget_ms, spawned_at).await?;
+        let deadline = deadline_for(child_root.created_at, budget_ms, 0).context("deadline")?;
+
+        // 1. The subtree ROOT itself is not there. Unknown, never silence.
+        assert!(
+            !stall_expired(&stores, &AgentTaskId::new(), deadline, None, now).await,
+            "a subtree root that is not there is UNKNOWN activity, never silence",
+        );
+
+        // 2. Give the child root a NESTED subagent of its own, everything
+        //    backdated so nothing in the subtree is fresh — the verdict must
+        //    turn purely on whether the linkage resolves.
+        let worker = WorkerId::from_string("w-dangling");
+        let lease = LeaseId::new();
+        stores
+            .task_store
+            .try_acquire_task(
+                &child_root.id,
+                worker.clone(),
+                lease.clone(),
+                now + time::Duration::seconds(600),
+                spawned_at,
+            )
+            .await?
+            .context("child root must acquire")?;
+
+        let nested_thread = ThreadId::from_string("t-dangling-nested");
+        stores
+            .thread_store
+            .get_or_create(&nested_thread, spawned_at)
+            .await?;
+        let (_child_root, invocation, _nested_root) = stores
+            .task_store
+            .spawn_subagent_invocation(
+                &child_root.id,
+                &worker,
+                &lease,
+                SubagentInvocationSpawn {
+                    child_thread_id: nested_thread,
+                    spec: subagent_timeout_spec(HANG_CHILD_TASK, budget_ms),
+                    child_root_input: vec![SubmittedInputItem::Text {
+                        text: HANG_CHILD_TASK.into(),
+                    }],
+                    spawn_index: 0,
+                    child_caller_metadata: None,
+                    payload: pending_call_suspension(&parent_thread, "subagent_hang"),
+                },
+                spawned_at,
+            )
+            .await?;
+
+        assert!(
+            stall_expired(&stores, &child_root.id, deadline, None, now).await,
+            "sanity: with the linkage RESOLVING and every row backdated, the subtree is \
+             genuinely silent and the child IS reaped — so the assertion below is decided \
+             by the dangling linkage alone",
+        );
+
+        // 3. Repoint the invocation at a child root that does not exist. The
+        //    nested subtree's evidence is now UNREADABLE — an entire live
+        //    nested subagent could be behind it — so the walk must not conclude
+        //    "silent" and kill the ancestor.
+        let mut dangling = invocation;
+        if let TaskState::SubagentInvocation { invocation } = &mut dangling.state {
+            invocation.child_root_task_id = AgentTaskId::new();
+        } else {
+            panic!("fixture must produce a SubagentInvocation row");
+        }
+        stores.task_store.update(dangling).await?;
+
+        assert!(
+            !stall_expired(&stores, &child_root.id, deadline, None, now).await,
+            "a dangling subagent linkage must never reap a live ancestor: a missing nested \
+             root is UNREADABLE evidence, not absent evidence",
         );
         Ok(())
     }
@@ -7335,6 +7693,10 @@ mod tests {
         /// renewed the lease BEFORE the probe ran.
         list_children_stall_ms: AtomicUsize,
         probe_started: Arc<tokio::sync::Notify>,
+        /// The `now` the last `fail_task` was called with — ADR-0003 I3 says
+        /// this must be the instant the transition HAPPENED, not one the
+        /// caller captured at task entry (before a possibly very long run).
+        fail_task_now: Arc<std::sync::Mutex<Option<time::OffsetDateTime>>>,
     }
 
     impl FlakyTaskStore {
@@ -7347,7 +7709,13 @@ mod tests {
                 heartbeat_rejections_remaining: AtomicUsize::new(0),
                 list_children_stall_ms: AtomicUsize::new(0),
                 probe_started: Arc::new(tokio::sync::Notify::new()),
+                fail_task_now: Arc::new(std::sync::Mutex::new(None)),
             }
+        }
+
+        /// The instant the last `fail_task` was stamped with, if any.
+        fn recorded_fail_now(&self) -> Option<time::OffsetDateTime> {
+            self.fail_task_now.lock().ok().and_then(|slot| *slot)
         }
 
         /// Make every `list_children` call (the subtree probe's expansion
@@ -7692,6 +8060,9 @@ mod tests {
             now: time::OffsetDateTime,
         ) -> Result<(AgentTask, Option<AgentTask>)> {
             self.fail_task_attempts.fetch_add(1, Ordering::SeqCst);
+            if let Ok(mut slot) = self.fail_task_now.lock() {
+                *slot = Some(now);
+            }
             if Self::take_injected_failure(&self.fail_task_failures_remaining) {
                 bail!("injected transient fail_task failure");
             }

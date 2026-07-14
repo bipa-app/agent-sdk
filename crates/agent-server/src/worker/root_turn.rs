@@ -52,7 +52,7 @@ use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::activity::ActivityBeacon;
+use super::activity::{ActivityBeacon, ActivityTrackingEventRepo};
 use super::definition::{AgentDefinition, ThinkingPolicy};
 use crate::journal::checkpoint::CheckpointKind;
 use crate::journal::checkpoint_store::CheckpointStore;
@@ -205,6 +205,25 @@ impl RootTurnDeps<'_> {
         if let Some(activity) = self.activity {
             activity.bump(OffsetDateTime::now_utc());
         }
+    }
+}
+
+impl<'a> RootTurnDeps<'a> {
+    /// Wire this task's stall-budget beacon (ADR-0003).
+    ///
+    /// Sets the beacon **and** routes every event commit through it, in one
+    /// call. The two are deliberately inseparable: a beacon wired *without* the
+    /// tracking repository is exactly how the auto-retry, compaction,
+    /// turn-start and suspension commits ended up invisible to the stall probe
+    /// — each one a healthy child reaped for work the journal had since purged.
+    /// Setting the fields independently is possible but is a bug; use this.
+    pub fn wire_activity(
+        &mut self,
+        beacon: &'a ActivityBeacon,
+        tracked: &'a ActivityTrackingEventRepo<'a>,
+    ) {
+        self.event_repo = tracked;
+        self.activity = Some(beacon);
     }
 }
 
@@ -3602,13 +3621,12 @@ async fn flush_streaming_deltas(
         .await
     {
         Ok(committed) => {
-            // Refresh point (c): a durable commit is evidence of work.
-            // The beacon records it on the task row, which event retention
-            // cannot purge — so a batch committed inside the stall window
-            // and later aged out of the journal still counts as life.
-            if let Some(activity) = deps.activity {
-                activity.bump(flush_now);
-            }
+            // Refresh point (c) — a durable commit is evidence of work — is
+            // recorded by `ActivityTrackingEventRepo`, which `wire_activity`
+            // installs as `deps.event_repo`. It is deliberately NOT bumped
+            // here: a per-call-site bump is precisely what left the auto-retry,
+            // compaction and suspension commits invisible to the stall probe.
+            // The decorator cannot be forgotten; this line could.
             deps.event_notifier.notify(&committed);
         }
         Err(error) => {
