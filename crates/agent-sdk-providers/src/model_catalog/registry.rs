@@ -531,12 +531,11 @@ mod tests {
                 model_id: "gpt-5.4".to_owned(),
                 context_window: None,
                 max_output_tokens: None,
-                // models.dev: base 2.5/15, tier above 272K context 5/22.5.
+                // models.dev: base 2.5/15, tier from 272K context 5/22.5.
                 pricing: Some(Pricing::flat(2.5, 15.0)),
                 pricing_tiers: vec![PricingTier {
-                    // Inclusive bound: models.dev's "above 272K" band starts at
-                    // the first token past 272K.
-                    min_input_tokens: 272_001,
+                    // Inclusive bound: the tier applies from 272K upward.
+                    min_input_tokens: 272_000,
                     pricing: Pricing::flat(5.0, 22.5),
                 }],
                 supports_thinking: None,
@@ -576,11 +575,26 @@ mod tests {
         Ok(())
     }
 
-    /// The threshold is exclusive: a call *at* the tier size still pays base
-    /// rates, and only the token past it moves the call into the tier.
+    /// The threshold is inclusive: a call *at* the tier size already pays the
+    /// tier rate, and one token below it still pays base.
     #[test]
-    fn tier_selection_is_exclusive_at_the_threshold() -> Result<()> {
+    fn tier_selection_is_inclusive_at_the_threshold() -> Result<()> {
         let registry = tiered_registry();
+
+        let just_below = Usage {
+            input_tokens: 271_999,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        let base_cost = registry
+            .estimate_cost_usd("openai", "gpt-5.4", &just_below)
+            .context("cost estimate missing")?;
+        // 271_999 / 1e6 * 2.5 = 0.6799975.
+        assert!(
+            (base_cost - 0.679_997_5).abs() < 1e-9,
+            "unexpected cost: {base_cost}"
+        );
 
         let at_threshold = Usage {
             input_tokens: 272_000,
@@ -588,27 +602,12 @@ mod tests {
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
         };
-        let base_cost = registry
+        let tier_cost = registry
             .estimate_cost_usd("openai", "gpt-5.4", &at_threshold)
             .context("cost estimate missing")?;
-        // 272_000 / 1e6 * 2.5 = 0.68.
+        // 272_000 / 1e6 * 5.0 = 1.36.
         assert!(
-            (base_cost - 0.68).abs() < 1e-9,
-            "unexpected cost: {base_cost}"
-        );
-
-        let past_threshold = Usage {
-            input_tokens: 272_001,
-            output_tokens: 0,
-            cached_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-        };
-        let tier_cost = registry
-            .estimate_cost_usd("openai", "gpt-5.4", &past_threshold)
-            .context("cost estimate missing")?;
-        // 272_001 / 1e6 * 5.0 = 1.360005.
-        assert!(
-            (tier_cost - 1.360_005).abs() < 1e-9,
+            (tier_cost - 1.36).abs() < 1e-9,
             "unexpected cost: {tier_cost}"
         );
         Ok(())
@@ -649,7 +648,7 @@ mod tests {
         Ok(())
     }
 
-    /// models.dev's gpt-5.4: base 2.5/15, tier above 272K context 5/22.5.
+    /// models.dev's gpt-5.4: base 2.5/15, tier from 272K context 5/22.5.
     fn tiered_registry() -> ModelRegistry {
         ModelRegistry::new().with_override(
             "openai",
@@ -661,9 +660,8 @@ mod tests {
                 max_output_tokens: None,
                 pricing: Some(Pricing::flat(2.5, 15.0)),
                 pricing_tiers: vec![PricingTier {
-                    // Inclusive bound: models.dev's "above 272K" band starts at
-                    // the first token past 272K.
-                    min_input_tokens: 272_001,
+                    // Inclusive bound: the tier applies from 272K upward.
+                    min_input_tokens: 272_000,
                     pricing: Pricing::flat(5.0, 22.5),
                 }],
                 supports_thinking: None,

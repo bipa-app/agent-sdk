@@ -144,10 +144,14 @@ fn tiers_from_modelsdev_cost(cost: &ModelsDevCost) -> Option<Vec<PricingTier>> {
             let band =
                 pricing_from_rates(tier.input, tier.output, tier.cache_read, tier.cache_write)?;
             Some(PricingTier {
-                // The feed's bound is exclusive — its sibling field is literally
-                // `context_over_200k` — so the first call the band covers is one
-                // token past it.
-                min_input_tokens: bound.size?.saturating_add(1),
+                // The bound is inclusive: the models.dev SDK schema documents
+                // `tier.size` as "Context size (in tokens) at which this tier
+                // starts to apply" / "Pricing that applies from a given context
+                // size upward". (The `context_over_200k` field is a legacy
+                // projection the same schema marks "Prefer `tiers`", not the
+                // definition — an earlier reading that took it as exclusive was
+                // wrong.)
+                min_input_tokens: bound.size?,
                 pricing: merge_band_over_base(base, band),
             })
         })
@@ -428,9 +432,9 @@ mod tests {
         assert!((base.input.context("input")?.usd_per_million_tokens - 2.5).abs() < f64::EPSILON);
         assert_eq!(tiered.pricing_tiers.len(), 1);
         let tier = tiered.pricing_tiers[0];
-        // The feed's bound is exclusive ("context over 272K"); the tier's is
-        // inclusive, so it starts one token later.
-        assert_eq!(tier.min_input_tokens, 272_001);
+        // The bound is inclusive (SDK schema: "at which this tier starts to
+        // apply"), so `size` maps straight across.
+        assert_eq!(tier.min_input_tokens, 272_000);
         assert!(
             (tier
                 .pricing

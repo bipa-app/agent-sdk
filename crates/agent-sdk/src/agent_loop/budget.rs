@@ -22,6 +22,7 @@ use crate::pricing::CostEstimator;
 use crate::types::{BudgetLimitKind, TokenUsage, UsageLimits};
 use agent_sdk_foundation::audit::AuditProvenance;
 use agent_sdk_foundation::llm::Usage;
+use std::borrow::Cow;
 
 /// What a [`TokenUsage`] being priced describes.
 ///
@@ -93,9 +94,9 @@ fn estimate_scoped(
     if let Some(estimator) = pricing
         && let Some(cost) =
             catalog_candidates(provider, model).find_map(|(provider, model)| match scope {
-                UsageScope::Call => estimator.estimate_cost_usd(provider, model, &usage),
+                UsageScope::Call => estimator.estimate_cost_usd(&provider, &model, &usage),
                 UsageScope::Aggregate => {
-                    estimator.estimate_aggregate_cost_usd(provider, model, &usage)
+                    estimator.estimate_aggregate_cost_usd(&provider, &model, &usage)
                 }
             })
     {
@@ -119,14 +120,56 @@ fn estimate_scoped(
 /// OpenRouter-routed `anthropic/claude-fable-5` would start pricing at
 /// Anthropic's direct-API rate, which is not what that run pays. Without a
 /// catalog the loop must price exactly as it always has.
+///
+/// Items are [`Cow`] because most keys borrow the provenance, but a gateway
+/// service key owns a freshly prefixed model id (see
+/// [`gateway_model_candidates`]).
 fn catalog_candidates<'a>(
     provider: &'a str,
     model: &'a str,
-) -> impl Iterator<Item = (&'a str, &'a str)> {
-    std::iter::once((provider, model))
-        .chain(feed_service_keys(provider, model).map(move |service| (service, model)))
-        .chain(backend_aliases(provider, model).map(move |backend| (backend, model)))
-        .chain(feed_slug_candidates(model))
+) -> impl Iterator<Item = (Cow<'a, str>, Cow<'a, str>)> {
+    std::iter::once((Cow::Borrowed(provider), Cow::Borrowed(model)))
+        .chain(
+            gateway_model_candidates(provider, model)
+                .map(|(service, prefixed)| (Cow::Borrowed(service), Cow::Owned(prefixed))),
+        )
+        .chain(
+            feed_service_keys(provider, model)
+                .map(move |service| (Cow::Borrowed(service), Cow::Borrowed(model))),
+        )
+        .chain(
+            backend_aliases(provider, model)
+                .map(move |backend| (Cow::Borrowed(backend), Cow::Borrowed(model))),
+        )
+        .chain(feed_slug_candidates(model).map(|(p, m)| (Cow::Borrowed(p), Cow::Borrowed(m))))
+}
+
+/// The keys models.dev files a Cloudflare AI Gateway pass-through row under.
+///
+/// `CloudflareAIGatewayProvider` reports `("cloudflare-ai-gateway", "claude-sonnet-4")`,
+/// but models.dev stores the row as `("cloudflare-ai-gateway", "anthropic/claude-sonnet-4")`
+/// — the same service provider, the model id prefixed with the backend vendor.
+/// So the model half is transformed (not the provider, as for Vertex): each
+/// backend the gateway fronts contributes a `backend/model` candidate.
+///
+/// These come before the direct-vendor aliases: the gateway's own rate is what
+/// the caller pays, so its rows answer first, and the wrapped vendor's direct
+/// rows are the approximation behind them. The prefixed model half is
+/// vendor-exact, so a backend that does not carry the model simply misses —
+/// there is no cross-vendor misprice. Only `anthropic` and `openai` have rows
+/// in the gateway section today; a Gemini gateway call finds none and falls
+/// through to the direct-vendor alias.
+fn gateway_model_candidates<'a>(
+    provider: &'a str,
+    model: &str,
+) -> impl Iterator<Item = (&'a str, String)> {
+    let backends: &'static [&'static str] = match provider {
+        "cloudflare-ai-gateway" => &["anthropic", "openai"],
+        _ => &[],
+    };
+    backends
+        .iter()
+        .map(move |backend| (provider, format!("{backend}/{model}")))
 }
 
 /// The names a feed files a *service* under, when the provider serves models
@@ -1162,6 +1205,90 @@ mod catalog_tests {
         let (limit, _) = status(Some(&limits), Some(&registry), &provenance, &usage, None)
             .context("a Vertex SKU must be able to trip the cost limit")?;
         assert_eq!(limit, BudgetLimitKind::CostUsd);
+        Ok(())
+    }
+
+    /// models.dev files a Cloudflare AI Gateway row under a backend-prefixed
+    /// model id (`anthropic/claude-sonnet-4`), while the gateway reports the
+    /// bare model id. The gateway rate is reached via the prefixed candidate,
+    /// and it wins over the direct-vendor row that the plain alias would find.
+    #[tokio::test]
+    async fn gateway_row_prices_via_the_prefixed_model_key() -> Result<()> {
+        const MODELSDEV_GATEWAY_FIXTURE: &str = r#"{
+          "cloudflare-ai-gateway": {
+            "id": "cloudflare-ai-gateway",
+            "models": {
+              "anthropic/claude-sonnet-4": {
+                "id": "anthropic/claude-sonnet-4",
+                "cost": { "input": 4, "output": 20 }
+              }
+            }
+          },
+          "anthropic": {
+            "id": "anthropic",
+            "models": {
+              "claude-sonnet-4": {
+                "id": "claude-sonnet-4",
+                "cost": { "input": 3, "output": 15 }
+              }
+            }
+          }
+        }"#;
+
+        let registry = registry_from_entries(parse_modelsdev(MODELSDEV_GATEWAY_FIXTURE)?).await?;
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+        let provenance = AuditProvenance::new("cloudflare-ai-gateway", "claude-sonnet-4");
+
+        // The gateway's own rate ($4 + $20 = $24), reached via the
+        // `anthropic/claude-sonnet-4` key — not the direct-vendor row ($3 + $15
+        // = $18) the plain `anthropic` alias would find.
+        let cost = estimate_cost_usd(Some(&registry), &provenance, &usage)
+            .context("the gateway service row must price this call")?;
+        assert!((cost - 24.0).abs() < 1e-9, "unexpected cost: {cost}");
+
+        let limits = UsageLimits {
+            max_cost_usd: Some(1.0),
+            ..Default::default()
+        };
+        let (limit, _) = status(Some(&limits), Some(&registry), &provenance, &usage, None)
+            .context("a gateway row must be able to trip the cost limit")?;
+        assert_eq!(limit, BudgetLimitKind::CostUsd);
+        Ok(())
+    }
+
+    /// When the gateway section has no row for a model, the direct-vendor row
+    /// is the documented fallback — not `None`.
+    #[tokio::test]
+    async fn gateway_falls_back_to_the_direct_vendor_row() -> Result<()> {
+        const MODELSDEV_DIRECT_ONLY_FIXTURE: &str = r#"{
+          "anthropic": {
+            "id": "anthropic",
+            "models": {
+              "claude-sonnet-4": {
+                "id": "claude-sonnet-4",
+                "cost": { "input": 3, "output": 15 }
+              }
+            }
+          }
+        }"#;
+
+        let registry =
+            registry_from_entries(parse_modelsdev(MODELSDEV_DIRECT_ONLY_FIXTURE)?).await?;
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+        let provenance = AuditProvenance::new("cloudflare-ai-gateway", "claude-sonnet-4");
+
+        // No gateway row; the `anthropic` alias reaches the direct row ($18).
+        let cost = estimate_cost_usd(Some(&registry), &provenance, &usage)
+            .context("the direct-vendor alias must price this call")?;
+        assert!((cost - 18.0).abs() < 1e-9, "unexpected cost: {cost}");
         Ok(())
     }
 

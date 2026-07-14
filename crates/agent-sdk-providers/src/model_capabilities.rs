@@ -131,6 +131,17 @@ impl Pricing {
         add(self.band_rate(self.cached_input), bands.cache_read);
         add(self.band_rate(self.cache_write), bands.cache_write);
 
+        // Every output token bills at the output rate, including any reasoning
+        // tokens. A few routes publish a distinct (lower) reasoning rate — and
+        // reasoning tokens ride inside the completion count — but `Usage` has no
+        // component that splits them out, so they cannot be billed separately.
+        // Pricing them at the completion rate is therefore a bounded
+        // OVER-estimate for those routes (never an under-estimate), which is the
+        // safe direction for a spend cap; the true over-count is bounded by the
+        // completion-minus-reasoning rate delta. Declining these rows instead
+        // would drop the whole model's budget enforcement — strictly worse.
+        // Billing reasoning exactly needs a reasoning-token component on
+        // `Usage`; see the PR residual.
         let output = self
             .output
             .map(|p| p.estimate_cost_usd(usage.output_tokens));
