@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(providers)* [**breaking**] carry Retry-After through streaming errors + parse body-embedded retry hints ([#366](https://github.com/bipa-app/agent-sdk/pull/366))
 - *(sdk)* budget consults dynamic model catalog with static fallback ([#356](https://github.com/bipa-app/agent-sdk/pull/356)) ([#368](https://github.com/bipa-app/agent-sdk/pull/368))
 
+### Fixed
+
+- *(sdk,providers)* bill reasoning at max-rate; take max of complete candidate estimates ([#380](https://github.com/bipa-app/agent-sdk/pull/380))
+
 ## [0.12.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.11.8...agent-sdk-providers-v0.12.0) - 2026-07-12
 
 ### Fixed
