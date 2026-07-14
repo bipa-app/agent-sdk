@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-sdk"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "agent-sdk-foundation",
  "agent-sdk-macros",
@@ -49,7 +49,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-cli"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "agent-sdk",
  "anyhow",
@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-foundation"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "insta",
  "proptest",
@@ -76,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-macros"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-otel"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "agent-sdk",
  "anyhow",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-providers"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "agent-sdk-foundation",
  "anyhow",
@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-tools"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "agent-sdk-foundation",
  "anyhow",
@@ -3533,9 +3533,9 @@ dependencies = [
 
 [[package]]
 name = "simd-adler32"
-version = "0.3.9"
+version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
+checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
 name = "simd_cesu8"
