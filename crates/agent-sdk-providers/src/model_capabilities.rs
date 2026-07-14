@@ -41,6 +41,19 @@ pub struct Pricing {
     /// cache-creation tokens then bill at the ordinary input rate, which is a
     /// bounded under-estimate of what the provider actually charges.
     pub cache_write: Option<PricePoint>,
+    /// Rate a source publishes for reasoning/thinking tokens, when it differs
+    /// from the output rate.
+    ///
+    /// Reasoning tokens ride *inside* the output-token count — no [`Usage`]
+    /// field splits them out — so they cannot be billed separately. Output is
+    /// therefore billed at `max(output, reasoning)`: on the many rows where
+    /// reasoning is cheaper this is the output rate (unchanged), and on the
+    /// rows where reasoning is dearer (e.g. `alibaba/qwen3-32b`: output $2.80/M,
+    /// reasoning $8.40/M) it lifts the whole output band to the reasoning rate,
+    /// so the estimate is never below what the reasoning tokens actually cost.
+    /// The exact split needs a reasoning component on [`Usage`]; see the PR
+    /// residual.
+    pub reasoning: Option<PricePoint>,
     pub notes: Option<&'static str>,
 }
 
@@ -75,6 +88,7 @@ impl Pricing {
             output: Some(PricePoint::new(output)),
             cached_input: None,
             cache_write: None,
+            reasoning: None,
             notes: None,
         }
     }
@@ -86,6 +100,7 @@ impl Pricing {
             output: Some(PricePoint::new(output)),
             cached_input: Some(PricePoint::new(cached_input)),
             cache_write: None,
+            reasoning: None,
             notes: None,
         }
     }
@@ -94,6 +109,13 @@ impl Pricing {
     #[must_use]
     pub const fn with_cache_write(mut self, cache_write: f64) -> Self {
         self.cache_write = Some(PricePoint::new(cache_write));
+        self
+    }
+
+    /// Builder-style: attach the reasoning-token rate.
+    #[must_use]
+    pub const fn with_reasoning(mut self, reasoning: f64) -> Self {
+        self.reasoning = Some(PricePoint::new(reasoning));
         self
     }
 
@@ -131,19 +153,13 @@ impl Pricing {
         add(self.band_rate(self.cached_input), bands.cache_read);
         add(self.band_rate(self.cache_write), bands.cache_write);
 
-        // Every output token bills at the output rate, including any reasoning
-        // tokens. A few routes publish a distinct (lower) reasoning rate — and
-        // reasoning tokens ride inside the completion count — but `Usage` has no
-        // component that splits them out, so they cannot be billed separately.
-        // Pricing them at the completion rate is therefore a bounded
-        // OVER-estimate for those routes (never an under-estimate), which is the
-        // safe direction for a spend cap; the true over-count is bounded by the
-        // completion-minus-reasoning rate delta. Declining these rows instead
-        // would drop the whole model's budget enforcement — strictly worse.
-        // Billing reasoning exactly needs a reasoning-token component on
-        // `Usage`; see the PR residual.
-        let output = self
-            .output
+        // Reasoning tokens ride inside `output_tokens` with no field to split
+        // them out, so the whole output band bills at the higher of the output
+        // and reasoning rates — see [`Pricing::reasoning`]. On a row with no
+        // reasoning rate, or one where reasoning is cheaper, this is just the
+        // output rate; where reasoning is dearer it lifts the band so the
+        // estimate never falls below the reasoning tokens' true cost.
+        let output = output_rate(self.output, self.reasoning)
             .map(|p| p.estimate_cost_usd(usage.output_tokens));
         match (input_cost, output) {
             (Some(input), Some(output)) => Some(input + output),
@@ -151,6 +167,25 @@ impl Pricing {
             (None, Some(output)) => Some(output),
             (None, None) => None,
         }
+    }
+}
+
+/// The rate the output band bills at: the more expensive of the output and
+/// reasoning rates when both are known, since reasoning tokens are billed
+/// inside the output count and must never be under-priced.
+const fn output_rate(
+    output: Option<PricePoint>,
+    reasoning: Option<PricePoint>,
+) -> Option<PricePoint> {
+    match (output, reasoning) {
+        (Some(output), Some(reasoning)) => {
+            if reasoning.usd_per_million_tokens > output.usd_per_million_tokens {
+                Some(reasoning)
+            } else {
+                Some(output)
+            }
+        }
+        (rate, None) | (None, rate) => rate,
     }
 }
 
@@ -928,6 +963,45 @@ pub const fn supported_model_capabilities() -> &'static [ModelCapabilities] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A row where reasoning is DEARER than output — `alibaba/qwen3-32b` in the
+    /// live feed ($2.80/M output, $8.40/M reasoning). Reasoning tokens ride
+    /// inside `output_tokens`, so the whole output band must bill at the higher
+    /// reasoning rate, or the estimate under-bills and the cap can miss.
+    #[test]
+    fn output_bills_at_the_dearer_reasoning_rate() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let pricing = Pricing::flat(0.7, 2.8).with_reasoning(8.4);
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        // 1M input @ $0.70 + 1M output @ max($2.80, $8.40) = 0.7 + 8.4 = 9.1.
+        let cost = pricing.estimate_cost_usd(&usage).context("priced")?;
+        assert!((cost - 9.1).abs() < 1e-9, "unexpected cost: {cost}");
+        Ok(())
+    }
+
+    /// When reasoning is CHEAPER than output the max leaves output unchanged —
+    /// billing the whole band at the output rate (a bounded over-estimate for
+    /// the reasoning tokens, the safe direction).
+    #[test]
+    fn output_keeps_the_dearer_output_rate() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let pricing = Pricing::flat(1.0, 8.0).with_reasoning(3.0);
+        let usage = Usage {
+            input_tokens: 0,
+            output_tokens: 1_000_000,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        // 1M output @ max($8, $3) = $8.
+        let cost = pricing.estimate_cost_usd(&usage).context("priced")?;
+        assert!((cost - 8.0).abs() < 1e-9, "unexpected cost: {cost}");
+        Ok(())
+    }
 
     #[test]
     fn test_lookup_anthropic_fable_5() -> anyhow::Result<()> {

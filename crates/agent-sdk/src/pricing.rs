@@ -64,6 +64,60 @@ pub trait CostEstimator: Send + Sync {
     ) -> Option<f64> {
         self.estimate_cost_usd(provider, model, usage)
     }
+
+    /// Estimate the USD cost *only if* `provider`/`model` resolves through a
+    /// source layer the caller must treat as authoritative over the others — a
+    /// user-registered override.
+    ///
+    /// The loop probes this across every candidate key before it takes the max
+    /// of the feed-level estimates: an override is a price the user set on
+    /// purpose (a negotiated or free rate), so it wins outright rather than
+    /// being out-maxed by a higher feed row under some derived key. The default
+    /// returns `None` — a source with no authority layers (a plain estimator)
+    /// simply has none, and all its estimates are treated as same-authority.
+    fn estimate_override_cost_usd(
+        &self,
+        _provider: &str,
+        _model: &str,
+        _usage: &Usage,
+    ) -> Option<f64> {
+        None
+    }
+
+    /// The summed-usage counterpart of
+    /// [`estimate_override_cost_usd`](Self::estimate_override_cost_usd).
+    fn estimate_override_aggregate_cost_usd(
+        &self,
+        provider: &str,
+        model: &str,
+        usage: &Usage,
+    ) -> Option<f64> {
+        self.estimate_override_cost_usd(provider, model, usage)
+    }
+
+    /// Estimate the USD cost from a source layer that has NO absolute authority
+    /// — a refreshable feed row, as opposed to a user override.
+    ///
+    /// The loop takes the max across every candidate's *feed* estimate, and
+    /// consults an override only when it is more specific than every live feed
+    /// price (see [`estimate_override_cost_usd`](Self::estimate_override_cost_usd)).
+    /// It therefore needs the feed price at a key independently of any override
+    /// on the same key. The default returns the plain estimate: a source with
+    /// no authority layers has only feed-level prices, so all of them qualify.
+    fn estimate_feed_cost_usd(&self, provider: &str, model: &str, usage: &Usage) -> Option<f64> {
+        self.estimate_cost_usd(provider, model, usage)
+    }
+
+    /// The summed-usage counterpart of
+    /// [`estimate_feed_cost_usd`](Self::estimate_feed_cost_usd).
+    fn estimate_feed_aggregate_cost_usd(
+        &self,
+        provider: &str,
+        model: &str,
+        usage: &Usage,
+    ) -> Option<f64> {
+        self.estimate_aggregate_cost_usd(provider, model, usage)
+    }
 }
 
 #[cfg(feature = "model-discovery")]
@@ -84,6 +138,37 @@ impl CostEstimator for agent_sdk_providers::ModelRegistry {
         usage: &Usage,
     ) -> Option<f64> {
         Self::estimate_dynamic_base_cost_usd(self, provider, model, usage)
+    }
+
+    fn estimate_override_cost_usd(
+        &self,
+        provider: &str,
+        model: &str,
+        usage: &Usage,
+    ) -> Option<f64> {
+        Self::estimate_override_cost_usd(self, provider, model, usage)
+    }
+
+    fn estimate_override_aggregate_cost_usd(
+        &self,
+        provider: &str,
+        model: &str,
+        usage: &Usage,
+    ) -> Option<f64> {
+        Self::estimate_override_base_cost_usd(self, provider, model, usage)
+    }
+
+    fn estimate_feed_cost_usd(&self, provider: &str, model: &str, usage: &Usage) -> Option<f64> {
+        Self::estimate_feed_cost_usd(self, provider, model, usage)
+    }
+
+    fn estimate_feed_aggregate_cost_usd(
+        &self,
+        provider: &str,
+        model: &str,
+        usage: &Usage,
+    ) -> Option<f64> {
+        Self::estimate_feed_base_cost_usd(self, provider, model, usage)
     }
 }
 

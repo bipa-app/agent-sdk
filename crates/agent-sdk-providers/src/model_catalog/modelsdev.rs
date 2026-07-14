@@ -18,6 +18,8 @@ struct ModelsDevCost {
     cache_read: Option<f64>,
     #[serde(default)]
     cache_write: Option<f64>,
+    #[serde(default)]
+    reasoning: Option<f64>,
     /// Long-context price bands. The feed publishes these for frontier models
     /// (GPT-5.x above 272K input tokens, Gemini / Claude above 200K).
     #[serde(default)]
@@ -34,6 +36,8 @@ struct ModelsDevTier {
     cache_read: Option<f64>,
     #[serde(default)]
     cache_write: Option<f64>,
+    #[serde(default)]
+    reasoning: Option<f64>,
     #[serde(default)]
     tier: Option<ModelsDevTierBound>,
 }
@@ -100,13 +104,20 @@ fn pricing_from_rates(
     output: Option<f64>,
     cache_read: Option<f64>,
     cache_write: Option<f64>,
+    reasoning: Option<f64>,
 ) -> Option<Pricing> {
     let input = input.and_then(modelsdev_price_per_million);
     let output = output.and_then(modelsdev_price_per_million);
     let cached_input = cache_read.and_then(modelsdev_price_per_million);
     let cache_write = cache_write.and_then(modelsdev_price_per_million);
+    let reasoning = reasoning.and_then(modelsdev_price_per_million);
 
-    if input.is_none() && output.is_none() && cached_input.is_none() && cache_write.is_none() {
+    if input.is_none()
+        && output.is_none()
+        && cached_input.is_none()
+        && cache_write.is_none()
+        && reasoning.is_none()
+    {
         return None;
     }
     Some(Pricing {
@@ -114,12 +125,19 @@ fn pricing_from_rates(
         output,
         cached_input,
         cache_write,
+        reasoning,
         notes: None,
     })
 }
 
 fn pricing_from_modelsdev_cost(cost: &ModelsDevCost) -> Option<Pricing> {
-    pricing_from_rates(cost.input, cost.output, cost.cache_read, cost.cache_write)
+    pricing_from_rates(
+        cost.input,
+        cost.output,
+        cost.cache_read,
+        cost.cache_write,
+        cost.reasoning,
+    )
 }
 
 /// The `context` tiers of a cost row, ascending.
@@ -141,8 +159,16 @@ fn tiers_from_modelsdev_cost(cost: &ModelsDevCost) -> Option<Vec<PricingTier>> {
             if bound.bound_type.as_deref() != Some("context") {
                 return None;
             }
-            let band =
-                pricing_from_rates(tier.input, tier.output, tier.cache_read, tier.cache_write)?;
+            // A models.dev tier is a full cost row (`CostTier extends Cost`),
+            // so it may restate the reasoning rate; when it does not, the base
+            // row's carries over through `merge_band_over_base`.
+            let band = pricing_from_rates(
+                tier.input,
+                tier.output,
+                tier.cache_read,
+                tier.cache_write,
+                tier.reasoning,
+            )?;
             Some(PricingTier {
                 // The bound is inclusive: the models.dev SDK schema documents
                 // `tier.size` as "Context size (in tokens) at which this tier
@@ -459,6 +485,103 @@ mod tests {
                 .abs()
                 < f64::EPSILON
         );
+        Ok(())
+    }
+
+    /// The feed's `cost.reasoning` rate is parsed onto `Pricing`. Live rows
+    /// price reasoning above output (`alibaba/qwen3-32b`: output 2.8, reasoning
+    /// 8.4), which the output band's `max(output, reasoning)` must reach.
+    #[test]
+    fn parse_modelsdev_reads_reasoning_rate() -> Result<()> {
+        const REASONING_FIXTURE: &str = r#"{
+          "alibaba": {
+            "id": "alibaba",
+            "models": {
+              "qwen3-32b": {
+                "id": "qwen3-32b",
+                "cost": { "input": 0.7, "output": 2.8, "reasoning": 8.4 }
+              }
+            }
+          }
+        }"#;
+
+        let entries = parse_modelsdev(REASONING_FIXTURE)?;
+        let row = find(&entries, "alibaba", "qwen3-32b")?;
+        let pricing = row.pricing.context("pricing missing")?;
+        assert!(
+            (pricing
+                .reasoning
+                .context("reasoning")?
+                .usd_per_million_tokens
+                - 8.4)
+                .abs()
+                < f64::EPSILON
+        );
+        Ok(())
+    }
+
+    /// A models.dev tier is a full cost row, so it may restate `reasoning` at a
+    /// different rate than the base. That rate must reach the tier's band, not
+    /// be dropped in favour of the inherited base rate.
+    #[test]
+    fn parse_modelsdev_reads_tier_reasoning_rate() -> Result<()> {
+        use agent_sdk_foundation::llm::Usage;
+
+        const TIER_REASONING_FIXTURE: &str = r#"{
+          "openai": {
+            "id": "openai",
+            "models": {
+              "reasoner": {
+                "id": "reasoner",
+                "cost": {
+                  "input": 1,
+                  "output": 2,
+                  "reasoning": 3,
+                  "tiers": [
+                    {
+                      "input": 2,
+                      "output": 4,
+                      "reasoning": 9,
+                      "tier": { "type": "context", "size": 200000 }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }"#;
+
+        let entries = parse_modelsdev(TIER_REASONING_FIXTURE)?;
+        let row = find(&entries, "openai", "reasoner")?;
+        assert_eq!(row.pricing_tiers.len(), 1);
+        let tier = row.pricing_tiers[0];
+        assert!(
+            (tier
+                .pricing
+                .reasoning
+                .context("tier reasoning")?
+                .usd_per_million_tokens
+                - 9.0)
+                .abs()
+                < f64::EPSILON,
+            "the tier's own reasoning rate must win over the base's",
+        );
+
+        // And it bills: a call in the tier band prices output at
+        // max(tier output 4, tier reasoning 9) = 9. 300K in + 100K out =
+        // 0.3*2 + 0.1*9 = 1.5, where the base tier output rate would say
+        // 0.3*2 + 0.1*4 = 1.0.
+        let usage = Usage {
+            input_tokens: 300_000,
+            output_tokens: 100_000,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        let cost = tier
+            .pricing
+            .estimate_cost_usd(&usage)
+            .context("tier prices the call")?;
+        assert!((cost - 1.5).abs() < 1e-9, "unexpected cost: {cost}");
         Ok(())
     }
 

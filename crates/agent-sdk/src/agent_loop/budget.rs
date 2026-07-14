@@ -91,16 +91,69 @@ fn estimate_scoped(
     let provider = provenance.provider.as_str();
     let model = provenance.model.as_str();
 
-    if let Some(estimator) = pricing
-        && let Some(cost) =
-            catalog_candidates(provider, model).find_map(|(provider, model)| match scope {
-                UsageScope::Call => estimator.estimate_cost_usd(&provider, &model, &usage),
-                UsageScope::Aggregate => {
-                    estimator.estimate_aggregate_cost_usd(&provider, &model, &usage)
-                }
-            })
-    {
-        return Some(cost);
+    if let Some(estimator) = pricing {
+        let candidates: Vec<(Cow<'_, str>, Cow<'_, str>)> =
+            catalog_candidates(provider, model).collect();
+        let override_estimate = |provider: &str, model: &str| match scope {
+            UsageScope::Call => estimator.estimate_override_cost_usd(provider, model, &usage),
+            UsageScope::Aggregate => {
+                estimator.estimate_override_aggregate_cost_usd(provider, model, &usage)
+            }
+        };
+        let feed_estimate = |provider: &str, model: &str| match scope {
+            UsageScope::Call => estimator.estimate_feed_cost_usd(provider, model, &usage),
+            UsageScope::Aggregate => {
+                estimator.estimate_feed_aggregate_cost_usd(provider, model, &usage)
+            }
+        };
+
+        // Override authority is POSITION-SCOPED: an override has absolute
+        // authority only down to its own key's specificity — it never displaces
+        // a more-specific live feed price. Candidates are most-specific-first
+        // (provenance → gateway → service → aliases → route → vendor-split), so
+        // for the first override at index `k`, if no candidate BEFORE `k` has a
+        // live feed row the override is the most specific price and wins
+        // outright; but if an earlier candidate does, that override belongs to a
+        // less-specific fallback context (e.g. a negotiated *direct*-vendor rate
+        // reached via a gateway call's vendor-split alias) and must not pre-empt
+        // the real price the call actually pays.
+        let first_override =
+            candidates
+                .iter()
+                .enumerate()
+                .find_map(|(index, (provider, model))| {
+                    override_estimate(provider, model)
+                        .filter(|cost| is_usable_estimate(*cost))
+                        .map(|cost| (index, cost))
+                });
+        if let Some((index, override_cost)) = first_override {
+            let more_specific_feed = candidates[..index].iter().any(|(provider, model)| {
+                feed_estimate(provider, model).is_some_and(is_usable_estimate)
+            });
+            if !more_specific_feed {
+                return Some(override_cost);
+            }
+        }
+
+        // Otherwise the MAX of every FEED candidate estimate (overrides
+        // excluded), not the first that resolves. A preferred candidate (route
+        // key, gateway key) can carry a flat row where a later candidate — the
+        // vendor's own — publishes the tier a long call falls in: models.dev's
+        // `openrouter/google/gemini-2.5-pro` route row is flat while its native
+        // `gemini-2.5-pro` carries the ≥200K band. First-Some would take the
+        // flat route estimate and under-bill the long call. Each estimate is
+        // computed WHOLLY from one row, so no rates are blended; taking the
+        // larger never bills below the best evidence in the candidate set, and
+        // the route/service price still wins whenever it is genuinely the higher
+        // one (see [`catalog_candidates`]).
+        let best = candidates
+            .iter()
+            .filter_map(|(provider, model)| feed_estimate(provider, model))
+            .filter(|cost| is_usable_estimate(*cost))
+            .max_by(f64::total_cmp);
+        if let Some(cost) = best {
+            return Some(cost);
+        }
     }
 
     // The compiled-in table prices every model at one flat rate, so the scope
@@ -109,6 +162,34 @@ fn estimate_scoped(
         crate::model_capabilities::get_model_capabilities(provider, model)?
             .estimate_cost_usd(&usage)
     })
+}
+
+/// Whether a candidate estimate may be used or entered into the max.
+///
+/// Rejects NaN and −∞; keeps +∞. `f64::total_cmp` ranks NaN above every finite
+/// value, so an unfiltered NaN would win the max and then compare false against
+/// `max_cost_usd`, silently disabling the cap while valid candidates existed.
+/// −∞ is a nonsensical price that can only win an empty field, and would then
+/// poison the accumulator and compare false against the cap — the same
+/// fail-open. +∞ is DIFFERENT: a legitimate unbounded over-estimate (a custom
+/// estimator, or a rate×tokens overflow), and it must trip any finite cap, so
+/// it is kept.
+fn is_usable_estimate(cost: f64) -> bool {
+    !cost.is_nan() && cost != f64::NEG_INFINITY
+}
+
+/// The value a cost is stored as, so a durable accumulator survives a
+/// serialize/restore round trip.
+///
+/// `serde_json` writes a non-finite float as `null`, which on reload looks like
+/// "cost unknown" and loses a budget trip. A `+∞` estimate (a legitimate
+/// unbounded over-estimate) therefore clamps to `f64::MAX`: finite, survives
+/// JSON, still exceeds any real cap so the trip is preserved, and saturates
+/// under further addition (`f64::MAX + x` re-clamps back to `f64::MAX`). NaN and
+/// −∞ never reach a stored accumulator — [`is_usable_estimate`] drops them
+/// before they can be folded — so only the `+∞` case bites.
+pub(super) const fn durable_cost(cost: f64) -> f64 {
+    cost.min(f64::MAX)
 }
 
 /// The keys a dynamic catalog may file this provenance under: everything the
@@ -120,6 +201,12 @@ fn estimate_scoped(
 /// OpenRouter-routed `anthropic/claude-fable-5` would start pricing at
 /// Anthropic's direct-API rate, which is not what that run pays. Without a
 /// catalog the loop must price exactly as it always has.
+///
+/// The order still matters even though the caller takes the **max** estimate
+/// across these keys rather than the first that resolves (see
+/// [`estimate_cost_usd`]): the max is what keeps a route/service row that lacks
+/// a tier from shadowing the vendor's tiered row for a long call, while the
+/// route/service price still wins whenever it is genuinely the higher one.
 ///
 /// Items are [`Cow`] because most keys borrow the provenance, but a gateway
 /// service key owns a freshly prefixed model id (see
@@ -345,14 +432,18 @@ pub(super) fn accumulate_cost(
 ) {
     if state.accumulated_cost_usd.is_none() && !usage_is_zero(pre_delta_total) {
         state.accumulated_cost_usd =
-            estimate_aggregate_cost_usd(pricing, provenance, pre_delta_total);
+            estimate_aggregate_cost_usd(pricing, provenance, pre_delta_total).map(durable_cost);
     }
     let delta_cost = match delta_scope {
         UsageScope::Call => estimate_cost_usd(pricing, provenance, delta),
         UsageScope::Aggregate => estimate_aggregate_cost_usd(pricing, provenance, delta),
     };
     if let Some(delta_cost) = delta_cost {
-        state.accumulated_cost_usd = Some(state.accumulated_cost_usd.unwrap_or(0.0) + delta_cost);
+        // Clamp AFTER the addition so the stored accumulator is always finite:
+        // `f64::MAX + delta` can round to `+∞`, which serde would then drop.
+        state.accumulated_cost_usd = Some(durable_cost(
+            state.accumulated_cost_usd.unwrap_or(0.0) + delta_cost,
+        ));
     }
 }
 
@@ -364,6 +455,10 @@ pub(super) fn accumulate_cost(
 /// The fallback prices a SUM, not a call, so it stays on base rates: the
 /// accumulated total is the only figure that reflects the tier each individual
 /// call actually paid.
+///
+/// The reported figure is clamped to a finite value ([`durable_cost`]): a
+/// `+∞` fallback estimate would otherwise serialize to `null` on the terminal
+/// state / event, reading as "cost unknown" instead of "over the cap".
 #[must_use]
 pub(super) fn run_cost_usd(
     accumulated: Option<f64>,
@@ -371,7 +466,9 @@ pub(super) fn run_cost_usd(
     provenance: &AuditProvenance,
     usage: &TokenUsage,
 ) -> Option<f64> {
-    accumulated.or_else(|| estimate_aggregate_cost_usd(pricing, provenance, usage))
+    accumulated
+        .or_else(|| estimate_aggregate_cost_usd(pricing, provenance, usage))
+        .map(durable_cost)
 }
 
 /// Evaluate the run-level usage budget against the cumulative `usage`.
@@ -465,12 +562,160 @@ mod tests {
         }
     }
 
+    /// Prices one candidate key `NaN` and another finitely, to prove a
+    /// non-finite estimate cannot poison the max.
+    struct NanThenFinitePricing;
+
+    impl CostEstimator for NanThenFinitePricing {
+        fn estimate_cost_usd(&self, provider: &str, _model: &str, _usage: &Usage) -> Option<f64> {
+            match provider {
+                // The preferred (route) candidate returns NaN.
+                "openrouter" => Some(f64::NAN),
+                // The vendor split returns a finite estimate.
+                "vendor" => Some(2.5),
+                _ => None,
+            }
+        }
+    }
+
+    /// Prices one candidate key `NaN` and another `+∞` — a legitimate unbounded
+    /// over-estimate that must survive the filter and trip any finite cap.
+    struct NanThenPosInfPricing;
+
+    impl CostEstimator for NanThenPosInfPricing {
+        fn estimate_cost_usd(&self, provider: &str, _model: &str, _usage: &Usage) -> Option<f64> {
+            match provider {
+                "openrouter" => Some(f64::NAN),
+                "vendor" => Some(f64::INFINITY),
+                _ => None,
+            }
+        }
+    }
+
+    /// Prices its only resolvable candidate `−∞` — a nonsensical price that must
+    /// be dropped, leaving the call un-priced rather than poisoned.
+    struct NegInfOnlyPricing;
+
+    impl CostEstimator for NegInfOnlyPricing {
+        fn estimate_cost_usd(&self, provider: &str, _model: &str, _usage: &Usage) -> Option<f64> {
+            (provider == "vendor").then_some(f64::NEG_INFINITY)
+        }
+    }
+
     fn one_million_each() -> TokenUsage {
         TokenUsage {
             input_tokens: 1_000_000,
             output_tokens: 1_000_000,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn non_finite_estimate_does_not_poison_the_max() -> anyhow::Result<()> {
+        use anyhow::Context;
+        // A slug provenance so the candidate set spans several keys: the route
+        // key resolves to NaN, the vendor split to a finite 2.5.
+        let provenance = AuditProvenance::new("openai", "vendor/model");
+        let usage = one_million_each();
+
+        let cost = estimate_cost_usd(Some(&NanThenFinitePricing), &provenance, &usage)
+            .context("a finite candidate must price the call")?;
+        assert!(cost.is_finite(), "NaN leaked into the estimate: {cost}");
+        assert!((cost - 2.5).abs() < 1e-9, "unexpected cost: {cost}");
+
+        // The cap must still fire — an unfiltered NaN would win the max and
+        // then compare false against the limit, silently disabling it.
+        let limits = UsageLimits {
+            max_cost_usd: Some(1.0),
+            ..Default::default()
+        };
+        let (limit, _) = status(
+            Some(&limits),
+            Some(&NanThenFinitePricing),
+            &provenance,
+            &usage,
+            None,
+        )
+        .context("the finite estimate must trip the cost limit")?;
+        assert_eq!(limit, BudgetLimitKind::CostUsd);
+        Ok(())
+    }
+
+    #[test]
+    fn positive_infinity_estimate_survives_and_trips_the_cap() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let provenance = AuditProvenance::new("openai", "vendor/model");
+        let usage = one_million_each();
+
+        // NaN is dropped; +∞ survives the filter as the max.
+        let cost = estimate_cost_usd(Some(&NanThenPosInfPricing), &provenance, &usage)
+            .context("+inf must survive as the estimate")?;
+        assert!(
+            cost.is_infinite() && cost > 0.0,
+            "expected +inf, got {cost}"
+        );
+
+        // +∞ trips any finite cap immediately.
+        let limits = UsageLimits {
+            max_cost_usd: Some(1_000_000.0),
+            ..Default::default()
+        };
+        let (limit, _) = status(
+            Some(&limits),
+            Some(&NanThenPosInfPricing),
+            &provenance,
+            &usage,
+            None,
+        )
+        .context("+inf must trip a finite cost cap")?;
+        assert_eq!(limit, BudgetLimitKind::CostUsd);
+
+        // A +∞ delta folds into the accumulator clamped to `f64::MAX` — finite,
+        // so it survives a serde round trip, and still over any real cap.
+        let mut state = AgentState::new(ThreadId::new());
+        accumulate_cost(
+            &mut state,
+            Some(&NanThenPosInfPricing),
+            &provenance,
+            &TokenUsage::default(),
+            &usage,
+            UsageScope::Call,
+        );
+        let accumulated = state
+            .accumulated_cost_usd
+            .context("the +inf delta must accumulate")?;
+        assert!(
+            accumulated.is_finite(),
+            "accumulator not clamped: {accumulated}"
+        );
+        assert!((accumulated - f64::MAX).abs() < f64::EPSILON);
+
+        // The clamped accumulator survives a serialize/restore (a bare +∞ would
+        // become `null`), and keeps tripping on the restored state.
+        let json = serde_json::to_string(&state).context("serialize state")?;
+        let restored: crate::types::AgentState =
+            serde_json::from_str(&json).context("deserialize state")?;
+        assert_eq!(restored.accumulated_cost_usd, Some(f64::MAX));
+        let (limit, _) = status(
+            Some(&limits),
+            Some(&NanThenPosInfPricing),
+            &provenance,
+            &usage,
+            restored.accumulated_cost_usd,
+        )
+        .context("the restored accumulator must keep tripping")?;
+        assert_eq!(limit, BudgetLimitKind::CostUsd);
+        Ok(())
+    }
+
+    #[test]
+    fn negative_infinity_estimate_is_dropped() {
+        let provenance = AuditProvenance::new("openai", "vendor/model");
+        let usage = one_million_each();
+        // −∞ is the only candidate estimate; filtering it leaves the catalog
+        // with nothing, and the static table has no such model — so the call is
+        // un-priced rather than billed at a poisoned −∞.
+        assert!(estimate_cost_usd(Some(&NegInfOnlyPricing), &provenance, &usage).is_none());
     }
 
     #[test]
@@ -1024,6 +1269,265 @@ mod catalog_tests {
             .context("gpt-4o is priced in the static table")?;
         assert!((cost - statically_priced).abs() < 1e-12);
         assert!((cost - 0.0075).abs() < 1e-9, "unexpected cost: {cost}");
+        Ok(())
+    }
+
+    /// A user override is authoritative: it wins over a HIGHER feed row under a
+    /// derived candidate key, rather than being out-maxed. A user who set a
+    /// negotiated/free price must not have their cap tripped on feed data they
+    /// overrode away.
+    #[tokio::test]
+    async fn override_authority_beats_a_higher_feed_row() -> Result<()> {
+        use crate::model_capabilities::Pricing;
+
+        // Override on the route key: $0.05/M in + $0.05/M out.
+        let registry = ModelRegistry::new().with_override(
+            "openrouter",
+            "vendor/model",
+            CatalogEntry {
+                provider: "openrouter".to_owned(),
+                model_id: "vendor/model".to_owned(),
+                context_window: None,
+                max_output_tokens: None,
+                pricing: Some(Pricing::flat(0.05, 0.05)),
+                pricing_tiers: Vec::new(),
+                supports_thinking: None,
+            },
+        );
+        // Feed row on the vendor alias: $2.50/M each — far higher.
+        registry
+            .refresh(&FixtureFeed(vec![CatalogEntry {
+                provider: "vendor".to_owned(),
+                model_id: "model".to_owned(),
+                context_window: None,
+                max_output_tokens: None,
+                pricing: Some(Pricing::flat(2.5, 2.5)),
+                pricing_tiers: Vec::new(),
+                supports_thinking: None,
+            }]))
+            .await?;
+
+        let provenance = AuditProvenance::new("openai", "vendor/model");
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+
+        // The override wins outright: 1M*0.05 + 1M*0.05 = $0.10, NOT the feed's
+        // $5.00 that a plain max over candidates would pick.
+        let cost = estimate_cost_usd(Some(&registry), &provenance, &usage)
+            .context("the override must price this call")?;
+        assert!((cost - 0.10).abs() < 1e-9, "unexpected cost: {cost}");
+
+        // A $1 cap must NOT trip on the overridden price (it would on the $5
+        // feed row).
+        let limits = UsageLimits {
+            max_cost_usd: Some(1.0),
+            ..Default::default()
+        };
+        assert!(
+            status(Some(&limits), Some(&registry), &provenance, &usage, None).is_none(),
+            "an overridden price must not trip a cap it is under",
+        );
+        Ok(())
+    }
+
+    /// Override authority is position-scoped: a later, less-specific override
+    /// must NOT displace an earlier candidate's genuine feed row. A negotiated
+    /// *direct*-vendor override is reached, on a gateway call, only through the
+    /// less-specific vendor-split alias — but the gateway has its own feed row
+    /// at a more specific candidate, and the call actually pays the gateway
+    /// rate, so the override must not leak in.
+    #[tokio::test]
+    async fn a_later_override_does_not_displace_an_earlier_feed_row() -> Result<()> {
+        use crate::model_capabilities::Pricing;
+
+        // A cheap/free DIRECT override on the vendor key (reached last, via the
+        // vendor-split alias): $0/M.
+        let registry = ModelRegistry::new().with_override(
+            "anthropic",
+            "claude-sonnet-4",
+            CatalogEntry {
+                provider: "anthropic".to_owned(),
+                model_id: "claude-sonnet-4".to_owned(),
+                context_window: None,
+                max_output_tokens: None,
+                pricing: Some(Pricing::flat(0.0, 0.0)),
+                pricing_tiers: Vec::new(),
+                supports_thinking: None,
+            },
+        );
+        // A real gateway feed row at the more-specific gateway candidate.
+        registry
+            .refresh(&FixtureFeed(vec![CatalogEntry {
+                provider: "cloudflare-ai-gateway".to_owned(),
+                model_id: "anthropic/claude-sonnet-4".to_owned(),
+                context_window: None,
+                max_output_tokens: None,
+                pricing: Some(Pricing::flat(4.0, 20.0)),
+                pricing_tiers: Vec::new(),
+                supports_thinking: None,
+            }]))
+            .await?;
+
+        let provenance = AuditProvenance::new("cloudflare-ai-gateway", "claude-sonnet-4");
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+
+        // The gateway feed ($4 + $20 = $24) prices the call — NOT the $0 direct
+        // override reached via the vendor-split alias.
+        let cost = estimate_cost_usd(Some(&registry), &provenance, &usage)
+            .context("the gateway feed row must price the call")?;
+        assert!((cost - 24.0).abs() < 1e-9, "unexpected cost: {cost}");
+
+        // The cap counts the real gateway price; the free override must not
+        // disable it.
+        let limits = UsageLimits {
+            max_cost_usd: Some(1.0),
+            ..Default::default()
+        };
+        let (limit, _) = status(Some(&limits), Some(&registry), &provenance, &usage, None)
+            .context("the gateway price must trip the cap")?;
+        assert_eq!(limit, BudgetLimitKind::CostUsd);
+        Ok(())
+    }
+
+    /// The SAME direct-vendor override, on a DIRECT call, wins — it is the
+    /// provenance key itself (the most-specific candidate), so no earlier feed
+    /// can out-specific it.
+    #[tokio::test]
+    async fn a_direct_override_wins_on_a_direct_call() -> Result<()> {
+        use crate::model_capabilities::Pricing;
+
+        let registry = ModelRegistry::new().with_override(
+            "anthropic",
+            "claude-sonnet-4",
+            CatalogEntry {
+                provider: "anthropic".to_owned(),
+                model_id: "claude-sonnet-4".to_owned(),
+                context_window: None,
+                max_output_tokens: None,
+                pricing: Some(Pricing::flat(0.0, 0.0)),
+                pricing_tiers: Vec::new(),
+                supports_thinking: None,
+            },
+        );
+        // A feed row exists for the direct key too, at a real price.
+        registry
+            .refresh(&FixtureFeed(vec![CatalogEntry {
+                provider: "anthropic".to_owned(),
+                model_id: "claude-sonnet-4".to_owned(),
+                context_window: None,
+                max_output_tokens: None,
+                pricing: Some(Pricing::flat(3.0, 15.0)),
+                pricing_tiers: Vec::new(),
+                supports_thinking: None,
+            }]))
+            .await?;
+
+        let provenance = AuditProvenance::new("anthropic", "claude-sonnet-4");
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+
+        // The override IS the provenance key — the most specific candidate — so
+        // it wins outright: $0, not the $18 feed row.
+        let cost = estimate_cost_usd(Some(&registry), &provenance, &usage)
+            .context("the override must price the direct call")?;
+        assert!(cost.abs() < 1e-9, "unexpected cost: {cost}");
+
+        // A $1 cap does not trip on the free direct price.
+        let limits = UsageLimits {
+            max_cost_usd: Some(1.0),
+            ..Default::default()
+        };
+        assert!(status(Some(&limits), Some(&registry), &provenance, &usage, None).is_none());
+        Ok(())
+    }
+
+    /// A preferred candidate's flat row must not shadow a later candidate's
+    /// tiered row for a long call. `models.dev` files the `OpenRouter` route row
+    /// for `google/gemini-2.5-pro` flat, while the native `gemini-2.5-pro` row
+    /// carries the ≥200K band; a routed call reaches both, and the max of the
+    /// two complete estimates bills the tier for a long call while a short call
+    /// stays on the flat route rate. (No override exists here, so the max
+    /// applies — the same-authority path.)
+    #[tokio::test]
+    async fn tiered_sibling_is_not_shadowed_by_a_flat_route_row() -> Result<()> {
+        // The `openrouter` service section files the route flat (no tiers); the
+        // `google` native section (remapped to `gemini`) carries the tier.
+        const MODELSDEV_ROUTE_AND_NATIVE_FIXTURE: &str = r#"{
+          "openrouter": {
+            "id": "openrouter",
+            "models": {
+              "google/gemini-2.5-pro": {
+                "id": "google/gemini-2.5-pro",
+                "cost": { "input": 1.25, "output": 10 }
+              }
+            }
+          },
+          "google": {
+            "id": "google",
+            "models": {
+              "gemini-2.5-pro": {
+                "id": "gemini-2.5-pro",
+                "cost": {
+                  "input": 1.25,
+                  "output": 10,
+                  "tiers": [
+                    {
+                      "input": 2.5,
+                      "output": 15,
+                      "tier": { "type": "context", "size": 200000 }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }"#;
+
+        let registry =
+            registry_from_entries(parse_modelsdev(MODELSDEV_ROUTE_AND_NATIVE_FIXTURE)?).await?;
+        // Open models route through OpenAIProvider: provenance is the router
+        // slug under `openai`.
+        let provenance = AuditProvenance::new("openai", "google/gemini-2.5-pro");
+
+        // Below the 200K band: route flat and native base agree — 100K in +
+        // 100K out = 0.1*1.25 + 0.1*10 = 1.125.
+        let short = TokenUsage {
+            input_tokens: 100_000,
+            output_tokens: 100_000,
+            ..Default::default()
+        };
+        let short_cost = estimate_cost_usd(Some(&registry), &provenance, &short)
+            .context("the route row prices a short call")?;
+        assert!(
+            (short_cost - 1.125).abs() < 1e-9,
+            "unexpected short cost: {short_cost}"
+        );
+
+        // 300K in + 100K out: the native tier ($2.5/$15) says
+        // 0.3*2.5 + 0.1*15 = 2.25, the flat route ($1.25/$10) only
+        // 0.3*1.25 + 0.1*10 = 1.375. The max bills the tier — the route row
+        // must not shadow it.
+        let long = TokenUsage {
+            input_tokens: 300_000,
+            output_tokens: 100_000,
+            ..Default::default()
+        };
+        let long_cost = estimate_cost_usd(Some(&registry), &provenance, &long)
+            .context("the tiered native row must price a long call")?;
+        assert!(
+            (long_cost - 2.25).abs() < 1e-9,
+            "unexpected long cost: {long_cost}"
+        );
         Ok(())
     }
 
