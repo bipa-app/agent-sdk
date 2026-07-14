@@ -121,6 +121,12 @@ struct GrpcShared {
     health: Arc<HealthSurface>,
     shutdown: CancellationToken,
     lease_duration: time::Duration,
+    /// The configured worker heartbeat cadence (ADR-0003 I4). Every
+    /// `heartbeat_loop` in the process beats at this one interval — including
+    /// the detached Confirm-tier drive — so the stall floor
+    /// (`2 x heartbeat_interval`) covers every cadence that can persist
+    /// activity for a probed subtree.
+    heartbeat_interval: std::time::Duration,
     admission: AdmissionConfig,
 }
 
@@ -131,6 +137,7 @@ impl GrpcShared {
         health: Arc<HealthSurface>,
         shutdown: CancellationToken,
         lease_duration: time::Duration,
+        heartbeat_interval: std::time::Duration,
         admission: AdmissionConfig,
     ) -> Self {
         Self {
@@ -139,6 +146,7 @@ impl GrpcShared {
             health,
             shutdown,
             lease_duration,
+            heartbeat_interval,
             admission,
         }
     }
@@ -384,6 +392,7 @@ impl GrpcShared {
             bootstrap,
             watermark,
             lease_duration: self.lease_duration,
+            heartbeat_interval: self.heartbeat_interval,
         }));
         Ok(())
     }
@@ -427,16 +436,7 @@ struct DriveApprovedConfirmation {
     bootstrap: agent_server::worker::ToolTaskBootstrap,
     watermark: u64,
     lease_duration: time::Duration,
-}
-
-/// Derive a heartbeat interval for a one-off resumed execution from the
-/// lease duration, mirroring the worker pool's default 1:3 ratio
-/// (10s heartbeat / 30s lease) and never returning a zero interval (a
-/// zero interval would panic `tokio::time::interval`).
-fn heartbeat_interval_for(lease_duration: time::Duration) -> std::time::Duration {
-    let lease_secs = lease_duration.whole_seconds().max(1);
-    let interval_secs = u64::try_from(lease_secs / 3).unwrap_or(1).max(1);
-    std::time::Duration::from_secs(interval_secs)
+    heartbeat_interval: std::time::Duration,
 }
 
 /// Drive an approved confirmation's resumed tool to completion on a
@@ -454,6 +454,7 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
         bootstrap,
         watermark,
         lease_duration,
+        heartbeat_interval,
     } = params;
 
     let task_id = bootstrap.task_id.clone();
@@ -488,7 +489,16 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
             worker_id: worker_id.clone(),
             lease_id: lease_id.clone(),
             lease_duration,
-            heartbeat_interval: heartbeat_interval_for(lease_duration),
+            // ADR-0003 I4. The CONFIGURED worker cadence, never one derived
+            // from the lease. This row's activity is what keeps a PARKED
+            // subagent ancestor alive, and that ancestor's stall floor is
+            // `2 x heartbeat_interval` — derived from exactly this constant.
+            // A drive that beat slower (the old `lease/3`: 20s under a 60s
+            // lease, against a floor built from a 5s worker interval) would
+            // persist this tool's progress less often than the floor assumes
+            // and get an actively-emitting tool reaped. One cadence in the
+            // system is what makes the floor correct by construction.
+            heartbeat_interval,
             cancel: heartbeat_cancel.clone(),
             // A terminal lease rejection means the row was taken from
             // us (most commonly a `cancel_tree`); trip the drive token
@@ -2001,6 +2011,10 @@ pub struct GrpcTransport {
 }
 
 impl GrpcTransport {
+    /// `heartbeat_interval` must be the SAME configured worker cadence the
+    /// pool beats at (`worker.heartbeat_interval`) — see ADR-0003 I4. The
+    /// detached Confirm-tier drive spawned from `DecideConfirmation` beats at
+    /// it, and the subagent stall floor is derived from it.
     #[must_use]
     pub fn new(
         stores: StoreRegistry,
@@ -2008,6 +2022,7 @@ impl GrpcTransport {
         health: Arc<HealthSurface>,
         shutdown: CancellationToken,
         lease_duration: time::Duration,
+        heartbeat_interval: std::time::Duration,
     ) -> Self {
         Self::with_admission(
             stores,
@@ -2015,6 +2030,7 @@ impl GrpcTransport {
             health,
             shutdown,
             lease_duration,
+            heartbeat_interval,
             AdmissionConfig::default(),
         )
     }
@@ -2028,6 +2044,7 @@ impl GrpcTransport {
         health: Arc<HealthSurface>,
         shutdown: CancellationToken,
         lease_duration: time::Duration,
+        heartbeat_interval: std::time::Duration,
         admission: AdmissionConfig,
     ) -> Self {
         Self {
@@ -2037,6 +2054,7 @@ impl GrpcTransport {
                 health,
                 shutdown,
                 lease_duration,
+                heartbeat_interval,
                 admission,
             )),
         }
@@ -2240,6 +2258,7 @@ impl LocalDaemon {
             health,
             shutdown.clone(),
             config.worker.lease_duration(),
+            config.worker.heartbeat_interval(),
             config.admission.clone(),
         );
 
@@ -3625,6 +3644,8 @@ mod tests {
             HealthSurface::shared(),
             CancellationToken::new(),
             time::Duration::seconds(30),
+            // The worker default: 30s lease / 10s heartbeat (ADR-0003 I4).
+            std::time::Duration::from_secs(10),
             AdmissionConfig::default(),
         )))
     }

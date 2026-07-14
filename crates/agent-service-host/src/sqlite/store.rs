@@ -2597,22 +2597,40 @@ impl AgentTaskStore for SqliteDurableStore {
         // submitted_input / state JSON blobs) on a per-tick heartbeat.
         // `RETURNING` hands back the refreshed row in one round trip.
         //
-        // The activity column advances but never retreats. SQLite's scalar
-        // `MAX` returns NULL if ANY argument is NULL, so each side is
-        // COALESCEd to the other first: that yields the surviving value
-        // when exactly one is NULL, NULL when both are, and the true
-        // maximum when neither is — i.e. a beat carrying no work (?6 IS
-        // NULL) leaves the column untouched. The comparison is on the TEXT
-        // encoding, whose lexicographic order is chronological for this
-        // schema's timestamps — the same property the lease-expiry sweep
-        // already relies on (`WHERE lease_expires_at <= ?1`).
+        // ADR-0003 I2 — the activity column advances but never retreats, and
+        // the comparison that decides "advance" must be CHRONOLOGICAL.
+        //
+        // It cannot be the text comparison it looks like it could be. sqlx
+        // binds `OffsetDateTime` as RFC3339 TEXT (`format(&Rfc3339)`) and
+        // `time` trims trailing zeros, so the stored fractional precision is
+        // VARIABLE — and lexicographic order is then NOT chronological:
+        //
+        //     MAX('..T10:00:00Z',   '..T10:00:00.5Z')  = '..:00Z'    (older!)
+        //     MAX('..T10:00:00.1Z', '..T10:00:00.12Z') = '..:00.1Z'  (older!)
+        //
+        // 'Z' (0x5A) sorts after '.' (0x2E), so a whole-second stamp beats a
+        // sub-second one inside the same second; and any fraction that is a
+        // lexical PREFIX of a later one wins over it. A scalar `MAX()` here
+        // therefore REWINDS `last_activity_at` — and a rewind is
+        // indistinguishable from silence, which reaps a healthy child.
+        //
+        // `julianday()` parses both operands to a numeric instant, restoring
+        // chronological order. Its ~50µs resolution is six orders of
+        // magnitude finer than the enforcement floor (>= 2 heartbeats), and a
+        // tie keeps the stored value, so it can never rewind. The NULL arms
+        // come first: a beat carrying no work (?6 IS NULL) leaves the column
+        // exactly as it was, and the first beat to carry work adopts it.
         let worker_str = worker.as_str();
         let lease_str = lease.as_str();
         let updated = sqlx::query_as::<_, TaskRecord>(concat!(
             "UPDATE agent_sdk_tasks \
              SET lease_expires_at = ?4, last_heartbeat_at = ?5, updated_at = ?5, \
-                 last_activity_at = MAX( \
-                     COALESCE(last_activity_at, ?6), COALESCE(?6, last_activity_at)) \
+                 last_activity_at = CASE \
+                     WHEN ?6 IS NULL THEN last_activity_at \
+                     WHEN last_activity_at IS NULL THEN ?6 \
+                     WHEN julianday(?6) > julianday(last_activity_at) THEN ?6 \
+                     ELSE last_activity_at \
+                 END \
              WHERE id = ?1 AND status = 'running' AND worker_id = ?2 AND lease_id = ?3 \
              RETURNING ",
             task_columns!(),
@@ -6713,6 +6731,136 @@ mod tests {
             committed.is_empty(),
             "rolled-back fork must not leave events on the destination"
         );
+
+        Ok(())
+    }
+
+    /// ADR-0003 I2 — the activity comparison must be CHRONOLOGICAL, never
+    /// lexical.
+    ///
+    /// sqlx binds `OffsetDateTime` as RFC3339 TEXT (`format(&Rfc3339)`) and
+    /// `time` trims trailing zeros, so the stored fractional precision is
+    /// VARIABLE. The scalar `MAX()` compares that text with the BINARY
+    /// collation, and `'Z'` (0x5A) sorts after `'.'` (0x2E) — so a whole-second
+    /// stamp beats a sub-second one inside the same second, and any fraction
+    /// that is a lexical PREFIX of a later one beats the later one:
+    ///
+    /// ```text
+    /// MAX('..T10:00:00Z',   '..T10:00:00.5Z')  = '..:00Z'    (the OLDER one!)
+    /// MAX('..T10:00:00.1Z', '..T10:00:00.12Z') = '..:00.1Z'  (the OLDER one!)
+    /// ```
+    ///
+    /// A heartbeat carrying genuinely newer work would then be silently
+    /// dropped, freezing `last_activity_at` — and frozen activity is
+    /// indistinguishable from silence, so a working child gets reaped.
+    ///
+    /// Every pair below is one where the LEXICALLY larger string is the
+    /// chronologically OLDER instant. `julianday()` restores real order.
+    #[tokio::test]
+    async fn heartbeat_activity_advances_chronologically_not_lexically() -> Result<()> {
+        use agent_server::journal::task::{AgentTask, LeaseId, WorkerId};
+        use agent_server::journal::thread_store::ThreadStore;
+
+        // `t0()` is a whole second (zero nanos), so it formats with NO
+        // fractional part — the operand that wins lexically but loses in time.
+        let base = t0();
+        let cases = [
+            (
+                "whole-second vs +500ms",
+                base,
+                base + Duration::milliseconds(500),
+            ),
+            (
+                "fraction that is a lexical prefix of a later one (.1 vs .12)",
+                base + Duration::milliseconds(100),
+                base + Duration::milliseconds(120),
+            ),
+            (
+                ".5 vs .55",
+                base + Duration::milliseconds(500),
+                base + Duration::milliseconds(550),
+            ),
+        ];
+
+        for (label, older, newer) in cases {
+            assert!(newer > older, "fixture sanity for {label}");
+
+            let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+            let thread_id = ThreadId::from_string("t-activity-order");
+            ThreadStore::get_or_create(&store, &thread_id, base).await?;
+            let task = AgentTask::new_root_turn(thread_id.clone(), base, 3);
+            let id = task.id.clone();
+            AgentTaskStore::submit_root_turn(&store, task).await?;
+
+            let worker = WorkerId::from_string("w-order");
+            let lease = LeaseId::new();
+            let expires = base + Duration::seconds(600);
+            AgentTaskStore::try_acquire_task(
+                &store,
+                &id,
+                worker.clone(),
+                lease.clone(),
+                expires,
+                base,
+            )
+            .await?
+            .context("acquire")?;
+
+            // Persist the older instant, then beat again carrying the newer.
+            AgentTaskStore::heartbeat_task(
+                &store,
+                &id,
+                &worker,
+                &lease,
+                expires,
+                Some(older),
+                base,
+            )
+            .await?;
+            let advanced = AgentTaskStore::heartbeat_task(
+                &store,
+                &id,
+                &worker,
+                &lease,
+                expires,
+                Some(newer),
+                base,
+            )
+            .await?;
+            assert_eq!(
+                advanced.last_activity_at,
+                Some(newer),
+                "{label}: a chronologically newer observation must advance the column \
+                 (a lexical MAX keeps the older string and drops this beat's work)",
+            );
+
+            // ...and the reverse must never rewind it.
+            let held = AgentTaskStore::heartbeat_task(
+                &store,
+                &id,
+                &worker,
+                &lease,
+                expires,
+                Some(older),
+                base,
+            )
+            .await?;
+            assert_eq!(
+                held.last_activity_at,
+                Some(newer),
+                "{label}: an older observation must never retire a newer one",
+            );
+
+            // A beat that carried no work leaves the column exactly as it was.
+            let idle =
+                AgentTaskStore::heartbeat_task(&store, &id, &worker, &lease, expires, None, base)
+                    .await?;
+            assert_eq!(
+                idle.last_activity_at,
+                Some(newer),
+                "{label}: an idle beat must neither advance nor clear activity",
+            );
+        }
 
         Ok(())
     }

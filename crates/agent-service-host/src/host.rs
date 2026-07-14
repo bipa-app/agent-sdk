@@ -770,6 +770,7 @@ async fn lease_sweep_loop(
                     &stores,
                     now,
                     min_stall_budget_ms(heartbeat_interval),
+                    STALL_PROBE_MAX,
                     &cancel,
                 )
                 .await
@@ -1503,18 +1504,31 @@ async fn collect_subtree_activity(
 }
 
 /// Fold one subtree row's durable activity into `out`. Returns `true` — a
-/// decisive early stop — when the row carries a `last_activity_at` at or
-/// after `cutoff` (a fresh sign of life); otherwise records the row's thread
-/// for the committed-event probe and returns `false`.
+/// decisive early stop — when the row's EFFECTIVE activity is at or after
+/// `cutoff` (a fresh sign of life); otherwise records the row's thread for
+/// the committed-event probe and returns `false`.
+///
+/// ADR-0003 I1 — effective activity is `last_activity_at ?? created_at`. A
+/// row carries no `last_activity_at` until it is first acquired (every
+/// constructor starts it `None`, and `mark_running` is what stamps it), and
+/// rows predating migration 0012 carry none either. Reading `None` as "no
+/// evidence" discards the one fact the row does assert: it EXISTS, and it was
+/// created at `created_at`. That misread reaps a parent which parked on
+/// children it *just spawned* — they are still `Queued`, so they carry no
+/// activity, and under tight retention the spawn events have already aged out
+/// of the journal.
+///
+/// This cannot weaken the reap: a child that never starts has an old
+/// `created_at`, so its effective activity is old and it still times out —
+/// `created_at` already carries exactly this meaning on the subject's own
+/// floor in [`stall_expired`]'s first condition.
 fn note_row_activity(
     task: &AgentTask,
     cutoff: time::OffsetDateTime,
     out: &mut SubtreeActivity,
 ) -> bool {
-    if task
-        .last_activity_at
-        .is_some_and(|activity| activity >= cutoff)
-    {
+    let effective_activity = task.last_activity_at.unwrap_or(task.created_at);
+    if effective_activity >= cutoff {
         out.found_fresh = true;
         return true;
     }
@@ -1722,6 +1736,19 @@ pub(crate) struct HeartbeatLoopParams {
     pub(crate) worker_id: WorkerId,
     pub(crate) lease_id: LeaseId,
     pub(crate) lease_duration: time::Duration,
+    /// The persistence cadence for this loop's activity — and, by ADR-0003
+    /// I4, the ONE cadence in the process.
+    ///
+    /// **Every** `heartbeat_loop` must be spawned with the configured
+    /// `worker.heartbeat_interval`, never a locally-derived value. The
+    /// subagent stall floor is `MIN_STALL_BUDGET_HEARTBEATS x` this interval
+    /// (see [`min_stall_budget_ms`]), and a probed subtree can contain a row
+    /// heartbeated by ANY loop — a worker-pool task, or the detached
+    /// Confirm-tier tool drive. A loop that beats slower than the floor
+    /// assumes persists its row's progress less often than the enforcement
+    /// side expects, and an actively-working child is reaped for the gap.
+    /// One cadence is what makes the floor correct by construction; deriving
+    /// a second one here (the old grpc `lease/3`) is what broke it.
     pub(crate) heartbeat_interval: std::time::Duration,
     /// Trips when the heartbeat loop itself should stop (exec finished /
     /// host shutdown).
@@ -2964,10 +2991,16 @@ async fn fail_timed_out_child_holding_lease(
 /// whole pass is idempotent across ticks: losing any race (a worker
 /// re-acquired the root, a concurrent cancel) is a clean skip that the
 /// acquisition-expiry check or the next tick converges on.
+/// `probe_timeout` bounds each stall probe (ADR-0003 I5). Production passes
+/// [`STALL_PROBE_MAX`]; it is a parameter — rather than the const read
+/// directly — so the fail-safe can be proved deterministically, exactly as the
+/// running leg's bound already is in [`deadline_tick`]. Both legs must be
+/// bounded; a probe that overruns answers "not expired" and retries.
 async fn enforce_subagent_deadlines(
     stores: &StoreRegistry,
     now: time::OffsetDateTime,
     min_budget_ms: u64,
+    probe_timeout: std::time::Duration,
     cancel: &CancellationToken,
 ) -> Result<usize> {
     let parked = stores
@@ -3032,7 +3065,7 @@ async fn enforce_subagent_deadlines(
         // pathological subtree cannot stall the whole sweep tick; a timeout
         // is treated as not-expired (fail-safe) and retried next sweep.
         let expired = match tokio::time::timeout(
-            STALL_PROBE_MAX,
+            probe_timeout,
             stall_expired(stores, &child_root.id, deadline, None, now),
         )
         .await
@@ -6186,6 +6219,132 @@ mod tests {
         Ok(())
     }
 
+    /// ADR-0003 I1 — effective activity is `last_activity_at ?? created_at`.
+    ///
+    /// A row carries NO `last_activity_at` until it is first acquired (every
+    /// constructor starts it `None`; `mark_running` is what stamps it), and
+    /// rows predating migration 0012 carry none either. Reading `None` as "no
+    /// evidence" discards the one fact the row does assert: it EXISTS, and it
+    /// was created at `created_at`.
+    ///
+    /// The kill this prevents: a parent parks on a child it JUST spawned; the
+    /// child is still `Queued` so it carries no activity stamp, and under
+    /// tight retention the spawn events have already aged out of the journal.
+    /// The parent is then reaped as silent moments after it demonstrably
+    /// worked.
+    ///
+    /// Both directions are asserted, because the fallback must not blunt the
+    /// reap: an OLD unacquired row is still silent.
+    #[tokio::test]
+    async fn a_freshly_spawned_descendant_is_itself_evidence_of_life() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            sample_registry(),
+            subagent_timeout_runtime(Arc::new(SubagentScriptProvider::new()))?,
+        )?;
+        let stores = host.stores().clone();
+
+        let budget_ms: u64 = 30 * 60 * 1_000;
+        let now = time::OffsetDateTime::now_utc();
+        let spawned_at = now - time::Duration::hours(2);
+        let (_parent, _invocation, child_root) = persist_subagent_fixture(
+            &stores,
+            &ThreadId::from_string("t-fresh-descendant"),
+            budget_ms,
+            spawned_at,
+        )
+        .await?;
+        let deadline = deadline_for(child_root.created_at, budget_ms, 0).context("deadline")?;
+
+        assert!(
+            stall_expired(&stores, &child_root.id, deadline, None, now).await,
+            "sanity: with no descendant at all the parked child reads as silent",
+        );
+
+        // An OLD unacquired row: never ran, no activity stamp, created well
+        // outside the budget. It must NOT rescue the parent — otherwise the
+        // fallback would make a wedged subtree immortal.
+        let stale = AgentTask::new_child(
+            &child_root,
+            TaskKind::ToolRuntime,
+            now - time::Duration::hours(1),
+            3,
+        )?;
+        assert!(
+            stale.last_activity_at.is_none(),
+            "a never-acquired row carries no activity stamp",
+        );
+        stores.task_store.insert(stale).await?;
+        assert!(
+            stall_expired(&stores, &child_root.id, deadline, None, now).await,
+            "an unacquired descendant created OUTSIDE the budget is still silent: the \
+             created_at fallback must not blunt the reap",
+        );
+
+        // A row the parent spawned one minute ago. Still `Queued`, so it has
+        // no activity stamp — but its creation IS its initial activity.
+        let fresh = AgentTask::new_child(
+            &child_root,
+            TaskKind::ToolRuntime,
+            now - time::Duration::minutes(1),
+            3,
+        )?;
+        assert!(fresh.last_activity_at.is_none());
+        stores.task_store.insert(fresh).await?;
+        assert!(
+            !stall_expired(&stores, &child_root.id, deadline, None, now).await,
+            "a descendant SPAWNED inside the budget is evidence the parent worked, even \
+             though it has not been acquired and so carries no last_activity_at",
+        );
+        Ok(())
+    }
+
+    /// ADR-0003 I4 — the enforcement floor must cover the SLOWEST cadence that
+    /// can persist activity for a probed subtree.
+    ///
+    /// The regression this pins: the detached Confirm-tier tool drive used to
+    /// derive its own heartbeat as `lease_duration / 3`, while the floor a
+    /// parked ancestor enforces with is `2 x worker.heartbeat_interval`. A
+    /// Confirm-tier tool's row is precisely what keeps that parked ancestor
+    /// alive — so under a 60s lease and a 5s worker heartbeat the tool
+    /// persisted its progress every 20s against a 10s floor, and an actively
+    /// emitting tool was reaped for the gap.
+    ///
+    /// The fix is structural: there is now exactly ONE cadence — every
+    /// `heartbeat_loop`, including the detached drive, beats at the configured
+    /// `worker.heartbeat_interval` — so `2 x heartbeat_interval` covers every
+    /// persister by construction.
+    #[test]
+    fn the_stall_floor_covers_every_activity_persistence_cadence() {
+        // The envelope that broke: a long (1min) lease with a fast worker
+        // heartbeat.
+        let lease = std::time::Duration::from_mins(1);
+        let heartbeat = std::time::Duration::from_secs(5);
+
+        let floor_ms = min_stall_budget_ms(heartbeat);
+        assert_eq!(floor_ms, 10_000, "floor is 2 x the worker heartbeat");
+
+        // The cadence the detached drive USED to run at, kept here as the
+        // counter-example the floor must never again fail to cover.
+        let old_derived_cadence_ms = u64::try_from(lease.as_millis()).unwrap_or(u64::MAX) / 3;
+        assert_eq!(old_derived_cadence_ms, 20_000);
+        assert!(
+            old_derived_cadence_ms > floor_ms,
+            "REGRESSION WITNESS: a lease-derived cadence out-runs the floor, so a tool \
+             persisting on it is reaped while actively emitting",
+        );
+
+        // Every heartbeat_loop now beats at the one configured interval, so
+        // the slowest persister IS the worker cadence and the floor covers it.
+        let slowest_cadence_ms = u64::try_from(heartbeat.as_millis()).unwrap_or(u64::MAX);
+        assert!(
+            floor_ms >= 2 * slowest_cadence_ms,
+            "the floor must be at least 2x the slowest cadence that persists activity",
+        );
+    }
+
     /// F2: a child running a NESTED subagent commits nothing on its own
     /// thread — the nested work commits on the nested child root's OWN
     /// thread. #376's probe saw only the outer thread's silence and killed
@@ -6975,6 +7134,77 @@ mod tests {
         Ok(())
     }
 
+    /// ADR-0003 I5 — the probe is bounded on EVERY leg, and a bounded-out
+    /// probe means "alive".
+    ///
+    /// The running leg's bound is pinned by
+    /// `stall_probe_timeout_is_treated_as_active`. This is the PARKED leg, the
+    /// other probe path — a slow or huge subtree must not let the sweep reap a
+    /// child on an incomplete walk. Never kill on unknown.
+    #[tokio::test]
+    async fn parked_sweep_probe_timeout_is_treated_as_active() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            sample_registry(),
+            subagent_timeout_runtime(Arc::new(SubagentScriptProvider::new()))?,
+        )?;
+        let stores = host.stores().clone();
+
+        // A genuinely silent parked child, well past its budget: an UNBOUNDED
+        // probe over a healthy store reaps it (asserted below), so the only
+        // thing sparing it in the bounded case is the fail-safe.
+        let backdated = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
+        let (_parent, _invocation, child_root) = persist_subagent_fixture(
+            &stores,
+            &ThreadId::from_string("t-sweep-probe-timeout"),
+            250,
+            backdated,
+        )
+        .await?;
+        park_child_root_on_tool_child(&stores, &child_root, backdated).await?;
+
+        // The store stalls `list_children` for 800ms; the probe is bounded to
+        // 50ms. The walk cannot complete, so its verdict is unknown.
+        let flaky = Arc::new(
+            FlakyTaskStore::new(Arc::clone(&stores.task_store)).stalling_list_children(800),
+        );
+        let mut flaky_stores = stores.clone();
+        flaky_stores.task_store = flaky;
+
+        let enforced = enforce_subagent_deadlines(
+            &flaky_stores,
+            time::OffsetDateTime::now_utc(),
+            0,
+            std::time::Duration::from_millis(50),
+            &CancellationToken::new(),
+        )
+        .await?;
+        assert_eq!(
+            enforced, 0,
+            "a parked-sweep probe that overran its bound must be treated as ACTIVE, never \
+             reaped on an incomplete walk",
+        );
+
+        // Control: the same child, same budget, against the healthy store with
+        // a full bound — it IS reaped. So the fail-safe above is what spared
+        // it, not a fixture that was never expiring in the first place.
+        let enforced = enforce_subagent_deadlines(
+            &stores,
+            time::OffsetDateTime::now_utc(),
+            0,
+            STALL_PROBE_MAX,
+            &CancellationToken::new(),
+        )
+        .await?;
+        assert_eq!(
+            enforced, 1,
+            "control: an unbounded-out probe over a healthy store does reap this child",
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn sweep_fails_expired_parked_child_and_cancels_hung_tool_children() -> Result<()> {
         use agent_sdk_foundation::ThreadId;
@@ -6995,6 +7225,7 @@ mod tests {
             &stores,
             time::OffsetDateTime::now_utc(),
             0,
+            STALL_PROBE_MAX,
             &CancellationToken::new(),
         )
         .await?;
@@ -7055,6 +7286,7 @@ mod tests {
             &stores,
             time::OffsetDateTime::now_utc(),
             0,
+            STALL_PROBE_MAX,
             &CancellationToken::new(),
         )
         .await?;
@@ -7814,6 +8046,7 @@ mod tests {
             &flaky_stores,
             time::OffsetDateTime::now_utc(),
             0,
+            STALL_PROBE_MAX,
             &CancellationToken::new(),
         )
         .await?;
@@ -8000,6 +8233,7 @@ mod tests {
             &stores,
             time::OffsetDateTime::now_utc(),
             0,
+            STALL_PROBE_MAX,
             &CancellationToken::new(),
         )
         .await?;

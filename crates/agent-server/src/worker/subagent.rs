@@ -555,17 +555,21 @@ pub struct EffectiveSubagentSpec {
     /// counts as evidence of work, so a re-acquired child is never reaped
     /// before it runs — however long it queued or sat stranded.
     ///
-    /// **Persistence-cadence floor.** A parked child's evidence is the
-    /// *durable* `last_activity_at`, which is persisted at most once per
-    /// heartbeat interval. A budget shorter than a couple of intervals
-    /// could therefore reap a parked child whose descendant IS reporting
-    /// but whose report has not yet been persisted. The service host floors
-    /// the *effective* budget at `k × heartbeat_interval` (k = 2) at
-    /// enforcement — the floor is applied there, not here, because only the
-    /// host knows its runtime heartbeat cadence. `timeout_ms` is unchanged
-    /// on the wire; only the enforced budget is floored, and only for
-    /// pathologically small configs (bip's minute-to-hours budgets are far
-    /// above it).
+    /// **Persistence-cadence floor (ADR-0003 I4).** A parked child's evidence
+    /// is the *durable* `last_activity_at`, which is persisted at most once
+    /// per heartbeat interval. A budget shorter than a couple of intervals
+    /// could therefore reap a parked child whose descendant IS reporting but
+    /// whose report has not yet been persisted. The service host therefore
+    /// floors the *effective* budget at `k × heartbeat_interval` (k = 2) —
+    /// **at enforcement**, not here, because only the host knows its runtime
+    /// cadence, and every heartbeat in the host beats at that one configured
+    /// interval so the floor covers them all.
+    ///
+    /// So a configured value below `2 × heartbeat_interval` is **NOT honored
+    /// literally**: enforcement silently uses the floor instead. `timeout_ms`
+    /// is unchanged on the wire, and the floor only ever bites pathologically
+    /// small configs — bip's minute-to-hours budgets are far above it.
+    ///
     /// Each leg carries up to one tick/sweep interval of slack. Not
     /// covered: a steering-resume exchange, which runs unbounded until
     /// the task's next ordinary acquisition. On expiry the child root
