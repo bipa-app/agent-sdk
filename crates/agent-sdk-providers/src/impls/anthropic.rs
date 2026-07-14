@@ -1827,7 +1827,7 @@ mod tests {
     /// "timed out" error. Hand-rolled server: wiremock cannot hold a
     /// connection open mid-body.
     #[tokio::test]
-    async fn sse_byte_stall_yields_connectivity_error() {
+    async fn sse_byte_stall_yields_connection_lost_error() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

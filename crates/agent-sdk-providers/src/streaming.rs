@@ -239,7 +239,7 @@ impl StreamErrorKind {
 /// Classify a typed HTTP client failure without relying on display text.
 #[must_use]
 pub fn classify_reqwest_error(error: &reqwest::Error) -> StreamErrorKind {
-    if is_proxy_tunnel_rejection(error) || has_tls_policy_source(error) {
+    if is_proxy_tunnel_rejection(error) || is_tls_rejection(error) {
         StreamErrorKind::ServerError
     } else if error.is_connect() {
         StreamErrorKind::Connectivity
@@ -267,21 +267,28 @@ fn is_proxy_tunnel_rejection(error: &reqwest::Error) -> bool {
     false
 }
 
-fn has_tls_policy_source(error: &reqwest::Error) -> bool {
+/// `true` when a TLS peer answered the handshake and rejected the session
+/// (certificate validation, hostname mismatch, protocol or cipher
+/// negotiation, an interception proxy presenting the wrong identity, …).
+///
+/// A peer that speaks TLS at us is reachable, so these are bounded server
+/// errors, never connectivity waits: retrying cannot fix a policy or
+/// configuration rejection, and misreading one as "offline" would park the
+/// caller in an indefinite wait on a failure that is deterministic. The one
+/// exception is a TLS-wrapped *transport* death — a socket that EOFs or
+/// resets mid-handshake — which stays on the connectivity path.
+fn is_tls_rejection(error: &reqwest::Error) -> bool {
+    if has_connectivity_io_source(error) {
+        return false;
+    }
     let mut source = std::error::Error::source(error);
     while let Some(cause) = source {
         if cause.downcast_ref::<native_tls::Error>().is_some() {
             let message = cause.to_string().to_ascii_lowercase();
-            return [
-                "certificate",
-                "hostname",
-                "host name",
-                "unknown issuer",
-                "self signed",
-                "peer identity",
-            ]
-            .iter()
-            .any(|marker| message.contains(marker));
+            let transport_death = ["eof", "close", "reset", "broken pipe", "timed out"]
+                .iter()
+                .any(|marker| message.contains(marker));
+            return !transport_death;
         }
         source = cause.source();
     }
@@ -977,6 +984,92 @@ mod tests {
             StreamErrorKind::Connectivity
         );
         server.await??;
+        Ok(())
+    }
+
+    /// A live TLS peer that fails certificate validation is a policy
+    /// rejection, not an outage — waiting for connectivity cannot fix it, so
+    /// it must stay on the bounded path. The server presents a self-signed
+    /// certificate the client refuses; the assertion also pins the
+    /// `native_tls::Error` downcast in `is_tls_rejection` against a version
+    /// drift between reqwest's native-tls and the workspace's.
+    #[tokio::test]
+    async fn tls_certificate_rejection_is_bounded_server_error() -> anyhow::Result<()> {
+        const SELF_SIGNED_CERT_PEM: &[u8] = b"-----BEGIN CERTIFICATE-----
+MIIDJzCCAg+gAwIBAgIUPiG3JI6c72crNdzYks8mo1pmHMEwDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDcxNDE4NDYzMloYDzIxMjYw
+NjIwMTg0NjMyWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwggEiMA0GCSqGSIb3DQEB
+AQUAA4IBDwAwggEKAoIBAQCtBOh4EAP48fjE59F+L9qNEp/yUlOJXYJbm6m4nzTg
+00RNc+dqsfrObIWJDuAaiKimunkGrSy77ELNAHlJmtOSkq8hu1C5/k6LW0GvPHuC
+faPFEevCmxbERVZnt1f9IQ2e77oZz752cNzDlUIKyy5v3LpGaL8vT1bLAFuHT9z/
+3mlqEwyK7mQlS3LZvwJQ6NfL2lgr5uVDFdsvfAY4mhbV8uRjKj+IZnOV1WYqQ62o
+xbjC/NKXbvqKBigOhbo+idk1sjKbkjm2uvyjmUszRpfh7YX2wkk3UqZgN1+zsRDK
+MBMyuZkkr7Vb/8ed07SN8Ma64fwCrrQba4l/R8TJmQpXAgMBAAGjbzBtMB0GA1Ud
+DgQWBBT8LxETkCZh4h6qjMlLJMooNHTgkTAfBgNVHSMEGDAWgBT8LxETkCZh4h6q
+jMlLJMooNHTgkTAPBgNVHRMBAf8EBTADAQH/MBoGA1UdEQQTMBGCCWxvY2FsaG9z
+dIcEfwAAATANBgkqhkiG9w0BAQsFAAOCAQEACjZ8oqjFooFxjS3BnbhrNrF29/Jv
+PbX32Tg3+3qUkS5+XnO64mLm+pQzUGs16+TyqdEkck//51KkyvzrnnGRYGc5eHEQ
+zorkR1zlE+c8sjKcenvVkkLEKWaWNtEvpb+U0Ps6rP2Y1Jo4/AxTuxXrYxQ+XSTy
+V4HyKriK6utlmhGpKUZhTZPTiTC/GaAwimCFgfw4wDuWGow92z3AnR9Q3KFpgrTP
+B5z+i0oiNv6GpalGq3oe1ucKt+fduYWsC2Vea/PObZowciqbsA0mv3oHlyT9jPFT
+hY9YjeYgUtEnf0BlrUrgbpd9DnVd5TNU0nDbPC7bv/yu8nF1nKUFWa2nsw==
+-----END CERTIFICATE-----";
+        const SELF_SIGNED_KEY_PEM: &[u8] = b"-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCtBOh4EAP48fjE
+59F+L9qNEp/yUlOJXYJbm6m4nzTg00RNc+dqsfrObIWJDuAaiKimunkGrSy77ELN
+AHlJmtOSkq8hu1C5/k6LW0GvPHuCfaPFEevCmxbERVZnt1f9IQ2e77oZz752cNzD
+lUIKyy5v3LpGaL8vT1bLAFuHT9z/3mlqEwyK7mQlS3LZvwJQ6NfL2lgr5uVDFdsv
+fAY4mhbV8uRjKj+IZnOV1WYqQ62oxbjC/NKXbvqKBigOhbo+idk1sjKbkjm2uvyj
+mUszRpfh7YX2wkk3UqZgN1+zsRDKMBMyuZkkr7Vb/8ed07SN8Ma64fwCrrQba4l/
+R8TJmQpXAgMBAAECggEAAk8G9RctnmRIMARx4K+tyGUfukGL+NDFHQjSNnL1Zyya
+hDgQNfXDBX8gNwh6SBBbw8HIPKUR7D4GVCr181v8B8AqUxZnSNwSWzyv/zEc6sxX
+Y5lOHo4oOx07vm2NYITQ5DaJsq95eKYf5AI5W+CDMZ3t5GOgbXavD01la0RPDCD7
+d+H9WI7RiKlCaiD174FQfSSwcAHpesrUcopPxMfZzpjxYClGdmMp7/RTmSVg8jex
+eGceJvZujmjTnYczIce0Ibtozbq91qbwro32U2wbkvNpbU8GTG+st6nRlNRGmHeF
+AJnOw+CiY9x7KaG4ZhsEY4VRk8YRJo/cLrPcx87JwQKBgQDv76cDYUgFzFXKWH+1
+hc+oTLuUcn+X6E3ljvMKk9P4nQDgTRDxx5bBm6lHVv3IZoszi60Hvzblqr2HIO5S
+Gl9KVBkHCLaYc8ny4rYQKVjKLA2/TnDE8Y8FhFnZTpBeEWhb2axQE5zb8WA6Ku6L
+gEl04OSHjMlqAWt2Va5PZnFQQQKBgQC4mlfFFkfu92RKkYfhXkXUd5psSL4/1C1S
+wYnqyL7rmAMmKO+y2MdnS1SAwSFGtmexibEcpDu8OASPQoovy4O5De+p/wL7v7aJ
++X2J9zaM2ggQN3tYz/HWCdCSpZJy+ufHtLwW9ESu0wW2G0ESRUxtEKvmBB/b/nrO
+pK7VWxW0lwKBgQCWPG1LRIKgfs3JIZj1xI++Ri2+SeNy7ta3wsaT/PRhW43M5PST
+L/JJ0HoyXVoTPYI0CGWT0DtDm6GJFymi5zh7hiUVrnMHCpmNKD/v5rPeA6+n9inO
+Z6KyRaks1HC5NhUuTiIDEgTKA13JjlBHsVBNivQNnC4R3km3kvbOaMrTAQKBgAoR
+6U3H/F6NwjvLGoVxtg90Asl7Yl1q/pnwEszq7Hc/kJRpUUIJTz9UPaTUZDNOSfPG
+VhIA531J9P23nIAk8ueKWhOE5K3E9HksUevPv3sJfb0cua7LkR6i5GzLeWSqSTB8
+rHH4GzMKMdqQPAl6HEQqz6W5fd9rT1msZBkhYdq7AoGBAJFTgwSK84D707FxGASw
+SyuZBVIVd3iF341tsgX48Q1SVq70Uu6AQ0qPJHyxk6pe8aCiermlvVX26nqSQqr7
+RrpkOaRQNnAfmLmSHvHWZmErDzlsl7pKdIByHK5nx1ccE8xspPEfHsg00E/SWWD+
+CQR0IwmxMNda1bOi/AL4rcN3
+-----END PRIVATE KEY-----";
+
+        use anyhow::Context as _;
+
+        let identity = native_tls::Identity::from_pkcs8(SELF_SIGNED_CERT_PEM, SELF_SIGNED_KEY_PEM)?;
+        let acceptor = native_tls::TlsAcceptor::new(identity)?;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let server = std::thread::spawn(move || {
+            if let Ok((socket, _)) = listener.accept() {
+                // The client aborts after rejecting the certificate, so the
+                // server-side handshake result is an expected error.
+                drop(acceptor.accept(socket));
+            }
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build()?;
+        let result = client
+            .get(format!("https://localhost:{}", address.port()))
+            .send()
+            .await;
+        let Err(error) = result else {
+            anyhow::bail!("self-signed certificate unexpectedly accepted")
+        };
+        assert_eq!(classify_reqwest_error(&error), StreamErrorKind::ServerError);
+        server
+            .join()
+            .ok()
+            .context("TLS test server thread panicked")?;
         Ok(())
     }
 
