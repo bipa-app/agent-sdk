@@ -18,6 +18,7 @@ use super::confirmation::{
     ConfirmationResumeOutcome, PolicyVerdict, apply_confirmation_decision,
     pause_tool_for_confirmation, resume_confirmed_tool,
 };
+use crate::worker::activity::ActivityBeacon;
 use std::sync::Arc;
 
 use super::root_turn::{RootTurnDeps, RootTurnOutcome, execute_root_turn};
@@ -255,6 +256,7 @@ impl TestStores {
             compaction_provider: None,
             cancel: None,
             wakeup: None,
+            activity: None,
         }
     }
 }
@@ -360,7 +362,7 @@ async fn pause_transitions_child_to_awaiting_confirmation() -> Result<()> {
 
     // Acquire the child and bootstrap it.
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let bootstrap = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
 
     // Pause for confirmation.
     let (paused, committed_events) =
@@ -420,7 +422,7 @@ async fn pause_persists_prepared_operation_from_listen_context() -> Result<()> {
     .await?;
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let bootstrap = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
 
     // The test mock doesn't set listen_context so prepared_operation
     // will be None. Verify the state handles this correctly.
@@ -457,7 +459,7 @@ async fn approve_and_policy_allows_executes_tool_successfully() -> Result<()> {
 
     // Acquire, bootstrap, pause.
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let bootstrap = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     pause_tool_for_confirmation(&bootstrap, &stores.tasks, &stores.events, t_plus(15)).await?;
 
     // Apply approval decision.
@@ -485,7 +487,8 @@ async fn approve_and_policy_allows_executes_tool_successfully() -> Result<()> {
         t_plus(25),
     )
     .await?;
-    let resume_bootstrap = resolve_tool_bootstrap(resumed_child, &stores.tasks).await?;
+    let resume_bootstrap =
+        resolve_tool_bootstrap(resumed_child, &stores.tasks, ActivityBeacon::default()).await?;
 
     // Resume with AllowAll policy → should execute.
     let resume_outcome = resume_confirmed_tool(
@@ -548,7 +551,7 @@ async fn approve_but_policy_denies_fails_child() -> Result<()> {
 
     // Acquire, bootstrap, pause, approve.
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let bootstrap = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     pause_tool_for_confirmation(&bootstrap, &stores.tasks, &stores.events, t_plus(15)).await?;
     apply_confirmation_decision(
         &children[0].id,
@@ -568,7 +571,8 @@ async fn approve_but_policy_denies_fails_child() -> Result<()> {
         t_plus(25),
     )
     .await?;
-    let resume_bootstrap = resolve_tool_bootstrap(resumed, &stores.tasks).await?;
+    let resume_bootstrap =
+        resolve_tool_bootstrap(resumed, &stores.tasks, ActivityBeacon::default()).await?;
 
     // Resume with DenyAll policy → should fail without executing.
     let policy = DenyAllPolicy::new("tool disabled by administrator");
@@ -640,7 +644,7 @@ async fn rejection_fails_child_without_executing() -> Result<()> {
 
     // Acquire, bootstrap, pause.
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let bootstrap = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     pause_tool_for_confirmation(&bootstrap, &stores.tasks, &stores.events, t_plus(15)).await?;
 
     // Reject.
@@ -703,7 +707,7 @@ async fn rejection_emits_failure_tool_call_end() -> Result<()> {
     .await?;
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let bootstrap = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     pause_tool_for_confirmation(&bootstrap, &stores.tasks, &stores.events, t_plus(15)).await?;
 
     apply_confirmation_decision(
@@ -754,7 +758,7 @@ async fn timeout_fails_child_without_executing() -> Result<()> {
 
     // Acquire, bootstrap, pause.
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let bootstrap = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     pause_tool_for_confirmation(&bootstrap, &stores.tasks, &stores.events, t_plus(15)).await?;
 
     // Timeout.
@@ -875,7 +879,7 @@ async fn awaiting_confirmation_state_survives_store_reread() -> Result<()> {
 
     // Acquire, bootstrap, pause.
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let bootstrap = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let (paused, _committed_events) =
         pause_tool_for_confirmation(&bootstrap, &stores.tasks, &stores.events, t_plus(15)).await?;
     assert_eq!(paused.status, TaskStatus::AwaitingConfirmation);
@@ -944,7 +948,8 @@ async fn multi_child_confirmation_does_not_affect_siblings() -> Result<()> {
 
     // Acquire child 0 (transfer, Confirm tier) → pause.
     let child_0 = acquire_child(&stores.tasks, &children[0].id).await?;
-    let bootstrap_0 = resolve_tool_bootstrap(child_0, &stores.tasks).await?;
+    let bootstrap_0 =
+        resolve_tool_bootstrap(child_0, &stores.tasks, ActivityBeacon::default()).await?;
     pause_tool_for_confirmation(&bootstrap_0, &stores.tasks, &stores.events, t_plus(15)).await?;
 
     // Acquire child 1 (bash, Observe tier) → execute directly.
@@ -956,7 +961,8 @@ async fn multi_child_confirmation_does_not_affect_siblings() -> Result<()> {
         t_plus(10),
     )
     .await?;
-    let bootstrap_1 = resolve_tool_bootstrap(child_1, &stores.tasks).await?;
+    let bootstrap_1 =
+        resolve_tool_bootstrap(child_1, &stores.tasks, ActivityBeacon::default()).await?;
     let outcome_1 = super::tool_task::execute_tool_task(
         bootstrap_1,
         &stores.tasks,
@@ -1056,7 +1062,7 @@ async fn full_confirmation_lifecycle_pause_approve_execute() -> Result<()> {
 
     // Step 2: Worker acquires child → bootstrap → pause.
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let bootstrap = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let (paused, _committed_events) =
         pause_tool_for_confirmation(&bootstrap, &stores.tasks, &stores.events, t_plus(15)).await?;
     assert_eq!(paused.status, TaskStatus::AwaitingConfirmation);
@@ -1084,7 +1090,8 @@ async fn full_confirmation_lifecycle_pause_approve_execute() -> Result<()> {
         t_plus(25),
     )
     .await?;
-    let resume_bootstrap = resolve_tool_bootstrap(resumed, &stores.tasks).await?;
+    let resume_bootstrap =
+        resolve_tool_bootstrap(resumed, &stores.tasks, ActivityBeacon::default()).await?;
 
     let resume_outcome = resume_confirmed_tool(
         resume_bootstrap,

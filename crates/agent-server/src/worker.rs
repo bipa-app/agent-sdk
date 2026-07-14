@@ -85,6 +85,7 @@
 //!   `Running` tasks. This prevents later slices from accidentally
 //!   bootstrapping a child task or a queued root.
 
+pub mod activity;
 pub mod bootstrap;
 pub mod compaction;
 pub mod confirmation;
@@ -129,6 +130,7 @@ mod test_support;
 #[cfg(test)]
 mod tool_task_test;
 
+pub use activity::{ActivityBeacon, ActivityTrackingEventRepo};
 pub use bootstrap::{WorkerBootstrapContext, resolve_bootstrap_context};
 pub use definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
 pub use registry::{AgentDefinitionRegistry, InMemoryAgentDefinitionRegistry};

@@ -57,6 +57,9 @@ fn main() -> Result<()> {
     let grpc_enabled = config.transport.grpc_enabled;
     let grpc_addr = config.transport.grpc_addr;
     let lease_duration = config.worker.lease_duration();
+    // ADR-0003 I4: the detached Confirm-tier drive must beat at the SAME
+    // cadence the worker pool does — the stall floor is derived from it.
+    let heartbeat_interval = config.worker.heartbeat_interval();
     let admission = config.admission.clone();
     let host = ServiceHost::new(config, registry, Arc::clone(&runtime))
         .context("creating service host")?;
@@ -98,6 +101,7 @@ fn main() -> Result<()> {
                     health,
                     shutdown,
                     lease_duration,
+                    heartbeat_interval,
                     admission,
                 );
                 tokio::try_join!(host.run(), grpc.serve(grpc_addr))?;

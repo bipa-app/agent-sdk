@@ -23,6 +23,7 @@
 //! `execution_intent`, `tool_audit`, `redaction`) rather than testing
 //! each in isolation.
 
+use crate::worker::activity::ActivityBeacon;
 use std::sync::Arc;
 
 use super::confirmation::{
@@ -299,6 +300,7 @@ impl TestStores {
             compaction_provider: None,
             cancel: None,
             wakeup: None,
+            activity: None,
         }
     }
 }
@@ -418,7 +420,7 @@ async fn execution_marks_intent_completed_blocking_retry() -> Result<()> {
 
     // First execution: success
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let op_id = OperationId::new(&ctx.task_id, &ctx.tool_call.id);
 
     let outcome = guarded_tool_execution(
@@ -469,7 +471,7 @@ async fn retry_with_ambiguous_in_flight_is_blocked() -> Result<()> {
     .await?;
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let op_id = OperationId::new(&ctx.task_id, &ctx.tool_call.id);
 
     // Pre-seed a Started intent (simulates crash mid-execution)
@@ -526,7 +528,7 @@ async fn replay_safe_tool_retries_freely_after_failure() -> Result<()> {
     .await?;
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
 
     // ReplaySafe bypasses intent entirely, so no intent to seed.
     let outcome = guarded_tool_execution(
@@ -574,7 +576,7 @@ async fn confirmation_state_survives_restart() -> Result<()> {
 
     // Acquire and pause for confirmation
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let child_id = ctx.task_id.clone();
 
     let (paused, _committed_events) =
@@ -637,7 +639,7 @@ async fn confirmation_approved_then_policy_denied() -> Result<()> {
     .await?;
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let child_id = ctx.task_id.clone();
 
     // Pause for confirmation
@@ -666,7 +668,8 @@ async fn confirmation_approved_then_policy_denied() -> Result<()> {
         .await?
         .context("child should be re-acquirable after approval")?;
 
-    let ctx2 = resolve_tool_bootstrap(resumed_child, &stores.tasks).await?;
+    let ctx2 =
+        resolve_tool_bootstrap(resumed_child, &stores.tasks, ActivityBeacon::default()).await?;
 
     // Policy denies at resume time
     let deny_policy = DenyAllPolicy {
@@ -736,7 +739,7 @@ async fn confirmation_rejected_produces_canonical_error() -> Result<()> {
     .await?;
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let child_id = ctx.task_id.clone();
 
     pause_tool_for_confirmation(&ctx, &stores.tasks, &stores.events, t_plus(10)).await?;
@@ -799,7 +802,7 @@ async fn confirmation_timeout_produces_canonical_error() -> Result<()> {
     .await?;
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let child_id = ctx.task_id.clone();
 
     pause_tool_for_confirmation(&ctx, &stores.tasks, &stores.events, t_plus(10)).await?;
@@ -861,7 +864,7 @@ async fn cancellation_before_execution_returns_cancelled() -> Result<()> {
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
     let child_id = child.id.clone();
-    let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
 
     // Cancel before execution
     cancel.cancel();
@@ -979,7 +982,7 @@ async fn fail_closed_on_intent_persist_failure() -> Result<()> {
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
     let child_id = child.id.clone();
-    let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
 
     let outcome = guarded_tool_execution(
         ctx,
@@ -1034,7 +1037,7 @@ async fn confirmation_approval_then_successful_execution() -> Result<()> {
     .await?;
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let child_id = ctx.task_id.clone();
 
     // Pause for confirmation
@@ -1063,7 +1066,7 @@ async fn confirmation_approval_then_successful_execution() -> Result<()> {
         .await?
         .context("child should be re-acquirable")?;
 
-    let ctx2 = resolve_tool_bootstrap(resumed, &stores.tasks).await?;
+    let ctx2 = resolve_tool_bootstrap(resumed, &stores.tasks, ActivityBeacon::default()).await?;
 
     let resume_outcome = resume_confirmed_tool(
         ctx2,
@@ -1123,7 +1126,7 @@ async fn audit_trail_covers_full_lifecycle() -> Result<()> {
     .await?;
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let child_id = ctx.task_id.clone();
     let op_str = OperationId::new(&child_id, "call_1").to_string();
 
@@ -1391,7 +1394,8 @@ async fn multi_child_independence_and_parent_resume() -> Result<()> {
 
     // Complete the bash (Observe) child — should succeed immediately
     let bash_child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let bash_ctx = resolve_tool_bootstrap(bash_child, &stores.tasks).await?;
+    let bash_ctx =
+        resolve_tool_bootstrap(bash_child, &stores.tasks, ActivityBeacon::default()).await?;
 
     let bash_outcome = guarded_tool_execution(
         bash_ctx,
@@ -1423,7 +1427,8 @@ async fn multi_child_independence_and_parent_resume() -> Result<()> {
 
     // Now complete the transfer child
     let transfer_child = acquire_child(&stores.tasks, &children[1].id).await?;
-    let transfer_ctx = resolve_tool_bootstrap(transfer_child, &stores.tasks).await?;
+    let transfer_ctx =
+        resolve_tool_bootstrap(transfer_child, &stores.tasks, ActivityBeacon::default()).await?;
 
     let transfer_outcome = guarded_tool_execution(
         transfer_ctx,
@@ -1483,7 +1488,7 @@ async fn intent_and_task_coherent_after_execution_failure() -> Result<()> {
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
     let child_id = child.id.clone();
-    let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let op_id = OperationId::new(&ctx.task_id, &ctx.tool_call.id);
 
     let outcome = guarded_tool_execution(
@@ -1548,7 +1553,7 @@ async fn no_intent_means_no_execution_invariant() -> Result<()> {
     .await?;
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
 
     // This uses a failing intent store, so the intent will not persist.
     // The executor must NOT be called.

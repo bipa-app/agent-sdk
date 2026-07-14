@@ -16,6 +16,7 @@
 use super::root_turn::{
     RootTurnDeps, RootTurnOutcome, execute_root_turn, fail_root_turn, resume_from_children,
 };
+use crate::worker::activity::ActivityBeacon;
 use std::sync::Arc;
 
 use super::tool_task::{ToolTaskOutcome, execute_tool_task, resolve_tool_bootstrap};
@@ -150,6 +151,7 @@ impl TestStores {
             compaction_provider: None,
             cancel: None,
             wakeup: None,
+            activity: None,
         }
     }
 }
@@ -380,9 +382,8 @@ impl LlmProvider for MockToolCallProvider {
 async fn monotonic_ordering_across_full_lifecycle() -> Result<()> {
     let stores = TestStores::new();
     let task = create_and_acquire(&stores.tasks, &thread_reg()).await?;
-    let ctx = bootstrap(task, definition_with_tools());
     let inputs = build_root_worker_inputs(
-        ctx,
+        bootstrap(task, definition_with_tools()),
         &stores.threads,
         &stores.checkpoints,
         &stores.messages,
@@ -419,7 +420,8 @@ async fn monotonic_ordering_across_full_lifecycle() -> Result<()> {
         )
         .await?
         .context("acquire child")?;
-    let child_bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let child_bootstrap =
+        resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let cancel = CancellationToken::new();
     execute_tool_task(
         child_bootstrap,
@@ -468,7 +470,6 @@ async fn monotonic_ordering_across_full_lifecycle() -> Result<()> {
     )
     .await?;
     resume_from_children(resume_inputs, &parent_acq, &provider, &stores.deps(), t0()).await?;
-
     // Verify: all events are contiguous and belong to the same thread.
     let events = stores.events.get_events(&thread_reg()).await?;
     assert_contiguous_sequences(&events);
@@ -911,7 +912,7 @@ async fn acquire_and_execute_child_with_progress(
         )
         .await?
         .context("acquire child")?;
-    let cb = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let cb = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let cancel = CancellationToken::new();
     let stages: Vec<(String, String)> = progress_stages
         .into_iter()

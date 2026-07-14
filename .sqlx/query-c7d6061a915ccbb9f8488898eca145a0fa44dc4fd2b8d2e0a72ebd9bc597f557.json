@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\nSELECT\n    id,\n    kind,\n    status,\n    parent_id,\n    root_id,\n    depth,\n    thread_id,\n    submitted_input_json,\n    caller_metadata_json,\n    worker_id,\n    lease_id,\n    lease_expires_at,\n    last_heartbeat_at,\n    state_json,\n    attempt,\n    max_attempts,\n    last_error,\n    pending_child_count,\n    spawn_index,\n    result_payload,\n    otel_traceparent,\n    created_at,\n    updated_at,\n    completed_at\nFROM agent_sdk_tasks\nWHERE kind = 'subagent'\n  AND status = 'waiting_on_children'\n  AND state_json -> 'invocation' ->> 'child_root_task_id' = $1\n",
+  "query": "\nSELECT\n    id,\n    kind,\n    status,\n    parent_id,\n    root_id,\n    depth,\n    thread_id,\n    submitted_input_json,\n    caller_metadata_json,\n    worker_id,\n    lease_id,\n    lease_expires_at,\n    last_heartbeat_at,\n    state_json,\n    attempt,\n    max_attempts,\n    last_error,\n    pending_child_count,\n    spawn_index,\n    result_payload,\n    otel_traceparent,\n    created_at,\n    updated_at,\n    completed_at,\n    last_activity_at\nFROM agent_sdk_tasks\nWHERE thread_id = $1\nORDER BY created_at, id\n",
   "describe": {
     "columns": [
       {
@@ -266,6 +266,17 @@
             "name": "completed_at"
           }
         }
+      },
+      {
+        "ordinal": 24,
+        "name": "last_activity_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_tasks",
+            "name": "last_activity_at"
+          }
+        }
       }
     ],
     "parameters": {
@@ -297,8 +308,9 @@
       true,
       false,
       false,
+      true,
       true
     ]
   },
-  "hash": "4030f3a59487a9412a11be1e65e3b757c9af5b5b28d1318c3277edacc3e5f7b9"
+  "hash": "c7d6061a915ccbb9f8488898eca145a0fa44dc4fd2b8d2e0a72ebd9bc597f557"
 }

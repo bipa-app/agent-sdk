@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\nSELECT\n    id,\n    kind,\n    status,\n    parent_id,\n    root_id,\n    depth,\n    thread_id,\n    submitted_input_json,\n    caller_metadata_json,\n    worker_id,\n    lease_id,\n    lease_expires_at,\n    last_heartbeat_at,\n    state_json,\n    attempt,\n    max_attempts,\n    last_error,\n    pending_child_count,\n    spawn_index,\n    result_payload,\n    otel_traceparent,\n    created_at,\n    updated_at,\n    completed_at\nFROM agent_sdk_tasks\nWHERE id = $1\nFOR UPDATE\n",
+  "query": "\nSELECT\n    id,\n    kind,\n    status,\n    parent_id,\n    root_id,\n    depth,\n    thread_id,\n    submitted_input_json,\n    caller_metadata_json,\n    worker_id,\n    lease_id,\n    lease_expires_at,\n    last_heartbeat_at,\n    state_json,\n    attempt,\n    max_attempts,\n    last_error,\n    pending_child_count,\n    spawn_index,\n    result_payload,\n    otel_traceparent,\n    created_at,\n    updated_at,\n    completed_at,\n    last_activity_at\nFROM agent_sdk_tasks\nWHERE thread_id = $1\n  AND kind = 'root_turn'\n  AND status = 'queued'\nORDER BY created_at, id\nLIMIT 1\nFOR UPDATE\n",
   "describe": {
     "columns": [
       {
@@ -266,6 +266,17 @@
             "name": "completed_at"
           }
         }
+      },
+      {
+        "ordinal": 24,
+        "name": "last_activity_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_tasks",
+            "name": "last_activity_at"
+          }
+        }
       }
     ],
     "parameters": {
@@ -297,8 +308,9 @@
       true,
       false,
       false,
+      true,
       true
     ]
   },
-  "hash": "73c943846ed7d2ccb4da24f435b83327d436a6604f7170222b858675ded0a27e"
+  "hash": "2e5f607f403e22d86003c93b669a75ec73e13aa793c8d656c27bca734e3fc9a1"
 }

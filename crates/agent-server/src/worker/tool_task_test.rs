@@ -13,6 +13,7 @@
 //!   info resolved per child.
 //! - End-to-end regression: root suspend + complete all children +
 //!   verify parent becomes Pending/ReadyToResume.
+use crate::worker::activity::ActivityBeacon;
 use std::sync::Arc;
 
 use super::root_turn::{RootTurnDeps, RootTurnOutcome, execute_root_turn};
@@ -205,6 +206,7 @@ impl TestStores {
             compaction_provider: None,
             cancel: None,
             wakeup: None,
+            activity: None,
         }
     }
 }
@@ -297,7 +299,7 @@ async fn bootstrap_resolves_tool_call_from_parent_continuation() -> Result<()> {
     assert_eq!(children.len(), 1);
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
 
     assert_eq!(ctx.tool_call.name, "bash");
     assert_eq!(ctx.tool_call.id, "call_1");
@@ -316,7 +318,7 @@ async fn bootstrap_rejects_root_turn_task() -> Result<()> {
     let stores = TestStores::new();
     let task = create_and_acquire_root(&stores.tasks).await?;
 
-    let err = resolve_tool_bootstrap(task, &stores.tasks)
+    let err = resolve_tool_bootstrap(task, &stores.tasks, ActivityBeacon::default())
         .await
         .unwrap_err();
     assert!(
@@ -345,7 +347,7 @@ async fn bootstrap_rejects_pending_child() -> Result<()> {
         .context("child should exist")?;
     assert_eq!(child.status, TaskStatus::Pending);
 
-    let err = resolve_tool_bootstrap(child, &stores.tasks)
+    let err = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default())
         .await
         .unwrap_err();
     assert!(
@@ -377,7 +379,7 @@ async fn bootstrap_rejects_missing_parent() -> Result<()> {
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
 
     // stores2 has never seen the parent — resolution should fail.
-    let err = resolve_tool_bootstrap(child, &stores2.tasks)
+    let err = resolve_tool_bootstrap(child, &stores2.tasks, ActivityBeacon::default())
         .await
         .unwrap_err();
     assert!(
@@ -417,7 +419,7 @@ async fn bootstrap_maps_multiple_children_to_correct_tool_calls() -> Result<()> 
 
     // Acquire and bootstrap each child.
     let child_0 = acquire_child(&stores.tasks, &children[0].id).await?;
-    let ctx_0 = resolve_tool_bootstrap(child_0, &stores.tasks).await?;
+    let ctx_0 = resolve_tool_bootstrap(child_0, &stores.tasks, ActivityBeacon::default()).await?;
 
     // Need a fresh lease for the second child.
     let child_1 = stores
@@ -431,7 +433,7 @@ async fn bootstrap_maps_multiple_children_to_correct_tool_calls() -> Result<()> 
         )
         .await?
         .context("acquire second child")?;
-    let ctx_1 = resolve_tool_bootstrap(child_1, &stores.tasks).await?;
+    let ctx_1 = resolve_tool_bootstrap(child_1, &stores.tasks, ActivityBeacon::default()).await?;
 
     assert_eq!(ctx_0.tool_call.id, "call_1");
     assert_eq!(ctx_0.tool_call.name, "bash");
@@ -471,7 +473,7 @@ async fn execute_success_completes_child_and_decrements_parent() -> Result<()> {
 
     // Acquire and bootstrap the child.
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
 
     // Execute with a successful result.
     let outcome = execute_tool_task(
@@ -534,7 +536,7 @@ async fn execute_failure_fails_child_without_corrupting_parent() -> Result<()> {
     .await?;
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
 
     // Execute with an error result.
     let outcome = execute_tool_task(
@@ -591,7 +593,8 @@ async fn execute_cancelled_before_tool_returns_cancelled() -> Result<()> {
     .await?;
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let ctx = resolve_tool_bootstrap(child.clone(), &stores.tasks).await?;
+    let ctx =
+        resolve_tool_bootstrap(child.clone(), &stores.tasks, ActivityBeacon::default()).await?;
 
     // Cancel before execution.
     cancel.cancel();
@@ -653,7 +656,7 @@ async fn multi_child_complete_all_makes_parent_resumable() -> Result<()> {
 
     // Complete first child — parent should still be WaitingOnChildren.
     let child_0 = acquire_child(&stores.tasks, &children[0].id).await?;
-    let ctx_0 = resolve_tool_bootstrap(child_0, &stores.tasks).await?;
+    let ctx_0 = resolve_tool_bootstrap(child_0, &stores.tasks, ActivityBeacon::default()).await?;
     let outcome_0 = execute_tool_task(
         ctx_0,
         &stores.tasks,
@@ -688,7 +691,7 @@ async fn multi_child_complete_all_makes_parent_resumable() -> Result<()> {
         )
         .await?
         .context("acquire second child")?;
-    let ctx_1 = resolve_tool_bootstrap(child_1, &stores.tasks).await?;
+    let ctx_1 = resolve_tool_bootstrap(child_1, &stores.tasks, ActivityBeacon::default()).await?;
     let outcome_1 = execute_tool_task(
         ctx_1,
         &stores.tasks,
@@ -743,7 +746,7 @@ async fn mixed_success_and_failure_still_makes_parent_resumable() -> Result<()> 
 
     // Complete first child successfully.
     let child_0 = acquire_child(&stores.tasks, &children[0].id).await?;
-    let ctx_0 = resolve_tool_bootstrap(child_0, &stores.tasks).await?;
+    let ctx_0 = resolve_tool_bootstrap(child_0, &stores.tasks, ActivityBeacon::default()).await?;
     execute_tool_task(
         ctx_0,
         &stores.tasks,
@@ -766,7 +769,7 @@ async fn mixed_success_and_failure_still_makes_parent_resumable() -> Result<()> 
         )
         .await?
         .context("acquire second child")?;
-    let ctx_1 = resolve_tool_bootstrap(child_1, &stores.tasks).await?;
+    let ctx_1 = resolve_tool_bootstrap(child_1, &stores.tasks, ActivityBeacon::default()).await?;
     let outcome = execute_tool_task(
         ctx_1,
         &stores.tasks,
@@ -805,7 +808,7 @@ async fn execute_with_wrong_lease_fails_at_complete() -> Result<()> {
     .await?;
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let mut ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let mut ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
 
     // Tamper with the lease to simulate expiry + re-acquisition.
     ctx.lease_id = LeaseId::from_string("stale_lease");

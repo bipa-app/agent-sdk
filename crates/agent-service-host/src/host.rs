@@ -59,11 +59,13 @@ use agent_server::journal::commit::StaleTurnCommit;
 use agent_server::journal::committed_event::CommittedEvent;
 use agent_server::journal::execution_context::build_root_worker_inputs;
 use agent_server::journal::execution_intent::{GuardedExecutionDeps, classify_tool_effect};
-use agent_server::journal::store::RequeueOutcome;
-use agent_server::journal::task::{AgentTask, LeaseId, TaskKind, TaskStatus, WorkerId};
+use agent_server::journal::store::{AgentTaskStore, RequeueOutcome};
+use agent_server::journal::task::{
+    AgentTask, AgentTaskId, LeaseId, TaskKind, TaskStatus, WorkerId,
+};
 use agent_server::journal::task_state::TaskState;
 use agent_server::worker::{
-    AgentDefinitionRegistry, RootTurnOutcome, SubagentTaskOutcome, ToolTaskOutcome,
+    ActivityBeacon, AgentDefinitionRegistry, RootTurnOutcome, SubagentTaskOutcome, ToolTaskOutcome,
     best_effort_close_open_attempts, execute_subagent_task, fail_root_turn,
     fail_root_turn_leaving_attempts_open, guarded_tool_execution, pause_tool_for_confirmation,
     resolve_bootstrap_context, resolve_subagent_bootstrap, resolve_tool_bootstrap,
@@ -354,6 +356,7 @@ impl ServiceHost {
         let sweep_handle = tokio::spawn(lease_sweep_loop(
             self.stores.clone(),
             self.config.worker.sweep_interval(),
+            self.config.worker.heartbeat_interval(),
             Arc::clone(&self.health),
             Arc::clone(&self.metrics),
             self.shutdown.clone(),
@@ -720,6 +723,7 @@ async fn wait_for_shutdown(shutdown: &CancellationToken) -> Result<()> {
 async fn lease_sweep_loop(
     stores: StoreRegistry,
     interval: std::time::Duration,
+    heartbeat_interval: std::time::Duration,
     health: Arc<HealthSurface>,
     metrics: Arc<dyn MetricsRecorder>,
     cancel: CancellationToken,
@@ -762,7 +766,15 @@ async fn lease_sweep_loop(
                 // Pending, so Running there implies a live worker) —
                 // which is also why the drain loops past the store's
                 // per-call batch instead of reclaiming one batch.
-                match enforce_subagent_deadlines(&stores, now, &cancel).await {
+                match enforce_subagent_deadlines(
+                    &stores,
+                    now,
+                    min_stall_budget_ms(heartbeat_interval),
+                    STALL_PROBE_MAX,
+                    &cancel,
+                )
+                .await
+                {
                     Ok(0) => {}
                     Ok(count) => {
                         info!(count, "failed timed-out parked subagent child roots");
@@ -1033,19 +1045,32 @@ async fn run_task_with_heartbeat(
             task_id = %task_id,
             "acquired task missing lease id; skipping heartbeat",
         );
-        if let Err(err) = Box::pin(execute_acquired_task(task, stores, runtime, cancel)).await {
+        // No lease means no heartbeat, and therefore nobody to persist a
+        // beacon: this task's activity cannot be recorded, so it reports
+        // none. Harmless — a row with no lease has no stall budget being
+        // enforced against it either.
+        if let Err(err) = Box::pin(execute_acquired_task(
+            task,
+            stores,
+            runtime,
+            cancel,
+            &ActivityBeacon::new(),
+        ))
+        .await
+        {
             warn!(%worker_id, error = %err, "task execution failed");
         }
         return;
     };
 
-    // Store-free eligibility precheck (issue #299): a child-thread
-    // root may carry a subagent deadline; everything else is exempt.
-    // The linkage LOOKUP deliberately runs below, only after the
-    // heartbeat is up — a stalled lookup before the first heartbeat
-    // could outlive the just-acquired lease, letting the sweep requeue
-    // the row and a second worker acquire it while this one later
-    // dispatched blind: duplicate LLM/tool execution.
+    // Store-free eligibility precheck (issue #299): a child-thread root may
+    // carry a subagent deadline; everything else is exempt. Only this
+    // store-free classification runs here; the linkage LOOKUP that resolves
+    // an `Unresolved` deadline is deferred to the heartbeat loop's first
+    // tick, deliberately after the heartbeat is up — a stalled lookup
+    // before the first heartbeat could outlive the just-acquired lease,
+    // letting the sweep requeue the row and a second worker acquire it
+    // while this one later dispatched blind: duplicate LLM/tool execution.
     let initial_deadline = initial_deadline_state(&task);
 
     // Per-task cancellation token wired into the worker's `RootTurnDeps`
@@ -1056,6 +1081,13 @@ async fn run_task_with_heartbeat(
     // shutdown still cascades to it.
     let task_cancel = cancel.child_token();
     let heartbeat_cancel = cancel.child_token();
+    // This task's live-progress beacon. Execution bumps it at every sign of
+    // work; the heartbeat below reads it once per tick and persists it to
+    // THIS row (it is the actor holding this row's lease, so it is the only
+    // one that can). Both halves must therefore be minted here, together —
+    // a beacon bumped in one task's execution but persisted by another
+    // task's heartbeat would record activity against the wrong row.
+    let activity = ActivityBeacon::new();
     let heartbeat_handle = tokio::spawn(heartbeat_loop(HeartbeatLoopParams {
         stores: stores.clone(),
         task_id: task_id.clone(),
@@ -1067,64 +1099,20 @@ async fn run_task_with_heartbeat(
         cancel: heartbeat_cancel.clone(),
         task_cancel: task_cancel.clone(),
         deadline: initial_deadline,
+        activity: activity.clone(),
     }));
 
-    // Resolve the deadline under the heartbeat's lease protection, and
-    // fail an already-expired child (sat queued too long, or
-    // re-acquired after a crash near the deadline) up front without
-    // dispatching any LLM call. The spawned heartbeat holds its own
-    // copy of the state (`Unresolved` here) and independently
-    // re-resolves each tick, so a transient failure of this lookup
-    // still converges on enforcement; the cost is one extra indexed
-    // point-lookup on the heartbeat's first tick.
-    if matches!(initial_deadline, SubagentDeadlineState::Unresolved { .. })
-        && let SubagentDeadlineState::Enforced(deadline) =
-            resolve_subagent_deadline(stores, &task).await
-        && time::OffsetDateTime::now_utc() >= deadline.expires_at
-    {
-        warn!(
-            %worker_id,
-            task_id = %task_id,
-            thread_id = %thread_id,
-            timeout_ms = deadline.timeout_ms,
-            "subagent child root acquired past its deadline; failing without execution",
-        );
-        // Stop the heartbeat first so its own deadline enforcement
-        // cannot race this fail on the same lease; the fail helper
-        // extends the lease itself between retries.
-        heartbeat_cancel.cancel();
-        if let Err(join_err) = heartbeat_handle.await {
-            warn!(
-                %worker_id,
-                task_id = %task_id,
-                error = %join_err,
-                "heartbeat loop join failed",
-            );
-        }
-        let _settled = fail_timed_out_child_holding_lease(
-            stores,
-            FailTimedOutChild {
-                task: &task_id,
-                thread: &thread_id,
-                worker: worker_id,
-                lease: &lease_id,
-                timeout_ms: deadline.timeout_ms,
-                // No live worker turn exists for this row (we never
-                // dispatched), so stale open attempts from a crashed
-                // prior lease holder are safe to close here.
-                attempt_close: AttemptClosePolicy::CloseOpenAttempts,
-            },
-            cancel,
-            lease_duration,
-            heartbeat_interval,
-            FailRetryBudget::UntilSettled,
-        )
-        .await;
-        return;
-    }
-
+    // No up-front stall check: under stall semantics acquisition is itself
+    // evidence of work (`mark_running` stamps `last_activity_at`), so a
+    // freshly-(re)acquired child is never stalled at dispatch — however
+    // long it queued or however stale its pre-crash activity was. The old
+    // since-spawn leg that failed a child here without dispatching punished
+    // exactly the queue-wait/age the founder's ruling forbids; a genuinely
+    // wedged child is now reaped by the heartbeat's own per-tick check,
+    // one budget after this acquisition, and never-started children by the
+    // parked sweep off their `created_at` floor.
     let exec_result =
-        execute_with_abort_grace(task, worker_id, stores, runtime, &task_cancel).await;
+        execute_with_abort_grace(task, worker_id, stores, runtime, &task_cancel, &activity).await;
 
     heartbeat_cancel.cancel();
     if let Err(join_err) = heartbeat_handle.await {
@@ -1174,11 +1162,18 @@ async fn execute_with_abort_grace(
     stores: &StoreRegistry,
     runtime: Arc<ExecutionRuntime>,
     task_cancel: &CancellationToken,
+    activity: &ActivityBeacon,
 ) -> Option<Result<()>> {
     let task_id = task.id.clone();
     let thread_id = task.thread_id.clone();
     let lease_id = task.lease_id.clone();
-    let mut exec_fut = Box::pin(execute_acquired_task(task, stores, runtime, task_cancel));
+    let mut exec_fut = Box::pin(execute_acquired_task(
+        task,
+        stores,
+        runtime,
+        task_cancel,
+        activity,
+    ));
     let outcome = tokio::select! {
         biased;
         result = &mut exec_fut => Some(result),
@@ -1283,25 +1278,413 @@ async fn settle_attempts_after_force_drop(
     .await;
 }
 
-/// Wall-clock execution deadline for a child-thread root task linked
-/// to a durable subagent invocation.
+/// **Stall** deadline for a child-thread root task linked to a durable
+/// subagent invocation.
 ///
-/// Anchored at the child root task's `created_at` plus the resolved
-/// `spec.timeout_ms` — "the child took too long since spawn" — matching
-/// the in-process SDK subagent semantics. Resolved once per acquisition
-/// by [`resolve_subagent_deadline`] and enforced by [`heartbeat_loop`]
-/// once per tick, so enforcement carries up to one heartbeat interval
-/// of slack past the nominal deadline. In a multi-node deployment,
-/// clock skew between the spawning node (which stamps `created_at`)
-/// and the enforcing node (which compares against its own
-/// `now_utc()`) shifts enforcement 1:1 with the skew — consistent
-/// with how wall-clock lease expiry is already handled.
+/// `spec.timeout_ms` is a budget of *silence*, not of work: a child is
+/// failed only after going the whole budget with **no evidence of
+/// work**. A child that keeps working never expires, however long it
+/// runs — a six-hour build worker that commits a frame every minute is
+/// as healthy as a six-second one.
+///
+/// This is a deliberate reversal of the original since-spawn semantics
+/// (issue #299 / #360), which failed *productive* children purely for
+/// being old and threw away everything they had done. Age is not
+/// evidence of being stuck.
+///
+/// ## The two conditions
+///
+/// [`stall_expired`] fails a child only when **both** hold:
+///
+/// 1. `now >= earliest_expiry_at` (`created_at + timeout_ms`) — spawn
+///    counts as the initial evidence of life, so a child younger than
+///    its own budget can never be stalled out. This also still reaps a
+///    child that never starts at all (wedged admission, hung before its
+///    first frame).
+/// 2. Its own thread committed **no event** at or after
+///    `now - timeout_ms` — nothing happened for a whole budget.
+///
+/// Together these mean "expires roughly `timeout_ms` after the last
+/// sign of life", with the spawn instant as the first such sign.
+///
+/// Enforced by [`heartbeat_loop`] once per tick, by the parked sweep,
+/// and once up front at acquisition, so enforcement carries up to one
+/// tick of slack past the nominal stall point. In a multi-node
+/// deployment, clock skew between the node stamping the durable
+/// timestamps and the enforcing node shifts enforcement 1:1 with the
+/// skew — consistent with how wall-clock lease expiry is already
+/// handled.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SubagentExecutionDeadline {
-    /// Instant past which the child must be failed.
-    expires_at: time::OffsetDateTime,
-    /// The resolved spec timeout, kept for the failure message.
+    /// Earliest instant the child *could* be failed — `created_at +
+    /// timeout_ms`. Reaching it is necessary but **not sufficient**:
+    /// the child must also have been silent for the whole budget. See
+    /// [`stall_expired`].
+    earliest_expiry_at: time::OffsetDateTime,
+    /// The resolved spec timeout. Doubles as the silence budget and as
+    /// the failure message's stated timeout.
     timeout_ms: u64,
+}
+
+/// Absolute ceiling on how long a single stall probe may run, independent
+/// of the lease. On the RUNNING leg the probe is additionally bounded to
+/// half the current lease (see [`heartbeat_loop`]) so a slow store can
+/// never lapse the freshly-renewed lease and open a double-execution
+/// window; this cap keeps a very long lease from permitting an equally long
+/// probe, and bounds the parked-sweep probe (which holds no lease). A probe
+/// that exceeds its budget is treated as "not expired" (fail-safe) and
+/// retried on the next tick/sweep.
+const STALL_PROBE_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Hard cap on the task rows one stall probe will walk.
+///
+/// The walk descends only through NON-terminal rows (see
+/// [`collect_subtree_activity`]), so for a stalled child its LIVE frontier
+/// is a handful of rows — retained terminal history is pruned and does not
+/// count against this bound. The cap is a last-resort backstop against a
+/// pathological live fan-out; hitting it answers "not expired" (fail-safe)
+/// and is logged, never a silent truncation.
+const MAX_ACTIVITY_SUBTREE_NODES: usize = 512;
+
+/// The activity signals of a walked subtree, in the order [`stall_expired`]
+/// consults them.
+#[derive(Debug, Default)]
+struct SubtreeActivity {
+    /// A row in the subtree carried `last_activity_at >= cutoff` — a
+    /// decisive, durable sign of life. The walk short-circuits on the
+    /// first one, so this is `true` iff the child is *not* stalled by the
+    /// durable signal.
+    found_fresh: bool,
+    /// Distinct threads the fully-walked subtree spans, for the committed-
+    /// event probe. More than one means a nested subagent (whose frames
+    /// land on ITS thread, never the enforced child's). Only meaningful
+    /// when neither `found_fresh` nor `truncated`.
+    threads: Vec<agent_sdk_foundation::ThreadId>,
+    /// The walk was cut short (node cap or store error); its verdict is
+    /// inconclusive and must not be read as "no activity".
+    truncated: bool,
+}
+
+/// Walk the task subtree rooted at `root`, stopping the instant it finds a
+/// durable sign of life at or after `cutoff`.
+///
+/// A children-BFS over `parent_id` that ALSO hops the subagent-invocation
+/// linkage (mirroring `collect_subtree` / `collect_subtree_tx`). Both hops
+/// are load-bearing:
+///
+/// * **`parent_id`** reaches a running tool child. Its row is where a long
+///   tool's live progress lands (the collector's beacon → that task's own
+///   heartbeat), and while it runs the parent child root is parked with no
+///   heartbeat of its own. Without this hop a child parked on ONE
+///   40-minute build commits nothing and reads as silent.
+/// * **the invocation linkage** reaches a nested subagent's child ROOT,
+///   which is a genuine root (`parent_id` is `None`) on a NEW thread — a
+///   `parent_id`-only walk misses the entire nested subtree, and a
+///   productive one would be killed for its parent's silence.
+///
+/// **Only NON-terminal rows are expanded; terminal rows are inspected but
+/// never descended into.** A terminal task's descendants are all terminal
+/// too (the tree completes bottom-up) and its own `last_activity_at` is its
+/// completion instant, so a completed subtree can hold nothing newer than
+/// the terminal row itself. Crucially, terminal rows are inspected **inline
+/// from the full `list_children` rows** — no extra read, and they never
+/// enter the frontier or count against the cap. So retained terminal
+/// history, however wide or deep, cannot inflate the walk: only the live
+/// frontier does. That is what preserves EVENTUAL enforcement — a wedged
+/// child's live frontier is small, so the walk exhausts and returns a real
+/// verdict instead of a perpetual "truncated → active" — while a
+/// just-completed child is still seen (as a direct child of its still-live
+/// parent) and counts as a fresh sign of life for a parked parent.
+/// What reading one ROOT-ish row told the walk. A "root-ish" row is one the
+/// walk must fetch by id rather than receive from a child listing: the subtree
+/// root itself, and every nested subagent child root reached by the invocation
+/// linkage.
+enum RootRead {
+    /// Decisive — stop the walk and answer with `out` as it stands. Either a
+    /// fresh sign of life was found, or the row was unreadable and the verdict
+    /// is inconclusive.
+    Stop,
+    /// The row was read and is not fresh. `Some` if it is non-terminal and the
+    /// walk should expand it. Boxed: `AgentTask` dwarfs the unit variant.
+    Expand(Option<Box<AgentTask>>),
+}
+
+/// Read one root-ish row and fold it into the walk.
+///
+/// **This is the single home of "unreadable means alive"** (ADR-0003's
+/// never-kill-on-unknown bias). Both callers — the subtree root and the nested
+/// linkage hop — had their own copy of this decision, and the nested one got it
+/// wrong: it silently skipped a missing row, so a DANGLING LINKAGE let the walk
+/// conclude "silent" while an entire live nested subagent went unexamined, and
+/// the ancestor was killed. A missing row is *unreadable* evidence, not *absent*
+/// evidence; the two must never collapse into the same answer.
+async fn read_probe_root(
+    task_store: &dyn AgentTaskStore,
+    id: &AgentTaskId,
+    cutoff: time::OffsetDateTime,
+    out: &mut SubtreeActivity,
+) -> RootRead {
+    match task_store.get(id).await {
+        Ok(Some(task)) => {
+            if note_row_activity(&task, cutoff, out) {
+                return RootRead::Stop;
+            }
+            if task.status.is_terminal() {
+                RootRead::Expand(None)
+            } else {
+                RootRead::Expand(Some(Box::new(task)))
+            }
+        }
+        Ok(None) => {
+            warn!(
+                task_id = %id,
+                "subagent activity probe found no row for a subtree root (vanished, or a \
+                 dangling subagent linkage); treating the child as active (fail-safe: a \
+                 missing row is UNKNOWN activity, never silence)",
+            );
+            out.truncated = true;
+            RootRead::Stop
+        }
+        Err(err) => {
+            warn!(
+                task_id = %id,
+                error = %err,
+                "subagent activity probe could not read a subtree root; treating the child \
+                 as active (fail-safe)",
+            );
+            out.truncated = true;
+            RootRead::Stop
+        }
+    }
+}
+
+async fn collect_subtree_activity(
+    task_store: &dyn AgentTaskStore,
+    root: &AgentTaskId,
+    cutoff: time::OffsetDateTime,
+) -> SubtreeActivity {
+    let mut out = SubtreeActivity::default();
+    // Tracks only the NON-terminal rows enqueued for expansion, so the cap
+    // bounds the *live* frontier — never the retained terminal history.
+    let mut expanded: std::collections::BTreeSet<AgentTaskId> = std::collections::BTreeSet::new();
+    let mut frontier: std::collections::VecDeque<AgentTask> = std::collections::VecDeque::new();
+
+    // The root — and any linkage-hopped nested root — is a genuine root task
+    // not returned by a `list_children`, so it needs its own read.
+    match read_probe_root(task_store, root, cutoff, &mut out).await {
+        RootRead::Stop => return out,
+        RootRead::Expand(Some(task)) => {
+            expanded.insert(task.id.clone());
+            frontier.push_back(*task);
+        }
+        RootRead::Expand(None) => {}
+    }
+
+    while let Some(task) = frontier.pop_front() {
+        if expanded.len() > MAX_ACTIVITY_SUBTREE_NODES {
+            warn!(
+                root = %root,
+                cap = MAX_ACTIVITY_SUBTREE_NODES,
+                "subagent activity probe hit the live-frontier cap; treating the child as \
+                 active (fail-safe: never time out on incomplete evidence)",
+            );
+            out.truncated = true;
+            return out;
+        }
+
+        // Nested subagent: its child root is a separate root task, reached
+        // by an explicit read (it is not a `parent_id` child).
+        if let Some(invocation) = task.state.subagent_invocation() {
+            let nested = invocation.child_root_task_id.clone();
+            if expanded.insert(nested.clone()) {
+                match read_probe_root(task_store, &nested, cutoff, &mut out).await {
+                    RootRead::Stop => return out,
+                    RootRead::Expand(Some(nested_root)) => frontier.push_back(*nested_root),
+                    RootRead::Expand(None) => {}
+                }
+            }
+        }
+
+        // Direct children, read with the READ ITSELF BOUNDED (ADR-0003 I5).
+        //
+        // Terminal task rows are RETAINED, so reading every child and filtering
+        // in memory made each probe materialize the parent's entire tool
+        // history — on every probe, for every parked ancestor. Past a few
+        // thousand rows the probe cannot finish inside its timeout, and a
+        // timed-out probe is treated as alive: unbounded DB work AND a wedged
+        // child that can never be reaped. `probe_children` answers the two
+        // questions the walk actually has, both bounded: "did ANY child show a
+        // sign of life?" (an indexed EXISTS across terminal and live alike, so
+        // a just-completed child still keeps its parked parent alive) and "give
+        // me the live frontier" (capped).
+        match task_store
+            .probe_children(&task.id, cutoff, MAX_ACTIVITY_SUBTREE_NODES)
+            .await
+        {
+            Ok(probe) => {
+                if probe.fresh_activity {
+                    out.found_fresh = true;
+                    return out;
+                }
+                for child in probe.live {
+                    if note_row_activity(&child, cutoff, &mut out) {
+                        return out;
+                    }
+                    if expanded.insert(child.id.clone()) {
+                        frontier.push_back(child);
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(
+                    task_id = %task.id,
+                    error = %err,
+                    "subagent activity probe could not list a subtree row's children; \
+                     treating the child as active (fail-safe)",
+                );
+                out.truncated = true;
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// Fold one subtree row's durable activity into `out`. Returns `true` — a
+/// decisive early stop — when the row's EFFECTIVE activity is at or after
+/// `cutoff` (a fresh sign of life); otherwise records the row's thread for
+/// the committed-event probe and returns `false`.
+///
+/// ADR-0003 I1 — effective activity is `last_activity_at ?? created_at`. A
+/// row carries no `last_activity_at` until it is first acquired (every
+/// constructor starts it `None`, and `mark_running` is what stamps it), and
+/// rows predating migration 0012 carry none either. Reading `None` as "no
+/// evidence" discards the one fact the row does assert: it EXISTS, and it was
+/// created at `created_at`. That misread reaps a parent which parked on
+/// children it *just spawned* — they are still `Queued`, so they carry no
+/// activity, and under tight retention the spawn events have already aged out
+/// of the journal.
+///
+/// This cannot weaken the reap: a child that never starts has an old
+/// `created_at`, so its effective activity is old and it still times out —
+/// `created_at` already carries exactly this meaning on the subject's own
+/// floor in [`stall_expired`]'s first condition.
+fn note_row_activity(
+    task: &AgentTask,
+    cutoff: time::OffsetDateTime,
+    out: &mut SubtreeActivity,
+) -> bool {
+    let effective_activity = task.last_activity_at.unwrap_or(task.created_at);
+    if effective_activity >= cutoff {
+        out.found_fresh = true;
+        return true;
+    }
+    if !out.threads.contains(&task.thread_id) {
+        out.threads.push(task.thread_id.clone());
+    }
+    false
+}
+
+/// Whether an enforced child has gone its entire `timeout_ms` budget
+/// without any evidence of work — the sole condition for failing it.
+///
+/// ## The evidence, and why it is not just committed events
+///
+/// #376 asked only one question: did the child's own thread commit an
+/// event inside the budget? That is a real signal — every assistant frame,
+/// tool call and tool result commits one — but it is not the *whole*
+/// signal, and each gap is a way to kill a perfectly healthy child:
+///
+/// | Healthy child | Why its journal looks silent |
+/// |---|---|
+/// | parked on one 40-minute build | `ToolEventCollector::emit` buffers in memory; the tool's events commit only *after* it returns |
+/// | running a nested subagent | the nested frames commit on the NESTED thread, not this child's |
+/// | streaming pure tool calls | `ToolUseStart`/`ToolInputDelta` carry no text or thinking, so nothing is journalled while the stream yields |
+/// | anything, under tight retention | `event_ttl_secs < timeout_ms` purges an event that fell inside the window |
+///
+/// So the probe asks for **any** sign of life across the child's whole
+/// subtree, and committed events are one input rather than the predicate:
+///
+/// 1. `live` — the in-memory beacon of a RUNNING child, read straight from
+///    its heartbeat loop. Exact: no durable round-trip, no tick of lag.
+/// 2. the newest durable `last_activity_at` across the subtree's task rows
+///    — which a tool child's own heartbeat advances while it runs, and
+///    which event retention cannot purge.
+/// 3. a committed event on any thread the subtree spans — the child's own,
+///    plus a nested subagent's.
+///
+/// ## What is deliberately NOT evidence
+///
+/// The lease heartbeat. It renews unconditionally while the task future is
+/// alive, so a child hung on a half-open connection beats forever — that is
+/// precisely the failure this enforcement exists to catch. A beat proves
+/// the process is alive; only the beacon proves work happened.
+///
+/// By the same logic a *running tool child is not itself evidence*: a tool
+/// wedged on a dead socket is indistinguishable from one doing 40 minutes
+/// of honest work, except that the honest one reports progress. Reaping a
+/// tool that reports nothing for a whole budget is the parked sweep's
+/// entire reason to exist, so a tool must EMIT to be credited.
+///
+/// ## Fail-safe
+///
+/// Any store error, or a subtree too large to walk, answers `false` (not
+/// expired). Never kill a child on *unknown* activity: the next tick or
+/// sweep retries, and a genuinely stalled child stays stalled.
+async fn stall_expired(
+    stores: &StoreRegistry,
+    subject: &AgentTaskId,
+    enforced: SubagentExecutionDeadline,
+    live: Option<time::OffsetDateTime>,
+    now: time::OffsetDateTime,
+) -> bool {
+    // Condition 1: spawn is the initial evidence of life, so a child
+    // younger than its own budget can never be stalled out — and one that
+    // never starts at all is still reaped.
+    if now < enforced.earliest_expiry_at {
+        return false;
+    }
+    let budget =
+        time::Duration::milliseconds(i64::try_from(enforced.timeout_ms).unwrap_or(i64::MAX));
+    let Some(cutoff) = now.checked_sub(budget) else {
+        // A budget too large to subtract can never elapse.
+        return false;
+    };
+
+    // Condition 2: did ANYTHING in this child's subtree happen inside the
+    // budget? Cheapest and most precise signal first.
+    if live.is_some_and(|live| live >= cutoff) {
+        return false;
+    }
+
+    let subtree = collect_subtree_activity(stores.task_store.as_ref(), subject, cutoff).await;
+    // `found_fresh`: a durable stamp inside the budget anywhere in the
+    // subtree. `truncated`: the walk was inconclusive — never time out on
+    // unknown activity.
+    if subtree.found_fresh || subtree.truncated {
+        return false;
+    }
+
+    for thread_id in &subtree.threads {
+        match stores
+            .event_repo
+            .min_sequence_at_or_after(thread_id, cutoff)
+            .await
+        {
+            Ok(Some(_)) => return false,
+            Ok(None) => {}
+            Err(err) => {
+                warn!(
+                    thread_id = %thread_id,
+                    error = %err,
+                    "subagent activity probe failed; treating the child as active \
+                     (fail-safe: never time out on unknown activity)",
+                );
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Per-acquisition resolution state for the subagent wall-clock
@@ -1331,19 +1714,47 @@ pub(crate) enum SubagentDeadlineState {
     Enforced(SubagentExecutionDeadline),
 }
 
-/// Build the deadline from durable anchors, or `None` when
+/// Build the stall deadline from durable anchors, or `None` when
 /// `created_at + timeout_ms` overflows the datetime range
 /// (practically unreachable; treated as "no deadline").
+///
+/// Only the *earliest* expiry is derived here. Whether the child is
+/// actually stalled at that point is [`stall_expired`]'s question, and
+/// it is re-asked on every tick — which is what lets a working child
+/// push its expiry out indefinitely.
 fn deadline_for(
     created_at: time::OffsetDateTime,
     timeout_ms: u64,
+    min_budget_ms: u64,
 ) -> Option<SubagentExecutionDeadline> {
-    let timeout = time::Duration::milliseconds(i64::try_from(timeout_ms).unwrap_or(i64::MAX));
-    let expires_at = created_at.checked_add(timeout)?;
+    // Floor the budget at the persistence cadence (see `MIN_STALL_BUDGET_HEARTBEATS`).
+    let effective_ms = timeout_ms.max(min_budget_ms);
+    let timeout = time::Duration::milliseconds(i64::try_from(effective_ms).unwrap_or(i64::MAX));
+    let earliest_expiry_at = created_at.checked_add(timeout)?;
     Some(SubagentExecutionDeadline {
-        expires_at,
-        timeout_ms,
+        earliest_expiry_at,
+        timeout_ms: effective_ms,
     })
+}
+
+/// Multiplier for the effective stall-budget floor: the durable
+/// `last_activity_at` a parked child's sweep reads is persisted at most once
+/// per heartbeat interval, so a budget shorter than a couple of intervals
+/// could reap a parked child whose descendant IS reporting but whose report
+/// has not yet been persisted. The effective budget is therefore floored at
+/// `MIN_STALL_BUDGET_HEARTBEATS × heartbeat_interval` at enforcement — where
+/// the actual cadence is known (spec resolution in the SDK cannot see the
+/// host's heartbeat interval). k = 2 gives one interval to persist and one
+/// for the sweep to observe. bip's minute-to-hours budgets are far above
+/// this and unaffected; the floor only rescues pathologically small configs.
+const MIN_STALL_BUDGET_HEARTBEATS: u32 = 2;
+
+/// The effective stall-budget floor for a given heartbeat/persistence
+/// cadence — see [`MIN_STALL_BUDGET_HEARTBEATS`].
+fn min_stall_budget_ms(heartbeat_interval: std::time::Duration) -> u64 {
+    u64::try_from(heartbeat_interval.as_millis())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::from(MIN_STALL_BUDGET_HEARTBEATS))
 }
 
 /// Derive the deadline state from a freshly-read linked invocation
@@ -1353,11 +1764,12 @@ fn deadline_for(
 fn deadline_from_invocation(
     invocation: &AgentTask,
     child_created_at: time::OffsetDateTime,
+    min_budget_ms: u64,
 ) -> SubagentDeadlineState {
     invocation
         .state
         .subagent_invocation()
-        .and_then(|state| deadline_for(child_created_at, state.spec.timeout_ms))
+        .and_then(|state| deadline_for(child_created_at, state.spec.timeout_ms, min_budget_ms))
         .map_or(
             SubagentDeadlineState::Exempt,
             SubagentDeadlineState::Enforced,
@@ -1371,6 +1783,19 @@ pub(crate) struct HeartbeatLoopParams {
     pub(crate) worker_id: WorkerId,
     pub(crate) lease_id: LeaseId,
     pub(crate) lease_duration: time::Duration,
+    /// The persistence cadence for this loop's activity — and, by ADR-0003
+    /// I4, the ONE cadence in the process.
+    ///
+    /// **Every** `heartbeat_loop` must be spawned with the configured
+    /// `worker.heartbeat_interval`, never a locally-derived value. The
+    /// subagent stall floor is `MIN_STALL_BUDGET_HEARTBEATS x` this interval
+    /// (see [`min_stall_budget_ms`]), and a probed subtree can contain a row
+    /// heartbeated by ANY loop — a worker-pool task, or the detached
+    /// Confirm-tier tool drive. A loop that beats slower than the floor
+    /// assumes persists its row's progress less often than the enforcement
+    /// side expects, and an actively-working child is reaped for the gap.
+    /// One cadence is what makes the floor correct by construction; deriving
+    /// a second one here (the old grpc `lease/3`) is what broke it.
     pub(crate) heartbeat_interval: std::time::Duration,
     /// Trips when the heartbeat loop itself should stop (exec finished /
     /// host shutdown).
@@ -1385,6 +1810,17 @@ pub(crate) struct HeartbeatLoopParams {
     /// (issue #299). [`SubagentDeadlineState::Exempt`] for every
     /// non-linked task — no enforcement.
     pub(crate) deadline: SubagentDeadlineState,
+    /// Live-progress beacon for the task this loop is beating for.
+    ///
+    /// Read once per tick and written through to `last_activity_at` under
+    /// the same lease CAS that extends the lease — so activity costs one
+    /// durable write per tick, not one per provider frame, and only the
+    /// worker that owns the row can advance it.
+    ///
+    /// Persisted for **every** task kind, not just enforced child roots: a
+    /// tool child's activity is what keeps its PARKED subagent parent
+    /// alive, and that parent has no heartbeat of its own while it waits.
+    pub(crate) activity: ActivityBeacon,
 }
 
 pub(crate) async fn heartbeat_loop(params: HeartbeatLoopParams) {
@@ -1399,8 +1835,17 @@ pub(crate) async fn heartbeat_loop(params: HeartbeatLoopParams) {
         cancel,
         task_cancel,
         mut deadline,
+        activity,
     } = params;
     let mut ticker = tokio::time::interval(heartbeat_interval);
+    // The stall probe runs under the lease this loop renews each tick; bound
+    // it to half that lease (capped) so a slow store or large subtree can
+    // never outlast the lease and open a double-execution window. Half
+    // leaves ample renewal headroom before the next beat.
+    let probe_timeout = (lease_duration.unsigned_abs() / 2).min(STALL_PROBE_MAX);
+    // Floor the stall budget at the persistence cadence, using this loop's
+    // actual heartbeat interval (see `MIN_STALL_BUDGET_HEARTBEATS`).
+    let min_budget_ms = min_stall_budget_ms(heartbeat_interval);
     // Skip the immediate first tick — the lease was just set by
     // acquire_next_runnable, so the first heartbeat should fire after
     // one full interval.
@@ -1413,35 +1858,32 @@ pub(crate) async fn heartbeat_loop(params: HeartbeatLoopParams) {
         }
 
         let now = time::OffsetDateTime::now_utc();
+        // One beacon read per tick, shared by the lease renewal (which
+        // persists it) and the deadline check (which enforces against it),
+        // so both see the same instant. The RUNNING leg thus consults the
+        // live in-memory value rather than last tick's durable one.
+        let observed_activity = activity.latest();
 
-        // Subagent timeout enforcement (issue #299): one deadline
-        // check per tick, before extending the lease.
-        match deadline_tick(
-            &stores,
-            OwnedRootTask {
-                task: &task_id,
-                thread: &thread_id,
-                worker: &worker_id,
-                lease: &lease_id,
-            },
-            deadline,
-            now,
-        )
-        .await
-        {
-            DeadlineTick::Stop => {
-                // Durably failed (or ownership cleanly moved on):
-                // abort the in-flight turn and stop.
-                task_cancel.cancel();
-                return;
-            }
-            DeadlineTick::Continue(next) => deadline = next,
-        }
-
+        // Renew the lease FIRST, before the (potentially slow) subtree
+        // probe in `deadline_tick`. That probe walks the child's subtree
+        // with serial store reads; awaiting it before extending the lease
+        // would let a large subtree or a slow store burn the remaining
+        // lease, and the expiry sweep would then requeue and reacquire the
+        // row while the original provider future is still running —
+        // duplicate execution, the worst failure mode on this path.
+        // Renewing first guarantees a full `lease_duration` of headroom
+        // before any probe runs.
         let new_expires_at = now + lease_duration;
         match stores
             .task_store
-            .heartbeat_task(&task_id, &worker_id, &lease_id, new_expires_at, now)
+            .heartbeat_task(
+                &task_id,
+                &worker_id,
+                &lease_id,
+                new_expires_at,
+                observed_activity,
+                now,
+            )
             .await
         {
             Ok(_) => {}
@@ -1464,11 +1906,10 @@ pub(crate) async fn heartbeat_loop(params: HeartbeatLoopParams) {
                 return;
             }
             Err(err) => {
-                // Transient store error (e.g. a DB blip). Exiting here
-                // would drop all subsequent beats and let the lease
-                // expire, opening a double-execution window. Keep
-                // retrying on the next tick until the lease is rejected
-                // or `cancel` fires.
+                // Transient store error (e.g. a DB blip). Skip the deadline
+                // probe on a tick whose lease renewal failed — the row may
+                // already be requeued — and retry the beat next tick before
+                // the lease (which has ~3 beats of headroom) expires.
                 warn!(
                     %worker_id,
                     task_id = %task_id,
@@ -1476,7 +1917,35 @@ pub(crate) async fn heartbeat_loop(params: HeartbeatLoopParams) {
                     error = %err,
                     "heartbeat hit a transient store error; retrying on next tick",
                 );
+                continue;
             }
+        }
+
+        // Subagent timeout enforcement (issue #299): the lease is now
+        // freshly renewed, so the subtree probe cannot jeopardise it.
+        match deadline_tick(
+            &stores,
+            OwnedRootTask {
+                task: &task_id,
+                thread: &thread_id,
+                worker: &worker_id,
+                lease: &lease_id,
+            },
+            deadline,
+            observed_activity,
+            probe_timeout,
+            min_budget_ms,
+            now,
+        )
+        .await
+        {
+            DeadlineTick::Stop => {
+                // Durably failed (or ownership cleanly moved on):
+                // abort the in-flight turn and stop.
+                task_cancel.cancel();
+                return;
+            }
+            DeadlineTick::Continue(next) => deadline = next,
         }
     }
 }
@@ -1507,6 +1976,9 @@ async fn deadline_tick(
     stores: &StoreRegistry,
     owned: OwnedRootTask<'_>,
     mut deadline: SubagentDeadlineState,
+    live_activity: Option<time::OffsetDateTime>,
+    probe_timeout: std::time::Duration,
+    min_budget_ms: u64,
     now: time::OffsetDateTime,
 ) -> DeadlineTick {
     // A resolution that failed at acquisition time is retried here
@@ -1519,7 +1991,7 @@ async fn deadline_tick(
             .await
         {
             Ok(Some(invocation)) => {
-                deadline = deadline_from_invocation(&invocation, created_at);
+                deadline = deadline_from_invocation(&invocation, created_at, min_budget_ms);
             }
             Ok(None) => deadline = SubagentDeadlineState::Exempt,
             Err(err) => {
@@ -1537,7 +2009,39 @@ async fn deadline_tick(
     let SubagentDeadlineState::Enforced(enforced) = deadline else {
         return DeadlineTick::Continue(deadline);
     };
-    if now < enforced.expires_at {
+    // Re-asked every tick, which is what makes the budget a STALL budget:
+    // a child that showed ANY sign of life inside the last `timeout_ms`
+    // pushes its expiry out and keeps running, no matter how long it has
+    // been alive. Only sustained silence ends it.
+    //
+    // This is the RUNNING leg, so the beacon is read live from the loop
+    // that owns this row — no durable round-trip, no tick of lag.
+    //
+    // The probe walks the subtree with serial store reads; bound it strictly
+    // below the lease it runs under (renewed just before this call) so a slow
+    // store or large subtree can never lapse the lease and requeue a still-
+    // running row → duplicate execution. On timeout, treat as NOT expired
+    // (never reap on an incomplete probe) and let the next tick retry.
+    let expired = match tokio::time::timeout(
+        probe_timeout,
+        stall_expired(stores, owned.task, enforced, live_activity, now),
+    )
+    .await
+    {
+        Ok(expired) => expired,
+        Err(_elapsed) => {
+            warn!(
+                worker_id = %owned.worker,
+                task_id = %owned.task,
+                thread_id = %owned.thread,
+                ?probe_timeout,
+                "subagent stall probe exceeded its lease-bounded budget; treating the child \
+                 as active (fail-safe) and retrying next tick",
+            );
+            false
+        }
+    };
+    if !expired {
         return DeadlineTick::Continue(deadline);
     }
 
@@ -1546,7 +2050,7 @@ async fn deadline_tick(
         task_id = %owned.task,
         thread_id = %owned.thread,
         timeout_ms = enforced.timeout_ms,
-        "subagent child root exceeded its deadline; failing and aborting the turn",
+        "subagent child root stalled for its whole budget; failing and aborting the turn",
     );
     match fail_timed_out_subagent_root(
         stores,
@@ -1603,10 +2107,16 @@ async fn execute_acquired_task(
     stores: &StoreRegistry,
     runtime: Arc<ExecutionRuntime>,
     cancel: &CancellationToken,
+    activity: &ActivityBeacon,
 ) -> Result<()> {
     match task.kind {
-        TaskKind::RootTurn => execute_root_task(task, stores, runtime, cancel).await,
-        TaskKind::ToolRuntime => execute_tool_task(task, stores, runtime, cancel).await,
+        TaskKind::RootTurn => execute_root_task(task, stores, runtime, cancel, activity).await,
+        TaskKind::ToolRuntime => execute_tool_task(task, stores, runtime, cancel, activity).await,
+        // A subagent invocation task neither streams from a provider nor
+        // runs a tool: it only fans results in. It has no work of its own
+        // to report, and it is never the subject of a stall budget (the
+        // budget is enforced on the child ROOT it spawned), so it carries
+        // no beacon.
         TaskKind::Subagent => execute_subagent_task_entry(task, stores, runtime).await,
     }
 }
@@ -1616,6 +2126,7 @@ async fn execute_root_task(
     stores: &StoreRegistry,
     runtime: Arc<ExecutionRuntime>,
     cancel: &CancellationToken,
+    activity: &ActivityBeacon,
 ) -> Result<()> {
     let now = time::OffsetDateTime::now_utc();
     let error_watermark = stores
@@ -1623,6 +2134,16 @@ async fn execute_root_task(
         .next_sequence(&task.thread_id)
         .await
         .context("reading root-task event watermark")?;
+
+    // ADR-0003 refresh point (c): route this task's event commits through the
+    // beacon. Installed once here and handed to every branch via
+    // `wire_activity`, so no execution path can journal work without recording
+    // it — including paths that commit outside the streaming loop (auto-retry,
+    // compaction, turn-start, suspension batches).
+    let tracked_event_repo = agent_server::worker::ActivityTrackingEventRepo::new(
+        stores.event_repo.as_ref(),
+        activity.clone(),
+    );
 
     let outcome = Box::pin(async {
         let bootstrap =
@@ -1659,6 +2180,7 @@ async fn execute_root_task(
             );
             deps.cancel = Some(cancel);
             deps.wakeup = runtime.wakeup_signal();
+            deps.wire_activity(activity, &tracked_event_repo);
             resume_for_steering(inputs, &task, provider.as_ref(), &deps, now)
                 .await
                 .context("resume parked root task for steering wake")
@@ -1671,6 +2193,7 @@ async fn execute_root_task(
             );
             deps.cancel = Some(cancel);
             deps.wakeup = runtime.wakeup_signal();
+            deps.wire_activity(activity, &tracked_event_repo);
             resume_from_children(inputs, &task, provider.as_ref(), &deps, now)
                 .await
                 .context("resume root task from durable child results")
@@ -1684,6 +2207,7 @@ async fn execute_root_task(
             );
             deps.cancel = Some(cancel);
             deps.wakeup = runtime.wakeup_signal();
+            deps.wire_activity(activity, &tracked_event_repo);
             agent_server::worker::execute_root_turn(
                 inputs,
                 user_input,
@@ -1993,21 +2517,28 @@ async fn execute_tool_task(
     stores: &StoreRegistry,
     runtime: Arc<ExecutionRuntime>,
     cancel: &CancellationToken,
+    activity: &ActivityBeacon,
 ) -> Result<()> {
     let now = time::OffsetDateTime::now_utc();
     let (worker_id, lease_id) = running_lease(&task)?;
 
-    let bootstrap = match resolve_tool_bootstrap(task.clone(), stores.task_store.as_ref()).await {
-        Ok(bootstrap) => bootstrap,
-        Err(err) => {
-            stores
-                .task_store
-                .fail_task(&task.id, &worker_id, &lease_id, format!("{err:#}"), now)
-                .await
-                .context("fail invalid tool task")?;
-            return Ok(());
-        }
-    };
+    // The beacon rides the bootstrap into the `ToolEventCollector`, so a
+    // tool that reports progress refreshes THIS tool task's row — which is
+    // the row this task's heartbeat owns.
+    let bootstrap =
+        match resolve_tool_bootstrap(task.clone(), stores.task_store.as_ref(), activity.clone())
+            .await
+        {
+            Ok(bootstrap) => bootstrap,
+            Err(err) => {
+                stores
+                    .task_store
+                    .fail_task(&task.id, &worker_id, &lease_id, format!("{err:#}"), now)
+                    .await
+                    .context("fail invalid tool task")?;
+                return Ok(());
+            }
+        };
 
     if bootstrap.tool_call.tier == ToolTier::Confirm {
         let (_paused, committed_events) = pause_tool_for_confirmation(
@@ -2079,9 +2610,22 @@ async fn execute_tool_task(
         }
         Ok(ToolTaskOutcome::Cancelled) => Ok(()),
         Err(err) => {
+            // ADR-0003 I3: the terminal instant is captured AT the transition,
+            // never inherited from a `now` bound at task entry. The tool above
+            // may have run for 40 minutes; stamping the entry instant would
+            // backdate this row's `completed_at` AND its `last_activity_at` by
+            // the whole execution, so a parent parked on sibling work reads a
+            // just-failed child as long-silent.
+            let failed_at = time::OffsetDateTime::now_utc();
             stores
                 .task_store
-                .fail_task(&task.id, &worker_id, &lease_id, format!("{err:#}"), now)
+                .fail_task(
+                    &task.id,
+                    &worker_id,
+                    &lease_id,
+                    format!("{err:#}"),
+                    failed_at,
+                )
                 .await
                 .context("fail tool task after guarded execution error")?;
             Ok(())
@@ -2132,9 +2676,19 @@ async fn execute_subagent_task_entry(
             Ok(())
         }
         Err(err) => {
+            // ADR-0003 I3: capture the terminal instant AT the transition —
+            // `now` was bound before `execute_subagent_task` ran, which can be
+            // an entire subagent lifetime ago.
+            let failed_at = time::OffsetDateTime::now_utc();
             stores
                 .task_store
-                .fail_task(&task.id, &worker_id, &lease_id, format!("{err:#}"), now)
+                .fail_task(
+                    &task.id,
+                    &worker_id,
+                    &lease_id,
+                    format!("{err:#}"),
+                    failed_at,
+                )
                 .await
                 .context("fail subagent task after materialization error")?;
             Ok(())
@@ -2318,6 +2872,16 @@ fn initial_deadline_state(task: &AgentTask) -> SubagentDeadlineState {
 /// [`SubagentDeadlineState::Unresolved`]; the heartbeat loop retries
 /// the lookup every tick so a store blip cannot silently disable
 /// enforcement for the whole acquisition.
+/// Resolve a task's subagent deadline against the store, distinguishing
+/// enforced child roots from exempt tasks and surfacing a transient lookup
+/// failure as [`SubagentDeadlineState::Unresolved`].
+///
+/// Test-only: the live enforcement legs derive their deadline differently —
+/// the heartbeat seeds from [`initial_deadline_state`] and re-resolves an
+/// `Unresolved` state per tick inside [`deadline_tick`], and the parked
+/// sweep derives from the invocation row it already holds. This helper
+/// gives tests one call that mirrors that resolution end to end.
+#[cfg(test)]
 async fn resolve_subagent_deadline(
     stores: &StoreRegistry,
     task: &AgentTask,
@@ -2330,7 +2894,7 @@ async fn resolve_subagent_deadline(
         .find_subagent_invocation_for_child_root(&task.id)
         .await
     {
-        Ok(Some(invocation)) => deadline_from_invocation(&invocation, task.created_at),
+        Ok(Some(invocation)) => deadline_from_invocation(&invocation, task.created_at, 0),
         Ok(None) => SubagentDeadlineState::Exempt,
         Err(err) => {
             warn!(
@@ -2393,19 +2957,6 @@ async fn fail_timed_out_subagent_root(
     .await
 }
 
-/// Retry budget for [`fail_timed_out_child_holding_lease`].
-#[derive(Clone, Copy, Debug)]
-enum FailRetryBudget {
-    /// Retry until the failure lands, ownership is lost, or the host
-    /// shuts down — the acquisition leg, whose worker slot is
-    /// dedicated to this row anyway.
-    UntilSettled,
-    /// Give up after this many tries — the sweep leg, whose shared
-    /// task must not block indefinitely on one wedged row (it still
-    /// owes the rest of the batch plus the next lease-expiry pass).
-    Tries(usize),
-}
-
 /// Drive a timeout failure to a durable outcome while holding the
 /// lease.
 ///
@@ -2421,17 +2972,20 @@ enum FailRetryBudget {
 /// Returns `true` once the row is settled from this caller's
 /// perspective (durable timeout failure landed, or ownership cleanly
 /// moved to another actor who now owns the terminal decision); `false`
-/// when a [`FailRetryBudget::Tries`] budget was exhausted or the host
-/// shut down mid-retry — in both `false` cases the row is left
-/// `Running` under a freshly-extended lease and converges through
-/// lease expiry.
+/// when the `max_tries` budget was exhausted or the host shut down
+/// mid-retry — in both `false` cases the row is left `Running` under a
+/// freshly-extended lease and converges through lease expiry.
+///
+/// The only caller is the parked sweep, whose shared task must not block
+/// indefinitely on one wedged row (it still owes the rest of the batch
+/// plus the next lease-expiry pass), so the budget is always bounded.
 async fn fail_timed_out_child_holding_lease(
     stores: &StoreRegistry,
     ctx: FailTimedOutChild<'_>,
     cancel: &CancellationToken,
     lease_duration: time::Duration,
     retry_interval: std::time::Duration,
-    budget: FailRetryBudget,
+    max_tries: usize,
 ) -> bool {
     let mut tries = 0usize;
     loop {
@@ -2450,9 +3004,7 @@ async fn fail_timed_out_child_holding_lease(
         }
 
         tries = tries.saturating_add(1);
-        if let FailRetryBudget::Tries(max) = budget
-            && tries >= max
-        {
+        if tries >= max_tries {
             return false;
         }
 
@@ -2460,9 +3012,12 @@ async fn fail_timed_out_child_holding_lease(
         // means ownership genuinely moved on — whoever owns the row now
         // is responsible for its terminal state.
         let new_expires_at = now + lease_duration;
+        // Lease-keepalive only, while we retry a timeout FAILURE. This row
+        // is being reaped, not worked: it has no activity to report, and
+        // `None` leaves `last_activity_at` untouched.
         if let Err(err) = stores
             .task_store
-            .heartbeat_task(ctx.task, ctx.worker, ctx.lease, new_expires_at, now)
+            .heartbeat_task(ctx.task, ctx.worker, ctx.lease, new_expires_at, None, now)
             .await
             && heartbeat_error_is_terminal(&err)
         {
@@ -2516,9 +3071,16 @@ async fn fail_timed_out_child_holding_lease(
 /// whole pass is idempotent across ticks: losing any race (a worker
 /// re-acquired the root, a concurrent cancel) is a clean skip that the
 /// acquisition-expiry check or the next tick converges on.
+/// `probe_timeout` bounds each stall probe (ADR-0003 I5). Production passes
+/// [`STALL_PROBE_MAX`]; it is a parameter — rather than the const read
+/// directly — so the fail-safe can be proved deterministically, exactly as the
+/// running leg's bound already is in [`deadline_tick`]. Both legs must be
+/// bounded; a probe that overruns answers "not expired" and retries.
 async fn enforce_subagent_deadlines(
     stores: &StoreRegistry,
     now: time::OffsetDateTime,
+    min_budget_ms: u64,
+    probe_timeout: std::time::Duration,
     cancel: &CancellationToken,
 ) -> Result<usize> {
     let parked = stores
@@ -2533,16 +3095,23 @@ async fn enforce_subagent_deadlines(
             continue;
         };
         let child_root_id = linkage.child_root_task_id.clone();
-        let Some(deadline) = deadline_for(invocation.created_at, linkage.spec.timeout_ms) else {
+        let Some(deadline) = deadline_for(
+            invocation.created_at,
+            linkage.spec.timeout_ms,
+            min_budget_ms,
+        ) else {
             continue;
         };
         // Cheap pre-filter on the invocation's own creation time: the
-        // child root is created in the same store transition, so its
-        // deadline can only be LATER than this bound. Skipping early
-        // avoids a per-candidate child-root read on every unexpired
-        // invocation; the authoritative check below re-derives the
-        // deadline from the child root's own `created_at`.
-        if now < deadline.expires_at {
+        // child root is created in the same store transition, so it can
+        // never expire BEFORE this bound (and under stall semantics it
+        // usually expires much later — every committed frame pushes it
+        // out). Skipping early avoids a per-candidate child-root read
+        // and an activity probe on every child that cannot possibly be
+        // stalled yet; the authoritative check below re-derives the
+        // bound from the child root's own `created_at` and then asks
+        // whether the child has actually gone silent.
+        if now < deadline.earliest_expiry_at {
             continue;
         }
         let child_root = match stores.task_store.get(&child_root_id).await {
@@ -2557,10 +3126,41 @@ async fn enforce_subagent_deadlines(
                 continue;
             }
         };
-        let Some(deadline) = deadline_for(child_root.created_at, linkage.spec.timeout_ms) else {
+        let Some(deadline) = deadline_for(
+            child_root.created_at,
+            linkage.spec.timeout_ms,
+            min_budget_ms,
+        ) else {
             continue;
         };
-        if now < deadline.expires_at {
+        // A parked child whose descendants are still working is making
+        // progress THROUGH them — this is the leg where that matters most,
+        // because a child root parks precisely while a tool child or a
+        // nested subagent runs, and it keeps no heartbeat of its own while
+        // parked. Its evidence is therefore entirely durable, and entirely
+        // in the subtree: the running descendant's `last_activity_at`
+        // (advanced by that descendant's OWN heartbeat) and the events on
+        // the threads the subtree spans. `live` is `None` here — no beacon
+        // for this row exists in this process. The probe is bounded so one
+        // pathological subtree cannot stall the whole sweep tick; a timeout
+        // is treated as not-expired (fail-safe) and retried next sweep.
+        let expired = match tokio::time::timeout(
+            probe_timeout,
+            stall_expired(stores, &child_root.id, deadline, None, now),
+        )
+        .await
+        {
+            Ok(expired) => expired,
+            Err(_elapsed) => {
+                warn!(
+                    child_root = %child_root.id,
+                    "parked subagent stall probe exceeded its budget; treating as active \
+                     (fail-safe) and retrying next sweep",
+                );
+                false
+            }
+        };
+        if !expired {
             continue;
         }
         match child_root.status {
@@ -2730,7 +3330,7 @@ async fn enforce_parked_child_deadline(
         cancel,
         SWEEP_FAIL_LEASE_DURATION,
         SWEEP_FAIL_RETRY_INTERVAL,
-        FailRetryBudget::Tries(SWEEP_FAIL_RETRY_TRIES),
+        SWEEP_FAIL_RETRY_TRIES,
     )
     .await;
     if !settled {
@@ -3596,6 +4196,7 @@ mod tests {
             cancel: cancel.clone(),
             task_cancel: CancellationToken::new(),
             deadline: SubagentDeadlineState::Exempt,
+            activity: ActivityBeacon::new(),
         }));
 
         // Auto-advance the synthetic clock past two heartbeat ticks.
@@ -3663,6 +4264,7 @@ mod tests {
             cancel: cancel.clone(),
             task_cancel: task_cancel.clone(),
             deadline: SubagentDeadlineState::Exempt,
+            activity: ActivityBeacon::new(),
         }));
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -5311,6 +5913,18 @@ mod tests {
         thread: &agent_sdk_foundation::ThreadId,
         tool_name: &str,
     ) -> agent_server::journal::task::SuspensionPayload {
+        pending_call_suspension_with_tier(thread, tool_name, ToolTier::Confirm)
+    }
+
+    /// Like [`pending_call_suspension`] but with an explicit tier. A `Confirm`
+    /// tool PAUSES instead of executing (`execute_tool_task` gates on the
+    /// tier), so a test that needs the tool to actually run must ask for
+    /// `Observe`.
+    fn pending_call_suspension_with_tier(
+        thread: &agent_sdk_foundation::ThreadId,
+        tool_name: &str,
+        tier: ToolTier,
+    ) -> agent_server::journal::task::SuspensionPayload {
         agent_server::journal::task::SuspensionPayload {
             continuation: agent_sdk_foundation::ContinuationEnvelope::wrap(
                 agent_sdk_foundation::AgentContinuation {
@@ -5322,7 +5936,7 @@ mod tests {
                         id: format!("call_{tool_name}"),
                         name: tool_name.to_owned(),
                         display_name: tool_name.to_owned(),
-                        tier: ToolTier::Confirm,
+                        tier,
                         input: serde_json::json!({ "task": HANG_CHILD_TASK }),
                         effective_input: serde_json::json!({ "task": HANG_CHILD_TASK }),
                         listen_context: None,
@@ -5407,61 +6021,1252 @@ mod tests {
         Ok((parent, invocation, child_root))
     }
 
+    /// Edge 2 (post-outage re-acquisition must not insta-reap).
+    ///
+    /// A child spawned long ago, then stranded by a crash/outage far longer
+    /// than its budget, carries a stale (or absent) `last_activity_at`. Under
+    /// the old since-spawn leg it was failed the instant a worker picked it
+    /// up — before executing a single instruction — which is exactly the
+    /// age/queue-wait punishment the founder's ruling forbids. Acquisition
+    /// now stamps `last_activity_at` (`mark_running`), so the re-acquired
+    /// child is judged healthy and gets a full fresh budget to prove itself.
+    ///
+    /// The companion property — a child that never gets acquired is still
+    /// reaped off its `created_at` floor — is asserted first, so this test
+    /// pins both halves: acquisition rescues, non-acquisition does not.
     #[tokio::test]
-    async fn expired_subagent_child_fails_at_acquisition_without_llm_dispatch() -> Result<()> {
+    async fn reacquired_aged_child_is_not_reaped_before_dispatch() -> Result<()> {
         use agent_sdk_foundation::ThreadId;
 
-        let config = ServiceConfig {
-            worker: crate::config::WorkerConfig {
-                pool_size: 2,
-                heartbeat_interval_secs: 1,
-                acquisition_interval_secs: 1,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let provider = Arc::new(SubagentScriptProvider::new());
-        let runtime = subagent_timeout_runtime(Arc::clone(&provider))?;
-        let host = ServiceHost::new(config, sample_registry(), runtime)?;
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            sample_registry(),
+            subagent_timeout_runtime(Arc::new(SubagentScriptProvider::new()))?,
+        )?;
         let stores = host.stores().clone();
-        let token = host.shutdown_token();
 
-        // Backdate the whole fixture: the child root's deadline
-        // (created_at + 250ms) is long past before any worker sees it.
-        let backdated = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
-        let parent_thread = ThreadId::from_string("t-subagent-expired");
-        let (parent, invocation, child_root) =
-            persist_subagent_fixture(&stores, &parent_thread, 250, backdated).await?;
+        // Spawned 5 minutes ago under a 250ms budget: hundreds of budgets
+        // past its `created_at` floor before anyone touches it.
+        let spawned_at = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
+        let parent_thread = ThreadId::from_string("t-reacquire-aged");
+        let (_parent, _invocation, child_root) =
+            persist_subagent_fixture(&stores, &parent_thread, 250, spawned_at).await?;
+        let SubagentDeadlineState::Enforced(deadline) =
+            resolve_subagent_deadline(&stores, &child_root).await
+        else {
+            bail!("linked child root must resolve an enforced deadline");
+        };
 
-        let host_handle = tokio::spawn(async move { host.run().await });
-
-        // The child must fail up front — before resolving a provider,
-        // before any LLM dispatch — and the failure must still flow
-        // through the invocation to resume and complete the parent.
-        let failed_child =
-            wait_for_status(&stores, &child_root.id, TaskStatus::Failed, 750).await?;
-        let child_error = failed_child.last_error.clone().unwrap_or_default();
+        // Before acquisition: never ran, no `last_activity_at`, no events —
+        // the parked sweep would (correctly) reap it off its floor.
+        let now = time::OffsetDateTime::now_utc();
         assert!(
-            child_error.contains("subagent timed out after 250ms"),
-            "expired child must carry the timeout message, got {child_error:?}",
+            child_root.last_activity_at.is_none(),
+            "a never-acquired child has no activity stamp yet",
         );
-        wait_for_status(&stores, &invocation.id, TaskStatus::Completed, 750).await?;
-        wait_for_status(&stores, &parent.id, TaskStatus::Completed, 750).await?;
+        assert!(
+            stall_expired(&stores, &child_root.id, deadline, None, now).await,
+            "a child that never started must still be reaped off its created_at floor",
+        );
 
+        // Acquire it (the post-outage requeue → re-acquire path).
+        let acquired = stores
+            .task_store
+            .try_acquire_task(
+                &child_root.id,
+                WorkerId::from_string("w-reacquire"),
+                LeaseId::new(),
+                now + time::Duration::seconds(30),
+                now,
+            )
+            .await?
+            .context("aged child must be acquirable")?;
+
+        // Acquisition stamped a fresh activity instant, so the very same
+        // predicate now spares it — no insta-reap, a whole budget to work.
         assert_eq!(
-            provider.hang_child_calls.load(Ordering::SeqCst),
-            0,
-            "an already-expired child must never dispatch an LLM call",
+            acquired.last_activity_at,
+            Some(now),
+            "mark_running must stamp last_activity_at at acquisition",
         );
-        let resume_text = provider.recorded_resume_text()?;
         assert!(
-            resume_text.contains("subagent timed out after 250ms"),
-            "the parent's resume request must carry the expired child's timeout message, got \
-             {resume_text:?}",
+            !stall_expired(&stores, &child_root.id, deadline, None, now).await,
+            "a freshly re-acquired child must not be reaped before it runs, however old it is",
+        );
+        Ok(())
+    }
+
+    /// The founder-facing property: a child that keeps working is never
+    /// timed out, no matter how old it gets.
+    ///
+    /// `timeout_ms` is a budget of silence, not of work. A worker that
+    /// has been running for ten hours but committed a frame a moment ago
+    /// is healthy — killing it would throw away ten hours of work, which
+    /// is exactly what the old since-spawn deadline did.
+    #[tokio::test]
+    async fn active_child_survives_arbitrarily_far_past_its_stall_budget() -> Result<()> {
+        use agent_sdk_foundation::{AgentEvent, ThreadId};
+
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            sample_registry(),
+            subagent_timeout_runtime(Arc::new(SubagentScriptProvider::new()))?,
+        )?;
+        let stores = host.stores().clone();
+
+        let spawned_at = time::OffsetDateTime::now_utc();
+        let budget_ms = 30 * 60 * 1_000; // 30 minutes, bip's default posture.
+        let (_parent, _invocation, child_root) = persist_subagent_fixture(
+            &stores,
+            &ThreadId::from_string("t-stall-active"),
+            budget_ms,
+            spawned_at,
+        )
+        .await?;
+        let SubagentDeadlineState::Enforced(deadline) =
+            resolve_subagent_deadline(&stores, &child_root).await
+        else {
+            bail!("linked child root must resolve an enforced deadline");
+        };
+
+        // Ten hours in — twenty budgets past the old since-spawn deadline —
+        // but the child committed a frame one minute ago.
+        let now = spawned_at + time::Duration::hours(10);
+        stores
+            .event_repo
+            .commit_event(
+                &child_root.thread_id,
+                AgentEvent::text("t1", "still working"),
+                now - time::Duration::minutes(1),
+            )
+            .await?;
+
+        assert!(
+            !stall_expired(&stores, &child_root.id, deadline, None, now,).await,
+            "a child that committed work inside its budget must never time out, \
+             however long it has been alive",
+        );
+        Ok(())
+    }
+
+    /// The other half: silence still ends a child — one budget after its
+    /// last sign of life, not one budget after spawn.
+    #[tokio::test]
+    async fn silent_child_expires_one_budget_after_its_last_frame() -> Result<()> {
+        use agent_sdk_foundation::{AgentEvent, ThreadId};
+
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            sample_registry(),
+            subagent_timeout_runtime(Arc::new(SubagentScriptProvider::new()))?,
+        )?;
+        let stores = host.stores().clone();
+
+        let spawned_at = time::OffsetDateTime::now_utc();
+        let budget = time::Duration::minutes(30);
+        let (_parent, _invocation, child_root) = persist_subagent_fixture(
+            &stores,
+            &ThreadId::from_string("t-stall-silent"),
+            30 * 60 * 1_000,
+            spawned_at,
+        )
+        .await?;
+        let SubagentDeadlineState::Enforced(deadline) =
+            resolve_subagent_deadline(&stores, &child_root).await
+        else {
+            bail!("linked child root must resolve an enforced deadline");
+        };
+
+        // The child worked for two hours, then went silent.
+        let last_frame_at = spawned_at + time::Duration::hours(2);
+        stores
+            .event_repo
+            .commit_event(
+                &child_root.thread_id,
+                AgentEvent::text("t1", "last thing I did"),
+                last_frame_at,
+            )
+            .await?;
+
+        // One second short of a full budget of silence: still alive. Note
+        // this instant is already FOUR budgets past spawn — under the old
+        // since-spawn rule the child would have been dead long ago.
+        let still_alive_at = last_frame_at + budget - time::Duration::seconds(1);
+        assert!(
+            !stall_expired(&stores, &child_root.id, deadline, None, still_alive_at,).await,
+            "expiry must be measured from the last frame, not from spawn",
         );
 
-        token.cancel();
-        host_handle.await??;
+        // A full budget of silence after that last frame: reaped.
+        let expired_at = last_frame_at + budget + time::Duration::seconds(1);
+        assert!(
+            stall_expired(&stores, &child_root.id, deadline, None, expired_at,).await,
+            "a child silent for its whole budget must still be timed out",
+        );
+        Ok(())
+    }
+
+    /// A child that never produces anything is still reaped: spawn is the
+    /// initial evidence of life, so the budget runs from `created_at` when
+    /// no frame ever lands (wedged admission, hung before the first token).
+    #[tokio::test]
+    async fn child_that_never_commits_anything_still_times_out() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            sample_registry(),
+            subagent_timeout_runtime(Arc::new(SubagentScriptProvider::new()))?,
+        )?;
+        let stores = host.stores().clone();
+
+        let spawned_at = time::OffsetDateTime::now_utc();
+        let (_parent, _invocation, child_root) = persist_subagent_fixture(
+            &stores,
+            &ThreadId::from_string("t-stall-never-starts"),
+            1_000,
+            spawned_at,
+        )
+        .await?;
+        let SubagentDeadlineState::Enforced(deadline) =
+            resolve_subagent_deadline(&stores, &child_root).await
+        else {
+            bail!("linked child root must resolve an enforced deadline");
+        };
+
+        assert!(
+            !stall_expired(
+                &stores,
+                &child_root.id,
+                deadline,
+                None,
+                spawned_at + time::Duration::milliseconds(500),
+            )
+            .await,
+            "a child younger than its own budget can never be stalled out",
+        );
+        assert!(
+            stall_expired(
+                &stores,
+                &child_root.id,
+                deadline,
+                None,
+                spawned_at + time::Duration::milliseconds(1_500),
+            )
+            .await,
+            "a child that never committed anything must still time out",
+        );
+        Ok(())
+    }
+
+    /// F1: a child parked on ONE long tool call (the founder's 40-minute
+    /// build) commits nothing on its own thread until the tool returns —
+    /// its live progress lands on the TOOL task's row via that task's own
+    /// heartbeat. The parked child root keeps no heartbeat of its own, so
+    /// its only evidence is the descendant's durable activity, reached by
+    /// the subtree walk. #376's journal-only probe reaped it; the subtree
+    /// max must keep it alive.
+    #[tokio::test]
+    async fn long_running_tool_child_keeps_its_parked_parent_alive() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            sample_registry(),
+            subagent_timeout_runtime(Arc::new(SubagentScriptProvider::new()))?,
+        )?;
+        let stores = host.stores().clone();
+
+        let budget_ms: u64 = 30 * 60 * 1_000;
+        let spawned_at = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+        let (_parent, _invocation, child_root) = persist_subagent_fixture(
+            &stores,
+            &ThreadId::from_string("t-long-tool"),
+            budget_ms,
+            spawned_at,
+        )
+        .await?;
+        let deadline = deadline_for(child_root.created_at, budget_ms, 0).context("deadline")?;
+
+        // Its own thread committed nothing and its own row carries no
+        // activity stamp: on the journal-only view it looks silent.
+        let now = time::OffsetDateTime::now_utc();
+        assert!(
+            stall_expired(&stores, &child_root.id, deadline, None, now).await,
+            "sanity: with no descendant activity the parked child reads as silent",
+        );
+
+        // Its tool child reported progress a minute ago — its own heartbeat
+        // persisted that onto the tool task's row.
+        let mut tool =
+            AgentTask::new_child(&child_root, TaskKind::ToolRuntime, child_root.created_at, 3)?;
+        tool.last_activity_at = Some(now - time::Duration::minutes(1));
+        stores.task_store.insert(tool).await?;
+
+        assert!(
+            !stall_expired(&stores, &child_root.id, deadline, None, now).await,
+            "a parked child whose tool descendant reported progress inside the budget must \
+             survive, even though the child's own thread committed nothing",
+        );
+        Ok(())
+    }
+
+    /// ADR-0003 I1 — effective activity is `last_activity_at ?? created_at`.
+    ///
+    /// A row carries NO `last_activity_at` until it is first acquired (every
+    /// constructor starts it `None`; `mark_running` is what stamps it), and
+    /// rows predating migration 0012 carry none either. Reading `None` as "no
+    /// evidence" discards the one fact the row does assert: it EXISTS, and it
+    /// was created at `created_at`.
+    ///
+    /// The kill this prevents: a parent parks on a child it JUST spawned; the
+    /// child is still `Queued` so it carries no activity stamp, and under
+    /// tight retention the spawn events have already aged out of the journal.
+    /// The parent is then reaped as silent moments after it demonstrably
+    /// worked.
+    ///
+    /// Both directions are asserted, because the fallback must not blunt the
+    /// reap: an OLD unacquired row is still silent.
+    #[tokio::test]
+    async fn a_freshly_spawned_descendant_is_itself_evidence_of_life() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            sample_registry(),
+            subagent_timeout_runtime(Arc::new(SubagentScriptProvider::new()))?,
+        )?;
+        let stores = host.stores().clone();
+
+        let budget_ms: u64 = 30 * 60 * 1_000;
+        let now = time::OffsetDateTime::now_utc();
+        let spawned_at = now - time::Duration::hours(2);
+        let (_parent, _invocation, child_root) = persist_subagent_fixture(
+            &stores,
+            &ThreadId::from_string("t-fresh-descendant"),
+            budget_ms,
+            spawned_at,
+        )
+        .await?;
+        let deadline = deadline_for(child_root.created_at, budget_ms, 0).context("deadline")?;
+
+        assert!(
+            stall_expired(&stores, &child_root.id, deadline, None, now).await,
+            "sanity: with no descendant at all the parked child reads as silent",
+        );
+
+        // An OLD unacquired row: never ran, no activity stamp, created well
+        // outside the budget. It must NOT rescue the parent — otherwise the
+        // fallback would make a wedged subtree immortal.
+        let stale = AgentTask::new_child(
+            &child_root,
+            TaskKind::ToolRuntime,
+            now - time::Duration::hours(1),
+            3,
+        )?;
+        assert!(
+            stale.last_activity_at.is_none(),
+            "a never-acquired row carries no activity stamp",
+        );
+        stores.task_store.insert(stale).await?;
+        assert!(
+            stall_expired(&stores, &child_root.id, deadline, None, now).await,
+            "an unacquired descendant created OUTSIDE the budget is still silent: the \
+             created_at fallback must not blunt the reap",
+        );
+
+        // A row the parent spawned one minute ago. Still `Queued`, so it has
+        // no activity stamp — but its creation IS its initial activity.
+        let fresh = AgentTask::new_child(
+            &child_root,
+            TaskKind::ToolRuntime,
+            now - time::Duration::minutes(1),
+            3,
+        )?;
+        assert!(fresh.last_activity_at.is_none());
+        stores.task_store.insert(fresh).await?;
+        assert!(
+            !stall_expired(&stores, &child_root.id, deadline, None, now).await,
+            "a descendant SPAWNED inside the budget is evidence the parent worked, even \
+             though it has not been acquired and so carries no last_activity_at",
+        );
+        Ok(())
+    }
+
+    /// A tool executor that stamps the instant it actually ran, then fails.
+    /// The stamp is the causal fence the transition-instant test needs.
+    struct FailingStampingToolExecutor {
+        executed_at: Arc<std::sync::Mutex<Option<time::OffsetDateTime>>>,
+    }
+
+    #[async_trait]
+    impl crate::runtime::ToolCallExecutor for FailingStampingToolExecutor {
+        async fn execute_tool_call(
+            &self,
+            _bootstrap: &agent_server::worker::ToolTaskBootstrap,
+            _collector: agent_server::worker::ToolEventCollector,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<agent_sdk_foundation::ToolResult> {
+            let ran_at = time::OffsetDateTime::now_utc();
+            if let Ok(mut slot) = self.executed_at.lock() {
+                *slot = Some(ran_at);
+            }
+            // Stand in for a long-running tool, WITHOUT a sleep: spin until the
+            // wall clock strictly advances past `ran_at`. This is what makes the
+            // test's causal fence strict rather than "greater-or-equal" — at
+            // sub-microsecond granularity an entry-bound `now` and `ran_at` can
+            // otherwise read as the SAME instant, and the assertion would pass
+            // against the very bug it exists to catch. Terminates in one clock
+            // tick.
+            while time::OffsetDateTime::now_utc() <= ran_at {
+                std::hint::spin_loop();
+            }
+            bail!("tool blew up after running for a long time")
+        }
+    }
+
+    /// ADR-0003 I3 — the terminal instant is captured AT the transition, never
+    /// inherited from a `now` bound at task ENTRY.
+    ///
+    /// `execute_tool_task` bound one `now` at the top and reused it to
+    /// `fail_task` *after* the tool had run. A tool can run for 40 minutes (a
+    /// detached Confirm-tier tool is designed to outlive its lease), so the
+    /// terminal row was stamped with an instant from before the work — which
+    /// backdates BOTH `completed_at` and `last_activity_at`, and makes a parent
+    /// parked on sibling work read a just-failed child as long-silent.
+    ///
+    /// Deterministic with no sleeps: the assertion is a CAUSAL ordering. The
+    /// executor stamps the wall clock at the moment it runs; the terminal
+    /// instant must be at or after that stamp. An entry-bound `now` is captured
+    /// strictly before the executor is ever invoked, so it cannot satisfy this
+    /// no matter how fast the machine is.
+    #[tokio::test]
+    async fn terminal_instant_is_captured_at_the_transition_not_at_task_entry() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+
+        let executed_at = Arc::new(std::sync::Mutex::new(None));
+        let runtime = subagent_timeout_runtime_with_executor(
+            Arc::new(SubagentScriptProvider::new()),
+            Arc::new(FailingStampingToolExecutor {
+                executed_at: Arc::clone(&executed_at),
+            }),
+        )?;
+        // `probe_definition` so the spawned tool ("probe", tier Observe) is a
+        // KNOWN tool and executes instead of pausing for confirmation.
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(probe_definition()));
+        let host = ServiceHost::new(ServiceConfig::default(), registry, runtime.clone())?;
+        let stores = host.stores().clone();
+
+        let at = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
+        let (_parent, _invocation, child_root) = persist_subagent_fixture(
+            &stores,
+            &ThreadId::from_string("t-terminal-instant"),
+            30 * 60 * 1_000,
+            at,
+        )
+        .await?;
+
+        // Park the child root on an OBSERVE-tier tool child: a Confirm-tier
+        // tool would pause instead of executing, and this test needs the tool
+        // to actually run and then fail.
+        let worker = WorkerId::from_string("w-park-observe");
+        let lease = LeaseId::new();
+        stores
+            .task_store
+            .try_acquire_task(
+                &child_root.id,
+                worker.clone(),
+                lease.clone(),
+                time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+                at,
+            )
+            .await?
+            .context("child root must acquire before parking")?;
+        let (_parked, children) = stores
+            .task_store
+            .spawn_tool_children(
+                &child_root.id,
+                &worker,
+                &lease,
+                vec![agent_server::journal::task::ChildSpawnSpec { max_attempts: 3 }],
+                pending_call_suspension_with_tier(
+                    &child_root.thread_id,
+                    "probe",
+                    ToolTier::Observe,
+                ),
+                None,
+                at,
+            )
+            .await?;
+        let tool_child = children.into_iter().next().context("one tool child")?;
+
+        // Acquire the tool child so `execute_tool_task` sees a Running lease.
+        let acquired = stores
+            .task_store
+            .try_acquire_task(
+                &tool_child.id,
+                WorkerId::from_string("w-terminal-instant"),
+                LeaseId::new(),
+                time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+                time::OffsetDateTime::now_utc(),
+            )
+            .await?
+            .context("tool child must acquire")?;
+
+        // Fail the FIRST `fail_task` — the one `guarded_tool_execution` makes to
+        // settle the tool's own terminal row (that instant is already captured
+        // post-execution and is correct). The injected error propagates out of
+        // guarded execution as `Err`, which drives `execute_tool_task`'s own
+        // fail arm — the site under test. `recorded_fail_now` therefore ends up
+        // holding the instant THAT arm stamped.
+        let recording =
+            Arc::new(FlakyTaskStore::new(Arc::clone(&stores.task_store)).failing_fail_tasks(1));
+        let mut recording_stores = stores.clone();
+        recording_stores.task_store = Arc::clone(&recording) as Arc<dyn AgentTaskStore>;
+
+        execute_tool_task(
+            acquired,
+            &recording_stores,
+            runtime,
+            &CancellationToken::new(),
+            &ActivityBeacon::new(),
+        )
+        .await?;
+
+        let ran_at = executed_at
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
+            .context("the tool executor must have run")?;
+        let failed_at = recording
+            .recorded_fail_now()
+            .context("the tool task must have been failed")?;
+
+        assert!(
+            failed_at > ran_at,
+            "the terminal instant ({failed_at}) must be captured AT the transition, strictly \
+             after the tool actually ran ({ran_at}) — a `now` bound at task entry predates \
+             the executor and backdates the row by the whole execution",
+        );
+        Ok(())
+    }
+
+    /// ADR-0003 never-kill-on-unknown — a row that is NOT THERE is unknown
+    /// activity, not silence.
+    ///
+    /// `collect_subtree_activity` used to return the default `SubtreeActivity`
+    /// when a row was missing: no fresh activity, and no threads to probe. That
+    /// falls straight through `stall_expired` to "expired" — so a subtree root
+    /// that vanished, or a subagent linkage pointing at a child root that is no
+    /// longer there, would KILL a live ancestor. The old comment even claimed
+    /// "a root that vanished is not evidence of silence" while returning a
+    /// value that was read as exactly that.
+    ///
+    /// Both missing-row paths are covered: the subtree root itself, and the
+    /// nested-root hop.
+    #[tokio::test]
+    async fn a_missing_row_is_inconclusive_never_silence() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+        use agent_server::journal::SubagentInvocationSpawn;
+
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            sample_registry(),
+            subagent_timeout_runtime(Arc::new(SubagentScriptProvider::new()))?,
+        )?;
+        let stores = host.stores().clone();
+
+        let budget_ms: u64 = 30 * 60 * 1_000;
+        let now = time::OffsetDateTime::now_utc();
+        let spawned_at = now - time::Duration::hours(2);
+        let parent_thread = ThreadId::from_string("t-dangling");
+        let (_parent, _invocation, child_root) =
+            persist_subagent_fixture(&stores, &parent_thread, budget_ms, spawned_at).await?;
+        let deadline = deadline_for(child_root.created_at, budget_ms, 0).context("deadline")?;
+
+        // 1. The subtree ROOT itself is not there. Unknown, never silence.
+        assert!(
+            !stall_expired(&stores, &AgentTaskId::new(), deadline, None, now).await,
+            "a subtree root that is not there is UNKNOWN activity, never silence",
+        );
+
+        // 2. Give the child root a NESTED subagent of its own, everything
+        //    backdated so nothing in the subtree is fresh — the verdict must
+        //    turn purely on whether the linkage resolves.
+        let worker = WorkerId::from_string("w-dangling");
+        let lease = LeaseId::new();
+        stores
+            .task_store
+            .try_acquire_task(
+                &child_root.id,
+                worker.clone(),
+                lease.clone(),
+                now + time::Duration::seconds(600),
+                spawned_at,
+            )
+            .await?
+            .context("child root must acquire")?;
+
+        let nested_thread = ThreadId::from_string("t-dangling-nested");
+        stores
+            .thread_store
+            .get_or_create(&nested_thread, spawned_at)
+            .await?;
+        let (_child_root, invocation, _nested_root) = stores
+            .task_store
+            .spawn_subagent_invocation(
+                &child_root.id,
+                &worker,
+                &lease,
+                SubagentInvocationSpawn {
+                    child_thread_id: nested_thread,
+                    spec: subagent_timeout_spec(HANG_CHILD_TASK, budget_ms),
+                    child_root_input: vec![SubmittedInputItem::Text {
+                        text: HANG_CHILD_TASK.into(),
+                    }],
+                    spawn_index: 0,
+                    child_caller_metadata: None,
+                    payload: pending_call_suspension(&parent_thread, "subagent_hang"),
+                },
+                spawned_at,
+            )
+            .await?;
+
+        assert!(
+            stall_expired(&stores, &child_root.id, deadline, None, now).await,
+            "sanity: with the linkage RESOLVING and every row backdated, the subtree is \
+             genuinely silent and the child IS reaped — so the assertion below is decided \
+             by the dangling linkage alone",
+        );
+
+        // 3. Repoint the invocation at a child root that does not exist. The
+        //    nested subtree's evidence is now UNREADABLE — an entire live
+        //    nested subagent could be behind it — so the walk must not conclude
+        //    "silent" and kill the ancestor.
+        let mut dangling = invocation;
+        if let TaskState::SubagentInvocation { invocation } = &mut dangling.state {
+            invocation.child_root_task_id = AgentTaskId::new();
+        } else {
+            panic!("fixture must produce a SubagentInvocation row");
+        }
+        stores.task_store.update(dangling).await?;
+
+        assert!(
+            !stall_expired(&stores, &child_root.id, deadline, None, now).await,
+            "a dangling subagent linkage must never reap a live ancestor: a missing nested \
+             root is UNREADABLE evidence, not absent evidence",
+        );
+        Ok(())
+    }
+
+    /// ADR-0003 I4 — the enforcement floor must cover the SLOWEST cadence that
+    /// can persist activity for a probed subtree.
+    ///
+    /// The regression this pins: the detached Confirm-tier tool drive used to
+    /// derive its own heartbeat as `lease_duration / 3`, while the floor a
+    /// parked ancestor enforces with is `2 x worker.heartbeat_interval`. A
+    /// Confirm-tier tool's row is precisely what keeps that parked ancestor
+    /// alive — so under a 60s lease and a 5s worker heartbeat the tool
+    /// persisted its progress every 20s against a 10s floor, and an actively
+    /// emitting tool was reaped for the gap.
+    ///
+    /// The fix is structural: there is now exactly ONE cadence — every
+    /// `heartbeat_loop`, including the detached drive, beats at the configured
+    /// `worker.heartbeat_interval` — so `2 x heartbeat_interval` covers every
+    /// persister by construction.
+    #[test]
+    fn the_stall_floor_covers_every_activity_persistence_cadence() {
+        // The envelope that broke: a long (1min) lease with a fast worker
+        // heartbeat.
+        let lease = std::time::Duration::from_mins(1);
+        let heartbeat = std::time::Duration::from_secs(5);
+
+        let floor_ms = min_stall_budget_ms(heartbeat);
+        assert_eq!(floor_ms, 10_000, "floor is 2 x the worker heartbeat");
+
+        // The cadence the detached drive USED to run at, kept here as the
+        // counter-example the floor must never again fail to cover.
+        let old_derived_cadence_ms = u64::try_from(lease.as_millis()).unwrap_or(u64::MAX) / 3;
+        assert_eq!(old_derived_cadence_ms, 20_000);
+        assert!(
+            old_derived_cadence_ms > floor_ms,
+            "REGRESSION WITNESS: a lease-derived cadence out-runs the floor, so a tool \
+             persisting on it is reaped while actively emitting",
+        );
+
+        // Every heartbeat_loop now beats at the one configured interval, so
+        // the slowest persister IS the worker cadence and the floor covers it.
+        let slowest_cadence_ms = u64::try_from(heartbeat.as_millis()).unwrap_or(u64::MAX);
+        assert!(
+            floor_ms >= 2 * slowest_cadence_ms,
+            "the floor must be at least 2x the slowest cadence that persists activity",
+        );
+    }
+
+    /// F2: a child running a NESTED subagent commits nothing on its own
+    /// thread — the nested work commits on the nested child root's OWN
+    /// thread. #376's probe saw only the outer thread's silence and killed
+    /// a productive subtree. The subtree walk must hop the invocation
+    /// linkage to the nested thread and find its activity.
+    #[tokio::test]
+    async fn active_nested_subagent_keeps_the_outer_child_alive() -> Result<()> {
+        use agent_sdk_foundation::{AgentEvent, ThreadId};
+        use agent_server::journal::task_state::SubagentInvocationState;
+
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            sample_registry(),
+            subagent_timeout_runtime(Arc::new(SubagentScriptProvider::new()))?,
+        )?;
+        let stores = host.stores().clone();
+
+        let budget_ms: u64 = 30 * 60 * 1_000;
+        let spawned_at = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+        let (_parent, invocation, outer) = persist_subagent_fixture(
+            &stores,
+            &ThreadId::from_string("t-nested-outer"),
+            budget_ms,
+            spawned_at,
+        )
+        .await?;
+        let deadline = deadline_for(outer.created_at, budget_ms, 0).context("deadline")?;
+
+        // Build a nested subagent under the outer child root: a fresh child
+        // root on its own thread, and an invocation task linking to it
+        // (reusing the fixture invocation's resolved spec).
+        let nested_thread = ThreadId::from_string("t-nested-inner");
+        stores
+            .thread_store
+            .get_or_create(&nested_thread, spawned_at)
+            .await?;
+        let nested_root = AgentTask::new_root_turn(nested_thread.clone(), spawned_at, 3);
+        let spec = invocation
+            .state
+            .subagent_invocation()
+            .context("fixture invocation carries linkage")?
+            .spec
+            .clone();
+        let nested_invocation = AgentTask::new_subagent_invocation(
+            &outer,
+            SubagentInvocationState {
+                spec,
+                child_thread_id: nested_thread.clone(),
+                child_root_task_id: nested_root.id.clone(),
+            },
+            0,
+            spawned_at,
+            3,
+        )?;
+        stores.task_store.insert(nested_root).await?;
+        stores.task_store.insert(nested_invocation).await?;
+
+        let now = time::OffsetDateTime::now_utc();
+
+        // With the nested subtree silent, the outer child reads as stalled.
+        assert!(
+            stall_expired(&stores, &outer.id, deadline, None, now).await,
+            "sanity: a fully silent nested subtree leaves the outer child stalled",
+        );
+
+        // The nested child commits a frame on its OWN thread inside the
+        // budget — the outer child's thread stays silent throughout.
+        stores
+            .event_repo
+            .commit_event(
+                &nested_thread,
+                AgentEvent::text("n1", "nested still working"),
+                now - time::Duration::minutes(1),
+            )
+            .await?;
+
+        assert!(
+            !stall_expired(&stores, &outer.id, deadline, None, now).await,
+            "an outer child whose nested subagent is still committing must survive, though its \
+             own thread is silent",
+        );
+        Ok(())
+    }
+
+    /// F3: a pure tool-call provider stream (`ToolUseStart` /
+    /// `ToolInputDelta` / signature deltas) journals nothing while it
+    /// actively yields, so the
+    /// journal-only probe reads an actively-streaming turn as silent. The
+    /// provider-frame refresh point bumps the live beacon on every frame;
+    /// the running leg reads that beacon directly, so the child survives on
+    /// the strength of the stream alone.
+    #[tokio::test]
+    async fn pure_tool_call_stream_keeps_a_running_child_alive() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            sample_registry(),
+            subagent_timeout_runtime(Arc::new(SubagentScriptProvider::new()))?,
+        )?;
+        let stores = host.stores().clone();
+
+        let budget_ms: u64 = 30 * 60 * 1_000;
+        let spawned_at = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+        let (_parent, _invocation, child_root) = persist_subagent_fixture(
+            &stores,
+            &ThreadId::from_string("t-pure-toolcall"),
+            budget_ms,
+            spawned_at,
+        )
+        .await?;
+        let deadline = deadline_for(child_root.created_at, budget_ms, 0).context("deadline")?;
+
+        let now = time::OffsetDateTime::now_utc();
+
+        // A live beacon bumped a moment ago by an arriving frame keeps the
+        // running child alive even though nothing was journalled.
+        assert!(
+            !stall_expired(
+                &stores,
+                &child_root.id,
+                deadline,
+                Some(now - time::Duration::minutes(1)),
+                now,
+            )
+            .await,
+            "a running child whose live beacon shows a recent frame must survive with an empty \
+             journal — a pure tool-call stream produces exactly this",
+        );
+
+        // The same child, viewed only through its (empty) journal — the
+        // pre-fix predicate — reads as silent and would be killed.
+        assert!(
+            stall_expired(&stores, &child_root.id, deadline, None, now).await,
+            "sanity: without the live beacon the empty journal looks like silence",
+        );
+        Ok(())
+    }
+
+    /// F4: event retention (`event_ttl_secs < timeout_ms`) can purge an
+    /// event that fell inside the stall window, so a busy child's journal
+    /// query returns `None` and #376 would false-kill it. `last_activity_at`
+    /// lives on the task row, which retention never touches, so the durable
+    /// stamp answers even when every event is gone.
+    #[tokio::test]
+    async fn durable_activity_survives_event_retention_purge() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            sample_registry(),
+            subagent_timeout_runtime(Arc::new(SubagentScriptProvider::new()))?,
+        )?;
+        let stores = host.stores().clone();
+
+        let budget_ms: u64 = 30 * 60 * 1_000;
+        let spawned_at = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+        let (_parent, _invocation, child_root) = persist_subagent_fixture(
+            &stores,
+            &ThreadId::from_string("t-retention"),
+            budget_ms,
+            spawned_at,
+        )
+        .await?;
+        let deadline = deadline_for(child_root.created_at, budget_ms, 0).context("deadline")?;
+
+        // Acquisition stamps a fresh `last_activity_at` on the row; then
+        // imagine retention has since purged every event this child ever
+        // committed, so the journal query would return `None`.
+        let acquired_at = time::OffsetDateTime::now_utc();
+        stores
+            .task_store
+            .try_acquire_task(
+                &child_root.id,
+                WorkerId::from_string("w-retention"),
+                LeaseId::new(),
+                acquired_at + time::Duration::seconds(30),
+                acquired_at,
+            )
+            .await?
+            .context("child must be acquirable")?;
+
+        // No events exist on the thread (all purged), yet the durable stamp
+        // is inside the budget — the child must not be killed.
+        let now = acquired_at + time::Duration::minutes(1);
+        assert!(
+            stores
+                .event_repo
+                .min_sequence_at_or_after(&child_root.thread_id, now - time::Duration::minutes(30))
+                .await?
+                .is_none(),
+            "the journal is empty (events purged) — the pre-fix predicate would false-kill here",
+        );
+        assert!(
+            !stall_expired(&stores, &child_root.id, deadline, None, now).await,
+            "the durable last_activity_at, which retention cannot purge, must keep the child alive",
+        );
+        Ok(())
+    }
+
+    /// r2 finding 4: a tool child that just completed must reset its parked
+    /// parent's stall budget. The completion instant is stamped on the
+    /// terminal transition itself (the row is no longer heartbeatable), so
+    /// the parent's subtree probe reads the terminal child as a fresh sign
+    /// of life even though the parent's own thread has been silent.
+    #[tokio::test]
+    async fn just_completed_tool_child_keeps_its_parked_parent_alive() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            sample_registry(),
+            subagent_timeout_runtime(Arc::new(SubagentScriptProvider::new()))?,
+        )?;
+        let stores = host.stores().clone();
+
+        let budget_ms: u64 = 30 * 60 * 1_000;
+        let spawned_at = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+        let (_parent, _invocation, child_root) = persist_subagent_fixture(
+            &stores,
+            &ThreadId::from_string("t-tool-complete"),
+            budget_ms,
+            spawned_at,
+        )
+        .await?;
+        let deadline = deadline_for(child_root.created_at, budget_ms, 0).context("deadline")?;
+        let now = time::OffsetDateTime::now_utc();
+
+        // Build a tool child that has just completed. `complete` stamps the
+        // completion instant onto `last_activity_at` as part of the terminal
+        // transition.
+        let tool = AgentTask::new_child(&child_root, TaskKind::ToolRuntime, spawned_at, 3)?
+            .mark_running(
+                WorkerId::from_string("w-tool"),
+                LeaseId::new(),
+                now,
+                spawned_at,
+            )
+            .map_err(|err| anyhow::anyhow!("mark_running: {err}"))?
+            .complete_with_result(
+                serde_json::json!({"ok": true}),
+                now - time::Duration::minutes(1),
+            )
+            .map_err(|err| anyhow::anyhow!("complete: {err}"))?;
+        assert_eq!(
+            tool.last_activity_at,
+            Some(now - time::Duration::minutes(1)),
+            "completion must stamp last_activity_at on the terminal row",
+        );
+        assert!(tool.status.is_terminal());
+        stores.task_store.insert(tool).await?;
+
+        assert!(
+            !stall_expired(&stores, &child_root.id, deadline, None, now).await,
+            "a parent whose tool child completed inside the budget must survive, though the \
+             parent's own thread is silent",
+        );
+        Ok(())
+    }
+
+    /// r2 finding 3: a wedged child buried under a large history of retained
+    /// terminal rows must still time out — the probe must not perpetually
+    /// truncate and treat it as active. Terminal rows are inspected inline
+    /// but never expanded or counted, so even a fan-out well past the node
+    /// cap leaves the live frontier tiny and the walk reaches a real verdict.
+    #[tokio::test]
+    async fn wedged_child_under_large_terminal_history_still_times_out() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            sample_registry(),
+            subagent_timeout_runtime(Arc::new(SubagentScriptProvider::new()))?,
+        )?;
+        let stores = host.stores().clone();
+
+        let budget_ms: u64 = 30 * 60 * 1_000;
+        let spawned_at = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+        let (_parent, _invocation, child_root) = persist_subagent_fixture(
+            &stores,
+            &ThreadId::from_string("t-large-history"),
+            budget_ms,
+            spawned_at,
+        )
+        .await?;
+        let deadline = deadline_for(child_root.created_at, budget_ms, 0).context("deadline")?;
+
+        // A retained history well past the node cap: every one of these is
+        // terminal and long silent. The OLD walk would enqueue them all,
+        // trip the cap, and truncate → "active" forever.
+        let stale = spawned_at;
+        for _ in 0..(MAX_ACTIVITY_SUBTREE_NODES + 16) {
+            let mut done = AgentTask::new_child(&child_root, TaskKind::ToolRuntime, spawned_at, 3)?;
+            done.status = TaskStatus::Completed;
+            done.completed_at = Some(stale);
+            done.last_activity_at = Some(stale);
+            stores.task_store.insert(done).await?;
+        }
+
+        let now = time::OffsetDateTime::now_utc();
+        assert!(
+            stall_expired(&stores, &child_root.id, deadline, None, now).await,
+            "a wedged child must still be reaped despite a retained terminal history larger \
+             than the probe's node cap",
+        );
+        Ok(())
+    }
+
+    /// r2 finding 2: the heartbeat must renew the lease BEFORE running the
+    /// (potentially slow) subtree probe. Otherwise a large subtree or slow
+    /// store consumes the remaining lease, the expiry sweep requeues the
+    /// row, and a second worker reacquires it while the original future is
+    /// still running — duplicate execution. Here the probe's `list_children`
+    /// stalls; the lease must nonetheless already be extended when it does.
+    #[tokio::test]
+    async fn lease_is_renewed_before_the_subtree_probe() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            sample_registry(),
+            subagent_timeout_runtime(Arc::new(SubagentScriptProvider::new()))?,
+        )?;
+        let stores = host.stores().clone();
+
+        let start = time::OffsetDateTime::now_utc();
+        let budget_ms: u64 = 30 * 60 * 1_000;
+        let spawned_at = start - time::Duration::hours(2);
+        let (_parent, _invocation, child_root) = persist_subagent_fixture(
+            &stores,
+            &ThreadId::from_string("t-lease-before-probe"),
+            budget_ms,
+            spawned_at,
+        )
+        .await?;
+        let deadline = deadline_for(child_root.created_at, budget_ms, 0).context("deadline")?;
+
+        // Acquire the child Running under a DELIBERATELY short lease, with a
+        // stale activity stamp (acquired "in the past"), so the probe does
+        // not early-exit and actually reaches `list_children`.
+        let worker = WorkerId::from_string("w-lease-probe");
+        let lease = LeaseId::new();
+        let short_lease_expiry = start + time::Duration::seconds(1);
+        stores
+            .task_store
+            .try_acquire_task(
+                &child_root.id,
+                worker.clone(),
+                lease.clone(),
+                short_lease_expiry,
+                spawned_at,
+            )
+            .await?
+            .context("child must acquire")?;
+
+        let flaky = Arc::new(
+            FlakyTaskStore::new(Arc::clone(&stores.task_store)).stalling_list_children(800),
+        );
+        let probe_started = Arc::clone(&flaky.probe_started);
+        let mut flaky_stores = stores.clone();
+        flaky_stores.task_store = flaky.clone();
+
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(heartbeat_loop(HeartbeatLoopParams {
+            stores: flaky_stores.clone(),
+            task_id: child_root.id.clone(),
+            thread_id: child_root.thread_id.clone(),
+            worker_id: worker.clone(),
+            lease_id: lease.clone(),
+            lease_duration: time::Duration::seconds(30),
+            heartbeat_interval: std::time::Duration::from_millis(50),
+            cancel: cancel.clone(),
+            task_cancel: CancellationToken::new(),
+            deadline: SubagentDeadlineState::Enforced(deadline),
+            activity: agent_server::worker::ActivityBeacon::new(),
+        }));
+
+        // Wait until the probe is in-flight (its stall has begun): the beat
+        // must have already run this tick.
+        probe_started.notified().await;
+
+        // Well past the short acquisition lease but far short of the renewed
+        // one: the row must not be sweepable, proving the beat ran first.
+        let swept = flaky
+            .release_expired_leases(start + time::Duration::seconds(5))
+            .await?;
+        assert!(
+            !swept.iter().any(|record| record.id == child_root.id),
+            "the lease must be renewed before the probe runs, so the child is not sweepable \
+             mid-probe; got {swept:?}",
+        );
+        let mid = flaky.get(&child_root.id).await?.context("child exists")?;
+        assert_eq!(
+            mid.status,
+            TaskStatus::Running,
+            "the child must still be Running under its worker mid-probe",
+        );
+
+        cancel.cancel();
+        handle.await?;
+        Ok(())
+    }
+
+    /// r3 finding 2: a probe that outruns its lease-bounded budget must be
+    /// treated as NOT expired (fail-safe) so a slow store can never cause a
+    /// false reap — the heartbeat retries on the next tick instead.
+    #[tokio::test]
+    async fn stall_probe_timeout_is_treated_as_active() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            sample_registry(),
+            subagent_timeout_runtime(Arc::new(SubagentScriptProvider::new()))?,
+        )?;
+        let stores = host.stores().clone();
+
+        let budget_ms: u64 = 30 * 60 * 1_000;
+        let spawned_at = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+        let (_parent, _invocation, child_root) = persist_subagent_fixture(
+            &stores,
+            &ThreadId::from_string("t-probe-timeout"),
+            budget_ms,
+            spawned_at,
+        )
+        .await?;
+        let deadline = deadline_for(child_root.created_at, budget_ms, 0).context("deadline")?;
+
+        // Acquire Running with a stale activity stamp so the probe does not
+        // early-exit and actually reaches the (stalling) `list_children`.
+        let worker = WorkerId::from_string("w-probe-timeout");
+        let lease = LeaseId::new();
+        stores
+            .task_store
+            .try_acquire_task(
+                &child_root.id,
+                worker.clone(),
+                lease.clone(),
+                time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+                spawned_at,
+            )
+            .await?
+            .context("child must acquire")?;
+
+        let flaky = Arc::new(
+            FlakyTaskStore::new(Arc::clone(&stores.task_store)).stalling_list_children(800),
+        );
+        let mut flaky_stores = stores.clone();
+        flaky_stores.task_store = flaky;
+
+        // The child is genuinely silent (no activity), so an UNBOUNDED probe
+        // would reap it; a probe bounded to 50ms against an 800ms store stall
+        // must instead be treated as active and keep running.
+        let outcome = deadline_tick(
+            &flaky_stores,
+            OwnedRootTask {
+                task: &child_root.id,
+                thread: &child_root.thread_id,
+                worker: &worker,
+                lease: &lease,
+            },
+            SubagentDeadlineState::Enforced(deadline),
+            None,
+            std::time::Duration::from_millis(50),
+            0,
+            time::OffsetDateTime::now_utc(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, DeadlineTick::Continue(_)),
+            "a probe that exceeds its budget must be treated as active (not reaped)",
+        );
+        let row = flaky_stores
+            .task_store
+            .get(&child_root.id)
+            .await?
+            .context("child exists")?;
+        assert_eq!(
+            row.status,
+            TaskStatus::Running,
+            "the child must not have been failed on a timed-out probe",
+        );
+        Ok(())
+    }
+
+    /// r3 finding 3: a budget below the persistence cadence is floored at
+    /// enforcement, so a parked child whose descendant reported within a
+    /// couple of heartbeat intervals is not reaped before its activity could
+    /// even be persisted.
+    #[tokio::test]
+    async fn effective_budget_is_floored_at_the_persistence_cadence() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+
+        // Pure floor: a sub-cadence budget is raised; a supra-cadence one is
+        // left exactly as configured.
+        let created = time::OffsetDateTime::now_utc();
+        let floored = deadline_for(created, 5_000, 20_000).context("floored")?;
+        assert_eq!(
+            floored.timeout_ms, 20_000,
+            "a 5s budget floors to the 20s cadence"
+        );
+        assert_eq!(
+            floored.earliest_expiry_at,
+            created + time::Duration::seconds(20)
+        );
+        let unfloored = deadline_for(created, 30_000, 20_000).context("unfloored")?;
+        assert_eq!(
+            unfloored.timeout_ms, 30_000,
+            "a supra-cadence budget is unchanged"
+        );
+
+        // Behavioural: a child that reported 17s ago, created 25s ago, under
+        // a configured 5s budget. Unfloored it looks long-silent and is
+        // reaped; floored to 20s it is correctly spared.
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            sample_registry(),
+            subagent_timeout_runtime(Arc::new(SubagentScriptProvider::new()))?,
+        )?;
+        let stores = host.stores().clone();
+        let now = time::OffsetDateTime::now_utc();
+        let (_parent, _invocation, child_root) = persist_subagent_fixture(
+            &stores,
+            &ThreadId::from_string("t-budget-floor"),
+            5_000,
+            now - time::Duration::seconds(25),
+        )
+        .await?;
+        // Stamp last activity 17s ago via acquisition.
+        stores
+            .task_store
+            .try_acquire_task(
+                &child_root.id,
+                WorkerId::from_string("w-floor"),
+                LeaseId::new(),
+                now + time::Duration::seconds(600),
+                now - time::Duration::seconds(17),
+            )
+            .await?
+            .context("child must acquire")?;
+
+        let floor = 20_000;
+        assert!(
+            stall_expired(
+                &stores,
+                &child_root.id,
+                deadline_for(child_root.created_at, 5_000, 0).context("d")?,
+                None,
+                now,
+            )
+            .await,
+            "without the floor a 5s budget reaps a child that reported 17s ago",
+        );
+        assert!(
+            !stall_expired(
+                &stores,
+                &child_root.id,
+                deadline_for(child_root.created_at, 5_000, floor).context("d")?,
+                None,
+                now,
+            )
+            .await,
+            "the persistence-cadence floor must spare a child that reported within it",
+        );
         Ok(())
     }
 
@@ -5480,7 +7285,9 @@ mod tests {
         let (parent, _invocation, child_root) =
             persist_subagent_fixture(&stores, &parent_thread, 250, at).await?;
 
-        // Linked child root: deadline anchored at created_at + timeout.
+        // Linked child root: the EARLIEST possible expiry is anchored at
+        // created_at + timeout. Reaching it is necessary but not
+        // sufficient — `stall_expired` still has to find the child silent.
         let SubagentDeadlineState::Enforced(deadline) =
             resolve_subagent_deadline(&stores, &child_root).await
         else {
@@ -5488,9 +7295,9 @@ mod tests {
         };
         assert_eq!(deadline.timeout_ms, 250);
         assert_eq!(
-            deadline.expires_at,
+            deadline.earliest_expiry_at,
             child_root.created_at + time::Duration::milliseconds(250),
-            "deadline must anchor at the child root's creation time",
+            "the earliest-expiry floor must anchor at the child root's creation time",
         );
 
         // The parent root (not a linked child root) resolves no deadline.
@@ -5685,6 +7492,77 @@ mod tests {
         Ok(())
     }
 
+    /// ADR-0003 I5 — the probe is bounded on EVERY leg, and a bounded-out
+    /// probe means "alive".
+    ///
+    /// The running leg's bound is pinned by
+    /// `stall_probe_timeout_is_treated_as_active`. This is the PARKED leg, the
+    /// other probe path — a slow or huge subtree must not let the sweep reap a
+    /// child on an incomplete walk. Never kill on unknown.
+    #[tokio::test]
+    async fn parked_sweep_probe_timeout_is_treated_as_active() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            sample_registry(),
+            subagent_timeout_runtime(Arc::new(SubagentScriptProvider::new()))?,
+        )?;
+        let stores = host.stores().clone();
+
+        // A genuinely silent parked child, well past its budget: an UNBOUNDED
+        // probe over a healthy store reaps it (asserted below), so the only
+        // thing sparing it in the bounded case is the fail-safe.
+        let backdated = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
+        let (_parent, _invocation, child_root) = persist_subagent_fixture(
+            &stores,
+            &ThreadId::from_string("t-sweep-probe-timeout"),
+            250,
+            backdated,
+        )
+        .await?;
+        park_child_root_on_tool_child(&stores, &child_root, backdated).await?;
+
+        // The store stalls `list_children` for 800ms; the probe is bounded to
+        // 50ms. The walk cannot complete, so its verdict is unknown.
+        let flaky = Arc::new(
+            FlakyTaskStore::new(Arc::clone(&stores.task_store)).stalling_list_children(800),
+        );
+        let mut flaky_stores = stores.clone();
+        flaky_stores.task_store = flaky;
+
+        let enforced = enforce_subagent_deadlines(
+            &flaky_stores,
+            time::OffsetDateTime::now_utc(),
+            0,
+            std::time::Duration::from_millis(50),
+            &CancellationToken::new(),
+        )
+        .await?;
+        assert_eq!(
+            enforced, 0,
+            "a parked-sweep probe that overran its bound must be treated as ACTIVE, never \
+             reaped on an incomplete walk",
+        );
+
+        // Control: the same child, same budget, against the healthy store with
+        // a full bound — it IS reaped. So the fail-safe above is what spared
+        // it, not a fixture that was never expiring in the first place.
+        let enforced = enforce_subagent_deadlines(
+            &stores,
+            time::OffsetDateTime::now_utc(),
+            0,
+            STALL_PROBE_MAX,
+            &CancellationToken::new(),
+        )
+        .await?;
+        assert_eq!(
+            enforced, 1,
+            "control: an unbounded-out probe over a healthy store does reap this child",
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn sweep_fails_expired_parked_child_and_cancels_hung_tool_children() -> Result<()> {
         use agent_sdk_foundation::ThreadId;
@@ -5704,6 +7582,8 @@ mod tests {
         let enforced = enforce_subagent_deadlines(
             &stores,
             time::OffsetDateTime::now_utc(),
+            0,
+            STALL_PROBE_MAX,
             &CancellationToken::new(),
         )
         .await?;
@@ -5763,6 +7643,8 @@ mod tests {
         let enforced = enforce_subagent_deadlines(
             &stores,
             time::OffsetDateTime::now_utc(),
+            0,
+            STALL_PROBE_MAX,
             &CancellationToken::new(),
         )
         .await?;
@@ -5799,17 +7681,22 @@ mod tests {
     /// `fail_task`, delegating everything (and everything else) to the
     /// wrapped in-memory store. Used to prove the deadline machinery
     /// survives transient store errors.
-    /// How long a stalled linkage lookup injected by
-    /// [`FlakyTaskStore::stalling_finds`] blocks before delegating.
-    const INJECTED_FIND_STALL: std::time::Duration = std::time::Duration::from_millis(800);
-
     struct FlakyTaskStore {
         inner: Arc<dyn AgentTaskStore>,
         find_failures_remaining: AtomicUsize,
-        find_stalls_remaining: AtomicUsize,
         fail_task_failures_remaining: AtomicUsize,
         fail_task_attempts: AtomicUsize,
         heartbeat_rejections_remaining: AtomicUsize,
+        /// When non-zero, `list_children` (the subtree probe's expansion
+        /// call) sleeps this many milliseconds before delegating, and fires
+        /// `probe_started` as it begins — so a test can prove the heartbeat
+        /// renewed the lease BEFORE the probe ran.
+        list_children_stall_ms: AtomicUsize,
+        probe_started: Arc<tokio::sync::Notify>,
+        /// The `now` the last `fail_task` was called with — ADR-0003 I3 says
+        /// this must be the instant the transition HAPPENED, not one the
+        /// caller captured at task entry (before a possibly very long run).
+        fail_task_now: Arc<std::sync::Mutex<Option<time::OffsetDateTime>>>,
     }
 
     impl FlakyTaskStore {
@@ -5817,20 +7704,31 @@ mod tests {
             Self {
                 inner,
                 find_failures_remaining: AtomicUsize::new(0),
-                find_stalls_remaining: AtomicUsize::new(0),
                 fail_task_failures_remaining: AtomicUsize::new(0),
                 fail_task_attempts: AtomicUsize::new(0),
                 heartbeat_rejections_remaining: AtomicUsize::new(0),
+                list_children_stall_ms: AtomicUsize::new(0),
+                probe_started: Arc::new(tokio::sync::Notify::new()),
+                fail_task_now: Arc::new(std::sync::Mutex::new(None)),
             }
+        }
+
+        /// The instant the last `fail_task` was stamped with, if any.
+        fn recorded_fail_now(&self) -> Option<time::OffsetDateTime> {
+            self.fail_task_now.lock().ok().and_then(|slot| *slot)
+        }
+
+        /// Make every `list_children` call (the subtree probe's expansion
+        /// step) sleep `ms` before delegating, firing `probe_started` as it
+        /// begins — so a test can assert the heartbeat renewed the lease
+        /// before the probe was even entered.
+        fn stalling_list_children(self, ms: usize) -> Self {
+            self.list_children_stall_ms.store(ms, Ordering::SeqCst);
+            self
         }
 
         fn failing_finds(self, count: usize) -> Self {
             self.find_failures_remaining.store(count, Ordering::SeqCst);
-            self
-        }
-
-        fn stalling_finds(self, count: usize) -> Self {
-            self.find_stalls_remaining.store(count, Ordering::SeqCst);
             self
         }
 
@@ -5912,6 +7810,11 @@ mod tests {
             self.inner.list_by_thread(thread_id).await
         }
         async fn list_children(&self, parent_id: &AgentTaskId) -> Result<Vec<AgentTask>> {
+            let stall_ms = self.list_children_stall_ms.load(Ordering::SeqCst);
+            if stall_ms > 0 {
+                self.probe_started.notify_one();
+                tokio::time::sleep(std::time::Duration::from_millis(stall_ms as u64)).await;
+            }
             self.inner.list_children(parent_id).await
         }
         async fn list_by_status(&self, status: TaskStatus) -> Result<Vec<AgentTask>> {
@@ -5977,13 +7880,14 @@ mod tests {
             worker: &WorkerId,
             lease: &LeaseId,
             expires_at: time::OffsetDateTime,
+            activity: Option<time::OffsetDateTime>,
             now: time::OffsetDateTime,
         ) -> Result<AgentTask> {
             if Self::take_injected_failure(&self.heartbeat_rejections_remaining) {
                 bail!("heartbeat rejected: injected terminal lease rejection");
             }
             self.inner
-                .heartbeat_task(task_id, worker, lease, expires_at, now)
+                .heartbeat_task(task_id, worker, lease, expires_at, activity, now)
                 .await
         }
         async fn release_expired_leases(
@@ -6119,9 +8023,6 @@ mod tests {
             if Self::take_injected_failure(&self.find_failures_remaining) {
                 bail!("injected transient linkage lookup failure");
             }
-            if Self::take_injected_failure(&self.find_stalls_remaining) {
-                tokio::time::sleep(INJECTED_FIND_STALL).await;
-            }
             self.inner
                 .find_subagent_invocation_for_child_root(child_root_id)
                 .await
@@ -6159,6 +8060,9 @@ mod tests {
             now: time::OffsetDateTime,
         ) -> Result<(AgentTask, Option<AgentTask>)> {
             self.fail_task_attempts.fetch_add(1, Ordering::SeqCst);
+            if let Ok(mut slot) = self.fail_task_now.lock() {
+                *slot = Some(now);
+            }
             if Self::take_injected_failure(&self.fail_task_failures_remaining) {
                 bail!("injected transient fail_task failure");
             }
@@ -6274,6 +8178,7 @@ mod tests {
             deadline: SubagentDeadlineState::Unresolved {
                 created_at: child_root.created_at,
             },
+            activity: ActivityBeacon::new(),
         }));
 
         // Two injected lookup failures burn two ticks; the third tick
@@ -6317,7 +8222,7 @@ mod tests {
             backdated,
         )
         .await?;
-        let Some(deadline) = deadline_for(child_root.created_at, 100) else {
+        let Some(deadline) = deadline_for(child_root.created_at, 100, 0) else {
             bail!("fixture deadline must resolve");
         };
 
@@ -6350,6 +8255,7 @@ mod tests {
             cancel: cancel.clone(),
             task_cancel: task_cancel.clone(),
             deadline: SubagentDeadlineState::Enforced(deadline),
+            activity: ActivityBeacon::new(),
         }));
 
         // Tick 1's fail hits the injected error; tick 2 retries and
@@ -6387,64 +8293,6 @@ mod tests {
 
         cancel.cancel();
         handle.await?;
-        Ok(())
-    }
-
-    /// Item 3 (acquisition leg): the up-front expiry failure must also
-    /// retry across transient store errors while keeping the lease,
-    /// and still never dispatch an LLM call.
-    #[tokio::test]
-    async fn expired_child_fail_retries_at_acquisition_until_durable() -> Result<()> {
-        let config = ServiceConfig::default();
-        let provider = Arc::new(SubagentScriptProvider::new());
-        let runtime = subagent_timeout_runtime(Arc::clone(&provider))?;
-        let host = ServiceHost::new(config, sample_registry(), runtime.clone())?;
-        let stores = host.stores().clone();
-
-        let flaky =
-            Arc::new(FlakyTaskStore::new(Arc::clone(&stores.task_store)).failing_fail_tasks(1));
-        let backdated = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
-        let (flaky_stores, acquired, worker, _lease) = acquired_child_with_flaky_store(
-            &stores,
-            Arc::clone(&flaky),
-            "t-flaky-acquire",
-            250,
-            backdated,
-        )
-        .await?;
-
-        let cancel = CancellationToken::new();
-        run_task_with_heartbeat(
-            acquired.clone(),
-            &worker,
-            &flaky_stores,
-            runtime,
-            &cancel,
-            time::Duration::seconds(30),
-            std::time::Duration::from_millis(50),
-        )
-        .await;
-
-        let failed = flaky_stores
-            .task_store
-            .get(&acquired.id)
-            .await?
-            .context("child root exists")?;
-        assert_eq!(failed.status, TaskStatus::Failed);
-        let error = failed.last_error.unwrap_or_default();
-        assert!(
-            error.contains("subagent timed out after 250ms"),
-            "the retried acquisition-expiry failure must carry the timeout message, got {error:?}",
-        );
-        assert!(
-            flaky.fail_task_attempts.load(Ordering::SeqCst) >= 2,
-            "the durable fail must have been retried after the injected error",
-        );
-        assert_eq!(
-            provider.hang_child_calls.load(Ordering::SeqCst),
-            0,
-            "an already-expired child must never dispatch an LLM call, even across retries",
-        );
         Ok(())
     }
 
@@ -6568,6 +8416,8 @@ mod tests {
         let enforced = enforce_subagent_deadlines(
             &flaky_stores,
             time::OffsetDateTime::now_utc(),
+            0,
+            STALL_PROBE_MAX,
             &CancellationToken::new(),
         )
         .await?;
@@ -6719,95 +8569,6 @@ mod tests {
         Ok(())
     }
 
-    /// Addendum B: the linkage lookup runs only AFTER the heartbeat is
-    /// up, so a lookup stalled past the acquired lease cannot let the
-    /// sweep requeue the row (which would hand it to a second worker
-    /// while this one later dispatched blind — duplicate execution).
-    #[tokio::test]
-    async fn stalled_deadline_lookup_keeps_the_lease() -> Result<()> {
-        let config = ServiceConfig::default();
-        let provider = Arc::new(SubagentScriptProvider::new());
-        let runtime = subagent_timeout_runtime(Arc::clone(&provider))?;
-        let host = ServiceHost::new(config, sample_registry(), runtime.clone())?;
-        let stores = host.stores().clone();
-
-        let flaky = Arc::new(FlakyTaskStore::new(Arc::clone(&stores.task_store)).stalling_finds(1));
-        // Generous budget: this test is about the lookup stall, not
-        // deadline expiry.
-        let (flaky_stores, acquired, worker, _lease) = acquired_child_with_flaky_store(
-            &stores,
-            Arc::clone(&flaky),
-            "t-stalled-lookup",
-            600_000,
-            time::OffsetDateTime::now_utc(),
-        )
-        .await?;
-        // Re-lease with a SHORT horizon so the 800ms stall would
-        // outlive it without heartbeat protection. `acquired` above
-        // used a long fixture lease; shrink it via heartbeat.
-        let short_expiry = time::OffsetDateTime::now_utc() + time::Duration::milliseconds(300);
-        let lease_id = acquired.lease_id.clone().context("acquired lease")?;
-        stores
-            .task_store
-            .heartbeat_task(
-                &acquired.id,
-                &worker,
-                &lease_id,
-                short_expiry,
-                time::OffsetDateTime::now_utc(),
-            )
-            .await?;
-
-        let cancel = CancellationToken::new();
-        let run_cancel = cancel.clone();
-        let run_stores = flaky_stores.clone();
-        let run_worker = worker.clone();
-        let run_task = acquired.clone();
-        let handle = tokio::spawn(async move {
-            run_task_with_heartbeat(
-                run_task,
-                &run_worker,
-                &run_stores,
-                runtime,
-                &run_cancel,
-                time::Duration::milliseconds(300),
-                std::time::Duration::from_millis(50),
-            )
-            .await;
-        });
-
-        // Mid-stall, past the original 300ms lease horizon: the
-        // heartbeat (started BEFORE the lookup) must have kept the
-        // lease alive, so the expiry sweep finds nothing to requeue
-        // and the row is still Running under our worker.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let swept = flaky_stores
-            .task_store
-            .release_expired_leases(time::OffsetDateTime::now_utc())
-            .await?;
-        assert!(
-            !swept.iter().any(|record| record.id == acquired.id),
-            "a stalled deadline lookup must not let the acquired lease expire, got {swept:?}",
-        );
-        let mid_stall = flaky_stores
-            .task_store
-            .get(&acquired.id)
-            .await?
-            .context("child root exists")?;
-        assert_eq!(
-            mid_stall.status,
-            TaskStatus::Running,
-            "the row must still be Running under the original worker mid-stall",
-        );
-        assert_eq!(mid_stall.worker_id.as_ref(), Some(&worker));
-
-        // Unwedge: host-shutdown cascade aborts the (hung-provider)
-        // execution through the per-task token.
-        cancel.cancel();
-        handle.await?;
-        Ok(())
-    }
-
     // ── Round 4: confirm-drive cancellation, force-drop attempt
     //    settlement, multi-batch lease drain ───────────────────────
 
@@ -6842,6 +8603,8 @@ mod tests {
         let enforced = enforce_subagent_deadlines(
             &stores,
             time::OffsetDateTime::now_utc(),
+            0,
+            STALL_PROBE_MAX,
             &CancellationToken::new(),
         )
         .await?;

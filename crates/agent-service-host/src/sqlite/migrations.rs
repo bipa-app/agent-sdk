@@ -64,11 +64,15 @@ const CHECKPOINT_KIND_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/sqlite/0011_checkpoint_kind.sql"
 ));
+const TASK_LAST_ACTIVITY_AT_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/sqlite/0012_task_last_activity_at.sql"
+));
 
 /// `sqlx`-managed migration bundle for the `SQLite` durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/sqlite");
 
-const MIGRATIONS: [SqliteMigration; 11] = [
+const MIGRATIONS: [SqliteMigration; 12] = [
     SqliteMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -123,6 +127,11 @@ const MIGRATIONS: [SqliteMigration; 11] = [
         version: "0011",
         summary: "explicit checkpoint kind discriminating cancel-salvage from full turns",
         sql: CHECKPOINT_KIND_SQL,
+    },
+    SqliteMigration {
+        version: "0012",
+        summary: "durable per-task last_activity_at anchoring the subagent stall budget",
+        sql: TASK_LAST_ACTIVITY_AT_SQL,
     },
 ];
 

@@ -21,7 +21,7 @@ use agent_server::journal::task::{
 };
 use agent_server::journal::task_state::TaskState;
 use agent_server::worker::{
-    AgentDefinitionRegistry, ConfirmationDecision, ConfirmationResumeOutcome,
+    ActivityBeacon, AgentDefinitionRegistry, ConfirmationDecision, ConfirmationResumeOutcome,
     apply_confirmation_decision, resolve_tool_bootstrap, resume_confirmed_tool,
 };
 use anyhow::{Context, Result};
@@ -121,6 +121,12 @@ struct GrpcShared {
     health: Arc<HealthSurface>,
     shutdown: CancellationToken,
     lease_duration: time::Duration,
+    /// The configured worker heartbeat cadence (ADR-0003 I4). Every
+    /// `heartbeat_loop` in the process beats at this one interval — including
+    /// the detached Confirm-tier drive — so the stall floor
+    /// (`2 x heartbeat_interval`) covers every cadence that can persist
+    /// activity for a probed subtree.
+    heartbeat_interval: std::time::Duration,
     admission: AdmissionConfig,
 }
 
@@ -131,6 +137,7 @@ impl GrpcShared {
         health: Arc<HealthSurface>,
         shutdown: CancellationToken,
         lease_duration: time::Duration,
+        heartbeat_interval: std::time::Duration,
         admission: AdmissionConfig,
     ) -> Self {
         Self {
@@ -139,6 +146,7 @@ impl GrpcShared {
             health,
             shutdown,
             lease_duration,
+            heartbeat_interval,
             admission,
         }
     }
@@ -356,9 +364,18 @@ impl GrpcShared {
             .await
             .context("capturing approved confirmation watermark")?;
 
-        let bootstrap = resolve_tool_bootstrap(acquired, self.stores.task_store.as_ref())
-            .await
-            .context("bootstrapping approved confirmation task")?;
+        // A Confirm-tier tool runs on its own detached heartbeat (see
+        // `drive_approved_confirmation`), so it gets its own beacon. The
+        // heartbeat there beats for `bootstrap.task_id` — the same row the
+        // collector's emissions describe — which is what makes persisting
+        // this beacon on that row correct.
+        let bootstrap = resolve_tool_bootstrap(
+            acquired,
+            self.stores.task_store.as_ref(),
+            ActivityBeacon::new(),
+        )
+        .await
+        .context("bootstrapping approved confirmation task")?;
 
         // Decouple the side-effecting tool from the RPC lifetime. A
         // Confirm-tier tool can run longer than one lease, so driving it
@@ -375,6 +392,7 @@ impl GrpcShared {
             bootstrap,
             watermark,
             lease_duration: self.lease_duration,
+            heartbeat_interval: self.heartbeat_interval,
         }));
         Ok(())
     }
@@ -418,16 +436,7 @@ struct DriveApprovedConfirmation {
     bootstrap: agent_server::worker::ToolTaskBootstrap,
     watermark: u64,
     lease_duration: time::Duration,
-}
-
-/// Derive a heartbeat interval for a one-off resumed execution from the
-/// lease duration, mirroring the worker pool's default 1:3 ratio
-/// (10s heartbeat / 30s lease) and never returning a zero interval (a
-/// zero interval would panic `tokio::time::interval`).
-fn heartbeat_interval_for(lease_duration: time::Duration) -> std::time::Duration {
-    let lease_secs = lease_duration.whole_seconds().max(1);
-    let interval_secs = u64::try_from(lease_secs / 3).unwrap_or(1).max(1);
-    std::time::Duration::from_secs(interval_secs)
+    heartbeat_interval: std::time::Duration,
 }
 
 /// Drive an approved confirmation's resumed tool to completion on a
@@ -445,6 +454,7 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
         bootstrap,
         watermark,
         lease_duration,
+        heartbeat_interval,
     } = params;
 
     let task_id = bootstrap.task_id.clone();
@@ -479,7 +489,16 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
             worker_id: worker_id.clone(),
             lease_id: lease_id.clone(),
             lease_duration,
-            heartbeat_interval: heartbeat_interval_for(lease_duration),
+            // ADR-0003 I4. The CONFIGURED worker cadence, never one derived
+            // from the lease. This row's activity is what keeps a PARKED
+            // subagent ancestor alive, and that ancestor's stall floor is
+            // `2 x heartbeat_interval` — derived from exactly this constant.
+            // A drive that beat slower (the old `lease/3`: 20s under a 60s
+            // lease, against a floor built from a 5s worker interval) would
+            // persist this tool's progress less often than the floor assumes
+            // and get an actively-emitting tool reaped. One cadence in the
+            // system is what makes the floor correct by construction.
+            heartbeat_interval,
             cancel: heartbeat_cancel.clone(),
             // A terminal lease rejection means the row was taken from
             // us (most commonly a `cancel_tree`); trip the drive token
@@ -487,15 +506,28 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
             // paths that never consult the drive registry — they still
             // converge within one heartbeat interval.
             task_cancel: drive_cancel.clone(),
-            // Not a subagent child-thread root — no wall-clock deadline.
+            // Not a subagent child-thread root — no stall budget of its
+            // own. It still persists activity: this tool's progress is what
+            // keeps a PARKED subagent ancestor alive, and that ancestor's
+            // stall probe reads this row.
             deadline: crate::host::SubagentDeadlineState::Exempt,
+            activity: bootstrap.activity.clone(),
         },
     ));
 
-    let now = OffsetDateTime::now_utc();
-    let outcome =
-        resume_confirmed_tool_with_abort_grace(&stores, &runtime, bootstrap, &drive_cancel, now)
-            .await;
+    // The instant the tool STARTS. Deliberately not called `now`: a
+    // Confirm-tier tool is detached precisely because it can run longer than a
+    // lease, so by the time it returns this value is stale by the whole
+    // execution. It must never be reused as a transition instant (ADR-0003 I3).
+    let started_at = OffsetDateTime::now_utc();
+    let outcome = resume_confirmed_tool_with_abort_grace(
+        &stores,
+        &runtime,
+        bootstrap,
+        &drive_cancel,
+        started_at,
+    )
+    .await;
 
     heartbeat_cancel.cancel();
     if let Err(join_err) = heartbeat_handle.await {
@@ -508,9 +540,18 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
     // already terminal, and failing it here would only CAS-reject.
     if let Some(Err(error)) = outcome {
         warn!(?error, task_id = %task_id, "approved confirmation resume failed");
+        // ADR-0003 I3: the terminal instant is captured HERE, at the
+        // transition — not `started_at`, which predates the whole tool run.
+        let failed_at = OffsetDateTime::now_utc();
         if let Err(fail_err) = stores
             .task_store
-            .fail_task(&task_id, &worker_id, &lease_id, format!("{error:#}"), now)
+            .fail_task(
+                &task_id,
+                &worker_id,
+                &lease_id,
+                format!("{error:#}"),
+                failed_at,
+            )
             .await
         {
             warn!(
@@ -1988,6 +2029,10 @@ pub struct GrpcTransport {
 }
 
 impl GrpcTransport {
+    /// `heartbeat_interval` must be the SAME configured worker cadence the
+    /// pool beats at (`worker.heartbeat_interval`) — see ADR-0003 I4. The
+    /// detached Confirm-tier drive spawned from `DecideConfirmation` beats at
+    /// it, and the subagent stall floor is derived from it.
     #[must_use]
     pub fn new(
         stores: StoreRegistry,
@@ -1995,6 +2040,7 @@ impl GrpcTransport {
         health: Arc<HealthSurface>,
         shutdown: CancellationToken,
         lease_duration: time::Duration,
+        heartbeat_interval: std::time::Duration,
     ) -> Self {
         Self::with_admission(
             stores,
@@ -2002,6 +2048,7 @@ impl GrpcTransport {
             health,
             shutdown,
             lease_duration,
+            heartbeat_interval,
             AdmissionConfig::default(),
         )
     }
@@ -2015,6 +2062,7 @@ impl GrpcTransport {
         health: Arc<HealthSurface>,
         shutdown: CancellationToken,
         lease_duration: time::Duration,
+        heartbeat_interval: std::time::Duration,
         admission: AdmissionConfig,
     ) -> Self {
         Self {
@@ -2024,6 +2072,7 @@ impl GrpcTransport {
                 health,
                 shutdown,
                 lease_duration,
+                heartbeat_interval,
                 admission,
             )),
         }
@@ -2227,6 +2276,7 @@ impl LocalDaemon {
             health,
             shutdown.clone(),
             config.worker.lease_duration(),
+            config.worker.heartbeat_interval(),
             config.admission.clone(),
         );
 
@@ -3612,6 +3662,8 @@ mod tests {
             HealthSurface::shared(),
             CancellationToken::new(),
             time::Duration::seconds(30),
+            // The worker default: 30s lease / 10s heartbeat (ADR-0003 I4).
+            std::time::Duration::from_secs(10),
             AdmissionConfig::default(),
         )))
     }
@@ -4888,10 +4940,11 @@ mod tests {
             worker: &WorkerId,
             lease: &LeaseId,
             expires_at: OffsetDateTime,
+            activity: Option<OffsetDateTime>,
             now: OffsetDateTime,
         ) -> Result<AgentTask> {
             self.inner
-                .heartbeat_task(task_id, worker, lease, expires_at, now)
+                .heartbeat_task(task_id, worker, lease, expires_at, activity, now)
                 .await
         }
         async fn release_expired_leases(&self, now: OffsetDateTime) -> Result<Vec<RecoveryRecord>> {

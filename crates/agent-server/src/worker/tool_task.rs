@@ -59,6 +59,7 @@ use crate::journal::committed_event::CommittedEvent;
 use crate::journal::event_repository::EventRepository;
 use crate::journal::store::AgentTaskStore;
 use crate::journal::task::{AgentTask, AgentTaskId, LeaseId, TaskKind, TaskStatus, WorkerId};
+use crate::worker::activity::ActivityBeacon;
 
 // ─────────────────────────────────────────────────────────────────────
 // Tool event collector
@@ -76,17 +77,44 @@ use crate::journal::task::{AgentTask, AgentTaskId, LeaseId, TaskKind, TaskStatus
 #[derive(Clone, Default)]
 pub struct ToolEventCollector {
     events: Arc<Mutex<Vec<AgentEvent>>>,
+    /// Live progress signal for the subagent stall budget.
+    ///
+    /// Buffered events do not become durable until the executor returns,
+    /// so a child parked on ONE long tool call (a 40-minute build) commits
+    /// nothing at all mid-flight and reads as silent. Bumping the beacon
+    /// on every [`emit`](Self::emit) makes that in-flight progress visible
+    /// to the stall probe *while the tool is still running*, via the tool
+    /// task's own heartbeat rather than via the journal.
+    activity: ActivityBeacon,
 }
 
 impl ToolEventCollector {
-    /// Create a new empty collector.
+    /// Create a new empty collector whose progress is not reported to any
+    /// stall budget.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Create a collector that reports live progress to `activity`.
+    ///
+    /// The beacon must belong to the **tool task's own** heartbeat — that
+    /// is the actor holding this row's lease, and therefore the only one
+    /// that can persist what the beacon sees.
+    #[must_use]
+    pub fn with_activity(activity: ActivityBeacon) -> Self {
+        Self {
+            events: Arc::new(Mutex::new(Vec::new())),
+            activity,
+        }
+    }
+
     /// Record a progress event. This is a non-blocking operation.
+    ///
+    /// Also marks the tool as *alive right now* for the stall budget: this
+    /// is the only signal a long-running tool produces before it returns.
     pub fn emit(&self, event: AgentEvent) {
+        self.activity.bump(OffsetDateTime::now_utc());
         if let Ok(mut events) = self.events.lock() {
             events.push(event);
         }
@@ -133,6 +161,15 @@ pub struct ToolTaskBootstrap {
     pub lease_id: LeaseId,
     /// The tool call this child is responsible for executing.
     pub tool_call: PendingToolCallInfo,
+    /// This tool task's own live-progress beacon.
+    ///
+    /// Handed to the [`ToolEventCollector`] so every progress emission
+    /// marks the tool alive *while it is still running*, and read once per
+    /// tick by the heartbeat that holds this row's lease — the only actor
+    /// that can persist it. A [`Default`] beacon (nobody reads it) is
+    /// harmless: the tool simply reports no live progress, exactly as
+    /// before this field existed.
+    pub activity: ActivityBeacon,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -165,6 +202,7 @@ pub struct ToolTaskBootstrap {
 pub async fn resolve_tool_bootstrap(
     child: AgentTask,
     task_store: &dyn AgentTaskStore,
+    activity: ActivityBeacon,
 ) -> anyhow::Result<ToolTaskBootstrap> {
     // ── Precondition: tool-runtime kind ──────────────────────────
     ensure!(
@@ -236,6 +274,7 @@ pub async fn resolve_tool_bootstrap(
         worker_id,
         lease_id,
         tool_call,
+        activity,
     })
 }
 
@@ -346,7 +385,10 @@ async fn execute_tool_task_inner<F, Fut>(
     event_repo: &dyn EventRepository,
     cancel: &CancellationToken,
     executor: F,
-    now: OffsetDateTime,
+    // The instant the task was acquired, kept only for signature symmetry;
+    // the terminal transition and its events are stamped with the ACTUAL
+    // completion instant captured after the tool returns (below).
+    _entry_now: OffsetDateTime,
 ) -> anyhow::Result<ToolTaskOutcome>
 where
     F: FnOnce(PendingToolCallInfo, ToolEventCollector) -> Fut,
@@ -366,8 +408,20 @@ where
     let lease_id = &bootstrap.lease_id;
 
     // ── Execute the tool ─────────────────────────────────────────
-    let collector = ToolEventCollector::new();
+    // The collector carries this task's activity beacon: nothing the tool
+    // emits reaches the journal until it returns (see the deferred commit
+    // below), so the beacon is the ONLY way a tool that runs for longer
+    // than a stall budget can prove it is alive while it runs.
+    let collector = ToolEventCollector::with_activity(bootstrap.activity.clone());
     let tool_result = executor(bootstrap.tool_call.clone(), collector.clone()).await;
+
+    // The tool may have run for a long time. Drive the terminal transition
+    // and its committed events with the ACTUAL completion instant, not the
+    // entry time captured before the await — otherwise a long child would
+    // stamp a stale `last_activity_at` that a parent's stall probe reads as
+    // silence the moment the child finishes. (`AgentTask`'s monotonic setter
+    // is the backstop against a rewind; the correct instant belongs here.)
+    let now = OffsetDateTime::now_utc();
 
     // NOTE: No post-execution cancellation check here. Once the
     // executor has returned, side effects have already been applied
@@ -410,6 +464,12 @@ where
                 now,
             )
             .await?;
+            // No beacon bump here: `complete_task_with_result` above has
+            // already made this row terminal, so a beacon-driven heartbeat
+            // write would be CAS-rejected. The completion instant is
+            // instead recorded durably on the terminal transition itself
+            // (`AgentTask::complete`), which is what a parent's stall probe
+            // reads.
 
             Ok(ToolTaskOutcome::Completed {
                 child,
@@ -474,4 +534,43 @@ async fn commit_tool_events(
         .commit_event_batch(thread_id, batch, now)
         .await
         .context("commit tool events")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F1 seam: `emit` must mark the tool alive, not merely buffer the
+    /// event. A tool that runs longer than a stall budget commits nothing
+    /// until it returns (the events are drained and committed afterwards),
+    /// so the beacon it bumps on every progress emission is the ONLY sign
+    /// of life the parked stall probe can see mid-flight.
+    #[test]
+    fn emit_marks_the_tool_alive_via_the_beacon() {
+        let beacon = ActivityBeacon::new();
+        assert!(beacon.latest().is_none(), "beacon starts empty");
+
+        let collector = ToolEventCollector::with_activity(beacon.clone());
+        collector.emit(AgentEvent::text("m1", "progress"));
+
+        assert!(
+            beacon.latest().is_some(),
+            "emit must advance the activity beacon so a long-running tool that only reports \
+             progress is not reaped as silent",
+        );
+        assert_eq!(
+            collector.drain().len(),
+            1,
+            "emit must still buffer the event for the deferred post-CAS commit",
+        );
+    }
+
+    /// A collector with no wired beacon (the default) still works — it just
+    /// reports no activity, exactly as before the beacon existed.
+    #[test]
+    fn a_default_collector_buffers_without_a_shared_beacon() {
+        let collector = ToolEventCollector::new();
+        collector.emit(AgentEvent::text("m1", "progress"));
+        assert_eq!(collector.drain().len(), 1);
+    }
 }

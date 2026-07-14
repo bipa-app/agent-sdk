@@ -314,7 +314,8 @@ impl ToolAuditEvent {
 /// Implementations MUST emit the
 /// `agent_server.tool_audit.outcome` metric for every event
 /// successfully recorded. The reference in-memory implementation
-/// calls [`crate::observability::ServerMetrics::record_tool_audit`]
+/// calls `ServerMetrics::record_tool_audit` (in the `otel`-gated
+/// `crate::observability` module)
 /// from inside [`InMemoryToolAuditEventStore::record_event`];
 /// durable backends should mirror that — typically once the
 /// underlying transaction commits — so dashboards see the same

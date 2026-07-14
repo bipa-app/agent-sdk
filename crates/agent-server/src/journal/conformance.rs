@@ -295,10 +295,11 @@ mod in_memory_bundle {
             worker: &WorkerId,
             lease: &LeaseId,
             expires_at: OffsetDateTime,
+            activity: Option<OffsetDateTime>,
             now: OffsetDateTime,
         ) -> Result<AgentTask> {
             self.task
-                .heartbeat_task(task_id, worker, lease, expires_at, now)
+                .heartbeat_task(task_id, worker, lease, expires_at, activity, now)
                 .await
         }
         async fn release_expired_leases(&self, now: OffsetDateTime) -> Result<Vec<RecoveryRecord>> {

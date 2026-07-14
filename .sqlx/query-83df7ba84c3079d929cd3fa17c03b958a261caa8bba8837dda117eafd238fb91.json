@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\nSELECT\n    id,\n    kind,\n    status,\n    parent_id,\n    root_id,\n    depth,\n    thread_id,\n    submitted_input_json,\n    caller_metadata_json,\n    worker_id,\n    lease_id,\n    lease_expires_at,\n    last_heartbeat_at,\n    state_json,\n    attempt,\n    max_attempts,\n    last_error,\n    pending_child_count,\n    spawn_index,\n    result_payload,\n    otel_traceparent,\n    created_at,\n    updated_at,\n    completed_at\nFROM agent_sdk_tasks\nWHERE status = 'running'\n  AND lease_expires_at <= $1\nORDER BY lease_expires_at, id\nLIMIT $2\nFOR UPDATE SKIP LOCKED\n",
+  "query": "\nSELECT\n    id,\n    kind,\n    status,\n    parent_id,\n    root_id,\n    depth,\n    thread_id,\n    submitted_input_json,\n    caller_metadata_json,\n    worker_id,\n    lease_id,\n    lease_expires_at,\n    last_heartbeat_at,\n    state_json,\n    attempt,\n    max_attempts,\n    last_error,\n    pending_child_count,\n    spawn_index,\n    result_payload,\n    otel_traceparent,\n    created_at,\n    updated_at,\n    completed_at,\n    last_activity_at\nFROM agent_sdk_tasks\nWHERE kind = 'subagent'\n  AND status = 'waiting_on_children'\nORDER BY created_at, id\n",
   "describe": {
     "columns": [
       {
@@ -266,13 +266,21 @@
             "name": "completed_at"
           }
         }
+      },
+      {
+        "ordinal": 24,
+        "name": "last_activity_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_tasks",
+            "name": "last_activity_at"
+          }
+        }
       }
     ],
     "parameters": {
-      "Left": [
-        "Timestamptz",
-        "Int8"
-      ]
+      "Left": []
     },
     "nullable": [
       false,
@@ -298,8 +306,9 @@
       true,
       false,
       false,
+      true,
       true
     ]
   },
-  "hash": "47ce72646b0b7cdc02cb8f4cf7595b6a6b2a77c5bfdd053550120435970eb1e7"
+  "hash": "83df7ba84c3079d929cd3fa17c03b958a261caa8bba8837dda117eafd238fb91"
 }

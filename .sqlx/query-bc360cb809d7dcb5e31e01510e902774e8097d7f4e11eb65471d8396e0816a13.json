@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\nSELECT\n    id,\n    kind,\n    status,\n    parent_id,\n    root_id,\n    depth,\n    thread_id,\n    submitted_input_json,\n    caller_metadata_json,\n    worker_id,\n    lease_id,\n    lease_expires_at,\n    last_heartbeat_at,\n    state_json,\n    attempt,\n    max_attempts,\n    last_error,\n    pending_child_count,\n    spawn_index,\n    result_payload,\n    otel_traceparent,\n    created_at,\n    updated_at,\n    completed_at\nFROM agent_sdk_tasks\nWHERE kind = 'subagent'\n  AND status = 'waiting_on_children'\n  AND state_json -> 'invocation' ->> 'child_root_task_id' = $1\nFOR UPDATE SKIP LOCKED\n",
+  "query": "\nUPDATE agent_sdk_tasks\nSET lease_expires_at = $4,\n    last_heartbeat_at = $5,\n    updated_at = $5,\n    last_activity_at = GREATEST(last_activity_at, $6)\nWHERE id = $1 AND status = 'running' AND worker_id = $2 AND lease_id = $3\nRETURNING\n    id,\n    kind,\n    status,\n    parent_id,\n    root_id,\n    depth,\n    thread_id,\n    submitted_input_json,\n    caller_metadata_json,\n    worker_id,\n    lease_id,\n    lease_expires_at,\n    last_heartbeat_at,\n    state_json,\n    attempt,\n    max_attempts,\n    last_error,\n    pending_child_count,\n    spawn_index,\n    result_payload,\n    otel_traceparent,\n    created_at,\n    updated_at,\n    completed_at,\n    last_activity_at\n",
   "describe": {
     "columns": [
       {
@@ -266,11 +266,27 @@
             "name": "completed_at"
           }
         }
+      },
+      {
+        "ordinal": 24,
+        "name": "last_activity_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_tasks",
+            "name": "last_activity_at"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Text",
+        "Text",
+        "Text",
+        "Timestamptz",
+        "Timestamptz",
+        "Timestamptz"
       ]
     },
     "nullable": [
@@ -297,8 +313,9 @@
       true,
       false,
       false,
+      true,
       true
     ]
   },
-  "hash": "3238244fe6f290f84f489d425c1e214dee5353a7190a5ecac90028e7b0bfcfac"
+  "hash": "bc360cb809d7dcb5e31e01510e902774e8097d7f4e11eb65471d8396e0816a13"
 }

@@ -255,6 +255,7 @@ impl Simulation {
                 &held.worker,
                 &held.lease_id,
                 expires,
+                None,
                 self.clock,
             )
             .await

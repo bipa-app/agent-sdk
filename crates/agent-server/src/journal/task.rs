@@ -591,6 +591,29 @@ pub struct AgentTask {
     #[serde(with = "time::serde::rfc3339::option")]
     pub last_heartbeat_at: Option<OffsetDateTime>,
 
+    /// Last durable **evidence of work** on this task.
+    ///
+    /// This is NOT `last_heartbeat_at`. The heartbeat renews unconditionally
+    /// while the task future is alive, so a child hung on a half-open
+    /// connection heartbeats forever — it proves the process is alive, not
+    /// that work is happening. This field only advances when the task
+    /// actually did something: a provider frame arrived, a tool emitted
+    /// progress, or an event was committed.
+    ///
+    /// It is written on the heartbeat path (which already holds the lease, so
+    /// only the owning worker can advance it) and it is deliberately **not**
+    /// an event: event retention cannot purge it, and it does not bloat the
+    /// journal.
+    ///
+    /// `None` means "nothing recorded yet" — a legacy row, or a child that
+    /// has not yet produced its first sign of life. Readers fall back to
+    /// [`Self::created_at`]: spawn is the initial evidence of life.
+    ///
+    /// Consumed by the subagent stall budget (`spec.timeout_ms`), which fails
+    /// a child only after a whole budget with no evidence of work.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub last_activity_at: Option<OffsetDateTime>,
+
     // ── typed durable state blob ────────────────────────────
     /// Strongly typed pause-state owned by the task kind.
     ///
@@ -702,6 +725,7 @@ impl AgentTask {
             lease_id: None,
             lease_expires_at: None,
             last_heartbeat_at: None,
+            last_activity_at: None,
             state: TaskState::None,
             attempt: 0,
             max_attempts,
@@ -807,6 +831,7 @@ impl AgentTask {
             lease_id: None,
             lease_expires_at: None,
             last_heartbeat_at: None,
+            last_activity_at: None,
             state: TaskState::None,
             attempt: 0,
             max_attempts,
@@ -863,6 +888,7 @@ impl AgentTask {
             lease_id: None,
             lease_expires_at: None,
             last_heartbeat_at: None,
+            last_activity_at: None,
             state: TaskState::SubagentInvocation {
                 invocation: Box::new(invocation),
             },
@@ -1167,6 +1193,23 @@ impl AgentTask {
         Ok(self)
     }
 
+    /// Move [`Self::last_activity_at`] forward to `at`, never backward.
+    ///
+    /// The stall-budget's evidence-of-work timestamp is **monotonic by
+    /// contract**: no transition may rewind it. This is the single setter
+    /// every activity write goes through, so the invariant cannot be broken
+    /// by a current or future call site — in particular a terminal
+    /// transition stamped with an instant captured *before* a long
+    /// execution can never overwrite newer heartbeat-persisted activity
+    /// (which would let a parked ancestor read the subtree as silent the
+    /// moment a long child completes). The SQL backends enforce the same
+    /// monotonicity on the heartbeat write with `GREATEST` / `MAX`.
+    fn advance_last_activity_at(&mut self, at: OffsetDateTime) {
+        if self.last_activity_at.is_none_or(|current| at > current) {
+            self.last_activity_at = Some(at);
+        }
+    }
+
     /// Transition from [`TaskStatus::Pending`] to [`TaskStatus::Running`]
     /// and stamp the lease fields.
     ///
@@ -1211,6 +1254,19 @@ impl AgentTask {
         self.lease_id = Some(lease);
         self.lease_expires_at = Some(expires_at);
         self.last_heartbeat_at = Some(now);
+        // Acquisition into Running is itself evidence of work — the fourth
+        // stall-budget refresh point, and the one that makes re-acquisition
+        // survivable. A child (re)acquired after a crash or outage longer
+        // than its budget carries a stale `last_activity_at` from before
+        // the gap; without this it would be reaped on its very first tick,
+        // throwing away a child that was about to resume productively. A
+        // fresh stamp gives it a full budget to prove itself, at the
+        // bounded cost of a genuinely wedged re-acquired child dying one
+        // budget later instead of at once (retries stay capped by
+        // `max_attempts`). A child that never starts is never acquired, so
+        // it never gets this stamp and is still reaped off its `created_at`
+        // floor by the parked sweep.
+        self.advance_last_activity_at(now);
         self.updated_at = now;
         self.validate()?;
         Ok(self)
@@ -1222,6 +1278,14 @@ impl AgentTask {
     /// Used by Phase 2.3's expiry sweeper when a worker misses its
     /// heartbeat. Note that this does NOT decrement `attempt` — the failed
     /// attempt still counts against the retry budget.
+    ///
+    /// ADR-0003 I3 — this is the one lease-dropping transition that
+    /// deliberately does **not** stamp `last_activity_at`. It is the
+    /// *sweeper* reclaiming a **dead worker's** row: nothing worked, and
+    /// crediting it would launder a crash into evidence of life, which is
+    /// precisely the signal the stall budget exists to distinguish. The row
+    /// gets a fresh stamp from `mark_running` when a worker actually picks
+    /// it up again.
     ///
     /// When the task is in [`TaskState::ReadyToResume`] (an ordinary
     /// child fan-in or an early steering resume — both share the
@@ -1298,6 +1362,14 @@ impl AgentTask {
             suspended_messages: payload.suspended_messages,
             child_ids,
         };
+        // ADR-0003 I3. Parking ENDS this row's heartbeat, so every activity
+        // bump since the last tick would otherwise be discarded — and this is
+        // the LAST instant the row records until it is re-acquired, which is
+        // exactly the clock the parked sweep reads. The park instant is the
+        // right stamp: the turn that decided to spawn these children *was*
+        // the work, and `now` dominates the in-memory beacon (every bump was
+        // observed during the execution now ending, so `now >= beacon`).
+        self.advance_last_activity_at(now);
         self.updated_at = now;
         self.validate()?;
         Ok(self)
@@ -1555,6 +1627,11 @@ impl AgentTask {
                 steering: Vec::new(),
             };
         }
+        // ADR-0003 I3. A re-park drops the lease and ends the heartbeat on
+        // BOTH arms, so it must stamp for the same reason `wait_on_children`
+        // does — the steering exchange that produced this re-park was work,
+        // and nothing else will record it.
+        self.advance_last_activity_at(now);
         self.updated_at = now;
         self.validate()?;
         Ok(self)
@@ -1596,6 +1673,11 @@ impl AgentTask {
             continuation: Box::new(continuation),
             prepared_operation,
         };
+        // ADR-0003 I3. Pausing on a confirmation drops the lease and ends the
+        // heartbeat: same park, same stamp. The turn that ran up to the
+        // confirmation point was work, and without this the row's durable
+        // clock stops one tick short of it.
+        self.advance_last_activity_at(now);
         self.updated_at = now;
         self.validate()?;
         Ok(self)
@@ -1660,6 +1742,16 @@ impl AgentTask {
         self.pending_child_count = 0;
         self.state = TaskState::None;
         self.completed_at = Some(now);
+        // Completion is the final evidence of work, recorded on the
+        // terminal transition ITSELF because the row is no longer
+        // heartbeatable — a later beacon-driven heartbeat write would be
+        // CAS-rejected. Keeping it here lets a parent's stall probe see a
+        // just-completed child as a fresh sign of life even after the
+        // child's completion event has aged out of the journal. `now` must
+        // be the actual completion instant (never one captured before a
+        // long execution); the monotonic setter is a second line of
+        // defence so even a stale `now` cannot rewind newer activity.
+        self.advance_last_activity_at(now);
         self.updated_at = now;
         self.validate()?;
         Ok(self)
@@ -1710,6 +1802,11 @@ impl AgentTask {
         self.state = TaskState::None;
         self.last_error = Some(error);
         self.completed_at = Some(now);
+        // Reaching a terminal outcome is itself a state change the parent
+        // fan-in will act on; record it on the transition so a parent
+        // parked on sibling work sees this child as a fresh sign of life
+        // (see [`Self::complete`]). Monotonic: never rewinds newer activity.
+        self.advance_last_activity_at(now);
         self.updated_at = now;
         self.validate()?;
         Ok(self)
@@ -1765,6 +1862,13 @@ impl AgentTask {
         self.pending_child_count = 0;
         self.state = TaskState::None;
         self.completed_at = Some(now);
+        // ADR-0003 I3. Cancellation is the third terminal outcome, and the
+        // stall probe reads terminal rows INLINE (a just-settled child is a
+        // fresh sign of life for a parent parked on sibling work). Stamping
+        // here for the same reason `complete` and `fail` do; omitting it was
+        // pure asymmetry, and it left a just-cancelled child contributing a
+        // stale instant to its parent's probe. Monotonic: never rewinds.
+        self.advance_last_activity_at(now);
         self.updated_at = now;
         self.validate()?;
         Ok(self)
@@ -1792,11 +1896,18 @@ impl AgentTask {
     ///   argument does not match the current lease holder.
     /// - [`TaskSchemaError::HeartbeatLeaseMismatch`] if the `lease`
     ///   argument does not match the current `lease_id`.
+    ///
+    /// `activity` carries the newest sign of work observed by the running
+    /// task since the last beat (`None` when it produced none). It only
+    /// ever moves [`Self::last_activity_at`] forward: a beat that saw no
+    /// work leaves the field untouched rather than clearing it, so a
+    /// task's evidence of life survives its idle beats.
     pub fn touch_heartbeat(
         &mut self,
         worker: &WorkerId,
         lease: &LeaseId,
         expires_at: OffsetDateTime,
+        activity: Option<OffsetDateTime>,
         now: OffsetDateTime,
     ) -> Result<(), TaskSchemaError> {
         if self.status != TaskStatus::Running {
@@ -1815,6 +1926,9 @@ impl AgentTask {
         }
         self.last_heartbeat_at = Some(now);
         self.lease_expires_at = Some(expires_at);
+        if let Some(activity) = activity {
+            self.advance_last_activity_at(activity);
+        }
         self.updated_at = now;
         self.validate()?;
         Ok(())
@@ -2857,6 +2971,7 @@ mod tests {
                 &WorkerId::from_string("w1"),
                 &LeaseId::from_string("l1"),
                 t_plus(60),
+                None,
                 t_plus(1),
             )
             .unwrap_err();
@@ -2876,6 +2991,7 @@ mod tests {
                 &WorkerId::from_string("other"),
                 &LeaseId::from_string("l1"),
                 t_plus(120),
+                None,
                 t_plus(2),
             )
             .unwrap_err();
@@ -2887,6 +3003,7 @@ mod tests {
                 &WorkerId::from_string("w1"),
                 &LeaseId::from_string("l-stale"),
                 t_plus(120),
+                None,
                 t_plus(2),
             )
             .unwrap_err();
@@ -2899,6 +3016,7 @@ mod tests {
                 &WorkerId::from_string("w1"),
                 &LeaseId::from_string("l1"),
                 t_plus(180),
+                None,
                 t_plus(3),
             )
             .context("heartbeat ok")?;
@@ -3119,6 +3237,192 @@ mod tests {
             t_plus(3),
         )?;
         assert_eq!(retried.attempt, 2, "normal retry must increment attempt");
+
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_transitions_stamp_last_activity_at() -> Result<()> {
+        // Reaching a terminal outcome is the child's final evidence of
+        // work, recorded on the transition itself (the row is no longer
+        // heartbeatable) so a parent's stall probe sees a just-terminal
+        // child as a fresh sign of life.
+        let running = AgentTask::new_root_turn(thread(), t0(), 3).mark_running(
+            WorkerId::from_string("w1"),
+            LeaseId::from_string("l1"),
+            t_plus(60),
+            t_plus(1),
+        )?;
+
+        let completed = running.clone().complete(t_plus(10))?;
+        assert_eq!(
+            completed.last_activity_at,
+            Some(t_plus(10)),
+            "completion must stamp last_activity_at",
+        );
+
+        let failed = running.fail("boom".into(), t_plus(20))?;
+        assert_eq!(
+            failed.last_activity_at,
+            Some(t_plus(20)),
+            "failure must stamp last_activity_at",
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_transition_never_rewinds_last_activity_at() -> Result<()> {
+        // A long child accrues fresh heartbeat-persisted activity (t+100),
+        // then completes with an instant captured BEFORE the run (t+50).
+        // The monotonic setter must keep the newer value, so a parked
+        // ancestor cannot read the subtree as silent the moment it finishes.
+        let running = AgentTask::new_root_turn(thread(), t0(), 3).mark_running(
+            WorkerId::from_string("w1"),
+            LeaseId::from_string("l1"),
+            t_plus(200),
+            t_plus(100),
+        )?;
+        assert_eq!(running.last_activity_at, Some(t_plus(100)));
+
+        let completed = running.clone().complete(t_plus(50))?;
+        assert_eq!(
+            completed.last_activity_at,
+            Some(t_plus(100)),
+            "a stale completion instant must never rewind newer activity",
+        );
+
+        let failed = running.fail("boom".into(), t_plus(50))?;
+        assert_eq!(
+            failed.last_activity_at,
+            Some(t_plus(100)),
+            "a stale failure instant must never rewind newer activity",
+        );
+
+        Ok(())
+    }
+
+    fn park_payload() -> SuspensionPayload {
+        SuspensionPayload {
+            continuation: sample_continuation(),
+            suspended_messages: Vec::new(),
+        }
+    }
+
+    /// ADR-0003 I3 — EVERY transition that drops a lease or ends a heartbeat
+    /// must record the transition instant durably.
+    ///
+    /// Activity is otherwise persisted only by the heartbeat, once per tick.
+    /// A transition that ends the heartbeat discards every bump since the last
+    /// tick — and for a row that PARKS, that discarded instant is the last one
+    /// it will ever record until re-acquisition, which is exactly the clock the
+    /// parked sweep reads.
+    ///
+    /// Written as a sweep over the whole transition set (not one case per
+    /// finding) so a NEW lease-dropping transition cannot be added without
+    /// landing here and being given a verdict.
+    #[test]
+    fn every_lease_dropping_transition_stamps_activity() -> Result<()> {
+        // Each case starts from the same Running row whose activity is t+1
+        // (stamped by acquisition) and transitions at t+50.
+        let running = || -> Result<AgentTask> {
+            Ok(AgentTask::new_root_turn(thread(), t0(), 3).mark_running(
+                WorkerId::from_string("w1"),
+                LeaseId::from_string("l1"),
+                t_plus(600),
+                t_plus(1),
+            )?)
+        };
+        let at = t_plus(50);
+
+        // Parks — each drops the lease and ends the heartbeat.
+        let waiting = running()?.wait_on_children(1, park_payload(), Vec::new(), at)?;
+        assert_eq!(
+            waiting.last_activity_at,
+            Some(at),
+            "wait_on_children parks and ends the heartbeat: it must stamp",
+        );
+
+        let reparked = running()?.repark_after_steering(1, park_payload(), Vec::new(), at)?;
+        assert_eq!(
+            reparked.last_activity_at,
+            Some(at),
+            "repark_after_steering parks and ends the heartbeat: it must stamp",
+        );
+
+        let awaiting = running()?.await_confirmation(sample_continuation(), None, at)?;
+        assert_eq!(
+            awaiting.last_activity_at,
+            Some(at),
+            "await_confirmation parks and ends the heartbeat: it must stamp",
+        );
+
+        // Terminals — the probe reads terminal rows INLINE, so a just-settled
+        // child is a fresh sign of life for a parent parked on sibling work.
+        let completed = running()?.complete(at)?;
+        assert_eq!(completed.last_activity_at, Some(at), "complete must stamp");
+
+        let failed = running()?.fail("boom".into(), at)?;
+        assert_eq!(failed.last_activity_at, Some(at), "fail must stamp");
+
+        let cancelled = running()?.cancel(at)?;
+        assert_eq!(
+            cancelled.last_activity_at,
+            Some(at),
+            "cancel is the third terminal outcome and must stamp like the other two",
+        );
+
+        // The ONE deliberate exception: the expiry sweeper reclaiming a DEAD
+        // worker's row. Nothing worked — crediting it would launder a crash
+        // into evidence of life, which is the exact signal the stall budget
+        // exists to distinguish. `mark_running` re-stamps when a worker
+        // actually picks the row up again.
+        let released = running()?.release_lease(at)?;
+        assert_eq!(
+            released.last_activity_at,
+            Some(t_plus(1)),
+            "release_lease must NOT stamp: reclaiming a crashed worker's row is not work",
+        );
+
+        Ok(())
+    }
+
+    /// ADR-0003 I2 — the park stamps route through the monotonic setter, so a
+    /// park carrying an instant older than newer heartbeat-persisted activity
+    /// cannot rewind it. A rewind is indistinguishable from silence.
+    #[test]
+    fn parking_transitions_never_rewind_newer_activity() -> Result<()> {
+        let mut running = AgentTask::new_root_turn(thread(), t0(), 3).mark_running(
+            WorkerId::from_string("w1"),
+            LeaseId::from_string("l1"),
+            t_plus(600),
+            t_plus(10),
+        )?;
+        running.touch_heartbeat(
+            &WorkerId::from_string("w1"),
+            &LeaseId::from_string("l1"),
+            t_plus(600),
+            Some(t_plus(100)),
+            t_plus(100),
+        )?;
+        assert_eq!(running.last_activity_at, Some(t_plus(100)));
+
+        let waiting =
+            running
+                .clone()
+                .wait_on_children(1, park_payload(), Vec::new(), t_plus(50))?;
+        assert_eq!(
+            waiting.last_activity_at,
+            Some(t_plus(100)),
+            "a stale park instant must never rewind newer activity",
+        );
+
+        let cancelled = running.cancel(t_plus(50))?;
+        assert_eq!(
+            cancelled.last_activity_at,
+            Some(t_plus(100)),
+            "a stale cancel instant must never rewind newer activity",
+        );
 
         Ok(())
     }

@@ -77,14 +77,17 @@ mod tests {
     fn executable_migration_bundle_contains_all_migrations() -> Result<()> {
         let migrations = &DURABLE_CORE_MIGRATOR.migrations;
         ensure!(
-            migrations.len() == 11,
-            "expected 11 executable migrations (durable core + event journal + execution intents + tool audit events + outbox kind + task caller metadata + message head drafts + turn attempt otel ids + idempotency + task otel traceparent + checkpoint kind), got {:?}",
+            migrations.len() == 12,
+            "expected 12 executable migrations (durable core + event journal + execution intents + tool audit events + outbox kind + task caller metadata + message head drafts + turn attempt otel ids + idempotency + task otel traceparent + checkpoint kind + task last activity at), got {:?}",
             migrations
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
         );
-        for (idx, expected) in [1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].iter().enumerate() {
+        for (idx, expected) in [1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+            .iter()
+            .enumerate()
+        {
             ensure!(
                 migrations[idx].version == *expected,
                 "expected migration version {expected}, got {}",

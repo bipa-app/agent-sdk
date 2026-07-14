@@ -8,6 +8,7 @@
 //! - Retry safety: in-flight intents for side-effecting tools fail-closed.
 //! - Retry safety: failed-before-start intents allow re-execution.
 //! - Intent status transitions through the full lifecycle.
+use crate::worker::activity::ActivityBeacon;
 use std::sync::Arc;
 
 use super::root_turn::{RootTurnDeps, RootTurnOutcome, execute_root_turn};
@@ -235,6 +236,7 @@ impl TestStores {
             compaction_provider: None,
             cancel: None,
             wakeup: None,
+            activity: None,
         }
     }
 }
@@ -320,7 +322,7 @@ async fn replay_safe_tool_bypasses_intent_persistence() -> Result<()> {
     .await?;
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let op_id = OperationId::new(&ctx.task_id, &ctx.tool_call.id);
 
     let outcome = guarded_tool_execution(
@@ -371,7 +373,7 @@ async fn side_effecting_tool_persists_intent_and_completes() -> Result<()> {
     .await?;
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let op_id = OperationId::new(&ctx.task_id, &ctx.tool_call.id);
 
     let outcome = guarded_tool_execution(
@@ -427,7 +429,7 @@ async fn fail_closed_when_intent_persist_fails() -> Result<()> {
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
     let child_id = child.id.clone();
-    let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
 
     let outcome = guarded_tool_execution(
         ctx,
@@ -491,7 +493,7 @@ async fn retry_blocked_when_intent_already_completed() -> Result<()> {
     .await?;
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let op_id = OperationId::new(&ctx.task_id, &ctx.tool_call.id);
 
     // Pre-seed a Completed intent to simulate a previous successful run.
@@ -556,7 +558,7 @@ async fn retry_blocked_when_intent_ambiguous_in_flight() -> Result<()> {
     .await?;
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let op_id = OperationId::new(&ctx.task_id, &ctx.tool_call.id);
 
     // Pre-seed a Started intent to simulate a crashed mid-execution.
@@ -620,7 +622,7 @@ async fn retry_blocked_when_side_effecting_intent_failed() -> Result<()> {
     .await?;
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let op_id = OperationId::new(&ctx.task_id, &ctx.tool_call.id);
 
     // Pre-seed a Failed intent — the executor ran and returned an error,
@@ -688,7 +690,7 @@ async fn retry_allowed_when_replay_safe_intent_failed() -> Result<()> {
     .await?;
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let op_id = OperationId::new(&ctx.task_id, &ctx.tool_call.id);
 
     // Pre-seed a Failed intent for a replay-safe tool — safe to retry
@@ -750,7 +752,7 @@ async fn side_effecting_failure_records_intent_as_failed() -> Result<()> {
     .await?;
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let op_id = OperationId::new(&ctx.task_id, &ctx.tool_call.id);
 
     let outcome = guarded_tool_execution(
@@ -812,7 +814,7 @@ async fn cancellation_records_intent_as_failed() -> Result<()> {
     .await?;
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let op_id = OperationId::new(&ctx.task_id, &ctx.tool_call.id);
 
     // Cancel before execution.

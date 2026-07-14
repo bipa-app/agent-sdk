@@ -28,7 +28,7 @@ use agent_sdk::{AgentCapabilities, Environment, InMemoryFileSystem, ToolRegistry
 use agent_sdk_foundation::types::{AgentContinuation, AgentState, PendingToolCallInfo, TokenUsage};
 use agent_sdk_foundation::{ContinuationEnvelope, ThreadId, ToolTier};
 use agent_server::journal::task::{AgentTask, AgentTaskId, LeaseId, WorkerId};
-use agent_server::worker::{ToolEventCollector, ToolTaskBootstrap};
+use agent_server::worker::{ActivityBeacon, ToolEventCollector, ToolTaskBootstrap};
 use agent_server::{TaskKind, TaskState, TaskStatus};
 use agent_service_host::registry_tool_executor::RegistryToolExecutor;
 use agent_service_host::runtime::ToolCallExecutor;
@@ -176,6 +176,7 @@ fn make_bootstrap(
         lease_id: None,
         lease_expires_at: None,
         last_heartbeat_at: None,
+        last_activity_at: None,
         state: TaskState::WaitingOnChildren {
             continuation: Box::new(continuation),
             suspended_messages: Vec::new(),
@@ -208,6 +209,7 @@ fn make_bootstrap(
     ToolTaskBootstrap {
         child_task,
         parent_task,
+        activity: ActivityBeacon::default(),
         thread_id: thread.clone(),
         task_id: child_id,
         worker_id,

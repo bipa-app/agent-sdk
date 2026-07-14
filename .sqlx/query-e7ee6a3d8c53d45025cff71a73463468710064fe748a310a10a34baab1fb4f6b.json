@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\nSELECT\n    id,\n    kind,\n    status,\n    parent_id,\n    root_id,\n    depth,\n    thread_id,\n    submitted_input_json,\n    caller_metadata_json,\n    worker_id,\n    lease_id,\n    lease_expires_at,\n    last_heartbeat_at,\n    state_json,\n    attempt,\n    max_attempts,\n    last_error,\n    pending_child_count,\n    spawn_index,\n    result_payload,\n    otel_traceparent,\n    created_at,\n    updated_at,\n    completed_at\nFROM agent_sdk_tasks\nWHERE thread_id = $1\n  AND kind = 'root_turn'\n  AND status = 'queued'\nORDER BY created_at, id\n",
+  "query": "\nSELECT\n    id,\n    kind,\n    status,\n    parent_id,\n    root_id,\n    depth,\n    thread_id,\n    submitted_input_json,\n    caller_metadata_json,\n    worker_id,\n    lease_id,\n    lease_expires_at,\n    last_heartbeat_at,\n    state_json,\n    attempt,\n    max_attempts,\n    last_error,\n    pending_child_count,\n    spawn_index,\n    result_payload,\n    otel_traceparent,\n    created_at,\n    updated_at,\n    completed_at,\n    last_activity_at\nFROM agent_sdk_tasks\nWHERE kind = 'subagent'\n  AND status = 'waiting_on_children'\n  AND state_json -> 'invocation' ->> 'child_root_task_id' = $1\n",
   "describe": {
     "columns": [
       {
@@ -266,6 +266,17 @@
             "name": "completed_at"
           }
         }
+      },
+      {
+        "ordinal": 24,
+        "name": "last_activity_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_tasks",
+            "name": "last_activity_at"
+          }
+        }
       }
     ],
     "parameters": {
@@ -297,8 +308,9 @@
       true,
       false,
       false,
+      true,
       true
     ]
   },
-  "hash": "50e25d15a58f3078db2f1260953bd3108053df5515e312cb9c4e0d0b4e8fee86"
+  "hash": "e7ee6a3d8c53d45025cff71a73463468710064fe748a310a10a34baab1fb4f6b"
 }

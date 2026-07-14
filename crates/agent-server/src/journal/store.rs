@@ -740,6 +740,51 @@ struct CancelMarkerCandidate {
     continuation_usage: Option<TokenUsage>,
 }
 
+/// The bounded result of [`AgentTaskStore::probe_children`].
+#[derive(Debug, Default, Clone)]
+pub struct ChildProbe {
+    /// At most `live_limit` NON-TERMINAL children — the frontier the stall
+    /// walk will expand.
+    pub live: Vec<AgentTask>,
+    /// Whether ANY child of the parent — terminal or live — showed a sign of
+    /// life at or after the cutoff.
+    pub fresh_activity: bool,
+}
+
+impl ChildProbe {
+    /// A task row's effective activity: `last_activity_at ?? created_at`
+    /// (ADR-0003 I1).
+    ///
+    /// A row carries no `last_activity_at` until it is first acquired, and
+    /// rows predating migration 0012 carry none at all. Its creation is still
+    /// its initial evidence of life — treating `None` as "stale forever" reaps
+    /// parents that parked on children they had just spawned.
+    ///
+    /// This is the single definition every backend's `probe_children` must
+    /// agree with, in Rust or in SQL.
+    #[must_use]
+    pub fn effective_activity(task: &AgentTask) -> OffsetDateTime {
+        task.last_activity_at.unwrap_or(task.created_at)
+    }
+
+    /// Fold a full child list into the bounded shape. Used by the default
+    /// (unbounded) implementation and by the in-memory store, and it is the
+    /// reference semantics the SQL backends' bounded queries must match.
+    #[must_use]
+    pub fn from_rows(children: Vec<AgentTask>, cutoff: OffsetDateTime, live_limit: usize) -> Self {
+        let mut out = Self::default();
+        for child in children {
+            if Self::effective_activity(&child) >= cutoff {
+                out.fresh_activity = true;
+            }
+            if !child.status.is_terminal() && out.live.len() < live_limit {
+                out.live.push(child);
+            }
+        }
+        out
+    }
+}
+
 /// Persistent store for [`AgentTask`] rows.
 ///
 /// Implementations are required to expose the index surface documented on
@@ -778,6 +823,7 @@ struct CancelMarkerCandidate {
 /// | [`reject_confirmation`](Self::reject_confirmation) | `AwaitingConfirmation` → `Failed` + parent recompute | status CAS |
 /// | [`cancel_tree`](Self::cancel_tree) | subtree → `Cancelled` | existence check |
 /// | [`release_expired_leases`](Self::release_expired_leases) | `Running` → `Pending` / `Failed` | lease-expiry CAS, recovery matrix |
+
 #[async_trait]
 pub trait AgentTaskStore: Send + Sync {
     /// Insert a new task row. **Not a mutation API** — see the
@@ -927,6 +973,50 @@ pub trait AgentTaskStore: Send + Sync {
     /// # Errors
     /// Returns an error if the store cannot be queried.
     async fn list_children(&self, parent_id: &AgentTaskId) -> Result<Vec<AgentTask>>;
+
+    /// The direct children of `parent_id`, read for the subagent stall probe
+    /// with the READ ITSELF BOUNDED (ADR-0003 I5).
+    ///
+    /// Returns at most `live_limit` **non-terminal** children — the live
+    /// frontier the walk will expand — plus a single flag: whether **any**
+    /// child, terminal or not, has effective activity
+    /// (`last_activity_at ?? created_at`, per I1) at or after `cutoff`.
+    ///
+    /// ## Why not just `list_children`
+    ///
+    /// The probe used to read every child and filter terminal rows in memory.
+    /// Terminal task rows are RETAINED, so a parent that has run thousands of
+    /// tool calls materializes thousands of rows on **every** probe of **every**
+    /// parked ancestor. Past a few thousand, the probe cannot finish inside its
+    /// timeout (I5) — and a probe that times out is treated as *alive*. The
+    /// result is the exact inverse failure: unbounded database work, and a
+    /// genuinely wedged child that can never be reaped because its probe never
+    /// completes. Bounding the read is what keeps enforcement able to converge.
+    ///
+    /// Terminal children are folded into `fresh_activity` rather than returned:
+    /// their activity stamp IS their terminal instant (every terminal
+    /// transition stamps it, per I3), which is at or after any event they
+    /// committed — and they share their parent's `thread_id` (`new_child`
+    /// inherits it), so they contribute no thread the walk has not already
+    /// collected. A nested subagent root, which DOES live on its own thread, is
+    /// a root task reached by the invocation-linkage hop, never by this call.
+    ///
+    /// The default implementation derives the answer from [`Self::list_children`]
+    /// and is therefore **unbounded** — correct, but only appropriate for
+    /// in-memory and decorator stores. Durable backends must override it with
+    /// bounded queries.
+    ///
+    /// # Errors
+    /// Returns an error if the store cannot be queried.
+    async fn probe_children(
+        &self,
+        parent_id: &AgentTaskId,
+        cutoff: OffsetDateTime,
+        live_limit: usize,
+    ) -> Result<ChildProbe> {
+        let children = self.list_children(parent_id).await?;
+        Ok(ChildProbe::from_rows(children, cutoff, live_limit))
+    }
 
     /// List every task currently in the given status.
     ///
@@ -1085,6 +1175,22 @@ pub trait AgentTaskStore: Send + Sync {
     /// expiry is how workers hold their lease open across a long-running
     /// tool call.
     ///
+    /// # Activity
+    ///
+    /// `activity` is the newest **evidence of work** the running task has
+    /// produced (a provider frame, a tool progress emission, an event
+    /// commit), or `None` if it produced none since the last beat. It
+    /// rides the heartbeat because the heartbeat already holds the
+    /// `(worker, lease)` CAS and already writes this row — so activity is
+    /// persisted once per tick instead of once per provider frame.
+    ///
+    /// It only ever moves `last_activity_at` **forward**; a beat carrying
+    /// `None` leaves the column untouched. Note this is emphatically NOT
+    /// `last_heartbeat_at`: the heartbeat renews unconditionally while the
+    /// task future is alive, so a child wedged on a half-open connection
+    /// beats forever. A beat proves the process is alive; `activity`
+    /// proves work happened. The subagent stall budget reads the latter.
+    ///
     /// Returns the refreshed row on success.
     ///
     /// # Errors
@@ -1102,6 +1208,7 @@ pub trait AgentTaskStore: Send + Sync {
         worker: &WorkerId,
         lease: &LeaseId,
         expires_at: OffsetDateTime,
+        activity: Option<OffsetDateTime>,
         now: OffsetDateTime,
     ) -> Result<AgentTask>;
 
@@ -3487,6 +3594,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         worker: &WorkerId,
         lease: &LeaseId,
         expires_at: OffsetDateTime,
+        activity: Option<OffsetDateTime>,
         now: OffsetDateTime,
     ) -> Result<AgentTask> {
         let mut inner = self.inner.write().await;
@@ -3498,10 +3606,11 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
 
         // Drive the row through the pure transition helper: it enforces
         // `status == Running`, the worker CAS, and the lease CAS, and
-        // bumps `last_heartbeat_at` / `lease_expires_at` together.
+        // bumps `last_heartbeat_at` / `lease_expires_at` together, moving
+        // `last_activity_at` forward only when this beat carried work.
         let mut refreshed = old.clone();
         refreshed
-            .touch_heartbeat(worker, lease, expires_at, now)
+            .touch_heartbeat(worker, lease, expires_at, activity, now)
             .context("heartbeat rejected")?;
 
         inner.rebalance_after_row_change(&old, &refreshed);
@@ -6704,6 +6813,7 @@ mod tests {
                 &WorkerId::from_string("w1"),
                 &LeaseId::from_string("l1"),
                 t_plus(180),
+                None,
                 t_plus(30),
             )
             .await
@@ -6746,6 +6856,7 @@ mod tests {
                 &WorkerId::from_string("w-imposter"),
                 &LeaseId::from_string("l1"),
                 t_plus(120),
+                None,
                 t_plus(10),
             )
             .await
@@ -6769,6 +6880,7 @@ mod tests {
                 &WorkerId::from_string("w1"),
                 &LeaseId::from_string("l-stale"),
                 t_plus(120),
+                None,
                 t_plus(10),
             )
             .await
@@ -6797,6 +6909,7 @@ mod tests {
                 &WorkerId::from_string("w1"),
                 &LeaseId::from_string("l1"),
                 t_plus(120),
+                None,
                 t_plus(10),
             )
             .await
@@ -6814,6 +6927,7 @@ mod tests {
                 &WorkerId::from_string("w1"),
                 &LeaseId::from_string("l1"),
                 t_plus(120),
+                None,
                 t_plus(10),
             )
             .await
@@ -7033,6 +7147,7 @@ mod tests {
                 &WorkerId::from_string("w-dead"),
                 &LeaseId::from_string("l-dead"),
                 t_plus(300),
+                None,
                 t_plus(21),
             )
             .await
@@ -7070,6 +7185,7 @@ mod tests {
                 &WorkerId::from_string("w1"),
                 &LeaseId::from_string("l1"),
                 t_plus(100),
+                None,
                 t_plus(5),
             )
             .await
@@ -7167,6 +7283,7 @@ mod tests {
                 &WorkerId::from_string("w-tool"),
                 &LeaseId::from_string("l-tool"),
                 t_plus(200),
+                None,
                 t_plus(6),
             )
             .await
@@ -8285,6 +8402,7 @@ mod tests {
                 &WorkerId::from_string("w-dead"),
                 &LeaseId::from_string("l-dead"),
                 t_plus(300),
+                None,
                 t_plus(30),
             )
             .await
@@ -8340,7 +8458,7 @@ mod tests {
         assert_eq!(reacquired.status, TaskStatus::Running);
         assert!(
             store
-                .heartbeat_task(&id, &worker, &lease, t_plus(60), t_plus(4))
+                .heartbeat_task(&id, &worker, &lease, t_plus(60), None, t_plus(4))
                 .await
                 .is_err(),
             "the requeued-then-reacquired row must reject the old lease",
@@ -8459,6 +8577,7 @@ mod tests {
                 &WorkerId::from_string("w-dead"),
                 &LeaseId::from_string("l-dead"),
                 t_plus(300),
+                None,
                 t_plus(30),
             )
             .await
@@ -10750,6 +10869,7 @@ mod tests {
                 &WorkerId::from_string("w-live"),
                 &LeaseId::from_string("l-live"),
                 t_plus(60),
+                None,
                 t_plus(5),
             )
             .await
@@ -11731,6 +11851,7 @@ mod tests {
                 &WorkerId::from_string("w-child"),
                 &LeaseId::from_string("l-child"),
                 t_plus(120),
+                None,
                 t_plus(11),
             )
             .await
@@ -12536,7 +12657,7 @@ mod tests {
             .await
             .context("sweep")?;
         let err = store
-            .heartbeat_task(&task_id, &old_w, &old_l, t_plus(60), t_plus(11))
+            .heartbeat_task(&task_id, &old_w, &old_l, t_plus(60), None, t_plus(11))
             .await
             .unwrap_err();
         let msg = format!("{err:#}");
@@ -12607,7 +12728,7 @@ mod tests {
         let hb_w = wid.clone();
         let hb_l = lid.clone();
         let hb_handle = tokio::spawn(async move {
-            st1.heartbeat_task(&id1, &hb_w, &hb_l, t_plus(120), t_plus(10))
+            st1.heartbeat_task(&id1, &hb_w, &hb_l, t_plus(120), None, t_plus(10))
                 .await
         });
         let sweep_handle =
@@ -12677,6 +12798,7 @@ mod tests {
                 &WorkerId::from_string("w-ce"),
                 &LeaseId::from_string("l-ce"),
                 t_plus(60),
+                None,
                 t_plus(11),
             )
             .await

@@ -52,6 +52,7 @@ use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::activity::{ActivityBeacon, ActivityTrackingEventRepo};
 use super::definition::{AgentDefinition, ThinkingPolicy};
 use crate::journal::checkpoint::CheckpointKind;
 use crate::journal::checkpoint_store::CheckpointStore;
@@ -160,6 +161,18 @@ pub struct RootTurnDeps<'a> {
     /// existing host; the ticker remains the lost-wakeup backstop even
     /// when a signal is wired.
     pub wakeup: Option<&'a WakeupSignal>,
+    /// Optional live-progress beacon for this task's stall budget.
+    ///
+    /// Bumped on **every** provider frame — including frames that journal
+    /// nothing, such as a pure tool-call stream (`ToolUseStart` /
+    /// `ToolInputDelta` / signature deltas carry no text or thinking, so
+    /// `buffer_stream_delta` buffers no event for them). Without this a
+    /// stream that is actively yielding reads as total silence.
+    ///
+    /// `None` (the default) means nobody is watching this task for stalls,
+    /// which is the case for every host that does not enforce a subagent
+    /// timeout.
+    pub activity: Option<&'a ActivityBeacon>,
 }
 
 impl RootTurnDeps<'_> {
@@ -181,6 +194,36 @@ impl RootTurnDeps<'_> {
         if let Some(signal) = self.wakeup {
             signal.wake_all_now();
         }
+    }
+
+    /// Refresh point (a) for the subagent stall budget: mark this task
+    /// alive because a provider frame arrived. Called on EVERY frame —
+    /// including pure tool-call frames (`ToolUseStart` / `ToolInputDelta` /
+    /// signature deltas) that journal nothing — so an actively-streaming
+    /// turn is never read as silent. No-op when no beacon is wired.
+    fn note_frame_activity(&self) {
+        if let Some(activity) = self.activity {
+            activity.bump(OffsetDateTime::now_utc());
+        }
+    }
+}
+
+impl<'a> RootTurnDeps<'a> {
+    /// Wire this task's stall-budget beacon (ADR-0003).
+    ///
+    /// Sets the beacon **and** routes every event commit through it, in one
+    /// call. The two are deliberately inseparable: a beacon wired *without* the
+    /// tracking repository is exactly how the auto-retry, compaction,
+    /// turn-start and suspension commits ended up invisible to the stall probe
+    /// — each one a healthy child reaped for work the journal had since purged.
+    /// Setting the fields independently is possible but is a bug; use this.
+    pub fn wire_activity(
+        &mut self,
+        beacon: &'a ActivityBeacon,
+        tracked: &'a ActivityTrackingEventRepo<'a>,
+    ) {
+        self.event_repo = tracked;
+        self.activity = Some(beacon);
     }
 }
 
@@ -2299,6 +2342,16 @@ const STREAM_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(330);
 /// crack; a tie is benign — both surface the same recoverable error.
 const STREAM_INTER_EVENT_TIMEOUT: Duration = Duration::from_mins(2);
 
+/// The stall budget for the next stream poll: the (longer) first-event
+/// budget until the stream yields anything, the inter-event budget after.
+const fn stream_stall_budget(received_first_item: bool) -> Duration {
+    if received_first_item {
+        STREAM_INTER_EVENT_TIMEOUT
+    } else {
+        STREAM_FIRST_EVENT_TIMEOUT
+    }
+}
+
 /// Maximum number of consecutive emergency compactions the worker
 /// will run inside a single [`call_llm_with_retry`] invocation
 /// before giving up and propagating the provider's
@@ -3228,11 +3281,7 @@ async fn poll_stream_item(
         usage,
         now,
     } = params;
-    let stall_budget = if received_first_item {
-        STREAM_INTER_EVENT_TIMEOUT
-    } else {
-        STREAM_FIRST_EVENT_TIMEOUT
-    };
+    let stall_budget = stream_stall_budget(received_first_item);
     let polled = match deps.cancel {
         Some(cancel) => {
             tokio::select! {
@@ -3306,6 +3355,9 @@ async fn call_llm_once_inner(
             break;
         };
         received_first_item = true;
+        // Refresh point (a), before the Ok/Err split and the text/thinking
+        // filter: any frame is evidence the provider is yielding.
+        deps.note_frame_activity();
 
         let delta = match result {
             Ok(delta) => delta,
@@ -3564,7 +3616,15 @@ async fn flush_streaming_deltas(
         .commit_event_batch(thread_id, batch, flush_now)
         .await
     {
-        Ok(committed) => deps.event_notifier.notify(&committed),
+        Ok(committed) => {
+            // Refresh point (c) — a durable commit is evidence of work — is
+            // recorded by `ActivityTrackingEventRepo`, which `wire_activity`
+            // installs as `deps.event_repo`. It is deliberately NOT bumped
+            // here: a per-call-site bump is precisely what left the auto-retry,
+            // compaction and suspension commits invisible to the stall probe.
+            // The decorator cannot be forgotten; this line could.
+            deps.event_notifier.notify(&committed);
+        }
         Err(error) => {
             log::warn!(
                 "failed to commit streaming delta batch for thread {thread_id} \
