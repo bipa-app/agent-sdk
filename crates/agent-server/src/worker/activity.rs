@@ -85,7 +85,9 @@ mod tests {
     use super::*;
 
     fn at(secs: i64) -> OffsetDateTime {
-        OffsetDateTime::from_unix_timestamp(secs).expect("valid timestamp")
+        // Infallible by construction: offsetting the epoch saturates
+        // rather than erroring, so no `expect`/`unwrap` in test code.
+        OffsetDateTime::UNIX_EPOCH.saturating_add(time::Duration::seconds(secs))
     }
 
     #[test]

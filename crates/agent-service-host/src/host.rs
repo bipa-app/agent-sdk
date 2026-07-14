@@ -1318,31 +1318,39 @@ pub(crate) struct SubagentExecutionDeadline {
 
 /// Hard cap on the task rows one stall probe will walk.
 ///
-/// A subagent subtree is normally a handful of rows (the child root, its
-/// tool children, any nested invocations). The cap only exists so a
-/// pathological tree cannot turn a per-tick probe into an unbounded scan.
-/// Hitting it answers "not expired" — see the fail-safe below.
+/// The walk descends only through NON-terminal rows (see
+/// [`collect_subtree_activity`]), so for a stalled child its LIVE frontier
+/// is a handful of rows — retained terminal history is pruned and does not
+/// count against this bound. The cap is a last-resort backstop against a
+/// pathological live fan-out; hitting it answers "not expired" (fail-safe)
+/// and is logged, never a silent truncation.
 const MAX_ACTIVITY_SUBTREE_NODES: usize = 512;
 
-/// Every sign of life the subtree under an enforced child can show.
+/// The activity signals of a walked subtree, in the order [`stall_expired`]
+/// consults them.
 #[derive(Debug, Default)]
 struct SubtreeActivity {
-    /// Newest durable `last_activity_at` across the subtree's task rows.
-    newest: Option<time::OffsetDateTime>,
-    /// Every distinct thread the subtree spans. More than one means the
-    /// child spawned a nested subagent, whose frames land on ITS thread —
-    /// never on the enforced child's.
+    /// A row in the subtree carried `last_activity_at >= cutoff` — a
+    /// decisive, durable sign of life. The walk short-circuits on the
+    /// first one, so this is `true` iff the child is *not* stalled by the
+    /// durable signal.
+    found_fresh: bool,
+    /// Distinct threads the fully-walked subtree spans, for the committed-
+    /// event probe. More than one means a nested subagent (whose frames
+    /// land on ITS thread, never the enforced child's). Only meaningful
+    /// when neither `found_fresh` nor `truncated`.
     threads: Vec<agent_sdk_foundation::ThreadId>,
-    /// The walk was cut short (node cap or store error), so `newest` and
-    /// `threads` are incomplete and must not be read as "no activity".
+    /// The walk was cut short (node cap or store error); its verdict is
+    /// inconclusive and must not be read as "no activity".
     truncated: bool,
 }
 
-/// Collect the activity signals of the task subtree rooted at `root`.
+/// Walk the task subtree rooted at `root`, stopping the instant it finds a
+/// durable sign of life at or after `cutoff`.
 ///
-/// Mirrors `InMemoryAgentTaskStore::collect_subtree` and the SQL stores'
-/// `collect_subtree_tx`: a children-BFS over `parent_id` that ALSO hops
-/// the subagent-invocation linkage. Both hops are load-bearing:
+/// A children-BFS over `parent_id` that ALSO hops the subagent-invocation
+/// linkage (mirroring `collect_subtree` / `collect_subtree_tx`). Both hops
+/// are load-bearing:
 ///
 /// * **`parent_id`** reaches a running tool child. Its row is where a long
 ///   tool's live progress lands (the collector's beacon → that task's own
@@ -1353,62 +1361,116 @@ struct SubtreeActivity {
 ///   which is a genuine root (`parent_id` is `None`) on a NEW thread — a
 ///   `parent_id`-only walk misses the entire nested subtree, and a
 ///   productive one would be killed for its parent's silence.
+///
+/// **Only NON-terminal rows are expanded; terminal rows are inspected but
+/// never descended into.** A terminal task's descendants are all terminal
+/// too (the tree completes bottom-up) and its own `last_activity_at` is its
+/// completion instant, so a completed subtree can hold nothing newer than
+/// the terminal row itself. Crucially, terminal rows are inspected **inline
+/// from the full `list_children` rows** — no extra read, and they never
+/// enter the frontier or count against the cap. So retained terminal
+/// history, however wide or deep, cannot inflate the walk: only the live
+/// frontier does. That is what preserves EVENTUAL enforcement — a wedged
+/// child's live frontier is small, so the walk exhausts and returns a real
+/// verdict instead of a perpetual "truncated → active" — while a
+/// just-completed child is still seen (as a direct child of its still-live
+/// parent) and counts as a fresh sign of life for a parked parent.
 async fn collect_subtree_activity(
     task_store: &dyn AgentTaskStore,
     root: &AgentTaskId,
+    cutoff: time::OffsetDateTime,
 ) -> SubtreeActivity {
     let mut out = SubtreeActivity::default();
-    let mut visited: std::collections::BTreeSet<AgentTaskId> = std::collections::BTreeSet::new();
-    let mut frontier: std::collections::VecDeque<AgentTaskId> =
-        std::collections::VecDeque::from([root.clone()]);
+    // Tracks only the NON-terminal rows enqueued for expansion, so the cap
+    // bounds the *live* frontier — never the retained terminal history.
+    let mut expanded: std::collections::BTreeSet<AgentTaskId> = std::collections::BTreeSet::new();
+    let mut frontier: std::collections::VecDeque<AgentTask> = std::collections::VecDeque::new();
 
-    while let Some(id) = frontier.pop_front() {
-        if !visited.insert(id.clone()) {
-            continue;
+    // The root — and any linkage-hopped nested root — is a genuine root task
+    // not returned by a `list_children`, so it needs its own read.
+    match task_store.get(root).await {
+        Ok(Some(task)) => {
+            if note_row_activity(&task, cutoff, &mut out) {
+                return out;
+            }
+            if !task.status.is_terminal() {
+                expanded.insert(task.id.clone());
+                frontier.push_back(task);
+            }
         }
-        if visited.len() > MAX_ACTIVITY_SUBTREE_NODES {
+        // A root that vanished is not evidence of silence.
+        Ok(None) => return out,
+        Err(err) => {
+            warn!(
+                task_id = %root,
+                error = %err,
+                "subagent activity probe could not read the subtree root; treating the child \
+                 as active (fail-safe)",
+            );
+            out.truncated = true;
+            return out;
+        }
+    }
+
+    while let Some(task) = frontier.pop_front() {
+        if expanded.len() > MAX_ACTIVITY_SUBTREE_NODES {
             warn!(
                 root = %root,
                 cap = MAX_ACTIVITY_SUBTREE_NODES,
-                "subagent activity probe hit the subtree node cap; treating the child as \
+                "subagent activity probe hit the live-frontier cap; treating the child as \
                  active (fail-safe: never time out on incomplete evidence)",
             );
             out.truncated = true;
             return out;
         }
-        let task = match task_store.get(&id).await {
-            Ok(Some(task)) => task,
-            // A row that vanished mid-walk is not evidence of silence.
-            Ok(None) => continue,
-            Err(err) => {
-                warn!(
-                    task_id = %id,
-                    error = %err,
-                    "subagent activity probe could not read a subtree row; treating the \
-                     child as active (fail-safe)",
-                );
-                out.truncated = true;
-                return out;
-            }
-        };
 
-        if let Some(activity) = task.last_activity_at
-            && out.newest.is_none_or(|newest| activity > newest)
-        {
-            out.newest = Some(activity);
-        }
-        if !out.threads.contains(&task.thread_id) {
-            out.threads.push(task.thread_id.clone());
-        }
-
+        // Nested subagent: its child root is a separate root task, reached
+        // by an explicit read (it is not a `parent_id` child).
         if let Some(invocation) = task.state.subagent_invocation() {
-            frontier.push_back(invocation.child_root_task_id.clone());
+            let nested = invocation.child_root_task_id.clone();
+            if expanded.insert(nested.clone()) {
+                match task_store.get(&nested).await {
+                    Ok(Some(nested_root)) => {
+                        if note_row_activity(&nested_root, cutoff, &mut out) {
+                            return out;
+                        }
+                        if !nested_root.status.is_terminal() {
+                            frontier.push_back(nested_root);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        warn!(
+                            task_id = %nested,
+                            error = %err,
+                            "subagent activity probe could not read a nested child root; \
+                             treating the child as active (fail-safe)",
+                        );
+                        out.truncated = true;
+                        return out;
+                    }
+                }
+            }
         }
-        match task_store.list_children(&id).await {
-            Ok(children) => frontier.extend(children.into_iter().map(|child| child.id)),
+
+        // Direct children come back as full rows: inspect every child's
+        // activity inline (so a just-completed TERMINAL child still counts
+        // as a fresh sign of life for its parked parent), but enqueue only
+        // NON-terminal children for expansion.
+        match task_store.list_children(&task.id).await {
+            Ok(children) => {
+                for child in children {
+                    if note_row_activity(&child, cutoff, &mut out) {
+                        return out;
+                    }
+                    if !child.status.is_terminal() && expanded.insert(child.id.clone()) {
+                        frontier.push_back(child);
+                    }
+                }
+            }
             Err(err) => {
                 warn!(
-                    task_id = %id,
+                    task_id = %task.id,
                     error = %err,
                     "subagent activity probe could not list a subtree row's children; \
                      treating the child as active (fail-safe)",
@@ -1419,6 +1481,28 @@ async fn collect_subtree_activity(
         }
     }
     out
+}
+
+/// Fold one subtree row's durable activity into `out`. Returns `true` — a
+/// decisive early stop — when the row carries a `last_activity_at` at or
+/// after `cutoff` (a fresh sign of life); otherwise records the row's thread
+/// for the committed-event probe and returns `false`.
+fn note_row_activity(
+    task: &AgentTask,
+    cutoff: time::OffsetDateTime,
+    out: &mut SubtreeActivity,
+) -> bool {
+    if task
+        .last_activity_at
+        .is_some_and(|activity| activity >= cutoff)
+    {
+        out.found_fresh = true;
+        return true;
+    }
+    if !out.threads.contains(&task.thread_id) {
+        out.threads.push(task.thread_id.clone());
+    }
+    false
 }
 
 /// Whether an enforced child has gone its entire `timeout_ms` budget
@@ -1493,11 +1577,11 @@ async fn stall_expired(
         return false;
     }
 
-    let subtree = collect_subtree_activity(stores.task_store.as_ref(), subject).await;
-    if subtree.truncated {
-        return false;
-    }
-    if subtree.newest.is_some_and(|newest| newest >= cutoff) {
+    let subtree = collect_subtree_activity(stores.task_store.as_ref(), subject, cutoff).await;
+    // `found_fresh`: a durable stamp inside the budget anywhere in the
+    // subtree. `truncated`: the walk was inconclusive — never time out on
+    // unknown activity.
+    if subtree.found_fresh || subtree.truncated {
         return false;
     }
 
@@ -1649,38 +1733,21 @@ pub(crate) async fn heartbeat_loop(params: HeartbeatLoopParams) {
         }
 
         let now = time::OffsetDateTime::now_utc();
-
-        // Subagent timeout enforcement (issue #299): one deadline
-        // check per tick, before extending the lease.
-        // Read the beacon BEFORE the deadline check so this tick enforces
-        // against the same instant it is about to persist — and so the
-        // RUNNING leg of enforcement consults the live in-memory value
-        // rather than last tick's durable one, making it exact.
+        // One beacon read per tick, shared by the lease renewal (which
+        // persists it) and the deadline check (which enforces against it),
+        // so both see the same instant. The RUNNING leg thus consults the
+        // live in-memory value rather than last tick's durable one.
         let observed_activity = activity.latest();
 
-        match deadline_tick(
-            &stores,
-            OwnedRootTask {
-                task: &task_id,
-                thread: &thread_id,
-                worker: &worker_id,
-                lease: &lease_id,
-            },
-            deadline,
-            observed_activity,
-            now,
-        )
-        .await
-        {
-            DeadlineTick::Stop => {
-                // Durably failed (or ownership cleanly moved on):
-                // abort the in-flight turn and stop.
-                task_cancel.cancel();
-                return;
-            }
-            DeadlineTick::Continue(next) => deadline = next,
-        }
-
+        // Renew the lease FIRST, before the (potentially slow) subtree
+        // probe in `deadline_tick`. That probe walks the child's subtree
+        // with serial store reads; awaiting it before extending the lease
+        // would let a large subtree or a slow store burn the remaining
+        // lease, and the expiry sweep would then requeue and reacquire the
+        // row while the original provider future is still running —
+        // duplicate execution, the worst failure mode on this path.
+        // Renewing first guarantees a full `lease_duration` of headroom
+        // before any probe runs.
         let new_expires_at = now + lease_duration;
         match stores
             .task_store
@@ -1714,11 +1781,10 @@ pub(crate) async fn heartbeat_loop(params: HeartbeatLoopParams) {
                 return;
             }
             Err(err) => {
-                // Transient store error (e.g. a DB blip). Exiting here
-                // would drop all subsequent beats and let the lease
-                // expire, opening a double-execution window. Keep
-                // retrying on the next tick until the lease is rejected
-                // or `cancel` fires.
+                // Transient store error (e.g. a DB blip). Skip the deadline
+                // probe on a tick whose lease renewal failed — the row may
+                // already be requeued — and retry the beat next tick before
+                // the lease (which has ~3 beats of headroom) expires.
                 warn!(
                     %worker_id,
                     task_id = %task_id,
@@ -1726,7 +1792,33 @@ pub(crate) async fn heartbeat_loop(params: HeartbeatLoopParams) {
                     error = %err,
                     "heartbeat hit a transient store error; retrying on next tick",
                 );
+                continue;
             }
+        }
+
+        // Subagent timeout enforcement (issue #299): the lease is now
+        // freshly renewed, so the subtree probe cannot jeopardise it.
+        match deadline_tick(
+            &stores,
+            OwnedRootTask {
+                task: &task_id,
+                thread: &thread_id,
+                worker: &worker_id,
+                lease: &lease_id,
+            },
+            deadline,
+            observed_activity,
+            now,
+        )
+        .await
+        {
+            DeadlineTick::Stop => {
+                // Durably failed (or ownership cleanly moved on):
+                // abort the in-flight turn and stop.
+                task_cancel.cancel();
+                return;
+            }
+            DeadlineTick::Continue(next) => deadline = next,
         }
     }
 }
@@ -6187,6 +6279,209 @@ mod tests {
         Ok(())
     }
 
+    /// r2 finding 4: a tool child that just completed must reset its parked
+    /// parent's stall budget. The completion instant is stamped on the
+    /// terminal transition itself (the row is no longer heartbeatable), so
+    /// the parent's subtree probe reads the terminal child as a fresh sign
+    /// of life even though the parent's own thread has been silent.
+    #[tokio::test]
+    async fn just_completed_tool_child_keeps_its_parked_parent_alive() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            sample_registry(),
+            subagent_timeout_runtime(Arc::new(SubagentScriptProvider::new()))?,
+        )?;
+        let stores = host.stores().clone();
+
+        let budget_ms: u64 = 30 * 60 * 1_000;
+        let spawned_at = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+        let (_parent, _invocation, child_root) = persist_subagent_fixture(
+            &stores,
+            &ThreadId::from_string("t-tool-complete"),
+            budget_ms,
+            spawned_at,
+        )
+        .await?;
+        let deadline = deadline_for(child_root.created_at, budget_ms).context("deadline")?;
+        let now = time::OffsetDateTime::now_utc();
+
+        // Build a tool child that has just completed. `complete` stamps the
+        // completion instant onto `last_activity_at` as part of the terminal
+        // transition.
+        let tool = AgentTask::new_child(&child_root, TaskKind::ToolRuntime, spawned_at, 3)?
+            .mark_running(
+                WorkerId::from_string("w-tool"),
+                LeaseId::new(),
+                now,
+                spawned_at,
+            )
+            .map_err(|err| anyhow::anyhow!("mark_running: {err}"))?
+            .complete_with_result(
+                serde_json::json!({"ok": true}),
+                now - time::Duration::minutes(1),
+            )
+            .map_err(|err| anyhow::anyhow!("complete: {err}"))?;
+        assert_eq!(
+            tool.last_activity_at,
+            Some(now - time::Duration::minutes(1)),
+            "completion must stamp last_activity_at on the terminal row",
+        );
+        assert!(tool.status.is_terminal());
+        stores.task_store.insert(tool).await?;
+
+        assert!(
+            !stall_expired(&stores, &child_root.id, deadline, None, now).await,
+            "a parent whose tool child completed inside the budget must survive, though the \
+             parent's own thread is silent",
+        );
+        Ok(())
+    }
+
+    /// r2 finding 3: a wedged child buried under a large history of retained
+    /// terminal rows must still time out — the probe must not perpetually
+    /// truncate and treat it as active. Terminal rows are inspected inline
+    /// but never expanded or counted, so even a fan-out well past the node
+    /// cap leaves the live frontier tiny and the walk reaches a real verdict.
+    #[tokio::test]
+    async fn wedged_child_under_large_terminal_history_still_times_out() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            sample_registry(),
+            subagent_timeout_runtime(Arc::new(SubagentScriptProvider::new()))?,
+        )?;
+        let stores = host.stores().clone();
+
+        let budget_ms: u64 = 30 * 60 * 1_000;
+        let spawned_at = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+        let (_parent, _invocation, child_root) = persist_subagent_fixture(
+            &stores,
+            &ThreadId::from_string("t-large-history"),
+            budget_ms,
+            spawned_at,
+        )
+        .await?;
+        let deadline = deadline_for(child_root.created_at, budget_ms).context("deadline")?;
+
+        // A retained history well past the node cap: every one of these is
+        // terminal and long silent. The OLD walk would enqueue them all,
+        // trip the cap, and truncate → "active" forever.
+        let stale = spawned_at;
+        for _ in 0..(MAX_ACTIVITY_SUBTREE_NODES + 16) {
+            let mut done = AgentTask::new_child(&child_root, TaskKind::ToolRuntime, spawned_at, 3)?;
+            done.status = TaskStatus::Completed;
+            done.completed_at = Some(stale);
+            done.last_activity_at = Some(stale);
+            stores.task_store.insert(done).await?;
+        }
+
+        let now = time::OffsetDateTime::now_utc();
+        assert!(
+            stall_expired(&stores, &child_root.id, deadline, None, now).await,
+            "a wedged child must still be reaped despite a retained terminal history larger \
+             than the probe's node cap",
+        );
+        Ok(())
+    }
+
+    /// r2 finding 2: the heartbeat must renew the lease BEFORE running the
+    /// (potentially slow) subtree probe. Otherwise a large subtree or slow
+    /// store consumes the remaining lease, the expiry sweep requeues the
+    /// row, and a second worker reacquires it while the original future is
+    /// still running — duplicate execution. Here the probe's `list_children`
+    /// stalls; the lease must nonetheless already be extended when it does.
+    #[tokio::test]
+    async fn lease_is_renewed_before_the_subtree_probe() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            sample_registry(),
+            subagent_timeout_runtime(Arc::new(SubagentScriptProvider::new()))?,
+        )?;
+        let stores = host.stores().clone();
+
+        let start = time::OffsetDateTime::now_utc();
+        let budget_ms: u64 = 30 * 60 * 1_000;
+        let spawned_at = start - time::Duration::hours(2);
+        let (_parent, _invocation, child_root) = persist_subagent_fixture(
+            &stores,
+            &ThreadId::from_string("t-lease-before-probe"),
+            budget_ms,
+            spawned_at,
+        )
+        .await?;
+        let deadline = deadline_for(child_root.created_at, budget_ms).context("deadline")?;
+
+        // Acquire the child Running under a DELIBERATELY short lease, with a
+        // stale activity stamp (acquired "in the past"), so the probe does
+        // not early-exit and actually reaches `list_children`.
+        let worker = WorkerId::from_string("w-lease-probe");
+        let lease = LeaseId::new();
+        let short_lease_expiry = start + time::Duration::seconds(1);
+        stores
+            .task_store
+            .try_acquire_task(
+                &child_root.id,
+                worker.clone(),
+                lease.clone(),
+                short_lease_expiry,
+                spawned_at,
+            )
+            .await?
+            .context("child must acquire")?;
+
+        let flaky = Arc::new(
+            FlakyTaskStore::new(Arc::clone(&stores.task_store)).stalling_list_children(800),
+        );
+        let probe_started = Arc::clone(&flaky.probe_started);
+        let mut flaky_stores = stores.clone();
+        flaky_stores.task_store = flaky.clone();
+
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(heartbeat_loop(HeartbeatLoopParams {
+            stores: flaky_stores.clone(),
+            task_id: child_root.id.clone(),
+            thread_id: child_root.thread_id.clone(),
+            worker_id: worker.clone(),
+            lease_id: lease.clone(),
+            lease_duration: time::Duration::seconds(30),
+            heartbeat_interval: std::time::Duration::from_millis(50),
+            cancel: cancel.clone(),
+            task_cancel: CancellationToken::new(),
+            deadline: SubagentDeadlineState::Enforced(deadline),
+            activity: agent_server::worker::ActivityBeacon::new(),
+        }));
+
+        // Wait until the probe is in-flight (its stall has begun): the beat
+        // must have already run this tick.
+        probe_started.notified().await;
+
+        // Well past the short acquisition lease but far short of the renewed
+        // one: the row must not be sweepable, proving the beat ran first.
+        let swept = flaky
+            .release_expired_leases(start + time::Duration::seconds(5))
+            .await?;
+        assert!(
+            !swept.iter().any(|record| record.id == child_root.id),
+            "the lease must be renewed before the probe runs, so the child is not sweepable \
+             mid-probe; got {swept:?}",
+        );
+        let mid = flaky.get(&child_root.id).await?.context("child exists")?;
+        assert_eq!(
+            mid.status,
+            TaskStatus::Running,
+            "the child must still be Running under its worker mid-probe",
+        );
+
+        cancel.cancel();
+        handle.await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn resolve_subagent_deadline_only_for_linked_child_roots() -> Result<()> {
         use agent_sdk_foundation::ThreadId;
@@ -6529,6 +6824,12 @@ mod tests {
         fail_task_failures_remaining: AtomicUsize,
         fail_task_attempts: AtomicUsize,
         heartbeat_rejections_remaining: AtomicUsize,
+        /// When non-zero, `list_children` (the subtree probe's expansion
+        /// call) sleeps this many milliseconds before delegating, and fires
+        /// `probe_started` as it begins — so a test can prove the heartbeat
+        /// renewed the lease BEFORE the probe ran.
+        list_children_stall_ms: AtomicUsize,
+        probe_started: Arc<tokio::sync::Notify>,
     }
 
     impl FlakyTaskStore {
@@ -6539,7 +6840,18 @@ mod tests {
                 fail_task_failures_remaining: AtomicUsize::new(0),
                 fail_task_attempts: AtomicUsize::new(0),
                 heartbeat_rejections_remaining: AtomicUsize::new(0),
+                list_children_stall_ms: AtomicUsize::new(0),
+                probe_started: Arc::new(tokio::sync::Notify::new()),
             }
+        }
+
+        /// Make every `list_children` call (the subtree probe's expansion
+        /// step) sleep `ms` before delegating, firing `probe_started` as it
+        /// begins — so a test can assert the heartbeat renewed the lease
+        /// before the probe was even entered.
+        fn stalling_list_children(self, ms: usize) -> Self {
+            self.list_children_stall_ms.store(ms, Ordering::SeqCst);
+            self
         }
 
         fn failing_finds(self, count: usize) -> Self {
@@ -6625,6 +6937,11 @@ mod tests {
             self.inner.list_by_thread(thread_id).await
         }
         async fn list_children(&self, parent_id: &AgentTaskId) -> Result<Vec<AgentTask>> {
+            let stall_ms = self.list_children_stall_ms.load(Ordering::SeqCst);
+            if stall_ms > 0 {
+                self.probe_started.notify_one();
+                tokio::time::sleep(std::time::Duration::from_millis(stall_ms as u64)).await;
+            }
             self.inner.list_children(parent_id).await
         }
         async fn list_by_status(&self, status: TaskStatus) -> Result<Vec<AgentTask>> {

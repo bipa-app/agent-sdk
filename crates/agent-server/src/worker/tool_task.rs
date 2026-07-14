@@ -453,11 +453,12 @@ where
                 now,
             )
             .await?;
-            // Refresh point (c): an event commit is evidence of work. The
-            // beacon records it independently of the journal, so event
-            // retention purging these rows cannot later make this moment
-            // look like silence.
-            bootstrap.activity.bump(now);
+            // No beacon bump here: `complete_task_with_result` above has
+            // already made this row terminal, so a beacon-driven heartbeat
+            // write would be CAS-rejected. The completion instant is
+            // instead recorded durably on the terminal transition itself
+            // (`AgentTask::complete`), which is what a parent's stall probe
+            // reads.
 
             Ok(ToolTaskOutcome::Completed {
                 child,

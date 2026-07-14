@@ -1699,6 +1699,13 @@ impl AgentTask {
         self.pending_child_count = 0;
         self.state = TaskState::None;
         self.completed_at = Some(now);
+        // Completion is the final evidence of work, recorded on the
+        // terminal transition ITSELF because the row is no longer
+        // heartbeatable — a later beacon-driven heartbeat write would be
+        // CAS-rejected. Keeping it here lets a parent's stall probe see a
+        // just-completed child as a fresh sign of life even after the
+        // child's completion event has aged out of the journal.
+        self.last_activity_at = Some(now);
         self.updated_at = now;
         self.validate()?;
         Ok(self)
@@ -1749,6 +1756,11 @@ impl AgentTask {
         self.state = TaskState::None;
         self.last_error = Some(error);
         self.completed_at = Some(now);
+        // Reaching a terminal outcome is itself a state change the parent
+        // fan-in will act on; record it on the transition so a parent
+        // parked on sibling work sees this child as a fresh sign of life
+        // (see [`Self::complete`]).
+        self.last_activity_at = Some(now);
         self.updated_at = now;
         self.validate()?;
         Ok(self)
@@ -3176,6 +3188,36 @@ mod tests {
             t_plus(3),
         )?;
         assert_eq!(retried.attempt, 2, "normal retry must increment attempt");
+
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_transitions_stamp_last_activity_at() -> Result<()> {
+        // Reaching a terminal outcome is the child's final evidence of
+        // work, recorded on the transition itself (the row is no longer
+        // heartbeatable) so a parent's stall probe sees a just-terminal
+        // child as a fresh sign of life.
+        let running = AgentTask::new_root_turn(thread(), t0(), 3).mark_running(
+            WorkerId::from_string("w1"),
+            LeaseId::from_string("l1"),
+            t_plus(60),
+            t_plus(1),
+        )?;
+
+        let completed = running.clone().complete(t_plus(10))?;
+        assert_eq!(
+            completed.last_activity_at,
+            Some(t_plus(10)),
+            "completion must stamp last_activity_at",
+        );
+
+        let failed = running.fail("boom".into(), t_plus(20))?;
+        assert_eq!(
+            failed.last_activity_at,
+            Some(t_plus(20)),
+            "failure must stamp last_activity_at",
+        );
 
         Ok(())
     }
