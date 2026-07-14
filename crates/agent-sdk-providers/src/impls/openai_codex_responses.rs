@@ -2643,14 +2643,27 @@ fn reset_websocket_connection(session: &mut WebsocketSessionState) {
 /// a terminal error and stop.
 ///
 /// `in_flight` stays set when a stream is merely *dropped* — that is how the
-/// next turn for the session learns its state is stale. A stream that finishes
-/// by reporting an error has no such successor to warn: the turn is over and
-/// the state is already reset here, so the marker must be cleared. Leaving it
-/// set makes [`evict_idle_sessions`] skip the entry forever, and the bounded
-/// session map then grows without limit — one stranded entry per distinct
-/// session id that ever hit a terminal stream error.
+/// next turn for the session learns its state is stale and runs the
+/// abandoned-turn cleanup on lock acquisition. A stream that finishes by
+/// reporting an error has no such successor to warn: the turn is over and the
+/// state is cleared here, so the marker is cleared. Leaving it set makes
+/// [`evict_idle_sessions`] skip the entry forever, and the bounded session map
+/// then grows without limit — one stranded entry per session id that ever hit a
+/// terminal stream error.
+///
+/// Because clearing `in_flight` bypasses that abandoned-turn cleanup, this must
+/// itself clear the incremental baseline (`last_request` / `last_response_id` /
+/// `last_response_items`). The baseline is a `previous_response_id` valid only
+/// on the socket that produced it; this turn ended in a terminal error on a
+/// now-discarded socket, so a retry reusing this idle session must send a FULL
+/// request on its fresh socket rather than a stale id the new connection
+/// rejects. (`reset_websocket_connection` clears the baseline only for a
+/// prewarmed session; a real turn is not prewarmed, so it is cleared here.)
 fn end_websocket_turn(session: &mut WebsocketSessionState) {
     reset_websocket_connection(session);
+    session.last_request = None;
+    session.last_response_id = None;
+    session.last_response_items.clear();
     session.in_flight = false;
 }
 
@@ -3733,6 +3746,84 @@ mod tests {
             }) => assert_eq!(text, "follow up"),
             _ => panic!("expected incremental follow-up user message"),
         }
+    }
+
+    #[test]
+    fn end_websocket_turn_clears_the_incremental_baseline_for_the_retry() {
+        // A reused session with an established baseline (turn 1 succeeded, so it
+        // carries `previous_response_id` + its input prefix). Turn 2 then hits a
+        // terminal websocket error and ends via `end_websocket_turn`.
+        let previous_request = ApiStreamingRequest {
+            model: MODEL_GPT53_CODEX.to_string(),
+            instructions: "system".to_string(),
+            input: vec![ApiInputItem::Message(ApiMessage {
+                role: ApiRole::User,
+                content: ApiMessageContent::Text("first".to_string()),
+                phase: None,
+            })],
+            tools: None,
+            max_output_tokens: None,
+            reasoning: None,
+            tool_choice: Some(ApiToolChoice::Mode("auto")),
+            parallel_tool_calls: None,
+            store: false,
+            text: Some(ApiTextSettings {
+                verbosity: "medium",
+                format: None,
+            }),
+            include: None,
+            prompt_cache_key: Some("thread-1".to_string()),
+            stream: true,
+        };
+        let mut session = WebsocketSessionState {
+            connection: None,
+            last_request: Some(previous_request.clone()),
+            last_response_id: Some("resp_prev".to_string()),
+            last_response_items: vec![ApiInputItem::Message(ApiMessage {
+                role: ApiRole::Assistant,
+                content: ApiMessageContent::Parts(vec![ApiInputContent::OutputText {
+                    text: "answer".to_string(),
+                }]),
+                phase: Some("final_answer".to_owned()),
+            })],
+            turn_state: None,
+            // A real turn established the baseline, so it is not prewarmed —
+            // the case where `reset_websocket_connection` would NOT clear it.
+            prewarmed: false,
+            websocket_disabled: false,
+            in_flight: true,
+            last_used: None,
+        };
+
+        end_websocket_turn(&mut session);
+
+        // The baseline is gone, so a retry that reuses this idle session builds
+        // a FULL request on its fresh socket — no `previous_response_id` that a
+        // new connection would reject.
+        assert!(session.last_request.is_none());
+        assert!(session.last_response_id.is_none());
+        assert!(session.last_response_items.is_empty());
+        assert!(!session.in_flight, "the ended turn must be evictable");
+
+        // The follow-up request the retry would send: full input, no incremental id.
+        let retry_request = ApiStreamingRequest {
+            input: vec![ApiInputItem::Message(ApiMessage {
+                role: ApiRole::User,
+                content: ApiMessageContent::Text("follow up".to_string()),
+                phase: None,
+            })],
+            ..previous_request
+        };
+        let websocket_request = prepare_websocket_request(&retry_request, &session, false);
+        assert!(
+            websocket_request.previous_response_id.is_none(),
+            "a retry after a terminal WS error must not reuse the dead socket's response id",
+        );
+        assert_eq!(
+            websocket_request.input.len(),
+            1,
+            "the retry must send the full input, not an incremental delta",
+        );
     }
 
     #[test]
