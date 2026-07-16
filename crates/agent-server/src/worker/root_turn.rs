@@ -1170,9 +1170,9 @@ async fn backfill_orphaned_tool_results(
     Ok(())
 }
 
-/// Maximum retries for a transient LLM stream error.  After this many
-/// recoverable failures (rate-limit / server / dropped connection) the
-/// turn is failed permanently and the user sees the last error.
+/// Maximum retries for a transient LLM stream `ServerError`.  After
+/// this many recoverable failures the turn is failed permanently and
+/// the user sees the last error.
 ///
 /// This budget is per-turn — a fresh user submission starts at zero —
 /// and applies on top of the journal's task-level `max_attempts`
@@ -1181,16 +1181,53 @@ async fn backfill_orphaned_tool_results(
 /// almost always succeeds on the first retry; budgeting three
 /// attempts (~14 s worst-case at the default backoff) covers a longer
 /// transient blip without dragging out a genuinely poisoned turn.
+///
+/// `RateLimited` failures carry their own, far more patient budget
+/// ([`RATE_LIMIT_MAX_RETRIES`]): a 429/529 window is provider weather
+/// measured in minutes, and the two classes must not share a counter
+/// or a short server-error streak would eat the patience an overload
+/// window needs (and vice versa).
 const STREAM_MAX_RETRIES: u32 = 3;
+
+/// Maximum retries for a rate-limited / overloaded LLM stream error
+/// (Anthropic 429 and 529 `overloaded_error` both map to
+/// [`StreamErrorKind::RateLimited`]).
+///
+/// Provider overload windows last minutes, not seconds — the
+/// 2026-07-16 incident held 529s for 30+ minutes and the previous
+/// shared 3-retry/<5 s budget terminally failed every in-flight turn,
+/// including multi-tool turns whose work was already durably
+/// committed and only needed one more model round to deliver.  Ten
+/// retries on the [`RATE_LIMIT_BASE_DELAY_MS`] schedule give ~8.5
+/// minutes of patience; real windows are spiky (other threads landed
+/// successful attempts throughout that incident), so surviving the
+/// gaps is what matters.  The wait is cooperative — cancellation
+/// aborts the backoff sleep immediately — and each retry emits
+/// `AutoRetryStart`, so renderers show an honest "retrying" state
+/// rather than a dead pane.
+const RATE_LIMIT_MAX_RETRIES: u32 = 10;
 
 /// Base backoff for the exponential retry schedule (`base * 2^(n-1)`
 /// with jitter, capped at [`STREAM_MAX_DELAY_MS`]).
 const STREAM_BASE_DELAY_MS: u64 = 500;
 
-/// Upper bound on the retry backoff.  The cap matches the
-/// daemon-reconnect ceiling in the bipi/desktop loops so a transient
-/// blip and a daemon respawn share the same wall-clock vocabulary.
+/// Upper bound on the server-error retry backoff.  The cap matches
+/// the daemon-reconnect ceiling in the bipi/desktop loops so a
+/// transient blip and a daemon respawn share the same wall-clock
+/// vocabulary.
 const STREAM_MAX_DELAY_MS: u64 = 8_000;
+
+/// Base backoff for the rate-limited retry schedule.  Starting at 2 s
+/// keeps the first retry prompt for a one-off 429 while the
+/// exponential climb (2, 4, 8, … capped at
+/// [`RATE_LIMIT_MAX_DELAY_MS`]) backs off hard during a sustained
+/// overload window instead of hammering an already-drowning provider.
+const RATE_LIMIT_BASE_DELAY_MS: u64 = 2_000;
+
+/// Upper bound on the rate-limited retry backoff.  Two minutes per
+/// wait × [`RATE_LIMIT_MAX_RETRIES`] retries bounds the total
+/// patience at roughly 8.5 minutes.
+const RATE_LIMIT_MAX_DELAY_MS: u64 = 120_000;
 
 /// Maximum number of consecutive emergency compactions the worker
 /// will run inside a single [`call_llm_with_retry`] invocation
@@ -1332,7 +1369,7 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
     } = params;
 
     let mut attempt = initial_attempt;
-    let mut retries: u32 = 0;
+    let mut budgets = RetryBudgets::default();
     // Separate budget for compaction-driven retries so transient
     // network blips can't burn through it before a real overflow
     // arrives, and a runaway compaction loop can't hide a genuine
@@ -1346,7 +1383,7 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
         if deps.is_cancelled() {
             bail!("root turn cancelled before LLM attempt");
         }
-        let attempt_now = if retries == 0 && compaction_retries == 0 {
+        let attempt_now = if budgets.total() == 0 && compaction_retries == 0 {
             now
         } else {
             OffsetDateTime::now_utc()
@@ -1365,8 +1402,8 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
                 response,
                 content_ids,
             }) => {
-                if retries > 0 {
-                    emit_auto_retry_end(deps, thread_id, retries, true, None).await;
+                if budgets.total() > 0 {
+                    emit_auto_retry_end(deps, thread_id, budgets.total(), true, None).await;
                 }
                 return Ok(StreamedTurn {
                     response,
@@ -1378,7 +1415,7 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
                 attempt = handle_recoverable_stream_error(RecoverableRetryParams {
                     kind,
                     message: &message,
-                    retries: &mut retries,
+                    budgets: &mut budgets,
                     inputs,
                     definition,
                     attempt_audit_prompt,
@@ -1417,13 +1454,41 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
     }
 }
 
+/// Per-class retry counters for [`call_llm_with_retry`].
+///
+/// `RateLimited` and `ServerError` failures deliberately do not share
+/// a counter: an overload window needs minutes of patience
+/// ([`RATE_LIMIT_MAX_RETRIES`] × up to [`RATE_LIMIT_MAX_DELAY_MS`])
+/// while a genuinely broken stream should fail fast
+/// ([`STREAM_MAX_RETRIES`] × up to [`STREAM_MAX_DELAY_MS`]).  Mixed
+/// streaks spend each class's own budget, so a 529 window interleaved
+/// with one dropped connection doesn't fail the turn early.
+#[derive(Default)]
+struct RetryBudgets {
+    /// Retries spent on `ServerError` (and unclassified-recoverable)
+    /// failures, budgeted by [`STREAM_MAX_RETRIES`].
+    server: u32,
+    /// Retries spent on `RateLimited` failures, budgeted by
+    /// [`RATE_LIMIT_MAX_RETRIES`].
+    rate_limit: u32,
+}
+
+impl RetryBudgets {
+    /// Total retries spent across both classes — used for the
+    /// `AutoRetryEnd { success: true }` attempt count and for
+    /// detecting "this is not the first attempt".
+    const fn total(&self) -> u32 {
+        self.server.saturating_add(self.rate_limit)
+    }
+}
+
 /// Parameters for [`handle_recoverable_stream_error`]. Bundled to
 /// dodge `clippy::too_many_arguments` and keep the call site at
 /// [`call_llm_with_retry`] readable.
 struct RecoverableRetryParams<'a> {
     kind: StreamErrorKind,
     message: &'a str,
-    retries: &'a mut u32,
+    budgets: &'a mut RetryBudgets,
     inputs: &'a RootWorkerInputs,
     definition: &'a AgentDefinition,
     attempt_audit_prompt: &'a str,
@@ -1431,18 +1496,18 @@ struct RecoverableRetryParams<'a> {
     thread_id: &'a agent_sdk_foundation::ThreadId,
 }
 
-/// Handle a recoverable streaming failure: bump the retry counter,
-/// surface `AutoRetryStart`/`AutoRetryEnd`, sleep for the
-/// exponential-backoff delay, and open a fresh turn attempt for the
-/// next iteration. Returns the new attempt the caller should retry
-/// against.
+/// Handle a recoverable streaming failure: bump the failure class's
+/// retry counter, surface `AutoRetryStart`/`AutoRetryEnd`, sleep for
+/// the class's exponential-backoff delay, and open a fresh turn
+/// attempt for the next iteration. Returns the new attempt the caller
+/// should retry against.
 async fn handle_recoverable_stream_error(
     params: RecoverableRetryParams<'_>,
 ) -> Result<TurnAttempt> {
     let RecoverableRetryParams {
         kind,
         message,
-        retries,
+        budgets,
         inputs,
         definition,
         attempt_audit_prompt,
@@ -1450,11 +1515,28 @@ async fn handle_recoverable_stream_error(
         thread_id,
     } = params;
 
+    // Pick the failure class's counter and schedule. Rate limits get
+    // the patient schedule; everything else recoverable keeps the
+    // fail-fast server-error schedule.
+    let (retries, max_retries, base_delay_ms, max_delay_ms) = match kind {
+        StreamErrorKind::RateLimited => (
+            &mut budgets.rate_limit,
+            RATE_LIMIT_MAX_RETRIES,
+            RATE_LIMIT_BASE_DELAY_MS,
+            RATE_LIMIT_MAX_DELAY_MS,
+        ),
+        _ => (
+            &mut budgets.server,
+            STREAM_MAX_RETRIES,
+            STREAM_BASE_DELAY_MS,
+            STREAM_MAX_DELAY_MS,
+        ),
+    };
+
     *retries = retries.saturating_add(1);
-    if *retries > STREAM_MAX_RETRIES {
-        let final_msg = format!(
-            "LLM stream error after {STREAM_MAX_RETRIES} retries (kind={kind:?}): {message}"
-        );
+    if *retries > max_retries {
+        let final_msg =
+            format!("LLM stream error after {max_retries} retries (kind={kind:?}): {message}");
         emit_auto_retry_end(
             deps,
             thread_id,
@@ -1465,24 +1547,16 @@ async fn handle_recoverable_stream_error(
         .await;
         bail!("{final_msg}");
     }
-    let delay = stream_backoff_delay(*retries);
+    let delay = stream_backoff_delay(*retries, base_delay_ms, max_delay_ms);
     let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
     log::warn!(
-        "LLM stream {kind:?} on attempt {retries}/{STREAM_MAX_RETRIES} \
+        "LLM stream {kind:?} on attempt {retries}/{max_retries} \
          for thread {thread_id}; retrying in {delay_ms} ms — {message}",
     );
-    emit_auto_retry_start(
-        deps,
-        thread_id,
-        *retries,
-        STREAM_MAX_RETRIES,
-        delay_ms,
-        message,
-    )
-    .await;
+    emit_auto_retry_start(deps, thread_id, *retries, max_retries, delay_ms, message).await;
     // Cooperative cancellation: abort the backoff promptly instead of
-    // sleeping out the full (up to 8s) delay on an already-cancelled
-    // turn.
+    // sleeping out the full (up to 120s on the rate-limit schedule)
+    // delay on an already-cancelled turn.
     match deps.cancel {
         Some(cancel) => {
             tokio::select! {
@@ -1615,13 +1689,17 @@ async fn try_recover_with_compaction(
 /// Exponential backoff with bounded jitter.  Mirrors
 /// `agent_sdk::agent_loop::helpers::calculate_backoff_delay` but
 /// is duplicated here to avoid leaking a `pub(crate)` boundary across
-/// crates for a tiny pure helper.
-fn stream_backoff_delay(attempt: u32) -> Duration {
+/// crates for a tiny pure helper.  The base/cap pair selects the
+/// schedule: fail-fast for server errors
+/// ([`STREAM_BASE_DELAY_MS`]/[`STREAM_MAX_DELAY_MS`]) or patient for
+/// rate limits
+/// ([`RATE_LIMIT_BASE_DELAY_MS`]/[`RATE_LIMIT_MAX_DELAY_MS`]).
+fn stream_backoff_delay(attempt: u32, base_delay_ms: u64, max_delay_ms: u64) -> Duration {
     // Exponential: base, base*2, base*4, ...
-    let base = STREAM_BASE_DELAY_MS.saturating_mul(1u64 << attempt.saturating_sub(1).min(20));
+    let base = base_delay_ms.saturating_mul(1u64 << attempt.saturating_sub(1).min(20));
     // Add jitter (0..min(base, 1000)ms) to spread out colliding
     // retries from independent turns hitting the same upstream blip.
-    let max_jitter = STREAM_BASE_DELAY_MS.min(1000);
+    let max_jitter = base_delay_ms.min(1000);
     let jitter = if max_jitter > 0 {
         use std::collections::hash_map::RandomState;
         use std::hash::{BuildHasher, Hasher};
@@ -1629,7 +1707,7 @@ fn stream_backoff_delay(attempt: u32) -> Duration {
     } else {
         0
     };
-    let delay_ms = base.saturating_add(jitter).min(STREAM_MAX_DELAY_MS);
+    let delay_ms = base.saturating_add(jitter).min(max_delay_ms);
     Duration::from_millis(delay_ms)
 }
 
