@@ -4305,6 +4305,205 @@ async fn stream_invalid_request_does_not_retry() -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Per-class retry budgets — RateLimited outlives the ServerError budget
+// ─────────────────────────────────────────────────────────────────────
+
+/// One scripted transient failure for [`ScriptedProvider`].
+enum ScriptedOutcome {
+    RateLimited,
+    ServerError,
+}
+
+/// Provider that plays a scripted sequence of transient outcomes
+/// before succeeding — lets tests interleave `RateLimited` and
+/// `ServerError` failures to pin the per-class retry budgets
+/// (`RATE_LIMIT_MAX_RETRIES` vs `STREAM_MAX_RETRIES`).
+struct ScriptedProvider {
+    script: Vec<ScriptedOutcome>,
+    success_text: String,
+    call_count: AtomicUsize,
+}
+
+impl ScriptedProvider {
+    fn new(script: Vec<ScriptedOutcome>, success_text: &str) -> Self {
+        Self {
+            script,
+            success_text: success_text.to_owned(),
+            call_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.call_count.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl LlmProvider for ScriptedProvider {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+        match self.script.get(n) {
+            Some(ScriptedOutcome::RateLimited) => Ok(ChatOutcome::RateLimited(None)),
+            Some(ScriptedOutcome::ServerError) => Ok(ChatOutcome::ServerError(format!(
+                "synthetic transient error #{n}"
+            ))),
+            None => Ok(ChatOutcome::Success(ChatResponse {
+                id: format!("msg_scripted_{n}"),
+                content: vec![ContentBlock::Text {
+                    text: self.success_text.clone(),
+                }],
+                model: "mock-model".into(),
+                stop_reason: Some(StopReason::EndTurn),
+                usage: Usage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cached_input_tokens: 10,
+                    cache_creation_input_tokens: 0,
+                },
+            })),
+        }
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
+// `start_paused` — the rate-limit schedule sleeps for minutes of
+// virtual time (2s → 120s per wait); tokio's auto-advancing test
+// clock makes these instant without weakening the schedule under test.
+#[tokio::test(start_paused = true)]
+async fn rate_limited_outlives_the_server_error_budget() -> Result<()> {
+    // Five consecutive rate-limited failures exceed the server-error
+    // budget (3) but sit well inside the rate-limit budget (10). The
+    // turn must ride out the window and complete — this is the
+    // 2026-07-16 overload-incident regression pin: a 529 window used
+    // to terminally fail the turn in under 5 seconds.
+    let stores = TestStores::new();
+    let script = (0..5).map(|_| ScriptedOutcome::RateLimited).collect();
+    let provider = ScriptedProvider::new(script, "Survived the overload window!");
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let bootstrap = sample_bootstrap(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    let outcome = execute_root_turn(inputs, "ping", &provider, &stores.deps(), t_plus(1)).await?;
+    let RootTurnOutcome::Completed { response_text, .. } = outcome else {
+        panic!("expected Completed after riding out the rate-limit window, got Suspended");
+    };
+    assert_eq!(response_text, "Survived the overload window!");
+    assert_eq!(provider.calls(), 6, "5 failures + 1 success");
+
+    let attempts = stores.attempts.list_by_task(&task_id).await?;
+    assert_eq!(attempts.len(), 6);
+    assert!(attempts.iter().all(TurnAttempt::is_closed));
+
+    let kinds = collected_event_kinds(&stores.events).await;
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "auto_retry_start").count(),
+        5,
+        "one auto_retry_start per rate-limited failure in {kinds:?}",
+    );
+    assert!(
+        kinds.iter().any(|k| k == "auto_retry_end"),
+        "expected an auto_retry_end event in {kinds:?}",
+    );
+
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn rate_limited_exhausts_its_own_deeper_budget() -> Result<()> {
+    // A provider that never stops rate-limiting must still fail
+    // eventually — after the rate-limit budget (10), not the
+    // server-error budget (3), and the terminal message must name the
+    // class so operators can tell weather from breakage.
+    let stores = TestStores::new();
+    let script = (0..32).map(|_| ScriptedOutcome::RateLimited).collect();
+    let provider = ScriptedProvider::new(script, "(unreachable)");
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let bootstrap = sample_bootstrap(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    let err = execute_root_turn(inputs, "ping", &provider, &stores.deps(), t_plus(1))
+        .await
+        .expect_err("expected rate-limit budget exhaustion");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("after 10 retries") && msg.contains("RateLimited"),
+        "expected rate-limit budget-exhausted message, got: {msg}",
+    );
+
+    // 1 initial + 10 retries, every audit row closed.
+    assert_eq!(provider.calls(), 11);
+    let attempts = stores.attempts.list_by_task(&task_id).await?;
+    assert_eq!(attempts.len(), 11);
+    assert!(attempts.iter().all(TurnAttempt::is_closed));
+
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn rate_limit_and_server_error_budgets_are_independent() -> Result<()> {
+    // Five rate-limited failures followed by two server errors: the
+    // rate-limit streak must not have consumed the server budget (2 of
+    // 3 spent), so the turn still completes. A shared counter would
+    // have failed the turn on the first server error (6th failure > 3).
+    let stores = TestStores::new();
+    let script = vec![
+        ScriptedOutcome::RateLimited,
+        ScriptedOutcome::RateLimited,
+        ScriptedOutcome::RateLimited,
+        ScriptedOutcome::RateLimited,
+        ScriptedOutcome::RateLimited,
+        ScriptedOutcome::ServerError,
+        ScriptedOutcome::ServerError,
+    ];
+    let provider = ScriptedProvider::new(script, "Both budgets intact!");
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let bootstrap = sample_bootstrap(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    let outcome = execute_root_turn(inputs, "ping", &provider, &stores.deps(), t_plus(1)).await?;
+    let RootTurnOutcome::Completed { response_text, .. } = outcome else {
+        panic!("expected Completed with independent budgets, got Suspended");
+    };
+    assert_eq!(response_text, "Both budgets intact!");
+    assert_eq!(provider.calls(), 8, "7 scripted failures + 1 success");
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Findings #3 / #11 / #12 — per-turn (`tools_fn`) tier drives the gate
 // ─────────────────────────────────────────────────────────────────────
 
