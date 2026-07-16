@@ -1141,7 +1141,7 @@ INSERT INTO agent_sdk_tasks (
             i64::from(task.depth),
             thread_key(&task.thread_id),
             json_to_value(&task.submitted_input, "task submitted input")?,
-            task.caller_metadata.clone(),
+            sanitize_optional_jsonb(task.caller_metadata.clone()),
             task.worker_id.as_ref().map(WorkerId::as_str),
             task.lease_id.as_ref().map(LeaseId::as_str),
             task.lease_expires_at,
@@ -1149,10 +1149,10 @@ INSERT INTO agent_sdk_tasks (
             json_to_value(&task.state, "task state")?,
             i64::from(task.attempt),
             i64::from(task.max_attempts),
-            task.last_error.clone(),
+            sanitize_optional_text(task.last_error.clone()),
             i64::from(task.pending_child_count),
             task.spawn_index.map(i64::from),
-            task.result_payload.clone(),
+            sanitize_optional_jsonb(task.result_payload.clone()),
             task.otel_traceparent.clone(),
             task.created_at,
             task.updated_at,
@@ -1209,14 +1209,14 @@ WHERE id = $1
             json_to_value(&task.state, "task state")?,
             i64::from(task.attempt),
             i64::from(task.max_attempts),
-            task.last_error.clone(),
+            sanitize_optional_text(task.last_error.clone()),
             i64::from(task.pending_child_count),
             task.spawn_index.map(i64::from),
-            task.result_payload.clone(),
+            sanitize_optional_jsonb(task.result_payload.clone()),
             task.created_at,
             task.updated_at,
             task.completed_at,
-            task.caller_metadata.clone(),
+            sanitize_optional_jsonb(task.caller_metadata.clone()),
             task.otel_traceparent.clone(),
         )
         .execute(&mut **tx)
@@ -5598,7 +5598,73 @@ const fn thread_key(thread_id: &ThreadId) -> &str {
 }
 
 fn json_to_value<T: Serialize + ?Sized>(value: &T, label: &str) -> Result<serde_json::Value> {
-    serde_json::to_value(value).with_context(|| format!("serialize {label} to JSON"))
+    let mut value =
+        serde_json::to_value(value).with_context(|| format!("serialize {label} to JSON"))?;
+    sanitize_jsonb(&mut value);
+    Ok(value)
+}
+
+/// Strip NUL (`\u{0}`) code points from every string in a JSON value —
+/// keys and values, recursively — so the value is storable in a
+/// `PostgreSQL` `jsonb` column.
+///
+/// `PostgreSQL` rejects NUL anywhere in `jsonb` (and `text`) with
+/// `unsupported Unicode escape sequence`, and tool outputs are
+/// arbitrary bytes-turned-strings: a production `bash` tool call that
+/// surfaced binary data made the child's `complete_task_with_result`
+/// write fail, burning the whole tool attempt. Dropping the NULs
+/// loses nothing `PostgreSQL` could have stored — the alternative is a
+/// failed write.
+fn sanitize_jsonb(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) if s.contains('\0') => {
+            s.retain(|c| c != '\0');
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                sanitize_jsonb(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if map.keys().any(|k| k.contains('\0')) {
+                // Keys are immutable in place — rebuild the map only on
+                // the (pathological) NUL-in-key path.
+                let entries: Vec<(String, serde_json::Value)> = std::mem::take(map)
+                    .into_iter()
+                    .map(|(k, mut v)| {
+                        sanitize_jsonb(&mut v);
+                        (k.replace('\0', ""), v)
+                    })
+                    .collect();
+                map.extend(entries);
+            } else {
+                for v in map.values_mut() {
+                    sanitize_jsonb(v);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// [`sanitize_jsonb`] for the optional raw-`serde_json::Value` task
+/// fields (`result_payload`, `caller_metadata`) that bind into
+/// `jsonb` columns without passing through [`json_to_value`].
+fn sanitize_optional_jsonb(mut value: Option<serde_json::Value>) -> Option<serde_json::Value> {
+    if let Some(v) = value.as_mut() {
+        sanitize_jsonb(v);
+    }
+    value
+}
+
+/// Strip NUL from an optional string bound into a `text` column
+/// (`PostgreSQL` rejects NUL in `text` exactly like in `jsonb`).
+/// `last_error` can embed tool output, so it shares the hazard.
+fn sanitize_optional_text(value: Option<String>) -> Option<String> {
+    match value {
+        Some(s) if s.contains('\0') => Some(s.replace('\0', "")),
+        other => other,
+    }
 }
 
 fn json_from_value<T: DeserializeOwned>(value: serde_json::Value, label: &str) -> Result<T> {
@@ -7347,6 +7413,109 @@ mod tests {
             wakeups_after_queued, 1,
             "a queued (parked) root must not emit an extra task_wakeup"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn sanitize_jsonb_strips_nul_from_strings_arrays_and_keys() {
+        let mut value = serde_json::json!({
+            "output": "binary\u{0}garbage\u{0}",
+            "nested": ["a\u{0}b", 42, {"k\u{0}ey": "v\u{0}al"}],
+            "clean": "untouched",
+            "count": 7,
+        });
+        sanitize_jsonb(&mut value);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "output": "binarygarbage",
+                "nested": ["ab", 42, {"key": "val"}],
+                "clean": "untouched",
+                "count": 7,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn nul_in_tool_result_payload_survives_the_jsonb_write() -> Result<()> {
+        // Production regression: a bash tool surfaced binary output
+        // containing NUL; PostgreSQL rejected the `result_payload`
+        // jsonb write with `unsupported Unicode escape sequence`,
+        // failing `complete_task_with_result` and burning the whole
+        // (already-approved) tool attempt.
+        let Some((store, _guard)) = test_store().await? else {
+            return Ok(());
+        };
+
+        let root = fresh_root("t-pg-nul-payload", 0);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await?;
+        let worker = WorkerId::from_string("w-pg-nul");
+        let lease = LeaseId::from_string("l-pg-nul");
+        store
+            .try_acquire_task(&id, worker.clone(), lease.clone(), t_plus(60), t_plus(1))
+            .await?
+            .context("claimed root")?;
+
+        let payload = serde_json::json!({
+            "output": "before\u{0}after",
+            "chunks": ["x\u{0}y"],
+        });
+        let (completed, _promoted) = store
+            .complete_task_with_result(&id, &worker, &lease, payload, t_plus(2))
+            .await
+            .context("complete_task_with_result must survive NUL in the payload")?;
+
+        assert_eq!(completed.status, TaskStatus::Completed);
+        let stored = AgentTaskStore::get(&store, &id)
+            .await?
+            .context("task should exist")?;
+        let stored_payload = stored.result_payload.context("payload should be stored")?;
+        assert_eq!(
+            stored_payload,
+            serde_json::json!({"output": "beforeafter", "chunks": ["xy"]}),
+            "NULs must be stripped, everything else preserved",
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nul_in_last_error_survives_the_text_write() -> Result<()> {
+        // `last_error` is TEXT and shares the NUL hazard: an error
+        // message quoting tool output must not make `fail_task` itself
+        // fail (a task that cannot be failed wedges its thread).
+        let Some((store, _guard)) = test_store().await? else {
+            return Ok(());
+        };
+
+        let root = fresh_root("t-pg-nul-error", 0);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await?;
+        let worker = WorkerId::from_string("w-pg-nul-err");
+        let lease = LeaseId::from_string("l-pg-nul-err");
+        store
+            .try_acquire_task(&id, worker.clone(), lease.clone(), t_plus(60), t_plus(1))
+            .await?
+            .context("claimed root")?;
+
+        let (failed, _promoted) = store
+            .fail_task(
+                &id,
+                &worker,
+                &lease,
+                "tool said: oops\u{0}!".into(),
+                t_plus(2),
+            )
+            .await
+            .context("fail_task must survive NUL in the error string")?;
+
+        assert_eq!(failed.status, TaskStatus::Failed);
+        let stored = AgentTaskStore::get(&store, &id)
+            .await?
+            .context("task should exist")?;
+        assert_eq!(stored.last_error.as_deref(), Some("tool said: oops!"));
 
         Ok(())
     }
