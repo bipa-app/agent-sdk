@@ -217,6 +217,15 @@ pub struct OpenAIProvider {
     base_url: String,
     thinking: Option<ThinkingConfig>,
     reasoning: Option<OpenAIReasoningConfig>,
+    /// Verbatim `reasoning.effort` string sent instead of the typed
+    /// mapping, always on the OpenAI-compatible nested wire.
+    ///
+    /// Effort vocabularies are model-specific and mutually incompatible
+    /// (GLM accepts `high|max|none`; o-series accept `low|medium|high`)
+    /// — gateways fronting such models (Baseten, `OpenRouter`) set the
+    /// exact string their model expects. `None` keeps the typed
+    /// [`OpenAIReasoningConfig`] / thinking-derived mapping.
+    reasoning_effort_override: Option<String>,
     /// Extra headers applied to every request (e.g. for gateway authentication).
     extra_headers: Vec<(String, String)>,
 }
@@ -235,6 +244,7 @@ impl OpenAIProvider {
             base_url: DEFAULT_BASE_URL.to_owned(),
             thinking: None,
             reasoning: None,
+            reasoning_effort_override: None,
             extra_headers: Vec::new(),
         }
     }
@@ -278,6 +288,7 @@ impl OpenAIProvider {
             base_url: base_url.into(),
             thinking: None,
             reasoning: None,
+            reasoning_effort_override: None,
             extra_headers: Vec::new(),
         }
     }
@@ -474,6 +485,17 @@ impl OpenAIProvider {
     pub fn with_reasoning(mut self, reasoning: OpenAIReasoningConfig) -> Self {
         self.reasoning = Some(reasoning);
         self.thinking = None;
+        self
+    }
+
+    /// Send this exact string as the OpenAI-compatible nested
+    /// `reasoning.effort` (verbatim; no typed mapping), winning over any
+    /// [`with_reasoning`](Self::with_reasoning) /
+    /// [`with_thinking`](Self::with_thinking)-derived effort. See
+    /// `reasoning_effort_override` for why gateways need this.
+    #[must_use]
+    pub fn with_reasoning_effort(mut self, effort: impl Into<String>) -> Self {
+        self.reasoning_effort_override = Some(effort.into());
         self
     }
 
@@ -770,6 +792,7 @@ impl LlmProvider for OpenAIProvider {
         let reasoning = build_chat_api_reasoning(
             reasoning_config.as_ref(),
             official_openai || self.reasoning.is_some(),
+            self.reasoning_effort_override.as_deref(),
         );
         let verbosity = reasoning_config
             .as_ref()
@@ -925,6 +948,7 @@ impl LlmProvider for OpenAIProvider {
             let reasoning = build_chat_api_reasoning(
                 reasoning_config.as_ref(),
                 official_openai || self.reasoning.is_some(),
+                self.reasoning_effort_override.as_deref(),
             );
             let verbosity = reasoning_config
                 .as_ref()
@@ -1571,7 +1595,21 @@ fn map_finish_reason(finish_reason: &str) -> StopReason {
 fn build_chat_api_reasoning(
     config: Option<&OpenAIReasoningConfig>,
     first_party_wire: bool,
+    verbatim_override: Option<&str>,
 ) -> Option<ApiChatReasoning> {
+    // A verbatim gateway vocabulary wins over any typed / thinking-derived
+    // effort and always rides the OpenAI-compatible nested wire — the
+    // gateways that need it (GLM's `max`, observed 400ing on the typed
+    // mapping in prod 2026-07-13) read `reasoning.effort`, not the
+    // first-party top-level `reasoning_effort`.
+    if let Some(effort) = verbatim_override {
+        return Some(ApiChatReasoning {
+            reasoning_effort: None,
+            reasoning: Some(ApiCompatibleReasoning {
+                effort: ApiReasoningEffortValue::Verbatim(effort.to_owned()),
+            }),
+        });
+    }
     config
         .and_then(OpenAIReasoningConfig::effort)
         .map(|effort| {
@@ -1583,7 +1621,9 @@ fn build_chat_api_reasoning(
             } else {
                 ApiChatReasoning {
                     reasoning_effort: None,
-                    reasoning: Some(ApiCompatibleReasoning { effort }),
+                    reasoning: Some(ApiCompatibleReasoning {
+                        effort: ApiReasoningEffortValue::Typed(effort),
+                    }),
                 }
             }
         })
@@ -2067,7 +2107,17 @@ struct ApiChatReasoning {
 
 #[derive(Serialize)]
 struct ApiCompatibleReasoning {
-    effort: OpenAIReasoningEffort,
+    effort: ApiReasoningEffortValue,
+}
+
+/// Nested-wire `reasoning.effort` value: the typed enum for the standard
+/// mapping, or a verbatim string for model-specific gateway vocabularies
+/// (see `OpenAIProvider::reasoning_effort_override`).
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ApiReasoningEffortValue {
+    Typed(OpenAIReasoningEffort),
+    Verbatim(String),
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -4625,6 +4675,7 @@ mod tests {
             reasoning: build_chat_api_reasoning(
                 Some(&OpenAIReasoningConfig::new().with_effort(OpenAIReasoningEffort::High)),
                 true,
+                None,
             ),
             response_format: None,
             verbosity: None,
@@ -4660,7 +4711,7 @@ mod tests {
             max_tokens: None,
             tools: None,
             tool_choice: None,
-            reasoning: build_chat_api_reasoning(Some(&reasoning), false),
+            reasoning: build_chat_api_reasoning(Some(&reasoning), false, None),
             response_format: None,
             verbosity: None,
             prompt_cache_options: None,
@@ -4673,6 +4724,28 @@ mod tests {
         let json = serde_json::to_value(&request)?;
         assert_eq!(json["reasoning"]["effort"], "high");
         assert!(json.get("reasoning_effort").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_reasoning_effort_override_is_sent_verbatim_on_the_nested_wire() -> anyhow::Result<()> {
+        // GLM-style vocabularies ("max") must pass through untouched on the
+        // OpenAI-compatible nested wire (GLM 400s on the typed mapping's
+        // "xhigh", and reads `reasoning.effort`, not the first-party
+        // top-level `reasoning_effort`). The override wins over any typed
+        // config even when `first_party_wire` would otherwise apply.
+        let typed = OpenAIReasoningConfig::new().with_effort(OpenAIReasoningEffort::Low);
+        let reasoning =
+            build_chat_api_reasoning(Some(&typed), true, Some("max")).expect("override present");
+        let json = serde_json::to_value(&reasoning)?;
+        assert_eq!(json["reasoning"]["effort"], "max");
+        assert!(json.get("reasoning_effort").is_none());
+
+        // Override also applies with no typed config at all.
+        let reasoning =
+            build_chat_api_reasoning(None, false, Some("none")).expect("override present");
+        let json = serde_json::to_value(&reasoning)?;
+        assert_eq!(json["reasoning"]["effort"], "none");
         Ok(())
     }
 
