@@ -1186,6 +1186,13 @@ fn responses_stream_error_kind(
         log::warn!("Responses API rate limited (recoverable): {message}");
         return StreamErrorKind::RateLimited(crate::retry_hints::openai_retry_delay(message));
     }
+    if is_context_window_rejection(code, message) {
+        // Fatal request-shape error, not transient: the worker's overflow
+        // compaction must fire instead of retrying the same oversized
+        // payload (mirrors `openai_codex_responses::is_context_window_rejection`).
+        log::warn!("Responses API context window exceeded (fatal): {message}");
+        return StreamErrorKind::InvalidRequest;
+    }
     if event_type == "response.failed"
         || code == Some("server_error")
         || raw.contains("server_error")
@@ -1195,6 +1202,21 @@ fn responses_stream_error_kind(
     }
     log::error!("Responses API error event: {message}");
     StreamErrorKind::InvalidRequest
+}
+
+/// True when a failure code/message rejects the prompt for exceeding the
+/// model's context window. The structured `context_length_exceeded` code is
+/// the primary signal; the prose shapes cover wrapped or proxied failures
+/// that drop the code. Mirrors
+/// `openai_codex_responses::is_context_window_rejection`.
+fn is_context_window_rejection(code: Option<&str>, message: &str) -> bool {
+    if matches!(code, Some("context_length_exceeded")) {
+        return true;
+    }
+    let lower = message.to_lowercase();
+    lower.contains("exceeds the context window")
+        || lower.contains("maximum context length")
+        || lower.contains("context_length_exceeded")
 }
 
 /// Classify a non-success HTTP status into an early [`ChatOutcome`].
@@ -2838,6 +2860,26 @@ mod tests {
     async fn in_band_non_rate_limit_error_keeps_its_previous_classification() -> anyhow::Result<()>
     {
         let body = "data: {\"type\":\"error\",\"code\":\"invalid_prompt\",\"message\":\"bad\"}\n\n";
+        let deltas = stream_deltas(body).await?;
+        let kind = deltas
+            .iter()
+            .find_map(|delta| match delta {
+                StreamDelta::Error { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .context("expected a stream error delta")?;
+
+        assert_eq!(kind, StreamErrorKind::InvalidRequest);
+        assert!(!kind.is_recoverable());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_band_response_failed_context_window_rejection_is_fatal() -> anyhow::Result<()> {
+        // `response.failed` defaults to ServerError, but a context-window
+        // rejection is a fatal request-shape error: the worker's overflow
+        // compaction must fire instead of retrying the oversized payload.
+        let body = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"Your input exceeds the context window of this model. Please adjust your input and try again.\"}}}\n\n";
         let deltas = stream_deltas(body).await?;
         let kind = deltas
             .iter()

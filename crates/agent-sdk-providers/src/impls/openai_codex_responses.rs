@@ -2854,8 +2854,11 @@ fn is_websocket_quota_rejection(error: &WrappedWebsocketError) -> bool {
 /// The stream already opened with HTTP 200, so a rate limit reported this way
 /// has neither a status nor a `Retry-After` header: the machine-readable code
 /// is the only classification signal, and the delay — when the service states
-/// one — is embedded in the message. Every other failure stays a (retriable)
-/// server error, as before.
+/// one — is embedded in the message. A context-window rejection
+/// (`context_length_exceeded`) is a fatal request-shape error, not a
+/// transient one: classifying it `InvalidRequest` lets the worker's overflow
+/// compaction fire instead of retrying the identical oversized payload.
+/// Every other failure stays a (retriable) server error, as before.
 fn codex_response_failed_error(response: Option<ApiStreamResponse>) -> CodexResponseFailure {
     // A failed response still reports the tokens it burned. They are returned
     // alongside the error so the caller can yield them *before* the terminal
@@ -2874,6 +2877,8 @@ fn codex_response_failed_error(response: Option<ApiStreamResponse>) -> CodexResp
         Some("rate_limit_exceeded" | "rate_limit_error")
     ) {
         StreamErrorKind::RateLimited(crate::retry_hints::openai_retry_delay(&message))
+    } else if is_context_window_rejection(code.as_deref(), &message) {
+        StreamErrorKind::InvalidRequest
     } else {
         StreamErrorKind::ServerError
     };
@@ -2882,6 +2887,20 @@ fn codex_response_failed_error(response: Option<ApiStreamResponse>) -> CodexResp
         kind,
         usage,
     }
+}
+
+/// True when a `response.failed` code/message rejects the prompt for
+/// exceeding the model's context window. The structured
+/// `context_length_exceeded` code is the primary signal; the prose shapes
+/// cover wrapped or proxied failures that drop the code.
+fn is_context_window_rejection(code: Option<&str>, message: &str) -> bool {
+    if matches!(code, Some("context_length_exceeded")) {
+        return true;
+    }
+    let lower = message.to_lowercase();
+    lower.contains("exceeds the context window")
+        || lower.contains("maximum context length")
+        || lower.contains("context_length_exceeded")
 }
 
 /// A `response.failed` event decoded into what the stream must emit for it.
@@ -3514,6 +3533,30 @@ mod tests {
 
         assert_eq!(failure.message, "upstream blew up");
         assert_eq!(failure.kind, StreamErrorKind::ServerError);
+        Ok(())
+    }
+
+    #[test]
+    fn in_band_response_failed_context_window_rejection_is_fatal() -> anyhow::Result<()> {
+        // The exact `response.failed` shape the Responses API emits when the
+        // staged history overflows the model: a fatal request-shape error so
+        // the worker's overflow compaction fires instead of blind retries.
+        let event: ApiStreamEvent = serde_json::from_str(
+            r#"{"type":"response.failed","response":{"error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model. Please adjust your input and try again."}}}"#,
+        )?;
+        let failure = codex_response_failed_error(event.response);
+
+        assert_eq!(failure.kind, StreamErrorKind::InvalidRequest);
+        assert!(!failure.kind.is_recoverable());
+
+        // A wrapped/proxied failure that drops the code is still caught by
+        // the prose shape.
+        let event: ApiStreamEvent = serde_json::from_str(
+            r#"{"type":"response.failed","response":{"error":{"message":"Your input exceeds the context window of this model. Please adjust your input and try again."}}}"#,
+        )?;
+        let failure = codex_response_failed_error(event.response);
+
+        assert_eq!(failure.kind, StreamErrorKind::InvalidRequest);
         Ok(())
     }
 

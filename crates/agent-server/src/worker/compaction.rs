@@ -280,6 +280,7 @@ pub fn is_prompt_too_long_error(msg: &str) -> bool {
     lower.contains("prompt is too long")
         || lower.contains("maximum context length")
         || lower.contains("context_length_exceeded")
+        || lower.contains("exceeds the context window")
         || lower.contains("input is too long")
         || lower.contains("request too large")
 }
@@ -300,6 +301,11 @@ mod tests {
         ));
         assert!(is_prompt_too_long_error(
             "Maximum context length 4096 tokens exceeded"
+        ));
+        // OpenAI Responses API (`response.failed` prose)
+        assert!(is_prompt_too_long_error(
+            "Your input exceeds the context window of this model. \
+             Please adjust your input and try again."
         ));
         // Gemini
         assert!(is_prompt_too_long_error("Input is too long for this model"));
