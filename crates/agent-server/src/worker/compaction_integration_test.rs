@@ -504,6 +504,111 @@ async fn prompt_too_long_triggers_emergency_compaction_and_retry() -> Result<()>
     Ok(())
 }
 
+/// `OpenAI` Responses regression: a seeded history whose older turns carry
+/// `OpaqueReasoning` blocks (encrypted provider scratchpad) must still
+/// recover when the provider rejects the turn with the Responses-API
+/// overflow prose. The widened matcher engages the emergency compaction,
+/// the summarized prefix's opaque blocks are dropped with it, and the
+/// retry succeeds on the rewritten projection.
+#[tokio::test]
+async fn prompt_too_long_recovers_history_carrying_opaque_reasoning() -> Result<()> {
+    let fixtures = Fixtures::new();
+
+    // Seed 12 turns (24 messages ≥ the default min_messages); the FIRST
+    // assistant message carries an opaque reasoning block like every
+    // assistant turn in an OpenAI Responses thread. It lands in the
+    // summarized prefix (default retain_recent=10 ⇒ split at 14).
+    let mut messages = Vec::new();
+    for i in 0..12 {
+        messages.push(Message::user(format!("user-{i}: {}", "y".repeat(200))));
+        if i == 0 {
+            messages.push(Message::assistant_with_content(vec![
+                ContentBlock::OpaqueReasoning {
+                    provider: "openai-responses".to_owned(),
+                    data: serde_json::json!({"id": "rs_0", "encrypted_content": "ciphertext"}),
+                },
+                ContentBlock::Text {
+                    text: format!("assistant-{i}: {}", "y".repeat(200)),
+                },
+            ]));
+        } else {
+            messages.push(Message::assistant(format!(
+                "assistant-{i}: {}",
+                "y".repeat(200)
+            )));
+        }
+    }
+    fixtures
+        .messages
+        .set_draft(&thread_id(), messages, t0())
+        .await
+        .map_err(|e| anyhow::anyhow!("seed projection draft: {e}"))?;
+
+    // High threshold so the pre-call check does NOT fire — only the
+    // post-failure overflow path may compact.
+    let cfg = CompactionConfig::default().with_threshold_tokens(usize::MAX);
+
+    let scripted = Arc::new(ScriptedProvider::new(vec![
+        // The exact prose the Responses API returns on context overflow.
+        ChatOutcome::InvalidRequest(
+            "Your input exceeds the context window of this model. \
+             Please adjust your input and try again."
+                .into(),
+        ),
+        // Compactor's summarisation call.
+        ok_response("[emergency summary]"),
+        // Retry of the original turn after compaction.
+        ok_response("Hello after recovery"),
+    ]));
+    let provider: Arc<dyn LlmProvider> = scripted.clone();
+
+    let deps = fixtures.deps_with_compaction(&cfg, &provider);
+
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &fixtures.threads,
+        &fixtures.checkpoints,
+        &fixtures.messages,
+        t0(),
+    )
+    .await?;
+
+    let outcome = execute_root_turn(
+        inputs,
+        "Tell me a joke",
+        provider.as_ref(),
+        &deps,
+        t0() + Duration::seconds(1),
+    )
+    .await?;
+
+    let RootTurnOutcome::Completed { response_text, .. } = outcome else {
+        panic!("expected Completed turn after emergency compaction over opaque history");
+    };
+    assert_eq!(response_text, "Hello after recovery");
+    assert_eq!(scripted.calls(), 3);
+
+    // The rewritten projection no longer carries the summarized prefix's
+    // opaque reasoning.
+    let durable = fixtures.messages.get_history(&thread_id()).await?;
+    let opaque_messages = durable
+        .iter()
+        .filter(|message| match &message.content {
+            agent_sdk_foundation::llm::Content::Blocks(blocks) => blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::OpaqueReasoning { .. })),
+            agent_sdk_foundation::llm::Content::Text(_) => false,
+        })
+        .count();
+    assert_eq!(
+        opaque_messages, 0,
+        "emergency compaction must drop the summarized prefix's opaque reasoning"
+    );
+
+    Ok(())
+}
+
 /// Negative case: when no `compaction_config` is wired, the provider
 /// rejecting with `prompt is too long` must fail the turn fatally —
 /// preserving the pre-PR behaviour for hosts that haven't opted in.

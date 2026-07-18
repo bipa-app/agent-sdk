@@ -2211,6 +2211,7 @@ fn is_prompt_too_long_error(msg: &str) -> bool {
     lower.contains("prompt is too long")
         || lower.contains("maximum context length")
         || lower.contains("context_length_exceeded")
+        || lower.contains("exceeds the context window")
         || lower.contains("input is too long")
         || lower.contains("request too large")
 }
