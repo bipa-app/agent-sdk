@@ -8958,6 +8958,9 @@ mod tests {
                     input_tokens: 111,
                     output_tokens: 222,
                     cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    route_provider: None,
+                    resolved_effort: None,
                 },
                 time::OffsetDateTime::now_utc(),
             )

@@ -304,6 +304,27 @@ impl ContentIds {
     }
 }
 
+/// Provider-owned evidence captured at dispatch and committed with the attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AttemptEvidence {
+    route_provider: String,
+    resolved_effort: Option<llm::Effort>,
+}
+
+impl AttemptEvidence {
+    fn from_dispatch(provider: &dyn LlmProvider, request: &ChatRequest) -> Self {
+        let resolved_effort = request
+            .thinking
+            .as_ref()
+            .or_else(|| provider.configured_thinking())
+            .and_then(|thinking| thinking.effort);
+        Self {
+            route_provider: provider.provider().to_owned(),
+            resolved_effort,
+        }
+    }
+}
+
 /// Outcome of a single [`call_llm_once`] call: the synthesized
 /// [`llm::ChatResponse`] plus the per-block IDs assigned during
 /// streaming.  Owned by the retry loop — callers see the
@@ -311,6 +332,7 @@ impl ContentIds {
 struct OnceOutcome {
     response: llm::ChatResponse,
     content_ids: ContentIds,
+    evidence: AttemptEvidence,
 }
 
 /// Outcome of [`call_llm_with_retry`]: the synthesized
@@ -333,6 +355,7 @@ struct StreamedTurn {
     /// from the folded `response.usage` so a failed attempt's tokens are not
     /// double-billed across two attempt rows.
     success_usage: llm::Usage,
+    evidence: AttemptEvidence,
 }
 
 /// Bundle of context needed to commit / suspend a root turn after
@@ -353,6 +376,7 @@ struct TurnCloseContext {
     /// The successful attempt's own usage, for its audit row — distinct from
     /// the turn-total `response.usage` when earlier attempts failed recoverably.
     success_usage: llm::Usage,
+    evidence: AttemptEvidence,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -783,6 +807,7 @@ async fn best_effort_close_attempts(
                 attempt,
                 TurnAttemptOutcome::Cancelled,
                 &ZERO_ATTEMPT_USAGE,
+                None,
                 attempt_store,
                 now,
             )
@@ -954,6 +979,9 @@ pub(crate) async fn commit_partial_turn_on_cancel(
                 input_tokens: 0,
                 output_tokens: 0,
                 cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                route_provider: None,
+                resolved_effort: None,
             },
             messages: prefix,
             // Zero for the same reason: `turn_usage` advances the
@@ -996,6 +1024,7 @@ pub(crate) async fn commit_partial_turn_on_cancel(
             &synthetic,
             TurnAttemptOutcome::Cancelled,
             &ZERO_ATTEMPT_USAGE,
+            None,
             deps.attempt_store,
             now,
         )
@@ -1456,6 +1485,7 @@ async fn execute_root_turn_inner(
         content_ids,
         attempt,
         success_usage,
+        evidence,
     } = match streamed {
         Ok(streamed) => streamed,
         Err(error) => {
@@ -1490,6 +1520,7 @@ async fn execute_root_turn_inner(
         user_input_committed,
         start_committed,
         success_usage,
+        evidence,
     };
 
     // 4. Branch: authorized tool handoff → suspend; otherwise commit.
@@ -1553,7 +1584,7 @@ async fn commit_text_only_turn(
     .context("buffer staged messages")?;
 
     let turn_number = usize::try_from(inputs.recovery_view.next_turn_number).unwrap_or(0);
-    let close_params = build_close_params(&response, &close_ctx.success_usage, &attempt);
+    let close_params = build_close_params(&response, &close_ctx.success_usage, &close_ctx.evidence);
     let turn_usage = response_token_usage(&response);
 
     let drained_messages = inputs
@@ -2507,6 +2538,7 @@ fn finalize_streamed_turn(
     let OnceOutcome {
         mut response,
         content_ids,
+        evidence,
     } = outcome;
     let success_usage = response.usage.clone();
     add_attempt_usage(&mut response.usage, abandoned_usage);
@@ -2515,6 +2547,7 @@ fn finalize_streamed_turn(
         content_ids,
         attempt,
         success_usage,
+        evidence,
     }
 }
 
@@ -2613,6 +2646,7 @@ async fn ensure_retry_not_cancelled(deps: &RootTurnDeps<'_>, attempt: &TurnAttem
         attempt,
         TurnAttemptOutcome::Cancelled,
         &ZERO_ATTEMPT_USAGE,
+        None,
         deps.attempt_store,
         OffsetDateTime::now_utc(),
     )
@@ -2858,6 +2892,7 @@ async fn race_wait_against_cancel<T>(
                 current_attempt,
                 TurnAttemptOutcome::Cancelled,
                 &ZERO_ATTEMPT_USAGE,
+                None,
                 deps.attempt_store,
                 OffsetDateTime::now_utc(),
             )
@@ -3379,13 +3414,15 @@ async fn call_llm_once(
     thread_id: &agent_sdk_foundation::ThreadId,
     now: OffsetDateTime,
 ) -> Result<OnceOutcome, StreamAttemptError> {
+    let evidence = AttemptEvidence::from_dispatch(provider, &request);
     #[cfg(feature = "otel")]
     {
-        call_llm_once_instrumented(provider, request, attempt, deps, thread_id, now).await
+        call_llm_once_instrumented(provider, request, attempt, &evidence, deps, thread_id, now)
+            .await
     }
     #[cfg(not(feature = "otel"))]
     {
-        call_llm_once_inner(provider, request, attempt, deps, thread_id, now).await
+        call_llm_once_inner(provider, request, attempt, &evidence, deps, thread_id, now).await
     }
 }
 
@@ -3401,6 +3438,7 @@ async fn call_llm_once_instrumented(
     provider: &dyn LlmProvider,
     request: ChatRequest,
     attempt: &TurnAttempt,
+    evidence: &AttemptEvidence,
     deps: &RootTurnDeps<'_>,
     thread_id: &agent_sdk_foundation::ThreadId,
     now: OffsetDateTime,
@@ -3427,7 +3465,8 @@ async fn call_llm_once_instrumented(
     });
 
     let started_at = std::time::Instant::now();
-    let result = call_llm_once_inner(provider, request, attempt, deps, thread_id, now).await;
+    let result =
+        call_llm_once_inner(provider, request, attempt, evidence, deps, thread_id, now).await;
     let elapsed = started_at.elapsed().as_secs_f64();
 
     match &result {
@@ -3499,6 +3538,18 @@ const STREAMING_DELTA_BATCH_SIZE: usize = 16;
 /// close. The flush fires on whichever bound trips first.
 const STREAMING_DELTA_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Shared inputs for flushing streamed deltas and closing their attempt row.
+struct CloseStreamAttemptParams<'a, 'deps> {
+    deps: &'a RootTurnDeps<'deps>,
+    thread_id: &'a agent_sdk_foundation::ThreadId,
+    pending_deltas: &'a mut Vec<AgentEvent>,
+    attempt: &'a TurnAttempt,
+    evidence: Option<&'a AttemptEvidence>,
+    outcome: TurnAttemptOutcome,
+    usage: &'a llm::Usage,
+    now: OffsetDateTime,
+}
+
 /// Parameters for [`close_stalled_attempt`]. Bundled to dodge
 /// `clippy::too_many_arguments` and keep the poll loop in
 /// [`call_llm_once_inner`] readable.
@@ -3507,6 +3558,7 @@ struct StalledAttemptParams<'a, 'deps> {
     thread_id: &'a agent_sdk_foundation::ThreadId,
     pending_deltas: &'a mut Vec<AgentEvent>,
     attempt: &'a TurnAttempt,
+    evidence: &'a AttemptEvidence,
     received_first_item: bool,
     stall_budget: Duration,
     /// Usage the stalled attempt streamed before going silent.
@@ -3526,6 +3578,7 @@ async fn close_stalled_attempt(params: StalledAttemptParams<'_, '_>) -> StreamAt
         thread_id,
         pending_deltas,
         attempt,
+        evidence,
         received_first_item,
         stall_budget,
         usage,
@@ -3539,15 +3592,16 @@ async fn close_stalled_attempt(params: StalledAttemptParams<'_, '_>) -> StreamAt
     // The provider already returned a stream, so the request may have been
     // accepted even if no item arrived. Settle this provider-call row before
     // retrying on a fresh attempt.
-    flush_and_close(
+    flush_and_close(CloseStreamAttemptParams {
         deps,
         thread_id,
         pending_deltas,
         attempt,
-        TurnAttemptOutcome::ServerError,
-        &usage,
+        evidence: Some(evidence),
+        outcome: TurnAttemptOutcome::ServerError,
+        usage: &usage,
         now,
-    )
+    })
     .await;
     StreamAttemptError::Recoverable {
         kind: StreamErrorKind::ConnectionLost,
@@ -3562,24 +3616,11 @@ async fn close_stalled_attempt(params: StalledAttemptParams<'_, '_>) -> StreamAt
 /// Flush the pending deltas, close the attempt with its streamed usage as a
 /// server error, and build the matching recoverable error carrying that usage.
 async fn close_recoverable_server_error(
-    deps: &RootTurnDeps<'_>,
-    thread_id: &agent_sdk_foundation::ThreadId,
-    pending_deltas: &mut Vec<AgentEvent>,
-    attempt: &TurnAttempt,
-    usage: llm::Usage,
+    params: CloseStreamAttemptParams<'_, '_>,
     message: String,
-    now: OffsetDateTime,
 ) -> StreamAttemptError {
-    flush_and_close(
-        deps,
-        thread_id,
-        pending_deltas,
-        attempt,
-        TurnAttemptOutcome::ServerError,
-        &usage,
-        now,
-    )
-    .await;
+    let usage = params.usage.clone();
+    flush_and_close(params).await;
     StreamAttemptError::Recoverable {
         kind: StreamErrorKind::ServerError,
         message,
@@ -3592,6 +3633,7 @@ struct FailedStreamAttemptParams<'a, 'deps> {
     thread_id: &'a agent_sdk_foundation::ThreadId,
     pending_deltas: &'a mut Vec<AgentEvent>,
     attempt: &'a TurnAttempt,
+    evidence: &'a AttemptEvidence,
     outcome: TurnAttemptOutcome,
     error: StreamAttemptError,
     usage: llm::Usage,
@@ -3606,6 +3648,7 @@ async fn finish_failed_stream_attempt(
         thread_id,
         pending_deltas,
         attempt,
+        evidence,
         outcome,
         error,
         usage,
@@ -3622,15 +3665,16 @@ async fn finish_failed_stream_attempt(
         // attempt open so offline probes do not manufacture audit rows.
         flush_streaming_deltas(deps, thread_id, pending_deltas).await;
     } else {
-        flush_and_close(
+        flush_and_close(CloseStreamAttemptParams {
             deps,
             thread_id,
             pending_deltas,
             attempt,
+            evidence: Some(evidence),
             outcome,
-            &usage,
+            usage: &usage,
             now,
-        )
+        })
         .await;
     }
     error.with_usage(usage)
@@ -3644,18 +3688,20 @@ async fn close_cancelled_attempt(
     thread_id: &agent_sdk_foundation::ThreadId,
     pending_deltas: &mut Vec<AgentEvent>,
     attempt: &TurnAttempt,
+    evidence: &AttemptEvidence,
     usage: &llm::Usage,
     now: OffsetDateTime,
 ) -> StreamAttemptError {
-    flush_and_close(
+    flush_and_close(CloseStreamAttemptParams {
         deps,
         thread_id,
         pending_deltas,
         attempt,
-        TurnAttemptOutcome::Cancelled,
+        evidence: Some(evidence),
+        outcome: TurnAttemptOutcome::Cancelled,
         usage,
         now,
-    )
+    })
     .await;
     StreamAttemptError::Cancelled {
         message: "root turn cancelled mid-stream".to_owned(),
@@ -3664,6 +3710,7 @@ async fn close_cancelled_attempt(
 
 async fn close_truncated_stream(
     attempt: &TurnAttempt,
+    evidence: &AttemptEvidence,
     deps: &RootTurnDeps<'_>,
     usage: llm::Usage,
     now: OffsetDateTime,
@@ -3672,6 +3719,7 @@ async fn close_truncated_stream(
         attempt,
         TurnAttemptOutcome::ServerError,
         &usage,
+        Some(evidence),
         deps.attempt_store,
         now,
     )
@@ -3698,6 +3746,7 @@ struct StreamPollParams<'a, 'deps> {
     thread_id: &'a agent_sdk_foundation::ThreadId,
     pending_deltas: &'a mut Vec<AgentEvent>,
     attempt: &'a TurnAttempt,
+    evidence: &'a AttemptEvidence,
     received_first_item: bool,
     usage: llm::Usage,
     now: OffsetDateTime,
@@ -3719,6 +3768,7 @@ async fn poll_stream_item(
         thread_id,
         pending_deltas,
         attempt,
+        evidence,
         received_first_item,
         usage,
         now,
@@ -3730,7 +3780,7 @@ async fn poll_stream_item(
                 biased;
                 () = cancel.cancelled() => {
                     return Err(close_cancelled_attempt(
-                        deps, thread_id, pending_deltas, attempt, &usage, now,
+                        deps, thread_id, pending_deltas, attempt, evidence, &usage, now,
                     )
                     .await);
                 }
@@ -3746,6 +3796,7 @@ async fn poll_stream_item(
             thread_id,
             pending_deltas,
             attempt,
+            evidence,
             received_first_item,
             stall_budget,
             usage,
@@ -3759,6 +3810,7 @@ async fn call_llm_once_inner(
     provider: &dyn LlmProvider,
     request: ChatRequest,
     attempt: &TurnAttempt,
+    evidence: &AttemptEvidence,
     deps: &RootTurnDeps<'_>,
     thread_id: &agent_sdk_foundation::ThreadId,
     now: OffsetDateTime,
@@ -3787,6 +3839,7 @@ async fn call_llm_once_inner(
                 thread_id,
                 pending_deltas: &mut pending_deltas,
                 attempt,
+                evidence,
                 received_first_item,
                 usage: attempt_usage(&accumulator),
                 now,
@@ -3809,14 +3862,19 @@ async fn call_llm_once_inner(
                 // they're the most common shape of "Anthropic SSE
                 // stream died mid-flight" and almost always succeed
                 // on retry.
+                let usage = attempt_usage(&accumulator);
                 return Err(close_recoverable_server_error(
-                    deps,
-                    thread_id,
-                    &mut pending_deltas,
-                    attempt,
-                    attempt_usage(&accumulator),
+                    CloseStreamAttemptParams {
+                        deps,
+                        thread_id,
+                        pending_deltas: &mut pending_deltas,
+                        attempt,
+                        evidence: Some(evidence),
+                        outcome: TurnAttemptOutcome::ServerError,
+                        usage: &usage,
+                        now,
+                    },
                     format!("LLM stream iteration error: {error:#}"),
-                    now,
                 )
                 .await);
             }
@@ -3833,6 +3891,7 @@ async fn call_llm_once_inner(
                     thread_id,
                     pending_deltas: &mut pending_deltas,
                     attempt,
+                    evidence,
                     outcome,
                     error,
                     usage: attempt_usage(&accumulator),
@@ -3857,13 +3916,21 @@ async fn call_llm_once_inner(
     // tool children with empty inputs. Treat it as a recoverable error
     // so `call_llm_with_retry` re-attempts instead.
     if accumulator.stop_reason().is_none() {
-        return Err(close_truncated_stream(attempt, deps, attempt_usage(&accumulator), now).await);
+        return Err(close_truncated_stream(
+            attempt,
+            evidence,
+            deps,
+            attempt_usage(&accumulator),
+            now,
+        )
+        .await);
     }
 
     let response = synthesize_response(accumulator, provider, thread_id);
     Ok(OnceOutcome {
         response,
         content_ids,
+        evidence: evidence.clone(),
     })
 }
 
@@ -4064,6 +4131,7 @@ async fn close_attempt_with(
     attempt: &TurnAttempt,
     outcome: TurnAttemptOutcome,
     usage: &llm::Usage,
+    evidence: Option<&AttemptEvidence>,
     attempt_store: &dyn TurnAttemptStore,
     now: OffsetDateTime,
 ) {
@@ -4078,6 +4146,9 @@ async fn close_attempt_with(
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         cached_input_tokens: usage.cached_input_tokens,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        route_provider: evidence.map(|value| value.route_provider.clone()),
+        resolved_effort: evidence.and_then(|value| value.resolved_effort),
     };
     // Best-effort: if closing fails, the primary error is more important.
     let _ = attempt_store.close_attempt(&attempt.id, params, now).await;
@@ -4087,17 +4158,17 @@ async fn close_attempt_with(
 ///
 /// Used on every early-return path so a failed / cancelled attempt still
 /// lands its partial transcript before the audit row is closed.
-async fn flush_and_close(
-    deps: &RootTurnDeps<'_>,
-    thread_id: &agent_sdk_foundation::ThreadId,
-    pending_deltas: &mut Vec<AgentEvent>,
-    attempt: &TurnAttempt,
-    outcome: TurnAttemptOutcome,
-    usage: &llm::Usage,
-    now: OffsetDateTime,
-) {
-    flush_streaming_deltas(deps, thread_id, pending_deltas).await;
-    close_attempt_with(attempt, outcome, usage, deps.attempt_store, now).await;
+async fn flush_and_close(params: CloseStreamAttemptParams<'_, '_>) {
+    flush_streaming_deltas(params.deps, params.thread_id, params.pending_deltas).await;
+    close_attempt_with(
+        params.attempt,
+        params.outcome,
+        params.usage,
+        params.evidence,
+        params.deps.attempt_store,
+        params.now,
+    )
+    .await;
 }
 
 /// Coalesce: flush buffered deltas once the count or time bound trips, so
@@ -4248,7 +4319,7 @@ fn sanitized_response_id(response: &llm::ChatResponse) -> Option<String> {
 fn build_close_params(
     response: &llm::ChatResponse,
     usage: &llm::Usage,
-    _attempt: &TurnAttempt,
+    evidence: &AttemptEvidence,
 ) -> CloseAttemptParams {
     let response_id = sanitized_response_id(response);
 
@@ -4270,6 +4341,9 @@ fn build_close_params(
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         cached_input_tokens: usage.cached_input_tokens,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        route_provider: Some(evidence.route_provider.clone()),
+        resolved_effort: evidence.resolved_effort,
     }
 }
 
@@ -4426,6 +4500,7 @@ async fn suspend_at_tool_boundary(
             &attempt,
             TurnAttemptOutcome::Cancelled,
             &close_ctx.success_usage,
+            Some(&close_ctx.evidence),
             deps.attempt_store,
             now,
         )
@@ -4441,6 +4516,7 @@ async fn suspend_at_tool_boundary(
         &attempt,
         &response,
         &close_ctx.success_usage,
+        &close_ctx.evidence,
         deps,
         "close attempt on tool suspension",
         now,
@@ -4910,11 +4986,12 @@ async fn close_attempt_or_propagate_already_closed(
     attempt: &TurnAttempt,
     response: &llm::ChatResponse,
     usage: &llm::Usage,
+    evidence: &AttemptEvidence,
     deps: &RootTurnDeps<'_>,
     error_context: &'static str,
     now: OffsetDateTime,
 ) -> Result<()> {
-    let params = build_close_params(response, usage, attempt);
+    let params = build_close_params(response, usage, evidence);
     match deps
         .attempt_store
         .close_attempt(&attempt.id, params, now)
@@ -5309,6 +5386,7 @@ pub async fn resume_root_turn(
         content_ids,
         attempt,
         success_usage,
+        evidence,
     } = match streamed {
         Ok(streamed) => streamed,
         Err(error) => {
@@ -5344,6 +5422,7 @@ pub async fn resume_root_turn(
             ResumeCloseContext {
                 content_ids: &content_ids,
                 success_usage: &success_usage,
+                evidence: &evidence,
             },
             deps,
             commit_now,
@@ -5359,6 +5438,7 @@ pub async fn resume_root_turn(
         ResumeCloseContext {
             content_ids: &content_ids,
             success_usage: &success_usage,
+            evidence: &evidence,
         },
         deps,
         commit_now,
@@ -5449,6 +5529,7 @@ struct ResumeCloseContext<'a> {
     content_ids: &'a ContentIds,
     /// The successful attempt's own usage, for its audit row.
     success_usage: &'a llm::Usage,
+    evidence: &'a AttemptEvidence,
 }
 
 async fn commit_resumed_turn(
@@ -5467,7 +5548,7 @@ async fn commit_resumed_turn(
 
     buffer_resumed_assistant(&inputs, continuation, response).await?;
 
-    let close_params = build_close_params(response, close.success_usage, attempt);
+    let close_params = build_close_params(response, close.success_usage, close.evidence);
     let turn_usage = merged_turn_usage(&continuation.turn_usage, response);
 
     let (drained_messages, agent_state_snapshot, total_usage) = drain_resumed_turn_state(&inputs)?;
@@ -5639,6 +5720,7 @@ async fn suspend_resumed_turn(
         &attempt,
         &response,
         close.success_usage,
+        close.evidence,
         deps,
         "close attempt on resumed tool suspension",
         now,
@@ -6335,6 +6417,7 @@ async fn run_steering_exchange(
         content_ids,
         attempt,
         success_usage,
+        evidence,
     } = stage_and_call_steering_llm(
         &inputs,
         deps,
@@ -6373,6 +6456,7 @@ async fn run_steering_exchange(
                 ResumeCloseContext {
                     content_ids: &content_ids,
                     success_usage: &success_usage,
+                    evidence: &evidence,
                 },
                 deps,
                 commit_now,
@@ -6390,6 +6474,7 @@ async fn run_steering_exchange(
             ResumeCloseContext {
                 content_ids: &content_ids,
                 success_usage: &success_usage,
+                evidence: &evidence,
             },
             deps,
             commit_now,
@@ -6410,6 +6495,7 @@ async fn run_steering_exchange(
             content_ids,
             attempt,
             success_usage,
+            evidence,
         },
         commit_now,
     )
@@ -6551,6 +6637,7 @@ struct SteeringRepark {
     attempt: TurnAttempt,
     /// The successful attempt's own usage, for its audit row.
     success_usage: llm::Usage,
+    evidence: AttemptEvidence,
 }
 
 /// Re-park a running steering exchange on the still-running children:
@@ -6573,6 +6660,7 @@ async fn repark_after_steering_exchange(
         content_ids,
         attempt,
         success_usage,
+        evidence,
     } = repark;
     let thread_id = &inputs.bootstrap.thread_id;
 
@@ -6589,6 +6677,7 @@ async fn repark_after_steering_exchange(
         &attempt,
         &response,
         &success_usage,
+        &evidence,
         deps,
         "close attempt on steering re-park",
         now,
@@ -6664,6 +6753,124 @@ async fn repark_after_steering_exchange(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+
+    struct EvidenceProvider {
+        route: &'static str,
+    }
+
+    #[async_trait]
+    impl LlmProvider for EvidenceProvider {
+        async fn chat(&self, _request: ChatRequest) -> Result<llm::ChatOutcome> {
+            bail!("evidence fixture does not dispatch chat")
+        }
+
+        fn model(&self) -> &'static str {
+            "claude-sonnet-4-6"
+        }
+
+        fn provider(&self) -> &'static str {
+            self.route
+        }
+    }
+
+    fn evidence_request(thinking: llm::ThinkingConfig) -> ChatRequest {
+        let mut request = ChatRequest::new("system", vec![llm::Message::user("hello")]);
+        request.thinking = Some(thinking);
+        request
+    }
+
+    fn evidence_attempt() -> TurnAttempt {
+        TurnAttempt::open(OpenAttemptParams {
+            task_id: AgentTaskId::from_string("task_evidence"),
+            attempt_number: 1,
+            provenance: AuditProvenance::new("anthropic", "claude-sonnet-4-6"),
+            request_blob: serde_json::json!({"messages": []}),
+            now: OffsetDateTime::UNIX_EPOCH,
+            otel_trace_id: None,
+            otel_span_id: None,
+        })
+    }
+
+    fn evidence_response(usage: llm::Usage) -> llm::ChatResponse {
+        llm::ChatResponse {
+            id: "msg_evidence".to_owned(),
+            content: vec![llm::ContentBlock::Text {
+                text: "done".to_owned(),
+            }],
+            model: "claude-sonnet-4-6".to_owned(),
+            stop_reason: Some(llm::StopReason::EndTurn),
+            usage,
+        }
+    }
+
+    #[test]
+    fn attempt_commit_records_provider_usage_route_and_resolved_effort() -> Result<()> {
+        let native = EvidenceProvider { route: "anthropic" };
+        let gateway = EvidenceProvider {
+            route: "cloudflare-ai-gateway",
+        };
+        let adaptive_request =
+            evidence_request(llm::ThinkingConfig::adaptive_with_effort(llm::Effort::High));
+        let fixed_request =
+            evidence_request(llm::ThinkingConfig::new(8_000).with_effort(llm::Effort::Medium));
+        let native_evidence = AttemptEvidence::from_dispatch(&native, &adaptive_request);
+        let gateway_evidence = AttemptEvidence::from_dispatch(&gateway, &adaptive_request);
+        let fixed_evidence = AttemptEvidence::from_dispatch(&native, &fixed_request);
+
+        assert_ne!(
+            native_evidence.route_provider,
+            gateway_evidence.route_provider
+        );
+        assert_eq!(native_evidence.resolved_effort, Some(llm::Effort::High));
+        assert_eq!(fixed_evidence.resolved_effort, Some(llm::Effort::Medium));
+
+        let reported = llm::Usage {
+            input_tokens: 100,
+            output_tokens: 20,
+            cached_input_tokens: 30,
+            cache_creation_input_tokens: 40,
+        };
+        let response = evidence_response(reported.clone());
+        let native_closed = evidence_attempt()
+            .close(
+                build_close_params(&response, &reported, &native_evidence),
+                OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+            )
+            .context("close native evidence attempt")?;
+        let gateway_closed = evidence_attempt()
+            .close(
+                build_close_params(&response, &reported, &gateway_evidence),
+                OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+            )
+            .context("close gateway evidence attempt")?;
+        let fixed_closed = evidence_attempt()
+            .close(
+                build_close_params(&response, &reported, &fixed_evidence),
+                OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+            )
+            .context("close fixed-effort evidence attempt")?;
+
+        assert_eq!(gateway_closed.input_tokens, Some(reported.input_tokens));
+        assert_eq!(gateway_closed.output_tokens, Some(reported.output_tokens));
+        assert_eq!(
+            gateway_closed.cached_input_tokens,
+            Some(reported.cached_input_tokens)
+        );
+        assert_eq!(
+            gateway_closed.cache_creation_input_tokens,
+            Some(reported.cache_creation_input_tokens),
+        );
+        assert_eq!(native_closed.route_provider.as_deref(), Some("anthropic"));
+        assert_eq!(
+            gateway_closed.route_provider.as_deref(),
+            Some("cloudflare-ai-gateway"),
+        );
+        assert_ne!(native_closed.route_provider, gateway_closed.route_provider);
+        assert_eq!(native_closed.resolved_effort, Some(llm::Effort::High));
+        assert_eq!(fixed_closed.resolved_effort, Some(llm::Effort::Medium));
+        Ok(())
+    }
 
     #[test]
     fn only_tool_use_or_missing_stop_reason_allows_tool_dispatch() {

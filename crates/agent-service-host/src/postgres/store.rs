@@ -516,6 +516,9 @@ SELECT
     input_tokens,
     output_tokens,
     cached_input_tokens,
+    cache_creation_input_tokens,
+    route_provider,
+    resolved_effort,
     opened_at,
     closed_at,
     duration_ms,
@@ -552,6 +555,9 @@ SELECT
     input_tokens,
     output_tokens,
     cached_input_tokens,
+    cache_creation_input_tokens,
+    route_provider,
+    resolved_effort,
     opened_at,
     closed_at,
     duration_ms,
@@ -589,14 +595,17 @@ INSERT INTO agent_sdk_turn_attempts (
     input_tokens,
     output_tokens,
     cached_input_tokens,
+    cache_creation_input_tokens,
+    route_provider,
+    resolved_effort,
     opened_at,
     closed_at,
     duration_ms,
     otel_trace_id,
     otel_span_id
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9,
-    $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+    $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
 )
 ",
             attempt.id.as_str(),
@@ -613,6 +622,9 @@ INSERT INTO agent_sdk_turn_attempts (
             optional_u32_to_i64(attempt.input_tokens),
             optional_u32_to_i64(attempt.output_tokens),
             optional_u32_to_i64(attempt.cached_input_tokens),
+            optional_u32_to_i64(attempt.cache_creation_input_tokens),
+            attempt.route_provider.clone(),
+            optional_enum_to_wire(attempt.resolved_effort.as_ref())?,
             attempt.opened_at,
             attempt.closed_at,
             optional_u64_to_i64(attempt.duration_ms, "attempt duration_ms")?,
@@ -646,11 +658,14 @@ SET
     input_tokens = $12,
     output_tokens = $13,
     cached_input_tokens = $14,
-    opened_at = $15,
-    closed_at = $16,
-    duration_ms = $17,
-    otel_trace_id = $18,
-    otel_span_id = $19
+    cache_creation_input_tokens = $15,
+    route_provider = $16,
+    resolved_effort = $17,
+    opened_at = $18,
+    closed_at = $19,
+    duration_ms = $20,
+    otel_trace_id = $21,
+    otel_span_id = $22
 WHERE id = $1
 ",
             attempt.id.as_str(),
@@ -667,6 +682,9 @@ WHERE id = $1
             optional_u32_to_i64(attempt.input_tokens),
             optional_u32_to_i64(attempt.output_tokens),
             optional_u32_to_i64(attempt.cached_input_tokens),
+            optional_u32_to_i64(attempt.cache_creation_input_tokens),
+            attempt.route_provider.clone(),
+            optional_enum_to_wire(attempt.resolved_effort.as_ref())?,
             attempt.opened_at,
             attempt.closed_at,
             optional_u64_to_i64(attempt.duration_ms, "attempt duration_ms")?,
@@ -4393,6 +4411,9 @@ SELECT
     input_tokens,
     output_tokens,
     cached_input_tokens,
+    cache_creation_input_tokens,
+    route_provider,
+    resolved_effort,
     opened_at,
     closed_at,
     duration_ms,
@@ -5932,6 +5953,9 @@ struct TurnAttemptRecord {
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
     cached_input_tokens: Option<i64>,
+    cache_creation_input_tokens: Option<i64>,
+    route_provider: Option<String>,
+    resolved_effort: Option<String>,
     opened_at: OffsetDateTime,
     closed_at: Option<OffsetDateTime>,
     duration_ms: Option<i64>,
@@ -5972,6 +5996,15 @@ impl TryFrom<TurnAttemptRecord> for TurnAttempt {
             cached_input_tokens: record
                 .cached_input_tokens
                 .map(|value| u32_from_i64(value, "turn attempt cached_input_tokens"))
+                .transpose()?,
+            cache_creation_input_tokens: record
+                .cache_creation_input_tokens
+                .map(|value| u32_from_i64(value, "turn attempt cache_creation_input_tokens"))
+                .transpose()?,
+            route_provider: record.route_provider,
+            resolved_effort: record
+                .resolved_effort
+                .map(|value| enum_from_wire(&value, "turn attempt resolved_effort"))
                 .transpose()?,
             opened_at: record.opened_at,
             closed_at: record.closed_at,
@@ -6353,6 +6386,9 @@ mod tests {
             input_tokens: 120,
             output_tokens: 60,
             cached_input_tokens: 12,
+            cache_creation_input_tokens: 0,
+            route_provider: None,
+            resolved_effort: None,
         }
     }
 

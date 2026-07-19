@@ -225,6 +225,9 @@ mod tests {
             input_tokens: 100,
             output_tokens: 50,
             cached_input_tokens: 10,
+            cache_creation_input_tokens: 0,
+            route_provider: None,
+            resolved_effort: None,
         }
     }
 

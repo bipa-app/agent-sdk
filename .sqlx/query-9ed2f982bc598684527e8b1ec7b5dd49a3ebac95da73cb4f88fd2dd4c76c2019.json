@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\nINSERT INTO agent_sdk_turn_attempts (\n    id, task_id, attempt_number, provider, requested_model, request_blob, opened_at\n) VALUES (?1, ?2, 1, 'anthropic', 'claude-sonnet-4-6', ?3, ?4)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "9ed2f982bc598684527e8b1ec7b5dd49a3ebac95da73cb4f88fd2dd4c76c2019"
+}

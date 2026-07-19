@@ -169,7 +169,8 @@ pub enum TurnAttemptSchemaError {
 /// | Request | `request_blob`, `requested_model`, `provider` |
 /// | Response | `response_blob`, `response_id`, `response_model` |
 /// | Outcome | `stop_reason`, `outcome` |
-/// | Usage | `input_tokens`, `output_tokens`, `cached_input_tokens` |
+/// | Usage | `input_tokens`, `output_tokens`, `cached_input_tokens`, `cache_creation_input_tokens` |
+/// | Routing | `route_provider`, `resolved_effort` |
 /// | Timing | `opened_at`, `closed_at`, `duration_ms` |
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TurnAttempt {
@@ -226,6 +227,21 @@ pub struct TurnAttempt {
 
     /// Cached input tokens (provider-specific). `None` while open.
     pub cached_input_tokens: Option<u32>,
+
+    /// Input tokens spent creating provider-side cache entries. `None` while
+    /// open or on rows that predate this evidence column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u32>,
+
+    /// Stable provider route used for the call (for example `"anthropic"` or
+    /// `"cloudflare-ai-gateway"`). `None` while open or on legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_provider: Option<String>,
+
+    /// Concrete thinking effort dispatched to the provider. `None` when no
+    /// effort applied or on rows that predate this evidence column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_effort: Option<agent_sdk_foundation::llm::Effort>,
 
     // ── Timing ───────────────────────────────────────────────────
     /// When the attempt was opened (LLM call started).
@@ -287,6 +303,9 @@ impl TurnAttempt {
             input_tokens: None,
             output_tokens: None,
             cached_input_tokens: None,
+            cache_creation_input_tokens: None,
+            route_provider: None,
+            resolved_effort: None,
             opened_at: params.now,
             closed_at: None,
             duration_ms: None,
@@ -324,6 +343,9 @@ impl TurnAttempt {
         self.input_tokens = Some(params.input_tokens);
         self.output_tokens = Some(params.output_tokens);
         self.cached_input_tokens = Some(params.cached_input_tokens);
+        self.cache_creation_input_tokens = Some(params.cache_creation_input_tokens);
+        self.route_provider = params.route_provider;
+        self.resolved_effort = params.resolved_effort;
         self.closed_at = Some(now);
 
         let dur = now - self.opened_at;
@@ -358,6 +380,7 @@ impl TurnAttempt {
     /// - **Open** rows must not have: `outcome`, `response_blob`,
     ///   `response_model`, `response_id`, `stop_reason`,
     ///   `input_tokens`, `output_tokens`, `cached_input_tokens`,
+    ///   `cache_creation_input_tokens`, `route_provider`, `resolved_effort`,
     ///   `duration_ms`, `closed_at`.
     /// - **Closed** rows must have: `outcome`, `duration_ms`,
     ///   `closed_at`.
@@ -387,6 +410,9 @@ impl TurnAttempt {
                 || self.input_tokens.is_some()
                 || self.output_tokens.is_some()
                 || self.cached_input_tokens.is_some()
+                || self.cache_creation_input_tokens.is_some()
+                || self.route_provider.is_some()
+                || self.resolved_effort.is_some()
             {
                 return Err(TurnAttemptSchemaError::ResponseOnOpenAttempt);
             }
@@ -451,6 +477,12 @@ pub struct CloseAttemptParams {
     pub output_tokens: u32,
     /// Cached input tokens.
     pub cached_input_tokens: u32,
+    /// Input tokens spent creating provider-side cache entries.
+    pub cache_creation_input_tokens: u32,
+    /// Stable provider route that dispatched this request.
+    pub route_provider: Option<String>,
+    /// Concrete thinking effort dispatched to the provider.
+    pub resolved_effort: Option<agent_sdk_foundation::llm::Effort>,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -499,6 +531,9 @@ mod tests {
             input_tokens: 100,
             output_tokens: 50,
             cached_input_tokens: 10,
+            cache_creation_input_tokens: 20,
+            route_provider: Some("anthropic".into()),
+            resolved_effort: Some(agent_sdk_foundation::llm::Effort::High),
         }
     }
 
@@ -587,6 +622,12 @@ mod tests {
         assert_eq!(closed.input_tokens, Some(100));
         assert_eq!(closed.output_tokens, Some(50));
         assert_eq!(closed.cached_input_tokens, Some(10));
+        assert_eq!(closed.cache_creation_input_tokens, Some(20));
+        assert_eq!(closed.route_provider.as_deref(), Some("anthropic"));
+        assert_eq!(
+            closed.resolved_effort,
+            Some(agent_sdk_foundation::llm::Effort::High),
+        );
         assert_eq!(closed.duration_ms, Some(5_000));
         closed.validate().context("validate")?;
         Ok(())
@@ -777,6 +818,9 @@ mod tests {
         assert_eq!(json["input_tokens"], 100);
         assert_eq!(json["output_tokens"], 50);
         assert_eq!(json["cached_input_tokens"], 10);
+        assert_eq!(json["cache_creation_input_tokens"], 20);
+        assert_eq!(json["route_provider"], "anthropic");
+        assert_eq!(json["resolved_effort"], "high");
 
         // Verify timing
         assert_eq!(json["duration_ms"], 2_000);
@@ -812,6 +856,9 @@ mod tests {
                     input_tokens: 0,
                     output_tokens: 0,
                     cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    route_provider: None,
+                    resolved_effort: None,
                 },
                 t_plus(1),
             )
@@ -836,6 +883,9 @@ mod tests {
                     input_tokens: 0,
                     output_tokens: 0,
                     cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    route_provider: None,
+                    resolved_effort: None,
                 },
                 t_plus(1),
             )
@@ -852,6 +902,9 @@ mod tests {
         let attempt = TurnAttempt::open(sample_open_params());
         assert!(attempt.otel_trace_id.is_none());
         assert!(attempt.otel_span_id.is_none());
+        assert!(attempt.cache_creation_input_tokens.is_none());
+        assert!(attempt.route_provider.is_none());
+        assert!(attempt.resolved_effort.is_none());
     }
 
     #[test]
@@ -904,6 +957,9 @@ mod tests {
             serde_json::from_value(legacy).context("deserialize legacy row")?;
         assert!(attempt.otel_trace_id.is_none());
         assert!(attempt.otel_span_id.is_none());
+        assert!(attempt.cache_creation_input_tokens.is_none());
+        assert!(attempt.route_provider.is_none());
+        assert!(attempt.resolved_effort.is_none());
         attempt.validate().context("validate")?;
         Ok(())
     }

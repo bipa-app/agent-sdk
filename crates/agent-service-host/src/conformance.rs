@@ -519,7 +519,10 @@ mod tests {
                     outcome: TurnAttemptOutcome::Success,
                     input_tokens: 100,
                     output_tokens: 50,
-                    cached_input_tokens: 0,
+                    cached_input_tokens: 30,
+                    cache_creation_input_tokens: 40,
+                    route_provider: Some("anthropic".into()),
+                    resolved_effort: Some(agent_sdk_foundation::llm::Effort::High),
                 },
                 messages: vec![agent_sdk_foundation::llm::Message::assistant(
                     "test response",
@@ -541,6 +544,25 @@ mod tests {
 
         assert_eq!(outcome.thread.committed_turns, 1);
         assert_eq!(outcome.checkpoint.turn_number, 1);
+        assert_eq!(outcome.closed_attempt.cache_creation_input_tokens, Some(40));
+        assert_eq!(
+            outcome.closed_attempt.route_provider.as_deref(),
+            Some("anthropic"),
+        );
+        assert_eq!(
+            outcome.closed_attempt.resolved_effort,
+            Some(agent_sdk_foundation::llm::Effort::High),
+        );
+        let stored_attempt = attempt_store
+            .get(&attempt.id)
+            .await?
+            .context("committed attempt missing")?;
+        assert_eq!(stored_attempt.cache_creation_input_tokens, Some(40));
+        assert_eq!(stored_attempt.route_provider.as_deref(), Some("anthropic"));
+        assert_eq!(
+            stored_attempt.resolved_effort,
+            Some(agent_sdk_foundation::llm::Effort::High),
+        );
 
         let latest = checkpoint_store
             .get_latest_by_thread(&tid)
@@ -600,6 +622,9 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 5,
                 cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                route_provider: None,
+                resolved_effort: None,
             },
             messages: vec![agent_sdk_foundation::llm::Message::assistant("guarded")],
             turn_usage: TokenUsage::default(),
@@ -774,6 +799,9 @@ mod tests {
                 input_tokens: 1,
                 output_tokens: 1,
                 cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                route_provider: None,
+                resolved_effort: None,
             },
             messages: vec![agent_sdk_foundation::llm::Message::assistant("stale")],
             turn_usage: TokenUsage::default(),

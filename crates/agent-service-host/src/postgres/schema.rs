@@ -580,6 +580,24 @@ const AGENT_SDK_TURN_ATTEMPT_COLUMNS: &[ColumnContract] = &[
         notes: "Provider-reported cached input usage.",
     },
     ColumnContract {
+        name: "cache_creation_input_tokens",
+        sql_type: "BIGINT",
+        nullable: true,
+        notes: "Provider-reported cache creation input usage.",
+    },
+    ColumnContract {
+        name: "route_provider",
+        sql_type: "TEXT",
+        nullable: true,
+        notes: "Stable native or gateway route identity captured at dispatch.",
+    },
+    ColumnContract {
+        name: "resolved_effort",
+        sql_type: "TEXT",
+        nullable: true,
+        notes: "Concrete thinking effort dispatched to the provider.",
+    },
+    ColumnContract {
         name: "opened_at",
         sql_type: "TIMESTAMPTZ",
         nullable: false,

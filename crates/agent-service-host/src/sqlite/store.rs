@@ -465,7 +465,8 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6)
 SELECT id, task_id, attempt_number, provider, requested_model,
        request_blob, response_blob, response_id, response_model,
        stop_reason, outcome, input_tokens, output_tokens,
-       cached_input_tokens, opened_at, closed_at, duration_ms,
+       cached_input_tokens, cache_creation_input_tokens, route_provider,
+       resolved_effort, opened_at, closed_at, duration_ms,
        otel_trace_id, otel_span_id
 FROM agent_sdk_turn_attempts
 WHERE id = ?1
@@ -487,7 +488,8 @@ WHERE id = ?1
 SELECT id, task_id, attempt_number, provider, requested_model,
        request_blob, response_blob, response_id, response_model,
        stop_reason, outcome, input_tokens, output_tokens,
-       cached_input_tokens, opened_at, closed_at, duration_ms,
+       cached_input_tokens, cache_creation_input_tokens, route_provider,
+       resolved_effort, opened_at, closed_at, duration_ms,
        otel_trace_id, otel_span_id
 FROM agent_sdk_turn_attempts
 WHERE id = ?1
@@ -514,6 +516,9 @@ WHERE id = ?1
         let input_tokens = attempt.input_tokens.map(i64::from);
         let output_tokens = attempt.output_tokens.map(i64::from);
         let cached_input_tokens = attempt.cached_input_tokens.map(i64::from);
+        let cache_creation_input_tokens = attempt.cache_creation_input_tokens.map(i64::from);
+        let route_provider = attempt.route_provider.as_deref();
+        let resolved_effort = optional_enum_to_wire(attempt.resolved_effort.as_ref())?;
         let duration_ms = attempt
             .duration_ms
             .map(|v| i64::try_from(v).context("duration_ms exceeds i64::MAX"))
@@ -526,9 +531,10 @@ INSERT INTO agent_sdk_turn_attempts (
     id, task_id, attempt_number, provider, requested_model,
     request_blob, response_blob, response_id, response_model,
     stop_reason, outcome, input_tokens, output_tokens,
-    cached_input_tokens, opened_at, closed_at, duration_ms,
+    cached_input_tokens, cache_creation_input_tokens, route_provider,
+    resolved_effort, opened_at, closed_at, duration_ms,
     otel_trace_id, otel_span_id
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
 ",
             id,
             task_id,
@@ -544,6 +550,9 @@ INSERT INTO agent_sdk_turn_attempts (
             input_tokens,
             output_tokens,
             cached_input_tokens,
+            cache_creation_input_tokens,
+            route_provider,
+            resolved_effort,
             attempt.opened_at,
             attempt.closed_at,
             duration_ms,
@@ -568,6 +577,9 @@ INSERT INTO agent_sdk_turn_attempts (
         let input_tokens = attempt.input_tokens.map(i64::from);
         let output_tokens = attempt.output_tokens.map(i64::from);
         let cached_input_tokens = attempt.cached_input_tokens.map(i64::from);
+        let cache_creation_input_tokens = attempt.cache_creation_input_tokens.map(i64::from);
+        let route_provider = attempt.route_provider.as_deref();
+        let resolved_effort = optional_enum_to_wire(attempt.resolved_effort.as_ref())?;
         let duration_ms = attempt
             .duration_ms
             .map(|v| i64::try_from(v).context("duration_ms exceeds i64::MAX"))
@@ -579,8 +591,10 @@ INSERT INTO agent_sdk_turn_attempts (
 UPDATE agent_sdk_turn_attempts SET
     response_blob = ?2, response_id = ?3, response_model = ?4,
     stop_reason = ?5, outcome = ?6, input_tokens = ?7, output_tokens = ?8,
-    cached_input_tokens = ?9, closed_at = ?10, duration_ms = ?11,
-    otel_trace_id = ?12, otel_span_id = ?13
+    cached_input_tokens = ?9, cache_creation_input_tokens = ?10,
+    route_provider = ?11, resolved_effort = ?12,
+    closed_at = ?13, duration_ms = ?14,
+    otel_trace_id = ?15, otel_span_id = ?16
 WHERE id = ?1
 ",
             id,
@@ -592,6 +606,9 @@ WHERE id = ?1
             input_tokens,
             output_tokens,
             cached_input_tokens,
+            cache_creation_input_tokens,
+            route_provider,
+            resolved_effort,
             attempt.closed_at,
             duration_ms,
             otel_trace_id,
@@ -3898,7 +3915,8 @@ impl TurnAttemptStore for SqliteDurableStore {
 SELECT id, task_id, attempt_number, provider, requested_model,
        request_blob, response_blob, response_id, response_model,
        stop_reason, outcome, input_tokens, output_tokens,
-       cached_input_tokens, opened_at, closed_at, duration_ms,
+       cached_input_tokens, cache_creation_input_tokens, route_provider,
+       resolved_effort, opened_at, closed_at, duration_ms,
        otel_trace_id, otel_span_id
 FROM agent_sdk_turn_attempts WHERE task_id = ?1 ORDER BY attempt_number
 ",
@@ -4944,6 +4962,9 @@ struct TurnAttemptRecord {
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
     cached_input_tokens: Option<i64>,
+    cache_creation_input_tokens: Option<i64>,
+    route_provider: Option<String>,
+    resolved_effort: Option<String>,
     opened_at: OffsetDateTime,
     closed_at: Option<OffsetDateTime>,
     duration_ms: Option<i64>,
@@ -4983,6 +5004,15 @@ impl TryFrom<TurnAttemptRecord> for TurnAttempt {
             cached_input_tokens: r
                 .cached_input_tokens
                 .map(|v| u32_from_i64(v, "turn attempt cached_input_tokens"))
+                .transpose()?,
+            cache_creation_input_tokens: r
+                .cache_creation_input_tokens
+                .map(|v| u32_from_i64(v, "turn attempt cache_creation_input_tokens"))
+                .transpose()?,
+            route_provider: r.route_provider,
+            resolved_effort: r
+                .resolved_effort
+                .map(|v| enum_from_wire(&v, "turn attempt resolved_effort"))
                 .transpose()?,
             opened_at: r.opened_at,
             closed_at: r.closed_at,
@@ -5261,7 +5291,9 @@ mod tests {
         ExecutionIntent, ExecutionIntentStore, IntentStatus, OperationId, ToolEffectClass,
     };
     use agent_server::journal::store::AgentTaskStore;
-    use agent_server::journal::task::AgentTaskId;
+    use agent_server::journal::task::{AgentTask, AgentTaskId};
+    use agent_server::journal::turn_attempt::{TurnAttempt, TurnAttemptId};
+    use agent_server::journal::turn_attempt_store::TurnAttemptStore;
 
     use super::SqliteDurableStore;
 
@@ -5288,6 +5320,48 @@ mod tests {
             created_at: t_plus(secs),
             updated_at: t_plus(secs),
         }
+    }
+
+    #[tokio::test]
+    async fn evidence_migration_preserves_legacy_attempt_as_null_read_fields() -> Result<()> {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await?;
+        let migrations = crate::sqlite::migrations::durable_core_migrations();
+        for migration in migrations.iter().take(12) {
+            sqlx::raw_sql(migration.sql).execute(&pool).await?;
+        }
+
+        let store = SqliteDurableStore::from_pool(pool.clone());
+        let task = AgentTask::new_root_turn(ThreadId::from_string("legacy-evidence"), t0(), 3);
+        AgentTaskStore::submit_root_turn(&store, task.clone()).await?;
+        let attempt_id = TurnAttemptId::from_string("attempt_legacy_evidence");
+        let request_blob = serde_json::json!({"messages": []});
+        sqlx::query!(
+            r"
+INSERT INTO agent_sdk_turn_attempts (
+    id, task_id, attempt_number, provider, requested_model, request_blob, opened_at
+) VALUES (?1, ?2, 1, 'anthropic', 'claude-sonnet-4-6', ?3, ?4)
+",
+            attempt_id.as_str(),
+            task.id.as_str(),
+            request_blob,
+            t0(),
+        )
+        .execute(&pool)
+        .await?;
+
+        let evidence_migration = migrations.get(12).context("migration 0013 missing")?;
+        sqlx::raw_sql(evidence_migration.sql).execute(&pool).await?;
+
+        let legacy: TurnAttempt = TurnAttemptStore::get(&store, &attempt_id)
+            .await?
+            .context("legacy attempt missing after migration")?;
+        assert!(legacy.cache_creation_input_tokens.is_none());
+        assert!(legacy.route_provider.is_none());
+        assert!(legacy.resolved_effort.is_none());
+        Ok(())
     }
 
     #[tokio::test]
@@ -6238,6 +6312,9 @@ mod tests {
                     input_tokens: 10,
                     output_tokens: 20,
                     cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    route_provider: None,
+                    resolved_effort: None,
                 },
                 messages: final_messages,
                 turn_usage: TokenUsage {
@@ -6347,6 +6424,9 @@ mod tests {
                     input_tokens: 10,
                     output_tokens: 20,
                     cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    route_provider: None,
+                    resolved_effort: None,
                 },
                 messages: vec![llm::Message::user("hi"), llm::Message::assistant("there")],
                 turn_usage: TokenUsage {

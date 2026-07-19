@@ -68,11 +68,15 @@ const TASK_LAST_ACTIVITY_AT_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/sqlite/0012_task_last_activity_at.sql"
 ));
+const TURN_ATTEMPT_EVIDENCE_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/sqlite/0013_turn_attempt_evidence.sql"
+));
 
 /// `sqlx`-managed migration bundle for the `SQLite` durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/sqlite");
 
-const MIGRATIONS: [SqliteMigration; 12] = [
+const MIGRATIONS: [SqliteMigration; 13] = [
     SqliteMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -132,6 +136,11 @@ const MIGRATIONS: [SqliteMigration; 12] = [
         version: "0012",
         summary: "durable per-task last_activity_at anchoring the subagent stall budget",
         sql: TASK_LAST_ACTIVITY_AT_SQL,
+    },
+    SqliteMigration {
+        version: "0013",
+        summary: "turn-attempt cache creation, route, and resolved effort evidence",
+        sql: TURN_ATTEMPT_EVIDENCE_SQL,
     },
 ];
 
@@ -201,7 +210,7 @@ pub const fn checkpoint_kind_migration() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{DURABLE_CORE_MIGRATOR, durable_core_migrations};
+    use super::{DURABLE_CORE_MIGRATOR, TURN_ATTEMPT_EVIDENCE_SQL, durable_core_migrations};
 
     /// Mirror of the Postgres finding-#20 guard: the schema-contract
     /// checks concatenate only the reviewable bundle, so a migration
@@ -234,5 +243,27 @@ mod tests {
             .map(|migration| format!("{:04}", migration.version))
             .collect();
         assert_eq!(reviewable, executable);
+    }
+
+    #[test]
+    fn turn_attempt_evidence_migration_is_additive_and_nullable() {
+        assert_eq!(
+            TURN_ATTEMPT_EVIDENCE_SQL.matches("ADD COLUMN").count(),
+            3,
+            "evidence migration must add exactly three columns",
+        );
+        assert!(
+            TURN_ATTEMPT_EVIDENCE_SQL
+                .lines()
+                .filter(|line| line.trim_start().starts_with("ADD COLUMN"))
+                .all(|line| line.contains(" NULL")),
+            "every evidence column must preserve legacy rows as NULL",
+        );
+        assert!(
+            !TURN_ATTEMPT_EVIDENCE_SQL
+                .to_ascii_uppercase()
+                .contains("UPDATE AGENT_SDK_TURN_ATTEMPTS"),
+            "evidence migration must not rewrite old attempt rows",
+        );
     }
 }
