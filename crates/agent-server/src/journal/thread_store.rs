@@ -35,6 +35,71 @@ use tokio::sync::RwLock;
 use super::completed_turn_transaction::AtomicCompletedTurnCommitter;
 use super::thread::Thread;
 
+/// Parameters that define the operation which first claimed a thread id.
+///
+/// These parameters are persisted/compared by durable stores under the
+/// destination thread's primary key. They intentionally exclude transport
+/// request ids: retries may use a different request id while still referring
+/// to the same logical thread creation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ThreadCreation {
+    /// A bare `CreateThread` operation.
+    Create,
+    /// A `ForkThread` operation with its immutable fork boundary.
+    Fork {
+        /// Source thread copied by the fork.
+        source_thread_id: ThreadId,
+        /// Completed-turn boundary copied from the source.
+        fork_after_committed_turns: u32,
+    },
+}
+
+impl ThreadCreation {
+    /// Idempotency operation kind used by durable storage.
+    #[must_use]
+    pub const fn idempotency_kind(&self) -> super::idempotency::IdempotencyKind {
+        match self {
+            Self::Create => super::idempotency::IdempotencyKind::CreateThread,
+            Self::Fork { .. } => super::idempotency::IdempotencyKind::ForkThread,
+        }
+    }
+
+    /// Stable comparison bytes persisted by durable storage.
+    #[must_use]
+    pub fn fingerprint(&self) -> Vec<u8> {
+        match self {
+            Self::Create => b"create-thread-v1".to_vec(),
+            Self::Fork {
+                source_thread_id,
+                fork_after_committed_turns,
+            } => {
+                let mut fingerprint = b"fork-thread-v1\0".to_vec();
+                fingerprint.extend_from_slice(source_thread_id.0.as_bytes());
+                fingerprint.push(0);
+                fingerprint.extend_from_slice(&fork_after_committed_turns.to_be_bytes());
+                fingerprint
+            }
+        }
+    }
+}
+
+/// Result of atomically claiming a caller-minted thread id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadCreationOutcome {
+    /// This call claimed the id and created the destination.
+    Created,
+    /// The id already represented the exact same creation parameters.
+    Existing,
+}
+
+/// Typed conflict returned when a thread id was already claimed differently.
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("thread id {thread_id} already exists with conflicting creation parameters")]
+pub struct ThreadIdConflict {
+    /// Caller-minted id that collided.
+    pub thread_id: ThreadId,
+}
+
 /// Storage trait for [`Thread`] projection rows.
 ///
 /// The trait surface is deliberately narrow: `commit_turn` is the
@@ -84,6 +149,31 @@ pub trait ThreadStore: Send + Sync {
     /// # Errors
     /// Returns an error if the underlying store cannot be written.
     async fn get_or_create(&self, thread_id: &ThreadId, now: OffsetDateTime) -> Result<Thread>;
+
+    /// Atomically create a caller-addressed thread or return the matching row.
+    ///
+    /// Implementations must use one upsert-shaped critical section keyed by
+    /// `thread_id`. An existing id with different [`ThreadCreation`] parameters
+    /// returns [`ThreadIdConflict`] and must not mutate any thread state.
+    ///
+    /// # Errors
+    /// - [`ThreadIdConflict`] when the id was claimed by different parameters.
+    /// - Store-level write errors.
+    async fn get_or_create_for_creation(
+        &self,
+        thread_id: &ThreadId,
+        creation: &ThreadCreation,
+        now: OffsetDateTime,
+    ) -> Result<(Thread, ThreadCreationOutcome)>;
+
+    /// Optional lock held across the non-atomic fork fallback.
+    ///
+    /// In-memory stores expose this so a concurrent matching fork cannot
+    /// observe the destination between its aggregate claim and projection
+    /// copy. Durable stores transact the full fork and return `None`.
+    fn sequential_fork_lock(&self) -> Option<&tokio::sync::Mutex<()>> {
+        None
+    }
 
     /// Optional process-wide serialization lock for the NON-ATOMIC
     /// sequential commit path in [`super::commit::commit_completed_turn`].
@@ -168,6 +258,7 @@ pub trait ThreadStore: Send + Sync {
 #[derive(Default)]
 struct Inner {
     by_id: HashMap<ThreadId, Thread>,
+    creation_by_id: HashMap<ThreadId, ThreadCreation>,
 }
 
 /// In-memory reference implementation of [`ThreadStore`].
@@ -181,6 +272,8 @@ pub struct InMemoryThreadStore {
     /// See [`ThreadStore::sequential_commit_lock`]. Shared across
     /// clones so every handle serializes against the same lock.
     sequential_commit_lock: Arc<tokio::sync::Mutex<()>>,
+    /// See [`ThreadStore::sequential_fork_lock`].
+    sequential_fork_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl InMemoryThreadStore {
@@ -197,6 +290,10 @@ impl ThreadStore for InMemoryThreadStore {
         Some(&self.sequential_commit_lock)
     }
 
+    fn sequential_fork_lock(&self) -> Option<&tokio::sync::Mutex<()>> {
+        Some(&self.sequential_fork_lock)
+    }
+
     async fn get_or_create(&self, thread_id: &ThreadId, now: OffsetDateTime) -> Result<Thread> {
         let mut inner = self.inner.write().await;
         let thread = inner
@@ -206,6 +303,33 @@ impl ThreadStore for InMemoryThreadStore {
             .clone();
         drop(inner);
         Ok(thread)
+    }
+
+    async fn get_or_create_for_creation(
+        &self,
+        thread_id: &ThreadId,
+        creation: &ThreadCreation,
+        now: OffsetDateTime,
+    ) -> Result<(Thread, ThreadCreationOutcome)> {
+        let mut inner = self.inner.write().await;
+        if let Some(thread) = inner.by_id.get(thread_id).cloned() {
+            let matches = inner.creation_by_id.get(thread_id) == Some(creation);
+            drop(inner);
+            if matches {
+                return Ok((thread, ThreadCreationOutcome::Existing));
+            }
+            return Err(anyhow::Error::new(ThreadIdConflict {
+                thread_id: thread_id.clone(),
+            }));
+        }
+
+        let thread = Thread::new(thread_id.clone(), now);
+        inner.by_id.insert(thread_id.clone(), thread.clone());
+        inner
+            .creation_by_id
+            .insert(thread_id.clone(), creation.clone());
+        drop(inner);
+        Ok((thread, ThreadCreationOutcome::Created))
     }
 
     async fn get(&self, thread_id: &ThreadId) -> Result<Option<Thread>> {

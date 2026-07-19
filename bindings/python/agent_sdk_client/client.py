@@ -83,10 +83,17 @@ class AgentClient:
         self.close()
 
     # ── Control plane ────────────────────────────────────────────────
-    def create_thread(self, request_id: str = "") -> str:
-        """Create a durable thread and return its id."""
+    def create_thread(self, request_id: str = "", *, thread_id: str = "") -> str:
+        """Create or retrieve a durable thread and return its id.
+
+        When ``thread_id`` is empty the server mints one, preserving the legacy
+        behavior. A supplied id makes retries idempotent by thread identity.
+        """
         resp = self._control.CreateThread(
-            control_pb2.CreateThreadRequest(request_id=request_id)
+            control_pb2.CreateThreadRequest(
+                request_id=request_id,
+                thread_id=thread_id,
+            )
         )
         return resp.thread.thread_id
 

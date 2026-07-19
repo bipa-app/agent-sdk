@@ -193,6 +193,7 @@ dependencies = [
  "lapin",
  "opentelemetry",
  "opentelemetry_sdk",
+ "proptest",
  "prost",
  "prost-types",
  "serde",

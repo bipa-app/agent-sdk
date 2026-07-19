@@ -12,8 +12,14 @@ import "agent/service/v1/common.proto";
 
 message CreateThreadRequest {
   // Caller-supplied idempotency key for the logical create operation.
-  // Retries must reuse the same value.
+  // Retries must reuse the same value on the legacy server-minted path.
   string request_id = 1;
+
+  // Optional caller-minted thread identity. When non-empty, this is the
+  // idempotency key for thread creation: matching retries return the existing
+  // thread, while reuse by a conflicting lifecycle operation is rejected.
+  // Empty preserves server-side id minting for existing callers.
+  string thread_id = 2;
 }
 
 message CreateThreadResponse {
@@ -135,10 +141,11 @@ message SubmitThreadWorkResponse {
 //
 // # Idempotency
 //
-// `request_id` is the idempotency key. A retry under the same
-// request_id returns the originally-minted thread; a retry with a
-// *different* `source_thread_id` or `fork_after_committed_turns`
-// under the same `request_id` is rejected with `ALREADY_EXISTS`.
+// `thread_id`, when supplied, is the primary idempotency key. A retry with
+// the same destination, source, and fork boundary returns the existing fork;
+// conflicting reuse is `ALREADY_EXISTS`. When `thread_id` is empty, the
+// legacy `request_id` contract remains unchanged and replays the originally
+// server-minted destination.
 //
 // # Errors
 //
@@ -162,6 +169,12 @@ message ForkThreadRequest {
   // `CreateThread`'d thread); `source.committed_turns` produces a
   // full fork that mirrors the entire conversation.
   uint32 fork_after_committed_turns = 3;
+
+  // Optional caller-minted destination identity. Matching
+  // `(thread_id, source_thread_id, fork_after_committed_turns)` retries return
+  // the existing fork; conflicting reuse of `thread_id` is rejected. Empty
+  // preserves server-side destination minting for existing callers.
+  string thread_id = 4;
 }
 
 message ForkThreadResponse {

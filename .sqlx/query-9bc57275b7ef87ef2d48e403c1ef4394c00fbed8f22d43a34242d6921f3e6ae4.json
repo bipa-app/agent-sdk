@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO agent_sdk_idempotency\n                       (request_id, kind, fingerprint, result_json, created_at)\n                   VALUES ($1, $2, $3, $4, $5)\n                   ON CONFLICT (request_id) DO NOTHING\n                   RETURNING request_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "request_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_idempotency",
+            "name": "request_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Bytea",
+        "Jsonb",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "9bc57275b7ef87ef2d48e403c1ef4394c00fbed8f22d43a34242d6921f3e6ae4"
+}

@@ -70,7 +70,9 @@ use agent_server::journal::task::{
 };
 use agent_server::journal::task_state::SubagentInvocationState;
 use agent_server::journal::thread::Thread;
-use agent_server::journal::thread_store::ThreadStore;
+use agent_server::journal::thread_store::{
+    ThreadCreation, ThreadCreationOutcome, ThreadIdConflict, ThreadStore,
+};
 use agent_server::journal::tool_audit::{ToolAuditEvent, ToolAuditEventId, ToolAuditEventStore};
 use agent_server::journal::turn_attempt::{
     CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptId,
@@ -215,18 +217,18 @@ impl SqliteDurableStore {
             .context("begin sqlite durable-core transaction")
     }
 
-    async fn bootstrap_thread_row_tx(
+    async fn insert_thread_row_tx(
         tx: &mut Transaction<'_, Sqlite>,
         thread_id: &ThreadId,
         now: OffsetDateTime,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let bootstrap = Thread::new(thread_id.clone(), now);
         let thread_id_key = thread_key(&bootstrap.thread_id);
         let status_wire = enum_to_wire(&bootstrap.status)?;
         let committed_turns = i64::from(bootstrap.committed_turns);
         let input_tokens = i64::from(bootstrap.total_usage.input_tokens);
         let output_tokens = i64::from(bootstrap.total_usage.output_tokens);
-        sqlx::query!(
+        let inserted = sqlx::query!(
             r"
 INSERT INTO agent_sdk_threads (
     thread_id, status, committed_turns,
@@ -244,8 +246,77 @@ ON CONFLICT (thread_id) DO NOTHING
         )
         .execute(&mut **tx)
         .await
-        .context("bootstrap thread row")?;
+        .context("insert thread row")?;
+        Ok(inserted.rows_affected() == 1)
+    }
+
+    async fn bootstrap_thread_row_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        thread_id: &ThreadId,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let _inserted = Self::insert_thread_row_tx(tx, thread_id, now).await?;
         Ok(())
+    }
+
+    async fn claim_thread_creation_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        thread_id: &ThreadId,
+        creation: &ThreadCreation,
+        now: OffsetDateTime,
+    ) -> Result<ThreadCreationOutcome> {
+        let inserted_thread = Self::insert_thread_row_tx(tx, thread_id, now).await?;
+        let identity_key = thread_creation_identity_key(thread_id);
+        let kind = creation.idempotency_kind();
+        let fingerprint = creation.fingerprint();
+        let result_json = serde_json::json!({ "thread_id": thread_id.0 });
+        let result_text = serde_json::to_string(&result_json)
+            .context("encode caller-minted thread identity result")?;
+
+        if inserted_thread {
+            let inserted_identity = sqlx::query!(
+                r#"INSERT INTO agent_sdk_idempotency
+                       (request_id, kind, fingerprint, result_json, created_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5)
+                   ON CONFLICT (request_id) DO NOTHING"#,
+                identity_key,
+                kind.as_str(),
+                fingerprint,
+                result_text,
+                now,
+            )
+            .execute(&mut **tx)
+            .await
+            .with_context(|| format!("claim creation identity for {thread_id}"))?;
+            if inserted_identity.rows_affected() == 1 {
+                return Ok(ThreadCreationOutcome::Created);
+            }
+            return Err(anyhow::Error::new(ThreadIdConflict {
+                thread_id: thread_id.clone(),
+            }));
+        }
+
+        let row = sqlx::query!(
+            r#"SELECT kind, fingerprint, result_json
+               FROM agent_sdk_idempotency WHERE request_id = ?1"#,
+            identity_key,
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| format!("load creation identity for {thread_id}"))?;
+        if let Some(row) = row {
+            let stored_result: serde_json::Value = serde_json::from_str(&row.result_json)
+                .context("decode caller-minted thread identity result")?;
+            if row.kind == kind.as_str()
+                && row.fingerprint == fingerprint
+                && stored_result == result_json
+            {
+                return Ok(ThreadCreationOutcome::Existing);
+            }
+        }
+        Err(anyhow::Error::new(ThreadIdConflict {
+            thread_id: thread_id.clone(),
+        }))
     }
 
     async fn get_thread_tx(
@@ -1714,18 +1785,33 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
     /// handler's idempotency replay can safely retry under the
     /// same `request_id` after a transport blip without seeing a
     /// half-finished fork.
-    async fn commit_fork_atomic_inner(&self, params: ForkCommitParams) -> Result<()> {
+    async fn commit_fork_atomic_inner(
+        &self,
+        params: ForkCommitParams,
+    ) -> Result<ThreadCreationOutcome> {
         use agent_server::journal::message::MessageProjection;
 
         let mut tx = self.begin().await?;
 
-        // 1. Bootstrap the destination thread aggregate. Same call
-        //    `bootstrap_thread_row_tx` makes for `commit_completed_turn`,
-        //    which means the row layout (status, created_at, etc.)
-        //    matches what `CreateThread` would have produced — the
-        //    fork's destination is indistinguishable from a fresh
-        //    thread the moment the transaction commits.
-        Self::bootstrap_thread_row_tx(&mut tx, &params.new_thread_id, params.now).await?;
+        // Claim caller-minted destinations by primary key inside the same
+        // transaction as the fork copy. Matching retries are no-ops; a
+        // conflicting origin is typed and rolls back without mutation.
+        let creation_outcome = if let Some(creation) = params.creation.as_ref() {
+            Self::claim_thread_creation_tx(&mut tx, &params.new_thread_id, creation, params.now)
+                .await?
+        } else {
+            Self::bootstrap_thread_row_tx(&mut tx, &params.new_thread_id, params.now).await?;
+            ThreadCreationOutcome::Created
+        };
+        if creation_outcome == ThreadCreationOutcome::Existing {
+            tx.commit()
+                .await
+                .context("commit idempotent sqlite fork lookup")?;
+            return Ok(ThreadCreationOutcome::Existing);
+        }
+
+        // 1. The destination aggregate was inserted by the claim above. Same
+        //    shape `bootstrap_thread_row_tx` makes for completed turns.
 
         // 2. Mirror `committed_turns` by repeatedly applying
         //    `Thread::apply_committed_turn`. Each call advances
@@ -1795,7 +1881,7 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
         tx.commit()
             .await
             .context("commit sqlite fork transaction")?;
-        Ok(())
+        Ok(creation_outcome)
     }
 
     /// Enforce [`CompletedTurnCommit::owner_guard`] on the task row
@@ -3712,6 +3798,24 @@ impl ThreadStore for SqliteDurableStore {
         Ok(thread)
     }
 
+    async fn get_or_create_for_creation(
+        &self,
+        thread_id: &ThreadId,
+        creation: &ThreadCreation,
+        now: OffsetDateTime,
+    ) -> Result<(Thread, ThreadCreationOutcome)> {
+        let mut tx = self.begin().await?;
+        let outcome = Self::claim_thread_creation_tx(&mut tx, thread_id, creation, now).await?;
+        let thread = Self::get_thread_tx(&mut tx, thread_id)
+            .await?
+            .context("thread missing after caller-addressed creation")?;
+        let _projection = Self::get_message_head_tx(&mut tx, thread_id, now).await?;
+        tx.commit()
+            .await
+            .context("commit caller-addressed thread get-or-create")?;
+        Ok((thread, outcome))
+    }
+
     async fn get(&self, thread_id: &ThreadId) -> Result<Option<Thread>> {
         self.get_thread_pool(thread_id).await
     }
@@ -4039,7 +4143,7 @@ impl AtomicCompletedTurnCommitter for SqliteDurableStore {
 
 #[async_trait]
 impl AtomicForkCommitter for SqliteDurableStore {
-    async fn commit_fork_atomic(&self, params: ForkCommitParams) -> Result<()> {
+    async fn commit_fork_atomic(&self, params: ForkCommitParams) -> Result<ThreadCreationOutcome> {
         self.commit_fork_atomic_inner(params).await
     }
 }
@@ -5209,6 +5313,10 @@ impl TryFrom<ToolAuditEventRecord> for ToolAuditEvent {
 // ─────────────────────────────────────────────────────────────────────
 // Wire format helpers
 // ─────────────────────────────────────────────────────────────────────
+
+fn thread_creation_identity_key(thread_id: &ThreadId) -> String {
+    format!("agent-sdk:thread-creation:{}", thread_id.0)
+}
 
 const fn thread_key(thread_id: &ThreadId) -> &str {
     thread_id.0.as_str()
@@ -6552,6 +6660,7 @@ mod tests {
         ];
         let params = ForkCommitParams {
             new_thread_id: new_thread_id.clone(),
+            creation: None,
             now,
             committed_turns: 1,
             cumulative_total_usage: agent_sdk_foundation::TokenUsage::default(),
@@ -6637,6 +6746,7 @@ mod tests {
         let messages = vec![Message::user("u"), Message::assistant("a")];
         let params = ForkCommitParams {
             new_thread_id: new_thread_id.clone(),
+            creation: None,
             now,
             committed_turns: 3,
             cumulative_total_usage: cumulative.clone(),
@@ -6743,6 +6853,7 @@ mod tests {
         let fresh_messages = vec![Message::user("seeded")];
         let params = ForkCommitParams {
             new_thread_id: new_thread_id.clone(),
+            creation: None,
             now,
             committed_turns: 1,
             cumulative_total_usage: agent_sdk_foundation::TokenUsage::default(),

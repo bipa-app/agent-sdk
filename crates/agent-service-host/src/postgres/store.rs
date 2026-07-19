@@ -71,7 +71,9 @@ use agent_server::journal::task::{
 };
 use agent_server::journal::task_state::SubagentInvocationState;
 use agent_server::journal::thread::Thread;
-use agent_server::journal::thread_store::ThreadStore;
+use agent_server::journal::thread_store::{
+    ThreadCreation, ThreadCreationOutcome, ThreadIdConflict, ThreadStore,
+};
 use agent_server::journal::tool_audit::{ToolAuditEvent, ToolAuditEventId, ToolAuditEventStore};
 use agent_server::journal::turn_attempt::{
     CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptId,
@@ -219,13 +221,13 @@ impl PostgresDurableStore {
             .context("begin postgres durable-core transaction")
     }
 
-    async fn bootstrap_thread_row_tx(
+    async fn insert_thread_row_tx(
         tx: &mut Transaction<'_, Postgres>,
         thread_id: &ThreadId,
         now: OffsetDateTime,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let bootstrap = Thread::new(thread_id.clone(), now);
-        sqlx::query!(
+        let inserted = sqlx::query!(
             r"
 INSERT INTO agent_sdk_threads (
     thread_id,
@@ -237,6 +239,7 @@ INSERT INTO agent_sdk_threads (
     updated_at
 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT (thread_id) DO NOTHING
+RETURNING thread_id
 ",
             thread_key(&bootstrap.thread_id),
             enum_to_wire(&bootstrap.status)?,
@@ -246,10 +249,75 @@ ON CONFLICT (thread_id) DO NOTHING
             bootstrap.created_at,
             bootstrap.updated_at,
         )
-        .execute(&mut **tx)
+        .fetch_optional(&mut **tx)
         .await
-        .context("bootstrap thread row")?;
+        .context("insert thread row")?;
+        Ok(inserted.is_some())
+    }
+
+    async fn bootstrap_thread_row_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        thread_id: &ThreadId,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let _inserted = Self::insert_thread_row_tx(tx, thread_id, now).await?;
         Ok(())
+    }
+
+    async fn claim_thread_creation_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        thread_id: &ThreadId,
+        creation: &ThreadCreation,
+        now: OffsetDateTime,
+    ) -> Result<ThreadCreationOutcome> {
+        let inserted_thread = Self::insert_thread_row_tx(tx, thread_id, now).await?;
+        let identity_key = thread_creation_identity_key(thread_id);
+        let kind = creation.idempotency_kind();
+        let fingerprint = creation.fingerprint();
+        let result_json = serde_json::json!({ "thread_id": thread_id.0 });
+
+        if inserted_thread {
+            let inserted_identity = sqlx::query!(
+                r#"INSERT INTO agent_sdk_idempotency
+                       (request_id, kind, fingerprint, result_json, created_at)
+                   VALUES ($1, $2, $3, $4, $5)
+                   ON CONFLICT (request_id) DO NOTHING
+                   RETURNING request_id"#,
+                identity_key,
+                kind.as_str(),
+                fingerprint,
+                result_json,
+                now,
+            )
+            .fetch_optional(&mut **tx)
+            .await
+            .with_context(|| format!("claim creation identity for {thread_id}"))?;
+            if inserted_identity.is_some() {
+                return Ok(ThreadCreationOutcome::Created);
+            }
+            return Err(anyhow::Error::new(ThreadIdConflict {
+                thread_id: thread_id.clone(),
+            }));
+        }
+
+        let row = sqlx::query!(
+            r#"SELECT kind, fingerprint, result_json
+               FROM agent_sdk_idempotency WHERE request_id = $1"#,
+            identity_key,
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| format!("load creation identity for {thread_id}"))?;
+        if row.is_some_and(|row| {
+            row.kind == kind.as_str()
+                && row.fingerprint == fingerprint
+                && row.result_json == result_json
+        }) {
+            return Ok(ThreadCreationOutcome::Existing);
+        }
+        Err(anyhow::Error::new(ThreadIdConflict {
+            thread_id: thread_id.clone(),
+        }))
     }
 
     async fn lock_thread_tx(
@@ -1901,12 +1969,31 @@ FOR UPDATE
     /// without seeing a half-finished fork (which would otherwise inflate
     /// `committed_turns` / `total_usage` on replay or hit a checkpoint
     /// uniqueness conflict).
-    async fn commit_fork_atomic_inner(&self, params: ForkCommitParams) -> Result<()> {
+    async fn commit_fork_atomic_inner(
+        &self,
+        params: ForkCommitParams,
+    ) -> Result<ThreadCreationOutcome> {
         let mut tx = self.begin().await?;
 
-        // 1. Bootstrap the destination thread aggregate, exactly as
-        //    `CreateThread` / `commit_completed_turn` would.
-        Self::bootstrap_thread_row_tx(&mut tx, &params.new_thread_id, params.now).await?;
+        // Claim caller-minted destinations by primary key inside the same
+        // transaction as the fork copy. Matching retries are no-ops; a
+        // conflicting origin is typed and rolls back without mutation.
+        let creation_outcome = if let Some(creation) = params.creation.as_ref() {
+            Self::claim_thread_creation_tx(&mut tx, &params.new_thread_id, creation, params.now)
+                .await?
+        } else {
+            Self::bootstrap_thread_row_tx(&mut tx, &params.new_thread_id, params.now).await?;
+            ThreadCreationOutcome::Created
+        };
+        if creation_outcome == ThreadCreationOutcome::Existing {
+            tx.commit()
+                .await
+                .context("commit idempotent postgres fork lookup")?;
+            return Ok(ThreadCreationOutcome::Existing);
+        }
+
+        // 1. The destination aggregate was inserted by the claim above,
+        //    exactly as `CreateThread` / `commit_completed_turn` would.
 
         // 2. Mirror `committed_turns` by repeatedly applying
         //    `Thread::apply_committed_turn`. Only the final iteration
@@ -1966,7 +2053,7 @@ FOR UPDATE
         tx.commit()
             .await
             .context("commit postgres fork transaction")?;
-        Ok(())
+        Ok(creation_outcome)
     }
 
     async fn commit_completed_turn_atomic_inner(
@@ -4190,6 +4277,24 @@ impl ThreadStore for PostgresDurableStore {
         Ok(thread)
     }
 
+    async fn get_or_create_for_creation(
+        &self,
+        thread_id: &ThreadId,
+        creation: &ThreadCreation,
+        now: OffsetDateTime,
+    ) -> Result<(Thread, ThreadCreationOutcome)> {
+        let mut tx = self.begin().await?;
+        let outcome = Self::claim_thread_creation_tx(&mut tx, thread_id, creation, now).await?;
+        let thread = Self::lock_thread_tx(&mut tx, thread_id)
+            .await?
+            .context("thread missing after caller-addressed creation")?;
+        let _projection = Self::lock_message_head_tx(&mut tx, thread_id, now).await?;
+        tx.commit()
+            .await
+            .context("commit caller-addressed thread get-or-create")?;
+        Ok((thread, outcome))
+    }
+
     async fn get(&self, thread_id: &ThreadId) -> Result<Option<Thread>> {
         self.get_thread_pool(thread_id).await
     }
@@ -4587,7 +4692,7 @@ impl AtomicCompletedTurnCommitter for PostgresDurableStore {
 
 #[async_trait]
 impl AtomicForkCommitter for PostgresDurableStore {
-    async fn commit_fork_atomic(&self, params: ForkCommitParams) -> Result<()> {
+    async fn commit_fork_atomic(&self, params: ForkCommitParams) -> Result<ThreadCreationOutcome> {
         self.commit_fork_atomic_inner(params).await
     }
 }
@@ -6163,6 +6268,10 @@ impl TryFrom<ExecutionIntentRecord> for ExecutionIntent {
             updated_at: record.updated_at,
         })
     }
+}
+
+fn thread_creation_identity_key(thread_id: &ThreadId) -> String {
+    format!("agent-sdk:thread-creation:{}", thread_id.0)
 }
 
 const fn thread_key(thread_id: &ThreadId) -> &str {
