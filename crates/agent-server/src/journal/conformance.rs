@@ -520,7 +520,7 @@ mod in_memory_bundle {
             thread_id: &ThreadId,
             creation: &ThreadCreation,
             now: OffsetDateTime,
-        ) -> Result<(Thread, ThreadCreationOutcome)> {
+        ) -> Result<ThreadCreationOutcome> {
             self.thread
                 .get_or_create_for_creation(thread_id, creation, now)
                 .await

@@ -691,7 +691,7 @@ impl GrpcControlService {
         fork_after: u32,
         creation: Option<ThreadCreation>,
         now: OffsetDateTime,
-    ) -> Result<(u64, u64, ThreadCreationOutcome), Status> {
+    ) -> Result<(u64, u64), Status> {
         let params = self
             .build_fork_commit_params(source_thread_id, new_thread_id, fork_after, creation, now)
             .await?;
@@ -721,7 +721,7 @@ impl GrpcControlService {
             ThreadCreationOutcome::Created => (requested_message_count, requested_event_count),
             ThreadCreationOutcome::Existing => self.fork_destination_counts(new_thread_id).await?,
         };
-        Ok((message_count, event_count, outcome))
+        Ok((message_count, event_count))
     }
 
     async fn fork_destination_counts(&self, thread_id: &ThreadId) -> Result<(u64, u64), Status> {
@@ -853,14 +853,12 @@ impl GrpcControlService {
         // caller-minted path claims its immutable creation parameters under
         // the same thread-store write lock before any projection mutation.
         let outcome = if let Some(creation) = params.creation.as_ref() {
-            let (_thread, outcome) = self
-                .shared
+            self.shared
                 .stores
                 .thread_store
                 .get_or_create_for_creation(&params.new_thread_id, creation, params.now)
                 .await
-                .map_err(map_thread_creation_error("creating forked thread"))?;
-            outcome
+                .map_err(map_thread_creation_error("creating forked thread"))?
         } else {
             self.shared
                 .stores
@@ -938,6 +936,7 @@ impl GrpcControlService {
         }
         Ok(outcome)
     }
+
     /// Replay a recorded `ForkThread` outcome under the same
     /// `request_id`. The source's `message_count` / `event_count` are
     /// re-derived from the live stores rather than the original
@@ -1103,9 +1102,9 @@ impl AgentControlService for GrpcControlService {
         let request = request.into_inner();
         require_request_id(&request.request_id)?;
 
-        if let Some(thread_id) = parse_optional_thread_id(&request.thread_id) {
+        if let Some(thread_id) = parse_caller_thread_id(&request.thread_id)? {
             let now = OffsetDateTime::now_utc();
-            let (_thread, _outcome) = self
+            let _outcome = self
                 .shared
                 .stores
                 .thread_store
@@ -1403,39 +1402,46 @@ impl AgentControlService for GrpcControlService {
         let request = request.into_inner();
         require_request_id(&request.request_id)?;
         let source_thread_id = parse_thread_id(&request.source_thread_id)?;
-        let caller_thread_id = parse_optional_thread_id(&request.thread_id);
+        let caller_thread_id = parse_caller_thread_id(&request.thread_id)?;
         let caller_minted = caller_thread_id.is_some();
         let fork_after = request.fork_after_committed_turns;
         let fingerprint = fork_thread_fingerprint(&request);
 
-        // Preserve request-id replay only for the legacy server-minted path.
-        // Caller-addressed forks are claimed atomically by destination PK.
-        if caller_thread_id.is_none() {
-            match self
-                .shared
-                .stores
-                .task_store
-                .claim_idempotency(
+        // Request-id replay guards BOTH paths. On the caller-minted path
+        // the destination PK claim below stays authoritative for
+        // creation, but the request_id remains a true secondary
+        // idempotency key: the fingerprint covers the caller's
+        // thread_id, so one request_id can never mint two different
+        // destinations (it conflicts instead).
+        match self
+            .shared
+            .stores
+            .task_store
+            .claim_idempotency(
+                &request.request_id,
+                IdempotencyKind::ForkThread,
+                &fingerprint,
+            )
+            .await
+            .map_err(internal_status("fork-thread idempotency lookup"))?
+        {
+            IdempotencyClaim::Conflict => {
+                return Err(idempotency_conflict_status(
+                    "ForkThread",
                     &request.request_id,
-                    IdempotencyKind::ForkThread,
-                    &fingerprint,
-                )
-                .await
-                .map_err(internal_status("fork-thread idempotency lookup"))?
-            {
-                IdempotencyClaim::Conflict => {
-                    return Err(idempotency_conflict_status(
-                        "ForkThread",
-                        &request.request_id,
-                    ));
-                }
-                IdempotencyClaim::Replay(record) => {
-                    let result: ForkThreadResult = decode_idempotency_result(&record.result_json)?;
-                    let response = self.replay_fork_thread_response(&result).await?;
-                    return Ok(Response::new(response));
-                }
-                IdempotencyClaim::Fresh => {}
+                ));
             }
+            IdempotencyClaim::Replay(record) if caller_minted && record.result_json.is_null() => {
+                // A prior caller-minted attempt died between claim and
+                // record; fall through — the destination PK claim is
+                // idempotent, so re-driving is safe.
+            }
+            IdempotencyClaim::Replay(record) => {
+                let result: ForkThreadResult = decode_idempotency_result(&record.result_json)?;
+                let response = self.replay_fork_thread_response(&result).await?;
+                return Ok(Response::new(response));
+            }
+            IdempotencyClaim::Fresh => {}
         }
 
         // The source must exist before we mint anything. NOT_FOUND
@@ -1452,31 +1458,29 @@ impl AgentControlService for GrpcControlService {
         let now = OffsetDateTime::now_utc();
         let (new_thread_id, creation) =
             fork_destination(caller_thread_id, &source_thread_id, fork_after);
-        let (message_count, event_count, _outcome) = self
+        let (message_count, event_count) = self
             .copy_thread_state(&source_thread_id, &new_thread_id, fork_after, creation, now)
             .await?;
 
-        if !caller_minted {
-            let result_json = serde_json::to_value(ForkThreadResult {
-                source_thread_id: request.source_thread_id.clone(),
-                fork_after_committed_turns: fork_after,
-                new_thread_id: new_thread_id.0.clone(),
+        let result_json = serde_json::to_value(ForkThreadResult {
+            source_thread_id: request.source_thread_id.clone(),
+            fork_after_committed_turns: fork_after,
+            new_thread_id: new_thread_id.0.clone(),
+        })
+        .map_err(|error| {
+            Status::internal(format!("encoding fork-thread idempotency result: {error}"))
+        })?;
+        self.shared
+            .stores
+            .task_store
+            .record_idempotency(IdempotencyRecord {
+                request_id: request.request_id.clone(),
+                kind: IdempotencyKind::ForkThread,
+                fingerprint,
+                result_json,
             })
-            .map_err(|error| {
-                Status::internal(format!("encoding fork-thread idempotency result: {error}"))
-            })?;
-            self.shared
-                .stores
-                .task_store
-                .record_idempotency(IdempotencyRecord {
-                    request_id: request.request_id.clone(),
-                    kind: IdempotencyKind::ForkThread,
-                    fingerprint,
-                    result_json,
-                })
-                .await
-                .map_err(internal_status("recording fork-thread idempotency"))?;
-        }
+            .await
+            .map_err(internal_status("recording fork-thread idempotency"))?;
 
         Ok(Response::new(pb::ForkThreadResponse {
             thread: Some(self.shared.thread_view(&new_thread_id).await?),
@@ -2405,9 +2409,23 @@ impl LocalDaemon {
     }
 }
 
+/// Caller-minted thread-creation claims are stored in the shared
+/// `request_id` keyspace under this prefix (see
+/// [`agent_server::journal::thread_store::creation_identity_key`]).
+/// Rejecting the prefix at the RPC boundary makes a caller/claim
+/// collision unrepresentable rather than merely unlikely.
+const RESERVED_REQUEST_ID_PREFIX: &str = "agent-sdk:";
+
 fn require_request_id(request_id: &str) -> RpcResult<()> {
-    if request_id.trim().is_empty() {
+    let trimmed = request_id.trim();
+    if trimmed.is_empty() {
         return Err(Status::invalid_argument("request_id is required").into());
+    }
+    if trimmed.starts_with(RESERVED_REQUEST_ID_PREFIX) {
+        return Err(Status::invalid_argument(
+            "the 'agent-sdk:' request_id prefix is reserved for server-internal claims",
+        )
+        .into());
     }
     Ok(())
 }
@@ -2419,8 +2437,20 @@ fn parse_thread_id(thread_id: &str) -> RpcResult<ThreadId> {
     Ok(ThreadId::from_string(thread_id))
 }
 
-fn parse_optional_thread_id(thread_id: &str) -> Option<ThreadId> {
-    (!thread_id.trim().is_empty()).then(|| ThreadId::from_string(thread_id))
+/// Parse a caller-supplied destination thread id. Empty means
+/// server-minted; a non-empty id must be a UUID so arbitrary caller
+/// strings never become durable primary keys.
+fn parse_caller_thread_id(thread_id: &str) -> RpcResult<Option<ThreadId>> {
+    let trimmed = thread_id.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if uuid::Uuid::parse_str(trimmed).is_err() {
+        return Err(
+            Status::invalid_argument(format!("thread_id must be a UUID, got {trimmed:?}")).into(),
+        );
+    }
+    Ok(Some(ThreadId::from_string(trimmed)))
 }
 
 fn fork_destination(
@@ -2475,7 +2505,7 @@ fn map_thread_creation_error(
         if let Some(conflict) = error.downcast_ref::<ThreadIdConflict>() {
             return Status::already_exists(conflict.to_string());
         }
-        Status::internal(format!("{context}: {error:#}"))
+        internal_status(context)(error)
     }
 }
 
@@ -2669,6 +2699,13 @@ fn decide_confirmation_fingerprint(request: &pb::DecideConfirmationRequest) -> V
     request.encode_to_vec()
 }
 
+/// Fingerprint for the REQUEST-level idempotency row (keyed by the
+/// caller's `request_id`): the whole wire request minus the id, so a
+/// reused `request_id` with any changed parameter — including a
+/// different caller-minted destination — conflicts. Distinct from
+/// [`ThreadCreation::fingerprint`], which keys the CREATION claim under
+/// the destination thread's identity and deliberately excludes
+/// transport request ids.
 fn fork_thread_fingerprint(request: &pb::ForkThreadRequest) -> Vec<u8> {
     let mut request = request.clone();
     request.request_id.clear();
@@ -5428,15 +5465,14 @@ mod tests {
                 let result: std::result::Result<(), String> = runtime.block_on(async {
                     let store = InMemoryThreadStore::new();
                     let create_id = ThreadId::from_string(format!("create-{suffix}"));
-                    let race_id = ThreadId::from_string(format!("race-{suffix}"));
                     let source_id = ThreadId::from_string(format!("source-{suffix}"));
                     let now = OffsetDateTime::UNIX_EPOCH;
 
-                    let (_, first) = store
+                    let first = store
                         .get_or_create_for_creation(&create_id, &ThreadCreation::Create, now)
                         .await
                         .map_err(|error| error.to_string())?;
-                    let (_, second) = store
+                    let second = store
                         .get_or_create_for_creation(&create_id, &ThreadCreation::Create, now)
                         .await
                         .map_err(|error| error.to_string())?;
@@ -5446,34 +5482,9 @@ mod tests {
                         return Err("double-call did not create then replay".to_owned());
                     }
 
-                    let left = store.clone();
-                    let right = store.clone();
-                    let left_id = race_id.clone();
-                    let right_id = race_id.clone();
-                    let (left_outcome, right_outcome) = tokio::join!(
-                        async move {
-                            left.get_or_create_for_creation(&left_id, &ThreadCreation::Create, now)
-                                .await
-                        },
-                        async move {
-                            right
-                                .get_or_create_for_creation(&right_id, &ThreadCreation::Create, now)
-                                .await
-                        }
-                    );
-                    let race_outcomes = [
-                        left_outcome.map_err(|error| error.to_string())?.1,
-                        right_outcome.map_err(|error| error.to_string())?.1,
-                    ];
-                    if race_outcomes
-                        .iter()
-                        .filter(|outcome| **outcome == ThreadCreationOutcome::Created)
-                        .count()
-                        != 1
-                    {
-                        return Err("racing calls did not create exactly once".to_owned());
-                    }
-
+                    // Concurrency is NOT probed here — a current-thread
+                    // proptest runtime cannot race anything. The real
+                    // races live in the multi-thread spawn tests below.
                     let conflict = store
                         .get_or_create_for_creation(
                             &create_id,
@@ -5495,8 +5506,8 @@ mod tests {
                     }
 
                     let rows = store.list().await.map_err(|error| error.to_string())?;
-                    if rows.iter().filter(|row| row.thread_id == race_id).count() != 1 {
-                        return Err("racing calls created more than one row".to_owned());
+                    if rows.iter().filter(|row| row.thread_id == create_id).count() != 1 {
+                        return Err("double-call created more than one row".to_owned());
                     }
                     Ok(())
                 });
@@ -5506,28 +5517,80 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// Deterministic UUID for caller-minted test ids — the boundary now
+    /// enforces UUID shape, so free-form strings are rejected.
+    fn caller_uuid(tag: u32) -> String {
+        format!("00000000-0000-4000-8000-{tag:012x}")
+    }
+
+    #[tokio::test]
+    async fn caller_thread_id_must_be_a_uuid_and_reserved_request_ids_are_rejected() -> Result<()> {
+        let shared = event_test_shared()?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+        let error = service
+            .create_thread(Request::new(pb::CreateThreadRequest {
+                request_id: "uuid-guard-1".into(),
+                thread_id: "not-a-uuid".into(),
+            }))
+            .await
+            .expect_err("non-UUID caller thread id must be rejected");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument, "{error:?}");
+
+        let error = service
+            .fork_thread(Request::new(pb::ForkThreadRequest {
+                request_id: "uuid-guard-2".into(),
+                source_thread_id: caller_uuid(900),
+                fork_after_committed_turns: 0,
+                thread_id: "also-not-a-uuid".into(),
+            }))
+            .await
+            .expect_err("non-UUID caller fork destination must be rejected");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument, "{error:?}");
+
+        let error = service
+            .create_thread(Request::new(pb::CreateThreadRequest {
+                request_id: "agent-sdk:thread-creation:sneaky".into(),
+                thread_id: String::new(),
+            }))
+            .await
+            .expect_err("the reserved server-internal request_id prefix must be rejected");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument, "{error:?}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn caller_minted_create_double_and_concurrent_calls_reuse_one_row() -> Result<()> {
         let shared = event_test_shared()?;
         let service = GrpcControlService {
             shared: Arc::clone(&shared),
         };
-        let thread_id = "caller-create-fixed";
+        let thread_id = caller_uuid(1);
 
-        let first = caller_create_direct(&service, "caller-create-1", thread_id).await?;
-        let second = caller_create_direct(&service, "caller-create-2", thread_id).await?;
+        let first = caller_create_direct(&service, "caller-create-1", &thread_id).await?;
+        let second = caller_create_direct(&service, "caller-create-2", &thread_id).await?;
         assert_eq!(first, thread_id);
         assert_eq!(second, thread_id);
 
-        let race_id = "caller-create-race";
-        let left = service.clone();
-        let right = service.clone();
-        let (left_result, right_result) = tokio::join!(
-            caller_create_direct(&left, "caller-race-1", race_id),
-            caller_create_direct(&right, "caller-race-2", race_id),
-        );
-        assert_eq!(left_result?, race_id);
-        assert_eq!(right_result?, race_id);
+        // A REAL race: two spawned tasks on a multi-thread runtime,
+        // released by one barrier — not tokio::join! polling both
+        // futures on a single task.
+        let race_id = caller_uuid(2);
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for request_id in ["caller-race-1", "caller-race-2"] {
+            let service = service.clone();
+            let barrier = Arc::clone(&barrier);
+            let race_id = race_id.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                caller_create_direct(&service, request_id, &race_id).await
+            }));
+        }
+        for handle in handles {
+            assert_eq!(handle.await??, race_id);
+        }
 
         let rows = shared.stores.thread_store.list().await?;
         assert_eq!(
@@ -5546,13 +5609,14 @@ mod tests {
         let service = GrpcControlService {
             shared: Arc::clone(&shared),
         };
-        let thread_id = "caller-create-conflict";
-        let source = caller_create_direct(&service, "conflict-source", "conflict-source").await?;
-        caller_create_direct(&service, "conflict-create", thread_id).await?;
+        let thread_id = caller_uuid(3);
+        let source_id = caller_uuid(4);
+        let source = caller_create_direct(&service, "conflict-source", &source_id).await?;
+        caller_create_direct(&service, "conflict-create", &thread_id).await?;
         let before = shared
             .stores
             .thread_store
-            .get(&ThreadId::from_string(thread_id))
+            .get(&ThreadId::from_string(thread_id.clone()))
             .await?
             .context("created destination missing before conflict")?;
 
@@ -5561,7 +5625,7 @@ mod tests {
                 request_id: "conflicting-fork".to_owned(),
                 source_thread_id: source,
                 fork_after_committed_turns: 0,
-                thread_id: thread_id.to_owned(),
+                thread_id: thread_id.clone(),
             }))
             .await
             .expect_err("fork parameters must conflict with an existing create");
@@ -5582,23 +5646,51 @@ mod tests {
         let service = GrpcControlService {
             shared: Arc::clone(&shared),
         };
-        let source_a = caller_create_direct(&service, "source-a-request", "source-a").await?;
-        let source_b = caller_create_direct(&service, "source-b-request", "source-b").await?;
-        let destination = "caller-fork-destination";
+        let source_a = caller_create_direct(&service, "source-a-request", &caller_uuid(5)).await?;
+        let source_b = caller_create_direct(&service, "source-b-request", &caller_uuid(6)).await?;
+        let destination = caller_uuid(7);
 
         let first =
-            caller_fork_direct(&service, "caller-fork-request-1", &source_a, destination).await?;
+            caller_fork_direct(&service, "caller-fork-request-1", &source_a, &destination).await?;
         let retry =
-            caller_fork_direct(&service, "caller-fork-request-2", &source_a, destination).await?;
+            caller_fork_direct(&service, "caller-fork-request-2", &source_a, &destination).await?;
         assert_eq!(first, destination);
         assert_eq!(retry, destination);
+
+        // Same request_id + same parameters replays the recorded result.
+        let replay =
+            caller_fork_direct(&service, "caller-fork-request-1", &source_a, &destination).await?;
+        assert_eq!(replay, destination);
+
+        // The request_id stays a true SECONDARY idempotency key on the
+        // caller-minted path: reusing it for a DIFFERENT destination is
+        // a conflict, never a second mint.
+        let reused = service
+            .fork_thread(Request::new(pb::ForkThreadRequest {
+                request_id: "caller-fork-request-1".to_owned(),
+                source_thread_id: source_a.clone(),
+                fork_after_committed_turns: 0,
+                thread_id: caller_uuid(8),
+            }))
+            .await
+            .expect_err("one request_id must never mint two destinations");
+        assert_eq!(reused.code(), tonic::Code::AlreadyExists, "{reused:?}");
+        assert!(
+            shared
+                .stores
+                .thread_store
+                .get(&ThreadId::from_string(caller_uuid(8)))
+                .await?
+                .is_none(),
+            "the rejected request_id reuse must not create the second destination",
+        );
 
         let conflict = service
             .fork_thread(Request::new(pb::ForkThreadRequest {
                 request_id: "caller-fork-conflict".to_owned(),
                 source_thread_id: source_b,
                 fork_after_committed_turns: 0,
-                thread_id: destination.to_owned(),
+                thread_id: destination.clone(),
             }))
             .await
             .expect_err("conflicting source must reject the caller-minted id");
@@ -5623,23 +5715,32 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn caller_minted_fork_concurrent_calls_create_once() -> Result<()> {
         let shared = event_test_shared()?;
         let service = GrpcControlService {
             shared: Arc::clone(&shared),
         };
-        let source = caller_create_direct(&service, "fork-race-source", "fork-race-source").await?;
-        let destination = "caller-fork-race";
-        let left = service.clone();
-        let right = service.clone();
+        let source_id = caller_uuid(9);
+        let source = caller_create_direct(&service, "fork-race-source", &source_id).await?;
+        let destination = caller_uuid(10);
 
-        let (left_result, right_result) = tokio::join!(
-            caller_fork_direct(&left, "fork-race-1", &source, destination),
-            caller_fork_direct(&right, "fork-race-2", &source, destination),
-        );
-        assert_eq!(left_result?, destination);
-        assert_eq!(right_result?, destination);
+        // A REAL race: spawned tasks released together by a barrier.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for request_id in ["fork-race-1", "fork-race-2"] {
+            let service = service.clone();
+            let barrier = Arc::clone(&barrier);
+            let source = source.clone();
+            let destination = destination.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                caller_fork_direct(&service, request_id, &source, &destination).await
+            }));
+        }
+        for handle in handles {
+            assert_eq!(handle.await??, destination);
+        }
         let rows = shared.stores.thread_store.list().await?;
         assert_eq!(
             rows.iter()

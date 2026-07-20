@@ -92,6 +92,18 @@ pub enum ThreadCreationOutcome {
     Existing,
 }
 
+/// Synthetic idempotency-row key under which a caller-minted thread's
+/// creation claim is persisted, shared by every durable backend so the
+/// key format cannot drift between them.
+///
+/// The claim lives in the shared `request_id` keyspace; the
+/// `agent-sdk:` prefix is REJECTED for caller-supplied request ids at
+/// the RPC boundary, so a caller/claim collision is unrepresentable.
+#[must_use]
+pub fn creation_identity_key(thread_id: &ThreadId) -> String {
+    format!("agent-sdk:thread-creation:{}", thread_id.0)
+}
+
 /// Typed conflict returned when a thread id was already claimed differently.
 #[derive(Clone, Debug, thiserror::Error)]
 #[error("thread id {thread_id} already exists with conflicting creation parameters")]
@@ -164,7 +176,7 @@ pub trait ThreadStore: Send + Sync {
         thread_id: &ThreadId,
         creation: &ThreadCreation,
         now: OffsetDateTime,
-    ) -> Result<(Thread, ThreadCreationOutcome)>;
+    ) -> Result<ThreadCreationOutcome>;
 
     /// Optional lock held across the non-atomic fork fallback.
     ///
@@ -310,13 +322,13 @@ impl ThreadStore for InMemoryThreadStore {
         thread_id: &ThreadId,
         creation: &ThreadCreation,
         now: OffsetDateTime,
-    ) -> Result<(Thread, ThreadCreationOutcome)> {
+    ) -> Result<ThreadCreationOutcome> {
         let mut inner = self.inner.write().await;
-        if let Some(thread) = inner.by_id.get(thread_id).cloned() {
+        if inner.by_id.contains_key(thread_id) {
             let matches = inner.creation_by_id.get(thread_id) == Some(creation);
             drop(inner);
             if matches {
-                return Ok((thread, ThreadCreationOutcome::Existing));
+                return Ok(ThreadCreationOutcome::Existing);
             }
             return Err(anyhow::Error::new(ThreadIdConflict {
                 thread_id: thread_id.clone(),
@@ -324,12 +336,12 @@ impl ThreadStore for InMemoryThreadStore {
         }
 
         let thread = Thread::new(thread_id.clone(), now);
-        inner.by_id.insert(thread_id.clone(), thread.clone());
+        inner.by_id.insert(thread_id.clone(), thread);
         inner
             .creation_by_id
             .insert(thread_id.clone(), creation.clone());
         drop(inner);
-        Ok((thread, ThreadCreationOutcome::Created))
+        Ok(ThreadCreationOutcome::Created)
     }
 
     async fn get(&self, thread_id: &ThreadId) -> Result<Option<Thread>> {

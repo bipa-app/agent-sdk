@@ -71,7 +71,7 @@ use agent_server::journal::task::{
 use agent_server::journal::task_state::SubagentInvocationState;
 use agent_server::journal::thread::Thread;
 use agent_server::journal::thread_store::{
-    ThreadCreation, ThreadCreationOutcome, ThreadIdConflict, ThreadStore,
+    ThreadCreation, ThreadCreationOutcome, ThreadIdConflict, ThreadStore, creation_identity_key,
 };
 use agent_server::journal::tool_audit::{ToolAuditEvent, ToolAuditEventId, ToolAuditEventStore};
 use agent_server::journal::turn_attempt::{
@@ -266,7 +266,7 @@ ON CONFLICT (thread_id) DO NOTHING
         now: OffsetDateTime,
     ) -> Result<ThreadCreationOutcome> {
         let inserted_thread = Self::insert_thread_row_tx(tx, thread_id, now).await?;
-        let identity_key = thread_creation_identity_key(thread_id);
+        let identity_key = creation_identity_key(thread_id);
         let kind = creation.idempotency_kind();
         let fingerprint = creation.fingerprint();
         let result_json = serde_json::json!({ "thread_id": thread_id.0 });
@@ -1810,8 +1810,9 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
             return Ok(ThreadCreationOutcome::Existing);
         }
 
-        // 1. The destination aggregate was inserted by the claim above. Same
-        //    shape `bootstrap_thread_row_tx` makes for completed turns.
+        // 1. The claim above inserted the destination aggregate row AND
+        //    its creation-identity idempotency row (unlike
+        //    `bootstrap_thread_row_tx`, which only writes the thread row).
 
         // 2. Mirror `committed_turns` by repeatedly applying
         //    `Thread::apply_committed_turn`. Each call advances
@@ -3803,17 +3804,14 @@ impl ThreadStore for SqliteDurableStore {
         thread_id: &ThreadId,
         creation: &ThreadCreation,
         now: OffsetDateTime,
-    ) -> Result<(Thread, ThreadCreationOutcome)> {
+    ) -> Result<ThreadCreationOutcome> {
         let mut tx = self.begin().await?;
         let outcome = Self::claim_thread_creation_tx(&mut tx, thread_id, creation, now).await?;
-        let thread = Self::get_thread_tx(&mut tx, thread_id)
-            .await?
-            .context("thread missing after caller-addressed creation")?;
         let _projection = Self::get_message_head_tx(&mut tx, thread_id, now).await?;
         tx.commit()
             .await
             .context("commit caller-addressed thread get-or-create")?;
-        Ok((thread, outcome))
+        Ok(outcome)
     }
 
     async fn get(&self, thread_id: &ThreadId) -> Result<Option<Thread>> {
@@ -5314,10 +5312,6 @@ impl TryFrom<ToolAuditEventRecord> for ToolAuditEvent {
 // Wire format helpers
 // ─────────────────────────────────────────────────────────────────────
 
-fn thread_creation_identity_key(thread_id: &ThreadId) -> String {
-    format!("agent-sdk:thread-creation:{}", thread_id.0)
-}
-
 const fn thread_key(thread_id: &ThreadId) -> &str {
     thread_id.0.as_str()
 }
@@ -5396,6 +5390,70 @@ mod tests {
             created_at: t_plus(secs),
             updated_at: t_plus(secs),
         }
+    }
+
+    /// Durable coverage of `claim_thread_creation_tx`: the caller-minted
+    /// claim must replay across calls AND across a real reopen, and a
+    /// conflicting creation must stay typed after restart.
+    #[tokio::test]
+    async fn caller_minted_creation_claim_survives_reopen_and_conflicts() -> Result<()> {
+        use agent_server::journal::thread_store::{
+            ThreadCreation, ThreadCreationOutcome, ThreadIdConflict, ThreadStore,
+        };
+
+        let db_path = std::env::temp_dir().join(format!(
+            "agent_sdk_creation_claim_{}.db",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let thread_id = ThreadId::from_string("00000000-0000-4000-8000-00000000c1a1");
+        let source_id = ThreadId::from_string("00000000-0000-4000-8000-00000000c1a2");
+        let fork = ThreadCreation::Fork {
+            source_thread_id: source_id,
+            fork_after_committed_turns: 0,
+        };
+
+        {
+            let store = SqliteDurableStore::connect(&url).await?;
+            let first = store
+                .get_or_create_for_creation(&thread_id, &ThreadCreation::Create, t0())
+                .await?;
+            assert_eq!(first, ThreadCreationOutcome::Created);
+            let second = store
+                .get_or_create_for_creation(&thread_id, &ThreadCreation::Create, t_plus(1))
+                .await?;
+            assert_eq!(second, ThreadCreationOutcome::Existing);
+            let conflict = store
+                .get_or_create_for_creation(&thread_id, &fork, t_plus(2))
+                .await
+                .expect_err("a fork claim on a created id must conflict");
+            assert!(
+                conflict.downcast_ref::<ThreadIdConflict>().is_some(),
+                "expected ThreadIdConflict, got {conflict:#}",
+            );
+        }
+
+        let reopened = SqliteDurableStore::connect(&url).await?;
+        let replay = reopened
+            .get_or_create_for_creation(&thread_id, &ThreadCreation::Create, t_plus(3))
+            .await?;
+        assert_eq!(
+            replay,
+            ThreadCreationOutcome::Existing,
+            "the creation claim must survive a restart",
+        );
+        let conflict = reopened
+            .get_or_create_for_creation(&thread_id, &fork, t_plus(4))
+            .await
+            .expect_err("the conflict must stay typed after restart");
+        assert!(
+            conflict.downcast_ref::<ThreadIdConflict>().is_some(),
+            "expected ThreadIdConflict after reopen, got {conflict:#}",
+        );
+
+        drop(reopened);
+        let _ = std::fs::remove_file(&db_path);
+        Ok(())
     }
 
     #[tokio::test]
