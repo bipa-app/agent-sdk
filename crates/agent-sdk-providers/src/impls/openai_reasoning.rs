@@ -503,9 +503,9 @@ pub(crate) const fn legacy_reasoning_effort(
             Effort::Low => OpenAIReasoningEffort::Low,
             Effort::Medium => OpenAIReasoningEffort::Medium,
             Effort::High => OpenAIReasoningEffort::High,
-            // Preserve the historical OpenAI mapping. Exact GPT-5.6 `max`
+            // The legacy parameter tops out at xhigh; exact GPT-5.6 `max`
             // is available through `OpenAIReasoningConfig`.
-            Effort::Max => OpenAIReasoningEffort::XHigh,
+            Effort::XHigh | Effort::Max => OpenAIReasoningEffort::XHigh,
         });
     }
 

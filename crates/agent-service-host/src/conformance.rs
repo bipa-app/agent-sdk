@@ -69,7 +69,7 @@ mod tests {
     use agent_server::journal::task_state::TaskState;
     use agent_server::journal::thread_store::ThreadStore;
     use agent_server::journal::turn_attempt::{
-        CloseAttemptParams, OpenAttemptParams, ResolvedEffort, TurnAttemptOutcome,
+        CloseAttemptParams, OpenAttemptParams, TurnAttemptOutcome,
     };
     use agent_server::journal::turn_attempt_store::TurnAttemptStore;
     use agent_server::worker::subagent::{
@@ -522,7 +522,8 @@ mod tests {
                     cached_input_tokens: 30,
                     cache_creation_input_tokens: 40,
                     route_provider: Some("anthropic".into()),
-                    resolved_effort: Some(ResolvedEffort::High),
+                    thinking_adaptive: true,
+                    resolved_effort: Some(agent_sdk_foundation::llm::Effort::XHigh),
                 },
                 messages: vec![agent_sdk_foundation::llm::Message::assistant(
                     "test response",
@@ -549,9 +550,13 @@ mod tests {
             outcome.closed_attempt.route_provider.as_deref(),
             Some("anthropic"),
         );
+        assert!(
+            outcome.closed_attempt.thinking_adaptive,
+            "adaptivity must survive the close",
+        );
         assert_eq!(
             outcome.closed_attempt.resolved_effort,
-            Some(ResolvedEffort::High),
+            Some(agent_sdk_foundation::llm::Effort::XHigh),
         );
         let stored_attempt = attempt_store
             .get(&attempt.id)
@@ -559,7 +564,14 @@ mod tests {
             .context("committed attempt missing")?;
         assert_eq!(stored_attempt.cache_creation_input_tokens, Some(40));
         assert_eq!(stored_attempt.route_provider.as_deref(), Some("anthropic"));
-        assert_eq!(stored_attempt.resolved_effort, Some(ResolvedEffort::High),);
+        assert!(
+            stored_attempt.thinking_adaptive,
+            "adaptivity must survive a store round-trip",
+        );
+        assert_eq!(
+            stored_attempt.resolved_effort,
+            Some(agent_sdk_foundation::llm::Effort::XHigh),
+        );
 
         let latest = checkpoint_store
             .get_latest_by_thread(&tid)
@@ -621,6 +633,7 @@ mod tests {
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
                 route_provider: None,
+                thinking_adaptive: false,
                 resolved_effort: None,
             },
             messages: vec![agent_sdk_foundation::llm::Message::assistant("guarded")],
@@ -798,6 +811,7 @@ mod tests {
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
                 route_provider: None,
+                thinking_adaptive: false,
                 resolved_effort: None,
             },
             messages: vec![agent_sdk_foundation::llm::Message::assistant("stale")],

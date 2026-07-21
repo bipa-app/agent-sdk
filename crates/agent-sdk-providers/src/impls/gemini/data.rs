@@ -177,7 +177,8 @@ pub const fn map_thinking_config(
         let level = match effort {
             Effort::Low => "LOW",
             Effort::Medium => "MEDIUM",
-            Effort::High | Effort::Max => "HIGH",
+            // Gemini's thinking levels top out at HIGH.
+            Effort::High | Effort::XHigh | Effort::Max => "HIGH",
         };
         return ApiThinkingConfig {
             thinking_level: level,

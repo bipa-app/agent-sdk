@@ -74,8 +74,7 @@ use crate::journal::task_state::TaskState;
 use crate::journal::task_wakeup::WakeupSignal;
 use crate::journal::thread_store::ThreadStore;
 use crate::journal::turn_attempt::{
-    CloseAttemptParams, OpenAttemptParams, ResolvedEffort, TurnAttempt, TurnAttemptOutcome,
-    TurnAttemptSchemaError,
+    CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptOutcome, TurnAttemptSchemaError,
 };
 use crate::journal::turn_attempt_store::TurnAttemptStore;
 
@@ -313,7 +312,8 @@ impl ContentIds {
 #[derive(Clone, Debug)]
 struct AttemptEvidence {
     route_provider: String,
-    resolved_effort: Option<ResolvedEffort>,
+    thinking_adaptive: bool,
+    resolved_effort: Option<agent_sdk_foundation::llm::Effort>,
 }
 
 impl AttemptEvidence {
@@ -327,34 +327,10 @@ impl AttemptEvidence {
             // share one provider impl, so only the route tells a gateway call
             // apart from the same model served natively.
             route_provider: provider.route().to_owned(),
-            resolved_effort: thinking.and_then(dispatched_effort),
+            thinking_adaptive: thinking
+                .is_some_and(|config| matches!(config.mode, llm::ThinkingMode::Adaptive)),
+            resolved_effort: thinking.and_then(|config| config.effort),
         }
-    }
-}
-
-/// The effort a dispatched request carries, as the durable row records it.
-///
-/// An explicit effort wins wherever it is set — request-level first, then the
-/// provider's configured default, matching how every provider's request
-/// builder resolves it.
-///
-/// Bare adaptive thinking resolves to no concrete level anywhere in this SDK
-/// before dispatch: Anthropic and Vertex send `thinking: {type: "adaptive"}`
-/// and omit `output_config` entirely, and the `OpenAI` Responses / Codex
-/// builders map `Adaptive` to `None`. The API picks the depth, so the row
-/// records that fact as [`ResolvedEffort::Adaptive`] rather than a NULL that
-/// would read as "no thinking was requested".
-///
-/// An explicit token budget with no effort stays `None`: the budget itself is
-/// the request's evidence and already lives in `request_blob`, and each
-/// provider maps it to a different scale.
-fn dispatched_effort(thinking: &llm::ThinkingConfig) -> Option<ResolvedEffort> {
-    if let Some(effort) = thinking.effort {
-        return Some(ResolvedEffort::from(effort));
-    }
-    match thinking.mode {
-        llm::ThinkingMode::Adaptive => Some(ResolvedEffort::Adaptive),
-        llm::ThinkingMode::Enabled { budget_tokens: _ } => None,
     }
 }
 
@@ -1023,6 +999,7 @@ pub(crate) async fn commit_partial_turn_on_cancel(
                 // provenance is literally `cancel-commit` — so there is no
                 // route or effort it could truthfully name.
                 route_provider: None,
+                thinking_adaptive: false,
                 resolved_effort: None,
             },
             messages: prefix,
@@ -4189,6 +4166,7 @@ async fn close_attempt_with(
         cached_input_tokens: usage.cached_input_tokens,
         cache_creation_input_tokens: usage.cache_creation_input_tokens,
         route_provider: evidence.map(|value| value.route_provider.clone()),
+        thinking_adaptive: evidence.is_some_and(|value| value.thinking_adaptive),
         resolved_effort: evidence.and_then(|value| value.resolved_effort),
     };
     // Best-effort: if closing fails, the primary error is more important.
@@ -4390,6 +4368,7 @@ fn build_close_params(
         cached_input_tokens: usage.cached_input_tokens,
         cache_creation_input_tokens: usage.cache_creation_input_tokens,
         route_provider: Some(evidence.route_provider.clone()),
+        thinking_adaptive: evidence.thinking_adaptive,
         resolved_effort: evidence.resolved_effort,
     }
 }
@@ -6924,14 +6903,9 @@ mod tests {
         Ok(())
     }
 
-    /// AC3 (D17): the effort column is never blank for a thinking request.
-    ///
-    /// The case that matters is **bare** `adaptive()` — no pre-set effort to
-    /// echo back. Nothing in the SDK resolves a concrete level for it before
-    /// dispatch, so the row records `adaptive` instead of a NULL that would
-    /// read as "no thinking was requested".
+    /// AC3 (D17): adaptivity and effort land as two independent columns.
     #[test]
-    fn attempt_rows_record_resolved_effort_including_the_adaptive_case() -> Result<()> {
+    fn attempt_rows_record_adaptivity_and_effort_as_two_dimensions() -> Result<()> {
         let (native, _) = native_and_gateway_providers();
         let usage = ZERO_ATTEMPT_USAGE;
 
@@ -6943,21 +6917,30 @@ mod tests {
             &usage,
             "close bare-adaptive evidence attempt",
         )?;
+        assert!(
+            adaptive.thinking_adaptive,
+            "bare adaptive thinking must set the adaptive flag",
+        );
         assert_eq!(
-            adaptive.resolved_effort,
-            Some(ResolvedEffort::Adaptive),
-            "bare adaptive thinking must persist evidence, not NULL",
+            adaptive.resolved_effort, None,
+            "bare adaptive has no concrete level — the flag carries the evidence",
         );
 
         let pinned = close_evidence_attempt(
             &AttemptEvidence::from_dispatch(
                 &native,
-                &evidence_request(llm::ThinkingConfig::adaptive_with_effort(llm::Effort::High)),
+                &evidence_request(llm::ThinkingConfig::adaptive_with_effort(
+                    llm::Effort::XHigh,
+                )),
             ),
             &usage,
             "close pinned-adaptive evidence attempt",
         )?;
-        assert_eq!(pinned.resolved_effort, Some(ResolvedEffort::High));
+        assert!(
+            pinned.thinking_adaptive,
+            "adaptive + effort must keep the adaptive flag",
+        );
+        assert_eq!(pinned.resolved_effort, Some(llm::Effort::XHigh));
 
         let budgeted = close_evidence_attempt(
             &AttemptEvidence::from_dispatch(
@@ -6967,7 +6950,8 @@ mod tests {
             &usage,
             "close budgeted evidence attempt",
         )?;
-        assert_eq!(budgeted.resolved_effort, Some(ResolvedEffort::Medium));
+        assert!(!budgeted.thinking_adaptive);
+        assert_eq!(budgeted.resolved_effort, Some(llm::Effort::Medium));
         Ok(())
     }
 
@@ -6985,7 +6969,14 @@ mod tests {
             &ZERO_ATTEMPT_USAGE,
             "close provider-default evidence attempt",
         )?;
-        assert_eq!(closed.resolved_effort, Some(ResolvedEffort::Max));
+        assert!(
+            closed.thinking_adaptive,
+            "the provider default is adaptive, so the fallback must carry both dimensions",
+        );
+        assert_eq!(
+            closed.resolved_effort,
+            Some(agent_sdk_foundation::llm::Effort::Max)
+        );
         Ok(())
     }
 

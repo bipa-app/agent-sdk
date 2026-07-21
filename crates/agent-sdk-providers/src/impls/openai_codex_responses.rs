@@ -2381,7 +2381,8 @@ const fn map_effort(effort: Effort) -> ReasoningEffort {
         Effort::Low => ReasoningEffort::Low,
         Effort::Medium => ReasoningEffort::Medium,
         Effort::High => ReasoningEffort::High,
-        Effort::Max => ReasoningEffort::XHigh,
+        // Codex reasoning effort tops out at xhigh.
+        Effort::XHigh | Effort::Max => ReasoningEffort::XHigh,
     }
 }
 
@@ -2390,7 +2391,7 @@ const fn map_reasoning_effort(effort: ReasoningEffort) -> Effort {
         ReasoningEffort::Low => Effort::Low,
         ReasoningEffort::Medium => Effort::Medium,
         ReasoningEffort::High => Effort::High,
-        ReasoningEffort::XHigh => Effort::Max,
+        ReasoningEffort::XHigh => Effort::XHigh,
     }
 }
 

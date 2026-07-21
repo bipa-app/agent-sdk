@@ -284,11 +284,11 @@ mod tests {
     }
 
     #[test]
-    fn turn_attempt_evidence_migration_is_additive_and_nullable() {
-        crate::migration_contract::assert_additive_nullable_migration(
+    fn turn_attempt_evidence_migration_is_additive_and_backfill_free() {
+        crate::migration_contract::assert_additive_migration(
             TURN_ATTEMPT_EVIDENCE_SQL,
             "agent_sdk_turn_attempts",
-            3,
+            4,
         );
     }
 }

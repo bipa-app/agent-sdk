@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\nSELECT\n    id,\n    task_id,\n    attempt_number,\n    provider,\n    requested_model,\n    request_blob,\n    response_blob,\n    response_id,\n    response_model,\n    stop_reason,\n    outcome,\n    input_tokens,\n    output_tokens,\n    cached_input_tokens,\n    cache_creation_input_tokens,\n    route_provider,\n    resolved_effort,\n    opened_at,\n    closed_at,\n    duration_ms,\n    otel_trace_id,\n    otel_span_id\nFROM agent_sdk_turn_attempts\nWHERE id = $1\nFOR UPDATE\n",
+  "query": "\nSELECT\n    id,\n    task_id,\n    attempt_number,\n    provider,\n    requested_model,\n    request_blob,\n    response_blob,\n    response_id,\n    response_model,\n    stop_reason,\n    outcome,\n    input_tokens,\n    output_tokens,\n    cached_input_tokens,\n    cache_creation_input_tokens,\n    route_provider,\n    thinking_adaptive,\n    resolved_effort,\n    opened_at,\n    closed_at,\n    duration_ms,\n    otel_trace_id,\n    otel_span_id\nFROM agent_sdk_turn_attempts\nWHERE task_id = $1\nORDER BY attempt_number\n",
   "describe": {
     "columns": [
       {
@@ -181,6 +181,17 @@
       },
       {
         "ordinal": 16,
+        "name": "thinking_adaptive",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "thinking_adaptive"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
         "name": "resolved_effort",
         "type_info": "Text",
         "origin": {
@@ -191,7 +202,7 @@
         }
       },
       {
-        "ordinal": 17,
+        "ordinal": 18,
         "name": "opened_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -202,7 +213,7 @@
         }
       },
       {
-        "ordinal": 18,
+        "ordinal": 19,
         "name": "closed_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -213,7 +224,7 @@
         }
       },
       {
-        "ordinal": 19,
+        "ordinal": 20,
         "name": "duration_ms",
         "type_info": "Int8",
         "origin": {
@@ -224,7 +235,7 @@
         }
       },
       {
-        "ordinal": 20,
+        "ordinal": 21,
         "name": "otel_trace_id",
         "type_info": "Text",
         "origin": {
@@ -235,7 +246,7 @@
         }
       },
       {
-        "ordinal": 21,
+        "ordinal": 22,
         "name": "otel_span_id",
         "type_info": "Text",
         "origin": {
@@ -268,6 +279,7 @@
       true,
       true,
       true,
+      false,
       true,
       false,
       true,
@@ -276,5 +288,5 @@
       true
     ]
   },
-  "hash": "cd3182d9a6eb64477b774f43dea9eb8a0016d7a681a3d05575ec3a5282f70687"
+  "hash": "898b61d494a2ccda87ffd4c16031b7398439894db63f9cdde9ee7046339a4006"
 }

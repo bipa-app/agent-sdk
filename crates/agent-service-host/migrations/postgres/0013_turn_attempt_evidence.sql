@@ -1,8 +1,8 @@
 -- Durable provider-call evidence for historical cost and thinking audits.
 --
--- All columns are nullable so existing attempts retain their exact row shape:
--- the migration neither rewrites nor infers evidence that was not captured at
--- dispatch time.
+-- All evidence columns are nullable (or default to their "absent" value) so
+-- existing attempts retain their exact row shape: the migration neither
+-- rewrites nor infers evidence that was not captured at dispatch time.
 
 ALTER TABLE agent_sdk_turn_attempts
     ADD COLUMN cache_creation_input_tokens BIGINT NULL
@@ -11,10 +11,14 @@ ALTER TABLE agent_sdk_turn_attempts
 ALTER TABLE agent_sdk_turn_attempts
     ADD COLUMN route_provider TEXT NULL;
 
--- 'adaptive' is not an Effort level: it records that the request asked for
--- adaptive thinking and the provider's API chose the depth, which a NULL
--- would make indistinguishable from "no thinking was requested at all".
+-- Thinking is recorded as two orthogonal dimensions, mirroring the request
+-- shape: adaptivity (did the request let the provider choose the depth?) and
+-- effort (which level the request carried, if any). An adaptive request may
+-- still carry an effort hint, so neither column can encode the other.
+ALTER TABLE agent_sdk_turn_attempts
+    ADD COLUMN thinking_adaptive BOOLEAN NOT NULL DEFAULT FALSE;
+
 ALTER TABLE agent_sdk_turn_attempts
     ADD COLUMN resolved_effort TEXT NULL
         CHECK (resolved_effort IS NULL
-               OR resolved_effort IN ('low', 'medium', 'high', 'max', 'adaptive'));
+               OR resolved_effort IN ('low', 'medium', 'high', 'xhigh', 'max'));

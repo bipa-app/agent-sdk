@@ -466,7 +466,7 @@ SELECT id, task_id, attempt_number, provider, requested_model,
        request_blob, response_blob, response_id, response_model,
        stop_reason, outcome, input_tokens, output_tokens,
        cached_input_tokens, cache_creation_input_tokens, route_provider,
-       resolved_effort, opened_at, closed_at, duration_ms,
+       thinking_adaptive, resolved_effort, opened_at, closed_at, duration_ms,
        otel_trace_id, otel_span_id
 FROM agent_sdk_turn_attempts
 WHERE id = ?1
@@ -489,7 +489,7 @@ SELECT id, task_id, attempt_number, provider, requested_model,
        request_blob, response_blob, response_id, response_model,
        stop_reason, outcome, input_tokens, output_tokens,
        cached_input_tokens, cache_creation_input_tokens, route_provider,
-       resolved_effort, opened_at, closed_at, duration_ms,
+       thinking_adaptive, resolved_effort, opened_at, closed_at, duration_ms,
        otel_trace_id, otel_span_id
 FROM agent_sdk_turn_attempts
 WHERE id = ?1
@@ -518,6 +518,7 @@ WHERE id = ?1
         let cached_input_tokens = attempt.cached_input_tokens.map(i64::from);
         let cache_creation_input_tokens = attempt.cache_creation_input_tokens.map(i64::from);
         let route_provider = attempt.route_provider.as_deref();
+        let thinking_adaptive = attempt.thinking_adaptive;
         let resolved_effort = optional_enum_to_wire(attempt.resolved_effort.as_ref())?;
         let duration_ms = attempt
             .duration_ms
@@ -532,9 +533,9 @@ INSERT INTO agent_sdk_turn_attempts (
     request_blob, response_blob, response_id, response_model,
     stop_reason, outcome, input_tokens, output_tokens,
     cached_input_tokens, cache_creation_input_tokens, route_provider,
-    resolved_effort, opened_at, closed_at, duration_ms,
+    thinking_adaptive, resolved_effort, opened_at, closed_at, duration_ms,
     otel_trace_id, otel_span_id
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
 ",
             id,
             task_id,
@@ -552,6 +553,7 @@ INSERT INTO agent_sdk_turn_attempts (
             cached_input_tokens,
             cache_creation_input_tokens,
             route_provider,
+            thinking_adaptive,
             resolved_effort,
             attempt.opened_at,
             attempt.closed_at,
@@ -579,6 +581,7 @@ INSERT INTO agent_sdk_turn_attempts (
         let cached_input_tokens = attempt.cached_input_tokens.map(i64::from);
         let cache_creation_input_tokens = attempt.cache_creation_input_tokens.map(i64::from);
         let route_provider = attempt.route_provider.as_deref();
+        let thinking_adaptive = attempt.thinking_adaptive;
         let resolved_effort = optional_enum_to_wire(attempt.resolved_effort.as_ref())?;
         let duration_ms = attempt
             .duration_ms
@@ -592,9 +595,9 @@ UPDATE agent_sdk_turn_attempts SET
     response_blob = ?2, response_id = ?3, response_model = ?4,
     stop_reason = ?5, outcome = ?6, input_tokens = ?7, output_tokens = ?8,
     cached_input_tokens = ?9, cache_creation_input_tokens = ?10,
-    route_provider = ?11, resolved_effort = ?12,
-    closed_at = ?13, duration_ms = ?14,
-    otel_trace_id = ?15, otel_span_id = ?16
+    route_provider = ?11, thinking_adaptive = ?12, resolved_effort = ?13,
+    closed_at = ?14, duration_ms = ?15,
+    otel_trace_id = ?16, otel_span_id = ?17
 WHERE id = ?1
 ",
             id,
@@ -608,6 +611,7 @@ WHERE id = ?1
             cached_input_tokens,
             cache_creation_input_tokens,
             route_provider,
+            thinking_adaptive,
             resolved_effort,
             attempt.closed_at,
             duration_ms,
@@ -3916,7 +3920,7 @@ SELECT id, task_id, attempt_number, provider, requested_model,
        request_blob, response_blob, response_id, response_model,
        stop_reason, outcome, input_tokens, output_tokens,
        cached_input_tokens, cache_creation_input_tokens, route_provider,
-       resolved_effort, opened_at, closed_at, duration_ms,
+       thinking_adaptive, resolved_effort, opened_at, closed_at, duration_ms,
        otel_trace_id, otel_span_id
 FROM agent_sdk_turn_attempts WHERE task_id = ?1 ORDER BY attempt_number
 ",
@@ -4964,6 +4968,7 @@ struct TurnAttemptRecord {
     cached_input_tokens: Option<i64>,
     cache_creation_input_tokens: Option<i64>,
     route_provider: Option<String>,
+    thinking_adaptive: bool,
     resolved_effort: Option<String>,
     opened_at: OffsetDateTime,
     closed_at: Option<OffsetDateTime>,
@@ -5010,6 +5015,7 @@ impl TryFrom<TurnAttemptRecord> for TurnAttempt {
                 .map(|v| u32_from_i64(v, "turn attempt cache_creation_input_tokens"))
                 .transpose()?,
             route_provider: r.route_provider,
+            thinking_adaptive: r.thinking_adaptive,
             resolved_effort: r
                 .resolved_effort
                 .map(|v| enum_from_wire(&v, "turn attempt resolved_effort"))
@@ -5368,6 +5374,10 @@ INSERT INTO agent_sdk_turn_attempts (
             .context("legacy attempt missing after migration")?;
         assert!(legacy.cache_creation_input_tokens.is_none());
         assert!(legacy.route_provider.is_none());
+        assert!(
+            !legacy.thinking_adaptive,
+            "pre-migration rows must default to non-adaptive",
+        );
         assert!(legacy.resolved_effort.is_none());
         Ok(())
     }
@@ -6322,6 +6332,7 @@ INSERT INTO agent_sdk_turn_attempts (
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
                     route_provider: None,
+                    thinking_adaptive: false,
                     resolved_effort: None,
                 },
                 messages: final_messages,
@@ -6357,6 +6368,23 @@ INSERT INTO agent_sdk_turn_attempts (
         Ok(())
     }
 
+    fn atomic_commit_close_params() -> agent_server::journal::turn_attempt::CloseAttemptParams {
+        agent_server::journal::turn_attempt::CloseAttemptParams {
+            response_blob: serde_json::json!({"id": "msg_01"}),
+            response_id: Some("msg_01".into()),
+            response_model: Some("claude-sonnet-4-5-20250929".into()),
+            stop_reason: Some(agent_sdk_foundation::llm::StopReason::EndTurn),
+            outcome: agent_server::journal::turn_attempt::TurnAttemptOutcome::Success,
+            input_tokens: 10,
+            output_tokens: 20,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            route_provider: None,
+            thinking_adaptive: false,
+            resolved_effort: None,
+        }
+    }
+
     /// Phase 10 · D regression: on `SQLite` a committed turn's lifecycle
     /// events and the coalesced advisory outbox row land in the SAME
     /// transaction as the state projections. "Events exist iff the turn
@@ -6376,9 +6404,7 @@ INSERT INTO agent_sdk_turn_attempts (
         use agent_server::journal::outbox_message::OutboxMessageKind;
         use agent_server::journal::task::{AgentTask, TaskStatus};
         use agent_server::journal::thread_store::ThreadStore;
-        use agent_server::journal::turn_attempt::{
-            CloseAttemptParams, OpenAttemptParams, TurnAttemptOutcome,
-        };
+        use agent_server::journal::turn_attempt::OpenAttemptParams;
         use agent_server::journal::turn_attempt_store::TurnAttemptStore;
 
         let store = SqliteDurableStore::connect("sqlite::memory:").await?;
@@ -6423,19 +6449,7 @@ INSERT INTO agent_sdk_turn_attempts (
                 task_id,
                 expected_turn: 1,
                 turn_attempt_id: attempt.id.clone(),
-                close_attempt_params: CloseAttemptParams {
-                    response_blob: serde_json::json!({"id": "msg_01"}),
-                    response_id: Some("msg_01".into()),
-                    response_model: Some("claude-sonnet-4-5-20250929".into()),
-                    stop_reason: Some(agent_sdk_foundation::llm::StopReason::EndTurn),
-                    outcome: TurnAttemptOutcome::Success,
-                    input_tokens: 10,
-                    output_tokens: 20,
-                    cached_input_tokens: 0,
-                    cache_creation_input_tokens: 0,
-                    route_provider: None,
-                    resolved_effort: None,
-                },
+                close_attempt_params: atomic_commit_close_params(),
                 messages: vec![llm::Message::user("hi"), llm::Message::assistant("there")],
                 turn_usage: TokenUsage {
                     input_tokens: 10,

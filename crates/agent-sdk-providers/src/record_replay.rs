@@ -604,6 +604,7 @@ fn canonical_thinking(thinking: Option<&ThinkingConfig>) -> serde_json::Value {
         Effort::Low => "low",
         Effort::Medium => "medium",
         Effort::High => "high",
+        Effort::XHigh => "xhigh",
         Effort::Max => "max",
     });
 

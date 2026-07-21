@@ -122,41 +122,6 @@ impl TurnAttemptOutcome {
 // Resolved effort
 // ─────────────────────────────────────────────────────────────────────
 
-/// Thinking effort evidence recorded on a closed attempt.
-///
-/// Widens [`agent_sdk_foundation::llm::Effort`] with the [`Adaptive`] case so
-/// the column can separate the two ways an attempt ends up without a concrete
-/// level: the request asked for adaptive thinking and the provider's API picked
-/// the depth, versus the request asked for no thinking at all. A plain
-/// `Option<Effort>` collapses both into `None`, blanking the column for exactly
-/// the attempts D17 wants to audit.
-///
-/// [`Adaptive`]: Self::Adaptive
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ResolvedEffort {
-    /// Concrete effort levels, mirroring [`agent_sdk_foundation::llm::Effort`].
-    Low,
-    Medium,
-    High,
-    Max,
-    /// Adaptive thinking dispatched without a concrete effort — the provider's
-    /// API chose the reasoning depth.
-    Adaptive,
-}
-
-impl From<agent_sdk_foundation::llm::Effort> for ResolvedEffort {
-    fn from(effort: agent_sdk_foundation::llm::Effort) -> Self {
-        use agent_sdk_foundation::llm::Effort;
-        match effort {
-            Effort::Low => Self::Low,
-            Effort::Medium => Self::Medium,
-            Effort::High => Self::High,
-            Effort::Max => Self::Max,
-        }
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────
 // Errors
 // ─────────────────────────────────────────────────────────────────────
@@ -209,7 +174,7 @@ pub enum TurnAttemptSchemaError {
 /// | Response | `response_blob`, `response_id`, `response_model` |
 /// | Outcome | `stop_reason`, `outcome` |
 /// | Usage | `input_tokens`, `output_tokens`, `cached_input_tokens`, `cache_creation_input_tokens` |
-/// | Routing | `route_provider`, `resolved_effort` |
+/// | Routing | `route_provider`, `thinking_adaptive`, `resolved_effort` |
 /// | Timing | `opened_at`, `closed_at`, `duration_ms` |
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TurnAttempt {
@@ -289,13 +254,17 @@ pub struct TurnAttempt {
     #[serde(default)]
     pub route_provider: Option<String>,
 
-    /// Thinking effort the request carried at dispatch. `None` while open, on
-    /// legacy rows, and when the request asked for no thinking at all —
-    /// adaptive thinking records [`ResolvedEffort::Adaptive`] rather than
-    /// `None`, so "the API chose the depth" stays distinguishable from "there
-    /// was no thinking".
+    /// Whether the dispatched request used adaptive thinking. Orthogonal
+    /// to `resolved_effort`: an adaptive request may still pin an effort
+    /// level. `false` on legacy rows and while open.
     #[serde(default)]
-    pub resolved_effort: Option<ResolvedEffort>,
+    pub thinking_adaptive: bool,
+
+    /// Thinking effort the request carried at dispatch, whether or not
+    /// the mode was adaptive. `None` while open, on legacy rows, and when
+    /// the request carried no effort level.
+    #[serde(default)]
+    pub resolved_effort: Option<agent_sdk_foundation::llm::Effort>,
 
     // ── Timing ───────────────────────────────────────────────────
     /// When the attempt was opened (LLM call started).
@@ -359,6 +328,7 @@ impl TurnAttempt {
             cached_input_tokens: None,
             cache_creation_input_tokens: None,
             route_provider: None,
+            thinking_adaptive: false,
             resolved_effort: None,
             opened_at: params.now,
             closed_at: None,
@@ -399,6 +369,7 @@ impl TurnAttempt {
         self.cached_input_tokens = Some(params.cached_input_tokens);
         self.cache_creation_input_tokens = Some(params.cache_creation_input_tokens);
         self.route_provider = params.route_provider;
+        self.thinking_adaptive = params.thinking_adaptive;
         self.resolved_effort = params.resolved_effort;
         self.closed_at = Some(now);
 
@@ -435,7 +406,7 @@ impl TurnAttempt {
     ///   `response_model`, `response_id`, `stop_reason`,
     ///   `input_tokens`, `output_tokens`, `cached_input_tokens`,
     ///   `cache_creation_input_tokens`, `route_provider`, `resolved_effort`,
-    ///   `duration_ms`, `closed_at`.
+    ///   `duration_ms`, `closed_at`, nor a `true` `thinking_adaptive`.
     /// - **Closed** rows must have: `outcome`, `duration_ms`,
     ///   `closed_at`.
     ///
@@ -466,6 +437,7 @@ impl TurnAttempt {
                 || self.cached_input_tokens.is_some()
                 || self.cache_creation_input_tokens.is_some()
                 || self.route_provider.is_some()
+                || self.thinking_adaptive
                 || self.resolved_effort.is_some()
             {
                 return Err(TurnAttemptSchemaError::ResponseOnOpenAttempt);
@@ -535,8 +507,10 @@ pub struct CloseAttemptParams {
     pub cache_creation_input_tokens: u32,
     /// Serving route this request was dispatched to.
     pub route_provider: Option<String>,
+    /// Whether the dispatched request used adaptive thinking.
+    pub thinking_adaptive: bool,
     /// Thinking effort the dispatched request carried.
-    pub resolved_effort: Option<ResolvedEffort>,
+    pub resolved_effort: Option<agent_sdk_foundation::llm::Effort>,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -587,7 +561,8 @@ mod tests {
             cached_input_tokens: 10,
             cache_creation_input_tokens: 20,
             route_provider: Some("anthropic".into()),
-            resolved_effort: Some(ResolvedEffort::High),
+            thinking_adaptive: true,
+            resolved_effort: Some(agent_sdk_foundation::llm::Effort::High),
         }
     }
 
@@ -678,7 +653,11 @@ mod tests {
         assert_eq!(closed.cached_input_tokens, Some(10));
         assert_eq!(closed.cache_creation_input_tokens, Some(20));
         assert_eq!(closed.route_provider.as_deref(), Some("anthropic"));
-        assert_eq!(closed.resolved_effort, Some(ResolvedEffort::High),);
+        assert!(closed.thinking_adaptive);
+        assert_eq!(
+            closed.resolved_effort,
+            Some(agent_sdk_foundation::llm::Effort::High),
+        );
         assert_eq!(closed.duration_ms, Some(5_000));
         closed.validate().context("validate")?;
         Ok(())
@@ -871,6 +850,7 @@ mod tests {
         assert_eq!(json["cached_input_tokens"], 10);
         assert_eq!(json["cache_creation_input_tokens"], 20);
         assert_eq!(json["route_provider"], "anthropic");
+        assert_eq!(json["thinking_adaptive"], true);
         assert_eq!(json["resolved_effort"], "high");
 
         // Verify timing
@@ -905,30 +885,23 @@ mod tests {
     fn resolved_effort_wire_strings_match_the_column_check_constraint() -> Result<()> {
         // These five strings are the `resolved_effort IN (…)` list in
         // migration 0013 for both dialects; the store persists whatever
-        // serde emits here, so a rename would start failing the CHECK.
+        // serde emits here, so a rename — or a new `Effort` variant not
+        // added to the CHECK — would start failing at write time.
+        use agent_sdk_foundation::llm::Effort;
         for (effort, wire) in [
-            (ResolvedEffort::Low, "low"),
-            (ResolvedEffort::Medium, "medium"),
-            (ResolvedEffort::High, "high"),
-            (ResolvedEffort::Max, "max"),
-            (ResolvedEffort::Adaptive, "adaptive"),
+            (Effort::Low, "low"),
+            (Effort::Medium, "medium"),
+            (Effort::High, "high"),
+            (Effort::XHigh, "xhigh"),
+            (Effort::Max, "max"),
         ] {
             let encoded = serde_json::to_value(effort).context("serialize resolved effort")?;
             assert_eq!(encoded, serde_json::Value::String(wire.to_owned()));
-            let decoded: ResolvedEffort =
+            let decoded: Effort =
                 serde_json::from_value(encoded).context("deserialize resolved effort")?;
             assert_eq!(decoded, effort);
         }
         Ok(())
-    }
-
-    #[test]
-    fn concrete_efforts_widen_into_resolved_effort_without_collapsing() {
-        use agent_sdk_foundation::llm::Effort;
-        assert_eq!(ResolvedEffort::from(Effort::Low), ResolvedEffort::Low);
-        assert_eq!(ResolvedEffort::from(Effort::Medium), ResolvedEffort::Medium);
-        assert_eq!(ResolvedEffort::from(Effort::High), ResolvedEffort::High);
-        assert_eq!(ResolvedEffort::from(Effort::Max), ResolvedEffort::Max);
     }
 
     // ── Multiple attempts ────────────────────────────────────────
@@ -962,6 +935,7 @@ mod tests {
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
                     route_provider: None,
+                    thinking_adaptive: false,
                     resolved_effort: None,
                 },
                 t_plus(1),
@@ -989,6 +963,7 @@ mod tests {
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
                     route_provider: None,
+                    thinking_adaptive: false,
                     resolved_effort: None,
                 },
                 t_plus(1),
@@ -1008,6 +983,7 @@ mod tests {
         assert!(attempt.otel_span_id.is_none());
         assert!(attempt.cache_creation_input_tokens.is_none());
         assert!(attempt.route_provider.is_none());
+        assert!(!attempt.thinking_adaptive);
         assert!(attempt.resolved_effort.is_none());
     }
 
@@ -1063,6 +1039,10 @@ mod tests {
         assert!(attempt.otel_span_id.is_none());
         assert!(attempt.cache_creation_input_tokens.is_none());
         assert!(attempt.route_provider.is_none());
+        assert!(
+            !attempt.thinking_adaptive,
+            "legacy rows without the column must default to non-adaptive",
+        );
         assert!(attempt.resolved_effort.is_none());
         attempt.validate().context("validate")?;
         Ok(())

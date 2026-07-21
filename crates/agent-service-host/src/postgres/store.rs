@@ -518,6 +518,7 @@ SELECT
     cached_input_tokens,
     cache_creation_input_tokens,
     route_provider,
+    thinking_adaptive,
     resolved_effort,
     opened_at,
     closed_at,
@@ -557,6 +558,7 @@ SELECT
     cached_input_tokens,
     cache_creation_input_tokens,
     route_provider,
+    thinking_adaptive,
     resolved_effort,
     opened_at,
     closed_at,
@@ -597,6 +599,7 @@ INSERT INTO agent_sdk_turn_attempts (
     cached_input_tokens,
     cache_creation_input_tokens,
     route_provider,
+    thinking_adaptive,
     resolved_effort,
     opened_at,
     closed_at,
@@ -604,8 +607,8 @@ INSERT INTO agent_sdk_turn_attempts (
     otel_trace_id,
     otel_span_id
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-    $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+    $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23
 )
 ",
             attempt.id.as_str(),
@@ -624,6 +627,7 @@ INSERT INTO agent_sdk_turn_attempts (
             optional_u32_to_i64(attempt.cached_input_tokens),
             optional_u32_to_i64(attempt.cache_creation_input_tokens),
             attempt.route_provider.clone(),
+            attempt.thinking_adaptive,
             optional_enum_to_wire(attempt.resolved_effort.as_ref())?,
             attempt.opened_at,
             attempt.closed_at,
@@ -660,12 +664,13 @@ SET
     cached_input_tokens = $14,
     cache_creation_input_tokens = $15,
     route_provider = $16,
-    resolved_effort = $17,
-    opened_at = $18,
-    closed_at = $19,
-    duration_ms = $20,
-    otel_trace_id = $21,
-    otel_span_id = $22
+    thinking_adaptive = $17,
+    resolved_effort = $18,
+    opened_at = $19,
+    closed_at = $20,
+    duration_ms = $21,
+    otel_trace_id = $22,
+    otel_span_id = $23
 WHERE id = $1
 ",
             attempt.id.as_str(),
@@ -684,6 +689,7 @@ WHERE id = $1
             optional_u32_to_i64(attempt.cached_input_tokens),
             optional_u32_to_i64(attempt.cache_creation_input_tokens),
             attempt.route_provider.clone(),
+            attempt.thinking_adaptive,
             optional_enum_to_wire(attempt.resolved_effort.as_ref())?,
             attempt.opened_at,
             attempt.closed_at,
@@ -4413,6 +4419,7 @@ SELECT
     cached_input_tokens,
     cache_creation_input_tokens,
     route_provider,
+    thinking_adaptive,
     resolved_effort,
     opened_at,
     closed_at,
@@ -5955,6 +5962,7 @@ struct TurnAttemptRecord {
     cached_input_tokens: Option<i64>,
     cache_creation_input_tokens: Option<i64>,
     route_provider: Option<String>,
+    thinking_adaptive: bool,
     resolved_effort: Option<String>,
     opened_at: OffsetDateTime,
     closed_at: Option<OffsetDateTime>,
@@ -6002,6 +6010,7 @@ impl TryFrom<TurnAttemptRecord> for TurnAttempt {
                 .map(|value| u32_from_i64(value, "turn attempt cache_creation_input_tokens"))
                 .transpose()?,
             route_provider: record.route_provider,
+            thinking_adaptive: record.thinking_adaptive,
             resolved_effort: record
                 .resolved_effort
                 .map(|value| enum_from_wire(&value, "turn attempt resolved_effort"))
@@ -6388,6 +6397,7 @@ mod tests {
             cached_input_tokens: 12,
             cache_creation_input_tokens: 0,
             route_provider: None,
+            thinking_adaptive: false,
             resolved_effort: None,
         }
     }

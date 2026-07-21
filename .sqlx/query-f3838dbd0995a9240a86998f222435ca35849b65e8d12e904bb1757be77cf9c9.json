@@ -1,0 +1,36 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nUPDATE agent_sdk_turn_attempts\nSET\n    task_id = $2,\n    attempt_number = $3,\n    provider = $4,\n    requested_model = $5,\n    request_blob = $6,\n    response_blob = $7,\n    response_id = $8,\n    response_model = $9,\n    stop_reason = $10,\n    outcome = $11,\n    input_tokens = $12,\n    output_tokens = $13,\n    cached_input_tokens = $14,\n    cache_creation_input_tokens = $15,\n    route_provider = $16,\n    thinking_adaptive = $17,\n    resolved_effort = $18,\n    opened_at = $19,\n    closed_at = $20,\n    duration_ms = $21,\n    otel_trace_id = $22,\n    otel_span_id = $23\nWHERE id = $1\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Jsonb",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Text",
+        "Bool",
+        "Text",
+        "Timestamptz",
+        "Timestamptz",
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f3838dbd0995a9240a86998f222435ca35849b65e8d12e904bb1757be77cf9c9"
+}
