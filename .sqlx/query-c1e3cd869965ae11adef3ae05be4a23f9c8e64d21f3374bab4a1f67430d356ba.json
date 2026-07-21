@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT kind, fingerprint, result_json\n               FROM agent_sdk_idempotency WHERE request_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_idempotency",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "fingerprint",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_idempotency",
+            "name": "fingerprint"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "result_json",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_idempotency",
+            "name": "result_json"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "c1e3cd869965ae11adef3ae05be4a23f9c8e64d21f3374bab4a1f67430d356ba"
+}

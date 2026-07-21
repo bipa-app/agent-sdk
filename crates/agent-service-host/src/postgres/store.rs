@@ -71,7 +71,9 @@ use agent_server::journal::task::{
 };
 use agent_server::journal::task_state::SubagentInvocationState;
 use agent_server::journal::thread::Thread;
-use agent_server::journal::thread_store::ThreadStore;
+use agent_server::journal::thread_store::{
+    ThreadCreation, ThreadCreationOutcome, ThreadIdConflict, ThreadStore, creation_identity_key,
+};
 use agent_server::journal::tool_audit::{ToolAuditEvent, ToolAuditEventId, ToolAuditEventStore};
 use agent_server::journal::turn_attempt::{
     CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptId,
@@ -219,13 +221,13 @@ impl PostgresDurableStore {
             .context("begin postgres durable-core transaction")
     }
 
-    async fn bootstrap_thread_row_tx(
+    async fn insert_thread_row_tx(
         tx: &mut Transaction<'_, Postgres>,
         thread_id: &ThreadId,
         now: OffsetDateTime,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let bootstrap = Thread::new(thread_id.clone(), now);
-        sqlx::query!(
+        let inserted = sqlx::query!(
             r"
 INSERT INTO agent_sdk_threads (
     thread_id,
@@ -237,6 +239,7 @@ INSERT INTO agent_sdk_threads (
     updated_at
 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT (thread_id) DO NOTHING
+RETURNING thread_id
 ",
             thread_key(&bootstrap.thread_id),
             enum_to_wire(&bootstrap.status)?,
@@ -246,10 +249,75 @@ ON CONFLICT (thread_id) DO NOTHING
             bootstrap.created_at,
             bootstrap.updated_at,
         )
-        .execute(&mut **tx)
+        .fetch_optional(&mut **tx)
         .await
-        .context("bootstrap thread row")?;
+        .context("insert thread row")?;
+        Ok(inserted.is_some())
+    }
+
+    async fn bootstrap_thread_row_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        thread_id: &ThreadId,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let _inserted = Self::insert_thread_row_tx(tx, thread_id, now).await?;
         Ok(())
+    }
+
+    async fn claim_thread_creation_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        thread_id: &ThreadId,
+        creation: &ThreadCreation,
+        now: OffsetDateTime,
+    ) -> Result<ThreadCreationOutcome> {
+        let inserted_thread = Self::insert_thread_row_tx(tx, thread_id, now).await?;
+        let identity_key = creation_identity_key(thread_id);
+        let kind = creation.idempotency_kind();
+        let fingerprint = creation.fingerprint();
+        let result_json = serde_json::json!({ "thread_id": thread_id.0 });
+
+        if inserted_thread {
+            let inserted_identity = sqlx::query!(
+                r#"INSERT INTO agent_sdk_idempotency
+                       (request_id, kind, fingerprint, result_json, created_at)
+                   VALUES ($1, $2, $3, $4, $5)
+                   ON CONFLICT (request_id) DO NOTHING
+                   RETURNING request_id"#,
+                identity_key,
+                kind.as_str(),
+                fingerprint,
+                result_json,
+                now,
+            )
+            .fetch_optional(&mut **tx)
+            .await
+            .with_context(|| format!("claim creation identity for {thread_id}"))?;
+            if inserted_identity.is_some() {
+                return Ok(ThreadCreationOutcome::Created);
+            }
+            return Err(anyhow::Error::new(ThreadIdConflict {
+                thread_id: thread_id.clone(),
+            }));
+        }
+
+        let row = sqlx::query!(
+            r#"SELECT kind, fingerprint, result_json
+               FROM agent_sdk_idempotency WHERE request_id = $1"#,
+            identity_key,
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| format!("load creation identity for {thread_id}"))?;
+        if row.is_some_and(|row| {
+            row.kind == kind.as_str()
+                && row.fingerprint == fingerprint
+                && row.result_json == result_json
+        }) {
+            return Ok(ThreadCreationOutcome::Existing);
+        }
+        Err(anyhow::Error::new(ThreadIdConflict {
+            thread_id: thread_id.clone(),
+        }))
     }
 
     async fn lock_thread_tx(
@@ -1901,12 +1969,33 @@ FOR UPDATE
     /// without seeing a half-finished fork (which would otherwise inflate
     /// `committed_turns` / `total_usage` on replay or hit a checkpoint
     /// uniqueness conflict).
-    async fn commit_fork_atomic_inner(&self, params: ForkCommitParams) -> Result<()> {
+    async fn commit_fork_atomic_inner(
+        &self,
+        params: ForkCommitParams,
+    ) -> Result<ThreadCreationOutcome> {
         let mut tx = self.begin().await?;
 
-        // 1. Bootstrap the destination thread aggregate, exactly as
-        //    `CreateThread` / `commit_completed_turn` would.
-        Self::bootstrap_thread_row_tx(&mut tx, &params.new_thread_id, params.now).await?;
+        // Claim caller-minted destinations by primary key inside the same
+        // transaction as the fork copy. Matching retries are no-ops; a
+        // conflicting origin is typed and rolls back without mutation.
+        let creation_outcome = if let Some(creation) = params.creation.as_ref() {
+            Self::claim_thread_creation_tx(&mut tx, &params.new_thread_id, creation, params.now)
+                .await?
+        } else {
+            Self::bootstrap_thread_row_tx(&mut tx, &params.new_thread_id, params.now).await?;
+            ThreadCreationOutcome::Created
+        };
+        if creation_outcome == ThreadCreationOutcome::Existing {
+            tx.commit()
+                .await
+                .context("commit idempotent postgres fork lookup")?;
+            return Ok(ThreadCreationOutcome::Existing);
+        }
+
+        // 1. The claim above inserted the destination aggregate row AND
+        //    its creation-identity idempotency row (unlike the
+        //    `CreateThread` / `commit_completed_turn` bootstraps, which
+        //    only write the thread row).
 
         // 2. Mirror `committed_turns` by repeatedly applying
         //    `Thread::apply_committed_turn`. Only the final iteration
@@ -1966,7 +2055,7 @@ FOR UPDATE
         tx.commit()
             .await
             .context("commit postgres fork transaction")?;
-        Ok(())
+        Ok(creation_outcome)
     }
 
     async fn commit_completed_turn_atomic_inner(
@@ -4190,6 +4279,21 @@ impl ThreadStore for PostgresDurableStore {
         Ok(thread)
     }
 
+    async fn get_or_create_for_creation(
+        &self,
+        thread_id: &ThreadId,
+        creation: &ThreadCreation,
+        now: OffsetDateTime,
+    ) -> Result<ThreadCreationOutcome> {
+        let mut tx = self.begin().await?;
+        let outcome = Self::claim_thread_creation_tx(&mut tx, thread_id, creation, now).await?;
+        let _projection = Self::lock_message_head_tx(&mut tx, thread_id, now).await?;
+        tx.commit()
+            .await
+            .context("commit caller-addressed thread get-or-create")?;
+        Ok(outcome)
+    }
+
     async fn get(&self, thread_id: &ThreadId) -> Result<Option<Thread>> {
         self.get_thread_pool(thread_id).await
     }
@@ -4587,7 +4691,7 @@ impl AtomicCompletedTurnCommitter for PostgresDurableStore {
 
 #[async_trait]
 impl AtomicForkCommitter for PostgresDurableStore {
-    async fn commit_fork_atomic(&self, params: ForkCommitParams) -> Result<()> {
+    async fn commit_fork_atomic(&self, params: ForkCommitParams) -> Result<ThreadCreationOutcome> {
         self.commit_fork_atomic_inner(params).await
     }
 }
@@ -6442,6 +6546,72 @@ mod tests {
                 database_url,
             },
         )))
+    }
+
+    /// Durable coverage of the Postgres `claim_thread_creation_tx`:
+    /// replay, typed conflict, and a REAL cross-connection race on the
+    /// same pool (spawned tasks released by one barrier).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn caller_minted_creation_claim_replays_conflicts_and_races_once() -> Result<()> {
+        use agent_server::journal::thread_store::{
+            ThreadCreation, ThreadCreationOutcome, ThreadIdConflict,
+        };
+        use std::sync::Arc;
+
+        let Some((store, _schema_guard)) = test_store().await? else {
+            return Ok(());
+        };
+        let store = Arc::new(store);
+        let created_id = thread_id("00000000-0000-4000-8000-00000000d0a1");
+        let raced_id = thread_id("00000000-0000-4000-8000-00000000d0a2");
+
+        let first = store
+            .get_or_create_for_creation(&created_id, &ThreadCreation::Create, t0())
+            .await?;
+        assert_eq!(first, ThreadCreationOutcome::Created);
+        let second = store
+            .get_or_create_for_creation(&created_id, &ThreadCreation::Create, t_plus(1))
+            .await?;
+        assert_eq!(second, ThreadCreationOutcome::Existing);
+        let conflict = store
+            .get_or_create_for_creation(
+                &created_id,
+                &ThreadCreation::Fork {
+                    source_thread_id: thread_id("00000000-0000-4000-8000-00000000d0a3"),
+                    fork_after_committed_turns: 0,
+                },
+                t_plus(2),
+            )
+            .await
+            .expect_err("a fork claim on a created id must conflict");
+        assert!(
+            conflict.downcast_ref::<ThreadIdConflict>().is_some(),
+            "expected ThreadIdConflict, got {conflict:#}",
+        );
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let raced_id = raced_id.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .get_or_create_for_creation(&raced_id, &ThreadCreation::Create, t_plus(3))
+                    .await
+            }));
+        }
+        let mut created = 0;
+        for handle in handles {
+            match handle.await? {
+                Ok(ThreadCreationOutcome::Created) => created += 1,
+                Ok(ThreadCreationOutcome::Existing) => {}
+                Err(error) => return Err(error.context("racing creation claim failed")),
+            }
+        }
+        assert_eq!(created, 1, "racing claims must create exactly once");
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

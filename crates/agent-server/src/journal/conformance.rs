@@ -72,7 +72,7 @@ use super::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, SuspensionPayload,
     TaskKind, TaskStatus, WorkerId,
 };
-use super::thread_store::ThreadStore;
+use super::thread_store::{ThreadCreation, ThreadCreationOutcome, ThreadStore};
 use super::turn_attempt::{CloseAttemptParams, OpenAttemptParams, TurnAttemptOutcome};
 use super::turn_attempt_store::TurnAttemptStore;
 
@@ -177,8 +177,8 @@ mod in_memory_bundle {
 
     use super::{
         AgentTask, AgentTaskId, AgentTaskStore, CheckpointStore, EventRepository,
-        InMemoryJournalStore, LeaseId, MessageProjectionStore, OffsetDateTime, Result, ThreadId,
-        ThreadStore, TurnAttemptStore, WorkerId,
+        InMemoryJournalStore, LeaseId, MessageProjectionStore, OffsetDateTime, Result,
+        ThreadCreation, ThreadCreationOutcome, ThreadId, ThreadStore, TurnAttemptStore, WorkerId,
     };
     use crate::journal::checkpoint::{Checkpoint, CheckpointId, NewCheckpointParams};
     use crate::journal::committed_event::CommittedEvent;
@@ -509,8 +509,21 @@ mod in_memory_bundle {
         fn sequential_commit_lock(&self) -> Option<&tokio::sync::Mutex<()>> {
             self.thread.sequential_commit_lock()
         }
+        fn sequential_fork_lock(&self) -> Option<&tokio::sync::Mutex<()>> {
+            self.thread.sequential_fork_lock()
+        }
         async fn get_or_create(&self, thread_id: &ThreadId, now: OffsetDateTime) -> Result<Thread> {
             self.thread.get_or_create(thread_id, now).await
+        }
+        async fn get_or_create_for_creation(
+            &self,
+            thread_id: &ThreadId,
+            creation: &ThreadCreation,
+            now: OffsetDateTime,
+        ) -> Result<ThreadCreationOutcome> {
+            self.thread
+                .get_or_create_for_creation(thread_id, creation, now)
+                .await
         }
         async fn get(&self, thread_id: &ThreadId) -> Result<Option<Thread>> {
             ThreadStore::get(&self.thread, thread_id).await

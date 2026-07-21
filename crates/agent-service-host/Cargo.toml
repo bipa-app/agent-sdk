@@ -91,6 +91,7 @@ agent-sdk = { workspace = true, features = ["web"] }
 agent-server = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
+proptest.workspace = true
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tower = { workspace = true }

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO agent_sdk_idempotency\n                       (request_id, kind, fingerprint, result_json, created_at)\n                   VALUES (?1, ?2, ?3, ?4, ?5)\n                   ON CONFLICT (request_id) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "e402faae893bacba2f441db4a12c72ae0bb9dc348de5c1f36d7cb26e85714689"
+}

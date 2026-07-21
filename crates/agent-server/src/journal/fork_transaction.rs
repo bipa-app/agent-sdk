@@ -33,6 +33,7 @@ use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::{ThreadId, TokenUsage, llm};
 
 use super::checkpoint::NewCheckpointParams;
+use super::thread_store::{ThreadCreation, ThreadCreationOutcome};
 
 /// Authoritative input for a single atomic fork-state copy.
 ///
@@ -46,6 +47,9 @@ pub struct ForkCommitParams {
     /// Server-minted destination thread id. The hook is responsible
     /// for inserting the thread aggregate row keyed on this id.
     pub new_thread_id: ThreadId,
+    /// Caller-addressed creation identity. `None` preserves the legacy
+    /// server-minted path; `Some` enables primary-key get-or-create.
+    pub creation: Option<ThreadCreation>,
     /// Wall-clock timestamp the new thread aggregate, projection,
     /// checkpoint, and events should record as their `created_at` /
     /// `updated_at` / `committed_at`. Held outside individual store
@@ -107,5 +111,7 @@ pub trait AtomicForkCommitter: Send + Sync {
     ///    `params.committed_turns` value; in-memory backends that
     ///    don't implement this hook achieve the same end state by
     ///    looping `commit_turn` outside the transaction.
-    async fn commit_fork_atomic(&self, params: ForkCommitParams) -> Result<()>;
+    /// Returns whether this call created the destination or found the exact
+    /// same caller-addressed fork already committed.
+    async fn commit_fork_atomic(&self, params: ForkCommitParams) -> Result<ThreadCreationOutcome>;
 }

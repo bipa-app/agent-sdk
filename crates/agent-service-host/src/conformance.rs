@@ -3320,6 +3320,7 @@ mod tests {
         ];
         let params = ForkCommitParams {
             new_thread_id: new_thread_id.clone(),
+            creation: None,
             now,
             committed_turns: 1,
             cumulative_total_usage: TokenUsage::default(),
@@ -3427,6 +3428,7 @@ mod tests {
         let fresh_messages = vec![Message::user("seeded")];
         let params = ForkCommitParams {
             new_thread_id: new_thread_id.clone(),
+            creation: None,
             now,
             committed_turns: 1,
             cumulative_total_usage: TokenUsage::default(),
