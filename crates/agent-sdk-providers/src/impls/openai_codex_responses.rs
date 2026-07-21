@@ -10,9 +10,11 @@ use crate::streaming::{
     SseLineBuffer, StreamBox, StreamDelta, StreamErrorKind, reqwest_body_error_delta,
     reqwest_error_delta,
 };
+#[cfg(test)]
+use agent_sdk_foundation::llm::ChatResponse;
 use agent_sdk_foundation::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Effort, ResponseFormat,
-    StopReason, ThinkingConfig, ThinkingMode, ToolChoice, Usage,
+    ChatOutcome, ChatRequest, Content, ContentBlock, Effort, ResponseFormat, StopReason,
+    ThinkingConfig, ThinkingMode, ToolChoice, Usage,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -395,6 +397,7 @@ impl OpenAICodexResponsesProvider {
         Ok((stream, turn_state))
     }
 
+    #[cfg(test)]
     fn map_response(api_response: ApiResponse) -> ChatResponse {
         let refused = output_contains_refusal(&api_response.output);
         let mut content = build_content_blocks(&api_response.output);
@@ -454,116 +457,11 @@ impl OpenAICodexResponsesProvider {
 #[async_trait]
 impl LlmProvider for OpenAICodexResponsesProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
-        let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
-            Ok(thinking) => thinking,
-            Err(error) => return Ok(ChatOutcome::InvalidRequest(error.to_string())),
-        };
-        if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
-            return Ok(ChatOutcome::InvalidRequest(error.to_string()));
-        }
-        let reasoning = build_api_reasoning(thinking_config.as_ref());
-        let input = build_api_input(&request);
-        let max_output_tokens = Self::max_output_tokens(&request);
-        let prompt_cache_key = request.session_id.as_deref();
-        let tools: Option<Vec<ApiTool>> = request
-            .tools
-            .as_ref()
-            .map(|ts| ts.iter().cloned().map(convert_tool).collect());
-        let parallel_tool_calls = tools.as_ref().is_some_and(|tools| !tools.is_empty());
-        let text_format = request
-            .response_format
-            .as_ref()
-            .map(ApiResponseTextFormat::from);
-        let tool_choice = codex_tool_choice(request.tool_choice.as_ref());
-
-        let api_request = ApiResponsesRequest {
-            model: &self.model,
-            instructions: request.system.as_str(),
-            input: &input,
-            tools: tools.as_deref(),
-            max_output_tokens,
-            reasoning,
-            tool_choice: Some(tool_choice),
-            parallel_tool_calls: parallel_tool_calls.then_some(true),
-            store: false,
-            text: Some(ApiTextSettings {
-                verbosity: "medium",
-                format: text_format,
-            }),
-            include: Some(&["reasoning.encrypted_content"]),
-            prompt_cache_key,
-        };
-
-        log::debug!(
-            "OpenAI Codex request model={} max_tokens={}",
-            self.model,
-            request.max_tokens
-        );
-
-        let response = self
-            .client
-            .post(codex_url(&self.base_url))
-            .headers(self.build_headers(false, request.session_id.as_deref(), None)?)
-            .json(&api_request)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
-
-        let status = response.status();
-        // Read `Retry-After` off the 429 response before the body is consumed.
-        let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
-            crate::http::retry_after_from_headers(response.headers())
-        } else {
-            None
-        };
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to read response body: {e}"))?;
-
-        log::debug!(
-            "OpenAI Codex response status={} body_len={}",
-            status,
-            bytes.len()
-        );
-
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            let body = String::from_utf8_lossy(&bytes);
-            let retry_after = retry_after
-                .or_else(|| codex_http_reset_after(&body))
-                .or_else(|| crate::retry_hints::openai_retry_delay(&body));
-            return Ok(ChatOutcome::RateLimited(retry_after));
-        }
-
-        if status.is_server_error() {
-            let body = String::from_utf8_lossy(&bytes);
-            log::error!("OpenAI Codex server error status={status} body={body}");
-            return Ok(ChatOutcome::ServerError(body.into_owned()));
-        }
-
-        if status.is_client_error() {
-            let body = String::from_utf8_lossy(&bytes);
-            log::warn!("OpenAI Codex client error status={status} body={body}");
-            return Ok(ChatOutcome::InvalidRequest(body.into_owned()));
-        }
-
-        let api_response: ApiResponse = serde_json::from_slice(&bytes)
-            .map_err(|e| anyhow::anyhow!("failed to parse response: {e}"))?;
-
-        // The Responses API reports generation failures as HTTP 200 with
-        // status=failed plus an error object. Surface that as a server error
-        // instead of a successful turn with empty content (mirrors the streaming
-        // `response.failed` handling).
-        if matches!(api_response.status, Some(ApiStatus::Failed)) {
-            let message = api_response
-                .error
-                .and_then(|error| error.message)
-                .unwrap_or_else(|| "OpenAI Codex reported status=failed".to_owned());
-            log::error!("OpenAI Codex generation failed: {message}");
-            return Ok(ChatOutcome::ServerError(message));
-        }
-
-        Ok(ChatOutcome::Success(Self::map_response(api_response)))
+        // The ChatGPT Codex backend requires every Responses request to stream,
+        // including callers such as context compaction that need one collected
+        // response. Reuse the SSE implementation so the wire request carries
+        // `stream: true`, then collect its deltas back into `ChatOutcome`.
+        crate::provider::collect_stream(self.chat_stream(request), self.model.clone()).await
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2283,6 +2181,7 @@ fn reasoning_summary_texts(fields: &serde_json::Map<String, serde_json::Value>) 
         .collect()
 }
 
+#[cfg(test)]
 fn build_content_blocks(output: &[ApiOutputItem]) -> Vec<ContentBlock> {
     let mut blocks = Vec::new();
 
@@ -2347,6 +2246,7 @@ fn build_content_blocks(output: &[ApiOutputItem]) -> Vec<ContentBlock> {
     blocks
 }
 
+#[cfg(test)]
 fn output_contains_refusal(output: &[ApiOutputItem]) -> bool {
     output.iter().any(|item| {
         matches!(
@@ -2450,10 +2350,6 @@ fn extract_account_id(token: &str) -> Result<String> {
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned)
         .ok_or_else(|| anyhow::anyhow!("chatgpt_account_id missing from OpenAI Codex token"))
-}
-
-fn is_empty(value: &str) -> bool {
-    value.trim().is_empty()
 }
 
 // ============================================================================
@@ -3018,31 +2914,6 @@ fn prepare_websocket_request(
 // API Request Types
 // ============================================================================
 
-#[derive(Serialize)]
-struct ApiResponsesRequest<'a> {
-    model: &'a str,
-    #[serde(skip_serializing_if = "is_empty")]
-    instructions: &'a str,
-    input: &'a [ApiInputItem],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<&'a [ApiTool]>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_output_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning: Option<ApiReasoning>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<ApiToolChoice>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    parallel_tool_calls: Option<bool>,
-    store: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    text: Option<ApiTextSettings>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    include: Option<&'a [&'static str]>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    prompt_cache_key: Option<&'a str>,
-}
-
 #[derive(Clone, PartialEq, Serialize)]
 struct ApiStreamingRequest {
     model: String,
@@ -3281,6 +3152,7 @@ struct ApiTool {
 // API Response Types
 // ============================================================================
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct ApiResponse {
     id: String,
@@ -3290,8 +3162,6 @@ struct ApiResponse {
     status: Option<ApiStatus>,
     #[serde(default)]
     usage: Option<ApiUsage>,
-    #[serde(default)]
-    error: Option<ApiErrorBody>,
     #[serde(default)]
     incomplete_details: Option<ApiIncompleteDetails>,
 }
@@ -4933,8 +4803,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_streams_and_collects_for_non_streaming_callers() -> anyhow::Result<()> {
+        let server = wiremock::MockServer::start().await;
+        let sse_body = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"compacted summary\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":265,\"output_tokens\":42}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/backend-api/codex/responses"))
+            .and(wiremock::matchers::header("accept", "text/event-stream"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"stream": true}),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_body),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = OpenAICodexResponsesProvider::with_base_url(
+            oauth_token(),
+            MODEL_GPT53_CODEX.to_owned(),
+            format!("{}/backend-api", server.uri()),
+        );
+
+        let outcome = provider
+            .chat(ChatRequest::new(
+                "You are a precise summarizer.",
+                vec![Message::user("summarize this history")],
+            ))
+            .await?;
+        let ChatOutcome::Success(response) = outcome else {
+            anyhow::bail!("streamed chat did not produce a successful outcome: {outcome:?}");
+        };
+
+        assert_eq!(response.first_text(), Some("compacted summary"));
+        assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(response.usage.input_tokens, 265);
+        assert_eq!(response.usage.output_tokens, 42);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn http_chat_429_reads_the_structured_reset_body() -> anyhow::Result<()> {
-        // The non-streaming chat() 429 branch: no Retry-After header, a
+        // The collected streaming chat() path: no Retry-After header, a
         // usage-limit body whose only usable hint is `resets_in_seconds`.
         let base_url = spawn_http_status_server(
             "429 Too Many Requests",
