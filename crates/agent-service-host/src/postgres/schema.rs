@@ -589,13 +589,15 @@ const AGENT_SDK_TURN_ATTEMPT_COLUMNS: &[ColumnContract] = &[
         name: "route_provider",
         sql_type: "TEXT",
         nullable: true,
-        notes: "Stable native or gateway route identity captured at dispatch.",
+        notes: "Serving route the call was dispatched to, distinct from `provider` \
+                whenever one API shape fronts several endpoints (native vs gateway).",
     },
     ColumnContract {
         name: "resolved_effort",
         sql_type: "TEXT",
         nullable: true,
-        notes: "Concrete thinking effort dispatched to the provider.",
+        notes: "Thinking effort the dispatched request carried: 'low' | 'medium' | \
+                'high' | 'max', or 'adaptive' when the provider's API chose the depth.",
     },
     ColumnContract {
         name: "opened_at",

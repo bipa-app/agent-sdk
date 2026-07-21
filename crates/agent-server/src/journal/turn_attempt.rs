@@ -119,6 +119,45 @@ impl TurnAttemptOutcome {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Resolved effort
+// ─────────────────────────────────────────────────────────────────────
+
+/// Thinking effort evidence recorded on a closed attempt.
+///
+/// Widens [`agent_sdk_foundation::llm::Effort`] with the [`Adaptive`] case so
+/// the column can separate the two ways an attempt ends up without a concrete
+/// level: the request asked for adaptive thinking and the provider's API picked
+/// the depth, versus the request asked for no thinking at all. A plain
+/// `Option<Effort>` collapses both into `None`, blanking the column for exactly
+/// the attempts D17 wants to audit.
+///
+/// [`Adaptive`]: Self::Adaptive
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResolvedEffort {
+    /// Concrete effort levels, mirroring [`agent_sdk_foundation::llm::Effort`].
+    Low,
+    Medium,
+    High,
+    Max,
+    /// Adaptive thinking dispatched without a concrete effort — the provider's
+    /// API chose the reasoning depth.
+    Adaptive,
+}
+
+impl From<agent_sdk_foundation::llm::Effort> for ResolvedEffort {
+    fn from(effort: agent_sdk_foundation::llm::Effort) -> Self {
+        use agent_sdk_foundation::llm::Effort;
+        match effort {
+            Effort::Low => Self::Low,
+            Effort::Medium => Self::Medium,
+            Effort::High => Self::High,
+            Effort::Max => Self::Max,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Errors
 // ─────────────────────────────────────────────────────────────────────
 
@@ -184,7 +223,11 @@ pub struct TurnAttempt {
     pub attempt_number: u32,
 
     // ── Request provenance ───────────────────────────────────────
-    /// Provider identifier (e.g. `"anthropic"`, `"openai"`).
+    /// Open-time provenance: the provider identity the attempt was opened
+    /// against, naming the API shape the request was built for — for example
+    /// `"anthropic"`. Recorded before the call is dispatched, so it answers
+    /// "what was this attempt configured as", never "who served it". For that,
+    /// see [`route_provider`](Self::route_provider).
     pub provider: String,
 
     /// Model the caller requested (may differ from what the
@@ -230,18 +273,29 @@ pub struct TurnAttempt {
 
     /// Input tokens spent creating provider-side cache entries. `None` while
     /// open or on rows that predate this evidence column.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub cache_creation_input_tokens: Option<u32>,
 
-    /// Stable provider route used for the call (for example `"anthropic"` or
-    /// `"cloudflare-ai-gateway"`). `None` while open or on legacy rows.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // ── Routing ──────────────────────────────────────────────────
+    /// Dispatch-time serving route: the endpoint the call was actually sent
+    /// to — for example `"openrouter"`.
+    ///
+    /// Distinct from [`provider`](Self::provider) whenever one API shape fronts
+    /// several endpoints: a request to `"anthropic"`-shaped Claude served
+    /// through `OpenRouter` records `provider = "anthropic"` and
+    /// `route_provider = "openrouter"`. Comparing cost or latency between a
+    /// gateway and its native endpoint reads this column, not `provider`.
+    /// `None` while open or on legacy rows.
+    #[serde(default)]
     pub route_provider: Option<String>,
 
-    /// Concrete thinking effort dispatched to the provider. `None` when no
-    /// effort applied or on rows that predate this evidence column.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolved_effort: Option<agent_sdk_foundation::llm::Effort>,
+    /// Thinking effort the request carried at dispatch. `None` while open, on
+    /// legacy rows, and when the request asked for no thinking at all —
+    /// adaptive thinking records [`ResolvedEffort::Adaptive`] rather than
+    /// `None`, so "the API chose the depth" stays distinguishable from "there
+    /// was no thinking".
+    #[serde(default)]
+    pub resolved_effort: Option<ResolvedEffort>,
 
     // ── Timing ───────────────────────────────────────────────────
     /// When the attempt was opened (LLM call started).
@@ -479,10 +533,10 @@ pub struct CloseAttemptParams {
     pub cached_input_tokens: u32,
     /// Input tokens spent creating provider-side cache entries.
     pub cache_creation_input_tokens: u32,
-    /// Stable provider route that dispatched this request.
+    /// Serving route this request was dispatched to.
     pub route_provider: Option<String>,
-    /// Concrete thinking effort dispatched to the provider.
-    pub resolved_effort: Option<agent_sdk_foundation::llm::Effort>,
+    /// Thinking effort the dispatched request carried.
+    pub resolved_effort: Option<ResolvedEffort>,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -533,7 +587,7 @@ mod tests {
             cached_input_tokens: 10,
             cache_creation_input_tokens: 20,
             route_provider: Some("anthropic".into()),
-            resolved_effort: Some(agent_sdk_foundation::llm::Effort::High),
+            resolved_effort: Some(ResolvedEffort::High),
         }
     }
 
@@ -624,10 +678,7 @@ mod tests {
         assert_eq!(closed.cached_input_tokens, Some(10));
         assert_eq!(closed.cache_creation_input_tokens, Some(20));
         assert_eq!(closed.route_provider.as_deref(), Some("anthropic"));
-        assert_eq!(
-            closed.resolved_effort,
-            Some(agent_sdk_foundation::llm::Effort::High),
-        );
+        assert_eq!(closed.resolved_effort, Some(ResolvedEffort::High),);
         assert_eq!(closed.duration_ms, Some(5_000));
         closed.validate().context("validate")?;
         Ok(())
@@ -825,6 +876,59 @@ mod tests {
         // Verify timing
         assert_eq!(json["duration_ms"], 2_000);
         Ok(())
+    }
+
+    #[test]
+    fn open_attempt_serializes_every_nullable_usage_field_as_null() -> Result<()> {
+        let json = serde_json::to_value(TurnAttempt::open(sample_open_params()))
+            .context("serialize open attempt")?;
+
+        // One policy for the whole group. A consumer that distinguishes
+        // absent-from-null must not have to learn which nullable column
+        // happens to be omitted and which is written as an explicit null.
+        for field in [
+            "cached_input_tokens",
+            "cache_creation_input_tokens",
+            "route_provider",
+            "resolved_effort",
+        ] {
+            assert_eq!(
+                json.get(field),
+                Some(&serde_json::Value::Null),
+                "{field} must serialize as an explicit null on an open attempt",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resolved_effort_wire_strings_match_the_column_check_constraint() -> Result<()> {
+        // These five strings are the `resolved_effort IN (…)` list in
+        // migration 0013 for both dialects; the store persists whatever
+        // serde emits here, so a rename would start failing the CHECK.
+        for (effort, wire) in [
+            (ResolvedEffort::Low, "low"),
+            (ResolvedEffort::Medium, "medium"),
+            (ResolvedEffort::High, "high"),
+            (ResolvedEffort::Max, "max"),
+            (ResolvedEffort::Adaptive, "adaptive"),
+        ] {
+            let encoded = serde_json::to_value(effort).context("serialize resolved effort")?;
+            assert_eq!(encoded, serde_json::Value::String(wire.to_owned()));
+            let decoded: ResolvedEffort =
+                serde_json::from_value(encoded).context("deserialize resolved effort")?;
+            assert_eq!(decoded, effort);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn concrete_efforts_widen_into_resolved_effort_without_collapsing() {
+        use agent_sdk_foundation::llm::Effort;
+        assert_eq!(ResolvedEffort::from(Effort::Low), ResolvedEffort::Low);
+        assert_eq!(ResolvedEffort::from(Effort::Medium), ResolvedEffort::Medium);
+        assert_eq!(ResolvedEffort::from(Effort::High), ResolvedEffort::High);
+        assert_eq!(ResolvedEffort::from(Effort::Max), ResolvedEffort::Max);
     }
 
     // ── Multiple attempts ────────────────────────────────────────

@@ -230,6 +230,15 @@ where
     fn provider(&self) -> &'static str {
         self.capable.provider()
     }
+
+    /// Reports the **`capable` tier's** route, not necessarily the one that
+    /// served the call: [`Self::chat`] classifies each request and may dispatch
+    /// to `fast` or `advanced` instead. Attributing the tier that actually ran
+    /// needs the serving route to travel back out of the per-request
+    /// classification with the response, which this trait has no channel for.
+    fn route(&self) -> &str {
+        self.capable.route()
+    }
 }
 
 const CLASSIFICATION_SYSTEM: &str = r"You are a task complexity classifier. Analyze the user's request and classify it as one of: SIMPLE, MODERATE, or COMPLEX.

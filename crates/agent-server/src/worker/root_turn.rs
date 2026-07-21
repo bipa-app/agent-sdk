@@ -74,7 +74,8 @@ use crate::journal::task_state::TaskState;
 use crate::journal::task_wakeup::WakeupSignal;
 use crate::journal::thread_store::ThreadStore;
 use crate::journal::turn_attempt::{
-    CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptOutcome, TurnAttemptSchemaError,
+    CloseAttemptParams, OpenAttemptParams, ResolvedEffort, TurnAttempt, TurnAttemptOutcome,
+    TurnAttemptSchemaError,
 };
 use crate::journal::turn_attempt_store::TurnAttemptStore;
 
@@ -305,23 +306,55 @@ impl ContentIds {
 }
 
 /// Provider-owned evidence captured at dispatch and committed with the attempt.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// A pure function of `(provider, request)`, so the retry loop can build it
+/// once per iteration and hand the same value to both the dispatch and the
+/// cancel paths that close the attempt without one.
+#[derive(Clone, Debug)]
 struct AttemptEvidence {
     route_provider: String,
-    resolved_effort: Option<llm::Effort>,
+    resolved_effort: Option<ResolvedEffort>,
 }
 
 impl AttemptEvidence {
     fn from_dispatch(provider: &dyn LlmProvider, request: &ChatRequest) -> Self {
-        let resolved_effort = request
+        let thinking = request
             .thinking
             .as_ref()
-            .or_else(|| provider.configured_thinking())
-            .and_then(|thinking| thinking.effort);
+            .or_else(|| provider.configured_thinking());
         Self {
-            route_provider: provider.provider().to_owned(),
-            resolved_effort,
+            // `route`, not `provider`: OpenRouter / Baseten / Fireworks all
+            // share one provider impl, so only the route tells a gateway call
+            // apart from the same model served natively.
+            route_provider: provider.route().to_owned(),
+            resolved_effort: thinking.and_then(dispatched_effort),
         }
+    }
+}
+
+/// The effort a dispatched request carries, as the durable row records it.
+///
+/// An explicit effort wins wherever it is set — request-level first, then the
+/// provider's configured default, matching how every provider's request
+/// builder resolves it.
+///
+/// Bare adaptive thinking resolves to no concrete level anywhere in this SDK
+/// before dispatch: Anthropic and Vertex send `thinking: {type: "adaptive"}`
+/// and omit `output_config` entirely, and the `OpenAI` Responses / Codex
+/// builders map `Adaptive` to `None`. The API picks the depth, so the row
+/// records that fact as [`ResolvedEffort::Adaptive`] rather than a NULL that
+/// would read as "no thinking was requested".
+///
+/// An explicit token budget with no effort stays `None`: the budget itself is
+/// the request's evidence and already lives in `request_blob`, and each
+/// provider maps it to a different scale.
+fn dispatched_effort(thinking: &llm::ThinkingConfig) -> Option<ResolvedEffort> {
+    if let Some(effort) = thinking.effort {
+        return Some(ResolvedEffort::from(effort));
+    }
+    match thinking.mode {
+        llm::ThinkingMode::Adaptive => Some(ResolvedEffort::Adaptive),
+        llm::ThinkingMode::Enabled { budget_tokens: _ } => None,
     }
 }
 
@@ -807,6 +840,10 @@ async fn best_effort_close_attempts(
                 attempt,
                 TurnAttemptOutcome::Cancelled,
                 &ZERO_ATTEMPT_USAGE,
+                // No evidence: these rows are read back from the store, with
+                // no provider or request in scope to describe a dispatch. The
+                // sweep settles rows a dead worker orphaned — inventing a
+                // route here would attribute a call this process never made.
                 None,
                 attempt_store,
                 now,
@@ -980,6 +1017,11 @@ pub(crate) async fn commit_partial_turn_on_cancel(
                 output_tokens: 0,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                // No evidence for the same reason the usage is zero: this
+                // synthetic row exists only to satisfy the commit
+                // transaction. It never dispatched to any provider — its
+                // provenance is literally `cancel-commit` — so there is no
+                // route or effort it could truthfully name.
                 route_provider: None,
                 resolved_effort: None,
             },
@@ -1024,6 +1066,7 @@ pub(crate) async fn commit_partial_turn_on_cancel(
             &synthetic,
             TurnAttemptOutcome::Cancelled,
             &ZERO_ATTEMPT_USAGE,
+            // Same synthetic row as above: never dispatched, so no evidence.
             None,
             deps.attempt_store,
             now,
@@ -2636,17 +2679,23 @@ pub(crate) struct LlmRetryParams<'a> {
 /// Cooperative cancellation gate at the top of every retry-loop iteration:
 /// bail with the cancel marker before opening another (billed) LLM call when
 /// the root turn was cancelled between attempts.
-async fn ensure_retry_not_cancelled(deps: &RootTurnDeps<'_>, attempt: &TurnAttempt) -> Result<()> {
+async fn ensure_retry_not_cancelled(
+    deps: &RootTurnDeps<'_>,
+    attempt: &TurnAttempt,
+    evidence: &AttemptEvidence,
+) -> Result<()> {
     if !deps.is_cancelled() {
         return Ok(());
     }
     // The attempt is open but has not begun another billed stream. No later
-    // path owns this row once the task is terminal, so close it here.
+    // path owns this row once the task is terminal, so close it here — with
+    // the evidence of the call it was about to make, so a turn cancelled
+    // mid-retry-storm still names the route it was hammering.
     close_attempt_with(
         attempt,
         TurnAttemptOutcome::Cancelled,
         &ZERO_ATTEMPT_USAGE,
-        None,
+        Some(evidence),
         deps.attempt_store,
         OffsetDateTime::now_utc(),
     )
@@ -2782,7 +2831,13 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
     let mut abandoned_usage = ZERO_ATTEMPT_USAGE;
 
     loop {
-        ensure_retry_not_cancelled(deps, &attempt).await?;
+        // Built before the gate, not inside `call_llm_once`: evidence is a
+        // pure function of (provider, request), so the same value describes
+        // both the dispatch and every cancel that closes this attempt's row
+        // without one — the route a cancelled attempt was aimed at is exactly
+        // what an operator needs from the audit trail.
+        let evidence = AttemptEvidence::from_dispatch(provider, &chat_request);
+        ensure_retry_not_cancelled(deps, &attempt, &evidence).await?;
         let was_retried = retry.any_stream_retry() || compaction_retries > 0;
         let attempt_now = if was_retried {
             OffsetDateTime::now_utc()
@@ -2793,6 +2848,7 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
             provider,
             chat_request.clone(),
             &attempt,
+            &evidence,
             deps,
             thread_id,
             attempt_now,
@@ -2815,6 +2871,7 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
                     kind,
                     message: &message,
                     current_attempt: &attempt,
+                    evidence: &evidence,
                     provider,
                     retry: &mut retry,
                     inputs,
@@ -2864,6 +2921,11 @@ struct RecoverableRetryParams<'a> {
     kind: StreamErrorKind,
     message: &'a str,
     current_attempt: &'a TurnAttempt,
+    /// Dispatch evidence for `current_attempt`. Needed because the
+    /// connectivity branch deliberately leaves that row OPEN across the
+    /// reachability wait, so a cancel landing during the wait is the path that
+    /// finally closes it — and must not blank its route.
+    evidence: &'a AttemptEvidence,
     provider: &'a dyn LlmProvider,
     retry: &'a mut WorkerRetryState,
     inputs: &'a RootWorkerInputs,
@@ -2879,6 +2941,7 @@ struct RecoverableRetryParams<'a> {
 async fn race_wait_against_cancel<T>(
     deps: &RootTurnDeps<'_>,
     current_attempt: &TurnAttempt,
+    evidence: &AttemptEvidence,
     wait: impl std::future::Future<Output = T>,
     cancel_context: &'static str,
 ) -> Result<T> {
@@ -2892,7 +2955,7 @@ async fn race_wait_against_cancel<T>(
                 current_attempt,
                 TurnAttemptOutcome::Cancelled,
                 &ZERO_ATTEMPT_USAGE,
-                None,
+                Some(evidence),
                 deps.attempt_store,
                 OffsetDateTime::now_utc(),
             )
@@ -2915,6 +2978,7 @@ async fn wait_for_provider_reachability(
     provider: &dyn LlmProvider,
     deps: &RootTurnDeps<'_>,
     current_attempt: &TurnAttempt,
+    evidence: &AttemptEvidence,
     retry: &mut WorkerRetryState,
 ) -> Result<()> {
     let mut probe_round: u32 = 0;
@@ -2923,6 +2987,7 @@ async fn wait_for_provider_reachability(
         race_wait_against_cancel(
             deps,
             current_attempt,
+            evidence,
             tokio::time::sleep(stream_backoff_delay(probe_round)),
             "root turn cancelled while waiting for connectivity",
         )
@@ -2931,6 +2996,7 @@ async fn wait_for_provider_reachability(
         let reachable = race_wait_against_cancel(
             deps,
             current_attempt,
+            evidence,
             provider.probe_connectivity(),
             "root turn cancelled while probing provider reachability",
         )
@@ -2972,6 +3038,7 @@ async fn wait_out_connectivity_loss(params: RecoverableRetryParams<'_>) -> Resul
         kind,
         message,
         current_attempt,
+        evidence,
         provider,
         retry,
         inputs,
@@ -3033,7 +3100,8 @@ async fn wait_out_connectivity_loss(params: RecoverableRetryParams<'_>) -> Resul
     let wait_guard = deps.connectivity_waits.map(|registry| {
         registry.enter(thread_id.clone(), retry.streak_sequence, message.to_owned())
     });
-    let waited = wait_for_provider_reachability(provider, deps, current_attempt, retry).await;
+    let waited =
+        wait_for_provider_reachability(provider, deps, current_attempt, evidence, retry).await;
     drop(wait_guard);
     waited?;
     if kind == StreamErrorKind::Connectivity {
@@ -3067,6 +3135,7 @@ async fn back_off_transient_stream_error(
         kind,
         message,
         current_attempt,
+        evidence,
         retry,
         inputs,
         definition,
@@ -3140,6 +3209,7 @@ async fn back_off_transient_stream_error(
     race_wait_against_cancel(
         deps,
         current_attempt,
+        evidence,
         tokio::time::sleep(delay),
         "root turn cancelled during retry backoff",
     )
@@ -3410,19 +3480,18 @@ async fn call_llm_once(
     provider: &dyn LlmProvider,
     request: ChatRequest,
     attempt: &TurnAttempt,
+    evidence: &AttemptEvidence,
     deps: &RootTurnDeps<'_>,
     thread_id: &agent_sdk_foundation::ThreadId,
     now: OffsetDateTime,
 ) -> Result<OnceOutcome, StreamAttemptError> {
-    let evidence = AttemptEvidence::from_dispatch(provider, &request);
     #[cfg(feature = "otel")]
     {
-        call_llm_once_instrumented(provider, request, attempt, &evidence, deps, thread_id, now)
-            .await
+        call_llm_once_instrumented(provider, request, attempt, evidence, deps, thread_id, now).await
     }
     #[cfg(not(feature = "otel"))]
     {
-        call_llm_once_inner(provider, request, attempt, &evidence, deps, thread_id, now).await
+        call_llm_once_inner(provider, request, attempt, evidence, deps, thread_id, now).await
     }
 }
 
@@ -3538,13 +3607,26 @@ const STREAMING_DELTA_BATCH_SIZE: usize = 16;
 /// close. The flush fires on whichever bound trips first.
 const STREAMING_DELTA_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Shared inputs for flushing streamed deltas and closing their attempt row.
-struct CloseStreamAttemptParams<'a, 'deps> {
+/// The per-attempt context every streaming close path carries: who to write
+/// to, which attempt is being settled, the deltas still owed to subscribers,
+/// and the dispatch evidence that attempt's row records.
+///
+/// Held by value inside the four `*Params` structs below so a new per-attempt
+/// field is added once here rather than at four construction sites.
+struct StreamAttemptCtx<'a, 'deps> {
     deps: &'a RootTurnDeps<'deps>,
     thread_id: &'a agent_sdk_foundation::ThreadId,
     pending_deltas: &'a mut Vec<AgentEvent>,
     attempt: &'a TurnAttempt,
-    evidence: Option<&'a AttemptEvidence>,
+    /// Non-optional: every streaming path runs after `call_llm_once` built the
+    /// evidence. The `Option` lives only at [`close_attempt_with`], whose
+    /// store-recovered callers have no dispatch to describe.
+    evidence: &'a AttemptEvidence,
+}
+
+/// Shared inputs for flushing streamed deltas and closing their attempt row.
+struct CloseStreamAttemptParams<'a, 'deps> {
+    ctx: StreamAttemptCtx<'a, 'deps>,
     outcome: TurnAttemptOutcome,
     usage: &'a llm::Usage,
     now: OffsetDateTime,
@@ -3554,11 +3636,7 @@ struct CloseStreamAttemptParams<'a, 'deps> {
 /// `clippy::too_many_arguments` and keep the poll loop in
 /// [`call_llm_once_inner`] readable.
 struct StalledAttemptParams<'a, 'deps> {
-    deps: &'a RootTurnDeps<'deps>,
-    thread_id: &'a agent_sdk_foundation::ThreadId,
-    pending_deltas: &'a mut Vec<AgentEvent>,
-    attempt: &'a TurnAttempt,
-    evidence: &'a AttemptEvidence,
+    ctx: StreamAttemptCtx<'a, 'deps>,
     received_first_item: bool,
     stall_budget: Duration,
     /// Usage the stalled attempt streamed before going silent.
@@ -3574,11 +3652,7 @@ struct StalledAttemptParams<'a, 'deps> {
 /// the retry wrapper re-sends on a fresh attempt.
 async fn close_stalled_attempt(params: StalledAttemptParams<'_, '_>) -> StreamAttemptError {
     let StalledAttemptParams {
-        deps,
-        thread_id,
-        pending_deltas,
-        attempt,
-        evidence,
+        ctx,
         received_first_item,
         stall_budget,
         usage,
@@ -3593,11 +3667,7 @@ async fn close_stalled_attempt(params: StalledAttemptParams<'_, '_>) -> StreamAt
     // accepted even if no item arrived. Settle this provider-call row before
     // retrying on a fresh attempt.
     flush_and_close(CloseStreamAttemptParams {
-        deps,
-        thread_id,
-        pending_deltas,
-        attempt,
-        evidence: Some(evidence),
+        ctx,
         outcome: TurnAttemptOutcome::ServerError,
         usage: &usage,
         now,
@@ -3629,11 +3699,7 @@ async fn close_recoverable_server_error(
 }
 
 struct FailedStreamAttemptParams<'a, 'deps> {
-    deps: &'a RootTurnDeps<'deps>,
-    thread_id: &'a agent_sdk_foundation::ThreadId,
-    pending_deltas: &'a mut Vec<AgentEvent>,
-    attempt: &'a TurnAttempt,
-    evidence: &'a AttemptEvidence,
+    ctx: StreamAttemptCtx<'a, 'deps>,
     outcome: TurnAttemptOutcome,
     error: StreamAttemptError,
     usage: llm::Usage,
@@ -3644,11 +3710,7 @@ async fn finish_failed_stream_attempt(
     params: FailedStreamAttemptParams<'_, '_>,
 ) -> StreamAttemptError {
     let FailedStreamAttemptParams {
-        deps,
-        thread_id,
-        pending_deltas,
-        attempt,
-        evidence,
+        ctx,
         outcome,
         error,
         usage,
@@ -3663,14 +3725,10 @@ async fn finish_failed_stream_attempt(
     ) {
         // The request never reached a usable provider response. Leave this
         // attempt open so offline probes do not manufacture audit rows.
-        flush_streaming_deltas(deps, thread_id, pending_deltas).await;
+        flush_streaming_deltas(ctx.deps, ctx.thread_id, ctx.pending_deltas).await;
     } else {
         flush_and_close(CloseStreamAttemptParams {
-            deps,
-            thread_id,
-            pending_deltas,
-            attempt,
-            evidence: Some(evidence),
+            ctx,
             outcome,
             usage: &usage,
             now,
@@ -3684,20 +3742,12 @@ async fn finish_failed_stream_attempt(
 /// [`RootTurnDeps::cancel`] token and build the matching non-retryable
 /// error (see [`StreamAttemptError::Cancelled`]).
 async fn close_cancelled_attempt(
-    deps: &RootTurnDeps<'_>,
-    thread_id: &agent_sdk_foundation::ThreadId,
-    pending_deltas: &mut Vec<AgentEvent>,
-    attempt: &TurnAttempt,
-    evidence: &AttemptEvidence,
+    ctx: StreamAttemptCtx<'_, '_>,
     usage: &llm::Usage,
     now: OffsetDateTime,
 ) -> StreamAttemptError {
     flush_and_close(CloseStreamAttemptParams {
-        deps,
-        thread_id,
-        pending_deltas,
-        attempt,
-        evidence: Some(evidence),
+        ctx,
         outcome: TurnAttemptOutcome::Cancelled,
         usage,
         now,
@@ -3742,11 +3792,7 @@ async fn close_truncated_stream(
 /// a cancel or a stall. `usage` is the tokens streamed so far, billed onto the
 /// closed row.
 struct StreamPollParams<'a, 'deps> {
-    deps: &'a RootTurnDeps<'deps>,
-    thread_id: &'a agent_sdk_foundation::ThreadId,
-    pending_deltas: &'a mut Vec<AgentEvent>,
-    attempt: &'a TurnAttempt,
-    evidence: &'a AttemptEvidence,
+    ctx: StreamAttemptCtx<'a, 'deps>,
     received_first_item: bool,
     usage: llm::Usage,
     now: OffsetDateTime,
@@ -3764,25 +3810,18 @@ async fn poll_stream_item(
     params: StreamPollParams<'_, '_>,
 ) -> Result<Option<Result<StreamDelta>>, StreamAttemptError> {
     let StreamPollParams {
-        deps,
-        thread_id,
-        pending_deltas,
-        attempt,
-        evidence,
+        ctx,
         received_first_item,
         usage,
         now,
     } = params;
     let stall_budget = stream_stall_budget(received_first_item);
-    let polled = match deps.cancel {
+    let polled = match ctx.deps.cancel {
         Some(cancel) => {
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
-                    return Err(close_cancelled_attempt(
-                        deps, thread_id, pending_deltas, attempt, evidence, &usage, now,
-                    )
-                    .await);
+                    return Err(close_cancelled_attempt(ctx, &usage, now).await);
                 }
                 polled = tokio::time::timeout(stall_budget, stream.next()) => polled,
             }
@@ -3792,11 +3831,7 @@ async fn poll_stream_item(
     match polled {
         Ok(next) => Ok(next),
         Err(_elapsed) => Err(close_stalled_attempt(StalledAttemptParams {
-            deps,
-            thread_id,
-            pending_deltas,
-            attempt,
-            evidence,
+            ctx,
             received_first_item,
             stall_budget,
             usage,
@@ -3835,11 +3870,13 @@ async fn call_llm_once_inner(
         let Some(result) = poll_stream_item(
             &mut stream,
             StreamPollParams {
-                deps,
-                thread_id,
-                pending_deltas: &mut pending_deltas,
-                attempt,
-                evidence,
+                ctx: StreamAttemptCtx {
+                    deps,
+                    thread_id,
+                    pending_deltas: &mut pending_deltas,
+                    attempt,
+                    evidence,
+                },
                 received_first_item,
                 usage: attempt_usage(&accumulator),
                 now,
@@ -3865,11 +3902,13 @@ async fn call_llm_once_inner(
                 let usage = attempt_usage(&accumulator);
                 return Err(close_recoverable_server_error(
                     CloseStreamAttemptParams {
-                        deps,
-                        thread_id,
-                        pending_deltas: &mut pending_deltas,
-                        attempt,
-                        evidence: Some(evidence),
+                        ctx: StreamAttemptCtx {
+                            deps,
+                            thread_id,
+                            pending_deltas: &mut pending_deltas,
+                            attempt,
+                            evidence,
+                        },
                         outcome: TurnAttemptOutcome::ServerError,
                         usage: &usage,
                         now,
@@ -3887,11 +3926,13 @@ async fn call_llm_once_inner(
             DeltaStep::Buffered => {}
             DeltaStep::Fail(outcome, error) => {
                 return Err(finish_failed_stream_attempt(FailedStreamAttemptParams {
-                    deps,
-                    thread_id,
-                    pending_deltas: &mut pending_deltas,
-                    attempt,
-                    evidence,
+                    ctx: StreamAttemptCtx {
+                        deps,
+                        thread_id,
+                        pending_deltas: &mut pending_deltas,
+                        attempt,
+                        evidence,
+                    },
                     outcome,
                     error,
                     usage: attempt_usage(&accumulator),
@@ -4159,14 +4200,20 @@ async fn close_attempt_with(
 /// Used on every early-return path so a failed / cancelled attempt still
 /// lands its partial transcript before the audit row is closed.
 async fn flush_and_close(params: CloseStreamAttemptParams<'_, '_>) {
-    flush_streaming_deltas(params.deps, params.thread_id, params.pending_deltas).await;
+    let CloseStreamAttemptParams {
+        ctx,
+        outcome,
+        usage,
+        now,
+    } = params;
+    flush_streaming_deltas(ctx.deps, ctx.thread_id, ctx.pending_deltas).await;
     close_attempt_with(
-        params.attempt,
-        params.outcome,
-        params.usage,
-        params.evidence,
-        params.deps.attempt_store,
-        params.now,
+        ctx.attempt,
+        outcome,
+        usage,
+        Some(ctx.evidence),
+        ctx.deps.attempt_store,
+        now,
     )
     .await;
 }
@@ -6753,25 +6800,17 @@ async fn repark_after_steering_exchange(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
+    use agent_sdk_providers::OpenAIProvider;
 
-    struct EvidenceProvider {
-        route: &'static str,
-    }
-
-    #[async_trait]
-    impl LlmProvider for EvidenceProvider {
-        async fn chat(&self, _request: ChatRequest) -> Result<llm::ChatOutcome> {
-            bail!("evidence fixture does not dispatch chat")
-        }
-
-        fn model(&self) -> &'static str {
-            "claude-sonnet-4-6"
-        }
-
-        fn provider(&self) -> &'static str {
-            self.route
-        }
+    /// Two **real** providers that differ only in the endpoint they are
+    /// pointed at. Both are the same struct and both answer `"openai"` from
+    /// `provider()`, so any route discrimination the rows show has to come
+    /// from production code — a test double could fake it by construction.
+    fn native_and_gateway_providers() -> (OpenAIProvider, OpenAIProvider) {
+        (
+            OpenAIProvider::with_base_url("key", "gpt-5.6", "https://api.openai.com/v1"),
+            OpenAIProvider::with_base_url("key", "gpt-5.6", "https://openrouter.ai/api/v1"),
+        )
     }
 
     fn evidence_request(thinking: llm::ThinkingConfig) -> ChatRequest {
@@ -6804,71 +6843,149 @@ mod tests {
         }
     }
 
+    fn close_evidence_attempt(
+        evidence: &AttemptEvidence,
+        usage: &llm::Usage,
+        context: &'static str,
+    ) -> Result<TurnAttempt> {
+        let response = evidence_response(usage.clone());
+        evidence_attempt()
+            .close(
+                build_close_params(&response, usage, evidence),
+                OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+            )
+            .context(context)
+    }
+
+    /// AC2 (R7): a gateway-served call and a natively-served call must land
+    /// **different** `route_provider` values on their rows.
     #[test]
-    fn attempt_commit_records_provider_usage_route_and_resolved_effort() -> Result<()> {
-        let native = EvidenceProvider { route: "anthropic" };
-        let gateway = EvidenceProvider {
-            route: "cloudflare-ai-gateway",
-        };
-        let adaptive_request =
-            evidence_request(llm::ThinkingConfig::adaptive_with_effort(llm::Effort::High));
-        let fixed_request =
-            evidence_request(llm::ThinkingConfig::new(8_000).with_effort(llm::Effort::Medium));
-        let native_evidence = AttemptEvidence::from_dispatch(&native, &adaptive_request);
-        let gateway_evidence = AttemptEvidence::from_dispatch(&gateway, &adaptive_request);
-        let fixed_evidence = AttemptEvidence::from_dispatch(&native, &fixed_request);
+    fn attempt_rows_distinguish_a_gateway_route_from_the_native_one() -> Result<()> {
+        let (native, gateway) = native_and_gateway_providers();
+        let request = evidence_request(llm::ThinkingConfig::adaptive());
 
-        assert_ne!(
-            native_evidence.route_provider,
-            gateway_evidence.route_provider
-        );
-        assert_eq!(native_evidence.resolved_effort, Some(llm::Effort::High));
-        assert_eq!(fixed_evidence.resolved_effort, Some(llm::Effort::Medium));
+        // The premise: one provider identity fronting two endpoints. If these
+        // ever diverge, `route_provider` is no longer the column carrying the
+        // discrimination and the assertions below stop proving R7.
+        assert_eq!(native.provider(), gateway.provider());
 
-        let reported = llm::Usage {
+        let usage = llm::Usage {
             input_tokens: 100,
             output_tokens: 20,
             cached_input_tokens: 30,
             cache_creation_input_tokens: 40,
         };
-        let response = evidence_response(reported.clone());
-        let native_closed = evidence_attempt()
-            .close(
-                build_close_params(&response, &reported, &native_evidence),
-                OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
-            )
-            .context("close native evidence attempt")?;
-        let gateway_closed = evidence_attempt()
-            .close(
-                build_close_params(&response, &reported, &gateway_evidence),
-                OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
-            )
-            .context("close gateway evidence attempt")?;
-        let fixed_closed = evidence_attempt()
-            .close(
-                build_close_params(&response, &reported, &fixed_evidence),
-                OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
-            )
-            .context("close fixed-effort evidence attempt")?;
+        let native_closed = close_evidence_attempt(
+            &AttemptEvidence::from_dispatch(&native, &request),
+            &usage,
+            "close native evidence attempt",
+        )?;
+        let gateway_closed = close_evidence_attempt(
+            &AttemptEvidence::from_dispatch(&gateway, &request),
+            &usage,
+            "close gateway evidence attempt",
+        )?;
 
-        assert_eq!(gateway_closed.input_tokens, Some(reported.input_tokens));
-        assert_eq!(gateway_closed.output_tokens, Some(reported.output_tokens));
-        assert_eq!(
-            gateway_closed.cached_input_tokens,
-            Some(reported.cached_input_tokens)
+        assert_eq!(native_closed.route_provider.as_deref(), Some("openai"));
+        assert_eq!(gateway_closed.route_provider.as_deref(), Some("openrouter"));
+        assert_ne!(
+            native_closed.route_provider, gateway_closed.route_provider,
+            "same model via a gateway vs natively must not collapse onto one route",
         );
+        Ok(())
+    }
+
+    /// AC1: the usage columns the evidence carries reach the closed row.
+    #[test]
+    fn attempt_rows_record_cache_creation_usage() -> Result<()> {
+        let (native, _) = native_and_gateway_providers();
+        let usage = llm::Usage {
+            input_tokens: 100,
+            output_tokens: 20,
+            cached_input_tokens: 30,
+            cache_creation_input_tokens: 40,
+        };
+        let closed = close_evidence_attempt(
+            &AttemptEvidence::from_dispatch(
+                &native,
+                &evidence_request(llm::ThinkingConfig::adaptive()),
+            ),
+            &usage,
+            "close usage evidence attempt",
+        )?;
+
+        assert_eq!(closed.input_tokens, Some(usage.input_tokens));
+        assert_eq!(closed.output_tokens, Some(usage.output_tokens));
+        assert_eq!(closed.cached_input_tokens, Some(usage.cached_input_tokens));
         assert_eq!(
-            gateway_closed.cache_creation_input_tokens,
-            Some(reported.cache_creation_input_tokens),
+            closed.cache_creation_input_tokens,
+            Some(usage.cache_creation_input_tokens),
         );
-        assert_eq!(native_closed.route_provider.as_deref(), Some("anthropic"));
+        Ok(())
+    }
+
+    /// AC3 (D17): the effort column is never blank for a thinking request.
+    ///
+    /// The case that matters is **bare** `adaptive()` — no pre-set effort to
+    /// echo back. Nothing in the SDK resolves a concrete level for it before
+    /// dispatch, so the row records `adaptive` instead of a NULL that would
+    /// read as "no thinking was requested".
+    #[test]
+    fn attempt_rows_record_resolved_effort_including_the_adaptive_case() -> Result<()> {
+        let (native, _) = native_and_gateway_providers();
+        let usage = ZERO_ATTEMPT_USAGE;
+
+        let adaptive = close_evidence_attempt(
+            &AttemptEvidence::from_dispatch(
+                &native,
+                &evidence_request(llm::ThinkingConfig::adaptive()),
+            ),
+            &usage,
+            "close bare-adaptive evidence attempt",
+        )?;
         assert_eq!(
-            gateway_closed.route_provider.as_deref(),
-            Some("cloudflare-ai-gateway"),
+            adaptive.resolved_effort,
+            Some(ResolvedEffort::Adaptive),
+            "bare adaptive thinking must persist evidence, not NULL",
         );
-        assert_ne!(native_closed.route_provider, gateway_closed.route_provider);
-        assert_eq!(native_closed.resolved_effort, Some(llm::Effort::High));
-        assert_eq!(fixed_closed.resolved_effort, Some(llm::Effort::Medium));
+
+        let pinned = close_evidence_attempt(
+            &AttemptEvidence::from_dispatch(
+                &native,
+                &evidence_request(llm::ThinkingConfig::adaptive_with_effort(llm::Effort::High)),
+            ),
+            &usage,
+            "close pinned-adaptive evidence attempt",
+        )?;
+        assert_eq!(pinned.resolved_effort, Some(ResolvedEffort::High));
+
+        let budgeted = close_evidence_attempt(
+            &AttemptEvidence::from_dispatch(
+                &native,
+                &evidence_request(llm::ThinkingConfig::new(8_000).with_effort(llm::Effort::Medium)),
+            ),
+            &usage,
+            "close budgeted evidence attempt",
+        )?;
+        assert_eq!(budgeted.resolved_effort, Some(ResolvedEffort::Medium));
+        Ok(())
+    }
+
+    /// A provider-configured default is dispatch evidence too: the request
+    /// carries no thinking, so the row must fall back to the provider's.
+    #[test]
+    fn provider_configured_thinking_supplies_the_effort_when_the_request_omits_it() -> Result<()> {
+        let native = OpenAIProvider::with_base_url("key", "gpt-5.6", "https://api.openai.com/v1")
+            .with_thinking(llm::ThinkingConfig::adaptive_with_effort(llm::Effort::Max));
+        let mut request = ChatRequest::new("system", vec![llm::Message::user("hello")]);
+        request.thinking = None;
+
+        let closed = close_evidence_attempt(
+            &AttemptEvidence::from_dispatch(&native, &request),
+            &ZERO_ATTEMPT_USAGE,
+            "close provider-default evidence attempt",
+        )?;
+        assert_eq!(closed.resolved_effort, Some(ResolvedEffort::Max));
         Ok(())
     }
 

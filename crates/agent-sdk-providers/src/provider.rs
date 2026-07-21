@@ -199,6 +199,21 @@ pub trait LlmProvider: Send + Sync {
     fn model(&self) -> &str;
     fn provider(&self) -> &'static str;
 
+    /// The endpoint that actually serves this provider's calls.
+    ///
+    /// [`Self::provider`] names the *API shape* a request is built for, and
+    /// several distinct endpoints share one shape: `OpenRouter`, `Baseten` and
+    /// `Fireworks` are all reached through [`OpenAIProvider`] pointed at a
+    /// different `base_url`, so all three answer `"openai"`. Durable audit rows
+    /// need to tell *model-X via a gateway* from *model-X native*, so this
+    /// reports the serving route instead — the two coincide only for providers
+    /// that front a single endpoint, which is why the default delegates.
+    ///
+    /// [`OpenAIProvider`]: crate::impls::openai::OpenAIProvider
+    fn route(&self) -> &str {
+        self.provider()
+    }
+
     /// Provider-owned thinking configuration, if any.
     fn configured_thinking(&self) -> Option<&ThinkingConfig> {
         None

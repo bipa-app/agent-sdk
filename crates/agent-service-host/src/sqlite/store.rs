@@ -5329,7 +5329,15 @@ mod tests {
             .connect("sqlite::memory:")
             .await?;
         let migrations = crate::sqlite::migrations::durable_core_migrations();
-        for migration in migrations.iter().take(12) {
+        // Locate 0013 by version, never by position: this batch stacks
+        // 0013–0018 with a reserved slot in play, and a renumber that shifted
+        // the ladder would silently turn a hardcoded index into a test that
+        // asserts something else entirely instead of failing.
+        let evidence_index = migrations
+            .iter()
+            .position(|migration| migration.version == "0013")
+            .context("migration 0013 missing from the reviewable bundle")?;
+        for migration in migrations.iter().take(evidence_index) {
             sqlx::raw_sql(migration.sql).execute(&pool).await?;
         }
 
@@ -5352,7 +5360,7 @@ INSERT INTO agent_sdk_turn_attempts (
         .execute(&pool)
         .await?;
 
-        let evidence_migration = migrations.get(12).context("migration 0013 missing")?;
+        let evidence_migration = &migrations[evidence_index];
         sqlx::raw_sql(evidence_migration.sql).execute(&pool).await?;
 
         let legacy: TurnAttempt = TurnAttemptStore::get(&store, &attempt_id)

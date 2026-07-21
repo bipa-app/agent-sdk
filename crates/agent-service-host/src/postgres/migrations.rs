@@ -285,23 +285,10 @@ mod tests {
 
     #[test]
     fn turn_attempt_evidence_migration_is_additive_and_nullable() {
-        assert_eq!(
-            TURN_ATTEMPT_EVIDENCE_SQL.matches("ADD COLUMN").count(),
+        crate::migration_contract::assert_additive_nullable_migration(
+            TURN_ATTEMPT_EVIDENCE_SQL,
+            "agent_sdk_turn_attempts",
             3,
-            "evidence migration must add exactly three columns",
-        );
-        assert!(
-            TURN_ATTEMPT_EVIDENCE_SQL
-                .lines()
-                .filter(|line| line.trim_start().starts_with("ADD COLUMN"))
-                .all(|line| line.contains(" NULL")),
-            "every evidence column must preserve legacy rows as NULL",
-        );
-        assert!(
-            !TURN_ATTEMPT_EVIDENCE_SQL
-                .to_ascii_uppercase()
-                .contains("UPDATE AGENT_SDK_TURN_ATTEMPTS"),
-            "evidence migration must not rewrite old attempt rows",
         );
     }
 }

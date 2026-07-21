@@ -69,7 +69,7 @@ mod tests {
     use agent_server::journal::task_state::TaskState;
     use agent_server::journal::thread_store::ThreadStore;
     use agent_server::journal::turn_attempt::{
-        CloseAttemptParams, OpenAttemptParams, TurnAttemptOutcome,
+        CloseAttemptParams, OpenAttemptParams, ResolvedEffort, TurnAttemptOutcome,
     };
     use agent_server::journal::turn_attempt_store::TurnAttemptStore;
     use agent_server::worker::subagent::{
@@ -522,7 +522,7 @@ mod tests {
                     cached_input_tokens: 30,
                     cache_creation_input_tokens: 40,
                     route_provider: Some("anthropic".into()),
-                    resolved_effort: Some(agent_sdk_foundation::llm::Effort::High),
+                    resolved_effort: Some(ResolvedEffort::High),
                 },
                 messages: vec![agent_sdk_foundation::llm::Message::assistant(
                     "test response",
@@ -551,7 +551,7 @@ mod tests {
         );
         assert_eq!(
             outcome.closed_attempt.resolved_effort,
-            Some(agent_sdk_foundation::llm::Effort::High),
+            Some(ResolvedEffort::High),
         );
         let stored_attempt = attempt_store
             .get(&attempt.id)
@@ -559,10 +559,7 @@ mod tests {
             .context("committed attempt missing")?;
         assert_eq!(stored_attempt.cache_creation_input_tokens, Some(40));
         assert_eq!(stored_attempt.route_provider.as_deref(), Some("anthropic"));
-        assert_eq!(
-            stored_attempt.resolved_effort,
-            Some(agent_sdk_foundation::llm::Effort::High),
-        );
+        assert_eq!(stored_attempt.resolved_effort, Some(ResolvedEffort::High),);
 
         let latest = checkpoint_store
             .get_latest_by_thread(&tid)

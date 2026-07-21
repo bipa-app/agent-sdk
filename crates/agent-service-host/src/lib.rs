@@ -106,3 +106,5 @@ mod durability_suite;
 mod ga_regression;
 #[cfg(test)]
 mod journal_conformance;
+#[cfg(test)]
+mod migration_contract;

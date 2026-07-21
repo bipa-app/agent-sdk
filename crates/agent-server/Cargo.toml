@@ -62,6 +62,12 @@ otel = ["dep:opentelemetry", "agent-sdk/otel"]
 failpoints = ["dep:fail", "fail/failpoints"]
 
 [dev-dependencies]
+# The turn-attempt evidence tests assert on REAL provider instances (an
+# `OpenAIProvider` pointed at a gateway URL vs the native one), because the
+# route discrimination they pin is exactly what a test double would fake by
+# construction. The workspace pins `default-features = false`, so the `openai`
+# feature has to be requested here rather than inherited.
+agent-sdk-providers = { workspace = true, features = ["openai"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 async-stream = { workspace = true }
 opentelemetry = { workspace = true }
