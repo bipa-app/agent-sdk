@@ -359,8 +359,8 @@ mod tests {
             cached_input_tokens: 10,
             cache_creation_input_tokens: 0,
             route_provider: None,
-            thinking_adaptive: false,
-            resolved_effort: None,
+            thinking_mode: None,
+            thinking_effort: None,
         }
     }
 

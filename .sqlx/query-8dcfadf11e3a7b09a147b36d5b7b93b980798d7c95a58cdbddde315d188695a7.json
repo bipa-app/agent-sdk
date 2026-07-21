@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\nSELECT\n    id,\n    task_id,\n    attempt_number,\n    provider,\n    requested_model,\n    request_blob,\n    response_blob,\n    response_id,\n    response_model,\n    stop_reason,\n    outcome,\n    input_tokens,\n    output_tokens,\n    cached_input_tokens,\n    cache_creation_input_tokens,\n    route_provider,\n    thinking_adaptive,\n    resolved_effort,\n    opened_at,\n    closed_at,\n    duration_ms,\n    otel_trace_id,\n    otel_span_id\nFROM agent_sdk_turn_attempts\nWHERE task_id = $1\nORDER BY attempt_number\n",
+  "query": "\nSELECT\n    id,\n    task_id,\n    attempt_number,\n    provider,\n    requested_model,\n    request_blob,\n    response_blob,\n    response_id,\n    response_model,\n    stop_reason,\n    outcome,\n    input_tokens,\n    output_tokens,\n    cached_input_tokens,\n    cache_creation_input_tokens,\n    route_provider,\n    thinking_mode,\n    thinking_effort,\n    opened_at,\n    closed_at,\n    duration_ms,\n    otel_trace_id,\n    otel_span_id\nFROM agent_sdk_turn_attempts\nWHERE task_id = $1\nORDER BY attempt_number\n",
   "describe": {
     "columns": [
       {
@@ -181,23 +181,23 @@
       },
       {
         "ordinal": 16,
-        "name": "thinking_adaptive",
-        "type_info": "Bool",
+        "name": "thinking_mode",
+        "type_info": "Text",
         "origin": {
           "Table": {
             "table": "agent_sdk_turn_attempts",
-            "name": "thinking_adaptive"
+            "name": "thinking_mode"
           }
         }
       },
       {
         "ordinal": 17,
-        "name": "resolved_effort",
+        "name": "thinking_effort",
         "type_info": "Text",
         "origin": {
           "Table": {
             "table": "agent_sdk_turn_attempts",
-            "name": "resolved_effort"
+            "name": "thinking_effort"
           }
         }
       },
@@ -279,7 +279,7 @@
       true,
       true,
       true,
-      false,
+      true,
       true,
       false,
       true,
@@ -288,5 +288,5 @@
       true
     ]
   },
-  "hash": "898b61d494a2ccda87ffd4c16031b7398439894db63f9cdde9ee7046339a4006"
+  "hash": "8dcfadf11e3a7b09a147b36d5b7b93b980798d7c95a58cdbddde315d188695a7"
 }

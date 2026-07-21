@@ -2140,8 +2140,8 @@ async fn commit_one_turn<S: JournalStore>(
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
                 route_provider: None,
-                thinking_adaptive: false,
-                resolved_effort: None,
+                thinking_mode: None,
+                thinking_effort: None,
             },
             // replace_history semantics: the checkpoint stores the full
             // cumulative snapshot at this turn.

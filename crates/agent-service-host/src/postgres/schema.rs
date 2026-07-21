@@ -593,11 +593,18 @@ const AGENT_SDK_TURN_ATTEMPT_COLUMNS: &[ColumnContract] = &[
                 whenever one API shape fronts several endpoints (native vs gateway).",
     },
     ColumnContract {
-        name: "resolved_effort",
+        name: "thinking_mode",
+        sql_type: "TEXT",
+        nullable: true,
+        notes: "Thinking mode the dispatched request used: 'off' | 'default' | \
+                'budget' | 'adaptive'. NULL while open and on legacy rows.",
+    },
+    ColumnContract {
+        name: "thinking_effort",
         sql_type: "TEXT",
         nullable: true,
         notes: "Thinking effort the dispatched request carried: 'low' | 'medium' | \
-                'high' | 'max', or 'adaptive' when the provider's API chose the depth.",
+                'high' | 'xhigh' | 'max'. NULL when the mode is 'off'.",
     },
     ColumnContract {
         name: "opened_at",

@@ -74,7 +74,8 @@ use crate::journal::task_state::TaskState;
 use crate::journal::task_wakeup::WakeupSignal;
 use crate::journal::thread_store::ThreadStore;
 use crate::journal::turn_attempt::{
-    CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptOutcome, TurnAttemptSchemaError,
+    CloseAttemptParams, OpenAttemptParams, ThinkingModeEvidence, TurnAttempt, TurnAttemptOutcome,
+    TurnAttemptSchemaError,
 };
 use crate::journal::turn_attempt_store::TurnAttemptStore;
 
@@ -312,8 +313,8 @@ impl ContentIds {
 #[derive(Clone, Debug)]
 struct AttemptEvidence {
     route_provider: String,
-    thinking_adaptive: bool,
-    resolved_effort: Option<agent_sdk_foundation::llm::Effort>,
+    thinking_mode: ThinkingModeEvidence,
+    thinking_effort: Option<agent_sdk_foundation::llm::Effort>,
 }
 
 impl AttemptEvidence {
@@ -327,9 +328,11 @@ impl AttemptEvidence {
             // share one provider impl, so only the route tells a gateway call
             // apart from the same model served natively.
             route_provider: provider.route().to_owned(),
-            thinking_adaptive: thinking
-                .is_some_and(|config| matches!(config.mode, llm::ThinkingMode::Adaptive)),
-            resolved_effort: thinking.and_then(|config| config.effort),
+            thinking_mode: thinking.map_or(ThinkingModeEvidence::Off, |config| match config.mode {
+                llm::ThinkingMode::Enabled { budget_tokens: _ } => ThinkingModeEvidence::Budget,
+                llm::ThinkingMode::Adaptive => ThinkingModeEvidence::Adaptive,
+            }),
+            thinking_effort: thinking.and_then(|config| config.effort),
         }
     }
 }
@@ -999,8 +1002,8 @@ pub(crate) async fn commit_partial_turn_on_cancel(
                 // provenance is literally `cancel-commit` — so there is no
                 // route or effort it could truthfully name.
                 route_provider: None,
-                thinking_adaptive: false,
-                resolved_effort: None,
+                thinking_mode: None,
+                thinking_effort: None,
             },
             messages: prefix,
             // Zero for the same reason: `turn_usage` advances the
@@ -4166,8 +4169,8 @@ async fn close_attempt_with(
         cached_input_tokens: usage.cached_input_tokens,
         cache_creation_input_tokens: usage.cache_creation_input_tokens,
         route_provider: evidence.map(|value| value.route_provider.clone()),
-        thinking_adaptive: evidence.is_some_and(|value| value.thinking_adaptive),
-        resolved_effort: evidence.and_then(|value| value.resolved_effort),
+        thinking_mode: evidence.map(|value| value.thinking_mode),
+        thinking_effort: evidence.and_then(|value| value.thinking_effort),
     };
     // Best-effort: if closing fails, the primary error is more important.
     let _ = attempt_store.close_attempt(&attempt.id, params, now).await;
@@ -4368,8 +4371,8 @@ fn build_close_params(
         cached_input_tokens: usage.cached_input_tokens,
         cache_creation_input_tokens: usage.cache_creation_input_tokens,
         route_provider: Some(evidence.route_provider.clone()),
-        thinking_adaptive: evidence.thinking_adaptive,
-        resolved_effort: evidence.resolved_effort,
+        thinking_mode: Some(evidence.thinking_mode),
+        thinking_effort: evidence.thinking_effort,
     }
 }
 
@@ -6909,6 +6912,16 @@ mod tests {
         let (native, _) = native_and_gateway_providers();
         let usage = ZERO_ATTEMPT_USAGE;
 
+        let mut off_request = ChatRequest::new("system", vec![llm::Message::user("hello")]);
+        off_request.thinking = None;
+        let off = close_evidence_attempt(
+            &AttemptEvidence::from_dispatch(&native, &off_request),
+            &usage,
+            "close no-thinking evidence attempt",
+        )?;
+        assert_eq!(off.thinking_mode, Some(ThinkingModeEvidence::Off));
+        assert_eq!(off.thinking_effort, None);
+
         let adaptive = close_evidence_attempt(
             &AttemptEvidence::from_dispatch(
                 &native,
@@ -6917,14 +6930,12 @@ mod tests {
             &usage,
             "close bare-adaptive evidence attempt",
         )?;
-        assert!(
-            adaptive.thinking_adaptive,
-            "bare adaptive thinking must set the adaptive flag",
-        );
         assert_eq!(
-            adaptive.resolved_effort, None,
-            "bare adaptive has no concrete level — the flag carries the evidence",
+            adaptive.thinking_mode,
+            Some(ThinkingModeEvidence::Adaptive),
+            "bare adaptive thinking must record the adaptive mode",
         );
+        assert_eq!(adaptive.thinking_effort, None);
 
         let pinned = close_evidence_attempt(
             &AttemptEvidence::from_dispatch(
@@ -6936,11 +6947,12 @@ mod tests {
             &usage,
             "close pinned-adaptive evidence attempt",
         )?;
-        assert!(
-            pinned.thinking_adaptive,
-            "adaptive + effort must keep the adaptive flag",
+        assert_eq!(
+            pinned.thinking_mode,
+            Some(ThinkingModeEvidence::Adaptive),
+            "adaptive + effort must keep the adaptive mode",
         );
-        assert_eq!(pinned.resolved_effort, Some(llm::Effort::XHigh));
+        assert_eq!(pinned.thinking_effort, Some(llm::Effort::XHigh));
 
         let budgeted = close_evidence_attempt(
             &AttemptEvidence::from_dispatch(
@@ -6950,8 +6962,8 @@ mod tests {
             &usage,
             "close budgeted evidence attempt",
         )?;
-        assert!(!budgeted.thinking_adaptive);
-        assert_eq!(budgeted.resolved_effort, Some(llm::Effort::Medium));
+        assert_eq!(budgeted.thinking_mode, Some(ThinkingModeEvidence::Budget));
+        assert_eq!(budgeted.thinking_effort, Some(llm::Effort::Medium));
         Ok(())
     }
 
@@ -6969,12 +6981,13 @@ mod tests {
             &ZERO_ATTEMPT_USAGE,
             "close provider-default evidence attempt",
         )?;
-        assert!(
-            closed.thinking_adaptive,
+        assert_eq!(
+            closed.thinking_mode,
+            Some(ThinkingModeEvidence::Adaptive),
             "the provider default is adaptive, so the fallback must carry both dimensions",
         );
         assert_eq!(
-            closed.resolved_effort,
+            closed.thinking_effort,
             Some(agent_sdk_foundation::llm::Effort::Max)
         );
         Ok(())

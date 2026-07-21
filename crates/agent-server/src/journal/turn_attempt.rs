@@ -152,6 +152,26 @@ pub enum TurnAttemptSchemaError {
     /// An open attempt has a duration set.
     #[error("open attempt must not have a duration")]
     DurationOnOpenAttempt,
+
+    /// An effort was recorded without a thinking mode that carries one.
+    #[error("thinking effort requires a thinking mode other than off")]
+    EffortWithoutThinking,
+}
+
+/// Thinking mode the dispatched request used, as the durable row records
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingModeEvidence {
+    /// No thinking was requested.
+    Off,
+    /// Thinking at the provider's default depth: no explicit budget, not
+    /// adaptive.
+    Default,
+    /// An explicit token budget; the budget itself lives in `request_blob`.
+    Budget,
+    /// The provider chose the depth.
+    Adaptive,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -174,7 +194,7 @@ pub enum TurnAttemptSchemaError {
 /// | Response | `response_blob`, `response_id`, `response_model` |
 /// | Outcome | `stop_reason`, `outcome` |
 /// | Usage | `input_tokens`, `output_tokens`, `cached_input_tokens`, `cache_creation_input_tokens` |
-/// | Routing | `route_provider`, `thinking_adaptive`, `resolved_effort` |
+/// | Routing | `route_provider`, `thinking_mode`, `thinking_effort` |
 /// | Timing | `opened_at`, `closed_at`, `duration_ms` |
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TurnAttempt {
@@ -254,17 +274,16 @@ pub struct TurnAttempt {
     #[serde(default)]
     pub route_provider: Option<String>,
 
-    /// Whether the dispatched request used adaptive thinking. Orthogonal
-    /// to `resolved_effort`: an adaptive request may still pin an effort
-    /// level. `false` on legacy rows and while open.
+    /// Thinking mode the dispatched request used. `None` while open and
+    /// on legacy rows.
     #[serde(default)]
-    pub thinking_adaptive: bool,
+    pub thinking_mode: Option<ThinkingModeEvidence>,
 
-    /// Thinking effort the request carried at dispatch, whether or not
-    /// the mode was adaptive. `None` while open, on legacy rows, and when
-    /// the request carried no effort level.
+    /// Thinking effort the request carried at dispatch. Orthogonal to the
+    /// mode: an adaptive request may still pin a level. `None` while open,
+    /// on legacy rows, and when the request carried no effort level.
     #[serde(default)]
-    pub resolved_effort: Option<agent_sdk_foundation::llm::Effort>,
+    pub thinking_effort: Option<agent_sdk_foundation::llm::Effort>,
 
     // ── Timing ───────────────────────────────────────────────────
     /// When the attempt was opened (LLM call started).
@@ -328,8 +347,8 @@ impl TurnAttempt {
             cached_input_tokens: None,
             cache_creation_input_tokens: None,
             route_provider: None,
-            thinking_adaptive: false,
-            resolved_effort: None,
+            thinking_mode: None,
+            thinking_effort: None,
             opened_at: params.now,
             closed_at: None,
             duration_ms: None,
@@ -369,8 +388,8 @@ impl TurnAttempt {
         self.cached_input_tokens = Some(params.cached_input_tokens);
         self.cache_creation_input_tokens = Some(params.cache_creation_input_tokens);
         self.route_provider = params.route_provider;
-        self.thinking_adaptive = params.thinking_adaptive;
-        self.resolved_effort = params.resolved_effort;
+        self.thinking_mode = params.thinking_mode;
+        self.thinking_effort = params.thinking_effort;
         self.closed_at = Some(now);
 
         let dur = now - self.opened_at;
@@ -405,8 +424,8 @@ impl TurnAttempt {
     /// - **Open** rows must not have: `outcome`, `response_blob`,
     ///   `response_model`, `response_id`, `stop_reason`,
     ///   `input_tokens`, `output_tokens`, `cached_input_tokens`,
-    ///   `cache_creation_input_tokens`, `route_provider`, `resolved_effort`,
-    ///   `duration_ms`, `closed_at`, nor a `true` `thinking_adaptive`.
+    ///   `cache_creation_input_tokens`, `route_provider`, `thinking_mode`,
+    ///   `thinking_effort`, `duration_ms`, `closed_at`.
     /// - **Closed** rows must have: `outcome`, `duration_ms`,
     ///   `closed_at`.
     ///
@@ -437,14 +456,27 @@ impl TurnAttempt {
                 || self.cached_input_tokens.is_some()
                 || self.cache_creation_input_tokens.is_some()
                 || self.route_provider.is_some()
-                || self.thinking_adaptive
-                || self.resolved_effort.is_some()
+                || self.thinking_mode.is_some()
+                || self.thinking_effort.is_some()
             {
                 return Err(TurnAttemptSchemaError::ResponseOnOpenAttempt);
             }
             if self.duration_ms.is_some() {
                 return Err(TurnAttemptSchemaError::DurationOnOpenAttempt);
             }
+        }
+
+        if self.thinking_effort.is_some()
+            && !matches!(
+                self.thinking_mode,
+                Some(
+                    ThinkingModeEvidence::Default
+                        | ThinkingModeEvidence::Budget
+                        | ThinkingModeEvidence::Adaptive
+                )
+            )
+        {
+            return Err(TurnAttemptSchemaError::EffortWithoutThinking);
         }
 
         Ok(())
@@ -507,10 +539,11 @@ pub struct CloseAttemptParams {
     pub cache_creation_input_tokens: u32,
     /// Serving route this request was dispatched to.
     pub route_provider: Option<String>,
-    /// Whether the dispatched request used adaptive thinking.
-    pub thinking_adaptive: bool,
+    /// Thinking mode the dispatched request used, when evidence was
+    /// captured.
+    pub thinking_mode: Option<ThinkingModeEvidence>,
     /// Thinking effort the dispatched request carried.
-    pub resolved_effort: Option<agent_sdk_foundation::llm::Effort>,
+    pub thinking_effort: Option<agent_sdk_foundation::llm::Effort>,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -561,8 +594,8 @@ mod tests {
             cached_input_tokens: 10,
             cache_creation_input_tokens: 20,
             route_provider: Some("anthropic".into()),
-            thinking_adaptive: true,
-            resolved_effort: Some(agent_sdk_foundation::llm::Effort::High),
+            thinking_mode: Some(ThinkingModeEvidence::Adaptive),
+            thinking_effort: Some(agent_sdk_foundation::llm::Effort::High),
         }
     }
 
@@ -653,9 +686,9 @@ mod tests {
         assert_eq!(closed.cached_input_tokens, Some(10));
         assert_eq!(closed.cache_creation_input_tokens, Some(20));
         assert_eq!(closed.route_provider.as_deref(), Some("anthropic"));
-        assert!(closed.thinking_adaptive);
+        assert_eq!(closed.thinking_mode, Some(ThinkingModeEvidence::Adaptive));
         assert_eq!(
-            closed.resolved_effort,
+            closed.thinking_effort,
             Some(agent_sdk_foundation::llm::Effort::High),
         );
         assert_eq!(closed.duration_ms, Some(5_000));
@@ -850,8 +883,8 @@ mod tests {
         assert_eq!(json["cached_input_tokens"], 10);
         assert_eq!(json["cache_creation_input_tokens"], 20);
         assert_eq!(json["route_provider"], "anthropic");
-        assert_eq!(json["thinking_adaptive"], true);
-        assert_eq!(json["resolved_effort"], "high");
+        assert_eq!(json["thinking_mode"], "adaptive");
+        assert_eq!(json["thinking_effort"], "high");
 
         // Verify timing
         assert_eq!(json["duration_ms"], 2_000);
@@ -870,7 +903,8 @@ mod tests {
             "cached_input_tokens",
             "cache_creation_input_tokens",
             "route_provider",
-            "resolved_effort",
+            "thinking_mode",
+            "thinking_effort",
         ] {
             assert_eq!(
                 json.get(field),
@@ -882,12 +916,25 @@ mod tests {
     }
 
     #[test]
-    fn resolved_effort_wire_strings_match_the_column_check_constraint() -> Result<()> {
-        // These five strings are the `resolved_effort IN (…)` list in
-        // migration 0013 for both dialects; the store persists whatever
-        // serde emits here, so a rename — or a new `Effort` variant not
-        // added to the CHECK — would start failing at write time.
+    fn thinking_wire_strings_match_the_column_check_constraints() -> Result<()> {
+        // These strings are the `thinking_mode IN (…)` and
+        // `thinking_effort IN (…)` lists in migration 0013 for both
+        // dialects; the store persists whatever serde emits here, so a
+        // rename — or a new variant not added to the CHECK — would start
+        // failing at write time.
         use agent_sdk_foundation::llm::Effort;
+        for (mode, wire) in [
+            (ThinkingModeEvidence::Off, "off"),
+            (ThinkingModeEvidence::Default, "default"),
+            (ThinkingModeEvidence::Budget, "budget"),
+            (ThinkingModeEvidence::Adaptive, "adaptive"),
+        ] {
+            let encoded = serde_json::to_value(mode).context("serialize thinking mode")?;
+            assert_eq!(encoded, serde_json::Value::String(wire.to_owned()));
+            let decoded: ThinkingModeEvidence =
+                serde_json::from_value(encoded).context("deserialize thinking mode")?;
+            assert_eq!(decoded, mode);
+        }
         for (effort, wire) in [
             (Effort::Low, "low"),
             (Effort::Medium, "medium"),
@@ -895,13 +942,28 @@ mod tests {
             (Effort::XHigh, "xhigh"),
             (Effort::Max, "max"),
         ] {
-            let encoded = serde_json::to_value(effort).context("serialize resolved effort")?;
+            let encoded = serde_json::to_value(effort).context("serialize thinking effort")?;
             assert_eq!(encoded, serde_json::Value::String(wire.to_owned()));
             let decoded: Effort =
-                serde_json::from_value(encoded).context("deserialize resolved effort")?;
+                serde_json::from_value(encoded).context("deserialize thinking effort")?;
             assert_eq!(decoded, effort);
         }
         Ok(())
+    }
+
+    #[test]
+    fn close_rejects_an_effort_without_a_carrying_mode() {
+        let attempt = TurnAttempt::open(sample_open_params());
+        let error = attempt
+            .close(
+                CloseAttemptParams {
+                    thinking_mode: Some(ThinkingModeEvidence::Off),
+                    ..sample_close_params()
+                },
+                t_plus(1),
+            )
+            .expect_err("an off-mode close carrying an effort must be rejected");
+        assert_eq!(error, TurnAttemptSchemaError::EffortWithoutThinking);
     }
 
     // ── Multiple attempts ────────────────────────────────────────
@@ -935,8 +997,8 @@ mod tests {
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
                     route_provider: None,
-                    thinking_adaptive: false,
-                    resolved_effort: None,
+                    thinking_mode: None,
+                    thinking_effort: None,
                 },
                 t_plus(1),
             )
@@ -963,8 +1025,8 @@ mod tests {
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
                     route_provider: None,
-                    thinking_adaptive: false,
-                    resolved_effort: None,
+                    thinking_mode: None,
+                    thinking_effort: None,
                 },
                 t_plus(1),
             )
@@ -983,8 +1045,8 @@ mod tests {
         assert!(attempt.otel_span_id.is_none());
         assert!(attempt.cache_creation_input_tokens.is_none());
         assert!(attempt.route_provider.is_none());
-        assert!(!attempt.thinking_adaptive);
-        assert!(attempt.resolved_effort.is_none());
+        assert!(attempt.thinking_mode.is_none());
+        assert!(attempt.thinking_effort.is_none());
     }
 
     #[test]
@@ -1040,10 +1102,10 @@ mod tests {
         assert!(attempt.cache_creation_input_tokens.is_none());
         assert!(attempt.route_provider.is_none());
         assert!(
-            !attempt.thinking_adaptive,
-            "legacy rows without the column must default to non-adaptive",
+            attempt.thinking_mode.is_none(),
+            "legacy rows without the column must read as evidence-not-captured",
         );
-        assert!(attempt.resolved_effort.is_none());
+        assert!(attempt.thinking_effort.is_none());
         attempt.validate().context("validate")?;
         Ok(())
     }

@@ -112,6 +112,8 @@ pub enum ReasoningEffort {
     /// Extra-high reasoning for complex problems
     #[serde(rename = "xhigh")]
     XHigh,
+    /// GPT-5.6 maximum reasoning effort
+    Max,
 }
 
 /// `OpenAI` Codex / `ChatGPT` subscription provider.
@@ -2381,8 +2383,8 @@ const fn map_effort(effort: Effort) -> ReasoningEffort {
         Effort::Low => ReasoningEffort::Low,
         Effort::Medium => ReasoningEffort::Medium,
         Effort::High => ReasoningEffort::High,
-        // Codex reasoning effort tops out at xhigh.
-        Effort::XHigh | Effort::Max => ReasoningEffort::XHigh,
+        Effort::XHigh => ReasoningEffort::XHigh,
+        Effort::Max => ReasoningEffort::Max,
     }
 }
 
@@ -2392,6 +2394,7 @@ const fn map_reasoning_effort(effort: ReasoningEffort) -> Effort {
         ReasoningEffort::Medium => Effort::Medium,
         ReasoningEffort::High => Effort::High,
         ReasoningEffort::XHigh => Effort::XHigh,
+        ReasoningEffort::Max => Effort::Max,
     }
 }
 

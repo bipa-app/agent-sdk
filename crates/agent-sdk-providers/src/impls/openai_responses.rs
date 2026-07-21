@@ -68,6 +68,8 @@ pub enum ReasoningEffort {
     /// Extra-high reasoning for complex problems
     #[serde(rename = "xhigh")]
     XHigh,
+    /// GPT-5.6 maximum reasoning effort
+    Max,
 }
 
 /// `OpenAI` Responses API provider.
@@ -214,6 +216,7 @@ impl OpenAIResponsesProvider {
             ReasoningEffort::Medium => OpenAIReasoningEffort::Medium,
             ReasoningEffort::High => OpenAIReasoningEffort::High,
             ReasoningEffort::XHigh => OpenAIReasoningEffort::XHigh,
+            ReasoningEffort::Max => OpenAIReasoningEffort::Max,
         };
         self.with_reasoning(OpenAIReasoningConfig::new().with_effort(effort))
     }

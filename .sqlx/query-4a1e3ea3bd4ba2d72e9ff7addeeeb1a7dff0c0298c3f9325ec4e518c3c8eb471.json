@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\nSELECT\n    id,\n    task_id,\n    attempt_number,\n    provider,\n    requested_model,\n    request_blob,\n    response_blob,\n    response_id,\n    response_model,\n    stop_reason,\n    outcome,\n    input_tokens,\n    output_tokens,\n    cached_input_tokens,\n    cache_creation_input_tokens,\n    route_provider,\n    thinking_adaptive,\n    resolved_effort,\n    opened_at,\n    closed_at,\n    duration_ms,\n    otel_trace_id,\n    otel_span_id\nFROM agent_sdk_turn_attempts\nWHERE id = $1\nFOR UPDATE\n",
+  "query": "\nSELECT\n    id,\n    task_id,\n    attempt_number,\n    provider,\n    requested_model,\n    request_blob,\n    response_blob,\n    response_id,\n    response_model,\n    stop_reason,\n    outcome,\n    input_tokens,\n    output_tokens,\n    cached_input_tokens,\n    cache_creation_input_tokens,\n    route_provider,\n    thinking_mode,\n    thinking_effort,\n    opened_at,\n    closed_at,\n    duration_ms,\n    otel_trace_id,\n    otel_span_id\nFROM agent_sdk_turn_attempts\nWHERE id = $1\n",
   "describe": {
     "columns": [
       {
@@ -181,23 +181,23 @@
       },
       {
         "ordinal": 16,
-        "name": "thinking_adaptive",
-        "type_info": "Bool",
+        "name": "thinking_mode",
+        "type_info": "Text",
         "origin": {
           "Table": {
             "table": "agent_sdk_turn_attempts",
-            "name": "thinking_adaptive"
+            "name": "thinking_mode"
           }
         }
       },
       {
         "ordinal": 17,
-        "name": "resolved_effort",
+        "name": "thinking_effort",
         "type_info": "Text",
         "origin": {
           "Table": {
             "table": "agent_sdk_turn_attempts",
-            "name": "resolved_effort"
+            "name": "thinking_effort"
           }
         }
       },
@@ -279,7 +279,7 @@
       true,
       true,
       true,
-      false,
+      true,
       true,
       false,
       true,
@@ -288,5 +288,5 @@
       true
     ]
   },
-  "hash": "97d59d3ffede1db3883e11e5d0989e4edb196a275bb23f4c1c588850a1f4ad86"
+  "hash": "4a1e3ea3bd4ba2d72e9ff7addeeeb1a7dff0c0298c3f9325ec4e518c3c8eb471"
 }

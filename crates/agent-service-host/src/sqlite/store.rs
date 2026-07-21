@@ -466,7 +466,7 @@ SELECT id, task_id, attempt_number, provider, requested_model,
        request_blob, response_blob, response_id, response_model,
        stop_reason, outcome, input_tokens, output_tokens,
        cached_input_tokens, cache_creation_input_tokens, route_provider,
-       thinking_adaptive, resolved_effort, opened_at, closed_at, duration_ms,
+       thinking_mode, thinking_effort, opened_at, closed_at, duration_ms,
        otel_trace_id, otel_span_id
 FROM agent_sdk_turn_attempts
 WHERE id = ?1
@@ -489,7 +489,7 @@ SELECT id, task_id, attempt_number, provider, requested_model,
        request_blob, response_blob, response_id, response_model,
        stop_reason, outcome, input_tokens, output_tokens,
        cached_input_tokens, cache_creation_input_tokens, route_provider,
-       thinking_adaptive, resolved_effort, opened_at, closed_at, duration_ms,
+       thinking_mode, thinking_effort, opened_at, closed_at, duration_ms,
        otel_trace_id, otel_span_id
 FROM agent_sdk_turn_attempts
 WHERE id = ?1
@@ -518,8 +518,8 @@ WHERE id = ?1
         let cached_input_tokens = attempt.cached_input_tokens.map(i64::from);
         let cache_creation_input_tokens = attempt.cache_creation_input_tokens.map(i64::from);
         let route_provider = attempt.route_provider.as_deref();
-        let thinking_adaptive = attempt.thinking_adaptive;
-        let resolved_effort = optional_enum_to_wire(attempt.resolved_effort.as_ref())?;
+        let thinking_mode = optional_enum_to_wire(attempt.thinking_mode.as_ref())?;
+        let thinking_effort = optional_enum_to_wire(attempt.thinking_effort.as_ref())?;
         let duration_ms = attempt
             .duration_ms
             .map(|v| i64::try_from(v).context("duration_ms exceeds i64::MAX"))
@@ -533,7 +533,7 @@ INSERT INTO agent_sdk_turn_attempts (
     request_blob, response_blob, response_id, response_model,
     stop_reason, outcome, input_tokens, output_tokens,
     cached_input_tokens, cache_creation_input_tokens, route_provider,
-    thinking_adaptive, resolved_effort, opened_at, closed_at, duration_ms,
+    thinking_mode, thinking_effort, opened_at, closed_at, duration_ms,
     otel_trace_id, otel_span_id
 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
 ",
@@ -553,8 +553,8 @@ INSERT INTO agent_sdk_turn_attempts (
             cached_input_tokens,
             cache_creation_input_tokens,
             route_provider,
-            thinking_adaptive,
-            resolved_effort,
+            thinking_mode,
+            thinking_effort,
             attempt.opened_at,
             attempt.closed_at,
             duration_ms,
@@ -581,8 +581,8 @@ INSERT INTO agent_sdk_turn_attempts (
         let cached_input_tokens = attempt.cached_input_tokens.map(i64::from);
         let cache_creation_input_tokens = attempt.cache_creation_input_tokens.map(i64::from);
         let route_provider = attempt.route_provider.as_deref();
-        let thinking_adaptive = attempt.thinking_adaptive;
-        let resolved_effort = optional_enum_to_wire(attempt.resolved_effort.as_ref())?;
+        let thinking_mode = optional_enum_to_wire(attempt.thinking_mode.as_ref())?;
+        let thinking_effort = optional_enum_to_wire(attempt.thinking_effort.as_ref())?;
         let duration_ms = attempt
             .duration_ms
             .map(|v| i64::try_from(v).context("duration_ms exceeds i64::MAX"))
@@ -595,7 +595,7 @@ UPDATE agent_sdk_turn_attempts SET
     response_blob = ?2, response_id = ?3, response_model = ?4,
     stop_reason = ?5, outcome = ?6, input_tokens = ?7, output_tokens = ?8,
     cached_input_tokens = ?9, cache_creation_input_tokens = ?10,
-    route_provider = ?11, thinking_adaptive = ?12, resolved_effort = ?13,
+    route_provider = ?11, thinking_mode = ?12, thinking_effort = ?13,
     closed_at = ?14, duration_ms = ?15,
     otel_trace_id = ?16, otel_span_id = ?17
 WHERE id = ?1
@@ -611,8 +611,8 @@ WHERE id = ?1
             cached_input_tokens,
             cache_creation_input_tokens,
             route_provider,
-            thinking_adaptive,
-            resolved_effort,
+            thinking_mode,
+            thinking_effort,
             attempt.closed_at,
             duration_ms,
             otel_trace_id,
@@ -3920,7 +3920,7 @@ SELECT id, task_id, attempt_number, provider, requested_model,
        request_blob, response_blob, response_id, response_model,
        stop_reason, outcome, input_tokens, output_tokens,
        cached_input_tokens, cache_creation_input_tokens, route_provider,
-       thinking_adaptive, resolved_effort, opened_at, closed_at, duration_ms,
+       thinking_mode, thinking_effort, opened_at, closed_at, duration_ms,
        otel_trace_id, otel_span_id
 FROM agent_sdk_turn_attempts WHERE task_id = ?1 ORDER BY attempt_number
 ",
@@ -4968,8 +4968,8 @@ struct TurnAttemptRecord {
     cached_input_tokens: Option<i64>,
     cache_creation_input_tokens: Option<i64>,
     route_provider: Option<String>,
-    thinking_adaptive: bool,
-    resolved_effort: Option<String>,
+    thinking_mode: Option<String>,
+    thinking_effort: Option<String>,
     opened_at: OffsetDateTime,
     closed_at: Option<OffsetDateTime>,
     duration_ms: Option<i64>,
@@ -5015,10 +5015,13 @@ impl TryFrom<TurnAttemptRecord> for TurnAttempt {
                 .map(|v| u32_from_i64(v, "turn attempt cache_creation_input_tokens"))
                 .transpose()?,
             route_provider: r.route_provider,
-            thinking_adaptive: r.thinking_adaptive,
-            resolved_effort: r
-                .resolved_effort
-                .map(|v| enum_from_wire(&v, "turn attempt resolved_effort"))
+            thinking_mode: r
+                .thinking_mode
+                .map(|v| enum_from_wire(&v, "turn attempt thinking_mode"))
+                .transpose()?,
+            thinking_effort: r
+                .thinking_effort
+                .map(|v| enum_from_wire(&v, "turn attempt thinking_effort"))
                 .transpose()?,
             opened_at: r.opened_at,
             closed_at: r.closed_at,
@@ -5329,6 +5332,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thinking_effort_with_mode_off_is_rejected_by_the_check_constraint() -> Result<()> {
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+        let task = AgentTask::new_root_turn(ThreadId::from_string("off-with-effort"), t0(), 3);
+        AgentTaskStore::submit_root_turn(&store, task.clone()).await?;
+
+        let result = sqlx::query(
+            r"
+INSERT INTO agent_sdk_turn_attempts (
+    id, task_id, attempt_number, provider, requested_model, request_blob,
+    opened_at, thinking_mode, thinking_effort
+) VALUES (?1, ?2, 1, 'anthropic', 'claude-sonnet-4-6', ?3, ?4, 'off', 'high')
+",
+        )
+        .bind("attempt_off_with_effort")
+        .bind(task.id.as_str())
+        .bind(serde_json::json!({"messages": []}))
+        .bind(t0())
+        .execute(store.pool())
+        .await;
+
+        let error = result.expect_err("an off-mode row carrying an effort must not persist");
+        assert!(
+            error.to_string().to_ascii_lowercase().contains("check"),
+            "unexpected error: {error}",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn evidence_migration_preserves_legacy_attempt_as_null_read_fields() -> Result<()> {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
@@ -5375,10 +5407,10 @@ INSERT INTO agent_sdk_turn_attempts (
         assert!(legacy.cache_creation_input_tokens.is_none());
         assert!(legacy.route_provider.is_none());
         assert!(
-            !legacy.thinking_adaptive,
-            "pre-migration rows must default to non-adaptive",
+            legacy.thinking_mode.is_none(),
+            "pre-migration rows must read as evidence-not-captured",
         );
-        assert!(legacy.resolved_effort.is_none());
+        assert!(legacy.thinking_effort.is_none());
         Ok(())
     }
 
@@ -6332,8 +6364,8 @@ INSERT INTO agent_sdk_turn_attempts (
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
                     route_provider: None,
-                    thinking_adaptive: false,
-                    resolved_effort: None,
+                    thinking_mode: None,
+                    thinking_effort: None,
                 },
                 messages: final_messages,
                 turn_usage: TokenUsage {
@@ -6380,8 +6412,8 @@ INSERT INTO agent_sdk_turn_attempts (
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
             route_provider: None,
-            thinking_adaptive: false,
-            resolved_effort: None,
+            thinking_mode: None,
+            thinking_effort: None,
         }
     }
 

@@ -503,9 +503,8 @@ pub(crate) const fn legacy_reasoning_effort(
             Effort::Low => OpenAIReasoningEffort::Low,
             Effort::Medium => OpenAIReasoningEffort::Medium,
             Effort::High => OpenAIReasoningEffort::High,
-            // The legacy parameter tops out at xhigh; exact GPT-5.6 `max`
-            // is available through `OpenAIReasoningConfig`.
-            Effort::XHigh | Effort::Max => OpenAIReasoningEffort::XHigh,
+            Effort::XHigh => OpenAIReasoningEffort::XHigh,
+            Effort::Max => OpenAIReasoningEffort::Max,
         });
     }
 
@@ -544,11 +543,16 @@ mod tests {
     }
 
     #[test]
-    fn legacy_max_remains_xhigh() {
-        let config = ThinkingConfig::adaptive_with_effort(Effort::Max);
+    fn legacy_effort_maps_xhigh_and_max_exactly() {
+        let xhigh = ThinkingConfig::adaptive_with_effort(Effort::XHigh);
         assert_eq!(
-            legacy_reasoning_effort(&config),
+            legacy_reasoning_effort(&xhigh),
             Some(OpenAIReasoningEffort::XHigh)
+        );
+        let max = ThinkingConfig::adaptive_with_effort(Effort::Max);
+        assert_eq!(
+            legacy_reasoning_effort(&max),
+            Some(OpenAIReasoningEffort::Max)
         );
     }
 
