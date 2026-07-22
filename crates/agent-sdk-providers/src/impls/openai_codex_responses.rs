@@ -2373,7 +2373,7 @@ const fn resolve_reasoning_effort(config: &ThinkingConfig) -> Option<ReasoningEf
     }
 
     match &config.mode {
-        ThinkingMode::Adaptive => None,
+        ThinkingMode::Adaptive | ThinkingMode::Default => None,
         ThinkingMode::Enabled { budget_tokens } => Some(map_budget_to_reasoning(*budget_tokens)),
     }
 }

@@ -263,7 +263,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         supports_adaptive_thinking: true,
         source_url: ANTHROPIC_MODELS_URL,
         source_status: SourceStatus::Derived,
-        notes: Some("Opus 4.8 requires adaptive thinking — `ThinkingMode::Enabled { budget_tokens }` is rejected by the Anthropic API. The SDK fails fast in validate_thinking_config."),
+        notes: Some("Opus 4.8 rejects budget thinking — `ThinkingMode::Enabled { budget_tokens }` returns 400 from the Anthropic API (the SDK fails fast in validate_thinking_config). Adaptive is supported but optional: an effort level can be sent without it via `ThinkingConfig::default_with_effort`."),
     },
     ModelCapabilities {
         provider: "anthropic",
@@ -275,7 +275,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         supports_adaptive_thinking: true,
         source_url: ANTHROPIC_MODELS_URL,
         source_status: SourceStatus::Derived,
-        notes: Some("Opus 4.7 requires adaptive thinking — `ThinkingMode::Enabled { budget_tokens }` is rejected by the Anthropic API. The SDK fails fast in validate_thinking_config."),
+        notes: Some("Opus 4.7 rejects budget thinking — `ThinkingMode::Enabled { budget_tokens }` returns 400 from the Anthropic API (the SDK fails fast in validate_thinking_config). Adaptive is supported but optional: an effort level can be sent without it via `ThinkingConfig::default_with_effort`."),
     },
     ModelCapabilities {
         provider: "anthropic",
@@ -1045,7 +1045,7 @@ mod tests {
         assert_eq!(caps.context_window, Some(1_000_000));
         assert_eq!(caps.max_output_tokens, Some(128_000));
         assert!(caps.supports_thinking);
-        // Adaptive-only (like Opus 4.8): manual budget_tokens 400s; adaptive is required.
+        // Like Opus 4.8: manual budget_tokens 400s; adaptive supported, not required.
         assert!(caps.supports_adaptive_thinking);
     }
 

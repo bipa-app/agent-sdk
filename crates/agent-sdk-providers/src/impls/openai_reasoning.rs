@@ -509,7 +509,7 @@ pub(crate) const fn legacy_reasoning_effort(
     }
 
     match &config.mode {
-        ThinkingMode::Adaptive => None,
+        ThinkingMode::Adaptive | ThinkingMode::Default => None,
         ThinkingMode::Enabled { budget_tokens } => Some(if *budget_tokens <= 4_096 {
             OpenAIReasoningEffort::Low
         } else if *budget_tokens <= 16_384 {

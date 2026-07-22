@@ -185,8 +185,8 @@ pub const fn map_thinking_config(
         };
     }
     let level = match &config.mode {
-        // Adaptive → let the model decide (HIGH = dynamic)
-        ThinkingMode::Adaptive => "HIGH",
+        // Adaptive / provider-default → let the model decide (HIGH = dynamic)
+        ThinkingMode::Adaptive | ThinkingMode::Default => "HIGH",
         // Explicit budget: map to LOW / MEDIUM / HIGH
         ThinkingMode::Enabled { budget_tokens } => {
             if *budget_tokens <= 4_096 {

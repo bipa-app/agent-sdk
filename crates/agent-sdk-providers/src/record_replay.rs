@@ -599,6 +599,7 @@ fn canonical_thinking(thinking: Option<&ThinkingConfig>) -> serde_json::Value {
             "budget_tokens": budget_tokens,
         }),
         ThinkingMode::Adaptive => serde_json::json!({"type": "adaptive"}),
+        ThinkingMode::Default => serde_json::json!({"type": "default"}),
     };
     let effort = thinking.effort.map(|effort| match effort {
         Effort::Low => "low",

@@ -331,6 +331,7 @@ impl AttemptEvidence {
             thinking_mode: thinking.map_or(ThinkingModeEvidence::Off, |config| match config.mode {
                 llm::ThinkingMode::Enabled { budget_tokens: _ } => ThinkingModeEvidence::Budget,
                 llm::ThinkingMode::Adaptive => ThinkingModeEvidence::Adaptive,
+                llm::ThinkingMode::Default => ThinkingModeEvidence::Default,
             }),
             thinking_effort: thinking.and_then(|config| config.effort),
         }
@@ -6953,6 +6954,21 @@ mod tests {
             "adaptive + effort must keep the adaptive mode",
         );
         assert_eq!(pinned.thinking_effort, Some(llm::Effort::XHigh));
+
+        let default_mode = close_evidence_attempt(
+            &AttemptEvidence::from_dispatch(
+                &native,
+                &evidence_request(llm::ThinkingConfig::default_with_effort(llm::Effort::High)),
+            ),
+            &usage,
+            "close default-mode evidence attempt",
+        )?;
+        assert_eq!(
+            default_mode.thinking_mode,
+            Some(ThinkingModeEvidence::Default),
+            "effort without adaptive must record the default mode",
+        );
+        assert_eq!(default_mode.thinking_effort, Some(llm::Effort::High));
 
         let budgeted = close_evidence_attempt(
             &AttemptEvidence::from_dispatch(

@@ -17,6 +17,9 @@ pub enum ThinkingMode {
     Enabled { budget_tokens: u32 },
     /// Adaptive thinking — the model decides how much to think.
     Adaptive,
+    /// Provider-default thinking: no explicit budget, not adaptive. An
+    /// effort level can still be sent alongside it.
+    Default,
 }
 
 /// Effort level for adaptive thinking via `output_config`.
@@ -75,6 +78,15 @@ impl ThinkingConfig {
     pub const fn adaptive_with_effort(effort: Effort) -> Self {
         Self {
             mode: ThinkingMode::Adaptive,
+            effort: Some(effort),
+        }
+    }
+
+    /// Create a provider-default-mode config with an effort level.
+    #[must_use]
+    pub const fn default_with_effort(effort: Effort) -> Self {
+        Self {
+            mode: ThinkingMode::Default,
             effort: Some(effort),
         }
     }
