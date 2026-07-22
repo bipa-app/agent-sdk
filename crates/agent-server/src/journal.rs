@@ -602,10 +602,12 @@ pub mod retention;
 pub mod retention_janitor;
 pub mod staged;
 pub mod store;
+pub mod subagent_spawn_transaction;
 pub mod task;
 pub mod task_state;
 pub mod task_wakeup;
 pub mod thread;
+pub mod thread_creation_transaction;
 pub mod thread_events_watch;
 #[cfg(test)]
 mod thread_events_watch_regression;
@@ -664,6 +666,9 @@ pub use store::{
     mixed_child_ids_in_slot_order, new_mixed_tool_child, validate_mixed_children_spawn,
     validate_mixed_slot_coverage,
 };
+pub use subagent_spawn_transaction::{
+    AtomicSubagentSpawnCommitter, SubagentSpawnCommit, SubagentSpawnEvent, SubagentSpawnOutcome,
+};
 pub use task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskKind, TaskSchemaError,
     TaskStatus, WorkerId,
@@ -674,6 +679,9 @@ pub use task_wakeup::{
     TaskWakeupOutcome, WakeupSignal, dispatch_payload,
 };
 pub use thread::{Thread, ThreadSchemaError, ThreadStatus};
+pub use thread_creation_transaction::{
+    AtomicThreadCreationCommitter, ThreadCreationCommit, ThreadCreationRows,
+};
 #[cfg(any(test, feature = "test-support"))]
 pub use thread_events_watch::CapturingThreadEventsWatchHandler;
 pub use thread_events_watch::{

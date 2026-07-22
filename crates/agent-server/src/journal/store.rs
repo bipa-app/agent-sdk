@@ -225,6 +225,7 @@ use super::outbox_message::{OutboxMessage, OutboxMessageKind, ThreadEventsAvaila
 use super::recovery::{
     FailureReason, RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
 };
+use super::subagent_spawn_transaction::{SubagentSpawnEvent, started_event_from_invocation};
 use super::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, SuspensionPayload,
     TaskKind, TaskStatus, WorkerId,
@@ -278,6 +279,17 @@ pub struct ToolChildSpawn {
 /// [`AgentTaskStore::spawn_subagent_batch`] persists; their per-entry
 /// `payload` field is ignored in favour of the shared [`Self::payload`]
 /// (one parent suspension covers the whole batch).
+/// One atomic subagent fan-out: the spawn entries, the shared parent
+/// suspension, and one slim start-event descriptor per entry.
+pub struct SubagentBatchSpawn {
+    /// Durable subagent invocations to persist, in input order.
+    pub spawns: Vec<SubagentInvocationSpawn>,
+    /// The one parent suspension shared by every entry.
+    pub payload: SuspensionPayload,
+    /// One [`SubagentSpawnEvent`] per entry, in input order.
+    pub events: Vec<SubagentSpawnEvent>,
+}
+
 #[derive(Clone, Debug)]
 pub struct MixedChildrenSpawn {
     /// Durable subagent invocations to persist, in input order.
@@ -295,6 +307,10 @@ pub struct MixedChildrenSpawn {
 /// Rows persisted by a successful [`AgentTaskStore::spawn_mixed_children`].
 #[derive(Clone, Debug)]
 pub struct SpawnedMixedChildren {
+    /// Parent-journal `SubagentProgress` start events, one per subagent
+    /// entry in input order, committed atomically with the rows on
+    /// durable backends.
+    pub committed_events: Vec<CommittedEvent>,
     /// Parent post-transition: `WaitingOnChildren` with
     /// `pending_child_count == subagents.len() + tool_children.len()`.
     pub parent: AgentTask,
@@ -826,6 +842,15 @@ impl ChildProbe {
 
 #[async_trait]
 pub trait AgentTaskStore: Send + Sync {
+    /// Optional backend hook for atomically creating one subagent's child
+    /// thread/tasks, parent progress event, and outbox advisory.
+    #[must_use]
+    fn atomic_subagent_spawn_committer(
+        &self,
+    ) -> Option<&dyn super::subagent_spawn_transaction::AtomicSubagentSpawnCommitter> {
+        None
+    }
+
     /// Insert a new task row. **Not a mutation API** — see the
     /// [CAS discipline](Self#cas-discipline-phase-27) table for the
     /// correct entry point for each state transition.
@@ -1635,15 +1660,23 @@ pub trait AgentTaskStore: Send + Sync {
     /// - `spawn rejected: duplicate child_thread_id ...` — two
     ///   entries collide on the same child thread.
     /// - schema errors from [`AgentTask::new_subagent_invocation`].
+    /// `events` carries one [`SubagentSpawnEvent`] per entry in
+    /// `spawns` (same order). Durable backends commit the rows, every
+    /// per-entry `SubagentProgress` start event, each child thread's
+    /// `ThreadCreated`, and the outbox advisories in ONE transaction —
+    /// a crash can never persist children whose start events were
+    /// lost. The in-memory store commits events through its wired
+    /// marker sink (bare stores commit rows only; in-memory rows have
+    /// no crash story to protect). The returned committed events are
+    /// the parent-journal start events, in entry order.
     async fn spawn_subagent_batch(
         &self,
         parent_id: &AgentTaskId,
         worker: &WorkerId,
         lease: &LeaseId,
-        spawns: Vec<SubagentInvocationSpawn>,
-        payload: SuspensionPayload,
+        batch: SubagentBatchSpawn,
         now: OffsetDateTime,
-    ) -> Result<(AgentTask, Vec<(AgentTask, AgentTask)>)>;
+    ) -> Result<(AgentTask, Vec<(AgentTask, AgentTask)>, Vec<CommittedEvent>)>;
 
     /// Atomically persist a **mixed** batch — N durable subagent
     /// invocations plus M tool-runtime children — under one parent
@@ -1682,12 +1715,16 @@ pub trait AgentTaskStore: Send + Sync {
     /// Same CAS, leaf-parent, duplicate-child-thread, and duplicate-id
     /// envelope as [`AgentTaskStore::spawn_subagent_batch`], plus every
     /// [`validate_mixed_children_spawn`] rejection.
+    /// `events` carries one [`SubagentSpawnEvent`] per entry in
+    /// `spawn.subagents` (same order), with the same atomicity contract
+    /// as [`AgentTaskStore::spawn_subagent_batch`].
     async fn spawn_mixed_children(
         &self,
         parent_id: &AgentTaskId,
         worker: &WorkerId,
         lease: &LeaseId,
         spawn: MixedChildrenSpawn,
+        events: Vec<SubagentSpawnEvent>,
         now: OffsetDateTime,
     ) -> Result<SpawnedMixedChildren>;
 
@@ -2215,6 +2252,50 @@ impl InMemoryAgentTaskStore {
             markers.push(committed);
         }
         Ok(markers)
+    }
+
+    /// Commit the per-entry `SubagentProgress` start events (parent
+    /// journal) and each child thread's `ThreadCreated` through the
+    /// wired marker sink, mirroring what the durable backends commit
+    /// inside their spawn transaction. Bare stores (no sink) commit
+    /// rows only — in-memory state has no crash story to protect.
+    async fn commit_spawn_started_events(
+        &self,
+        parent_thread: &ThreadId,
+        prepared: &[(AgentTask, AgentTask)],
+        events: Vec<SubagentSpawnEvent>,
+        now: OffsetDateTime,
+    ) -> Result<Vec<CommittedEvent>> {
+        let Some(sink) = &self.marker_sink else {
+            return Ok(Vec::new());
+        };
+        let mut started = Vec::with_capacity(events.len());
+        for (event, (invocation, child_root)) in events.into_iter().zip(prepared) {
+            started.push(started_event_from_invocation(
+                event, invocation, child_root,
+            )?);
+        }
+        let committed = sink
+            .event_repo
+            .commit_event_batch(parent_thread, started, now)
+            .await
+            .context("commit subagent start events")?;
+        if let Some(last) = committed.last() {
+            Self::insert_marker_advisory(sink, last, now).await?;
+        }
+        for (_, child_root) in prepared {
+            let child_created = sink
+                .event_repo
+                .commit_event(
+                    &child_root.thread_id,
+                    AgentEvent::thread_created(child_root.thread_id.clone(), None, None),
+                    now,
+                )
+                .await
+                .context("commit child ThreadCreated")?;
+            Self::insert_marker_advisory(sink, &child_created, now).await?;
+        }
+        Ok(committed)
     }
 
     /// Write the `thread_events_available` advisory that wakes cross-host
@@ -4209,12 +4290,23 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         parent_id: &AgentTaskId,
         worker: &WorkerId,
         lease: &LeaseId,
-        spawns: Vec<SubagentInvocationSpawn>,
-        payload: SuspensionPayload,
+        batch: SubagentBatchSpawn,
         now: OffsetDateTime,
-    ) -> Result<(AgentTask, Vec<(AgentTask, AgentTask)>)> {
+    ) -> Result<(AgentTask, Vec<(AgentTask, AgentTask)>, Vec<CommittedEvent>)> {
+        let SubagentBatchSpawn {
+            spawns,
+            payload,
+            events,
+        } = batch;
         if spawns.is_empty() {
             return Err(anyhow!("spawn rejected: spawns must be non-empty"));
+        }
+        if events.len() != spawns.len() {
+            return Err(anyhow!(
+                "spawn rejected: {} events for {} spawns",
+                events.len(),
+                spawns.len()
+            ));
         }
         let mut inner = self.inner.write().await;
 
@@ -4250,7 +4342,10 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         }
 
         drop(inner);
-        Ok((new_parent, prepared))
+        let committed = self
+            .commit_spawn_started_events(&new_parent.thread_id, &prepared, events, now)
+            .await?;
+        Ok((new_parent, prepared, committed))
     }
 
     async fn spawn_mixed_children(
@@ -4259,6 +4354,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         worker: &WorkerId,
         lease: &LeaseId,
         spawn: MixedChildrenSpawn,
+        events: Vec<SubagentSpawnEvent>,
         now: OffsetDateTime,
     ) -> Result<SpawnedMixedChildren> {
         validate_mixed_children_spawn(&spawn)?;
@@ -4268,6 +4364,13 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             payload,
             child_otel_traceparent,
         } = spawn;
+        if events.len() != subagents.len() {
+            return Err(anyhow!(
+                "spawn rejected: {} events for {} subagent entries",
+                events.len(),
+                subagents.len()
+            ));
+        }
 
         let mut inner = self.inner.write().await;
 
@@ -4315,7 +4418,11 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         }
 
         drop(inner);
+        let committed = self
+            .commit_spawn_started_events(&new_parent.thread_id, &prepared, events, now)
+            .await?;
         Ok(SpawnedMixedChildren {
+            committed_events: committed,
             parent: new_parent,
             subagents: prepared,
             tool_children: tool_rows,
@@ -9186,15 +9293,18 @@ mod tests {
             })
             .collect();
 
-        let (parked_parent, prepared) = store
+        let (parked_parent, prepared, _started_events) = store
             .spawn_subagent_batch(
                 &parent_id,
                 &worker,
                 &lease,
-                spawns,
-                SuspensionPayload {
-                    continuation: sample_continuation("t-subagent-batch"),
-                    suspended_messages: Vec::new(),
+                SubagentBatchSpawn {
+                    spawns,
+                    payload: SuspensionPayload {
+                        continuation: sample_continuation("t-subagent-batch"),
+                        suspended_messages: Vec::new(),
+                    },
+                    events: test_spawn_events(3),
                 },
                 t_plus(2),
             )
@@ -9268,10 +9378,13 @@ mod tests {
                 &parent_id,
                 &worker,
                 &lease,
-                Vec::new(),
-                SuspensionPayload {
-                    continuation: sample_continuation("t-subagent-batch-empty"),
-                    suspended_messages: Vec::new(),
+                SubagentBatchSpawn {
+                    spawns: Vec::new(),
+                    payload: SuspensionPayload {
+                        continuation: sample_continuation("t-subagent-batch-empty"),
+                        suspended_messages: Vec::new(),
+                    },
+                    events: test_spawn_events(0),
                 },
                 t_plus(2),
             )
@@ -9311,6 +9424,15 @@ mod tests {
             })
             .collect();
         continuation
+    }
+
+    fn test_spawn_events(count: usize) -> Vec<SubagentSpawnEvent> {
+        (0..count)
+            .map(|slot| SubagentSpawnEvent {
+                subagent_id: format!("test-subagent-call-{slot}"),
+                subagent_name: "explorer".to_owned(),
+            })
+            .collect()
     }
 
     fn mixed_spawn_for(
@@ -9369,7 +9491,14 @@ mod tests {
         );
         subagents_only.tool_children.clear();
         let err = store
-            .spawn_mixed_children(&parent_id, &worker, &lease, subagents_only, t_plus(2))
+            .spawn_mixed_children(
+                &parent_id,
+                &worker,
+                &lease,
+                subagents_only,
+                test_spawn_events(1),
+                t_plus(2),
+            )
             .await
             .err()
             .context("a subagent-only batch must be rejected")?;
@@ -9382,7 +9511,14 @@ mod tests {
             mixed_spawn_for("t-mixed-single-kind", vec![thread("t-mixed-child-2")], &[1]);
         tools_only.subagents.clear();
         let err = store
-            .spawn_mixed_children(&parent_id, &worker, &lease, tools_only, t_plus(2))
+            .spawn_mixed_children(
+                &parent_id,
+                &worker,
+                &lease,
+                tools_only,
+                test_spawn_events(0),
+                t_plus(2),
+            )
             .await
             .err()
             .context("a tool-only batch must be rejected")?;
@@ -9414,7 +9550,14 @@ mod tests {
         // Subagent takes slot 0; the tool child claims slot 0 as well.
         let spawn = mixed_spawn_for("t-mixed-dup-slot", vec![thread("t-mixed-dup-child")], &[0]);
         let err = store
-            .spawn_mixed_children(&parent_id, &worker, &lease, spawn, t_plus(2))
+            .spawn_mixed_children(
+                &parent_id,
+                &worker,
+                &lease,
+                spawn,
+                test_spawn_events(1),
+                t_plus(2),
+            )
             .await
             .err()
             .context("a duplicated slot must be rejected")?;
@@ -9471,10 +9614,13 @@ mod tests {
                 &parent_id,
                 &worker,
                 &lease,
-                spawns,
-                SuspensionPayload {
-                    continuation: sample_continuation("t-subagent-batch-dup"),
-                    suspended_messages: Vec::new(),
+                SubagentBatchSpawn {
+                    spawns,
+                    payload: SuspensionPayload {
+                        continuation: sample_continuation("t-subagent-batch-dup"),
+                        suspended_messages: Vec::new(),
+                    },
+                    events: test_spawn_events(2),
                 },
                 t_plus(2),
             )
@@ -9523,10 +9669,13 @@ mod tests {
                 &parent_id,
                 &WorkerId::from_string("w-imposter"),
                 &lease,
-                make_spawns(),
-                SuspensionPayload {
-                    continuation: sample_continuation("t-subagent-batch-cas"),
-                    suspended_messages: Vec::new(),
+                SubagentBatchSpawn {
+                    spawns: make_spawns(),
+                    payload: SuspensionPayload {
+                        continuation: sample_continuation("t-subagent-batch-cas"),
+                        suspended_messages: Vec::new(),
+                    },
+                    events: test_spawn_events(1),
                 },
                 t_plus(2),
             )

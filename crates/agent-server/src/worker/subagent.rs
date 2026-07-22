@@ -37,7 +37,10 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+use crate::journal::commit::DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS;
 use crate::journal::message_store::MessageProjectionStore;
+use crate::journal::store::SubagentBatchSpawn;
+use crate::journal::subagent_spawn_transaction::{SubagentSpawnCommit, SubagentSpawnEvent};
 use crate::journal::task::SubmittedInputItem;
 use crate::journal::{
     AgentTask, AgentTaskId, AgentTaskStore, CommittedEvent, EventRepository, LeaseId,
@@ -1336,7 +1339,7 @@ async fn execute_subagent_task_inner(
         .await
         .context("complete subagent invocation task")?;
     let committed_events =
-        commit_completed_subagent_progress(&bootstrap, &subagent_result.summary, deps, now).await;
+        commit_completed_subagent_progress(&bootstrap, &subagent_result.summary, deps, now).await?;
 
     Ok(SubagentTaskOutcome {
         invocation_task,
@@ -1391,6 +1394,48 @@ pub async fn spawn_subagent_invocation(
     if spawn.child_root_input.is_empty() {
         spawn.child_root_input = build_child_root_input(&spawn.spec);
     }
+    if let Some(committer) = deps.task_store.atomic_subagent_spawn_committer() {
+        let outcome = committer
+            .commit_subagent_spawn_atomic(SubagentSpawnCommit {
+                parent_id: parent_id.clone(),
+                worker: worker.clone(),
+                lease: lease.clone(),
+                spawn,
+                event: SubagentSpawnEvent {
+                    subagent_id: pending_tool.id.clone(),
+                    subagent_name: canonical_subagent_name(&pending_tool.name).to_owned(),
+                },
+                outbox_max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+                now,
+            })
+            .await
+            .context("atomically persist subagent invocation")?;
+        return Ok(SpawnedSubagentInvocation {
+            parent_task: outcome.parent_task,
+            invocation_task: outcome.invocation_task,
+            child_thread: outcome.child_thread,
+            child_root_task: outcome.child_root_task,
+            committed_events: vec![outcome.committed_event],
+        });
+    }
+    spawn_subagent_invocation_sequential(parent_id, worker, lease, spawn, &pending_tool, deps, now)
+        .await
+}
+
+/// Sequential fallback for stores without an atomic spawn committer
+/// (the in-memory backend): rows, the child's `ThreadCreated`, and the
+/// parent progress event commit one after another. In-memory state has
+/// no crash story to protect, so the non-transactional gap is
+/// acceptable there and only there.
+async fn spawn_subagent_invocation_sequential(
+    parent_id: &AgentTaskId,
+    worker: &WorkerId,
+    lease: &LeaseId,
+    spawn: SubagentInvocationSpawn,
+    pending_tool: &agent_sdk_foundation::PendingToolCallInfo,
+    deps: &SubagentInvocationDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<SpawnedSubagentInvocation> {
     let child_thread = deps
         .thread_store
         .get_or_create(&spawn.child_thread_id, now)
@@ -1402,6 +1447,19 @@ pub async fn spawn_subagent_invocation(
         .spawn_subagent_invocation(parent_id, worker, lease, spawn, now)
         .await
         .context("persist subagent invocation tasks")?;
+
+    // Consumer parity with the atomic committer: the child thread's
+    // journal opens with its ThreadCreated. This fallback is the
+    // in-memory path, so the two commits are sequential rather than
+    // transactional — in-memory state has no crash story to protect.
+    deps.event_repo
+        .commit_event(
+            &child_root_task.thread_id,
+            AgentEvent::thread_created(child_root_task.thread_id.clone(), None, None),
+            now,
+        )
+        .await
+        .context("commit child ThreadCreated")?;
 
     let linkage = invocation_task
         .state
@@ -1440,15 +1498,13 @@ pub async fn spawn_subagent_invocation(
         tool_count: 0,
         total_tokens: 0,
     });
-    let committed_events = commit_parent_subagent_progress_if_possible(
+    let committed_events = commit_parent_subagent_progress(
         deps.event_repo,
         &parent_task.thread_id,
         started_event,
         now,
-        "spawn",
-        &pending_tool.id,
     )
-    .await;
+    .await?;
 
     Ok(SpawnedSubagentInvocation {
         parent_task,
@@ -1629,7 +1685,6 @@ struct BatchEntryAssembly<'a> {
     invocation_task: AgentTask,
     child_root_task: AgentTask,
     child_thread: Thread,
-    pending_tool: agent_sdk_foundation::PendingToolCallInfo,
 }
 
 /// Verify the durable linkage on one batch entry and emit its
@@ -1639,17 +1694,15 @@ struct BatchEntryAssembly<'a> {
 /// the fan-out case: confirms the store materialized the same child
 /// thread / child root the worker pre-allocated, then commits the
 /// `started` event so observers see a `SubagentProgress` per child.
-async fn build_batch_invocation(
+fn assemble_batch_invocation(
     entry: BatchEntryAssembly<'_>,
-    deps: &SubagentInvocationDeps<'_>,
-    now: OffsetDateTime,
+    committed_events: Vec<CommittedEvent>,
 ) -> Result<SpawnedSubagentInvocation> {
     let BatchEntryAssembly {
         parent_task,
         invocation_task,
         child_root_task,
         child_thread,
-        pending_tool,
     } = entry;
 
     let linkage = invocation_task
@@ -1674,30 +1727,6 @@ async fn build_batch_invocation(
         child_thread.thread_id,
         child_root_task.thread_id,
     );
-
-    let subagent_name = canonical_subagent_name(&pending_tool.name);
-    let started_event = build_parent_progress_event(&SubagentProgressSnapshot {
-        subagent_id: &pending_tool.id,
-        subagent_name,
-        spec: &linkage.spec,
-        child_thread_id: &child_thread.thread_id,
-        child_root_task_id: &child_root_task.id,
-        subagent_task_id: &invocation_task.id,
-        completed: false,
-        success: false,
-        current_turn: 0,
-        tool_count: 0,
-        total_tokens: 0,
-    });
-    let committed_events = commit_parent_subagent_progress_if_possible(
-        deps.event_repo,
-        &parent_task.thread_id,
-        started_event,
-        now,
-        "batch_spawn",
-        &pending_tool.id,
-    )
-    .await;
 
     Ok(SpawnedSubagentInvocation {
         parent_task: parent_task.clone(),
@@ -1767,9 +1796,20 @@ pub async fn spawn_subagent_batch_invocations(
         })
         .collect();
 
-    let (parent_task, prepared) = deps
+    let events = started_events_for_entries(&pending_tools_by_entry);
+    let (parent_task, prepared, committed_events) = deps
         .task_store
-        .spawn_subagent_batch(parent_id, worker, lease, spawns, payload, now)
+        .spawn_subagent_batch(
+            parent_id,
+            worker,
+            lease,
+            SubagentBatchSpawn {
+                spawns,
+                payload,
+                events,
+            },
+            now,
+        )
         .await
         .context("persist subagent batch invocation tasks")?;
 
@@ -1785,24 +1825,23 @@ pub async fn spawn_subagent_batch_invocations(
         prepared.len(),
         pending_tools_by_entry.len(),
     );
+    let per_entry_events = distribute_committed_events(committed_events, prepared.len())?;
 
     let mut invocations = Vec::with_capacity(prepared.len());
-    for ((invocation_task, child_root_task), (child_thread, pending_tool)) in prepared
+    for (((invocation_task, child_root_task), child_thread), committed) in prepared
         .into_iter()
-        .zip(child_threads.into_iter().zip(pending_tools_by_entry))
+        .zip(child_threads)
+        .zip(per_entry_events)
     {
-        let assembled = build_batch_invocation(
+        let assembled = assemble_batch_invocation(
             BatchEntryAssembly {
                 parent_task: &parent_task,
                 invocation_task,
                 child_root_task,
                 child_thread,
-                pending_tool,
             },
-            deps,
-            now,
-        )
-        .await?;
+            committed,
+        )?;
         invocations.push(assembled);
     }
 
@@ -1810,6 +1849,40 @@ pub async fn spawn_subagent_batch_invocations(
         parent_task,
         invocations,
     })
+}
+
+/// One slim start-event descriptor per batch entry, in entry order —
+/// the store builds the full `SubagentProgress` events from these
+/// inside its spawn transaction.
+fn started_events_for_entries(
+    pending_tools: &[agent_sdk_foundation::PendingToolCallInfo],
+) -> Vec<SubagentSpawnEvent> {
+    pending_tools
+        .iter()
+        .map(|tool| SubagentSpawnEvent {
+            subagent_id: tool.id.clone(),
+            subagent_name: canonical_subagent_name(&tool.name).to_owned(),
+        })
+        .collect()
+}
+
+/// Split the store's committed start events back into per-entry slots.
+/// A bare in-memory store commits nothing (no sink) — every entry then
+/// carries no events; a durable store returns exactly one per entry.
+fn distribute_committed_events(
+    committed: Vec<CommittedEvent>,
+    entries: usize,
+) -> Result<Vec<Vec<CommittedEvent>>> {
+    if committed.is_empty() {
+        return Ok(vec![Vec::new(); entries]);
+    }
+    ensure!(
+        committed.len() == entries,
+        "store returned {} start events for {} entries",
+        committed.len(),
+        entries,
+    );
+    Ok(committed.into_iter().map(|event| vec![event]).collect())
 }
 
 /// Records returned by [`spawn_mixed_children_invocations`].
@@ -1917,6 +1990,7 @@ pub async fn spawn_mixed_children_invocations(
         })
         .collect();
 
+    let events = started_events_for_entries(&pending_tools_by_entry);
     let spawned = deps
         .task_store
         .spawn_mixed_children(
@@ -1929,12 +2003,14 @@ pub async fn spawn_mixed_children_invocations(
                 payload,
                 child_otel_traceparent,
             },
+            events,
             now,
         )
         .await
         .context("persist mixed batch children")?;
 
     let SpawnedMixedChildren {
+        committed_events,
         parent,
         subagents: prepared,
         tool_children,
@@ -1952,24 +2028,23 @@ pub async fn spawn_mixed_children_invocations(
         prepared.len(),
         pending_tools_by_entry.len(),
     );
+    let per_entry_events = distribute_committed_events(committed_events, prepared.len())?;
 
     let mut invocations = Vec::with_capacity(prepared.len());
-    for ((invocation_task, child_root_task), (child_thread, pending_tool)) in prepared
+    for (((invocation_task, child_root_task), child_thread), committed) in prepared
         .into_iter()
-        .zip(child_threads.into_iter().zip(pending_tools_by_entry))
+        .zip(child_threads)
+        .zip(per_entry_events)
     {
-        let assembled = build_batch_invocation(
+        let assembled = assemble_batch_invocation(
             BatchEntryAssembly {
                 parent_task: &parent,
                 invocation_task,
                 child_root_task,
                 child_thread,
-                pending_tool,
             },
-            deps,
-            now,
-        )
-        .await?;
+            committed,
+        )?;
         invocations.push(assembled);
     }
 
@@ -2078,35 +2153,24 @@ async fn commit_parent_subagent_progress(
     event: AgentEvent,
     now: OffsetDateTime,
 ) -> Result<Vec<CommittedEvent>> {
+    if let Some(committer) = event_repo.atomic_event_outbox_committer() {
+        return committer
+            .commit_events_with_outbox(crate::journal::EventOutboxCommit {
+                thread_id: parent_thread_id.clone(),
+                events: vec![event],
+                outbox_max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+                now,
+            })
+            .await
+            .map(|outcome| outcome.committed_events)
+            .context("commit parent subagent progress event with outbox advisory");
+    }
     Ok(vec![
         event_repo
             .commit_event(parent_thread_id, event, now)
             .await
             .context("commit parent subagent progress event")?,
     ])
-}
-
-async fn commit_parent_subagent_progress_if_possible(
-    event_repo: &dyn EventRepository,
-    parent_thread_id: &ThreadId,
-    event: AgentEvent,
-    now: OffsetDateTime,
-    phase: &str,
-    subagent_id: &str,
-) -> Vec<CommittedEvent> {
-    match commit_parent_subagent_progress(event_repo, parent_thread_id, event, now).await {
-        Ok(events) => events,
-        Err(error) => {
-            log::warn!(
-                phase,
-                parent_thread:? = parent_thread_id,
-                subagent_id,
-                error:? = error;
-                "Failed to commit parent subagent progress event"
-            );
-            Vec::new()
-        }
-    }
 }
 
 fn pending_subagent_tool_call(
@@ -2232,7 +2296,7 @@ async fn commit_completed_subagent_progress(
     summary: &SubagentSummary,
     deps: &SubagentResultDeps<'_>,
     now: OffsetDateTime,
-) -> Vec<CommittedEvent> {
+) -> Result<Vec<CommittedEvent>> {
     let completed_event = build_parent_progress_event(&SubagentProgressSnapshot {
         subagent_id: &bootstrap.subagent_id,
         subagent_name: &bootstrap.subagent_name,
@@ -2247,15 +2311,14 @@ async fn commit_completed_subagent_progress(
         total_tokens: subagent_total_tokens(&summary.total_usage),
     });
 
-    commit_parent_subagent_progress_if_possible(
-        deps.event_repo,
-        &bootstrap.thread_id,
-        completed_event,
-        now,
-        "completion",
-        &bootstrap.subagent_id,
-    )
-    .await
+    // The card's contract: a failed progress commit PROPAGATES — the
+    // swallowed-error arm is deleted, not bypassed. The invocation row
+    // completed above; a failed event commit surfaces to the worker,
+    // whose retry/lease machinery re-drives the completion path rather
+    // than silently losing the parent-visible completion event.
+    commit_parent_subagent_progress(deps.event_repo, &bootstrap.thread_id, completed_event, now)
+        .await
+        .context("commit completed subagent progress event")
 }
 
 fn validate_request(request: &SubagentSpawnRequest) -> Result<()> {

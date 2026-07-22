@@ -189,9 +189,11 @@ message ForkThreadResponse {
   // fork-point turn into the new thread.
   uint64 message_count = 3;
 
-  // Number of events re-committed against the new thread. Equal to
-  // the highest source sequence whose committed turn is `<=
-  // fork_after_committed_turns`.
+  // Number of SOURCE events re-committed against the new thread. Equal
+  // to the highest source sequence whose committed turn is `<=
+  // fork_after_committed_turns`. The destination journal additionally
+  // holds its own ThreadCreated event at sequence 0, so a full replay
+  // of the new thread yields `event_count + 1` events.
   uint64 event_count = 4;
 
   // The fork-point turn echoed back. Useful for clients that want

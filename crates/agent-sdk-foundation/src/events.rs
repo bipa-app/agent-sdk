@@ -69,6 +69,17 @@ mod duration_ms_serde {
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum AgentEvent {
+    /// A thread aggregate became durably visible.
+    ThreadCreated {
+        thread_id: ThreadId,
+        /// Source thread when this thread was created by `ForkThread`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_thread_id: Option<ThreadId>,
+        /// Source turn boundary copied by `ForkThread`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fork_after_committed_turns: Option<u32>,
+    },
+
     /// Agent loop has started
     Start {
         thread_id: ThreadId,
@@ -358,6 +369,19 @@ pub enum AgentEvent {
 }
 
 impl AgentEvent {
+    #[must_use]
+    pub const fn thread_created(
+        thread_id: ThreadId,
+        source_thread_id: Option<ThreadId>,
+        fork_after_committed_turns: Option<u32>,
+    ) -> Self {
+        Self::ThreadCreated {
+            thread_id,
+            source_thread_id,
+            fork_after_committed_turns,
+        }
+    }
+
     #[must_use]
     pub const fn start(thread_id: ThreadId, turn: usize) -> Self {
         Self::Start {
@@ -1157,6 +1181,11 @@ mod tests {
     /// `Start` / `UserInput`: the events opening a thread turn.
     fn session_open_events(thread: &ThreadId) -> Vec<AgentEvent> {
         vec![
+            AgentEvent::ThreadCreated {
+                thread_id: thread.clone(),
+                source_thread_id: None,
+                fork_after_committed_turns: None,
+            },
             AgentEvent::Start {
                 thread_id: thread.clone(),
                 turn: 1,
