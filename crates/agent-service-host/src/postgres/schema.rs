@@ -580,6 +580,40 @@ const AGENT_SDK_TURN_ATTEMPT_COLUMNS: &[ColumnContract] = &[
         notes: "Provider-reported cached input usage.",
     },
     ColumnContract {
+        name: "cache_creation_input_tokens",
+        sql_type: "BIGINT",
+        nullable: true,
+        notes: "Provider-reported cache creation input usage.",
+    },
+    ColumnContract {
+        name: "route_provider",
+        sql_type: "TEXT",
+        nullable: true,
+        notes: "Serving route the call was dispatched to, distinct from `provider` \
+                whenever one API shape fronts several endpoints (native vs gateway).",
+    },
+    ColumnContract {
+        name: "thinking_mode",
+        sql_type: "TEXT",
+        nullable: true,
+        notes: "Thinking mode the dispatched request used: 'off' | 'default' | \
+                'budget' | 'adaptive'. NULL while open and on legacy rows.",
+    },
+    ColumnContract {
+        name: "thinking_budget_tokens",
+        sql_type: "BIGINT",
+        nullable: true,
+        notes: "Token budget the dispatched request carried; set exactly when \
+                thinking_mode = 'budget'.",
+    },
+    ColumnContract {
+        name: "thinking_effort",
+        sql_type: "TEXT",
+        nullable: true,
+        notes: "Thinking effort the dispatched request carried: 'low' | 'medium' | \
+                'high' | 'xhigh' | 'max'. NULL when the mode is 'off'.",
+    },
+    ColumnContract {
         name: "opened_at",
         sql_type: "TIMESTAMPTZ",
         nullable: false,

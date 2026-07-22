@@ -1099,8 +1099,31 @@ impl LlmProvider for OpenAIProvider {
         "openai"
     }
 
+    fn route(&self) -> &str {
+        serving_route(&self.base_url)
+    }
+
     fn configured_thinking(&self) -> Option<&ThinkingConfig> {
         self.thinking.as_ref()
+    }
+}
+
+/// Name the OpenAI-compatible endpoint `base_url` points at.
+///
+/// Every gateway below speaks the Chat Completions shape, so they all share
+/// this one struct via [`OpenAIProvider::with_base_url`] and all report
+/// `"openai"` from [`LlmProvider::provider`]. The configured base URL is the
+/// only thing that still distinguishes them at dispatch time — the same
+/// discrimination [`use_openrouter_usage_options`] already makes.
+fn serving_route(base_url: &str) -> &'static str {
+    if base_url.contains("openrouter.ai") {
+        "openrouter"
+    } else if base_url.contains("baseten") {
+        "baseten"
+    } else if base_url.contains("fireworks") {
+        "fireworks"
+    } else {
+        "openai"
     }
 }
 
@@ -4512,6 +4535,31 @@ mod tests {
     fn openrouter_usage_flag_only_for_openrouter() {
         assert!(use_openrouter_usage_options("https://openrouter.ai/api/v1"));
         assert!(!use_openrouter_usage_options("https://api.openai.com/v1"));
+    }
+
+    #[test]
+    fn serving_route_names_the_gateway_behind_the_base_url() {
+        assert_eq!(serving_route("https://openrouter.ai/api/v1"), "openrouter");
+        assert_eq!(serving_route("https://model.baseten.co/v1"), "baseten");
+        assert_eq!(
+            serving_route("https://api.fireworks.ai/inference/v1"),
+            "fireworks",
+        );
+        assert_eq!(serving_route("https://api.openai.com/v1"), "openai");
+        assert_eq!(serving_route("http://localhost:1234/v1"), "openai");
+    }
+
+    #[test]
+    fn route_distinguishes_gateways_that_share_one_provider_identity() {
+        let native = OpenAIProvider::with_base_url("k", "gpt-5.6", "https://api.openai.com/v1");
+        let gateway = OpenAIProvider::with_base_url("k", "gpt-5.6", "https://openrouter.ai/api/v1");
+
+        // Same API shape, so the same `provider()` — the discrimination R7
+        // needs lives entirely in `route()`.
+        assert_eq!(native.provider(), gateway.provider());
+        assert_eq!(native.route(), "openai");
+        assert_eq!(gateway.route(), "openrouter");
+        assert_ne!(native.route(), gateway.route());
     }
 
     #[test]

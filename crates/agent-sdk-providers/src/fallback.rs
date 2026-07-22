@@ -233,6 +233,15 @@ impl LlmProvider for FallbackProvider {
     fn provider(&self) -> &'static str {
         self.primary.provider()
     }
+
+    /// Reports the **configured primary's** route, not necessarily the one that
+    /// served the call: [`Self::chat`] walks the chain, so a request the primary
+    /// failed and a backup answered still names the primary here. Attributing
+    /// the tier that actually ran needs the serving route to travel back out of
+    /// the chain walk with the response, which this trait has no channel for.
+    fn route(&self) -> &str {
+        self.primary.route()
+    }
 }
 
 #[cfg(test)]

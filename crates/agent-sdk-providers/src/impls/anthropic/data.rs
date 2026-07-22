@@ -117,17 +117,26 @@ pub enum ApiThinkingConfig {
 }
 
 impl ApiThinkingConfig {
-    pub const fn from_thinking_config(config: &agent_sdk_foundation::llm::ThinkingConfig) -> Self {
+    pub const fn from_thinking_config(
+        config: &agent_sdk_foundation::llm::ThinkingConfig,
+    ) -> Option<Self> {
+        let display = match config.display {
+            agent_sdk_foundation::llm::ThinkingDisplay::Summarized => "summarized",
+            agent_sdk_foundation::llm::ThinkingDisplay::Omitted => "omitted",
+        };
         match &config.mode {
-            agent_sdk_foundation::llm::ThinkingMode::Enabled { budget_tokens } => Self::Enabled {
-                config_type: "enabled",
-                budget_tokens: *budget_tokens,
-                display: "omitted",
-            },
-            agent_sdk_foundation::llm::ThinkingMode::Adaptive => Self::Adaptive {
+            agent_sdk_foundation::llm::ThinkingMode::Enabled { budget_tokens } => {
+                Some(Self::Enabled {
+                    config_type: "enabled",
+                    budget_tokens: *budget_tokens,
+                    display,
+                })
+            }
+            agent_sdk_foundation::llm::ThinkingMode::Adaptive => Some(Self::Adaptive {
                 config_type: "adaptive",
-                display: "omitted",
-            },
+                display,
+            }),
+            agent_sdk_foundation::llm::ThinkingMode::Default => None,
         }
     }
 }

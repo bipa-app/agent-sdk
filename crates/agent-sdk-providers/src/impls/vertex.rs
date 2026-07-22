@@ -162,7 +162,7 @@ impl VertexProvider {
         self
     }
 
-    fn requires_anthropic_adaptive_thinking(&self) -> bool {
+    fn is_anthropic_adaptive_thinking_model(&self) -> bool {
         matches!(
             self.model.as_str(),
             MODEL_SONNET_46
@@ -272,11 +272,11 @@ impl LlmProvider for VertexProvider {
         }
 
         if self.is_claude_model()
-            && self.requires_anthropic_adaptive_thinking()
+            && self.is_anthropic_adaptive_thinking_model()
             && matches!(thinking.mode, ThinkingMode::Enabled { .. })
         {
             return Err(anyhow::anyhow!(
-                "budget_tokens thinking is deprecated for provider={} model={}; use ThinkingConfig::adaptive() instead",
+                "budget_tokens thinking is rejected for provider={} model={}; use ThinkingConfig::adaptive() or ThinkingConfig::default_with_effort(_) instead",
                 self.provider(),
                 self.model()
             ));
@@ -686,7 +686,7 @@ impl VertexProvider {
         let tools = build_vertex_claude_tools(&request);
         let thinking = thinking_config
             .as_ref()
-            .map(anthropic_data::ApiThinkingConfig::from_thinking_config);
+            .and_then(anthropic_data::ApiThinkingConfig::from_thinking_config);
         let output_config = thinking_config
             .as_ref()
             .and_then(|t| t.effort)
@@ -805,7 +805,7 @@ impl VertexProvider {
             let tools = build_vertex_claude_tools(&request);
             let thinking = thinking_config
                 .as_ref()
-                .map(anthropic_data::ApiThinkingConfig::from_thinking_config);
+                .and_then(anthropic_data::ApiThinkingConfig::from_thinking_config);
             let output_config = thinking_config
                 .as_ref()
                 .and_then(|t| t.effort)

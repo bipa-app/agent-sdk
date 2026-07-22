@@ -148,6 +148,34 @@ pub enum TurnAttemptSchemaError {
     /// An open attempt has a duration set.
     #[error("open attempt must not have a duration")]
     DurationOnOpenAttempt,
+
+    /// An effort was recorded without a thinking mode that carries one.
+    #[error("thinking effort requires a thinking mode other than off")]
+    EffortWithoutThinking,
+
+    /// A budget-mode row is missing its token budget.
+    #[error("budget thinking mode requires thinking_budget_tokens")]
+    BudgetModeWithoutTokens,
+
+    /// A token budget was recorded for a non-budget mode.
+    #[error("thinking_budget_tokens requires the budget thinking mode")]
+    TokensWithoutBudgetMode,
+}
+
+/// Thinking mode the dispatched request used, as the durable row records
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingModeEvidence {
+    /// No thinking was requested.
+    Off,
+    /// Thinking at the provider's default depth: no explicit budget, not
+    /// adaptive.
+    Default,
+    /// An explicit token budget, recorded in `thinking_budget_tokens`.
+    Budget,
+    /// The provider chose the depth.
+    Adaptive,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -169,7 +197,8 @@ pub enum TurnAttemptSchemaError {
 /// | Request | `request_blob`, `requested_model`, `provider` |
 /// | Response | `response_blob`, `response_id`, `response_model` |
 /// | Outcome | `stop_reason`, `outcome` |
-/// | Usage | `input_tokens`, `output_tokens`, `cached_input_tokens` |
+/// | Usage | `input_tokens`, `output_tokens`, `cached_input_tokens`, `cache_creation_input_tokens` |
+/// | Routing | `route_provider`, `thinking_mode`, `thinking_budget_tokens`, `thinking_effort` |
 /// | Timing | `opened_at`, `closed_at`, `duration_ms` |
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TurnAttempt {
@@ -183,7 +212,11 @@ pub struct TurnAttempt {
     pub attempt_number: u32,
 
     // ── Request provenance ───────────────────────────────────────
-    /// Provider identifier (e.g. `"anthropic"`, `"openai"`).
+    /// Open-time provenance: the provider identity the attempt was opened
+    /// against, naming the API shape the request was built for — for example
+    /// `"anthropic"`. Recorded before the call is dispatched, so it answers
+    /// "what was this attempt configured as", never "who served it". For that,
+    /// see [`route_provider`](Self::route_provider).
     pub provider: String,
 
     /// Model the caller requested (may differ from what the
@@ -226,6 +259,40 @@ pub struct TurnAttempt {
 
     /// Cached input tokens (provider-specific). `None` while open.
     pub cached_input_tokens: Option<u32>,
+
+    /// Input tokens spent creating provider-side cache entries. `None` while
+    /// open or on rows that predate this evidence column.
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u32>,
+
+    // ── Routing ──────────────────────────────────────────────────
+    /// Dispatch-time serving route: the endpoint the call was actually sent
+    /// to — for example `"openrouter"`.
+    ///
+    /// Distinct from [`provider`](Self::provider) whenever one API shape fronts
+    /// several endpoints: a request to `"anthropic"`-shaped Claude served
+    /// through `OpenRouter` records `provider = "anthropic"` and
+    /// `route_provider = "openrouter"`. Comparing cost or latency between a
+    /// gateway and its native endpoint reads this column, not `provider`.
+    /// `None` while open or on legacy rows.
+    #[serde(default)]
+    pub route_provider: Option<String>,
+
+    /// Thinking mode the dispatched request used. `None` while open and
+    /// on legacy rows.
+    #[serde(default)]
+    pub thinking_mode: Option<ThinkingModeEvidence>,
+
+    /// Token budget the dispatched request carried. Present exactly when
+    /// the mode is [`ThinkingModeEvidence::Budget`].
+    #[serde(default)]
+    pub thinking_budget_tokens: Option<u32>,
+
+    /// Thinking effort the request carried at dispatch. Orthogonal to the
+    /// mode: an adaptive request may still pin a level. `None` while open,
+    /// on legacy rows, and when the request carried no effort level.
+    #[serde(default)]
+    pub thinking_effort: Option<agent_sdk_foundation::llm::Effort>,
 
     // ── Timing ───────────────────────────────────────────────────
     /// When the attempt was opened (LLM call started).
@@ -287,6 +354,11 @@ impl TurnAttempt {
             input_tokens: None,
             output_tokens: None,
             cached_input_tokens: None,
+            cache_creation_input_tokens: None,
+            route_provider: None,
+            thinking_mode: None,
+            thinking_budget_tokens: None,
+            thinking_effort: None,
             opened_at: params.now,
             closed_at: None,
             duration_ms: None,
@@ -324,6 +396,11 @@ impl TurnAttempt {
         self.input_tokens = Some(params.input_tokens);
         self.output_tokens = Some(params.output_tokens);
         self.cached_input_tokens = Some(params.cached_input_tokens);
+        self.cache_creation_input_tokens = Some(params.cache_creation_input_tokens);
+        self.route_provider = params.route_provider;
+        self.thinking_mode = params.thinking_mode;
+        self.thinking_budget_tokens = params.thinking_budget_tokens;
+        self.thinking_effort = params.thinking_effort;
         self.closed_at = Some(now);
 
         let dur = now - self.opened_at;
@@ -358,7 +435,8 @@ impl TurnAttempt {
     /// - **Open** rows must not have: `outcome`, `response_blob`,
     ///   `response_model`, `response_id`, `stop_reason`,
     ///   `input_tokens`, `output_tokens`, `cached_input_tokens`,
-    ///   `duration_ms`, `closed_at`.
+    ///   `cache_creation_input_tokens`, `route_provider`, `thinking_mode`,
+    ///   `thinking_effort`, `duration_ms`, `closed_at`.
     /// - **Closed** rows must have: `outcome`, `duration_ms`,
     ///   `closed_at`.
     ///
@@ -387,12 +465,37 @@ impl TurnAttempt {
                 || self.input_tokens.is_some()
                 || self.output_tokens.is_some()
                 || self.cached_input_tokens.is_some()
+                || self.cache_creation_input_tokens.is_some()
+                || self.route_provider.is_some()
+                || self.thinking_mode.is_some()
+                || self.thinking_budget_tokens.is_some()
+                || self.thinking_effort.is_some()
             {
                 return Err(TurnAttemptSchemaError::ResponseOnOpenAttempt);
             }
             if self.duration_ms.is_some() {
                 return Err(TurnAttemptSchemaError::DurationOnOpenAttempt);
             }
+        }
+
+        if self.thinking_effort.is_some()
+            && !matches!(
+                self.thinking_mode,
+                Some(
+                    ThinkingModeEvidence::Default
+                        | ThinkingModeEvidence::Budget
+                        | ThinkingModeEvidence::Adaptive
+                )
+            )
+        {
+            return Err(TurnAttemptSchemaError::EffortWithoutThinking);
+        }
+        let budget_mode = matches!(self.thinking_mode, Some(ThinkingModeEvidence::Budget));
+        if budget_mode && self.thinking_budget_tokens.is_none() {
+            return Err(TurnAttemptSchemaError::BudgetModeWithoutTokens);
+        }
+        if !budget_mode && self.thinking_budget_tokens.is_some() {
+            return Err(TurnAttemptSchemaError::TokensWithoutBudgetMode);
         }
 
         Ok(())
@@ -451,6 +554,17 @@ pub struct CloseAttemptParams {
     pub output_tokens: u32,
     /// Cached input tokens.
     pub cached_input_tokens: u32,
+    /// Input tokens spent creating provider-side cache entries.
+    pub cache_creation_input_tokens: u32,
+    /// Serving route this request was dispatched to.
+    pub route_provider: Option<String>,
+    /// Thinking mode the dispatched request used, when evidence was
+    /// captured.
+    pub thinking_mode: Option<ThinkingModeEvidence>,
+    /// Token budget the dispatched request carried; budget mode only.
+    pub thinking_budget_tokens: Option<u32>,
+    /// Thinking effort the dispatched request carried.
+    pub thinking_effort: Option<agent_sdk_foundation::llm::Effort>,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -499,6 +613,11 @@ mod tests {
             input_tokens: 100,
             output_tokens: 50,
             cached_input_tokens: 10,
+            cache_creation_input_tokens: 20,
+            route_provider: Some("anthropic".into()),
+            thinking_mode: Some(ThinkingModeEvidence::Adaptive),
+            thinking_budget_tokens: None,
+            thinking_effort: Some(agent_sdk_foundation::llm::Effort::High),
         }
     }
 
@@ -587,6 +706,13 @@ mod tests {
         assert_eq!(closed.input_tokens, Some(100));
         assert_eq!(closed.output_tokens, Some(50));
         assert_eq!(closed.cached_input_tokens, Some(10));
+        assert_eq!(closed.cache_creation_input_tokens, Some(20));
+        assert_eq!(closed.route_provider.as_deref(), Some("anthropic"));
+        assert_eq!(closed.thinking_mode, Some(ThinkingModeEvidence::Adaptive));
+        assert_eq!(
+            closed.thinking_effort,
+            Some(agent_sdk_foundation::llm::Effort::High),
+        );
         assert_eq!(closed.duration_ms, Some(5_000));
         closed.validate().context("validate")?;
         Ok(())
@@ -777,10 +903,120 @@ mod tests {
         assert_eq!(json["input_tokens"], 100);
         assert_eq!(json["output_tokens"], 50);
         assert_eq!(json["cached_input_tokens"], 10);
+        assert_eq!(json["cache_creation_input_tokens"], 20);
+        assert_eq!(json["route_provider"], "anthropic");
+        assert_eq!(json["thinking_mode"], "adaptive");
+        assert_eq!(json["thinking_effort"], "high");
 
         // Verify timing
         assert_eq!(json["duration_ms"], 2_000);
         Ok(())
+    }
+
+    #[test]
+    fn open_attempt_serializes_every_nullable_usage_field_as_null() -> Result<()> {
+        let json = serde_json::to_value(TurnAttempt::open(sample_open_params()))
+            .context("serialize open attempt")?;
+
+        // One policy for the whole group. A consumer that distinguishes
+        // absent-from-null must not have to learn which nullable column
+        // happens to be omitted and which is written as an explicit null.
+        for field in [
+            "cached_input_tokens",
+            "cache_creation_input_tokens",
+            "route_provider",
+            "thinking_mode",
+            "thinking_effort",
+        ] {
+            assert_eq!(
+                json.get(field),
+                Some(&serde_json::Value::Null),
+                "{field} must serialize as an explicit null on an open attempt",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn thinking_wire_strings_match_the_column_check_constraints() -> Result<()> {
+        // These strings are the `thinking_mode IN (…)` and
+        // `thinking_effort IN (…)` lists in migration 0013 for both
+        // dialects; the store persists whatever serde emits here, so a
+        // rename — or a new variant not added to the CHECK — would start
+        // failing at write time.
+        use agent_sdk_foundation::llm::Effort;
+        for (mode, wire) in [
+            (ThinkingModeEvidence::Off, "off"),
+            (ThinkingModeEvidence::Default, "default"),
+            (ThinkingModeEvidence::Budget, "budget"),
+            (ThinkingModeEvidence::Adaptive, "adaptive"),
+        ] {
+            let encoded = serde_json::to_value(mode).context("serialize thinking mode")?;
+            assert_eq!(encoded, serde_json::Value::String(wire.to_owned()));
+            let decoded: ThinkingModeEvidence =
+                serde_json::from_value(encoded).context("deserialize thinking mode")?;
+            assert_eq!(decoded, mode);
+        }
+        for (effort, wire) in [
+            (Effort::Low, "low"),
+            (Effort::Medium, "medium"),
+            (Effort::High, "high"),
+            (Effort::XHigh, "xhigh"),
+            (Effort::Max, "max"),
+        ] {
+            let encoded = serde_json::to_value(effort).context("serialize thinking effort")?;
+            assert_eq!(encoded, serde_json::Value::String(wire.to_owned()));
+            let decoded: Effort =
+                serde_json::from_value(encoded).context("deserialize thinking effort")?;
+            assert_eq!(decoded, effort);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn close_rejects_budget_mode_without_tokens() {
+        let attempt = TurnAttempt::open(sample_open_params());
+        let error = attempt
+            .close(
+                CloseAttemptParams {
+                    thinking_mode: Some(ThinkingModeEvidence::Budget),
+                    thinking_budget_tokens: None,
+                    ..sample_close_params()
+                },
+                t_plus(1),
+            )
+            .expect_err("a budget-mode close without tokens must be rejected");
+        assert_eq!(error, TurnAttemptSchemaError::BudgetModeWithoutTokens);
+    }
+
+    #[test]
+    fn close_rejects_tokens_without_budget_mode() {
+        let attempt = TurnAttempt::open(sample_open_params());
+        let error = attempt
+            .close(
+                CloseAttemptParams {
+                    thinking_budget_tokens: Some(10_000),
+                    ..sample_close_params()
+                },
+                t_plus(1),
+            )
+            .expect_err("tokens on a non-budget close must be rejected");
+        assert_eq!(error, TurnAttemptSchemaError::TokensWithoutBudgetMode);
+    }
+
+    #[test]
+    fn close_rejects_an_effort_without_a_carrying_mode() {
+        let attempt = TurnAttempt::open(sample_open_params());
+        let error = attempt
+            .close(
+                CloseAttemptParams {
+                    thinking_mode: Some(ThinkingModeEvidence::Off),
+                    ..sample_close_params()
+                },
+                t_plus(1),
+            )
+            .expect_err("an off-mode close carrying an effort must be rejected");
+        assert_eq!(error, TurnAttemptSchemaError::EffortWithoutThinking);
     }
 
     // ── Multiple attempts ────────────────────────────────────────
@@ -812,6 +1048,11 @@ mod tests {
                     input_tokens: 0,
                     output_tokens: 0,
                     cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    route_provider: None,
+                    thinking_mode: None,
+                    thinking_budget_tokens: None,
+                    thinking_effort: None,
                 },
                 t_plus(1),
             )
@@ -836,6 +1077,11 @@ mod tests {
                     input_tokens: 0,
                     output_tokens: 0,
                     cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    route_provider: None,
+                    thinking_mode: None,
+                    thinking_budget_tokens: None,
+                    thinking_effort: None,
                 },
                 t_plus(1),
             )
@@ -852,6 +1098,10 @@ mod tests {
         let attempt = TurnAttempt::open(sample_open_params());
         assert!(attempt.otel_trace_id.is_none());
         assert!(attempt.otel_span_id.is_none());
+        assert!(attempt.cache_creation_input_tokens.is_none());
+        assert!(attempt.route_provider.is_none());
+        assert!(attempt.thinking_mode.is_none());
+        assert!(attempt.thinking_effort.is_none());
     }
 
     #[test]
@@ -904,6 +1154,13 @@ mod tests {
             serde_json::from_value(legacy).context("deserialize legacy row")?;
         assert!(attempt.otel_trace_id.is_none());
         assert!(attempt.otel_span_id.is_none());
+        assert!(attempt.cache_creation_input_tokens.is_none());
+        assert!(attempt.route_provider.is_none());
+        assert!(
+            attempt.thinking_mode.is_none(),
+            "legacy rows without the column must read as evidence-not-captured",
+        );
+        assert!(attempt.thinking_effort.is_none());
         attempt.validate().context("validate")?;
         Ok(())
     }

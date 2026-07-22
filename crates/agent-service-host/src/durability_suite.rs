@@ -329,6 +329,11 @@ mod tests {
                     input_tokens: 100,
                     output_tokens: 50,
                     cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    route_provider: None,
+                    thinking_mode: None,
+                    thinking_budget_tokens: None,
+                    thinking_effort: None,
                 },
                 messages,
                 turn_usage: TokenUsage {

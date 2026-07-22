@@ -503,14 +503,13 @@ pub(crate) const fn legacy_reasoning_effort(
             Effort::Low => OpenAIReasoningEffort::Low,
             Effort::Medium => OpenAIReasoningEffort::Medium,
             Effort::High => OpenAIReasoningEffort::High,
-            // Preserve the historical OpenAI mapping. Exact GPT-5.6 `max`
-            // is available through `OpenAIReasoningConfig`.
-            Effort::Max => OpenAIReasoningEffort::XHigh,
+            Effort::XHigh => OpenAIReasoningEffort::XHigh,
+            Effort::Max => OpenAIReasoningEffort::Max,
         });
     }
 
     match &config.mode {
-        ThinkingMode::Adaptive => None,
+        ThinkingMode::Adaptive | ThinkingMode::Default => None,
         ThinkingMode::Enabled { budget_tokens } => Some(if *budget_tokens <= 4_096 {
             OpenAIReasoningEffort::Low
         } else if *budget_tokens <= 16_384 {
@@ -544,11 +543,31 @@ mod tests {
     }
 
     #[test]
-    fn legacy_max_remains_xhigh() {
-        let config = ThinkingConfig::adaptive_with_effort(Effort::Max);
+    fn legacy_effort_is_passed_for_every_mode() {
+        for config in [
+            ThinkingConfig::adaptive_with_effort(Effort::Max),
+            ThinkingConfig::default_with_effort(Effort::Max),
+            ThinkingConfig::new(10_000).with_effort(Effort::Max),
+        ] {
+            assert_eq!(
+                legacy_reasoning_effort(&config),
+                Some(OpenAIReasoningEffort::Max),
+                "a configured effort must never be cancelled by the mode",
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_effort_maps_xhigh_and_max_exactly() {
+        let xhigh = ThinkingConfig::adaptive_with_effort(Effort::XHigh);
         assert_eq!(
-            legacy_reasoning_effort(&config),
+            legacy_reasoning_effort(&xhigh),
             Some(OpenAIReasoningEffort::XHigh)
+        );
+        let max = ThinkingConfig::adaptive_with_effort(Effort::Max);
+        assert_eq!(
+            legacy_reasoning_effort(&max),
+            Some(OpenAIReasoningEffort::Max)
         );
     }
 

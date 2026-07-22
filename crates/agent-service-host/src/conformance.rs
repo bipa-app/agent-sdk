@@ -469,6 +469,26 @@ mod tests {
         Ok(())
     }
 
+    fn evidence_close_params() -> CloseAttemptParams {
+        CloseAttemptParams {
+            response_blob: serde_json::json!({"id": "msg_conf_1"}),
+            response_id: Some("msg_conf_1".into()),
+            response_model: Some("claude-sonnet-4-5-20250929".into()),
+            stop_reason: Some(agent_sdk_foundation::llm::StopReason::EndTurn),
+            outcome: TurnAttemptOutcome::Success,
+            input_tokens: 100,
+            output_tokens: 50,
+            cached_input_tokens: 30,
+            cache_creation_input_tokens: 40,
+            route_provider: Some("anthropic".into()),
+            thinking_mode: Some(
+                agent_server::journal::turn_attempt::ThinkingModeEvidence::Adaptive,
+            ),
+            thinking_budget_tokens: None,
+            thinking_effort: Some(agent_sdk_foundation::llm::Effort::XHigh),
+        }
+    }
+
     /// Completed-turn commit creates a checkpoint.
     async fn test_completed_turn_commit(
         task_store: &dyn AgentTaskStore,
@@ -511,16 +531,7 @@ mod tests {
                 task_id: root.id.clone(),
                 expected_turn: 1,
                 turn_attempt_id: attempt.id.clone(),
-                close_attempt_params: CloseAttemptParams {
-                    response_blob: serde_json::json!({"id": "msg_conf_1"}),
-                    response_id: Some("msg_conf_1".into()),
-                    response_model: Some("claude-sonnet-4-5-20250929".into()),
-                    stop_reason: Some(agent_sdk_foundation::llm::StopReason::EndTurn),
-                    outcome: TurnAttemptOutcome::Success,
-                    input_tokens: 100,
-                    output_tokens: 50,
-                    cached_input_tokens: 0,
-                },
+                close_attempt_params: evidence_close_params(),
                 messages: vec![agent_sdk_foundation::llm::Message::assistant(
                     "test response",
                 )],
@@ -541,6 +552,35 @@ mod tests {
 
         assert_eq!(outcome.thread.committed_turns, 1);
         assert_eq!(outcome.checkpoint.turn_number, 1);
+        assert_eq!(outcome.closed_attempt.cache_creation_input_tokens, Some(40));
+        assert_eq!(
+            outcome.closed_attempt.route_provider.as_deref(),
+            Some("anthropic"),
+        );
+        assert_eq!(
+            outcome.closed_attempt.thinking_mode,
+            Some(agent_server::journal::turn_attempt::ThinkingModeEvidence::Adaptive),
+            "the thinking mode must survive the close",
+        );
+        assert_eq!(
+            outcome.closed_attempt.thinking_effort,
+            Some(agent_sdk_foundation::llm::Effort::XHigh),
+        );
+        let stored_attempt = attempt_store
+            .get(&attempt.id)
+            .await?
+            .context("committed attempt missing")?;
+        assert_eq!(stored_attempt.cache_creation_input_tokens, Some(40));
+        assert_eq!(stored_attempt.route_provider.as_deref(), Some("anthropic"));
+        assert_eq!(
+            stored_attempt.thinking_mode,
+            Some(agent_server::journal::turn_attempt::ThinkingModeEvidence::Adaptive),
+            "the thinking mode must survive a store round-trip",
+        );
+        assert_eq!(
+            stored_attempt.thinking_effort,
+            Some(agent_sdk_foundation::llm::Effort::XHigh),
+        );
 
         let latest = checkpoint_store
             .get_latest_by_thread(&tid)
@@ -600,6 +640,11 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 5,
                 cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                route_provider: None,
+                thinking_mode: None,
+                thinking_budget_tokens: None,
+                thinking_effort: None,
             },
             messages: vec![agent_sdk_foundation::llm::Message::assistant("guarded")],
             turn_usage: TokenUsage::default(),
@@ -774,6 +819,11 @@ mod tests {
                 input_tokens: 1,
                 output_tokens: 1,
                 cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                route_provider: None,
+                thinking_mode: None,
+                thinking_budget_tokens: None,
+                thinking_effort: None,
             },
             messages: vec![agent_sdk_foundation::llm::Message::assistant("stale")],
             turn_usage: TokenUsage::default(),

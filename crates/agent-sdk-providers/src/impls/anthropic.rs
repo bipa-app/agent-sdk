@@ -334,7 +334,7 @@ impl AnthropicProvider {
                     // predicate as the OAuth arm to keep the cached request
                     // prefix minimal and stable. Do NOT add other OAuth-identity
                     // betas here — API-key auth is not Claude Code.
-                    if self.requires_adaptive_thinking() {
+                    if self.is_adaptive_thinking_model() {
                         builder
                     } else {
                         builder.header("anthropic-beta", "interleaved-thinking-2025-05-14")
@@ -349,7 +349,7 @@ impl AnthropicProvider {
                         "oauth-2025-04-20",
                         "fine-grained-tool-streaming-2025-05-14",
                     ];
-                    if !self.requires_adaptive_thinking() {
+                    if !self.is_adaptive_thinking_model() {
                         beta_features.push("interleaved-thinking-2025-05-14");
                     }
                     builder
@@ -506,10 +506,11 @@ impl AnthropicProvider {
 
     /// Create a provider using Claude Opus 4.7.
     ///
-    /// Note: Opus 4.7 requires adaptive thinking. Passing a
+    /// Note: Opus 4.7 rejects budget thinking. Passing a
     /// `ThinkingConfig` with `ThinkingMode::Enabled { budget_tokens }`
-    /// will return an `InvalidRequest` — use `ThinkingConfig::adaptive()`
-    /// or `ThinkingConfig::adaptive_with_effort(_)` instead.
+    /// will return an `InvalidRequest` — use `ThinkingConfig::adaptive()`,
+    /// `ThinkingConfig::adaptive_with_effort(_)`, or
+    /// `ThinkingConfig::default_with_effort(_)` instead.
     #[must_use]
     pub fn opus_47(api_key: impl Into<String>) -> Self {
         Self::new(api_key, MODEL_OPUS_47)
@@ -517,10 +518,11 @@ impl AnthropicProvider {
 
     /// Create a provider using Claude Opus 4.8.
     ///
-    /// Note: Opus 4.8 requires adaptive thinking. Passing a
+    /// Note: Opus 4.8 rejects budget thinking. Passing a
     /// `ThinkingConfig` with `ThinkingMode::Enabled { budget_tokens }`
-    /// will return an `InvalidRequest` — use `ThinkingConfig::adaptive()`
-    /// or `ThinkingConfig::adaptive_with_effort(_)` instead.
+    /// will return an `InvalidRequest` — use `ThinkingConfig::adaptive()`,
+    /// `ThinkingConfig::adaptive_with_effort(_)`, or
+    /// `ThinkingConfig::default_with_effort(_)` instead.
     #[must_use]
     pub fn opus_48(api_key: impl Into<String>) -> Self {
         Self::new(api_key, MODEL_OPUS_48)
@@ -532,15 +534,17 @@ impl AnthropicProvider {
     /// even when no thinking config is sent, and raw chain of thought is
     /// never returned (thinking blocks arrive with empty content). Passing a
     /// `ThinkingConfig` with `ThinkingMode::Enabled { budget_tokens }`
-    /// will return an `InvalidRequest` — use `ThinkingConfig::adaptive()`
-    /// or `ThinkingConfig::adaptive_with_effort(_)` instead.
+    /// will return an `InvalidRequest` — use `ThinkingConfig::adaptive()`,
+    /// `ThinkingConfig::adaptive_with_effort(_)`, or
+    /// `ThinkingConfig::default_with_effort(_)` instead.
     #[must_use]
     pub fn fable(api_key: impl Into<String>) -> Self {
         Self::new(api_key, MODEL_FABLE_5)
     }
 
-    /// Claude Sonnet 5 — adaptive-only like Opus 4.8: manual `budget_tokens`
-    /// returns a 400; use `ThinkingConfig::adaptive()` instead.
+    /// Claude Sonnet 5 — like Opus 4.8, manual `budget_tokens` returns a
+    /// 400; use `ThinkingConfig::adaptive()` or
+    /// `ThinkingConfig::default_with_effort(_)` instead.
     #[must_use]
     pub fn sonnet_5(api_key: impl Into<String>) -> Self {
         Self::new(api_key, MODEL_SONNET_5)
@@ -583,7 +587,7 @@ impl AnthropicProvider {
         self
     }
 
-    fn requires_adaptive_thinking(&self) -> bool {
+    fn is_adaptive_thinking_model(&self) -> bool {
         matches!(
             self.model.as_str(),
             MODEL_SONNET_46
@@ -638,7 +642,7 @@ impl LlmProvider for AnthropicProvider {
         };
         let thinking = thinking_config
             .as_ref()
-            .map(ApiThinkingConfig::from_thinking_config);
+            .and_then(ApiThinkingConfig::from_thinking_config);
         let output_config = thinking_config
             .as_ref()
             .and_then(|t| t.effort)
@@ -838,7 +842,7 @@ impl LlmProvider for AnthropicProvider {
             };
             let thinking = thinking_config
                 .as_ref()
-                .map(ApiThinkingConfig::from_thinking_config);
+                .and_then(ApiThinkingConfig::from_thinking_config);
             let output_config = thinking_config
                 .as_ref()
                 .and_then(|t| t.effort)
@@ -1161,11 +1165,11 @@ impl LlmProvider for AnthropicProvider {
             ));
         }
 
-        if self.requires_adaptive_thinking()
+        if self.is_adaptive_thinking_model()
             && matches!(thinking.mode, ThinkingMode::Enabled { .. })
         {
             return Err(anyhow::anyhow!(
-                "budget_tokens thinking is deprecated for provider={} model={}; use ThinkingConfig::adaptive() instead",
+                "budget_tokens thinking is rejected for provider={} model={}; use ThinkingConfig::adaptive() or ThinkingConfig::default_with_effort(_) instead",
                 self.provider(),
                 self.model()
             ));
@@ -1399,6 +1403,14 @@ mod tests {
                 )))
                 .is_ok()
         );
+        assert!(
+            opus_47
+                .validate_thinking_config(Some(&ThinkingConfig::default_with_effort(
+                    agent_sdk_foundation::llm::Effort::High
+                )))
+                .is_ok(),
+            "effort without adaptive must be accepted",
+        );
     }
 
     #[test]
@@ -1439,6 +1451,14 @@ mod tests {
                 )))
                 .is_ok()
         );
+        assert!(
+            opus_48
+                .validate_thinking_config(Some(&ThinkingConfig::default_with_effort(
+                    agent_sdk_foundation::llm::Effort::High
+                )))
+                .is_ok(),
+            "effort without adaptive must be accepted",
+        );
     }
 
     #[test]
@@ -1477,6 +1497,14 @@ mod tests {
                 )))
                 .is_ok()
         );
+        assert!(
+            sonnet_5
+                .validate_thinking_config(Some(&ThinkingConfig::default_with_effort(
+                    agent_sdk_foundation::llm::Effort::High
+                )))
+                .is_ok(),
+            "effort without adaptive must be accepted",
+        );
     }
 
     #[test]
@@ -1508,6 +1536,14 @@ mod tests {
                     agent_sdk_foundation::llm::Effort::High
                 )))
                 .is_ok()
+        );
+        assert!(
+            fable
+                .validate_thinking_config(Some(&ThinkingConfig::default_with_effort(
+                    agent_sdk_foundation::llm::Effort::High
+                )))
+                .is_ok(),
+            "effort without adaptive must be accepted",
         );
     }
 
@@ -1784,6 +1820,53 @@ mod tests {
         assert_eq!(
             body["thinking"]["type"], "enabled",
             "configured thinking must survive when no tool is forced, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn thinking_display_defaults_to_omitted_and_honors_the_override() {
+        let server = wiremock::MockServer::start().await;
+        let provider = AnthropicProvider::fable("sk-ant-api-test")
+            .with_thinking(ThinkingConfig::adaptive())
+            .with_base_url(server.uri());
+        let body =
+            captured_request_body(&provider, request_with_tools(vec![tool("read")]), &server).await;
+        assert_eq!(body["thinking"]["display"], "omitted");
+
+        let server = wiremock::MockServer::start().await;
+        let provider = AnthropicProvider::fable("sk-ant-api-test")
+            .with_thinking(
+                ThinkingConfig::adaptive()
+                    .with_display(agent_sdk_foundation::llm::ThinkingDisplay::Summarized),
+            )
+            .with_base_url(server.uri());
+        let body =
+            captured_request_body(&provider, request_with_tools(vec![tool("read")]), &server).await;
+        assert_eq!(
+            body["thinking"]["display"], "summarized",
+            "the configured display must reach the wire, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_mode_effort_sends_output_config_without_thinking_block() {
+        let server = wiremock::MockServer::start().await;
+        let provider = AnthropicProvider::fable("sk-ant-api-test")
+            .with_thinking(ThinkingConfig::default_with_effort(
+                agent_sdk_foundation::llm::Effort::High,
+            ))
+            .with_base_url(server.uri());
+
+        let request = request_with_tools(vec![tool("read")]);
+        let body = captured_request_body(&provider, request, &server).await;
+
+        assert!(
+            body.get("thinking").is_none(),
+            "default mode must not send a thinking block, got: {body}"
+        );
+        assert_eq!(
+            body["output_config"]["effort"], "high",
+            "the effort must reach output_config, got: {body}"
         );
     }
 

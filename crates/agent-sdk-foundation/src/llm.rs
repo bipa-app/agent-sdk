@@ -17,6 +17,24 @@ pub enum ThinkingMode {
     Enabled { budget_tokens: u32 },
     /// Adaptive thinking — the model decides how much to think.
     Adaptive,
+    /// Provider-default thinking: no explicit budget, not adaptive. An
+    /// effort level can still be sent alongside it.
+    Default,
+}
+
+/// How thinking content is returned in responses.
+///
+/// The Anthropic API accepts exactly these two values; the per-model
+/// default differs (`Omitted` on Fable 5 / Sonnet 5 / Opus 4.7+,
+/// `Summarized` on the 4.6 generation), so the SDK always sends one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingDisplay {
+    /// Thinking blocks carry a readable summary of the reasoning.
+    Summarized,
+    /// Thinking blocks arrive with an empty `thinking` field; the
+    /// encrypted `signature` still carries multi-turn continuity.
+    Omitted,
 }
 
 /// Effort level for adaptive thinking via `output_config`.
@@ -26,6 +44,7 @@ pub enum Effort {
     Low,
     Medium,
     High,
+    XHigh,
     Max,
 }
 
@@ -39,6 +58,8 @@ pub struct ThinkingConfig {
     pub mode: ThinkingMode,
     /// Optional effort level (sent via `output_config`).
     pub effort: Option<Effort>,
+    /// How thinking content is returned.
+    pub display: ThinkingDisplay,
 }
 
 impl ThinkingConfig {
@@ -57,6 +78,7 @@ impl ThinkingConfig {
         Self {
             mode: ThinkingMode::Enabled { budget_tokens },
             effort: None,
+            display: ThinkingDisplay::Omitted,
         }
     }
 
@@ -66,6 +88,7 @@ impl ThinkingConfig {
         Self {
             mode: ThinkingMode::Adaptive,
             effort: None,
+            display: ThinkingDisplay::Omitted,
         }
     }
 
@@ -75,7 +98,25 @@ impl ThinkingConfig {
         Self {
             mode: ThinkingMode::Adaptive,
             effort: Some(effort),
+            display: ThinkingDisplay::Omitted,
         }
+    }
+
+    /// Create a provider-default-mode config with an effort level.
+    #[must_use]
+    pub const fn default_with_effort(effort: Effort) -> Self {
+        Self {
+            mode: ThinkingMode::Default,
+            effort: Some(effort),
+            display: ThinkingDisplay::Omitted,
+        }
+    }
+
+    /// Set how thinking content is returned.
+    #[must_use]
+    pub const fn with_display(mut self, display: ThinkingDisplay) -> Self {
+        self.display = display;
+        self
     }
 
     /// Set the effort level on an existing config.

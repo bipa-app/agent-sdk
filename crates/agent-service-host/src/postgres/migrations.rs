@@ -83,11 +83,15 @@ const TASK_LAST_ACTIVITY_AT_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/postgres/0012_task_last_activity_at.sql"
 ));
+const TURN_ATTEMPT_EVIDENCE_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/postgres/0013_turn_attempt_evidence.sql"
+));
 
 /// `sqlx`-managed migration bundle for the Postgres durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/postgres");
 
-const MIGRATIONS: [PostgresMigration; 12] = [
+const MIGRATIONS: [PostgresMigration; 13] = [
     PostgresMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -147,6 +151,11 @@ const MIGRATIONS: [PostgresMigration; 12] = [
         version: "0012",
         summary: "durable per-task last_activity_at anchoring the subagent stall budget",
         sql: TASK_LAST_ACTIVITY_AT_SQL,
+    },
+    PostgresMigration {
+        version: "0013",
+        summary: "turn-attempt cache creation, route, and resolved effort evidence",
+        sql: TURN_ATTEMPT_EVIDENCE_SQL,
     },
 ];
 
@@ -234,7 +243,7 @@ pub const fn checkpoint_kind_migration() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{DURABLE_CORE_MIGRATOR, durable_core_migrations};
+    use super::{DURABLE_CORE_MIGRATOR, TURN_ATTEMPT_EVIDENCE_SQL, durable_core_migrations};
 
     /// Guard against the finding-#20 regression: the reviewable
     /// [`durable_core_migrations`] array silently omitted 0006/0007/0010,
@@ -271,6 +280,15 @@ mod tests {
         assert_eq!(
             reviewable, executable,
             "reviewable migration versions must match the executable migrator's, in order",
+        );
+    }
+
+    #[test]
+    fn turn_attempt_evidence_migration_is_additive_and_nullable() {
+        crate::migration_contract::assert_additive_nullable_migration(
+            TURN_ATTEMPT_EVIDENCE_SQL,
+            "agent_sdk_turn_attempts",
+            5,
         );
     }
 }

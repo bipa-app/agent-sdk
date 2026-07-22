@@ -7050,6 +7050,11 @@ fn salvage_close_params() -> CloseAttemptParams {
         input_tokens: 0,
         output_tokens: 0,
         cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        route_provider: None,
+        thinking_mode: None,
+        thinking_budget_tokens: None,
+        thinking_effort: None,
     }
 }
 
@@ -7792,6 +7797,11 @@ async fn lost_ownership_rejection_settles_the_open_attempt() -> Result<()> {
             input_tokens: 77,
             output_tokens: 33,
             cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            route_provider: None,
+            thinking_mode: None,
+            thinking_budget_tokens: None,
+            thinking_effort: None,
         },
         messages: vec![],
         turn_usage: TokenUsage::default(),

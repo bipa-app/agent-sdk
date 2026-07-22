@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\nSELECT\n    id,\n    task_id,\n    attempt_number,\n    provider,\n    requested_model,\n    request_blob,\n    response_blob,\n    response_id,\n    response_model,\n    stop_reason,\n    outcome,\n    input_tokens,\n    output_tokens,\n    cached_input_tokens,\n    opened_at,\n    closed_at,\n    duration_ms,\n    otel_trace_id,\n    otel_span_id\nFROM agent_sdk_turn_attempts\nWHERE task_id = $1\nORDER BY attempt_number\n",
+  "query": "\nSELECT\n    id,\n    task_id,\n    attempt_number,\n    provider,\n    requested_model,\n    request_blob,\n    response_blob,\n    response_id,\n    response_model,\n    stop_reason,\n    outcome,\n    input_tokens,\n    output_tokens,\n    cached_input_tokens,\n    cache_creation_input_tokens,\n    route_provider,\n    thinking_mode,\n    thinking_budget_tokens,\n    thinking_effort,\n    opened_at,\n    closed_at,\n    duration_ms,\n    otel_trace_id,\n    otel_span_id\nFROM agent_sdk_turn_attempts\nWHERE id = $1\nFOR UPDATE\n",
   "describe": {
     "columns": [
       {
@@ -159,6 +159,61 @@
       },
       {
         "ordinal": 14,
+        "name": "cache_creation_input_tokens",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "cache_creation_input_tokens"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "route_provider",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "route_provider"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "thinking_mode",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "thinking_mode"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "thinking_budget_tokens",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "thinking_budget_tokens"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "thinking_effort",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "thinking_effort"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
         "name": "opened_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -169,7 +224,7 @@
         }
       },
       {
-        "ordinal": 15,
+        "ordinal": 20,
         "name": "closed_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -180,7 +235,7 @@
         }
       },
       {
-        "ordinal": 16,
+        "ordinal": 21,
         "name": "duration_ms",
         "type_info": "Int8",
         "origin": {
@@ -191,7 +246,7 @@
         }
       },
       {
-        "ordinal": 17,
+        "ordinal": 22,
         "name": "otel_trace_id",
         "type_info": "Text",
         "origin": {
@@ -202,7 +257,7 @@
         }
       },
       {
-        "ordinal": 18,
+        "ordinal": 23,
         "name": "otel_span_id",
         "type_info": "Text",
         "origin": {
@@ -233,6 +288,11 @@
       true,
       true,
       true,
+      true,
+      true,
+      true,
+      true,
+      true,
       false,
       true,
       true,
@@ -240,5 +300,5 @@
       true
     ]
   },
-  "hash": "ebd5513b95e7e57358e45ff311e0debe407b0615983eab00f40a7b94ab2606d8"
+  "hash": "d840ddf944d6eb85ee25c3aa44b7721f5393159ea209ff7d5c7800447e14948c"
 }

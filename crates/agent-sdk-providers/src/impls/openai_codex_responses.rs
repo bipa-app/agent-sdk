@@ -114,6 +114,8 @@ pub enum ReasoningEffort {
     /// Extra-high reasoning for complex problems
     #[serde(rename = "xhigh")]
     XHigh,
+    /// GPT-5.6 maximum reasoning effort
+    Max,
 }
 
 /// `OpenAI` Codex / `ChatGPT` subscription provider.
@@ -2271,7 +2273,7 @@ const fn resolve_reasoning_effort(config: &ThinkingConfig) -> Option<ReasoningEf
     }
 
     match &config.mode {
-        ThinkingMode::Adaptive => None,
+        ThinkingMode::Adaptive | ThinkingMode::Default => None,
         ThinkingMode::Enabled { budget_tokens } => Some(map_budget_to_reasoning(*budget_tokens)),
     }
 }
@@ -2281,7 +2283,8 @@ const fn map_effort(effort: Effort) -> ReasoningEffort {
         Effort::Low => ReasoningEffort::Low,
         Effort::Medium => ReasoningEffort::Medium,
         Effort::High => ReasoningEffort::High,
-        Effort::Max => ReasoningEffort::XHigh,
+        Effort::XHigh => ReasoningEffort::XHigh,
+        Effort::Max => ReasoningEffort::Max,
     }
 }
 
@@ -2290,7 +2293,8 @@ const fn map_reasoning_effort(effort: ReasoningEffort) -> Effort {
         ReasoningEffort::Low => Effort::Low,
         ReasoningEffort::Medium => Effort::Medium,
         ReasoningEffort::High => Effort::High,
-        ReasoningEffort::XHigh => Effort::Max,
+        ReasoningEffort::XHigh => Effort::XHigh,
+        ReasoningEffort::Max => Effort::Max,
     }
 }
 
@@ -3492,6 +3496,22 @@ mod tests {
         let reasoning =
             build_api_reasoning(Some(&ThinkingConfig::adaptive_with_effort(Effort::Low))).unwrap();
         assert!(matches!(reasoning.effort, ReasoningEffort::Low));
+    }
+
+    #[test]
+    fn test_build_api_reasoning_passes_effort_for_every_mode() {
+        for config in [
+            ThinkingConfig::adaptive_with_effort(Effort::XHigh),
+            ThinkingConfig::default_with_effort(Effort::XHigh),
+            ThinkingConfig::new(10_000).with_effort(Effort::XHigh),
+        ] {
+            let reasoning = build_api_reasoning(Some(&config)).unwrap();
+            assert_eq!(
+                reasoning.effort,
+                ReasoningEffort::XHigh,
+                "a configured effort must never be cancelled by the mode",
+            );
+        }
     }
 
     #[test]
