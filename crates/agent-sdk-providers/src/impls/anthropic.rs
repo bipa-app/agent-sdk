@@ -1824,6 +1824,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thinking_display_defaults_to_omitted_and_honors_the_override() {
+        let server = wiremock::MockServer::start().await;
+        let provider = AnthropicProvider::fable("sk-ant-api-test")
+            .with_thinking(ThinkingConfig::adaptive())
+            .with_base_url(server.uri());
+        let body =
+            captured_request_body(&provider, request_with_tools(vec![tool("read")]), &server).await;
+        assert_eq!(body["thinking"]["display"], "omitted");
+
+        let server = wiremock::MockServer::start().await;
+        let provider = AnthropicProvider::fable("sk-ant-api-test")
+            .with_thinking(
+                ThinkingConfig::adaptive()
+                    .with_display(agent_sdk_foundation::llm::ThinkingDisplay::Summarized),
+            )
+            .with_base_url(server.uri());
+        let body =
+            captured_request_body(&provider, request_with_tools(vec![tool("read")]), &server).await;
+        assert_eq!(
+            body["thinking"]["display"], "summarized",
+            "the configured display must reach the wire, got: {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn default_mode_effort_sends_output_config_without_thinking_block() {
         let server = wiremock::MockServer::start().await;
         let provider = AnthropicProvider::fable("sk-ant-api-test")

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\nUPDATE agent_sdk_turn_attempts SET\n    response_blob = ?2, response_id = ?3, response_model = ?4,\n    stop_reason = ?5, outcome = ?6, input_tokens = ?7, output_tokens = ?8,\n    cached_input_tokens = ?9, cache_creation_input_tokens = ?10,\n    route_provider = ?11, thinking_mode = ?12, thinking_budget_tokens = ?13,\n    thinking_effort = ?14, closed_at = ?15, duration_ms = ?16,\n    otel_trace_id = ?17, otel_span_id = ?18\nWHERE id = ?1\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 18
+    },
+    "nullable": []
+  },
+  "hash": "3f0baacf8feb4b3b43dea4bf602cb7df9334b65b985092aa3725eaca2b4bc709"
+}

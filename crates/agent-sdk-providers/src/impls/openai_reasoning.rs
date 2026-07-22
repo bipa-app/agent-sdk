@@ -543,6 +543,21 @@ mod tests {
     }
 
     #[test]
+    fn legacy_effort_is_passed_for_every_mode() {
+        for config in [
+            ThinkingConfig::adaptive_with_effort(Effort::Max),
+            ThinkingConfig::default_with_effort(Effort::Max),
+            ThinkingConfig::new(10_000).with_effort(Effort::Max),
+        ] {
+            assert_eq!(
+                legacy_reasoning_effort(&config),
+                Some(OpenAIReasoningEffort::Max),
+                "a configured effort must never be cancelled by the mode",
+            );
+        }
+    }
+
+    #[test]
     fn legacy_effort_maps_xhigh_and_max_exactly() {
         let xhigh = ThinkingConfig::adaptive_with_effort(Effort::XHigh);
         assert_eq!(

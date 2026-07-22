@@ -519,6 +519,7 @@ SELECT
     cache_creation_input_tokens,
     route_provider,
     thinking_mode,
+    thinking_budget_tokens,
     thinking_effort,
     opened_at,
     closed_at,
@@ -559,6 +560,7 @@ SELECT
     cache_creation_input_tokens,
     route_provider,
     thinking_mode,
+    thinking_budget_tokens,
     thinking_effort,
     opened_at,
     closed_at,
@@ -600,6 +602,7 @@ INSERT INTO agent_sdk_turn_attempts (
     cache_creation_input_tokens,
     route_provider,
     thinking_mode,
+    thinking_budget_tokens,
     thinking_effort,
     opened_at,
     closed_at,
@@ -608,7 +611,7 @@ INSERT INTO agent_sdk_turn_attempts (
     otel_span_id
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-    $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23
+    $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24
 )
 ",
             attempt.id.as_str(),
@@ -628,6 +631,7 @@ INSERT INTO agent_sdk_turn_attempts (
             optional_u32_to_i64(attempt.cache_creation_input_tokens),
             attempt.route_provider.clone(),
             optional_enum_to_wire(attempt.thinking_mode.as_ref())?,
+            optional_u32_to_i64(attempt.thinking_budget_tokens),
             optional_enum_to_wire(attempt.thinking_effort.as_ref())?,
             attempt.opened_at,
             attempt.closed_at,
@@ -665,12 +669,13 @@ SET
     cache_creation_input_tokens = $15,
     route_provider = $16,
     thinking_mode = $17,
-    thinking_effort = $18,
-    opened_at = $19,
-    closed_at = $20,
-    duration_ms = $21,
-    otel_trace_id = $22,
-    otel_span_id = $23
+    thinking_budget_tokens = $18,
+    thinking_effort = $19,
+    opened_at = $20,
+    closed_at = $21,
+    duration_ms = $22,
+    otel_trace_id = $23,
+    otel_span_id = $24
 WHERE id = $1
 ",
             attempt.id.as_str(),
@@ -690,6 +695,7 @@ WHERE id = $1
             optional_u32_to_i64(attempt.cache_creation_input_tokens),
             attempt.route_provider.clone(),
             optional_enum_to_wire(attempt.thinking_mode.as_ref())?,
+            optional_u32_to_i64(attempt.thinking_budget_tokens),
             optional_enum_to_wire(attempt.thinking_effort.as_ref())?,
             attempt.opened_at,
             attempt.closed_at,
@@ -4420,6 +4426,7 @@ SELECT
     cache_creation_input_tokens,
     route_provider,
     thinking_mode,
+    thinking_budget_tokens,
     thinking_effort,
     opened_at,
     closed_at,
@@ -5963,6 +5970,7 @@ struct TurnAttemptRecord {
     cache_creation_input_tokens: Option<i64>,
     route_provider: Option<String>,
     thinking_mode: Option<String>,
+    thinking_budget_tokens: Option<i64>,
     thinking_effort: Option<String>,
     opened_at: OffsetDateTime,
     closed_at: Option<OffsetDateTime>,
@@ -6013,6 +6021,10 @@ impl TryFrom<TurnAttemptRecord> for TurnAttempt {
             thinking_mode: record
                 .thinking_mode
                 .map(|value| enum_from_wire(&value, "turn attempt thinking_mode"))
+                .transpose()?,
+            thinking_budget_tokens: record
+                .thinking_budget_tokens
+                .map(|value| u32_from_i64(value, "turn attempt thinking_budget_tokens"))
                 .transpose()?,
             thinking_effort: record
                 .thinking_effort
@@ -6401,6 +6413,7 @@ mod tests {
             cache_creation_input_tokens: 0,
             route_provider: None,
             thinking_mode: None,
+            thinking_budget_tokens: None,
             thinking_effort: None,
         }
     }
@@ -6491,6 +6504,40 @@ mod tests {
                 database_url,
             },
         )))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn budget_mode_and_tokens_must_travel_together_in_the_check_constraint() -> Result<()> {
+        let Some((store, _schema_guard)) = test_store().await? else {
+            return Ok(());
+        };
+        let task = AgentTask::new_root_turn(thread_id("budget-coherence"), t0(), 3);
+        AgentTaskStore::submit_root_turn(&store, task.clone()).await?;
+
+        for (suffix, mode, tokens) in [
+            ("missing_tokens", "'budget'", "NULL"),
+            ("stray_tokens", "'adaptive'", "9000"),
+        ] {
+            let sql = format!(
+                "INSERT INTO agent_sdk_turn_attempts (
+                    id, task_id, attempt_number, provider, requested_model, request_blob,
+                    opened_at, thinking_mode, thinking_budget_tokens
+                ) VALUES ($1, $2, 1, 'anthropic', 'claude-sonnet-4-6', $3, $4, {mode}, {tokens})"
+            );
+            let result = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(format!("attempt_budget_{suffix}"))
+                .bind(task.id.as_str())
+                .bind(serde_json::json!({"messages": []}))
+                .bind(t0())
+                .execute(store.pool())
+                .await;
+            let error = result.expect_err("incoherent budget evidence must not persist");
+            assert!(
+                error.to_string().to_ascii_lowercase().contains("check"),
+                "unexpected error for {suffix}: {error}",
+            );
+        }
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

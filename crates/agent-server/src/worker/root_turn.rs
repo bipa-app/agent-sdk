@@ -314,6 +314,7 @@ impl ContentIds {
 struct AttemptEvidence {
     route_provider: String,
     thinking_mode: ThinkingModeEvidence,
+    thinking_budget_tokens: Option<u32>,
     thinking_effort: Option<agent_sdk_foundation::llm::Effort>,
 }
 
@@ -332,6 +333,10 @@ impl AttemptEvidence {
                 llm::ThinkingMode::Enabled { budget_tokens: _ } => ThinkingModeEvidence::Budget,
                 llm::ThinkingMode::Adaptive => ThinkingModeEvidence::Adaptive,
                 llm::ThinkingMode::Default => ThinkingModeEvidence::Default,
+            }),
+            thinking_budget_tokens: thinking.and_then(|config| match config.mode {
+                llm::ThinkingMode::Enabled { budget_tokens } => Some(budget_tokens),
+                llm::ThinkingMode::Adaptive | llm::ThinkingMode::Default => None,
             }),
             thinking_effort: thinking.and_then(|config| config.effort),
         }
@@ -1004,6 +1009,7 @@ pub(crate) async fn commit_partial_turn_on_cancel(
                 // route or effort it could truthfully name.
                 route_provider: None,
                 thinking_mode: None,
+                thinking_budget_tokens: None,
                 thinking_effort: None,
             },
             messages: prefix,
@@ -4171,6 +4177,7 @@ async fn close_attempt_with(
         cache_creation_input_tokens: usage.cache_creation_input_tokens,
         route_provider: evidence.map(|value| value.route_provider.clone()),
         thinking_mode: evidence.map(|value| value.thinking_mode),
+        thinking_budget_tokens: evidence.and_then(|value| value.thinking_budget_tokens),
         thinking_effort: evidence.and_then(|value| value.thinking_effort),
     };
     // Best-effort: if closing fails, the primary error is more important.
@@ -4373,6 +4380,7 @@ fn build_close_params(
         cache_creation_input_tokens: usage.cache_creation_input_tokens,
         route_provider: Some(evidence.route_provider.clone()),
         thinking_mode: Some(evidence.thinking_mode),
+        thinking_budget_tokens: evidence.thinking_budget_tokens,
         thinking_effort: evidence.thinking_effort,
     }
 }
@@ -6936,6 +6944,7 @@ mod tests {
             Some(ThinkingModeEvidence::Adaptive),
             "bare adaptive thinking must record the adaptive mode",
         );
+        assert_eq!(adaptive.thinking_budget_tokens, None);
         assert_eq!(adaptive.thinking_effort, None);
 
         let pinned = close_evidence_attempt(
@@ -6979,6 +6988,11 @@ mod tests {
             "close budgeted evidence attempt",
         )?;
         assert_eq!(budgeted.thinking_mode, Some(ThinkingModeEvidence::Budget));
+        assert_eq!(
+            budgeted.thinking_budget_tokens,
+            Some(8_000),
+            "budget mode must record the budget itself",
+        );
         assert_eq!(budgeted.thinking_effort, Some(llm::Effort::Medium));
         Ok(())
     }

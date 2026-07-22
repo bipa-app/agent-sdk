@@ -73,6 +73,7 @@ mod tests {
             cache_creation_input_tokens: 0,
             route_provider: None,
             thinking_mode: None,
+            thinking_budget_tokens: None,
             thinking_effort: None,
         }
     }
@@ -331,6 +332,7 @@ mod tests {
                     cache_creation_input_tokens: 0,
                     route_provider: None,
                     thinking_mode: None,
+                    thinking_budget_tokens: None,
                     thinking_effort: None,
                 },
                 t_plus(2),

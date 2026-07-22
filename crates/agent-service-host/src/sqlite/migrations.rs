@@ -250,7 +250,7 @@ mod tests {
         crate::migration_contract::assert_additive_nullable_migration(
             TURN_ATTEMPT_EVIDENCE_SQL,
             "agent_sdk_turn_attempts",
-            4,
+            5,
         );
     }
 }

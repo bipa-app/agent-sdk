@@ -119,10 +119,6 @@ impl TurnAttemptOutcome {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Resolved effort
-// ─────────────────────────────────────────────────────────────────────
-
-// ─────────────────────────────────────────────────────────────────────
 // Errors
 // ─────────────────────────────────────────────────────────────────────
 
@@ -156,6 +152,14 @@ pub enum TurnAttemptSchemaError {
     /// An effort was recorded without a thinking mode that carries one.
     #[error("thinking effort requires a thinking mode other than off")]
     EffortWithoutThinking,
+
+    /// A budget-mode row is missing its token budget.
+    #[error("budget thinking mode requires thinking_budget_tokens")]
+    BudgetModeWithoutTokens,
+
+    /// A token budget was recorded for a non-budget mode.
+    #[error("thinking_budget_tokens requires the budget thinking mode")]
+    TokensWithoutBudgetMode,
 }
 
 /// Thinking mode the dispatched request used, as the durable row records
@@ -168,7 +172,7 @@ pub enum ThinkingModeEvidence {
     /// Thinking at the provider's default depth: no explicit budget, not
     /// adaptive.
     Default,
-    /// An explicit token budget; the budget itself lives in `request_blob`.
+    /// An explicit token budget, recorded in `thinking_budget_tokens`.
     Budget,
     /// The provider chose the depth.
     Adaptive,
@@ -194,7 +198,7 @@ pub enum ThinkingModeEvidence {
 /// | Response | `response_blob`, `response_id`, `response_model` |
 /// | Outcome | `stop_reason`, `outcome` |
 /// | Usage | `input_tokens`, `output_tokens`, `cached_input_tokens`, `cache_creation_input_tokens` |
-/// | Routing | `route_provider`, `thinking_mode`, `thinking_effort` |
+/// | Routing | `route_provider`, `thinking_mode`, `thinking_budget_tokens`, `thinking_effort` |
 /// | Timing | `opened_at`, `closed_at`, `duration_ms` |
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TurnAttempt {
@@ -279,6 +283,11 @@ pub struct TurnAttempt {
     #[serde(default)]
     pub thinking_mode: Option<ThinkingModeEvidence>,
 
+    /// Token budget the dispatched request carried. Present exactly when
+    /// the mode is [`ThinkingModeEvidence::Budget`].
+    #[serde(default)]
+    pub thinking_budget_tokens: Option<u32>,
+
     /// Thinking effort the request carried at dispatch. Orthogonal to the
     /// mode: an adaptive request may still pin a level. `None` while open,
     /// on legacy rows, and when the request carried no effort level.
@@ -348,6 +357,7 @@ impl TurnAttempt {
             cache_creation_input_tokens: None,
             route_provider: None,
             thinking_mode: None,
+            thinking_budget_tokens: None,
             thinking_effort: None,
             opened_at: params.now,
             closed_at: None,
@@ -389,6 +399,7 @@ impl TurnAttempt {
         self.cache_creation_input_tokens = Some(params.cache_creation_input_tokens);
         self.route_provider = params.route_provider;
         self.thinking_mode = params.thinking_mode;
+        self.thinking_budget_tokens = params.thinking_budget_tokens;
         self.thinking_effort = params.thinking_effort;
         self.closed_at = Some(now);
 
@@ -457,6 +468,7 @@ impl TurnAttempt {
                 || self.cache_creation_input_tokens.is_some()
                 || self.route_provider.is_some()
                 || self.thinking_mode.is_some()
+                || self.thinking_budget_tokens.is_some()
                 || self.thinking_effort.is_some()
             {
                 return Err(TurnAttemptSchemaError::ResponseOnOpenAttempt);
@@ -477,6 +489,13 @@ impl TurnAttempt {
             )
         {
             return Err(TurnAttemptSchemaError::EffortWithoutThinking);
+        }
+        let budget_mode = matches!(self.thinking_mode, Some(ThinkingModeEvidence::Budget));
+        if budget_mode && self.thinking_budget_tokens.is_none() {
+            return Err(TurnAttemptSchemaError::BudgetModeWithoutTokens);
+        }
+        if !budget_mode && self.thinking_budget_tokens.is_some() {
+            return Err(TurnAttemptSchemaError::TokensWithoutBudgetMode);
         }
 
         Ok(())
@@ -542,6 +561,8 @@ pub struct CloseAttemptParams {
     /// Thinking mode the dispatched request used, when evidence was
     /// captured.
     pub thinking_mode: Option<ThinkingModeEvidence>,
+    /// Token budget the dispatched request carried; budget mode only.
+    pub thinking_budget_tokens: Option<u32>,
     /// Thinking effort the dispatched request carried.
     pub thinking_effort: Option<agent_sdk_foundation::llm::Effort>,
 }
@@ -595,6 +616,7 @@ mod tests {
             cache_creation_input_tokens: 20,
             route_provider: Some("anthropic".into()),
             thinking_mode: Some(ThinkingModeEvidence::Adaptive),
+            thinking_budget_tokens: None,
             thinking_effort: Some(agent_sdk_foundation::llm::Effort::High),
         }
     }
@@ -952,6 +974,37 @@ mod tests {
     }
 
     #[test]
+    fn close_rejects_budget_mode_without_tokens() {
+        let attempt = TurnAttempt::open(sample_open_params());
+        let error = attempt
+            .close(
+                CloseAttemptParams {
+                    thinking_mode: Some(ThinkingModeEvidence::Budget),
+                    thinking_budget_tokens: None,
+                    ..sample_close_params()
+                },
+                t_plus(1),
+            )
+            .expect_err("a budget-mode close without tokens must be rejected");
+        assert_eq!(error, TurnAttemptSchemaError::BudgetModeWithoutTokens);
+    }
+
+    #[test]
+    fn close_rejects_tokens_without_budget_mode() {
+        let attempt = TurnAttempt::open(sample_open_params());
+        let error = attempt
+            .close(
+                CloseAttemptParams {
+                    thinking_budget_tokens: Some(10_000),
+                    ..sample_close_params()
+                },
+                t_plus(1),
+            )
+            .expect_err("tokens on a non-budget close must be rejected");
+        assert_eq!(error, TurnAttemptSchemaError::TokensWithoutBudgetMode);
+    }
+
+    #[test]
     fn close_rejects_an_effort_without_a_carrying_mode() {
         let attempt = TurnAttempt::open(sample_open_params());
         let error = attempt
@@ -998,6 +1051,7 @@ mod tests {
                     cache_creation_input_tokens: 0,
                     route_provider: None,
                     thinking_mode: None,
+                    thinking_budget_tokens: None,
                     thinking_effort: None,
                 },
                 t_plus(1),
@@ -1026,6 +1080,7 @@ mod tests {
                     cache_creation_input_tokens: 0,
                     route_provider: None,
                     thinking_mode: None,
+                    thinking_budget_tokens: None,
                     thinking_effort: None,
                 },
                 t_plus(1),

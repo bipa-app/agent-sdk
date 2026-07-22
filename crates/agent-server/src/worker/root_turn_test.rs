@@ -7053,6 +7053,7 @@ fn salvage_close_params() -> CloseAttemptParams {
         cache_creation_input_tokens: 0,
         route_provider: None,
         thinking_mode: None,
+        thinking_budget_tokens: None,
         thinking_effort: None,
     }
 }
@@ -7799,6 +7800,7 @@ async fn lost_ownership_rejection_settles_the_open_attempt() -> Result<()> {
             cache_creation_input_tokens: 0,
             route_provider: None,
             thinking_mode: None,
+            thinking_budget_tokens: None,
             thinking_effort: None,
         },
         messages: vec![],

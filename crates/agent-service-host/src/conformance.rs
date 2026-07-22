@@ -484,6 +484,7 @@ mod tests {
             thinking_mode: Some(
                 agent_server::journal::turn_attempt::ThinkingModeEvidence::Adaptive,
             ),
+            thinking_budget_tokens: None,
             thinking_effort: Some(agent_sdk_foundation::llm::Effort::XHigh),
         }
     }
@@ -642,6 +643,7 @@ mod tests {
                 cache_creation_input_tokens: 0,
                 route_provider: None,
                 thinking_mode: None,
+                thinking_budget_tokens: None,
                 thinking_effort: None,
             },
             messages: vec![agent_sdk_foundation::llm::Message::assistant("guarded")],
@@ -820,6 +822,7 @@ mod tests {
                 cache_creation_input_tokens: 0,
                 route_provider: None,
                 thinking_mode: None,
+                thinking_budget_tokens: None,
                 thinking_effort: None,
             },
             messages: vec![agent_sdk_foundation::llm::Message::assistant("stale")],

@@ -3629,6 +3629,22 @@ mod tests {
     }
 
     #[test]
+    fn test_build_api_reasoning_passes_effort_for_every_mode() {
+        for config in [
+            ThinkingConfig::adaptive_with_effort(Effort::XHigh),
+            ThinkingConfig::default_with_effort(Effort::XHigh),
+            ThinkingConfig::new(10_000).with_effort(Effort::XHigh),
+        ] {
+            let reasoning = build_api_reasoning(Some(&config)).unwrap();
+            assert_eq!(
+                reasoning.effort,
+                ReasoningEffort::XHigh,
+                "a configured effort must never be cancelled by the mode",
+            );
+        }
+    }
+
+    #[test]
     fn test_build_api_reasoning_omits_adaptive_without_effort() {
         assert!(build_api_reasoning(Some(&ThinkingConfig::adaptive())).is_none());
     }

@@ -600,6 +600,13 @@ const AGENT_SDK_TURN_ATTEMPT_COLUMNS: &[ColumnContract] = &[
                 'budget' | 'adaptive'. NULL while open and on legacy rows.",
     },
     ColumnContract {
+        name: "thinking_budget_tokens",
+        sql_type: "BIGINT",
+        nullable: true,
+        notes: "Token budget the dispatched request carried; set exactly when \
+                thinking_mode = 'budget'.",
+    },
+    ColumnContract {
         name: "thinking_effort",
         sql_type: "TEXT",
         nullable: true,

@@ -2141,6 +2141,7 @@ async fn commit_one_turn<S: JournalStore>(
                 cache_creation_input_tokens: 0,
                 route_provider: None,
                 thinking_mode: None,
+                thinking_budget_tokens: None,
                 thinking_effort: None,
             },
             // replace_history semantics: the checkpoint stores the full
