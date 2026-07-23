@@ -595,10 +595,9 @@ mod in_memory_bundle {
         async fn begin_purge(
             &self,
             thread_id: &ThreadId,
-            scope: crate::journal::PurgeScope,
-            now: OffsetDateTime,
-        ) -> Result<Option<crate::journal::PurgeReceipt>> {
-            self.thread.begin_purge(thread_id, scope, now).await
+            seed: crate::journal::PurgeSeed,
+        ) -> Result<crate::journal::BeginPurge> {
+            self.thread.begin_purge(thread_id, seed).await
         }
         async fn finish_purge(
             &self,
