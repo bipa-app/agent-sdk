@@ -2179,6 +2179,7 @@ mod tests {
                 result_json,
             }),
             max_queued_depth,
+            disposition: agent_server::journal::store::SubmitDisposition::NextTurn,
         }
     }
 

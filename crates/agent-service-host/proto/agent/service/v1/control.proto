@@ -58,6 +58,14 @@ message GetTaskResponse {
   TaskSnapshot task = 1;
 }
 
+enum SubmitDisposition {
+  // Default: preserve the existing same-thread FIFO root queue.
+  SUBMIT_DISPOSITION_NEXT_TURN = 0;
+  // Deliver into a running root at its next safe between-call boundary.
+  // If no root turn is running, the server degrades this to NEXT_TURN.
+  SUBMIT_DISPOSITION_INJECT_AT_BOUNDARY = 1;
+}
+
 message SubmitThreadWorkRequest {
   // Caller-supplied idempotency key for the logical submission.
   string request_id = 1;
@@ -79,6 +87,12 @@ message SubmitThreadWorkRequest {
   // the definition's static tool list is used). Additive and optional — a
   // client that never sets it observes no behavior change.
   string caller_metadata = 4;
+
+  // Execution disposition. NEXT_TURN is the wire default and is byte-for-byte
+  // compatible with clients that predate this field. INJECT_AT_BOUNDARY is
+  // delivered only between LLM calls (including resume-from-children); when no
+  // root turn is running it degrades to NEXT_TURN.
+  SubmitDisposition disposition = 5;
 }
 
 message SubmitThreadWorkResponse {

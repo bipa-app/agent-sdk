@@ -50,6 +50,15 @@ use crate::journal::task::SubmittedInputItem;
 /// worker and the resume path never drift.
 pub const RESUME_AUDIT_PROMPT: &str = "<resume>";
 
+/// Boundary-injection placeholder for the worker's audit blob.
+///
+/// Synthetic `attempt_user_prompt` value used when a turn opens an extra LLM
+/// call to deliver input that arrived mid-turn. Distinct from
+/// [`RESUME_AUDIT_PROMPT`] so audit readers can tell a resume-from-children
+/// call apart from a steering injection, and a constant for the same reason
+/// that one is: the sentinel consumers grep for must be the sentinel written.
+pub const BOUNDARY_INJECTION_AUDIT_PROMPT: &str = "<boundary-injection>";
+
 /// Typed user input for a root-turn entry.
 ///
 /// Wraps the [`ContentBlock`] vector that the worker hands to

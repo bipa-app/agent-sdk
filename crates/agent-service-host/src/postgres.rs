@@ -25,7 +25,8 @@ mod tests {
     use anyhow::{Context, Result, ensure};
 
     use super::migrations::{
-        DURABLE_CORE_MIGRATOR, TASK_TERMINAL_REASON_MIGRATION_VERSION, durable_core_migrations,
+        DURABLE_CORE_MIGRATOR, INPUT_INJECTION_KIND_MIGRATION_VERSION,
+        TASK_TERMINAL_REASON_MIGRATION_VERSION, durable_core_migrations,
         event_journal_outbox_migration, outbox_message_kind_migration, tool_audit_events_migration,
     };
     use super::repository::{
@@ -96,6 +97,11 @@ mod tests {
             versions.contains(&TASK_TERMINAL_REASON_MIGRATION_VERSION),
             "bundle is missing this PR's migration \
              {TASK_TERMINAL_REASON_MIGRATION_VERSION}, got {versions:?}",
+        );
+        ensure!(
+            versions.contains(&INPUT_INJECTION_KIND_MIGRATION_VERSION),
+            "bundle is missing this PR's migration \
+             {INPUT_INJECTION_KIND_MIGRATION_VERSION}, got {versions:?}",
         );
         Ok(())
     }

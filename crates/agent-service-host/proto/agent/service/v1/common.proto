@@ -23,6 +23,7 @@ enum TaskKind {
   TASK_KIND_ROOT_TURN = 1;
   TASK_KIND_TOOL_RUNTIME = 2;
   TASK_KIND_SUBAGENT = 3;
+  TASK_KIND_INPUT_INJECTION = 4;
 }
 
 enum TaskStatus {

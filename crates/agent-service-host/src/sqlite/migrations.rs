@@ -78,10 +78,15 @@ const TASK_TERMINAL_REASON_SQL: &str = include_str!(concat!(
     "/migrations/sqlite/0014_task_terminal_reason.sql"
 ));
 
+const INPUT_INJECTION_KIND_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/sqlite/0016_input_injection_kind.sql"
+));
+
 /// `sqlx`-managed migration bundle for the `SQLite` durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/sqlite");
 
-const MIGRATIONS: [SqliteMigration; 14] = [
+const MIGRATIONS: [SqliteMigration; 15] = [
     SqliteMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -152,6 +157,11 @@ const MIGRATIONS: [SqliteMigration; 14] = [
         summary: "typed reason required on every terminal task row",
         sql: TASK_TERMINAL_REASON_SQL,
     },
+    SqliteMigration {
+        version: "0016",
+        summary: "input-injection task kind for durable boundary delivery",
+        sql: INPUT_INJECTION_KIND_SQL,
+    },
 ];
 
 /// Version of the migration this PR introduces: the typed terminal
@@ -161,6 +171,11 @@ const MIGRATIONS: [SqliteMigration; 14] = [
 /// without pinning the versions its sibling PRs own.
 #[cfg(test)]
 pub(crate) const TASK_TERMINAL_REASON_MIGRATION_VERSION: i64 = 14;
+
+/// Version of the migration this PR introduces: the durable
+/// input-injection task kind.
+#[cfg(test)]
+pub(crate) const INPUT_INJECTION_KIND_MIGRATION_VERSION: i64 = 16;
 
 /// The reviewable executable migration bundle for the `SQLite` durable core.
 #[must_use]

@@ -148,6 +148,10 @@ pub enum AgentEvent {
         /// `ContentBlock` type lets the field round-trip through
         /// the same wire shapes the projection uses.
         content: Vec<ContentBlock>,
+        /// Durable task that admitted this input. Present for boundary
+        /// injections; absent on ordinary root prompts and legacy rows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emitter_task_id: Option<String>,
     },
 
     /// Agent is "thinking" - complete thinking text after stream ends
@@ -460,6 +464,9 @@ impl AgentEvent {
             Self::Start {
                 emitter_task_id, ..
             }
+            | Self::UserInput {
+                emitter_task_id, ..
+            }
             | Self::TurnComplete {
                 emitter_task_id, ..
             }
@@ -489,6 +496,9 @@ impl AgentEvent {
             Self::Start {
                 emitter_task_id, ..
             }
+            | Self::UserInput {
+                emitter_task_id, ..
+            }
             | Self::TurnComplete {
                 emitter_task_id, ..
             }
@@ -510,7 +520,11 @@ impl AgentEvent {
 
     #[must_use]
     pub const fn user_input(thread_id: ThreadId, content: Vec<ContentBlock>) -> Self {
-        Self::UserInput { thread_id, content }
+        Self::UserInput {
+            thread_id,
+            content,
+            emitter_task_id: None,
+        }
     }
 
     #[must_use]
@@ -1332,6 +1346,7 @@ mod tests {
             AgentEvent::UserInput {
                 thread_id: thread.clone(),
                 content: vec![ContentBlock::Text { text: "hi".into() }],
+                emitter_task_id: None,
             },
         ]
     }
