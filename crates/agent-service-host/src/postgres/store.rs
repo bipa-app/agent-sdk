@@ -61,9 +61,10 @@ use agent_server::journal::relay::{
 use agent_server::journal::retention::{RetentionCursor, RetentionStore};
 use agent_server::journal::store::{
     AgentTaskStore, CancelTreeOutcome, ChildProbe, MixedChildrenSpawn, RequeueOutcome,
-    SpawnedMixedChildren, SubagentBatchSpawn, SubagentInvocationSpawn, SubmitRootIdempotency,
-    SubmitRootTurnError, SubmitRootTurnOutcome, SubmitRootTurnParams,
-    mixed_child_ids_in_slot_order, new_mixed_tool_child, validate_mixed_children_spawn,
+    SpawnedMixedChildren, SubagentBatchSpawn, SubagentInvocationSpawn, SubmitDisposition,
+    SubmitRootIdempotency, SubmitRootTurnError, SubmitRootTurnOutcome, SubmitRootTurnParams,
+    mixed_child_ids_in_slot_order, new_mixed_tool_child, submitted_task_disposition,
+    validate_mixed_children_spawn,
 };
 use agent_server::journal::subagent_spawn_transaction::{
     AtomicSubagentSpawnCommitter, SubagentSpawnCommit, SubagentSpawnEvent, SubagentSpawnOutcome,
@@ -1131,6 +1132,7 @@ WHERE thread_id = $1
             .await
             .map_err(SubmitRootTurnError::Other)?;
         Ok(Some(SubmitRootTurnOutcome {
+            disposition: submitted_task_disposition(&admitted),
             task: admitted,
             replayed: true,
             replayed_result: Some(row.result_json),
@@ -1166,10 +1168,15 @@ WHERE thread_id = $1
     async fn commit_fresh_admission_tx(
         mut tx: Transaction<'_, Postgres>,
         task: AgentTask,
+        injection_parent: Option<AgentTask>,
         would_queue: bool,
         idempotency: Option<SubmitRootIdempotency>,
     ) -> std::result::Result<SubmitRootTurnOutcome, SubmitRootTurnError> {
-        let admitted = if would_queue {
+        let admitted = if let Some(parent) = injection_parent {
+            task.into_input_injection(&parent)
+                .context("submit injection rejected: invalid parent linkage")
+                .map_err(SubmitRootTurnError::Other)?
+        } else if would_queue {
             let created_at = task.created_at;
             task.admit_as_queued(created_at)
                 .context("submit_root_turn rejected: cannot admit as queued")
@@ -1217,6 +1224,7 @@ WHERE thread_id = $1
             .context("commit submit_root_turn_idempotent")
             .map_err(SubmitRootTurnError::Other)?;
         Ok(SubmitRootTurnOutcome {
+            disposition: submitted_task_disposition(&admitted),
             task: admitted,
             replayed: false,
             replayed_result: None,
@@ -2448,6 +2456,64 @@ fn validate_subagent_spawn_parent(
     Ok(())
 }
 
+/// The thread's active (non-queued, non-terminal) root turn, if any.
+///
+/// Generic over the executor so the admission transaction and the pooled
+/// trait method share one compile-checked statement instead of drifting into
+/// two orderings — the deterministic `ORDER BY created_at, id` is what makes
+/// "the active root" a single well-defined row for both callers.
+async fn active_root_for_thread_exec<'e, E>(
+    executor: E,
+    thread_id: &ThreadId,
+) -> Result<Option<AgentTask>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let record = sqlx::query_as!(
+        TaskRecord,
+        r"
+SELECT
+    id,
+    kind,
+    status,
+    parent_id,
+    root_id,
+    depth,
+    thread_id,
+    submitted_input_json,
+    caller_metadata_json,
+    worker_id,
+    lease_id,
+    lease_expires_at,
+    last_heartbeat_at,
+    state_json,
+    attempt,
+    max_attempts,
+    last_error,
+    terminal_reason_json,
+    pending_child_count,
+    spawn_index,
+    result_payload,
+    otel_traceparent,
+    created_at,
+    updated_at,
+    completed_at,
+    last_activity_at
+FROM agent_sdk_tasks
+WHERE thread_id = $1
+  AND kind = 'root_turn'
+  AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation')
+ORDER BY created_at, id
+LIMIT 1
+",
+        thread_key(thread_id),
+    )
+    .fetch_optional(executor)
+    .await
+    .with_context(|| format!("load active root for {thread_id}"))?;
+    record.map(TryInto::try_into).transpose()
+}
+
 async fn ensure_child_thread_available_for_spawn_tx(
     tx: &mut Transaction<'_, Postgres>,
     child_thread_id: &ThreadId,
@@ -2699,6 +2765,7 @@ SELECT EXISTS (
             task,
             idempotency,
             max_queued_depth,
+            disposition,
         } = params;
         agent_server::journal::store::validate_submit_root_shape(&task)?;
 
@@ -2753,8 +2820,16 @@ SELECT EXISTS (
             )));
         }
 
-        let thread_has_blocking_root = sqlx::query_scalar!(
-            r#"
+        // A `NextTurn` submit only needs to know *whether* the thread holds an
+        // active root, so it keeps the cheap existence probe: reading the row
+        // would put every concurrent submit behind the same tuple for the rest
+        // of the transaction, which the unchanged back-pressure path must not
+        // pay for. Only an injection request, which has to inspect the root's
+        // status to decide parentage, reads it.
+        let (thread_has_blocking_root, active_root) = match disposition {
+            SubmitDisposition::NextTurn => (
+                sqlx::query_scalar!(
+                    r#"
 SELECT EXISTS (
     SELECT 1
     FROM agent_sdk_tasks
@@ -2763,20 +2838,34 @@ SELECT EXISTS (
       AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation')
 ) AS "exists!"
 "#,
-            thread_key(&task.thread_id),
+                    thread_key(&task.thread_id),
+                )
+                .fetch_one(&mut *tx)
+                .await
+                .with_context(|| format!("check active root slot for {}", task.thread_id))
+                .map_err(SubmitRootTurnError::Other)?,
+                None,
+            ),
+            SubmitDisposition::InjectAtBoundary => {
+                let root = active_root_for_thread_exec(&mut *tx, &task.thread_id)
+                    .await
+                    .map_err(SubmitRootTurnError::Other)?;
+                (root.is_some(), root)
+            }
+        };
+        let injection_parent = agent_server::journal::store::resolve_injection_parent(
+            disposition,
+            active_root.as_ref(),
         )
-        .fetch_one(&mut *tx)
-        .await
-        .with_context(|| format!("check active root slot for {}", task.thread_id))
-        .map_err(SubmitRootTurnError::Other)?;
+        .cloned();
 
         let current_queued = Self::queued_root_count_tx(&mut tx, &task.thread_id)
             .await
             .map_err(SubmitRootTurnError::Other)?;
 
-        // 2. Back-pressure: reject a submission that would be queued and
-        // push the queued depth past the cap before any write.
-        let would_queue = thread_has_blocking_root || current_queued > 0;
+        // Back-pressure applies only when the request remains a future root.
+        let would_queue =
+            injection_parent.is_none() && (thread_has_blocking_root || current_queued > 0);
         if let Some(cap) = max_queued_depth
             && would_queue
             && current_queued >= cap
@@ -2789,7 +2878,7 @@ SELECT EXISTS (
         }
 
         // 3. Admit, claim the idempotency key, and commit — all atomic.
-        Self::commit_fresh_admission_tx(tx, task, would_queue, idempotency).await
+        Self::commit_fresh_admission_tx(tx, task, injection_parent, would_queue, idempotency).await
     }
 
     async fn claim_idempotency(
@@ -2970,6 +3059,28 @@ ORDER BY created_at, id
         records.into_iter().map(TryInto::try_into).collect()
     }
 
+    async fn complete_input_injection(
+        &self,
+        id: &AgentTaskId,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>> {
+        let mut tx = self.begin().await?;
+        let Some(old) = Self::load_task_tx(&mut tx, id, true).await? else {
+            return Ok(None);
+        };
+        if old.kind != TaskKind::InputInjection || old.status != TaskStatus::Queued {
+            return Ok(None);
+        }
+        let completed = old
+            .complete_input_injection(now)
+            .context("complete input injection transition failed")?;
+        Self::update_task_tx(&mut tx, &completed).await?;
+        tx.commit()
+            .await
+            .context("commit input injection delivery")?;
+        Ok(Some(completed))
+    }
+
     /// ADR-0003 I5 — bounded. Two indexed reads on `parent_id`, neither of
     /// which grows with retained terminal history: an `EXISTS` for a fresh sign
     /// of life across ALL children, and at most `live_limit` NON-terminal rows
@@ -3073,49 +3184,7 @@ ORDER BY created_at, id
     }
 
     async fn active_root_for_thread(&self, thread_id: &ThreadId) -> Result<Option<AgentTask>> {
-        let record = sqlx::query_as!(
-            TaskRecord,
-            r"
-SELECT
-    id,
-    kind,
-    status,
-    parent_id,
-    root_id,
-    depth,
-    thread_id,
-    submitted_input_json,
-    caller_metadata_json,
-    worker_id,
-    lease_id,
-    lease_expires_at,
-    last_heartbeat_at,
-    state_json,
-    attempt,
-    max_attempts,
-    last_error,
-    terminal_reason_json,
-    pending_child_count,
-    spawn_index,
-    result_payload,
-    otel_traceparent,
-    created_at,
-    updated_at,
-    completed_at,
-    last_activity_at
-FROM agent_sdk_tasks
-WHERE thread_id = $1
-  AND kind = 'root_turn'
-  AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation')
-ORDER BY created_at, id
-LIMIT 1
-",
-            thread_key(thread_id),
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .with_context(|| format!("load active root for {thread_id}"))?;
-        record.map(TryInto::try_into).transpose()
+        active_root_for_thread_exec(&self.pool, thread_id).await
     }
 
     async fn list_queued_roots(&self, thread_id: &ThreadId) -> Result<Vec<AgentTask>> {
@@ -8461,6 +8530,7 @@ INSERT INTO agent_sdk_turn_attempts (
                 result_json,
             }),
             max_queued_depth,
+            disposition: SubmitDisposition::NextTurn,
         }
     }
 

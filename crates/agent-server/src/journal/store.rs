@@ -489,6 +489,18 @@ pub struct SubmitRootIdempotency {
     pub result_json: serde_json::Value,
 }
 
+/// Engine-owned disposition for a submitted root-turn input.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SubmitDisposition {
+    /// Preserve the existing same-thread FIFO queued-root behavior.
+    #[default]
+    NextTurn,
+    /// Attach input to a running root for delivery at its next safe LLM
+    /// boundary. If no root turn has started, admission degrades to
+    /// [`Self::NextTurn`].
+    InjectAtBoundary,
+}
+
 /// Parameters for [`AgentTaskStore::submit_root_turn_idempotent`].
 ///
 /// Phase 10 · E bundles the durable idempotency claim and the
@@ -507,6 +519,9 @@ pub struct SubmitRootTurnParams {
     /// [`SubmitRootTurnError::QueueDepthExceeded`]. `None` disables the
     /// cap.
     pub max_queued_depth: Option<u32>,
+    /// Whether this input should queue as a future root or enter the
+    /// currently running root at its next safe boundary.
+    pub disposition: SubmitDisposition,
 }
 
 /// Successful outcome of [`AgentTaskStore::submit_root_turn_idempotent`].
@@ -524,6 +539,9 @@ pub struct SubmitRootTurnOutcome {
     /// (excludes the active/blocking root). Surfaced to the caller so
     /// at-least-once clients can observe back-pressure.
     pub queued_depth: u32,
+    /// Effective disposition after applying the documented no-running-turn
+    /// degradation rule.
+    pub disposition: SubmitDisposition,
 }
 
 /// Outcome of [`AgentTaskStore::requeue_owned_task`].
@@ -602,6 +620,40 @@ impl From<anyhow::Error> for SubmitRootTurnError {
 /// in-memory reference store applies the same cap so the drain
 /// contract is testable without a database.
 pub const LEASE_RELEASE_BATCH: usize = 256;
+
+/// Derive a persisted submission's effective disposition from its task kind.
+#[must_use]
+pub const fn submitted_task_disposition(task: &AgentTask) -> SubmitDisposition {
+    match task.kind {
+        TaskKind::InputInjection => SubmitDisposition::InjectAtBoundary,
+        TaskKind::RootTurn | TaskKind::ToolRuntime | TaskKind::Subagent => {
+            SubmitDisposition::NextTurn
+        }
+    }
+}
+
+/// Decide which root, if any, a submitted input attaches to as a boundary
+/// injection.
+///
+/// Returns `Some(root)` only when the caller asked for
+/// [`SubmitDisposition::InjectAtBoundary`] **and** the thread's active root has
+/// actually started ([`AgentTask::has_started`]). Every other combination
+/// yields `None`, which is the documented degrade-to-[`SubmitDisposition::NextTurn`]
+/// rule: with nothing running there is no boundary to inject at, so the input
+/// becomes a future root turn instead.
+///
+/// Shared by all three backends so a new [`SubmitDisposition`] variant is a
+/// single-site change, and so the policy is testable without a database.
+#[must_use]
+pub const fn resolve_injection_parent(
+    disposition: SubmitDisposition,
+    active_root: Option<&AgentTask>,
+) -> Option<&AgentTask> {
+    match (disposition, active_root) {
+        (SubmitDisposition::InjectAtBoundary, Some(root)) if root.has_started() => Some(root),
+        (SubmitDisposition::NextTurn | SubmitDisposition::InjectAtBoundary, _) => None,
+    }
+}
 
 /// Shared shape gate for root-turn admission.
 ///
@@ -1001,6 +1053,18 @@ pub trait AgentTaskStore: Send + Sync {
     /// # Errors
     /// Returns an error if the store cannot be queried.
     async fn list_children(&self, parent_id: &AgentTaskId) -> Result<Vec<AgentTask>>;
+
+    /// Mark one queued input-injection child delivered at a safe execution
+    /// boundary. The queued → completed CAS makes repeated boundary scans
+    /// idempotent and lets `cancel_tree` win cleanly before delivery.
+    ///
+    /// Returns `None` when the row is already terminal or is not an
+    /// input-injection, so a restart can repeat the drain safely.
+    async fn complete_input_injection(
+        &self,
+        id: &AgentTaskId,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>>;
 
     /// The direct children of `parent_id`, read for the subagent stall probe
     /// with the READ ITSELF BOUNDED (ADR-0003 I5).
@@ -3315,6 +3379,28 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         Ok(result)
     }
 
+    async fn complete_input_injection(
+        &self,
+        id: &AgentTaskId,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>> {
+        let mut inner = self.inner.write().await;
+        let Some(old) = inner.by_id.get(id).cloned() else {
+            return Ok(None);
+        };
+        if old.kind != TaskKind::InputInjection || old.status != TaskStatus::Queued {
+            return Ok(None);
+        }
+        let completed = old
+            .clone()
+            .complete_input_injection(now)
+            .context("complete input injection transition failed")?;
+        inner.rebalance_after_row_change(&old, &completed);
+        inner.by_id.insert(completed.id.clone(), completed.clone());
+        drop(inner);
+        Ok(Some(completed))
+    }
+
     async fn list_by_status(&self, status: TaskStatus) -> Result<Vec<AgentTask>> {
         let inner = self.inner.read().await;
         let result: Vec<AgentTask> = inner
@@ -3393,6 +3479,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             task,
             idempotency,
             max_queued_depth,
+            disposition,
         } = params;
         validate_submit_root_shape(&task)?;
 
@@ -3420,6 +3507,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             let queued_depth = inner.queued_root_count(&admitted.thread_id);
             drop(inner);
             return Ok(SubmitRootTurnOutcome {
+                disposition: submitted_task_disposition(&admitted),
                 task: admitted,
                 replayed: true,
                 replayed_result: Some(recorded.result_json),
@@ -3434,16 +3522,18 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             )));
         }
 
-        let has_blocking = inner.thread_has_blocking_root(&task.thread_id);
+        let active_root = inner
+            .active_root_by_thread
+            .get(&task.thread_id)
+            .and_then(|id| inner.by_id.get(id))
+            .cloned();
         let current_queued = inner.queued_root_count(&task.thread_id);
+        let injection_parent = resolve_injection_parent(disposition, active_root.as_ref());
 
-        // 2. Back-pressure: a submission that would be *queued* (the
-        // thread already holds the active slot or has queued roots) and
-        // would push the queued depth past the cap is rejected before
-        // anything is written. A submission that lands in the active
-        // slot (no blocking root, no queued roots) never counts against
-        // the cap.
-        let would_queue = has_blocking || current_queued > 0;
+        // Back-pressure applies only to future root turns. An injection is a
+        // child of the running root and does not consume the queued-root cap.
+        let would_queue =
+            injection_parent.is_none() && (active_root.is_some() || current_queued > 0);
         if let Some(cap) = max_queued_depth
             && would_queue
             && current_queued >= cap
@@ -3454,7 +3544,10 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             });
         }
 
-        let admitted = if would_queue {
+        let admitted = if let Some(parent) = injection_parent {
+            task.into_input_injection(parent)
+                .context("submit injection rejected: invalid parent linkage")?
+        } else if would_queue {
             let created_at = task.created_at;
             task.admit_as_queued(created_at)
                 .context("submit_root_turn rejected: cannot admit as queued")?
@@ -3481,6 +3574,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         let queued_depth = inner.queued_root_count(&admitted.thread_id);
         drop(inner);
         Ok(SubmitRootTurnOutcome {
+            disposition: submitted_task_disposition(&admitted),
             task: admitted,
             replayed: false,
             replayed_result: None,
@@ -4870,6 +4964,42 @@ mod tests {
 
     fn fresh_root(name: &str) -> AgentTask {
         AgentTask::new_root_turn(thread(name), t0(), 3)
+    }
+
+    /// The disposition→parent policy the three backends share, exercised
+    /// without a database (the reason it lives beside
+    /// [`validate_submit_root_shape`]).
+    #[test]
+    fn resolve_injection_parent_covers_every_disposition_and_root_state() -> Result<()> {
+        let idle = fresh_root("t-resolve");
+        assert!(
+            resolve_injection_parent(SubmitDisposition::NextTurn, Some(&idle)).is_none(),
+            "next_turn never attaches to a running root",
+        );
+        assert!(
+            resolve_injection_parent(SubmitDisposition::InjectAtBoundary, None).is_none(),
+            "with no active root, an injection degrades to a future root turn",
+        );
+        assert!(
+            resolve_injection_parent(SubmitDisposition::InjectAtBoundary, Some(&idle)).is_none(),
+            "a pending, never-attempted root has not started: fold in, don't inject",
+        );
+
+        let running = idle.clone().mark_running(
+            WorkerId::from_string("w"),
+            LeaseId::from_string("l"),
+            t_plus(60),
+            t_plus(1),
+        )?;
+        assert_eq!(
+            resolve_injection_parent(SubmitDisposition::InjectAtBoundary, Some(&running))
+                .map(|parent| parent.id.clone()),
+            Some(running.id.clone()),
+            "a started root is the injection parent",
+        );
+        assert!(running.has_started());
+        assert!(!idle.has_started());
+        Ok(())
     }
 
     /// Sample [`ContinuationEnvelope`] used by every Phase 2.4 pause /

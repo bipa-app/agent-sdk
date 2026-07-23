@@ -60,9 +60,10 @@ use agent_server::journal::relay::{
 use agent_server::journal::retention::{RetentionCursor, RetentionStore};
 use agent_server::journal::store::{
     AgentTaskStore, CancelTreeOutcome, ChildProbe, MixedChildrenSpawn, RequeueOutcome,
-    SpawnedMixedChildren, SubagentBatchSpawn, SubagentInvocationSpawn, SubmitRootTurnError,
-    SubmitRootTurnOutcome, SubmitRootTurnParams, mixed_child_ids_in_slot_order,
-    new_mixed_tool_child, validate_mixed_children_spawn,
+    SpawnedMixedChildren, SubagentBatchSpawn, SubagentInvocationSpawn, SubmitDisposition,
+    SubmitRootTurnError, SubmitRootTurnOutcome, SubmitRootTurnParams,
+    mixed_child_ids_in_slot_order, new_mixed_tool_child, submitted_task_disposition,
+    validate_mixed_children_spawn,
 };
 use agent_server::journal::subagent_spawn_transaction::{
     AtomicSubagentSpawnCommitter, SubagentSpawnCommit, SubagentSpawnEvent, SubagentSpawnOutcome,
@@ -868,6 +869,7 @@ INSERT INTO agent_sdk_turn_checkpoints (
             .await
             .map_err(SubmitRootTurnError::Other)?;
         Ok(Some(SubmitRootTurnOutcome {
+            disposition: submitted_task_disposition(&admitted),
             task: admitted,
             replayed: true,
             replayed_result: Some(result_json),
@@ -908,10 +910,15 @@ INSERT INTO agent_sdk_turn_checkpoints (
     async fn commit_fresh_admission_tx(
         mut tx: Transaction<'_, Sqlite>,
         task: AgentTask,
+        injection_parent: Option<AgentTask>,
         would_queue: bool,
         idempotency: Option<agent_server::journal::store::SubmitRootIdempotency>,
     ) -> std::result::Result<SubmitRootTurnOutcome, SubmitRootTurnError> {
-        let admitted = if would_queue {
+        let admitted = if let Some(parent) = injection_parent {
+            task.into_input_injection(&parent)
+                .context("submit injection rejected: invalid parent linkage")
+                .map_err(SubmitRootTurnError::Other)?
+        } else if would_queue {
             let created_at = task.created_at;
             task.admit_as_queued(created_at)
                 .context("submit_root_turn rejected: cannot admit as queued")
@@ -958,6 +965,7 @@ INSERT INTO agent_sdk_turn_checkpoints (
             .context("commit submit_root_turn_idempotent")
             .map_err(SubmitRootTurnError::Other)?;
         Ok(SubmitRootTurnOutcome {
+            disposition: submitted_task_disposition(&admitted),
             task: admitted,
             replayed: false,
             replayed_result: None,
@@ -2340,6 +2348,38 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
 // AgentTaskStore
 // ─────────────────────────────────────────────────────────────────────
 
+/// The thread's active (non-queued, non-terminal) root turn, if any.
+///
+/// Generic over the executor so the admission transaction and the pooled
+/// trait method share one statement — including the `ORDER BY created_at, id`
+/// that makes "the active root" the same row here as in the Postgres backend
+/// rather than whatever the query plan happens to return first.
+///
+/// Runtime `query_as` per the `SQLite` carve-out in `CLAUDE.md`: this is a complex
+/// SELECT mapping onto the `TaskRecord` `FromRow` type.
+async fn active_root_for_thread_exec<'e, E>(
+    executor: E,
+    thread_id: &ThreadId,
+) -> Result<Option<AgentTask>>
+where
+    E: sqlx::SqliteExecutor<'e>,
+{
+    let record = sqlx::query_as::<_, TaskRecord>(concat!(
+        "SELECT ",
+        task_columns!(),
+        " FROM agent_sdk_tasks \
+         WHERE thread_id = ?1 \
+           AND kind = 'root_turn' \
+           AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation') \
+         ORDER BY created_at, id LIMIT 1",
+    ))
+    .bind(thread_key(thread_id))
+    .fetch_optional(executor)
+    .await
+    .with_context(|| format!("load active root for {thread_id}"))?;
+    record.map(TryInto::try_into).transpose()
+}
+
 fn validate_subagent_spawn_parent(
     parent: &AgentTask,
     parent_id: &AgentTaskId,
@@ -2589,6 +2629,7 @@ impl AgentTaskStore for SqliteDurableStore {
             task,
             idempotency,
             max_queued_depth,
+            disposition,
         } = params;
         agent_server::journal::store::validate_submit_root_shape(&task)?;
 
@@ -2640,20 +2681,41 @@ impl AgentTaskStore for SqliteDurableStore {
         }
 
         let blocking_check_key = thread_key(&task.thread_id);
-        let thread_has_blocking_root: bool = sqlx::query_scalar!("SELECT id FROM agent_sdk_tasks WHERE thread_id = ?1 AND kind = 'root_turn' AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation') LIMIT 1", blocking_check_key)
-            .fetch_optional(&mut *tx)
-            .await
-            .with_context(|| format!("check active root slot for {}", task.thread_id))
-            .map_err(SubmitRootTurnError::Other)?
-            .flatten()
-            .is_some();
+        // Mirrors the Postgres split: a `NextTurn` submit only needs to know
+        // *whether* an active root exists, so it keeps main's cheap id probe;
+        // only an injection request, which inspects the root's status to decide
+        // parentage, reads the full ordered row.
+        let (thread_has_blocking_root, active_root) = match disposition {
+            SubmitDisposition::NextTurn => (
+                sqlx::query_scalar!("SELECT id FROM agent_sdk_tasks WHERE thread_id = ?1 AND kind = 'root_turn' AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation') LIMIT 1", blocking_check_key)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .with_context(|| format!("check active root slot for {}", task.thread_id))
+                    .map_err(SubmitRootTurnError::Other)?
+                    .flatten()
+                    .is_some(),
+                None,
+            ),
+            SubmitDisposition::InjectAtBoundary => {
+                let root = active_root_for_thread_exec(&mut *tx, &task.thread_id)
+                    .await
+                    .map_err(SubmitRootTurnError::Other)?;
+                (root.is_some(), root)
+            }
+        };
+        let injection_parent = agent_server::journal::store::resolve_injection_parent(
+            disposition,
+            active_root.as_ref(),
+        )
+        .cloned();
 
         let current_queued = Self::queued_root_count_tx(&mut tx, &task.thread_id)
             .await
             .map_err(SubmitRootTurnError::Other)?;
 
-        // 2. Back-pressure before any write.
-        let would_queue = thread_has_blocking_root || current_queued > 0;
+        // Back-pressure applies only when the request remains a future root.
+        let would_queue =
+            injection_parent.is_none() && (thread_has_blocking_root || current_queued > 0);
         if let Some(cap) = max_queued_depth
             && would_queue
             && current_queued >= cap
@@ -2666,7 +2728,7 @@ impl AgentTaskStore for SqliteDurableStore {
         }
 
         // 3. Admit, claim the idempotency key, and commit — all atomic.
-        Self::commit_fresh_admission_tx(tx, task, would_queue, idempotency).await
+        Self::commit_fresh_admission_tx(tx, task, injection_parent, would_queue, idempotency).await
     }
 
     async fn claim_idempotency(
@@ -2794,6 +2856,28 @@ impl AgentTaskStore for SqliteDurableStore {
         records.into_iter().map(TryInto::try_into).collect()
     }
 
+    async fn complete_input_injection(
+        &self,
+        id: &AgentTaskId,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>> {
+        let mut tx = self.begin().await?;
+        let Some(old) = Self::load_task_tx(&mut tx, id).await? else {
+            return Ok(None);
+        };
+        if old.kind != TaskKind::InputInjection || old.status != TaskStatus::Queued {
+            return Ok(None);
+        }
+        let completed = old
+            .complete_input_injection(now)
+            .context("complete input injection transition failed")?;
+        Self::update_task_tx(&mut tx, &completed).await?;
+        tx.commit()
+            .await
+            .context("commit input injection delivery")?;
+        Ok(Some(completed))
+    }
+
     /// ADR-0003 I5 — bounded. Two indexed reads on `parent_id`, neither of
     /// which can grow with retained terminal history:
     ///
@@ -2863,19 +2947,7 @@ impl AgentTaskStore for SqliteDurableStore {
     }
 
     async fn active_root_for_thread(&self, thread_id: &ThreadId) -> Result<Option<AgentTask>> {
-        let record = sqlx::query_as::<_, TaskRecord>(concat!(
-            "SELECT ", task_columns!(),
-            " FROM agent_sdk_tasks \
-             WHERE thread_id = ?1 \
-               AND kind = 'root_turn' \
-               AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation') \
-             ORDER BY created_at, id LIMIT 1",
-        ))
-        .bind(thread_key(thread_id))
-        .fetch_optional(&self.pool)
-        .await
-        .with_context(|| format!("load active root for {thread_id}"))?;
-        record.map(TryInto::try_into).transpose()
+        active_root_for_thread_exec(&self.pool, thread_id).await
     }
 
     async fn list_queued_roots(&self, thread_id: &ThreadId) -> Result<Vec<AgentTask>> {
@@ -5910,6 +5982,32 @@ INSERT INTO agent_sdk_turn_attempts (
     }
 
     #[tokio::test]
+    async fn terminal_reason_triggers_survive_the_task_table_rebuild() -> Result<()> {
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+        let task = AgentTask::new_root_turn(ThreadId::from_string("trigger-survival"), t0(), 3);
+        AgentTaskStore::submit_root_turn(&store, task.clone()).await?;
+
+        let result = sqlx::query(
+            "INSERT INTO agent_sdk_tasks (
+                id, kind, status, root_id, depth, thread_id, attempt, max_attempts,
+                created_at, updated_at, completed_at
+             ) VALUES ('task_no_reason', 'root_turn', 'completed', 'task_no_reason', 0,
+                'trigger-survival', 0, 1, '2026-01-01', '2026-01-01', '2026-01-01')",
+        )
+        .execute(store.pool())
+        .await;
+
+        let error = result.expect_err("a terminal row without a reason must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("terminal_reason_json must be set exactly"),
+            "unexpected error: {error}",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn budget_mode_and_tokens_must_travel_together_in_the_check_constraint() -> Result<()> {
         let store = SqliteDurableStore::connect("sqlite::memory:").await?;
         let task = AgentTask::new_root_turn(ThreadId::from_string("budget-coherence"), t0(), 3);
@@ -7197,6 +7295,7 @@ INSERT INTO agent_sdk_turn_attempts (
                     result_json,
                 }),
                 max_queued_depth: None,
+                disposition: agent_server::journal::store::SubmitDisposition::NextTurn,
             }
         }
 
@@ -7777,6 +7876,73 @@ INSERT INTO agent_sdk_turn_attempts (
             );
         }
 
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod input_injection_migration_test {
+    use super::*;
+    use agent_server::journal::task::SubmittedInputItem;
+
+    fn t_plus(seconds: i64) -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1_700_000_000 + seconds)
+    }
+
+    #[tokio::test]
+    async fn sqlite_persists_and_cancels_input_injection_rows() -> anyhow::Result<()> {
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+        let thread = ThreadId::from_string("sqlite-injection");
+        let root = store
+            .submit_root_turn_idempotent(SubmitRootTurnParams {
+                task: AgentTask::new_root_turn_with_input(
+                    thread.clone(),
+                    vec![SubmittedInputItem::Text {
+                        text: "root".into(),
+                    }],
+                    t_plus(1),
+                    3,
+                ),
+                idempotency: None,
+                max_queued_depth: None,
+                disposition: SubmitDisposition::NextTurn,
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("root submit: {error}"))?;
+        let running = store
+            .try_acquire_task(
+                &root.task.id,
+                WorkerId::from_string("worker"),
+                LeaseId::from_string("lease"),
+                t_plus(100),
+                t_plus(2),
+            )
+            .await?
+            .context("acquire root")?;
+        let injection = store
+            .submit_root_turn_idempotent(SubmitRootTurnParams {
+                task: AgentTask::new_root_turn_with_input(
+                    thread,
+                    vec![SubmittedInputItem::Text {
+                        text: "inject".into(),
+                    }],
+                    t_plus(3),
+                    3,
+                ),
+                idempotency: None,
+                max_queued_depth: None,
+                disposition: SubmitDisposition::InjectAtBoundary,
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("injection submit: {error}"))?;
+        assert_eq!(injection.task.kind, TaskKind::InputInjection);
+        assert_eq!(injection.task.status, TaskStatus::Queued);
+
+        store.cancel_tree(&running.id, t_plus(4)).await?;
+        let cancelled = AgentTaskStore::get(&store, &injection.task.id)
+            .await?
+            .context("injection survives as cancelled journal row")?;
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
         Ok(())
     }
 }

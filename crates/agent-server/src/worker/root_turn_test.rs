@@ -7,10 +7,10 @@
 
 use super::root_turn::{
     PartialCancelCommit, RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes, cancel_root_turn,
-    commit_partial_turn_on_cancel, derive_reattach_tool_use_id, execute_root_turn, fail_root_turn,
-    is_root_turn_cancelled, provider_valid_split, resume_for_steering, resume_from_children,
-    resume_root_turn, revert_steering_wake, settle_attempt_after_lost_ownership,
-    terminal_reason_for_root_error,
+    commit_partial_turn_on_cancel, derive_reattach_tool_use_id, drain_boundary_injections,
+    execute_root_turn, fail_root_turn, is_root_turn_cancelled, provider_valid_split,
+    resume_for_steering, resume_from_children, resume_root_turn, revert_steering_wake,
+    settle_attempt_after_lost_ownership, terminal_reason_for_root_error,
 };
 use crate::journal::checkpoint::CheckpointKind;
 use std::sync::Arc;
@@ -23,7 +23,10 @@ use crate::journal::execution_context::build_root_worker_inputs;
 use crate::journal::message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
 use crate::journal::outbox::{InMemoryOutboxStore, OutboxStore as _};
 use crate::journal::outbox_message::OutboxMessageKind;
-use crate::journal::store::{AgentTaskStore, CancellationMarkerSink, InMemoryAgentTaskStore};
+use crate::journal::store::{
+    AgentTaskStore, CancellationMarkerSink, InMemoryAgentTaskStore, SubmitDisposition,
+    SubmitRootTurnParams,
+};
 use crate::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskKind, TaskStatus,
     WorkerId,
@@ -37,6 +40,7 @@ use crate::journal::turn_attempt_store::{InMemoryTurnAttemptStore, TurnAttemptSt
 use crate::worker::bootstrap::WorkerBootstrapContext;
 use crate::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
 use agent_sdk_foundation::audit::AuditProvenance;
+use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, Role, StopReason, Tool, Usage,
 };
@@ -8247,6 +8251,246 @@ async fn interleaved_mixed_batch_survives_a_steering_revert_with_original_bindin
     Ok(())
 }
 
+#[tokio::test]
+async fn inject_at_boundary_degrades_without_running_root_and_cancel_reaches_pending_input()
+-> Result<()> {
+    let store = InMemoryAgentTaskStore::new();
+    let thread = ThreadId::from_string("t-inject-disposition");
+
+    let degraded = store
+        .submit_root_turn_idempotent(SubmitRootTurnParams {
+            task: AgentTask::new_root_turn_with_input(
+                thread.clone(),
+                vec![crate::journal::task::SubmittedInputItem::Text {
+                    text: "first".into(),
+                }],
+                t_plus(1),
+                3,
+            ),
+            idempotency: None,
+            max_queued_depth: None,
+            disposition: SubmitDisposition::InjectAtBoundary,
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("degraded submit failed: {error}"))?;
+    assert_eq!(degraded.disposition, SubmitDisposition::NextTurn);
+    assert_eq!(degraded.task.kind, TaskKind::RootTurn);
+    assert_eq!(degraded.task.status, TaskStatus::Pending);
+
+    let running = store
+        .try_acquire_task(
+            &degraded.task.id,
+            WorkerId::from_string("inject-worker"),
+            LeaseId::from_string("inject-lease"),
+            t_plus(100),
+            t_plus(2),
+        )
+        .await?
+        .context("acquire root before injection")?;
+    let injected = store
+        .submit_root_turn_idempotent(SubmitRootTurnParams {
+            task: AgentTask::new_root_turn_with_input(
+                thread,
+                vec![crate::journal::task::SubmittedInputItem::Text {
+                    text: "cancel me".into(),
+                }],
+                t_plus(3),
+                3,
+            ),
+            idempotency: None,
+            max_queued_depth: None,
+            disposition: SubmitDisposition::InjectAtBoundary,
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("injection submit failed: {error}"))?;
+    assert_eq!(injected.disposition, SubmitDisposition::InjectAtBoundary);
+    assert_eq!(injected.task.kind, TaskKind::InputInjection);
+    assert_eq!(injected.task.parent_id.as_ref(), Some(&running.id));
+    assert_eq!(injected.task.status, TaskStatus::Queued);
+
+    let cancelled = store.cancel_tree(&running.id, t_plus(4)).await?;
+    assert!(cancelled.transitioned.contains(&injected.task.id));
+    let injection = store
+        .get(&injected.task.id)
+        .await?
+        .context("injection after cancel")?;
+    assert_eq!(injection.status, TaskStatus::Cancelled);
+    assert!(
+        store
+            .complete_input_injection(&injected.task.id, t_plus(5))
+            .await?
+            .is_none(),
+        "a cancelled injection must never be delivered"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn boundary_injection_is_transcript_visible_exactly_once_across_retry() -> Result<()> {
+    let stores = TestStores::new();
+    let child_results = vec![(
+        "call_1".to_owned(),
+        agent_sdk_foundation::ToolResult::success("done"),
+    )];
+    let parent = Box::pin(suspend_and_complete_children_durably(
+        &stores,
+        vec![(
+            "call_1".into(),
+            "bash".into(),
+            serde_json::json!({"command": "true"}),
+        )],
+        &child_results,
+    ))
+    .await?;
+
+    let submitted = stores
+        .tasks
+        .submit_root_turn_idempotent(SubmitRootTurnParams {
+            task: AgentTask::new_root_turn_with_input(
+                thread_a(),
+                vec![crate::journal::task::SubmittedInputItem::Text {
+                    text: "use the concise format".into(),
+                }],
+                t_plus(18),
+                3,
+            ),
+            idempotency: None,
+            max_queued_depth: None,
+            disposition: SubmitDisposition::InjectAtBoundary,
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("injection submit failed: {error}"))?;
+    assert_eq!(submitted.task.kind, TaskKind::InputInjection);
+
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent.id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            t_plus(19),
+        )
+        .await?
+        .context("acquire parent at injection boundary")?;
+    let bootstrap = sample_bootstrap_with_tools(acquired);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(19),
+    )
+    .await?;
+    let provider = MockTextProvider::new("concise answer");
+    let outcome =
+        resume_from_children(inputs, &parent, &provider, &stores.deps(), t_plus(20)).await?;
+    assert!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+
+    let history = stores.messages.get_history(&thread_a()).await?;
+    let encoded_history = serde_json::to_string(&history)?;
+    assert_eq!(
+        encoded_history.matches("use the concise format").count(),
+        1,
+        "the injected user message enters the resumed LLM transcript once"
+    );
+
+    // Simulate a restart repeating the boundary scan after the completed row
+    // and journal event have been recovered.
+    let deps = stores.deps();
+    let retry = drain_boundary_injections(&deps, &parent.id, &thread_a(), &[], t_plus(21)).await?;
+    assert!(retry.is_empty(), "restart/retry must not deliver it twice");
+
+    let events = stores.events.get_events(&thread_a()).await?;
+    let injection_event_count = events
+        .iter()
+        .filter(|committed| {
+            matches!(committed.event, AgentEvent::UserInput { .. })
+                && committed.event.emitter_task_id() == Some(submitted.task.id.as_str())
+        })
+        .count();
+    assert_eq!(
+        injection_event_count, 1,
+        "the durable transcript contains exactly one injected user-input event"
+    );
+
+    let completed = stores
+        .tasks
+        .get(&submitted.task.id)
+        .await?
+        .context("completed injection row")?;
+    assert_eq!(completed.status, TaskStatus::Completed);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_injection_after_acquire_runs_a_second_llm_call_at_boundary() -> Result<()> {
+    let stores = TestStores::new();
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let submitted = stores
+        .tasks
+        .submit_root_turn_idempotent(SubmitRootTurnParams {
+            task: AgentTask::new_root_turn_with_input(
+                thread_a(),
+                vec![crate::journal::task::SubmittedInputItem::Text {
+                    text: "steer the running turn".into(),
+                }],
+                t_plus(1),
+                3,
+            ),
+            idempotency: None,
+            max_queued_depth: None,
+            disposition: SubmitDisposition::InjectAtBoundary,
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("injection submit failed: {error}"))?;
+    assert_eq!(submitted.task.kind, TaskKind::InputInjection);
+
+    let bootstrap = sample_bootstrap(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let provider = MockTextProvider::new("assistant response");
+    let outcome = execute_root_turn(
+        inputs,
+        "original prompt",
+        &provider,
+        &stores.deps(),
+        t_plus(2),
+    )
+    .await?;
+    assert!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+    assert_eq!(
+        provider.calls(),
+        2,
+        "the injection is delivered only after the first LLM call returns"
+    );
+
+    let history = stores.messages.get_history(&thread_a()).await?;
+    let encoded = serde_json::to_string(&history)?;
+    assert_eq!(encoded.matches("steer the running turn").count(), 1);
+    let events = stores.events.get_events(&thread_a()).await?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                matches!(event.event, AgentEvent::UserInput { .. })
+                    && event.event.emitter_task_id() == Some(submitted.task.id.as_str())
+            })
+            .count(),
+        1,
+    );
+
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Terminal-reason classification — both provider-failure producers
 // ─────────────────────────────────────────────────────────────────────
@@ -8496,5 +8740,341 @@ async fn mid_turn_beacon_reports_one_calls_usage_not_one_per_restating_frame() -
         "the beacon must hold one call's usage; a multiple of it means restatements \
          were summed instead of the increment",
     );
+    Ok(())
+}
+
+/// Text on every call except `fail_at`, where it returns a terminal
+/// `InvalidRequest`. Scripts the "process died mid-turn" shape for the
+/// boundary-injection durability tests: the failure lands AFTER the drain has
+/// journaled the input event but BEFORE the turn's commit makes it durable.
+struct BoundaryFailProvider {
+    fail_at: usize,
+    call_count: AtomicUsize,
+}
+
+impl BoundaryFailProvider {
+    const fn new(fail_at: usize) -> Self {
+        Self {
+            fail_at,
+            call_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.call_count.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl LlmProvider for BoundaryFailProvider {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+        if n == self.fail_at {
+            return Ok(ChatOutcome::InvalidRequest(
+                "scripted mid-turn death".into(),
+            ));
+        }
+        Ok(ChatOutcome::Success(ChatResponse {
+            id: format!("msg_boundary_{n}"),
+            content: vec![ContentBlock::Text {
+                text: format!("answer {n}"),
+            }],
+            model: "mock-model".into(),
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cached_input_tokens: 10,
+                cache_creation_input_tokens: 0,
+            },
+        }))
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
+/// Submits a second injection from inside call #1, so the input lands while
+/// the post-injection LLM call is in flight — the case a single-shot boundary
+/// strands `Queued` under a completed root forever.
+struct SecondWaveProvider<'a> {
+    stores: &'a TestStores,
+    call_count: AtomicUsize,
+}
+
+#[async_trait]
+impl LlmProvider for SecondWaveProvider<'_> {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+        if n == 1 {
+            submit_boundary_injection(self.stores, "second steer")
+                .await
+                .map_err(|error| anyhow::anyhow!("mid-call submit: {error}"))?;
+        }
+        Ok(ChatOutcome::Success(ChatResponse {
+            id: format!("msg_wave_{n}"),
+            content: vec![ContentBlock::Text {
+                text: format!("answer {n}"),
+            }],
+            model: "mock-model".into(),
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cached_input_tokens: 10,
+                cache_creation_input_tokens: 0,
+            },
+        }))
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
+/// Count `UserInput` events emitted by `emitter` in the thread journal.
+async fn injected_user_input_events(stores: &TestStores, emitter: &AgentTaskId) -> Result<usize> {
+    Ok(stores
+        .events
+        .get_events(&thread_a())
+        .await?
+        .iter()
+        .filter(|committed| {
+            matches!(committed.event, AgentEvent::UserInput { .. })
+                && committed.event.emitter_task_id() == Some(emitter.as_str())
+        })
+        .count())
+}
+
+async fn submit_boundary_injection(stores: &TestStores, text: &str) -> Result<AgentTask> {
+    let submitted = stores
+        .tasks
+        .submit_root_turn_idempotent(SubmitRootTurnParams {
+            task: AgentTask::new_root_turn_with_input(
+                thread_a(),
+                vec![crate::journal::task::SubmittedInputItem::Text { text: text.into() }],
+                t_plus(1),
+                3,
+            ),
+            idempotency: None,
+            max_queued_depth: None,
+            disposition: SubmitDisposition::InjectAtBoundary,
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("injection submit failed: {error}"))?;
+    Ok(submitted.task)
+}
+
+#[tokio::test]
+async fn injection_drained_then_lost_to_a_turn_failure_redelivers_exactly_once() -> Result<()> {
+    let stores = TestStores::new();
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let injection = submit_boundary_injection(&stores, "use the concise format").await?;
+    assert_eq!(injection.kind, TaskKind::InputInjection);
+
+    // Attempt 1 — the first call succeeds, the boundary drains the injection
+    // and journals its UserInput event, then the post-injection call dies.
+    let dying = BoundaryFailProvider::new(1);
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task.clone()),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let error = execute_root_turn(inputs, "original prompt", &dying, &stores.deps(), t_plus(2))
+        .await
+        .expect_err("the scripted post-injection call must fail the turn");
+    assert!(
+        format!("{error:#}").contains("scripted mid-turn death"),
+        "unexpected failure: {error:#}",
+    );
+    assert_eq!(dying.calls(), 2, "the drain ran between the two calls");
+
+    // The message never became durable, so the row must NOT read as delivered.
+    let after_failure = stores
+        .tasks
+        .get(&injection.id)
+        .await?
+        .context("injection row after the failed turn")?;
+    assert_eq!(
+        after_failure.status,
+        TaskStatus::Queued,
+        "an injection is only delivered once the turn carrying it commits",
+    );
+    assert_eq!(injected_user_input_events(&stores, &injection.id).await?, 1);
+    let history_after_failure = stores.messages.get_history(&thread_a()).await?;
+    assert!(
+        !serde_json::to_string(&history_after_failure)?.contains("use the concise format"),
+        "the failed turn committed nothing",
+    );
+
+    // Attempt 2 — the retry re-drains the still-queued row. The journal lookup
+    // finds the event from attempt 1 and reuses it (no second UserInput) while
+    // the message is staged again, so delivery is exactly-once end to end.
+    let healthy = MockTextProvider::new("recovered answer");
+    let retry_inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(3),
+    )
+    .await?;
+    let outcome = execute_root_turn(
+        retry_inputs,
+        "original prompt",
+        &healthy,
+        &stores.deps(),
+        t_plus(4),
+    )
+    .await?;
+    assert!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+
+    assert_eq!(
+        injected_user_input_events(&stores, &injection.id).await?,
+        1,
+        "the retry reuses the journaled event instead of writing a second one",
+    );
+    let history = serde_json::to_string(&stores.messages.get_history(&thread_a()).await?)?;
+    assert_eq!(
+        history.matches("use the concise format").count(),
+        1,
+        "the injected message reaches the committed history exactly once",
+    );
+    let delivered = stores
+        .tasks
+        .get(&injection.id)
+        .await?
+        .context("injection row after the successful turn")?;
+    assert_eq!(
+        delivered.status,
+        TaskStatus::Completed,
+        "the row completes only after the commit that made its message durable",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn boundary_injections_loop_until_no_input_remains() -> Result<()> {
+    let stores = TestStores::new();
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let first = submit_boundary_injection(&stores, "first steer").await?;
+
+    let provider = SecondWaveProvider {
+        stores: &stores,
+        call_count: AtomicUsize::new(0),
+    };
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let outcome = execute_root_turn(
+        inputs,
+        "original prompt",
+        &provider,
+        &stores.deps(),
+        t_plus(2),
+    )
+    .await?;
+    assert!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+    assert_eq!(
+        provider.call_count.load(Ordering::SeqCst),
+        3,
+        "prompt call, first-injection call, then second-injection call",
+    );
+
+    let history = serde_json::to_string(&stores.messages.get_history(&thread_a()).await?)?;
+    assert_eq!(history.matches("first steer").count(), 1);
+    assert_eq!(
+        history.matches("second steer").count(),
+        1,
+        "an injection arriving during the post-injection call is not stranded",
+    );
+    for id in [&first.id] {
+        let row = stores.tasks.get(id).await?.context("injection row")?;
+        assert_eq!(row.status, TaskStatus::Completed);
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_boundary_injection_journals_one_turn_and_bills_every_call() -> Result<()> {
+    let stores = TestStores::new();
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    submit_boundary_injection(&stores, "steer me").await?;
+
+    let provider = MockTextProvider::new("answered");
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let outcome = execute_root_turn(
+        inputs,
+        "original prompt",
+        &provider,
+        &stores.deps(),
+        t_plus(2),
+    )
+    .await?;
+    assert!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+    assert_eq!(provider.calls(), 2);
+
+    let checkpoint = stores
+        .checkpoints
+        .get_by_turn(&thread_a(), 1)
+        .await?
+        .context("checkpoint")?;
+    let turn_usage = checkpoint.turn_usage.clone();
+    let state: agent_sdk_foundation::AgentState =
+        serde_json::from_value(checkpoint.agent_state_snapshot)?;
+    assert_eq!(
+        state.turn_count, 1,
+        "two LLM calls at one boundary are one journaled turn",
+    );
+    // Both calls are billed: `turn_usage` must not report only the last one.
+    assert_eq!(
+        turn_usage.output_tokens, state.total_usage.output_tokens,
+        "checkpoint turn usage and cumulative usage cover the same calls",
+    );
+    assert_eq!(turn_usage.output_tokens, 100);
+
+    // The pre-injection assistant text still gets its consolidated Text event.
+    let texts: Vec<String> = stores
+        .events
+        .get_events(&thread_a())
+        .await?
+        .into_iter()
+        .filter_map(|committed| match committed.event {
+            AgentEvent::Text { text, .. } => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        texts.iter().filter(|text| *text == "answered").count(),
+        2,
+        "every call in the turn contributes its consolidated Text event",
+    );
+
     Ok(())
 }

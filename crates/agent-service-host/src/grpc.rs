@@ -14,7 +14,7 @@ use agent_server::journal::execution_intent::GuardedExecutionDeps;
 use agent_server::journal::fork_transaction::ForkCommitParams;
 use agent_server::journal::idempotency::{IdempotencyClaim, IdempotencyKind, IdempotencyRecord};
 use agent_server::journal::store::{
-    SubmitRootIdempotency, SubmitRootTurnError, SubmitRootTurnParams,
+    SubmitDisposition, SubmitRootIdempotency, SubmitRootTurnError, SubmitRootTurnParams,
 };
 use agent_server::journal::task::{
     AgentTask, AgentTaskId, LeaseId, SubmittedInputItem, TaskKind as JournalTaskKind,
@@ -1385,6 +1385,7 @@ impl AgentControlService for GrpcControlService {
                 )?,
             )
         };
+        let disposition = map_submit_disposition(request.disposition)?;
 
         let now = OffsetDateTime::now_utc();
         // Resolve the agent definition from a throwaway template. The
@@ -1439,6 +1440,7 @@ impl AgentControlService for GrpcControlService {
                     result_json,
                 }),
                 max_queued_depth: self.shared.admission.max_queued_roots_per_thread,
+                disposition,
             })
             .await
             .map_err(|error| {
@@ -2599,6 +2601,16 @@ fn map_submit_root_error(method: &str, request_id: &str, error: SubmitRootTurnEr
     }
 }
 
+fn map_submit_disposition(value: i32) -> Result<SubmitDisposition, Status> {
+    match pb::SubmitDisposition::try_from(value) {
+        Ok(pb::SubmitDisposition::NextTurn) => Ok(SubmitDisposition::NextTurn),
+        Ok(pb::SubmitDisposition::InjectAtBoundary) => Ok(SubmitDisposition::InjectAtBoundary),
+        Err(_) => Err(Status::invalid_argument(format!(
+            "unknown submit disposition {value}"
+        ))),
+    }
+}
+
 fn submit_work_fingerprint(request: &pb::SubmitThreadWorkRequest) -> Vec<u8> {
     let mut request = request.clone();
     request.request_id.clear();
@@ -2781,6 +2793,7 @@ const fn map_task_kind(kind: JournalTaskKind) -> i32 {
         JournalTaskKind::RootTurn => pb::TaskKind::RootTurn as i32,
         JournalTaskKind::ToolRuntime => pb::TaskKind::ToolRuntime as i32,
         JournalTaskKind::Subagent => pb::TaskKind::Subagent as i32,
+        JournalTaskKind::InputInjection => pb::TaskKind::InputInjection as i32,
     }
 }
 
@@ -3158,7 +3171,11 @@ fn map_message_event_payload(event: &AgentEvent) -> RpcResult<Option<pb::event_e
                 text: text.clone(),
             })))
         }
-        AgentEvent::UserInput { thread_id, content } => {
+        AgentEvent::UserInput {
+            thread_id,
+            content,
+            emitter_task_id,
+        } => {
             let content_proto: Vec<pb::ConversationContentBlock> = content
                 .iter()
                 .map(map_content_block)
@@ -3167,6 +3184,7 @@ fn map_message_event_payload(event: &AgentEvent) -> RpcResult<Option<pb::event_e
                 pb::UserInputEvent {
                     thread_id: thread_id.0.clone(),
                     content: content_proto,
+                    emitter_task_id: emitter_task_id.clone(),
                 },
             )))
         }
@@ -4202,6 +4220,7 @@ mod tests {
                 thread_id: thread_id.into(),
                 input: vec![text_input(text)],
                 caller_metadata: String::new(),
+                disposition: pb::SubmitDisposition::NextTurn as i32,
             })
             .await
             .context("submit_thread_work rpc")?
@@ -5144,6 +5163,14 @@ mod tests {
         async fn list_children(&self, parent_id: &AgentTaskId) -> Result<Vec<AgentTask>> {
             self.inner.list_children(parent_id).await
         }
+        async fn complete_input_injection(
+            &self,
+            id: &AgentTaskId,
+            now: OffsetDateTime,
+        ) -> Result<Option<AgentTask>> {
+            self.inner.complete_input_injection(id, now).await
+        }
+
         async fn list_by_status(&self, status: JournalTaskStatus) -> Result<Vec<AgentTask>> {
             self.inner.list_by_status(status).await
         }
@@ -6512,6 +6539,7 @@ mod tests {
                     thread_id: thread.clone(),
                     input: vec![text_input("hello")],
                     caller_metadata: String::new(),
+                    disposition: pb::SubmitDisposition::NextTurn as i32,
                 })
                 .await
                 .context("first submit")?
@@ -6526,6 +6554,7 @@ mod tests {
                     thread_id: thread.clone(),
                     input: vec![text_input("hello")],
                     caller_metadata: String::new(),
+                    disposition: pb::SubmitDisposition::NextTurn as i32,
                 })
                 .await
                 .context("retry submit")?
@@ -6544,6 +6573,7 @@ mod tests {
                     thread_id: thread.clone(),
                     input: vec![text_input("different")],
                     caller_metadata: String::new(),
+                    disposition: pb::SubmitDisposition::NextTurn as i32,
                 })
                 .await
                 .expect_err("payload change under same key must conflict");
@@ -6589,6 +6619,7 @@ mod tests {
                     thread_id: thread.clone(),
                     input: vec![text_input(&huge)],
                     caller_metadata: String::new(),
+                    disposition: pb::SubmitDisposition::NextTurn as i32,
                 })
                 .await
                 .expect_err("oversized input must reject");
@@ -6633,6 +6664,7 @@ mod tests {
                 thread_id: thread.clone(),
                 input: vec![text_input("armed turn")],
                 caller_metadata: r#"{"plan_mode":true}"#.into(),
+                disposition: pb::SubmitDisposition::NextTurn as i32,
             }))
             .await?
             .into_inner()
@@ -6658,6 +6690,7 @@ mod tests {
                 thread_id: thread.clone(),
                 input: vec![text_input("plain turn")],
                 caller_metadata: String::new(),
+                disposition: pb::SubmitDisposition::NextTurn as i32,
             }))
             .await?
             .into_inner()
@@ -6678,6 +6711,7 @@ mod tests {
                 thread_id: thread.clone(),
                 input: vec![text_input("bad turn")],
                 caller_metadata: "{not json".into(),
+                disposition: pb::SubmitDisposition::NextTurn as i32,
             }))
             .await
             .expect_err("malformed caller_metadata must reject");
@@ -6713,6 +6747,7 @@ mod tests {
                 thread_id: thread.clone(),
                 input: vec![text_input("do work")],
                 caller_metadata: String::new(),
+                disposition: pb::SubmitDisposition::NextTurn as i32,
             }))
             .await?
             .into_inner()
@@ -7264,6 +7299,7 @@ mod tests {
                 thread_id: thread.clone(),
                 input: vec![text_input("queued work")],
                 caller_metadata: String::new(),
+                disposition: pb::SubmitDisposition::NextTurn as i32,
             }))
             .await?
             .into_inner()

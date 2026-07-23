@@ -80,6 +80,8 @@ message UserInputEvent {
   // the common `ConversationContentBlock` shape so wire types
   // stay consistent with the projection snapshot.
   repeated ConversationContentBlock content = 2;
+  // Durable input-injection task that admitted this boundary input.
+  optional string emitter_task_id = 3;
 }
 
 message ThinkingEvent {

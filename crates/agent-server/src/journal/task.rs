@@ -282,6 +282,10 @@ pub enum TaskKind {
     /// Reserved for Phase 3 subagent work. Accepted by the schema now so
     /// later phases don't need a disruptive migration.
     Subagent,
+    /// User input waiting to enter its parent root turn at a safe LLM
+    /// boundary. Injection rows are children so `cancel_tree` reaches
+    /// undelivered input through the existing task-tree walk.
+    InputInjection,
 }
 
 impl TaskKind {
@@ -295,7 +299,7 @@ impl TaskKind {
     /// parent of another task.
     #[must_use]
     pub const fn is_leaf(self) -> bool {
-        matches!(self, Self::ToolRuntime)
+        matches!(self, Self::ToolRuntime | Self::InputInjection)
     }
 }
 
@@ -305,6 +309,7 @@ impl fmt::Display for TaskKind {
             Self::RootTurn => f.write_str("root_turn"),
             Self::ToolRuntime => f.write_str("tool_runtime"),
             Self::Subagent => f.write_str("subagent"),
+            Self::InputInjection => f.write_str("input_injection"),
         }
     }
 }
@@ -810,6 +815,83 @@ impl AgentTask {
         }
     }
 
+    /// Whether this row has left its pre-execution state.
+    ///
+    /// A [`TaskStatus::Pending`] row on `attempt == 0` was admitted but no
+    /// worker has claimed it yet, so its input can still be folded into the
+    /// turn it is about to run; every other shape means execution already
+    /// began and out-of-band input needs a delivery boundary instead.
+    #[must_use]
+    pub const fn has_started(&self) -> bool {
+        match self.status {
+            TaskStatus::Pending => self.attempt > 0,
+            TaskStatus::Queued
+            | TaskStatus::Running
+            | TaskStatus::WaitingOnChildren
+            | TaskStatus::AwaitingConfirmation
+            | TaskStatus::Completed
+            | TaskStatus::Failed
+            | TaskStatus::Cancelled => true,
+        }
+    }
+
+    /// Convert a fresh root-turn candidate into a queued input-injection
+    /// child of the currently running root. The candidate keeps its id,
+    /// submitted input, caller metadata, and submission timestamp so the
+    /// transport's idempotency record points at the durable injection row.
+    ///
+    /// # Errors
+    /// Returns a schema error when `parent` cannot own children.
+    pub fn into_input_injection(mut self, parent: &Self) -> Result<Self, TaskSchemaError> {
+        if parent.kind.is_leaf() {
+            return Err(TaskSchemaError::ToolRuntimeCannotSpawnChildren);
+        }
+        self.kind = TaskKind::InputInjection;
+        self.status = TaskStatus::Queued;
+        self.parent_id = Some(parent.id.clone());
+        self.root_id = parent.root_id.clone();
+        self.depth = parent.depth.saturating_add(1);
+        self.thread_id = parent.thread_id.clone();
+        self.worker_id = None;
+        self.lease_id = None;
+        self.lease_expires_at = None;
+        self.last_heartbeat_at = None;
+        self.last_activity_at = None;
+        self.state = TaskState::None;
+        self.attempt = 0;
+        self.pending_child_count = 0;
+        self.spawn_index = None;
+        self.result_payload = None;
+        self.completed_at = None;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Mark an undelivered injection as delivered at an execution boundary.
+    /// Delivery is a transport-owned CAS and therefore does not require a
+    /// worker lease; only a queued input-injection row can take this edge.
+    ///
+    /// # Errors
+    /// Returns an invalid-transition error for any other row shape.
+    pub fn complete_input_injection(
+        mut self,
+        now: OffsetDateTime,
+    ) -> Result<Self, TaskSchemaError> {
+        if self.kind != TaskKind::InputInjection || self.status != TaskStatus::Queued {
+            return Err(TaskSchemaError::InvalidTransition {
+                from: self.status,
+                to: TaskStatus::Completed,
+            });
+        }
+        self.status = TaskStatus::Completed;
+        self.terminal_reason = Some(TerminalReason::Completed);
+        self.completed_at = Some(now);
+        self.updated_at = now;
+        self.advance_last_activity_at(now);
+        self.validate()?;
+        Ok(self)
+    }
+
     /// Allocate a fresh child task under `parent`.
     ///
     /// The child inherits `parent.root_id` and `parent.thread_id`, sets
@@ -1010,7 +1092,9 @@ impl AgentTask {
         }
 
         // Kind ↔ status
-        if self.status == TaskStatus::Queued && self.kind != TaskKind::RootTurn {
+        if self.status == TaskStatus::Queued
+            && !matches!(self.kind, TaskKind::RootTurn | TaskKind::InputInjection)
+        {
             return Err(TaskSchemaError::QueuedOnlyForRootTurns);
         }
 

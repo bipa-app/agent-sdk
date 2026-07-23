@@ -49,6 +49,22 @@ class SubmittedWork:
     queue_depth: int
 
 
+def _submit_disposition(disposition: "int | str | None") -> int:
+    """Resolve a caller-supplied disposition to its generated enum value.
+
+    Both forms are validated by the generated ``SubmitDisposition`` descriptor
+    rather than a hand-written ladder, so a variant added to the proto is
+    accepted here as soon as the stubs are regenerated, and an unknown name or
+    value raises ``ValueError`` from the descriptor itself.
+    """
+    if disposition is None:
+        return control_pb2.SUBMIT_DISPOSITION_NEXT_TURN
+    if isinstance(disposition, str):
+        return control_pb2.SubmitDisposition.Value(disposition)
+    control_pb2.SubmitDisposition.Name(disposition)
+    return disposition
+
+
 class AgentClient:
     """Synchronous client for the durable agent serving host.
 
@@ -98,14 +114,27 @@ class AgentClient:
         return resp.thread.thread_id
 
     def submit_text(
-        self, thread_id: str, text: str, *, request_id: str = ""
+        self,
+        thread_id: str,
+        text: str,
+        *,
+        request_id: str = "",
+        disposition: "int | str | None" = None,
     ) -> SubmittedWork:
-        """Submit a single text input as the next root turn on a thread."""
+        """Submit text for the next turn or inject it at an execution boundary.
+
+        ``disposition`` takes a generated ``control_pb2.SubmitDisposition``
+        value (the default is ``SUBMIT_DISPOSITION_NEXT_TURN``) or its name as
+        a string. ``SUBMIT_DISPOSITION_INJECT_AT_BOUNDARY`` degrades to
+        ``NEXT_TURN`` when no root turn is running, matching the engine
+        contract.
+        """
         resp = self._control.SubmitThreadWork(
             control_pb2.SubmitThreadWorkRequest(
                 request_id=request_id,
                 thread_id=thread_id,
                 input=[common_pb2.UserInputItem(text=text)],
+                disposition=_submit_disposition(disposition),
             )
         )
         return SubmittedWork(

@@ -239,6 +239,13 @@ mod in_memory_bundle {
         async fn list_children(&self, parent_id: &AgentTaskId) -> Result<Vec<AgentTask>> {
             self.task.list_children(parent_id).await
         }
+        async fn complete_input_injection(
+            &self,
+            id: &AgentTaskId,
+            now: OffsetDateTime,
+        ) -> Result<Option<AgentTask>> {
+            self.task.complete_input_injection(id, now).await
+        }
         async fn list_by_status(&self, status: TaskStatus) -> Result<Vec<AgentTask>> {
             self.task.list_by_status(status).await
         }

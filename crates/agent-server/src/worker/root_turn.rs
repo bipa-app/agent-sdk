@@ -420,6 +420,14 @@ struct TurnCloseContext {
     /// the turn-total `response.usage` when earlier attempts failed recoverably.
     success_usage: llm::Usage,
     evidence: AttemptEvidence,
+    /// Events already committed for LLM calls this turn made before the final
+    /// one (see [`BoundaryContinuation::committed_events`]).
+    boundary_committed: Vec<CommittedEvent>,
+    /// Messages staged before the final call
+    /// (see [`BoundaryContinuation::staged_prefix`]).
+    staged_prefix: Vec<llm::Message>,
+    /// Injection rows to complete once this turn's messages are durable.
+    delivered_injections: Vec<AgentTaskId>,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1376,6 +1384,193 @@ async fn best_effort_commit_parked_cancel(
 // Entry point
 // ─────────────────────────────────────────────────────────────────────
 
+/// What a turn's boundary loop accumulated across the LLM calls it ran.
+struct BoundaryContinuation {
+    /// The final call's outcome. `response.usage` is folded to the turn total
+    /// across every call, so the checkpoint's `turn_usage` and the staged
+    /// state's `total_usage` are derived from the same number and cannot
+    /// diverge; `content_ids` covers the final call only, because each earlier
+    /// call's consolidated content events were committed when it closed.
+    streamed: StreamedTurn,
+    /// Input seeding the final exchange: the caller's prompt when no injection
+    /// landed, otherwise a resume sentinel — the earlier exchanges are staged
+    /// already and must not be appended a second time.
+    close_input: super::user_input::UserInput,
+    /// Messages staged before the final call (earlier exchanges + injected
+    /// input). The tool-suspension path has no staged buffer in its durable
+    /// payload, so it must carry these explicitly or the model loses them.
+    staged_prefix: Vec<llm::Message>,
+    /// Consolidated content events already committed for the earlier calls.
+    committed_events: Vec<CommittedEvent>,
+    /// Injection rows folded into this turn, completed once it commits.
+    delivered_injections: Vec<AgentTaskId>,
+}
+
+impl BoundaryContinuation {
+    fn started(first: StreamedTurn, initial_input: &super::user_input::UserInput) -> Self {
+        Self {
+            streamed: first,
+            close_input: initial_input.clone(),
+            staged_prefix: Vec::new(),
+            committed_events: Vec::new(),
+            delivered_injections: Vec::new(),
+        }
+    }
+}
+
+/// Deliver input that arrived mid-turn, looping until no injection is queued.
+///
+/// A boundary opens after any LLM call that did **not** request tool dispatch
+/// (a call that did goes to the tool-suspension path, whose resume drains
+/// separately — injecting there would leave `tool_use` blocks without their
+/// `tool_result`). Each pass consumes every queued row, so another pass runs
+/// only if a fresh submit landed during the call that just finished: the loop
+/// is bounded by injections actually arriving, and a turn that never receives
+/// one pays a single `list_children` probe.
+async fn continue_at_pending_input_boundary(
+    inputs: &RootWorkerInputs,
+    initial_input: &super::user_input::UserInput,
+    first: StreamedTurn,
+    provider: &dyn LlmProvider,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<BoundaryContinuation> {
+    let mut acc = BoundaryContinuation::started(first, initial_input);
+    while !response_requests_tool_dispatch(&acc.streamed.response) {
+        let drained = drain_boundary_injections(
+            deps,
+            &inputs.bootstrap.task_id,
+            &inputs.bootstrap.thread_id,
+            &acc.delivered_injections,
+            now,
+        )
+        .await
+        .context("drain injections after LLM call")?;
+        if drained.is_empty() {
+            break;
+        }
+        if drained.messages.is_empty() {
+            // Content-free submission: the row is delivered and completes with
+            // the turn, but there is nothing to send the model.
+            acc.delivered_injections.extend(drained.delivered);
+            continue;
+        }
+        acc = run_boundary_injection_call(inputs, acc, drained, provider, deps, now).await?;
+    }
+    Ok(acc)
+}
+
+/// Close the finished call, stage the injected input, and run the next call.
+async fn run_boundary_injection_call(
+    inputs: &RootWorkerInputs,
+    mut acc: BoundaryContinuation,
+    drained: DrainedInjections,
+    provider: &dyn LlmProvider,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<BoundaryContinuation> {
+    let definition = inputs.definition();
+    let thread_id = &inputs.bootstrap.thread_id;
+
+    let staged = stage_boundary_exchange(inputs, &acc.close_input, &acc.streamed, &drained).await?;
+    acc.staged_prefix.extend(staged);
+    acc.delivered_injections.extend(drained.delivered);
+
+    close_attempt_or_propagate_already_closed(
+        &acc.streamed.attempt,
+        &acc.streamed.response,
+        &acc.streamed.success_usage,
+        &acc.streamed.evidence,
+        deps,
+        "close attempt before boundary injection",
+        now,
+    )
+    .await?;
+
+    // This call's consolidated content events are committed here rather than
+    // deferred into the turn-close context: `build_content_events` matches ids
+    // to blocks positionally within ONE response, so ids from two responses
+    // cannot be carried in a single `ContentIds` without colliding by block
+    // index — and dropping them is how the pre-injection text went missing.
+    let content_events = build_content_events(&acc.streamed.response, &acc.streamed.content_ids);
+    if !content_events.is_empty() {
+        acc.committed_events.extend(
+            deps.event_repo
+                .commit_event_batch(thread_id, content_events, now)
+                .await
+                .context("commit content events for the pre-injection call")?,
+        );
+    }
+
+    let resume_input = super::user_input::UserInput::resume();
+    let attempt = open_attempt(
+        inputs,
+        definition,
+        super::user_input::BOUNDARY_INJECTION_AUDIT_PROMPT,
+        deps.attempt_store,
+        now,
+        None,
+    )
+    .await
+    .context("open boundary-injection attempt")?;
+    let chat_request = build_chat_request(
+        definition,
+        &inputs.staged_stores.messages,
+        thread_id,
+        &resume_input,
+        inputs.bootstrap.task.caller_metadata.as_ref(),
+    )
+    .await
+    .context("build boundary-injection request")?;
+    let mut streamed = call_llm_with_retry(LlmRetryParams {
+        inputs,
+        definition,
+        user_input: &resume_input,
+        attempt_audit_prompt: super::user_input::BOUNDARY_INJECTION_AUDIT_PROMPT,
+        provider,
+        chat_request,
+        initial_attempt: attempt,
+        deps,
+        thread_id,
+        now,
+    })
+    .await
+    .context("boundary-injection LLM call")?;
+
+    // The provider billed the call that just closed, and the turn is billed
+    // once from the final response — fold, or the checkpoint under-reports.
+    add_attempt_usage(&mut streamed.response.usage, &acc.streamed.response.usage);
+    acc.streamed = streamed;
+    acc.close_input = resume_input;
+    Ok(acc)
+}
+
+/// Stage the completed exchange plus the injected input into the turn buffer,
+/// returning the same messages for the suspension path's durable payload.
+///
+/// Deliberately NOT [`buffer_turn_messages`]: that also advances the staged
+/// `turn_count`, and every LLM call in a turn shares one journaled turn.
+async fn stage_boundary_exchange(
+    inputs: &RootWorkerInputs,
+    close_input: &super::user_input::UserInput,
+    streamed: &StreamedTurn,
+    drained: &DrainedInjections,
+) -> Result<Vec<llm::Message>> {
+    let thread_id = &inputs.bootstrap.thread_id;
+    let mut staged: Vec<llm::Message> = close_input.clone().into_message().into_iter().collect();
+    staged.push(build_assistant_message(&streamed.response));
+    staged.extend(drained.messages.iter().cloned());
+    for message in &staged {
+        inputs
+            .staged_stores
+            .messages
+            .append(thread_id, message.clone())
+            .await
+            .context("stage boundary exchange")?;
+    }
+    Ok(staged)
+}
+
 /// Execute a root turn end to end.
 ///
 /// Depending on the LLM response this either:
@@ -1631,13 +1826,7 @@ async fn execute_root_turn_inner(
     #[cfg(not(feature = "otel"))]
     let streamed = llm_call.await;
 
-    let StreamedTurn {
-        response,
-        content_ids,
-        attempt,
-        success_usage,
-        evidence,
-    } = match streamed {
+    let first_streamed = match streamed {
         Ok(streamed) => streamed,
         Err(error) => {
             // Seam B (fresh turn): on a mid-stream (or between-retry)
@@ -1662,6 +1851,28 @@ async fn execute_root_turn_inner(
             return Err(error);
         }
     };
+    let BoundaryContinuation {
+        streamed,
+        close_input,
+        staged_prefix,
+        committed_events: boundary_committed,
+        delivered_injections,
+    } = continue_at_pending_input_boundary(
+        &inputs,
+        &user_input,
+        first_streamed,
+        provider,
+        deps,
+        now,
+    )
+    .await?;
+    let StreamedTurn {
+        response,
+        content_ids,
+        attempt,
+        success_usage,
+        evidence,
+    } = streamed;
 
     // Capture a post-LLM timestamp so the turn attempt's duration_ms
     // reflects actual wall-clock latency instead of always being 0.
@@ -1672,6 +1883,9 @@ async fn execute_root_turn_inner(
         start_committed,
         success_usage,
         evidence,
+        boundary_committed,
+        staged_prefix,
+        delivered_injections,
     };
 
     // 4. Branch: authorized tool handoff → suspend; otherwise commit.
@@ -1682,7 +1896,7 @@ async fn execute_root_turn_inner(
     if response_requests_tool_dispatch(&response) {
         return suspend_at_tool_boundary(
             inputs,
-            &user_input,
+            &close_input,
             response,
             attempt,
             deps,
@@ -1695,7 +1909,7 @@ async fn execute_root_turn_inner(
     // ── Text-only path (Phase 4.3) ──────────────────────────────
     commit_text_only_turn(
         inputs,
-        &user_input,
+        &close_input,
         response,
         attempt,
         deps,
@@ -1798,7 +2012,12 @@ async fn commit_text_only_turn(
     let mut committed_events: Vec<CommittedEvent> = Vec::new();
     committed_events.extend(close_ctx.user_input_committed);
     committed_events.push(close_ctx.start_committed);
+    committed_events.extend(close_ctx.boundary_committed);
     committed_events.extend(commit.committed_events.iter().cloned());
+
+    // The staged transcript — including anything injected mid-turn — is durable
+    // as of the commit above, so the injection rows may now be marked delivered.
+    complete_delivered_injections(deps, &close_ctx.delivered_injections, now).await;
 
     let (completed_task, resumed_invocation) = deps
         .task_store
@@ -4727,7 +4946,13 @@ async fn suspend_at_tool_boundary(
     //    those don't reach this branch (resume goes through
     //    `resume_root_turn` / `suspend_resumed_turn`), but the guard
     //    keeps the call site type-safe.
-    let mut suspended_messages = Vec::with_capacity(2);
+    //    `close_ctx.staged_prefix` leads: when a mid-turn injection ran an
+    //    extra LLM call, the earlier exchanges and the injected input live only
+    //    in the staged buffer, which this path never drains — omitting them
+    //    would resume the turn with the original prompt and the steering input
+    //    both missing from the model's view.
+    let mut suspended_messages = close_ctx.staged_prefix;
+    suspended_messages.reserve(2);
     if let Some(user_message) = user_input.clone().into_message() {
         suspended_messages.push(user_message);
     }
@@ -4806,7 +5031,12 @@ async fn suspend_at_tool_boundary(
     let mut committed_events: Vec<CommittedEvent> = Vec::new();
     committed_events.extend(close_ctx.user_input_committed);
     committed_events.push(close_ctx.start_committed);
+    committed_events.extend(close_ctx.boundary_committed);
     committed_events.extend(suspension_committed);
+
+    // `suspended_messages` (carrying the injected input) is durable on the
+    // parent task as of the spawn above, so the rows may be marked delivered.
+    complete_delivered_injections(deps, &close_ctx.delivered_injections, now).await;
 
     Ok(RootTurnOutcome::Suspended {
         parent_task,
@@ -5394,6 +5624,110 @@ struct ResumeSuspension<'a> {
     history_prefix: Vec<llm::Message>,
 }
 
+/// Input-injection rows taken into an in-flight turn at one boundary.
+///
+/// The rows are deliberately still `Queued` when this is returned: they are
+/// completed by [`complete_delivered_injections`] only after the commit that
+/// makes `messages` durable, so a turn that fails between drain and commit
+/// leaves them re-drainable instead of marking undelivered input as delivered.
+#[derive(Debug, Default)]
+pub(crate) struct DrainedInjections {
+    /// Injected user messages, in submission order, to stage into the turn.
+    messages: Vec<llm::Message>,
+    /// Ids of the rows these messages came from.
+    delivered: Vec<AgentTaskId>,
+}
+
+impl DrainedInjections {
+    /// Whether the boundary scan found nothing to deliver.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.delivered.is_empty()
+    }
+}
+
+/// Drain queued input-injection children at an execution boundary.
+///
+/// The `UserInput` event is keyed by the injection task id, so a retry after a
+/// crash finds the event already journaled and reuses it instead of writing a
+/// second one — while still re-staging the message, which is what makes
+/// delivery exactly-once end-to-end rather than merely at-most-once.
+///
+/// `already_drained` excludes rows this turn has taken at an earlier boundary:
+/// rows stay `Queued` until the turn commits, so the in-turn loop would
+/// otherwise serve the same injection on every pass.
+///
+/// The journal read is hoisted out of the per-row loop — it is the most
+/// expensive call on this path and one scan answers every row.
+pub(crate) async fn drain_boundary_injections(
+    deps: &RootTurnDeps<'_>,
+    parent_id: &AgentTaskId,
+    thread_id: &agent_sdk_foundation::ThreadId,
+    already_drained: &[AgentTaskId],
+    now: OffsetDateTime,
+) -> Result<DrainedInjections> {
+    let queued: Vec<AgentTask> = deps
+        .task_store
+        .list_children(parent_id)
+        .await?
+        .into_iter()
+        .filter(|injection| {
+            injection.kind == crate::journal::task::TaskKind::InputInjection
+                && injection.status == TaskStatus::Queued
+                && !already_drained.contains(&injection.id)
+        })
+        .collect();
+    if queued.is_empty() {
+        return Ok(DrainedInjections::default());
+    }
+
+    let journaled = deps.event_repo.get_events(thread_id).await?;
+    let mut drained = DrainedInjections::default();
+    for injection in queued {
+        let user_input = super::user_input::user_input_from_submitted(&injection.submitted_input);
+        let already_journaled = journaled.iter().any(|committed| {
+            matches!(committed.event, AgentEvent::UserInput { .. })
+                && committed.event.emitter_task_id() == Some(injection.id.as_str())
+        });
+        if !already_journaled {
+            let event = AgentEvent::user_input(thread_id.clone(), user_input.blocks().to_vec())
+                .with_emitter_task_id(injection.id.as_str());
+            let committed = deps.event_repo.commit_event(thread_id, event, now).await?;
+            deps.event_notifier.notify(std::slice::from_ref(&committed));
+        }
+
+        if let Some(message) = user_input.into_message() {
+            drained.messages.push(message);
+        }
+        drained.delivered.push(injection.id);
+    }
+    Ok(drained)
+}
+
+/// Mark every injection this turn consumed as delivered.
+///
+/// MUST run only after the commit that makes the injected messages durable.
+/// [`StagedMessageStore`](crate::journal::staged::StagedMessageStore) "never
+/// touches durable storage", so completing a row before that commit would
+/// publish a delivery the model may never have received — the failure mode the
+/// mailbox this replaces was built to remove.
+///
+/// Failure is logged rather than propagated: the turn is already committed, so
+/// returning an error here would retry a turn that succeeded. The row stays
+/// `Queued` and the next boundary re-delivers it — a visible duplicate, which
+/// is the safe direction to fail relative to silently dropping the input.
+async fn complete_delivered_injections(
+    deps: &RootTurnDeps<'_>,
+    delivered: &[AgentTaskId],
+    now: OffsetDateTime,
+) {
+    for id in delivered {
+        if let Err(error) = deps.task_store.complete_input_injection(id, now).await {
+            log::error!("boundary injection {id} committed but not marked delivered: {error:#}");
+        }
+    }
+}
+
 /// Resume a suspended root turn after all child tool tasks have
 /// reached terminal states.
 ///
@@ -5444,6 +5778,9 @@ pub async fn resume_root_turn(
 ) -> Result<RootTurnOutcome> {
     let definition = inputs.definition();
     let thread_id = &inputs.bootstrap.thread_id;
+    let injected = drain_boundary_injections(deps, &inputs.bootstrap.task_id, thread_id, &[], now)
+        .await
+        .context("drain boundary injections")?;
 
     // 1. Open a new turn attempt for the resume LLM call. The
     //    audit prompt is the canonical resume sentinel exported as
@@ -5509,6 +5846,14 @@ pub async fn resume_root_turn(
     )
     .await
     .context("buffer resume messages")?;
+    for message in &injected.messages {
+        inputs
+            .staged_stores
+            .messages
+            .append(thread_id, message.clone())
+            .await
+            .context("append boundary injection")?;
+    }
 
     // 4. Refresh the projection's draft slot with the completed child
     //    results so recovery surfaces the full in-flight transcript.
@@ -5517,12 +5862,13 @@ pub async fn resume_root_turn(
     //    independently reconstructable from the parent's ReadyToResume
     //    state, so a transient store error must not abort an otherwise
     //    healthy resume (matches the suspend paths' draft contract).
-    let resumed_draft = build_resumed_draft_messages(&suspended_messages, &child_results);
+    let mut resumed_draft = build_resumed_draft_messages(&suspended_messages, &child_results);
+    resumed_draft.extend(injected.messages.clone());
     snapshot_suspension_draft(
         deps,
         thread_id,
         &inputs.bootstrap.task_id,
-        resumed_draft,
+        resumed_draft.clone(),
         now,
         "refresh draft with completed child results before resume LLM call",
     )
@@ -5607,7 +5953,7 @@ pub async fn resume_root_turn(
             inputs,
             ResumeSuspension {
                 continuation: &continuation,
-                history_prefix: build_resumed_draft_messages(&suspended_messages, &child_results),
+                history_prefix: resumed_draft,
             },
             response,
             attempt,
@@ -5615,6 +5961,7 @@ pub async fn resume_root_turn(
                 content_ids: &content_ids,
                 success_usage: &success_usage,
                 evidence: &evidence,
+                delivered_injections: &injected.delivered,
             },
             deps,
             commit_now,
@@ -5631,6 +5978,7 @@ pub async fn resume_root_turn(
             content_ids: &content_ids,
             success_usage: &success_usage,
             evidence: &evidence,
+            delivered_injections: &injected.delivered,
         },
         deps,
         commit_now,
@@ -5722,6 +6070,8 @@ struct ResumeCloseContext<'a> {
     /// The successful attempt's own usage, for its audit row.
     success_usage: &'a llm::Usage,
     evidence: &'a AttemptEvidence,
+    /// Injection rows to complete once this turn's messages are durable.
+    delivered_injections: &'a [AgentTaskId],
 }
 
 async fn commit_resumed_turn(
@@ -5782,6 +6132,9 @@ async fn commit_resumed_turn(
     .context("commit resumed turn")?;
 
     let committed_events = commit.committed_events.clone();
+
+    // Injected input is part of the transcript the commit above persisted.
+    complete_delivered_injections(deps, close.delivered_injections, now).await;
 
     // Advance the root task to Completed.
     let (completed_task, resumed_invocation) = deps
@@ -5967,6 +6320,10 @@ async fn suspend_resumed_turn(
         now,
     )
     .await?;
+
+    // `suspended_messages` (carrying the injected input) is durable on the
+    // parent task as of the spawn above, so the rows may be marked delivered.
+    complete_delivered_injections(deps, close.delivered_injections, now).await;
 
     // Refresh the projection draft so a subsequent failure on the
     // *next* resume LLM call still surfaces the full in-flight
@@ -6649,6 +7006,9 @@ async fn run_steering_exchange(
                     content_ids: &content_ids,
                     success_usage: &success_usage,
                     evidence: &evidence,
+                    // The steering exchange is not an injection boundary — it
+                    // drains none, so it has none to mark delivered.
+                    delivered_injections: &[],
                 },
                 deps,
                 commit_now,
@@ -6667,6 +7027,7 @@ async fn run_steering_exchange(
                 content_ids: &content_ids,
                 success_usage: &success_usage,
                 evidence: &evidence,
+                delivered_injections: &[],
             },
             deps,
             commit_now,

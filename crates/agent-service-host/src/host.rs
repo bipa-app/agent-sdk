@@ -2296,6 +2296,10 @@ async fn execute_acquired_task(
         // budget is enforced on the child ROOT it spawned), so it carries
         // no beacon.
         TaskKind::Subagent => execute_subagent_task_entry(task, stores, runtime).await,
+        TaskKind::InputInjection => Err(anyhow::anyhow!(
+            "input-injection task {} reached runnable worker dispatch",
+            task.id
+        )),
     }
 }
 
@@ -8311,6 +8315,13 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(stall_ms as u64)).await;
             }
             self.inner.list_children(parent_id).await
+        }
+        async fn complete_input_injection(
+            &self,
+            id: &AgentTaskId,
+            now: time::OffsetDateTime,
+        ) -> Result<Option<AgentTask>> {
+            self.inner.complete_input_injection(id, now).await
         }
         async fn list_by_status(&self, status: TaskStatus) -> Result<Vec<AgentTask>> {
             self.inner.list_by_status(status).await
