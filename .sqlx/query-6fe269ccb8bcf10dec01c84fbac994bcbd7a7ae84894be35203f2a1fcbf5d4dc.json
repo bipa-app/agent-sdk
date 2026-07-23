@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\nSELECT\n    id,\n    kind,\n    status,\n    parent_id,\n    root_id,\n    depth,\n    thread_id,\n    submitted_input_json,\n    caller_metadata_json,\n    worker_id,\n    lease_id,\n    lease_expires_at,\n    last_heartbeat_at,\n    state_json,\n    attempt,\n    max_attempts,\n    last_error,\n    terminal_reason_json,\n    pending_child_count,\n    spawn_index,\n    result_payload,\n    otel_traceparent,\n    created_at,\n    updated_at,\n    completed_at,\n    last_activity_at\nFROM agent_sdk_tasks\nWHERE status = 'pending'\nORDER BY created_at, id\nLIMIT 1\nFOR UPDATE SKIP LOCKED\n",
+  "query": "\nSELECT\n    id,\n    kind,\n    status,\n    parent_id,\n    root_id,\n    depth,\n    thread_id,\n    submitted_input_json,\n    caller_metadata_json,\n    worker_id,\n    lease_id,\n    lease_expires_at,\n    last_heartbeat_at,\n    state_json,\n    attempt,\n    max_attempts,\n    last_error,\n    terminal_reason_json,\n    pending_child_count,\n    spawn_index,\n    result_payload,\n    otel_traceparent,\n    created_at,\n    updated_at,\n    completed_at,\n    last_activity_at\nFROM agent_sdk_tasks\nWHERE status = 'pending'\n  AND thread_id NOT IN (\n      SELECT thread_id FROM agent_sdk_threads WHERE status IN ('deleting', 'deleted')\n  )\nORDER BY created_at, id\nLIMIT 1\n",
   "describe": {
     "columns": [
       {
@@ -322,5 +322,5 @@
       true
     ]
   },
-  "hash": "afb3db39ceb11b16ae1ea1edc3a94aad6d4f65157f167e41d6d9a168ee4c571e"
+  "hash": "6fe269ccb8bcf10dec01c84fbac994bcbd7a7ae84894be35203f2a1fcbf5d4dc"
 }

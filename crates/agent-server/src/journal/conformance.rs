@@ -567,6 +567,21 @@ mod in_memory_bundle {
         ) -> Result<Thread> {
             self.thread.mark_completed(thread_id, now).await
         }
+        async fn begin_purge(
+            &self,
+            thread_id: &ThreadId,
+            scope: crate::journal::PurgeScope,
+            now: OffsetDateTime,
+        ) -> Result<Option<crate::journal::PurgeReceipt>> {
+            self.thread.begin_purge(thread_id, scope, now).await
+        }
+        async fn finish_purge(
+            &self,
+            thread_id: &ThreadId,
+            receipt: &crate::journal::PurgeReceipt,
+        ) -> Result<crate::journal::PurgeReceipt> {
+            self.thread.finish_purge(thread_id, receipt).await
+        }
         async fn list(&self) -> Result<Vec<Thread>> {
             self.thread.list().await
         }

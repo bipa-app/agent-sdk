@@ -678,7 +678,10 @@ pub use task_wakeup::{
     CapturingTaskWakeupHandler, FallbackWakeupSweep, JournalTaskWakeupHandler, TaskWakeupHandler,
     TaskWakeupOutcome, WakeupSignal, dispatch_payload,
 };
-pub use thread::{Thread, ThreadSchemaError, ThreadStatus};
+pub use thread::{
+    PurgeReceipt, PurgeScope, Thread, ThreadNotFound, ThreadOperation, ThreadSchemaError,
+    ThreadStateConflict, ThreadStatus,
+};
 pub use thread_creation_transaction::{
     AtomicThreadCreationCommitter, ThreadCreationCommit, ThreadCreationRows,
 };

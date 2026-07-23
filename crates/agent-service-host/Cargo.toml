@@ -41,7 +41,7 @@ otel = [
 # `commit.before_event_commit` immediately before their atomic
 # `tx.commit()`. OFF by default — production builds compile the call
 # sites away to nothing.
-failpoints = ["agent-server/failpoints"]
+failpoints = ["agent-server/failpoints", "dep:fail"]
 
 [dependencies]
 agent-sdk-foundation.workspace = true
@@ -80,6 +80,7 @@ opentelemetry = { workspace = true, optional = true }
 agent-sdk-otel = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
+fail = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The `with_builtin_tools_v2` example and `registry_tool_executor` test build

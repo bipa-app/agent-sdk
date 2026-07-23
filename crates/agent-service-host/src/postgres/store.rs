@@ -75,7 +75,9 @@ use agent_server::journal::task::{
     TaskKind, TaskStatus, WorkerId,
 };
 use agent_server::journal::task_state::SubagentInvocationState;
-use agent_server::journal::thread::Thread;
+use agent_server::journal::thread::{
+    PurgeReceipt, PurgeScope, Thread, ThreadNotFound, ThreadOperation, ThreadStatus,
+};
 use agent_server::journal::thread_creation_transaction::{
     AtomicThreadCreationCommitter, ThreadCreationCommit, ThreadCreationRows,
 };
@@ -244,8 +246,9 @@ INSERT INTO agent_sdk_threads (
     total_input_tokens,
     total_output_tokens,
     created_at,
-    updated_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7)
+    updated_at,
+    purge_receipt_json
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 ON CONFLICT (thread_id) DO NOTHING
 RETURNING thread_id
 ",
@@ -256,6 +259,7 @@ RETURNING thread_id
             i64::from(bootstrap.total_usage.output_tokens),
             bootstrap.created_at,
             bootstrap.updated_at,
+            Option::<serde_json::Value>::None,
         )
         .fetch_optional(&mut **tx)
         .await
@@ -342,7 +346,8 @@ SELECT
     total_input_tokens,
     total_output_tokens,
     created_at,
-    updated_at
+    updated_at,
+    purge_receipt_json
 FROM agent_sdk_threads
 WHERE thread_id = $1
 FOR UPDATE
@@ -353,6 +358,20 @@ FOR UPDATE
         .await
         .with_context(|| format!("lock thread {thread_id}"))?;
         record.map(TryInto::try_into).transpose()
+    }
+
+    async fn require_active_thread_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        thread_id: &ThreadId,
+        operation: ThreadOperation,
+    ) -> Result<()> {
+        let thread = Self::lock_thread_tx(tx, thread_id).await?.ok_or_else(|| {
+            anyhow::Error::new(ThreadNotFound {
+                thread_id: thread_id.clone(),
+            })
+        })?;
+        thread.require_active(operation)?;
+        Ok(())
     }
 
     async fn get_thread_pool(&self, thread_id: &ThreadId) -> Result<Option<Thread>> {
@@ -366,7 +385,8 @@ SELECT
     total_input_tokens,
     total_output_tokens,
     created_at,
-    updated_at
+    updated_at,
+    purge_receipt_json
 FROM agent_sdk_threads
 WHERE thread_id = $1
 ",
@@ -388,15 +408,17 @@ INSERT INTO agent_sdk_threads (
     total_input_tokens,
     total_output_tokens,
     created_at,
-    updated_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7)
+    updated_at,
+    purge_receipt_json
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 ON CONFLICT (thread_id) DO UPDATE SET
     status = EXCLUDED.status,
     committed_turns = EXCLUDED.committed_turns,
     total_input_tokens = EXCLUDED.total_input_tokens,
     total_output_tokens = EXCLUDED.total_output_tokens,
     created_at = EXCLUDED.created_at,
-    updated_at = EXCLUDED.updated_at
+    updated_at = EXCLUDED.updated_at,
+    purge_receipt_json = EXCLUDED.purge_receipt_json
 ",
             thread_key(&thread.thread_id),
             enum_to_wire(&thread.status)?,
@@ -405,6 +427,12 @@ ON CONFLICT (thread_id) DO UPDATE SET
             i64::from(thread.total_usage.output_tokens),
             thread.created_at,
             thread.updated_at,
+            thread
+                .purge_receipt
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .context("encode purge receipt")?,
         )
         .execute(&mut **tx)
         .await
@@ -2281,6 +2309,7 @@ FOR UPDATE
         let old_thread = Self::lock_thread_tx(&mut tx, &params.thread_id)
             .await?
             .context("thread missing after bootstrap")?;
+        old_thread.require_active(ThreadOperation::Commit)?;
         // Stale turn double-commit guard. The thread row is locked
         // FOR UPDATE; assert it is still positioned to produce
         // `expected_turn` before incrementing. A stale-lease worker that
@@ -2658,6 +2687,91 @@ async fn commit_cancel_markers_tx(
     Ok(markers)
 }
 
+async fn lock_cancel_threads_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    tasks: &[AgentTask],
+    now: OffsetDateTime,
+) -> Result<std::collections::HashSet<ThreadId>> {
+    let mut locked = std::collections::HashSet::new();
+    let mut fenced = std::collections::HashSet::new();
+    for task in tasks {
+        if task.kind != TaskKind::RootTurn
+            || !task.is_root()
+            || !locked.insert(task.thread_id.clone())
+        {
+            continue;
+        }
+        PostgresDurableStore::bootstrap_thread_row_tx(tx, &task.thread_id, now).await?;
+        let thread = PostgresDurableStore::lock_thread_tx(tx, &task.thread_id)
+            .await?
+            .context("thread missing after cancellation bootstrap")?;
+        if thread.status.is_purge_fenced() {
+            fenced.insert(task.thread_id.clone());
+        }
+    }
+    Ok(fenced)
+}
+
+async fn task_id_exists_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    task_id: &AgentTaskId,
+) -> Result<bool> {
+    let id = sqlx::query_scalar!(
+        "SELECT id FROM agent_sdk_tasks WHERE id = $1 LIMIT 1",
+        task_id.as_str(),
+    )
+    .fetch_optional(&mut **tx)
+    .await
+    .with_context(|| format!("check existing task {task_id}"))?;
+    Ok(id.is_some())
+}
+
+async fn load_runnable_head_tx(tx: &mut Transaction<'_, Postgres>) -> Result<Option<AgentTask>> {
+    let record = sqlx::query_as!(
+        TaskRecord,
+        r"
+SELECT
+    id,
+    kind,
+    status,
+    parent_id,
+    root_id,
+    depth,
+    thread_id,
+    submitted_input_json,
+    caller_metadata_json,
+    worker_id,
+    lease_id,
+    lease_expires_at,
+    last_heartbeat_at,
+    state_json,
+    attempt,
+    max_attempts,
+    last_error,
+    terminal_reason_json,
+    pending_child_count,
+    spawn_index,
+    result_payload,
+    otel_traceparent,
+    created_at,
+    updated_at,
+    completed_at,
+    last_activity_at
+FROM agent_sdk_tasks
+WHERE status = 'pending'
+  AND thread_id NOT IN (
+      SELECT thread_id FROM agent_sdk_threads WHERE status IN ('deleting', 'deleted')
+  )
+ORDER BY created_at, id
+LIMIT 1
+",
+    )
+    .fetch_optional(&mut **tx)
+    .await
+    .context("load runnable head")?;
+    record.map(AgentTask::try_from).transpose()
+}
+
 #[async_trait]
 impl AgentTaskStore for PostgresDurableStore {
     fn atomic_subagent_spawn_committer(&self) -> Option<&dyn AtomicSubagentSpawnCommitter> {
@@ -2677,16 +2791,9 @@ impl AgentTaskStore for PostgresDurableStore {
 
         let mut tx = self.begin().await?;
         Self::bootstrap_thread_row_tx(&mut tx, &task.thread_id, task.created_at).await?;
-        let _ = Self::lock_thread_tx(&mut tx, &task.thread_id).await?;
+        Self::require_active_thread_tx(&mut tx, &task.thread_id, ThreadOperation::Submit).await?;
 
-        let id_exists = sqlx::query_scalar!(
-            "SELECT id FROM agent_sdk_tasks WHERE id = $1 LIMIT 1",
-            task.id.as_str(),
-        )
-        .fetch_optional(&mut *tx)
-        .await
-        .with_context(|| format!("check existing task {}", task.id))?;
-        if id_exists.is_some() {
+        if task_id_exists_tx(&mut tx, &task.id).await? {
             return Err(anyhow!(
                 "submit_root_turn rejected: task id {} already exists",
                 task.id
@@ -2776,9 +2883,9 @@ SELECT EXISTS (
         // Serialize concurrent submissions on the same thread so the
         // idempotency claim, queue-depth check, and admission insert are
         // atomic with respect to one another.
-        let _ = Self::lock_thread_tx(&mut tx, &task.thread_id)
+        Self::require_active_thread_tx(&mut tx, &task.thread_id, ThreadOperation::Submit)
             .await
-            .map_err(SubmitRootTurnError::Other)?;
+            .map_err(SubmitRootTurnError::from)?;
 
         // 1. Idempotency replay / conflict, inside the same transaction.
         // Both the replay and the conflict path must release the
@@ -2804,15 +2911,10 @@ SELECT EXISTS (
             }
         }
 
-        let id_exists = sqlx::query_scalar!(
-            "SELECT id FROM agent_sdk_tasks WHERE id = $1 LIMIT 1",
-            task.id.as_str(),
-        )
-        .fetch_optional(&mut *tx)
-        .await
-        .with_context(|| format!("check existing task {}", task.id))
-        .map_err(SubmitRootTurnError::Other)?;
-        if id_exists.is_some() {
+        let id_exists = task_id_exists_tx(&mut tx, &task.id)
+            .await
+            .map_err(SubmitRootTurnError::Other)?;
+        if id_exists {
             let _ = tx.rollback().await;
             return Err(SubmitRootTurnError::Other(anyhow!(
                 "submit_root_turn rejected: task id {} already exists",
@@ -3239,7 +3341,7 @@ ORDER BY created_at, id
     ) -> Result<Option<AgentTask>> {
         let mut tx = self.begin().await?;
         Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
-        let _ = Self::lock_thread_tx(&mut tx, thread_id).await?;
+        Self::require_active_thread_tx(&mut tx, thread_id, ThreadOperation::Promote).await?;
         let promoted = Self::promote_next_queued_root_tx(&mut tx, thread_id, now).await?;
         // Explicit terminal disposition (never leave a FOR UPDATE
         // transaction parked idle-in-transaction): commit on a real
@@ -3266,8 +3368,14 @@ ORDER BY created_at, id
         now: OffsetDateTime,
     ) -> Result<Option<AgentTask>> {
         let mut tx = self.begin().await?;
-        let Some(old) = Self::load_task_tx(&mut tx, id, true).await? else {
+        let Some(screened) = Self::load_task_tx(&mut tx, id, false).await? else {
             tx.rollback().await.context("rollback missing acquire")?;
+            return Ok(None);
+        };
+        Self::require_active_thread_tx(&mut tx, &screened.thread_id, ThreadOperation::Acquire)
+            .await?;
+        let Some(old) = Self::load_task_tx(&mut tx, id, true).await? else {
+            tx.rollback().await.context("rollback vanished acquire")?;
             return Ok(None);
         };
         if !old.status.can_be_leased() {
@@ -3313,54 +3421,31 @@ ORDER BY created_at, id
     ) -> Result<Option<AgentTask>> {
         loop {
             let mut tx = self.begin().await?;
-            let record = sqlx::query_as!(
-                TaskRecord,
-                r"
-SELECT
-    id,
-    kind,
-    status,
-    parent_id,
-    root_id,
-    depth,
-    thread_id,
-    submitted_input_json,
-    caller_metadata_json,
-    worker_id,
-    lease_id,
-    lease_expires_at,
-    last_heartbeat_at,
-    state_json,
-    attempt,
-    max_attempts,
-    last_error,
-    terminal_reason_json,
-    pending_child_count,
-    spawn_index,
-    result_payload,
-    otel_traceparent,
-    created_at,
-    updated_at,
-    completed_at,
-    last_activity_at
-FROM agent_sdk_tasks
-WHERE status = 'pending'
-ORDER BY created_at, id
-LIMIT 1
-FOR UPDATE SKIP LOCKED
-",
-            )
-            .fetch_optional(&mut *tx)
-            .await
-            .context("load runnable head")?;
-            let Some(record) = record else {
+            let head = load_runnable_head_tx(&mut tx).await?;
+            let Some(head) = head else {
                 tx.rollback()
                     .await
                     .context("rollback empty runnable scan")?;
                 return Ok(None);
             };
-            let old = AgentTask::try_from(record)?;
+            let Some(old) = Self::load_task_tx(&mut tx, &head.id, true).await? else {
+                tx.rollback()
+                    .await
+                    .context("rollback vanished runnable head")?;
+                continue;
+            };
             if !old.status.can_be_leased() {
+                if old.status == TaskStatus::Running {
+                    // Lost the claim race to another worker between the
+                    // head scan and the FOR UPDATE load — rescan.
+                    tx.rollback()
+                        .await
+                        .context("rollback raced runnable head")?;
+                    continue;
+                }
+                // Anything else in the pending scan is index corruption,
+                // not a race — same hard error the sqlite and in-memory
+                // backends raise.
                 let status = old.status;
                 tx.rollback()
                     .await
@@ -3862,6 +3947,11 @@ FOR UPDATE SKIP LOCKED
         }
 
         let mut tx = self.begin().await?;
+        let screened_parent = Self::load_task_tx(&mut tx, parent_id, false)
+            .await?
+            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
+        Self::require_active_thread_tx(&mut tx, &screened_parent.thread_id, ThreadOperation::Spawn)
+            .await?;
         let old_parent = Self::load_task_tx(&mut tx, parent_id, true)
             .await?
             .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
@@ -3922,6 +4012,12 @@ FOR UPDATE SKIP LOCKED
             child_caller_metadata,
         } = spawn;
 
+        let screened_parent = Self::load_task_tx(&mut tx, parent_id, false)
+            .await?
+            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
+        Self::require_active_thread_tx(&mut tx, &screened_parent.thread_id, ThreadOperation::Spawn)
+            .await?;
+        Self::require_active_thread_tx(&mut tx, &child_thread_id, ThreadOperation::Spawn).await?;
         let old_parent = Self::load_task_tx(&mut tx, parent_id, true)
             .await?
             .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
@@ -3989,6 +4085,15 @@ FOR UPDATE SKIP LOCKED
         }
         let mut tx = self.begin().await?;
 
+        let screened_parent = Self::load_task_tx(&mut tx, parent_id, false)
+            .await?
+            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
+        Self::require_active_thread_tx(&mut tx, &screened_parent.thread_id, ThreadOperation::Spawn)
+            .await?;
+        for child_thread_id in spawns.iter().map(|spawn| &spawn.child_thread_id) {
+            Self::require_active_thread_tx(&mut tx, child_thread_id, ThreadOperation::Spawn)
+                .await?;
+        }
         let old_parent = Self::load_task_tx(&mut tx, parent_id, true)
             .await?
             .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
@@ -4052,9 +4157,17 @@ FOR UPDATE SKIP LOCKED
 
         let mut tx = self.begin().await?;
 
-        // Lock order matches `spawn_subagent_batch`: the parent task row
-        // first, then each child thread row. Diverging here would let a
-        // mixed spawn and a pure fan-out deadlock against each other.
+        // Lock order matches `spawn_subagent_batch`: thread rows first,
+        // followed by the parent task row.
+        let screened_parent = Self::load_task_tx(&mut tx, parent_id, false)
+            .await?
+            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
+        Self::require_active_thread_tx(&mut tx, &screened_parent.thread_id, ThreadOperation::Spawn)
+            .await?;
+        for child_thread_id in subagents.iter().map(|spawn| &spawn.child_thread_id) {
+            Self::require_active_thread_tx(&mut tx, child_thread_id, ThreadOperation::Spawn)
+                .await?;
+        }
         let old_parent = Self::load_task_tx(&mut tx, parent_id, true)
             .await?
             .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
@@ -4335,17 +4448,7 @@ ORDER BY created_at, id
         // but kind / is_root / thread_id cannot. BFS order keeps the
         // thread-lock order deterministic (parent thread before its
         // descendants' threads) for concurrent overlapping cancels.
-        let mut marker_threads_locked: std::collections::HashSet<ThreadId> =
-            std::collections::HashSet::new();
-        for row in &all_tasks {
-            if row.kind == TaskKind::RootTurn
-                && row.is_root()
-                && marker_threads_locked.insert(row.thread_id.clone())
-            {
-                Self::bootstrap_thread_row_tx(&mut tx, &row.thread_id, now).await?;
-                let _ = Self::lock_thread_tx(&mut tx, &row.thread_id).await?;
-            }
-        }
+        let fenced_threads = lock_cancel_threads_tx(&mut tx, &all_tasks, now).await?;
 
         // Phase 2 — CAS cancel transitions. Apply the cancel UPDATEs
         // deepest-first so the per-row locks are taken in the same
@@ -4445,7 +4548,9 @@ ORDER BY created_at, id
         // durable wakeup) so cancelling the active root never strands its
         // queued successors.
         for thread_id in &cancelled_root_threads {
-            Self::promote_next_queued_root_tx(&mut tx, thread_id, now).await?;
+            if !fenced_threads.contains(thread_id) {
+                Self::promote_next_queued_root_tx(&mut tx, thread_id, now).await?;
+            }
         }
 
         // Mid-tree cancel: when the cancelled subtree hangs under a
@@ -4622,6 +4727,7 @@ impl ThreadStore for PostgresDurableStore {
         let thread = Self::lock_thread_tx(&mut tx, thread_id)
             .await?
             .context("thread missing after bootstrap")?;
+        thread.require_active(ThreadOperation::Create)?;
         tx.commit().await.context("commit get_or_create thread")?;
         Ok(thread)
     }
@@ -4657,6 +4763,7 @@ impl ThreadStore for PostgresDurableStore {
         let old = Self::lock_thread_tx(&mut tx, thread_id)
             .await?
             .context("thread missing after bootstrap")?;
+        old.require_active(ThreadOperation::Commit)?;
         if old.committed_turns.saturating_add(1) != expected_turn {
             return Err(anyhow::Error::new(StaleTurnCommit {
                 expected_turn,
@@ -4680,6 +4787,56 @@ impl ThreadStore for PostgresDurableStore {
         Ok(completed)
     }
 
+    async fn begin_purge(
+        &self,
+        thread_id: &ThreadId,
+        _scope: PurgeScope,
+        now: OffsetDateTime,
+    ) -> Result<Option<PurgeReceipt>> {
+        let mut tx = self.begin().await?;
+        let old = Self::lock_thread_tx(&mut tx, thread_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::Error::new(ThreadNotFound {
+                    thread_id: thread_id.clone(),
+                })
+            })?;
+        if old.status == ThreadStatus::Deleted {
+            return old
+                .purge_receipt
+                .ok_or_else(|| anyhow!("deleted thread {thread_id} is missing its purge receipt"))
+                .map(Some);
+        }
+        let deleting = old.begin_purge(now);
+        Self::upsert_thread_tx(&mut tx, &deleting).await?;
+        tx.commit().await.context("commit begin thread purge")?;
+        Ok(None)
+    }
+
+    async fn finish_purge(
+        &self,
+        thread_id: &ThreadId,
+        receipt: &PurgeReceipt,
+    ) -> Result<PurgeReceipt> {
+        let mut tx = self.begin().await?;
+        let old = Self::lock_thread_tx(&mut tx, thread_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::Error::new(ThreadNotFound {
+                    thread_id: thread_id.clone(),
+                })
+            })?;
+        if old.status == ThreadStatus::Deleted {
+            return old
+                .purge_receipt
+                .ok_or_else(|| anyhow!("deleted thread {thread_id} is missing its purge receipt"));
+        }
+        let deleted = old.finish_purge(receipt.clone());
+        Self::upsert_thread_tx(&mut tx, &deleted).await?;
+        tx.commit().await.context("commit finish thread purge")?;
+        Ok(receipt.clone())
+    }
+
     async fn list(&self) -> Result<Vec<Thread>> {
         let records = sqlx::query_as!(
             ThreadRecord,
@@ -4691,7 +4848,8 @@ SELECT
     total_input_tokens,
     total_output_tokens,
     created_at,
-    updated_at
+    updated_at,
+    purge_receipt_json
 FROM agent_sdk_threads
 ORDER BY created_at, thread_id
 ",
@@ -6403,6 +6561,7 @@ struct ThreadRecord {
     total_output_tokens: i64,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
+    purge_receipt_json: Option<serde_json::Value>,
 }
 
 impl TryFrom<ThreadRecord> for Thread {
@@ -6420,6 +6579,10 @@ impl TryFrom<ThreadRecord> for Thread {
             },
             created_at: record.created_at,
             updated_at: record.updated_at,
+            purge_receipt: record
+                .purge_receipt_json
+                .map(|value| serde_json::from_value(value).context("decode purge receipt"))
+                .transpose()?,
         };
         thread
             .validate()

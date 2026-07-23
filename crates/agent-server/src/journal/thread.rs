@@ -26,8 +26,9 @@
 //! # Wire format
 //!
 //! [`ThreadStatus`] uses `#[serde(rename_all = "snake_case")]` so
-//! durable rows serialize as `"active"` / `"completed"`, matching
-//! the `snake_case` convention every other journal enum follows.
+//! durable rows serialize as `"active"` / `"completed"` / `"deleting"` /
+//! `"deleted"`, matching the `snake_case` convention every other journal enum
+//! follows.
 
 use agent_sdk_foundation::{ThreadId, TokenUsage};
 use serde::{Deserialize, Serialize};
@@ -39,10 +40,12 @@ use time::OffsetDateTime;
 
 /// Lifecycle status of a thread projection row.
 ///
-/// A thread starts [`ThreadStatus::Active`] on first creation and
-/// stays active while turns are being committed. A caller may
-/// transition it to [`ThreadStatus::Completed`] once the conversation
-/// is done, after which no further turns may be committed.
+/// A thread starts [`ThreadStatus::Active`] on first creation. Purge first
+/// installs a durable [`ThreadStatus::Deleting`] fence and only then advances
+/// it to [`ThreadStatus::Deleted`]. Both fence states are permanent admission
+/// barriers; the row remains as a tombstone so no bootstrap path can recreate
+/// the thread. [`ThreadStatus::Completed`] is retained for backwards
+/// compatibility with the existing close-with-history contract.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThreadStatus {
@@ -50,20 +53,112 @@ pub enum ThreadStatus {
     Active,
     /// The thread is closed — no further turns may be committed.
     Completed,
+    /// Purge has started and new work is durably fenced out.
+    Deleting,
+    /// Purge completed; this tombstone is permanent.
+    Deleted,
+}
+
+impl std::fmt::Display for ThreadStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let status = match self {
+            Self::Active => "active",
+            Self::Completed => "completed",
+            Self::Deleting => "deleting",
+            Self::Deleted => "deleted",
+        };
+        f.write_str(status)
+    }
 }
 
 impl ThreadStatus {
-    /// `true` if the thread is still open for turn commits.
+    /// `true` if the thread is still open for turn commits and task admission.
     #[must_use]
     pub const fn is_active(self) -> bool {
         matches!(self, Self::Active)
     }
 
-    /// `true` if the thread is closed.
+    /// `true` if the thread is closed through the legacy completion path.
     #[must_use]
     pub const fn is_completed(self) -> bool {
         matches!(self, Self::Completed)
     }
+
+    /// `true` once the durable deletion fence has been installed.
+    #[must_use]
+    pub const fn is_purge_fenced(self) -> bool {
+        matches!(self, Self::Deleting | Self::Deleted)
+    }
+}
+
+/// Store operation guarded by the thread lifecycle fence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadOperation {
+    Create,
+    Fork,
+    Submit,
+    Spawn,
+    Promote,
+    Acquire,
+    Commit,
+}
+
+impl std::fmt::Display for ThreadOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let operation = match self {
+            Self::Create => "create",
+            Self::Fork => "fork",
+            Self::Submit => "submit",
+            Self::Spawn => "spawn",
+            Self::Promote => "promote",
+            Self::Acquire => "acquire",
+            Self::Commit => "commit",
+        };
+        f.write_str(operation)
+    }
+}
+
+/// Typed rejection returned by every admission surface for a non-active
+/// thread.
+///
+/// Callers can downcast `anyhow::Error` to this type and inspect the exact
+/// lifecycle state rather than parsing an error string.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("thread {thread_id} is {status}; {operation} is fenced")]
+pub struct ThreadStateConflict {
+    pub thread_id: ThreadId,
+    pub status: ThreadStatus,
+    pub operation: ThreadOperation,
+}
+
+/// Purge reach: only the named thread, or its durable subagent invocation
+/// descendants as well.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PurgeScope {
+    Thread,
+    InvocationTree,
+}
+
+/// Durable, idempotent proof of one completed purge.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PurgeReceipt {
+    pub root_thread_id: ThreadId,
+    pub scope: PurgeScope,
+    pub purged_thread_ids: Vec<ThreadId>,
+    pub cancelled_task_ids: Vec<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub started_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub completed_at: OffsetDateTime,
+}
+
+/// Typed purge failure for an id that has no live row or tombstone.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("thread {thread_id} does not exist")]
+pub struct ThreadNotFound {
+    pub thread_id: ThreadId,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -112,6 +207,10 @@ pub struct Thread {
     /// Last time this row was modified.
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+    /// Completed purge receipt. Present only on the permanent tombstone and
+    /// retained so retries return byte-for-byte equivalent evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purge_receipt: Option<PurgeReceipt>,
 }
 
 impl Thread {
@@ -128,6 +227,7 @@ impl Thread {
             total_usage: TokenUsage::default(),
             created_at: now,
             updated_at: now,
+            purge_receipt: None,
         }
     }
 
@@ -180,6 +280,56 @@ impl Thread {
         self.updated_at = now;
         self.validate()?;
         Ok(self)
+    }
+
+    /// Install the durable deletion fence.
+    ///
+    /// Active and legacy-completed rows may enter deletion. A deleting row is
+    /// returned unchanged so an interrupted purge can resume. A deleted row
+    /// must be handled as an idempotent receipt replay by the store.
+    #[must_use]
+    pub const fn begin_purge(mut self, now: OffsetDateTime) -> Self {
+        match self.status {
+            ThreadStatus::Active | ThreadStatus::Completed => {
+                self.status = ThreadStatus::Deleting;
+                self.updated_at = now;
+            }
+            ThreadStatus::Deleting | ThreadStatus::Deleted => {}
+        }
+        self
+    }
+
+    /// Advance a fenced row to its permanent tombstone and retain the receipt.
+    #[must_use]
+    pub fn finish_purge(mut self, receipt: PurgeReceipt) -> Self {
+        self.status = ThreadStatus::Deleted;
+        self.updated_at = receipt.completed_at;
+        self.purge_receipt = Some(receipt);
+        self
+    }
+
+    /// Return a typed error unless this row accepts `operation`.
+    ///
+    /// Legacy-completed rows remain readable through create replay/recovery and
+    /// may still be forked, preserving the pre-purge contract. All other
+    /// admission requires an active row. Deleting and deleted rows reject every
+    /// operation.
+    ///
+    /// # Errors
+    /// Returns [`ThreadStateConflict`] with the exact durable state when the
+    /// operation is fenced.
+    pub fn require_active(&self, operation: ThreadOperation) -> Result<(), ThreadStateConflict> {
+        let allowed = self.status.is_active()
+            || (self.status.is_completed()
+                && matches!(operation, ThreadOperation::Create | ThreadOperation::Fork));
+        if allowed {
+            return Ok(());
+        }
+        Err(ThreadStateConflict {
+            thread_id: self.thread_id.clone(),
+            status: self.status,
+            operation,
+        })
     }
 
     /// Check every structural invariant on this row.
@@ -351,6 +501,60 @@ mod tests {
         }
         assert_eq!(value["status"], serde_json::json!("active"));
         Ok(())
+    }
+
+    #[test]
+    fn method_state_fence_matrix_is_exhaustive() {
+        // Every named admission operation × every thread status, as a
+        // plain nested-loop table (randomizing the id added nothing —
+        // the property never depended on it). `Completed` is in the
+        // matrix so its Create/Fork carve-out is pinned rather than
+        // dead-coded, and `Commit` so a committed-turn write on a
+        // fenced thread is provably refused.
+        let operations = [
+            ThreadOperation::Create,
+            ThreadOperation::Fork,
+            ThreadOperation::Submit,
+            ThreadOperation::Spawn,
+            ThreadOperation::Promote,
+            ThreadOperation::Acquire,
+            ThreadOperation::Commit,
+        ];
+        let statuses = [
+            ThreadStatus::Active,
+            ThreadStatus::Completed,
+            ThreadStatus::Deleting,
+            ThreadStatus::Deleted,
+        ];
+
+        for operation in operations {
+            for status in statuses {
+                let mut thread = Thread::new(ThreadId::from_string("matrix"), t0());
+                if status == ThreadStatus::Completed {
+                    thread.committed_turns = 1;
+                }
+                thread.status = status;
+                let expected_ok = match status {
+                    ThreadStatus::Active => true,
+                    ThreadStatus::Completed => {
+                        matches!(operation, ThreadOperation::Create | ThreadOperation::Fork)
+                    }
+                    ThreadStatus::Deleting | ThreadStatus::Deleted => false,
+                };
+                match thread.require_active(operation) {
+                    Ok(()) => assert!(expected_ok, "{status:?} unexpectedly accepted {operation}"),
+                    Err(error) => {
+                        assert!(
+                            !expected_ok,
+                            "{status:?} unexpectedly refused {operation}: {error}",
+                        );
+                        assert_eq!(error.thread_id, thread.thread_id);
+                        assert_eq!(error.status, status);
+                        assert_eq!(error.operation, operation);
+                    }
+                }
+            }
+        }
     }
 
     // ── ThreadStatus classification ───────────────────────────────

@@ -74,7 +74,9 @@ use agent_server::journal::task::{
     WorkerId,
 };
 use agent_server::journal::task_state::SubagentInvocationState;
-use agent_server::journal::thread::Thread;
+use agent_server::journal::thread::{
+    PurgeReceipt, PurgeScope, Thread, ThreadNotFound, ThreadOperation, ThreadStatus,
+};
 use agent_server::journal::thread_creation_transaction::{
     AtomicThreadCreationCommitter, ThreadCreationCommit, ThreadCreationRows,
 };
@@ -236,12 +238,14 @@ impl SqliteDurableStore {
         let committed_turns = i64::from(bootstrap.committed_turns);
         let input_tokens = i64::from(bootstrap.total_usage.input_tokens);
         let output_tokens = i64::from(bootstrap.total_usage.output_tokens);
+        let purge_receipt_json: Option<String> = None;
         let inserted = sqlx::query!(
             r"
 INSERT INTO agent_sdk_threads (
     thread_id, status, committed_turns,
-    total_input_tokens, total_output_tokens, created_at, updated_at
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+    total_input_tokens, total_output_tokens, created_at, updated_at,
+    purge_receipt_json
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
 ON CONFLICT (thread_id) DO NOTHING
 ",
             thread_id_key,
@@ -251,6 +255,7 @@ ON CONFLICT (thread_id) DO NOTHING
             output_tokens,
             bootstrap.created_at,
             bootstrap.updated_at,
+            purge_receipt_json,
         )
         .execute(&mut **tx)
         .await
@@ -334,7 +339,8 @@ ON CONFLICT (thread_id) DO NOTHING
         let record = sqlx::query_as::<_, ThreadRecord>(
             r"
 SELECT thread_id, status, committed_turns,
-       total_input_tokens, total_output_tokens, created_at, updated_at
+       total_input_tokens, total_output_tokens, created_at, updated_at,
+       purge_receipt_json
 FROM agent_sdk_threads
 WHERE thread_id = ?1
 ",
@@ -346,11 +352,26 @@ WHERE thread_id = ?1
         record.map(TryInto::try_into).transpose()
     }
 
+    async fn require_active_thread_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        thread_id: &ThreadId,
+        operation: ThreadOperation,
+    ) -> Result<()> {
+        let thread = Self::get_thread_tx(tx, thread_id).await?.ok_or_else(|| {
+            anyhow::Error::new(ThreadNotFound {
+                thread_id: thread_id.clone(),
+            })
+        })?;
+        thread.require_active(operation)?;
+        Ok(())
+    }
+
     async fn get_thread_pool(&self, thread_id: &ThreadId) -> Result<Option<Thread>> {
         let record = sqlx::query_as::<_, ThreadRecord>(
             r"
 SELECT thread_id, status, committed_turns,
-       total_input_tokens, total_output_tokens, created_at, updated_at
+       total_input_tokens, total_output_tokens, created_at, updated_at,
+       purge_receipt_json
 FROM agent_sdk_threads
 WHERE thread_id = ?1
 ",
@@ -368,18 +389,26 @@ WHERE thread_id = ?1
         let committed_turns = i64::from(thread.committed_turns);
         let input_tokens = i64::from(thread.total_usage.input_tokens);
         let output_tokens = i64::from(thread.total_usage.output_tokens);
+        let purge_receipt_json = thread
+            .purge_receipt
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("encode purge receipt")?;
         sqlx::query!(
             r"
 INSERT INTO agent_sdk_threads (
     thread_id, status, committed_turns,
-    total_input_tokens, total_output_tokens, created_at, updated_at
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+    total_input_tokens, total_output_tokens, created_at, updated_at,
+    purge_receipt_json
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
 ON CONFLICT (thread_id) DO UPDATE SET
     status = excluded.status,
     committed_turns = excluded.committed_turns,
     total_input_tokens = excluded.total_input_tokens,
     total_output_tokens = excluded.total_output_tokens,
-    updated_at = excluded.updated_at
+    updated_at = excluded.updated_at,
+    purge_receipt_json = excluded.purge_receipt_json
 ",
             thread_id_key,
             status_wire,
@@ -388,6 +417,7 @@ ON CONFLICT (thread_id) DO UPDATE SET
             output_tokens,
             thread.created_at,
             thread.updated_at,
+            purge_receipt_json,
         )
         .execute(&mut **tx)
         .await
@@ -2238,6 +2268,7 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
         let old_thread = Self::get_thread_tx(&mut tx, &params.thread_id)
             .await?
             .context("thread missing after bootstrap")?;
+        old_thread.require_active(ThreadOperation::Commit)?;
         // Stale turn double-commit guard. The transaction holds the
         // write lock on the thread row; assert it is still positioned to
         // produce `expected_turn` before incrementing. A stale-lease
@@ -2557,6 +2588,13 @@ impl AgentTaskStore for SqliteDurableStore {
             .context("submit_root_turn rejected: task failed schema validation")?;
 
         let mut tx = self.begin().await?;
+        // Fence BEFORE bootstrap: a deleting/deleted tombstone must be
+        // seen before the get-or-create could touch the thread row, so
+        // the fence — not the bootstrap's ON CONFLICT — is what refuses
+        // resurrection.
+        if let Some(existing) = Self::get_thread_tx(&mut tx, &task.thread_id).await? {
+            existing.require_active(ThreadOperation::Submit)?;
+        }
         Self::bootstrap_thread_row_tx(&mut tx, &task.thread_id, task.created_at).await?;
 
         let task_id_str = task.id.as_str();
@@ -2639,6 +2677,9 @@ impl AgentTaskStore for SqliteDurableStore {
         Self::bootstrap_thread_row_tx(&mut tx, &task.thread_id, task.created_at)
             .await
             .map_err(SubmitRootTurnError::Other)?;
+        Self::require_active_thread_tx(&mut tx, &task.thread_id, ThreadOperation::Submit)
+            .await
+            .map_err(SubmitRootTurnError::from)?;
 
         // 1. Idempotency replay / conflict, inside the same transaction.
         // Always explicitly commit (replay) or roll back (conflict /
@@ -2972,6 +3013,7 @@ impl AgentTaskStore for SqliteDurableStore {
     ) -> Result<Option<AgentTask>> {
         let mut tx = self.begin().await?;
         Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
+        Self::require_active_thread_tx(&mut tx, thread_id, ThreadOperation::Promote).await?;
         let promoted = Self::promote_next_queued_root_tx(&mut tx, thread_id, now).await?;
         tx.commit()
             .await
@@ -2991,6 +3033,7 @@ impl AgentTaskStore for SqliteDurableStore {
         let Some(old) = Self::load_task_tx(&mut tx, id).await? else {
             return Ok(None);
         };
+        Self::require_active_thread_tx(&mut tx, &old.thread_id, ThreadOperation::Acquire).await?;
         if !old.status.can_be_leased() {
             return Ok(None);
         }
@@ -3034,10 +3077,15 @@ impl AgentTaskStore for SqliteDurableStore {
         // fail-closed rows, same as the Postgres backend.
         loop {
             let mut tx = self.begin().await?;
+            // Threads mid-purge are excluded IN the scan: one fenced
+            // thread's oldest pending row must never stall every other
+            // thread's acquires (its rows are cancelled by the purge).
             let record = sqlx::query_as::<_, TaskRecord>(concat!(
                 "SELECT ",
                 task_columns!(),
                 " FROM agent_sdk_tasks WHERE status = 'pending' \
+                 AND thread_id NOT IN (SELECT thread_id FROM agent_sdk_threads \
+                 WHERE status IN ('deleting', 'deleted')) \
                  ORDER BY created_at, id LIMIT 1",
             ))
             .fetch_optional(&mut *tx)
@@ -3493,6 +3541,8 @@ impl AgentTaskStore for SqliteDurableStore {
         let old_parent = Self::load_task_tx(&mut tx, parent_id)
             .await?
             .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
+        Self::require_active_thread_tx(&mut tx, &old_parent.thread_id, ThreadOperation::Spawn)
+            .await?;
         validate_subagent_spawn_parent(&old_parent, parent_id, worker, lease)?;
 
         let mut children = Vec::with_capacity(specs.len());
@@ -3549,15 +3599,11 @@ impl AgentTaskStore for SqliteDurableStore {
         let old_parent = Self::load_task_tx(&mut tx, parent_id)
             .await?
             .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
+        Self::require_active_thread_tx(&mut tx, &old_parent.thread_id, ThreadOperation::Spawn)
+            .await?;
         validate_subagent_spawn_parent(&old_parent, parent_id, worker, lease)?;
 
-        // Verify child thread exists
-        let child_thread = Self::get_thread_tx(&mut tx, &child_thread_id).await?;
-        if child_thread.is_none() {
-            return Err(anyhow!(
-                "spawn rejected: child thread {child_thread_id} does not exist"
-            ));
-        }
+        Self::require_active_thread_tx(&mut tx, &child_thread_id, ThreadOperation::Spawn).await?;
         let child_thread_key = thread_key(&child_thread_id);
         let existing_task = sqlx::query_scalar!(
             "SELECT id FROM agent_sdk_tasks WHERE thread_id = ?1 LIMIT 1",
@@ -3649,7 +3695,13 @@ impl AgentTaskStore for SqliteDurableStore {
         let old_parent = Self::load_task_tx(&mut tx, parent_id)
             .await?
             .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
+        Self::require_active_thread_tx(&mut tx, &old_parent.thread_id, ThreadOperation::Spawn)
+            .await?;
         validate_subagent_spawn_parent(&old_parent, parent_id, worker, lease)?;
+        for child_thread_id in spawns.iter().map(|spawn| &spawn.child_thread_id) {
+            Self::require_active_thread_tx(&mut tx, child_thread_id, ThreadOperation::Spawn)
+                .await?;
+        }
 
         // Build (invocation, child_root) per entry, validating against
         // existing rows under the same transaction so the whole batch
@@ -3719,7 +3771,13 @@ impl AgentTaskStore for SqliteDurableStore {
         let old_parent = Self::load_task_tx(&mut tx, parent_id)
             .await?
             .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
+        Self::require_active_thread_tx(&mut tx, &old_parent.thread_id, ThreadOperation::Spawn)
+            .await?;
         validate_subagent_spawn_parent(&old_parent, parent_id, worker, lease)?;
+        for child_thread_id in subagents.iter().map(|spawn| &spawn.child_thread_id) {
+            Self::require_active_thread_tx(&mut tx, child_thread_id, ThreadOperation::Spawn)
+                .await?;
+        }
 
         let prepared = prepare_subagent_batch_rows_tx(&mut tx, &old_parent, subagents, now).await?;
 
@@ -3939,6 +3997,19 @@ impl AgentTaskStore for SqliteDurableStore {
         // `conformance_sqlite_concurrent_cancels_single_marker` race
         // test).
         let all_tasks = Self::collect_subtree_tx(&mut tx, root_id).await?;
+        let candidate_threads: std::collections::HashSet<ThreadId> = all_tasks
+            .iter()
+            .map(|task| task.thread_id.clone())
+            .collect();
+        let mut fenced_threads = std::collections::HashSet::new();
+        for thread_id in candidate_threads {
+            if Self::get_thread_tx(&mut tx, &thread_id)
+                .await?
+                .is_some_and(|thread| thread.status.is_purge_fenced())
+            {
+                fenced_threads.insert(thread_id);
+            }
+        }
 
         let mut transitioned = Vec::with_capacity(all_tasks.len());
         // Track cancelled root-turn roots (and their threads) so we can
@@ -4006,7 +4077,9 @@ impl AgentTaskStore for SqliteDurableStore {
         // durable wakeup) so cancelling the active root never strands its
         // queued successors.
         for thread_id in &cancelled_root_threads {
-            Self::promote_next_queued_root_tx(&mut tx, thread_id, now).await?;
+            if !fenced_threads.contains(thread_id) {
+                Self::promote_next_queued_root_tx(&mut tx, thread_id, now).await?;
+            }
         }
 
         // Mid-tree cancel: when the cancelled subtree hangs under a
@@ -4241,6 +4314,7 @@ impl ThreadStore for SqliteDurableStore {
         let thread = Self::get_thread_tx(&mut tx, thread_id)
             .await?
             .context("thread missing after bootstrap")?;
+        thread.require_active(ThreadOperation::Create)?;
         tx.commit().await.context("commit get_or_create thread")?;
         Ok(thread)
     }
@@ -4276,6 +4350,7 @@ impl ThreadStore for SqliteDurableStore {
         let old = Self::get_thread_tx(&mut tx, thread_id)
             .await?
             .context("thread missing after bootstrap")?;
+        old.require_active(ThreadOperation::Commit)?;
         if old.committed_turns.saturating_add(1) != expected_turn {
             return Err(anyhow::Error::new(StaleTurnCommit {
                 expected_turn,
@@ -4299,9 +4374,59 @@ impl ThreadStore for SqliteDurableStore {
         Ok(completed)
     }
 
+    async fn begin_purge(
+        &self,
+        thread_id: &ThreadId,
+        _scope: PurgeScope,
+        now: OffsetDateTime,
+    ) -> Result<Option<PurgeReceipt>> {
+        let mut tx = self.begin().await?;
+        let old = Self::get_thread_tx(&mut tx, thread_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::Error::new(ThreadNotFound {
+                    thread_id: thread_id.clone(),
+                })
+            })?;
+        if old.status == ThreadStatus::Deleted {
+            return old
+                .purge_receipt
+                .ok_or_else(|| anyhow!("deleted thread {thread_id} is missing its purge receipt"))
+                .map(Some);
+        }
+        let deleting = old.begin_purge(now);
+        Self::upsert_thread_tx(&mut tx, &deleting).await?;
+        tx.commit().await.context("commit begin thread purge")?;
+        Ok(None)
+    }
+
+    async fn finish_purge(
+        &self,
+        thread_id: &ThreadId,
+        receipt: &PurgeReceipt,
+    ) -> Result<PurgeReceipt> {
+        let mut tx = self.begin().await?;
+        let old = Self::get_thread_tx(&mut tx, thread_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::Error::new(ThreadNotFound {
+                    thread_id: thread_id.clone(),
+                })
+            })?;
+        if old.status == ThreadStatus::Deleted {
+            return old
+                .purge_receipt
+                .ok_or_else(|| anyhow!("deleted thread {thread_id} is missing its purge receipt"));
+        }
+        let deleted = old.finish_purge(receipt.clone());
+        Self::upsert_thread_tx(&mut tx, &deleted).await?;
+        tx.commit().await.context("commit finish thread purge")?;
+        Ok(receipt.clone())
+    }
+
     async fn list(&self) -> Result<Vec<Thread>> {
         let records = sqlx::query_as::<_, ThreadRecord>(
-            "SELECT thread_id, status, committed_turns, total_input_tokens, total_output_tokens, created_at, updated_at FROM agent_sdk_threads ORDER BY created_at, thread_id",
+            "SELECT thread_id, status, committed_turns, total_input_tokens, total_output_tokens, created_at, updated_at, purge_receipt_json FROM agent_sdk_threads ORDER BY created_at, thread_id",
         )
         .fetch_all(&self.pool)
         .await
@@ -5447,14 +5572,16 @@ struct ThreadRecord {
     total_output_tokens: i64,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
+    purge_receipt_json: Option<String>,
 }
 
 impl TryFrom<ThreadRecord> for Thread {
     type Error = anyhow::Error;
     fn try_from(r: ThreadRecord) -> Result<Self> {
+        let status = enum_from_wire(&r.status, "thread status")?;
         let thread = Self {
             thread_id: ThreadId::from_string(r.thread_id),
-            status: enum_from_wire(&r.status, "thread status")?,
+            status,
             committed_turns: u32_from_i64(r.committed_turns, "thread committed_turns")?,
             total_usage: TokenUsage {
                 input_tokens: u32_from_i64(r.total_input_tokens, "thread input tokens")?,
@@ -5463,6 +5590,10 @@ impl TryFrom<ThreadRecord> for Thread {
             },
             created_at: r.created_at,
             updated_at: r.updated_at,
+            purge_receipt: r
+                .purge_receipt_json
+                .map(|json| serde_json::from_str(&json).context("decode purge receipt"))
+                .transpose()?,
         };
         thread
             .validate()
@@ -6109,6 +6240,59 @@ INSERT INTO agent_sdk_turn_attempts (
         );
         assert!(legacy.thinking_budget_tokens.is_none());
         assert!(legacy.thinking_effort.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn acquire_skips_the_fenced_head_and_claims_the_next_thread() -> Result<()> {
+        use agent_server::journal::PurgeScope;
+        use agent_server::journal::store::AgentTaskStore as _;
+        use agent_server::journal::task::{AgentTask, LeaseId, WorkerId};
+        use agent_server::journal::thread_store::ThreadStore as _;
+
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+        let fenced_thread = ThreadId::from_string("t-acq-fenced");
+        let live_thread = ThreadId::from_string("t-acq-live");
+        store.get_or_create(&fenced_thread, t0()).await?;
+        store.get_or_create(&live_thread, t0()).await?;
+        let fenced_root = AgentTask::new_root_turn(fenced_thread.clone(), t0(), 3);
+        let fenced_root_id = fenced_root.id.clone();
+        let live_root = AgentTask::new_root_turn(live_thread.clone(), t_plus(1), 3);
+        let live_root_id = live_root.id.clone();
+        store.submit_root_turn(fenced_root).await?;
+        store.submit_root_turn(live_root).await?;
+        let _ = store
+            .begin_purge(&fenced_thread, PurgeScope::Thread, t_plus(2))
+            .await?;
+
+        let claimed = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w-skip"),
+                LeaseId::from_string("l-skip"),
+                t_plus(600),
+                t_plus(3),
+            )
+            .await?
+            .context("acquire must skip the fenced head and claim the live root")?;
+        assert_eq!(claimed.id, live_root_id);
+
+        let none = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w-skip-2"),
+                LeaseId::from_string("l-skip-2"),
+                t_plus(600),
+                t_plus(4),
+            )
+            .await?;
+        assert!(none.is_none(), "only the fenced row remains: {none:?}");
+        let fenced_after =
+            agent_server::journal::store::AgentTaskStore::get(&store, &fenced_root_id)
+                .await?
+                .context("fenced root survives")?;
+        assert_eq!(
+            fenced_after.status,
+            agent_server::journal::TaskStatus::Pending
+        );
         Ok(())
     }
 
