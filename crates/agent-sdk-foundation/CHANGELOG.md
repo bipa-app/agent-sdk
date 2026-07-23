@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-foundation-v0.13.1...agent-sdk-foundation-v0.14.0) - 2026-07-23
+
+### Other
+
+- Add durable AwaitingQuestion state ([#398](https://github.com/bipa-app/agent-sdk/pull/398))
+- Add submit boundary disposition ([#396](https://github.com/bipa-app/agent-sdk/pull/396))
+- Persist terminal reasons and live subagent usage ([#394](https://github.com/bipa-app/agent-sdk/pull/394))
+- Atomically commit spawn, create, and fork journal facts ([#395](https://github.com/bipa-app/agent-sdk/pull/395))
+- persist turn attempt evidence ([#392](https://github.com/bipa-app/agent-sdk/pull/392))
+
 ## [0.13.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-foundation-v0.12.0...agent-sdk-foundation-v0.13.0) - 2026-07-14
 
 ### Added

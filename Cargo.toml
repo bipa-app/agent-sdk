@@ -26,20 +26,20 @@ homepage = "https://github.com/bipa-app/agent-sdk"
 authors = ["Bipa <engineering@bipa.app>"]
 
 [workspace.dependencies]
-agent-sdk-foundation = { path = "crates/agent-sdk-foundation", version = "0.13.1" }
-agent-sdk-tools = { path = "crates/agent-sdk-tools", version = "0.13.1" }
+agent-sdk-foundation = { path = "crates/agent-sdk-foundation", version = "0.14.0" }
+agent-sdk-tools = { path = "crates/agent-sdk-tools", version = "0.14.0" }
 # Phase 13·E ergonomics macros (`#[derive(Tool)]` / `#[derive(TypedTool)]`,
 # `tool!`, `#[derive(ToolName)]`). Re-exported from the `agent-sdk` façade so
 # consumers never depend on this crate directly. COORDINATION (13·D): this is
 # a new workspace member + manifest; 13·D edits packaging/CI metadata — both
 # are additive and reconcile at merge.
-agent-sdk-macros = { path = "crates/agent-sdk-macros", version = "0.13.1" }
+agent-sdk-macros = { path = "crates/agent-sdk-macros", version = "0.14.0" }
 # `default-features = false` here lets each consumer (notably the `agent-sdk`
 # façade) decide which provider impls compile. Crates that only use the
 # `LlmProvider` trait / streaming types pull no concrete provider at all.
-agent-sdk-providers = { path = "crates/agent-sdk-providers", version = "0.13.1", default-features = false }
-agent-sdk = { path = "crates/agent-sdk", version = "0.13.1" }
-agent-sdk-otel = { path = "crates/agent-sdk-otel", version = "0.13.1" }
+agent-sdk-providers = { path = "crates/agent-sdk-providers", version = "0.14.0", default-features = false }
+agent-sdk = { path = "crates/agent-sdk", version = "0.14.0" }
+agent-sdk-otel = { path = "crates/agent-sdk-otel", version = "0.14.0" }
 agent-server = { path = "crates/agent-server", version = "0.8.0" }
 agent-service-host = { path = "crates/agent-service-host", version = "0.8.0" }
 tokio = { version = "1.52.0", features = ["sync", "fs", "process", "time", "macros"] }
