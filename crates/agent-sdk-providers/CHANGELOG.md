@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.13.1...agent-sdk-providers-v0.14.0) - 2026-07-23
+
+### Fixed
+
+- *(codex)* stream collected chat responses ([#393](https://github.com/bipa-app/agent-sdk/pull/393))
+- *(compaction)* recover OpenAI Responses threads from context overflow ([#389](https://github.com/bipa-app/agent-sdk/pull/389))
+
+### Other
+
+- Persist terminal reasons and live subagent usage ([#394](https://github.com/bipa-app/agent-sdk/pull/394))
+- persist turn attempt evidence ([#392](https://github.com/bipa-app/agent-sdk/pull/392))
+
 ## [0.13.1](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.13.0...agent-sdk-providers-v0.13.1) - 2026-07-14
 
 ### Other
