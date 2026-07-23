@@ -63,6 +63,36 @@ mod duration_ms_serde {
     }
 }
 
+/// Typed explanation for a durable task reaching a terminal state.
+///
+/// The tagged wire shape keeps variants stable while allowing structured
+/// details such as the provider error `kind`. `Unknown` is the explicit
+/// forward-compatibility sink for a newer producer's reason; callers must still
+/// name it in exhaustive matches rather than silently discarding it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum TerminalReason {
+    /// The task completed successfully.
+    Completed,
+    /// The caller explicitly cancelled this task tree.
+    UserCancel,
+    /// A configured turn, token, cost, or retry budget was exhausted.
+    Budget,
+    /// The subagent watchdog observed no work for the full stall budget.
+    WatchdogStall,
+    /// The provider failed the request with a provider-specific category.
+    ProviderError { kind: String },
+    /// An ancestor was cancelled, so this descendant was cancelled with it.
+    ParentCancelled,
+    /// A pending confirmation was rejected, revoked, or timed out.
+    ConfirmationRejected,
+    /// An internal execution or persistence error terminated the task.
+    InternalError,
+    /// A reason introduced by a newer producer.
+    #[serde(other)]
+    Unknown,
+}
+
 /// Events emitted by the agent loop during execution.
 /// These are streamed to the client for real-time UI updates.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -243,6 +273,9 @@ pub enum AgentEvent {
     Error {
         message: String,
         recoverable: bool,
+        /// Typed terminal explanation when this error closes a durable task.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<TerminalReason>,
         /// Durable task that committed this event. See
         /// [`AgentEvent::with_emitter_task_id`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -314,6 +347,9 @@ pub enum AgentEvent {
     Cancelled {
         turn: usize,
         usage: TokenUsage,
+        /// Typed explanation for why the durable task was cancelled.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<TerminalReason>,
         /// Durable task that committed this event — the cancelled
         /// root, not the promoted successor. See
         /// [`AgentEvent::with_emitter_task_id`].
@@ -363,8 +399,20 @@ pub enum AgentEvent {
         success: bool,
         /// Current total tool count for this subagent
         tool_count: u32,
-        /// Current total tokens used by this subagent
+        /// Current total tokens used by this subagent (input + output).
         total_tokens: u64,
+        /// Cumulative input tokens used by the child thread.
+        #[serde(default)]
+        input_tokens: u64,
+        /// Cumulative output tokens used by the child thread.
+        #[serde(default)]
+        output_tokens: u64,
+        /// Cumulative cached-input tokens read by the child thread.
+        #[serde(default)]
+        cache_read_input_tokens: u64,
+        /// Cumulative cache-creation input tokens used by the child thread.
+        #[serde(default)]
+        cache_creation_input_tokens: u64,
     },
 }
 
@@ -634,6 +682,18 @@ impl AgentEvent {
         Self::Error {
             message: message.into(),
             recoverable,
+            reason: None,
+            emitter_task_id: None,
+        }
+    }
+
+    /// Build a terminal error event with its durable task reason attached.
+    #[must_use]
+    pub fn terminal_error(message: impl Into<String>, reason: TerminalReason) -> Self {
+        Self::Error {
+            message: message.into(),
+            recoverable: false,
+            reason: Some(reason),
             emitter_task_id: None,
         }
     }
@@ -648,9 +708,20 @@ impl AgentEvent {
 
     #[must_use]
     pub const fn cancelled(turn: usize, usage: TokenUsage) -> Self {
+        Self::cancelled_with_reason(turn, usage, TerminalReason::UserCancel)
+    }
+
+    /// Build a terminal cancellation event with its durable task reason.
+    #[must_use]
+    pub const fn cancelled_with_reason(
+        turn: usize,
+        usage: TokenUsage,
+        reason: TerminalReason,
+    ) -> Self {
         Self::Cancelled {
             turn,
             usage,
+            reason: Some(reason),
             emitter_task_id: None,
         }
     }
@@ -1105,6 +1176,73 @@ mod tests {
     }
 
     #[test]
+    fn terminal_reason_round_trips_provider_kind_and_accepts_future_variants()
+    -> serde_json::Result<()> {
+        let provider = TerminalReason::ProviderError {
+            kind: "rate_limited".to_owned(),
+        };
+        let encoded = serde_json::to_value(&provider)?;
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "reason": "provider_error",
+                "kind": "rate_limited",
+            }),
+        );
+        let restored: TerminalReason = serde_json::from_value(encoded)?;
+        assert_eq!(restored, provider);
+
+        let future: TerminalReason = serde_json::from_value(serde_json::json!({
+            "reason": "provider_shutdown",
+            "retryable": false,
+        }))?;
+        assert_eq!(future, TerminalReason::Unknown);
+        Ok(())
+    }
+
+    #[test]
+    fn subagent_progress_deserializes_legacy_rows_without_usage_breakdown() -> serde_json::Result<()>
+    {
+        let legacy = serde_json::json!({
+            "type": "subagent_progress",
+            "subagent_id": "call-1",
+            "subagent_name": "explore",
+            "nickname": null,
+            "child_thread_id": null,
+            "child_root_task_id": null,
+            "subagent_task_id": null,
+            "max_turns": 3,
+            "current_turn": 1,
+            "model": "mock",
+            "tool_name": "explore",
+            "tool_context": "inspect",
+            "completed": false,
+            "success": false,
+            "tool_count": 0,
+            "total_tokens": 12,
+        });
+        let event: AgentEvent = serde_json::from_value(legacy)?;
+        match event {
+            AgentEvent::SubagentProgress {
+                total_tokens,
+                input_tokens,
+                output_tokens,
+                cache_read_input_tokens,
+                cache_creation_input_tokens,
+                ..
+            } => {
+                assert_eq!(total_tokens, 12);
+                assert_eq!(input_tokens, 0);
+                assert_eq!(output_tokens, 0);
+                assert_eq!(cache_read_input_tokens, 0);
+                assert_eq!(cache_creation_input_tokens, 0);
+            }
+            other => panic!("expected SubagentProgress, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
     fn budget_exceeded_event_deserializes_legacy_duration_object() -> serde_json::Result<()> {
         // BudgetExceeded has no pre-rename durable rows, but the field uses
         // the same adapter — keep it uniformly lenient.
@@ -1280,6 +1418,7 @@ mod tests {
             AgentEvent::Error {
                 message: "e".into(),
                 recoverable: true,
+                reason: None,
                 emitter_task_id: Some("task-error".into()),
             },
             AgentEvent::AutoRetryStart {
@@ -1307,6 +1446,7 @@ mod tests {
             AgentEvent::Cancelled {
                 turn: 1,
                 usage: usage.clone(),
+                reason: Some(TerminalReason::UserCancel),
                 emitter_task_id: Some("task-cancelled".into()),
             },
             AgentEvent::BudgetExceeded {
@@ -1340,6 +1480,10 @@ mod tests {
                 success: false,
                 tool_count: 0,
                 total_tokens: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             },
         ]
     }

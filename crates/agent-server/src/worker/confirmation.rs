@@ -81,7 +81,9 @@
 //! [`PendingToolCallInfo::listen_context`]: agent_sdk_foundation::PendingToolCallInfo
 
 use agent_sdk_foundation::events::AgentEvent;
-use agent_sdk_foundation::{ListenExecutionContext, PendingToolCallInfo, ToolResult};
+use agent_sdk_foundation::{
+    ListenExecutionContext, PendingToolCallInfo, TerminalReason, ToolResult,
+};
 use anyhow::{Context, ensure};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -502,11 +504,12 @@ where
         let error = format!("{CONFIRMATION_POLICY_DENIED_PREFIX} {reason}");
         let (child, parent) = deps
             .task_store
-            .fail_task(
+            .fail_task_with_reason(
                 &bootstrap.task_id,
                 &bootstrap.worker_id,
                 &bootstrap.lease_id,
                 error.clone(),
+                TerminalReason::ConfirmationRejected,
                 now,
             )
             .await

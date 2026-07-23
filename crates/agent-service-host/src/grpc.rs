@@ -3073,6 +3073,10 @@ fn map_subagent_event_payload(event: &AgentEvent) -> Option<pb::event_envelope::
         success,
         tool_count,
         total_tokens,
+        input_tokens,
+        output_tokens,
+        cache_read_input_tokens,
+        cache_creation_input_tokens,
     } = event
     else {
         return None;
@@ -3094,6 +3098,10 @@ fn map_subagent_event_payload(event: &AgentEvent) -> Option<pb::event_envelope::
             success: *success,
             tool_count: *tool_count,
             total_tokens: *total_tokens,
+            input_tokens: *input_tokens,
+            output_tokens: *output_tokens,
+            cache_read_input_tokens: *cache_read_input_tokens,
+            cache_creation_input_tokens: *cache_creation_input_tokens,
         },
     ))
 }
@@ -3273,6 +3281,30 @@ const fn budget_stop_reason(
     }
 }
 
+fn map_terminal_reason(reason: &agent_sdk_foundation::TerminalReason) -> pb::TerminalReason {
+    use agent_sdk_foundation::TerminalReason;
+
+    let (kind, provider_error_kind) = match reason {
+        TerminalReason::Completed => (pb::terminal_reason::Kind::Completed, None),
+        TerminalReason::UserCancel => (pb::terminal_reason::Kind::UserCancel, None),
+        TerminalReason::Budget => (pb::terminal_reason::Kind::Budget, None),
+        TerminalReason::WatchdogStall => (pb::terminal_reason::Kind::WatchdogStall, None),
+        TerminalReason::ProviderError { kind } => {
+            (pb::terminal_reason::Kind::ProviderError, Some(kind.clone()))
+        }
+        TerminalReason::ParentCancelled => (pb::terminal_reason::Kind::ParentCancelled, None),
+        TerminalReason::ConfirmationRejected => {
+            (pb::terminal_reason::Kind::ConfirmationRejected, None)
+        }
+        TerminalReason::InternalError => (pb::terminal_reason::Kind::InternalError, None),
+        TerminalReason::Unknown => (pb::terminal_reason::Kind::Unknown, None),
+    };
+    pb::TerminalReason {
+        kind: kind.into(),
+        provider_error_kind,
+    }
+}
+
 fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelope::Event> {
     match event {
         AgentEvent::TurnComplete {
@@ -3324,20 +3356,24 @@ fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelo
         AgentEvent::Error {
             message,
             recoverable,
+            reason,
             emitter_task_id,
         } => Ok(pb::event_envelope::Event::Error(pb::ErrorEvent {
             message: message.clone(),
             recoverable: *recoverable,
             emitter_task_id: emitter_task_id.clone(),
+            reason: reason.as_ref().map(map_terminal_reason),
         })),
         AgentEvent::Cancelled {
             turn,
             usage,
+            reason,
             emitter_task_id,
         } => Ok(pb::event_envelope::Event::Cancelled(pb::CancelledEvent {
             turn: map_u64(*turn, "turn")?,
             usage: Some(map_token_usage(usage)),
             emitter_task_id: emitter_task_id.clone(),
+            reason: reason.as_ref().map(map_terminal_reason),
         })),
         AgentEvent::ContextCompacted {
             original_count,
@@ -3413,6 +3449,10 @@ fn map_subagent_progress_payload(event: &AgentEvent) -> RpcResult<pb::event_enve
         success,
         tool_count,
         total_tokens,
+        input_tokens,
+        output_tokens,
+        cache_read_input_tokens,
+        cache_creation_input_tokens,
     } = event
     else {
         return Err(Status::internal("expected a subagent-progress event").into());
@@ -3434,6 +3474,10 @@ fn map_subagent_progress_payload(event: &AgentEvent) -> RpcResult<pb::event_enve
             success: *success,
             tool_count: *tool_count,
             total_tokens: *total_tokens,
+            input_tokens: *input_tokens,
+            output_tokens: *output_tokens,
+            cache_read_input_tokens: *cache_read_input_tokens,
+            cache_creation_input_tokens: *cache_creation_input_tokens,
         },
     ))
 }
@@ -5331,6 +5375,23 @@ mod tests {
         ) -> Result<(AgentTask, Option<AgentTask>)> {
             self.inner
                 .fail_task(task_id, worker, lease, error, now)
+                .await
+        }
+        async fn fail_task_with_reason(
+            &self,
+            task_id: &AgentTaskId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+            error: String,
+            reason: agent_sdk_foundation::TerminalReason,
+            now: OffsetDateTime,
+        ) -> Result<(AgentTask, Option<AgentTask>)> {
+            // Transparent forward, preserving the reason. Mirrors this
+            // double's `fail_task` (which also just delegates); required
+            // now only because the trait default that used to supply it
+            // was removed.
+            self.inner
+                .fail_task_with_reason(task_id, worker, lease, error, reason, now)
                 .await
         }
         async fn cancel_tree(
@@ -8402,6 +8463,60 @@ mod tests {
             terminal_close_reason(&committed),
             Some(pb::StreamCloseReason::ThreadCompleted)
         );
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct LegacyErrorEvent {
+        #[prost(string, tag = "1")]
+        message: String,
+        #[prost(bool, tag = "2")]
+        recoverable: bool,
+        #[prost(string, optional, tag = "3")]
+        emitter_task_id: Option<String>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct LegacySubagentProgressEvent {
+        #[prost(string, tag = "1")]
+        subagent_id: String,
+        #[prost(string, tag = "2")]
+        subagent_name: String,
+        #[prost(uint64, tag = "12")]
+        total_tokens: u64,
+    }
+
+    #[test]
+    fn legacy_proto_clients_ignore_terminal_reason_and_usage_counter_fields() -> Result<()> {
+        use prost::Message;
+
+        let error = pb::ErrorEvent {
+            message: "provider failed".into(),
+            recoverable: false,
+            emitter_task_id: Some("task-1".into()),
+            reason: Some(pb::TerminalReason {
+                kind: pb::terminal_reason::Kind::ProviderError.into(),
+                provider_error_kind: Some("rate_limited".into()),
+            }),
+        };
+        let legacy_error = LegacyErrorEvent::decode(error.encode_to_vec().as_slice())?;
+        assert_eq!(legacy_error.message, "provider failed");
+        assert_eq!(legacy_error.emitter_task_id.as_deref(), Some("task-1"));
+
+        let progress = pb::SubagentProgressEvent {
+            subagent_id: "call-1".into(),
+            subagent_name: "explore".into(),
+            total_tokens: 30,
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_input_tokens: 4,
+            cache_creation_input_tokens: 2,
+            ..Default::default()
+        };
+        let legacy_progress =
+            LegacySubagentProgressEvent::decode(progress.encode_to_vec().as_slice())?;
+        assert_eq!(legacy_progress.subagent_id, "call-1");
+        assert_eq!(legacy_progress.total_tokens, 30);
+        Ok(())
     }
 
     /// A fork below a terminal marker must not inherit it: `BudgetExceeded`

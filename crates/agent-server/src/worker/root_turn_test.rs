@@ -10,6 +10,7 @@ use super::root_turn::{
     commit_partial_turn_on_cancel, derive_reattach_tool_use_id, execute_root_turn, fail_root_turn,
     is_root_turn_cancelled, provider_valid_split, resume_for_steering, resume_from_children,
     resume_root_turn, revert_steering_wake, settle_attempt_after_lost_ownership,
+    terminal_reason_for_root_error,
 };
 use crate::journal::checkpoint::CheckpointKind;
 use std::sync::Arc;
@@ -40,7 +41,7 @@ use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, Role, StopReason, Tool, Usage,
 };
 use agent_sdk_foundation::{
-    AgentContinuation, AgentState, ContinuationEnvelope, ThreadId, TokenUsage,
+    AgentContinuation, AgentState, ContinuationEnvelope, TerminalReason, ThreadId, TokenUsage,
 };
 use agent_sdk_providers::LlmProvider;
 use agent_sdk_providers::streaming::{StreamBox, StreamDelta, StreamErrorKind};
@@ -8243,5 +8244,257 @@ async fn interleaved_mixed_batch_survives_a_steering_revert_with_original_bindin
         other => panic!("expected WaitingOnChildren revert, got {other:?}"),
     }
 
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Terminal-reason classification — both provider-failure producers
+// ─────────────────────────────────────────────────────────────────────
+
+/// Provider whose every stream dies with a retryable rate limit, so the
+/// turn exhausts `RATE_LIMIT_MAX_RETRIES` and ends on the
+/// retry-exhausted producer.
+struct AlwaysRateLimitedProvider;
+
+#[async_trait]
+impl LlmProvider for AlwaysRateLimitedProvider {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        bail!("chat is not used by this streaming provider")
+    }
+
+    fn chat_stream(&self, _request: ChatRequest) -> StreamBox<'_> {
+        Box::pin(async_stream::stream! {
+            yield Ok(StreamDelta::Error {
+                message: "429 too many requests".to_owned(),
+                kind: StreamErrorKind::RateLimited(None),
+            });
+        })
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
+/// Provider whose stream dies with a non-retryable rejection, so the turn
+/// ends on the direct (fatal) producer without ever retrying.
+struct StreamInvalidRequestProvider;
+
+#[async_trait]
+impl LlmProvider for StreamInvalidRequestProvider {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        bail!("chat is not used by this streaming provider")
+    }
+
+    fn chat_stream(&self, _request: ChatRequest) -> StreamBox<'_> {
+        Box::pin(async_stream::stream! {
+            yield Ok(StreamDelta::Error {
+                message: "schema rejected".to_owned(),
+                kind: StreamErrorKind::InvalidRequest,
+            });
+        })
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
+async fn failed_root_turn_error(provider: &dyn LlmProvider) -> Result<anyhow::Error> {
+    let stores = TestStores::new();
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let bootstrap = sample_bootstrap(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    match execute_root_turn(inputs, "ping", provider, &stores.deps(), t_plus(1)).await {
+        Ok(_) => bail!("the provider always fails; the turn must not complete"),
+        Err(error) => Ok(error),
+    }
+}
+
+/// The retry-exhausted producer must classify as `provider_error`.
+///
+/// This is the terminal operators see most: a rate limit or overload that
+/// outlives the retry budget. Its message is worded differently from the
+/// direct-failure producer's ("after N retries" sits between "error" and
+/// "(kind="), so any classifier that reads the message rather than the
+/// typed cause records this — the *common* case — as `internal_error`.
+#[tokio::test(start_paused = true)]
+async fn rate_limit_exhausting_retries_is_classified_as_a_provider_error() -> Result<()> {
+    let error = failed_root_turn_error(&AlwaysRateLimitedProvider).await?;
+
+    assert_eq!(
+        terminal_reason_for_root_error(&error),
+        TerminalReason::ProviderError {
+            kind: "rate_limited".to_owned(),
+        },
+        "a rate limit that exhausted its retry budget is a provider failure, not an \
+         internal fault: {error:#}",
+    );
+    Ok(())
+}
+
+/// The direct (no-retry) producer must classify as `provider_error` and
+/// carry its own kind — not the retry path's.
+#[tokio::test(start_paused = true)]
+async fn invalid_request_failing_immediately_is_classified_as_a_provider_error() -> Result<()> {
+    let error = failed_root_turn_error(&StreamInvalidRequestProvider).await?;
+
+    assert_eq!(
+        terminal_reason_for_root_error(&error),
+        TerminalReason::ProviderError {
+            kind: "invalid_request".to_owned(),
+        },
+        "a non-retryable provider rejection is a provider failure: {error:#}",
+    );
+    Ok(())
+}
+
+/// A failure with no provider cause in its chain stays `internal_error`.
+///
+/// The negative half of the contract: classification keys off the typed
+/// cause, so a store rejection or serialization fault must NOT be
+/// laundered into a provider error just because its text mentions one.
+#[test]
+fn a_non_provider_failure_is_classified_as_an_internal_error() {
+    let error = anyhow::anyhow!("LLM stream error (kind=RateLimited(None)): not a real cause")
+        .context("store rejected the terminal transition");
+
+    assert_eq!(
+        terminal_reason_for_root_error(&error),
+        TerminalReason::InternalError,
+        "message text must not be enough to claim a provider failure",
+    );
+}
+
+/// The turn-commit boundary hands the beacon's usage to the thread
+/// aggregate and leaves the beacon empty.
+///
+/// The unit tests in `worker::activity` pin `take_usage`'s arithmetic;
+/// this pins that `commit_completed_turn_shifting_slot` actually CALLS it.
+/// Without the call the two ledgers overlap: `thread.total_usage` and the
+/// beacon both hold this turn's tokens, and every later mid-turn progress
+/// tick — which reports their sum — doubles them for the rest of the
+/// child's life.
+#[tokio::test]
+async fn committing_a_turn_hands_its_usage_to_the_thread_and_empties_the_beacon() -> Result<()> {
+    let stores = TestStores::new();
+    let provider = MockTextProvider::new("done");
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let bootstrap = sample_bootstrap(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    let beacon = crate::worker::ActivityBeacon::new();
+    let tracked = crate::worker::ActivityTrackingEventRepo::new(&stores.events, beacon.clone());
+    let mut deps = stores.deps();
+    deps.wire_activity(&beacon, &tracked);
+
+    let outcome = execute_root_turn(inputs, "ping", &provider, &deps, t_plus(1)).await?;
+    assert!(
+        matches!(outcome, RootTurnOutcome::Completed { .. }),
+        "the mock provider completes the turn",
+    );
+
+    let thread = stores
+        .threads
+        .get(&thread_a())
+        .await?
+        .context("thread must exist after a committed turn")?;
+    assert_eq!(
+        thread.total_usage,
+        TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cached_input_tokens: 10,
+            cache_creation_input_tokens: 0,
+        },
+        "the committed turn's usage must land on the thread aggregate",
+    );
+    assert_eq!(
+        beacon.usage(),
+        TokenUsage::default(),
+        "the beacon must hold nothing the thread aggregate already counts; \
+         a live reader adds the two and would otherwise report double",
+    );
+    Ok(())
+}
+
+/// Mid-turn, the beacon reports ONE call's usage — not that call's usage
+/// multiplied by the number of frames that restated it.
+///
+/// `StreamAccumulator::usage()` yields the running total for the call in
+/// flight, and the stream loop reads it after every frame, so the same
+/// tokens are observed several times per call. The beacon sums (it has to:
+/// a turn makes several provider calls), so it must be handed the
+/// increment. Feeding it the restatement inflates every mid-turn progress
+/// event by the frame count.
+///
+/// A tool-call turn suspends without committing, which is precisely the
+/// state a progress tick observes: the thread aggregate is still empty and
+/// the beacon alone carries the turn.
+#[tokio::test]
+async fn mid_turn_beacon_reports_one_calls_usage_not_one_per_restating_frame() -> Result<()> {
+    let stores = TestStores::new();
+    let provider = MockToolCallProvider::single("call_1", "probe", serde_json::json!({}));
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let bootstrap = sample_bootstrap(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    let beacon = crate::worker::ActivityBeacon::new();
+    let tracked = crate::worker::ActivityTrackingEventRepo::new(&stores.events, beacon.clone());
+    let mut deps = stores.deps();
+    deps.wire_activity(&beacon, &tracked);
+
+    let outcome = execute_root_turn(inputs, "ping", &provider, &deps, t_plus(1)).await?;
+    assert!(
+        matches!(outcome, RootTurnOutcome::Suspended { .. }),
+        "a tool-call turn suspends without committing, leaving the usage uncommitted",
+    );
+    assert_eq!(
+        provider.calls(),
+        1,
+        "exactly one provider call, so the beacon must show exactly its usage",
+    );
+
+    assert_eq!(
+        beacon.usage(),
+        TokenUsage {
+            input_tokens: 120,
+            output_tokens: 60,
+            cached_input_tokens: 15,
+            cache_creation_input_tokens: 0,
+        },
+        "the beacon must hold one call's usage; a multiple of it means restatements \
+         were summed instead of the increment",
+    );
     Ok(())
 }

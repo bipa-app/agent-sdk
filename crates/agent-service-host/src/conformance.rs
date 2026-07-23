@@ -48,7 +48,7 @@ mod tests {
     use crate::fail;
     use agent_sdk_foundation::audit::AuditProvenance;
     use agent_sdk_foundation::events::AgentEvent;
-    use agent_sdk_foundation::{ThreadId, TokenUsage};
+    use agent_sdk_foundation::{TerminalReason, ThreadId, TokenUsage};
     use agent_server::journal::checkpoint::CheckpointKind;
     use agent_server::journal::checkpoint_store::CheckpointStore;
     use agent_server::journal::commit::{CompletedTurnCommit, commit_completed_turn};
@@ -967,6 +967,10 @@ mod tests {
             .complete_task(&child.id, &cw, &cl, t_plus(64))
             .await?;
         assert_eq!(completed_child.status, TaskStatus::Completed);
+        assert_eq!(
+            completed_child.terminal_reason,
+            Some(TerminalReason::Completed),
+        );
         let resumed = resumed_parent.context("parent should be returned")?;
         assert_eq!(resumed.status, TaskStatus::Pending);
         Ok(())
@@ -1151,6 +1155,7 @@ mod tests {
         // Every node is durably Cancelled.
         let root_after = task_store.get(&root.id).await?.context("root exists")?;
         assert_eq!(root_after.status, TaskStatus::Cancelled);
+        assert_eq!(root_after.terminal_reason, Some(TerminalReason::UserCancel));
         for child in &children {
             let child_after = task_store
                 .get(&child.id)
@@ -1160,6 +1165,12 @@ mod tests {
                 child_after.status,
                 TaskStatus::Cancelled,
                 "descendant {} must land Cancelled",
+                child.id,
+            );
+            assert_eq!(
+                child_after.terminal_reason,
+                Some(TerminalReason::ParentCancelled),
+                "descendant {} must explain parent cancellation",
                 child.id,
             );
         }
@@ -1425,6 +1436,15 @@ mod tests {
             .cancel_tree(&queued_admitted.id, t_plus(322))
             .await?;
         assert_eq!(outcome.transitioned, vec![queued_admitted.id.clone()]);
+        let cancelled_queued = task_store
+            .get(&queued_admitted.id)
+            .await?
+            .context("cancelled queued root remains readable")?;
+        assert_eq!(cancelled_queued.status, TaskStatus::Cancelled);
+        assert_eq!(
+            cancelled_queued.terminal_reason,
+            Some(TerminalReason::UserCancel),
+        );
         assert!(
             outcome.markers.is_empty(),
             "queued-behind-active cancel must not emit a thread-terminal marker",
@@ -1469,6 +1489,16 @@ mod tests {
             .transitioned;
         assert_eq!(cancelled, vec![child_root.id.clone()]);
 
+        let child_after = task_store
+            .get(&child_root.id)
+            .await?
+            .context("cancelled child root remains readable")?;
+        assert_eq!(child_after.status, TaskStatus::Cancelled);
+        assert_eq!(
+            child_after.terminal_reason,
+            Some(TerminalReason::UserCancel)
+        );
+
         let woken = task_store
             .get(&invocation.id)
             .await?
@@ -1510,6 +1540,7 @@ mod tests {
             .await?
             .context("child root exists")?;
         assert_eq!(child_after.status, TaskStatus::Failed);
+        assert_eq!(child_after.terminal_reason, Some(TerminalReason::Budget));
 
         let woken = task_store
             .get(&invocation.id)
@@ -1694,6 +1725,15 @@ mod tests {
 
         // Cancelling one child leaves the parent parked on the other.
         task_store.cancel_tree(&first.id, t_plus(4)).await?;
+        let first_cancelled = task_store
+            .get(&first.id)
+            .await?
+            .context("first cancelled child remains readable")?;
+        assert_eq!(first_cancelled.status, TaskStatus::Cancelled);
+        assert_eq!(
+            first_cancelled.terminal_reason,
+            Some(TerminalReason::UserCancel),
+        );
         let still_parked = task_store
             .get(&parent_id)
             .await?
@@ -1707,6 +1747,15 @@ mod tests {
 
         // Cancelling the LAST live child must resume the parked parent.
         task_store.cancel_tree(&second.id, t_plus(5)).await?;
+        let second_cancelled = task_store
+            .get(&second.id)
+            .await?
+            .context("second cancelled child remains readable")?;
+        assert_eq!(second_cancelled.status, TaskStatus::Cancelled);
+        assert_eq!(
+            second_cancelled.terminal_reason,
+            Some(TerminalReason::UserCancel),
+        );
         let resumed = task_store
             .get(&parent_id)
             .await?
@@ -1899,7 +1948,9 @@ mod tests {
         let _ = task_store
             .try_acquire_task(&r1.id, w.clone(), l.clone(), t_plus(110), t_plus(82))
             .await?;
-        let _ = task_store.complete_task(&r1.id, &w, &l, t_plus(83)).await?;
+        let (completed, _) = task_store.complete_task(&r1.id, &w, &l, t_plus(83)).await?;
+        assert_eq!(completed.status, TaskStatus::Completed);
+        assert_eq!(completed.terminal_reason, Some(TerminalReason::Completed),);
 
         // The successor is ALREADY Pending — observed via `get`, not via the
         // explicit promote call.
@@ -1963,6 +2014,7 @@ mod tests {
 
         let task = task_store.get(&root.id).await?.context("task exists")?;
         assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.terminal_reason, Some(TerminalReason::Budget));
         Ok(())
     }
 
@@ -2039,6 +2091,7 @@ mod tests {
         // Pending with no live children.
         let child_after = task_store.get(&child.id).await?.context("child exists")?;
         assert_eq!(child_after.status, TaskStatus::Failed);
+        assert_eq!(child_after.terminal_reason, Some(TerminalReason::Budget));
         let parent_after = task_store.get(&parent.id).await?.context("parent exists")?;
         assert_eq!(parent_after.pending_child_count, 0);
         assert_eq!(parent_after.status, TaskStatus::Pending);

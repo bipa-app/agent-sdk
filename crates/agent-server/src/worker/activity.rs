@@ -25,14 +25,14 @@
 //! the task actually *did* something.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use time::OffsetDateTime;
 
-use agent_sdk_foundation::ThreadId;
 use agent_sdk_foundation::events::AgentEvent;
+use agent_sdk_foundation::{ThreadId, TokenUsage};
 
 use crate::journal::committed_event::CommittedEvent;
 use crate::journal::event_outbox_transaction::AtomicEventOutboxCommitter;
@@ -54,6 +54,65 @@ pub struct ActivityBeacon {
     /// "never bumped" — the epoch itself is not a representable activity
     /// instant in any live system, so it doubles as the sentinel.
     latest_unix_nanos: Arc<AtomicI64>,
+    /// Usage streamed since the last turn commit — see
+    /// [`ActivityBeacon::record_usage`] for why this is *uncommitted*
+    /// usage rather than a running total.
+    uncommitted_usage: Arc<AtomicTokenUsage>,
+}
+
+/// The four [`TokenUsage`] counters as lock-free atomics.
+///
+/// Exists so [`ActivityBeacon`] holds one named aggregate instead of four
+/// loose atomics: the counters are only ever read, added, and cleared
+/// together, and a fifth counter should be one edit, not five.
+///
+/// Atomics rather than a `Mutex<TokenUsage>` because `add` runs on the
+/// provider-frame path, which must never block. The four fields are not
+/// updated as one atomic unit, so a concurrent [`Self::snapshot`] can
+/// observe a torn mid-update value; that is deliberate and harmless — the
+/// snapshot feeds a progress event, and the next tick reconciles.
+#[derive(Debug, Default)]
+struct AtomicTokenUsage {
+    input: AtomicU32,
+    output: AtomicU32,
+    cache_read: AtomicU32,
+    cache_creation: AtomicU32,
+}
+
+impl AtomicTokenUsage {
+    /// Add one provider call's usage to the running total.
+    ///
+    /// Saturating: a counter that would wrap past `u32::MAX` pins there
+    /// instead of restarting at zero, so the progress stream can never
+    /// report a token count that fell off a cliff.
+    fn add(&self, usage: &TokenUsage) {
+        for (counter, delta) in [
+            (&self.input, usage.input_tokens),
+            (&self.output, usage.output_tokens),
+            (&self.cache_read, usage.cached_input_tokens),
+            (&self.cache_creation, usage.cache_creation_input_tokens),
+        ] {
+            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(delta))
+            });
+        }
+    }
+
+    fn snapshot(&self) -> TokenUsage {
+        TokenUsage {
+            input_tokens: self.input.load(Ordering::Relaxed),
+            output_tokens: self.output.load(Ordering::Relaxed),
+            cached_input_tokens: self.cache_read.load(Ordering::Relaxed),
+            cache_creation_input_tokens: self.cache_creation.load(Ordering::Relaxed),
+        }
+    }
+
+    fn clear(&self) {
+        self.input.store(0, Ordering::Relaxed);
+        self.output.store(0, Ordering::Relaxed);
+        self.cache_read.store(0, Ordering::Relaxed);
+        self.cache_creation.store(0, Ordering::Relaxed);
+    }
 }
 
 impl ActivityBeacon {
@@ -86,6 +145,41 @@ impl ActivityBeacon {
             return None;
         }
         OffsetDateTime::from_unix_timestamp_nanos(i128::from(nanos)).ok()
+    }
+
+    /// Add one provider call's usage to this turn's uncommitted total.
+    ///
+    /// The caller hands over a **per-call** `TokenUsage` built fresh from
+    /// that call's `llm::Usage` — not a restated running total — so the
+    /// reducer must be addition. Summing is also what makes the counters
+    /// monotonic within a turn: each call only ever adds.
+    ///
+    /// What accumulates here is strictly the usage the thread aggregate
+    /// does **not** know about yet. [`Self::take_usage`] hands it back at
+    /// the turn-commit boundary, where `thread.total_usage` takes
+    /// ownership of it; a reader that adds `thread.total_usage` to
+    /// [`Self::usage`] therefore counts every token exactly once.
+    pub fn record_usage(&self, usage: &TokenUsage) {
+        self.uncommitted_usage.add(usage);
+    }
+
+    /// Snapshot the usage streamed since the last turn commit.
+    #[must_use]
+    pub fn usage(&self) -> TokenUsage {
+        self.uncommitted_usage.snapshot()
+    }
+
+    /// Clear the uncommitted counters, returning what they held.
+    ///
+    /// Called once per successful turn commit, because that commit folds
+    /// the same tokens into the thread's durable `total_usage`. Skipping
+    /// it is a double-count that never self-corrects: every later progress
+    /// tick reports `total_usage + the same tokens again`.
+    #[must_use]
+    pub fn take_usage(&self) -> TokenUsage {
+        let taken = self.uncommitted_usage.snapshot();
+        self.uncommitted_usage.clear();
+        taken
     }
 }
 
@@ -228,6 +322,87 @@ mod tests {
         let observer = beacon.clone();
         beacon.bump(at(1_000));
         assert_eq!(observer.latest(), Some(at(1_000)));
+    }
+
+    fn usage(input: u32, output: u32, cache_read: u32, cache_creation: u32) -> TokenUsage {
+        TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cached_input_tokens: cache_read,
+            cache_creation_input_tokens: cache_creation,
+        }
+    }
+
+    /// Per-call usage ACCUMULATES; it is not a running total to max over.
+    ///
+    /// `note_stream_usage` builds a fresh `TokenUsage` from each provider
+    /// call's own `llm::Usage`, so a turn of N calls hands over N
+    /// independent values. The reducer used to be `fetch_max`, which keeps
+    /// only the single largest call and silently drops the rest — a
+    /// five-call turn reported roughly one call's tokens. The counters
+    /// below are chosen so max-of-two and sum-of-two cannot coincide on
+    /// any field.
+    #[test]
+    fn record_usage_sums_every_call_rather_than_keeping_the_largest() {
+        let beacon = ActivityBeacon::new();
+
+        beacon.record_usage(&usage(100, 20, 7, 3));
+        beacon.record_usage(&usage(30, 50, 1, 9));
+
+        assert_eq!(
+            beacon.usage(),
+            usage(130, 70, 8, 12),
+            "each provider call's usage must add; keeping the max would give (100, 50, 7, 9)",
+        );
+    }
+
+    /// The beacon carries only UNCOMMITTED usage, so a live reader can add
+    /// it to the thread total without double-counting.
+    ///
+    /// Replays the exact defect: turn 1 streams U, the turn commits and
+    /// folds U into `thread.total_usage`, and the next progress tick reads
+    /// `total_usage + beacon.usage()`. With no hand-off at the commit
+    /// boundary that tick reports 2U — and stays inflated for the rest of
+    /// the subagent's life, because nothing ever subtracts.
+    #[test]
+    fn take_usage_hands_the_turn_off_so_a_committed_turn_is_not_counted_twice() {
+        let beacon = ActivityBeacon::new();
+        beacon.record_usage(&usage(100, 20, 7, 3));
+
+        let committed = beacon.take_usage();
+        assert_eq!(
+            committed,
+            usage(100, 20, 7, 3),
+            "the commit boundary must receive exactly what the turn streamed",
+        );
+
+        // The thread aggregate now owns those tokens.
+        let mut thread_total = TokenUsage::default();
+        thread_total.add(&committed);
+
+        assert_eq!(
+            beacon.usage(),
+            TokenUsage::default(),
+            "a committed turn must leave nothing behind on the beacon",
+        );
+
+        let mut live_total = thread_total.clone();
+        live_total.add(&beacon.usage());
+        assert_eq!(
+            live_total,
+            usage(100, 20, 7, 3),
+            "the post-commit progress tick must report the true total, not double it",
+        );
+
+        // Turn 2 streams on the same beacon: only the NEW usage is live.
+        beacon.record_usage(&usage(5, 6, 0, 0));
+        let mut mid_turn_two = thread_total;
+        mid_turn_two.add(&beacon.usage());
+        assert_eq!(
+            mid_turn_two,
+            usage(105, 26, 7, 3),
+            "turn 2's live total is turn 1 committed plus turn 2 so far",
+        );
     }
 
     #[test]

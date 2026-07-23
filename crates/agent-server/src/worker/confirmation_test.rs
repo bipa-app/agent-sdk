@@ -39,7 +39,9 @@ use crate::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
 use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Tool, Usage,
 };
-use agent_sdk_foundation::{AgentEvent, PendingToolCallInfo, ThreadId, ToolResult, ToolTier};
+use agent_sdk_foundation::{
+    AgentEvent, PendingToolCallInfo, TerminalReason, ThreadId, ToolResult, ToolTier,
+};
 use agent_sdk_providers::LlmProvider;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -603,6 +605,10 @@ async fn approve_but_policy_denies_fails_child() -> Result<()> {
     };
 
     assert_eq!(child.status, TaskStatus::Failed);
+    assert_eq!(
+        child.terminal_reason,
+        Some(TerminalReason::ConfirmationRejected),
+    );
     assert!(
         child
             .last_error
@@ -670,6 +676,10 @@ async fn rejection_fails_child_without_executing() -> Result<()> {
     };
 
     assert_eq!(child.status, TaskStatus::Failed);
+    assert_eq!(
+        child.terminal_reason,
+        Some(TerminalReason::ConfirmationRejected),
+    );
     assert!(
         child
             .last_error
@@ -777,6 +787,10 @@ async fn timeout_fails_child_without_executing() -> Result<()> {
     };
 
     assert_eq!(child.status, TaskStatus::Failed);
+    assert_eq!(
+        child.terminal_reason,
+        Some(TerminalReason::ConfirmationRejected),
+    );
     assert!(
         child
             .last_error

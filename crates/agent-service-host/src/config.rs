@@ -319,6 +319,8 @@ pub struct WorkerConfig {
     pub heartbeat_interval_secs: u64,
     /// Seconds between expired-lease sweep runs.
     pub sweep_interval_secs: u64,
+    /// Seconds between coarse parent-visible subagent progress snapshots.
+    pub subagent_progress_interval_secs: u64,
     /// Seconds between idle worker acquisition polls.
     ///
     /// When a worker has no active task it sleeps for this duration
@@ -335,6 +337,7 @@ impl Default for WorkerConfig {
             lease_duration_secs: 30,
             heartbeat_interval_secs: 10,
             sweep_interval_secs: 5,
+            subagent_progress_interval_secs: 30,
             acquisition_interval_secs: 1,
         }
     }
@@ -358,6 +361,12 @@ impl WorkerConfig {
     #[must_use]
     pub const fn sweep_interval(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.sweep_interval_secs)
+    }
+
+    /// Coarse subagent progress interval as a [`std::time::Duration`].
+    #[must_use]
+    pub const fn subagent_progress_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.subagent_progress_interval_secs)
     }
 
     /// Acquisition poll interval as a [`std::time::Duration`] (for tokio timers).

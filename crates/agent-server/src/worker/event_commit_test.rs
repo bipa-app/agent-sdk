@@ -24,7 +24,7 @@ use crate::worker::bootstrap::WorkerBootstrapContext;
 use crate::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::llm::{StopReason, Tool};
-use agent_sdk_foundation::{ThreadId, ToolResult, ToolTier};
+use agent_sdk_foundation::{TerminalReason, ThreadId, ToolResult, ToolTier};
 use anyhow::{Context, Result};
 use time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -585,7 +585,7 @@ async fn fail_root_turn_emits_error_event() -> Result<()> {
     let lease_id = LeaseId::from_string("lease_evt");
 
     let err = anyhow::anyhow!("something went wrong");
-    fail_root_turn(
+    let failed = fail_root_turn(
         &task_id,
         &worker_id,
         &lease_id,
@@ -595,14 +595,17 @@ async fn fail_root_turn_emits_error_event() -> Result<()> {
         t0(),
     )
     .await?;
+    assert_eq!(failed.terminal_reason, Some(TerminalReason::InternalError),);
 
     let repo_events = stores.events.get_events(&thread_a()).await?;
     assert_eq!(repo_events.len(), 1, "expected 1 Error event");
-    assert!(
-        matches!(&repo_events[0].event, AgentEvent::Error { .. }),
-        "expected Error, got {:?}",
-        repo_events[0].event,
-    );
+    match &repo_events[0].event {
+        AgentEvent::Error {
+            reason: Some(reason),
+            ..
+        } => assert_eq!(reason, &TerminalReason::InternalError),
+        event => anyhow::bail!("expected Error with terminal reason, got {event:?}"),
+    }
 
     Ok(())
 }

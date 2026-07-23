@@ -88,10 +88,15 @@ const TURN_ATTEMPT_EVIDENCE_SQL: &str = include_str!(concat!(
     "/migrations/postgres/0013_turn_attempt_evidence.sql"
 ));
 
+const TASK_TERMINAL_REASON_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/postgres/0014_task_terminal_reason.sql"
+));
+
 /// `sqlx`-managed migration bundle for the Postgres durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/postgres");
 
-const MIGRATIONS: [PostgresMigration; 13] = [
+const MIGRATIONS: [PostgresMigration; 14] = [
     PostgresMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -157,7 +162,20 @@ const MIGRATIONS: [PostgresMigration; 13] = [
         summary: "turn-attempt cache creation, route, and resolved effort evidence",
         sql: TURN_ATTEMPT_EVIDENCE_SQL,
     },
+    PostgresMigration {
+        version: "0014",
+        summary: "typed reason required on every terminal task row",
+        sql: TASK_TERMINAL_REASON_SQL,
+    },
 ];
+
+/// Version of the migration this PR introduces: the typed terminal
+/// reason column plus its enforcement.
+///
+/// Named so the bundle test can assert "my migration is in the bundle"
+/// without pinning the versions its sibling PRs own.
+#[cfg(test)]
+pub(crate) const TASK_TERMINAL_REASON_MIGRATION_VERSION: i64 = 14;
 
 /// The reviewable executable migration bundle for the current durable core.
 #[must_use]

@@ -71,7 +71,9 @@
 //! narrow input struct, and leaves cross-row orchestration to the
 //! store.
 
-use agent_sdk_foundation::{ContinuationEnvelope, ListenExecutionContext, ThreadId};
+use agent_sdk_foundation::{
+    ContinuationEnvelope, ListenExecutionContext, TerminalReason, ThreadId,
+};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use time::OffsetDateTime;
@@ -466,6 +468,10 @@ pub enum TaskSchemaError {
     TerminalMissingCompletedAt { status: TaskStatus },
     #[error("non-terminal status {status:?} must not set completed_at")]
     NonTerminalWithCompletedAt { status: TaskStatus },
+    #[error("terminal status {status:?} requires terminal_reason to be set")]
+    TerminalMissingReason { status: TaskStatus },
+    #[error("non-terminal status {status:?} must not carry terminal_reason")]
+    NonTerminalWithReason { status: TaskStatus },
     #[error("Failed status requires last_error to be set")]
     FailedMissingError,
     #[error("non-Failed status {status:?} must not carry last_error")]
@@ -632,6 +638,9 @@ pub struct AgentTask {
     pub max_attempts: u32,
     /// Populated on terminal `Failed`.
     pub last_error: Option<String>,
+    /// Typed explanation populated on every terminal row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<TerminalReason>,
 
     // ── child blocking counter (used by 2.6) ────────────────
     /// Number of child tasks that still need to reach a terminal state
@@ -730,6 +739,7 @@ impl AgentTask {
             attempt: 0,
             max_attempts,
             last_error: None,
+            terminal_reason: None,
             pending_child_count: 0,
             spawn_index: None,
             result_payload: None,
@@ -836,6 +846,7 @@ impl AgentTask {
             attempt: 0,
             max_attempts,
             last_error: None,
+            terminal_reason: None,
             pending_child_count: 0,
             spawn_index: None,
             result_payload: None,
@@ -895,6 +906,7 @@ impl AgentTask {
             attempt: 0,
             max_attempts,
             last_error: None,
+            terminal_reason: None,
             pending_child_count: 1,
             spawn_index: Some(spawn_index),
             result_payload: None,
@@ -1051,10 +1063,22 @@ impl AgentTask {
                     status: self.status,
                 });
             }
-        } else if self.completed_at.is_some() {
-            return Err(TaskSchemaError::NonTerminalWithCompletedAt {
-                status: self.status,
-            });
+            if self.terminal_reason.is_none() {
+                return Err(TaskSchemaError::TerminalMissingReason {
+                    status: self.status,
+                });
+            }
+        } else {
+            if self.completed_at.is_some() {
+                return Err(TaskSchemaError::NonTerminalWithCompletedAt {
+                    status: self.status,
+                });
+            }
+            if self.terminal_reason.is_some() {
+                return Err(TaskSchemaError::NonTerminalWithReason {
+                    status: self.status,
+                });
+            }
         }
 
         match self.status {
@@ -1741,6 +1765,7 @@ impl AgentTask {
         self.last_heartbeat_at = None;
         self.pending_child_count = 0;
         self.state = TaskState::None;
+        self.terminal_reason = Some(TerminalReason::Completed);
         self.completed_at = Some(now);
         // Completion is the final evidence of work, recorded on the
         // terminal transition ITSELF because the row is no longer
@@ -1786,7 +1811,21 @@ impl AgentTask {
     /// # Errors
     /// Returns [`TaskSchemaError::InvalidTransition`] if the task is
     /// already in a terminal state.
-    pub fn fail(mut self, error: String, now: OffsetDateTime) -> Result<Self, TaskSchemaError> {
+    pub fn fail(self, error: String, now: OffsetDateTime) -> Result<Self, TaskSchemaError> {
+        self.fail_with_terminal_reason(error, TerminalReason::InternalError, now)
+    }
+
+    /// Mark the task [`TaskStatus::Failed`] with an explicit typed reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskSchemaError::InvalidTransition`] if the task is already terminal.
+    pub fn fail_with_terminal_reason(
+        mut self,
+        error: String,
+        reason: TerminalReason,
+        now: OffsetDateTime,
+    ) -> Result<Self, TaskSchemaError> {
         if self.status.is_terminal() {
             return Err(TaskSchemaError::InvalidTransition {
                 from: self.status,
@@ -1801,6 +1840,7 @@ impl AgentTask {
         self.pending_child_count = 0;
         self.state = TaskState::None;
         self.last_error = Some(error);
+        self.terminal_reason = Some(reason);
         self.completed_at = Some(now);
         // Reaching a terminal outcome is itself a state change the parent
         // fan-in will act on; record it on the transition so a parent
@@ -1836,7 +1876,13 @@ impl AgentTask {
         now: OffsetDateTime,
     ) -> Result<Self, TaskSchemaError> {
         let error = reason.error_message(&self);
-        self.fail(error, now)
+        let terminal_reason = match reason {
+            FailureReason::RetryBudgetExhausted | FailureReason::LeaseExpiredBudgetExhausted => {
+                TerminalReason::Budget
+            }
+            FailureReason::UnsafePreparedOperationRecovery => TerminalReason::InternalError,
+        };
+        self.fail_with_terminal_reason(error, terminal_reason, now)
     }
 
     /// Mark the task [`TaskStatus::Cancelled`].
@@ -1847,7 +1893,20 @@ impl AgentTask {
     /// # Errors
     /// Returns [`TaskSchemaError::InvalidTransition`] if the task is
     /// already in a terminal state.
-    pub fn cancel(mut self, now: OffsetDateTime) -> Result<Self, TaskSchemaError> {
+    pub fn cancel(self, now: OffsetDateTime) -> Result<Self, TaskSchemaError> {
+        self.cancel_with_reason(TerminalReason::UserCancel, now)
+    }
+
+    /// Mark the task [`TaskStatus::Cancelled`] with an explicit typed reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskSchemaError::InvalidTransition`] if the task is already terminal.
+    pub fn cancel_with_reason(
+        mut self,
+        reason: TerminalReason,
+        now: OffsetDateTime,
+    ) -> Result<Self, TaskSchemaError> {
         if self.status.is_terminal() {
             return Err(TaskSchemaError::InvalidTransition {
                 from: self.status,
@@ -1861,6 +1920,7 @@ impl AgentTask {
         self.last_heartbeat_at = None;
         self.pending_child_count = 0;
         self.state = TaskState::None;
+        self.terminal_reason = Some(reason);
         self.completed_at = Some(now);
         // ADR-0003 I3. Cancellation is the third terminal outcome, and the
         // stall probe reads terminal rows INLINE (a just-settled child is a
@@ -2240,10 +2300,36 @@ mod tests {
     }
 
     #[test]
+    fn validate_requires_terminal_reason_on_terminal() {
+        let mut task = fresh_root();
+        task.status = TaskStatus::Completed;
+        task.completed_at = Some(t_plus(5));
+        assert_eq!(
+            task.validate(),
+            Err(TaskSchemaError::TerminalMissingReason {
+                status: TaskStatus::Completed,
+            }),
+        );
+    }
+
+    #[test]
+    fn validate_rejects_terminal_reason_on_non_terminal() {
+        let mut task = fresh_root();
+        task.terminal_reason = Some(TerminalReason::InternalError);
+        assert_eq!(
+            task.validate(),
+            Err(TaskSchemaError::NonTerminalWithReason {
+                status: TaskStatus::Pending,
+            }),
+        );
+    }
+
+    #[test]
     fn validate_requires_error_on_failed() {
         let mut task = fresh_root();
         task.status = TaskStatus::Failed;
         task.completed_at = Some(t_plus(5));
+        task.terminal_reason = Some(TerminalReason::InternalError);
         // last_error missing
         assert_eq!(task.validate(), Err(TaskSchemaError::FailedMissingError));
     }
@@ -2812,6 +2898,7 @@ mod tests {
             .context("running")?;
         let done = running.clone().complete(t_plus(2)).context("complete")?;
         assert_eq!(done.status, TaskStatus::Completed);
+        assert_eq!(done.terminal_reason, Some(TerminalReason::Completed));
         assert_eq!(done.completed_at, Some(t_plus(2)));
         assert!(done.worker_id.is_none());
         assert!(done.state.is_none());
@@ -2831,6 +2918,7 @@ mod tests {
             .complete(t_plus(3))
             .context("complete from waiting")?;
         assert_eq!(done2.status, TaskStatus::Completed);
+        assert_eq!(done2.terminal_reason, Some(TerminalReason::Completed));
         assert_eq!(done2.pending_child_count, 0);
         // Terminal rows must hold TaskState::None even when reached
         // directly from a waiting state.
@@ -2852,6 +2940,7 @@ mod tests {
             .fail("provider timeout".into(), t_plus(2))
             .context("fail")?;
         assert_eq!(failed.status, TaskStatus::Failed);
+        assert_eq!(failed.terminal_reason, Some(TerminalReason::InternalError),);
         assert_eq!(failed.last_error.as_deref(), Some("provider timeout"));
         assert_eq!(failed.completed_at, Some(t_plus(2)));
         assert!(failed.worker_id.is_none());
@@ -2863,6 +2952,7 @@ mod tests {
         // Pending
         let task = fresh_root().cancel(t_plus(1)).context("cancel pending")?;
         assert_eq!(task.status, TaskStatus::Cancelled);
+        assert_eq!(task.terminal_reason, Some(TerminalReason::UserCancel));
 
         // Queued
         let task = fresh_root()
@@ -2871,6 +2961,7 @@ mod tests {
             .cancel(t_plus(2))
             .context("cancel queued")?;
         assert_eq!(task.status, TaskStatus::Cancelled);
+        assert_eq!(task.terminal_reason, Some(TerminalReason::UserCancel));
 
         // Running
         let task = fresh_root()
@@ -2884,6 +2975,7 @@ mod tests {
             .cancel(t_plus(2))
             .context("cancel running")?;
         assert_eq!(task.status, TaskStatus::Cancelled);
+        assert_eq!(task.terminal_reason, Some(TerminalReason::UserCancel));
         assert!(task.worker_id.is_none());
 
         // WaitingOnChildren
@@ -2908,6 +3000,7 @@ mod tests {
             .cancel(t_plus(3))
             .context("cancel waiting")?;
         assert_eq!(task.status, TaskStatus::Cancelled);
+        assert_eq!(task.terminal_reason, Some(TerminalReason::UserCancel));
         assert_eq!(task.pending_child_count, 0);
         assert!(task.state.is_none());
 
@@ -2925,6 +3018,7 @@ mod tests {
             .cancel(t_plus(3))
             .context("cancel awaiting")?;
         assert_eq!(task.status, TaskStatus::Cancelled);
+        assert_eq!(task.terminal_reason, Some(TerminalReason::UserCancel));
         assert!(task.state.is_none());
 
         // Already-terminal is rejected
@@ -3126,6 +3220,7 @@ mod tests {
             .fail_with_reason(FailureReason::RetryBudgetExhausted, t_plus(2))
             .context("fail with reason")?;
         assert_eq!(failed.status, TaskStatus::Failed);
+        assert_eq!(failed.terminal_reason, Some(TerminalReason::Budget));
         let message = failed.last_error.as_deref().expect("last_error set");
         assert!(
             message.starts_with("retry_budget_exhausted:"),

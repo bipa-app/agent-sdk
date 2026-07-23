@@ -234,6 +234,30 @@ impl StreamErrorKind {
     pub const fn is_connectivity(self) -> bool {
         matches!(self, Self::Connectivity | Self::ConnectionLost)
     }
+
+    /// Stable `snake_case` label naming this failure class on the wire.
+    ///
+    /// Durable runtimes persist this on a task's terminal reason and
+    /// republish it as `TerminalReason.provider_error_kind`, so operators
+    /// can group terminals by provider failure class. The match is
+    /// exhaustive **inside this crate** — `#[non_exhaustive]` only binds
+    /// downstream — so adding a variant is a compile error here rather
+    /// than a silent relabel at a distant consumer.
+    ///
+    /// The rate-limit delay hint is deliberately dropped: the label is a
+    /// grouping key, and folding a per-response duration into it would
+    /// produce an unbounded cardinality of "kinds".
+    #[must_use]
+    pub const fn wire_label(self) -> &'static str {
+        match self {
+            Self::Connectivity => "connectivity",
+            Self::ConnectionLost => "connection_lost",
+            Self::RateLimited(_) => "rate_limited",
+            Self::ServerError => "server_error",
+            Self::InvalidRequest => "invalid_request",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 /// Classify a typed HTTP client failure without relying on display text.

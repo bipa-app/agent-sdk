@@ -139,6 +139,12 @@ const AGENT_SDK_TASK_COLUMNS: &[ColumnContract] = &[
         notes: "Canonical fail-closed error for `failed` rows.",
     },
     ColumnContract {
+        name: "terminal_reason_json",
+        sql_type: "JSONB",
+        nullable: true,
+        notes: "Typed reason required exactly when a task row is terminal.",
+    },
+    ColumnContract {
         name: "pending_child_count",
         sql_type: "BIGINT",
         nullable: false,
@@ -236,6 +242,10 @@ const AGENT_SDK_TASK_CONSTRAINTS: &[ConstraintContract] = &[
     ConstraintContract {
         name: "agent_sdk_tasks_terminal_completion_check",
         invariant: "Terminal rows require `completed_at`; non-terminal rows must not set it.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_tasks_terminal_reason_json_check",
+        invariant: "Terminal rows require a typed reason; non-terminal rows must not carry one.",
     },
     ConstraintContract {
         name: "agent_sdk_tasks_failure_payload_check",

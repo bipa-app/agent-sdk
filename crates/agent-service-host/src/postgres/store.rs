@@ -16,7 +16,7 @@
 
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::{
-    ContinuationEnvelope, ListenExecutionContext, ThreadId, TokenUsage, llm,
+    ContinuationEnvelope, ListenExecutionContext, TerminalReason, ThreadId, TokenUsage, llm,
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
@@ -918,6 +918,7 @@ SELECT
     attempt,
     max_attempts,
     last_error,
+    terminal_reason_json,
     pending_child_count,
     spawn_index,
     result_payload,
@@ -956,6 +957,7 @@ SELECT
     attempt,
     max_attempts,
     last_error,
+    terminal_reason_json,
     pending_child_count,
     spawn_index,
     result_payload,
@@ -998,6 +1000,7 @@ SELECT
     attempt,
     max_attempts,
     last_error,
+    terminal_reason_json,
     pending_child_count,
     spawn_index,
     result_payload,
@@ -1043,6 +1046,7 @@ SELECT
     attempt,
     max_attempts,
     last_error,
+    terminal_reason_json,
     pending_child_count,
     spawn_index,
     result_payload,
@@ -1241,6 +1245,7 @@ INSERT INTO agent_sdk_tasks (
     attempt,
     max_attempts,
     last_error,
+    terminal_reason_json,
     pending_child_count,
     spawn_index,
     result_payload,
@@ -1251,7 +1256,7 @@ INSERT INTO agent_sdk_tasks (
     last_activity_at
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-    $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25
+    $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26
 )
 ",
             task.id.as_str(),
@@ -1271,6 +1276,10 @@ INSERT INTO agent_sdk_tasks (
             i64::from(task.attempt),
             i64::from(task.max_attempts),
             sanitize_optional_text(task.last_error.clone()),
+            task.terminal_reason
+                .as_ref()
+                .map(|reason| json_to_value(reason, "task terminal reason"))
+                .transpose()?,
             i64::from(task.pending_child_count),
             task.spawn_index.map(i64::from),
             sanitize_optional_jsonb(task.result_payload.clone()),
@@ -1306,15 +1315,16 @@ SET
     attempt = $14,
     max_attempts = $15,
     last_error = $16,
-    pending_child_count = $17,
-    spawn_index = $18,
-    result_payload = $19,
-    created_at = $20,
-    updated_at = $21,
-    completed_at = $22,
-    caller_metadata_json = $23,
-    otel_traceparent = $24,
-    last_activity_at = $25
+    terminal_reason_json = $17,
+    pending_child_count = $18,
+    spawn_index = $19,
+    result_payload = $20,
+    created_at = $21,
+    updated_at = $22,
+    completed_at = $23,
+    caller_metadata_json = $24,
+    otel_traceparent = $25,
+    last_activity_at = $26
 WHERE id = $1
 ",
             task.id.as_str(),
@@ -1333,6 +1343,10 @@ WHERE id = $1
             i64::from(task.attempt),
             i64::from(task.max_attempts),
             sanitize_optional_text(task.last_error.clone()),
+            task.terminal_reason
+                .as_ref()
+                .map(|reason| json_to_value(reason, "task terminal reason"))
+                .transpose()?,
             i64::from(task.pending_child_count),
             task.spawn_index.map(i64::from),
             sanitize_optional_jsonb(task.result_payload.clone()),
@@ -1796,6 +1810,7 @@ SELECT
     attempt,
     max_attempts,
     last_error,
+    terminal_reason_json,
     pending_child_count,
     spawn_index,
     result_payload,
@@ -1885,6 +1900,7 @@ SELECT
     attempt,
     max_attempts,
     last_error,
+    terminal_reason_json,
     pending_child_count,
     spawn_index,
     result_payload,
@@ -2547,6 +2563,35 @@ async fn prepare_subagent_batch_rows_tx(
     Ok(prepared)
 }
 
+async fn commit_cancel_markers_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    all_tasks: &[AgentTask],
+    mut candidates: std::collections::BTreeMap<
+        AgentTaskId,
+        (ThreadId, Option<TokenUsage>, TerminalReason),
+    >,
+    now: OffsetDateTime,
+) -> Result<Vec<CommittedEvent>> {
+    let mut markers = Vec::new();
+    for row in all_tasks {
+        let Some((thread_id, continuation_usage, reason)) = candidates.remove(&row.id) else {
+            continue;
+        };
+        markers.push(
+            PostgresDurableStore::insert_cancelled_marker_tx(
+                tx,
+                &thread_id,
+                &row.id,
+                continuation_usage,
+                reason,
+                now,
+            )
+            .await?,
+        );
+    }
+    Ok(markers)
+}
+
 #[async_trait]
 impl AgentTaskStore for PostgresDurableStore {
     fn atomic_subagent_spawn_committer(&self) -> Option<&dyn AtomicSubagentSpawnCommitter> {
@@ -2562,29 +2607,7 @@ impl AgentTaskStore for PostgresDurableStore {
     }
 
     async fn submit_root_turn(&self, task: AgentTask) -> Result<AgentTask> {
-        if task.kind != TaskKind::RootTurn {
-            let kind = task.kind;
-            return Err(anyhow!(
-                "submit_root_turn rejected: expected root_turn, got {kind:?}"
-            ));
-        }
-        if task.status != TaskStatus::Pending {
-            let status = task.status;
-            return Err(anyhow!(
-                "submit_root_turn rejected: new root must start in Pending (got {status:?})"
-            ));
-        }
-        if task.attempt != 0 {
-            let attempt = task.attempt;
-            return Err(anyhow!(
-                "submit_root_turn rejected: new root must have attempt == 0 (got {attempt})"
-            ));
-        }
-        if !task.is_root() {
-            return Err(anyhow!("submit_root_turn rejected: task must be a root"));
-        }
-        task.validate()
-            .context("submit_root_turn rejected: task failed schema validation")?;
+        agent_server::journal::store::validate_submit_root_shape(&task)?;
 
         let mut tx = self.begin().await?;
         Self::bootstrap_thread_row_tx(&mut tx, &task.thread_id, task.created_at).await?;
@@ -2883,6 +2906,7 @@ SELECT
     attempt,
     max_attempts,
     last_error,
+    terminal_reason_json,
     pending_child_count,
     spawn_index,
     result_payload,
@@ -2925,6 +2949,7 @@ SELECT
     attempt,
     max_attempts,
     last_error,
+    terminal_reason_json,
     pending_child_count,
     spawn_index,
     result_payload,
@@ -2979,7 +3004,7 @@ SELECT
     id, kind, status, parent_id, root_id, depth, thread_id,
     submitted_input_json, caller_metadata_json, worker_id, lease_id,
     lease_expires_at, last_heartbeat_at, state_json, attempt, max_attempts,
-    last_error, pending_child_count, spawn_index, result_payload,
+    last_error, terminal_reason_json, pending_child_count, spawn_index, result_payload,
     otel_traceparent, created_at, updated_at, completed_at, last_activity_at
 FROM agent_sdk_tasks
 WHERE parent_id = $1 AND status NOT IN ('completed', 'failed', 'cancelled')
@@ -3026,6 +3051,7 @@ SELECT
     attempt,
     max_attempts,
     last_error,
+    terminal_reason_json,
     pending_child_count,
     spawn_index,
     result_payload,
@@ -3068,6 +3094,7 @@ SELECT
     attempt,
     max_attempts,
     last_error,
+    terminal_reason_json,
     pending_child_count,
     spawn_index,
     result_payload,
@@ -3113,6 +3140,7 @@ SELECT
     attempt,
     max_attempts,
     last_error,
+    terminal_reason_json,
     pending_child_count,
     spawn_index,
     result_payload,
@@ -3237,6 +3265,7 @@ SELECT
     attempt,
     max_attempts,
     last_error,
+    terminal_reason_json,
     pending_child_count,
     spawn_index,
     result_payload,
@@ -3362,6 +3391,7 @@ RETURNING
     attempt,
     max_attempts,
     last_error,
+    terminal_reason_json,
     pending_child_count,
     spawn_index,
     result_payload,
@@ -3427,6 +3457,7 @@ SELECT
     attempt,
     max_attempts,
     last_error,
+    terminal_reason_json,
     pending_child_count,
     spawn_index,
     result_payload,
@@ -4033,6 +4064,7 @@ SELECT
     attempt,
     max_attempts,
     last_error,
+    terminal_reason_json,
     pending_child_count,
     spawn_index,
     result_payload,
@@ -4078,6 +4110,7 @@ SELECT
     attempt,
     max_attempts,
     last_error,
+    terminal_reason_json,
     pending_child_count,
     spawn_index,
     result_payload,
@@ -4168,6 +4201,30 @@ ORDER BY created_at, id
         Ok(result)
     }
 
+    async fn fail_task_with_reason(
+        &self,
+        child_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        error: String,
+        reason: TerminalReason,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<AgentTask>)> {
+        let mut tx = self.begin().await?;
+        let result = Self::apply_task_terminal_transition_tx(
+            &mut tx,
+            child_id,
+            worker,
+            lease,
+            now,
+            "fail_task_with_reason",
+            move |child| child.fail_with_terminal_reason(error, reason, now),
+        )
+        .await?;
+        tx.commit().await.context("commit fail_task_with_reason")?;
+        Ok(result)
+    }
+
     async fn cancel_tree(
         &self,
         root_id: &AgentTaskId,
@@ -4246,7 +4303,7 @@ ORDER BY created_at, id
         // before `cancel` clears the typed state.
         let mut marker_candidates: std::collections::BTreeMap<
             AgentTaskId,
-            (ThreadId, Option<TokenUsage>),
+            (ThreadId, Option<TokenUsage>, TerminalReason),
         > = std::collections::BTreeMap::new();
         for row in cancel_order {
             let Some(current) = Self::load_task_tx(&mut tx, &row.id, true).await? else {
@@ -4257,6 +4314,11 @@ ORDER BY created_at, id
             }
             let is_root_turn_root = current.kind == TaskKind::RootTurn && current.is_root();
             let thread_id = current.thread_id.clone();
+            let reason = if current.id == *root_id {
+                TerminalReason::UserCancel
+            } else {
+                TerminalReason::ParentCancelled
+            };
             if is_root_turn_root && current.status.blocks_root_admission() {
                 marker_candidates.insert(
                     current.id.clone(),
@@ -4266,11 +4328,12 @@ ORDER BY created_at, id
                             .state
                             .continuation()
                             .map(|continuation| continuation.payload.total_usage.clone()),
+                        reason.clone(),
                     ),
                 );
             }
             let cancelled = current
-                .cancel(now)
+                .cancel_with_reason(reason, now)
                 .context("cancel_tree: cancel transition failed")?;
             Self::update_task_tx(&mut tx, &cancelled).await?;
             cancelled_ids.insert(cancelled.id.clone());
@@ -4297,21 +4360,7 @@ ORDER BY created_at, id
         // nothing. The thread rows were locked in phase 1, so the
         // sequence allocation here re-locks held rows (no new lock
         // edges). Emitted in BFS order.
-        let mut markers: Vec<CommittedEvent> = Vec::new();
-        for row in &all_tasks {
-            let Some((thread_id, continuation_usage)) = marker_candidates.remove(&row.id) else {
-                continue;
-            };
-            let committed = Self::insert_cancelled_marker_tx(
-                &mut tx,
-                &thread_id,
-                &row.id,
-                continuation_usage,
-                now,
-            )
-            .await?;
-            markers.push(committed);
-        }
+        let markers = commit_cancel_markers_tx(&mut tx, &all_tasks, marker_candidates, now).await?;
 
         // Phase 7.6: wake linked SubagentInvocation tasks that were
         // WaitingOnChildren on a now-cancelled child root. This
@@ -4433,7 +4482,7 @@ ORDER BY created_at, id
         }
         let failed = old
             .clone()
-            .fail(error, now)
+            .fail_with_terminal_reason(error, TerminalReason::ConfirmationRejected, now)
             .context("reject_confirmation: fail transition failed")?;
         Self::update_task_tx(&mut tx, &failed).await?;
 
@@ -5433,6 +5482,7 @@ VALUES ($1, 'task_wakeup', $2, NULL, NULL, 'pending', $3, $4, $4, 0, $5)
         thread_id: &ThreadId,
         task_id: &AgentTaskId,
         continuation_usage: Option<TokenUsage>,
+        reason: TerminalReason,
         now: OffsetDateTime,
     ) -> Result<CommittedEvent> {
         // A blocking root's thread row always exists (submit
@@ -5449,7 +5499,10 @@ VALUES ($1, 'task_wakeup', $2, NULL, NULL, 'pending', $3, $4, $4, 0, $5)
         let mut committed = Self::insert_events_tx(
             tx,
             thread_id,
-            vec![AgentEvent::cancelled(turn, usage).with_emitter_task_id(task_id.as_str())],
+            vec![
+                AgentEvent::cancelled_with_reason(turn, usage, reason)
+                    .with_emitter_task_id(task_id.as_str()),
+            ],
             start_seq,
             now,
         )
@@ -6211,6 +6264,7 @@ struct TaskRecord {
     attempt: i64,
     max_attempts: i64,
     last_error: Option<String>,
+    terminal_reason_json: Option<serde_json::Value>,
     pending_child_count: i64,
     spawn_index: Option<i64>,
     result_payload: Option<serde_json::Value>,
@@ -6247,6 +6301,10 @@ impl TryFrom<TaskRecord> for AgentTask {
             attempt: u32_from_i64(record.attempt, "task attempt")?,
             max_attempts: u32_from_i64(record.max_attempts, "task max_attempts")?,
             last_error: record.last_error,
+            terminal_reason: record
+                .terminal_reason_json
+                .map(|value| json_from_value(value, "task terminal_reason_json"))
+                .transpose()?,
             pending_child_count: u32_from_i64(
                 record.pending_child_count,
                 "task pending_child_count",

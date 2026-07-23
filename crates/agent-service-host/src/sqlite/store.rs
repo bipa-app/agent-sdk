@@ -16,7 +16,7 @@
 
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::{
-    ContinuationEnvelope, ListenExecutionContext, ThreadId, TokenUsage, llm,
+    ContinuationEnvelope, ListenExecutionContext, TerminalReason, ThreadId, TokenUsage, llm,
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
@@ -206,7 +206,7 @@ macro_rules! task_columns {
         "id, kind, status, parent_id, root_id, depth, thread_id, \
          submitted_input_json, caller_metadata_json, worker_id, lease_id, \
          lease_expires_at, last_heartbeat_at, state_json, attempt, max_attempts, \
-         last_error, pending_child_count, spawn_index, result_payload, \
+         last_error, terminal_reason_json, pending_child_count, spawn_index, result_payload, \
          otel_traceparent, created_at, updated_at, completed_at, last_activity_at"
     };
 }
@@ -980,6 +980,11 @@ INSERT INTO agent_sdk_turn_checkpoints (
         let state_json = json_to_value(&task.state, "task state")?;
         let attempt = i64::from(task.attempt);
         let max_attempts = i64::from(task.max_attempts);
+        let terminal_reason = task
+            .terminal_reason
+            .as_ref()
+            .map(|reason| json_to_value(reason, "task terminal reason"))
+            .transpose()?;
         let pending_child_count = i64::from(task.pending_child_count);
         let spawn_index = task.spawn_index.map(i64::from);
         sqlx::query!(
@@ -987,12 +992,12 @@ INSERT INTO agent_sdk_turn_checkpoints (
 INSERT INTO agent_sdk_tasks (
     id, kind, status, parent_id, root_id, depth, thread_id,
     submitted_input_json, caller_metadata_json, worker_id, lease_id, lease_expires_at,
-    last_heartbeat_at, state_json, attempt, max_attempts, last_error,
+    last_heartbeat_at, state_json, attempt, max_attempts, last_error, terminal_reason_json,
     pending_child_count, spawn_index, result_payload,
     created_at, updated_at, completed_at, otel_traceparent, last_activity_at
 ) VALUES (
     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
+    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26
 )
 ",
             id,
@@ -1012,6 +1017,7 @@ INSERT INTO agent_sdk_tasks (
             attempt,
             max_attempts,
             task.last_error,
+            terminal_reason,
             pending_child_count,
             spawn_index,
             task.result_payload,
@@ -1042,6 +1048,11 @@ INSERT INTO agent_sdk_tasks (
         let state_json = json_to_value(&task.state, "task state")?;
         let attempt = i64::from(task.attempt);
         let max_attempts = i64::from(task.max_attempts);
+        let terminal_reason = task
+            .terminal_reason
+            .as_ref()
+            .map(|reason| json_to_value(reason, "task terminal reason"))
+            .transpose()?;
         let pending_child_count = i64::from(task.pending_child_count);
         let spawn_index = task.spawn_index.map(i64::from);
         let result = sqlx::query!(
@@ -1051,12 +1062,13 @@ UPDATE agent_sdk_tasks SET
     depth = ?6, thread_id = ?7, submitted_input_json = ?8,
     worker_id = ?9, lease_id = ?10, lease_expires_at = ?11,
     last_heartbeat_at = ?12, state_json = ?13, attempt = ?14,
-    max_attempts = ?15, last_error = ?16, pending_child_count = ?17,
-    spawn_index = ?18, result_payload = ?19,
-    created_at = ?20, updated_at = ?21, completed_at = ?22,
-    caller_metadata_json = ?23,
-    otel_traceparent = ?24,
-    last_activity_at = ?25
+    max_attempts = ?15, last_error = ?16, terminal_reason_json = ?17,
+    pending_child_count = ?18,
+    spawn_index = ?19, result_payload = ?20,
+    created_at = ?21, updated_at = ?22, completed_at = ?23,
+    caller_metadata_json = ?24,
+    otel_traceparent = ?25,
+    last_activity_at = ?26
 WHERE id = ?1
 ",
             id,
@@ -1075,6 +1087,7 @@ WHERE id = ?1
             attempt,
             max_attempts,
             task.last_error,
+            terminal_reason,
             pending_child_count,
             spawn_index,
             task.result_payload,
@@ -1837,6 +1850,7 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
         thread_id: &ThreadId,
         task_id: &AgentTaskId,
         continuation_usage: Option<TokenUsage>,
+        reason: TerminalReason,
         now: OffsetDateTime,
     ) -> Result<CommittedEvent> {
         Self::bootstrap_thread_row_tx(tx, thread_id, now).await?;
@@ -1850,7 +1864,10 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
         let mut committed = Self::insert_events_tx(
             tx,
             thread_id,
-            vec![AgentEvent::cancelled(turn, usage).with_emitter_task_id(task_id.as_str())],
+            vec![
+                AgentEvent::cancelled_with_reason(turn, usage, reason)
+                    .with_emitter_task_id(task_id.as_str()),
+            ],
             start_seq,
             now,
         )
@@ -3792,6 +3809,30 @@ impl AgentTaskStore for SqliteDurableStore {
         Ok(result)
     }
 
+    async fn fail_task_with_reason(
+        &self,
+        child_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        error: String,
+        reason: TerminalReason,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<AgentTask>)> {
+        let mut tx = self.begin().await?;
+        let result = Self::apply_task_terminal_transition_tx(
+            &mut tx,
+            child_id,
+            worker,
+            lease,
+            now,
+            "fail_task_with_reason",
+            move |child| child.fail_with_terminal_reason(error, reason, now),
+        )
+        .await?;
+        tx.commit().await.context("commit fail_task_with_reason")?;
+        Ok(result)
+    }
+
     async fn cancel_tree(
         &self,
         root_id: &AgentTaskId,
@@ -3847,6 +3888,11 @@ impl AgentTaskStore for SqliteDurableStore {
             }
             let is_root_turn_root = row.kind == TaskKind::RootTurn && row.is_root();
             let thread_id = row.thread_id.clone();
+            let reason = if row.id == *root_id {
+                TerminalReason::UserCancel
+            } else {
+                TerminalReason::ParentCancelled
+            };
             if is_root_turn_root && row.status.blocks_root_admission() {
                 let continuation_usage = row
                     .state
@@ -3857,13 +3903,14 @@ impl AgentTaskStore for SqliteDurableStore {
                     &thread_id,
                     &row.id,
                     continuation_usage,
+                    reason.clone(),
                     now,
                 )
                 .await?;
                 markers.push(committed);
             }
             let cancelled = row
-                .cancel(now)
+                .cancel_with_reason(reason, now)
                 .context("cancel_tree: cancel transition failed")?;
             Self::update_task_tx(&mut tx, &cancelled).await?;
             if is_root_turn_root {
@@ -3990,7 +4037,7 @@ impl AgentTaskStore for SqliteDurableStore {
         }
         let failed = old
             .clone()
-            .fail(error, now)
+            .fail_with_terminal_reason(error, TerminalReason::ConfirmationRejected, now)
             .context("reject_confirmation: fail transition failed")?;
         Self::update_task_tx(&mut tx, &failed).await?;
 
@@ -5265,6 +5312,7 @@ struct TaskRecord {
     attempt: i64,
     max_attempts: i64,
     last_error: Option<String>,
+    terminal_reason_json: Option<serde_json::Value>,
     pending_child_count: i64,
     spawn_index: Option<i64>,
     result_payload: Option<serde_json::Value>,
@@ -5297,6 +5345,10 @@ impl TryFrom<TaskRecord> for AgentTask {
             attempt: u32_from_i64(r.attempt, "task attempt")?,
             max_attempts: u32_from_i64(r.max_attempts, "task max_attempts")?,
             last_error: r.last_error,
+            terminal_reason: r
+                .terminal_reason_json
+                .map(|value| json_from_value(value, "task terminal_reason_json"))
+                .transpose()?,
             pending_child_count: u32_from_i64(r.pending_child_count, "task pending_child_count")?,
             spawn_index: r
                 .spawn_index
@@ -5909,8 +5961,26 @@ INSERT INTO agent_sdk_turn_attempts (
         }
 
         let store = SqliteDurableStore::from_pool(pool.clone());
-        let task = AgentTask::new_root_turn(ThreadId::from_string("legacy-evidence"), t0(), 3);
-        AgentTaskStore::submit_root_turn(&store, task.clone()).await?;
+        let task_id = "task_legacy_evidence";
+        sqlx::query(
+            "INSERT INTO agent_sdk_threads (
+                thread_id, status, committed_turns, total_input_tokens, total_output_tokens,
+                created_at, updated_at
+             ) VALUES ('legacy-evidence', 'active', 0, 0, 0, '2026-01-01', '2026-01-01')",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO agent_sdk_tasks (
+                id, kind, status, root_id, depth, thread_id, attempt, max_attempts,
+                created_at, updated_at
+             ) VALUES (?, 'root_turn', 'queued', ?, 0, 'legacy-evidence', 0, 3,
+                '2026-01-01', '2026-01-01')",
+        )
+        .bind(task_id)
+        .bind(task_id)
+        .execute(&pool)
+        .await?;
         let attempt_id = TurnAttemptId::from_string("attempt_legacy_evidence");
         let request_blob = serde_json::json!({"messages": []});
         sqlx::query!(
@@ -5920,7 +5990,7 @@ INSERT INTO agent_sdk_turn_attempts (
 ) VALUES (?1, ?2, 1, 'anthropic', 'claude-sonnet-4-6', ?3, ?4)
 ",
             attempt_id.as_str(),
-            task.id.as_str(),
+            task_id,
             request_blob,
             t0(),
         )

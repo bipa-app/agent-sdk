@@ -40,10 +40,12 @@ pub use store::SqliteDurableStore;
 mod tests {
     use std::collections::BTreeSet;
 
-    use anyhow::{Result, ensure};
+    use anyhow::{Context, Result, ensure};
+    use sqlx::sqlite::SqlitePoolOptions;
 
     use super::migrations::{
-        DURABLE_CORE_MIGRATOR, durable_core_migrations, outbox_message_kind_migration,
+        DURABLE_CORE_MIGRATOR, TASK_TERMINAL_REASON_MIGRATION_VERSION, durable_core_migrations,
+        outbox_message_kind_migration,
     };
 
     #[test]
@@ -78,24 +80,35 @@ mod tests {
         Ok(())
     }
 
+    /// The bundle is ordered, gap-tolerant, and contains this PR's
+    /// migration.
+    ///
+    /// Deliberately NOT a hardcoded version list. Sibling PRs each own a
+    /// reserved version number and merge in an arbitrary order, so
+    /// pinning the exact set makes every one of them break the others
+    /// until rebased — a merge-order coupling that says nothing about
+    /// whether the migrator is correct. What actually matters is that
+    /// versions apply in a strictly increasing order (sqlx applies them
+    /// in slice order, so a descending pair would run out of sequence)
+    /// and that this PR's own migration is present.
     #[test]
-    fn sqlite_executable_migration_bundle_contains_all_migrations() -> Result<()> {
-        let migrations = &DURABLE_CORE_MIGRATOR.migrations;
-        ensure!(
-            migrations.len() == 13,
-            "expected 13 executable migrations, got {:?}",
-            migrations.iter().map(|m| m.version).collect::<Vec<_>>(),
-        );
-        for (idx, expected) in [1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+    fn sqlite_executable_migration_bundle_is_ordered_and_contains_this_prs_migration() -> Result<()>
+    {
+        let versions: Vec<i64> = DURABLE_CORE_MIGRATOR
+            .migrations
             .iter()
-            .enumerate()
-        {
-            ensure!(
-                migrations[idx].version == *expected,
-                "expected version {expected}, got {}",
-                migrations[idx].version,
-            );
-        }
+            .map(|migration| migration.version)
+            .collect();
+
+        ensure!(
+            versions.windows(2).all(|pair| pair[0] < pair[1]),
+            "migration versions must be strictly increasing (ordered and unique), got {versions:?}",
+        );
+        ensure!(
+            versions.contains(&TASK_TERMINAL_REASON_MIGRATION_VERSION),
+            "bundle is missing this PR's migration \
+             {TASK_TERMINAL_REASON_MIGRATION_VERSION}, got {versions:?}",
+        );
         Ok(())
     }
 
@@ -195,6 +208,101 @@ mod tests {
         for name in required_indexes {
             ensure!(sql_bundle.contains(name), "missing index: {name}");
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminal_reason_migration_backfills_all_terminal_rows() -> Result<()> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await?;
+        let migrations = durable_core_migrations();
+        let terminal_reason_index = migrations
+            .iter()
+            .position(|migration| migration.version == "0014")
+            .context("terminal-reason migration must be registered as 0014")?;
+
+        for migration in &migrations[..terminal_reason_index] {
+            sqlx::raw_sql(migration.sql).execute(&pool).await?;
+        }
+
+        sqlx::query(
+            "INSERT INTO agent_sdk_threads (
+                thread_id, status, committed_turns, total_input_tokens, total_output_tokens,
+                created_at, updated_at
+             ) VALUES ('thread-1', 'active', 0, 0, 0, '2026-01-01', '2026-01-01')",
+        )
+        .execute(&pool)
+        .await?;
+
+        for (id, status, last_error, completed_at) in [
+            ("completed-task", "completed", None, Some("2026-01-01")),
+            (
+                "failed-task",
+                "failed",
+                Some("provider failed"),
+                Some("2026-01-01"),
+            ),
+            ("cancelled-task", "cancelled", None, Some("2026-01-01")),
+            ("queued-task", "queued", None, None),
+        ] {
+            sqlx::query(
+                "INSERT INTO agent_sdk_tasks (
+                    id, kind, status, root_id, depth, thread_id, attempt, max_attempts,
+                    last_error, created_at, updated_at, completed_at
+                 ) VALUES (?, 'root_turn', ?, ?, 0, 'thread-1', 0, 1, ?, '2026-01-01',
+                    '2026-01-01', ?)",
+            )
+            .bind(id)
+            .bind(status)
+            .bind(id)
+            .bind(last_error)
+            .bind(completed_at)
+            .execute(&pool)
+            .await?;
+        }
+
+        sqlx::raw_sql(migrations[terminal_reason_index].sql)
+            .execute(&pool)
+            .await?;
+
+        let terminal_rows_without_reason: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM agent_sdk_tasks
+             WHERE status IN ('completed', 'failed', 'cancelled')
+               AND terminal_reason_json IS NULL",
+        )
+        .fetch_one(&pool)
+        .await?;
+        ensure!(
+            terminal_rows_without_reason.0 == 0,
+            "terminal rows must be backfilled before the migration completes",
+        );
+
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT status, terminal_reason_json FROM agent_sdk_tasks ORDER BY status",
+        )
+        .fetch_all(&pool)
+        .await?;
+        ensure!(
+            rows == vec![
+                (
+                    "cancelled".to_owned(),
+                    Some(r#"{"reason":"user_cancel"}"#.to_owned()),
+                ),
+                (
+                    "completed".to_owned(),
+                    Some(r#"{"reason":"completed"}"#.to_owned()),
+                ),
+                (
+                    "failed".to_owned(),
+                    Some(r#"{"reason":"internal_error"}"#.to_owned()),
+                ),
+                ("queued".to_owned(), None),
+            ],
+            "unexpected terminal reason backfill: {rows:?}",
+        );
+
         Ok(())
     }
 
