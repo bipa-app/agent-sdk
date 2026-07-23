@@ -190,6 +190,7 @@ mod in_memory_bundle {
         MixedChildrenSpawn, SpawnedMixedChildren, SubagentInvocationSpawn, SubmitRootTurnError,
         SubmitRootTurnOutcome, SubmitRootTurnParams,
     };
+    use crate::journal::subagent_spawn_transaction::SubagentSpawnEvent;
     use crate::journal::task::{ChildSpawnSpec, SuspensionPayload, TaskStatus};
     use crate::journal::thread::Thread;
     use crate::journal::turn_attempt::{
@@ -401,12 +402,11 @@ mod in_memory_bundle {
             parent_id: &AgentTaskId,
             worker: &WorkerId,
             lease: &LeaseId,
-            spawns: Vec<SubagentInvocationSpawn>,
-            payload: SuspensionPayload,
+            batch: crate::journal::store::SubagentBatchSpawn,
             now: OffsetDateTime,
-        ) -> Result<(AgentTask, Vec<(AgentTask, AgentTask)>)> {
+        ) -> Result<(AgentTask, Vec<(AgentTask, AgentTask)>, Vec<CommittedEvent>)> {
             self.task
-                .spawn_subagent_batch(parent_id, worker, lease, spawns, payload, now)
+                .spawn_subagent_batch(parent_id, worker, lease, batch, now)
                 .await
         }
         async fn spawn_mixed_children(
@@ -415,10 +415,11 @@ mod in_memory_bundle {
             worker: &WorkerId,
             lease: &LeaseId,
             spawn: MixedChildrenSpawn,
+            events: Vec<SubagentSpawnEvent>,
             now: OffsetDateTime,
         ) -> Result<SpawnedMixedChildren> {
             self.task
-                .spawn_mixed_children(parent_id, worker, lease, spawn, now)
+                .spawn_mixed_children(parent_id, worker, lease, spawn, events, now)
                 .await
         }
         async fn find_subagent_invocation_for_child_root(
@@ -944,6 +945,21 @@ async fn mixed_batch_fixture<S: JournalStore>(
 /// Assemble a mixed batch: one subagent entry per child thread — taking
 /// the slots named in `subagent_slots`, pairwise with the fixture's
 /// threads — and one tool child per slot named in `tool_slots`.
+/// Slim per-entry start-event descriptors for spawn calls in the
+/// conformance battery, matching the subagent entry count.
+fn spawn_events(
+    count: usize,
+) -> Vec<crate::journal::subagent_spawn_transaction::SubagentSpawnEvent> {
+    (0..count)
+        .map(
+            |slot| crate::journal::subagent_spawn_transaction::SubagentSpawnEvent {
+                subagent_id: format!("conf-subagent-call-{slot}"),
+                subagent_name: "explorer".to_owned(),
+            },
+        )
+        .collect()
+}
+
 fn mixed_batch_spawn(
     fixture: &MixedBatchFixture,
     payload: SuspensionPayload,
@@ -1003,6 +1019,7 @@ async fn case_mixed_batch_spawns_subagents_and_tools<S: JournalStore>(store: &S)
         &fixture.worker,
         &fixture.lease,
         spawn,
+        spawn_events(2),
         t_plus(2),
     )
     .await
@@ -1117,6 +1134,7 @@ async fn case_mixed_batch_child_ids_follow_slot_order<S: JournalStore>(store: &S
         &fixture.worker,
         &fixture.lease,
         spawn,
+        spawn_events(2),
         t_plus(2),
     )
     .await
@@ -1186,6 +1204,7 @@ async fn case_mixed_batch_losing_cas_spawns_nothing<S: JournalStore>(store: &S) 
         &fixture.worker,
         &stale_lease,
         spawn,
+        spawn_events(1),
         t_plus(2),
     )
     .await;
@@ -1236,6 +1255,7 @@ async fn case_mixed_batch_rejects_cancelled_parent<S: JournalStore>(store: &S) -
         &fixture.worker,
         &fixture.lease,
         spawn,
+        spawn_events(1),
         t_plus(3),
     )
     .await;
@@ -1281,6 +1301,7 @@ async fn case_mixed_batch_rejects_uncovered_slot<S: JournalStore>(store: &S) -> 
         &fixture.worker,
         &fixture.lease,
         spawn,
+        spawn_events(1),
         t_plus(2),
     )
     .await;

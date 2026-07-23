@@ -34,6 +34,14 @@ enum StreamCloseReason {
   STREAM_CLOSE_REASON_TURN_CANCELLED = 4;
 }
 
+// A thread aggregate became durably visible. `source_thread_id` and
+// `fork_after_committed_turns` are present only for `ForkThread`.
+message ThreadCreatedEvent {
+  string thread_id = 1;
+  optional string source_thread_id = 2;
+  optional uint32 fork_after_committed_turns = 3;
+}
+
 // Opens a turn. `turn` is the slot number the worker BOOTSTRAPPED
 // with, committed before streaming begins — and in one rare race it is
 // not the slot the turn finally lands on: a successor turn that loses
@@ -335,6 +343,7 @@ message EventEnvelope {
     AutoRetryEndEvent auto_retry_end = 26;
     UserInputEvent user_input = 27;
     CancelledEvent cancelled = 28;
+    ThreadCreatedEvent thread_created = 29;
   }
 }
 

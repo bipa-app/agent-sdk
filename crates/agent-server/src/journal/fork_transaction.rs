@@ -79,10 +79,14 @@ pub struct ForkCommitParams {
     /// `new_thread_id`. `None` for a turn-zero fork (no source
     /// checkpoint to mirror).
     pub checkpoint: Option<NewCheckpointParams>,
-    /// Source events to re-commit under the destination thread.
-    /// `commit_event_batch` semantics — fresh sequences are assigned
-    /// inside the transaction. Empty for a turn-zero fork.
+    /// Full destination journal seed: `events[0]` is the destination's
+    /// `ThreadCreated` (built once by the params constructor — the ONE
+    /// choke point for that invariant), followed by the source events
+    /// re-committed under the destination. Fresh sequences are assigned
+    /// inside the transaction; committers write this vector verbatim.
     pub events: Vec<AgentEvent>,
+    /// Maximum relay attempts for the coalesced outbox advisory.
+    pub outbox_max_attempts: u32,
 }
 
 /// Backend-specific hook for atomically committing a fork.

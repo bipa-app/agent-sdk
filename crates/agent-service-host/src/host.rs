@@ -7999,12 +7999,15 @@ mod tests {
             parent_id: &AgentTaskId,
             worker: &WorkerId,
             lease: &LeaseId,
-            spawns: Vec<SubagentInvocationSpawn>,
-            payload: SuspensionPayload,
+            batch: agent_server::journal::store::SubagentBatchSpawn,
             now: time::OffsetDateTime,
-        ) -> Result<(AgentTask, Vec<(AgentTask, AgentTask)>)> {
+        ) -> Result<(
+            AgentTask,
+            Vec<(AgentTask, AgentTask)>,
+            Vec<agent_server::CommittedEvent>,
+        )> {
             self.inner
-                .spawn_subagent_batch(parent_id, worker, lease, spawns, payload, now)
+                .spawn_subagent_batch(parent_id, worker, lease, batch, now)
                 .await
         }
         async fn spawn_mixed_children(
@@ -8013,10 +8016,11 @@ mod tests {
             worker: &WorkerId,
             lease: &LeaseId,
             spawn: agent_server::journal::MixedChildrenSpawn,
+            events: Vec<agent_server::journal::subagent_spawn_transaction::SubagentSpawnEvent>,
             now: time::OffsetDateTime,
         ) -> Result<agent_server::journal::SpawnedMixedChildren> {
             self.inner
-                .spawn_mixed_children(parent_id, worker, lease, spawn, now)
+                .spawn_mixed_children(parent_id, worker, lease, spawn, events, now)
                 .await
         }
         async fn find_subagent_invocation_for_child_root(

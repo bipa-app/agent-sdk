@@ -9,6 +9,7 @@ use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::llm::{self, ContentBlock, ContentSource};
 use agent_sdk_foundation::{ThreadId, TokenUsage, ToolResult, ToolTier};
 use agent_server::journal::checkpoint::NewCheckpointParams;
+use agent_server::journal::commit::DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS;
 use agent_server::journal::execution_intent::GuardedExecutionDeps;
 use agent_server::journal::fork_transaction::ForkCommitParams;
 use agent_server::journal::idempotency::{IdempotencyClaim, IdempotencyKind, IdempotencyRecord};
@@ -20,6 +21,7 @@ use agent_server::journal::task::{
     TaskStatus as JournalTaskStatus, WorkerId,
 };
 use agent_server::journal::task_state::TaskState;
+use agent_server::journal::thread_creation_transaction::ThreadCreationCommit;
 use agent_server::journal::thread_store::{
     ThreadCreation, ThreadCreationOutcome, ThreadIdConflict,
 };
@@ -653,6 +655,53 @@ struct GrpcEventService {
 }
 
 impl GrpcControlService {
+    /// Create an anonymous thread's aggregate, projection, and
+    /// `ThreadCreated` event — in one transaction when the backend
+    /// exposes the atomic hook, sequentially otherwise.
+    async fn commit_anonymous_thread_creation(
+        &self,
+        thread_id: &ThreadId,
+        now: OffsetDateTime,
+    ) -> Result<(), Status> {
+        let creation_event = AgentEvent::thread_created(thread_id.clone(), None, None);
+        if let Some(committer) = self
+            .shared
+            .stores
+            .thread_store
+            .atomic_thread_creation_committer()
+        {
+            committer
+                .commit_thread_creation_atomic(ThreadCreationCommit {
+                    thread_id: thread_id.clone(),
+                    event: creation_event,
+                    outbox_max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+                    now,
+                })
+                .await
+                .map_err(internal_status("atomic thread creation"))?;
+        } else {
+            self.shared
+                .stores
+                .thread_store
+                .get_or_create(thread_id, now)
+                .await
+                .map_err(internal_status("creating thread"))?;
+            self.shared
+                .stores
+                .message_store
+                .get_or_create(thread_id, now)
+                .await
+                .map_err(internal_status("creating message projection"))?;
+            self.shared
+                .stores
+                .event_repo
+                .commit_event_batch(thread_id, vec![creation_event], now)
+                .await
+                .map_err(internal_status("committing creation event"))?;
+        }
+        Ok(())
+    }
+
     /// Copy the source thread's durable state onto the freshly-minted
     /// destination thread, cut at the chosen turn boundary.
     ///
@@ -696,7 +745,11 @@ impl GrpcControlService {
             .build_fork_commit_params(source_thread_id, new_thread_id, fork_after, creation, now)
             .await?;
         let requested_message_count = params.messages.len() as u64;
-        let requested_event_count = params.events.len() as u64;
+        // `events[0]` is the destination's ThreadCreated; the response's
+        // `event_count` counts only the source events re-committed, so
+        // fresh and replayed responses agree (the replay path derives
+        // the same value as `next_sequence - 1`).
+        let requested_event_count = (params.events.len() as u64).saturating_sub(1);
 
         // Prefer the atomic hook when the backend exposes one. This
         // is the load-bearing case: durable SQL backends commit the
@@ -766,7 +819,12 @@ impl GrpcControlService {
                 cumulative_total_usage: TokenUsage::default(),
                 messages: Vec::new(),
                 checkpoint: None,
-                events: Vec::new(),
+                events: vec![AgentEvent::thread_created(
+                    new_thread_id.clone(),
+                    Some(source_thread_id.clone()),
+                    Some(0),
+                )],
+                outbox_max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
             });
         }
 
@@ -811,7 +869,15 @@ impl GrpcControlService {
             .get_events(source_thread_id)
             .await
             .map_err(internal_status("loading source events for fork"))?;
-        let events = events_up_to_fork_boundary(source_events, fork_after);
+        let mut events = events_up_to_fork_boundary(source_events, fork_after);
+        events.insert(
+            0,
+            AgentEvent::thread_created(
+                new_thread_id.clone(),
+                Some(source_thread_id.clone()),
+                Some(checkpoint.turn_number),
+            ),
+        );
 
         Ok(ForkCommitParams {
             new_thread_id: new_thread_id.clone(),
@@ -833,6 +899,7 @@ impl GrpcControlService {
                 now,
             }),
             events,
+            outbox_max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
         })
     }
 
@@ -926,14 +993,12 @@ impl GrpcControlService {
                 .map_err(internal_status("seeding forked checkpoint"))?;
         }
 
-        if !params.events.is_empty() {
-            self.shared
-                .stores
-                .event_repo
-                .commit_event_batch(&params.new_thread_id, params.events, params.now)
-                .await
-                .map_err(internal_status("re-committing events on forked thread"))?;
-        }
+        self.shared
+            .stores
+            .event_repo
+            .commit_event_batch(&params.new_thread_id, params.events, params.now)
+            .await
+            .map_err(internal_status("re-committing events on forked thread"))?;
         Ok(outcome)
     }
 
@@ -966,7 +1031,9 @@ impl GrpcControlService {
             .await
             .map_err(internal_status(
                 "idempotent fork: load forked event sequence",
-            ))?;
+            ))?
+            .checked_sub(1)
+            .ok_or_else(|| Status::internal("forked thread is missing its creation event"))?;
         Ok(pb::ForkThreadResponse {
             thread: Some(self.shared.thread_view(&new_thread_id).await?),
             source_thread_id: record.source_thread_id.clone(),
@@ -1160,18 +1227,8 @@ impl AgentControlService for GrpcControlService {
 
         let now = OffsetDateTime::now_utc();
         let thread_id = ThreadId::new();
-        self.shared
-            .stores
-            .thread_store
-            .get_or_create(&thread_id, now)
-            .await
-            .map_err(internal_status("creating thread"))?;
-        self.shared
-            .stores
-            .message_store
-            .get_or_create(&thread_id, now)
-            .await
-            .map_err(internal_status("creating message projection"))?;
+        self.commit_anonymous_thread_creation(&thread_id, now)
+            .await?;
 
         let result_json = serde_json::to_value(CreateThreadResult {
             thread_id: thread_id.0.clone(),
@@ -3043,6 +3100,17 @@ fn map_subagent_event_payload(event: &AgentEvent) -> Option<pb::event_envelope::
 
 fn map_message_event_payload(event: &AgentEvent) -> RpcResult<Option<pb::event_envelope::Event>> {
     match event {
+        AgentEvent::ThreadCreated {
+            thread_id,
+            source_thread_id,
+            fork_after_committed_turns,
+        } => Ok(Some(pb::event_envelope::Event::ThreadCreated(
+            pb::ThreadCreatedEvent {
+                thread_id: thread_id.0.clone(),
+                source_thread_id: source_thread_id.as_ref().map(ToString::to_string),
+                fork_after_committed_turns: *fork_after_committed_turns,
+            },
+        ))),
         AgentEvent::Start {
             thread_id,
             turn,
@@ -5194,12 +5262,15 @@ mod tests {
             parent_id: &AgentTaskId,
             worker: &WorkerId,
             lease: &LeaseId,
-            spawns: Vec<SubagentInvocationSpawn>,
-            payload: SuspensionPayload,
+            batch: agent_server::journal::store::SubagentBatchSpawn,
             now: OffsetDateTime,
-        ) -> Result<(AgentTask, Vec<(AgentTask, AgentTask)>)> {
+        ) -> Result<(
+            AgentTask,
+            Vec<(AgentTask, AgentTask)>,
+            Vec<agent_server::CommittedEvent>,
+        )> {
             self.inner
-                .spawn_subagent_batch(parent_id, worker, lease, spawns, payload, now)
+                .spawn_subagent_batch(parent_id, worker, lease, batch, now)
                 .await
         }
         async fn spawn_mixed_children(
@@ -5208,10 +5279,11 @@ mod tests {
             worker: &WorkerId,
             lease: &LeaseId,
             spawn: agent_server::journal::MixedChildrenSpawn,
+            events: Vec<agent_server::journal::subagent_spawn_transaction::SubagentSpawnEvent>,
             now: OffsetDateTime,
         ) -> Result<agent_server::journal::SpawnedMixedChildren> {
             self.inner
-                .spawn_mixed_children(parent_id, worker, lease, spawn, now)
+                .spawn_mixed_children(parent_id, worker, lease, spawn, events, now)
                 .await
         }
         async fn find_subagent_invocation_for_child_root(
@@ -5899,8 +5971,27 @@ mod tests {
                 .filter(|item| matches!(item.item.as_ref(), Some(StreamItem::Event(_))))
                 .count() as u64;
             assert_eq!(
-                fork_event_count, fork_response.event_count,
-                "stream replay must surface every event the fork response promised",
+                fork_event_count,
+                fork_response
+                    .event_count
+                    .checked_add(1)
+                    .context("fork event count overflow")?,
+                "stream replay includes the fork creation event plus every copied source event",
+            );
+            let first_event = fork_items.iter().find_map(|item| {
+                if let Some(StreamItem::Event(event)) = item.item.as_ref() {
+                    event.event.as_ref()
+                } else {
+                    None
+                }
+            });
+            let Some(pb::event_envelope::Event::ThreadCreated(created)) = first_event else {
+                anyhow::bail!("fork journal must open with ThreadCreated, got {first_event:?}");
+            };
+            assert_eq!(
+                created.thread_id, fork_id,
+                "the fork's journal must open with ITS OWN creation event, \
+                 not a creation event copied from the source",
             );
 
             Ok(())
@@ -7030,11 +7121,22 @@ mod tests {
             .await?
             .into_inner();
 
-        // Drain the (empty-journal) replay phase.
+        // Drain the creation event and finish the replay phase.
         let opened = next_inline_frame(&mut stream).await?;
         ensure!(
             matches!(opened.item, Some(StreamItem::ReplayOpened(_))),
             "expected replay_opened, got {opened:?}",
+        );
+        let created = next_inline_frame(&mut stream).await?;
+        ensure!(
+            matches!(
+                created.item,
+                Some(StreamItem::Event(pb::EventEnvelope {
+                    event: Some(pb::event_envelope::Event::ThreadCreated(_)),
+                    ..
+                }))
+            ),
+            "expected thread_created, got {created:?}",
         );
         let catchup = next_inline_frame(&mut stream).await?;
         ensure!(
@@ -7124,6 +7226,17 @@ mod tests {
         ensure!(
             matches!(opened.item, Some(StreamItem::ReplayOpened(_))),
             "expected replay_opened, got {opened:?}",
+        );
+        let created = next_inline_frame(&mut stream).await?;
+        ensure!(
+            matches!(
+                created.item,
+                Some(StreamItem::Event(pb::EventEnvelope {
+                    event: Some(pb::event_envelope::Event::ThreadCreated(_)),
+                    ..
+                }))
+            ),
+            "expected thread_created, got {created:?}",
         );
         let catchup = next_inline_frame(&mut stream).await?;
         ensure!(

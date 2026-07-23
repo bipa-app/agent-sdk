@@ -6,6 +6,7 @@ use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
 
 use crate::journal::event_repository::{EventRepository, InMemoryEventRepository};
+use crate::journal::store::CancellationMarkerSink;
 use crate::journal::{
     AgentTask, AgentTaskStore, InMemoryAgentTaskStore, InMemoryThreadStore, LeaseId,
     SubagentInvocationSpawn, SuspensionPayload, TaskKind, TaskStatus, ThreadStore, ToolChildSpawn,
@@ -963,9 +964,15 @@ async fn spawn_batch_creates_n_invocations_under_one_parent() -> Result<()> {
     // WaitingOnChildren with `pending_child_count = 3`, allocates
     // 3 invocation tasks + 3 child-thread root tasks, and emits
     // 3 SubagentProgress events on the parent thread.
-    let task_store = InMemoryAgentTaskStore::new();
     let thread_store = InMemoryThreadStore::new();
     let event_repo = InMemoryEventRepository::new();
+    let outbox_store = crate::journal::outbox::InMemoryOutboxStore::new();
+    let task_store =
+        InMemoryAgentTaskStore::new().with_cancellation_markers(CancellationMarkerSink {
+            event_repo: std::sync::Arc::new(event_repo.clone()),
+            outbox_store: std::sync::Arc::new(outbox_store.clone()),
+            thread_store: std::sync::Arc::new(thread_store.clone()),
+        });
     let (parent, worker, lease) = running_parent_root(&task_store).await?;
     let tasks = vec!["explore A", "explore B", "explore C"];
     let payload = parent_suspension_payload_with_tools(&parent.thread_id, &tasks);
@@ -1254,22 +1261,20 @@ async fn spawn_carries_child_caller_metadata_onto_child_root() -> Result<()> {
 }
 
 #[tokio::test]
-async fn spawn_flow_tolerates_parent_progress_commit_failures() -> Result<()> {
+async fn spawn_flow_surfaces_parent_progress_commit_failures() -> Result<()> {
     let task_store = InMemoryAgentTaskStore::new();
     let thread_store = InMemoryThreadStore::new();
     let event_repo = FailingEventRepository;
     let (parent, worker, lease) = running_parent_root(&task_store).await?;
     let task = "Inspect durable linkage";
-    let spec = sample_spec(task);
 
-    let child_thread_id = agent_sdk_foundation::ThreadId::new();
-    let created: SpawnedSubagentInvocation = spawn_subagent_invocation(
+    let error = spawn_subagent_invocation(
         &parent.id,
         &worker,
         &lease,
         SubagentInvocationSpawn {
-            child_thread_id,
-            spec: spec.clone(),
+            child_thread_id: agent_sdk_foundation::ThreadId::new(),
+            spec: sample_spec(task),
             child_root_input: child_root_input(task),
             spawn_index: 0,
             payload: parent_suspension_payload(&parent.thread_id, task),
@@ -1282,19 +1287,14 @@ async fn spawn_flow_tolerates_parent_progress_commit_failures() -> Result<()> {
         },
         t_plus(2),
     )
-    .await?;
+    .await
+    .err()
+    .ok_or_else(|| anyhow!("spawn must surface parent progress commit failure"))?;
 
-    assert_spawned_invocation_contract(
-        &task_store,
-        &thread_store,
-        &parent,
-        &created,
-        &spec,
-        "Stay in read-only mode.\n\nInspect durable linkage",
-    )
-    .await?;
-    assert!(created.committed_events.is_empty());
-
+    assert!(
+        error_text(&error).contains("commit child ThreadCreated"),
+        "unexpected error: {error:#}",
+    );
     Ok(())
 }
 
@@ -1572,9 +1572,15 @@ async fn spawn_mixed_creates_subagents_and_tool_children_under_one_parent() -> R
     // root) and one tool-runtime child, with the parent parked on all
     // three. This is the turn shape an LLM coordinator routinely emits
     // (N subagent calls + a stray tool call).
-    let task_store = InMemoryAgentTaskStore::new();
     let thread_store = InMemoryThreadStore::new();
     let event_repo = InMemoryEventRepository::new();
+    let outbox_store = crate::journal::outbox::InMemoryOutboxStore::new();
+    let task_store =
+        InMemoryAgentTaskStore::new().with_cancellation_markers(CancellationMarkerSink {
+            event_repo: std::sync::Arc::new(event_repo.clone()),
+            outbox_store: std::sync::Arc::new(outbox_store.clone()),
+            thread_store: std::sync::Arc::new(thread_store.clone()),
+        });
     let (parent, worker, lease) = running_parent_root(&task_store).await?;
     let tasks = ["explore A", "explore B"];
     let payload = mixed_suspension_payload(&parent.thread_id, &tasks, &["todo_write"]);

@@ -1506,17 +1506,29 @@ async fn assert_single_spawn_summary_on_thread(
     thread_id: &ThreadId,
     notifier: &EventNotifier,
     expected_invocation_id: &AgentTaskId,
+    expect_creation_event: bool,
     context_msg: &'static str,
 ) -> Result<()> {
-    let events = drain_thread_stream(thread_id, &stores.events, notifier, 1).await?;
-    assert_eq!(events.len(), 1);
-    match &events[0] {
+    // A SPAWNED child thread's journal opens with its ThreadCreated
+    // (committed with the spawn); a harness-created root has none.
+    let expected_len = if expect_creation_event { 2 } else { 1 };
+    let events = drain_thread_stream(thread_id, &stores.events, notifier, expected_len).await?;
+    assert_eq!(events.len(), expected_len, "{context_msg}");
+    let mut events = events.into_iter();
+    if expect_creation_event {
+        let first = events.next().context("missing creation event")?;
+        assert!(
+            matches!(first, AgentEvent::ThreadCreated { .. }),
+            "spawned child journal must open with ThreadCreated, got {first:?} ({context_msg})",
+        );
+    }
+    match events.next().context("missing spawn summary")? {
         AgentEvent::SubagentProgress {
             subagent_task_id,
             completed,
             ..
         } => {
-            assert!(!*completed);
+            assert!(!completed);
             assert_eq!(
                 subagent_task_id.as_deref(),
                 Some(expected_invocation_id.to_string().as_str()),
@@ -1857,6 +1869,7 @@ async fn nested_grandchild_tree_linkage_survives_restart() -> Result<()> {
         &parent_thread,
         &reconnect_notifier,
         &spawned_a.invocation_task.id,
+        false,
         "parent thread must see invocation_A spawn summary",
     )
     .await?;
@@ -1865,6 +1878,7 @@ async fn nested_grandchild_tree_linkage_survives_restart() -> Result<()> {
         &child_thread,
         &reconnect_notifier,
         &spawned_b.invocation_task.id,
+        true,
         "child thread must see invocation_B spawn summary only",
     )
     .await?;
@@ -1873,9 +1887,15 @@ async fn nested_grandchild_tree_linkage_survives_restart() -> Result<()> {
     // grandchild root has not been claimed. Reading from the
     // repository directly avoids blocking on the live channel.
     let grand_events = stores.events.get_events(&grandchild_thread).await?;
+    assert_eq!(
+        grand_events.len(),
+        1,
+        "grandchild thread must hold only its creation event until its root runs, got {grand_events:?}",
+    );
     assert!(
-        grand_events.is_empty(),
-        "grandchild thread must be empty until its root runs, got {grand_events:?}",
+        matches!(grand_events[0].event, AgentEvent::ThreadCreated { .. }),
+        "grandchild journal must open with ThreadCreated, got {:?}",
+        grand_events[0].event,
     );
 
     // Idempotency across restart: a second sweep still finds

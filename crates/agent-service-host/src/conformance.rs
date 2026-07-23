@@ -44,6 +44,8 @@ mod tests {
     use anyhow::{Context, Result};
     use time::{Duration, OffsetDateTime};
 
+    #[cfg(all(feature = "sqlite", feature = "failpoints"))]
+    use crate::fail;
     use agent_sdk_foundation::audit::AuditProvenance;
     use agent_sdk_foundation::events::AgentEvent;
     use agent_sdk_foundation::{ThreadId, TokenUsage};
@@ -62,11 +64,19 @@ mod tests {
     use agent_server::journal::outbox_message::OutboxMessageKind;
     use agent_server::journal::recovery::RecoveryAction;
     use agent_server::journal::store::{AgentTaskStore, SubagentInvocationSpawn};
+    #[cfg(feature = "sqlite")]
+    use agent_server::journal::subagent_spawn_transaction::{
+        AtomicSubagentSpawnCommitter, SubagentSpawnCommit, SubagentSpawnEvent,
+    };
     use agent_server::journal::task::{
         AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, SuspensionPayload,
         TaskStatus, WorkerId,
     };
     use agent_server::journal::task_state::TaskState;
+    #[cfg(feature = "sqlite")]
+    use agent_server::journal::thread_creation_transaction::{
+        AtomicThreadCreationCommitter, ThreadCreationCommit,
+    };
     use agent_server::journal::thread_store::ThreadStore;
     use agent_server::journal::turn_attempt::{
         CloseAttemptParams, OpenAttemptParams, TurnAttemptOutcome,
@@ -176,6 +186,39 @@ mod tests {
         vec![SubmittedInputItem::Text {
             text: "Stay in read-only mode.\n\nInspect durable linkage".into(),
         }]
+    }
+
+    #[cfg(feature = "sqlite")]
+    async fn prepare_atomic_spawn(
+        store: &crate::sqlite::SqliteDurableStore,
+        name: &str,
+    ) -> Result<(AgentTaskId, WorkerId, LeaseId, SubagentInvocationSpawn)> {
+        let parent_thread = thread_id(&format!("{name}-parent"));
+        ThreadStore::get_or_create(store, &parent_thread, t0()).await?;
+        let parent = AgentTask::new_root_turn(parent_thread.clone(), t0(), 3);
+        let parent_id = parent.id.clone();
+        AgentTaskStore::submit_root_turn(store, parent).await?;
+        let worker = WorkerId::new();
+        let lease = LeaseId::new();
+        AgentTaskStore::try_acquire_task(
+            store,
+            &parent_id,
+            worker.clone(),
+            lease.clone(),
+            t_plus(600),
+            t_plus(1),
+        )
+        .await?
+        .context("atomic spawn parent must acquire")?;
+        let spawn = SubagentInvocationSpawn {
+            child_thread_id: thread_id(&format!("{name}-child")),
+            spec: sample_subagent_spec(),
+            child_root_input: sample_subagent_input(),
+            spawn_index: 0,
+            child_caller_metadata: None,
+            payload: suspension_payload(&parent_thread.0),
+        };
+        Ok((parent_id, worker, lease, spawn))
     }
 
     /// Build a parent root → subagent invocation → child-thread root tree.
@@ -3359,7 +3402,15 @@ mod tests {
             Message::user("hi from source"),
             Message::assistant("hello from source"),
         ];
+        // Per the ForkCommitParams contract, events[0] is the
+        // destination's ThreadCreated — built by the caller, committed
+        // verbatim by the store.
         let events = vec![
+            AgentEvent::thread_created(
+                new_thread_id.clone(),
+                Some(source_thread_id.clone()),
+                Some(1),
+            ),
             AgentEvent::start(source_thread_id.clone(), 1),
             AgentEvent::done(
                 source_thread_id.clone(),
@@ -3369,8 +3420,8 @@ mod tests {
             ),
         ];
         let params = ForkCommitParams {
-            new_thread_id: new_thread_id.clone(),
             creation: None,
+            new_thread_id: new_thread_id.clone(),
             now,
             committed_turns: 1,
             cumulative_total_usage: TokenUsage::default(),
@@ -3392,6 +3443,7 @@ mod tests {
                 now,
             }),
             events: events.clone(),
+            outbox_max_attempts: 3,
         };
 
         store.commit_fork_atomic(params).await?;
@@ -3407,12 +3459,12 @@ mod tests {
             .context("forked checkpoint must exist")?;
         assert_eq!(checkpoint.messages.len(), 2);
         let committed = EventRepository::get_events(&store, &new_thread_id).await?;
-        assert_eq!(committed.len(), 2);
+        assert_eq!(committed.len(), 3);
         let sequences: Vec<_> = committed.iter().map(|c| c.sequence).collect();
         assert_eq!(
             sequences,
-            vec![0, 1],
-            "events committed with fresh sequences"
+            vec![0, 1, 2],
+            "copied events and creation event committed with fresh sequences"
         );
         Ok(())
     }
@@ -3477,8 +3529,8 @@ mod tests {
 
         let fresh_messages = vec![Message::user("seeded")];
         let params = ForkCommitParams {
-            new_thread_id: new_thread_id.clone(),
             creation: None,
+            new_thread_id: new_thread_id.clone(),
             now,
             committed_turns: 1,
             cumulative_total_usage: TokenUsage::default(),
@@ -3500,6 +3552,7 @@ mod tests {
                 now,
             }),
             events: vec![AgentEvent::start(source_thread_id.clone(), 1)],
+            outbox_max_attempts: 3,
         };
         let err = store.commit_fork_atomic(params).await;
         anyhow::ensure!(
@@ -3519,6 +3572,400 @@ mod tests {
             committed.is_empty(),
             "rolled-back fork must not leave events on the destination",
         );
+        Ok(())
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_atomic_creation_paths_write_one_outbox_each() -> Result<()> {
+        use agent_server::journal::fork_transaction::{AtomicForkCommitter, ForkCommitParams};
+
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        let now = t0();
+
+        let created = thread_id("atomic-create-success");
+        store
+            .commit_thread_creation_atomic(ThreadCreationCommit {
+                thread_id: created.clone(),
+                event: AgentEvent::thread_created(created.clone(), None, None),
+                outbox_max_attempts: 3,
+                now,
+            })
+            .await?;
+        assert_eq!(
+            OutboxStore::list_by_thread(&store, &created).await?.len(),
+            1
+        );
+        let created_events = EventRepository::get_events(&store, &created).await?;
+        assert_eq!(created_events.len(), 1);
+        assert!(matches!(
+            created_events
+                .first()
+                .context("created thread event must exist")?
+                .event,
+            AgentEvent::ThreadCreated { .. }
+        ));
+
+        let forked = thread_id("atomic-fork-success");
+        store
+            .commit_fork_atomic(ForkCommitParams {
+                creation: None,
+                new_thread_id: forked.clone(),
+                now,
+                committed_turns: 0,
+                cumulative_total_usage: TokenUsage::default(),
+                messages: Vec::new(),
+                checkpoint: None,
+                events: vec![AgentEvent::thread_created(forked.clone(), None, Some(0))],
+                outbox_max_attempts: 3,
+            })
+            .await?;
+        assert_eq!(OutboxStore::list_by_thread(&store, &forked).await?.len(), 1);
+        let forked_events = EventRepository::get_events(&store, &forked).await?;
+        assert_eq!(forked_events.len(), 1);
+        assert!(matches!(
+            forked_events
+                .first()
+                .context("fork creation event must exist")?
+                .event,
+            AgentEvent::ThreadCreated { .. }
+        ));
+
+        let (parent_id, worker, lease, spawn) =
+            prepare_atomic_spawn(&store, "atomic-spawn-success").await?;
+        let spawn_child_thread = spawn.child_thread_id.clone();
+        let parent_thread = AgentTaskStore::get(&store, &parent_id)
+            .await?
+            .context("spawn parent must exist")?
+            .thread_id;
+        store
+            .commit_subagent_spawn_atomic(SubagentSpawnCommit {
+                parent_id,
+                worker,
+                lease,
+                spawn,
+                event: SubagentSpawnEvent {
+                    subagent_id: "call-1".into(),
+                    subagent_name: "explore".into(),
+                },
+                outbox_max_attempts: 3,
+                now,
+            })
+            .await?;
+        assert_eq!(
+            OutboxStore::list_by_thread(&store, &parent_thread)
+                .await?
+                .iter()
+                .filter(|row| row.kind == OutboxMessageKind::ThreadEventsAvailable)
+                .count(),
+            1,
+        );
+        let spawn_events = EventRepository::get_events(&store, &parent_thread).await?;
+        assert_eq!(spawn_events.len(), 1);
+        assert!(matches!(
+            spawn_events
+                .first()
+                .context("spawn progress event must exist")?
+                .event,
+            AgentEvent::SubagentProgress {
+                completed: false,
+                ..
+            }
+        ));
+        assert_child_journal_opened(&store, &spawn_child_thread).await?;
+        Ok(())
+    }
+
+    /// The child thread's journal opens with its `ThreadCreated`,
+    /// committed in the SAME spawn transaction, with its own
+    /// events-available advisory.
+    #[cfg(feature = "sqlite")]
+    async fn assert_child_journal_opened(
+        store: &crate::sqlite::SqliteDurableStore,
+        child_thread: &agent_sdk_foundation::ThreadId,
+    ) -> Result<()> {
+        let child_events = EventRepository::get_events(store, child_thread).await?;
+        assert_eq!(child_events.len(), 1);
+        assert!(matches!(
+            child_events
+                .first()
+                .context("child creation event must exist")?
+                .event,
+            AgentEvent::ThreadCreated { .. }
+        ));
+        assert_eq!(
+            OutboxStore::list_by_thread(store, child_thread)
+                .await?
+                .iter()
+                .filter(|row| row.kind == OutboxMessageKind::ThreadEventsAvailable)
+                .count(),
+            1,
+        );
+        Ok(())
+    }
+
+    #[cfg(all(feature = "sqlite", feature = "failpoints"))]
+    #[tokio::test]
+    async fn sqlite_create_failpoint_rolls_back_row_event_and_outbox() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        fail::cfg("atomic_create.after_rows", "panic")
+            .map_err(|error| anyhow::anyhow!("configure create failpoint: {error}"))?;
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        let thread = thread_id("atomic-create-rollback");
+        let crashed = std::panic::AssertUnwindSafe(store.commit_thread_creation_atomic(
+            ThreadCreationCommit {
+                thread_id: thread.clone(),
+                event: AgentEvent::thread_created(thread.clone(), None, None),
+                outbox_max_attempts: 3,
+                now: t0(),
+            },
+        ));
+        let result = futures::FutureExt::catch_unwind(crashed).await;
+        fail::remove("atomic_create.after_rows");
+        assert!(result.is_err(), "create failpoint must panic");
+        assert!(ThreadStore::get(&store, &thread).await?.is_none());
+        assert!(
+            EventRepository::get_events(&store, &thread)
+                .await?
+                .is_empty()
+        );
+        assert!(
+            OutboxStore::list_by_thread(&store, &thread)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[cfg(all(feature = "sqlite", feature = "failpoints"))]
+    #[tokio::test]
+    async fn sqlite_fork_failpoint_rolls_back_row_event_and_outbox() -> Result<()> {
+        use agent_server::journal::fork_transaction::{AtomicForkCommitter, ForkCommitParams};
+
+        let _scenario = fail::FailScenario::setup();
+        fail::cfg("atomic_fork.after_rows", "panic")
+            .map_err(|error| anyhow::anyhow!("configure fork failpoint: {error}"))?;
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        let forked = thread_id("atomic-fork-rollback");
+        let crashed = std::panic::AssertUnwindSafe(store.commit_fork_atomic(ForkCommitParams {
+            creation: None,
+            new_thread_id: forked.clone(),
+            now: t0(),
+            committed_turns: 0,
+            cumulative_total_usage: TokenUsage::default(),
+            messages: Vec::new(),
+            checkpoint: None,
+            events: Vec::new(),
+            outbox_max_attempts: 3,
+        }));
+        let result = futures::FutureExt::catch_unwind(crashed).await;
+        fail::remove("atomic_fork.after_rows");
+        assert!(result.is_err(), "fork failpoint must panic");
+        assert!(ThreadStore::get(&store, &forked).await?.is_none());
+        assert!(
+            EventRepository::get_events(&store, &forked)
+                .await?
+                .is_empty()
+        );
+        assert!(
+            OutboxStore::list_by_thread(&store, &forked)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[cfg(all(feature = "sqlite", feature = "failpoints"))]
+    #[tokio::test]
+    async fn sqlite_spawn_failpoint_rolls_back_rows_event_and_outbox() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        fail::cfg("atomic_spawn.after_rows", "panic")
+            .map_err(|error| anyhow::anyhow!("configure spawn failpoint: {error}"))?;
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        let (parent_id, worker, lease, spawn) =
+            prepare_atomic_spawn(&store, "atomic-spawn-rollback").await?;
+        let child_thread = spawn.child_thread_id.clone();
+        let parent_before = AgentTaskStore::get(&store, &parent_id)
+            .await?
+            .context("spawn parent must exist")?;
+        let crashed =
+            std::panic::AssertUnwindSafe(store.commit_subagent_spawn_atomic(SubagentSpawnCommit {
+                parent_id: parent_id.clone(),
+                worker,
+                lease,
+                spawn,
+                event: SubagentSpawnEvent {
+                    subagent_id: "call-rollback".into(),
+                    subagent_name: "explore".into(),
+                },
+                outbox_max_attempts: 3,
+                now: t_plus(2),
+            }));
+        let result = futures::FutureExt::catch_unwind(crashed).await;
+        fail::remove("atomic_spawn.after_rows");
+        assert!(result.is_err(), "spawn failpoint must panic");
+        assert!(ThreadStore::get(&store, &child_thread).await?.is_none());
+        assert!(
+            AgentTaskStore::list_by_thread(&store, &child_thread)
+                .await?
+                .is_empty()
+        );
+        assert!(
+            EventRepository::get_events(&store, &parent_before.thread_id)
+                .await?
+                .is_empty()
+        );
+        assert!(
+            OutboxStore::list_by_thread(&store, &parent_before.thread_id)
+                .await?
+                .iter()
+                .all(|row| row.kind != OutboxMessageKind::ThreadEventsAvailable)
+        );
+        let parent_after = AgentTaskStore::get(&store, &parent_id)
+            .await?
+            .context("spawn parent must survive rollback")?;
+        assert_eq!(parent_after.status, TaskStatus::Running);
+        Ok(())
+    }
+
+    /// Happy-path counterpart of the batch failpoint test: the batch
+    /// spawn's `SQLite` transaction commits the per-entry start events on
+    /// the parent journal, each child's `ThreadCreated`, and the
+    /// advisories — so removing the in-tx event insertion cannot ship.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_spawn_batch_commits_rows_events_and_advisories_atomically() -> Result<()> {
+        use agent_server::journal::subagent_spawn_transaction::SubagentSpawnEvent;
+
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        let (parent_id, worker, lease, spawn) =
+            prepare_atomic_spawn(&store, "atomic-batch-success").await?;
+        let child_thread = spawn.child_thread_id.clone();
+        // The batch primitive's contract: the caller materializes each
+        // child thread before the store sees the spawn.
+        ThreadStore::get_or_create(&store, &child_thread, t0()).await?;
+        let payload = spawn.payload.clone();
+        let parent_thread = AgentTaskStore::get(&store, &parent_id)
+            .await?
+            .context("batch parent must exist")?
+            .thread_id;
+        let (parent_after, prepared, committed) = store
+            .spawn_subagent_batch(
+                &parent_id,
+                &worker,
+                &lease,
+                agent_server::journal::store::SubagentBatchSpawn {
+                    spawns: vec![spawn],
+                    payload,
+                    events: vec![SubagentSpawnEvent {
+                        subagent_id: "batch-call-success".into(),
+                        subagent_name: "explore".into(),
+                    }],
+                },
+                t_plus(2),
+            )
+            .await?;
+        assert_eq!(parent_after.status, TaskStatus::WaitingOnChildren);
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(committed.len(), 1);
+        assert!(matches!(
+            committed[0].event,
+            AgentEvent::SubagentProgress {
+                completed: false,
+                ..
+            }
+        ));
+        let parent_events = EventRepository::get_events(&store, &parent_thread).await?;
+        assert_eq!(parent_events.len(), 1);
+        let child_events = EventRepository::get_events(&store, &child_thread).await?;
+        assert_eq!(child_events.len(), 1);
+        assert!(matches!(
+            child_events[0].event,
+            AgentEvent::ThreadCreated { .. }
+        ));
+        assert_eq!(
+            OutboxStore::list_by_thread(&store, &parent_thread)
+                .await?
+                .iter()
+                .filter(|row| row.kind == OutboxMessageKind::ThreadEventsAvailable)
+                .count(),
+            1,
+        );
+        assert_eq!(
+            OutboxStore::list_by_thread(&store, &child_thread)
+                .await?
+                .iter()
+                .filter(|row| row.kind == OutboxMessageKind::ThreadEventsAvailable)
+                .count(),
+            1,
+        );
+        Ok(())
+    }
+
+    /// The BATCH spawn commits rows, per-entry start events, child
+    /// `ThreadCreated` events, and advisories in one transaction: a crash
+    /// after the rows must roll back everything.
+    #[cfg(all(feature = "sqlite", feature = "failpoints"))]
+    #[tokio::test]
+    async fn sqlite_spawn_batch_failpoint_rolls_back_rows_events_and_outbox() -> Result<()> {
+        use agent_server::journal::subagent_spawn_transaction::SubagentSpawnEvent;
+
+        let _scenario = fail::FailScenario::setup();
+        fail::cfg("atomic_spawn_batch.after_rows", "panic")
+            .map_err(|error| anyhow::anyhow!("configure batch failpoint: {error}"))?;
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        let (parent_id, worker, lease, spawn) =
+            prepare_atomic_spawn(&store, "atomic-spawn-batch-rollback").await?;
+        let child_thread = spawn.child_thread_id.clone();
+        // The batch primitive's contract: the caller materializes each
+        // child thread before the store sees the spawn.
+        ThreadStore::get_or_create(&store, &child_thread, t0()).await?;
+        let payload = spawn.payload.clone();
+        let parent_before = AgentTaskStore::get(&store, &parent_id)
+            .await?
+            .context("batch parent must exist")?;
+        let crashed = std::panic::AssertUnwindSafe(store.spawn_subagent_batch(
+            &parent_id,
+            &worker,
+            &lease,
+            agent_server::journal::store::SubagentBatchSpawn {
+                spawns: vec![spawn],
+                payload,
+                events: vec![SubagentSpawnEvent {
+                    subagent_id: "batch-call-rollback".into(),
+                    subagent_name: "explore".into(),
+                }],
+            },
+            t_plus(2),
+        ));
+        let result = futures::FutureExt::catch_unwind(crashed).await;
+        fail::remove("atomic_spawn_batch.after_rows");
+        assert!(result.is_err(), "batch failpoint must panic");
+        assert!(
+            AgentTaskStore::list_by_thread(&store, &child_thread)
+                .await?
+                .is_empty()
+        );
+        assert!(
+            EventRepository::get_events(&store, &parent_before.thread_id)
+                .await?
+                .is_empty()
+        );
+        assert!(
+            EventRepository::get_events(&store, &child_thread)
+                .await?
+                .is_empty()
+        );
+        assert!(
+            OutboxStore::list_by_thread(&store, &parent_before.thread_id)
+                .await?
+                .iter()
+                .all(|row| row.kind != OutboxMessageKind::ThreadEventsAvailable)
+        );
+        let parent_after = AgentTaskStore::get(&store, &parent_id)
+            .await?
+            .context("batch parent must survive rollback")?;
+        assert_eq!(parent_after.status, TaskStatus::Running);
         Ok(())
     }
 }

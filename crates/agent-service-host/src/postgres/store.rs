@@ -61,9 +61,13 @@ use agent_server::journal::relay::{
 use agent_server::journal::retention::{RetentionCursor, RetentionStore};
 use agent_server::journal::store::{
     AgentTaskStore, CancelTreeOutcome, ChildProbe, MixedChildrenSpawn, RequeueOutcome,
-    SpawnedMixedChildren, SubagentInvocationSpawn, SubmitRootIdempotency, SubmitRootTurnError,
-    SubmitRootTurnOutcome, SubmitRootTurnParams, mixed_child_ids_in_slot_order,
-    new_mixed_tool_child, validate_mixed_children_spawn,
+    SpawnedMixedChildren, SubagentBatchSpawn, SubagentInvocationSpawn, SubmitRootIdempotency,
+    SubmitRootTurnError, SubmitRootTurnOutcome, SubmitRootTurnParams,
+    mixed_child_ids_in_slot_order, new_mixed_tool_child, validate_mixed_children_spawn,
+};
+use agent_server::journal::subagent_spawn_transaction::{
+    AtomicSubagentSpawnCommitter, SubagentSpawnCommit, SubagentSpawnEvent, SubagentSpawnOutcome,
+    started_event_from_invocation, subagent_started_event,
 };
 use agent_server::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, SuspensionPayload,
@@ -71,6 +75,9 @@ use agent_server::journal::task::{
 };
 use agent_server::journal::task_state::SubagentInvocationState;
 use agent_server::journal::thread::Thread;
+use agent_server::journal::thread_creation_transaction::{
+    AtomicThreadCreationCommitter, ThreadCreationCommit, ThreadCreationRows,
+};
 use agent_server::journal::thread_store::{
     ThreadCreation, ThreadCreationOutcome, ThreadIdConflict, ThreadStore, creation_identity_key,
 };
@@ -1987,6 +1994,136 @@ FOR UPDATE
             .await
     }
 
+    async fn commit_subagent_spawn_atomic_inner(
+        &self,
+        params: SubagentSpawnCommit,
+    ) -> Result<SubagentSpawnOutcome> {
+        let mut tx = self.begin().await?;
+        Self::bootstrap_thread_row_tx(&mut tx, &params.spawn.child_thread_id, params.now).await?;
+        let child_thread = Self::lock_thread_tx(&mut tx, &params.spawn.child_thread_id)
+            .await?
+            .context("spawned child thread missing after bootstrap")?;
+
+        let old_parent = Self::load_task_tx(&mut tx, &params.parent_id, true)
+            .await?
+            .ok_or_else(|| anyhow!("spawn rejected: task {} does not exist", params.parent_id))?;
+        validate_subagent_spawn_parent(
+            &old_parent,
+            &params.parent_id,
+            &params.worker,
+            &params.lease,
+        )?;
+        ensure_child_thread_available_for_spawn_tx(&mut tx, &params.spawn.child_thread_id).await?;
+
+        let child_root = AgentTask::new_root_turn_with_optional_caller(
+            params.spawn.child_thread_id.clone(),
+            params.spawn.child_root_input.clone(),
+            params.spawn.child_caller_metadata.clone(),
+            params.now,
+            AgentTask::DEFAULT_MAX_ATTEMPTS,
+        );
+        ensure_spawn_task_id_available_tx(&mut tx, &child_root.id, "child root").await?;
+        let invocation = AgentTask::new_subagent_invocation(
+            &old_parent,
+            SubagentInvocationState {
+                spec: params.spawn.spec.clone(),
+                child_thread_id: params.spawn.child_thread_id.clone(),
+                child_root_task_id: child_root.id.clone(),
+            },
+            params.spawn.spawn_index,
+            params.now,
+            AgentTask::DEFAULT_MAX_ATTEMPTS,
+        )
+        .context("spawn rejected: new_subagent_invocation failed")?;
+        ensure_spawn_task_id_available_tx(&mut tx, &invocation.id, "invocation").await?;
+
+        let parent_task = old_parent
+            .wait_on_children(
+                1,
+                params.spawn.payload.clone(),
+                vec![invocation.id.clone()],
+                params.now,
+            )
+            .context("spawn rejected: wait_on_children transition failed")?;
+        Self::update_task_tx(&mut tx, &parent_task).await?;
+        Self::insert_task_tx(&mut tx, &invocation).await?;
+        Self::insert_task_tx(&mut tx, &child_root).await?;
+
+        agent_server::fail_point!("atomic_spawn.after_rows");
+
+        let event = subagent_started_event(params.event, &params.spawn, &invocation, &child_root);
+        let start_seq = Self::next_event_sequence_tx(&mut tx, &parent_task.thread_id).await?;
+        let mut committed = Self::insert_events_tx(
+            &mut tx,
+            &parent_task.thread_id,
+            vec![event],
+            start_seq,
+            params.now,
+        )
+        .await?;
+        Self::insert_thread_events_outbox_row_tx(
+            &mut tx,
+            &committed,
+            params.outbox_max_attempts,
+            params.now,
+        )
+        .await?;
+        let committed_event = committed.pop().context("spawn event batch was empty")?;
+        Self::insert_child_created_tx(&mut tx, &child_root.thread_id, params.now).await?;
+        tx.commit()
+            .await
+            .context("commit postgres atomic subagent spawn")?;
+
+        Ok(SubagentSpawnOutcome {
+            parent_task,
+            invocation_task: invocation,
+            child_thread,
+            child_root_task: child_root,
+            committed_event,
+        })
+    }
+
+    async fn commit_thread_creation_atomic_inner(
+        &self,
+        params: ThreadCreationCommit,
+    ) -> Result<ThreadCreationRows> {
+        let mut tx = self.begin().await?;
+        Self::bootstrap_thread_row_tx(&mut tx, &params.thread_id, params.now).await?;
+        let thread = Self::lock_thread_tx(&mut tx, &params.thread_id)
+            .await?
+            .context("created thread missing after bootstrap")?;
+        Self::lock_message_head_tx(&mut tx, &params.thread_id, params.now).await?;
+
+        agent_server::fail_point!("atomic_create.after_rows");
+
+        let start_seq = Self::next_event_sequence_tx(&mut tx, &params.thread_id).await?;
+        let mut committed = Self::insert_events_tx(
+            &mut tx,
+            &params.thread_id,
+            vec![params.event],
+            start_seq,
+            params.now,
+        )
+        .await?;
+        Self::insert_thread_events_outbox_row_tx(
+            &mut tx,
+            &committed,
+            params.outbox_max_attempts,
+            params.now,
+        )
+        .await?;
+        let committed_event = committed
+            .pop()
+            .context("thread creation event batch was empty")?;
+        tx.commit()
+            .await
+            .context("commit postgres thread creation transaction")?;
+        Ok(ThreadCreationRows {
+            thread,
+            committed_event,
+        })
+    }
+
     /// Atomic fork transaction for Postgres (mirror of
     /// `SqliteDurableStore::commit_fork_atomic_inner`).
     ///
@@ -2053,9 +2190,12 @@ FOR UPDATE
 
         // 3. Seed the projection via `replace_history` so the bumped
         //    `version` is consistent with `recover_thread`'s expectations.
+        //    The lock call also CREATES the projection row on the
+        //    empty-messages path — that get-or-create side effect is
+        //    load-bearing for turn-zero forks.
+        let projection_before =
+            Self::lock_message_head_tx(&mut tx, &params.new_thread_id, params.now).await?;
         if !params.messages.is_empty() {
-            let projection_before =
-                Self::lock_message_head_tx(&mut tx, &params.new_thread_id, params.now).await?;
             let updated_projection =
                 MessageProjection::replace_history(projection_before, params.messages, params.now);
             Self::upsert_message_head_tx(&mut tx, &updated_projection).await?;
@@ -2068,19 +2208,28 @@ FOR UPDATE
             Self::insert_checkpoint_tx(&mut tx, &checkpoint).await?;
         }
 
-        // 5. Re-commit events under the new thread id with fresh
-        //    sequences (a freshly-bootstrapped thread starts at 0).
-        if !params.events.is_empty() {
-            let start_seq = Self::next_event_sequence_tx(&mut tx, &params.new_thread_id).await?;
-            Self::insert_events_tx(
-                &mut tx,
-                &params.new_thread_id,
-                params.events,
-                start_seq,
-                params.now,
-            )
-            .await?;
-        }
+        agent_server::fail_point!("atomic_fork.after_rows");
+
+        // 5. Commit the destination journal seed (`events[0]` is the
+        //    ThreadCreated built by the params constructor) plus the
+        //    coalesced outbox advisory — same transaction as every row
+        //    above, which is the point of this committer.
+        let start_seq = Self::next_event_sequence_tx(&mut tx, &params.new_thread_id).await?;
+        let committed = Self::insert_events_tx(
+            &mut tx,
+            &params.new_thread_id,
+            params.events,
+            start_seq,
+            params.now,
+        )
+        .await?;
+        Self::insert_thread_events_outbox_row_tx(
+            &mut tx,
+            &committed,
+            params.outbox_max_attempts,
+            params.now,
+        )
+        .await?;
 
         tx.commit()
             .await
@@ -2400,6 +2549,10 @@ async fn prepare_subagent_batch_rows_tx(
 
 #[async_trait]
 impl AgentTaskStore for PostgresDurableStore {
+    fn atomic_subagent_spawn_committer(&self) -> Option<&dyn AtomicSubagentSpawnCommitter> {
+        Some(self)
+    }
+
     async fn insert(&self, task: AgentTask) -> Result<()> {
         let mut tx = self.begin().await?;
         Self::enforce_insert_cross_row_invariants_tx(&mut tx, &task).await?;
@@ -3716,12 +3869,23 @@ FOR UPDATE SKIP LOCKED
         parent_id: &AgentTaskId,
         worker: &WorkerId,
         lease: &LeaseId,
-        spawns: Vec<SubagentInvocationSpawn>,
-        payload: SuspensionPayload,
+        batch: SubagentBatchSpawn,
         now: OffsetDateTime,
-    ) -> Result<(AgentTask, Vec<(AgentTask, AgentTask)>)> {
+    ) -> Result<(AgentTask, Vec<(AgentTask, AgentTask)>, Vec<CommittedEvent>)> {
+        let SubagentBatchSpawn {
+            spawns,
+            payload,
+            events,
+        } = batch;
         if spawns.is_empty() {
             return Err(anyhow!("spawn rejected: spawns must be non-empty"));
+        }
+        if events.len() != spawns.len() {
+            return Err(anyhow!(
+                "spawn rejected: {} events for {} spawns",
+                events.len(),
+                spawns.len()
+            ));
         }
         let mut tx = self.begin().await?;
 
@@ -3747,8 +3911,19 @@ FOR UPDATE SKIP LOCKED
             Self::insert_task_tx(&mut tx, invocation).await?;
             Self::insert_task_tx(&mut tx, child_root).await?;
         }
+
+        agent_server::fail_point!("atomic_spawn_batch.after_rows");
+
+        let committed = Self::insert_spawn_started_events_tx(
+            &mut tx,
+            &new_parent.thread_id,
+            &prepared,
+            events,
+            now,
+        )
+        .await?;
         tx.commit().await.context("commit spawn_subagent_batch")?;
-        Ok((new_parent, prepared))
+        Ok((new_parent, prepared, committed))
     }
 
     async fn spawn_mixed_children(
@@ -3757,6 +3932,7 @@ FOR UPDATE SKIP LOCKED
         worker: &WorkerId,
         lease: &LeaseId,
         spawn: MixedChildrenSpawn,
+        events: Vec<SubagentSpawnEvent>,
         now: OffsetDateTime,
     ) -> Result<SpawnedMixedChildren> {
         validate_mixed_children_spawn(&spawn)?;
@@ -3766,6 +3942,13 @@ FOR UPDATE SKIP LOCKED
             payload,
             child_otel_traceparent,
         } = spawn;
+        if events.len() != subagents.len() {
+            return Err(anyhow!(
+                "spawn rejected: {} events for {} subagent entries",
+                events.len(),
+                subagents.len()
+            ));
+        }
 
         let mut tx = self.begin().await?;
 
@@ -3803,8 +3986,20 @@ FOR UPDATE SKIP LOCKED
         for child in &tool_rows {
             Self::insert_task_tx(&mut tx, child).await?;
         }
+
+        agent_server::fail_point!("atomic_spawn_batch.after_rows");
+
+        let committed = Self::insert_spawn_started_events_tx(
+            &mut tx,
+            &new_parent.thread_id,
+            &prepared,
+            events,
+            now,
+        )
+        .await?;
         tx.commit().await.context("commit spawn_mixed_children")?;
         Ok(SpawnedMixedChildren {
+            committed_events: committed,
             parent: new_parent,
             subagents: prepared,
             tool_children: tool_rows,
@@ -4299,6 +4494,10 @@ impl ThreadStore for PostgresDurableStore {
         Some(self)
     }
 
+    fn atomic_thread_creation_committer(&self) -> Option<&dyn AtomicThreadCreationCommitter> {
+        Some(self)
+    }
+
     async fn get_or_create(&self, thread_id: &ThreadId, now: OffsetDateTime) -> Result<Thread> {
         let mut tx = self.begin().await?;
         Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
@@ -4725,6 +4924,26 @@ impl AtomicCompletedTurnCommitter for PostgresDurableStore {
 }
 
 #[async_trait]
+impl AtomicSubagentSpawnCommitter for PostgresDurableStore {
+    async fn commit_subagent_spawn_atomic(
+        &self,
+        params: SubagentSpawnCommit,
+    ) -> Result<SubagentSpawnOutcome> {
+        self.commit_subagent_spawn_atomic_inner(params).await
+    }
+}
+
+#[async_trait]
+impl AtomicThreadCreationCommitter for PostgresDurableStore {
+    async fn commit_thread_creation_atomic(
+        &self,
+        params: ThreadCreationCommit,
+    ) -> Result<ThreadCreationRows> {
+        self.commit_thread_creation_atomic_inner(params).await
+    }
+}
+
+#[async_trait]
 impl AtomicForkCommitter for PostgresDurableStore {
     async fn commit_fork_atomic(&self, params: ForkCommitParams) -> Result<ThreadCreationOutcome> {
         self.commit_fork_atomic_inner(params).await
@@ -4972,6 +5191,65 @@ impl PostgresDurableStore {
     }
 
     /// Insert committed events into an existing transaction.
+    /// Insert a spawned child thread's `ThreadCreated` and its
+    /// events-available advisory inside the caller's transaction.
+    async fn insert_child_created_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        child_thread: &ThreadId,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let seq = Self::next_event_sequence_tx(tx, child_thread).await?;
+        let committed = Self::insert_events_tx(
+            tx,
+            child_thread,
+            vec![AgentEvent::thread_created(child_thread.clone(), None, None)],
+            seq,
+            now,
+        )
+        .await?;
+        Self::insert_thread_events_outbox_row_tx(
+            tx,
+            &committed,
+            DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+            now,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Commit the per-entry `SubagentProgress` start events on the
+    /// parent journal (one batch + one advisory) and each child
+    /// thread's `ThreadCreated` (one event + advisory per child),
+    /// inside the caller's spawn transaction — a crash can never
+    /// persist spawned rows without their events.
+    async fn insert_spawn_started_events_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        parent_thread: &ThreadId,
+        prepared: &[(AgentTask, AgentTask)],
+        events: Vec<SubagentSpawnEvent>,
+        now: OffsetDateTime,
+    ) -> Result<Vec<CommittedEvent>> {
+        let mut started = Vec::with_capacity(events.len());
+        for (event, (invocation, child_root)) in events.into_iter().zip(prepared) {
+            started.push(started_event_from_invocation(
+                event, invocation, child_root,
+            )?);
+        }
+        let start_seq = Self::next_event_sequence_tx(tx, parent_thread).await?;
+        let committed = Self::insert_events_tx(tx, parent_thread, started, start_seq, now).await?;
+        Self::insert_thread_events_outbox_row_tx(
+            tx,
+            &committed,
+            DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+            now,
+        )
+        .await?;
+        for (_, child_root) in prepared {
+            Self::insert_child_created_tx(tx, &child_root.thread_id, now).await?;
+        }
+        Ok(committed)
+    }
+
     async fn insert_events_tx(
         tx: &mut Transaction<'_, Postgres>,
         thread_id: &ThreadId,
@@ -8386,6 +8664,103 @@ INSERT INTO agent_sdk_turn_attempts (
             .context("task should exist")?;
         assert_eq!(stored.last_error.as_deref(), Some("tool said: oops!"));
 
+        Ok(())
+    }
+    /// The Postgres creation committer's failpoint hook, exercised the
+    /// same way the sqlite conformance tests exercise theirs: a crash
+    /// after the rows must roll back the thread row, the creation
+    /// event, and the outbox advisory. Skips without `TEST_DATABASE_URL`.
+    #[cfg(feature = "failpoints")]
+    #[tokio::test]
+    async fn postgres_create_failpoint_rolls_back_row_event_and_outbox() -> Result<()> {
+        use crate::fail;
+        use agent_server::journal::event_repository::EventRepository;
+        use agent_server::journal::outbox::OutboxStore;
+        use agent_server::journal::thread_store::ThreadStore;
+
+        let Some((store, _schema_guard)) = test_store().await? else {
+            return Ok(());
+        };
+        let _scenario = fail::FailScenario::setup();
+        fail::cfg("atomic_create.after_rows", "panic")
+            .map_err(|error| anyhow::anyhow!("configure create failpoint: {error}"))?;
+        let thread = thread_id("00000000-0000-4000-8000-0000000fa1c0");
+        let crashed = std::panic::AssertUnwindSafe(store.commit_thread_creation_atomic(
+            ThreadCreationCommit {
+                thread_id: thread.clone(),
+                event: agent_sdk_foundation::events::AgentEvent::thread_created(
+                    thread.clone(),
+                    None,
+                    None,
+                ),
+                outbox_max_attempts: 3,
+                now: t_plus(1),
+            },
+        ));
+        let result = futures::FutureExt::catch_unwind(crashed).await;
+        fail::remove("atomic_create.after_rows");
+        assert!(result.is_err(), "create failpoint must panic");
+        assert!(ThreadStore::get(&store, &thread).await?.is_none());
+        assert!(
+            EventRepository::get_events(&store, &thread)
+                .await?
+                .is_empty()
+        );
+        assert!(
+            OutboxStore::list_by_thread(&store, &thread)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    /// Same contract for the fork committer's hook on Postgres: crash
+    /// after the rows → no thread, no events, no advisory.
+    #[cfg(feature = "failpoints")]
+    #[tokio::test]
+    async fn postgres_fork_failpoint_rolls_back_rows_events_and_outbox() -> Result<()> {
+        use crate::fail;
+        use agent_server::journal::event_repository::EventRepository;
+        use agent_server::journal::fork_transaction::ForkCommitParams;
+        use agent_server::journal::outbox::OutboxStore;
+        use agent_server::journal::thread_store::ThreadStore;
+
+        let Some((store, _schema_guard)) = test_store().await? else {
+            return Ok(());
+        };
+        let _scenario = fail::FailScenario::setup();
+        fail::cfg("atomic_fork.after_rows", "panic")
+            .map_err(|error| anyhow::anyhow!("configure fork failpoint: {error}"))?;
+        let forked = thread_id("00000000-0000-4000-8000-0000000fa1c1");
+        let crashed = std::panic::AssertUnwindSafe(store.commit_fork_atomic(ForkCommitParams {
+            creation: None,
+            new_thread_id: forked.clone(),
+            now: t_plus(1),
+            committed_turns: 0,
+            cumulative_total_usage: TokenUsage::default(),
+            messages: Vec::new(),
+            checkpoint: None,
+            events: vec![agent_sdk_foundation::events::AgentEvent::thread_created(
+                forked.clone(),
+                None,
+                Some(0),
+            )],
+            outbox_max_attempts: 3,
+        }));
+        let result = futures::FutureExt::catch_unwind(crashed).await;
+        fail::remove("atomic_fork.after_rows");
+        assert!(result.is_err(), "fork failpoint must panic");
+        assert!(ThreadStore::get(&store, &forked).await?.is_none());
+        assert!(
+            EventRepository::get_events(&store, &forked)
+                .await?
+                .is_empty()
+        );
+        assert!(
+            OutboxStore::list_by_thread(&store, &forked)
+                .await?
+                .is_empty()
+        );
         Ok(())
     }
 }

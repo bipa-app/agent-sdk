@@ -822,7 +822,7 @@ async fn cancelled_child_thread_does_not_count_unexecuted_tool_tasks() -> Result
 }
 
 #[tokio::test]
-async fn completion_tolerates_parent_progress_commit_failures() -> Result<()> {
+async fn completion_surfaces_parent_progress_commit_failures() -> Result<()> {
     let stores = TestStores::new();
     let parent_thread_id = ThreadId::from_string("t-parent-subagent-progress-failure");
     let (parent, worker, lease) =
@@ -863,7 +863,7 @@ async fn completion_tolerates_parent_progress_commit_failures() -> Result<()> {
         .context("claim invocation task")?;
     let subagent_bootstrap = resolve_subagent_bootstrap(invocation_running, &stores.tasks).await?;
     let failing_events = FailingEventRepository;
-    let subagent_outcome = execute_subagent_task(
+    let error = execute_subagent_task(
         subagent_bootstrap,
         &SubagentResultDeps {
             task_store: &stores.tasks,
@@ -873,10 +873,26 @@ async fn completion_tolerates_parent_progress_commit_failures() -> Result<()> {
         },
         t_plus(10),
     )
-    .await?;
+    .await
+    .err()
+    .context("a failed completion-progress commit must PROPAGATE, not be swallowed")?;
+    assert!(
+        format!("{error:#}").contains("commit completed subagent progress event"),
+        "unexpected error: {error:#}",
+    );
 
-    assert!(subagent_outcome.tool_result.success);
-    assert!(subagent_outcome.committed_events.is_empty());
+    // The invocation row completed before the event commit — the
+    // surfaced error hands the re-drive to the worker's retry/lease
+    // machinery instead of silently losing the parent-visible event.
+    let invocation_after = stores
+        .tasks
+        .get(&spawned.invocation_task.id)
+        .await?
+        .context("invocation row survives the failed event commit")?;
+    assert_eq!(
+        invocation_after.status,
+        crate::journal::TaskStatus::Completed
+    );
 
     Ok(())
 }

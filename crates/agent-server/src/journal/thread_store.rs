@@ -152,6 +152,15 @@ pub trait ThreadStore: Send + Sync {
         None
     }
 
+    /// Optional backend hook for creating a thread, its empty message
+    /// projection, creation event, and outbox advisory in one transaction.
+    #[must_use]
+    fn atomic_thread_creation_committer(
+        &self,
+    ) -> Option<&dyn super::thread_creation_transaction::AtomicThreadCreationCommitter> {
+        None
+    }
+
     /// Return the thread row, creating it if it does not exist.
     ///
     /// Idempotent: if the row already exists, returns it unchanged.
