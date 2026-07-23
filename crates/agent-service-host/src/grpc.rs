@@ -1,6 +1,6 @@
 //! gRPC transport and local-daemon runtime for the durable service host.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -21,6 +21,9 @@ use agent_server::journal::task::{
     TaskStatus as JournalTaskStatus, WorkerId,
 };
 use agent_server::journal::task_state::TaskState;
+use agent_server::journal::thread::{
+    PurgeReceipt, PurgeScope, ThreadNotFound, ThreadOperation, ThreadStateConflict,
+};
 use agent_server::journal::thread_creation_transaction::ThreadCreationCommit;
 use agent_server::journal::thread_store::{
     ThreadCreation, ThreadCreationOutcome, ThreadIdConflict,
@@ -1013,6 +1016,10 @@ impl GrpcControlService {
         record: &ForkThreadResult,
     ) -> RpcResult<pb::ForkThreadResponse> {
         let new_thread_id = ThreadId::from_string(&record.new_thread_id);
+        let thread = self.shared.require_thread(&new_thread_id).await?;
+        thread
+            .require_active(ThreadOperation::Fork)
+            .map_err(|error| thread_state_conflict_status(&error))?;
         let message_count = self
             .shared
             .stores
@@ -1158,6 +1165,157 @@ impl GrpcControlService {
 
         self.load_task_and_parent(task_id).await
     }
+
+    async fn invocation_tree_threads(
+        &self,
+        root_thread_id: &ThreadId,
+        scope: PurgeScope,
+    ) -> Result<Vec<ThreadId>, Status> {
+        if scope == PurgeScope::Thread {
+            return Ok(vec![root_thread_id.clone()]);
+        }
+
+        let mut visited = HashSet::new();
+        let mut ordered = Vec::new();
+        let mut frontier = VecDeque::from([root_thread_id.clone()]);
+        while let Some(thread_id) = frontier.pop_front() {
+            if !visited.insert(thread_id.clone()) {
+                continue;
+            }
+            ordered.push(thread_id.clone());
+            let tasks = self
+                .shared
+                .stores
+                .task_store
+                .list_by_thread(&thread_id)
+                .await
+                .map_err(internal_status("discovering invocation-tree threads"))?;
+            for task in tasks {
+                if let TaskState::SubagentInvocation { invocation } = task.state
+                    && !visited.contains(&invocation.child_thread_id)
+                {
+                    frontier.push_back(invocation.child_thread_id);
+                }
+            }
+        }
+        Ok(ordered)
+    }
+
+    async fn execute_purge_thread(
+        &self,
+        root_thread_id: &ThreadId,
+        scope: PurgeScope,
+    ) -> Result<PurgeReceipt, Status> {
+        let started_at = OffsetDateTime::now_utc();
+        if let Some(receipt) = self
+            .shared
+            .stores
+            .thread_store
+            .begin_purge(root_thread_id, scope, started_at)
+            .await
+            .map_err(|error| map_thread_store_error("fencing thread for purge", &error))?
+        {
+            return Ok(receipt);
+        }
+
+        // Deterministic race seam: tests pause here after the tombstone fence
+        // commits but before cancellation starts. A concurrent submit must see
+        // `deleting` and fail rather than silently bootstrapping the thread.
+        agent_server::fail_point!("purge.after_fence");
+
+        let thread_ids = self.invocation_tree_threads(root_thread_id, scope).await?;
+        for thread_id in thread_ids.iter().skip(1) {
+            let _ = self
+                .shared
+                .stores
+                .thread_store
+                .begin_purge(thread_id, PurgeScope::Thread, started_at)
+                .await
+                .map_err(|error| {
+                    map_thread_store_error("fencing child thread for purge", &error)
+                })?;
+        }
+
+        let mut cancelled = BTreeSet::new();
+        let mut cancelled_by_thread: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for thread_id in &thread_ids {
+            let mut roots: Vec<AgentTask> = self
+                .shared
+                .stores
+                .task_store
+                .list_by_thread(thread_id)
+                .await
+                .map_err(internal_status("listing roots for purge"))?
+                .into_iter()
+                .filter(|task| task.kind == JournalTaskKind::RootTurn && task.is_root())
+                .collect();
+            roots.sort_by_key(|task| (task.created_at, task.id.clone()));
+            for root in roots {
+                let outcome = self
+                    .shared
+                    .stores
+                    .task_store
+                    .cancel_tree(&root.id, OffsetDateTime::now_utc())
+                    .await
+                    .map_err(internal_status("cancelling task tree for purge"))?;
+                let ids: Vec<String> = outcome
+                    .transitioned
+                    .into_iter()
+                    .map(|id| id.to_string())
+                    .collect();
+                cancelled.extend(ids.iter().cloned());
+                cancelled_by_thread
+                    .entry(thread_id.0.clone())
+                    .or_default()
+                    .extend(ids);
+            }
+        }
+
+        let completed_at = OffsetDateTime::now_utc();
+        let purged_thread_ids: Vec<ThreadId> = thread_ids.iter().rev().cloned().collect();
+        let receipt = PurgeReceipt {
+            root_thread_id: root_thread_id.clone(),
+            scope,
+            purged_thread_ids: purged_thread_ids.clone(),
+            cancelled_task_ids: cancelled.into_iter().collect(),
+            started_at,
+            completed_at,
+        };
+
+        // Every purged thread stores a receipt describing what happened
+        // TO IT: `purged_thread_ids` names only itself and
+        // `cancelled_task_ids` only its own tasks, while
+        // `root_thread_id` keeps the tree provenance. A later direct
+        // `PurgeThread(child)` therefore replays a child-subject
+        // receipt instead of the whole tree's. The ROOT stores the full
+        // tree receipt, which is also the RPC response.
+        for thread_id in &purged_thread_ids {
+            let stored = if thread_id == root_thread_id {
+                receipt.clone()
+            } else {
+                PurgeReceipt {
+                    root_thread_id: root_thread_id.clone(),
+                    scope,
+                    purged_thread_ids: vec![thread_id.clone()],
+                    cancelled_task_ids: cancelled_by_thread
+                        .get(thread_id.0.as_str())
+                        .cloned()
+                        .unwrap_or_default(),
+                    started_at,
+                    completed_at,
+                }
+            };
+            let _ = self
+                .shared
+                .stores
+                .thread_store
+                .finish_purge(thread_id, &stored)
+                .await
+                .map_err(|error| map_thread_store_error("completing thread purge", &error))?;
+        }
+        Ok(receipt)
+    }
 }
 
 #[tonic::async_trait]
@@ -1214,12 +1372,13 @@ impl AgentControlService for GrpcControlService {
             }
             IdempotencyClaim::Replay(record) => {
                 let result: CreateThreadResult = decode_idempotency_result(&record.result_json)?;
+                let thread_id = ThreadId::from_string(result.thread_id);
+                let thread = self.shared.require_thread(&thread_id).await?;
+                thread
+                    .require_active(ThreadOperation::Create)
+                    .map_err(|error| thread_state_conflict_status(&error))?;
                 return Ok(Response::new(pb::CreateThreadResponse {
-                    thread: Some(
-                        self.shared
-                            .thread_view(&ThreadId::from_string(result.thread_id))
-                            .await?,
-                    ),
+                    thread: Some(self.shared.thread_view(&thread_id).await?),
                 }));
             }
             IdempotencyClaim::Fresh => {}
@@ -1355,13 +1514,10 @@ impl AgentControlService for GrpcControlService {
 
         let fingerprint = submit_work_fingerprint(&request);
 
-        let thread = self.shared.require_thread(&thread_id).await?;
-        if thread.status.is_completed() {
-            return Err(Status::failed_precondition(format!(
-                "thread {} is completed",
-                thread.thread_id
-            )));
-        }
+        // Preserve the transport's typed not-found response, but leave the
+        // lifecycle decision to the task store where it is atomic with
+        // admission and cannot be raced by purge.
+        let _ = self.shared.require_thread(&thread_id).await?;
 
         let submitted_input = request
             .input
@@ -1507,6 +1663,9 @@ impl AgentControlService for GrpcControlService {
         // here matches `GetThread` / `SubmitThreadWork` semantics for
         // an unknown thread id.
         let source_thread = self.shared.require_thread(&source_thread_id).await?;
+        source_thread
+            .require_active(ThreadOperation::Fork)
+            .map_err(|error| thread_state_conflict_status(&error))?;
         if fork_after > source_thread.committed_turns {
             return Err(Status::invalid_argument(format!(
                 "fork_after_committed_turns {} exceeds source's committed_turns {}",
@@ -1726,6 +1885,25 @@ impl AgentControlService for GrpcControlService {
         Ok(Response::new(pb::CancelTaskResponse {
             cancelled_task_ids,
             cancelled_count,
+        }))
+    }
+
+    async fn purge_thread(
+        &self,
+        request: Request<pb::PurgeThreadRequest>,
+    ) -> Result<Response<pb::PurgeThreadResponse>, Status> {
+        let request = request.into_inner();
+        let thread_id = parse_thread_id(&request.thread_id)?;
+        let scope = match pb::PurgeScope::try_from(request.scope) {
+            Ok(pb::PurgeScope::Thread) => PurgeScope::Thread,
+            Ok(pb::PurgeScope::InvocationTree) => PurgeScope::InvocationTree,
+            Ok(pb::PurgeScope::Unspecified) | Err(_) => {
+                return Err(Status::invalid_argument("purge scope is required"));
+            }
+        };
+        let receipt = self.execute_purge_thread(&thread_id, scope).await?;
+        Ok(Response::new(pb::PurgeThreadResponse {
+            receipt: Some(map_purge_receipt(&receipt)?),
         }))
     }
 }
@@ -2578,6 +2756,38 @@ fn not_found_status(resource_kind: &str, resource_id: &str) -> Status {
     Status::not_found(format!("{resource_kind} '{resource_id}' was not found"))
 }
 
+fn thread_state_conflict_status(error: &ThreadStateConflict) -> Status {
+    Status::failed_precondition(error.to_string())
+}
+
+fn map_thread_store_error(context: &'static str, error: &anyhow::Error) -> Status {
+    if let Some(not_found) = error.downcast_ref::<ThreadNotFound>() {
+        return not_found_status("thread", &not_found.thread_id.0);
+    }
+    if let Some(conflict) = error.downcast_ref::<ThreadStateConflict>() {
+        return thread_state_conflict_status(conflict);
+    }
+    Status::internal(format!("{context}: {error:#}"))
+}
+
+fn map_purge_receipt(receipt: &PurgeReceipt) -> Result<pb::PurgeReceipt, Status> {
+    Ok(pb::PurgeReceipt {
+        root_thread_id: receipt.root_thread_id.0.clone(),
+        scope: match receipt.scope {
+            PurgeScope::Thread => pb::PurgeScope::Thread as i32,
+            PurgeScope::InvocationTree => pb::PurgeScope::InvocationTree as i32,
+        },
+        purged_thread_ids: receipt
+            .purged_thread_ids
+            .iter()
+            .map(|thread_id| thread_id.0.clone())
+            .collect(),
+        cancelled_task_ids: receipt.cancelled_task_ids.clone(),
+        started_at: Some(map_timestamp(receipt.started_at)?),
+        completed_at: Some(map_timestamp(receipt.completed_at)?),
+    })
+}
+
 fn idempotency_conflict_status(method: &str, request_id: &str) -> Status {
     Status::already_exists(format!(
         "request_id '{request_id}' was already used for a different {method} request"
@@ -2595,6 +2805,7 @@ fn map_submit_root_error(method: &str, request_id: &str, error: SubmitRootTurnEr
                  retry after in-flight roots drain"
             ))
         }
+        SubmitRootTurnError::ThreadStateConflict(error) => thread_state_conflict_status(&error),
         SubmitRootTurnError::Other(error) => {
             Status::internal(format!("submitting root turn: {error:#}"))
         }
@@ -2785,6 +2996,8 @@ const fn map_thread_status(status: agent_server::ThreadStatus) -> i32 {
     match status {
         agent_server::ThreadStatus::Active => pb::ThreadStatus::Active as i32,
         agent_server::ThreadStatus::Completed => pb::ThreadStatus::Completed as i32,
+        agent_server::ThreadStatus::Deleting => pb::ThreadStatus::Deleting as i32,
+        agent_server::ThreadStatus::Deleted => pb::ThreadStatus::Deleted as i32,
     }
 }
 
@@ -3944,6 +4157,316 @@ mod tests {
             std::time::Duration::from_secs(10),
             AdmissionConfig::default(),
         )))
+    }
+
+    #[cfg(feature = "failpoints")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_racing_purge_observes_deleting_fence_without_resurrection() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        fail::cfg("purge.after_fence", "pause")
+            .map_err(|error| anyhow!("configure purge failpoint: {error}"))?;
+        let shared = event_test_shared()?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+        let created = service
+            .create_thread(Request::new(pb::CreateThreadRequest {
+                request_id: "purge-race-create".into(),
+                thread_id: String::new(),
+            }))
+            .await?;
+        let thread_id = created
+            .into_inner()
+            .thread
+            .and_then(|view| view.thread)
+            .map(|thread| thread.thread_id)
+            .context("create response missing thread id")?;
+
+        let purge_service = service.clone();
+        let purge_thread_id = thread_id.clone();
+        let purge = tokio::spawn(async move {
+            purge_service
+                .purge_thread(Request::new(pb::PurgeThreadRequest {
+                    thread_id: purge_thread_id,
+                    scope: pb::PurgeScope::Thread as i32,
+                }))
+                .await
+        });
+
+        let mut fence_observed = false;
+        for _ in 0..2_000 {
+            let status = shared
+                .stores
+                .thread_store
+                .get(&ThreadId::from_string(&thread_id))
+                .await?
+                .map(|thread| thread.status);
+            if status == Some(agent_server::ThreadStatus::Deleting) {
+                fence_observed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        if !fence_observed {
+            fail::remove("purge.after_fence");
+            anyhow::bail!("purge did not reach the deleting failpoint");
+        }
+
+        let submit = service
+            .submit_thread_work(Request::new(pb::SubmitThreadWorkRequest {
+                disposition: pb::SubmitDisposition::NextTurn as i32,
+                request_id: "purge-race-submit".into(),
+                thread_id: thread_id.clone(),
+                input: vec![pb::UserInputItem {
+                    item: Some(pb::user_input_item::Item::Text("must reject".into())),
+                }],
+                caller_metadata: String::new(),
+            }))
+            .await;
+        fail::remove("purge.after_fence");
+
+        let Err(status) = submit else {
+            anyhow::bail!("submit unexpectedly crossed the deletion fence");
+        };
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("is deleting"));
+        let _ = purge.await.context("join paused purge")??;
+
+        let tombstone = shared
+            .stores
+            .thread_store
+            .get(&ThreadId::from_string(&thread_id))
+            .await?
+            .context("purged thread tombstone disappeared")?;
+        assert_eq!(tombstone.status, agent_server::ThreadStatus::Deleted);
+        assert!(
+            shared
+                .stores
+                .task_store
+                .list_by_thread(&ThreadId::from_string(thread_id))
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    /// Spawn a real subagent invocation under the (running) parent root
+    /// so the purge walk has durable linkage to discover.
+    async fn spawn_linked_child_thread(
+        shared: &Arc<GrpcShared>,
+        parent_thread: &str,
+        parent_task_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+    ) -> Result<ThreadId> {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1);
+        let child_thread = ThreadId::from_string(format!("{parent_thread}-child"));
+        shared
+            .stores
+            .thread_store
+            .get_or_create(&child_thread, now)
+            .await?;
+        let parent_tid = ThreadId::from_string(parent_thread.to_owned());
+        let continuation = ContinuationEnvelope::wrap(AgentContinuation {
+            thread_id: parent_tid.clone(),
+            turn: 1,
+            total_usage: TokenUsage::default(),
+            turn_usage: TokenUsage::default(),
+            pending_tool_calls: Vec::new(),
+            awaiting_index: 0,
+            completed_results: Vec::new(),
+            state: AgentState::new(parent_tid),
+            response_id: None,
+            stop_reason: None,
+            response_content: Vec::new(),
+        });
+        let spec: agent_server::worker::subagent::EffectiveSubagentSpec =
+            serde_json::from_value(serde_json::json!({
+                "task": "inspect",
+                "prompt": "",
+                "model": "test-model",
+                "max_turns": 1,
+                "timeout_ms": 1000,
+                "depth": 1,
+                "max_parallel_subagents": 1,
+                "sandbox": {},
+                "mcp": {},
+                "capabilities": {"profile": "research"},
+            }))
+            .context("build minimal subagent spec")?;
+        shared
+            .stores
+            .task_store
+            .spawn_subagent_invocation(
+                parent_task_id,
+                worker,
+                lease,
+                SubagentInvocationSpawn {
+                    child_thread_id: child_thread.clone(),
+                    spec,
+                    child_root_input: vec![],
+                    spawn_index: 0,
+                    payload: SuspensionPayload {
+                        continuation,
+                        suspended_messages: Vec::new(),
+                    },
+                    child_caller_metadata: None,
+                },
+                now,
+            )
+            .await
+            .context("spawn linked subagent invocation")?;
+        Ok(child_thread)
+    }
+
+    #[tokio::test]
+    async fn invocation_tree_purge_fences_children_and_stores_per_thread_receipts() -> Result<()> {
+        let shared = event_test_shared()?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+        let (parent_thread, parent_task) = seed_pending_root(&service, "tree-purge").await?;
+        let parent_task_id = AgentTaskId::from_string(parent_task.clone());
+        let worker = WorkerId::from_string("tree-purge-worker");
+        let lease = LeaseId::from_string("tree-purge-lease");
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1);
+        shared
+            .stores
+            .task_store
+            .try_acquire_task(
+                &parent_task_id,
+                worker.clone(),
+                lease.clone(),
+                now + time::Duration::seconds(600),
+                now,
+            )
+            .await?
+            .context("acquire tree-purge parent root")?;
+
+        let child_thread =
+            spawn_linked_child_thread(&shared, &parent_thread, &parent_task_id, &worker, &lease)
+                .await?;
+        let parent_tid = ThreadId::from_string(parent_thread.clone());
+
+        let receipt = service
+            .purge_thread(Request::new(pb::PurgeThreadRequest {
+                thread_id: parent_thread.clone(),
+                scope: pb::PurgeScope::InvocationTree as i32,
+            }))
+            .await?
+            .into_inner()
+            .receipt
+            .context("tree purge missing receipt")?;
+
+        // Bottom-up: the child is purged before the root.
+        assert_eq!(
+            receipt.purged_thread_ids,
+            vec![child_thread.0.clone(), parent_thread.clone()],
+            "tree purge must cover the child bottom-up",
+        );
+        assert!(
+            !receipt.cancelled_task_ids.is_empty(),
+            "tree purge must cancel the live tree",
+        );
+
+        // Both threads are tombstoned and refuse admission.
+        for thread in [&parent_tid, &child_thread] {
+            let after = shared
+                .stores
+                .thread_store
+                .get(thread)
+                .await?
+                .context("purged thread row must survive as a tombstone")?;
+            assert_eq!(
+                after.status,
+                agent_server::journal::thread::ThreadStatus::Deleted,
+                "{thread} must be Deleted after the tree purge",
+            );
+        }
+        let refused = service
+            .submit_thread_work(Request::new(pb::SubmitThreadWorkRequest {
+                disposition: pb::SubmitDisposition::NextTurn as i32,
+                request_id: "tree-purge-resubmit".into(),
+                thread_id: child_thread.0.clone(),
+                input: vec![text_input("resurrect?")],
+                caller_metadata: String::new(),
+            }))
+            .await;
+        let Err(status) = refused else {
+            anyhow::bail!("submit on a purged child unexpectedly succeeded");
+        };
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+
+        // A later DIRECT purge of the child replays a CHILD-subject
+        // receipt (its own id, its own tasks), not the whole tree's.
+        let replay = service
+            .purge_thread(Request::new(pb::PurgeThreadRequest {
+                thread_id: child_thread.0.clone(),
+                scope: pb::PurgeScope::Thread as i32,
+            }))
+            .await?
+            .into_inner()
+            .receipt
+            .context("child replay missing receipt")?;
+        assert_eq!(
+            replay.purged_thread_ids,
+            vec![child_thread.0.clone()],
+            "a purged child's stored receipt must describe the child itself",
+        );
+        assert_eq!(
+            replay.root_thread_id, parent_thread,
+            "the child's receipt keeps the tree provenance",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn purge_is_idempotent_and_unknown_thread_is_not_found() -> Result<()> {
+        let shared = event_test_shared()?;
+        let service = GrpcControlService { shared };
+        let created = service
+            .create_thread(Request::new(pb::CreateThreadRequest {
+                request_id: "purge-idempotent-create".into(),
+                thread_id: String::new(),
+            }))
+            .await?;
+        let thread_id = created
+            .into_inner()
+            .thread
+            .and_then(|view| view.thread)
+            .map(|thread| thread.thread_id)
+            .context("create response missing thread id")?;
+        let request = pb::PurgeThreadRequest {
+            thread_id: thread_id.clone(),
+            scope: pb::PurgeScope::Thread as i32,
+        };
+        let first = service
+            .purge_thread(Request::new(request.clone()))
+            .await?
+            .into_inner()
+            .receipt
+            .context("first purge missing receipt")?;
+        let second = service
+            .purge_thread(Request::new(request))
+            .await?
+            .into_inner()
+            .receipt
+            .context("second purge missing receipt")?;
+        assert_eq!(first, second);
+        assert_eq!(first.root_thread_id, thread_id);
+
+        let unknown = service
+            .purge_thread(Request::new(pb::PurgeThreadRequest {
+                thread_id: "unknown-purge-thread".into(),
+                scope: pb::PurgeScope::Thread as i32,
+            }))
+            .await;
+        let Err(status) = unknown else {
+            anyhow::bail!("unknown purge unexpectedly succeeded");
+        };
+        assert_eq!(status.code(), tonic::Code::NotFound);
+        assert!(status.message().contains("unknown-purge-thread"));
+        Ok(())
     }
 
     async fn seed_events(shared: &GrpcShared, thread_id: &ThreadId, count: u32) -> Result<()> {

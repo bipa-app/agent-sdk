@@ -83,10 +83,15 @@ const INPUT_INJECTION_KIND_SQL: &str = include_str!(concat!(
     "/migrations/sqlite/0016_input_injection_kind.sql"
 ));
 
+const THREAD_PURGE_LIFECYCLE_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/sqlite/0017_thread_purge_lifecycle.sql"
+));
+
 /// `sqlx`-managed migration bundle for the `SQLite` durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/sqlite");
 
-const MIGRATIONS: [SqliteMigration; 15] = [
+const MIGRATIONS: [SqliteMigration; 16] = [
     SqliteMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -162,6 +167,11 @@ const MIGRATIONS: [SqliteMigration; 15] = [
         summary: "input-injection task kind for durable boundary delivery",
         sql: INPUT_INJECTION_KIND_SQL,
     },
+    SqliteMigration {
+        version: "0017",
+        summary: "resurrection-proof thread purge lifecycle and durable receipts",
+        sql: THREAD_PURGE_LIFECYCLE_SQL,
+    },
 ];
 
 /// Version of the migration this PR introduces: the typed terminal
@@ -176,6 +186,11 @@ pub(crate) const TASK_TERMINAL_REASON_MIGRATION_VERSION: i64 = 14;
 /// input-injection task kind.
 #[cfg(test)]
 pub(crate) const INPUT_INJECTION_KIND_MIGRATION_VERSION: i64 = 16;
+
+/// Version of the migration this PR introduces: the thread purge
+/// lifecycle fence.
+#[cfg(test)]
+pub(crate) const THREAD_PURGE_LIFECYCLE_MIGRATION_VERSION: i64 = 17;
 
 /// The reviewable executable migration bundle for the `SQLite` durable core.
 #[must_use]

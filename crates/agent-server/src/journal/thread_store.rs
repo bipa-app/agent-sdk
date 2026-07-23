@@ -33,7 +33,9 @@ use time::OffsetDateTime;
 use tokio::sync::RwLock;
 
 use super::completed_turn_transaction::AtomicCompletedTurnCommitter;
-use super::thread::Thread;
+use super::thread::{
+    PurgeReceipt, PurgeScope, Thread, ThreadNotFound, ThreadOperation, ThreadStatus,
+};
 
 /// Parameters that define the operation which first claimed a thread id.
 ///
@@ -265,6 +267,27 @@ pub trait ThreadStore: Send + Sync {
     ///   have been committed.
     async fn mark_completed(&self, thread_id: &ThreadId, now: OffsetDateTime) -> Result<Thread>;
 
+    /// Atomically install the durable deletion fence.
+    ///
+    /// Returns a stored receipt when the thread is already deleted, allowing
+    /// `PurgeThread` retries to replay the original result. A row already in
+    /// `Deleting` remains fenced and returns `None` so an interrupted purge can
+    /// resume. Unknown ids return [`ThreadNotFound`].
+    async fn begin_purge(
+        &self,
+        thread_id: &ThreadId,
+        scope: PurgeScope,
+        now: OffsetDateTime,
+    ) -> Result<Option<PurgeReceipt>>;
+
+    /// Advance a deleting thread to its permanent tombstone and durably retain
+    /// `receipt`. Repeating the call returns the original stored receipt.
+    async fn finish_purge(
+        &self,
+        thread_id: &ThreadId,
+        receipt: &PurgeReceipt,
+    ) -> Result<PurgeReceipt>;
+
     /// List all threads in the store.
     ///
     /// # Errors
@@ -320,8 +343,9 @@ impl ThreadStore for InMemoryThreadStore {
         let thread = inner
             .by_id
             .entry(thread_id.clone())
-            .or_insert_with(|| Thread::new(thread_id.clone(), now))
-            .clone();
+            .or_insert_with(|| Thread::new(thread_id.clone(), now));
+        thread.require_active(ThreadOperation::Create)?;
+        let thread = thread.clone();
         drop(inner);
         Ok(thread)
     }
@@ -372,6 +396,7 @@ impl ThreadStore for InMemoryThreadStore {
             .by_id
             .entry(thread_id.clone())
             .or_insert_with(|| Thread::new(thread_id.clone(), now));
+        thread.require_active(ThreadOperation::Commit)?;
         if thread.committed_turns.saturating_add(1) != expected_turn {
             let committed_turns = thread.committed_turns;
             drop(inner);
@@ -400,6 +425,55 @@ impl ThreadStore for InMemoryThreadStore {
         Ok(completed)
     }
 
+    async fn begin_purge(
+        &self,
+        thread_id: &ThreadId,
+        _scope: PurgeScope,
+        now: OffsetDateTime,
+    ) -> Result<Option<PurgeReceipt>> {
+        let mut inner = self.inner.write().await;
+        let thread = inner.by_id.get_mut(thread_id).ok_or_else(|| {
+            anyhow::Error::new(ThreadNotFound {
+                thread_id: thread_id.clone(),
+            })
+        })?;
+        let result =
+            if thread.status == ThreadStatus::Deleted {
+                thread.purge_receipt.clone().map(Some).ok_or_else(|| {
+                    anyhow!("deleted thread {thread_id} is missing its purge receipt")
+                })
+            } else {
+                *thread = thread.clone().begin_purge(now);
+                Ok(None)
+            };
+        drop(inner);
+        result
+    }
+
+    async fn finish_purge(
+        &self,
+        thread_id: &ThreadId,
+        receipt: &PurgeReceipt,
+    ) -> Result<PurgeReceipt> {
+        let mut inner = self.inner.write().await;
+        let thread = inner.by_id.get_mut(thread_id).ok_or_else(|| {
+            anyhow::Error::new(ThreadNotFound {
+                thread_id: thread_id.clone(),
+            })
+        })?;
+        let result = if thread.status == ThreadStatus::Deleted {
+            thread
+                .purge_receipt
+                .clone()
+                .ok_or_else(|| anyhow!("deleted thread {thread_id} is missing its purge receipt"))
+        } else {
+            *thread = thread.clone().finish_purge(receipt.clone());
+            Ok(receipt.clone())
+        };
+        drop(inner);
+        result
+    }
+
     async fn list(&self) -> Result<Vec<Thread>> {
         let inner = self.inner.read().await;
         let result = inner.by_id.values().cloned().collect();
@@ -416,6 +490,7 @@ impl ThreadStore for InMemoryThreadStore {
 mod tests {
     use super::*;
     use crate::journal::thread::ThreadStatus;
+    use anyhow::Context as _;
     use time::Duration;
 
     fn t0() -> OffsetDateTime {
@@ -611,6 +686,46 @@ mod tests {
             err.to_string().contains("committed_turns"),
             "expected zero-turns error, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn double_purge_replays_same_receipt_and_unknown_is_typed() -> Result<()> {
+        let store = InMemoryThreadStore::new();
+        let thread_id = thread_a();
+        let _ = store.get_or_create(&thread_id, t0()).await?;
+        assert!(
+            store
+                .begin_purge(&thread_id, PurgeScope::Thread, t_plus(1))
+                .await?
+                .is_none()
+        );
+        let receipt = PurgeReceipt {
+            root_thread_id: thread_id.clone(),
+            scope: PurgeScope::Thread,
+            purged_thread_ids: vec![thread_id.clone()],
+            cancelled_task_ids: Vec::new(),
+            started_at: t_plus(1),
+            completed_at: t_plus(2),
+        };
+        let first = store.finish_purge(&thread_id, &receipt).await?;
+        let second = store
+            .begin_purge(&thread_id, PurgeScope::Thread, t_plus(3))
+            .await?
+            .context("deleted thread must replay a receipt")?;
+        assert_eq!(first, second);
+
+        let unknown = ThreadId::from_string("unknown-purge-thread");
+        let Err(error) = store
+            .begin_purge(&unknown, PurgeScope::Thread, t_plus(4))
+            .await
+        else {
+            anyhow::bail!("unknown purge unexpectedly succeeded");
+        };
+        let typed = error
+            .downcast_ref::<ThreadNotFound>()
+            .context("unknown purge error must remain typed")?;
+        assert_eq!(typed.thread_id, unknown);
+        Ok(())
     }
 
     // ── list ──────────────────────────────────────────────────────

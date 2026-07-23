@@ -206,7 +206,7 @@
 //! aggregated success / failure outcomes). The counter is
 //! re-derived the next time any child reaches a terminal state.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use agent_sdk_foundation::events::AgentEvent;
@@ -583,6 +583,9 @@ pub enum SubmitRootTurnError {
         /// The current queued-root depth at rejection time.
         current_depth: u32,
     },
+    /// The thread's durable deletion fence rejects admission. Maps to
+    /// `FAILED_PRECONDITION` with the exact `deleting` / `deleted` status.
+    ThreadStateConflict(super::thread::ThreadStateConflict),
     /// Any other store-level failure (validation, IO, …).
     Other(anyhow::Error),
 }
@@ -597,6 +600,7 @@ impl std::fmt::Display for SubmitRootTurnError {
                 f,
                 "thread queued-root depth {current_depth} reached the cap {cap}"
             ),
+            Self::ThreadStateConflict(error) => write!(f, "{error}"),
             Self::Other(error) => write!(f, "{error:#}"),
         }
     }
@@ -606,7 +610,10 @@ impl std::error::Error for SubmitRootTurnError {}
 
 impl From<anyhow::Error> for SubmitRootTurnError {
     fn from(error: anyhow::Error) -> Self {
-        Self::Other(error)
+        match error.downcast::<super::thread::ThreadStateConflict>() {
+            Ok(conflict) => Self::ThreadStateConflict(conflict),
+            Err(error) => Self::Other(error),
+        }
     }
 }
 
@@ -2237,6 +2244,116 @@ impl InMemoryAgentTaskStore {
         self
     }
 
+    /// Whether the thread is mid-purge (`Deleting` / `Deleted`). Bare
+    /// stores (no sink) see no thread lifecycle and fence nothing.
+    async fn thread_is_fenced(&self, thread_id: &ThreadId) -> Result<bool> {
+        let Some(sink) = &self.marker_sink else {
+            return Ok(false);
+        };
+        let Some(thread) = sink.thread_store.get(thread_id).await? else {
+            return Ok(false);
+        };
+        Ok(matches!(
+            thread.status,
+            super::thread::ThreadStatus::Deleting | super::thread::ThreadStatus::Deleted
+        ))
+    }
+
+    async fn require_thread_active(
+        &self,
+        thread_id: &ThreadId,
+        operation: super::thread::ThreadOperation,
+    ) -> Result<()> {
+        let Some(sink) = &self.marker_sink else {
+            return Ok(());
+        };
+        let Some(thread) = sink.thread_store.get(thread_id).await? else {
+            return Ok(());
+        };
+        thread.require_active(operation)?;
+        Ok(())
+    }
+
+    async fn guard_task_thread(
+        &self,
+        task_id: &AgentTaskId,
+        operation: super::thread::ThreadOperation,
+    ) -> Result<()> {
+        let thread_id = {
+            let inner = self.inner.read().await;
+            inner.by_id.get(task_id).map(|task| task.thread_id.clone())
+        };
+        if let Some(thread_id) = thread_id {
+            self.require_thread_active(&thread_id, operation).await?;
+        }
+        Ok(())
+    }
+
+    async fn validate_submit_admission(
+        &self,
+        task: &AgentTask,
+    ) -> std::result::Result<(), SubmitRootTurnError> {
+        validate_submit_root_shape(task)?;
+        self.require_thread_active(&task.thread_id, super::thread::ThreadOperation::Submit)
+            .await
+            .map_err(SubmitRootTurnError::from)
+    }
+
+    fn replay_submit(
+        inner: &Inner,
+        idempotency: Option<&SubmitRootIdempotency>,
+    ) -> std::result::Result<Option<SubmitRootTurnOutcome>, SubmitRootTurnError> {
+        let Some(claim) = idempotency else {
+            return Ok(None);
+        };
+        let Some(record) = inner.idempotency.get(&claim.request_id) else {
+            return Ok(None);
+        };
+        if record.kind != IdempotencyKind::SubmitWork || record.fingerprint != claim.fingerprint {
+            return Err(SubmitRootTurnError::IdempotencyConflict);
+        }
+        let recorded = record.clone();
+        let task_id = submit_record_task_id(&recorded)?;
+        let admitted = inner
+            .by_id
+            .get(&task_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("idempotent submit record points at missing task"))?;
+        Ok(Some(SubmitRootTurnOutcome {
+            queued_depth: inner.queued_root_count(&admitted.thread_id),
+            disposition: submitted_task_disposition(&admitted),
+            task: admitted,
+            replayed: true,
+            replayed_result: Some(recorded.result_json),
+        }))
+    }
+
+    async fn fenced_threads_for_cancel(
+        &self,
+        inner: &Inner,
+        task_ids: &[AgentTaskId],
+    ) -> Result<HashSet<ThreadId>> {
+        let Some(sink) = &self.marker_sink else {
+            return Ok(HashSet::new());
+        };
+        let candidate_threads: HashSet<ThreadId> = task_ids
+            .iter()
+            .filter_map(|id| inner.by_id.get(id).map(|task| task.thread_id.clone()))
+            .collect();
+        let mut fenced_threads = HashSet::new();
+        for thread_id in candidate_threads {
+            let is_fenced = sink
+                .thread_store
+                .get(&thread_id)
+                .await?
+                .is_some_and(|thread| thread.status.is_purge_fenced());
+            if is_fenced {
+                fenced_threads.insert(thread_id);
+            }
+        }
+        Ok(fenced_threads)
+    }
+
     /// The marker this candidate already carries on its thread, if any.
     ///
     /// Keyed on the marker's emitter — the cancelled root's own task id —
@@ -2727,7 +2844,7 @@ impl Inner {
             .context("fail_row_closed: fail_with_reason transition failed")?;
         self.rebalance_after_row_change(old, &failed);
         self.by_id.insert(failed.id.clone(), failed.clone());
-        let _ = self.propagate_terminal_child_transition(&failed, now, "fail_row_closed")?;
+        let _ = self.propagate_terminal_child_transition(&failed, now, "fail_row_closed", false)?;
         Ok(())
     }
 
@@ -2824,6 +2941,7 @@ impl Inner {
         id: &AgentTaskId,
         reason: TerminalReason,
         now: OffsetDateTime,
+        suppress_root_promotion: bool,
     ) -> Result<bool> {
         let Some(old) = self.by_id.get(id).cloned() else {
             return Ok(false);
@@ -2837,8 +2955,32 @@ impl Inner {
             .context("cancel_tree: cancel transition failed")?;
         self.rebalance_after_row_change(&old, &cancelled);
         self.by_id.insert(cancelled.id.clone(), cancelled.clone());
-        let _ = self.propagate_terminal_child_transition(&cancelled, now, "cancel_tree")?;
+        let _ = self.propagate_terminal_child_transition(
+            &cancelled,
+            now,
+            "cancel_tree",
+            suppress_root_promotion,
+        )?;
         Ok(true)
+    }
+
+    fn cancel_rows(
+        &mut self,
+        to_cancel: Vec<(AgentTaskId, TerminalReason)>,
+        fenced_threads: &HashSet<ThreadId>,
+        now: OffsetDateTime,
+    ) -> Result<Vec<AgentTaskId>> {
+        let mut transitioned = Vec::with_capacity(to_cancel.len());
+        for (id, reason) in to_cancel {
+            let suppress_root_promotion = self
+                .by_id
+                .get(&id)
+                .is_some_and(|task| fenced_threads.contains(&task.thread_id));
+            if self.cancel_row_in_place(&id, reason, now, suppress_root_promotion)? {
+                transitioned.push(id);
+            }
+        }
+        Ok(transitioned)
     }
 
     /// Drive a terminal child transition (complete / fail) and, under
@@ -2893,7 +3035,8 @@ impl Inner {
         self.rebalance_after_row_change(&old_child, &new_child);
         self.by_id.insert(new_child.id.clone(), new_child.clone());
 
-        let parent = self.propagate_terminal_child_transition(&new_child, now, error_prefix)?;
+        let parent =
+            self.propagate_terminal_child_transition(&new_child, now, error_prefix, false)?;
 
         Ok((new_child, parent))
     }
@@ -2903,6 +3046,7 @@ impl Inner {
         new_child: &AgentTask,
         now: OffsetDateTime,
         error_prefix: &'static str,
+        suppress_root_promotion: bool,
     ) -> Result<Option<AgentTask>> {
         // Phase 2.6 recompute: the parent's counter is derived from
         // the `by_parent` index so a double-complete or a dropped
@@ -2933,7 +3077,10 @@ impl Inner {
             } else {
                 Ok(Some(old_parent))
             }
-        } else if new_child.kind == TaskKind::RootTurn && new_child.is_root() {
+        } else if new_child.kind == TaskKind::RootTurn
+            && new_child.is_root()
+            && !suppress_root_promotion
+        {
             // A terminal root turn frees the thread's active-root slot.
             // Promote the next queued FIFO head in the SAME locked scope
             // as the terminal transition so a queued root can never be
@@ -3432,6 +3579,13 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         validate_submit_root_shape(&task)?;
 
         let mut inner = self.inner.write().await;
+        // The fence check runs INSIDE the admission critical section: a
+        // purge landing between a pre-lock check and the insert below
+        // would otherwise be missed. The durable backends get this for
+        // free from their transactions; this keeps the in-memory spec
+        // honest.
+        self.require_thread_active(&task.thread_id, super::thread::ThreadOperation::Submit)
+            .await?;
 
         if inner.by_id.contains_key(&task.id) {
             let id = &task.id;
@@ -3481,7 +3635,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             max_queued_depth,
             disposition,
         } = params;
-        validate_submit_root_shape(&task)?;
+        self.validate_submit_admission(&task).await?;
 
         // Everything below runs under a single write lock so the
         // idempotency claim, the queue-depth check, and the admission
@@ -3490,29 +3644,9 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         let mut inner = self.inner.write().await;
 
         // 1. Idempotency replay / conflict, checked before any write.
-        if let Some(claim) = &idempotency
-            && let Some(record) = inner.idempotency.get(&claim.request_id)
-        {
-            if record.kind != IdempotencyKind::SubmitWork || record.fingerprint != claim.fingerprint
-            {
-                return Err(SubmitRootTurnError::IdempotencyConflict);
-            }
-            let recorded = record.clone();
-            let task_id = submit_record_task_id(&recorded)?;
-            let admitted = inner
-                .by_id
-                .get(&task_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("idempotent submit record points at missing task"))?;
-            let queued_depth = inner.queued_root_count(&admitted.thread_id);
+        if let Some(outcome) = Self::replay_submit(&inner, idempotency.as_ref())? {
             drop(inner);
-            return Ok(SubmitRootTurnOutcome {
-                disposition: submitted_task_disposition(&admitted),
-                task: admitted,
-                replayed: true,
-                replayed_result: Some(recorded.result_json),
-                queued_depth,
-            });
+            return Ok(outcome);
         }
 
         if inner.by_id.contains_key(&task.id) {
@@ -3667,6 +3801,8 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         thread_id: &ThreadId,
         now: OffsetDateTime,
     ) -> Result<Option<AgentTask>> {
+        self.require_thread_active(thread_id, super::thread::ThreadOperation::Promote)
+            .await?;
         let mut inner = self.inner.write().await;
         let promoted = inner.promote_next_queued_root_locked(thread_id, now)?;
         drop(inner);
@@ -3681,6 +3817,14 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         expires_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<Option<AgentTask>> {
+        let thread_id = {
+            let inner = self.inner.read().await;
+            inner.by_id.get(id).map(|task| task.thread_id.clone())
+        };
+        if let Some(thread_id) = thread_id {
+            self.require_thread_active(&thread_id, super::thread::ThreadOperation::Acquire)
+                .await?;
+        }
         let mut inner = self.inner.write().await;
         let Some(old) = inner.by_id.get(id).cloned() else {
             return Ok(None);
@@ -3746,14 +3890,26 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         // the kind and never accidentally lease a waiting / terminal
         // / queued row (those statuses are absent from the index by
         // construction).
+        // Scan the runnable rows in FIFO order, SKIPPING rows whose
+        // thread is mid-purge instead of erroring: one fenced thread's
+        // oldest pending row must never stall every other thread's
+        // acquires (the purge cancels those rows itself). The fence
+        // check runs under the same write lock as the claim, so a purge
+        // cannot slip between screening and acquisition.
         let mut inner = self.inner.write().await;
-        let result = loop {
-            let Some((_, id)) = inner.runnable_by_created_at.iter().next().cloned() else {
-                break None;
-            };
+        let candidates: Vec<_> = inner
+            .runnable_by_created_at
+            .iter()
+            .map(|(_, id)| id.clone())
+            .collect();
+        let mut result = None;
+        for id in candidates {
             let old = inner.by_id.get(&id).cloned().ok_or_else(|| {
                 anyhow!("acquire_next_runnable: runnable head {id} missing from by_id")
             })?;
+            if self.thread_is_fenced(&old.thread_id).await? {
+                continue;
+            }
             // Defense in depth: the index should only contain
             // `Pending` rows. A non-runnable row here is an internal
             // bookkeeping bug.
@@ -3774,7 +3930,8 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                         )?;
                     inner.rebalance_after_row_change(&old, &claimed);
                     inner.by_id.insert(claimed.id.clone(), claimed.clone());
-                    break Some(claimed);
+                    result = Some(claimed);
+                    break;
                 }
                 RecoveryAction::FailClosed(reason) => {
                     // Fail the exhausted head closed and keep
@@ -3790,7 +3947,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                     ));
                 }
             }
-        };
+        }
         drop(inner);
         Ok(result)
     }
@@ -4199,43 +4356,12 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         if specs.is_empty() {
             return Err(anyhow!("spawn rejected: specs must be non-empty"));
         }
+        self.guard_task_thread(parent_id, super::thread::ThreadOperation::Spawn)
+            .await?;
 
         let mut inner = self.inner.write().await;
 
-        // CAS + structural guards on the parent.
-        let old_parent = inner
-            .by_id
-            .get(parent_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
-        if old_parent.status != TaskStatus::Running {
-            let status = old_parent.status;
-            return Err(anyhow!(
-                "spawn rejected: task {parent_id} is not running (status {status:?})"
-            ));
-        }
-        match &old_parent.worker_id {
-            Some(current) if current == worker => {}
-            _ => {
-                return Err(anyhow!(
-                    "spawn rejected: worker mismatch on task {parent_id}"
-                ));
-            }
-        }
-        match &old_parent.lease_id {
-            Some(current) if current == lease => {}
-            _ => {
-                return Err(anyhow!(
-                    "spawn rejected: lease mismatch on task {parent_id}"
-                ));
-            }
-        }
-        if old_parent.kind.is_leaf() {
-            let parent_kind = old_parent.kind;
-            return Err(anyhow!(
-                "spawn rejected: parent {parent_id} is a leaf kind ({parent_kind:?}) and cannot spawn children"
-            ));
-        }
+        let old_parent = inner.validate_running_owned_non_leaf_parent(parent_id, worker, lease)?;
 
         // Build every child row **before** mutating any index so a
         // schema error on child N rolls back the whole batch cleanly.
@@ -4303,7 +4429,6 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         spawn: SubagentInvocationSpawn,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, AgentTask, AgentTask)> {
-        let mut inner = self.inner.write().await;
         let SubagentInvocationSpawn {
             child_thread_id,
             spec,
@@ -4312,40 +4437,13 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             payload,
             child_caller_metadata,
         } = spawn;
+        self.guard_task_thread(parent_id, super::thread::ThreadOperation::Spawn)
+            .await?;
+        self.require_thread_active(&child_thread_id, super::thread::ThreadOperation::Spawn)
+            .await?;
+        let mut inner = self.inner.write().await;
 
-        let old_parent = inner
-            .by_id
-            .get(parent_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
-        if old_parent.status != TaskStatus::Running {
-            let status = old_parent.status;
-            return Err(anyhow!(
-                "spawn rejected: task {parent_id} is not running (status {status:?})"
-            ));
-        }
-        match &old_parent.worker_id {
-            Some(current) if current == worker => {}
-            _ => {
-                return Err(anyhow!(
-                    "spawn rejected: worker mismatch on task {parent_id}"
-                ));
-            }
-        }
-        match &old_parent.lease_id {
-            Some(current) if current == lease => {}
-            _ => {
-                return Err(anyhow!(
-                    "spawn rejected: lease mismatch on task {parent_id}"
-                ));
-            }
-        }
-        if old_parent.kind.is_leaf() {
-            let parent_kind = old_parent.kind;
-            return Err(anyhow!(
-                "spawn rejected: parent {parent_id} is a leaf kind ({parent_kind:?}) and cannot spawn children"
-            ));
-        }
+        let old_parent = inner.validate_running_owned_non_leaf_parent(parent_id, worker, lease)?;
 
         if inner.by_thread.contains_key(&child_thread_id)
             || inner.active_root_by_thread.contains_key(&child_thread_id)
@@ -4427,6 +4525,12 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         if spawns.is_empty() {
             return Err(anyhow!("spawn rejected: spawns must be non-empty"));
         }
+        self.guard_task_thread(parent_id, super::thread::ThreadOperation::Spawn)
+            .await?;
+        for child_thread_id in spawns.iter().map(|spawn| &spawn.child_thread_id) {
+            self.require_thread_active(child_thread_id, super::thread::ThreadOperation::Spawn)
+                .await?;
+        }
         if events.len() != spawns.len() {
             return Err(anyhow!(
                 "spawn rejected: {} events for {} spawns",
@@ -4496,6 +4600,13 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                 events.len(),
                 subagents.len()
             ));
+        }
+
+        self.guard_task_thread(parent_id, super::thread::ThreadOperation::Spawn)
+            .await?;
+        for child_thread_id in subagents.iter().map(|spawn| &spawn.child_thread_id) {
+            self.require_thread_active(child_thread_id, super::thread::ThreadOperation::Spawn)
+                .await?;
         }
 
         let mut inner = self.inner.write().await;
@@ -4753,6 +4864,9 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             to_cancel.push((id, reason));
         }
 
+        let cancel_ids: Vec<AgentTaskId> = to_cancel.iter().map(|(id, _)| id.clone()).collect();
+        let fenced_threads = self.fenced_threads_for_cancel(&inner, &cancel_ids).await?;
+
         // The whole marker set is journaled BEFORE any row flips, while
         // STILL holding the task-store write lock.
         //
@@ -4791,12 +4905,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
 
         // The transitions: pure, synchronous, no await. Once the markers
         // are durable nothing can interrupt the flips they describe.
-        let mut transitioned = Vec::with_capacity(to_cancel.len());
-        for (id, reason) in to_cancel {
-            if inner.cancel_row_in_place(&id, reason, now)? {
-                transitioned.push(id);
-            }
-        }
+        let transitioned = inner.cancel_rows(to_cancel, &fenced_threads, now)?;
 
         drop(inner);
         Ok(CancelTreeOutcome {
@@ -5852,6 +5961,220 @@ mod tests {
                 .context("queued")?
                 .is_empty()
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn acquire_skips_the_fenced_head_and_claims_the_next_thread() -> Result<()> {
+        // c1 regression: the OLDEST pending row belonging to a mid-purge
+        // thread must be SKIPPED, never allowed to stall every worker's
+        // acquire for every other thread.
+        let fenced_thread = thread("t-acquire-fenced");
+        let live_thread = thread("t-acquire-live");
+        let threads = Arc::new(crate::journal::thread_store::InMemoryThreadStore::new());
+        let _ = threads.get_or_create(&fenced_thread, t0()).await?;
+        let _ = threads.get_or_create(&live_thread, t0()).await?;
+        let events = Arc::new(crate::journal::event_repository::InMemoryEventRepository::new());
+        let outbox = Arc::new(crate::journal::outbox::InMemoryOutboxStore::new());
+        let store =
+            InMemoryAgentTaskStore::new().with_cancellation_markers(CancellationMarkerSink {
+                event_repo: events,
+                outbox_store: outbox,
+                thread_store: threads.clone(),
+            });
+        let fenced_root = AgentTask::new_root_turn(fenced_thread.clone(), t0(), 3);
+        let fenced_root_id = fenced_root.id.clone();
+        let live_root = AgentTask::new_root_turn(live_thread.clone(), t_plus(1), 3);
+        let live_root_id = live_root.id.clone();
+        let _ = store.submit_root_turn(fenced_root).await?;
+        let _ = store.submit_root_turn(live_root).await?;
+        let _ = threads
+            .begin_purge(
+                &fenced_thread,
+                crate::journal::PurgeScope::Thread,
+                t_plus(2),
+            )
+            .await?;
+
+        let claimed = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w-skip"),
+                LeaseId::from_string("l-skip"),
+                t_plus(600),
+                t_plus(3),
+            )
+            .await?
+            .context("acquire must claim the live thread's root, not error")?;
+        assert_eq!(
+            claimed.id, live_root_id,
+            "the fenced head must be skipped, not claimed and not fatal",
+        );
+
+        // Nothing else is claimable: the fenced row is skipped (still
+        // Pending for the purge's own cancel), not failed.
+        let none = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w-skip-2"),
+                LeaseId::from_string("l-skip-2"),
+                t_plus(600),
+                t_plus(4),
+            )
+            .await?;
+        assert!(none.is_none(), "only the fenced row remains, got {none:?}");
+        let fenced_after = store
+            .get(&fenced_root_id)
+            .await?
+            .context("fenced root row must survive")?;
+        assert_eq!(
+            fenced_after.status,
+            TaskStatus::Pending,
+            "the fenced row is left for the purge to cancel",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn every_admission_method_is_refused_on_deleting_and_deleted_threads() -> Result<()> {
+        // The card's AC4, against REAL store admission methods rather
+        // than the pure predicate: submit / spawn / promote / acquire
+        // must refuse for both fenced states, and succeed when active.
+        for target in [
+            crate::journal::thread::ThreadStatus::Deleting,
+            crate::journal::thread::ThreadStatus::Deleted,
+        ] {
+            let thread_id = thread(&format!("t-admission-{target:?}"));
+            let threads = Arc::new(crate::journal::thread_store::InMemoryThreadStore::new());
+            let _ = threads.get_or_create(&thread_id, t0()).await?;
+            let events = Arc::new(crate::journal::event_repository::InMemoryEventRepository::new());
+            let outbox = Arc::new(crate::journal::outbox::InMemoryOutboxStore::new());
+            let store =
+                InMemoryAgentTaskStore::new().with_cancellation_markers(CancellationMarkerSink {
+                    event_repo: events,
+                    outbox_store: outbox,
+                    thread_store: threads.clone(),
+                });
+
+            // A running root + a queued successor exist BEFORE the fence
+            // so promote/spawn/acquire have live rows to act on.
+            let root = AgentTask::new_root_turn(thread_id.clone(), t0(), 3);
+            let root_id = root.id.clone();
+            let _ = store.submit_root_turn(root).await?;
+            let queued = AgentTask::new_root_turn(thread_id.clone(), t_plus(1), 3);
+            let _ = store.submit_root_turn(queued).await?;
+            let worker = WorkerId::from_string("w-adm");
+            let lease = LeaseId::from_string("l-adm");
+            let running = store
+                .try_acquire_task(
+                    &root_id,
+                    worker.clone(),
+                    lease.clone(),
+                    t_plus(600),
+                    t_plus(2),
+                )
+                .await?
+                .context("acquire admission root")?;
+
+            let _ = threads
+                .begin_purge(&thread_id, crate::journal::PurgeScope::Thread, t_plus(3))
+                .await?;
+            if target == crate::journal::thread::ThreadStatus::Deleted {
+                let receipt = crate::journal::thread::PurgeReceipt {
+                    root_thread_id: thread_id.clone(),
+                    scope: crate::journal::PurgeScope::Thread,
+                    purged_thread_ids: vec![thread_id.clone()],
+                    cancelled_task_ids: Vec::new(),
+                    started_at: t_plus(3),
+                    completed_at: t_plus(4),
+                };
+                let _ = threads.finish_purge(&thread_id, &receipt).await?;
+            }
+
+            // Submit — a brand-new root is refused.
+            let refused = store
+                .submit_root_turn(AgentTask::new_root_turn(thread_id.clone(), t_plus(5), 3))
+                .await;
+            assert!(refused.is_err(), "submit must refuse on {target:?}");
+
+            // Spawn — children under the still-running root are refused.
+            let spawn = store
+                .spawn_tool_children(
+                    &root_id,
+                    &worker,
+                    &lease,
+                    vec![ChildSpawnSpec::new(2)],
+                    SuspensionPayload {
+                        continuation: sample_continuation("t-admission"),
+                        suspended_messages: Vec::new(),
+                    },
+                    None,
+                    t_plus(5),
+                )
+                .await;
+            assert!(spawn.is_err(), "spawn must refuse on {target:?}");
+
+            // Promote — the queued successor must not be promoted.
+            let promote = store.promote_next_queued_root(&thread_id, t_plus(5)).await;
+            assert!(promote.is_err(), "promote must refuse on {target:?}");
+
+            // Acquire — the fenced thread's rows are invisible to the
+            // scan (skipped, not fatal).
+            drop(running);
+            let acquired = store
+                .acquire_next_runnable(
+                    WorkerId::from_string("w-adm-2"),
+                    LeaseId::from_string("l-adm-2"),
+                    t_plus(600),
+                    t_plus(6),
+                )
+                .await?;
+            assert!(
+                acquired.is_none(),
+                "acquire must skip every row on {target:?}, got {acquired:?}",
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_tree_on_fenced_thread_does_not_promote_queued_root() -> Result<()> {
+        let thread_id = thread("t-fenced-cancel");
+        let threads = Arc::new(crate::journal::thread_store::InMemoryThreadStore::new());
+        let _ = threads.get_or_create(&thread_id, t0()).await?;
+        let events = Arc::new(crate::journal::event_repository::InMemoryEventRepository::new());
+        let outbox = Arc::new(crate::journal::outbox::InMemoryOutboxStore::new());
+        let store =
+            InMemoryAgentTaskStore::new().with_cancellation_markers(CancellationMarkerSink {
+                event_repo: events,
+                outbox_store: outbox,
+                thread_store: threads.clone(),
+            });
+        let first = AgentTask::new_root_turn(thread_id.clone(), t0(), 3);
+        let second = AgentTask::new_root_turn(thread_id.clone(), t_plus(1), 3);
+        let _ = store.submit_root_turn(first.clone()).await?;
+        let queued = store.submit_root_turn(second.clone()).await?;
+        assert_eq!(queued.status, TaskStatus::Queued);
+
+        let _ = threads
+            .begin_purge(&thread_id, crate::journal::PurgeScope::Thread, t_plus(2))
+            .await?;
+        let outcome = store.cancel_tree(&first.id, t_plus(3)).await?;
+        assert_eq!(outcome.transitioned, vec![first.id]);
+
+        let successor = store
+            .get(&second.id)
+            .await?
+            .context("queued successor must survive first cancellation")?;
+        assert_eq!(successor.status, TaskStatus::Queued);
+        assert!(store.active_root_for_thread(&thread_id).await?.is_none());
+
+        let Err(error) = store.promote_next_queued_root(&thread_id, t_plus(4)).await else {
+            anyhow::bail!("direct promotion unexpectedly crossed deletion fence");
+        };
+        let conflict = error
+            .downcast_ref::<crate::journal::ThreadStateConflict>()
+            .context("promotion rejection must remain typed")?;
+        assert_eq!(conflict.status, crate::journal::ThreadStatus::Deleting);
+        assert_eq!(conflict.operation, crate::journal::ThreadOperation::Promote);
         Ok(())
     }
 

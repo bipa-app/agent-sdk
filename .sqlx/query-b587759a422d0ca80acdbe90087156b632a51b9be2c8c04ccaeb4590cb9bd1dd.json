@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\nSELECT\n    thread_id,\n    status,\n    committed_turns,\n    total_input_tokens,\n    total_output_tokens,\n    created_at,\n    updated_at\nFROM agent_sdk_threads\nWHERE thread_id = $1\n",
+  "query": "\nSELECT\n    thread_id,\n    status,\n    committed_turns,\n    total_input_tokens,\n    total_output_tokens,\n    created_at,\n    updated_at,\n    purge_receipt_json\nFROM agent_sdk_threads\nWHERE thread_id = $1\n",
   "describe": {
     "columns": [
       {
@@ -79,6 +79,17 @@
             "name": "updated_at"
           }
         }
+      },
+      {
+        "ordinal": 7,
+        "name": "purge_receipt_json",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_threads",
+            "name": "purge_receipt_json"
+          }
+        }
       }
     ],
     "parameters": {
@@ -93,8 +104,9 @@
       false,
       false,
       false,
-      false
+      false,
+      true
     ]
   },
-  "hash": "93d4d7aeb2608a1000695af2eff5b14ff7e4dc148466fa4c5418628181453ee9"
+  "hash": "b587759a422d0ca80acdbe90087156b632a51b9be2c8c04ccaeb4590cb9bd1dd"
 }

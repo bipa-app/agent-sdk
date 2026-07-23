@@ -3,6 +3,7 @@ syntax = "proto3";
 package agent.service.v1;
 
 import "agent/service/v1/common.proto";
+import "google/protobuf/timestamp.proto";
 
 // Unary control and inspection surface for threads, tasks, committed
 // transcript snapshots, and durable confirmations.
@@ -352,6 +353,34 @@ message CancelTaskResponse {
   uint32 cancelled_count = 2;
 }
 
+// Whether purge fences only the named thread or every child thread reachable
+// through durable subagent-invocation links.
+enum PurgeScope {
+  PURGE_SCOPE_UNSPECIFIED = 0;
+  PURGE_SCOPE_THREAD = 1;
+  PURGE_SCOPE_INVOCATION_TREE = 2;
+}
+
+message PurgeThreadRequest {
+  string thread_id = 1;
+  PurgeScope scope = 2;
+}
+
+// Durable proof of a completed purge. The same receipt is returned for every
+// idempotent retry, including retries after process restart.
+message PurgeReceipt {
+  string root_thread_id = 1;
+  PurgeScope scope = 2;
+  repeated string purged_thread_ids = 3;
+  repeated string cancelled_task_ids = 4;
+  google.protobuf.Timestamp started_at = 5;
+  google.protobuf.Timestamp completed_at = 6;
+}
+
+message PurgeThreadResponse {
+  PurgeReceipt receipt = 1;
+}
+
 service AgentControlService {
   // Allocate a new active thread and return its committed snapshot.
   rpc CreateThread(CreateThreadRequest) returns (CreateThreadResponse);
@@ -389,4 +418,9 @@ service AgentControlService {
   // subtree via the durable cancellation-tree transition. Interior
   // (non-root) task ids are rejected; see `CancelTaskRequest`.
   rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
+
+  // Permanently fence a thread, cancel its live work, and retain a tombstone.
+  // Invocation-tree scope also fences descendant threads and completes them
+  // bottom-up after cancellation.
+  rpc PurgeThread(PurgeThreadRequest) returns (PurgeThreadResponse);
 }
