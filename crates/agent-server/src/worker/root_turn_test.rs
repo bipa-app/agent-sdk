@@ -9,8 +9,8 @@ use super::root_turn::{
     PartialCancelCommit, RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes, cancel_root_turn,
     commit_partial_turn_on_cancel, derive_reattach_tool_use_id, drain_boundary_injections,
     execute_root_turn, fail_root_turn, is_root_turn_cancelled, provider_valid_split,
-    resume_for_steering, resume_from_children, resume_root_turn, revert_steering_wake,
-    settle_attempt_after_lost_ownership, terminal_reason_for_root_error,
+    resume_for_steering, resume_from_children, resume_from_question, resume_root_turn,
+    revert_steering_wake, settle_attempt_after_lost_ownership, terminal_reason_for_root_error,
 };
 use crate::journal::checkpoint::CheckpointKind;
 use std::sync::Arc;
@@ -45,7 +45,8 @@ use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, Role, StopReason, Tool, Usage,
 };
 use agent_sdk_foundation::{
-    AgentContinuation, AgentState, ContinuationEnvelope, TerminalReason, ThreadId, TokenUsage,
+    AgentContinuation, AgentState, ContinuationEnvelope, QuestionAnswer, TerminalReason, ThreadId,
+    TokenUsage,
 };
 use agent_sdk_providers::LlmProvider;
 use agent_sdk_providers::streaming::{StreamBox, StreamDelta, StreamErrorKind};
@@ -8841,6 +8842,112 @@ impl LlmProvider for SecondWaveProvider<'_> {
     }
 }
 
+/// A first call that answers in text lets the boundary loop drain an
+/// injection; the second call requests a tool, so the turn suspends.
+struct TextThenToolProvider<'a> {
+    stores: &'a TestStores,
+    call_count: AtomicUsize,
+}
+
+#[async_trait]
+impl LlmProvider for TextThenToolProvider<'_> {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            submit_boundary_injection(self.stores, "mid-turn steer")
+                .await
+                .map_err(|error| anyhow::anyhow!("mid-call submit: {error}"))?;
+            return Ok(ChatOutcome::Success(ChatResponse {
+                id: "msg_text".into(),
+                content: vec![ContentBlock::Text {
+                    text: "first answer".into(),
+                }],
+                model: "mock-model".into(),
+                stop_reason: Some(StopReason::EndTurn),
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                },
+            }));
+        }
+        Ok(ChatOutcome::Success(ChatResponse {
+            id: "msg_tool".into(),
+            content: vec![ContentBlock::ToolUse {
+                id: "call_after_injection".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+                thought_signature: None,
+            }],
+            model: "mock-model".into(),
+            stop_reason: Some(StopReason::ToolUse),
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+        }))
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
+/// A tool suspension AFTER a boundary injection must park the staged
+/// prefix (first exchange + injected input) in `suspended_messages` —
+/// dropping it resumes the turn with the injection missing from the
+/// model's view.
+#[tokio::test]
+async fn tool_suspension_after_injection_parks_the_staged_prefix() -> Result<()> {
+    let stores = TestStores::new();
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let provider = TextThenToolProvider {
+        stores: &stores,
+        call_count: AtomicUsize::new(0),
+    };
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap_with_tools(task),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let outcome = execute_root_turn(
+        inputs,
+        "original prompt",
+        &provider,
+        &stores.deps(),
+        t_plus(2),
+    )
+    .await?;
+    assert!(matches!(outcome, RootTurnOutcome::Suspended { .. }));
+
+    let suspended = stores
+        .tasks
+        .get(&task_id)
+        .await?
+        .context("suspended root row")?;
+    let parked = serde_json::to_string(suspended.state.suspended_messages())?;
+    assert!(
+        parked.contains("first answer"),
+        "the pre-injection assistant text must ride the suspension, got: {parked}",
+    );
+    assert!(
+        parked.contains("mid-turn steer"),
+        "the injected input must ride the suspension, got: {parked}",
+    );
+    Ok(())
+}
+
 /// Count `UserInput` events emitted by `emitter` in the thread journal.
 async fn injected_user_input_events(stores: &TestStores, emitter: &AgentTaskId) -> Result<usize> {
     Ok(stores
@@ -9076,5 +9183,500 @@ async fn a_boundary_injection_journals_one_turn_and_bills_every_call() -> Result
         "every call in the turn contributes its consolidated Text event",
     );
 
+    Ok(())
+}
+
+async fn suspend_durable_question(stores: &TestStores) -> Result<AgentTask> {
+    let provider = MockToolCallProvider::single(
+        "question-call-1",
+        "ask_user",
+        serde_json::json!({
+            "question": "Which environment?",
+            "header": "Deploy target",
+            "options": [
+                {"label": "Staging", "description": "Safe validation"},
+                {"label": "Production"}
+            ],
+            "multi_select": false
+        }),
+    );
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let outcome = execute_root_turn(
+        inputs,
+        "deploy the service",
+        &provider,
+        &stores.deps(),
+        t_plus(1),
+    )
+    .await?;
+    let RootTurnOutcome::Suspended {
+        parent_task,
+        child_tasks,
+        ..
+    } = outcome
+    else {
+        bail!("ask_user must suspend the root turn")
+    };
+    assert!(
+        child_tasks.is_empty(),
+        "ask_user must not spawn a mailbox child"
+    );
+    Ok(parent_task)
+}
+
+fn staging_answer() -> Vec<QuestionAnswer> {
+    vec![QuestionAnswer {
+        tool_call_id: "question-call-1".into(),
+        answer: "Staging".into(),
+    }]
+}
+
+#[tokio::test]
+async fn ask_user_is_durable_and_emitted_exactly_once() -> Result<()> {
+    let stores = TestStores::new();
+    let parent = suspend_durable_question(&stores).await?;
+    assert_eq!(parent.status, TaskStatus::AwaitingQuestion);
+    let questions = parent
+        .state
+        .questions()
+        .context("durable question payload")?;
+    let [question] = questions else {
+        bail!("expected exactly one parked question, got {questions:?}");
+    };
+    assert_eq!(question.tool_call_id, "question-call-1");
+    assert_eq!(question.question, "Which environment?");
+    assert_eq!(question.header.as_deref(), Some("Deploy target"));
+    assert_eq!(question.options.len(), 2);
+    assert!(!question.multi_select);
+
+    let events = stores.events.get_events(&thread_a()).await?;
+    let asked: Vec<_> = events
+        .iter()
+        .filter_map(|committed| {
+            if let agent_sdk_foundation::AgentEvent::QuestionAsked { task_id, questions } =
+                &committed.event
+            {
+                Some((task_id, questions))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(asked.len(), 1, "one stream question batch per ask");
+    assert_eq!(asked[0].0, parent.id.as_str());
+    assert_eq!(asked[0].1.as_slice(), questions);
+    Ok(())
+}
+
+#[tokio::test]
+async fn answer_question_is_idempotent_and_conflict_typed() -> Result<()> {
+    let stores = TestStores::new();
+    let parent = suspend_durable_question(&stores).await?;
+    let first = stores
+        .tasks
+        .answer_question(&parent.id, "answer-request-1", staging_answer(), t_plus(2))
+        .await?;
+    let replay = stores
+        .tasks
+        .answer_question(&parent.id, "answer-request-1", staging_answer(), t_plus(3))
+        .await?;
+    assert_eq!(first.status, TaskStatus::Pending);
+    assert_eq!(
+        serde_json::to_value(&first)?,
+        serde_json::to_value(&replay)?,
+        "same answer must return the original durable receipt state",
+    );
+
+    let result = stores
+        .tasks
+        .answer_question(
+            &parent.id,
+            "answer-request-2",
+            vec![QuestionAnswer {
+                tool_call_id: "question-call-1".into(),
+                answer: "Production".into(),
+            }],
+            t_plus(4),
+        )
+        .await;
+    let error = result.err().context("different answer must conflict")?;
+    assert!(
+        error
+            .downcast_ref::<crate::journal::store::QuestionAnswerConflict>()
+            .is_some(),
+        "different answer must surface QuestionAnswerConflict: {error:#}",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn answer_question_rejects_partial_and_unknown_batches() -> Result<()> {
+    let stores = TestStores::new();
+    let parent = suspend_durable_question(&stores).await?;
+
+    let partial = stores
+        .tasks
+        .answer_question(&parent.id, "answer-partial", Vec::new(), t_plus(2))
+        .await;
+    let error = partial.err().context("empty batch must be rejected")?;
+    let mismatch = error
+        .downcast_ref::<crate::journal::store::QuestionAnswerMismatch>()
+        .context("empty batch must surface QuestionAnswerMismatch")?;
+    assert_eq!(mismatch.missing, vec!["question-call-1".to_string()]);
+
+    let stray = stores
+        .tasks
+        .answer_question(
+            &parent.id,
+            "answer-stray",
+            vec![
+                QuestionAnswer {
+                    tool_call_id: "question-call-1".into(),
+                    answer: "Staging".into(),
+                },
+                QuestionAnswer {
+                    tool_call_id: "question-call-9".into(),
+                    answer: "Blue".into(),
+                },
+            ],
+            t_plus(3),
+        )
+        .await;
+    let error = stray.err().context("stray id must be rejected")?;
+    let mismatch = error
+        .downcast_ref::<crate::journal::store::QuestionAnswerMismatch>()
+        .context("stray id must surface QuestionAnswerMismatch")?;
+    assert_eq!(mismatch.unknown, vec!["question-call-9".to_string()]);
+
+    let untouched = stores
+        .tasks
+        .get(&parent.id)
+        .await?
+        .context("task must survive rejected batches")?;
+    assert_eq!(
+        untouched.status,
+        TaskStatus::AwaitingQuestion,
+        "rejected batches must not mutate the parked task",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn persisted_question_answer_survives_reacquire_without_reasking() -> Result<()> {
+    let stores = TestStores::new();
+    let parent = suspend_durable_question(&stores).await?;
+    let answered = stores
+        .tasks
+        .answer_question(
+            &parent.id,
+            "answer-crash-receipt",
+            staging_answer(),
+            t_plus(2),
+        )
+        .await?;
+    assert!(matches!(answered.state, TaskState::AnsweredQuestion { .. }));
+
+    // This reacquisition is the boot boundary after a process dies after the
+    // answer commit but before it starts the resume LLM call.
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent.id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(100),
+            t_plus(3),
+        )
+        .await?
+        .context("answered task was not reacquired on boot")?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(acquired.clone()),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(3),
+    )
+    .await?;
+    let provider = MockTextProvider::new("deploying to staging");
+    let outcome =
+        resume_from_question(inputs, &acquired, &provider, &stores.deps(), t_plus(4)).await?;
+    assert!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+
+    let history = stores.messages.get_history(&thread_a()).await?;
+    assert!(
+        history.iter().any(|message| matches!(
+            &message.content,
+            agent_sdk_foundation::llm::Content::Blocks(blocks)
+                if blocks.iter().any(|block| matches!(
+                    block,
+                    ContentBlock::ToolResult { tool_use_id, content, .. }
+                        if tool_use_id == "question-call-1" && content == "User answered: Staging"
+                ))
+        )),
+        "persisted answer was not applied to the resumed turn"
+    );
+    let question_count = stores
+        .events
+        .get_events(&thread_a())
+        .await?
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event,
+                agent_sdk_foundation::AgentEvent::QuestionAsked { .. }
+            )
+        })
+        .count();
+    assert_eq!(question_count, 1, "boot resume must never re-ask");
+    Ok(())
+}
+
+/// Park a root turn on TWO `ask_user` calls issued in one assistant
+/// response and assert the whole batch parked in pending order.
+async fn suspend_two_question_batch(stores: &TestStores) -> Result<AgentTask> {
+    let provider = MockToolCallProvider::new(vec![
+        (
+            "question-call-1".into(),
+            "ask_user".into(),
+            serde_json::json!({"question": "Which environment?"}),
+        ),
+        (
+            "question-call-2".into(),
+            "ask_user".into(),
+            serde_json::json!({"question": "Blue or green rollout?"}),
+        ),
+    ]);
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let outcome = execute_root_turn(
+        inputs,
+        "deploy the service",
+        &provider,
+        &stores.deps(),
+        t_plus(1),
+    )
+    .await?;
+    let RootTurnOutcome::Suspended { parent_task, .. } = outcome else {
+        bail!("a batch of ask_user calls must suspend the root turn")
+    };
+    assert_eq!(parent_task.status, TaskStatus::AwaitingQuestion);
+    let questions = parent_task
+        .state
+        .questions()
+        .context("durable question batch")?;
+    assert_eq!(
+        questions
+            .iter()
+            .map(|q| q.tool_call_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["question-call-1", "question-call-2"],
+        "every pending ask_user must park in pending order",
+    );
+    Ok(parent_task)
+}
+
+#[tokio::test]
+async fn batched_ask_user_parks_once_and_one_answer_call_resumes_all() -> Result<()> {
+    let stores = TestStores::new();
+    let parent_task = suspend_two_question_batch(&stores).await?;
+
+    // Answering only one question must be rejected and change nothing.
+    let partial = stores
+        .tasks
+        .answer_question(
+            &parent_task.id,
+            "batch-receipt",
+            vec![QuestionAnswer {
+                tool_call_id: "question-call-1".into(),
+                answer: "Staging".into(),
+            }],
+            t_plus(2),
+        )
+        .await;
+    assert!(
+        partial.is_err(),
+        "a partial answer batch must not make the task runnable",
+    );
+
+    // The whole batch in ONE call makes the task runnable.
+    let answered = stores
+        .tasks
+        .answer_question(
+            &parent_task.id,
+            "batch-receipt",
+            vec![
+                QuestionAnswer {
+                    tool_call_id: "question-call-1".into(),
+                    answer: "Staging".into(),
+                },
+                QuestionAnswer {
+                    tool_call_id: "question-call-2".into(),
+                    answer: "Blue".into(),
+                },
+            ],
+            t_plus(3),
+        )
+        .await?;
+    assert_eq!(answered.status, TaskStatus::Pending);
+
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &answered.id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(100),
+            t_plus(4),
+        )
+        .await?
+        .context("answered batch was not reacquired")?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(acquired.clone()),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(4),
+    )
+    .await?;
+    let resume_provider = MockTextProvider::new("rolling out to staging as blue");
+    let outcome = resume_from_question(
+        inputs,
+        &acquired,
+        &resume_provider,
+        &stores.deps(),
+        t_plus(5),
+    )
+    .await?;
+    assert!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+
+    let history = stores.messages.get_history(&thread_a()).await?;
+    for (id, expected) in [
+        ("question-call-1", "User answered: Staging"),
+        ("question-call-2", "User answered: Blue"),
+    ] {
+        assert!(
+            history.iter().any(|message| matches!(
+                &message.content,
+                agent_sdk_foundation::llm::Content::Blocks(blocks)
+                    if blocks.iter().any(|block| matches!(
+                        block,
+                        ContentBlock::ToolResult { tool_use_id, content, .. }
+                            if tool_use_id == id && content == expected
+                    ))
+            )),
+            "answer for {id} was not applied to the resumed turn",
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn ask_user_mixed_with_real_tools_degrades_to_child_path_not_silently_lost() -> Result<()> {
+    let stores = TestStores::new();
+    let provider = MockToolCallProvider::new(vec![
+        (
+            "question-call-1".into(),
+            "ask_user".into(),
+            serde_json::json!({"question": "Which environment?"}),
+        ),
+        (
+            "tool-call-1".into(),
+            "read_file".into(),
+            serde_json::json!({"path": "deploy.yaml"}),
+        ),
+    ]);
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let outcome = execute_root_turn(
+        inputs,
+        "deploy the service",
+        &provider,
+        &stores.deps(),
+        t_plus(1),
+    )
+    .await?;
+    let RootTurnOutcome::Suspended {
+        parent_task,
+        child_tasks,
+        ..
+    } = outcome
+    else {
+        bail!("a mixed batch must suspend on spawned children")
+    };
+    assert_eq!(
+        parent_task.status,
+        TaskStatus::WaitingOnChildren,
+        "a mixed batch takes the ordinary child-task path",
+    );
+    assert_eq!(
+        child_tasks.len(),
+        2,
+        "both the ask_user and the real tool must spawn as children",
+    );
+    let question_events = stores
+        .events
+        .get_events(&thread_a())
+        .await?
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event,
+                agent_sdk_foundation::AgentEvent::QuestionAsked { .. }
+            )
+        })
+        .count();
+    assert_eq!(
+        question_events, 0,
+        "the degraded path must not emit a durable QuestionAsked",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelling_awaiting_question_settles_root_and_closes_stream() -> Result<()> {
+    let stores = TestStores::new();
+    let parent = suspend_durable_question(&stores).await?;
+    let cancelled = cancel_root_turn(&parent.id, &stores.deps(), t_plus(2)).await?;
+    assert_eq!(cancelled, vec![parent.id.clone()]);
+    let settled = stores
+        .tasks
+        .get(&parent.id)
+        .await?
+        .context("cancelled question task missing")?;
+    assert_eq!(settled.status, TaskStatus::Cancelled);
+    assert!(settled.state.is_none());
+    assert!(
+        stores
+            .events
+            .get_events(&thread_a())
+            .await?
+            .iter()
+            .any(|event| matches!(
+                event.event,
+                agent_sdk_foundation::AgentEvent::Cancelled { .. }
+            ))
+    );
     Ok(())
 }

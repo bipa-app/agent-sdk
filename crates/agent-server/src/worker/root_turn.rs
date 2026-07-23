@@ -38,14 +38,15 @@ use agent_sdk_foundation::audit::AuditProvenance;
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::llm::{self, ChatRequest};
 use agent_sdk_foundation::{
-    AgentContinuation, AgentState, ContinuationEnvelope, PendingToolCallInfo, TerminalReason,
-    TokenUsage, ToolResult, ToolTier,
+    AgentContinuation, AgentState, ContinuationEnvelope, PendingToolCallInfo, QuestionOption,
+    QuestionPayload, TerminalReason, TokenUsage, ToolResult, ToolTier,
 };
 use agent_sdk_providers::LlmProvider;
 use agent_sdk_providers::streaming::{StreamAccumulator, StreamBox, StreamDelta, StreamErrorKind};
 use agent_sdk_tools::stores::{MessageStore, StateStore};
 use anyhow::{Context, Result, bail, ensure};
 use futures::StreamExt;
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -66,7 +67,7 @@ use crate::journal::event_notifier::EventNotifier;
 use crate::journal::event_repository::EventRepository;
 use crate::journal::execution_context::RootWorkerInputs;
 use crate::journal::message_store::MessageProjectionStore;
-use crate::journal::store::AgentTaskStore;
+use crate::journal::store::{AgentTaskStore, QuestionPause};
 use crate::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskStatus, WorkerId,
 };
@@ -1284,8 +1285,11 @@ async fn best_effort_commit_parked_cancel(
     now: OffsetDateTime,
 ) {
     let parked = match task.status {
-        TaskStatus::WaitingOnChildren => true,
-        TaskStatus::Pending => matches!(task.state, TaskState::ReadyToResume { .. }),
+        TaskStatus::WaitingOnChildren | TaskStatus::AwaitingQuestion => true,
+        TaskStatus::Pending => matches!(
+            task.state,
+            TaskState::ReadyToResume { .. } | TaskState::AnsweredQuestion { .. }
+        ),
         _ => false,
     };
     if !parked {
@@ -4863,6 +4867,69 @@ fn build_turn_complete_events(params: TurnCompleteEventsParams<'_>) -> Vec<Agent
 // Tool-boundary suspension (Phase 4.4)
 // ─────────────────────────────────────────────────────────────────────
 
+/// `staged_prefix` leads: when a mid-turn injection ran an extra LLM
+/// call, the earlier exchanges and the injected input live only in the
+/// staged buffer, which the suspension path never drains — omitting
+/// them would resume the turn with the original prompt and the
+/// steering input both missing from the model's view.
+fn initial_suspended_messages(
+    staged_prefix: &[llm::Message],
+    user_input: &super::user_input::UserInput,
+    response: &llm::ChatResponse,
+) -> Vec<llm::Message> {
+    let mut messages = staged_prefix.to_vec();
+    messages.reserve(2);
+    if let Some(user_message) = user_input.clone().into_message() {
+        messages.push(user_message);
+    }
+    messages.push(build_full_assistant_message(response));
+    messages
+}
+
+/// Idempotency guard: re-read the task from the durable store to
+/// detect if a prior worker already completed this suspension (e.g.
+/// our lease expired between `spawn_tool_children` and returning the
+/// result, and another worker re-acquired and completed the flow).
+async fn guard_against_duplicate_suspension(
+    inputs: &RootWorkerInputs,
+    attempt: &TurnAttempt,
+    deps: &RootTurnDeps<'_>,
+    close_ctx: &TurnCloseContext,
+    now: OffsetDateTime,
+) -> Result<()> {
+    let task_id = &inputs.bootstrap.task_id;
+    let current_task = deps
+        .task_store
+        .get(task_id)
+        .await
+        .context("re-read task for suspension idempotency check")?
+        .context("task disappeared during suspension")?;
+
+    if current_task.status == TaskStatus::WaitingOnChildren {
+        // Close the attempt opened at the start of execute_root_turn so it
+        // doesn't remain permanently unclosed in the audit trail. Unlike the
+        // pre-stream synthetic closes (which bill zero because nothing
+        // streamed), this fires AFTER a real LLM call the provider already
+        // billed, so the row records that attempt's own usage — the winning
+        // worker's separate call committed the turn, but this loser's tokens
+        // were billed too and belong on its audit row.
+        close_attempt_with(
+            attempt,
+            TurnAttemptOutcome::Cancelled,
+            &close_ctx.success_usage,
+            Some(&close_ctx.evidence),
+            deps.attempt_store,
+            now,
+        )
+        .await;
+        bail!(
+            "task {task_id} already transitioned to WaitingOnChildren; \
+             skipping duplicate suspension",
+        );
+    }
+    Ok(())
+}
+
 /// Suspend execution at the tool boundary.
 ///
 /// Called when the LLM response contains tool-use blocks. This path:
@@ -4887,40 +4954,7 @@ async fn suspend_at_tool_boundary(
     close_ctx: TurnCloseContext,
 ) -> Result<RootTurnOutcome> {
     let task_id = &inputs.bootstrap.task_id;
-
-    // Idempotency guard: re-read the task from the durable store to
-    // detect if a prior worker already completed this suspension (e.g.
-    // our lease expired between spawn_tool_children and returning the
-    // result, and another worker re-acquired and completed the flow).
-    let current_task = deps
-        .task_store
-        .get(task_id)
-        .await
-        .context("re-read task for suspension idempotency check")?
-        .context("task disappeared during suspension")?;
-
-    if current_task.status == TaskStatus::WaitingOnChildren {
-        // Close the attempt opened at the start of execute_root_turn so it
-        // doesn't remain permanently unclosed in the audit trail. Unlike the
-        // pre-stream synthetic closes (which bill zero because nothing
-        // streamed), this fires AFTER a real LLM call the provider already
-        // billed, so the row records that attempt's own usage — the winning
-        // worker's separate call committed the turn, but this loser's tokens
-        // were billed too and belong on its audit row.
-        close_attempt_with(
-            &attempt,
-            TurnAttemptOutcome::Cancelled,
-            &close_ctx.success_usage,
-            Some(&close_ctx.evidence),
-            deps.attempt_store,
-            now,
-        )
-        .await;
-        bail!(
-            "task {task_id} already transitioned to WaitingOnChildren; \
-             skipping duplicate suspension",
-        );
-    }
+    guard_against_duplicate_suspension(&inputs, &attempt, deps, &close_ctx, now).await?;
 
     // 1. Close the turn attempt — the LLM call itself succeeded.
     close_attempt_or_propagate_already_closed(
@@ -4939,24 +4973,10 @@ async fn suspend_at_tool_boundary(
         .await
         .context("build continuation for tool suspension")?;
 
-    // 3. Capture the suspended messages (user prompt + full assistant
-    //    response including tool-use blocks) so the resume path can
-    //    reconstruct the conversation from durable state alone.
-    //    `user_input.into_message()` returns `None` for resume turns —
-    //    those don't reach this branch (resume goes through
-    //    `resume_root_turn` / `suspend_resumed_turn`), but the guard
-    //    keeps the call site type-safe.
-    //    `close_ctx.staged_prefix` leads: when a mid-turn injection ran an
-    //    extra LLM call, the earlier exchanges and the injected input live only
-    //    in the staged buffer, which this path never drains — omitting them
-    //    would resume the turn with the original prompt and the steering input
-    //    both missing from the model's view.
-    let mut suspended_messages = close_ctx.staged_prefix;
-    suspended_messages.reserve(2);
-    if let Some(user_message) = user_input.clone().into_message() {
-        suspended_messages.push(user_message);
-    }
-    suspended_messages.push(build_full_assistant_message(&response));
+    // Capture the staged prefix + prompt + assistant tool-use response
+    // for durable resume.
+    let suspended_messages =
+        initial_suspended_messages(&close_ctx.staged_prefix, user_input, &response);
 
     // 4. One child task per tool call, inheriting the configured retry budget.
     let specs = child_spawn_specs_for_response(&response, &inputs);
@@ -4967,6 +4987,28 @@ async fn suspend_at_tool_boundary(
 
     // Build ToolCallStart events before continuation is moved.
     let tool_call_events = build_tool_call_start_events(&continuation);
+
+    if let Some(questions) = durable_questions(&continuation) {
+        let draft = suspended_messages.clone();
+        let mut events = content_events;
+        events.extend(tool_call_events);
+        return park_initial_question(
+            &inputs,
+            deps,
+            QuestionSuspension {
+                payload: SuspensionPayload {
+                    continuation,
+                    suspended_messages,
+                },
+                draft,
+                questions,
+                events,
+            },
+            close_ctx,
+            now,
+        )
+        .await;
+    }
 
     // 4.b Consult the per-call subagent-spawn selector (if wired).
     //     A `SingleSubagent` / `MultiSubagent` verdict re-routes
@@ -5028,8 +5070,7 @@ async fn suspend_at_tool_boundary(
     // when present + `Start`) committed before streaming so the
     // outcome's `committed_events` represents every event committed
     // for this turn (matching the pre-streaming contract).
-    let mut committed_events: Vec<CommittedEvent> = Vec::new();
-    committed_events.extend(close_ctx.user_input_committed);
+    let mut committed_events: Vec<_> = close_ctx.user_input_committed.into_iter().collect();
     committed_events.push(close_ctx.start_committed);
     committed_events.extend(close_ctx.boundary_committed);
     committed_events.extend(suspension_committed);
@@ -5471,6 +5512,142 @@ fn build_tool_call_start_events(
             )
         })
         .collect()
+}
+
+#[derive(Deserialize)]
+struct AskUserQuestionInput {
+    question: String,
+    #[serde(default)]
+    header: Option<String>,
+    #[serde(default)]
+    options: Vec<QuestionOption>,
+    #[serde(default)]
+    multi_select: bool,
+}
+
+/// Classify the pending tool calls at the boundary as a durable
+/// question batch.
+///
+/// Returns `Some` only when EVERY pending call is a well-formed
+/// `ask_user` — the resume fan-in needs a result for every pending id,
+/// and answers are the only results a parked question can produce.
+/// Everything else — a batch mixing `ask_user` with real tools, a
+/// malformed or blank `ask_user` input — degrades to the ordinary
+/// child-task path with a warning, never a hard failure: the tool
+/// runtime then surfaces the malformed input as a tool error the model
+/// can react to, and a mixed batch executes its real tools normally.
+/// The degraded path is not crash-durable; the warning is the operator
+/// signal for how often that trade-off is hit.
+fn durable_questions(continuation: &ContinuationEnvelope) -> Option<Vec<QuestionPayload>> {
+    let pending = &continuation.payload.pending_tool_calls;
+    if pending.is_empty() || !pending.iter().any(|tc| tc.name == "ask_user") {
+        return None;
+    }
+    if pending.iter().any(|tc| tc.name != "ask_user") {
+        log::warn!(
+            "ask_user batched with other tools ({:?}); degrading to the non-durable child-task path",
+            pending
+                .iter()
+                .map(|tc| tc.name.as_str())
+                .collect::<Vec<_>>(),
+        );
+        return None;
+    }
+    let mut questions = Vec::with_capacity(pending.len());
+    for tool_call in pending {
+        let input: AskUserQuestionInput = match serde_json::from_value(tool_call.input.clone()) {
+            Ok(input) => input,
+            Err(error) => {
+                log::warn!(
+                    "ask_user call {} input is not a valid durable question ({error}); \
+                     degrading to the non-durable child-task path",
+                    tool_call.id,
+                );
+                return None;
+            }
+        };
+        if input.question.trim().is_empty() {
+            log::warn!(
+                "ask_user call {} question is blank; degrading to the non-durable child-task path",
+                tool_call.id,
+            );
+            return None;
+        }
+        questions.push(QuestionPayload {
+            tool_call_id: tool_call.id.clone(),
+            question: input.question,
+            header: input.header,
+            options: input.options,
+            multi_select: input.multi_select,
+        });
+    }
+    Some(questions)
+}
+
+struct QuestionSuspension {
+    payload: SuspensionPayload,
+    draft: Vec<llm::Message>,
+    questions: Vec<QuestionPayload>,
+    events: Vec<AgentEvent>,
+}
+
+async fn park_on_question(
+    inputs: &RootWorkerInputs,
+    deps: &RootTurnDeps<'_>,
+    suspension: QuestionSuspension,
+    now: OffsetDateTime,
+) -> Result<(AgentTask, Vec<CommittedEvent>)> {
+    let task_id = &inputs.bootstrap.task_id;
+    let QuestionSuspension {
+        payload,
+        draft,
+        questions,
+        events,
+    } = suspension;
+    let (parent, committed) = deps
+        .task_store
+        .pause_on_question(
+            task_id,
+            &inputs.bootstrap.worker_id,
+            &inputs.bootstrap.lease_id,
+            QuestionPause {
+                payload,
+                questions,
+                events,
+            },
+            now,
+        )
+        .await
+        .context("pause root turn on durable question")?;
+    snapshot_suspension_draft(
+        deps,
+        &inputs.bootstrap.thread_id,
+        task_id,
+        draft,
+        now,
+        "snapshot durable question messages",
+    )
+    .await;
+    Ok((parent, committed))
+}
+
+async fn park_initial_question(
+    inputs: &RootWorkerInputs,
+    deps: &RootTurnDeps<'_>,
+    suspension: QuestionSuspension,
+    close: TurnCloseContext,
+    now: OffsetDateTime,
+) -> Result<RootTurnOutcome> {
+    let (parent_task, question_events) = park_on_question(inputs, deps, suspension, now).await?;
+    let mut committed_events = Vec::new();
+    committed_events.extend(close.user_input_committed);
+    committed_events.push(close.start_committed);
+    committed_events.extend(question_events);
+    Ok(RootTurnOutcome::Suspended {
+        parent_task,
+        child_tasks: Vec::new(),
+        committed_events,
+    })
 }
 
 /// Snapshot the post-spawn `suspended_messages` to the projection's
@@ -6298,6 +6475,32 @@ async fn suspend_resumed_turn(
     // Build ToolCallStart events before continuation is moved.
     let tool_call_events = build_tool_call_start_events(&new_continuation);
 
+    if let Some(questions) = durable_questions(&new_continuation) {
+        let draft = new_suspended.clone();
+        let mut events = content_events;
+        events.extend(tool_call_events);
+        let (parent_task, committed_events) = park_on_question(
+            &inputs,
+            deps,
+            QuestionSuspension {
+                payload: SuspensionPayload {
+                    continuation: new_continuation,
+                    suspended_messages: new_suspended,
+                },
+                draft,
+                questions,
+                events,
+            },
+            now,
+        )
+        .await?;
+        return Ok(RootTurnOutcome::Suspended {
+            parent_task,
+            child_tasks: Vec::new(),
+            committed_events,
+        });
+    }
+
     // Consult the per-call subagent-spawn selector — same contract
     // as `suspend_at_tool_boundary`.
     let routing = classify_batch_for_inputs(&inputs, deps, &new_continuation).await?;
@@ -6600,6 +6803,65 @@ pub async fn resume_from_children(
         continuation,
         suspended_messages,
         child_results,
+        provider,
+        deps,
+        now,
+    ))
+    .await
+}
+
+/// Resume a root turn from the answer persisted on `AnsweredQuestion`.
+///
+/// # Errors
+///
+/// Returns an error when `parent` is not an answered question or when the
+/// shared root-resume path cannot rebuild, execute, or commit the turn.
+pub async fn resume_from_question(
+    inputs: RootWorkerInputs,
+    parent: &AgentTask,
+    provider: &dyn LlmProvider,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<RootTurnOutcome> {
+    let TaskState::AnsweredQuestion {
+        continuation,
+        suspended_messages,
+        questions,
+        answers,
+        ..
+    } = &parent.state
+    else {
+        bail!(
+            "resume_from_question requires AnsweredQuestion state, got {:?}",
+            std::mem::discriminant(&parent.state),
+        );
+    };
+    // One result per parked question, in pending-tool-call order — the
+    // resume fan-in requires every pending id. `answer_question`
+    // validated the batch one-to-one, so a miss here is corruption.
+    let results = questions
+        .iter()
+        .map(|question| {
+            let answer = answers
+                .iter()
+                .find(|entry| entry.tool_call_id == question.tool_call_id)
+                .with_context(|| {
+                    format!(
+                        "durable answer batch on task {} is missing tool call {}",
+                        parent.id, question.tool_call_id,
+                    )
+                })?;
+            Ok((
+                question.tool_call_id.clone(),
+                ToolResult::success(format!("User answered: {}", answer.answer)),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Box::pin(resume_root_turn(
+        inputs,
+        continuation.payload.clone(),
+        suspended_messages.clone(),
+        results,
         provider,
         deps,
         now,

@@ -38,6 +38,7 @@ enum TaskStatus {
   TASK_STATUS_COMPLETED = 6;
   TASK_STATUS_FAILED = 7;
   TASK_STATUS_CANCELLED = 8;
+  TASK_STATUS_AWAITING_QUESTION = 9;
 }
 
 enum ToolTier {
@@ -193,6 +194,41 @@ message AwaitingConfirmationState {
   PendingConfirmation confirmation = 1;
 }
 
+message QuestionOption {
+  string label = 1;
+  optional string description = 2;
+}
+
+message PendingQuestion {
+  string tool_call_id = 1;
+  string question = 2;
+  optional string header = 3;
+  repeated QuestionOption options = 4;
+  bool multi_select = 5;
+}
+
+message AwaitingQuestionState {
+  // Every pending ask_user call in the parked batch, in pending order.
+  // AnswerQuestion must resolve all of them in a single call.
+  repeated PendingQuestion questions = 1;
+}
+
+// One durable answer, resolving exactly one parked question.
+message QuestionAnswerEntry {
+  // Tool-use id of the ask_user call this answer resolves.
+  string tool_call_id = 1;
+  // Free-form text or the selected option labels.
+  string answer = 2;
+}
+
+message AnsweredQuestionState {
+  repeated PendingQuestion questions = 1;
+  // Exactly one entry per question.
+  repeated QuestionAnswerEntry answers = 2;
+  // Stable receipt: the request_id of the winning AnswerQuestion call.
+  string receipt_id = 3;
+}
+
 message ReadyToResumeState {
   repeated string child_task_ids = 1;
 }
@@ -231,6 +267,8 @@ message TaskSnapshot {
     AwaitingConfirmationState awaiting_confirmation = 14;
     ReadyToResumeState ready_to_resume = 15;
     SubagentInvocationState subagent_invocation = 16;
+    AwaitingQuestionState awaiting_question = 17;
+    AnsweredQuestionState answered_question = 18;
   }
 
   google.protobuf.Timestamp created_at = 20;

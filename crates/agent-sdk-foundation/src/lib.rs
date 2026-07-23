@@ -34,7 +34,7 @@ pub use privacy::{
 pub use types::{
     AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState,
     CONTINUATION_VERSION, ContinuationEnvelope, ExecutionStatus, ExternalToolResult,
-    ListenExecutionContext, PendingToolCallInfo, RetryConfig, ThreadId, TokenUsage, ToolExecution,
-    ToolInvocation, ToolOutcome, ToolResult, ToolRuntime, ToolTier, TurnOptions, TurnOutcome,
-    TurnSummary,
+    ListenExecutionContext, PendingToolCallInfo, QuestionAnswer, QuestionOption, QuestionPayload,
+    RetryConfig, ThreadId, TokenUsage, ToolExecution, ToolInvocation, ToolOutcome, ToolResult,
+    ToolRuntime, ToolTier, TurnOptions, TurnOutcome, TurnSummary,
 };

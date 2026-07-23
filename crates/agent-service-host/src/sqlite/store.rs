@@ -16,7 +16,8 @@
 
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::{
-    ContinuationEnvelope, ListenExecutionContext, TerminalReason, ThreadId, TokenUsage, llm,
+    ContinuationEnvelope, ListenExecutionContext, QuestionAnswer, TerminalReason, ThreadId,
+    TokenUsage, llm,
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
@@ -59,9 +60,10 @@ use agent_server::journal::relay::{
 };
 use agent_server::journal::retention::{RetentionCursor, RetentionStore};
 use agent_server::journal::store::{
-    AgentTaskStore, CancelTreeOutcome, ChildProbe, MixedChildrenSpawn, RequeueOutcome,
-    SpawnedMixedChildren, SubagentBatchSpawn, SubagentInvocationSpawn, SubmitDisposition,
-    SubmitRootTurnError, SubmitRootTurnOutcome, SubmitRootTurnParams,
+    AgentTaskStore, CancelTreeOutcome, ChildProbe, MixedChildrenSpawn, QuestionAnswerApplied,
+    QuestionPause, RequeueOutcome, SpawnedMixedChildren, SubagentBatchSpawn,
+    SubagentInvocationSpawn, SubmitDisposition, SubmitRootTurnError, SubmitRootTurnOutcome,
+    SubmitRootTurnParams, apply_question_answer, apply_question_pause,
     mixed_child_ids_in_slot_order, new_mixed_tool_child, submitted_task_disposition,
     validate_mixed_children_spawn,
 };
@@ -1198,7 +1200,7 @@ WHERE id = ?1
                 r"
 SELECT id FROM agent_sdk_tasks
 WHERE thread_id = ?1 AND kind = 'root_turn'
-  AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation')
+  AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation', 'awaiting_question')
   AND id <> ?2
 LIMIT 1
 ",
@@ -1284,7 +1286,7 @@ LIMIT 1
                 r"
 SELECT id FROM agent_sdk_tasks
 WHERE thread_id = ?1 AND kind = 'root_turn'
-  AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation')
+  AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation', 'awaiting_question')
   AND id <> ?2
 LIMIT 1
 ",
@@ -1513,7 +1515,7 @@ LIMIT 1
         now: OffsetDateTime,
     ) -> Result<Option<AgentTask>> {
         let blocking_check_key = thread_key(thread_id);
-        let blocking = sqlx::query_scalar!("SELECT id FROM agent_sdk_tasks WHERE thread_id = ?1 AND kind = 'root_turn' AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation') LIMIT 1", blocking_check_key)
+        let blocking = sqlx::query_scalar!("SELECT id FROM agent_sdk_tasks WHERE thread_id = ?1 AND kind = 'root_turn' AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation', 'awaiting_question') LIMIT 1", blocking_check_key)
             .fetch_optional(&mut **tx)
             .await
             .with_context(|| format!("check blocking root for {thread_id}"))?
@@ -2401,7 +2403,7 @@ where
         " FROM agent_sdk_tasks \
          WHERE thread_id = ?1 \
            AND kind = 'root_turn' \
-           AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation') \
+           AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation', 'awaiting_question') \
          ORDER BY created_at, id LIMIT 1",
     ))
     .bind(thread_key(thread_id))
@@ -2614,7 +2616,7 @@ impl AgentTaskStore for SqliteDurableStore {
         }
 
         let blocking_check_key = thread_key(&task.thread_id);
-        let thread_has_blocking_root: bool = sqlx::query_scalar!("SELECT id FROM agent_sdk_tasks WHERE thread_id = ?1 AND kind = 'root_turn' AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation') LIMIT 1", blocking_check_key)
+        let thread_has_blocking_root: bool = sqlx::query_scalar!("SELECT id FROM agent_sdk_tasks WHERE thread_id = ?1 AND kind = 'root_turn' AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation', 'awaiting_question') LIMIT 1", blocking_check_key)
             .fetch_optional(&mut *tx)
             .await
             .with_context(|| format!("check active root slot for {}", task.thread_id))?
@@ -2728,7 +2730,7 @@ impl AgentTaskStore for SqliteDurableStore {
         // parentage, reads the full ordered row.
         let (thread_has_blocking_root, active_root) = match disposition {
             SubmitDisposition::NextTurn => (
-                sqlx::query_scalar!("SELECT id FROM agent_sdk_tasks WHERE thread_id = ?1 AND kind = 'root_turn' AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation') LIMIT 1", blocking_check_key)
+                sqlx::query_scalar!("SELECT id FROM agent_sdk_tasks WHERE thread_id = ?1 AND kind = 'root_turn' AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation', 'awaiting_question') LIMIT 1", blocking_check_key)
                     .fetch_optional(&mut *tx)
                     .await
                     .with_context(|| format!("check active root slot for {}", task.thread_id))
@@ -3521,6 +3523,63 @@ impl AgentTaskStore for SqliteDurableStore {
         Self::update_task_tx(&mut tx, &paused).await?;
         tx.commit().await.context("commit pause_on_confirmation")?;
         Ok(paused)
+    }
+
+    async fn pause_on_question(
+        &self,
+        id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        pause: QuestionPause,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Vec<CommittedEvent>)> {
+        let QuestionPause {
+            payload,
+            questions,
+            mut events,
+        } = pause;
+        let mut tx = self.begin().await?;
+        let old = Self::load_task_tx(&mut tx, id)
+            .await?
+            .ok_or_else(|| anyhow!("question pause rejected: task {id} does not exist"))?;
+        let paused = apply_question_pause(&old, worker, lease, payload, questions.clone(), now)?;
+        Self::update_task_tx(&mut tx, &paused).await?;
+        events.push(AgentEvent::question_asked(id.as_str(), questions));
+        let start_seq = Self::next_event_sequence_tx(&mut tx, &paused.thread_id).await?;
+        let committed =
+            Self::insert_events_tx(&mut tx, &paused.thread_id, events, start_seq, now).await?;
+        Self::insert_thread_events_outbox_row_tx(
+            &mut tx,
+            &committed,
+            DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+            now,
+        )
+        .await?;
+        tx.commit().await.context("commit pause_on_question")?;
+        Ok((paused, committed))
+    }
+
+    async fn answer_question(
+        &self,
+        id: &AgentTaskId,
+        receipt_id: &str,
+        answers: Vec<QuestionAnswer>,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask> {
+        let mut tx = self.begin().await?;
+        let old = Self::load_task_tx(&mut tx, id)
+            .await?
+            .ok_or_else(|| anyhow!("answer_question rejected: task {id} does not exist"))?;
+        let answered = match apply_question_answer(&old, receipt_id, &answers, now)? {
+            QuestionAnswerApplied::Replay(task) => {
+                tx.commit().await.context("commit answer_question replay")?;
+                return Ok(task);
+            }
+            QuestionAnswerApplied::Answered(task) => task,
+        };
+        Self::update_task_tx(&mut tx, &answered).await?;
+        tx.commit().await.context("commit answer_question")?;
+        Ok(answered)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5983,12 +6042,20 @@ mod tests {
     use anyhow::{Context, Result};
     use time::Duration;
 
-    use agent_sdk_foundation::ThreadId;
+    use agent_sdk_foundation::events::AgentEvent;
+    use agent_sdk_foundation::{
+        AgentContinuation, AgentState, ContinuationEnvelope, PendingToolCallInfo, QuestionAnswer,
+        QuestionPayload, ThreadId, TokenUsage, ToolTier,
+    };
     use agent_server::journal::execution_intent::{
         ExecutionIntent, ExecutionIntentStore, IntentStatus, OperationId, ToolEffectClass,
     };
-    use agent_server::journal::store::AgentTaskStore;
-    use agent_server::journal::task::{AgentTask, AgentTaskId};
+    use agent_server::journal::store::{AgentTaskStore, QuestionPause};
+    use agent_server::journal::task::{
+        AgentTask, AgentTaskId, LeaseId, SuspensionPayload, WorkerId,
+    };
+    use agent_server::journal::task_state::TaskState;
+    use agent_server::journal::thread_store::ThreadStore;
     use agent_server::journal::turn_attempt::{TurnAttempt, TurnAttemptId};
     use agent_server::journal::turn_attempt_store::TurnAttemptStore;
 
@@ -6411,6 +6478,129 @@ INSERT INTO agent_sdk_turn_attempts (
         drop(store2);
         let _ = std::fs::remove_file(&db_path);
 
+        Ok(())
+    }
+
+    /// Seed a store lifetime with a submitted, acquired, parked, and
+    /// answered question root, so the restart test's subject is the
+    /// reopen boundary rather than a long setup.
+    async fn seed_answered_question(url: &str, thread_id: &ThreadId) -> Result<AgentTaskId> {
+        let store = SqliteDurableStore::connect(url).await?;
+        store.get_or_create(thread_id, t0()).await?;
+        let task = AgentTask::new_root_turn(thread_id.clone(), t0(), 3);
+        let task_id = task.id.clone();
+        store.submit_root_turn(task).await?;
+        let worker = WorkerId::from_string("question-worker");
+        let lease = LeaseId::from_string("question-lease");
+        store
+            .try_acquire_task(
+                &task_id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(60),
+                t_plus(1),
+            )
+            .await?
+            .context("acquire question task")?;
+        let tool_call = PendingToolCallInfo {
+            id: "question-call".into(),
+            name: "ask_user".into(),
+            display_name: "Ask User".into(),
+            tier: ToolTier::Observe,
+            input: serde_json::json!({"question": "Where?"}),
+            effective_input: serde_json::json!({"question": "Where?"}),
+            listen_context: None,
+        };
+        let (_paused, committed) = store
+            .pause_on_question(
+                &task_id,
+                &worker,
+                &lease,
+                QuestionPause {
+                    payload: SuspensionPayload {
+                        continuation: ContinuationEnvelope::wrap(AgentContinuation {
+                            thread_id: thread_id.clone(),
+                            turn: 1,
+                            total_usage: TokenUsage::default(),
+                            turn_usage: TokenUsage::default(),
+                            pending_tool_calls: vec![tool_call],
+                            awaiting_index: 0,
+                            completed_results: Vec::new(),
+                            state: AgentState::new(thread_id.clone()),
+                            response_id: None,
+                            stop_reason: None,
+                            response_content: Vec::new(),
+                        }),
+                        suspended_messages: Vec::new(),
+                    },
+                    questions: vec![QuestionPayload {
+                        tool_call_id: "question-call".into(),
+                        question: "Where?".into(),
+                        header: None,
+                        options: Vec::new(),
+                        multi_select: false,
+                    }],
+                    events: Vec::new(),
+                },
+                t_plus(2),
+            )
+            .await?;
+        assert!(
+            committed
+                .iter()
+                .any(|event| matches!(event.event, AgentEvent::QuestionAsked { .. })),
+            "pause_on_question must journal QuestionAsked in the same transaction",
+        );
+        store
+            .answer_question(
+                &task_id,
+                "restart-receipt",
+                vec![QuestionAnswer {
+                    tool_call_id: "question-call".into(),
+                    answer: "Staging".into(),
+                }],
+                t_plus(3),
+            )
+            .await?;
+        Ok(task_id)
+    }
+
+    #[tokio::test]
+    async fn answered_question_survives_sqlite_restart_and_reacquire() -> Result<()> {
+        let db_path = std::env::temp_dir().join(format!(
+            "agent_sdk_answered_question_restart_{}.db",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let thread_id = ThreadId::from_string("question-restart-thread");
+        let task_id = seed_answered_question(&url, &thread_id).await?;
+
+        let reopened = SqliteDurableStore::connect(&url).await?;
+        let loaded = AgentTaskStore::get(&reopened, &task_id)
+            .await?
+            .context("answered question must survive restart")?;
+        let (receipt_id, answers) = loaded
+            .state
+            .question_answers()
+            .with_context(|| format!("restarted task lost AnsweredQuestion: {:?}", loaded.state))?;
+        assert_eq!(receipt_id, "restart-receipt");
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].tool_call_id, "question-call");
+        assert_eq!(answers[0].answer, "Staging");
+        let acquired = reopened
+            .try_acquire_task(
+                &task_id,
+                WorkerId::from_string("boot-worker"),
+                LeaseId::from_string("boot-lease"),
+                t_plus(120),
+                t_plus(4),
+            )
+            .await?
+            .context("boot did not reacquire answered question")?;
+        assert!(matches!(acquired.state, TaskState::AnsweredQuestion { .. }));
+
+        drop(reopened);
+        let _ = std::fs::remove_file(&db_path);
         Ok(())
     }
 

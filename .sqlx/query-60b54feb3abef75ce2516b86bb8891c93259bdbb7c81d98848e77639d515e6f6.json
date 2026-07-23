@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT id FROM agent_sdk_tasks WHERE thread_id = ?1 AND kind = 'root_turn' AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation') LIMIT 1",
+  "query": "SELECT id FROM agent_sdk_tasks WHERE thread_id = ?1 AND kind = 'root_turn' AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation', 'awaiting_question') LIMIT 1",
   "describe": {
     "columns": [
       {
@@ -22,5 +22,5 @@
       true
     ]
   },
-  "hash": "5797087b4364500a9488a451fcea6d9ee48b8de29bb2fc518beae688986c229f"
+  "hash": "60b54feb3abef75ce2516b86bb8891c93259bdbb7c81d98848e77639d515e6f6"
 }

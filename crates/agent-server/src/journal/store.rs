@@ -211,7 +211,8 @@ use std::sync::Arc;
 
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::{
-    ContinuationEnvelope, ListenExecutionContext, TerminalReason, ThreadId, TokenUsage,
+    ContinuationEnvelope, ListenExecutionContext, QuestionAnswer, QuestionPayload, TerminalReason,
+    ThreadId, TokenUsage,
 };
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -232,7 +233,7 @@ use super::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, SuspensionPayload,
     TaskKind, TaskStatus, WorkerId,
 };
-use super::task_state::SubagentInvocationState;
+use super::task_state::{SubagentInvocationState, TaskState};
 use super::thread_store::ThreadStore;
 use crate::worker::definition::RuntimePolicy;
 use crate::worker::subagent::EffectiveSubagentSpec;
@@ -861,6 +862,175 @@ impl ChildProbe {
         }
         out
     }
+}
+
+/// A second answer attempted to overwrite the durable answers for a
+/// question batch.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("question {task_id} was already answered by request {original_receipt_id}")]
+pub struct QuestionAnswerConflict {
+    /// Task whose answers are immutable once persisted.
+    pub task_id: AgentTaskId,
+    /// Idempotency key that won the first answer race.
+    pub original_receipt_id: String,
+}
+
+/// An answer batch did not line up one-to-one with the parked questions.
+///
+/// `AnswerQuestion` resolves every parked question in one call: each
+/// question's `tool_call_id` must appear exactly once in the batch and
+/// no stray ids may appear at all.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "answers for task {task_id} do not match the parked questions \
+     (unanswered: [{missing}], unknown or duplicate: [{unknown}])",
+    missing = .missing.join(", "),
+    unknown = .unknown.join(", ")
+)]
+pub struct QuestionAnswerMismatch {
+    /// Task whose question batch was mis-answered.
+    pub task_id: AgentTaskId,
+    /// Parked question tool-call ids the batch left unanswered.
+    pub missing: Vec<String>,
+    /// Answer tool-call ids that match no parked question, or repeat one.
+    pub unknown: Vec<String>,
+}
+
+/// Everything a question park commits besides the task row itself.
+///
+/// See [`AgentTaskStore::pause_on_question`] for the atomicity contract.
+pub struct QuestionPause {
+    /// Continuation + suspended messages captured at the ask boundary.
+    pub payload: SuspensionPayload,
+    /// One payload per pending `ask_user` call, in pending-tool-call
+    /// order. Never empty.
+    pub questions: Vec<QuestionPayload>,
+    /// Boundary events (content, tool-call-start) committed before the
+    /// trailing [`AgentEvent::QuestionAsked`] in the same batch.
+    pub events: Vec<AgentEvent>,
+}
+
+/// Outcome of [`apply_question_answer`].
+pub enum QuestionAnswerApplied {
+    /// The stored row already carries this exact `(receipt, answers)`
+    /// batch — return it unchanged.
+    Replay(AgentTask),
+    /// Fresh transition to [`TaskState::AnsweredQuestion`].
+    Answered(AgentTask),
+}
+
+/// Shared guard cascade + transition for parking a running root on a
+/// question batch.
+///
+/// Every backend (in-memory, `SQLite`, `PostgreSQL`) drives its
+/// `pause_on_question` through this one function so the CAS guards
+/// cannot drift between them.
+///
+/// # Errors
+/// Rejects a non-running row, a `(worker, lease)` mismatch, an empty
+/// question batch, or a transition that fails schema validation.
+pub fn apply_question_pause(
+    old: &AgentTask,
+    worker: &WorkerId,
+    lease: &LeaseId,
+    payload: SuspensionPayload,
+    questions: Vec<QuestionPayload>,
+    now: OffsetDateTime,
+) -> Result<AgentTask> {
+    let id = &old.id;
+    if old.status != TaskStatus::Running {
+        return Err(anyhow!(
+            "question pause rejected: task {id} is not running (status {:?})",
+            old.status
+        ));
+    }
+    if old.worker_id.as_ref() != Some(worker) {
+        return Err(anyhow!(
+            "question pause rejected: worker mismatch on task {id}"
+        ));
+    }
+    if old.lease_id.as_ref() != Some(lease) {
+        return Err(anyhow!(
+            "question pause rejected: lease mismatch on task {id}"
+        ));
+    }
+    if questions.is_empty() {
+        return Err(anyhow!(
+            "question pause rejected: question batch for task {id} is empty"
+        ));
+    }
+    old.clone()
+        .await_question(payload, questions, now)
+        .context("question pause rejected: await_question transition failed")
+}
+
+/// Shared guard cascade + transition for persisting an answer batch.
+///
+/// Single source of truth for replay, conflict, batch-matching, and the
+/// runnable transition — all three backends call this under their own
+/// lock or transaction.
+///
+/// # Errors
+/// Returns [`QuestionAnswerConflict`] when a different batch was already
+/// persisted, [`QuestionAnswerMismatch`] when the batch does not resolve
+/// the parked questions one-to-one, and a plain error when the task is
+/// not awaiting a question (a client retrying a delivered answer must
+/// reuse its original `request_id`, which replays at the RPC layer).
+pub fn apply_question_answer(
+    old: &AgentTask,
+    receipt_id: &str,
+    answers: &[QuestionAnswer],
+    now: OffsetDateTime,
+) -> Result<QuestionAnswerApplied> {
+    let id = &old.id;
+    if let TaskState::AnsweredQuestion {
+        receipt_id: original_receipt,
+        answers: original_answers,
+        ..
+    } = &old.state
+    {
+        if original_receipt == receipt_id && original_answers == answers {
+            return Ok(QuestionAnswerApplied::Replay(old.clone()));
+        }
+        return Err(QuestionAnswerConflict {
+            task_id: id.clone(),
+            original_receipt_id: original_receipt.clone(),
+        }
+        .into());
+    }
+    if old.status != TaskStatus::AwaitingQuestion {
+        return Err(anyhow!(
+            "answer_question rejected: task {id} is not awaiting a question (status {:?}); \
+             a retry of an already-delivered answer must reuse its original request_id",
+            old.status
+        ));
+    }
+    let Some(questions) = old.state.questions() else {
+        return Err(anyhow!(
+            "answer_question rejected: task {id} is awaiting a question without a durable payload"
+        ));
+    };
+    let mut remaining: std::collections::BTreeSet<&str> =
+        questions.iter().map(|q| q.tool_call_id.as_str()).collect();
+    let mut unknown = Vec::new();
+    for entry in answers {
+        if !remaining.remove(entry.tool_call_id.as_str()) {
+            unknown.push(entry.tool_call_id.clone());
+        }
+    }
+    let missing: Vec<String> = remaining.into_iter().map(str::to_owned).collect();
+    if !missing.is_empty() || !unknown.is_empty() {
+        return Err(QuestionAnswerMismatch {
+            task_id: id.clone(),
+            missing,
+            unknown,
+        }
+        .into());
+    }
+    old.clone()
+        .answer_question(receipt_id.to_owned(), answers.to_vec(), now)
+        .context("answer_question transition failed")
+        .map(QuestionAnswerApplied::Answered)
 }
 
 /// Persistent store for [`AgentTask`] rows.
@@ -1585,6 +1755,42 @@ pub trait AgentTaskStore: Send + Sync {
         lease: &LeaseId,
         continuation: ContinuationEnvelope,
         prepared_operation: Option<ListenExecutionContext>,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask>;
+
+    /// Atomically park a running root turn on an `ask_user` batch and
+    /// journal its question events.
+    ///
+    /// `pause.events` are committed to the task's thread journal
+    /// followed by a trailing [`AgentEvent::QuestionAsked`] carrying
+    /// `pause.questions`, plus the coalesced events-available outbox
+    /// advisory. Durable backends commit the task CAS, the events, and
+    /// the advisory in ONE transaction, so a crash can never leave a
+    /// task parked on a question no client was ever shown. The
+    /// in-memory store commits through its wired marker sink (`None` on
+    /// bare test stores → the park succeeds and no events are
+    /// returned; in-memory rows have no crash story to protect).
+    async fn pause_on_question(
+        &self,
+        id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        pause: QuestionPause,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Vec<CommittedEvent>)>;
+
+    /// Persist an immutable answer batch and make the root turn runnable.
+    ///
+    /// Every parked question must be answered in this single call —
+    /// partial or stray batches return [`QuestionAnswerMismatch`].
+    /// Repeating the same `(receipt_id, answers)` returns the existing
+    /// row; any other batch after the first returns
+    /// [`QuestionAnswerConflict`].
+    async fn answer_question(
+        &self,
+        id: &AgentTaskId,
+        receipt_id: &str,
+        answers: Vec<QuestionAnswer>,
         now: OffsetDateTime,
     ) -> Result<AgentTask>;
 
@@ -4340,6 +4546,67 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         inner.by_id.insert(paused.id.clone(), paused.clone());
         drop(inner);
         Ok(paused)
+    }
+
+    async fn pause_on_question(
+        &self,
+        id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        pause: QuestionPause,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Vec<CommittedEvent>)> {
+        let QuestionPause {
+            payload,
+            questions,
+            mut events,
+        } = pause;
+        let mut inner = self.inner.write().await;
+        let old = inner
+            .by_id
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow!("question pause rejected: task {id} does not exist"))?;
+        let paused = apply_question_pause(&old, worker, lease, payload, questions.clone(), now)?;
+        inner.rebalance_after_row_change(&old, &paused);
+        inner.by_id.insert(paused.id.clone(), paused.clone());
+        drop(inner);
+        events.push(AgentEvent::question_asked(id.as_str(), questions));
+        let Some(sink) = &self.marker_sink else {
+            return Ok((paused, Vec::new()));
+        };
+        let committed = sink
+            .event_repo
+            .commit_event_batch(&paused.thread_id, events, now)
+            .await
+            .context("pause_on_question: commit question events")?;
+        if let Some(last) = committed.last() {
+            Self::insert_marker_advisory(sink, last, now).await?;
+        }
+        Ok((paused, committed))
+    }
+
+    async fn answer_question(
+        &self,
+        id: &AgentTaskId,
+        receipt_id: &str,
+        answers: Vec<QuestionAnswer>,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask> {
+        let mut inner = self.inner.write().await;
+        let old = inner
+            .by_id
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow!("answer_question rejected: task {id} does not exist"))?;
+        let answered = match apply_question_answer(&old, receipt_id, &answers, now)? {
+            QuestionAnswerApplied::Replay(task) => return Ok(task),
+            QuestionAnswerApplied::Answered(task) => task,
+        };
+        inner.rebalance_after_row_change(&old, &answered);
+        inner.by_id.insert(answered.id.clone(), answered.clone());
+        drop(inner);
+        Ok(answered)
     }
 
     #[allow(clippy::too_many_arguments)]

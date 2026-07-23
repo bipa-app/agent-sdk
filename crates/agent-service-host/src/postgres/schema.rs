@@ -280,7 +280,7 @@ const AGENT_SDK_TASK_INDEXES: &[IndexContract] = &[
         name: "agent_sdk_tasks_root_admission_slot_idx",
         key_columns: "(thread_id)",
         predicate: Some(
-            "kind = 'root_turn' AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation')",
+            "kind = 'root_turn' AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation', 'awaiting_question')",
         ),
         purpose: "Enforces the one-blocking-root-per-thread admission invariant.",
     },
