@@ -54,7 +54,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use agent_sdk_foundation::ToolTier;
+use agent_sdk_foundation::{TerminalReason, ToolTier};
 use agent_server::journal::commit::StaleTurnCommit;
 use agent_server::journal::committed_event::CommittedEvent;
 use agent_server::journal::execution_context::build_root_worker_inputs;
@@ -65,11 +65,14 @@ use agent_server::journal::task::{
 };
 use agent_server::journal::task_state::TaskState;
 use agent_server::worker::{
-    ActivityBeacon, AgentDefinitionRegistry, RootTurnOutcome, SubagentTaskOutcome, ToolTaskOutcome,
-    best_effort_close_open_attempts, execute_subagent_task, fail_root_turn,
-    fail_root_turn_leaving_attempts_open, guarded_tool_execution, pause_tool_for_confirmation,
+    ActivityBeacon, AgentDefinitionRegistry, FailRootTurnParams, RootTurnOutcome,
+    SubagentProgressSnapshot, SubagentTaskOutcome, ToolTaskOutcome,
+    best_effort_close_open_attempts, build_parent_progress_event, canonical_subagent_name,
+    execute_subagent_task, fail_root_turn_leaving_attempts_open_with_reason,
+    fail_root_turn_with_reason, guarded_tool_execution, pause_tool_for_confirmation,
     resolve_bootstrap_context, resolve_subagent_bootstrap, resolve_tool_bootstrap,
     resume_for_steering, resume_from_children, revert_steering_wake,
+    terminal_reason_for_root_error,
 };
 
 use super::broker::{BrokerAdapter, InMemoryBrokerAdapter};
@@ -182,6 +185,10 @@ impl ServiceHost {
         anyhow::ensure!(
             config.worker.sweep_interval_secs > 0,
             "worker.sweep_interval_secs must be > 0"
+        );
+        anyhow::ensure!(
+            config.worker.subagent_progress_interval_secs > 0,
+            "worker.subagent_progress_interval_secs must be > 0"
         );
         anyhow::ensure!(config.worker.pool_size > 0, "worker.pool_size must be > 0");
         anyhow::ensure!(
@@ -466,6 +473,7 @@ impl ServiceHost {
                 runtime: Arc::clone(&self.runtime),
                 lease_duration: self.config.worker.lease_duration(),
                 heartbeat_interval: self.config.worker.heartbeat_interval(),
+                progress_interval: self.config.worker.subagent_progress_interval(),
                 poll_interval: self.config.worker.acquisition_interval(),
                 wakeup_signal: Arc::clone(wakeup_signal),
                 cancel: self.shutdown.clone(),
@@ -895,14 +903,20 @@ struct WorkerLoopParams {
     runtime: Arc<ExecutionRuntime>,
     lease_duration: time::Duration,
     heartbeat_interval: std::time::Duration,
+    progress_interval: std::time::Duration,
     poll_interval: std::time::Duration,
     wakeup_signal: Arc<WakeupSignal>,
     cancel: CancellationToken,
 }
 
+struct TaskRunIntervals {
+    lease: time::Duration,
+    heartbeat: std::time::Duration,
+    progress: std::time::Duration,
+}
+
 /// A single worker's acquisition loop.
 ///
-/// Each worker:
 /// 1. Parks on either (a) its per-worker `acquisition_interval`
 ///    ticker or (b) the shared [`WakeupSignal`].  Whichever fires
 ///    first produces the same action.
@@ -922,6 +936,7 @@ async fn worker_loop(params: WorkerLoopParams) {
         runtime,
         lease_duration,
         heartbeat_interval,
+        progress_interval,
         poll_interval,
         wakeup_signal,
         cancel,
@@ -975,8 +990,11 @@ async fn worker_loop(params: WorkerLoopParams) {
                     &stores,
                     Arc::clone(&runtime),
                     &cancel,
-                    lease_duration,
-                    heartbeat_interval,
+                    TaskRunIntervals {
+                        lease: lease_duration,
+                        heartbeat: heartbeat_interval,
+                        progress: progress_interval,
+                    },
                 )
                 .await;
             }
@@ -1034,9 +1052,13 @@ async fn run_task_with_heartbeat(
     stores: &StoreRegistry,
     runtime: Arc<ExecutionRuntime>,
     cancel: &CancellationToken,
-    lease_duration: time::Duration,
-    heartbeat_interval: std::time::Duration,
+    intervals: TaskRunIntervals,
 ) {
+    let TaskRunIntervals {
+        lease: lease_duration,
+        heartbeat: heartbeat_interval,
+        progress: progress_interval,
+    } = intervals;
     let task_id = task.id.clone();
     let thread_id = task.thread_id.clone();
     let Some(lease_id) = task.lease_id.clone() else {
@@ -1101,6 +1123,14 @@ async fn run_task_with_heartbeat(
         deadline: initial_deadline,
         activity: activity.clone(),
     }));
+    let progress_handle = tokio::spawn(subagent_progress_loop(
+        stores.clone(),
+        task_id.clone(),
+        thread_id.clone(),
+        progress_interval,
+        activity.clone(),
+        heartbeat_cancel.clone(),
+    ));
 
     // No up-front stall check: under stall semantics acquisition is itself
     // evidence of work (`mark_running` stamps `last_activity_at`), so a
@@ -1121,6 +1151,14 @@ async fn run_task_with_heartbeat(
             task_id = %task_id,
             error = %join_err,
             "heartbeat loop join failed",
+        );
+    }
+    if let Err(join_err) = progress_handle.await {
+        warn!(
+            %worker_id,
+            task_id = %task_id,
+            error = %join_err,
+            "subagent progress loop join failed",
         );
     }
 
@@ -1950,6 +1988,146 @@ pub(crate) async fn heartbeat_loop(params: HeartbeatLoopParams) {
     }
 }
 
+async fn subagent_progress_loop(
+    stores: StoreRegistry,
+    child_root_id: AgentTaskId,
+    thread_id: agent_sdk_foundation::ThreadId,
+    interval: std::time::Duration,
+    activity: ActivityBeacon,
+    cancel: CancellationToken,
+) {
+    // Gate: this loop is spawned for EVERY acquired task, but only a
+    // subagent child root has a parent to report progress to. Resolving
+    // the linkage once here turns a plain root turn's cost from three
+    // store queries per tick, forever, into a single query at dispatch.
+    //
+    // A transient store error is NOT treated as "no linkage": failing
+    // open (entering the loop, where each tick retries) costs a few
+    // wasted queries, while failing closed would silently blind a real
+    // subagent's progress stream for the whole turn.
+    match stores
+        .task_store
+        .find_subagent_invocation_for_child_root(&child_root_id)
+        .await
+    {
+        Ok(None) => return,
+        Ok(Some(_)) => {}
+        Err(err) => warn!(
+            task_id = %child_root_id,
+            %thread_id,
+            error = %err,
+            "subagent linkage probe failed; entering progress loop and retrying per tick",
+        ),
+    }
+
+    let mut ticker = tokio::time::interval(interval);
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            _ = ticker.tick() => {}
+        }
+
+        if let Err(err) = emit_periodic_subagent_progress(
+            &stores,
+            &child_root_id,
+            &activity,
+            time::OffsetDateTime::now_utc(),
+        )
+        .await
+        {
+            warn!(
+                task_id = %child_root_id,
+                %thread_id,
+                error = %err,
+                "periodic subagent progress emission failed; retrying next interval",
+            );
+        }
+    }
+}
+
+async fn emit_periodic_subagent_progress(
+    stores: &StoreRegistry,
+    child_root_id: &AgentTaskId,
+    activity: &ActivityBeacon,
+    now: time::OffsetDateTime,
+) -> Result<()> {
+    let Some(invocation) = stores
+        .task_store
+        .find_subagent_invocation_for_child_root(child_root_id)
+        .await
+        .context("find invocation for periodic subagent progress")?
+    else {
+        return Ok(());
+    };
+    let linkage = invocation
+        .state
+        .subagent_invocation()
+        .context("periodic progress invocation missing linkage")?;
+    let parent_id = invocation
+        .parent_id
+        .as_ref()
+        .context("periodic progress invocation missing parent")?;
+    let parent = stores
+        .task_store
+        .get(parent_id)
+        .await
+        .context("load periodic progress parent")?
+        .context("periodic progress parent no longer exists")?;
+    let spawn_index = usize::try_from(
+        invocation
+            .spawn_index
+            .context("periodic progress invocation missing spawn_index")?,
+    )
+    .context("periodic progress spawn_index exceeds usize")?;
+    let pending_tool = parent
+        .state
+        .continuation()
+        .and_then(|continuation| continuation.payload.pending_tool_calls.get(spawn_index))
+        .context("periodic progress parent missing pending subagent tool")?;
+    let child_thread = stores
+        .thread_store
+        .get(&linkage.child_thread_id)
+        .await
+        .context("load periodic progress child thread")?
+        .context("periodic progress child thread no longer exists")?;
+    let mut usage = child_thread.total_usage;
+    usage.add(&activity.usage());
+    let tool_count = u32::try_from(
+        stores
+            .task_store
+            .list_by_thread(&linkage.child_thread_id)
+            .await
+            .context("list periodic progress child tasks")?
+            .into_iter()
+            .filter(|task| task.kind == TaskKind::ToolRuntime)
+            .count(),
+    )
+    .context("periodic progress tool count exceeds u32")?;
+    let event = build_parent_progress_event(&SubagentProgressSnapshot {
+        subagent_id: &pending_tool.id,
+        subagent_name: canonical_subagent_name(&pending_tool.name),
+        spec: &linkage.spec,
+        child_thread_id: &linkage.child_thread_id,
+        child_root_task_id: &linkage.child_root_task_id,
+        subagent_task_id: &invocation.id,
+        completed: false,
+        success: false,
+        current_turn: child_thread.committed_turns.saturating_add(1),
+        tool_count,
+        usage,
+    });
+    let committed = stores
+        .event_repo
+        .commit_event(&parent.thread_id, event, now)
+        .await
+        .context("commit periodic subagent progress")?;
+    stores
+        .event_notifier
+        .notify(std::slice::from_ref(&committed));
+    Ok(())
+}
+
 /// Outcome of one heartbeat tick's subagent-deadline handling.
 enum DeadlineTick {
     /// Keep heartbeating with this (possibly updated) state.
@@ -2716,6 +2894,7 @@ async fn fail_root_task(
             lease: &lease_id,
         },
         error,
+        terminal_reason_for_root_error(error),
         event_watermark,
         AttemptClosePolicy::CloseOpenAttempts,
         now,
@@ -2758,6 +2937,7 @@ async fn fail_root_task_if_owned(
     stores: &StoreRegistry,
     owned: OwnedRootTask<'_>,
     error: &anyhow::Error,
+    reason: TerminalReason,
     event_watermark: u64,
     attempt_close: AttemptClosePolicy,
     now: time::OffsetDateTime,
@@ -2800,12 +2980,15 @@ async fn fail_root_task_if_owned(
 
     match attempt_close {
         AttemptClosePolicy::CloseOpenAttempts => {
-            fail_root_turn(
-                task_id,
-                worker_id,
-                lease_id,
-                thread_id,
-                error,
+            fail_root_turn_with_reason(
+                FailRootTurnParams {
+                    task_id,
+                    worker_id,
+                    lease_id,
+                    thread_id,
+                    error,
+                    reason: reason.clone(),
+                },
                 &stores.root_turn_deps(),
                 now,
             )
@@ -2813,12 +2996,15 @@ async fn fail_root_task_if_owned(
             .context("mark root task failed")?;
         }
         AttemptClosePolicy::LeaveOpenForLiveWorker => {
-            fail_root_turn_leaving_attempts_open(
-                task_id,
-                worker_id,
-                lease_id,
-                thread_id,
-                error,
+            fail_root_turn_leaving_attempts_open_with_reason(
+                FailRootTurnParams {
+                    task_id,
+                    worker_id,
+                    lease_id,
+                    thread_id,
+                    error,
+                    reason,
+                },
                 &stores.root_turn_deps(),
                 now,
             )
@@ -2953,6 +3139,7 @@ async fn fail_timed_out_subagent_root(
             lease: ctx.lease,
         },
         &error,
+        TerminalReason::WatchdogStall,
         event_watermark,
         ctx.attempt_close,
         now,
@@ -5569,7 +5756,30 @@ mod tests {
         /// hangs — the child root parks in `WaitingOnChildren`,
         /// exercising the parked-leg enforcement (deadline sweep).
         RequestHungTool,
+        /// The child stays inside one provider turn long enough for the
+        /// coarse progress ticker to emit, then completes normally.
+        SlowThenText,
     }
+
+    /// First usage frame the slow child's stream reports.
+    const SLOW_CHILD_USAGE_FIRST_FRAME: Usage = Usage {
+        input_tokens: 100,
+        output_tokens: 50,
+        cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+    };
+
+    /// Its second usage frame — a RESTATED running total, which is what
+    /// `StreamAccumulator` stores (it replaces, it does not add). The
+    /// stall beacon sums across a turn's provider calls, so it must be
+    /// handed the increment between these two; handed the restatements it
+    /// would report their sum, 240/120.
+    const SLOW_CHILD_USAGE_FINAL: Usage = Usage {
+        input_tokens: 140,
+        output_tokens: 70,
+        cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+    };
 
     /// Scripted provider for the timeout tests, routed on request
     /// content:
@@ -5599,6 +5809,13 @@ mod tests {
         fn with_hung_tool() -> Self {
             Self {
                 hang_child: HangChildBehavior::RequestHungTool,
+                ..Self::new()
+            }
+        }
+
+        fn with_slow_child() -> Self {
+            Self {
+                hang_child: HangChildBehavior::SlowThenText,
                 ..Self::new()
             }
         }
@@ -5655,6 +5872,13 @@ mod tests {
                             cache_creation_input_tokens: 0,
                         },
                     })),
+                    HangChildBehavior::SlowThenText => {
+                        tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+                        Ok(ChatOutcome::Success(text_response(
+                            "resp_slow_child",
+                            "slow child done",
+                        )))
+                    }
                 };
             }
             if flat.contains(FAST_CHILD_TASK) {
@@ -5741,6 +5965,63 @@ mod tests {
                     }
                 })
                 .collect())
+        }
+    }
+
+    /// Wraps [`SubagentScriptProvider`] so the hang child's turn streams
+    /// its usage BEFORE it goes quiet.
+    ///
+    /// The plain script provider sleeps inside `chat()`, so every mid-turn
+    /// progress tick lands before a single usage frame exists: the
+    /// counters read zero and any assertion over them is vacuous. Here the
+    /// stream reports usage twice — the second frame RESTATING the running
+    /// total, which is what real providers send and what
+    /// `StreamAccumulator` stores (it replaces, it does not add) — and only
+    /// then stalls, so ticks observe live counters with the thread
+    /// aggregate still empty.
+    ///
+    /// Every other route delegates to the inner provider's default
+    /// `chat_stream`, leaving the sibling timeout tests untouched.
+    use agent_sdk_providers::streaming::{StreamBox, StreamDelta};
+
+    struct SlowStreamingChildProvider {
+        inner: Arc<SubagentScriptProvider>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for SlowStreamingChildProvider {
+        async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
+            self.inner.chat(request).await
+        }
+
+        fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
+            let is_hang_child = !request_contains_tool_result(&request)
+                && request_flat_text(&request).contains(HANG_CHILD_TASK);
+            if !is_hang_child {
+                return self.inner.chat_stream(request);
+            }
+            Box::pin(async_stream::stream! {
+                yield Ok(StreamDelta::Usage(SLOW_CHILD_USAGE_FIRST_FRAME));
+                yield Ok(StreamDelta::Usage(SLOW_CHILD_USAGE_FINAL));
+                // The observation window: usage live on the beacon,
+                // nothing committed, for several progress ticks.
+                tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+                yield Ok(StreamDelta::TextDelta {
+                    delta: "slow child done".to_owned(),
+                    block_index: 0,
+                });
+                yield Ok(StreamDelta::Done {
+                    stop_reason: Some(StopReason::EndTurn),
+                });
+            })
+        }
+
+        fn model(&self) -> &'static str {
+            "mock-model"
+        }
+
+        fn provider(&self) -> &'static str {
+            "mock"
         }
     }
 
@@ -7000,6 +7281,7 @@ mod tests {
         for _ in 0..(MAX_ACTIVITY_SUBTREE_NODES + 16) {
             let mut done = AgentTask::new_child(&child_root, TaskKind::ToolRuntime, spawned_at, 3)?;
             done.status = TaskStatus::Completed;
+            done.terminal_reason = Some(TerminalReason::Completed);
             done.completed_at = Some(stale);
             done.last_activity_at = Some(stale);
             stores.task_store.insert(done).await?;
@@ -7492,6 +7774,216 @@ mod tests {
 
         token.cancel();
         host_handle.await??;
+        Ok(())
+    }
+
+    /// AC2: a child whose turn runs long still reports progress to its
+    /// parent mid-turn, the token counters only ever climb, and no
+    /// snapshot ever exceeds the child's true durable total.
+    ///
+    /// Without the periodic emitter a parent sees nothing between spawn
+    /// and completion, so a slow child is indistinguishable from a hung
+    /// one. Monotonicity alone is a weak guard, though — it holds just as
+    /// well when the counters are wrong, because a double-counted or
+    /// max-reduced total still only climbs. The ceiling assertion is the
+    /// one with teeth: mid-turn snapshots report
+    /// `thread.total_usage + beacon`, so a beacon that still holds usage
+    /// the thread already committed produces a snapshot LARGER than the
+    /// finished child's real total — impossible if the two ledgers are
+    /// disjoint.
+    #[tokio::test]
+    async fn long_child_turn_emits_monotonic_mid_turn_progress() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+
+        let config = ServiceConfig {
+            worker: crate::config::WorkerConfig {
+                pool_size: 4,
+                heartbeat_interval_secs: 10,
+                subagent_progress_interval_secs: 1,
+                acquisition_interval_secs: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let provider = Arc::new(SubagentScriptProvider::with_slow_child());
+        let resolver = Arc::new(StaticProviderResolver::new());
+        resolver.set_fallback(Arc::new(SlowStreamingChildProvider {
+            inner: Arc::clone(&provider),
+        }))?;
+        let runtime = Arc::new(
+            ExecutionRuntime::new(
+                resolver,
+                Arc::new(NoopToolExecutor),
+                Arc::new(AllowAllConfirmationPolicy),
+            )
+            .with_subagent_spawn_selector(Arc::new(DeadlineSpawnSelector)),
+        );
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(probe_definition()));
+        let host = ServiceHost::new(config, registry, runtime)?;
+        let stores = host.stores().clone();
+        let shutdown = host.shutdown_token();
+
+        let parent_thread = ThreadId::from_string("t-subagent-periodic-progress");
+        let parent = AgentTask::new_root_turn_with_input(
+            parent_thread.clone(),
+            vec![SubmittedInputItem::Text {
+                text: "coordinate the helpers".into(),
+            }],
+            time::OffsetDateTime::now_utc(),
+            3,
+        );
+        let parent_id = parent.id.clone();
+        stores.task_store.submit_root_turn(parent).await?;
+        let host_handle = tokio::spawn(async move { host.run().await });
+
+        wait_for_status(&stores, &parent_id, TaskStatus::Completed, 5_000).await?;
+        let events = stores.event_repo.get_events(&parent_thread).await?;
+        let (snapshots, child_thread, saw_mid_turn) = collect_hang_child_progress(events);
+        assert!(
+            saw_mid_turn,
+            "expected a non-terminal progress event during the slow child turn"
+        );
+        assert!(
+            snapshots.len() >= 3,
+            "expected spawn, mid-turn, and completion snapshots; got {snapshots:?}",
+        );
+        assert_progress_monotonic(&snapshots)?;
+
+        let child_thread_id = child_thread.context("progress events must name the child thread")?;
+        let child_total = stores
+            .thread_store
+            .get(&child_thread_id)
+            .await?
+            .context("child thread must exist after the subagent completed")?
+            .total_usage;
+        let expected = (
+            u64::from(SLOW_CHILD_USAGE_FINAL.input_tokens),
+            u64::from(SLOW_CHILD_USAGE_FINAL.output_tokens),
+            0,
+            0,
+        );
+        assert_no_double_counted_progress(&snapshots, &child_total, expected)?;
+
+        shutdown.cancel();
+        host_handle.await??;
+        Ok(())
+    }
+
+    /// A `SubagentProgress` event's four token counters, in the order the
+    /// monotonicity and ceiling assertions compare them.
+    type ProgressUsage = (u64, u64, u64, u64);
+
+    /// Collect the `call_hang` child's progress snapshots from a parent
+    /// thread's committed events, plus the child thread id those events
+    /// carry and whether any non-terminal (mid-turn) tick appeared.
+    fn collect_hang_child_progress(
+        events: Vec<CommittedEvent>,
+    ) -> (
+        Vec<ProgressUsage>,
+        Option<agent_sdk_foundation::ThreadId>,
+        bool,
+    ) {
+        let mut snapshots = Vec::new();
+        let mut saw_mid_turn = false;
+        let mut child_thread: Option<agent_sdk_foundation::ThreadId> = None;
+        for committed in events {
+            if let agent_sdk_foundation::AgentEvent::SubagentProgress {
+                subagent_id,
+                current_turn,
+                completed,
+                child_thread_id,
+                input_tokens,
+                output_tokens,
+                cache_read_input_tokens,
+                cache_creation_input_tokens,
+                ..
+            } = committed.event
+                && subagent_id == "call_hang"
+            {
+                if !completed && current_turn == Some(1) {
+                    saw_mid_turn = true;
+                }
+                child_thread = child_thread.or(child_thread_id);
+                snapshots.push((
+                    input_tokens,
+                    output_tokens,
+                    cache_read_input_tokens,
+                    cache_creation_input_tokens,
+                ));
+            }
+        }
+        (snapshots, child_thread, saw_mid_turn)
+    }
+
+    /// Every counter only ever climbs across consecutive snapshots.
+    fn assert_progress_monotonic(snapshots: &[ProgressUsage]) -> Result<()> {
+        for pair in snapshots.windows(2) {
+            let [before, after] = pair else {
+                anyhow::bail!("progress window must contain two snapshots");
+            };
+            assert!(after.0 >= before.0, "input tokens decreased: {snapshots:?}");
+            assert!(
+                after.1 >= before.1,
+                "output tokens decreased: {snapshots:?}"
+            );
+            assert!(
+                after.2 >= before.2,
+                "cache-read tokens decreased: {snapshots:?}"
+            );
+            assert!(
+                after.3 >= before.3,
+                "cache-creation tokens decreased: {snapshots:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// No snapshot exceeds the child's true durable total, that total is
+    /// exactly `expected`, and at least one snapshot carried live usage.
+    ///
+    /// The ceiling is what catches a double-count: mid-turn ticks report
+    /// `thread.total_usage + beacon`, so a beacon still holding usage the
+    /// commit already folded into `total_usage` produces a snapshot LARGER
+    /// than the finished child's real total. The live-snapshot lookup keeps
+    /// the whole assertion from being vacuous when every tick reads zero.
+    fn assert_no_double_counted_progress(
+        snapshots: &[ProgressUsage],
+        child_total: &agent_sdk_foundation::TokenUsage,
+        expected: ProgressUsage,
+    ) -> Result<()> {
+        let ceiling = (
+            u64::from(child_total.input_tokens),
+            u64::from(child_total.output_tokens),
+            u64::from(child_total.cached_input_tokens),
+            u64::from(child_total.cache_creation_input_tokens),
+        );
+        for snapshot in snapshots {
+            assert!(
+                snapshot.0 <= ceiling.0
+                    && snapshot.1 <= ceiling.1
+                    && snapshot.2 <= ceiling.2
+                    && snapshot.3 <= ceiling.3,
+                "progress snapshot {snapshot:?} exceeds the child's true total {ceiling:?}; \
+                 the live beacon is reporting usage the thread aggregate already committed",
+            );
+        }
+        assert_eq!(
+            ceiling, expected,
+            "the child total is its stream's final restated usage, counted once",
+        );
+        let live = snapshots
+            .iter()
+            .find(|snapshot| snapshot.0 > 0)
+            .copied()
+            .context(
+                "expected a snapshot carrying live, uncommitted usage; without one the \
+                 monotonicity and ceiling assertions here are vacuous",
+            )?;
+        assert_eq!(
+            live, expected,
+            "a mid-turn tick must report the stream running total once; a multiple of it means \
+             restated usage frames were summed instead of their increment",
+        );
         Ok(())
     }
 
@@ -8075,6 +8567,34 @@ mod tests {
             }
             self.inner
                 .fail_task(task_id, worker, lease, error, now)
+                .await
+        }
+        /// Same fault injection as [`Self::fail_task`], because this is
+        /// the method the host's root-fail paths actually call.
+        ///
+        /// This used to inherit the trait default, which routed back
+        /// through `self.fail_task` and so picked up the injection for
+        /// free. With the default gone the injection has to be stated
+        /// here, or every "`fail_task` is flaky" test would silently
+        /// exercise a healthy store.
+        async fn fail_task_with_reason(
+            &self,
+            task_id: &AgentTaskId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+            error: String,
+            reason: agent_sdk_foundation::TerminalReason,
+            now: time::OffsetDateTime,
+        ) -> Result<(AgentTask, Option<AgentTask>)> {
+            self.fail_task_attempts.fetch_add(1, Ordering::SeqCst);
+            if let Ok(mut slot) = self.fail_task_now.lock() {
+                *slot = Some(now);
+            }
+            if Self::take_injected_failure(&self.fail_task_failures_remaining) {
+                bail!("injected transient fail_task failure");
+            }
+            self.inner
+                .fail_task_with_reason(task_id, worker, lease, error, reason, now)
                 .await
         }
         async fn cancel_tree(
@@ -8693,8 +9213,11 @@ mod tests {
             &stores,
             runtime,
             &CancellationToken::new(),
-            time::Duration::seconds(30),
-            std::time::Duration::from_millis(50),
+            TaskRunIntervals {
+                lease: time::Duration::seconds(30),
+                heartbeat: std::time::Duration::from_millis(50),
+                progress: std::time::Duration::from_secs(30),
+            },
         )
         .await;
 
@@ -8860,8 +9383,11 @@ mod tests {
                 &flaky_stores,
                 runtime,
                 &CancellationToken::new(),
-                time::Duration::milliseconds(300),
-                std::time::Duration::from_millis(50),
+                TaskRunIntervals {
+                    lease: time::Duration::milliseconds(300),
+                    heartbeat: std::time::Duration::from_millis(50),
+                    progress: std::time::Duration::from_secs(30),
+                },
             )
             .await;
         }))

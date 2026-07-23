@@ -22,7 +22,7 @@ pub mod types;
 // into sub-modules.
 
 pub use audit::{AuditProvenance, ToolAuditOutcome, ToolAuditRecord, ToolAuditRecordParams};
-pub use events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
+pub use events::{AgentEvent, AgentEventEnvelope, SequenceCounter, TerminalReason};
 pub use llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, ContentSource, Effort, Message,
     Role, StopReason, ThinkingConfig, ThinkingMode, Tool, Usage,

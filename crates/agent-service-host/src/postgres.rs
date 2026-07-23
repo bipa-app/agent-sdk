@@ -25,8 +25,8 @@ mod tests {
     use anyhow::{Context, Result, ensure};
 
     use super::migrations::{
-        DURABLE_CORE_MIGRATOR, durable_core_migrations, event_journal_outbox_migration,
-        outbox_message_kind_migration, tool_audit_events_migration,
+        DURABLE_CORE_MIGRATOR, TASK_TERMINAL_REASON_MIGRATION_VERSION, durable_core_migrations,
+        event_journal_outbox_migration, outbox_message_kind_migration, tool_audit_events_migration,
     };
     use super::repository::{
         completed_turn_units_of_work, event_journal_repository_boundaries,
@@ -73,27 +73,30 @@ mod tests {
         Ok(())
     }
 
+    /// The bundle is ordered, gap-tolerant, and contains this PR's
+    /// migration.
+    ///
+    /// Deliberately NOT a hardcoded version list — see the matching
+    /// `SQLite` test for why. Both backends share one reserved version
+    /// space, so both assertions have to stay merge-order independent or
+    /// neither does.
     #[test]
-    fn executable_migration_bundle_contains_all_migrations() -> Result<()> {
-        let migrations = &DURABLE_CORE_MIGRATOR.migrations;
-        ensure!(
-            migrations.len() == 13,
-            "expected 13 executable migrations (durable core + event journal + execution intents + tool audit events + outbox kind + task caller metadata + message head drafts + turn attempt otel ids + idempotency + task otel traceparent + checkpoint kind + task last activity at + turn attempt evidence), got {:?}",
-            migrations
-                .iter()
-                .map(|migration| migration.version)
-                .collect::<Vec<_>>(),
-        );
-        for (idx, expected) in [1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+    fn executable_migration_bundle_is_ordered_and_contains_this_prs_migration() -> Result<()> {
+        let versions: Vec<i64> = DURABLE_CORE_MIGRATOR
+            .migrations
             .iter()
-            .enumerate()
-        {
-            ensure!(
-                migrations[idx].version == *expected,
-                "expected migration version {expected}, got {}",
-                migrations[idx].version,
-            );
-        }
+            .map(|migration| migration.version)
+            .collect();
+
+        ensure!(
+            versions.windows(2).all(|pair| pair[0] < pair[1]),
+            "migration versions must be strictly increasing (ordered and unique), got {versions:?}",
+        );
+        ensure!(
+            versions.contains(&TASK_TERMINAL_REASON_MIGRATION_VERSION),
+            "bundle is missing this PR's migration \
+             {TASK_TERMINAL_REASON_MIGRATION_VERSION}, got {versions:?}",
+        );
         Ok(())
     }
 

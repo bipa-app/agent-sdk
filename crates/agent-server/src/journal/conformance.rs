@@ -466,6 +466,19 @@ mod in_memory_bundle {
                 .fail_task(task_id, worker, lease, error, now)
                 .await
         }
+        async fn fail_task_with_reason(
+            &self,
+            task_id: &AgentTaskId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+            error: String,
+            reason: agent_sdk_foundation::TerminalReason,
+            now: OffsetDateTime,
+        ) -> Result<(AgentTask, Option<AgentTask>)> {
+            self.task
+                .fail_task_with_reason(task_id, worker, lease, error, reason, now)
+                .await
+        }
         async fn cancel_tree(
             &self,
             root_id: &AgentTaskId,
@@ -2407,13 +2420,23 @@ mod tests {
             !outcome.markers.is_empty(),
             "cancel_tree through the bundle must commit a Cancelled marker",
         );
+        let cancelled = AgentTaskStore::get(&store, &root_id)
+            .await?
+            .context("cancelled root remains readable")?;
+        ensure!(
+            cancelled.terminal_reason == Some(agent_sdk_foundation::TerminalReason::UserCancel),
+            "cancelled root must persist user_cancel",
+        );
         let events = EventRepository::get_events(&store, &thread).await?;
         ensure!(
             events.iter().any(|committed| matches!(
-                committed.event,
-                agent_sdk_foundation::events::AgentEvent::Cancelled { .. }
+                &committed.event,
+                agent_sdk_foundation::events::AgentEvent::Cancelled {
+                    reason: Some(agent_sdk_foundation::TerminalReason::UserCancel),
+                    ..
+                }
             )),
-            "the marker must be readable back through the bundle's event journal",
+            "the marker must echo user_cancel through the bundle's event journal",
         );
         Ok(())
     }

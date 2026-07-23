@@ -38,8 +38,8 @@ use agent_sdk_foundation::audit::AuditProvenance;
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::llm::{self, ChatRequest};
 use agent_sdk_foundation::{
-    AgentContinuation, AgentState, ContinuationEnvelope, PendingToolCallInfo, TokenUsage,
-    ToolResult, ToolTier,
+    AgentContinuation, AgentState, ContinuationEnvelope, PendingToolCallInfo, TerminalReason,
+    TokenUsage, ToolResult, ToolTier,
 };
 use agent_sdk_providers::LlmProvider;
 use agent_sdk_providers::streaming::{StreamAccumulator, StreamBox, StreamDelta, StreamErrorKind};
@@ -215,6 +215,31 @@ impl RootTurnDeps<'_> {
     fn note_frame_activity(&self) {
         if let Some(activity) = self.activity {
             activity.bump(OffsetDateTime::now_utc());
+        }
+    }
+
+    fn note_stream_usage(&self, usage: &llm::Usage) {
+        if let Some(activity) = self.activity {
+            activity.record_usage(&TokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cached_input_tokens: usage.cached_input_tokens,
+                cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            });
+        }
+    }
+
+    /// Hand this turn's streamed usage over to the thread aggregate.
+    ///
+    /// Called exactly where `commit_completed_turn` folds `turn_usage`
+    /// into `thread.total_usage`: from that instant the durable total
+    /// owns those tokens, so the beacon must stop reporting them. Live
+    /// readers add `thread.total_usage + beacon.usage()` to show a
+    /// mid-turn total, and that sum is only correct while the beacon
+    /// holds nothing the thread already counts.
+    fn note_turn_usage_committed(&self) {
+        if let Some(activity) = self.activity {
+            let _ = activity.take_usage();
         }
     }
 
@@ -447,6 +472,16 @@ pub enum RootTurnOutcome {
 // Failure & cancellation
 // ─────────────────────────────────────────────────────────────────────
 
+/// Inputs for failing a root turn with a typed terminal reason.
+pub struct FailRootTurnParams<'a> {
+    pub task_id: &'a AgentTaskId,
+    pub worker_id: &'a WorkerId,
+    pub lease_id: &'a LeaseId,
+    pub thread_id: &'a agent_sdk_foundation::ThreadId,
+    pub error: &'a anyhow::Error,
+    pub reason: TerminalReason,
+}
+
 /// Fail a root turn after `execute_root_turn` or `resume_root_turn`
 /// returns `Err`.
 ///
@@ -474,57 +509,91 @@ pub async fn fail_root_turn(
 ) -> Result<AgentTask> {
     // Best-effort close any open turn attempts for this task.
     best_effort_close_open_attempts(task_id, deps.attempt_store, now).await;
-    fail_root_turn_inner(task_id, worker_id, lease_id, thread_id, error, deps, now).await
+    fail_root_turn_inner(
+        FailRootTurnParams {
+            task_id,
+            worker_id,
+            lease_id,
+            thread_id,
+            error,
+            reason: TerminalReason::InternalError,
+        },
+        deps,
+        now,
+    )
+    .await
 }
 
-/// [`fail_root_turn`] without the open-attempt pre-close, for callers
-/// that fail a root turn whose worker is still LIVE in this process —
-/// the host's subagent-timeout heartbeat path.
-///
-/// The pre-close would race the live worker: in the window between a
-/// successful stream and `commit_completed_turn`, closing its open
-/// attempt as `Cancelled` with zero tokens both clobbers the
-/// real-usage close (the billing source of truth on attempt rows) and
-/// makes the in-transaction close hit `AlreadyClosed`, aborting the
-/// whole commit. The live worker's own abort path (mid-stream cancel
-/// close, or its terminal commit) owns its attempts; this variant only
-/// performs the durable fail + error event.
+/// Fail a root turn with a caller-classified terminal reason.
 ///
 /// # Errors
 ///
-/// Same envelope as [`fail_root_turn`].
-pub async fn fail_root_turn_leaving_attempts_open(
-    task_id: &AgentTaskId,
-    worker_id: &WorkerId,
-    lease_id: &LeaseId,
-    thread_id: &agent_sdk_foundation::ThreadId,
-    error: &anyhow::Error,
+/// Returns an error if the store rejects the terminal transition.
+pub async fn fail_root_turn_with_reason(
+    params: FailRootTurnParams<'_>,
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<AgentTask> {
-    fail_root_turn_inner(task_id, worker_id, lease_id, thread_id, error, deps, now).await
+    best_effort_close_open_attempts(params.task_id, deps.attempt_store, now).await;
+    fail_root_turn_inner(params, deps, now).await
+}
+
+/// [`fail_root_turn_with_reason`] without the open-attempt pre-close, for
+/// callers that fail a root turn whose worker is still LIVE in this
+/// process — the host's subagent-timeout heartbeat path.
+///
+/// The pre-close would race the live worker: in the window between a
+/// successful stream and `commit_completed_turn`, closing its open
+/// attempt as `Cancelled` with zero tokens both clobbers the real-usage
+/// close (the billing source of truth on attempt rows) and makes the
+/// in-transaction close hit `AlreadyClosed`, aborting the whole commit.
+/// The live worker's own abort path (mid-stream cancel close, or its
+/// terminal commit) owns its attempts; this variant only performs the
+/// durable fail + error event.
+///
+/// # Errors
+///
+/// Returns an error if the store rejects the terminal transition.
+pub async fn fail_root_turn_leaving_attempts_open_with_reason(
+    params: FailRootTurnParams<'_>,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<AgentTask> {
+    fail_root_turn_inner(params, deps, now).await
 }
 
 async fn fail_root_turn_inner(
-    task_id: &AgentTaskId,
-    worker_id: &WorkerId,
-    lease_id: &LeaseId,
-    thread_id: &agent_sdk_foundation::ThreadId,
-    error: &anyhow::Error,
+    params: FailRootTurnParams<'_>,
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<AgentTask> {
+    let FailRootTurnParams {
+        task_id,
+        worker_id,
+        lease_id,
+        thread_id,
+        error,
+        reason,
+    } = params;
     let error_msg = format!("{error:#}");
     let (failed_task, _parent) = deps
         .task_store
-        .fail_task(task_id, worker_id, lease_id, error_msg.clone(), now)
+        .fail_task_with_reason(
+            task_id,
+            worker_id,
+            lease_id,
+            error_msg.clone(),
+            reason.clone(),
+            now,
+        )
         .await
         .context("fail root task")?;
 
     // Best-effort: the task is durably Failed; event commit failure
     // must not override that outcome. Consistent with
     // best_effort_close_open_attempts.
-    let error_event = AgentEvent::error(error_msg, false).with_emitter_task_id(task_id.as_str());
+    let error_event =
+        AgentEvent::terminal_error(error_msg, reason).with_emitter_task_id(task_id.as_str());
     let _ = deps
         .event_repo
         .commit_event(thread_id, error_event, now)
@@ -870,6 +939,58 @@ pub(crate) fn is_root_turn_cancelled(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.downcast_ref::<RootTurnCancelledMarker>().is_some())
+}
+
+/// Typed cause attached to every root-turn failure a provider stream
+/// produced, carrying the failure's [`StreamErrorKind`] verbatim.
+///
+/// The classification a durable runtime needs (`provider_error` vs
+/// `internal_error`, and which provider class) must survive the trip from
+/// the stream loop to the terminal-transition writer. Carrying it as a
+/// typed cause rather than a formatted message means
+/// [`terminal_reason_for_root_error`] downcasts instead of parsing prose:
+/// the two producers below word their messages differently (one names the
+/// retry count), and a message-shape divergence is exactly how the
+/// retry-exhausted terminal — the most common real provider failure —
+/// silently classified as `internal_error`.
+#[derive(Debug, thiserror::Error)]
+#[error("provider stream failed (kind={kind:?})")]
+pub struct RootStreamFailure {
+    /// Provider-reported failure class, forwarded unchanged from the
+    /// [`StreamDelta::Error`] frame that ended the turn.
+    pub kind: StreamErrorKind,
+}
+
+/// Attach [`RootStreamFailure`] as the typed cause under `message`.
+///
+/// Both provider-failure exits route through here so neither can grow a
+/// message shape the classifier does not understand.
+fn root_stream_failure(kind: StreamErrorKind, message: String) -> anyhow::Error {
+    anyhow::Error::new(RootStreamFailure { kind }).context(message)
+}
+
+/// Classify a failed root turn into the durable [`TerminalReason`] its
+/// terminal transition records.
+///
+/// Lives beside the producers on purpose: it is the only consumer of
+/// [`RootStreamFailure`], and a producer that forgets to attach the cause
+/// is caught by the tests in this module rather than by an operator
+/// reading `internal_error` on a rate-limit terminal.
+///
+/// Anything without a [`RootStreamFailure`] in its chain is genuinely not
+/// a provider failure — a store rejection, a serialization fault, a
+/// panic-to-error boundary — and is recorded as
+/// [`TerminalReason::InternalError`].
+#[must_use]
+pub fn terminal_reason_for_root_error(error: &anyhow::Error) -> TerminalReason {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<RootStreamFailure>())
+        .map_or(TerminalReason::InternalError, |failure| {
+            TerminalReason::ProviderError {
+                kind: failure.kind.wire_label().to_owned(),
+            }
+        })
 }
 
 /// Split `messages` into `(committable prefix, retained suffix)` per the
@@ -1911,7 +2032,12 @@ pub(crate) async fn commit_completed_turn_shifting_slot(
                 )
                 .await
                 {
-                    Ok(outcome) => return Ok(outcome),
+                    Ok(outcome) => {
+                        // The thread aggregate just took ownership of this
+                        // turn's tokens; the beacon must stop reporting them.
+                        deps.note_turn_usage_committed();
+                        return Ok(outcome);
+                    }
                     Err(error) => error,
                 }
             }
@@ -2526,7 +2652,13 @@ enum StreamAttemptError {
     /// Provider returned `InvalidRequest` (caller-side error) — no
     /// retry will help.  The turn attempt was already closed with
     /// `InvalidRequest`.
-    Fatal { message: String },
+    Fatal {
+        message: String,
+        /// The stream's own classification, carried so the terminal
+        /// transition records the provider failure class instead of
+        /// re-deriving it from `message`. See [`RootStreamFailure`].
+        kind: StreamErrorKind,
+    },
     /// The root turn was cancelled mid-stream via the
     /// [`RootTurnDeps::cancel`] token.  The turn attempt was already
     /// closed with `Cancelled`; the retry wrapper bails immediately,
@@ -2592,6 +2724,30 @@ const ZERO_ATTEMPT_USAGE: llm::Usage = llm::Usage {
 /// Usage the stream has accumulated so far, or zero when it reported none.
 fn attempt_usage(accumulator: &StreamAccumulator) -> llm::Usage {
     accumulator.usage().cloned().unwrap_or(ZERO_ATTEMPT_USAGE)
+}
+
+/// The increment from `previous` to `current`, per counter.
+///
+/// [`StreamAccumulator`] restates its **running total for the current
+/// call** on every frame, so a consumer that sums (the stall beacon, which
+/// must add up a turn's separate provider calls) has to be handed the
+/// difference. Feeding it the restatement instead multiplies one call's
+/// usage by its frame count.
+///
+/// Saturating: the accumulator only grows within a call, so a negative
+/// difference is not reachable — and if a provider ever restated
+/// downwards, contributing zero beats wrapping to `u32::MAX`.
+const fn usage_increment(previous: &llm::Usage, current: &llm::Usage) -> llm::Usage {
+    llm::Usage {
+        input_tokens: current.input_tokens.saturating_sub(previous.input_tokens),
+        output_tokens: current.output_tokens.saturating_sub(previous.output_tokens),
+        cached_input_tokens: current
+            .cached_input_tokens
+            .saturating_sub(previous.cached_input_tokens),
+        cache_creation_input_tokens: current
+            .cache_creation_input_tokens
+            .saturating_sub(previous.cache_creation_input_tokens),
+    }
 }
 
 /// Fold `delta` into `total`, saturating so token counters never wrap.
@@ -2869,7 +3025,7 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
                 })
                 .await?;
             }
-            Err(StreamAttemptError::Fatal { message }) => {
+            Err(StreamAttemptError::Fatal { message, kind }) => {
                 if let Some(next_attempt) =
                     try_recover_with_compaction(PromptTooLongRecoveryParams {
                         message: &message,
@@ -2887,7 +3043,7 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
                     attempt = next_attempt;
                     continue;
                 }
-                bail!("{message}");
+                return Err(root_stream_failure(kind, message));
             }
             Err(StreamAttemptError::Cancelled { message }) => {
                 // The turn was cancelled mid-stream — the attempt is
@@ -3163,7 +3319,7 @@ async fn back_off_transient_stream_error(
             Some(final_msg.clone()),
         )
         .await;
-        bail!("{final_msg}");
+        return Err(root_stream_failure(kind, final_msg));
     }
     retry.last_emitted = retry.event_retries;
     let delay = kind
@@ -3537,10 +3693,17 @@ async fn call_llm_once_instrumented(
         }
         Err(error) => {
             let (error_type, message) = match error {
-                StreamAttemptError::Recoverable { kind, message, .. } => {
-                    (stream_error_kind_type(*kind), message.as_str())
+                // `wire_label` is the single stable vocabulary for a
+                // stream failure class — the same labels
+                // `agent_sdk::observability::loop_instrument::classify_llm_error`
+                // produces for the in-process loop, and the same ones the
+                // terminal reason persists. Fatal carries its own kind, so
+                // an unclassified failure is no longer mislabelled
+                // `invalid_request`.
+                StreamAttemptError::Recoverable { kind, message, .. }
+                | StreamAttemptError::Fatal { message, kind } => {
+                    (kind.wire_label(), message.as_str())
                 }
-                StreamAttemptError::Fatal { message } => ("invalid_request", message.as_str()),
                 StreamAttemptError::Cancelled { message } => ("cancelled", message.as_str()),
             };
             loop_instrument::finish_chat_span_error(
@@ -3555,24 +3718,6 @@ async fn call_llm_once_instrumented(
     }
 
     result
-}
-
-/// Map a [`StreamErrorKind`] to the stable `error.type` attribute /
-/// metric label, matching the vocabulary
-/// `agent_sdk::observability::loop_instrument::classify_llm_error`
-/// produces for the in-process loop.
-#[cfg(feature = "otel")]
-const fn stream_error_kind_type(kind: StreamErrorKind) -> &'static str {
-    match kind {
-        StreamErrorKind::Connectivity => "connectivity",
-        StreamErrorKind::ConnectionLost => "connection_lost",
-        StreamErrorKind::RateLimited(_) => "rate_limited",
-        StreamErrorKind::ServerError => "server_error",
-        StreamErrorKind::InvalidRequest => "invalid_request",
-        // `StreamErrorKind` is #[non_exhaustive]; `Unknown` and any future
-        // variant map to the same stable label the in-process loop uses.
-        _ => "unknown",
-    }
 }
 
 /// Number of buffered streaming deltas that forces a coalesced
@@ -3841,6 +3986,10 @@ async fn call_llm_once_inner(
     // directly without an outer `pin!`.
     let mut stream = provider.chat_stream(request);
     let mut accumulator = StreamAccumulator::new();
+    // Usage from THIS call already handed to the stall beacon. The
+    // accumulator restates its running total on every frame, and the
+    // beacon sums across a turn's calls, so it must receive increments.
+    let mut beaconed_usage = ZERO_ATTEMPT_USAGE;
     let mut content_ids = ContentIds::default();
     // Buffered `TextDelta` / `ThinkingDelta` events awaiting a batched
     // commit. Flushed when the buffer reaches `STREAMING_DELTA_BATCH_SIZE`
@@ -3907,6 +4056,10 @@ async fn call_llm_once_inner(
         };
 
         accumulator.apply(&delta);
+        if let Some(usage) = accumulator.usage() {
+            deps.note_stream_usage(&usage_increment(&beaconed_usage, usage));
+            beaconed_usage = usage.clone();
+        }
 
         match buffer_stream_delta(&delta, &mut content_ids, &mut pending_deltas) {
             DeltaStep::Skip => continue,
@@ -4042,6 +4195,7 @@ fn buffer_stream_delta(
             } else {
                 StreamAttemptError::Fatal {
                     message: format!("LLM stream error (kind={kind:?}): {message}"),
+                    kind,
                 }
             };
             DeltaStep::Fail(outcome, error)

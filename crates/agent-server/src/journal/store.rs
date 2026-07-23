@@ -210,7 +210,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use agent_sdk_foundation::events::AgentEvent;
-use agent_sdk_foundation::{ContinuationEnvelope, ListenExecutionContext, ThreadId, TokenUsage};
+use agent_sdk_foundation::{
+    ContinuationEnvelope, ListenExecutionContext, TerminalReason, ThreadId, TokenUsage,
+};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use time::OffsetDateTime;
@@ -754,6 +756,7 @@ struct CancelMarkerCandidate {
     /// when the root carried one. Preferred over the thread aggregate
     /// because it includes the suspended turn's already-billed calls.
     continuation_usage: Option<TokenUsage>,
+    reason: TerminalReason,
 }
 
 /// The bounded result of [`AgentTaskStore::probe_children`].
@@ -1876,6 +1879,30 @@ pub trait AgentTaskStore: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Option<AgentTask>)>;
 
+    /// [`Self::fail_task`] with an explicit typed terminal reason.
+    ///
+    /// Required, deliberately: this method previously carried a default
+    /// that dropped `reason` and delegated to [`Self::fail_task`], which
+    /// records `internal_error`. Any store that did not override it
+    /// therefore mislabelled **every** terminal — a rate-limit exhaustion,
+    /// a user cancel, a watchdog stall — as an internal fault, and nothing
+    /// in the type system or the test suite said so. Making it required
+    /// turns that silent downgrade into a compile error, so a new store
+    /// must decide what it does with the reason.
+    ///
+    /// # Errors
+    ///
+    /// Same error envelope as [`Self::fail_task`].
+    async fn fail_task_with_reason(
+        &self,
+        child_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        error: String,
+        reason: TerminalReason,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<AgentTask>)>;
+
     /// Cancel `root_id` and every descendant in its subtree under a
     /// single store write, producing a fully-terminal subtree in
     /// deterministic breadth-first (level) order.
@@ -2237,7 +2264,7 @@ impl InMemoryAgentTaskStore {
                 .event_repo
                 .commit_event(
                     &candidate.thread_id,
-                    AgentEvent::cancelled(turn, usage)
+                    AgentEvent::cancelled_with_reason(turn, usage, candidate.reason)
                         .with_emitter_task_id(candidate.task_id.as_str()),
                     now,
                 )
@@ -2728,7 +2755,12 @@ impl Inner {
     /// show up in the returned transitioned-id slice).
     ///
     /// Returns `true` if the row was actually transitioned.
-    fn cancel_row_in_place(&mut self, id: &AgentTaskId, now: OffsetDateTime) -> Result<bool> {
+    fn cancel_row_in_place(
+        &mut self,
+        id: &AgentTaskId,
+        reason: TerminalReason,
+        now: OffsetDateTime,
+    ) -> Result<bool> {
         let Some(old) = self.by_id.get(id).cloned() else {
             return Ok(false);
         };
@@ -2737,7 +2769,7 @@ impl Inner {
         }
         let cancelled = old
             .clone()
-            .cancel(now)
+            .cancel_with_reason(reason, now)
             .context("cancel_tree: cancel transition failed")?;
         self.rebalance_after_row_change(&old, &cancelled);
         self.by_id.insert(cancelled.id.clone(), cancelled.clone());
@@ -4524,14 +4556,34 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         error: String,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Option<AgentTask>)> {
+        self.fail_task_with_reason(
+            child_id,
+            worker,
+            lease,
+            error,
+            TerminalReason::InternalError,
+            now,
+        )
+        .await
+    }
+
+    async fn fail_task_with_reason(
+        &self,
+        child_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        error: String,
+        reason: TerminalReason,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<AgentTask>)> {
         let mut inner = self.inner.write().await;
         let result = inner.apply_task_terminal_transition(
             child_id,
             worker,
             lease,
             now,
-            "fail_task",
-            move |child| child.fail(error, now),
+            "fail_task_with_reason",
+            move |child| child.fail_with_terminal_reason(error, reason, now),
         )?;
         drop(inner);
         Ok(result)
@@ -4587,6 +4639,11 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             if row.status.is_terminal() {
                 continue;
             }
+            let reason = if id == *root_id {
+                TerminalReason::UserCancel
+            } else {
+                TerminalReason::ParentCancelled
+            };
             if row.kind == TaskKind::RootTurn && row.is_root() && row.status.blocks_root_admission()
             {
                 marker_candidates.push(CancelMarkerCandidate {
@@ -4596,9 +4653,10 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                         .state
                         .continuation()
                         .map(|continuation| continuation.payload.total_usage.clone()),
+                    reason: reason.clone(),
                 });
             }
-            to_cancel.push(id);
+            to_cancel.push((id, reason));
         }
 
         // The whole marker set is journaled BEFORE any row flips, while
@@ -4640,8 +4698,8 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         // The transitions: pure, synchronous, no await. Once the markers
         // are durable nothing can interrupt the flips they describe.
         let mut transitioned = Vec::with_capacity(to_cancel.len());
-        for id in to_cancel {
-            if inner.cancel_row_in_place(&id, now)? {
+        for (id, reason) in to_cancel {
+            if inner.cancel_row_in_place(&id, reason, now)? {
                 transitioned.push(id);
             }
         }
@@ -4740,7 +4798,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
 
         let failed = old
             .clone()
-            .fail(error, now)
+            .fail_with_terminal_reason(error, TerminalReason::ConfirmationRejected, now)
             .context("reject_confirmation: fail transition failed")?;
         inner.rebalance_after_row_change(&old, &failed);
         inner.by_id.insert(failed.id.clone(), failed.clone());
@@ -10696,6 +10754,7 @@ mod tests {
             .await
             .context("fail b")?;
         assert_eq!(failed.status, TaskStatus::Failed);
+        assert_eq!(failed.terminal_reason, Some(TerminalReason::InternalError),);
         assert_eq!(failed.last_error.as_deref(), Some("tool timed out"));
         let observed_parent = observed_parent.context("parent returned")?;
         // Second child is the last live one → parent resumes.
@@ -10925,6 +10984,10 @@ mod tests {
             .context("get")?
             .context("exists")?;
         assert_eq!(persisted_parent.status, TaskStatus::Cancelled);
+        assert_eq!(
+            persisted_parent.terminal_reason,
+            Some(TerminalReason::UserCancel),
+        );
         assert_eq!(persisted_parent.pending_child_count, 0);
         assert!(persisted_parent.state.is_none());
         for child in &children {
@@ -10934,6 +10997,7 @@ mod tests {
                 .context("get child")?
                 .context("child exists")?;
             assert_eq!(row.status, TaskStatus::Cancelled);
+            assert_eq!(row.terminal_reason, Some(TerminalReason::ParentCancelled),);
             assert!(row.worker_id.is_none());
             assert!(row.state.is_none());
         }

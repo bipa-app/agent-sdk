@@ -68,6 +68,10 @@ pub fn started_event_from_invocation(
         success: false,
         tool_count: 0,
         total_tokens: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
     })
 }
 
@@ -105,5 +109,9 @@ pub fn subagent_started_event(
         success: false,
         tool_count: 0,
         total_tokens: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
     }
 }

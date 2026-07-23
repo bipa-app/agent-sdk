@@ -1496,7 +1496,7 @@ async fn spawn_subagent_invocation_sequential(
         success: false,
         current_turn: 0,
         tool_count: 0,
-        total_tokens: 0,
+        usage: TokenUsage::default(),
     });
     let committed_events = commit_parent_subagent_progress(
         deps.event_repo,
@@ -2113,21 +2113,34 @@ fn build_parent_tool_result(result: &SubagentResult) -> Result<ToolResult> {
     })
 }
 
-struct SubagentProgressSnapshot<'a> {
-    subagent_id: &'a str,
-    subagent_name: &'a str,
-    spec: &'a EffectiveSubagentSpec,
-    child_thread_id: &'a ThreadId,
-    child_root_task_id: &'a AgentTaskId,
-    subagent_task_id: &'a AgentTaskId,
-    completed: bool,
-    success: bool,
-    current_turn: u32,
-    tool_count: u32,
-    total_tokens: u64,
+/// Everything one `SubagentProgress` frame reports about a child.
+///
+/// The four token counters travel as one [`TokenUsage`] rather than four
+/// loose `u64` fields: they are always sourced together and widened to
+/// the proto's `uint64` in exactly one place ([`build_parent_progress_event`]),
+/// so adding a fifth counter is one edit here instead of one per call
+/// site.
+pub struct SubagentProgressSnapshot<'a> {
+    pub subagent_id: &'a str,
+    pub subagent_name: &'a str,
+    pub spec: &'a EffectiveSubagentSpec,
+    pub child_thread_id: &'a ThreadId,
+    pub child_root_task_id: &'a AgentTaskId,
+    pub subagent_task_id: &'a AgentTaskId,
+    pub completed: bool,
+    pub success: bool,
+    pub current_turn: u32,
+    pub tool_count: u32,
+    pub usage: TokenUsage,
 }
 
-fn build_parent_progress_event(snapshot: &SubagentProgressSnapshot<'_>) -> AgentEvent {
+/// The single constructor for a parent-facing `SubagentProgress` event.
+///
+/// Every emitter — spawn, batch spawn, completion, and the host's
+/// periodic mid-turn tick — goes through here, so a field added to the
+/// event cannot land on some emitters and not others.
+#[must_use]
+pub fn build_parent_progress_event(snapshot: &SubagentProgressSnapshot<'_>) -> AgentEvent {
     AgentEvent::SubagentProgress {
         subagent_id: snapshot.subagent_id.to_owned(),
         subagent_name: snapshot.subagent_name.to_owned(),
@@ -2143,7 +2156,11 @@ fn build_parent_progress_event(snapshot: &SubagentProgressSnapshot<'_>) -> Agent
         completed: snapshot.completed,
         success: snapshot.success,
         tool_count: snapshot.tool_count,
-        total_tokens: snapshot.total_tokens,
+        total_tokens: subagent_total_tokens(&snapshot.usage),
+        input_tokens: u64::from(snapshot.usage.input_tokens),
+        output_tokens: u64::from(snapshot.usage.output_tokens),
+        cache_read_input_tokens: u64::from(snapshot.usage.cached_input_tokens),
+        cache_creation_input_tokens: u64::from(snapshot.usage.cache_creation_input_tokens),
     }
 }
 
@@ -2198,7 +2215,14 @@ fn pending_subagent_tool_call(
     Ok(continuation.pending_tool_calls[spawn_index].clone())
 }
 
-fn canonical_subagent_name(tool_name: &str) -> &str {
+/// The agent name behind a subagent tool call.
+///
+/// Tool names reach the runtime as `subagent_<name>`; every consumer that
+/// displays or records the agent wants the bare `<name>`. One definition,
+/// because a second copy of this rule in another crate is how the two
+/// drift.
+#[must_use]
+pub fn canonical_subagent_name(tool_name: &str) -> &str {
     tool_name.strip_prefix("subagent_").unwrap_or(tool_name)
 }
 
@@ -2308,7 +2332,7 @@ async fn commit_completed_subagent_progress(
         success: summary.success,
         current_turn: summary.total_turns,
         tool_count: summary.tool_count,
-        total_tokens: subagent_total_tokens(&summary.total_usage),
+        usage: summary.total_usage.clone(),
     });
 
     // The card's contract: a failed progress commit PROPAGATES — the

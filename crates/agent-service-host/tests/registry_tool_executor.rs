@@ -114,6 +114,7 @@ fn make_bootstrap_with_context(
         attempt: 0,
         max_attempts: 3,
         last_error: None,
+        terminal_reason: None,
         pending_child_count: 1,
         spawn_index: None,
         result_payload: None,

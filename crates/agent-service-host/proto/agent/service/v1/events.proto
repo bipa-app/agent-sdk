@@ -185,6 +185,64 @@ message DoneEvent {
   optional string emitter_task_id = 7;
 }
 
+// Why a durable task reached a terminal state.
+//
+// Recorded on the task row inside the terminal transition itself, so the
+// reason and the status can never disagree, and republished here for
+// clients that surface "why did this stop" without reading the journal.
+//
+// Every terminal transition carries one. A reader that needs to
+// distinguish "the run was cancelled" from "the provider gave up" reads
+// `kind`; anything needing the provider's own failure class reads
+// `provider_error_kind`.
+message TerminalReason {
+  enum Kind {
+    // The producer set no reason. Only appears on frames from servers
+    // that predate this message; a current server always sets a
+    // specific kind. Distinct from KIND_UNKNOWN — see below.
+    KIND_UNSPECIFIED = 0;
+    // The task finished its work successfully.
+    KIND_COMPLETED = 1;
+    // A caller explicitly cancelled this task tree.
+    KIND_USER_CANCEL = 2;
+    // A configured turn, token, cost, or retry budget was exhausted.
+    KIND_BUDGET = 3;
+    // The subagent watchdog observed no evidence of work for the full
+    // stall budget. Measures silence, not age: a slow-but-working task
+    // is never terminated by this.
+    KIND_WATCHDOG_STALL = 4;
+    // The provider failed the request. `provider_error_kind` names the
+    // failure class; this is the only kind that populates it.
+    KIND_PROVIDER_ERROR = 5;
+    // An ancestor was cancelled, so this descendant was cancelled with
+    // it. Distinct from KIND_USER_CANCEL, which names the task the
+    // caller actually targeted.
+    KIND_PARENT_CANCELLED = 6;
+    // A pending confirmation was rejected, revoked, or timed out.
+    KIND_CONFIRMATION_REJECTED = 7;
+    // An internal execution or persistence fault ended the task — a
+    // store rejection, a serialization failure. Not a provider failure:
+    // if this shows up where a provider error is expected, the
+    // classification path lost the typed cause.
+    KIND_INTERNAL_ERROR = 8;
+    // A NEWER server sent a reason this client's schema does not have.
+    // The producer did name a reason (unlike KIND_UNSPECIFIED, where
+    // none was sent) — this client simply cannot decode it. Treat as
+    // "terminal, cause unknown to me" and prefer the free-text error
+    // message.
+    KIND_UNKNOWN = 9;
+  }
+
+  Kind kind = 1;
+  // Provider failure class, in stable snake_case: `connectivity`,
+  // `connection_lost`, `rate_limited`, `server_error`,
+  // `invalid_request`, `unknown`. Set if and only if `kind` is
+  // KIND_PROVIDER_ERROR. Safe to use as a metrics grouping key — it is
+  // a closed vocabulary that carries no per-request detail (a
+  // rate-limit's retry-after hint is deliberately not folded in).
+  optional string provider_error_kind = 2;
+}
+
 message ErrorEvent {
   string message = 1;
   bool recoverable = 2;
@@ -195,6 +253,7 @@ message ErrorEvent {
   // that root, so a reader can tell a superseded frame apart from the
   // thread's live one.
   optional string emitter_task_id = 3;
+  optional TerminalReason reason = 4;
 }
 
 // A root task (queued, parked, or running) was cancelled via the
@@ -257,6 +316,7 @@ message CancelledEvent {
   // that root, so a reader can tell a superseded frame apart from the
   // thread's live one.
   optional string emitter_task_id = 3;
+  optional TerminalReason reason = 4;
 }
 
 message RefusalEvent {
@@ -287,6 +347,10 @@ message SubagentProgressEvent {
   optional string child_thread_id = 13;
   optional string child_root_task_id = 14;
   optional string subagent_task_id = 15;
+  uint64 input_tokens = 16;
+  uint64 output_tokens = 17;
+  uint64 cache_read_input_tokens = 18;
+  uint64 cache_creation_input_tokens = 19;
 }
 
 // Auto-retry was initiated for a transient LLM error (rate limit,

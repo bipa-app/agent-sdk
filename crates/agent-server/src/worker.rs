@@ -137,18 +137,21 @@ pub use connectivity::{ConnectivityWait, ConnectivityWaitGuard, ConnectivityWait
 pub use definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
 pub use registry::{AgentDefinitionRegistry, InMemoryAgentDefinitionRegistry};
 pub use root_turn::{
-    RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes, best_effort_close_open_attempts,
-    cancel_root_turn, execute_root_turn, fail_root_turn, fail_root_turn_leaving_attempts_open,
+    FailRootTurnParams, RootStreamFailure, RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes,
+    best_effort_close_open_attempts, cancel_root_turn, execute_root_turn, fail_root_turn,
+    fail_root_turn_leaving_attempts_open_with_reason, fail_root_turn_with_reason,
     resume_for_steering, resume_from_children, resume_root_turn, revert_steering_wake,
+    terminal_reason_for_root_error,
 };
 pub use subagent::{
     EffectiveSubagentCapabilities, EffectiveSubagentMcpPolicy, EffectiveSubagentSpec,
     InheritedSubagentConstraints, InheritedSubagentPolicy, MixedChildrenRequest,
     ServerSubagentSpawnPolicy, SpawnedMixedBatch, SpawnedSubagentBatch, SpawnedSubagentInvocation,
     SubagentBatchEntry, SubagentCapabilityProfile, SubagentCapabilityRequest,
-    SubagentInvocationDeps, SubagentMcpRequest, SubagentResult, SubagentResultDeps,
-    SubagentSandboxMode, SubagentSandboxPolicy, SubagentSpawnPolicy, SubagentSpawnRequest,
-    SubagentSummary, SubagentTaskBootstrap, SubagentTaskOutcome, execute_subagent_task,
+    SubagentInvocationDeps, SubagentMcpRequest, SubagentProgressSnapshot, SubagentResult,
+    SubagentResultDeps, SubagentSandboxMode, SubagentSandboxPolicy, SubagentSpawnPolicy,
+    SubagentSpawnRequest, SubagentSummary, SubagentTaskBootstrap, SubagentTaskOutcome,
+    build_parent_progress_event, canonical_subagent_name, execute_subagent_task,
     resolve_subagent_bootstrap, resolve_subagent_spec, spawn_mixed_children_invocations,
     spawn_subagent_batch_invocations, spawn_subagent_invocation,
 };
