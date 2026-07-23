@@ -62,7 +62,9 @@
 //! introduce, the same forward-compatibility rule
 //! [`agent_sdk_foundation::ContinuationEnvelope`] follows.
 
-use agent_sdk_foundation::{ContinuationEnvelope, ListenExecutionContext, ThreadId, llm};
+use agent_sdk_foundation::{
+    ContinuationEnvelope, ListenExecutionContext, QuestionAnswer, QuestionPayload, ThreadId, llm,
+};
 use serde::{Deserialize, Serialize};
 
 use super::task::TaskStatus;
@@ -158,6 +160,45 @@ pub enum TaskState {
         /// `None` for non-listen tools (the common case).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prepared_operation: Option<ListenExecutionContext>,
+    },
+
+    /// Durable root-turn state while a batch of `ask_user` calls awaits
+    /// its answers.
+    ///
+    /// The batch parks as one unit: every pending tool call at the ask
+    /// boundary is an `ask_user`, and the `AnswerQuestion` RPC must
+    /// resolve all of them in a single call before the turn resumes
+    /// (the resume fan-in requires a result for every pending id).
+    AwaitingQuestion {
+        /// Versioned continuation captured at the ask boundary.
+        continuation: Box<ContinuationEnvelope>,
+        /// Uncommitted prompt and assistant tool-use response.
+        #[serde(default)]
+        suspended_messages: Vec<llm::Message>,
+        /// User-facing payloads emitted to clients and retained across
+        /// restarts, in pending-tool-call order. Never empty.
+        questions: Vec<QuestionPayload>,
+    },
+
+    /// Durable, runnable state after `AnswerQuestion` records the answers.
+    ///
+    /// The answers stay on the task through `Pending` and `Running`, so a
+    /// process death before or during the resume LLM call re-drives from this
+    /// state without re-emitting the questions.
+    AnsweredQuestion {
+        /// Versioned continuation captured at the ask boundary.
+        continuation: Box<ContinuationEnvelope>,
+        /// Uncommitted prompt and assistant tool-use response.
+        #[serde(default)]
+        suspended_messages: Vec<llm::Message>,
+        /// Original questions, retained for idempotent answer checks.
+        questions: Vec<QuestionPayload>,
+        /// Caller-owned idempotency key from the winning
+        /// `AnswerQuestion` call — the stable receipt every replay
+        /// returns.
+        receipt_id: String,
+        /// Persisted answers, exactly one per question.
+        answers: Vec<QuestionAnswer>,
     },
 
     /// Durable state for a `subagent` invocation task that supervises
@@ -258,10 +299,11 @@ impl TaskState {
         match self {
             Self::None => None,
             Self::WaitingOnChildren { .. } => Some(TaskStatus::WaitingOnChildren),
-            Self::SubagentInvocation { .. } | Self::ReadyToResume { .. } => {
-                Some(TaskStatus::Pending)
-            }
+            Self::SubagentInvocation { .. }
+            | Self::ReadyToResume { .. }
+            | Self::AnsweredQuestion { .. } => Some(TaskStatus::Pending),
             Self::AwaitingConfirmation { .. } => Some(TaskStatus::AwaitingConfirmation),
+            Self::AwaitingQuestion { .. } => Some(TaskStatus::AwaitingQuestion),
         }
     }
 
@@ -279,7 +321,8 @@ impl TaskState {
             Self::WaitingOnChildren { .. } => "WaitingOnChildren",
             Self::SubagentInvocation { .. } => "WaitingOnChildren, Pending, or Running",
             Self::AwaitingConfirmation { .. } => "AwaitingConfirmation",
-            Self::ReadyToResume { .. } => "Pending or Running",
+            Self::AwaitingQuestion { .. } => "AwaitingQuestion",
+            Self::AnsweredQuestion { .. } | Self::ReadyToResume { .. } => "Pending or Running",
         }
     }
 
@@ -295,7 +338,9 @@ impl TaskState {
         match self {
             Self::None => !matches!(
                 status,
-                TaskStatus::WaitingOnChildren | TaskStatus::AwaitingConfirmation
+                TaskStatus::WaitingOnChildren
+                    | TaskStatus::AwaitingConfirmation
+                    | TaskStatus::AwaitingQuestion
             ),
             Self::WaitingOnChildren { .. } => matches!(status, TaskStatus::WaitingOnChildren),
             Self::SubagentInvocation { .. } => {
@@ -307,7 +352,8 @@ impl TaskState {
             Self::AwaitingConfirmation { .. } => {
                 matches!(status, TaskStatus::AwaitingConfirmation)
             }
-            Self::ReadyToResume { .. } => {
+            Self::AwaitingQuestion { .. } => matches!(status, TaskStatus::AwaitingQuestion),
+            Self::AnsweredQuestion { .. } | Self::ReadyToResume { .. } => {
                 matches!(status, TaskStatus::Pending | TaskStatus::Running)
             }
         }
@@ -328,6 +374,8 @@ impl TaskState {
             Self::None | Self::SubagentInvocation { .. } => None,
             Self::WaitingOnChildren { continuation, .. }
             | Self::AwaitingConfirmation { continuation, .. }
+            | Self::AwaitingQuestion { continuation, .. }
+            | Self::AnsweredQuestion { continuation, .. }
             | Self::ReadyToResume { continuation, .. } => Some(continuation),
         }
     }
@@ -340,6 +388,12 @@ impl TaskState {
     pub fn suspended_messages(&self) -> &[llm::Message] {
         match self {
             Self::WaitingOnChildren {
+                suspended_messages, ..
+            }
+            | Self::AwaitingQuestion {
+                suspended_messages, ..
+            }
+            | Self::AnsweredQuestion {
                 suspended_messages, ..
             }
             | Self::ReadyToResume {
@@ -377,6 +431,40 @@ impl TaskState {
                 ..
             } => Some(op),
             _ => None,
+        }
+    }
+
+    /// Borrow the questions retained by an awaiting or answered task.
+    #[must_use]
+    pub fn questions(&self) -> Option<&[QuestionPayload]> {
+        match self {
+            Self::AwaitingQuestion { questions, .. } | Self::AnsweredQuestion { questions, .. } => {
+                Some(questions)
+            }
+            Self::None
+            | Self::WaitingOnChildren { .. }
+            | Self::AwaitingConfirmation { .. }
+            | Self::SubagentInvocation { .. }
+            | Self::ReadyToResume { .. } => None,
+        }
+    }
+
+    /// Borrow the persisted receipt and answers that make a question
+    /// resume crash-safe.
+    #[must_use]
+    pub fn question_answers(&self) -> Option<(&str, &[QuestionAnswer])> {
+        match self {
+            Self::AnsweredQuestion {
+                receipt_id,
+                answers,
+                ..
+            } => Some((receipt_id, answers)),
+            Self::None
+            | Self::WaitingOnChildren { .. }
+            | Self::AwaitingConfirmation { .. }
+            | Self::AwaitingQuestion { .. }
+            | Self::SubagentInvocation { .. }
+            | Self::ReadyToResume { .. } => None,
         }
     }
 

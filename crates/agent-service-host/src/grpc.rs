@@ -7,14 +7,15 @@ use std::sync::Arc;
 
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::llm::{self, ContentBlock, ContentSource};
-use agent_sdk_foundation::{ThreadId, TokenUsage, ToolResult, ToolTier};
+use agent_sdk_foundation::{QuestionAnswer, ThreadId, TokenUsage, ToolResult, ToolTier};
 use agent_server::journal::checkpoint::NewCheckpointParams;
 use agent_server::journal::commit::DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS;
 use agent_server::journal::execution_intent::GuardedExecutionDeps;
 use agent_server::journal::fork_transaction::ForkCommitParams;
 use agent_server::journal::idempotency::{IdempotencyClaim, IdempotencyKind, IdempotencyRecord};
 use agent_server::journal::store::{
-    SubmitDisposition, SubmitRootIdempotency, SubmitRootTurnError, SubmitRootTurnParams,
+    QuestionAnswerConflict, QuestionAnswerMismatch, SubmitDisposition, SubmitRootIdempotency,
+    SubmitRootTurnError, SubmitRootTurnParams,
 };
 use agent_server::journal::task::{
     AgentTask, AgentTaskId, LeaseId, SubmittedInputItem, TaskKind as JournalTaskKind,
@@ -120,6 +121,12 @@ struct ForkThreadResult {
 struct DecideConfirmationResult {
     task_id: String,
     parent_task_id: Option<String>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct AnswerQuestionResult {
+    task_id: String,
+    receipt_id: String,
 }
 
 #[derive(Clone)]
@@ -282,6 +289,29 @@ impl GrpcShared {
                     child_task_ids: child_ids.iter().map(ToString::to_string).collect(),
                 }),
             ),
+            TaskState::AwaitingQuestion { questions, .. } => Some(
+                pb::task_snapshot::StateDetail::AwaitingQuestion(pb::AwaitingQuestionState {
+                    questions: questions.iter().map(map_pending_question).collect(),
+                }),
+            ),
+            TaskState::AnsweredQuestion {
+                questions,
+                receipt_id,
+                answers,
+                ..
+            } => Some(pb::task_snapshot::StateDetail::AnsweredQuestion(
+                pb::AnsweredQuestionState {
+                    questions: questions.iter().map(map_pending_question).collect(),
+                    answers: answers
+                        .iter()
+                        .map(|entry| pb::QuestionAnswerEntry {
+                            tool_call_id: entry.tool_call_id.clone(),
+                            answer: entry.answer.clone(),
+                        })
+                        .collect(),
+                    receipt_id: receipt_id.clone(),
+                },
+            )),
             TaskState::AwaitingConfirmation {
                 continuation,
                 prepared_operation,
@@ -1780,6 +1810,106 @@ impl AgentControlService for GrpcControlService {
         ))
     }
 
+    async fn answer_question(
+        &self,
+        request: Request<pb::AnswerQuestionRequest>,
+    ) -> Result<Response<pb::AnswerQuestionResponse>, Status> {
+        let request = request.into_inner();
+        require_request_id(&request.request_id)?;
+        let thread_id = parse_thread_id(&request.thread_id)?;
+        let task_id = parse_task_id(&request.task_id)?;
+        let answers = parse_answer_batch(&request)?;
+        let fingerprint = answer_question_fingerprint(&request);
+        let claim = self
+            .shared
+            .stores
+            .task_store
+            .claim_idempotency(
+                &request.request_id,
+                IdempotencyKind::AnswerQuestion,
+                &fingerprint,
+            )
+            .await
+            .map_err(internal_status("answer-question idempotency lookup"))?;
+        if matches!(&claim, IdempotencyClaim::Conflict) {
+            return Err(idempotency_conflict_status(
+                "AnswerQuestion",
+                &request.request_id,
+            ));
+        }
+
+        let current = self
+            .shared
+            .stores
+            .task_store
+            .get(&task_id)
+            .await
+            .map_err(internal_status("loading question task"))?
+            .ok_or_else(|| not_found_status("task", &task_id.to_string()))?;
+        if current.thread_id != thread_id {
+            return Err(Status::failed_precondition(format!(
+                "task {task_id} does not belong to thread {thread_id}"
+            )));
+        }
+
+        let task = match claim {
+            IdempotencyClaim::Replay(record)
+                if !record.result_json.is_null()
+                    || !matches!(&current.state, TaskState::AwaitingQuestion { .. }) =>
+            {
+                current
+            }
+            IdempotencyClaim::Fresh | IdempotencyClaim::Replay(_) => self
+                .shared
+                .stores
+                .task_store
+                .answer_question(
+                    &task_id,
+                    &request.request_id,
+                    answers,
+                    OffsetDateTime::now_utc(),
+                )
+                .await
+                .map_err(|error| {
+                    if error.downcast_ref::<QuestionAnswerConflict>().is_some() {
+                        Status::already_exists(error.to_string())
+                    } else if error.downcast_ref::<QuestionAnswerMismatch>().is_some() {
+                        Status::invalid_argument(error.to_string())
+                    } else {
+                        Status::failed_precondition(error.to_string())
+                    }
+                })?,
+            IdempotencyClaim::Conflict => {
+                return Err(idempotency_conflict_status(
+                    "AnswerQuestion",
+                    &request.request_id,
+                ));
+            }
+        };
+
+        let result_json = serde_json::to_value(AnswerQuestionResult {
+            task_id: task.id.to_string(),
+            receipt_id: request.request_id.clone(),
+        })
+        .map_err(|error| Status::internal(format!("encoding answer receipt: {error}")))?;
+        self.shared
+            .stores
+            .task_store
+            .record_idempotency(IdempotencyRecord {
+                request_id: request.request_id.clone(),
+                kind: IdempotencyKind::AnswerQuestion,
+                fingerprint,
+                result_json,
+            })
+            .await
+            .map_err(internal_status("recording answer-question idempotency"))?;
+
+        Ok(Response::new(pb::AnswerQuestionResponse {
+            task: Some(self.shared.task_snapshot(&task).await?),
+            receipt_id: request.request_id,
+        }))
+    }
+
     /// Cancel a root task and its entire descendant subtree.
     ///
     /// Interior (non-root) task ids are rejected with
@@ -2979,6 +3109,38 @@ fn decide_confirmation_fingerprint(request: &pb::DecideConfirmationRequest) -> V
     request.encode_to_vec()
 }
 
+fn answer_question_fingerprint(request: &pb::AnswerQuestionRequest) -> Vec<u8> {
+    let mut request = request.clone();
+    request.request_id.clear();
+    // Same canonical order as the persisted batch, so a retry that
+    // reorders its entries fingerprints identically.
+    request
+        .answers
+        .sort_by(|a, b| a.tool_call_id.cmp(&b.tool_call_id));
+    request.encode_to_vec()
+}
+
+/// Map the wire answer entries into the durable batch, in the same
+/// canonical `tool_call_id` order the fingerprint uses, so a retry that
+/// reorders its entries still replays instead of conflicting.
+fn parse_answer_batch(request: &pb::AnswerQuestionRequest) -> Result<Vec<QuestionAnswer>, Status> {
+    if request.answers.is_empty() {
+        return Err(Status::invalid_argument(
+            "answers must contain one entry per parked question",
+        ));
+    }
+    let mut answers: Vec<QuestionAnswer> = request
+        .answers
+        .iter()
+        .map(|entry| QuestionAnswer {
+            tool_call_id: entry.tool_call_id.clone(),
+            answer: entry.answer.clone(),
+        })
+        .collect();
+    answers.sort_by(|a, b| a.tool_call_id.cmp(&b.tool_call_id));
+    Ok(answers)
+}
+
 /// Fingerprint for the REQUEST-level idempotency row (keyed by the
 /// caller's `request_id`): the whole wire request minus the id, so a
 /// reused `request_id` with any changed parameter — including a
@@ -3017,6 +3179,7 @@ const fn map_task_status(status: JournalTaskStatus) -> i32 {
         JournalTaskStatus::Running => pb::TaskStatus::Running as i32,
         JournalTaskStatus::WaitingOnChildren => pb::TaskStatus::WaitingOnChildren as i32,
         JournalTaskStatus::AwaitingConfirmation => pb::TaskStatus::AwaitingConfirmation as i32,
+        JournalTaskStatus::AwaitingQuestion => pb::TaskStatus::AwaitingQuestion as i32,
         JournalTaskStatus::Completed => pb::TaskStatus::Completed as i32,
         JournalTaskStatus::Failed => pb::TaskStatus::Failed as i32,
         JournalTaskStatus::Cancelled => pb::TaskStatus::Cancelled as i32,
@@ -3043,6 +3206,23 @@ fn map_token_usage(usage: &TokenUsage) -> pb::TokenUsage {
         output_tokens: u64::from(usage.output_tokens),
         cached_input_tokens: u64::from(usage.cached_input_tokens),
         cache_creation_input_tokens: u64::from(usage.cache_creation_input_tokens),
+    }
+}
+
+fn map_pending_question(question: &agent_sdk_foundation::QuestionPayload) -> pb::PendingQuestion {
+    pb::PendingQuestion {
+        tool_call_id: question.tool_call_id.clone(),
+        question: question.question.clone(),
+        header: question.header.clone(),
+        options: question
+            .options
+            .iter()
+            .map(|option| pb::QuestionOption {
+                label: option.label.clone(),
+                description: option.description.clone(),
+            })
+            .collect(),
+        multi_select: question.multi_select,
     }
 }
 
@@ -3467,6 +3647,12 @@ fn map_tool_event_payload(event: &AgentEvent) -> RpcResult<Option<pb::event_enve
                 description: description.clone(),
             },
         ))),
+        AgentEvent::QuestionAsked { task_id, questions } => Ok(Some(
+            pb::event_envelope::Event::QuestionAsked(pb::QuestionAskedEvent {
+                task_id: task_id.clone(),
+                questions: questions.iter().map(map_pending_question).collect(),
+            }),
+        )),
         _ => Ok(None),
     }
 }
@@ -3960,6 +4146,7 @@ mod tests {
     };
     use agent_sdk_foundation::{
         AgentContinuation, AgentState, ContinuationEnvelope, ListenExecutionContext,
+        PendingToolCallInfo, QuestionAnswer, QuestionPayload,
     };
     use agent_sdk_providers::LlmProvider;
     #[cfg(feature = "postgres")]
@@ -5817,6 +6004,32 @@ mod tests {
                 )
                 .await
         }
+        async fn pause_on_question(
+            &self,
+            task_id: &AgentTaskId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+            pause: agent_server::journal::store::QuestionPause,
+            now: OffsetDateTime,
+        ) -> Result<(
+            AgentTask,
+            Vec<agent_server::journal::committed_event::CommittedEvent>,
+        )> {
+            self.inner
+                .pause_on_question(task_id, worker, lease, pause, now)
+                .await
+        }
+        async fn answer_question(
+            &self,
+            task_id: &AgentTaskId,
+            receipt_id: &str,
+            answers: Vec<QuestionAnswer>,
+            now: OffsetDateTime,
+        ) -> Result<AgentTask> {
+            self.inner
+                .answer_question(task_id, receipt_id, answers, now)
+                .await
+        }
         async fn spawn_tool_children(
             &self,
             parent_id: &AgentTaskId,
@@ -7277,6 +7490,161 @@ mod tests {
             .task
             .context("submit_thread_work missing task")?;
         Ok((thread, task.task_id))
+    }
+
+    /// Acquire the seeded root and park it on a single `ask_user`
+    /// question so the `AnswerQuestion` RPC tests exercise only the
+    /// answer surface.
+    async fn park_rpc_question(
+        shared: &Arc<GrpcShared>,
+        thread_id: &str,
+        task_id: &str,
+    ) -> Result<()> {
+        let id = AgentTaskId::from_string(task_id);
+        let worker = WorkerId::from_string("question-worker");
+        let lease = LeaseId::from_string("question-lease");
+        shared
+            .stores
+            .task_store
+            .try_acquire_task(
+                &id,
+                worker.clone(),
+                lease.clone(),
+                OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .await?
+            .context("acquire question root")?;
+        let question = QuestionPayload {
+            tool_call_id: "question-call-rpc".into(),
+            question: "Choose?".into(),
+            header: None,
+            options: Vec::new(),
+            multi_select: false,
+        };
+        let continuation = ContinuationEnvelope::wrap(AgentContinuation {
+            thread_id: ThreadId::from_string(thread_id),
+            turn: 1,
+            total_usage: TokenUsage::default(),
+            turn_usage: TokenUsage::default(),
+            pending_tool_calls: vec![PendingToolCallInfo {
+                id: question.tool_call_id.clone(),
+                name: "ask_user".into(),
+                display_name: "Ask User".into(),
+                tier: ToolTier::Observe,
+                input: serde_json::json!({"question": "Choose?"}),
+                effective_input: serde_json::json!({"question": "Choose?"}),
+                listen_context: None,
+            }],
+            awaiting_index: 0,
+            completed_results: Vec::new(),
+            state: AgentState::new(ThreadId::from_string(thread_id)),
+            response_id: None,
+            stop_reason: Some(StopReason::ToolUse),
+            response_content: Vec::new(),
+        });
+        shared
+            .stores
+            .task_store
+            .pause_on_question(
+                &id,
+                &worker,
+                &lease,
+                agent_server::journal::store::QuestionPause {
+                    payload: SuspensionPayload {
+                        continuation,
+                        suspended_messages: Vec::new(),
+                    },
+                    questions: vec![question],
+                    events: Vec::new(),
+                },
+                OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+            )
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn answer_question_replays_receipt_and_rejects_changed_answer() -> Result<()> {
+        let shared = event_test_shared()?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+        let (thread_id, task_id) = seed_pending_root(&service, "answer-question").await?;
+        park_rpc_question(&shared, &thread_id, &task_id).await?;
+
+        let answer_a = vec![pb::QuestionAnswerEntry {
+            tool_call_id: "question-call-rpc".into(),
+            answer: "A".into(),
+        }];
+        let request = pb::AnswerQuestionRequest {
+            request_id: "answer-receipt-1".into(),
+            thread_id: thread_id.clone(),
+            task_id: task_id.clone(),
+            answers: answer_a,
+        };
+
+        // While still awaiting: a stray tool_call_id must be rejected
+        // as a bad batch and persist nothing.
+        let mut stray = request.clone();
+        stray.request_id = "answer-receipt-0".into();
+        stray.answers.push(pb::QuestionAnswerEntry {
+            tool_call_id: "question-call-unknown".into(),
+            answer: "C".into(),
+        });
+        let error = service
+            .answer_question(Request::new(stray))
+            .await
+            .err()
+            .context("a stray tool_call_id must be rejected")?;
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+
+        let first = service
+            .answer_question(Request::new(request.clone()))
+            .await?
+            .into_inner();
+        let replay = service
+            .answer_question(Request::new(request.clone()))
+            .await?
+            .into_inner();
+        assert_eq!(first.receipt_id, "answer-receipt-1");
+        assert_eq!(replay.receipt_id, first.receipt_id);
+
+        let mut changed = request.clone();
+        changed.answers[0].answer = "B".into();
+        let error = service
+            .answer_question(Request::new(changed))
+            .await
+            .err()
+            .context("same receipt with a changed answer must conflict")?;
+        assert_eq!(error.code(), tonic::Code::AlreadyExists);
+
+        let mut second_receipt = request.clone();
+        second_receipt.request_id = "answer-receipt-2".into();
+        second_receipt.answers[0].answer = "B".into();
+        let error = service
+            .answer_question(Request::new(second_receipt))
+            .await
+            .err()
+            .context("second receipt with a changed answer must conflict")?;
+        assert_eq!(error.code(), tonic::Code::AlreadyExists);
+
+        // After the turn is answered, even a stray batch under a new
+        // receipt surfaces the immutable-answer conflict — the durable
+        // answers win over batch-shape validation.
+        let mut stray_after = request;
+        stray_after.request_id = "answer-receipt-3".into();
+        stray_after.answers.push(pb::QuestionAnswerEntry {
+            tool_call_id: "question-call-unknown".into(),
+            answer: "C".into(),
+        });
+        let error = service
+            .answer_question(Request::new(stray_after))
+            .await
+            .err()
+            .context("a stray batch after the answer must conflict")?;
+        assert_eq!(error.code(), tonic::Code::AlreadyExists);
+        Ok(())
     }
 
     /// `CancelTask` transitions a queued/running root turn to

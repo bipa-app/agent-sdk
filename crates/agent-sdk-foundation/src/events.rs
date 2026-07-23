@@ -209,6 +209,17 @@ pub enum AgentEvent {
         description: String,
     },
 
+    /// Agent execution is durably parked until the user answers every
+    /// question in the batch.
+    QuestionAsked {
+        /// Root task to pass to the `AnswerQuestion` RPC.
+        task_id: String,
+        /// User-facing questions, one per pending `ask_user` call, in
+        /// pending-tool-call order. The `AnswerQuestion` RPC must
+        /// resolve all of them in one call.
+        questions: Vec<crate::QuestionPayload>,
+    },
+
     /// Agent turn completed (one LLM round-trip)
     TurnComplete {
         turn: usize,
@@ -624,6 +635,19 @@ impl AgentEvent {
             display_name: display_name.into(),
             input,
             description: description.into(),
+        }
+    }
+
+    /// Build the durable event that asks a client to render the parked
+    /// question batch.
+    #[must_use]
+    pub fn question_asked(
+        task_id: impl Into<String>,
+        questions: Vec<crate::QuestionPayload>,
+    ) -> Self {
+        Self::QuestionAsked {
+            task_id: task_id.into(),
+            questions,
         }
     }
 

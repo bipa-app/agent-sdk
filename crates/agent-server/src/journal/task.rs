@@ -72,7 +72,8 @@
 //! store.
 
 use agent_sdk_foundation::{
-    ContinuationEnvelope, ListenExecutionContext, TerminalReason, ThreadId,
+    ContinuationEnvelope, ListenExecutionContext, QuestionAnswer, QuestionPayload, TerminalReason,
+    ThreadId,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -341,6 +342,8 @@ pub enum TaskStatus {
     /// Paused on an out-of-band confirmation (e.g. a user approval for a
     /// tool call that is in the `confirm` tier).
     AwaitingConfirmation,
+    /// Paused on an `ask_user` tool call until an external client answers.
+    AwaitingQuestion,
     /// Terminal: task finished successfully.
     Completed,
     /// Terminal: task finished with an error.
@@ -364,7 +367,10 @@ impl TaskStatus {
     /// (child tasks finishing or a confirmation arriving).
     #[must_use]
     pub const fn is_waiting(self) -> bool {
-        matches!(self, Self::WaitingOnChildren | Self::AwaitingConfirmation)
+        matches!(
+            self,
+            Self::WaitingOnChildren | Self::AwaitingConfirmation | Self::AwaitingQuestion
+        )
     }
 
     /// `true` if this row has reached a terminal state and will never
@@ -418,7 +424,11 @@ impl TaskStatus {
     pub const fn blocks_root_admission(self) -> bool {
         matches!(
             self,
-            Self::Pending | Self::Running | Self::WaitingOnChildren | Self::AwaitingConfirmation,
+            Self::Pending
+                | Self::Running
+                | Self::WaitingOnChildren
+                | Self::AwaitingConfirmation
+                | Self::AwaitingQuestion,
         )
     }
 
@@ -829,6 +839,7 @@ impl AgentTask {
             | TaskStatus::Running
             | TaskStatus::WaitingOnChildren
             | TaskStatus::AwaitingConfirmation
+            | TaskStatus::AwaitingQuestion
             | TaskStatus::Completed
             | TaskStatus::Failed
             | TaskStatus::Cancelled => true,
@@ -1209,6 +1220,8 @@ impl AgentTask {
             TaskState::None => "none",
             TaskState::WaitingOnChildren { .. } => "waiting_on_children",
             TaskState::AwaitingConfirmation { .. } => "awaiting_confirmation",
+            TaskState::AwaitingQuestion { .. } => "awaiting_question",
+            TaskState::AnsweredQuestion { .. } => "answered_question",
             TaskState::SubagentInvocation { .. } => "subagent_invocation",
             TaskState::ReadyToResume { .. } => "ready_to_resume",
         };
@@ -1216,7 +1229,9 @@ impl AgentTask {
             TaskState::None
                 if matches!(
                     self.status,
-                    TaskStatus::WaitingOnChildren | TaskStatus::AwaitingConfirmation
+                    TaskStatus::WaitingOnChildren
+                        | TaskStatus::AwaitingConfirmation
+                        | TaskStatus::AwaitingQuestion
                 ) =>
             {
                 Err(TaskSchemaError::PausedStatusMissingPayload {
@@ -1818,6 +1833,87 @@ impl AgentTask {
         self.updated_at = now;
         self.validate()?;
         Ok((self, prepared_operation))
+    }
+
+    /// Pause a running root turn on a durable user question.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskSchemaError::InvalidTransition`] unless the task is
+    /// running, or a state/status validation error if the payload is invalid.
+    pub fn await_question(
+        mut self,
+        payload: SuspensionPayload,
+        questions: Vec<QuestionPayload>,
+        now: OffsetDateTime,
+    ) -> Result<Self, TaskSchemaError> {
+        if self.status != TaskStatus::Running || questions.is_empty() {
+            return Err(TaskSchemaError::InvalidTransition {
+                from: self.status,
+                to: TaskStatus::AwaitingQuestion,
+            });
+        }
+        self.status = TaskStatus::AwaitingQuestion;
+        self.worker_id = None;
+        self.lease_id = None;
+        self.lease_expires_at = None;
+        self.last_heartbeat_at = None;
+        self.state = TaskState::AwaitingQuestion {
+            continuation: Box::new(payload.continuation),
+            suspended_messages: payload.suspended_messages,
+            questions,
+        };
+        self.advance_last_activity_at(now);
+        self.updated_at = now;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Persist the answer batch and make an awaiting question runnable.
+    ///
+    /// The caller is responsible for matching `answers` against the
+    /// parked questions (see
+    /// [`super::store::apply_question_answer`]); this transition only swaps the
+    /// durable shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskSchemaError::InvalidTransition`] unless the task is
+    /// awaiting a question, or a state/status validation error when its
+    /// durable payload is inconsistent.
+    pub fn answer_question(
+        mut self,
+        receipt_id: String,
+        answers: Vec<QuestionAnswer>,
+        now: OffsetDateTime,
+    ) -> Result<Self, TaskSchemaError> {
+        if self.status != TaskStatus::AwaitingQuestion {
+            return Err(TaskSchemaError::InvalidTransition {
+                from: self.status,
+                to: TaskStatus::Pending,
+            });
+        }
+        let TaskState::AwaitingQuestion {
+            continuation,
+            suspended_messages,
+            questions,
+        } = self.state
+        else {
+            return Err(TaskSchemaError::PausedStatusMissingPayload {
+                status: TaskStatus::AwaitingQuestion,
+            });
+        };
+        self.status = TaskStatus::Pending;
+        self.state = TaskState::AnsweredQuestion {
+            continuation,
+            suspended_messages,
+            questions,
+            receipt_id,
+            answers,
+        };
+        self.updated_at = now;
+        self.validate()?;
+        Ok(self)
     }
 
     /// Mark the task [`TaskStatus::Completed`].
@@ -2515,22 +2611,48 @@ mod tests {
     // corrupt the root queue. Lock every variant in a single table test
     // so any future TaskStatus addition forces an explicit classification.
 
+    /// Compiler-enforced classification: adding a `TaskStatus` variant
+    /// refuses to compile until it is classified HERE — and classifying
+    /// it here is the reminder that the blocking set is restated as SQL
+    /// literals that the compiler cannot check. When this match gains a
+    /// blocking variant, update every restatement:
+    ///
+    /// - `agent-service-host/src/postgres/store.rs` — the
+    ///   `status IN ('pending', …)` admission lists
+    /// - `agent-service-host/src/sqlite/store.rs` — the same lists,
+    ///   including inside `query_scalar!` string literals
+    /// - both backends' latest migration —
+    ///   `agent_sdk_tasks_root_admission_slot_idx` partial index
+    const fn expected_blocks_root_admission(status: TaskStatus) -> bool {
+        match status {
+            TaskStatus::Pending
+            | TaskStatus::Running
+            | TaskStatus::WaitingOnChildren
+            | TaskStatus::AwaitingConfirmation
+            | TaskStatus::AwaitingQuestion => true,
+            TaskStatus::Queued
+            | TaskStatus::Completed
+            | TaskStatus::Failed
+            | TaskStatus::Cancelled => false,
+        }
+    }
+
     #[test]
     fn blocks_root_admission_classification_is_stable() {
-        let table = [
-            (TaskStatus::Queued, false),
-            (TaskStatus::Pending, true),
-            (TaskStatus::Running, true),
-            (TaskStatus::WaitingOnChildren, true),
-            (TaskStatus::AwaitingConfirmation, true),
-            (TaskStatus::Completed, false),
-            (TaskStatus::Failed, false),
-            (TaskStatus::Cancelled, false),
-        ];
-        for (status, expected) in table {
+        for status in [
+            TaskStatus::Queued,
+            TaskStatus::Pending,
+            TaskStatus::Running,
+            TaskStatus::WaitingOnChildren,
+            TaskStatus::AwaitingConfirmation,
+            TaskStatus::AwaitingQuestion,
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+        ] {
             assert_eq!(
                 status.blocks_root_admission(),
-                expected,
+                expected_blocks_root_admission(status),
                 "blocks_root_admission classification drifted for {status:?}"
             );
         }
@@ -2545,6 +2667,7 @@ mod tests {
             TaskStatus::Running,
             TaskStatus::WaitingOnChildren,
             TaskStatus::AwaitingConfirmation,
+            TaskStatus::AwaitingQuestion,
         ] {
             assert!(status.is_active(), "{status:?} must still be is_active");
         }

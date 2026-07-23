@@ -446,6 +446,28 @@ mod tests {
                 )?;
                 running.await_confirmation(sample_continuation(), None, t_plus(160))
             }
+            TaskStatus::AwaitingQuestion => {
+                let running = root.mark_running(
+                    WorkerId::from_string("w-run"),
+                    LeaseId::from_string("l-run"),
+                    t_plus(200),
+                    t_plus(150),
+                )?;
+                running.await_question(
+                    SuspensionPayload {
+                        continuation: sample_continuation(),
+                        suspended_messages: Vec::new(),
+                    },
+                    vec![agent_sdk_foundation::QuestionPayload {
+                        tool_call_id: "question-call".into(),
+                        question: "Continue?".into(),
+                        header: None,
+                        options: Vec::new(),
+                        multi_select: false,
+                    }],
+                    t_plus(160),
+                )
+            }
             TaskStatus::Completed => {
                 let running = root.mark_running(
                     WorkerId::from_string("w-run"),

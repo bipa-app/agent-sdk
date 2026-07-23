@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\nSELECT\n    id,\n    kind,\n    status,\n    parent_id,\n    root_id,\n    depth,\n    thread_id,\n    submitted_input_json,\n    caller_metadata_json,\n    worker_id,\n    lease_id,\n    lease_expires_at,\n    last_heartbeat_at,\n    state_json,\n    attempt,\n    max_attempts,\n    last_error,\n    terminal_reason_json,\n    pending_child_count,\n    spawn_index,\n    result_payload,\n    otel_traceparent,\n    created_at,\n    updated_at,\n    completed_at,\n    last_activity_at\nFROM agent_sdk_tasks\nWHERE thread_id = $1\n  AND kind = 'root_turn'\n  AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation')\nORDER BY created_at, id\nLIMIT 1\n",
+  "query": "\nSELECT\n    id,\n    kind,\n    status,\n    parent_id,\n    root_id,\n    depth,\n    thread_id,\n    submitted_input_json,\n    caller_metadata_json,\n    worker_id,\n    lease_id,\n    lease_expires_at,\n    last_heartbeat_at,\n    state_json,\n    attempt,\n    max_attempts,\n    last_error,\n    terminal_reason_json,\n    pending_child_count,\n    spawn_index,\n    result_payload,\n    otel_traceparent,\n    created_at,\n    updated_at,\n    completed_at,\n    last_activity_at\nFROM agent_sdk_tasks\nWHERE thread_id = $1\n  AND kind = 'root_turn'\n  AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation', 'awaiting_question')\nORDER BY created_at, id\nLIMIT 1\n",
   "describe": {
     "columns": [
       {
@@ -324,5 +324,5 @@
       true
     ]
   },
-  "hash": "2fe3786215d98535eeba521bc42603f9b71fe0fd7443d52711418f48abcd4583"
+  "hash": "d4515518f44140db24a840acea0f928dec7afc0028264a57fb1f254ce9b75bd3"
 }

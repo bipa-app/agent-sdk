@@ -136,6 +136,13 @@ message ToolRequiresConfirmationEvent {
   string description = 5;
 }
 
+message QuestionAskedEvent {
+  string task_id = 1;
+  // Every question in the parked batch, in pending-tool-call order.
+  // AnswerQuestion must resolve all of them in a single call.
+  repeated PendingQuestion questions = 2;
+}
+
 // `turn` is the slot the turn actually COMMITTED on — after a
 // slot-shifted commit (see `StartEvent`) it can be one higher than the
 // preceding `start.turn`. A shifted successor's durable message
@@ -410,6 +417,7 @@ message EventEnvelope {
     UserInputEvent user_input = 27;
     CancelledEvent cancelled = 28;
     ThreadCreatedEvent thread_created = 29;
+    QuestionAskedEvent question_asked = 30;
   }
 }
 

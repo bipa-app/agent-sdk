@@ -503,6 +503,49 @@ pub struct PendingToolCallInfo {
     pub listen_context: Option<ListenExecutionContext>,
 }
 
+/// One selectable choice in a durable user question.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionOption {
+    /// Text rendered for the choice.
+    pub label: String,
+    /// Optional supporting explanation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// User-facing payload persisted while a task awaits an answer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionPayload {
+    /// Tool-use id that the eventual answer resolves.
+    pub tool_call_id: String,
+    /// Question text shown to the user.
+    pub question: String,
+    /// Optional short category or title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    /// Optional selectable choices.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<QuestionOption>,
+    /// Whether more than one choice may be selected.
+    #[serde(default)]
+    pub multi_select: bool,
+}
+
+/// Durable answer for one pending question, applied through the
+/// `AnswerQuestion` control RPC.
+///
+/// A single RPC call answers **every** question the task parked on in
+/// one shot; each entry resolves exactly one `ask_user` tool call. The
+/// batch-level idempotency key / receipt lives on the task state
+/// (`receipt_id`), not on the per-question entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionAnswer {
+    /// Tool-use id of the `ask_user` call this answer resolves.
+    pub tool_call_id: String,
+    /// Free-form text or the selected option labels.
+    pub answer: String,
+}
+
 /// Default tier used when deserializing a continuation that predates
 /// the `tier` field — the strictest default so legacy continuations
 /// surface as confirm-tier rather than silently observe-tier.

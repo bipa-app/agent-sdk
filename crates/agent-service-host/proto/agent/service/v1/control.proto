@@ -248,6 +248,27 @@ message DecideConfirmationResponse {
   TaskSnapshot parent_task = 2;
 }
 
+message AnswerQuestionRequest {
+  // Caller-supplied idempotency key. Retries must reuse the same value.
+  string request_id = 1;
+  // Thread guard for the awaiting root task.
+  string thread_id = 2;
+  // Root task currently in TASK_STATUS_AWAITING_QUESTION.
+  string task_id = 3;
+  // One answer per parked question — the whole batch in one call.
+  // A batch that leaves a question unanswered, answers an unknown
+  // tool_call_id, or repeats one is rejected with INVALID_ARGUMENT
+  // and nothing is persisted.
+  repeated QuestionAnswerEntry answers = 4;
+}
+
+message AnswerQuestionResponse {
+  // Task after the answer was persisted and made runnable.
+  TaskSnapshot task = 1;
+  // Stable receipt. Equal to the original request_id on every replay.
+  string receipt_id = 2;
+}
+
 // Cancel a queued or running root task and its entire descendant subtree.
 //
 // `task_id` must reference a root turn. Cancellation cascades from the
@@ -413,6 +434,9 @@ service AgentControlService {
 
   // Apply a durable confirmation decision to an awaiting task.
   rpc DecideConfirmation(DecideConfirmationRequest) returns (DecideConfirmationResponse);
+
+  // Persist an answer and resume a task parked in AwaitingQuestion.
+  rpc AnswerQuestion(AnswerQuestionRequest) returns (AnswerQuestionResponse);
 
   // Cancel a queued or running root task and its entire descendant
   // subtree via the durable cancellation-tree transition. Interior

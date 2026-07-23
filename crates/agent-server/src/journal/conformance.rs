@@ -187,8 +187,8 @@ mod in_memory_bundle {
     use crate::journal::message::MessageProjection;
     use crate::journal::recovery::RecoveryRecord;
     use crate::journal::store::{
-        MixedChildrenSpawn, SpawnedMixedChildren, SubagentInvocationSpawn, SubmitRootTurnError,
-        SubmitRootTurnOutcome, SubmitRootTurnParams,
+        MixedChildrenSpawn, QuestionPause, SpawnedMixedChildren, SubagentInvocationSpawn,
+        SubmitRootTurnError, SubmitRootTurnOutcome, SubmitRootTurnParams,
     };
     use crate::journal::subagent_spawn_transaction::SubagentSpawnEvent;
     use crate::journal::task::{ChildSpawnSpec, SuspensionPayload, TaskStatus};
@@ -197,7 +197,9 @@ mod in_memory_bundle {
         CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptId,
     };
     use agent_sdk_foundation::events::AgentEvent;
-    use agent_sdk_foundation::{ContinuationEnvelope, ListenExecutionContext, TokenUsage};
+    use agent_sdk_foundation::{
+        ContinuationEnvelope, ListenExecutionContext, QuestionAnswer, TokenUsage,
+    };
     use async_trait::async_trait;
 
     #[async_trait]
@@ -367,6 +369,29 @@ mod in_memory_bundle {
                     prepared_operation,
                     now,
                 )
+                .await
+        }
+        async fn pause_on_question(
+            &self,
+            task_id: &AgentTaskId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+            pause: QuestionPause,
+            now: OffsetDateTime,
+        ) -> Result<(AgentTask, Vec<CommittedEvent>)> {
+            self.task
+                .pause_on_question(task_id, worker, lease, pause, now)
+                .await
+        }
+        async fn answer_question(
+            &self,
+            task_id: &AgentTaskId,
+            receipt_id: &str,
+            answers: Vec<QuestionAnswer>,
+            now: OffsetDateTime,
+        ) -> Result<AgentTask> {
+            self.task
+                .answer_question(task_id, receipt_id, answers, now)
                 .await
         }
         #[allow(clippy::too_many_arguments)]

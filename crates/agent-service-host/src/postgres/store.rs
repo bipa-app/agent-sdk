@@ -16,7 +16,8 @@
 
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::{
-    ContinuationEnvelope, ListenExecutionContext, TerminalReason, ThreadId, TokenUsage, llm,
+    ContinuationEnvelope, ListenExecutionContext, QuestionAnswer, TerminalReason, ThreadId,
+    TokenUsage, llm,
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
@@ -60,9 +61,10 @@ use agent_server::journal::relay::{
 };
 use agent_server::journal::retention::{RetentionCursor, RetentionStore};
 use agent_server::journal::store::{
-    AgentTaskStore, CancelTreeOutcome, ChildProbe, MixedChildrenSpawn, RequeueOutcome,
-    SpawnedMixedChildren, SubagentBatchSpawn, SubagentInvocationSpawn, SubmitDisposition,
-    SubmitRootIdempotency, SubmitRootTurnError, SubmitRootTurnOutcome, SubmitRootTurnParams,
+    AgentTaskStore, CancelTreeOutcome, ChildProbe, MixedChildrenSpawn, QuestionAnswerApplied,
+    QuestionPause, RequeueOutcome, SpawnedMixedChildren, SubagentBatchSpawn,
+    SubagentInvocationSpawn, SubmitDisposition, SubmitRootIdempotency, SubmitRootTurnError,
+    SubmitRootTurnOutcome, SubmitRootTurnParams, apply_question_answer, apply_question_pause,
     mixed_child_ids_in_slot_order, new_mixed_tool_child, submitted_task_disposition,
     validate_mixed_children_spawn,
 };
@@ -1473,7 +1475,7 @@ SELECT id
 FROM agent_sdk_tasks
 WHERE thread_id = $1
   AND kind = 'root_turn'
-  AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation')
+  AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation', 'awaiting_question')
   AND id <> $2
 LIMIT 1
 FOR UPDATE
@@ -1616,7 +1618,7 @@ SELECT id
 FROM agent_sdk_tasks
 WHERE thread_id = $1
   AND kind = 'root_turn'
-  AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation')
+  AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation', 'awaiting_question')
   AND id <> $2
 LIMIT 1
 FOR UPDATE
@@ -1902,7 +1904,7 @@ SELECT id
 FROM agent_sdk_tasks
 WHERE thread_id = $1
   AND kind = 'root_turn'
-  AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation')
+  AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation', 'awaiting_question')
 LIMIT 1
 FOR UPDATE
 ",
@@ -2531,7 +2533,7 @@ SELECT
 FROM agent_sdk_tasks
 WHERE thread_id = $1
   AND kind = 'root_turn'
-  AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation')
+  AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation', 'awaiting_question')
 ORDER BY created_at, id
 LIMIT 1
 ",
@@ -2807,7 +2809,7 @@ SELECT EXISTS (
     FROM agent_sdk_tasks
     WHERE thread_id = $1
       AND kind = 'root_turn'
-      AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation')
+      AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation', 'awaiting_question')
 ) AS "exists!"
 "#,
             thread_key(&task.thread_id),
@@ -2937,7 +2939,7 @@ SELECT EXISTS (
     FROM agent_sdk_tasks
     WHERE thread_id = $1
       AND kind = 'root_turn'
-      AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation')
+      AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation', 'awaiting_question')
 ) AS "exists!"
 "#,
                     thread_key(&task.thread_id),
@@ -3929,6 +3931,63 @@ FOR UPDATE SKIP LOCKED
         Self::update_task_tx(&mut tx, &paused).await?;
         tx.commit().await.context("commit pause_on_confirmation")?;
         Ok(paused)
+    }
+
+    async fn pause_on_question(
+        &self,
+        id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        pause: QuestionPause,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Vec<CommittedEvent>)> {
+        let QuestionPause {
+            payload,
+            questions,
+            mut events,
+        } = pause;
+        let mut tx = self.begin().await?;
+        let old = Self::load_task_tx(&mut tx, id, true)
+            .await?
+            .ok_or_else(|| anyhow!("question pause rejected: task {id} does not exist"))?;
+        let paused = apply_question_pause(&old, worker, lease, payload, questions.clone(), now)?;
+        Self::update_task_tx(&mut tx, &paused).await?;
+        events.push(AgentEvent::question_asked(id.as_str(), questions));
+        let start_seq = Self::next_event_sequence_tx(&mut tx, &paused.thread_id).await?;
+        let committed =
+            Self::insert_events_tx(&mut tx, &paused.thread_id, events, start_seq, now).await?;
+        Self::insert_thread_events_outbox_row_tx(
+            &mut tx,
+            &committed,
+            DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+            now,
+        )
+        .await?;
+        tx.commit().await.context("commit pause_on_question")?;
+        Ok((paused, committed))
+    }
+
+    async fn answer_question(
+        &self,
+        id: &AgentTaskId,
+        receipt_id: &str,
+        answers: Vec<QuestionAnswer>,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask> {
+        let mut tx = self.begin().await?;
+        let old = Self::load_task_tx(&mut tx, id, true)
+            .await?
+            .ok_or_else(|| anyhow!("answer_question rejected: task {id} does not exist"))?;
+        let answered = match apply_question_answer(&old, receipt_id, &answers, now)? {
+            QuestionAnswerApplied::Replay(task) => {
+                tx.commit().await.context("commit answer_question replay")?;
+                return Ok(task);
+            }
+            QuestionAnswerApplied::Answered(task) => task,
+        };
+        Self::update_task_tx(&mut tx, &answered).await?;
+        tx.commit().await.context("commit answer_question")?;
+        Ok(answered)
     }
 
     #[allow(clippy::too_many_arguments)]

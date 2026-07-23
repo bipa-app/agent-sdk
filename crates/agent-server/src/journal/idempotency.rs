@@ -43,6 +43,8 @@ pub enum IdempotencyKind {
     ForkThread,
     /// `DecideConfirmation`.
     DecideConfirmation,
+    /// `AnswerQuestion`.
+    AnswerQuestion,
 }
 
 impl IdempotencyKind {
@@ -54,6 +56,7 @@ impl IdempotencyKind {
             Self::SubmitWork => "submit_work",
             Self::ForkThread => "fork_thread",
             Self::DecideConfirmation => "decide_confirmation",
+            Self::AnswerQuestion => "answer_question",
         }
     }
 
@@ -65,6 +68,7 @@ impl IdempotencyKind {
             "submit_work" => Some(Self::SubmitWork),
             "fork_thread" => Some(Self::ForkThread),
             "decide_confirmation" => Some(Self::DecideConfirmation),
+            "answer_question" => Some(Self::AnswerQuestion),
             _ => None,
         }
     }

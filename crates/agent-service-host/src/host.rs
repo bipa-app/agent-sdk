@@ -71,7 +71,7 @@ use agent_server::worker::{
     execute_subagent_task, fail_root_turn_leaving_attempts_open_with_reason,
     fail_root_turn_with_reason, guarded_tool_execution, pause_tool_for_confirmation,
     resolve_bootstrap_context, resolve_subagent_bootstrap, resolve_tool_bootstrap,
-    resume_for_steering, resume_from_children, revert_steering_wake,
+    resume_for_steering, resume_from_children, resume_from_question, revert_steering_wake,
     terminal_reason_for_root_error,
 };
 
@@ -2289,7 +2289,9 @@ async fn execute_acquired_task(
 ) -> Result<()> {
     match task.kind {
         TaskKind::RootTurn => execute_root_task(task, stores, runtime, cancel, activity).await,
-        TaskKind::ToolRuntime => execute_tool_task(task, stores, runtime, cancel, activity).await,
+        TaskKind::ToolRuntime => {
+            Box::pin(execute_tool_task(task, stores, runtime, cancel, activity)).await
+        }
         // A subagent invocation task neither streams from a provider nor
         // runs a tool: it only fans results in. It has no work of its own
         // to report, and it is never the subject of a stall budget (the
@@ -2347,6 +2349,21 @@ async fn execute_root_task(
             .await
             .context("resolve runtime provider")?;
 
+        // One deps wiring for every dispatch arm below. A dep added to
+        // this block later reaches steering, question, child-resume,
+        // and fresh-turn execution alike — the arms only choose the
+        // resume entry point.
+        let selector = runtime.subagent_spawn_selector();
+        let mut deps = stores.root_turn_deps_with_selector_and_compaction(
+            selector.as_ref(),
+            runtime.compaction_config(),
+            runtime.compaction_config().map(|_| &provider),
+        );
+        deps.cancel = Some(cancel);
+        deps.wakeup = runtime.wakeup_signal();
+        deps.wire_activity(activity, &tracked_event_repo);
+        deps.connectivity_waits = Some(runtime.connectivity_waits());
+
         if task.state.is_steering_resume() {
             // R2 steering wake: a mailbox note woke this parked parent
             // early (a `ReadyToResume` row carrying a steering payload).
@@ -2354,45 +2371,19 @@ async fn execute_root_task(
             // still-running children. The spawn selector is not
             // consulted — the re-park re-binds existing children rather
             // than spawning new ones.
-            let selector = runtime.subagent_spawn_selector();
-            let mut deps = stores.root_turn_deps_with_selector_and_compaction(
-                selector.as_ref(),
-                runtime.compaction_config(),
-                runtime.compaction_config().map(|_| &provider),
-            );
-            deps.cancel = Some(cancel);
-            deps.wakeup = runtime.wakeup_signal();
-            deps.wire_activity(activity, &tracked_event_repo);
-            deps.connectivity_waits = Some(runtime.connectivity_waits());
             resume_for_steering(inputs, &task, provider.as_ref(), &deps, now)
                 .await
                 .context("resume parked root task for steering wake")
+        } else if matches!(task.state, TaskState::AnsweredQuestion { .. }) {
+            resume_from_question(inputs, &task, provider.as_ref(), &deps, now)
+                .await
+                .context("resume root task from durable question answer")
         } else if matches!(task.state, TaskState::ReadyToResume { .. }) {
-            let selector = runtime.subagent_spawn_selector();
-            let mut deps = stores.root_turn_deps_with_selector_and_compaction(
-                selector.as_ref(),
-                runtime.compaction_config(),
-                runtime.compaction_config().map(|_| &provider),
-            );
-            deps.cancel = Some(cancel);
-            deps.wakeup = runtime.wakeup_signal();
-            deps.wire_activity(activity, &tracked_event_repo);
-            deps.connectivity_waits = Some(runtime.connectivity_waits());
             resume_from_children(inputs, &task, provider.as_ref(), &deps, now)
                 .await
                 .context("resume root task from durable child results")
         } else {
             let user_input = root_task_user_input(&task)?;
-            let selector = runtime.subagent_spawn_selector();
-            let mut deps = stores.root_turn_deps_with_selector_and_compaction(
-                selector.as_ref(),
-                runtime.compaction_config(),
-                runtime.compaction_config().map(|_| &provider),
-            );
-            deps.cancel = Some(cancel);
-            deps.wakeup = runtime.wakeup_signal();
-            deps.wire_activity(activity, &tracked_event_repo);
-            deps.connectivity_waits = Some(runtime.connectivity_waits());
             agent_server::worker::execute_root_turn(
                 inputs,
                 user_input,
@@ -2406,12 +2397,22 @@ async fn execute_root_task(
     })
     .await;
 
+    handle_root_turn_outcome(stores, &task, outcome, error_watermark, now).await
+}
+
+async fn handle_root_turn_outcome(
+    stores: &StoreRegistry,
+    task: &AgentTask,
+    outcome: Result<RootTurnOutcome>,
+    error_watermark: u64,
+    now: time::OffsetDateTime,
+) -> Result<()> {
     match outcome {
         Ok(RootTurnOutcome::Completed {
             committed_events, ..
         }) => {
             publish_events(stores, &committed_events);
-            promote_next_root(stores, &task, now).await?;
+            promote_next_root(stores, task, now).await?;
             Ok(())
         }
         Ok(RootTurnOutcome::Suspended {
@@ -2420,7 +2421,7 @@ async fn execute_root_task(
             publish_events(stores, &committed_events);
             Ok(())
         }
-        Err(err) => fail_or_revert_root_task(stores, &task, &err, error_watermark, now).await,
+        Err(err) => fail_or_revert_root_task(stores, task, &err, error_watermark, now).await,
     }
 }
 
@@ -3832,6 +3833,233 @@ mod tests {
         let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
         let _stores = host.stores();
         let _deps = host.stores().root_turn_deps();
+        Ok(())
+    }
+
+    /// Provider that fails the turn unless the persisted question
+    /// answer reached it as a tool result, so the dispatch test cannot
+    /// pass through any arm that skips `resume_from_question`.
+    struct AnswerProbeProvider {
+        saw_answer: std::sync::atomic::AtomicBool,
+    }
+
+    impl AnswerProbeProvider {
+        const fn new() -> Self {
+            Self {
+                saw_answer: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn saw_answer(&self) -> bool {
+            self.saw_answer.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for AnswerProbeProvider {
+        async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
+            let answered = request.messages.iter().any(|message| {
+                matches!(
+                    &message.content,
+                    agent_sdk_foundation::llm::Content::Blocks(blocks)
+                        if blocks.iter().any(|block| matches!(
+                            block,
+                            ContentBlock::ToolResult { tool_use_id, content, .. }
+                                if tool_use_id == "dispatch-question"
+                                    && content == "User answered: Staging"
+                        ))
+                )
+            });
+            anyhow::ensure!(
+                answered,
+                "dispatch did not resume through the persisted question answer"
+            );
+            self.saw_answer.store(true, Ordering::SeqCst);
+            Ok(ChatOutcome::Success(ChatResponse {
+                id: "msg_dispatch_01".into(),
+                content: vec![ContentBlock::Text {
+                    text: "deploying to staging".into(),
+                }],
+                model: "mock-model".into(),
+                stop_reason: Some(StopReason::EndTurn),
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                },
+            }))
+        }
+
+        fn model(&self) -> &'static str {
+            "mock-model"
+        }
+
+        fn provider(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    /// Submit, acquire, park on one `ask_user`, and answer it, so the
+    /// dispatch test's subject is only the reacquire-then-dispatch hop.
+    async fn seed_answered_question_task(
+        stores: &StoreRegistry,
+        now: time::OffsetDateTime,
+    ) -> Result<AgentTaskId> {
+        use agent_sdk_foundation::{
+            AgentContinuation, AgentState, ContinuationEnvelope, PendingToolCallInfo,
+            QuestionAnswer, QuestionPayload, TokenUsage, ToolTier, llm,
+        };
+        use agent_server::journal::store::QuestionPause;
+        use agent_server::journal::task::{LeaseId, SuspensionPayload, WorkerId};
+
+        let thread = agent_sdk_foundation::ThreadId::from_string("t-answered-dispatch");
+        stores.thread_store.get_or_create(&thread, now).await?;
+        stores.message_store.get_or_create(&thread, now).await?;
+        let root = AgentTask::new_root_turn(thread.clone(), now, 3);
+        let id = root.id.clone();
+        stores.task_store.submit_root_turn(root).await?;
+        let worker = WorkerId::from_string("w-question");
+        let lease = LeaseId::from_string("l-question");
+        stores
+            .task_store
+            .try_acquire_task(
+                &id,
+                worker.clone(),
+                lease.clone(),
+                now + time::Duration::seconds(600),
+                now,
+            )
+            .await?
+            .context("acquire question root")?;
+        stores
+            .task_store
+            .pause_on_question(
+                &id,
+                &worker,
+                &lease,
+                QuestionPause {
+                    payload: SuspensionPayload {
+                        continuation: ContinuationEnvelope::wrap(AgentContinuation {
+                            thread_id: thread.clone(),
+                            turn: 1,
+                            total_usage: TokenUsage::default(),
+                            turn_usage: TokenUsage::default(),
+                            pending_tool_calls: vec![PendingToolCallInfo {
+                                id: "dispatch-question".into(),
+                                name: "ask_user".into(),
+                                display_name: "Ask User".into(),
+                                tier: ToolTier::Observe,
+                                input: serde_json::json!({"question": "Where?"}),
+                                effective_input: serde_json::json!({"question": "Where?"}),
+                                listen_context: None,
+                            }],
+                            awaiting_index: 0,
+                            completed_results: Vec::new(),
+                            state: AgentState::new(thread.clone()),
+                            response_id: None,
+                            stop_reason: Some(StopReason::ToolUse),
+                            response_content: Vec::new(),
+                        }),
+                        suspended_messages: vec![
+                            llm::Message::user("Deploy the service"),
+                            llm::Message::assistant_with_content(vec![ContentBlock::ToolUse {
+                                id: "dispatch-question".into(),
+                                name: "ask_user".into(),
+                                input: serde_json::json!({"question": "Where?"}),
+                                thought_signature: None,
+                            }]),
+                        ],
+                    },
+                    questions: vec![QuestionPayload {
+                        tool_call_id: "dispatch-question".into(),
+                        question: "Where?".into(),
+                        header: None,
+                        options: Vec::new(),
+                        multi_select: false,
+                    }],
+                    events: Vec::new(),
+                },
+                now,
+            )
+            .await?;
+        stores
+            .task_store
+            .answer_question(
+                &id,
+                "dispatch-receipt",
+                vec![QuestionAnswer {
+                    tool_call_id: "dispatch-question".into(),
+                    answer: "Staging".into(),
+                }],
+                now,
+            )
+            .await?;
+        Ok(id)
+    }
+
+    /// An `AnsweredQuestion` reacquisition must route through the
+    /// question-resume arm of `execute_root_task` — through the REAL
+    /// acquire-then-dispatch entry point, not `resume_from_question`
+    /// called directly — so a wrong arm order or an under-wired arm
+    /// cannot ship green.
+    #[tokio::test]
+    async fn answered_question_reacquire_dispatches_into_question_resume() -> Result<()> {
+        use agent_server::journal::task::{LeaseId, TaskStatus, WorkerId};
+
+        let config = ServiceConfig::default();
+        let resolver = Arc::new(StaticProviderResolver::new());
+        let probe = Arc::new(AnswerProbeProvider::new());
+        resolver.set_fallback(probe.clone())?;
+        let runtime = Arc::new(ExecutionRuntime::new(
+            resolver,
+            Arc::new(NoopToolExecutor),
+            Arc::new(AllowAllConfirmationPolicy),
+        ));
+        let host = ServiceHost::new(config, sample_registry(), Arc::clone(&runtime))?;
+        let stores = host.stores().clone();
+        let now = time::OffsetDateTime::now_utc();
+        let id = seed_answered_question_task(&stores, now).await?;
+
+        let reacquired = stores
+            .task_store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w-boot"),
+                LeaseId::from_string("l-boot"),
+                now + time::Duration::seconds(600),
+                now,
+            )
+            .await?
+            .context("reacquire answered root")?;
+        assert!(matches!(
+            reacquired.state,
+            TaskState::AnsweredQuestion { .. }
+        ));
+
+        let cancel = CancellationToken::new();
+        execute_acquired_task(
+            reacquired,
+            &stores,
+            runtime,
+            &cancel,
+            &ActivityBeacon::new(),
+        )
+        .await?;
+        assert!(
+            probe.saw_answer(),
+            "the dispatch never routed through resume_from_question",
+        );
+        let after = stores
+            .task_store
+            .get(&id)
+            .await?
+            .context("task after dispatch")?;
+        assert_eq!(
+            after.status,
+            TaskStatus::Completed,
+            "the answered turn must complete through the dispatch entry point",
+        );
         Ok(())
     }
 
@@ -6812,13 +7040,13 @@ mod tests {
         let mut recording_stores = stores.clone();
         recording_stores.task_store = Arc::clone(&recording) as Arc<dyn AgentTaskStore>;
 
-        execute_tool_task(
+        Box::pin(execute_tool_task(
             acquired,
             &recording_stores,
             runtime,
             &CancellationToken::new(),
             &ActivityBeacon::new(),
-        )
+        ))
         .await?;
 
         let ran_at = executed_at
@@ -8258,7 +8486,7 @@ mod tests {
         }
     }
 
-    use agent_sdk_foundation::{ContinuationEnvelope, ListenExecutionContext};
+    use agent_sdk_foundation::{ContinuationEnvelope, ListenExecutionContext, QuestionAnswer};
     use agent_server::journal::SubagentInvocationSpawn;
     use agent_server::journal::idempotency::{
         IdempotencyClaim, IdempotencyKind, IdempotencyRecord,
@@ -8456,6 +8684,32 @@ mod tests {
                     prepared_operation,
                     now,
                 )
+                .await
+        }
+        async fn pause_on_question(
+            &self,
+            task_id: &AgentTaskId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+            pause: agent_server::journal::store::QuestionPause,
+            now: time::OffsetDateTime,
+        ) -> Result<(
+            AgentTask,
+            Vec<agent_server::journal::committed_event::CommittedEvent>,
+        )> {
+            self.inner
+                .pause_on_question(task_id, worker, lease, pause, now)
+                .await
+        }
+        async fn answer_question(
+            &self,
+            task_id: &AgentTaskId,
+            receipt_id: &str,
+            answers: Vec<QuestionAnswer>,
+            now: time::OffsetDateTime,
+        ) -> Result<AgentTask> {
+            self.inner
+                .answer_question(task_id, receipt_id, answers, now)
                 .await
         }
         // Trait-signature-mandated: every impl of this frozen trait
