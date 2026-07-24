@@ -328,6 +328,102 @@ mod tests {
         Ok(())
     }
 
+    /// A populated database is the case production upgrades hit: the
+    /// 0016..0019 table rebuilds drop tables that message commits, turn
+    /// attempts, and checkpoints reference. Under `defer_foreign_keys`,
+    /// `SQLite` counts one deferred violation per referencing row when the
+    /// old table drops and the RENAME never resolves them, so COMMIT
+    /// fails on any database with real turn history while staying green
+    /// on the empty databases CI migrates.
+    #[tokio::test]
+    async fn migrations_apply_to_a_populated_database() -> Result<()> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await?;
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await?;
+
+        DURABLE_CORE_MIGRATOR
+            .run_to(TASK_TERMINAL_REASON_MIGRATION_VERSION, &pool)
+            .await?;
+
+        sqlx::query(
+            "INSERT INTO agent_sdk_threads (
+                thread_id, status, committed_turns, total_input_tokens, total_output_tokens,
+                created_at, updated_at
+             ) VALUES ('thread-1', 'active', 1, 0, 0, '2026-01-01', '2026-01-01')",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO agent_sdk_tasks (
+                id, kind, status, root_id, depth, thread_id, attempt, max_attempts,
+                terminal_reason_json, created_at, updated_at, completed_at
+             ) VALUES ('task-1', 'root_turn', 'completed', 'task-1', 0, 'thread-1', 0, 1,
+                '{"reason":"completed"}', '2026-01-01', '2026-01-01', '2026-01-01')"#,
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO agent_sdk_message_commits (
+                thread_id, turn_number, task_id, head_version_after, batch_json, committed_at
+             ) VALUES ('thread-1', 1, 'task-1', 1, '[]', '2026-01-01')",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO agent_sdk_turn_attempts (
+                id, task_id, attempt_number, provider, requested_model, request_blob, opened_at
+             ) VALUES ('attempt-1', 'task-1', 1, 'test', 'test-model', '{}', '2026-01-01')",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO agent_sdk_turn_checkpoints (
+                id, thread_id, turn_number, task_id, messages_json, agent_state_snapshot,
+                turn_input_tokens, turn_output_tokens, created_at
+             ) VALUES ('checkpoint-1', 'thread-1', 1, 'task-1', '[]', '{}', 0, 0, '2026-01-01')",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO agent_sdk_idempotency (
+                request_id, kind, fingerprint, result_json, created_at
+             ) VALUES ('request-1', 'submit_work', x'00', '{}', '2026-01-01')",
+        )
+        .execute(&pool)
+        .await?;
+
+        DURABLE_CORE_MIGRATOR.run(&pool).await?;
+
+        let counts: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                (SELECT count(*) FROM agent_sdk_tasks),
+                (SELECT count(*) FROM agent_sdk_threads),
+                (SELECT count(*) FROM agent_sdk_message_commits),
+                (SELECT count(*) FROM agent_sdk_turn_attempts),
+                (SELECT count(*) FROM agent_sdk_turn_checkpoints),
+                (SELECT count(*) FROM agent_sdk_idempotency)",
+        )
+        .fetch_one(&pool)
+        .await?;
+        ensure!(
+            counts == (1, 1, 1, 1, 1, 1),
+            "every row must survive the rebuilds: {counts:?}",
+        );
+
+        let violations: (i64,) = sqlx::query_as("SELECT count(*) FROM pragma_foreign_key_check")
+            .fetch_one(&pool)
+            .await?;
+        ensure!(
+            violations.0 == 0,
+            "rebuilt schema must satisfy every foreign key: {violations:?}",
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn sqlite_migrations_apply_to_in_memory_database() -> Result<()> {
         let store = super::SqliteDurableStore::connect("sqlite::memory:").await?;
