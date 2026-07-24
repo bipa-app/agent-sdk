@@ -255,6 +255,7 @@ async fn interleaved_text_and_tool_deltas_suspend_with_balanced_history() -> Res
         }),
         StreamDelta::Done {
             stop_reason: Some(StopReason::ToolUse),
+            served_route: None,
         },
     ]));
 
@@ -334,6 +335,7 @@ async fn out_of_order_block_index_sorts_into_block_order() -> Result<()> {
         },
         StreamDelta::Done {
             stop_reason: Some(StopReason::ToolUse),
+            served_route: None,
         },
     ]));
 
@@ -380,6 +382,7 @@ async fn mid_stream_server_error_retries_then_succeeds() -> Result<()> {
         },
         StreamDelta::Done {
             stop_reason: Some(StopReason::EndTurn),
+            served_route: None,
         },
     ])
     .fail_after(1, StreamErrorKind::ServerError, "upstream 503 mid-stream");
@@ -596,6 +599,7 @@ async fn mid_stream_stall_is_retried_then_succeeds() -> Result<()> {
         },
         StreamDelta::Done {
             stop_reason: Some(StopReason::EndTurn),
+            served_route: None,
         },
     ])
     .with_delay(std::time::Duration::from_secs(200));

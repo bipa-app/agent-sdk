@@ -4330,12 +4330,29 @@ async fn call_llm_once_inner(
         .await);
     }
 
+    let evidence = evidence_with_served_route(evidence, &accumulator);
     let response = synthesize_response(accumulator, provider, thread_id);
     Ok(OnceOutcome {
         response,
         content_ids,
-        evidence: evidence.clone(),
+        evidence,
     })
+}
+
+/// Post-dispatch attribution: the stream's `Done` marker names the
+/// provider that actually served the call, which under a fallback /
+/// router / refresh wrapper can differ from the configured route the
+/// pre-dispatch evidence captured. Streams from providers that predate
+/// the marker keep the pre-dispatch route.
+fn evidence_with_served_route(
+    evidence: &AttemptEvidence,
+    accumulator: &StreamAccumulator,
+) -> AttemptEvidence {
+    let mut evidence = evidence.clone();
+    if let Some(route) = accumulator.served_route() {
+        route.clone_into(&mut evidence.route_provider);
+    }
+    evidence
 }
 
 /// What [`call_llm_once_inner`] should do after classifying a single

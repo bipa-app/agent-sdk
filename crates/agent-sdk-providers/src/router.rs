@@ -231,11 +231,11 @@ where
         self.capable.provider()
     }
 
-    /// Reports the **`capable` tier's** route, not necessarily the one that
-    /// served the call: [`Self::chat`] classifies each request and may dispatch
-    /// to `fast` or `advanced` instead. Attributing the tier that actually ran
-    /// needs the serving route to travel back out of the per-request
-    /// classification with the response, which this trait has no channel for.
+    /// Reports the **`capable` tier's** route — pre-dispatch identity only.
+    /// Post-dispatch attribution does not go through this method: the tier
+    /// that actually serves a stream stamps itself on
+    /// [`StreamDelta::Done::served_route`](crate::streaming::StreamDelta),
+    /// which this router forwards untouched.
     fn route(&self) -> &str {
         self.capable.route()
     }
@@ -330,6 +330,84 @@ fn parse_complexity(response: &ChatResponse) -> TaskComplexity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::streaming::StreamDelta;
+    use agent_sdk_foundation::llm::{ContentBlock, StopReason, Usage};
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use futures::StreamExt;
+
+    /// Chat-only mock: streaming goes through the trait's default
+    /// `chat_stream`, which stamps this provider's `route()` on `Done` —
+    /// exactly what a concrete provider does.
+    struct StaticProvider {
+        name: &'static str,
+        reply: &'static str,
+    }
+
+    #[async_trait]
+    impl LlmProvider for StaticProvider {
+        async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+            Ok(ChatOutcome::Success(ChatResponse {
+                id: "r".to_owned(),
+                content: vec![ContentBlock::Text {
+                    text: self.reply.to_owned(),
+                }],
+                model: self.name.to_owned(),
+                stop_reason: Some(StopReason::EndTurn),
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                },
+            }))
+        }
+
+        fn model(&self) -> &str {
+            self.name
+        }
+
+        fn provider(&self) -> &'static str {
+            self.name
+        }
+    }
+
+    /// A request classified `SIMPLE` streams from the `fast` tier, and the
+    /// stream's `Done` names that tier — not the `capable` tier the
+    /// router's own `route()` reports.
+    #[tokio::test]
+    async fn streamed_dispatch_attributes_the_tier_that_served() -> Result<()> {
+        let router = ModelRouter::new(
+            StaticProvider {
+                name: "classifier",
+                reply: "SIMPLE",
+            },
+            StaticProvider {
+                name: "fast-tier",
+                reply: "quick answer",
+            },
+            StaticProvider {
+                name: "capable-tier",
+                reply: "unused",
+            },
+            StaticProvider {
+                name: "advanced-tier",
+                reply: "unused",
+            },
+        );
+        assert_eq!(LlmProvider::route(&router), "capable-tier");
+
+        let request = ChatRequest::new("system", vec![Message::user("2+2?")]);
+        let mut stream = router.chat_stream(request);
+        let mut served = None;
+        while let Some(item) = stream.next().await {
+            if let StreamDelta::Done { served_route, .. } = item? {
+                served = served_route;
+            }
+        }
+        assert_eq!(served.as_deref(), Some("fast-tier"));
+        Ok(())
+    }
 
     #[test]
     fn complexity_to_tier() {

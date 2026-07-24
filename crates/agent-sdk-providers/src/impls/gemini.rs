@@ -375,6 +375,7 @@ impl LlmProvider for GeminiProvider {
     }
 
     fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
+        let served_route = self.route().to_owned();
         Box::pin(async_stream::stream! {
             let thinking = match self.resolve_thinking_config(request.thinking.as_ref()) {
                 Ok(thinking) => thinking,
@@ -491,7 +492,13 @@ impl LlmProvider for GeminiProvider {
 
             let mut inner = data::stream_gemini_response(response);
             while let Some(item) = futures::StreamExt::next(&mut inner).await {
-                yield item;
+                yield match item {
+                    Ok(StreamDelta::Done { stop_reason, .. }) => Ok(StreamDelta::Done {
+                        stop_reason,
+                        served_route: Some(served_route.clone()),
+                    }),
+                    other => other,
+                };
             }
         })
     }

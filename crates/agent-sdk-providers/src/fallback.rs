@@ -234,11 +234,11 @@ impl LlmProvider for FallbackProvider {
         self.primary.provider()
     }
 
-    /// Reports the **configured primary's** route, not necessarily the one that
-    /// served the call: [`Self::chat`] walks the chain, so a request the primary
-    /// failed and a backup answered still names the primary here. Attributing
-    /// the tier that actually ran needs the serving route to travel back out of
-    /// the chain walk with the response, which this trait has no channel for.
+    /// Reports the **configured primary's** route — pre-dispatch identity
+    /// only. Post-dispatch attribution does not go through this method: the
+    /// provider that actually serves a stream stamps its route on
+    /// [`StreamDelta::Done`], which this wrapper forwards untouched, so a
+    /// failed-over call still attributes to the backend that answered.
     fn route(&self) -> &str {
         self.primary.route()
     }
@@ -471,6 +471,7 @@ mod tests {
             },
             StreamDelta::Done {
                 stop_reason: Some(StopReason::EndTurn),
+                served_route: None,
             },
         ] {
             assert!(
@@ -526,6 +527,7 @@ mod tests {
                 })),
                 Ok(StreamDelta::Done {
                     stop_reason: Some(StopReason::EndTurn),
+                    served_route: None,
                 }),
             ],
         );
@@ -583,6 +585,7 @@ mod tests {
                 }),
                 Ok(StreamDelta::Done {
                     stop_reason: Some(StopReason::EndTurn),
+                    served_route: None,
                 }),
             ],
         );
@@ -609,5 +612,44 @@ mod tests {
         assert_eq!(fb.model(), "primary");
         assert_eq!(fb.len(), 1);
         assert!(!fb.is_empty());
+    }
+
+    /// A failed-over stream's `Done` still names the backend that served
+    /// it: the chain forwards the secondary's `served_route` untouched,
+    /// even though the wrapper's own `route()` keeps naming the primary.
+    #[tokio::test]
+    async fn failed_over_stream_attributes_the_serving_secondary() -> Result<()> {
+        let primary = ScriptedProvider::streaming(
+            "primary",
+            vec![Ok(StreamDelta::Error {
+                message: "boom".to_owned(),
+                kind: StreamErrorKind::ServerError,
+            })],
+        );
+        let secondary = ScriptedProvider::streaming(
+            "secondary",
+            vec![
+                Ok(StreamDelta::TextDelta {
+                    delta: "hello".to_owned(),
+                    block_index: 0,
+                }),
+                Ok(StreamDelta::Done {
+                    stop_reason: Some(StopReason::EndTurn),
+                    served_route: Some("secondary".to_owned()),
+                }),
+            ],
+        );
+        let fb = FallbackProvider::new(primary).with_fallback(secondary);
+        assert_eq!(fb.route(), "primary");
+
+        let mut stream = fb.chat_stream(request());
+        let mut served = None;
+        while let Some(item) = stream.next().await {
+            if let StreamDelta::Done { served_route, .. } = item? {
+                served = served_route;
+            }
+        }
+        assert_eq!(served.as_deref(), Some("secondary"));
+        Ok(())
     }
 }

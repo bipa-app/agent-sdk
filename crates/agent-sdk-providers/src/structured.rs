@@ -1400,6 +1400,7 @@ mod tests {
                 },
                 StreamDelta::Done {
                     stop_reason: Some(StopReason::EndTurn),
+                    served_route: None,
                 },
             ],
         );
@@ -1434,6 +1435,7 @@ mod tests {
                 },
                 StreamDelta::Done {
                     stop_reason: Some(StopReason::EndTurn),
+                    served_route: None,
                 },
             ],
         );
@@ -1474,6 +1476,7 @@ mod tests {
                 },
                 StreamDelta::Done {
                     stop_reason: Some(StopReason::ToolUse),
+                    served_route: None,
                 },
             ],
         );

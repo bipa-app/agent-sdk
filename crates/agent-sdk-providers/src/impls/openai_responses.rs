@@ -387,6 +387,7 @@ impl LlmProvider for OpenAIResponsesProvider {
 
     #[allow(clippy::too_many_lines)]
     fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
+        let served_route = self.route().to_owned();
         Box::pin(async_stream::stream! {
             let reasoning_config = match self.resolve_openai_reasoning(request.thinking.as_ref()) {
                 Ok(reasoning) => reasoning,
@@ -733,6 +734,7 @@ impl LlmProvider for OpenAIResponsesProvider {
                                 }
                                 yield Ok(StreamDelta::Done {
                                     stop_reason: Some(stop_reason),
+                                    served_route: Some(served_route.clone()),
                                 });
                                 return;
                             }
@@ -748,6 +750,7 @@ impl LlmProvider for OpenAIResponsesProvider {
                                 }
                                 yield Ok(StreamDelta::Done {
                                     stop_reason: Some(stop_reason),
+                                    served_route: Some(served_route.clone()),
                                 });
                                 return;
                             }
@@ -2933,7 +2936,8 @@ mod tests {
         assert!(matches!(
             deltas.last(),
             Some(StreamDelta::Done {
-                stop_reason: Some(StopReason::EndTurn)
+                stop_reason: Some(StopReason::EndTurn),
+                ..
             })
         ));
         Ok(())
@@ -2950,7 +2954,8 @@ mod tests {
         assert!(matches!(
             incomplete_deltas.last(),
             Some(StreamDelta::Done {
-                stop_reason: Some(StopReason::MaxTokens)
+                stop_reason: Some(StopReason::MaxTokens),
+                ..
             })
         ));
         assert!(!incomplete_deltas.iter().any(|delta| matches!(
@@ -2968,7 +2973,8 @@ mod tests {
         assert!(matches!(
             refusal_deltas.last(),
             Some(StreamDelta::Done {
-                stop_reason: Some(StopReason::Refusal)
+                stop_reason: Some(StopReason::Refusal),
+                ..
             })
         ));
         assert!(!refusal_deltas.iter().any(|delta| matches!(
@@ -3015,7 +3021,8 @@ mod tests {
         assert!(matches!(
             deltas.last(),
             Some(StreamDelta::Done {
-                stop_reason: Some(StopReason::Refusal)
+                stop_reason: Some(StopReason::Refusal),
+                ..
             })
         ));
         Ok(())
