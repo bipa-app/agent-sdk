@@ -3939,6 +3939,7 @@ mod tests {
                 &worker,
                 &lease,
                 QuestionPause {
+                    delivered_injection_ids: Vec::new(),
                     payload: SuspensionPayload {
                         continuation: ContinuationEnvelope::wrap(AgentContinuation {
                             thread_id: thread.clone(),
@@ -6530,6 +6531,7 @@ mod tests {
                     child_caller_metadata: None,
                     payload,
                 },
+                Vec::new(),
                 at,
             )
             .await
@@ -7011,6 +7013,7 @@ mod tests {
                     ToolTier::Observe,
                 ),
                 None,
+                Vec::new(),
                 at,
             )
             .await?;
@@ -7144,6 +7147,7 @@ mod tests {
                     child_caller_metadata: None,
                     payload: pending_call_suspension(&parent_thread, "subagent_hang"),
                 },
+                Vec::new(),
                 spawned_at,
             )
             .await?;
@@ -7898,6 +7902,7 @@ mod tests {
                 vec![ChildSpawnSpec { max_attempts: 3 }],
                 pending_call_suspension(&child_root.thread_id, "probe"),
                 None,
+                Vec::new(),
                 at,
             )
             .await?;
@@ -8725,6 +8730,7 @@ mod tests {
             specs: Vec<ChildSpawnSpec>,
             payload: SuspensionPayload,
             child_otel_traceparent: Option<String>,
+            delivered_injection_ids: Vec<AgentTaskId>,
             now: time::OffsetDateTime,
         ) -> Result<(AgentTask, Vec<AgentTask>)> {
             self.inner
@@ -8735,6 +8741,7 @@ mod tests {
                     specs,
                     payload,
                     child_otel_traceparent,
+                    delivered_injection_ids,
                     now,
                 )
                 .await
@@ -8745,10 +8752,18 @@ mod tests {
             worker: &WorkerId,
             lease: &LeaseId,
             spawn: SubagentInvocationSpawn,
+            delivered_injection_ids: Vec<AgentTaskId>,
             now: time::OffsetDateTime,
         ) -> Result<(AgentTask, AgentTask, AgentTask)> {
             self.inner
-                .spawn_subagent_invocation(parent_id, worker, lease, spawn, now)
+                .spawn_subagent_invocation(
+                    parent_id,
+                    worker,
+                    lease,
+                    spawn,
+                    delivered_injection_ids,
+                    now,
+                )
                 .await
         }
         async fn spawn_subagent_batch(

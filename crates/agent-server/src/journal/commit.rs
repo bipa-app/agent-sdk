@@ -104,6 +104,11 @@ pub struct CompletedTurnCommit {
     /// turn (double-incrementing `committed_turns`, appending the same
     /// messages twice, and double-billing usage).
     pub expected_turn: u32,
+    /// Boundary-injection rows this turn already delivered; completed
+    /// Queued→Completed inside the same transaction as the turn commit,
+    /// so "turn durably committed" and "delivered injections completed"
+    /// are one atomic fact.
+    pub delivered_injection_ids: Vec<AgentTaskId>,
     /// The open attempt to close.
     pub turn_attempt_id: TurnAttemptId,
     /// Parameters for closing the turn attempt.
@@ -294,6 +299,7 @@ pub struct CommitOutcome {
 /// transaction hook.
 pub async fn commit_completed_turn(
     mut params: CompletedTurnCommit,
+    task_store: &dyn super::store::AgentTaskStore,
     thread_store: &dyn ThreadStore,
     message_store: &dyn MessageProjectionStore,
     turn_attempt_store: &dyn TurnAttemptStore,
@@ -338,6 +344,7 @@ pub async fn commit_completed_turn(
     // under its own write lock. Pull the events out so the state steps
     // run first, then commit the events as the final step.
     let events = std::mem::take(&mut params.events);
+    let delivered_injection_ids = std::mem::take(&mut params.delivered_injection_ids);
     let thread_id_for_events = params.thread_id.clone();
 
     // Stale turn double-commit guard. Two racing committers could both
@@ -446,7 +453,15 @@ pub async fn commit_completed_turn(
     // (and not compiled) unless the `failpoints` feature is enabled.
     crate::fail_point!("commit.before_event_commit");
 
-    // 6. Commit lifecycle events. Skipped when no events are provided
+    // 6. Complete the boundary-injection rows this turn delivered. The
+    //    in-memory task store is atomic per call; durable backends never
+    //    reach this path (their committer completes the rows in-tx).
+    task_store
+        .complete_delivered_injections(&delivered_injection_ids, params.now)
+        .await
+        .context("commit: complete delivered injections")?;
+
+    // 7. Commit lifecycle events. Skipped when no events are provided
     //    (e.g. callers that don't produce lifecycle events yet).
     let committed_events = if events.is_empty() {
         Vec::new()
@@ -541,6 +556,7 @@ mod tests {
     }
 
     struct Stores {
+        tasks: crate::journal::store::InMemoryAgentTaskStore,
         threads: InMemoryThreadStore,
         messages: InMemoryMessageProjectionStore,
         attempts: InMemoryTurnAttemptStore,
@@ -551,6 +567,7 @@ mod tests {
     impl Stores {
         fn new() -> Self {
             Self {
+                tasks: crate::journal::store::InMemoryAgentTaskStore::new(),
                 threads: InMemoryThreadStore::new(),
                 messages: InMemoryMessageProjectionStore::new(),
                 attempts: InMemoryTurnAttemptStore::new(),
@@ -588,6 +605,7 @@ mod tests {
 
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
+                delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task_id.clone(),
@@ -602,6 +620,7 @@ mod tests {
                 owner_guard: None,
                 now: t_plus(5),
             },
+            &s.tasks,
             &s.threads,
             &s.messages,
             &s.attempts,
@@ -652,6 +671,7 @@ mod tests {
         // Turn 1
         let o1 = commit_completed_turn(
             CompletedTurnCommit {
+                delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task1,
@@ -666,6 +686,7 @@ mod tests {
                 owner_guard: None,
                 now: t_plus(1),
             },
+            &s.tasks,
             &s.threads,
             &s.messages,
             &s.attempts,
@@ -678,6 +699,7 @@ mod tests {
         // Turn 2
         let o2 = commit_completed_turn(
             CompletedTurnCommit {
+                delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task2,
@@ -692,6 +714,7 @@ mod tests {
                 owner_guard: None,
                 now: t_plus(2),
             },
+            &s.tasks,
             &s.threads,
             &s.messages,
             &s.attempts,
@@ -746,6 +769,7 @@ mod tests {
         // Turn 1 commits cleanly; the thread now sits at committed_turns = 1.
         commit_completed_turn(
             CompletedTurnCommit {
+                delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task1,
@@ -760,6 +784,7 @@ mod tests {
                 owner_guard: None,
                 now: t_plus(1),
             },
+            &s.tasks,
             &s.threads,
             &s.messages,
             &s.attempts,
@@ -773,6 +798,7 @@ mod tests {
         // The guard rejects it before any projection advances.
         let err = commit_completed_turn(
             CompletedTurnCommit {
+                delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task2_stale,
@@ -787,6 +813,7 @@ mod tests {
                 owner_guard: None,
                 now: t_plus(2),
             },
+            &s.tasks,
             &s.threads,
             &s.messages,
             &s.attempts,
@@ -808,6 +835,7 @@ mod tests {
         // The correct expected_turn for the next turn succeeds.
         let ok = commit_completed_turn(
             CompletedTurnCommit {
+                delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task2_ok,
@@ -822,6 +850,7 @@ mod tests {
                 owner_guard: None,
                 now: t_plus(3),
             },
+            &s.tasks,
             &s.threads,
             &s.messages,
             &s.attempts,
@@ -849,6 +878,7 @@ mod tests {
 
         commit_completed_turn(
             CompletedTurnCommit {
+                delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task_a,
@@ -863,6 +893,7 @@ mod tests {
                 owner_guard: None,
                 now: t_plus(1),
             },
+            &s.tasks,
             &s.threads,
             &s.messages,
             &s.attempts,
@@ -874,6 +905,7 @@ mod tests {
 
         commit_completed_turn(
             CompletedTurnCommit {
+                delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_b(),
                 task_id: task_b,
@@ -888,6 +920,7 @@ mod tests {
                 owner_guard: None,
                 now: t_plus(2),
             },
+            &s.tasks,
             &s.threads,
             &s.messages,
             &s.attempts,
@@ -919,6 +952,7 @@ mod tests {
         let s = Stores::new();
         let err = commit_completed_turn(
             CompletedTurnCommit {
+                delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: AgentTaskId::from_string("task_x"),
@@ -933,6 +967,7 @@ mod tests {
                 owner_guard: None,
                 now: t_plus(1),
             },
+            &s.tasks,
             &s.threads,
             &s.messages,
             &s.attempts,
@@ -975,6 +1010,7 @@ mod tests {
         // Attempt to commit with the already-closed attempt.
         let err = commit_completed_turn(
             CompletedTurnCommit {
+                delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id,
@@ -989,6 +1025,7 @@ mod tests {
                 owner_guard: None,
                 now: t_plus(2),
             },
+            &s.tasks,
             &s.threads,
             &s.messages,
             &s.attempts,
@@ -1025,6 +1062,7 @@ mod tests {
         let commit_for = |task_id: AgentTaskId,
                           attempt_id: crate::journal::turn_attempt::TurnAttemptId,
                           expected_turn: u32| CompletedTurnCommit {
+            delivered_injection_ids: Vec::new(),
             checkpoint_kind: CheckpointKind::FullTurn,
             thread_id: thread_a(),
             task_id,
@@ -1043,6 +1081,7 @@ mod tests {
         let run = |params: CompletedTurnCommit, stores: std::sync::Arc<Stores>| async move {
             commit_completed_turn(
                 params,
+                &stores.tasks,
                 &stores.threads,
                 &stores.messages,
                 &stores.attempts,
@@ -1099,6 +1138,7 @@ mod tests {
         // The loser retries at the next slot and lands cleanly.
         let retried = commit_completed_turn(
             commit_for(loser_task.clone(), loser_attempt, 2),
+            &s.tasks,
             &s.threads,
             &s.messages,
             &s.attempts,
@@ -1125,6 +1165,7 @@ mod tests {
         // Commit first turn then mark thread completed.
         commit_completed_turn(
             CompletedTurnCommit {
+                delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task1,
@@ -1139,6 +1180,7 @@ mod tests {
                 owner_guard: None,
                 now: t_plus(1),
             },
+            &s.tasks,
             &s.threads,
             &s.messages,
             &s.attempts,
@@ -1156,6 +1198,7 @@ mod tests {
         // Second commit should fail at thread aggregate step.
         let err = commit_completed_turn(
             CompletedTurnCommit {
+                delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id: task2,
@@ -1170,6 +1213,7 @@ mod tests {
                 owner_guard: None,
                 now: t_plus(3),
             },
+            &s.tasks,
             &s.threads,
             &s.messages,
             &s.attempts,
@@ -1224,6 +1268,7 @@ mod tests {
 
         commit_completed_turn(
             CompletedTurnCommit {
+                delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id,
@@ -1238,6 +1283,7 @@ mod tests {
                 owner_guard: None,
                 now: t_plus(5),
             },
+            &s.tasks,
             &s.threads,
             &s.messages,
             &s.attempts,
@@ -1273,6 +1319,7 @@ mod tests {
 
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
+                delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id,
@@ -1287,6 +1334,7 @@ mod tests {
                 owner_guard: None,
                 now: t_plus(1),
             },
+            &s.tasks,
             &s.threads,
             &s.messages,
             &s.attempts,
@@ -1335,6 +1383,7 @@ mod tests {
 
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
+                delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
                 task_id,
@@ -1349,6 +1398,7 @@ mod tests {
                 owner_guard: None,
                 now: t_plus(5),
             },
+            &s.tasks,
             &s.threads,
             &s.messages,
             &s.attempts,

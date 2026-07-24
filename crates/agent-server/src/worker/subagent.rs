@@ -1378,18 +1378,11 @@ pub async fn spawn_subagent_invocation(
     worker: &WorkerId,
     lease: &LeaseId,
     mut spawn: SubagentInvocationSpawn,
+    delivered_injection_ids: Vec<AgentTaskId>,
     deps: &SubagentInvocationDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<SpawnedSubagentInvocation> {
-    let pending_tool_count = spawn.payload.continuation.payload.pending_tool_calls.len();
-    let spawn_index_usize =
-        usize::try_from(spawn.spawn_index).context("subagent spawn_index exceeds usize")?;
-    ensure!(
-        spawn_index_usize < pending_tool_count,
-        "subagent spawn_index {spawn_index_usize} out of bounds for {pending_tool_count} pending tool calls",
-    );
-    let pending_tool =
-        spawn.payload.continuation.payload.pending_tool_calls[spawn_index_usize].clone();
+    let pending_tool = pending_tool_for_spawn(&spawn)?;
     ensure_confirm_tier_subagent_tool(&pending_tool)?;
     if spawn.child_root_input.is_empty() {
         spawn.child_root_input = build_child_root_input(&spawn.spec);
@@ -1397,6 +1390,7 @@ pub async fn spawn_subagent_invocation(
     if let Some(committer) = deps.task_store.atomic_subagent_spawn_committer() {
         let outcome = committer
             .commit_subagent_spawn_atomic(SubagentSpawnCommit {
+                delivered_injection_ids,
                 parent_id: parent_id.clone(),
                 worker: worker.clone(),
                 lease: lease.clone(),
@@ -1418,8 +1412,31 @@ pub async fn spawn_subagent_invocation(
             committed_events: vec![outcome.committed_event],
         });
     }
-    spawn_subagent_invocation_sequential(parent_id, worker, lease, spawn, &pending_tool, deps, now)
-        .await
+    spawn_subagent_invocation_sequential(
+        parent_id,
+        worker,
+        lease,
+        spawn,
+        delivered_injection_ids,
+        deps,
+        now,
+    )
+    .await
+}
+
+/// The pending tool call a spawn's `spawn_index` points at inside its
+/// own suspension payload.
+fn pending_tool_for_spawn(
+    spawn: &SubagentInvocationSpawn,
+) -> Result<agent_sdk_foundation::PendingToolCallInfo> {
+    let pending_tool_count = spawn.payload.continuation.payload.pending_tool_calls.len();
+    let spawn_index_usize =
+        usize::try_from(spawn.spawn_index).context("subagent spawn_index exceeds usize")?;
+    ensure!(
+        spawn_index_usize < pending_tool_count,
+        "subagent spawn_index {spawn_index_usize} out of bounds for {pending_tool_count} pending tool calls",
+    );
+    Ok(spawn.payload.continuation.payload.pending_tool_calls[spawn_index_usize].clone())
 }
 
 /// Sequential fallback for stores without an atomic spawn committer
@@ -1432,10 +1449,11 @@ async fn spawn_subagent_invocation_sequential(
     worker: &WorkerId,
     lease: &LeaseId,
     spawn: SubagentInvocationSpawn,
-    pending_tool: &agent_sdk_foundation::PendingToolCallInfo,
+    delivered_injection_ids: Vec<AgentTaskId>,
     deps: &SubagentInvocationDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<SpawnedSubagentInvocation> {
+    let pending_tool = pending_tool_for_spawn(&spawn)?;
     let child_thread = deps
         .thread_store
         .get_or_create(&spawn.child_thread_id, now)
@@ -1444,7 +1462,14 @@ async fn spawn_subagent_invocation_sequential(
 
     let (parent_task, invocation_task, child_root_task) = deps
         .task_store
-        .spawn_subagent_invocation(parent_id, worker, lease, spawn, now)
+        .spawn_subagent_invocation(
+            parent_id,
+            worker,
+            lease,
+            spawn,
+            delivered_injection_ids,
+            now,
+        )
         .await
         .context("persist subagent invocation tasks")?;
 
@@ -1557,6 +1582,18 @@ pub struct SubagentBatchEntry {
     /// root turn (`None` when the caller supplies none). Propagated
     /// verbatim into the child's `SubagentInvocationSpawn`.
     pub child_caller_metadata: Option<serde_json::Value>,
+}
+
+/// One all-subagent fan-out batch, mirroring [`MixedChildrenRequest`]
+/// for the no-tool-children case.
+pub struct SubagentBatchRequest {
+    /// Boundary-injection rows this turn already delivered; completed
+    /// with the spawn in one store write.
+    pub delivered_injection_ids: Vec<AgentTaskId>,
+    /// Durable subagent invocations to persist, in input order.
+    pub entries: Vec<SubagentBatchEntry>,
+    /// The one parent suspension shared by every entry in the batch.
+    pub payload: SuspensionPayload,
 }
 
 /// Persist N durable subagent invocations atomically under one parent
@@ -1762,11 +1799,15 @@ pub async fn spawn_subagent_batch_invocations(
     parent_id: &AgentTaskId,
     worker: &WorkerId,
     lease: &LeaseId,
-    mut entries: Vec<SubagentBatchEntry>,
-    payload: SuspensionPayload,
+    request: SubagentBatchRequest,
     deps: &SubagentInvocationDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<SpawnedSubagentBatch> {
+    let SubagentBatchRequest {
+        delivered_injection_ids,
+        mut entries,
+        payload,
+    } = request;
     ensure!(!entries.is_empty(), "subagent batch must be non-empty");
 
     // Validate every entry against the shared continuation envelope
@@ -1804,6 +1845,7 @@ pub async fn spawn_subagent_batch_invocations(
             worker,
             lease,
             SubagentBatchSpawn {
+                delivered_injection_ids,
                 spawns,
                 payload,
                 events,
@@ -1905,6 +1947,9 @@ pub struct SpawnedMixedBatch {
 /// `pending_tool_calls`: together their spawn indices must name every
 /// slot exactly once (the store enforces this before it writes a row).
 pub struct MixedChildrenRequest {
+    /// Boundary-injection rows this turn already delivered; completed
+    /// with the spawn in one store write.
+    pub delivered_injection_ids: Vec<AgentTaskId>,
     /// Durable subagent invocations to persist, in input order.
     pub subagents: Vec<SubagentBatchEntry>,
     /// Tool-runtime children to persist, in input order.
@@ -1956,6 +2001,7 @@ pub async fn spawn_mixed_children_invocations(
     now: OffsetDateTime,
 ) -> Result<SpawnedMixedBatch> {
     let MixedChildrenRequest {
+        delivered_injection_ids,
         mut subagents,
         tool_children,
         payload,
@@ -1998,6 +2044,7 @@ pub async fn spawn_mixed_children_invocations(
             worker,
             lease,
             MixedChildrenSpawn {
+                delivered_injection_ids,
                 subagents: spawns,
                 tool_children,
                 payload,

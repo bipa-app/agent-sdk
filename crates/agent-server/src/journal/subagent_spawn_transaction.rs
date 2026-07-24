@@ -12,6 +12,9 @@ use super::thread::Thread;
 
 /// Complete write set for one durable subagent spawn.
 pub struct SubagentSpawnCommit {
+    /// Boundary-injection rows this turn already delivered; completed
+    /// Queued→Completed inside the same transaction as the spawn.
+    pub delivered_injection_ids: Vec<AgentTaskId>,
     pub parent_id: AgentTaskId,
     pub worker: WorkerId,
     pub lease: LeaseId,

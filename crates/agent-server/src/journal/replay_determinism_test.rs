@@ -79,6 +79,7 @@ struct DurableDigest(String);
 /// A fresh, empty set of in-memory stores plus the helpers to drive and
 /// digest one commit history through them.
 struct ReplayStores {
+    tasks: crate::journal::store::InMemoryAgentTaskStore,
     threads: InMemoryThreadStore,
     messages: InMemoryMessageProjectionStore,
     attempts: InMemoryTurnAttemptStore,
@@ -89,6 +90,7 @@ struct ReplayStores {
 impl ReplayStores {
     fn new() -> Self {
         Self {
+            tasks: crate::journal::store::InMemoryAgentTaskStore::new(),
             threads: InMemoryThreadStore::new(),
             messages: InMemoryMessageProjectionStore::new(),
             attempts: InMemoryTurnAttemptStore::new(),
@@ -122,6 +124,7 @@ impl ReplayStores {
             .await
             .context("open attempt for replay")?;
         Ok(CompletedTurnCommit {
+            delivered_injection_ids: Vec::new(),
             checkpoint_kind: CheckpointKind::FullTurn,
             thread_id: thread(),
             task_id: turn.task_id.clone(),
@@ -162,6 +165,7 @@ impl ReplayStores {
                 .await?;
             commit_completed_turn(
                 params,
+                &self.tasks,
                 &self.threads,
                 &self.messages,
                 &self.attempts,

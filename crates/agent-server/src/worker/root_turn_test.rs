@@ -6919,6 +6919,7 @@ async fn cancelled_event_derives_usage_from_parked_continuation() -> Result<()> 
                 suspended_messages: Vec::new(),
             },
             None,
+            Vec::new(),
             t_plus(1),
         )
         .await
@@ -7114,6 +7115,7 @@ impl SalvageRacingAttemptStore {
                 .context("open salvage attempt")?;
             crate::journal::commit::commit_completed_turn(
                 crate::journal::commit::CompletedTurnCommit {
+                    delivered_injection_ids: Vec::new(),
                     checkpoint_kind: *kind,
                     thread_id: thread_a(),
                     task_id: self.salvager_task.clone(),
@@ -7130,6 +7132,7 @@ impl SalvageRacingAttemptStore {
                     owner_guard: None,
                     now,
                 },
+                &self.stores.tasks,
                 &self.stores.threads,
                 &self.stores.messages,
                 &self.inner,
@@ -7789,6 +7792,7 @@ async fn lost_ownership_rejection_settles_the_open_attempt() -> Result<()> {
         .await?;
 
     let params = crate::journal::commit::CompletedTurnCommit {
+        delivered_injection_ids: Vec::new(),
         checkpoint_kind: CheckpointKind::FullTurn,
         thread_id: thread_a(),
         task_id: task_id.clone(),

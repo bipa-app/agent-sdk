@@ -173,6 +173,7 @@ async fn seed_awaiting_question(store: &SqliteDurableStore) -> Result<AgentTaskI
             &worker,
             &lease,
             QuestionPause {
+                delivered_injection_ids: Vec::new(),
                 payload: SuspensionPayload {
                     continuation: ContinuationEnvelope::wrap(AgentContinuation {
                         thread_id: thread_id.clone(),

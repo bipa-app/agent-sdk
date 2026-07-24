@@ -267,6 +267,7 @@ mod tests {
                     child_caller_metadata: None,
                     payload: suspension_payload(parent_thread),
                 },
+                Vec::new(),
                 t_plus(2),
             )
             .await
@@ -569,6 +570,7 @@ mod tests {
         };
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
+                delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: tid.clone(),
                 task_id: root.id.clone(),
@@ -585,6 +587,7 @@ mod tests {
                 owner_guard: None,
                 now: t_plus(55),
             },
+            task_store,
             thread_store,
             message_store,
             attempt_store,
@@ -669,6 +672,7 @@ mod tests {
             })
             .await?;
         let params = CompletedTurnCommit {
+            delivered_injection_ids: Vec::new(),
             checkpoint_kind: CheckpointKind::FullTurn,
             thread_id: thread_id(tid),
             task_id: root.id.clone(),
@@ -736,6 +740,7 @@ mod tests {
 
         let error = commit_completed_turn(
             params,
+            task_store,
             thread_store,
             message_store,
             attempt_store,
@@ -792,6 +797,7 @@ mod tests {
 
         let outcome = commit_completed_turn(
             params,
+            task_store,
             thread_store,
             message_store,
             attempt_store,
@@ -825,6 +831,7 @@ mod tests {
                 .await?;
         commit_completed_turn(
             params,
+            task_store,
             thread_store,
             message_store,
             attempt_store,
@@ -848,6 +855,7 @@ mod tests {
             })
             .await?;
         let stale = CompletedTurnCommit {
+            delivered_injection_ids: Vec::new(),
             checkpoint_kind: CheckpointKind::FullTurn,
             thread_id: thread_id("conformance-stale-typed"),
             task_id: root.id.clone(),
@@ -878,6 +886,7 @@ mod tests {
         };
         let error = commit_completed_turn(
             stale,
+            task_store,
             thread_store,
             message_store,
             attempt_store,
@@ -950,6 +959,7 @@ mod tests {
                 vec![spec],
                 payload,
                 None,
+                Vec::new(),
                 t_plus(62),
             )
             .await?;
@@ -1010,6 +1020,7 @@ mod tests {
                 ],
                 suspension_payload(tid),
                 None,
+                Vec::new(),
                 t_plus(62),
             )
             .await?;
@@ -1127,6 +1138,7 @@ mod tests {
                 ],
                 suspension_payload(tid),
                 None,
+                Vec::new(),
                 t_plus(72),
             )
             .await?;
@@ -1642,6 +1654,7 @@ mod tests {
                 vec![ChildSpawnSpec { max_attempts: 3 }],
                 suspension_payload(tid),
                 None,
+                Vec::new(),
                 t_plus(3),
             )
             .await?;
@@ -1715,6 +1728,7 @@ mod tests {
                 ],
                 suspension_payload(tid),
                 None,
+                Vec::new(),
                 t_plus(3),
             )
             .await?;
@@ -2067,6 +2081,7 @@ mod tests {
                 vec![ChildSpawnSpec { max_attempts: 1 }],
                 payload,
                 None,
+                Vec::new(),
                 t_plus(202),
             )
             .await?;
@@ -2150,6 +2165,7 @@ mod tests {
                 vec![spec],
                 payload,
                 None,
+                Vec::new(),
                 t_plus(102),
             )
             .await?;
@@ -3694,6 +3710,7 @@ mod tests {
             .thread_id;
         store
             .commit_subagent_spawn_atomic(SubagentSpawnCommit {
+                delivered_injection_ids: Vec::new(),
                 parent_id,
                 worker,
                 lease,
@@ -3844,6 +3861,7 @@ mod tests {
             .context("spawn parent must exist")?;
         let crashed =
             std::panic::AssertUnwindSafe(store.commit_subagent_spawn_atomic(SubagentSpawnCommit {
+                delivered_injection_ids: Vec::new(),
                 parent_id: parent_id.clone(),
                 worker,
                 lease,
@@ -3909,6 +3927,7 @@ mod tests {
                 &worker,
                 &lease,
                 agent_server::journal::store::SubagentBatchSpawn {
+                    delivered_injection_ids: Vec::new(),
                     spawns: vec![spawn],
                     payload,
                     events: vec![SubagentSpawnEvent {
@@ -3983,6 +4002,7 @@ mod tests {
             &worker,
             &lease,
             agent_server::journal::store::SubagentBatchSpawn {
+                delivered_injection_ids: Vec::new(),
                 spawns: vec![spawn],
                 payload,
                 events: vec![SubagentSpawnEvent {

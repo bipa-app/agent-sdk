@@ -1111,6 +1111,7 @@ pub(crate) async fn commit_partial_turn_on_cancel(
     let commit_result = commit_completed_turn(
         CompletedTurnCommit {
             checkpoint_kind: CheckpointKind::CancelSalvage,
+            delivered_injection_ids: Vec::new(),
             thread_id: thread_id.clone(),
             task_id: task_id.clone(),
             expected_turn,
@@ -1162,6 +1163,7 @@ pub(crate) async fn commit_partial_turn_on_cancel(
             owner_guard: None,
             now,
         },
+        deps.task_store,
         deps.thread_store,
         deps.message_store,
         deps.attempt_store,
@@ -1997,6 +1999,7 @@ async fn commit_text_only_turn(
             messages: drained_messages,
             turn_usage,
             agent_state_snapshot,
+            delivered_injection_ids: close_ctx.delivered_injections.clone(),
             events: lifecycle_events,
             outbox_max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
             owner_guard: None,
@@ -2018,10 +2021,6 @@ async fn commit_text_only_turn(
     committed_events.push(close_ctx.start_committed);
     committed_events.extend(close_ctx.boundary_committed);
     committed_events.extend(commit.committed_events.iter().cloned());
-
-    // The staged transcript — including anything injected mid-turn — is durable
-    // as of the commit above, so the injection rows may now be marked delivered.
-    complete_delivered_injections(deps, &close_ctx.delivered_injections, now).await;
 
     let (completed_task, resumed_invocation) = deps
         .task_store
@@ -2247,6 +2246,7 @@ pub(crate) async fn commit_completed_turn_shifting_slot(
             Ok(()) => {
                 match commit_completed_turn(
                     params.clone(),
+                    deps.task_store,
                     deps.thread_store,
                     deps.message_store,
                     deps.attempt_store,
@@ -5003,6 +5003,7 @@ async fn suspend_at_tool_boundary(
                 draft,
                 questions,
                 events,
+                delivered_injections: close_ctx.delivered_injections.clone(),
             },
             close_ctx,
             now,
@@ -5031,7 +5032,10 @@ async fn suspend_at_tool_boundary(
         &inputs,
         deps,
         routing,
-        payload,
+        SuspendedBatch {
+            payload,
+            delivered_injection_ids: close_ctx.delivered_injections.clone(),
+        },
         specs,
         "spawn tool children",
         now,
@@ -5074,10 +5078,6 @@ async fn suspend_at_tool_boundary(
     committed_events.push(close_ctx.start_committed);
     committed_events.extend(close_ctx.boundary_committed);
     committed_events.extend(suspension_committed);
-
-    // `suspended_messages` (carrying the injected input) is durable on the
-    // parent task as of the spawn above, so the rows may be marked delivered.
-    complete_delivered_injections(deps, &close_ctx.delivered_injections, now).await;
 
     Ok(RootTurnOutcome::Suspended {
         parent_task,
@@ -5154,6 +5154,7 @@ async fn spawn_single_subagent_invocation(
     deps: &RootTurnDeps<'_>,
     plan: &super::subagent_spawn_selector::SubagentSpawnPlan,
     payload: SuspensionPayload,
+    delivered_injection_ids: Vec<AgentTaskId>,
     spawn_index: usize,
     now: OffsetDateTime,
 ) -> Result<super::subagent::SpawnedSubagentInvocation> {
@@ -5176,6 +5177,7 @@ async fn spawn_single_subagent_invocation(
         &inputs.bootstrap.worker_id,
         &inputs.bootstrap.lease_id,
         spawn,
+        delivered_injection_ids,
         &invocation_deps,
         now,
     )
@@ -5200,6 +5202,7 @@ async fn spawn_multi_subagent_invocations(
         Box<super::subagent_spawn_selector::SubagentSpawnPlan>,
     )>,
     payload: SuspensionPayload,
+    delivered_injection_ids: Vec<AgentTaskId>,
     now: OffsetDateTime,
 ) -> Result<super::subagent::SpawnedSubagentBatch> {
     let mut entries = Vec::with_capacity(plans.len());
@@ -5223,8 +5226,11 @@ async fn spawn_multi_subagent_invocations(
         &inputs.bootstrap.task_id,
         &inputs.bootstrap.worker_id,
         &inputs.bootstrap.lease_id,
-        entries,
-        payload,
+        super::subagent::SubagentBatchRequest {
+            delivered_injection_ids,
+            entries,
+            payload,
+        },
         &invocation_deps,
         now,
     )
@@ -5246,6 +5252,7 @@ async fn spawn_mixed_batch_children(
     deps: &RootTurnDeps<'_>,
     routing: MixedRoutingInputs,
     payload: SuspensionPayload,
+    delivered_injection_ids: Vec<AgentTaskId>,
     now: OffsetDateTime,
 ) -> Result<super::subagent::SpawnedMixedBatch> {
     let MixedRoutingInputs {
@@ -5291,6 +5298,7 @@ async fn spawn_mixed_batch_children(
         &inputs.bootstrap.worker_id,
         &inputs.bootstrap.lease_id,
         super::subagent::MixedChildrenRequest {
+            delivered_injection_ids,
             subagents,
             tool_children,
             payload,
@@ -5337,6 +5345,15 @@ async fn child_tool_traceparent(deps: &RootTurnDeps<'_>, task_id: &AgentTaskId) 
     }
 }
 
+/// What a closing turn hands to whichever spawn path the routing
+/// verdict picks: the parent's suspension plus the boundary-injection
+/// rows the turn already delivered (completed atomically with the
+/// spawn).
+struct SuspendedBatch {
+    payload: SuspensionPayload,
+    delivered_injection_ids: Vec<AgentTaskId>,
+}
+
 /// Drive the routing match arm common to both `suspend_at_tool_boundary`
 /// (initial suspend) and `suspend_resumed_turn` (post-resume re-suspend).
 ///
@@ -5364,21 +5381,40 @@ async fn apply_batch_routing(
     inputs: &RootWorkerInputs,
     deps: &RootTurnDeps<'_>,
     routing: super::subagent_spawn_selector::BatchRouting,
-    payload: SuspensionPayload,
+    batch: SuspendedBatch,
     specs: Vec<ChildSpawnSpec>,
     tool_children_context: &'static str,
     now: OffsetDateTime,
 ) -> Result<(AgentTask, Vec<AgentTask>)> {
+    let SuspendedBatch {
+        payload,
+        delivered_injection_ids,
+    } = batch;
     let task_id = &inputs.bootstrap.task_id;
     let spawned = match routing {
         super::subagent_spawn_selector::BatchRouting::SingleSubagent { spawn_index, plan } => {
-            let spawned =
-                spawn_single_subagent_invocation(inputs, deps, &plan, payload, spawn_index, now)
-                    .await?;
+            let spawned = spawn_single_subagent_invocation(
+                inputs,
+                deps,
+                &plan,
+                payload,
+                delivered_injection_ids,
+                spawn_index,
+                now,
+            )
+            .await?;
             (spawned.parent_task, vec![spawned.invocation_task])
         }
         super::subagent_spawn_selector::BatchRouting::MultiSubagent { plans } => {
-            let batch = spawn_multi_subagent_invocations(inputs, deps, plans, payload, now).await?;
+            let batch = spawn_multi_subagent_invocations(
+                inputs,
+                deps,
+                plans,
+                payload,
+                delivered_injection_ids,
+                now,
+            )
+            .await?;
             let invocation_tasks = batch
                 .invocations
                 .into_iter()
@@ -5399,6 +5435,7 @@ async fn apply_batch_routing(
                     specs,
                 },
                 payload,
+                delivered_injection_ids,
                 now,
             )
             .await?;
@@ -5421,6 +5458,7 @@ async fn apply_batch_routing(
                     specs,
                     payload,
                     child_otel_traceparent,
+                    delivered_injection_ids,
                     now,
                 )
                 .await
@@ -5589,6 +5627,7 @@ struct QuestionSuspension {
     draft: Vec<llm::Message>,
     questions: Vec<QuestionPayload>,
     events: Vec<AgentEvent>,
+    delivered_injections: Vec<AgentTaskId>,
 }
 
 async fn park_on_question(
@@ -5603,6 +5642,7 @@ async fn park_on_question(
         draft,
         questions,
         events,
+        delivered_injections,
     } = suspension;
     let (parent, committed) = deps
         .task_store
@@ -5611,6 +5651,7 @@ async fn park_on_question(
             &inputs.bootstrap.worker_id,
             &inputs.bootstrap.lease_id,
             QuestionPause {
+                delivered_injection_ids: delivered_injections,
                 payload,
                 questions,
                 events,
@@ -5804,7 +5845,7 @@ struct ResumeSuspension<'a> {
 /// Input-injection rows taken into an in-flight turn at one boundary.
 ///
 /// The rows are deliberately still `Queued` when this is returned: they are
-/// completed by [`complete_delivered_injections`] only after the commit that
+/// completed inside the same store transaction as the durable fact that
 /// makes `messages` durable, so a turn that fails between drain and commit
 /// leaves them re-drainable instead of marking undelivered input as delivered.
 #[derive(Debug, Default)]
@@ -5879,30 +5920,6 @@ pub(crate) async fn drain_boundary_injections(
         drained.delivered.push(injection.id);
     }
     Ok(drained)
-}
-
-/// Mark every injection this turn consumed as delivered.
-///
-/// MUST run only after the commit that makes the injected messages durable.
-/// [`StagedMessageStore`](crate::journal::staged::StagedMessageStore) "never
-/// touches durable storage", so completing a row before that commit would
-/// publish a delivery the model may never have received — the failure mode the
-/// mailbox this replaces was built to remove.
-///
-/// Failure is logged rather than propagated: the turn is already committed, so
-/// returning an error here would retry a turn that succeeded. The row stays
-/// `Queued` and the next boundary re-delivers it — a visible duplicate, which
-/// is the safe direction to fail relative to silently dropping the input.
-async fn complete_delivered_injections(
-    deps: &RootTurnDeps<'_>,
-    delivered: &[AgentTaskId],
-    now: OffsetDateTime,
-) {
-    for id in delivered {
-        if let Err(error) = deps.task_store.complete_input_injection(id, now).await {
-            log::error!("boundary injection {id} committed but not marked delivered: {error:#}");
-        }
-    }
 }
 
 /// Resume a suspended root turn after all child tool tasks have
@@ -6296,6 +6313,7 @@ async fn commit_resumed_turn(
             messages: drained_messages,
             turn_usage,
             agent_state_snapshot,
+            delivered_injection_ids: close.delivered_injections.to_vec(),
             events: lifecycle_events,
             outbox_max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
             owner_guard: None,
@@ -6309,9 +6327,6 @@ async fn commit_resumed_turn(
     .context("commit resumed turn")?;
 
     let committed_events = commit.committed_events.clone();
-
-    // Injected input is part of the transcript the commit above persisted.
-    complete_delivered_injections(deps, close.delivered_injections, now).await;
 
     // Advance the root task to Completed.
     let (completed_task, resumed_invocation) = deps
@@ -6490,6 +6505,7 @@ async fn suspend_resumed_turn(
                 draft,
                 questions,
                 events,
+                delivered_injections: close.delivered_injections.to_vec(),
             },
             now,
         )
@@ -6517,16 +6533,15 @@ async fn suspend_resumed_turn(
         &inputs,
         deps,
         routing,
-        payload,
+        SuspendedBatch {
+            payload,
+            delivered_injection_ids: close.delivered_injections.to_vec(),
+        },
         specs,
         "re-spawn tool children on resume",
         now,
     )
     .await?;
-
-    // `suspended_messages` (carrying the injected input) is durable on the
-    // parent task as of the spawn above, so the rows may be marked delivered.
-    complete_delivered_injections(deps, close.delivered_injections, now).await;
 
     // Refresh the projection draft so a subsequent failure on the
     // *next* resume LLM call still surfaces the full in-flight
