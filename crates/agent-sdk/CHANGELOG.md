@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-v0.14.0...agent-sdk-v0.15.0) - 2026-07-24
+
+### Other
+
+- Attribute attempts to the route that actually served the stream ([#402](https://github.com/bipa-app/agent-sdk/pull/402))
+
 ## [0.14.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-v0.13.1...agent-sdk-v0.14.0) - 2026-07-23
 
 ### Fixed
