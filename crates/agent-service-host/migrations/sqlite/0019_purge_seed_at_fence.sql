@@ -1,8 +1,15 @@
+-- no-transaction
 -- Purge identity becomes durable at FENCE time (SQLite dialect). Mirror of
 -- postgres/0019_purge_seed_at_fence.sql. SQLite cannot alter CHECK
 -- constraints in place, so the thread table is rebuilt carrying the full
 -- current schema with the widened purge-record constraint.
-PRAGMA defer_foreign_keys = ON;
+--
+-- Runs outside sqlx's transaction with foreign_keys OFF — see
+-- 0016_input_injection_kind.sql for the deferred-FK constraint that
+-- forbids dropping a referenced table under defer_foreign_keys.
+PRAGMA foreign_keys = OFF;
+
+BEGIN;
 
 CREATE TABLE agent_sdk_threads_new (
     thread_id TEXT PRIMARY KEY,
@@ -57,3 +64,11 @@ FROM agent_sdk_threads;
 
 DROP TABLE agent_sdk_threads;
 ALTER TABLE agent_sdk_threads_new RENAME TO agent_sdk_threads;
+
+CREATE TEMP TABLE fk_rebuild_gate (violations INTEGER NOT NULL CHECK (violations = 0));
+INSERT INTO fk_rebuild_gate SELECT count(*) FROM pragma_foreign_key_check;
+DROP TABLE fk_rebuild_gate;
+
+COMMIT;
+
+PRAGMA foreign_keys = ON;

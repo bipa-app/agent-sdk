@@ -1,6 +1,13 @@
+-- no-transaction
 -- ENG-9279: SQLite cannot alter CHECK constraints in place. Rebuild the
 -- task and idempotency tables to admit durable question states and requests.
-PRAGMA defer_foreign_keys = ON;
+--
+-- Runs outside sqlx's transaction with foreign_keys OFF — see
+-- 0016_input_injection_kind.sql for the deferred-FK constraint that
+-- forbids dropping a referenced table under defer_foreign_keys.
+PRAGMA foreign_keys = OFF;
+
+BEGIN;
 
 CREATE TABLE agent_sdk_tasks_new (
     id TEXT PRIMARY KEY,
@@ -30,10 +37,10 @@ CREATE TABLE agent_sdk_tasks_new (
     completed_at TEXT NULL,
     last_activity_at TEXT NULL,
     CONSTRAINT agent_sdk_tasks_parent_fk
-        FOREIGN KEY (parent_id) REFERENCES agent_sdk_tasks_new(id)
+        FOREIGN KEY (parent_id) REFERENCES agent_sdk_tasks(id)
         ON DELETE RESTRICT,
     CONSTRAINT agent_sdk_tasks_root_fk
-        FOREIGN KEY (root_id) REFERENCES agent_sdk_tasks_new(id)
+        FOREIGN KEY (root_id) REFERENCES agent_sdk_tasks(id)
         ON DELETE RESTRICT,
     -- SQLite does not support ALTER TABLE ADD CONSTRAINT for foreign
     -- keys, but it DOES allow forward-referencing the parent table in
@@ -307,3 +314,11 @@ WHEN (
 BEGIN
     SELECT RAISE(ABORT, 'terminal_reason_json must be set exactly on terminal task rows');
 END;
+
+CREATE TEMP TABLE fk_rebuild_gate (violations INTEGER NOT NULL CHECK (violations = 0));
+INSERT INTO fk_rebuild_gate SELECT count(*) FROM pragma_foreign_key_check;
+DROP TABLE fk_rebuild_gate;
+
+COMMIT;
+
+PRAGMA foreign_keys = ON;
