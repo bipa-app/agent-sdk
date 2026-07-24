@@ -679,8 +679,8 @@ pub use task_wakeup::{
     TaskWakeupOutcome, WakeupSignal, dispatch_payload,
 };
 pub use thread::{
-    PurgeReceipt, PurgeScope, Thread, ThreadNotFound, ThreadOperation, ThreadSchemaError,
-    ThreadStateConflict, ThreadStatus,
+    PurgeReceipt, PurgeRecord, PurgeScope, PurgeSeed, Thread, ThreadNotFound, ThreadOperation,
+    ThreadSchemaError, ThreadStateConflict, ThreadStatus,
 };
 pub use thread_creation_transaction::{
     AtomicThreadCreationCommitter, ThreadCreationCommit, ThreadCreationRows,
@@ -692,7 +692,7 @@ pub use thread_events_watch::{
     dispatch_thread_events_payload,
 };
 pub use thread_recover::{ThreadRecoveryView, recover_thread};
-pub use thread_store::{InMemoryThreadStore, ThreadStore};
+pub use thread_store::{BeginPurge, InMemoryThreadStore, ThreadStore};
 pub use tool_audit::{
     InMemoryToolAuditEventStore, ToolAuditEvent, ToolAuditEventId, ToolAuditEventKind,
     ToolAuditEventParams, ToolAuditEventStore,

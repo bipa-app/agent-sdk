@@ -78,13 +78,14 @@ use agent_server::journal::task::{
 };
 use agent_server::journal::task_state::SubagentInvocationState;
 use agent_server::journal::thread::{
-    PurgeReceipt, PurgeScope, Thread, ThreadNotFound, ThreadOperation, ThreadStatus,
+    PurgeReceipt, PurgeSeed, Thread, ThreadNotFound, ThreadOperation, ThreadStatus,
 };
 use agent_server::journal::thread_creation_transaction::{
     AtomicThreadCreationCommitter, ThreadCreationCommit, ThreadCreationRows,
 };
 use agent_server::journal::thread_store::{
-    ThreadCreation, ThreadCreationOutcome, ThreadIdConflict, ThreadStore, creation_identity_key,
+    BeginPurge, ThreadCreation, ThreadCreationOutcome, ThreadIdConflict, ThreadStore,
+    creation_identity_key,
 };
 use agent_server::journal::tool_audit::{ToolAuditEvent, ToolAuditEventId, ToolAuditEventStore};
 use agent_server::journal::turn_attempt::{
@@ -430,11 +431,10 @@ ON CONFLICT (thread_id) DO UPDATE SET
             thread.created_at,
             thread.updated_at,
             thread
-                .purge_receipt
-                .as_ref()
-                .map(serde_json::to_value)
+                .purge_record()
+                .map(|record| serde_json::to_value(&record))
                 .transpose()
-                .context("encode purge receipt")?,
+                .context("encode purge record")?,
         )
         .execute(&mut **tx)
         .await
@@ -4846,12 +4846,7 @@ impl ThreadStore for PostgresDurableStore {
         Ok(completed)
     }
 
-    async fn begin_purge(
-        &self,
-        thread_id: &ThreadId,
-        _scope: PurgeScope,
-        now: OffsetDateTime,
-    ) -> Result<Option<PurgeReceipt>> {
+    async fn begin_purge(&self, thread_id: &ThreadId, seed: PurgeSeed) -> Result<BeginPurge> {
         let mut tx = self.begin().await?;
         let old = Self::lock_thread_tx(&mut tx, thread_id)
             .await?
@@ -4863,13 +4858,17 @@ impl ThreadStore for PostgresDurableStore {
         if old.status == ThreadStatus::Deleted {
             return old
                 .purge_receipt
-                .ok_or_else(|| anyhow!("deleted thread {thread_id} is missing its purge receipt"))
-                .map(Some);
+                .map(BeginPurge::AlreadyDeleted)
+                .ok_or_else(|| anyhow!("deleted thread {thread_id} is missing its purge receipt"));
         }
-        let deleting = old.begin_purge(now);
+        let deleting = old.begin_purge(seed);
+        let effective = deleting
+            .purge_seed
+            .clone()
+            .ok_or_else(|| anyhow!("deleting thread {thread_id} is missing its purge seed"))?;
         Self::upsert_thread_tx(&mut tx, &deleting).await?;
         tx.commit().await.context("commit begin thread purge")?;
-        Ok(None)
+        Ok(BeginPurge::Fenced(effective))
     }
 
     async fn finish_purge(
@@ -6638,10 +6637,18 @@ impl TryFrom<ThreadRecord> for Thread {
             },
             created_at: record.created_at,
             updated_at: record.updated_at,
-            purge_receipt: record
-                .purge_receipt_json
-                .map(|value| serde_json::from_value(value).context("decode purge receipt"))
-                .transpose()?,
+            purge_receipt: None,
+            purge_seed: None,
+        };
+        let record_value = record
+            .purge_receipt_json
+            .map(|value| serde_json::from_value(value).context("decode purge record"))
+            .transpose()?;
+        let (purge_receipt, purge_seed) = Self::split_purge_record(record_value);
+        let thread = Self {
+            purge_receipt,
+            purge_seed,
+            ..thread
         };
         thread
             .validate()
@@ -7091,6 +7098,8 @@ fn maybe_inject_failure(
 
 #[cfg(test)]
 mod tests {
+    use agent_server::journal::BeginPurge;
+    use agent_server::journal::thread::PurgeSeed;
     use std::env;
 
     use agent_sdk_foundation::audit::AuditProvenance;
@@ -7334,6 +7343,78 @@ mod tests {
                 "unexpected error for {suffix}: {error}",
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn purge_record_check_binds_record_presence_to_lifecycle() -> Result<()> {
+        let Some((store, _schema_guard)) = test_store().await? else {
+            return Ok(());
+        };
+
+        for (suffix, status, record) in [
+            ("deleting_null", "'deleting'", "NULL"),
+            ("deleted_null", "'deleted'", "NULL"),
+            (
+                "active_with_record",
+                "'active'",
+                "'{\"root_thread_id\":\"x\"}'",
+            ),
+        ] {
+            let sql = format!(
+                "INSERT INTO agent_sdk_threads (
+                    thread_id, status, committed_turns, total_input_tokens,
+                    total_output_tokens, created_at, updated_at, purge_receipt_json
+                 ) VALUES ('t-{suffix}', {status}, 0, 0, 0, now(), now(), {record})"
+            );
+            let result = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(store.pool())
+                .await;
+            let error = result.expect_err("lifecycle-incoherent purge record must not persist");
+            assert!(
+                error.to_string().to_ascii_lowercase().contains("check"),
+                "unexpected error for {suffix}: {error}",
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn begin_purge_persists_the_seed_on_the_deleting_row() -> Result<()> {
+        let Some((store, _schema_guard)) = test_store().await? else {
+            return Ok(());
+        };
+        let thread_id = thread_id("t-seeded-fence");
+        ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
+
+        let seed = PurgeSeed {
+            root_thread_id: ThreadId::from_string("t-tree-root"),
+            scope: agent_server::journal::PurgeScope::InvocationTree,
+            started_at: t_plus(1),
+        };
+        let outcome = ThreadStore::begin_purge(&store, &thread_id, seed.clone()).await?;
+        assert_eq!(outcome, BeginPurge::Fenced(seed.clone()));
+
+        let fenced = ThreadStore::get(&store, &thread_id)
+            .await?
+            .context("fenced row")?;
+        assert_eq!(fenced.purge_seed, Some(seed.clone()));
+
+        let retry = ThreadStore::begin_purge(
+            &store,
+            &thread_id,
+            PurgeSeed {
+                root_thread_id: thread_id.clone(),
+                scope: agent_server::journal::PurgeScope::Thread,
+                started_at: t_plus(60),
+            },
+        )
+        .await?;
+        assert_eq!(
+            retry,
+            BeginPurge::Fenced(seed),
+            "a retry resumes under the FIRST fence's stored seed",
+        );
         Ok(())
     }
 

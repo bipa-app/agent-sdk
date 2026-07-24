@@ -143,6 +143,15 @@ pub enum PurgeScope {
 
 /// Durable, idempotent proof of one completed purge.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PurgeSeed {
+    pub root_thread_id: ThreadId,
+    pub scope: PurgeScope,
+    #[serde(with = "time::serde::rfc3339")]
+    pub started_at: OffsetDateTime,
+}
+
+/// Everything a completed purge recorded, retained on the tombstone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PurgeReceipt {
     pub root_thread_id: ThreadId,
     pub scope: PurgeScope,
@@ -152,6 +161,18 @@ pub struct PurgeReceipt {
     pub started_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub completed_at: OffsetDateTime,
+}
+
+/// The one durable purge column, in either lifecycle shape.
+///
+/// Serialized untagged: a completed receipt is a strict superset of a
+/// seed, so decode tries [`PurgeRecord::Receipt`] first and a seed can
+/// never masquerade as one. Pre-seed tombstones decode unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PurgeRecord {
+    Receipt(PurgeReceipt),
+    Seed(PurgeSeed),
 }
 
 /// Typed purge failure for an id that has no live row or tombstone.
@@ -176,6 +197,15 @@ pub enum ThreadSchemaError {
 
     #[error("committed_turns must be > 0 for a completed thread")]
     CompletedWithZeroTurns,
+
+    #[error("a deleting thread must carry its purge seed")]
+    DeletingWithoutSeed,
+
+    #[error("a deleted thread must carry its purge receipt")]
+    DeletedWithoutReceipt,
+
+    #[error("purge evidence is only valid on deleting/deleted rows, one kind each")]
+    StrayPurgeRecord,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -211,6 +241,11 @@ pub struct Thread {
     /// retained so retries return byte-for-byte equivalent evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purge_receipt: Option<PurgeReceipt>,
+    /// Fence-time purge identity, persisted with the `Deleting` fence so a
+    /// crash-retry resumes with the same `started_at` and scope. Cleared
+    /// when [`Self::finish_purge`] stores the completed receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purge_seed: Option<PurgeSeed>,
 }
 
 impl Thread {
@@ -228,6 +263,7 @@ impl Thread {
             created_at: now,
             updated_at: now,
             purge_receipt: None,
+            purge_seed: None,
         }
     }
 
@@ -282,17 +318,20 @@ impl Thread {
         Ok(self)
     }
 
-    /// Install the durable deletion fence.
+    /// Install the durable deletion fence and persist its identity.
     ///
-    /// Active and legacy-completed rows may enter deletion. A deleting row is
-    /// returned unchanged so an interrupted purge can resume. A deleted row
-    /// must be handled as an idempotent receipt replay by the store.
+    /// Active and legacy-completed rows enter deletion carrying `seed` — the
+    /// purge's durable identity (root, scope, `started_at`). A deleting row
+    /// is returned unchanged, keeping its ORIGINAL seed, so an interrupted
+    /// purge resumes under the first attempt's identity. A deleted row must
+    /// be handled as an idempotent receipt replay by the store.
     #[must_use]
-    pub const fn begin_purge(mut self, now: OffsetDateTime) -> Self {
+    pub fn begin_purge(mut self, seed: PurgeSeed) -> Self {
         match self.status {
             ThreadStatus::Active | ThreadStatus::Completed => {
                 self.status = ThreadStatus::Deleting;
-                self.updated_at = now;
+                self.updated_at = seed.started_at;
+                self.purge_seed = Some(seed);
             }
             ThreadStatus::Deleting | ThreadStatus::Deleted => {}
         }
@@ -305,7 +344,31 @@ impl Thread {
         self.status = ThreadStatus::Deleted;
         self.updated_at = receipt.completed_at;
         self.purge_receipt = Some(receipt);
+        self.purge_seed = None;
         self
+    }
+
+    /// The durable purge column's current content, whichever shape the
+    /// lifecycle is in. Stores persist exactly this value.
+    #[must_use]
+    pub fn purge_record(&self) -> Option<PurgeRecord> {
+        match (&self.purge_receipt, &self.purge_seed) {
+            (Some(receipt), _) => Some(PurgeRecord::Receipt(receipt.clone())),
+            (None, Some(seed)) => Some(PurgeRecord::Seed(seed.clone())),
+            (None, None) => None,
+        }
+    }
+
+    /// Split a decoded purge column back into the two domain fields.
+    #[must_use]
+    pub fn split_purge_record(
+        record: Option<PurgeRecord>,
+    ) -> (Option<PurgeReceipt>, Option<PurgeSeed>) {
+        match record {
+            Some(PurgeRecord::Receipt(receipt)) => (Some(receipt), None),
+            Some(PurgeRecord::Seed(seed)) => (None, Some(seed)),
+            None => (None, None),
+        }
     }
 
     /// Return a typed error unless this row accepts `operation`.
@@ -339,6 +402,29 @@ impl Thread {
     pub const fn validate(&self) -> Result<(), ThreadSchemaError> {
         if self.status.is_completed() && self.committed_turns == 0 {
             return Err(ThreadSchemaError::CompletedWithZeroTurns);
+        }
+        match self.status {
+            ThreadStatus::Deleting => {
+                if self.purge_seed.is_none() {
+                    return Err(ThreadSchemaError::DeletingWithoutSeed);
+                }
+                if self.purge_receipt.is_some() {
+                    return Err(ThreadSchemaError::StrayPurgeRecord);
+                }
+            }
+            ThreadStatus::Deleted => {
+                if self.purge_receipt.is_none() {
+                    return Err(ThreadSchemaError::DeletedWithoutReceipt);
+                }
+                if self.purge_seed.is_some() {
+                    return Err(ThreadSchemaError::StrayPurgeRecord);
+                }
+            }
+            ThreadStatus::Active | ThreadStatus::Completed => {
+                if self.purge_receipt.is_some() || self.purge_seed.is_some() {
+                    return Err(ThreadSchemaError::StrayPurgeRecord);
+                }
+            }
         }
         Ok(())
     }

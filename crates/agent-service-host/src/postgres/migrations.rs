@@ -108,10 +108,15 @@ const DURABLE_AWAITING_QUESTION_SQL: &str = include_str!(concat!(
     "/migrations/postgres/0018_durable_awaiting_question.sql"
 ));
 
+const PURGE_SEED_AT_FENCE_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/postgres/0019_purge_seed_at_fence.sql"
+));
+
 /// `sqlx`-managed migration bundle for the Postgres durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/postgres");
 
-const MIGRATIONS: [PostgresMigration; 17] = [
+const MIGRATIONS: [PostgresMigration; 18] = [
     PostgresMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -197,6 +202,11 @@ const MIGRATIONS: [PostgresMigration; 17] = [
         summary: "durable AwaitingQuestion state and AnswerQuestion idempotency",
         sql: DURABLE_AWAITING_QUESTION_SQL,
     },
+    PostgresMigration {
+        version: "0019",
+        summary: "purge seed persists at fence time for stable crash-retry identity",
+        sql: PURGE_SEED_AT_FENCE_SQL,
+    },
 ];
 
 /// Version of the migration this PR introduces: the typed terminal
@@ -221,6 +231,10 @@ pub(crate) const THREAD_PURGE_LIFECYCLE_MIGRATION_VERSION: i64 = 17;
 /// awaiting-question state.
 #[cfg(test)]
 pub(crate) const AWAITING_QUESTION_MIGRATION_VERSION: i64 = 18;
+
+/// Version of the migration this PR introduces: the fence-time purge seed.
+#[cfg(test)]
+pub(crate) const PURGE_SEED_MIGRATION_VERSION: i64 = 19;
 
 /// The reviewable executable migration bundle for the current durable core.
 #[must_use]

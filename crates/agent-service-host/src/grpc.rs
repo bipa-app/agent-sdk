@@ -23,9 +23,10 @@ use agent_server::journal::task::{
 };
 use agent_server::journal::task_state::TaskState;
 use agent_server::journal::thread::{
-    PurgeReceipt, PurgeScope, ThreadNotFound, ThreadOperation, ThreadStateConflict,
+    PurgeReceipt, PurgeScope, PurgeSeed, ThreadNotFound, ThreadOperation, ThreadStateConflict,
 };
 use agent_server::journal::thread_creation_transaction::ThreadCreationCommit;
+use agent_server::journal::thread_store::BeginPurge;
 use agent_server::journal::thread_store::{
     ThreadCreation, ThreadCreationOutcome, ThreadIdConflict,
 };
@@ -1231,22 +1232,61 @@ impl GrpcControlService {
         Ok(ordered)
     }
 
+    /// Fence every non-root member of the purge tree under the tree's
+    /// `started_at`, each carrying a thread-scoped seed.
+    async fn fence_child_threads(
+        &self,
+        root_thread_id: &ThreadId,
+        thread_ids: &[ThreadId],
+        started_at: OffsetDateTime,
+    ) -> Result<(), Status> {
+        for thread_id in thread_ids.iter().skip(1) {
+            let _ = self
+                .shared
+                .stores
+                .thread_store
+                .begin_purge(
+                    thread_id,
+                    PurgeSeed {
+                        root_thread_id: root_thread_id.clone(),
+                        scope: PurgeScope::Thread,
+                        started_at,
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    map_thread_store_error("fencing child thread for purge", &error)
+                })?;
+        }
+        Ok(())
+    }
+
     async fn execute_purge_thread(
         &self,
         root_thread_id: &ThreadId,
         scope: PurgeScope,
     ) -> Result<PurgeReceipt, Status> {
-        let started_at = OffsetDateTime::now_utc();
-        if let Some(receipt) = self
+        let requested = PurgeSeed {
+            root_thread_id: root_thread_id.clone(),
+            scope,
+            started_at: OffsetDateTime::now_utc(),
+        };
+        // The seed the purge RUNS UNDER is whatever the fence stored: on a
+        // fresh purge that is `requested`; on a crash-retry it is the FIRST
+        // attempt's seed, so the eventual receipt keeps a stable identity.
+        let seed = match self
             .shared
             .stores
             .thread_store
-            .begin_purge(root_thread_id, scope, started_at)
+            .begin_purge(root_thread_id, requested)
             .await
             .map_err(|error| map_thread_store_error("fencing thread for purge", &error))?
         {
-            return Ok(receipt);
-        }
+            BeginPurge::AlreadyDeleted(receipt) => return Ok(receipt),
+            BeginPurge::Fenced(seed) => seed,
+        };
+        let scope = seed.scope;
+        let started_at = seed.started_at;
 
         // Deterministic race seam: tests pause here after the tombstone fence
         // commits but before cancellation starts. A concurrent submit must see
@@ -1254,17 +1294,8 @@ impl GrpcControlService {
         agent_server::fail_point!("purge.after_fence");
 
         let thread_ids = self.invocation_tree_threads(root_thread_id, scope).await?;
-        for thread_id in thread_ids.iter().skip(1) {
-            let _ = self
-                .shared
-                .stores
-                .thread_store
-                .begin_purge(thread_id, PurgeScope::Thread, started_at)
-                .await
-                .map_err(|error| {
-                    map_thread_store_error("fencing child thread for purge", &error)
-                })?;
-        }
+        self.fence_child_threads(root_thread_id, &thread_ids, started_at)
+            .await?;
 
         let mut cancelled = BTreeSet::new();
         let mut cancelled_by_thread: std::collections::BTreeMap<String, Vec<String>> =
@@ -4344,6 +4375,94 @@ mod tests {
             std::time::Duration::from_secs(10),
             AdmissionConfig::default(),
         )))
+    }
+
+    /// AC1+AC2 (ENG-9351): a purge killed between the fence and
+    /// `finish_purge` retries under the FIRST attempt's durable identity —
+    /// same `started_at`, same recorded scope — read back from the seed the
+    /// fence persisted.
+    #[cfg(feature = "failpoints")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn purge_retry_after_crash_keeps_the_first_attempts_identity() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        fail::cfg("purge.after_fence", "pause")
+            .map_err(|error| anyhow!("configure purge failpoint: {error}"))?;
+        let shared = event_test_shared()?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+        let created = service
+            .create_thread(Request::new(pb::CreateThreadRequest {
+                request_id: "purge-crash-create".into(),
+                thread_id: String::new(),
+            }))
+            .await?;
+        let thread_id = created
+            .into_inner()
+            .thread
+            .and_then(|view| view.thread)
+            .map(|thread| thread.thread_id)
+            .context("create response missing thread id")?;
+
+        let purge_service = service.clone();
+        let purge_thread_id = thread_id.clone();
+        let first_attempt = tokio::spawn(async move {
+            purge_service
+                .purge_thread(Request::new(pb::PurgeThreadRequest {
+                    thread_id: purge_thread_id,
+                    scope: pb::PurgeScope::InvocationTree as i32,
+                }))
+                .await
+        });
+
+        let mut fenced_seed = None;
+        for _ in 0..2_000 {
+            let thread = shared
+                .stores
+                .thread_store
+                .get(&ThreadId::from_string(&thread_id))
+                .await?;
+            if let Some(thread) = thread
+                && thread.status == agent_server::ThreadStatus::Deleting
+            {
+                fenced_seed = thread.purge_seed;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // Simulate the crash: kill the paused purge before finish_purge.
+        // Order matters — the pause parks an OS thread, so release the
+        // failpoint BEFORE joining or the join waits on the parked thread.
+        first_attempt.abort();
+        fail::remove("purge.after_fence");
+        let _ = first_attempt.await;
+
+        let seed = fenced_seed.context("deleting row must carry the purge seed")?;
+        assert_eq!(
+            seed.scope,
+            agent_server::journal::PurgeScope::InvocationTree,
+            "the fence records the REQUESTED scope, not a default",
+        );
+
+        let retried = service
+            .purge_thread(Request::new(pb::PurgeThreadRequest {
+                thread_id: thread_id.clone(),
+                scope: pb::PurgeScope::InvocationTree as i32,
+            }))
+            .await?
+            .into_inner()
+            .receipt
+            .context("retried purge must return a receipt")?;
+        let started = retried.started_at.context("receipt missing started_at")?;
+        assert_eq!(
+            (started.seconds, started.nanos),
+            (
+                seed.started_at.unix_timestamp(),
+                i32::try_from(seed.started_at.nanosecond()).context("nanos out of range")?,
+            ),
+            "the receipt keeps the FIRST attempt's started_at",
+        );
+        Ok(())
     }
 
     #[cfg(feature = "failpoints")]

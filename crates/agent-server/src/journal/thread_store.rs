@@ -34,7 +34,7 @@ use tokio::sync::RwLock;
 
 use super::completed_turn_transaction::AtomicCompletedTurnCommitter;
 use super::thread::{
-    PurgeReceipt, PurgeScope, Thread, ThreadNotFound, ThreadOperation, ThreadStatus,
+    PurgeReceipt, PurgeSeed, Thread, ThreadNotFound, ThreadOperation, ThreadStatus,
 };
 
 /// Parameters that define the operation which first claimed a thread id.
@@ -125,6 +125,17 @@ pub struct ThreadIdConflict {
 /// Implementations must guarantee that concurrent `commit_turn` calls
 /// on the same thread serialize (only one succeeds per atomic scope),
 /// and that `get_or_create` is idempotent.
+/// Outcome of [`ThreadStore::begin_purge`]: the identity the purge MUST run
+/// under, or the completed receipt to replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BeginPurge {
+    /// The thread is already a tombstone; replay this receipt.
+    AlreadyDeleted(PurgeReceipt),
+    /// The fence is installed; run the purge under this seed (the stored
+    /// one when resuming an interrupted purge).
+    Fenced(PurgeSeed),
+}
+
 #[async_trait]
 pub trait ThreadStore: Send + Sync {
     /// Optional backend-specific hook that can commit the completed
@@ -267,18 +278,16 @@ pub trait ThreadStore: Send + Sync {
     ///   have been committed.
     async fn mark_completed(&self, thread_id: &ThreadId, now: OffsetDateTime) -> Result<Thread>;
 
-    /// Atomically install the durable deletion fence.
+    /// Atomically install the durable deletion fence, persisting `seed` —
+    /// the purge's identity — in the same write.
     ///
-    /// Returns a stored receipt when the thread is already deleted, allowing
-    /// `PurgeThread` retries to replay the original result. A row already in
-    /// `Deleting` remains fenced and returns `None` so an interrupted purge can
-    /// resume. Unknown ids return [`ThreadNotFound`].
-    async fn begin_purge(
-        &self,
-        thread_id: &ThreadId,
-        scope: PurgeScope,
-        now: OffsetDateTime,
-    ) -> Result<Option<PurgeReceipt>>;
+    /// Returns [`BeginPurge::AlreadyDeleted`] with the stored receipt when
+    /// the thread is already a tombstone, so `PurgeThread` retries replay
+    /// the original result. A row already in `Deleting` stays fenced and
+    /// returns [`BeginPurge::Fenced`] with its ORIGINAL stored seed, so an
+    /// interrupted purge resumes under the first attempt's identity.
+    /// Unknown ids return [`ThreadNotFound`].
+    async fn begin_purge(&self, thread_id: &ThreadId, seed: PurgeSeed) -> Result<BeginPurge>;
 
     /// Advance a deleting thread to its permanent tombstone and durably retain
     /// `receipt`. Repeating the call returns the original stored receipt.
@@ -425,27 +434,27 @@ impl ThreadStore for InMemoryThreadStore {
         Ok(completed)
     }
 
-    async fn begin_purge(
-        &self,
-        thread_id: &ThreadId,
-        _scope: PurgeScope,
-        now: OffsetDateTime,
-    ) -> Result<Option<PurgeReceipt>> {
+    async fn begin_purge(&self, thread_id: &ThreadId, seed: PurgeSeed) -> Result<BeginPurge> {
         let mut inner = self.inner.write().await;
         let thread = inner.by_id.get_mut(thread_id).ok_or_else(|| {
             anyhow::Error::new(ThreadNotFound {
                 thread_id: thread_id.clone(),
             })
         })?;
-        let result =
-            if thread.status == ThreadStatus::Deleted {
-                thread.purge_receipt.clone().map(Some).ok_or_else(|| {
-                    anyhow!("deleted thread {thread_id} is missing its purge receipt")
-                })
-            } else {
-                *thread = thread.clone().begin_purge(now);
-                Ok(None)
-            };
+        let result = if thread.status == ThreadStatus::Deleted {
+            thread
+                .purge_receipt
+                .clone()
+                .map(BeginPurge::AlreadyDeleted)
+                .ok_or_else(|| anyhow!("deleted thread {thread_id} is missing its purge receipt"))
+        } else {
+            *thread = thread.clone().begin_purge(seed);
+            thread
+                .purge_seed
+                .clone()
+                .map(BeginPurge::Fenced)
+                .ok_or_else(|| anyhow!("deleting thread {thread_id} is missing its purge seed"))
+        };
         drop(inner);
         result
     }
@@ -489,7 +498,7 @@ impl ThreadStore for InMemoryThreadStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::journal::thread::ThreadStatus;
+    use crate::journal::thread::{PurgeScope, ThreadStatus};
     use anyhow::Context as _;
     use time::Duration;
 
@@ -693,12 +702,17 @@ mod tests {
         let store = InMemoryThreadStore::new();
         let thread_id = thread_a();
         let _ = store.get_or_create(&thread_id, t0()).await?;
-        assert!(
-            store
-                .begin_purge(&thread_id, PurgeScope::Thread, t_plus(1))
-                .await?
-                .is_none()
-        );
+        let fenced = store
+            .begin_purge(
+                &thread_id,
+                PurgeSeed {
+                    root_thread_id: thread_id.clone(),
+                    scope: PurgeScope::Thread,
+                    started_at: t_plus(1),
+                },
+            )
+            .await?;
+        assert!(matches!(fenced, BeginPurge::Fenced(_)));
         let receipt = PurgeReceipt {
             root_thread_id: thread_id.clone(),
             scope: PurgeScope::Thread,
@@ -709,14 +723,27 @@ mod tests {
         };
         let first = store.finish_purge(&thread_id, &receipt).await?;
         let second = store
-            .begin_purge(&thread_id, PurgeScope::Thread, t_plus(3))
-            .await?
-            .context("deleted thread must replay a receipt")?;
-        assert_eq!(first, second);
+            .begin_purge(
+                &thread_id,
+                PurgeSeed {
+                    root_thread_id: thread_id.clone(),
+                    scope: PurgeScope::Thread,
+                    started_at: t_plus(3),
+                },
+            )
+            .await?;
+        assert_eq!(BeginPurge::AlreadyDeleted(first), second);
 
         let unknown = ThreadId::from_string("unknown-purge-thread");
         let Err(error) = store
-            .begin_purge(&unknown, PurgeScope::Thread, t_plus(4))
+            .begin_purge(
+                &unknown,
+                PurgeSeed {
+                    root_thread_id: unknown.clone(),
+                    scope: PurgeScope::Thread,
+                    started_at: t_plus(4),
+                },
+            )
             .await
         else {
             anyhow::bail!("unknown purge unexpectedly succeeded");

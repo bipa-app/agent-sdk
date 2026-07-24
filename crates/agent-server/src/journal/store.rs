@@ -6258,8 +6258,11 @@ mod tests {
         let _ = threads
             .begin_purge(
                 &fenced_thread,
-                crate::journal::PurgeScope::Thread,
-                t_plus(2),
+                crate::journal::PurgeSeed {
+                    root_thread_id: fenced_thread.clone(),
+                    scope: crate::journal::PurgeScope::Thread,
+                    started_at: t_plus(2),
+                },
             )
             .await?;
 
@@ -6342,7 +6345,14 @@ mod tests {
                 .context("acquire admission root")?;
 
             let _ = threads
-                .begin_purge(&thread_id, crate::journal::PurgeScope::Thread, t_plus(3))
+                .begin_purge(
+                    &thread_id,
+                    crate::journal::PurgeSeed {
+                        root_thread_id: thread_id.clone(),
+                        scope: crate::journal::PurgeScope::Thread,
+                        started_at: t_plus(3),
+                    },
+                )
                 .await?;
             if target == crate::journal::thread::ThreadStatus::Deleted {
                 let receipt = crate::journal::thread::PurgeReceipt {
@@ -6422,7 +6432,14 @@ mod tests {
         assert_eq!(queued.status, TaskStatus::Queued);
 
         let _ = threads
-            .begin_purge(&thread_id, crate::journal::PurgeScope::Thread, t_plus(2))
+            .begin_purge(
+                &thread_id,
+                crate::journal::PurgeSeed {
+                    root_thread_id: thread_id.clone(),
+                    scope: crate::journal::PurgeScope::Thread,
+                    started_at: t_plus(2),
+                },
+            )
             .await?;
         let outcome = store.cancel_tree(&first.id, t_plus(3)).await?;
         assert_eq!(outcome.transitioned, vec![first.id]);
