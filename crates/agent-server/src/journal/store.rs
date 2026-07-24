@@ -285,6 +285,9 @@ pub struct ToolChildSpawn {
 /// One atomic subagent fan-out: the spawn entries, the shared parent
 /// suspension, and one slim start-event descriptor per entry.
 pub struct SubagentBatchSpawn {
+    /// Boundary-injection rows this turn already delivered; completed
+    /// Queued→Completed inside the same store write as the spawn.
+    pub delivered_injection_ids: Vec<AgentTaskId>,
     /// Durable subagent invocations to persist, in input order.
     pub spawns: Vec<SubagentInvocationSpawn>,
     /// The one parent suspension shared by every entry.
@@ -295,6 +298,10 @@ pub struct SubagentBatchSpawn {
 
 #[derive(Clone, Debug)]
 pub struct MixedChildrenSpawn {
+    /// Boundary-injection rows this turn already delivered; completed
+    /// Queued→Completed inside the same store write as the spawn, so
+    /// "suspension durable" and "injections delivered" are one fact.
+    pub delivered_injection_ids: Vec<AgentTaskId>,
     /// Durable subagent invocations to persist, in input order.
     pub subagents: Vec<SubagentInvocationSpawn>,
     /// Tool-runtime children to persist, in input order.
@@ -900,6 +907,9 @@ pub struct QuestionAnswerMismatch {
 ///
 /// See [`AgentTaskStore::pause_on_question`] for the atomicity contract.
 pub struct QuestionPause {
+    /// Boundary-injection rows this turn already delivered; completed
+    /// Queued→Completed inside the same store write as the park.
+    pub delivered_injection_ids: Vec<AgentTaskId>,
     /// Continuation + suspended messages captured at the ask boundary.
     pub payload: SuspensionPayload,
     /// One payload per pending `ask_user` call, in pending-tool-call
@@ -1242,6 +1252,24 @@ pub trait AgentTaskStore: Send + Sync {
         id: &AgentTaskId,
         now: OffsetDateTime,
     ) -> Result<Option<AgentTask>>;
+
+    /// Complete every delivered boundary-injection row in `ids`.
+    ///
+    /// Provided default: one [`Self::complete_input_injection`] per id —
+    /// used by the non-atomic in-memory commit path, where each store
+    /// call is already atomic under its own write lock. Durable backends
+    /// never reach this: their completed-turn committer flips the rows
+    /// inside the commit transaction itself.
+    async fn complete_delivered_injections(
+        &self,
+        ids: &[AgentTaskId],
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        for id in ids {
+            let _ = self.complete_input_injection(id, now).await?;
+        }
+        Ok(())
+    }
 
     /// The direct children of `parent_id`, read for the subagent stall probe
     /// with the READ ITSELF BOUNDED (ADR-0003 I5).
@@ -1861,6 +1889,7 @@ pub trait AgentTaskStore: Send + Sync {
         specs: Vec<ChildSpawnSpec>,
         payload: SuspensionPayload,
         child_otel_traceparent: Option<String>,
+        delivered_injection_ids: Vec<AgentTaskId>,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Vec<AgentTask>)>;
 
@@ -1898,6 +1927,7 @@ pub trait AgentTaskStore: Send + Sync {
         worker: &WorkerId,
         lease: &LeaseId,
         spawn: SubagentInvocationSpawn,
+        delivered_injection_ids: Vec<AgentTaskId>,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, AgentTask, AgentTask)>;
 
@@ -3168,6 +3198,27 @@ impl Inner {
             suppress_root_promotion,
         )?;
         Ok(true)
+    }
+
+    /// Complete delivered boundary-injection rows under the SAME write
+    /// lock as the enclosing durable fact. Non-queued rows (a replayed
+    /// commit) are skipped.
+    fn complete_injection_rows(&mut self, ids: &[AgentTaskId], now: OffsetDateTime) -> Result<()> {
+        for id in ids {
+            let Some(old) = self.by_id.get(id).cloned() else {
+                continue;
+            };
+            if old.kind != TaskKind::InputInjection || old.status != TaskStatus::Queued {
+                continue;
+            }
+            let completed = old
+                .clone()
+                .complete_input_injection(now)
+                .context("complete input injection transition failed")?;
+            self.rebalance_after_row_change(&old, &completed);
+            self.by_id.insert(completed.id.clone(), completed.clone());
+        }
+        Ok(())
     }
 
     fn cancel_rows(
@@ -4557,6 +4608,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Vec<CommittedEvent>)> {
         let QuestionPause {
+            delivered_injection_ids,
             payload,
             questions,
             mut events,
@@ -4570,6 +4622,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         let paused = apply_question_pause(&old, worker, lease, payload, questions.clone(), now)?;
         inner.rebalance_after_row_change(&old, &paused);
         inner.by_id.insert(paused.id.clone(), paused.clone());
+        inner.complete_injection_rows(&delivered_injection_ids, now)?;
         drop(inner);
         events.push(AgentEvent::question_asked(id.as_str(), questions));
         let Some(sink) = &self.marker_sink else {
@@ -4618,6 +4671,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         specs: Vec<ChildSpawnSpec>,
         payload: SuspensionPayload,
         child_otel_traceparent: Option<String>,
+        delivered_injection_ids: Vec<AgentTaskId>,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Vec<AgentTask>)> {
         if specs.is_empty() {
@@ -4684,6 +4738,8 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             inner.by_id.insert(child.id.clone(), child.clone());
         }
 
+        inner.complete_injection_rows(&delivered_injection_ids, now)?;
+
         drop(inner);
         Ok((new_parent, children))
     }
@@ -4694,6 +4750,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         worker: &WorkerId,
         lease: &LeaseId,
         spawn: SubagentInvocationSpawn,
+        delivered_injection_ids: Vec<AgentTaskId>,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, AgentTask, AgentTask)> {
         let SubagentInvocationSpawn {
@@ -4772,6 +4829,8 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             .by_id
             .insert(child_root.id.clone(), child_root.clone());
 
+        inner.complete_injection_rows(&delivered_injection_ids, now)?;
+
         drop(inner);
         Ok((new_parent, invocation, child_root))
     }
@@ -4785,6 +4844,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Vec<(AgentTask, AgentTask)>, Vec<CommittedEvent>)> {
         let SubagentBatchSpawn {
+            delivered_injection_ids,
             spawns,
             payload,
             events,
@@ -4838,6 +4898,8 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                 .insert(child_root.id.clone(), child_root.clone());
         }
 
+        inner.complete_injection_rows(&delivered_injection_ids, now)?;
+
         drop(inner);
         let committed = self
             .commit_spawn_started_events(&new_parent.thread_id, &prepared, events, now)
@@ -4856,6 +4918,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
     ) -> Result<SpawnedMixedChildren> {
         validate_mixed_children_spawn(&spawn)?;
         let MixedChildrenSpawn {
+            delivered_injection_ids,
             subagents,
             tool_children,
             payload,
@@ -4920,6 +4983,8 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             inner.add_to_indexes(child);
             inner.by_id.insert(child.id.clone(), child.clone());
         }
+
+        inner.complete_injection_rows(&delivered_injection_ids, now)?;
 
         drop(inner);
         let committed = self
@@ -6374,6 +6439,7 @@ mod tests {
                         suspended_messages: Vec::new(),
                     },
                     None,
+                    Vec::new(),
                     t_plus(5),
                 )
                 .await;
@@ -9723,6 +9789,7 @@ mod tests {
                     },
                     child_caller_metadata: None,
                 },
+                Vec::new(),
                 t_plus(2),
             )
             .await
@@ -9778,6 +9845,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 t_plus(2),
             )
             .await
@@ -9843,6 +9911,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 t_plus(2),
             )
             .await
@@ -9863,6 +9932,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 t_plus(3),
             )
             .await
@@ -9912,6 +9982,7 @@ mod tests {
                     },
                     child_caller_metadata: None,
                 },
+                Vec::new(),
                 t_plus(2),
             )
             .await
@@ -9992,6 +10063,7 @@ mod tests {
                     },
                     child_caller_metadata: None,
                 },
+                Vec::new(),
                 t_plus(2),
             )
             .await
@@ -10018,6 +10090,7 @@ mod tests {
                     },
                     child_caller_metadata: None,
                 },
+                Vec::new(),
                 t_plus(3),
             )
             .await
@@ -10077,6 +10150,7 @@ mod tests {
                 &worker,
                 &lease,
                 SubagentBatchSpawn {
+                    delivered_injection_ids: Vec::new(),
                     spawns,
                     payload: SuspensionPayload {
                         continuation: sample_continuation("t-subagent-batch"),
@@ -10157,6 +10231,7 @@ mod tests {
                 &worker,
                 &lease,
                 SubagentBatchSpawn {
+                    delivered_injection_ids: Vec::new(),
                     spawns: Vec::new(),
                     payload: SuspensionPayload {
                         continuation: sample_continuation("t-subagent-batch-empty"),
@@ -10243,6 +10318,7 @@ mod tests {
             })
             .collect();
         MixedChildrenSpawn {
+            delivered_injection_ids: Vec::new(),
             subagents,
             tool_children,
             payload,
@@ -10393,6 +10469,7 @@ mod tests {
                 &worker,
                 &lease,
                 SubagentBatchSpawn {
+                    delivered_injection_ids: Vec::new(),
                     spawns,
                     payload: SuspensionPayload {
                         continuation: sample_continuation("t-subagent-batch-dup"),
@@ -10448,6 +10525,7 @@ mod tests {
                 &WorkerId::from_string("w-imposter"),
                 &lease,
                 SubagentBatchSpawn {
+                    delivered_injection_ids: Vec::new(),
                     spawns: make_spawns(),
                     payload: SuspensionPayload {
                         continuation: sample_continuation("t-subagent-batch-cas"),
@@ -10500,6 +10578,7 @@ mod tests {
                     },
                     child_caller_metadata: None,
                 },
+                Vec::new(),
                 t_plus(2),
             )
             .await
@@ -10647,6 +10726,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 t_plus(1),
             )
             .await
@@ -10680,6 +10760,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 t_plus(2),
             )
             .await
@@ -10713,6 +10794,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 t_plus(4),
             )
             .await
@@ -10741,6 +10823,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 t_plus(2),
             )
             .await
@@ -10781,6 +10864,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 t_plus(10),
             )
             .await
@@ -10842,6 +10926,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 t_plus(2),
             )
             .await
@@ -10938,6 +11023,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 t_plus(2),
             )
             .await
@@ -11130,6 +11216,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 t_plus(2),
             )
             .await
@@ -11214,6 +11301,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 t_plus(2),
             )
             .await
@@ -11276,6 +11364,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 t_plus(2),
             )
             .await
@@ -11345,6 +11434,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 t_plus(2),
             )
             .await
@@ -11423,6 +11513,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 t_plus(2),
             )
             .await
@@ -11513,6 +11604,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 t_plus(2),
             )
             .await
@@ -11596,6 +11688,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 t_plus(2),
             )
             .await
@@ -11676,6 +11769,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 t_plus(2),
             )
             .await
@@ -11758,6 +11852,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 t_plus(2),
             )
             .await
@@ -11845,6 +11940,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 t_plus(2),
             )
             .await
@@ -11888,6 +11984,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 t_plus(2),
             )
             .await
@@ -12668,6 +12765,7 @@ mod tests {
                     },
                     child_caller_metadata: None,
                 },
+                Vec::new(),
                 t_plus(4),
             )
             .await
@@ -12910,6 +13008,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 t_plus(2),
             )
             .await
@@ -13027,6 +13126,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 t_plus(2),
             )
             .await
@@ -13431,6 +13531,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 t_plus(2),
             )
             .await
@@ -13500,6 +13601,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 t_plus(2),
             )
             .await
@@ -13894,6 +13996,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 t_plus(2),
             )
             .await

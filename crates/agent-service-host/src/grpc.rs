@@ -4499,6 +4499,7 @@ mod tests {
                     },
                     child_caller_metadata: None,
                 },
+                Vec::new(),
                 now,
             )
             .await
@@ -6038,6 +6039,7 @@ mod tests {
             specs: Vec<ChildSpawnSpec>,
             payload: SuspensionPayload,
             child_otel_traceparent: Option<String>,
+            delivered_injection_ids: Vec<AgentTaskId>,
             now: OffsetDateTime,
         ) -> Result<(AgentTask, Vec<AgentTask>)> {
             self.inner
@@ -6048,6 +6050,7 @@ mod tests {
                     specs,
                     payload,
                     child_otel_traceparent,
+                    delivered_injection_ids,
                     now,
                 )
                 .await
@@ -6058,10 +6061,18 @@ mod tests {
             worker: &WorkerId,
             lease: &LeaseId,
             spawn: SubagentInvocationSpawn,
+            delivered_injection_ids: Vec<AgentTaskId>,
             now: OffsetDateTime,
         ) -> Result<(AgentTask, AgentTask, AgentTask)> {
             self.inner
-                .spawn_subagent_invocation(parent_id, worker, lease, spawn, now)
+                .spawn_subagent_invocation(
+                    parent_id,
+                    worker,
+                    lease,
+                    spawn,
+                    delivered_injection_ids,
+                    now,
+                )
                 .await
         }
         async fn spawn_subagent_batch(
@@ -7551,6 +7562,7 @@ mod tests {
                 &worker,
                 &lease,
                 agent_server::journal::store::QuestionPause {
+                    delivered_injection_ids: Vec::new(),
                     payload: SuspensionPayload {
                         continuation,
                         suspended_messages: Vec::new(),
@@ -7972,6 +7984,7 @@ mod tests {
                     suspended_messages: Vec::new(),
                 },
                 None,
+                Vec::new(),
                 now,
             )
             .await

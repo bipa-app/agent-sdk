@@ -403,6 +403,7 @@ mod in_memory_bundle {
             specs: Vec<ChildSpawnSpec>,
             payload: SuspensionPayload,
             child_otel_traceparent: Option<String>,
+            delivered_injection_ids: Vec<AgentTaskId>,
             now: OffsetDateTime,
         ) -> Result<(AgentTask, Vec<AgentTask>)> {
             self.task
@@ -413,6 +414,7 @@ mod in_memory_bundle {
                     specs,
                     payload,
                     child_otel_traceparent,
+                    delivered_injection_ids,
                     now,
                 )
                 .await
@@ -423,10 +425,18 @@ mod in_memory_bundle {
             worker: &WorkerId,
             lease: &LeaseId,
             spawn: SubagentInvocationSpawn,
+            delivered_injection_ids: Vec<AgentTaskId>,
             now: OffsetDateTime,
         ) -> Result<(AgentTask, AgentTask, AgentTask)> {
             self.task
-                .spawn_subagent_invocation(parent_id, worker, lease, spawn, now)
+                .spawn_subagent_invocation(
+                    parent_id,
+                    worker,
+                    lease,
+                    spawn,
+                    delivered_injection_ids,
+                    now,
+                )
                 .await
         }
         async fn spawn_subagent_batch(
@@ -1051,6 +1061,7 @@ fn mixed_batch_spawn(
         })
         .collect();
     Ok(crate::journal::store::MixedChildrenSpawn {
+        delivered_injection_ids: Vec::new(),
         subagents,
         tool_children,
         payload,
@@ -1715,6 +1726,7 @@ async fn case_delete_cascades_main_to_subkeys<S: JournalStore>(store: &S) -> Res
         ],
         empty_suspension(&thread),
         None,
+        Vec::new(),
         t_plus(3),
     )
     .await?;
@@ -1801,6 +1813,7 @@ async fn case_subkey_vs_main_count_separation<S: JournalStore>(store: &S) -> Res
         ],
         empty_suspension(&thread),
         None,
+        Vec::new(),
         t_plus(3),
     )
     .await?;
@@ -2219,6 +2232,7 @@ async fn commit_one_turn<S: JournalStore>(
     let outcome = commit_completed_turn(
         CompletedTurnCommit {
             checkpoint_kind: CheckpointKind::FullTurn,
+            delivered_injection_ids: Vec::new(),
             thread_id: thread.clone(),
             task_id: task_id.clone(),
             expected_turn: turn_number,
@@ -2252,6 +2266,7 @@ async fn commit_one_turn<S: JournalStore>(
             owner_guard: None,
             now,
         },
+        store,
         store,
         store,
         store,

@@ -2291,6 +2291,29 @@ FOR UPDATE
         Ok(creation_outcome)
     }
 
+    /// Complete boundary-injection rows Queued→Completed inside `tx`, so
+    /// delivery and the enclosing durable fact commit or roll back
+    /// together. Rows already completed (a replayed commit) are skipped.
+    async fn complete_injections_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        ids: &[AgentTaskId],
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        for id in ids {
+            let Some(old) = Self::load_task_tx(tx, id, true).await? else {
+                continue;
+            };
+            if old.kind != TaskKind::InputInjection || old.status != TaskStatus::Queued {
+                continue;
+            }
+            let completed = old
+                .complete_input_injection(now)
+                .context("complete input injection transition failed")?;
+            Self::update_task_tx(tx, &completed).await?;
+        }
+        Ok(())
+    }
+
     async fn commit_completed_turn_atomic_inner(
         &self,
         params: CompletedTurnCommit,
@@ -2418,6 +2441,8 @@ FOR UPDATE
         // `fail-rs` failpoint. No-op (and not compiled) without the
         // `failpoints` feature.
         agent_server::fail_point!("commit.before_event_commit");
+
+        Self::complete_injections_tx(&mut tx, &params.delivered_injection_ids, params.now).await?;
 
         tx.commit()
             .await
@@ -3942,6 +3967,7 @@ FOR UPDATE SKIP LOCKED
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Vec<CommittedEvent>)> {
         let QuestionPause {
+            delivered_injection_ids,
             payload,
             questions,
             mut events,
@@ -3963,6 +3989,7 @@ FOR UPDATE SKIP LOCKED
             now,
         )
         .await?;
+        Self::complete_injections_tx(&mut tx, &delivered_injection_ids, now).await?;
         tx.commit().await.context("commit pause_on_question")?;
         Ok((paused, committed))
     }
@@ -3999,6 +4026,7 @@ FOR UPDATE SKIP LOCKED
         specs: Vec<ChildSpawnSpec>,
         payload: SuspensionPayload,
         child_otel_traceparent: Option<String>,
+        delivered_injection_ids: Vec<AgentTaskId>,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Vec<AgentTask>)> {
         if specs.is_empty() {
@@ -4049,6 +4077,7 @@ FOR UPDATE SKIP LOCKED
         for child in &children {
             Self::insert_task_tx(&mut tx, child).await?;
         }
+        Self::complete_injections_tx(&mut tx, &delivered_injection_ids, now).await?;
         tx.commit().await.context("commit spawn_tool_children")?;
         Ok((new_parent, children))
     }
@@ -4059,6 +4088,7 @@ FOR UPDATE SKIP LOCKED
         worker: &WorkerId,
         lease: &LeaseId,
         spawn: SubagentInvocationSpawn,
+        delivered_injection_ids: Vec<AgentTaskId>,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, AgentTask, AgentTask)> {
         let mut tx = self.begin().await?;
@@ -4113,6 +4143,7 @@ FOR UPDATE SKIP LOCKED
         Self::update_task_tx(&mut tx, &new_parent).await?;
         Self::insert_task_tx(&mut tx, &invocation).await?;
         Self::insert_task_tx(&mut tx, &child_root).await?;
+        Self::complete_injections_tx(&mut tx, &delivered_injection_ids, now).await?;
         tx.commit()
             .await
             .context("commit spawn_subagent_invocation")?;
@@ -4128,6 +4159,7 @@ FOR UPDATE SKIP LOCKED
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Vec<(AgentTask, AgentTask)>, Vec<CommittedEvent>)> {
         let SubagentBatchSpawn {
+            delivered_injection_ids,
             spawns,
             payload,
             events,
@@ -4186,6 +4218,7 @@ FOR UPDATE SKIP LOCKED
             now,
         )
         .await?;
+        Self::complete_injections_tx(&mut tx, &delivered_injection_ids, now).await?;
         tx.commit().await.context("commit spawn_subagent_batch")?;
         Ok((new_parent, prepared, committed))
     }
@@ -4201,6 +4234,7 @@ FOR UPDATE SKIP LOCKED
     ) -> Result<SpawnedMixedChildren> {
         validate_mixed_children_spawn(&spawn)?;
         let MixedChildrenSpawn {
+            delivered_injection_ids,
             subagents,
             tool_children,
             payload,
@@ -4269,6 +4303,7 @@ FOR UPDATE SKIP LOCKED
             now,
         )
         .await?;
+        Self::complete_injections_tx(&mut tx, &delivered_injection_ids, now).await?;
         tx.commit().await.context("commit spawn_mixed_children")?;
         Ok(SpawnedMixedChildren {
             committed_events: committed,
@@ -7619,6 +7654,7 @@ INSERT INTO agent_sdk_turn_attempts (
             .commit_completed_turn_atomic_with_failure(
                 CompletedTurnCommit {
                     checkpoint_kind: CheckpointKind::FullTurn,
+                    delivered_injection_ids: Vec::new(),
                     thread_id: running.thread_id.clone(),
                     task_id: running.id.clone(),
                     expected_turn: 1,
@@ -7698,6 +7734,7 @@ INSERT INTO agent_sdk_turn_attempts (
         let thread_id = running.thread_id.clone();
         let commit_params = |now| CompletedTurnCommit {
             checkpoint_kind: CheckpointKind::FullTurn,
+            delivered_injection_ids: Vec::new(),
             thread_id: thread_id.clone(),
             task_id: running.id.clone(),
             expected_turn: 1,
@@ -7784,6 +7821,7 @@ INSERT INTO agent_sdk_turn_attempts (
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
                 checkpoint_kind: CheckpointKind::FullTurn,
+                delivered_injection_ids: Vec::new(),
                 thread_id: running.thread_id.clone(),
                 task_id: running.id.clone(),
                 expected_turn: 1,
@@ -7801,6 +7839,7 @@ INSERT INTO agent_sdk_turn_attempts (
                 owner_guard: None,
                 now: t_plus(2),
             },
+            &store,
             &store,
             &store,
             &store,

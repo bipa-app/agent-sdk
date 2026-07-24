@@ -784,6 +784,7 @@ async fn cancelled_child_thread_does_not_count_unexecuted_tool_tasks() -> Result
         &worker,
         &lease,
         child_spawn(&parent_thread_id),
+        Vec::new(),
         &SubagentInvocationDeps {
             task_store: &stores.tasks,
             thread_store: &stores.threads,
@@ -833,6 +834,7 @@ async fn completion_surfaces_parent_progress_commit_failures() -> Result<()> {
         &worker,
         &lease,
         child_spawn(&parent_thread_id),
+        Vec::new(),
         &SubagentInvocationDeps {
             task_store: &stores.tasks,
             thread_store: &stores.threads,
@@ -958,6 +960,7 @@ async fn child_thread_reuses_root_turn_and_tool_runtime_before_materializing_par
         &worker,
         &lease,
         child_spawn(&parent_thread_id),
+        Vec::new(),
         &SubagentInvocationDeps {
             task_store: &stores.tasks,
             thread_store: &stores.threads,

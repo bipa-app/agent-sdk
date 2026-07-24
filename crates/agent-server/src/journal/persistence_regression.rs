@@ -81,6 +81,7 @@ mod tests {
     // ── Shared test harness ─────────────────────────────────────────
 
     struct Stores {
+        tasks: crate::journal::store::InMemoryAgentTaskStore,
         threads: InMemoryThreadStore,
         messages: InMemoryMessageProjectionStore,
         attempts: InMemoryTurnAttemptStore,
@@ -91,6 +92,7 @@ mod tests {
     impl Stores {
         fn new() -> Self {
             Self {
+                tasks: crate::journal::store::InMemoryAgentTaskStore::new(),
                 threads: InMemoryThreadStore::new(),
                 messages: InMemoryMessageProjectionStore::new(),
                 attempts: InMemoryTurnAttemptStore::new(),
@@ -138,6 +140,7 @@ mod tests {
                 .saturating_add(1);
             commit_completed_turn(
                 CompletedTurnCommit {
+                    delivered_injection_ids: Vec::new(),
                     checkpoint_kind: CheckpointKind::FullTurn,
                     thread_id: thread_id.clone(),
                     task_id: task_id.clone(),
@@ -152,6 +155,7 @@ mod tests {
                     owner_guard: None,
                     now: at,
                 },
+                &self.tasks,
                 &self.threads,
                 &self.messages,
                 &self.attempts,
@@ -377,6 +381,7 @@ mod tests {
         // Attempt the full commit — should fail at step 1.
         let err = commit_completed_turn(
             CompletedTurnCommit {
+                delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_id.clone(),
                 task_id: task,
@@ -393,6 +398,7 @@ mod tests {
                 owner_guard: None,
                 now: t_plus(2),
             },
+            &s.tasks,
             &s.threads,
             &s.messages,
             &s.attempts,
@@ -1017,6 +1023,7 @@ mod tests {
         let attempt_id = s.open_attempt(&task2, 1).await?;
         let commit_err = commit_completed_turn(
             CompletedTurnCommit {
+                delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_id.clone(),
                 task_id: task2,
@@ -1034,6 +1041,7 @@ mod tests {
                 owner_guard: None,
                 now: t_plus(3),
             },
+            &s.tasks,
             &s.threads,
             &s.messages,
             &s.attempts,

@@ -21,10 +21,10 @@ use super::subagent::{
     EffectiveSubagentCapabilities, EffectiveSubagentMcpPolicy, EffectiveSubagentSpec,
     InheritedSubagentConstraints, InheritedSubagentPolicy, MixedChildrenRequest,
     ServerSubagentSpawnPolicy, SpawnedSubagentBatch, SpawnedSubagentInvocation, SubagentBatchEntry,
-    SubagentCapabilityProfile, SubagentCapabilityRequest, SubagentInvocationDeps,
-    SubagentMcpRequest, SubagentSandboxPolicy, SubagentSpawnPolicy, SubagentSpawnRequest,
-    resolve_subagent_spec, spawn_mixed_children_invocations, spawn_subagent_batch_invocations,
-    spawn_subagent_invocation,
+    SubagentBatchRequest, SubagentCapabilityProfile, SubagentCapabilityRequest,
+    SubagentInvocationDeps, SubagentMcpRequest, SubagentSandboxPolicy, SubagentSpawnPolicy,
+    SubagentSpawnRequest, resolve_subagent_spec, spawn_mixed_children_invocations,
+    spawn_subagent_batch_invocations, spawn_subagent_invocation,
 };
 
 fn set(values: &[&str]) -> BTreeSet<String> {
@@ -993,8 +993,11 @@ async fn spawn_batch_creates_n_invocations_under_one_parent() -> Result<()> {
         &parent.id,
         &worker,
         &lease,
-        entries,
-        payload,
+        SubagentBatchRequest {
+            delivered_injection_ids: Vec::new(),
+            entries,
+            payload,
+        },
         &SubagentInvocationDeps {
             task_store: &task_store,
             thread_store: &thread_store,
@@ -1063,8 +1066,11 @@ async fn spawn_batch_rejects_empty_input() -> Result<()> {
         &parent.id,
         &worker,
         &lease,
-        Vec::new(),
-        payload,
+        SubagentBatchRequest {
+            delivered_injection_ids: Vec::new(),
+            entries: Vec::new(),
+            payload,
+        },
         &SubagentInvocationDeps {
             task_store: &task_store,
             thread_store: &thread_store,
@@ -1112,8 +1118,11 @@ async fn spawn_batch_rejects_out_of_bounds_spawn_index() -> Result<()> {
         &parent.id,
         &worker,
         &lease,
-        entries,
-        payload,
+        SubagentBatchRequest {
+            delivered_injection_ids: Vec::new(),
+            entries,
+            payload,
+        },
         &SubagentInvocationDeps {
             task_store: &task_store,
             thread_store: &thread_store,
@@ -1153,6 +1162,7 @@ async fn spawn_flow_creates_invocation_child_thread_and_child_root() -> Result<(
             payload: parent_suspension_payload(&parent.thread_id, task),
             child_caller_metadata: None,
         },
+        Vec::new(),
         &SubagentInvocationDeps {
             task_store: &task_store,
             thread_store: &thread_store,
@@ -1243,6 +1253,7 @@ async fn spawn_carries_child_caller_metadata_onto_child_root() -> Result<()> {
             payload: parent_suspension_payload(&parent.thread_id, task),
             child_caller_metadata: Some(caller.clone()),
         },
+        Vec::new(),
         &SubagentInvocationDeps {
             task_store: &task_store,
             thread_store: &thread_store,
@@ -1280,6 +1291,7 @@ async fn spawn_flow_surfaces_parent_progress_commit_failures() -> Result<()> {
             payload: parent_suspension_payload(&parent.thread_id, task),
             child_caller_metadata: None,
         },
+        Vec::new(),
         &SubagentInvocationDeps {
             task_store: &task_store,
             thread_store: &thread_store,
@@ -1439,6 +1451,7 @@ async fn spawn_flow_rejects_non_confirm_tier_subagent_tools() -> Result<()> {
             ),
             child_caller_metadata: None,
         },
+        Vec::new(),
         &SubagentInvocationDeps {
             task_store: &task_store,
             thread_store: &thread_store,
@@ -1590,6 +1603,7 @@ async fn spawn_mixed_creates_subagents_and_tool_children_under_one_parent() -> R
         &worker,
         &lease,
         MixedChildrenRequest {
+            delivered_injection_ids: Vec::new(),
             subagents: mixed_subagent_entries(&tasks)?,
             tool_children: mixed_tool_children(tasks.len(), 3)?,
             payload,
@@ -1673,6 +1687,7 @@ async fn spawn_mixed_rejects_losing_cas_without_partial_spawn() -> Result<()> {
         &worker,
         &LeaseId::from_string("l-stale"),
         MixedChildrenRequest {
+            delivered_injection_ids: Vec::new(),
             subagents: mixed_subagent_entries(&tasks)?,
             tool_children: mixed_tool_children(tasks.len(), 2)?,
             payload,
@@ -1722,6 +1737,7 @@ async fn spawn_mixed_rejects_uncovered_pending_tool_call() -> Result<()> {
         &worker,
         &lease,
         MixedChildrenRequest {
+            delivered_injection_ids: Vec::new(),
             subagents: mixed_subagent_entries(&tasks)?,
             tool_children: mixed_tool_children(tasks.len(), 2)?,
             payload,
@@ -1777,6 +1793,7 @@ async fn spawn_mixed_rejects_bad_tool_slot_without_orphaning_child_threads() -> 
         &worker,
         &lease,
         MixedChildrenRequest {
+            delivered_injection_ids: Vec::new(),
             subagents,
             tool_children: vec![ToolChildSpawn {
                 spawn_index: 7, // out of range — only 2 pending tool calls
@@ -1847,6 +1864,7 @@ async fn spawn_mixed_records_child_ids_in_slot_order_when_interleaved() -> Resul
         &worker,
         &lease,
         MixedChildrenRequest {
+            delivered_injection_ids: Vec::new(),
             subagents,
             tool_children: vec![ToolChildSpawn {
                 spawn_index: 0,
@@ -1929,8 +1947,11 @@ async fn spawn_batch_rejects_duplicate_child_thread_without_orphaning_projection
         &parent.id,
         &worker,
         &lease,
-        entries,
-        payload,
+        SubagentBatchRequest {
+            delivered_injection_ids: Vec::new(),
+            entries,
+            payload,
+        },
         &SubagentInvocationDeps {
             task_store: &task_store,
             thread_store: &thread_store,
@@ -1989,6 +2010,7 @@ async fn spawn_mixed_rejects_duplicate_child_thread_without_orphaning_projection
         &worker,
         &lease,
         MixedChildrenRequest {
+            delivered_injection_ids: Vec::new(),
             subagents,
             tool_children: mixed_tool_children(tasks.len(), 3)?,
             payload,

@@ -366,6 +366,7 @@ mod tests {
     }
 
     struct Stores {
+        tasks: crate::journal::store::InMemoryAgentTaskStore,
         threads: InMemoryThreadStore,
         messages: InMemoryMessageProjectionStore,
         attempts: InMemoryTurnAttemptStore,
@@ -376,6 +377,7 @@ mod tests {
     impl Stores {
         fn new() -> Self {
             Self {
+                tasks: crate::journal::store::InMemoryAgentTaskStore::new(),
                 threads: InMemoryThreadStore::new(),
                 messages: InMemoryMessageProjectionStore::new(),
                 attempts: InMemoryTurnAttemptStore::new(),
@@ -424,6 +426,7 @@ mod tests {
                 .saturating_add(1);
             commit_completed_turn(
                 CompletedTurnCommit {
+                    delivered_injection_ids: Vec::new(),
                     checkpoint_kind: CheckpointKind::FullTurn,
                     thread_id: thread_id.clone(),
                     task_id: task_id.clone(),
@@ -438,6 +441,7 @@ mod tests {
                     owner_guard: None,
                     now: at,
                 },
+                &self.tasks,
                 &self.threads,
                 &self.messages,
                 &self.attempts,

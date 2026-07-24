@@ -509,6 +509,7 @@ async fn spawn_child_invocation(
         &setup.worker,
         &setup.lease,
         child_spawn(parent_thread, tool_id),
+        Vec::new(),
         &stores.invocation_deps(),
         at,
     )
@@ -1833,6 +1834,7 @@ async fn nested_grandchild_tree_linkage_survives_restart() -> Result<()> {
             .context("child worker id")?,
         child_running.lease_id.as_ref().context("child lease id")?,
         grand_spawn,
+        Vec::new(),
         &stores.invocation_deps(),
         t_plus(4),
     )

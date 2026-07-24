@@ -46,9 +46,13 @@ mod tests {
     use agent_server::journal::commit::{CompletedTurnCommit, commit_completed_turn};
     use agent_server::journal::recovery::RecoveryAction;
     use agent_server::journal::store::AgentTaskStore;
+    #[cfg(feature = "failpoints")]
+    use agent_server::journal::store::{SubmitDisposition, SubmitRootTurnParams};
     use agent_server::journal::task::{
         AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskStatus, WorkerId,
     };
+    #[cfg(feature = "failpoints")]
+    use agent_server::journal::task::{SubmittedInputItem, TaskKind};
     use agent_server::journal::thread_recover::recover_thread;
     use agent_server::journal::turn_attempt::{
         CloseAttemptParams, OpenAttemptParams, TurnAttemptOutcome,
@@ -252,6 +256,7 @@ mod tests {
                 vec![ChildSpawnSpec { max_attempts: 3 }],
                 suspension_payload(thread),
                 None,
+                Vec::new(),
                 t_plus(12),
             )
             .await
@@ -314,6 +319,7 @@ mod tests {
         commit_completed_turn(
             CompletedTurnCommit {
                 checkpoint_kind: CheckpointKind::FullTurn,
+                delivered_injection_ids: Vec::new(),
                 thread_id: thread.clone(),
                 task_id: task_id.clone(),
                 // Every caller of this helper commits the thread's first
@@ -347,6 +353,7 @@ mod tests {
                 owner_guard: None,
                 now: at,
             },
+            store,
             store,
             store,
             store,
@@ -893,6 +900,214 @@ mod tests {
             "exactly one checkpoint after replay",
         );
 
+        drop(store);
+        Ok(())
+    }
+
+    /// Commit one turn whose delivered list carries the injection AND
+    /// the root's own id — the latter to prove non-injection rows are
+    /// skipped, never force-completed.
+    #[cfg(feature = "failpoints")]
+    async fn commit_delivering<S>(
+        store: &S,
+        thread: &ThreadId,
+        task_id: &AgentTaskId,
+        injection_id: &AgentTaskId,
+        attempt_number: u32,
+        at: OffsetDateTime,
+    ) -> Result<()>
+    where
+        S: DurableStore,
+    {
+        let attempt = store
+            .open_attempt(OpenAttemptParams {
+                task_id: task_id.clone(),
+                attempt_number,
+                provenance: agent_sdk_foundation::audit::AuditProvenance::new(
+                    "anthropic",
+                    "claude-sonnet-4-5-20250929",
+                ),
+                request_blob: serde_json::json!({"messages": []}),
+                now: at,
+                otel_trace_id: None,
+                otel_span_id: None,
+            })
+            .await
+            .context("open attempt for delivering commit")?;
+        commit_completed_turn(
+            CompletedTurnCommit {
+                checkpoint_kind: CheckpointKind::FullTurn,
+                delivered_injection_ids: vec![injection_id.clone(), task_id.clone()],
+                thread_id: thread.clone(),
+                task_id: task_id.clone(),
+                expected_turn: 1,
+                turn_attempt_id: attempt.id,
+                close_attempt_params: CloseAttemptParams {
+                    response_blob: serde_json::json!({"id": "msg", "content": []}),
+                    response_id: Some("msg".into()),
+                    response_model: Some("claude-sonnet-4-5-20250929".into()),
+                    stop_reason: Some(llm::StopReason::EndTurn),
+                    outcome: TurnAttemptOutcome::Success,
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    route_provider: None,
+                    thinking_mode: None,
+                    thinking_budget_tokens: None,
+                    thinking_effort: None,
+                },
+                messages: vec![llm::Message::user("steer the turn")],
+                turn_usage: TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    ..Default::default()
+                },
+                agent_state_snapshot: serde_json::json!({"turn": 1}),
+                events: vec![AgentEvent::text("inj-evt", "turn body")],
+                outbox_max_attempts: 3,
+                owner_guard: None,
+                now: at,
+            },
+            store,
+            store,
+            store,
+            store,
+            store,
+            store,
+        )
+        .await
+        .context("commit completed turn with delivered injections")?;
+        Ok(())
+    }
+    /// A boundary injection the turn delivered completes inside the SAME
+    /// transaction as the completed-turn commit, so "turn durable" and
+    /// "injection completed" are one atomic fact:
+    ///
+    /// * crash at the atomic-commit boundary → the turn AND the
+    ///   completion both roll back (the row is still `Queued`, so the
+    ///   retry re-drains it — nothing is lost);
+    /// * the successful retry → the turn AND the completion both land
+    ///   (the row is `Completed`, so the next boundary re-drains
+    ///   nothing — nothing is duplicated).
+    ///
+    /// Non-injection ids in the delivered list are skipped, never
+    /// force-completed.
+    #[cfg(feature = "failpoints")]
+    async fn assert_injection_completion_rides_the_commit<S>(store: &S) -> Result<()>
+    where
+        S: DurableStore,
+    {
+        let thread = ThreadId::from_string("injection-commit");
+        let task_id = AgentTaskId::from_string("task_injection-commit");
+        prepare_running_root(store, &thread, &task_id, t_plus(5)).await?;
+
+        let injection = store
+            .submit_root_turn_idempotent(SubmitRootTurnParams {
+                task: AgentTask::new_root_turn_with_input(
+                    thread.clone(),
+                    vec![SubmittedInputItem::Text {
+                        text: "steer the turn".into(),
+                    }],
+                    t_plus(6),
+                    3,
+                ),
+                idempotency: None,
+                max_queued_depth: None,
+                disposition: SubmitDisposition::InjectAtBoundary,
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("injection submit: {error}"))?
+            .task;
+        assert_eq!(injection.kind, TaskKind::InputInjection);
+        assert_eq!(injection.status, TaskStatus::Queued);
+
+        // ── Crash half: the failpoint aborts the transaction, so the
+        //    completion must roll back with the turn. ──────────────────
+        fail::cfg("commit.before_event_commit", "panic")
+            .map_err(|e| anyhow::anyhow!("configure failpoint: {e}"))?;
+        let crashed = std::panic::AssertUnwindSafe(commit_delivering(
+            store,
+            &thread,
+            &task_id,
+            &injection.id,
+            1,
+            t_plus(7),
+        ));
+        let result = futures::FutureExt::catch_unwind(crashed).await;
+        assert!(result.is_err(), "first attempt must crash at the failpoint");
+        fail::remove("commit.before_event_commit");
+
+        let after_crash = AgentTaskStore::get(store, &injection.id)
+            .await?
+            .context("injection row after the crashed commit")?;
+        assert_eq!(
+            after_crash.status,
+            TaskStatus::Queued,
+            "a completion must never outlive its aborted turn commit",
+        );
+
+        // ── Success half: the retry lands the turn and the completion
+        //    as one write. ─────────────────────────────────────────────
+        commit_delivering(store, &thread, &task_id, &injection.id, 2, t_plus(8)).await?;
+
+        let committed_thread = ThreadStore::get(store, &thread)
+            .await?
+            .context("thread row after the successful retry")?;
+        assert_eq!(committed_thread.committed_turns, 1);
+        let completed = AgentTaskStore::get(store, &injection.id)
+            .await?
+            .context("injection row after the successful retry")?;
+        assert_eq!(
+            completed.status,
+            TaskStatus::Completed,
+            "the committed turn completes its delivered injection with it",
+        );
+        assert_eq!(
+            completed.terminal_reason,
+            Some(agent_sdk_foundation::TerminalReason::Completed),
+        );
+        let root = AgentTaskStore::get(store, &task_id)
+            .await?
+            .context("root row after the successful retry")?;
+        assert_ne!(
+            root.kind,
+            TaskKind::InputInjection,
+            "the skip-guard probe must be a non-injection row",
+        );
+        assert_ne!(
+            root.status,
+            TaskStatus::Completed,
+            "non-injection ids in the delivered list are skipped, not completed",
+        );
+        Ok(())
+    }
+
+    /// MUST run under nextest (process-global `fail-rs` registry).
+    #[cfg(all(feature = "sqlite", feature = "failpoints"))]
+    #[tokio::test]
+    async fn sqlite_injection_completion_rides_the_commit_transaction() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("durability-injection.db");
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let _scenario = fail::FailScenario::setup();
+        let store = SqliteDurableStore::connect(&url).await?;
+        assert_injection_completion_rides_the_commit(&store).await?;
+        drop(store);
+        Ok(())
+    }
+
+    /// MUST run under nextest (process-global `fail-rs` registry).
+    /// Runs only when `TEST_DATABASE_URL` is set.
+    #[cfg(all(feature = "postgres", feature = "failpoints"))]
+    #[tokio::test]
+    async fn postgres_injection_completion_rides_the_commit_transaction() -> Result<()> {
+        let Some(schema) = PgSchema::create().await? else {
+            return Ok(());
+        };
+        let _scenario = fail::FailScenario::setup();
+        let store = schema.open_store().await?;
+        assert_injection_completion_rides_the_commit(&store).await?;
         drop(store);
         Ok(())
     }
