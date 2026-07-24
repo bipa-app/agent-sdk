@@ -2179,6 +2179,7 @@ async fn llm_span_emits_stream_lifecycle_events() -> Result<()> {
         }),
         StreamDelta::Done {
             stop_reason: Some(StopReason::EndTurn),
+            served_route: None,
         },
     ]);
     let agent = builder::<()>()
@@ -2922,6 +2923,7 @@ mod metrics {
             }),
             StreamDelta::Done {
                 stop_reason: Some(StopReason::EndTurn),
+                served_route: None,
             },
         ]);
         let agent = builder::<()>()

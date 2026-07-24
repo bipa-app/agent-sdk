@@ -387,6 +387,10 @@ enum CassetteDelta {
     Usage(Usage),
     Done {
         stop_reason: Option<StopReason>,
+        /// Absent in cassettes recorded before serving-route attribution;
+        /// `default` keeps them replayable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        served_route: Option<String>,
     },
     Error {
         message: String,
@@ -450,8 +454,12 @@ impl CassetteDelta {
                 block_index: *block_index,
             },
             StreamDelta::Usage(usage) => Self::Usage(usage.clone()),
-            StreamDelta::Done { stop_reason } => Self::Done {
+            StreamDelta::Done {
+                stop_reason,
+                served_route,
+            } => Self::Done {
                 stop_reason: *stop_reason,
+                served_route: served_route.clone(),
             },
             StreamDelta::Error { message, kind } => Self::Error {
                 message: message.clone(),
@@ -503,7 +511,13 @@ impl CassetteDelta {
                 block_index,
             },
             Self::Usage(usage) => StreamDelta::Usage(usage),
-            Self::Done { stop_reason } => StreamDelta::Done { stop_reason },
+            Self::Done {
+                stop_reason,
+                served_route,
+            } => StreamDelta::Done {
+                stop_reason,
+                served_route,
+            },
             Self::Error {
                 message,
                 kind,
@@ -852,6 +866,7 @@ mod tests {
                 },
                 StreamDelta::Done {
                     stop_reason: Some(StopReason::EndTurn),
+                    served_route: None,
                 },
             ],
         });
@@ -882,6 +897,72 @@ mod tests {
         }
         assert_eq!(replayed, "hello");
         assert!(stop_seen, "Done delta should replay");
+
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    /// A recorded `served_route` survives the cassette round trip, and a
+    /// pre-attribution cassette — one whose `Done` entry has no
+    /// `served_route` key at all — still replays, reporting `None`.
+    #[tokio::test]
+    async fn served_route_round_trips_and_legacy_cassettes_still_replay() -> Result<()> {
+        let path = temp_cassette_path();
+        let inner = Arc::new(InnerProvider {
+            model: "inner-model",
+            chat_outcome: success_outcome("unused"),
+            deltas: vec![StreamDelta::Done {
+                stop_reason: Some(StopReason::EndTurn),
+                served_route: Some("gateway-x".to_owned()),
+            }],
+        });
+
+        let recorder = RecordReplayProvider::record(inner, &path);
+        let mut stream = recorder.chat_stream(request());
+        while let Some(item) = stream.next().await {
+            item?;
+        }
+        drop(stream);
+
+        let player = RecordReplayProvider::replay(&path)?;
+        let mut served = None;
+        let mut stream = player.chat_stream(request());
+        while let Some(item) = stream.next().await {
+            if let StreamDelta::Done { served_route, .. } = item? {
+                served = served_route;
+            }
+        }
+        drop(stream);
+        assert_eq!(served.as_deref(), Some("gateway-x"));
+
+        // Strip the field from the file — the exact shape a cassette
+        // recorded before the field existed has on disk.
+        let json = std::fs::read_to_string(&path)?;
+        assert!(json.contains("served_route"));
+        let mut cassette: serde_json::Value = serde_json::from_str(&json)?;
+        for entry in cassette["entries"]
+            .as_array_mut()
+            .context("cassette entries")?
+        {
+            if let Some(deltas) = entry["interaction"]["Stream"].as_array_mut() {
+                for delta in deltas {
+                    if let Some(done) = delta.get_mut("Done").and_then(|d| d.as_object_mut()) {
+                        done.remove("served_route");
+                    }
+                }
+            }
+        }
+        std::fs::write(&path, serde_json::to_string_pretty(&cassette)?)?;
+
+        let legacy_player = RecordReplayProvider::replay(&path)?;
+        let mut legacy_served = Some("sentinel".to_owned());
+        let mut stream = legacy_player.chat_stream(request());
+        while let Some(item) = stream.next().await {
+            if let StreamDelta::Done { served_route, .. } = item? {
+                legacy_served = served_route;
+            }
+        }
+        assert_eq!(legacy_served, None);
 
         let _ = std::fs::remove_file(&path);
         Ok(())

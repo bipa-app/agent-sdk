@@ -235,6 +235,7 @@ impl crate::llm::LlmProvider for StreamScriptProvider {
             None => Box::pin(futures::stream::iter(std::iter::once(Ok(
                 StreamDelta::Done {
                     stop_reason: Some(StopReason::EndTurn),
+                    served_route: None,
                 },
             )))),
         }

@@ -481,6 +481,7 @@ impl VertexProvider {
     }
 
     fn chat_stream_gemini(&self, request: ChatRequest) -> StreamBox<'_> {
+        let served_route = self.route().to_owned();
         Box::pin(async_stream::stream! {
             let thinking = match self.resolve_thinking_config(request.thinking.as_ref()) {
                 Ok(thinking) => thinking,
@@ -547,7 +548,13 @@ impl VertexProvider {
 
             let mut inner = stream_gemini_response(response);
             while let Some(item) = futures::StreamExt::next(&mut inner).await {
-                yield item;
+                yield match item {
+                    Ok(StreamDelta::Done { stop_reason, .. }) => Ok(StreamDelta::Done {
+                        stop_reason,
+                        served_route: Some(served_route.clone()),
+                    }),
+                    other => other,
+                };
             }
         })
     }
@@ -779,6 +786,7 @@ impl VertexProvider {
 
     #[allow(clippy::too_many_lines)]
     fn chat_stream_claude(&self, request: ChatRequest) -> StreamBox<'_> {
+        let served_route = self.route().to_owned();
         Box::pin(async_stream::stream! {
             let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
                 // Forcing a specific tool is incompatible with extended thinking
@@ -938,6 +946,7 @@ impl VertexProvider {
                     if anthropic_data::is_message_stop_event(&event_block) {
                         yield Ok(StreamDelta::Done {
                             stop_reason: pending_stop_reason.take(),
+                            served_route: Some(served_route.clone()),
                         });
                     }
                 }
@@ -964,6 +973,7 @@ impl VertexProvider {
                 if anthropic_data::is_message_stop_event(remaining) {
                     yield Ok(StreamDelta::Done {
                         stop_reason: pending_stop_reason.take(),
+                        served_route: Some(served_route.clone()),
                     });
                 }
             }

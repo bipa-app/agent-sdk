@@ -538,6 +538,7 @@ impl LlmProvider for PausableStreamProvider {
             });
             yield Ok(StreamDelta::Done {
                 stop_reason: Some(StopReason::ToolUse),
+                served_route: None,
             });
         })
     }

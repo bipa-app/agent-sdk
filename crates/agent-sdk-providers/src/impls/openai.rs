@@ -848,14 +848,25 @@ impl LlmProvider for OpenAIProvider {
             self.reasoning.as_ref(),
         ) {
             let responses_provider = self.responses_reroute();
+            // The reroute is an implementation detail of this handle: the
+            // stream's serving route stays this provider's, not the inner
+            // Responses provider's.
+            let served_route = self.route().to_owned();
             return Box::pin(async_stream::stream! {
                 let mut stream = std::pin::pin!(responses_provider.chat_stream(request));
                 while let Some(item) = futures::StreamExt::next(&mut stream).await {
-                    yield item;
+                    yield match item {
+                        Ok(StreamDelta::Done { stop_reason, .. }) => Ok(StreamDelta::Done {
+                            stop_reason,
+                            served_route: Some(served_route.clone()),
+                        }),
+                        other => other,
+                    };
                 }
             });
         }
 
+        let served_route = self.route().to_owned();
         Box::pin(async_stream::stream! {
             let reasoning_config = match self.resolve_openai_reasoning(request.thinking.as_ref()) {
                 Ok(reasoning) => reasoning,
@@ -1056,7 +1067,15 @@ impl LlmProvider for OpenAIProvider {
                     );
                     for delta in outcome.immediate { yield Ok(delta); }
                     if let Some(terminal) = outcome.terminal {
-                        for delta in terminal { yield Ok(delta); }
+                        for delta in terminal {
+                            yield Ok(match delta {
+                                StreamDelta::Done { stop_reason, .. } => StreamDelta::Done {
+                                    stop_reason,
+                                    served_route: Some(served_route.clone()),
+                                },
+                                other => other,
+                            });
+                        }
                         return;
                     }
                 }
@@ -1304,9 +1323,11 @@ fn build_stream_end_deltas(
         deltas.push(StreamDelta::Usage(u));
     }
 
-    // Emit done
+    // Emit done. The serving route is stamped by the yield loop that owns
+    // the provider handle; this helper only sees parsed wire state.
     deltas.push(StreamDelta::Done {
         stop_reason: Some(stop_reason),
+        served_route: None,
     });
 
     deltas
@@ -3856,7 +3877,8 @@ mod tests {
         assert!(done.iter().any(|delta| matches!(
             delta,
             StreamDelta::Done {
-                stop_reason: Some(StopReason::Refusal)
+                stop_reason: Some(StopReason::Refusal),
+                ..
             }
         )));
         Ok(())
@@ -4814,7 +4836,8 @@ mod tests {
         assert!(terminal.iter().any(|d| matches!(
             d,
             StreamDelta::Done {
-                stop_reason: Some(StopReason::EndTurn)
+                stop_reason: Some(StopReason::EndTurn),
+                ..
             }
         )));
     }

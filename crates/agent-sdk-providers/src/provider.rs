@@ -161,6 +161,7 @@ pub trait LlmProvider: Send + Sync {
                         yield Ok(StreamDelta::Usage(response.usage));
                         yield Ok(StreamDelta::Done {
                             stop_reason: response.stop_reason,
+                            served_route: Some(self.route().to_owned()),
                         });
                     }
                     ChatOutcome::RateLimited(retry_after) => {
@@ -208,6 +209,13 @@ pub trait LlmProvider: Send + Sync {
     /// need to tell *model-X via a gateway* from *model-X native*, so this
     /// reports the serving route instead — the two coincide only for providers
     /// that front a single endpoint, which is why the default delegates.
+    ///
+    /// This is *pre-dispatch* identity: for wrappers (fallback / router /
+    /// refresh) it names the configured representative, not necessarily the
+    /// backend a given call reached. Post-dispatch attribution rides the
+    /// stream instead — the serving provider stamps its route on
+    /// [`StreamDelta::Done`](crate::streaming::StreamDelta), and wrappers
+    /// forward it untouched.
     ///
     /// [`OpenAIProvider`]: crate::impls::openai::OpenAIProvider
     fn route(&self) -> &str {

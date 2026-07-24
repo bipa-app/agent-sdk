@@ -735,7 +735,12 @@ fn parse_gemini_sse_line(line: &str) -> GeminiLineParse {
 /// loop does not persist a partial completion as success.
 fn gemini_stream_terminal(saw_finish_reason: bool, stop_reason: Option<StopReason>) -> StreamDelta {
     if saw_finish_reason {
-        StreamDelta::Done { stop_reason }
+        StreamDelta::Done {
+            stop_reason,
+            // Stamped by the provider-owned wrapper loop; this helper only
+            // sees parsed wire state.
+            served_route: None,
+        }
     } else {
         log::warn!(
             "Gemini SSE stream ended without a finishReason - stream may have been truncated"
@@ -1536,7 +1541,8 @@ mod tests {
         assert!(matches!(
             terminal,
             StreamDelta::Done {
-                stop_reason: Some(StopReason::EndTurn)
+                stop_reason: Some(StopReason::EndTurn),
+                ..
             }
         ));
     }

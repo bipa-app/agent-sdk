@@ -468,6 +468,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
 
     #[allow(clippy::too_many_lines)]
     fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
+        let served_route = self.route().to_owned();
         Box::pin(async_stream::stream! {
             let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
                 Ok(thinking) => thinking,
@@ -1204,6 +1205,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                 websocket_session.in_flight = false;
                                                 yield Ok(StreamDelta::Done {
                                                     stop_reason,
+                                                    served_route: Some(served_route.clone()),
                                                 });
                                                 return;
                                             }
@@ -1443,6 +1445,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                     websocket_session.in_flight = false;
                                                     yield Ok(StreamDelta::Done {
                                                         stop_reason,
+                                                        served_route: Some(served_route.clone()),
                                                     });
                                                     return;
                                                 }
@@ -1640,6 +1643,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                         }
                         yield Ok(StreamDelta::Done {
                             stop_reason: Some(stop_reason),
+                            served_route: Some(served_route.clone()),
                         });
                         return;
                     }
@@ -1792,6 +1796,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
             }
             yield Ok(StreamDelta::Done {
                 stop_reason: Some(stop_reason),
+                served_route: Some(served_route.clone()),
             });
         })
     }
@@ -5065,7 +5070,8 @@ mod tests {
         assert!(matches!(
             deltas.last(),
             Some(StreamDelta::Done {
-                stop_reason: Some(StopReason::ToolUse)
+                stop_reason: Some(StopReason::ToolUse),
+                ..
             })
         ));
         Ok(())
@@ -5111,7 +5117,8 @@ mod tests {
             assert!(matches!(
                 deltas.last(),
                 Some(StreamDelta::Done {
-                    stop_reason: Some(stop_reason)
+                    stop_reason: Some(stop_reason),
+                    ..
                 }) if *stop_reason == expected_stop
             ));
             assert!(!deltas.iter().any(|delta| matches!(

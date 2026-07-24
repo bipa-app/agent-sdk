@@ -90,6 +90,7 @@ impl TurnScript {
             StreamDelta::Usage(DEFAULT_USAGE),
             StreamDelta::Done {
                 stop_reason: Some(StopReason::EndTurn),
+                served_route: None,
             },
         ])
     }
@@ -109,6 +110,7 @@ impl TurnScript {
         deltas.push(StreamDelta::Usage(DEFAULT_USAGE));
         deltas.push(StreamDelta::Done {
             stop_reason: Some(StopReason::EndTurn),
+            served_route: None,
         });
         Self::from_deltas(deltas)
     }
@@ -125,6 +127,7 @@ impl TurnScript {
             StreamDelta::Usage(DEFAULT_USAGE),
             StreamDelta::Done {
                 stop_reason: Some(stop_reason),
+                served_route: None,
             },
         ])
     }
@@ -149,6 +152,7 @@ impl TurnScript {
             StreamDelta::Usage(DEFAULT_USAGE),
             StreamDelta::Done {
                 stop_reason: Some(StopReason::EndTurn),
+                served_route: None,
             },
         ])
     }
@@ -176,6 +180,7 @@ impl TurnScript {
         deltas.push(StreamDelta::Usage(DEFAULT_USAGE));
         deltas.push(StreamDelta::Done {
             stop_reason: Some(StopReason::ToolUse),
+            served_route: None,
         });
         Self::from_deltas(deltas)
     }
@@ -216,6 +221,7 @@ impl TurnScript {
         deltas.push(StreamDelta::Usage(DEFAULT_USAGE));
         deltas.push(StreamDelta::Done {
             stop_reason: Some(StopReason::ToolUse),
+            served_route: None,
         });
         Self::from_deltas(deltas)
     }

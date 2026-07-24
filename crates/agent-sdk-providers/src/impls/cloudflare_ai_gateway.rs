@@ -50,7 +50,7 @@ use crate::impls::gemini::GeminiProvider;
 use crate::impls::openai::OpenAIProvider;
 use crate::model_capabilities::ModelCapabilities;
 use crate::provider::LlmProvider;
-use crate::streaming::StreamBox;
+use crate::streaming::{StreamBox, StreamDelta};
 use agent_sdk_foundation::llm::{ChatOutcome, ChatRequest, ThinkingConfig};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -280,11 +280,26 @@ impl LlmProvider for CloudflareAIGatewayProvider {
     }
 
     fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
-        match &self.inner {
+        // The inner provider is an implementation detail of this handle:
+        // the stream's serving route stays the gateway's, not the wire
+        // shape it borrowed.
+        let served_route = self.route().to_owned();
+        let mut inner = match &self.inner {
             Inner::Anthropic(p) => p.chat_stream(request),
             Inner::OpenAI(p) => p.chat_stream(request),
             Inner::Gemini(p) => p.chat_stream(request),
-        }
+        };
+        Box::pin(async_stream::stream! {
+            while let Some(item) = futures::StreamExt::next(&mut inner).await {
+                yield match item {
+                    Ok(StreamDelta::Done { stop_reason, .. }) => Ok(StreamDelta::Done {
+                        stop_reason,
+                        served_route: Some(served_route.clone()),
+                    }),
+                    other => other,
+                };
+            }
+        })
     }
 
     fn model(&self) -> &str {

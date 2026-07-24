@@ -3768,6 +3768,7 @@ impl LlmProvider for OfflineThenSuccessProvider {
             }));
             yield Ok(StreamDelta::Done {
                 stop_reason: Some(StopReason::EndTurn),
+                served_route: None,
             });
         })
     }
@@ -9681,6 +9682,173 @@ async fn cancelling_awaiting_question_settles_root_and_closes_stream() -> Result
                 event.event,
                 agent_sdk_foundation::AgentEvent::Cancelled { .. }
             ))
+    );
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Serving-route attribution through wrapper providers
+// ─────────────────────────────────────────────────────────────────────
+
+/// Chat-only scripted backend: streaming goes through the trait's
+/// default `chat_stream`, which stamps this provider's `route()` on the
+/// `Done` marker — the same mechanism a concrete provider uses.
+struct RoutedBackend {
+    name: &'static str,
+    fails: bool,
+}
+
+#[async_trait]
+impl LlmProvider for RoutedBackend {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        if self.fails {
+            return Ok(ChatOutcome::ServerError("scripted primary outage".into()));
+        }
+        Ok(ChatOutcome::Success(ChatResponse {
+            id: "resp_secondary".to_owned(),
+            content: vec![ContentBlock::Text {
+                text: "served by the secondary".to_owned(),
+            }],
+            model: self.name.to_owned(),
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+        }))
+    }
+
+    fn model(&self) -> &str {
+        self.name
+    }
+
+    fn provider(&self) -> &'static str {
+        self.name
+    }
+}
+
+/// A turn served by a fallback chain whose primary failed must land the
+/// SECONDARY's route on the attempt row — the wrapper's configured
+/// `route()` still names the primary, so the row's value can only have
+/// travelled back with the stream that actually served the call.
+#[tokio::test]
+async fn failed_over_turn_records_the_serving_secondary_route() -> Result<()> {
+    let stores = TestStores::new();
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+
+    let fallback = agent_sdk_providers::FallbackProvider::new(Arc::new(RoutedBackend {
+        name: "scripted-primary",
+        fails: true,
+    }))
+    .with_fallback(Arc::new(RoutedBackend {
+        name: "scripted-secondary",
+        fails: false,
+    }));
+    assert_eq!(
+        fallback.route(),
+        "scripted-primary",
+        "the wrapper's configured route names the primary — the premise \
+         that makes the row assertion below discriminating",
+    );
+
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let outcome = execute_root_turn(inputs, "prompt", &fallback, &stores.deps(), t_plus(2)).await?;
+    assert!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+
+    let attempts = stores.attempts.list_by_task(&task_id).await?;
+    assert_eq!(
+        attempts.len(),
+        1,
+        "the fallback absorbed the primary's failure"
+    );
+    let attempt = &attempts[0];
+    assert!(attempt.is_closed());
+    assert_eq!(attempt.outcome, Some(TurnAttemptOutcome::Success));
+    assert_eq!(
+        attempt.route_provider.as_deref(),
+        Some("scripted-secondary"),
+        "the row must name the backend that served, not the configured primary",
+    );
+    Ok(())
+}
+
+/// Streams its scripted text with a `Done` that carries NO
+/// `served_route` — the shape every provider produced before the field
+/// existed.
+struct RoutelessStreamProvider;
+
+#[async_trait]
+impl LlmProvider for RoutelessStreamProvider {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        bail!("this mock only streams")
+    }
+
+    fn chat_stream(&self, _request: ChatRequest) -> StreamBox<'_> {
+        Box::pin(async_stream::stream! {
+            yield Ok(StreamDelta::TextDelta {
+                delta: "plain answer".to_owned(),
+                block_index: 0,
+            });
+            yield Ok(StreamDelta::Usage(Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            }));
+            yield Ok(StreamDelta::Done {
+                stop_reason: Some(StopReason::EndTurn),
+                served_route: None,
+            });
+        })
+    }
+
+    fn model(&self) -> &'static str {
+        "routeless-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "routeless-mock"
+    }
+}
+
+/// Regression pin for providers that predate the field: a stream whose
+/// `Done` carries no `served_route` records the dispatch handle's
+/// configured route, exactly as before the field existed.
+#[tokio::test]
+async fn routeless_stream_keeps_the_configured_route_on_the_row() -> Result<()> {
+    let stores = TestStores::new();
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+
+    let provider = RoutelessStreamProvider;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let outcome = execute_root_turn(inputs, "prompt", &provider, &stores.deps(), t_plus(2)).await?;
+    assert!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+
+    let attempts = stores.attempts.list_by_task(&task_id).await?;
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(
+        attempts[0].route_provider.as_deref(),
+        Some("routeless-mock"),
+        "a route-less stream must leave attribution exactly where it was \
+         before the field existed",
     );
     Ok(())
 }
