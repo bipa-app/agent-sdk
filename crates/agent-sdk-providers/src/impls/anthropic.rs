@@ -79,6 +79,7 @@ pub const MODEL_SONNET_5: &str = "claude-sonnet-5";
 pub const MODEL_OPUS_46: &str = "claude-opus-4-6";
 pub const MODEL_OPUS_47: &str = "claude-opus-4-7";
 pub const MODEL_OPUS_48: &str = "claude-opus-4-8";
+pub const MODEL_OPUS_5: &str = "claude-opus-5";
 pub const MODEL_FABLE_5: &str = "claude-fable-5";
 
 /// Claude Code tool name mappings for OAuth mode.
@@ -528,6 +529,19 @@ impl AnthropicProvider {
         Self::new(api_key, MODEL_OPUS_48)
     }
 
+    /// Create a provider using Claude Opus 5.
+    ///
+    /// Note: Opus 5 rejects budget thinking. Passing a `ThinkingConfig`
+    /// with `ThinkingMode::Enabled { budget_tokens }` will return an
+    /// `InvalidRequest` — use `ThinkingConfig::adaptive()`,
+    /// `ThinkingConfig::adaptive_with_effort(_)`, or
+    /// `ThinkingConfig::default_with_effort(_)` instead. When no effort is
+    /// sent the API defaults to `Effort::High`.
+    #[must_use]
+    pub fn opus_5(api_key: impl Into<String>) -> Self {
+        Self::new(api_key, MODEL_OPUS_5)
+    }
+
     /// Create a provider using Claude Fable 5.
     ///
     /// Note: Fable 5 is adaptive-only — the API applies adaptive thinking
@@ -595,6 +609,7 @@ impl AnthropicProvider {
                 | MODEL_OPUS_46
                 | MODEL_OPUS_47
                 | MODEL_OPUS_48
+                | MODEL_OPUS_5
                 | MODEL_FABLE_5
         )
     }
@@ -1472,6 +1487,53 @@ mod tests {
     }
 
     #[test]
+    fn test_opus_5_rejects_budgeted_thinking() {
+        // Opus 5 keeps the adaptive-only policy of 4.6/4.7/4.8: extended
+        // thinking with an explicit budget is not offered at all, so fail
+        // fast with a migration hint instead of a 400 from the API.
+        let opus_5 = AnthropicProvider::opus_5("test-api-key".to_string());
+        let error = opus_5
+            .validate_thinking_config(Some(&ThinkingConfig::new(10_000)))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("ThinkingConfig::adaptive()"),
+            "expected migration hint, got: {error}"
+        );
+    }
+
+    #[test]
+    fn test_opus_5_accepts_adaptive_thinking() {
+        let opus_5 = AnthropicProvider::opus_5("test-api-key".to_string());
+        assert!(
+            opus_5
+                .validate_thinking_config(Some(&ThinkingConfig::adaptive()))
+                .is_ok()
+        );
+        assert!(
+            opus_5
+                .validate_thinking_config(Some(&ThinkingConfig::adaptive_with_effort(
+                    agent_sdk_foundation::llm::Effort::High
+                )))
+                .is_ok()
+        );
+        assert!(
+            opus_5
+                .validate_thinking_config(Some(&ThinkingConfig::default_with_effort(
+                    agent_sdk_foundation::llm::Effort::High
+                )))
+                .is_ok(),
+            "effort without adaptive must be accepted",
+        );
+    }
+
+    #[test]
+    fn test_opus_5_factory_creates_opus_5_provider() {
+        let provider = AnthropicProvider::opus_5("test-api-key".to_string());
+        assert_eq!(provider.model(), MODEL_OPUS_5);
+        assert_eq!(provider.provider(), "anthropic");
+    }
+
+    #[test]
     fn test_sonnet_5_rejects_budgeted_thinking() {
         // Sonnet 5 is adaptive-only (like Opus 4.8): manual budget_tokens 400s.
         // Fail fast at the SDK with a migration hint instead of a 400 from the API.
@@ -1728,6 +1790,7 @@ mod tests {
         // header as deprecated/ignored, so we keep the cached prefix minimal.
         for provider in [
             AnthropicProvider::opus_48("test-key-not-a-secret"),
+            AnthropicProvider::opus_5("test-key-not-a-secret"),
             AnthropicProvider::sonnet_5("test-key-not-a-secret"),
             AnthropicProvider::fable("test-key-not-a-secret"),
         ] {

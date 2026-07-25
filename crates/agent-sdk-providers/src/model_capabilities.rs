@@ -255,6 +255,18 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
     },
     ModelCapabilities {
         provider: "anthropic",
+        model_id: "claude-opus-5",
+        context_window: Some(1_000_000),
+        max_output_tokens: Some(128_000),
+        pricing: Some(Pricing::flat(5.0, 25.0).with_notes("Anthropic Opus 5 official pricing: $5 input / $25 output per 1M tokens. Fast mode (`speed: \"fast\"`, not implemented by this SDK) is billed at $10/$50. Uses the Opus 4.7 tokenizer, which produces ~30% more tokens than Opus 4.6 and earlier for the same text.")),
+        supports_thinking: true,
+        supports_adaptive_thinking: true,
+        source_url: ANTHROPIC_MODELS_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("Opus 5 rejects budget thinking — extended thinking (`thinking.type: \"enabled\"`) is not offered, so `ThinkingMode::Enabled { budget_tokens }` returns 400 from the Anthropic API (the SDK fails fast in validate_thinking_config). Adaptive is supported but optional: an effort level can be sent without it via `ThinkingConfig::default_with_effort`. When effort is unset the Claude API defaults to `high`."),
+    },
+    ModelCapabilities {
+        provider: "anthropic",
         model_id: "claude-opus-4-8",
         context_window: Some(1_000_000),
         max_output_tokens: Some(128_000),
@@ -1019,6 +1031,26 @@ mod tests {
         let output = pricing.output.context("output price missing")?;
         assert!((input.usd_per_million_tokens - 10.0).abs() < f64::EPSILON);
         assert!((output.usd_per_million_tokens - 50.0).abs() < f64::EPSILON);
+        Ok(())
+    }
+
+    #[test]
+    fn test_lookup_anthropic_opus_5() -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let caps = get_model_capabilities("anthropic", "claude-opus-5")
+            .context("claude-opus-5 capabilities missing")?;
+        assert_eq!(caps.context_window, Some(1_000_000));
+        assert_eq!(caps.max_output_tokens, Some(128_000));
+        assert!(caps.supports_thinking);
+        // Like Opus 4.8: manual budget_tokens 400s; adaptive supported, not required.
+        assert!(caps.supports_adaptive_thinking);
+        assert_eq!(caps.source_status, SourceStatus::Official);
+        let pricing = caps.pricing.context("pricing missing")?;
+        let input = pricing.input.context("input price missing")?;
+        let output = pricing.output.context("output price missing")?;
+        assert!((input.usd_per_million_tokens - 5.0).abs() < f64::EPSILON);
+        assert!((output.usd_per_million_tokens - 25.0).abs() < f64::EPSILON);
         Ok(())
     }
 
