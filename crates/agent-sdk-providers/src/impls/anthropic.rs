@@ -499,9 +499,20 @@ impl AnthropicProvider {
         Self::new(api_key, MODEL_SONNET_46)
     }
 
-    /// Create a provider using Claude Opus 4.6.
+    /// Create a provider using the current Opus flagship, Claude Opus 5.
+    ///
+    /// This alias tracks the newest Opus release and changes when a new one
+    /// ships; call [`Self::opus_5`] (or another versioned factory) to pin a
+    /// specific model. See [`Self::opus_5`] for the thinking constraints that
+    /// come with Opus 5.
     #[must_use]
     pub fn opus(api_key: impl Into<String>) -> Self {
+        Self::opus_5(api_key)
+    }
+
+    /// Create a provider using Claude Opus 4.6.
+    #[must_use]
+    pub fn opus_46(api_key: impl Into<String>) -> Self {
         Self::new(api_key, MODEL_OPUS_46)
     }
 
@@ -1645,7 +1656,16 @@ mod tests {
 
     #[test]
     fn test_opus_factory_creates_opus_provider() {
+        // `opus()` is the flagship alias, so it moves with each Opus release.
         let provider = AnthropicProvider::opus("test-api-key".to_string());
+
+        assert_eq!(provider.model(), MODEL_OPUS_5);
+        assert_eq!(provider.provider(), "anthropic");
+    }
+
+    #[test]
+    fn test_opus_46_factory_creates_opus_46_provider() {
+        let provider = AnthropicProvider::opus_46("test-api-key".to_string());
 
         assert_eq!(provider.model(), MODEL_OPUS_46);
         assert_eq!(provider.provider(), "anthropic");
