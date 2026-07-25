@@ -599,7 +599,7 @@ Configure thinking on the provider when you choose the model:
 ```rust
 use agent_sdk::{builder, Effort, ThinkingConfig, providers::{AnthropicProvider, OpenAIProvider}};
 
-// Anthropic Claude Sonnet 4.6, Opus 4.6+, and Fable 5 support adaptive thinking.
+// Anthropic Claude Sonnet 4.6+, Opus 4.6+, and Fable 5 support adaptive thinking.
 let anthropic_agent = builder::<()>()
     .provider(
         AnthropicProvider::sonnet(api_key.clone())
@@ -616,9 +616,10 @@ let openai_agent = builder::<()>()
     .build();
 ```
 
-Adaptive thinking is only supported for Anthropic `claude-sonnet-4-6`, `claude-opus-4-6`,
-`claude-opus-4-7`, `claude-opus-4-8`, and `claude-fable-5`. These models reject
-budget-based thinking (`ThinkingConfig::new(budget)`); on `claude-fable-5` adaptive
+Adaptive thinking is only supported for Anthropic `claude-sonnet-4-6`, `claude-sonnet-5`,
+`claude-opus-4-6`, `claude-opus-4-7`, `claude-opus-4-8`, `claude-opus-5`, and
+`claude-fable-5`. These models reject budget-based thinking
+(`ThinkingConfig::new(budget)`); on `claude-fable-5` adaptive
 thinking is always on, even when no thinking config is set. Note that `claude-fable-5`
 never returns raw chain of thought, so its `AgentEvent::Thinking` / `AgentEvent::ThinkingDelta`
 events carry empty thinking content.

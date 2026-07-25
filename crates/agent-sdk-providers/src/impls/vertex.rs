@@ -10,8 +10,8 @@
 
 use crate::attachments::validate_request_attachments;
 use crate::impls::anthropic::{
-    MODEL_FABLE_5, MODEL_OPUS_46, MODEL_OPUS_47, MODEL_OPUS_48, MODEL_SONNET_5, MODEL_SONNET_46,
-    data as anthropic_data,
+    MODEL_FABLE_5, MODEL_OPUS_5, MODEL_OPUS_46, MODEL_OPUS_47, MODEL_OPUS_48, MODEL_SONNET_5,
+    MODEL_SONNET_46, data as anthropic_data,
 };
 use crate::impls::gemini::data::{
     ApiContent, ApiFunctionCallingConfig, ApiGenerateContentRequest, ApiGenerateContentResponse,
@@ -170,6 +170,7 @@ impl VertexProvider {
                 | MODEL_OPUS_46
                 | MODEL_OPUS_47
                 | MODEL_OPUS_48
+                | MODEL_OPUS_5
                 | MODEL_FABLE_5
         )
     }
@@ -1166,6 +1167,21 @@ mod tests {
             "project".to_string(),
             "global".to_string(),
             MODEL_OPUS_48.to_string(),
+        );
+
+        let error = provider
+            .validate_thinking_config(Some(&ThinkingConfig::new(10_000)))
+            .unwrap_err();
+        assert!(error.to_string().contains("ThinkingConfig::adaptive()"));
+    }
+
+    #[test]
+    fn test_vertex_claude_opus_5_rejects_budgeted_thinking() {
+        let provider = VertexProvider::new(
+            "token".to_string(),
+            "project".to_string(),
+            "global".to_string(),
+            MODEL_OPUS_5.to_string(),
         );
 
         let error = provider

@@ -119,14 +119,16 @@ impl CloudflareAIGatewayProvider {
         .with_gateway_token(cf_token)
     }
 
-    /// Route to Claude Opus 4.6 — BYOK mode (CF token only).
+    /// Route to the current Opus flagship, Claude Opus 5 — BYOK mode (CF
+    /// token only). Tracks the newest Opus release; pass an explicit model to
+    /// [`Self::anthropic`] to pin one.
     #[must_use]
     pub fn anthropic_opus(cf_token: &str, account_id: &str, gateway_id: &str) -> Self {
         Self::anthropic(
             String::new(),
             account_id,
             gateway_id,
-            "claude-opus-4-6".to_owned(),
+            crate::impls::anthropic::MODEL_OPUS_5.to_owned(),
         )
         .with_gateway_token(cf_token)
     }
@@ -369,7 +371,7 @@ mod tests {
     #[test]
     fn anthropic_opus_byok() {
         let p = CloudflareAIGatewayProvider::anthropic_opus("cf-tok", "acct", "gw");
-        assert_eq!(p.model(), "claude-opus-4-6");
+        assert_eq!(p.model(), "claude-opus-5");
     }
 
     #[test]

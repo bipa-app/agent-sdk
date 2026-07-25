@@ -85,8 +85,10 @@ pub struct ProviderArgs {
     pub provider: Provider,
 
     /// Model to use. Provider-aware: for `anthropic` the aliases
-    /// `haiku`/`sonnet`/`opus`/`fable` are accepted in addition to full model
-    /// ids; other providers take a full model string. Defaults per provider.
+    /// `haiku`/`sonnet`/`sonnet5`/`opus`/`opus5`/`fable` are accepted in
+    /// addition to full model ids; other providers take a full model string.
+    /// `sonnet` and `opus` track the current flagship of their family.
+    /// Defaults per provider.
     #[arg(long)]
     pub model: Option<String>,
 
@@ -159,7 +161,9 @@ fn anthropic_provider(api_key: String, model: &str) -> AnthropicProvider {
     match model {
         "haiku" => AnthropicProvider::haiku(api_key),
         "sonnet" => AnthropicProvider::sonnet(api_key),
+        "sonnet5" => AnthropicProvider::sonnet_5(api_key),
         "opus" => AnthropicProvider::opus(api_key),
+        "opus5" => AnthropicProvider::opus_5(api_key),
         "fable" => AnthropicProvider::fable(api_key),
         other => AnthropicProvider::new(api_key, other.to_owned()),
     }
@@ -522,8 +526,16 @@ mod tests {
             "claude-sonnet-4-6"
         );
         assert_eq!(
+            anthropic_provider("k".to_owned(), "sonnet5").model(),
+            "claude-sonnet-5"
+        );
+        assert_eq!(
             anthropic_provider("k".to_owned(), "opus").model(),
-            "claude-opus-4-6"
+            "claude-opus-5"
+        );
+        assert_eq!(
+            anthropic_provider("k".to_owned(), "opus5").model(),
+            "claude-opus-5"
         );
         assert_eq!(
             anthropic_provider("k".to_owned(), "fable").model(),
