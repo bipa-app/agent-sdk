@@ -626,6 +626,42 @@ events carry empty thinking content.
 When thinking is enabled, the agent emits `AgentEvent::Thinking` and `AgentEvent::ThinkingDelta`
 events with the model's reasoning output.
 
+## Speed Tiers (Premium Low Latency)
+
+`SpeedTier` is the provider-neutral "pay more, go faster" knob. Set it on the provider:
+
+```rust
+use agent_sdk::{SpeedTier, providers::{AnthropicProvider, OpenAIProvider}};
+
+// Anthropic fast mode: same weights, up to 2.5x output tokens/sec, $10/$50 per 1M.
+let fast_opus = AnthropicProvider::opus_5(api_key).with_speed(SpeedTier::Fast);
+
+// OpenAI priority processing: queue priority for lower, more consistent latency.
+let priority_gpt = OpenAIProvider::gpt54(openai_api_key).with_speed(SpeedTier::Fast);
+```
+
+The two mechanisms differ, so the per-provider rules do too:
+
+| Provider | Wire | Availability |
+| --- | --- | --- |
+| `anthropic` | `speed: "fast"` + `fast-mode-2026-02-01` beta | `claude-opus-5` and `claude-opus-4-8` only; research preview, so the account also needs access granted |
+| `openai` / `openai-responses` | `service_tier: "priority"` | Most current models; OpenAI rejects the rest server-side |
+| `openai-codex` | — | Refused: a ChatGPT subscription has no priority tier |
+| `vertex` | — | Refused: fast mode is not offered on Google Cloud |
+
+Requesting a tier a provider/model cannot serve fails fast as an `InvalidRequest` rather than
+being dropped at the wire boundary, so you never pay standard latency for a request you believe
+is expedited. Two caveats worth designing around:
+
+- **Switching tiers mid-conversation invalidates the prompt cache.** Requests at different
+  speeds do not share cached prefixes.
+- **A premium request can still be served at standard speed and billed at standard rates** —
+  Anthropic does this on `claude-opus-4-6`, and OpenAI downgrades under a sharp traffic ramp.
+  Both report the tier they actually used; surfacing that in `Usage` is not implemented yet.
+
+`SpeedTier::Standard` is not the same as leaving the tier unset on OpenAI: it sends
+`service_tier: "default"` to override a project configured to default to priority.
+
 ## Lifecycle Hooks
 
 Hooks let you intercept and control agent behavior:

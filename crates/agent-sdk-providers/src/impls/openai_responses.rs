@@ -11,8 +11,8 @@ use crate::streaming::{
     reqwest_error_delta,
 };
 use agent_sdk_foundation::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, ResponseFormat, StopReason,
-    ThinkingConfig, ToolChoice, Usage,
+    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, ResponseFormat, SpeedTier,
+    StopReason, ThinkingConfig, ToolChoice, Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -24,7 +24,7 @@ use super::openai_reasoning::{
     OpenAIAllowedToolsMode, OpenAIPromptCacheMode, OpenAIPromptCacheTtl, OpenAIReasoningConfig,
     OpenAIReasoningContext, OpenAIReasoningEffort, OpenAIReasoningMode, OpenAIReasoningSummary,
     OpenAITextVerbosity, OpenAIToolChoice, is_gpt56_model, legacy_reasoning_effort,
-    validate_reasoning_config, validate_tool_choice,
+    service_tier_wire_value, validate_reasoning_config, validate_tool_choice,
 };
 use super::openai_schema::normalize_strict_schema;
 
@@ -84,6 +84,8 @@ pub struct OpenAIResponsesProvider {
     base_url: String,
     thinking: Option<ThinkingConfig>,
     reasoning: Option<OpenAIReasoningConfig>,
+    /// Priority-processing opt-in ([`OpenAIResponsesProvider::with_speed`]).
+    speed: Option<SpeedTier>,
     /// Extra headers applied to every request (e.g. for gateway / BYOK auth).
     extra_headers: Vec<(String, String)>,
 }
@@ -99,6 +101,7 @@ impl OpenAIResponsesProvider {
             base_url: DEFAULT_BASE_URL.to_owned(),
             thinking: None,
             reasoning: None,
+            speed: None,
             extra_headers: Vec::new(),
         }
     }
@@ -113,6 +116,7 @@ impl OpenAIResponsesProvider {
             base_url,
             thinking: None,
             reasoning: None,
+            speed: None,
             extra_headers: Vec::new(),
         }
     }
@@ -205,6 +209,17 @@ impl OpenAIResponsesProvider {
     pub fn with_reasoning(mut self, reasoning: OpenAIReasoningConfig) -> Self {
         self.reasoning = Some(reasoning);
         self.thinking = None;
+        self
+    }
+
+    /// Request an inference speed tier for every request from this provider.
+    ///
+    /// See [`OpenAIProvider::with_speed`](super::openai::OpenAIProvider::with_speed)
+    /// — the Responses API takes the same `service_tier` field with the same
+    /// semantics.
+    #[must_use]
+    pub const fn with_speed(mut self, speed: SpeedTier) -> Self {
+        self.speed = Some(speed);
         self
     }
 
@@ -359,6 +374,7 @@ impl LlmProvider for OpenAIResponsesProvider {
             safety_identifier: reasoning_config
                 .as_ref()
                 .and_then(OpenAIReasoningConfig::safety_identifier),
+            service_tier: service_tier_wire_value(self.speed),
         };
 
         log::debug!(
@@ -484,6 +500,7 @@ impl LlmProvider for OpenAIResponsesProvider {
                     .as_ref()
                     .and_then(OpenAIReasoningConfig::safety_identifier)
                     .map(ToOwned::to_owned),
+                service_tier: service_tier_wire_value(self.speed),
                 stream: true,
             };
 
@@ -828,6 +845,16 @@ impl LlmProvider for OpenAIResponsesProvider {
 
     fn configured_thinking(&self) -> Option<&ThinkingConfig> {
         self.thinking.as_ref()
+    }
+
+    fn configured_speed(&self) -> Option<SpeedTier> {
+        self.speed
+    }
+
+    /// See [`OpenAIProvider::validate_speed_tier`](super::openai::OpenAIProvider)
+    /// — eligibility is enforced by the API, not by a static model list.
+    fn validate_speed_tier(&self, _speed: Option<SpeedTier>) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -1456,6 +1483,8 @@ struct ApiResponsesRequest<'a> {
     prompt_cache_key: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     safety_identifier: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -1483,6 +1512,8 @@ struct ApiResponsesRequestStreaming<'a> {
     prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     safety_identifier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<&'static str>,
     stream: bool,
 }
 
@@ -2368,6 +2399,7 @@ mod tests {
             include: None,
             prompt_cache_key: None,
             safety_identifier: None,
+            service_tier: None,
         };
 
         let json = serde_json::to_value(&req).unwrap();

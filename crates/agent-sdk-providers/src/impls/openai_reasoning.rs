@@ -6,7 +6,7 @@
 //! context. These additive types preserve those wire values without changing
 //! the public foundation structs used by every provider.
 
-use agent_sdk_foundation::llm::{Effort, ThinkingConfig, ThinkingMode};
+use agent_sdk_foundation::llm::{Effort, SpeedTier, ThinkingConfig, ThinkingMode};
 use anyhow::{Result, bail};
 use serde::Serialize;
 
@@ -375,6 +375,32 @@ pub(crate) const fn is_gpt56_model(model: &str) -> bool {
     )
 }
 
+/// `service_tier` value selecting `OpenAI` priority processing.
+pub(crate) const SERVICE_TIER_PRIORITY: &str = "priority";
+/// `service_tier` value selecting standard processing.
+pub(crate) const SERVICE_TIER_DEFAULT: &str = "default";
+
+/// Map a speed tier onto `OpenAI`'s `service_tier` request field.
+///
+/// A configured [`SpeedTier::Standard`] serialises `"default"` rather than
+/// omitting the field, because omitting it is not the same as asking for
+/// standard: priority can be the default for a whole `OpenAI` project, in which
+/// case a request that says nothing is served — and billed — at the priority
+/// rate. Only `None` (the caller never expressed a preference) leaves the
+/// account default in charge.
+pub(crate) const fn service_tier_wire_value(speed: Option<SpeedTier>) -> Option<&'static str> {
+    match speed {
+        None => None,
+        Some(tier) => {
+            if tier.is_premium() {
+                Some(SERVICE_TIER_PRIORITY)
+            } else {
+                Some(SERVICE_TIER_DEFAULT)
+            }
+        }
+    }
+}
+
 pub(crate) fn validate_reasoning_config(model: &str, config: &OpenAIReasoningConfig) -> Result<()> {
     if let Some(effort) = config.effort() {
         let validation = if is_gpt56_model(model) {
@@ -525,6 +551,22 @@ pub(crate) const fn legacy_reasoning_effort(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_tier_distinguishes_unset_from_explicitly_standard() {
+        // Omitting the field lets an OpenAI project that defaults to priority
+        // bill this request at the priority rate, so an explicit Standard must
+        // serialise "default" rather than collapsing into None.
+        assert_eq!(service_tier_wire_value(None), None);
+        assert_eq!(
+            service_tier_wire_value(Some(SpeedTier::Standard)),
+            Some(SERVICE_TIER_DEFAULT)
+        );
+        assert_eq!(
+            service_tier_wire_value(Some(SpeedTier::Fast)),
+            Some(SERVICE_TIER_PRIORITY)
+        );
+    }
 
     #[test]
     fn exact_efforts_serialize_without_collapsing_xhigh_and_max() -> anyhow::Result<()> {

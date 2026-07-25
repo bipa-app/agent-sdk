@@ -649,7 +649,9 @@ macro_rules! tool {
 }
 
 // agent-sdk-providers (via thin modules)
-pub use llm::{ContentBlock, ContentSource, Effort, LlmProvider, ThinkingConfig, ThinkingMode};
+pub use llm::{
+    ContentBlock, ContentSource, Effort, LlmProvider, SpeedTier, ThinkingConfig, ThinkingMode,
+};
 pub use model_capabilities::{
     ModelCapabilities, PricePoint, Pricing, SourceStatus, get_model_capabilities,
     supported_model_capabilities,

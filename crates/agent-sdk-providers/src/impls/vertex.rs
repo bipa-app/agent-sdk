@@ -716,6 +716,10 @@ impl VertexProvider {
             stream: false,
             thinking,
             output_config,
+            // Fast mode is a first-party Claude API feature; Google Cloud does
+            // not offer it, so the field never goes on the Vertex wire. The
+            // default `validate_speed_tier` rejects a premium tier here.
+            speed: None,
             anthropic_version: Some(VERTEX_ANTHROPIC_VERSION),
         };
 
@@ -836,6 +840,8 @@ impl VertexProvider {
                 stream: true,
                 thinking,
                 output_config,
+                // See the non-streaming path: not available on Vertex.
+                speed: None,
                 anthropic_version: Some(VERTEX_ANTHROPIC_VERSION),
             };
 
@@ -1173,6 +1179,26 @@ mod tests {
             .validate_thinking_config(Some(&ThinkingConfig::new(10_000)))
             .unwrap_err();
         assert!(error.to_string().contains("ThinkingConfig::adaptive()"));
+    }
+
+    #[test]
+    fn test_vertex_refuses_a_premium_speed_tier() {
+        // Fast mode is a first-party Claude API feature. Opus 5 on Vertex is
+        // the same model but cannot be expedited, and VertexProvider exposes no
+        // `with_speed`, so the default refusal is the intended outcome.
+        let provider = VertexProvider::new(
+            "token".to_string(),
+            "project".to_string(),
+            "global".to_string(),
+            MODEL_OPUS_5.to_string(),
+        );
+
+        assert_eq!(provider.configured_speed(), None);
+        assert!(
+            provider
+                .validate_speed_tier(Some(agent_sdk_foundation::llm::SpeedTier::Fast))
+                .is_err()
+        );
     }
 
     #[test]

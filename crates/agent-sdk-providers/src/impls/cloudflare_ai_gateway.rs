@@ -51,7 +51,7 @@ use crate::impls::openai::OpenAIProvider;
 use crate::model_capabilities::ModelCapabilities;
 use crate::provider::LlmProvider;
 use crate::streaming::{StreamBox, StreamDelta};
-use agent_sdk_foundation::llm::{ChatOutcome, ChatRequest, ThinkingConfig};
+use agent_sdk_foundation::llm::{ChatOutcome, ChatRequest, SpeedTier, ThinkingConfig};
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -345,6 +345,25 @@ impl LlmProvider for CloudflareAIGatewayProvider {
             Inner::Anthropic(p) => p.validate_thinking_config(thinking),
             Inner::OpenAI(p) => p.validate_thinking_config(thinking),
             Inner::Gemini(p) => p.validate_thinking_config(thinking),
+        }
+    }
+
+    fn configured_speed(&self) -> Option<SpeedTier> {
+        match &self.inner {
+            Inner::Anthropic(p) => p.configured_speed(),
+            Inner::OpenAI(p) => p.configured_speed(),
+            Inner::Gemini(p) => p.configured_speed(),
+        }
+    }
+
+    /// Delegate to the upstream provider: the gateway is a provider-native
+    /// proxy, so whichever tier the upstream API accepts is the tier that
+    /// works through it.
+    fn validate_speed_tier(&self, speed: Option<SpeedTier>) -> Result<()> {
+        match &self.inner {
+            Inner::Anthropic(p) => p.validate_speed_tier(speed),
+            Inner::OpenAI(p) => p.validate_speed_tier(speed),
+            Inner::Gemini(p) => p.validate_speed_tier(speed),
         }
     }
 

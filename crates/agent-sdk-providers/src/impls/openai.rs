@@ -30,8 +30,8 @@ use crate::streaming::{
     reqwest_error_delta,
 };
 use agent_sdk_foundation::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, StopReason, ThinkingConfig,
-    ToolChoice, Usage,
+    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, SpeedTier, StopReason,
+    ThinkingConfig, ToolChoice, Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -45,7 +45,8 @@ use std::collections::HashMap;
 use super::openai_reasoning::{
     OpenAIAllowedToolsMode, OpenAIApiSurface, OpenAIPromptCacheMode, OpenAIPromptCacheTtl,
     OpenAIReasoningConfig, OpenAIReasoningEffort, OpenAITextVerbosity, OpenAIToolChoice,
-    is_gpt56_model, legacy_reasoning_effort, validate_reasoning_config, validate_tool_choice,
+    is_gpt56_model, legacy_reasoning_effort, service_tier_wire_value, validate_reasoning_config,
+    validate_tool_choice,
 };
 use super::openai_responses::OpenAIResponsesProvider;
 use super::openai_schema::normalize_strict_schema;
@@ -217,6 +218,8 @@ pub struct OpenAIProvider {
     base_url: String,
     thinking: Option<ThinkingConfig>,
     reasoning: Option<OpenAIReasoningConfig>,
+    /// Priority-processing opt-in ([`OpenAIProvider::with_speed`]).
+    speed: Option<SpeedTier>,
     /// Extra headers applied to every request (e.g. for gateway authentication).
     extra_headers: Vec<(String, String)>,
 }
@@ -235,6 +238,7 @@ impl OpenAIProvider {
             base_url: DEFAULT_BASE_URL.to_owned(),
             thinking: None,
             reasoning: None,
+            speed: None,
             extra_headers: Vec::new(),
         }
     }
@@ -278,6 +282,7 @@ impl OpenAIProvider {
             base_url: base_url.into(),
             thinking: None,
             reasoning: None,
+            speed: None,
             extra_headers: Vec::new(),
         }
     }
@@ -474,6 +479,25 @@ impl OpenAIProvider {
     pub fn with_reasoning(mut self, reasoning: OpenAIReasoningConfig) -> Self {
         self.reasoning = Some(reasoning);
         self.thinking = None;
+        self
+    }
+
+    /// Request an inference speed tier for every request from this provider.
+    ///
+    /// [`SpeedTier::Fast`] maps to `OpenAI` priority processing
+    /// (`service_tier: "priority"`): queue priority for lower, more consistent
+    /// latency, billed at a premium per token. Unlike Anthropic fast mode this
+    /// is not gated to specific models — `OpenAI` validates eligibility itself
+    /// (long-context, fine-tuned, and embedding models are excluded) and can
+    /// downgrade a request to standard under a sharp traffic ramp, billing it
+    /// at standard rates.
+    ///
+    /// Passing [`SpeedTier::Standard`] is not the same as leaving this unset:
+    /// it sends `service_tier: "default"` to override a project configured to
+    /// default to priority.
+    #[must_use]
+    pub const fn with_speed(mut self, speed: SpeedTier) -> Self {
+        self.speed = Some(speed);
         self
     }
 
@@ -699,9 +723,14 @@ impl OpenAIProvider {
     }
 
     /// Build the `OpenAIResponsesProvider` used for the transparent Responses-API
-    /// reroute, forwarding this provider's pooled client, thinking config, and
-    /// extra headers so the rerouted request reuses connections and authenticates
-    /// identically (critical for BYOK / gateway setups with an empty `api_key`).
+    /// reroute, forwarding this provider's pooled client, thinking config, speed
+    /// tier, and extra headers so the rerouted request reuses connections and
+    /// authenticates identically (critical for BYOK / gateway setups with an
+    /// empty `api_key`).
+    ///
+    /// Every provider-owned knob must be forwarded here or the reroute silently
+    /// downgrades the request — for the speed tier that would mean paying for
+    /// standard latency after asking for priority.
     fn responses_reroute(&self) -> OpenAIResponsesProvider {
         let mut provider = OpenAIResponsesProvider::with_base_url(
             self.api_key.clone(),
@@ -715,6 +744,9 @@ impl OpenAIProvider {
         }
         if let Some(reasoning) = self.reasoning.clone() {
             provider = provider.with_reasoning(reasoning);
+        }
+        if let Some(speed) = self.speed {
+            provider = provider.with_speed(speed);
         }
         provider
     }
@@ -810,6 +842,7 @@ impl LlmProvider for OpenAIProvider {
             parallel_tool_calls,
             safety_identifier,
             prompt_cache_key,
+            service_tier: service_tier_wire_value(self.speed),
         };
 
         log::debug!(
@@ -982,6 +1015,7 @@ impl LlmProvider for OpenAIProvider {
                 parallel_tool_calls,
                 safety_identifier,
                 prompt_cache_key,
+                service_tier: service_tier_wire_value(self.speed),
                 stream_options: include_stream_usage.then_some(ApiStreamOptions {
                     include_usage: true,
                 }),
@@ -1124,6 +1158,18 @@ impl LlmProvider for OpenAIProvider {
 
     fn configured_thinking(&self) -> Option<&ThinkingConfig> {
         self.thinking.as_ref()
+    }
+
+    fn configured_speed(&self) -> Option<SpeedTier> {
+        self.speed
+    }
+
+    /// `OpenAI` accepts priority processing on most current models and rejects
+    /// the rest server-side, so there is no static model gate to enforce here.
+    /// Accepting the tier keeps this provider from refusing a request the API
+    /// would have served.
+    fn validate_speed_tier(&self, _speed: Option<SpeedTier>) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -1940,6 +1986,8 @@ struct ApiChatRequest<'a> {
     safety_identifier: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_key: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -1970,6 +2018,8 @@ struct ApiChatRequestStreaming<'a> {
     safety_identifier: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_key: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<ApiStreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4389,6 +4439,7 @@ mod tests {
             parallel_tool_calls: None,
             safety_identifier: None,
             prompt_cache_key: None,
+            service_tier: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -4457,6 +4508,7 @@ mod tests {
             parallel_tool_calls: Some(false),
             safety_identifier: Some("safety-user-42"),
             prompt_cache_key: Some("thread-42"),
+            service_tier: None,
         };
 
         let json = serde_json::to_value(request)?;
@@ -4493,6 +4545,7 @@ mod tests {
             parallel_tool_calls: None,
             safety_identifier: None,
             prompt_cache_key: None,
+            service_tier: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -4527,6 +4580,7 @@ mod tests {
             parallel_tool_calls: None,
             safety_identifier: None,
             prompt_cache_key: None,
+            service_tier: None,
             stream_options: Some(ApiStreamOptions {
                 include_usage: true,
             }),
@@ -4609,6 +4663,7 @@ mod tests {
             parallel_tool_calls: None,
             safety_identifier: None,
             prompt_cache_key: None,
+            service_tier: None,
             stream_options: Some(ApiStreamOptions {
                 include_usage: true,
             }),
@@ -4662,6 +4717,7 @@ mod tests {
             parallel_tool_calls: None,
             safety_identifier: None,
             prompt_cache_key: None,
+            service_tier: None,
             stream_options: None,
             usage: None,
             stream: true,
@@ -4703,6 +4759,7 @@ mod tests {
             parallel_tool_calls: None,
             safety_identifier: None,
             prompt_cache_key: None,
+            service_tier: None,
         };
 
         let json = serde_json::to_value(&request)?;
@@ -4738,6 +4795,7 @@ mod tests {
             parallel_tool_calls: None,
             safety_identifier: None,
             prompt_cache_key: None,
+            service_tier: None,
         };
 
         let json = serde_json::to_value(&request)?;
@@ -4780,6 +4838,7 @@ mod tests {
             parallel_tool_calls: None,
             safety_identifier: None,
             prompt_cache_key: None,
+            service_tier: None,
         };
 
         let json = serde_json::to_value(&request).unwrap();
@@ -4896,6 +4955,57 @@ mod tests {
     }
 
     #[test]
+    fn priority_processing_reaches_the_chat_completions_wire() -> anyhow::Result<()> {
+        let messages: Vec<ApiMessage> = vec![];
+        let mut request = ApiChatRequest {
+            model: "gpt-5.4",
+            messages: &messages,
+            max_completion_tokens: Some(1024),
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            reasoning: None,
+            response_format: None,
+            verbosity: None,
+            prompt_cache_options: None,
+            store: Some(false),
+            parallel_tool_calls: None,
+            safety_identifier: None,
+            prompt_cache_key: None,
+            service_tier: service_tier_wire_value(Some(SpeedTier::Fast)),
+        };
+
+        let json = serde_json::to_string(&request)?;
+        assert!(json.contains("\"service_tier\":\"priority\""), "{json}");
+
+        request.service_tier = None;
+        let json = serde_json::to_string(&request)?;
+        assert!(!json.contains("service_tier"), "{json}");
+        Ok(())
+    }
+
+    #[test]
+    fn the_responses_reroute_carries_the_speed_tier() {
+        // The reroute rebuilds a provider from scratch; a knob it forgets is a
+        // silent downgrade — here, standard latency at the caller's request for
+        // priority.
+        let provider = OpenAIProvider::new("test-key-not-a-secret", "gpt-5.4")
+            .with_speed(SpeedTier::Fast)
+            .responses_reroute();
+
+        assert_eq!(provider.configured_speed(), Some(SpeedTier::Fast));
+    }
+
+    #[test]
+    fn openai_accepts_a_premium_tier_without_a_static_model_gate() -> anyhow::Result<()> {
+        // Eligibility is OpenAI's to enforce; refusing here would block models
+        // the API would have served on priority.
+        OpenAIProvider::new("test-key-not-a-secret", "gpt-5.4")
+            .validate_speed_tier(Some(SpeedTier::Fast))?;
+        Ok(())
+    }
+
+    #[test]
     fn test_response_format_omitted_when_absent() {
         let messages = vec![ApiMessage {
             role: ApiRole::User,
@@ -4921,6 +5031,7 @@ mod tests {
             parallel_tool_calls: None,
             safety_identifier: None,
             prompt_cache_key: None,
+            service_tier: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();

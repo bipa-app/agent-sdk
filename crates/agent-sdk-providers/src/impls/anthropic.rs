@@ -12,8 +12,8 @@ use crate::streaming::{
     StreamBox, StreamDelta, StreamErrorKind, reqwest_body_error_delta, reqwest_error_delta,
 };
 use agent_sdk_foundation::llm::{
-    CacheTtl, ChatOutcome, ChatRequest, ChatResponse, ContentBlock, ThinkingConfig, ThinkingMode,
-    Usage,
+    CacheTtl, ChatOutcome, ChatRequest, ChatResponse, ContentBlock, SpeedTier, ThinkingConfig,
+    ThinkingMode, Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -81,6 +81,14 @@ pub const MODEL_OPUS_47: &str = "claude-opus-4-7";
 pub const MODEL_OPUS_48: &str = "claude-opus-4-8";
 pub const MODEL_OPUS_5: &str = "claude-opus-5";
 pub const MODEL_FABLE_5: &str = "claude-fable-5";
+
+/// Beta header that opts a request into interleaved (mid-loop) thinking.
+const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+/// Beta header required alongside `speed: "fast"`. Fast mode is a research
+/// preview, so the API rejects the field without it.
+const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
+/// Wire value for the fast-mode `speed` field.
+const SPEED_FAST: &str = "fast";
 
 /// Claude Code tool name mappings for OAuth mode.
 ///
@@ -248,6 +256,8 @@ pub struct AnthropicProvider {
     base_url: String,
     auth_mode: AuthMode,
     thinking: Option<ThinkingConfig>,
+    /// Fast-mode opt-in ([`Self::with_speed`]). `None` runs the standard path.
+    speed: Option<SpeedTier>,
     /// Extra headers applied to every request (e.g. for gateway authentication).
     extra_headers: Vec<(String, String)>,
     /// Streaming-path deadline for response headers ([`STREAM_HEADERS_TIMEOUT`]).
@@ -302,6 +312,7 @@ impl AnthropicProvider {
             base_url: API_BASE_URL.to_owned(),
             auth_mode,
             thinking: None,
+            speed: None,
             extra_headers: Vec::new(),
             stream_headers_timeout: STREAM_HEADERS_TIMEOUT,
             sse_byte_idle_timeout: SSE_BYTE_IDLE_TIMEOUT,
@@ -335,10 +346,17 @@ impl AnthropicProvider {
                     // predicate as the OAuth arm to keep the cached request
                     // prefix minimal and stable. Do NOT add other OAuth-identity
                     // betas here — API-key auth is not Claude Code.
-                    if self.is_adaptive_thinking_model() {
+                    let mut beta_features = Vec::new();
+                    if !self.is_adaptive_thinking_model() {
+                        beta_features.push(INTERLEAVED_THINKING_BETA);
+                    }
+                    beta_features.extend(self.fast_mode_beta());
+                    // No header at all when nothing opted in, so the cached
+                    // prefix of an adaptive standard-speed request is unchanged.
+                    if beta_features.is_empty() {
                         builder
                     } else {
-                        builder.header("anthropic-beta", "interleaved-thinking-2025-05-14")
+                        builder.header("anthropic-beta", beta_features.join(","))
                     }
                 }
                 AuthMode::OAuth => {
@@ -351,8 +369,9 @@ impl AnthropicProvider {
                         "fine-grained-tool-streaming-2025-05-14",
                     ];
                     if !self.is_adaptive_thinking_model() {
-                        beta_features.push("interleaved-thinking-2025-05-14");
+                        beta_features.push(INTERLEAVED_THINKING_BETA);
                     }
+                    beta_features.extend(self.fast_mode_beta());
                     builder
                         .header("Authorization", format!("Bearer {}", self.api_key))
                         .header("anthropic-version", API_VERSION)
@@ -582,6 +601,50 @@ impl AnthropicProvider {
         self
     }
 
+    /// Request an inference speed tier for every request from this provider.
+    ///
+    /// [`SpeedTier::Fast`] selects Anthropic fast mode: the same model weights
+    /// on a faster inference configuration (up to 2.5x output tokens per
+    /// second, most visible when streaming), billed at a premium — $10/$50 per
+    /// 1M tokens instead of $5/$25.
+    ///
+    /// Only Opus 5 and Opus 4.8 offer fast mode; every other model is rejected
+    /// by [`Self::validate_speed_tier`] before a request is spent. Fast mode is
+    /// a research preview that must be enabled on the account, so a model that
+    /// does support it can still return an error until access is granted.
+    ///
+    /// Note that switching a conversation between speed tiers invalidates the
+    /// prompt cache — requests at different speeds do not share cached
+    /// prefixes.
+    #[must_use]
+    pub const fn with_speed(mut self, speed: SpeedTier) -> Self {
+        self.speed = Some(speed);
+        self
+    }
+
+    /// Whether this model offers fast mode.
+    ///
+    /// Only Opus 5 and Opus 4.8 do. The two nearby Opus releases fail in
+    /// different ways, and neither is a useful outcome for a caller who asked
+    /// to pay for speed: Opus 4.7 returns an API error, while Opus 4.6
+    /// silently serves the request at standard speed (billed at standard
+    /// rates, reporting `usage.speed = "standard"`).
+    fn supports_fast_mode(&self) -> bool {
+        matches!(self.model.as_str(), MODEL_OPUS_5 | MODEL_OPUS_48)
+    }
+
+    /// The `speed` field value to put on the wire, if any.
+    fn speed_wire_value(&self) -> Option<&'static str> {
+        self.speed
+            .is_some_and(SpeedTier::is_premium)
+            .then_some(SPEED_FAST)
+    }
+
+    /// The beta header entry fast mode requires, if it is on.
+    fn fast_mode_beta(&self) -> Option<&'static str> {
+        self.speed_wire_value().map(|_| FAST_MODE_BETA)
+    }
+
     /// Override the base URL (default: `https://api.anthropic.com`).
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
@@ -630,6 +693,9 @@ impl AnthropicProvider {
 #[allow(clippy::too_many_lines)]
 impl LlmProvider for AnthropicProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
+        if let Err(error) = self.resolve_speed_tier() {
+            return Ok(ChatOutcome::InvalidRequest(error.to_string()));
+        }
         let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
             // Forcing a specific tool is incompatible with extended thinking on
             // Anthropic (the API 400s), so drop thinking at the wire boundary
@@ -691,6 +757,7 @@ impl LlmProvider for AnthropicProvider {
             stream: false,
             thinking,
             output_config,
+            speed: self.speed_wire_value(),
             anthropic_version: None,
         };
 
@@ -816,6 +883,14 @@ impl LlmProvider for AnthropicProvider {
                 .map(|ts| ts.iter().map(|t| t.name.clone()).collect())
                 .unwrap_or_default();
 
+            if let Err(error) = self.resolve_speed_tier() {
+                yield Ok(StreamDelta::Error {
+                    message: error.to_string(),
+                    kind: StreamErrorKind::InvalidRequest,
+                });
+                return;
+            }
+
             if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
                 yield Ok(StreamDelta::Error {
                     message: error.to_string(),
@@ -892,6 +967,7 @@ impl LlmProvider for AnthropicProvider {
                 stream: true,
                 thinking,
                 output_config,
+                speed: self.speed_wire_value(),
                 anthropic_version: None,
             };
 
@@ -1254,6 +1330,22 @@ impl LlmProvider for AnthropicProvider {
 
     fn configured_thinking(&self) -> Option<&ThinkingConfig> {
         self.thinking.as_ref()
+    }
+
+    fn configured_speed(&self) -> Option<SpeedTier> {
+        self.speed
+    }
+
+    fn validate_speed_tier(&self, speed: Option<SpeedTier>) -> Result<()> {
+        if !speed.is_some_and(SpeedTier::is_premium) || self.supports_fast_mode() {
+            return Ok(());
+        }
+        Err(anyhow::anyhow!(
+            "fast mode is not available for provider={} model={} \
+             (only {MODEL_OPUS_5} and {MODEL_OPUS_48} support it)",
+            self.provider(),
+            self.model()
+        ))
     }
 
     fn default_max_tokens(&self) -> u32 {
@@ -1823,6 +1915,110 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    // ===================
+    // Fast mode (speed: "fast")
+    // ===================
+
+    #[test]
+    fn fast_mode_sends_the_speed_field_and_its_beta() -> anyhow::Result<()> {
+        let provider =
+            AnthropicProvider::opus_5("test-key-not-a-secret").with_speed(SpeedTier::Fast);
+
+        assert_eq!(provider.speed_wire_value(), Some(SPEED_FAST));
+        let betas = apply_auth_beta_header(&provider)?
+            .ok_or_else(|| anyhow::anyhow!("expected a beta header"))?;
+        assert!(
+            betas.contains(FAST_MODE_BETA),
+            "fast mode needs its beta header or the API rejects `speed`, got: {betas}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn standard_speed_sends_neither_the_field_nor_the_beta() -> anyhow::Result<()> {
+        let provider =
+            AnthropicProvider::opus_5("test-key-not-a-secret").with_speed(SpeedTier::Standard);
+
+        assert_eq!(provider.speed_wire_value(), None);
+        // Opus 5 is adaptive, so with no premium tier there is nothing to
+        // declare and the cached request prefix stays header-free.
+        assert_eq!(apply_auth_beta_header(&provider)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn fast_mode_beta_is_added_alongside_the_oauth_betas() -> anyhow::Result<()> {
+        // OAuth already sends a beta list; fast mode must extend it rather
+        // than replace it, or Claude Code identity betas go missing.
+        let provider = AnthropicProvider::new("sk-ant-oat-test-not-a-secret", MODEL_OPUS_5)
+            .with_speed(SpeedTier::Fast);
+        assert!(provider.is_oauth());
+
+        let betas = apply_auth_beta_header(&provider)?
+            .ok_or_else(|| anyhow::anyhow!("expected a beta header"))?;
+        assert!(betas.contains(FAST_MODE_BETA), "got: {betas}");
+        assert!(betas.contains("claude-code-20250219"), "got: {betas}");
+        assert!(betas.contains("oauth-2025-04-20"), "got: {betas}");
+        Ok(())
+    }
+
+    #[test]
+    fn fast_mode_is_refused_on_models_that_do_not_offer_it() {
+        // Opus 4.7 errors at the API and Opus 4.6 silently serves standard
+        // speed. Both are refused here so the caller finds out before paying
+        // for a request that cannot be expedited.
+        for provider in [
+            AnthropicProvider::opus_47("test-key-not-a-secret"),
+            AnthropicProvider::opus_46("test-key-not-a-secret"),
+            AnthropicProvider::sonnet_5("test-key-not-a-secret"),
+            AnthropicProvider::fable("test-key-not-a-secret"),
+        ] {
+            let provider = provider.with_speed(SpeedTier::Fast);
+            let error = provider
+                .validate_speed_tier(Some(SpeedTier::Fast))
+                .expect_err("fast mode must be refused");
+            assert!(
+                error.to_string().contains("fast mode is not available"),
+                "expected a fast-mode refusal for {}, got: {error}",
+                provider.model()
+            );
+        }
+    }
+
+    #[test]
+    fn fast_mode_is_accepted_on_opus_5_and_opus_48() -> anyhow::Result<()> {
+        for provider in [
+            AnthropicProvider::opus_5("test-key-not-a-secret"),
+            AnthropicProvider::opus_48("test-key-not-a-secret"),
+        ] {
+            provider.validate_speed_tier(Some(SpeedTier::Fast))?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_fast_mode_request_never_reaches_the_wire() -> anyhow::Result<()> {
+        // The base URL is unroutable: reaching the network at all would hang
+        // or connection-error instead of returning InvalidRequest.
+        let provider = AnthropicProvider::opus_47("test-key-not-a-secret")
+            .with_base_url("http://127.0.0.1:1/never-served")
+            .with_speed(SpeedTier::Fast);
+
+        let outcome = provider
+            .chat(ChatRequest::new(
+                "",
+                vec![agent_sdk_foundation::llm::Message::user("hi")],
+            ))
+            .await?;
+        match outcome {
+            ChatOutcome::InvalidRequest(message) => {
+                assert!(message.contains("fast mode is not available"), "{message}");
+                Ok(())
+            }
+            other => anyhow::bail!("expected InvalidRequest, got {other:?}"),
+        }
     }
 
     // ===================
