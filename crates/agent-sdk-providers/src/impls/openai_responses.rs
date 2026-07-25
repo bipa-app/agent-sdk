@@ -24,7 +24,8 @@ use super::openai_reasoning::{
     OpenAIAllowedToolsMode, OpenAIPromptCacheMode, OpenAIPromptCacheTtl, OpenAIReasoningConfig,
     OpenAIReasoningContext, OpenAIReasoningEffort, OpenAIReasoningMode, OpenAIReasoningSummary,
     OpenAITextVerbosity, OpenAIToolChoice, is_gpt56_model, legacy_reasoning_effort,
-    service_tier_wire_value, validate_reasoning_config, validate_tool_choice,
+    served_speed_from_service_tier, service_tier_wire_value, validate_reasoning_config,
+    validate_tool_choice,
 };
 use super::openai_schema::normalize_strict_schema;
 
@@ -734,8 +735,14 @@ impl LlmProvider for OpenAIResponsesProvider {
                             // ── Completion / usage ──────────────────────
                             "response.completed" => {
                                 let response = event.response;
-                                if let Some(usage) = response.and_then(|response| response.usage) {
-                                    yield Ok(StreamDelta::Usage(map_usage(Some(usage))));
+                                if let Some(response) = response {
+                                    let service_tier = response.service_tier;
+                                    if let Some(usage) = response.usage {
+                                        yield Ok(StreamDelta::Usage(map_usage(
+                                            Some(usage),
+                                            service_tier.as_deref(),
+                                        )));
+                                    }
                                 }
                                 let stop_reason = if refused {
                                     StopReason::Refusal
@@ -762,8 +769,14 @@ impl LlmProvider for OpenAIResponsesProvider {
                                     .and_then(|response| response.incomplete_details.as_ref())
                                     .and_then(|details| details.reason.as_deref())
                                     .map_or(StopReason::Unknown, incomplete_stop_reason);
-                                if let Some(usage) = response.and_then(|response| response.usage) {
-                                    yield Ok(StreamDelta::Usage(map_usage(Some(usage))));
+                                if let Some(response) = response {
+                                    let service_tier = response.service_tier;
+                                    if let Some(usage) = response.usage {
+                                        yield Ok(StreamDelta::Usage(map_usage(
+                                            Some(usage),
+                                            service_tier.as_deref(),
+                                        )));
+                                    }
                                 }
                                 yield Ok(StreamDelta::Done {
                                     stop_reason: Some(stop_reason),
@@ -777,13 +790,13 @@ impl LlmProvider for OpenAIResponsesProvider {
                                 // burned, so the usage is emitted before the error
                                 // that ends the stream — the caller's accumulator
                                 // only ever sees deltas that were yielded.
-                                let (failed_usage, response_error) = event
+                                let (failed_usage, response_error, failed_tier) = event
                                     .response
-                                    .map_or((None, None), |response| {
-                                        (response.usage, response.error)
+                                    .map_or((None, None, None), |response| {
+                                        (response.usage, response.error, response.service_tier)
                                     });
-                                let failed_usage =
-                                    failed_usage.map(|usage| map_usage(Some(usage)));
+                                let failed_usage = failed_usage
+                                    .map(|usage| map_usage(Some(usage), failed_tier.as_deref()));
                                 let (error_code, error_message) = response_error
                                     .map_or((None, None), |error| (error.code, error.message));
                                 let code = error_code.or(event.code);
@@ -1332,20 +1345,26 @@ fn build_responses_outcome(api_response: ApiResponse) -> ChatOutcome {
         content,
         model: api_response.model,
         stop_reason,
-        usage: map_usage(api_response.usage),
+        usage: map_usage(api_response.usage, api_response.service_tier.as_deref()),
     })
 }
 
 /// Convert the Responses API usage object into the SDK [`Usage`] shape.
-fn map_usage(usage: Option<ApiUsage>) -> Usage {
+///
+/// `service_tier` lives on the response rather than inside `usage`, so it is
+/// threaded in separately.
+fn map_usage(usage: Option<ApiUsage>, service_tier: Option<&str>) -> Usage {
+    let served_speed = served_speed_from_service_tier(service_tier);
     usage.map_or(
         Usage {
+            served_speed,
             input_tokens: 0,
             output_tokens: 0,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
         },
         |u| Usage {
+            served_speed,
             input_tokens: u.input_tokens,
             output_tokens: u.output_tokens,
             cached_input_tokens: u
@@ -1948,6 +1967,9 @@ struct ApiResponse {
     error: Option<ApiResponseError>,
     #[serde(default)]
     incomplete_details: Option<ApiIncompleteDetails>,
+    /// Tier that served the request, echoed back by the API.
+    #[serde(default)]
+    service_tier: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2076,6 +2098,10 @@ struct ApiStreamResponse {
     incomplete_details: Option<ApiIncompleteDetails>,
     #[serde(default)]
     error: Option<ApiResponseError>,
+    /// Tier that served the request, echoed on the terminal stream frames the
+    /// same way as on the non-streaming response.
+    #[serde(default)]
+    service_tier: Option<String>,
 }
 
 // ============================================================================
@@ -2304,7 +2330,7 @@ mod tests {
             }
         }))?;
 
-        let usage = map_usage(Some(api_usage));
+        let usage = map_usage(Some(api_usage), None);
         assert_eq!(usage.input_tokens, 42);
         assert_eq!(usage.output_tokens, 7);
         assert_eq!(usage.cached_input_tokens, 10);

@@ -462,6 +462,7 @@ pub struct ApiUsageMetadata {
 impl ApiUsageMetadata {
     pub const fn into_usage(self) -> Usage {
         Usage {
+            served_speed: None,
             input_tokens: self.prompt,
             output_tokens: self.candidates,
             cached_input_tokens: self.cached_content,

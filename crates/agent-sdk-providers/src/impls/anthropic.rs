@@ -865,6 +865,7 @@ impl LlmProvider for AnthropicProvider {
             model: api_response.model,
             stop_reason,
             usage: Usage {
+                served_speed: api_response.usage.served_speed(),
                 input_tokens: api_response.usage.total_input_tokens(),
                 output_tokens: api_response.usage.output,
                 cached_input_tokens: api_response.usage.cached_input_tokens(),
@@ -876,370 +877,361 @@ impl LlmProvider for AnthropicProvider {
     fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
         let served_route = self.route().to_owned();
         Box::pin(async_stream::stream! {
-            let is_oauth = self.is_oauth();
-            let original_tool_names: Vec<String> = request
-                .tools
-                .as_ref()
-                .map(|ts| ts.iter().map(|t| t.name.clone()).collect())
-                .unwrap_or_default();
+                    let is_oauth = self.is_oauth();
+                    let original_tool_names: Vec<String> = request
+                        .tools
+                        .as_ref()
+                        .map(|ts| ts.iter().map(|t| t.name.clone()).collect())
+                        .unwrap_or_default();
 
-            if let Err(error) = self.resolve_speed_tier() {
-                yield Ok(StreamDelta::Error {
-                    message: error.to_string(),
-                    kind: StreamErrorKind::InvalidRequest,
-                });
-                return;
-            }
-
-            if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
-                yield Ok(StreamDelta::Error {
-                    message: error.to_string(),
-                    kind: StreamErrorKind::InvalidRequest,
-                });
-                return;
-            }
-
-            if is_oauth
-                && let Some((first, second)) = oauth_tool_name_collision(request.tools.as_deref())
-            {
-                yield Ok(StreamDelta::Error {
-                    message: oauth_tool_collision_message(&first, &second),
-                    kind: StreamErrorKind::InvalidRequest,
-                });
-                return;
-            }
-
-            let CacheRegions {
-                tools: tools_cache,
-                system: system_cache,
-                messages: messages_cache,
-            } = Self::cache_regions(&request);
-            let messages = Self::build_cached_api_messages(&request, messages_cache);
-            let tools = if is_oauth {
-                build_api_tools_with_cache(&request, tools_cache).map(|tools| {
-                    tools
-                        .into_iter()
-                        .map(|mut t| {
-                            t.name = to_claude_code_name(&t.name);
-                            t
-                        })
-                        .collect::<Vec<_>>()
-                })
-            } else {
-                build_api_tools_with_cache(&request, tools_cache)
-            };
-            let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
-                // Forcing a specific tool is incompatible with extended thinking
-                // on Anthropic (the API 400s), so drop thinking at the wire
-                // boundary even when it was resurrected from the
-                // provider-configured default.
-                Ok(thinking) => thinking_for_forced_tool(thinking, request.tool_choice.as_ref()),
-                Err(error) => {
-                    yield Ok(StreamDelta::Error {
-                        message: error.to_string(),
-                        kind: StreamErrorKind::InvalidRequest,
-                    });
-                    return;
-                }
-            };
-            let thinking = thinking_config
-                .as_ref()
-                .and_then(ApiThinkingConfig::from_thinking_config);
-            let output_config = thinking_config
-                .as_ref()
-                .and_then(|t| t.effort)
-                .map(|effort| ApiOutputConfig { effort });
-
-            let system = self.build_system_prompt_for_request(&request.system, system_cache);
-            let max_tokens = self.effective_max_tokens(&request);
-            let tool_choice = request
-                .tool_choice
-                .as_ref()
-                .map(ApiToolChoice::from_tool_choice);
-
-            let api_request = ApiMessagesRequest {
-                model: Some(&self.model),
-                max_tokens,
-                system,
-                messages: &messages,
-                tools: tools.as_deref(),
-                tool_choice,
-                stream: true,
-                thinking,
-                output_config,
-                speed: self.speed_wire_value(),
-                anthropic_version: None,
-            };
-
-            log::debug!("Anthropic streaming LLM request model={} max_tokens={} oauth={}", self.model, max_tokens, is_oauth);
-
-            // Log full request payload for debugging
-            if log::log_enabled!(log::Level::Debug) {
-                match serde_json::to_string_pretty(&api_request) {
-                    Ok(json) => log::debug!("Anthropic streaming API request payload:\n{json}"),
-                    Err(e) => log::debug!("Failed to serialize streaming request for logging: {e}"),
-                }
-            }
-
-            let builder = self
-                .client
-                .post(format!("{}/v1/messages", self.base_url))
-                .header("Content-Type", "application/json");
-            // With `stream: true` the server answers promptly (200 +
-            // `message_start`, then pings through generation gaps), so slow
-            // headers only ever mean a dead connection — typically a pooled
-            // keep-alive the server/edge half-closed after a long previous
-            // response. `connect_timeout` never covers reused connections;
-            // this deadline does. The message says "timed out" so every
-            // retry layer classifies it as a retryable transport error and
-            // re-sends on a fresh connection.
-            let headers_timeout = self.stream_headers_timeout;
-            let send = self.apply_auth(builder).json(&api_request).send();
-            let response = match tokio::time::timeout(headers_timeout, send).await {
-                Ok(Ok(r)) => r,
-                Ok(Err(error)) => {
-                    yield Ok(reqwest_error_delta("request failed", &error));
-                    return;
-                }
-                Err(_elapsed) => {
-                    log::error!(
-                        "Anthropic streaming request timed out awaiting response headers after {}s — stalled connection",
-                        headers_timeout.as_secs()
-                    );
-                    yield Ok(StreamDelta::Error {
-                        message: format!(
-                            "request timed out awaiting response headers after {}s",
-                            headers_timeout.as_secs()
-                        ),
-                        kind: StreamErrorKind::ConnectionLost,
-                    });
-                    return;
-                }
-            };
-
-            let status = response.status();
-
-            if status == StatusCode::TOO_MANY_REQUESTS {
-                let retry_after = crate::http::retry_after_from_headers(response.headers());
-                yield Ok(StreamDelta::Error {
-                    message: "Rate limited".to_string(),
-                    kind: StreamErrorKind::RateLimited(retry_after),
-                });
-                return;
-            }
-
-            if status.is_server_error() {
-                let body = response.text().await.unwrap_or_default();
-                log::error!("Anthropic server error status={status} body={body}");
-                yield Ok(StreamDelta::Error {
-                    message: body,
-                    kind: StreamErrorKind::ServerError,
-                });
-                return;
-            }
-
-            if status.is_client_error() {
-                let body = response.text().await.unwrap_or_default();
-                log::warn!("Anthropic client error status={status} body={body}");
-                yield Ok(StreamDelta::Error {
-                    message: body,
-                    kind: StreamErrorKind::InvalidRequest,
-                });
-                return;
-            }
-
-            // Process SSE stream
-            let mut stream = response.bytes_stream();
-            let mut buffer = String::new();
-            let mut input_tokens: u32 = 0;
-            let mut output_tokens: u32 = 0;
-            let mut cached_input_tokens: u32 = 0;
-            let mut cache_creation_input_tokens: u32 = 0;
-            // Track tool IDs by block index for correlating input deltas
-            let mut tool_ids: std::collections::HashMap<usize, String> =
-                std::collections::HashMap::new();
-
-            let mut received_message_stop = false;
-            // Set when Anthropic streamed a terminal `error` event (parsed
-            // into a StreamDelta::Error below). Suppresses the generic
-            // "stream ended without message_stop" fallback so the caller
-            // sees the real error, not a second misleading one.
-            let mut stream_errored = false;
-            let mut pending_stop_reason: Option<agent_sdk_foundation::llm::StopReason> = None;
-            let mut chunk_count: u64 = 0;
-            let mut total_bytes: u64 = 0;
-
-            // Drop guard to detect if the stream is dropped before completion
-            struct StreamDropGuard {
-                completed: bool,
-                chunk_count: u64,
-            }
-            impl Drop for StreamDropGuard {
-                fn drop(&mut self) {
-                    if !self.completed {
-                        // Stream drops are expected when the user cancels a running
-                        // agent loop (Esc / Ctrl-C).  Log at debug level so it does
-                        // not surface as noise in every cancelled session.
-                        log::debug!(
-                            "SSE stream dropped before completion at chunk_count={} (task was likely cancelled)",
-                            self.chunk_count
-                        );
+                    if let Err(error) = self.resolve_speed_tier() {
+                        yield Ok(StreamDelta::Error {
+                            message: error.to_string(),
+                            kind: StreamErrorKind::InvalidRequest,
+                        });
+                        return;
                     }
-                }
-            }
-            let mut drop_guard = StreamDropGuard { completed: false, chunk_count: 0 };
 
-            log::debug!("Starting SSE stream processing");
+                    if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
+                        yield Ok(StreamDelta::Error {
+                            message: error.to_string(),
+                            kind: StreamErrorKind::InvalidRequest,
+                        });
+                        return;
+                    }
 
-            // Byte-level inactivity guard: `message_start` and periodic
-            // `ping` events keep a healthy stream's bytes flowing even while
-            // no content delta is ready, so silence past the budget means
-            // the connection is dead — not that the model is thinking.
-            let byte_idle_timeout = self.sse_byte_idle_timeout;
-            loop {
-                let next = match tokio::time::timeout(byte_idle_timeout, stream.next()).await {
-                    Ok(next) => next,
-                    Err(_elapsed) => {
-                        log::error!(
-                            "SSE stream timed out: no bytes for {}s chunk_count={chunk_count} total_bytes={total_bytes} — stalled connection",
-                            byte_idle_timeout.as_secs()
+                    if is_oauth
+                        && let Some((first, second)) = oauth_tool_name_collision(request.tools.as_deref())
+                    {
+                        yield Ok(StreamDelta::Error {
+                            message: oauth_tool_collision_message(&first, &second),
+                            kind: StreamErrorKind::InvalidRequest,
+                        });
+                        return;
+                    }
+
+                    let CacheRegions {
+                        tools: tools_cache,
+                        system: system_cache,
+                        messages: messages_cache,
+                    } = Self::cache_regions(&request);
+                    let messages = Self::build_cached_api_messages(&request, messages_cache);
+                    let tools = if is_oauth {
+                        build_api_tools_with_cache(&request, tools_cache).map(|tools| {
+                            tools
+                                .into_iter()
+                                .map(|mut t| {
+                                    t.name = to_claude_code_name(&t.name);
+                                    t
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    } else {
+                        build_api_tools_with_cache(&request, tools_cache)
+                    };
+                    let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
+                        // Forcing a specific tool is incompatible with extended thinking
+                        // on Anthropic (the API 400s), so drop thinking at the wire
+                        // boundary even when it was resurrected from the
+                        // provider-configured default.
+                        Ok(thinking) => thinking_for_forced_tool(thinking, request.tool_choice.as_ref()),
+                        Err(error) => {
+                            yield Ok(StreamDelta::Error {
+                                message: error.to_string(),
+                                kind: StreamErrorKind::InvalidRequest,
+                            });
+                            return;
+                        }
+                    };
+                    let thinking = thinking_config
+                        .as_ref()
+                        .and_then(ApiThinkingConfig::from_thinking_config);
+                    let output_config = thinking_config
+                        .as_ref()
+                        .and_then(|t| t.effort)
+                        .map(|effort| ApiOutputConfig { effort });
+
+                    let system = self.build_system_prompt_for_request(&request.system, system_cache);
+                    let max_tokens = self.effective_max_tokens(&request);
+                    let tool_choice = request
+                        .tool_choice
+                        .as_ref()
+                        .map(ApiToolChoice::from_tool_choice);
+
+                    let api_request = ApiMessagesRequest {
+                        model: Some(&self.model),
+                        max_tokens,
+                        system,
+                        messages: &messages,
+                        tools: tools.as_deref(),
+                        tool_choice,
+                        stream: true,
+                        thinking,
+                        output_config,
+                        speed: self.speed_wire_value(),
+                        anthropic_version: None,
+                    };
+
+                    log::debug!("Anthropic streaming LLM request model={} max_tokens={} oauth={}", self.model, max_tokens, is_oauth);
+
+                    // Log full request payload for debugging
+                    if log::log_enabled!(log::Level::Debug) {
+                        match serde_json::to_string_pretty(&api_request) {
+                            Ok(json) => log::debug!("Anthropic streaming API request payload:\n{json}"),
+                            Err(e) => log::debug!("Failed to serialize streaming request for logging: {e}"),
+                        }
+                    }
+
+                    let builder = self
+                        .client
+                        .post(format!("{}/v1/messages", self.base_url))
+                        .header("Content-Type", "application/json");
+                    // With `stream: true` the server answers promptly (200 +
+                    // `message_start`, then pings through generation gaps), so slow
+                    // headers only ever mean a dead connection — typically a pooled
+                    // keep-alive the server/edge half-closed after a long previous
+                    // response. `connect_timeout` never covers reused connections;
+                    // this deadline does. The message says "timed out" so every
+                    // retry layer classifies it as a retryable transport error and
+                    // re-sends on a fresh connection.
+                    let headers_timeout = self.stream_headers_timeout;
+                    let send = self.apply_auth(builder).json(&api_request).send();
+                    let response = match tokio::time::timeout(headers_timeout, send).await {
+                        Ok(Ok(r)) => r,
+                        Ok(Err(error)) => {
+                            yield Ok(reqwest_error_delta("request failed", &error));
+                            return;
+                        }
+                        Err(_elapsed) => {
+                            log::error!(
+                                "Anthropic streaming request timed out awaiting response headers after {}s — stalled connection",
+                                headers_timeout.as_secs()
+                            );
+                            yield Ok(StreamDelta::Error {
+                                message: format!(
+                                    "request timed out awaiting response headers after {}s",
+                                    headers_timeout.as_secs()
+                                ),
+                                kind: StreamErrorKind::ConnectionLost,
+                            });
+                            return;
+                        }
+                    };
+
+                    let status = response.status();
+
+                    if status == StatusCode::TOO_MANY_REQUESTS {
+                        let retry_after = crate::http::retry_after_from_headers(response.headers());
+                        yield Ok(StreamDelta::Error {
+                            message: "Rate limited".to_string(),
+                            kind: StreamErrorKind::RateLimited(retry_after),
+                        });
+                        return;
+                    }
+
+                    if status.is_server_error() {
+                        let body = response.text().await.unwrap_or_default();
+                        log::error!("Anthropic server error status={status} body={body}");
+                        yield Ok(StreamDelta::Error {
+                            message: body,
+                            kind: StreamErrorKind::ServerError,
+                        });
+                        return;
+                    }
+
+                    if status.is_client_error() {
+                        let body = response.text().await.unwrap_or_default();
+                        log::warn!("Anthropic client error status={status} body={body}");
+                        yield Ok(StreamDelta::Error {
+                            message: body,
+                            kind: StreamErrorKind::InvalidRequest,
+                        });
+                        return;
+                    }
+
+                    // Process SSE stream
+                    let mut stream = response.bytes_stream();
+                    let mut buffer = String::new();
+                    let mut usage = data::SseUsageState::default();
+                    // Track tool IDs by block index for correlating input deltas
+                    let mut tool_ids: std::collections::HashMap<usize, String> =
+                        std::collections::HashMap::new();
+
+                    let mut received_message_stop = false;
+                    // Set when Anthropic streamed a terminal `error` event (parsed
+                    // into a StreamDelta::Error below). Suppresses the generic
+                    // "stream ended without message_stop" fallback so the caller
+                    // sees the real error, not a second misleading one.
+                    let mut stream_errored = false;
+                    let mut pending_stop_reason: Option<agent_sdk_foundation::llm::StopReason> = None;
+                    let mut chunk_count: u64 = 0;
+                    let mut total_bytes: u64 = 0;
+
+                    // Drop guard to detect if the stream is dropped before completion
+                    struct StreamDropGuard {
+                        completed: bool,
+                        chunk_count: u64,
+                    }
+                    impl Drop for StreamDropGuard {
+                        fn drop(&mut self) {
+                            if !self.completed {
+                                // Stream drops are expected when the user cancels a running
+                                // agent loop (Esc / Ctrl-C).  Log at debug level so it does
+                                // not surface as noise in every cancelled session.
+                                log::debug!(
+                                    "SSE stream dropped before completion at chunk_count={} (task was likely cancelled)",
+                                    self.chunk_count
+                                );
+                            }
+                        }
+                    }
+                    let mut drop_guard = StreamDropGuard { completed: false, chunk_count: 0 };
+
+                    log::debug!("Starting SSE stream processing");
+
+                    // Byte-level inactivity guard: `message_start` and periodic
+                    // `ping` events keep a healthy stream's bytes flowing even while
+                    // no content delta is ready, so silence past the budget means
+                    // the connection is dead — not that the model is thinking.
+                    let byte_idle_timeout = self.sse_byte_idle_timeout;
+                    loop {
+                        let next = match tokio::time::timeout(byte_idle_timeout, stream.next()).await {
+                            Ok(next) => next,
+                            Err(_elapsed) => {
+                                log::error!(
+                                    "SSE stream timed out: no bytes for {}s chunk_count={chunk_count} total_bytes={total_bytes} — stalled connection",
+                                    byte_idle_timeout.as_secs()
+                                );
+                                yield Ok(StreamDelta::Error {
+                                    message: format!(
+                                        "SSE stream timed out: no bytes for {}s",
+                                        byte_idle_timeout.as_secs()
+                                    ),
+                                    kind: StreamErrorKind::ConnectionLost,
+                                });
+                                return;
+                            }
+                        };
+                        let Some(chunk_result) = next else { break };
+                        let chunk = match chunk_result {
+                            Ok(c) => c,
+                            Err(error) => {
+                                log::error!("Stream error while reading chunk error={error} chunk_count={chunk_count} total_bytes={total_bytes}");
+                                yield Ok(reqwest_body_error_delta("stream error", &error));
+                                return;
+                            }
+                        };
+
+                        chunk_count += 1;
+                        total_bytes += chunk.len() as u64;
+                        drop_guard.chunk_count = chunk_count;
+
+                        // Log progress every 10 chunks to show HTTP stream is alive
+                        if chunk_count.is_multiple_of(10) {
+                            log::debug!("SSE chunk progress: chunk_count={chunk_count} total_bytes={total_bytes}");
+                        }
+                        buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                        // Process complete SSE events (terminated by a blank line)
+                        while let Some(event_block) = take_next_sse_event(&mut buffer) {
+                            // Track if we received message_stop
+                            if is_message_stop_event(&event_block) {
+                                log::debug!("Received message_stop event chunk_count={chunk_count} total_bytes={total_bytes}");
+                                received_message_stop = true;
+                            }
+
+                            // Parse SSE event
+                            if let Some(mut delta) = parse_sse_event(
+        &event_block,
+        &mut usage,
+                                &mut tool_ids,
+                                &mut pending_stop_reason,
+                            ) {
+                                // Reverse-map tool names from Claude Code casing
+                                if is_oauth
+                                    && let StreamDelta::ToolUseStart { ref mut name, .. } = delta
+                                {
+                                    *name = from_claude_code_name(name, &original_tool_names);
+                                }
+                                // A terminal error event ends the stream — flag it
+                                // so the no-message_stop fallback stays silent.
+                                if matches!(delta, StreamDelta::Error { .. }) {
+                                    stream_errored = true;
+                                }
+                                yield Ok(delta);
+                            }
+                            // After message_stop (which emits Usage), emit Done
+                            if is_message_stop_event(&event_block) {
+                                yield Ok(StreamDelta::Done {
+                                    stop_reason: pending_stop_reason.take(),
+                                    served_route: Some(served_route.clone()),
+                                });
+                            }
+                        }
+                    }
+
+                    log::debug!(
+                        "SSE stream ended chunk_count={chunk_count} total_bytes={total_bytes} buffer_remaining={} received_message_stop={received_message_stop}",
+                        buffer.len()
+                    );
+
+                    // Process any remaining buffer content (handles incomplete final chunk)
+                    let remaining = buffer.trim();
+                    if !remaining.is_empty() {
+                        log::debug!(
+                            "Processing remaining buffer content remaining_len={} remaining_preview={}",
+                            remaining.len(),
+                            remaining.chars().take(100).collect::<String>()
+                        );
+
+                        // Track if remaining buffer contains message_stop
+                        if is_message_stop_event(remaining) {
+                            received_message_stop = true;
+                        }
+
+                        if let Some(mut delta) = parse_sse_event(
+        remaining,
+        &mut usage,
+                            &mut tool_ids,
+                            &mut pending_stop_reason,
+                        ) {
+                            if is_oauth
+                                && let StreamDelta::ToolUseStart { ref mut name, .. } = delta
+                            {
+                                *name = from_claude_code_name(name, &original_tool_names);
+                            }
+                            if matches!(delta, StreamDelta::Error { .. }) {
+                                stream_errored = true;
+                            }
+                            yield Ok(delta);
+                        }
+                        // After message_stop (which emits Usage), emit Done
+                        if is_message_stop_event(remaining) {
+                            yield Ok(StreamDelta::Done {
+                                stop_reason: pending_stop_reason.take(),
+                                served_route: Some(served_route.clone()),
+                            });
+                        }
+                    }
+
+                    // Mark stream as properly completed
+                    drop_guard.completed = true;
+
+                    // If stream ended without message_stop AND without a parsed
+                    // error event, emit a generic server-error (transient) signal.
+                    // When Anthropic streamed a terminal `error` event, it was
+                    // already surfaced above with its real message + kind — don't
+                    // mask it with this generic one.
+                    if !received_message_stop && !stream_errored {
+                        log::warn!(
+                            "SSE stream ended without message_stop event - stream may have been interrupted chunk_count={chunk_count} total_bytes={total_bytes}"
                         );
                         yield Ok(StreamDelta::Error {
-                            message: format!(
-                                "SSE stream timed out: no bytes for {}s",
-                                byte_idle_timeout.as_secs()
-                            ),
-                            kind: StreamErrorKind::ConnectionLost,
-                        });
-                        return;
-                    }
-                };
-                let Some(chunk_result) = next else { break };
-                let chunk = match chunk_result {
-                    Ok(c) => c,
-                    Err(error) => {
-                        log::error!("Stream error while reading chunk error={error} chunk_count={chunk_count} total_bytes={total_bytes}");
-                        yield Ok(reqwest_body_error_delta("stream error", &error));
-                        return;
-                    }
-                };
-
-                chunk_count += 1;
-                total_bytes += chunk.len() as u64;
-                drop_guard.chunk_count = chunk_count;
-
-                // Log progress every 10 chunks to show HTTP stream is alive
-                if chunk_count.is_multiple_of(10) {
-                    log::debug!("SSE chunk progress: chunk_count={chunk_count} total_bytes={total_bytes}");
-                }
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-                // Process complete SSE events (terminated by a blank line)
-                while let Some(event_block) = take_next_sse_event(&mut buffer) {
-                    // Track if we received message_stop
-                    if is_message_stop_event(&event_block) {
-                        log::debug!("Received message_stop event chunk_count={chunk_count} total_bytes={total_bytes}");
-                        received_message_stop = true;
-                    }
-
-                    // Parse SSE event
-                    if let Some(mut delta) = parse_sse_event(
-                        &event_block,
-                        &mut input_tokens,
-                        &mut output_tokens,
-                        &mut cached_input_tokens,
-                        &mut cache_creation_input_tokens,
-                        &mut tool_ids,
-                        &mut pending_stop_reason,
-                    ) {
-                        // Reverse-map tool names from Claude Code casing
-                        if is_oauth
-                            && let StreamDelta::ToolUseStart { ref mut name, .. } = delta
-                        {
-                            *name = from_claude_code_name(name, &original_tool_names);
-                        }
-                        // A terminal error event ends the stream — flag it
-                        // so the no-message_stop fallback stays silent.
-                        if matches!(delta, StreamDelta::Error { .. }) {
-                            stream_errored = true;
-                        }
-                        yield Ok(delta);
-                    }
-                    // After message_stop (which emits Usage), emit Done
-                    if is_message_stop_event(&event_block) {
-                        yield Ok(StreamDelta::Done {
-                            stop_reason: pending_stop_reason.take(),
-                            served_route: Some(served_route.clone()),
+                            message: "Stream ended unexpectedly without completion".to_string(),
+                            kind: StreamErrorKind::ServerError,
                         });
                     }
-                }
-            }
-
-            log::debug!(
-                "SSE stream ended chunk_count={chunk_count} total_bytes={total_bytes} buffer_remaining={} received_message_stop={received_message_stop}",
-                buffer.len()
-            );
-
-            // Process any remaining buffer content (handles incomplete final chunk)
-            let remaining = buffer.trim();
-            if !remaining.is_empty() {
-                log::debug!(
-                    "Processing remaining buffer content remaining_len={} remaining_preview={}",
-                    remaining.len(),
-                    remaining.chars().take(100).collect::<String>()
-                );
-
-                // Track if remaining buffer contains message_stop
-                if is_message_stop_event(remaining) {
-                    received_message_stop = true;
-                }
-
-                if let Some(mut delta) = parse_sse_event(
-                    remaining,
-                    &mut input_tokens,
-                    &mut output_tokens,
-                    &mut cached_input_tokens,
-                    &mut cache_creation_input_tokens,
-                    &mut tool_ids,
-                    &mut pending_stop_reason,
-                ) {
-                    if is_oauth
-                        && let StreamDelta::ToolUseStart { ref mut name, .. } = delta
-                    {
-                        *name = from_claude_code_name(name, &original_tool_names);
-                    }
-                    if matches!(delta, StreamDelta::Error { .. }) {
-                        stream_errored = true;
-                    }
-                    yield Ok(delta);
-                }
-                // After message_stop (which emits Usage), emit Done
-                if is_message_stop_event(remaining) {
-                    yield Ok(StreamDelta::Done {
-                        stop_reason: pending_stop_reason.take(),
-                        served_route: Some(served_route.clone()),
-                    });
-                }
-            }
-
-            // Mark stream as properly completed
-            drop_guard.completed = true;
-
-            // If stream ended without message_stop AND without a parsed
-            // error event, emit a generic server-error (transient) signal.
-            // When Anthropic streamed a terminal `error` event, it was
-            // already surfaced above with its real message + kind — don't
-            // mask it with this generic one.
-            if !received_message_stop && !stream_errored {
-                log::warn!(
-                    "SSE stream ended without message_stop event - stream may have been interrupted chunk_count={chunk_count} total_bytes={total_bytes}"
-                );
-                yield Ok(StreamDelta::Error {
-                    message: "Stream ended unexpectedly without completion".to_string(),
-                    kind: StreamErrorKind::ServerError,
-                });
-            }
-        })
+                })
     }
 
     fn validate_thinking_config(&self, thinking: Option<&ThinkingConfig>) -> Result<()> {

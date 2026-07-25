@@ -2936,8 +2936,10 @@ fn finalize_streamed_turn(
     }
 }
 
-/// A zero-token [`llm::Usage`] — `Usage` has no `Default`.
+/// A zero-token [`llm::Usage`]. Spelled out rather than `Default::default()`
+/// because a `const` item cannot call it.
 const ZERO_ATTEMPT_USAGE: llm::Usage = llm::Usage {
+    served_speed: None,
     input_tokens: 0,
     output_tokens: 0,
     cached_input_tokens: 0,
@@ -2962,6 +2964,9 @@ fn attempt_usage(accumulator: &StreamAccumulator) -> llm::Usage {
 /// downwards, contributing zero beats wrapping to `u32::MAX`.
 const fn usage_increment(previous: &llm::Usage, current: &llm::Usage) -> llm::Usage {
     llm::Usage {
+        // A delta between two restatements of the same call: the tier is that
+        // call's, not something to re-derive from the difference.
+        served_speed: current.served_speed,
         input_tokens: current.input_tokens.saturating_sub(previous.input_tokens),
         output_tokens: current.output_tokens.saturating_sub(previous.output_tokens),
         cached_input_tokens: current
@@ -2975,6 +2980,7 @@ const fn usage_increment(previous: &llm::Usage, current: &llm::Usage) -> llm::Us
 
 /// Fold `delta` into `total`, saturating so token counters never wrap.
 const fn add_attempt_usage(total: &mut llm::Usage, delta: &llm::Usage) {
+    total.served_speed = llm::ServedSpeed::merge(total.served_speed, delta.served_speed);
     total.input_tokens = total.input_tokens.saturating_add(delta.input_tokens);
     total.output_tokens = total.output_tokens.saturating_add(delta.output_tokens);
     total.cached_input_tokens = total
@@ -4485,6 +4491,7 @@ fn synthesize_response(
             provider.provider(),
         );
         llm::Usage {
+            served_speed: None,
             input_tokens: 0,
             output_tokens: 0,
             cached_input_tokens: 0,
@@ -7670,6 +7677,7 @@ mod tests {
         assert_eq!(native.provider(), gateway.provider());
 
         let usage = llm::Usage {
+            served_speed: None,
             input_tokens: 100,
             output_tokens: 20,
             cached_input_tokens: 30,
@@ -7700,6 +7708,7 @@ mod tests {
     fn attempt_rows_record_cache_creation_usage() -> Result<()> {
         let (native, _) = native_and_gateway_providers();
         let usage = llm::Usage {
+            served_speed: None,
             input_tokens: 100,
             output_tokens: 20,
             cached_input_tokens: 30,

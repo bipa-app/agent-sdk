@@ -303,7 +303,8 @@ impl CacheConfig {
 /// standard rates — a requested tier is not a guarantee; see
 /// [`LlmProvider::validate_speed_tier`](https://docs.rs/agent-sdk-providers)
 /// for how unsupported combinations are rejected up front.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum SpeedTier {
     /// The provider's normal inference path at standard pricing.
@@ -321,6 +322,15 @@ impl SpeedTier {
     #[must_use]
     pub const fn is_premium(self) -> bool {
         matches!(self, Self::Fast)
+    }
+
+    /// `const`-callable equality, since `PartialEq::eq` is not `const`.
+    #[must_use]
+    pub const fn same(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Standard, Self::Standard) | (Self::Fast, Self::Fast)
+        )
     }
 }
 
@@ -722,7 +732,61 @@ impl StopReason {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Which speed tier a provider actually used, as reported back on the response.
+///
+/// This is the observed counterpart to the requested [`SpeedTier`], and it is a
+/// distinct type because a [`Usage`] is not always one response: the agent loop
+/// folds per-call readings into a running total, and a total that mixes an
+/// expedited call with a downgraded one has no single tier. Collapsing that case
+/// to "unknown" would make a real downgrade indistinguishable from a provider
+/// that never reported a tier at all, so it gets its own variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ServedSpeed {
+    /// Every folded reading reported this same tier.
+    Uniform(SpeedTier),
+    /// Folded readings disagreed — at least one call ran on a different tier
+    /// than another. Worth investigating: asking for a premium tier and getting
+    /// this back means something was downgraded.
+    Mixed,
+}
+
+impl ServedSpeed {
+    /// Fold another reading in, tracking disagreement rather than hiding it.
+    ///
+    /// `None` means "no tier reported", which is not itself a disagreement —
+    /// folding it in leaves the known side untouched. Kept `const` so the
+    /// usage accumulators it is called from stay `const` too.
+    #[must_use]
+    pub const fn merge(left: Option<Self>, right: Option<Self>) -> Option<Self> {
+        match (left, right) {
+            (None, other) | (other, None) => other,
+            (Some(Self::Uniform(left)), Some(Self::Uniform(right))) => {
+                if left.same(right) {
+                    Some(Self::Uniform(left))
+                } else {
+                    Some(Self::Mixed)
+                }
+            }
+            // Any pairing that involves an already-Mixed side stays Mixed.
+            (Some(_), Some(_)) => Some(Self::Mixed),
+        }
+    }
+
+    /// Whether any folded reading ran on a premium tier.
+    #[must_use]
+    pub const fn used_premium(self) -> bool {
+        match self {
+            Self::Uniform(tier) => tier.is_premium(),
+            // Mixed only arises from disagreeing readings, and Standard is the
+            // only non-premium tier, so at least one side was premium.
+            Self::Mixed => true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
     /// Total input tokens reported by the provider.
     pub input_tokens: u32,
@@ -733,6 +797,18 @@ pub struct Usage {
     /// Portion of `input_tokens` spent creating provider-side prompt cache entries.
     #[serde(default)]
     pub cache_creation_input_tokens: u32,
+    /// Which speed tier actually served the request, when the provider says.
+    ///
+    /// Requesting a premium tier does not guarantee getting one: Anthropic
+    /// serves `claude-opus-4-6` at standard speed without erroring, and
+    /// `OpenAI` downgrades priority requests under a sharp traffic ramp. Both
+    /// bill the tier they actually ran, so this is the field that says whether
+    /// the premium request was honoured.
+    ///
+    /// `None` when the provider reported no tier — which is the normal case for
+    /// every provider and model that has no premium tier to begin with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_speed: Option<ServedSpeed>,
 }
 
 #[derive(Debug, Clone)]
@@ -961,6 +1037,51 @@ pub fn balance_tool_results(messages: &[Message], cancel_text: &str) -> Vec<Mess
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn served_speed_merge_reports_disagreement_instead_of_hiding_it() {
+        let fast = Some(ServedSpeed::Uniform(SpeedTier::Fast));
+        let standard = Some(ServedSpeed::Uniform(SpeedTier::Standard));
+
+        // Nothing reported stays nothing reported.
+        assert_eq!(ServedSpeed::merge(None, None), None);
+
+        // An unreported reading is not a disagreement — it must not erase a
+        // known tier, or a single quiet call would hide a whole turn's tier.
+        assert_eq!(ServedSpeed::merge(None, fast), fast);
+        assert_eq!(ServedSpeed::merge(fast, None), fast);
+
+        // Agreement folds to itself.
+        assert_eq!(ServedSpeed::merge(fast, fast), fast);
+        assert_eq!(ServedSpeed::merge(standard, standard), standard);
+
+        // The case this type exists for: a downgraded call folded in with an
+        // expedited one must not read as either.
+        assert_eq!(ServedSpeed::merge(fast, standard), Some(ServedSpeed::Mixed));
+        assert_eq!(ServedSpeed::merge(standard, fast), Some(ServedSpeed::Mixed));
+
+        // Mixed is absorbing.
+        let mixed = Some(ServedSpeed::Mixed);
+        assert_eq!(ServedSpeed::merge(mixed, fast), mixed);
+        assert_eq!(ServedSpeed::merge(mixed, mixed), mixed);
+        assert_eq!(ServedSpeed::merge(None, mixed), mixed);
+    }
+
+    #[test]
+    fn served_speed_used_premium_flags_any_premium_call() {
+        assert!(!ServedSpeed::Uniform(SpeedTier::Standard).used_premium());
+        assert!(ServedSpeed::Uniform(SpeedTier::Fast).used_premium());
+        // Mixed can only arise from disagreeing readings, and Standard is the
+        // only non-premium tier, so a premium call is implied.
+        assert!(ServedSpeed::Mixed.used_premium());
+    }
+
+    #[test]
+    fn usage_defaults_report_no_served_tier() {
+        let usage = Usage::default();
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.served_speed, None);
+    }
 
     #[test]
     fn speed_tier_defaults_to_standard_and_only_fast_is_premium() {

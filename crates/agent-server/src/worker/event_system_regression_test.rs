@@ -259,6 +259,7 @@ fn text_turn_stream(text: String) -> StreamBox<'static> {
 
 const fn reg_usage() -> Usage {
     Usage {
+        served_speed: None,
         input_tokens: 100,
         output_tokens: 50,
         cached_input_tokens: 0,

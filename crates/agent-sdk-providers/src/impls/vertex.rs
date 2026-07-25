@@ -219,6 +219,7 @@ impl VertexProvider {
             model: api_response.model,
             stop_reason,
             usage: Usage {
+                served_speed: None,
                 input_tokens: api_response.usage.total_input_tokens(),
                 output_tokens: api_response.usage.output,
                 cached_input_tokens: api_response.usage.cached_input_tokens(),
@@ -793,208 +794,199 @@ impl VertexProvider {
     fn chat_stream_claude(&self, request: ChatRequest) -> StreamBox<'_> {
         let served_route = self.route().to_owned();
         Box::pin(async_stream::stream! {
-            let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
-                // Forcing a specific tool is incompatible with extended thinking
-                // on Claude (the API 400s), so drop thinking at the wire boundary
-                // even when it was resurrected from the provider-configured
-                // default.
-                Ok(thinking) => thinking_for_forced_tool(thinking, request.tool_choice.as_ref()),
-                Err(error) => {
-                    yield Ok(StreamDelta::Error {
-                        message: error.to_string(),
-                        kind: StreamErrorKind::InvalidRequest,
-                    });
-                    return;
-                }
-            };
-            if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
-                yield Ok(StreamDelta::Error {
-                    message: error.to_string(),
-                    kind: StreamErrorKind::InvalidRequest,
-                });
-                return;
-            }
-            let messages = Self::build_cached_vertex_claude_messages(&request);
-            let tools = build_vertex_claude_tools(&request);
-            let thinking = thinking_config
-                .as_ref()
-                .and_then(anthropic_data::ApiThinkingConfig::from_thinking_config);
-            let output_config = thinking_config
-                .as_ref()
-                .and_then(|t| t.effort)
-                .map(|effort| anthropic_data::ApiOutputConfig { effort });
-            let system = Self::build_vertex_claude_system_prompt(&request.system);
-            let tool_choice = request
-                .tool_choice
-                .as_ref()
-                .map(anthropic_data::ApiToolChoice::from_tool_choice);
-
-            let max_tokens = self.effective_max_tokens(&request);
-            let api_request = anthropic_data::ApiMessagesRequest {
-                model: None, // model is in the URL for Vertex
-                max_tokens,
-                system,
-                messages: &messages,
-                tools: tools.as_deref(),
-                tool_choice,
-                stream: true,
-                thinking,
-                output_config,
-                // See the non-streaming path: not available on Vertex.
-                speed: None,
-                anthropic_version: Some(VERTEX_ANTHROPIC_VERSION),
-            };
-
-            log::debug!(
-                "Vertex AI (Claude) streaming request model={} max_tokens={}",
-                self.model,
-                max_tokens
-            );
-
-            if log::log_enabled!(log::Level::Debug) {
-                match serde_json::to_string_pretty(&api_request) {
-                    Ok(json) => log::debug!("Vertex AI (Claude) streaming request payload:\n{json}"),
-                    Err(e) => log::debug!("Failed to serialize request for logging: {e}"),
-                }
-            }
-
-            let url = format!("{}:streamRawPredict", self.base_url("anthropic"));
-
-            let response = match self
-                .client
-                .post(&url)
-                .header("Content-Type", "application/json")
-                .bearer_auth(&self.access_token)
-                .json(&api_request)
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(error) => {
-                    yield Ok(reqwest_error_delta("request failed", &error));
-                    return;
-                }
-            };
-
-            let status = response.status();
-
-            if status == StatusCode::TOO_MANY_REQUESTS {
-                // Headers are read before the body: `text()` consumes the response.
-                let header_hint = crate::http::retry_after_from_headers(response.headers());
-                let body = response.text().await.unwrap_or_default();
-                log::warn!("Vertex AI (Claude) rate limited status={status} body={body}");
-                yield Ok(StreamDelta::Error {
-                    message: "Rate limited".to_string(),
-                    kind: StreamErrorKind::RateLimited(vertex_retry_delay(header_hint, &body)),
-                });
-                return;
-            }
-
-            if status.is_server_error() {
-                let body = response.text().await.unwrap_or_default();
-                log::error!("Vertex AI (Claude) server error status={status} body={body}");
-                yield Ok(StreamDelta::Error {
-                    message: body,
-                    kind: StreamErrorKind::ServerError,
-                });
-                return;
-            }
-
-            if status.is_client_error() {
-                let body = response.text().await.unwrap_or_default();
-                log::warn!("Vertex AI (Claude) client error status={status} body={body}");
-                yield Ok(StreamDelta::Error {
-                    message: body,
-                    kind: StreamErrorKind::InvalidRequest,
-                });
-                return;
-            }
-
-            // Process SSE stream using the Anthropic SSE parser
-            let mut stream = response.bytes_stream();
-            let mut buffer = String::new();
-            let mut input_tokens: u32 = 0;
-            let mut output_tokens: u32 = 0;
-            let mut cached_input_tokens: u32 = 0;
-            let mut cache_creation_input_tokens: u32 = 0;
-            let mut tool_ids: std::collections::HashMap<usize, String> =
-                std::collections::HashMap::new();
-            let mut received_message_stop = false;
-            let mut pending_stop_reason: Option<agent_sdk_foundation::llm::StopReason> = None;
-
-            while let Some(chunk_result) = stream.next().await {
-                let chunk = match chunk_result {
-                    Ok(c) => c,
-                    Err(error) => {
-                        yield Ok(reqwest_body_error_delta("stream error", &error));
+                    let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
+                        // Forcing a specific tool is incompatible with extended thinking
+                        // on Claude (the API 400s), so drop thinking at the wire boundary
+                        // even when it was resurrected from the provider-configured
+                        // default.
+                        Ok(thinking) => thinking_for_forced_tool(thinking, request.tool_choice.as_ref()),
+                        Err(error) => {
+                            yield Ok(StreamDelta::Error {
+                                message: error.to_string(),
+                                kind: StreamErrorKind::InvalidRequest,
+                            });
+                            return;
+                        }
+                    };
+                    if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
+                        yield Ok(StreamDelta::Error {
+                            message: error.to_string(),
+                            kind: StreamErrorKind::InvalidRequest,
+                        });
                         return;
                     }
-                };
+                    let messages = Self::build_cached_vertex_claude_messages(&request);
+                    let tools = build_vertex_claude_tools(&request);
+                    let thinking = thinking_config
+                        .as_ref()
+                        .and_then(anthropic_data::ApiThinkingConfig::from_thinking_config);
+                    let output_config = thinking_config
+                        .as_ref()
+                        .and_then(|t| t.effort)
+                        .map(|effort| anthropic_data::ApiOutputConfig { effort });
+                    let system = Self::build_vertex_claude_system_prompt(&request.system);
+                    let tool_choice = request
+                        .tool_choice
+                        .as_ref()
+                        .map(anthropic_data::ApiToolChoice::from_tool_choice);
 
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    let max_tokens = self.effective_max_tokens(&request);
+                    let api_request = anthropic_data::ApiMessagesRequest {
+                        model: None, // model is in the URL for Vertex
+                        max_tokens,
+                        system,
+                        messages: &messages,
+                        tools: tools.as_deref(),
+                        tool_choice,
+                        stream: true,
+                        thinking,
+                        output_config,
+                        // See the non-streaming path: not available on Vertex.
+                        speed: None,
+                        anthropic_version: Some(VERTEX_ANTHROPIC_VERSION),
+                    };
 
-                // Process complete SSE events (terminated by a blank line)
-                while let Some(event_block) = anthropic_data::take_next_sse_event(&mut buffer) {
-                    if anthropic_data::is_message_stop_event(&event_block) {
-                        received_message_stop = true;
+                    log::debug!(
+                        "Vertex AI (Claude) streaming request model={} max_tokens={}",
+                        self.model,
+                        max_tokens
+                    );
+
+                    if log::log_enabled!(log::Level::Debug) {
+                        match serde_json::to_string_pretty(&api_request) {
+                            Ok(json) => log::debug!("Vertex AI (Claude) streaming request payload:\n{json}"),
+                            Err(e) => log::debug!("Failed to serialize request for logging: {e}"),
+                        }
                     }
 
-                    if let Some(delta) = anthropic_data::parse_sse_event(
-                        &event_block,
-                        &mut input_tokens,
-                        &mut output_tokens,
-                        &mut cached_input_tokens,
-                        &mut cache_creation_input_tokens,
-                        &mut tool_ids,
-                        &mut pending_stop_reason,
-                    ) {
-                        yield Ok(delta);
+                    let url = format!("{}:streamRawPredict", self.base_url("anthropic"));
+
+                    let response = match self
+                        .client
+                        .post(&url)
+                        .header("Content-Type", "application/json")
+                        .bearer_auth(&self.access_token)
+                        .json(&api_request)
+                        .send()
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(error) => {
+                            yield Ok(reqwest_error_delta("request failed", &error));
+                            return;
+                        }
+                    };
+
+                    let status = response.status();
+
+                    if status == StatusCode::TOO_MANY_REQUESTS {
+                        // Headers are read before the body: `text()` consumes the response.
+                        let header_hint = crate::http::retry_after_from_headers(response.headers());
+                        let body = response.text().await.unwrap_or_default();
+                        log::warn!("Vertex AI (Claude) rate limited status={status} body={body}");
+                        yield Ok(StreamDelta::Error {
+                            message: "Rate limited".to_string(),
+                            kind: StreamErrorKind::RateLimited(vertex_retry_delay(header_hint, &body)),
+                        });
+                        return;
                     }
-                    if anthropic_data::is_message_stop_event(&event_block) {
-                        yield Ok(StreamDelta::Done {
-                            stop_reason: pending_stop_reason.take(),
-                            served_route: Some(served_route.clone()),
+
+                    if status.is_server_error() {
+                        let body = response.text().await.unwrap_or_default();
+                        log::error!("Vertex AI (Claude) server error status={status} body={body}");
+                        yield Ok(StreamDelta::Error {
+                            message: body,
+                            kind: StreamErrorKind::ServerError,
+                        });
+                        return;
+                    }
+
+                    if status.is_client_error() {
+                        let body = response.text().await.unwrap_or_default();
+                        log::warn!("Vertex AI (Claude) client error status={status} body={body}");
+                        yield Ok(StreamDelta::Error {
+                            message: body,
+                            kind: StreamErrorKind::InvalidRequest,
+                        });
+                        return;
+                    }
+
+                    // Process SSE stream using the Anthropic SSE parser
+                    let mut stream = response.bytes_stream();
+                    let mut buffer = String::new();
+                    let mut usage = anthropic_data::SseUsageState::default();
+                    let mut tool_ids: std::collections::HashMap<usize, String> =
+                        std::collections::HashMap::new();
+                    let mut received_message_stop = false;
+                    let mut pending_stop_reason: Option<agent_sdk_foundation::llm::StopReason> = None;
+
+                    while let Some(chunk_result) = stream.next().await {
+                        let chunk = match chunk_result {
+                            Ok(c) => c,
+                            Err(error) => {
+                                yield Ok(reqwest_body_error_delta("stream error", &error));
+                                return;
+                            }
+                        };
+
+                        buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                        // Process complete SSE events (terminated by a blank line)
+                        while let Some(event_block) = anthropic_data::take_next_sse_event(&mut buffer) {
+                            if anthropic_data::is_message_stop_event(&event_block) {
+                                received_message_stop = true;
+                            }
+
+                            if let Some(delta) = anthropic_data::parse_sse_event(
+        &event_block,
+        &mut usage,
+                                &mut tool_ids,
+                                &mut pending_stop_reason,
+                            ) {
+                                yield Ok(delta);
+                            }
+                            if anthropic_data::is_message_stop_event(&event_block) {
+                                yield Ok(StreamDelta::Done {
+                                    stop_reason: pending_stop_reason.take(),
+                                    served_route: Some(served_route.clone()),
+                                });
+                            }
+                        }
+                    }
+
+                    // Process remaining buffer
+                    let remaining = buffer.trim();
+                    if !remaining.is_empty() {
+                        if anthropic_data::is_message_stop_event(remaining) {
+                            received_message_stop = true;
+                        }
+
+                        if let Some(delta) = anthropic_data::parse_sse_event(
+        remaining,
+        &mut usage,
+                            &mut tool_ids,
+                            &mut pending_stop_reason,
+                        ) {
+                            yield Ok(delta);
+                        }
+                        if anthropic_data::is_message_stop_event(remaining) {
+                            yield Ok(StreamDelta::Done {
+                                stop_reason: pending_stop_reason.take(),
+                                served_route: Some(served_route.clone()),
+                            });
+                        }
+                    }
+
+                    if !received_message_stop {
+                        log::warn!(
+                            "Vertex AI (Claude) SSE stream ended without message_stop"
+                        );
+                        yield Ok(StreamDelta::Error {
+                            message: "Stream ended unexpectedly without completion".to_string(),
+                            kind: StreamErrorKind::ServerError,
                         });
                     }
-                }
-            }
-
-            // Process remaining buffer
-            let remaining = buffer.trim();
-            if !remaining.is_empty() {
-                if anthropic_data::is_message_stop_event(remaining) {
-                    received_message_stop = true;
-                }
-
-                if let Some(delta) = anthropic_data::parse_sse_event(
-                    remaining,
-                    &mut input_tokens,
-                    &mut output_tokens,
-                    &mut cached_input_tokens,
-                    &mut cache_creation_input_tokens,
-                    &mut tool_ids,
-                    &mut pending_stop_reason,
-                ) {
-                    yield Ok(delta);
-                }
-                if anthropic_data::is_message_stop_event(remaining) {
-                    yield Ok(StreamDelta::Done {
-                        stop_reason: pending_stop_reason.take(),
-                        served_route: Some(served_route.clone()),
-                    });
-                }
-            }
-
-            if !received_message_stop {
-                log::warn!(
-                    "Vertex AI (Claude) SSE stream ended without message_stop"
-                );
-                yield Ok(StreamDelta::Error {
-                    message: "Stream ended unexpectedly without completion".to_string(),
-                    kind: StreamErrorKind::ServerError,
-                });
-            }
-        })
+                })
     }
 }
 

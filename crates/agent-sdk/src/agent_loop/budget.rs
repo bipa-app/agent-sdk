@@ -83,6 +83,7 @@ fn estimate_scoped(
     scope: UsageScope,
 ) -> Option<f64> {
     let usage = Usage {
+        served_speed: None,
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         cached_input_tokens: usage.cached_input_tokens,

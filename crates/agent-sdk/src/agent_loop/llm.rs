@@ -6,7 +6,8 @@ use super::types::{
 use crate::events::AgentEvent;
 use crate::hooks::{AgentHooks, RequestDecision, ResponseDecision};
 use crate::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, LlmProvider, StreamAccumulator, StreamDelta, Usage,
+    ChatOutcome, ChatRequest, ChatResponse, LlmProvider, ServedSpeed, StreamAccumulator,
+    StreamDelta, Usage,
 };
 use crate::types::{AgentConfig, AgentError};
 use futures::StreamExt;
@@ -1020,6 +1021,7 @@ impl StreamChunkTiming {
 
 /// A zero-token [`Usage`], used as the identity when folding attempts together.
 const ZERO_USAGE: Usage = Usage {
+    served_speed: None,
     input_tokens: 0,
     output_tokens: 0,
     cached_input_tokens: 0,
@@ -1032,7 +1034,12 @@ fn accumulated_usage(accumulator: &StreamAccumulator) -> Usage {
 }
 
 /// Fold `delta` into `total`. Saturating: token counters must never wrap.
+///
+/// The served tier folds rather than being overwritten, so a total that mixes
+/// an expedited call with a downgraded one reports `Mixed` instead of silently
+/// taking whichever call happened to land last.
 const fn add_usage(total: &mut Usage, delta: &Usage) {
+    total.served_speed = ServedSpeed::merge(total.served_speed, delta.served_speed);
     total.input_tokens = total.input_tokens.saturating_add(delta.input_tokens);
     total.output_tokens = total.output_tokens.saturating_add(delta.output_tokens);
     total.cached_input_tokens = total

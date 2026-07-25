@@ -169,6 +169,7 @@ use agent_sdk_providers::streaming::{StreamBox, StreamDelta};
 
 const fn replay_usage() -> Usage {
     Usage {
+        served_speed: None,
         input_tokens: 200,
         output_tokens: 100,
         cached_input_tokens: 0,
@@ -265,6 +266,7 @@ impl LlmProvider for ThinkingToolCallProvider {
                 model: "mock-model".into(),
                 stop_reason: Some(StopReason::EndTurn),
                 usage: Usage {
+                    served_speed: None,
                     input_tokens: 50,
                     output_tokens: 25,
                     cached_input_tokens: 0,

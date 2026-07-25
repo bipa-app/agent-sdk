@@ -149,6 +149,7 @@ impl LlmProvider for MockTextProvider {
             model: "mock-model".into(),
             stop_reason: Some(StopReason::EndTurn),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 40,
                 output_tokens: 20,
                 cached_input_tokens: 0,
@@ -210,6 +211,7 @@ impl LlmProvider for MockToolThenText {
                 model: "mock-model".into(),
                 stop_reason: Some(StopReason::ToolUse),
                 usage: Usage {
+                    served_speed: None,
                     input_tokens: 80,
                     output_tokens: 40,
                     cached_input_tokens: 0,
@@ -225,6 +227,7 @@ impl LlmProvider for MockToolThenText {
                 model: "mock-model".into(),
                 stop_reason: Some(StopReason::EndTurn),
                 usage: Usage {
+                    served_speed: None,
                     input_tokens: 50,
                     output_tokens: 25,
                     cached_input_tokens: 0,

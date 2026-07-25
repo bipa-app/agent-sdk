@@ -985,6 +985,7 @@ mod tests {
         use anyhow::Context;
         let pricing = Pricing::flat(0.7, 2.8).with_reasoning(8.4);
         let usage = Usage {
+            served_speed: None,
             input_tokens: 1_000_000,
             output_tokens: 1_000_000,
             cached_input_tokens: 0,
@@ -1004,6 +1005,7 @@ mod tests {
         use anyhow::Context;
         let pricing = Pricing::flat(1.0, 8.0).with_reasoning(3.0);
         let usage = Usage {
+            served_speed: None,
             input_tokens: 0,
             output_tokens: 1_000_000,
             cached_input_tokens: 0,
@@ -1280,6 +1282,7 @@ mod tests {
         let caps = get_model_capabilities("openai", "gpt-4o").unwrap();
         let cost = caps
             .estimate_cost_usd(&Usage {
+                served_speed: None,
                 input_tokens: 2_000,
                 output_tokens: 1_000,
                 cached_input_tokens: 0,
@@ -1294,6 +1297,7 @@ mod tests {
         let caps = get_model_capabilities("openai", "gpt-5.4").unwrap();
         let cost = caps
             .estimate_cost_usd(&Usage {
+                served_speed: None,
                 input_tokens: 2_000,
                 output_tokens: 1_000,
                 cached_input_tokens: 1_000,

@@ -113,6 +113,7 @@ fn ok_response(text: &str) -> ChatOutcome {
         model: "mock-model".into(),
         stop_reason: Some(StopReason::EndTurn),
         usage: Usage {
+            served_speed: None,
             input_tokens: 100,
             output_tokens: 50,
             cached_input_tokens: 0,

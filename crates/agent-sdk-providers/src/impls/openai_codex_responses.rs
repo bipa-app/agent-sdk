@@ -445,6 +445,7 @@ impl OpenAICodexResponsesProvider {
             stop_reason,
             usage: api_response.usage.map_or(
                 Usage {
+                    served_speed: None,
                     input_tokens: 0,
                     output_tokens: 0,
                     cached_input_tokens: 0,
@@ -2401,6 +2402,7 @@ struct ToolCallAccumulator {
 
 fn usage_from_api_usage(usage: &ApiUsage) -> Usage {
     Usage {
+        served_speed: None,
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         cached_input_tokens: usage

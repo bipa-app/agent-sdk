@@ -64,12 +64,7 @@
 //!             content: vec![ContentBlock::Text { text: "Paris.".to_string() }],
 //!             model: self.model().to_string(),
 //!             stop_reason: Some(StopReason::EndTurn),
-//!             usage: Usage {
-//!                 input_tokens: 0,
-//!                 output_tokens: 0,
-//!                 cached_input_tokens: 0,
-//!                 cache_creation_input_tokens: 0,
-//!             },
+//!             usage: Usage::default(),
 //!         }))
 //!     }
 //!     fn model(&self) -> &str { "stub-model" }
@@ -650,7 +645,8 @@ macro_rules! tool {
 
 // agent-sdk-providers (via thin modules)
 pub use llm::{
-    ContentBlock, ContentSource, Effort, LlmProvider, SpeedTier, ThinkingConfig, ThinkingMode,
+    ContentBlock, ContentSource, Effort, LlmProvider, ServedSpeed, SpeedTier, ThinkingConfig,
+    ThinkingMode,
 };
 pub use model_capabilities::{
     ModelCapabilities, PricePoint, Pricing, SourceStatus, get_model_capabilities,

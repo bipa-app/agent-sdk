@@ -347,6 +347,7 @@ mod tests {
             model: "m".to_owned(),
             stop_reason: Some(StopReason::EndTurn),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 1,
                 output_tokens: 1,
                 cached_input_tokens: 0,
@@ -483,6 +484,7 @@ mod tests {
         // Usage is metadata the user never sees, so it must not strand the chain
         // on a provider that reported its billing and then died.
         assert!(!commits_stream(&StreamDelta::Usage(Usage {
+            served_speed: None,
             input_tokens: 1,
             output_tokens: 1,
             cached_input_tokens: 0,
@@ -501,6 +503,7 @@ mod tests {
             "primary",
             vec![
                 Ok(StreamDelta::Usage(Usage {
+                    served_speed: None,
                     input_tokens: 100,
                     output_tokens: 50,
                     cached_input_tokens: 0,
@@ -520,6 +523,7 @@ mod tests {
                     block_index: 0,
                 }),
                 Ok(StreamDelta::Usage(Usage {
+                    served_speed: None,
                     input_tokens: 10,
                     output_tokens: 5,
                     cached_input_tokens: 0,

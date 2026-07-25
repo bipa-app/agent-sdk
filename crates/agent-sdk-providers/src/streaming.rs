@@ -4,7 +4,7 @@
 //! The [`StreamDelta`] enum represents individual events in a streaming response,
 //! and [`StreamAccumulator`] helps collect these events into a final response.
 
-use agent_sdk_foundation::llm::{ContentBlock, StopReason, Usage};
+use agent_sdk_foundation::llm::{ContentBlock, ServedSpeed, StopReason, Usage};
 #[cfg(any(feature = "openai", feature = "openai-codex"))]
 use bytes::BytesMut;
 use futures::Stream;
@@ -381,6 +381,7 @@ fn add_usage(carried: Option<&Usage>, usage: &Usage) -> Usage {
         return usage.clone();
     };
     Usage {
+        served_speed: ServedSpeed::merge(carried.served_speed, usage.served_speed),
         input_tokens: carried.input_tokens.saturating_add(usage.input_tokens),
         output_tokens: carried.output_tokens.saturating_add(usage.output_tokens),
         cached_input_tokens: carried
@@ -668,6 +669,48 @@ impl StreamAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_sdk_foundation::llm::SpeedTier;
+
+    #[test]
+    fn folding_usage_surfaces_a_downgrade_instead_of_picking_a_winner() {
+        let fast = Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            served_speed: Some(ServedSpeed::Uniform(SpeedTier::Fast)),
+            ..Usage::default()
+        };
+        let downgraded = Usage {
+            input_tokens: 3,
+            output_tokens: 2,
+            served_speed: Some(ServedSpeed::Uniform(SpeedTier::Standard)),
+            ..Usage::default()
+        };
+
+        let total = add_usage(Some(&fast), &downgraded);
+        assert_eq!(total.input_tokens, 13);
+        assert_eq!(total.output_tokens, 7);
+        assert_eq!(
+            total.served_speed,
+            Some(ServedSpeed::Mixed),
+            "a turn mixing an expedited call with a downgraded one must not \
+             report either tier as if it covered the whole turn",
+        );
+    }
+
+    #[test]
+    fn folding_usage_keeps_a_uniform_tier() {
+        let call = Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            served_speed: Some(ServedSpeed::Uniform(SpeedTier::Fast)),
+            ..Usage::default()
+        };
+        let total = add_usage(Some(&call), &call);
+        assert_eq!(
+            total.served_speed,
+            Some(ServedSpeed::Uniform(SpeedTier::Fast))
+        );
+    }
 
     #[test]
     fn test_accumulator_text_deltas() {
@@ -814,6 +857,7 @@ mod tests {
             block_index: 1,
         });
         acc.apply(&StreamDelta::Usage(Usage {
+            served_speed: None,
             input_tokens: 100,
             output_tokens: 50,
             cached_input_tokens: 0,

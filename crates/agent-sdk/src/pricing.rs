@@ -194,6 +194,7 @@ mod tests {
             },
         );
         let usage = Usage {
+            served_speed: None,
             input_tokens: 1_000_000,
             output_tokens: 1_000_000,
             cached_input_tokens: 0,

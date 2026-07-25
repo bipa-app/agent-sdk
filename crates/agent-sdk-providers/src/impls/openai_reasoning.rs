@@ -6,7 +6,7 @@
 //! context. These additive types preserve those wire values without changing
 //! the public foundation structs used by every provider.
 
-use agent_sdk_foundation::llm::{Effort, SpeedTier, ThinkingConfig, ThinkingMode};
+use agent_sdk_foundation::llm::{Effort, ServedSpeed, SpeedTier, ThinkingConfig, ThinkingMode};
 use anyhow::{Result, bail};
 use serde::Serialize;
 
@@ -380,6 +380,20 @@ pub(crate) const SERVICE_TIER_PRIORITY: &str = "priority";
 /// `service_tier` value selecting standard processing.
 pub(crate) const SERVICE_TIER_DEFAULT: &str = "default";
 
+/// Read the tier `OpenAI` says actually served a request.
+///
+/// `OpenAI` echoes `service_tier` on the response, and a request that asked for
+/// `priority` can come back `default` — a downgrade, billed at standard rates.
+/// An unrecognised value reads as "not reported" rather than being forced into
+/// one of the two known tiers.
+pub(crate) fn served_speed_from_service_tier(tier: Option<&str>) -> Option<ServedSpeed> {
+    match tier? {
+        SERVICE_TIER_PRIORITY => Some(ServedSpeed::Uniform(SpeedTier::Fast)),
+        SERVICE_TIER_DEFAULT => Some(ServedSpeed::Uniform(SpeedTier::Standard)),
+        _ => None,
+    }
+}
+
 /// Map a speed tier onto `OpenAI`'s `service_tier` request field.
 ///
 /// A configured [`SpeedTier::Standard`] serialises `"default"` rather than
@@ -566,6 +580,23 @@ mod tests {
             service_tier_wire_value(Some(SpeedTier::Fast)),
             Some(SERVICE_TIER_PRIORITY)
         );
+    }
+
+    #[test]
+    fn served_tier_is_read_back_from_the_echoed_service_tier() {
+        assert_eq!(
+            served_speed_from_service_tier(Some(SERVICE_TIER_PRIORITY)),
+            Some(ServedSpeed::Uniform(SpeedTier::Fast))
+        );
+        // The downgrade case: asked for priority, OpenAI served default.
+        assert_eq!(
+            served_speed_from_service_tier(Some(SERVICE_TIER_DEFAULT)),
+            Some(ServedSpeed::Uniform(SpeedTier::Standard))
+        );
+        assert_eq!(served_speed_from_service_tier(None), None);
+        // An unknown tier reads as "not reported" rather than being forced
+        // into one of the two we know.
+        assert_eq!(served_speed_from_service_tier(Some("flex")), None);
     }
 
     #[test]

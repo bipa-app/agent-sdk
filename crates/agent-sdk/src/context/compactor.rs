@@ -993,6 +993,7 @@ mod tests {
                 model: "mock".to_string(),
                 stop_reason: Some(self.stop_reason),
                 usage: Usage {
+                    served_speed: None,
                     input_tokens: 100,
                     output_tokens: 50,
                     cached_input_tokens: 0,

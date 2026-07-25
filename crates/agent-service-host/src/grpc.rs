@@ -4310,6 +4310,7 @@ mod tests {
             model: "mock-model".into(),
             stop_reason: Some(StopReason::EndTurn),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 10,
                 output_tokens: 5,
                 cached_input_tokens: 0,
@@ -4335,6 +4336,7 @@ mod tests {
             model: "mock-model".into(),
             stop_reason: Some(StopReason::ToolUse),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 12,
                 output_tokens: 6,
                 cached_input_tokens: 0,

@@ -481,6 +481,7 @@ mod tests {
         // gpt-5.2 from the feed: $1.75/M input, $14/M output, $0.175/M cache_read.
         // 1000 uncached input + 1000 cached input + 1000 output.
         let usage = Usage {
+            served_speed: None,
             input_tokens: 2_000,
             output_tokens: 1_000,
             cached_input_tokens: 1_000,
@@ -502,6 +503,7 @@ mod tests {
         registry.refresh(&source).await?;
 
         let usage = Usage {
+            served_speed: None,
             input_tokens: 1_000_000,
             output_tokens: 1_000_000,
             cached_input_tokens: 0,
@@ -558,6 +560,7 @@ mod tests {
         // plus 1M output.
         // 0.2*1 + 0.3*0.1 + 0.5*1.25 + 1*5 = 0.2 + 0.03 + 0.625 + 5 = 5.855.
         let usage = Usage {
+            served_speed: None,
             input_tokens: 1_000_000,
             output_tokens: 1_000_000,
             cached_input_tokens: 300_000,
@@ -589,6 +592,7 @@ mod tests {
             },
         );
         let usage = Usage {
+            served_speed: None,
             input_tokens: 1_000_000,
             output_tokens: 0,
             cached_input_tokens: 0,
@@ -628,6 +632,7 @@ mod tests {
 
         // Inside the base band: 200K in + 100K out = 0.2*2.5 + 0.1*15 = 2.0.
         let short = Usage {
+            served_speed: None,
             input_tokens: 200_000,
             output_tokens: 100_000,
             cached_input_tokens: 0,
@@ -644,6 +649,7 @@ mod tests {
         // Past the threshold: 300K in + 100K out = 0.3*5 + 0.1*22.5 = 3.75,
         // where the base rates would have said 0.3*2.5 + 0.1*15 = 2.25.
         let long = Usage {
+            served_speed: None,
             input_tokens: 300_000,
             output_tokens: 100_000,
             cached_input_tokens: 0,
@@ -666,6 +672,7 @@ mod tests {
         let registry = tiered_registry();
 
         let just_below = Usage {
+            served_speed: None,
             input_tokens: 271_999,
             output_tokens: 0,
             cached_input_tokens: 0,
@@ -681,6 +688,7 @@ mod tests {
         );
 
         let at_threshold = Usage {
+            served_speed: None,
             input_tokens: 272_000,
             output_tokens: 0,
             cached_input_tokens: 0,
@@ -707,6 +715,7 @@ mod tests {
 
         // Three 100K-token calls: 300K summed, but no call ever crossed 272K.
         let aggregate = Usage {
+            served_speed: None,
             input_tokens: 300_000,
             output_tokens: 0,
             cached_input_tokens: 0,
@@ -779,6 +788,7 @@ mod tests {
         );
 
         let with_output = Usage {
+            served_speed: None,
             input_tokens: 2_000,
             output_tokens: 1_000,
             cached_input_tokens: 0,
@@ -793,6 +803,7 @@ mod tests {
 
         // The same row still prices a call that bills no output tokens.
         let input_only = Usage {
+            served_speed: None,
             input_tokens: 2_000,
             output_tokens: 0,
             cached_input_tokens: 0,

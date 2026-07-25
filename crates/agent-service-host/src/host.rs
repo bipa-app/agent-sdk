@@ -3706,6 +3706,7 @@ mod tests {
                 model: "mock-model".into(),
                 stop_reason: Some(StopReason::EndTurn),
                 usage: Usage {
+                    served_speed: None,
                     input_tokens: 10,
                     output_tokens: 5,
                     cached_input_tokens: 0,
@@ -3883,6 +3884,7 @@ mod tests {
                 model: "mock-model".into(),
                 stop_reason: Some(StopReason::EndTurn),
                 usage: Usage {
+                    served_speed: None,
                     input_tokens: 1,
                     output_tokens: 1,
                     cached_input_tokens: 0,
@@ -5644,6 +5646,7 @@ mod tests {
             model: "mock-model".into(),
             stop_reason: Some(StopReason::EndTurn),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 10,
                 output_tokens: 5,
                 cached_input_tokens: 0,
@@ -5668,6 +5671,7 @@ mod tests {
             model: "mock-model".into(),
             stop_reason: Some(StopReason::ToolUse),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 12,
                 output_tokens: 6,
                 cached_input_tokens: 0,
@@ -5996,6 +6000,7 @@ mod tests {
 
     /// First usage frame the slow child's stream reports.
     const SLOW_CHILD_USAGE_FIRST_FRAME: Usage = Usage {
+        served_speed: None,
         input_tokens: 100,
         output_tokens: 50,
         cached_input_tokens: 0,
@@ -6008,6 +6013,7 @@ mod tests {
     /// handed the increment between these two; handed the restatements it
     /// would report their sum, 240/120.
     const SLOW_CHILD_USAGE_FINAL: Usage = Usage {
+        served_speed: None,
         input_tokens: 140,
         output_tokens: 70,
         cached_input_tokens: 0,
@@ -6099,6 +6105,7 @@ mod tests {
                         model: "mock-model".into(),
                         stop_reason: Some(StopReason::ToolUse),
                         usage: Usage {
+                            served_speed: None,
                             input_tokens: 8,
                             output_tokens: 4,
                             cached_input_tokens: 0,
@@ -6140,6 +6147,7 @@ mod tests {
                 model: "mock-model".into(),
                 stop_reason: Some(StopReason::ToolUse),
                 usage: Usage {
+                    served_speed: None,
                     input_tokens: 12,
                     output_tokens: 6,
                     cached_input_tokens: 0,

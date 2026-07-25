@@ -2072,6 +2072,7 @@ async fn terminal_stop_reason_ignores_tool_blocks_before_execution_and_persisten
         model: "mock-model".to_string(),
         stop_reason: Some(StopReason::EndTurn),
         usage: Usage {
+            served_speed: None,
             input_tokens: 10,
             output_tokens: 20,
             cached_input_tokens: 0,
@@ -5343,6 +5344,7 @@ async fn streaming_retry_bills_the_failed_attempts_usage() -> anyhow::Result<()>
     // sail past the limit.
     let usage = |input: u32, output: u32| {
         StreamDelta::Usage(Usage {
+            served_speed: None,
             input_tokens: input,
             output_tokens: output,
             cached_input_tokens: 0,
@@ -5449,6 +5451,7 @@ async fn failover_after_usage_bills_both_providers() -> anyhow::Result<()> {
     // primary's partial spend and the secondary's full response.
     let usage = |input: u32, output: u32| {
         StreamDelta::Usage(Usage {
+            served_speed: None,
             input_tokens: input,
             output_tokens: output,
             cached_input_tokens: 0,
@@ -5532,6 +5535,7 @@ async fn cancelled_stream_bills_the_usage_it_already_streamed() -> anyhow::Resul
             block_index: 0,
         },
         StreamDelta::Usage(Usage {
+            served_speed: None,
             input_tokens: 90,
             output_tokens: 10,
             cached_input_tokens: 0,
@@ -5810,6 +5814,7 @@ impl crate::llm::LlmProvider for PricedProvider {
             model: "gpt-4o".to_string(),
             stop_reason: Some(StopReason::EndTurn),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 2_000,
                 output_tokens: 1_000,
                 cached_input_tokens: 0,
@@ -6806,6 +6811,7 @@ fn refusal_response() -> ChatOutcome {
         model: "mock-model".to_string(),
         stop_reason: Some(StopReason::Refusal),
         usage: Usage {
+            served_speed: None,
             input_tokens: 10,
             output_tokens: 20,
             cached_input_tokens: 0,
@@ -8368,6 +8374,7 @@ impl crate::llm::LlmProvider for FablePricedProvider {
             model: "claude-fable-5".to_string(),
             stop_reason: Some(StopReason::EndTurn),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 2_000,
                 output_tokens: 1_000,
                 cached_input_tokens: 0,

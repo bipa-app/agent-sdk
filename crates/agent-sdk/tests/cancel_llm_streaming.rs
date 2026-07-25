@@ -339,6 +339,7 @@ impl LlmProvider for SimpleTextProvider {
             model: "test-model".to_string(),
             stop_reason: Some(StopReason::EndTurn),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 1,
                 output_tokens: 1,
                 cached_input_tokens: 0,

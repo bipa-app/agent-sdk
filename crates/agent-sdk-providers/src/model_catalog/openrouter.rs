@@ -440,6 +440,7 @@ mod tests {
         let registry = ModelRegistry::new();
         registry.refresh(&StaticSource(entries)).await?;
         let usage = Usage {
+            served_speed: None,
             input_tokens: 1_000,
             output_tokens: 1_000,
             cached_input_tokens: 0,
@@ -546,6 +547,7 @@ mod tests {
 
         // Inside the base band: 100K in + 100K out = 0.1*1.25 + 0.1*10 = 1.125.
         let short = Usage {
+            served_speed: None,
             input_tokens: 100_000,
             output_tokens: 100_000,
             cached_input_tokens: 0,
@@ -564,6 +566,7 @@ mod tests {
         // 0.2*2.5 + 0.1*15 = 2.0, where the base rates would say 1.25.
         for input_tokens in [200_000, 300_000] {
             let long = Usage {
+                served_speed: None,
                 input_tokens,
                 output_tokens: 100_000,
                 cached_input_tokens: 0,
@@ -581,6 +584,7 @@ mod tests {
 
         // One token below the threshold still pays base rates.
         let just_under = Usage {
+            served_speed: None,
             input_tokens: 199_999,
             output_tokens: 0,
             cached_input_tokens: 0,
@@ -610,6 +614,7 @@ mod tests {
 
         // Three 100K-prompt calls: 300K summed, no call near the 200K bound.
         let aggregate = Usage {
+            served_speed: None,
             input_tokens: 300_000,
             output_tokens: 0,
             cached_input_tokens: 0,
@@ -654,6 +659,7 @@ mod tests {
         let registry = ModelRegistry::new();
         registry.refresh(&StaticSource(entries)).await?;
         let out = |n: u32| Usage {
+            served_speed: None,
             input_tokens: n,
             output_tokens: 0,
             cached_input_tokens: 0,

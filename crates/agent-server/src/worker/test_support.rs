@@ -43,6 +43,7 @@ use std::time::Duration;
 /// `Usage{100,50,0,0}` shape the ported chat-only mocks used so token
 /// assertions carry over unchanged.
 const DEFAULT_USAGE: Usage = Usage {
+    served_speed: None,
     input_tokens: 100,
     output_tokens: 50,
     cached_input_tokens: 0,
