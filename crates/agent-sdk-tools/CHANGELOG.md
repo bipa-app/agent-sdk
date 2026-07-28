@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-tools-v0.15.0...agent-sdk-tools-v0.16.0) - 2026-07-28
+
+### Added
+
+- *(providers)* report which speed tier actually served a request ([#409](https://github.com/bipa-app/agent-sdk/pull/409))
+
 ## [0.13.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-tools-v0.12.0...agent-sdk-tools-v0.13.0) - 2026-07-14
 
 ### Other
