@@ -88,6 +88,7 @@ impl LlmProvider for AnswerCheckingProvider {
             model: "crash-test-model".into(),
             stop_reason: Some(StopReason::EndTurn),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 1,
                 output_tokens: 1,
                 cached_input_tokens: 0,

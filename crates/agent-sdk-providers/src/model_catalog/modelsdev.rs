@@ -572,6 +572,7 @@ mod tests {
         // 0.3*2 + 0.1*9 = 1.5, where the base tier output rate would say
         // 0.3*2 + 0.1*4 = 1.0.
         let usage = Usage {
+            served_speed: None,
             input_tokens: 300_000,
             output_tokens: 100_000,
             cached_input_tokens: 0,

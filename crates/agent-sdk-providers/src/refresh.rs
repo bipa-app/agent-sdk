@@ -464,6 +464,7 @@ mod tests {
             model: "mock-model".to_string(),
             stop_reason: Some(StopReason::EndTurn),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 1,
                 output_tokens: 1,
                 cached_input_tokens: 0,
@@ -722,6 +723,7 @@ mod tests {
         let mock_a = MockProvider::new();
         let usage = |i, o| {
             MockStreamItem::Ok(StreamDelta::Usage(Usage {
+                served_speed: None,
                 input_tokens: i,
                 output_tokens: o,
                 cached_input_tokens: 0,
@@ -784,6 +786,7 @@ mod tests {
         let mock = MockProvider::new();
         mock.queue_stream(vec![
             MockStreamItem::Ok(StreamDelta::Usage(Usage {
+                served_speed: None,
                 input_tokens: 100,
                 output_tokens: 50,
                 cached_input_tokens: 0,
@@ -800,6 +803,7 @@ mod tests {
                 block_index: 0,
             }),
             MockStreamItem::Ok(StreamDelta::Usage(Usage {
+                served_speed: None,
                 input_tokens: 10,
                 output_tokens: 5,
                 cached_input_tokens: 0,

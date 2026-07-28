@@ -503,6 +503,7 @@ fn non_success_outcome_error(outcome: &ChatOutcome) -> StructuredOutputError {
 /// Materialize a [`ChatResponse`] from a fully-consumed stream accumulator.
 fn build_streamed_response(mut accumulator: StreamAccumulator, model: String) -> ChatResponse {
     let usage = accumulator.take_usage().unwrap_or(Usage {
+        served_speed: None,
         input_tokens: 0,
         output_tokens: 0,
         cached_input_tokens: 0,
@@ -902,6 +903,7 @@ mod tests {
             model: "scripted-model".to_owned(),
             stop_reason: Some(StopReason::EndTurn),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 1,
                 output_tokens: 1,
                 cached_input_tokens: 0,

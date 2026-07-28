@@ -50,6 +50,7 @@ impl TestProvider {
             model: "test-model".to_string(),
             stop_reason: Some(StopReason::EndTurn),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 10,
                 output_tokens: 20,
                 cached_input_tokens: 0,
@@ -70,6 +71,7 @@ impl TestProvider {
             model: "test-model".to_string(),
             stop_reason: Some(StopReason::ToolUse),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 15,
                 output_tokens: 25,
                 cached_input_tokens: 0,
@@ -638,6 +640,7 @@ async fn llm_span_emits_cached_token_attributes() -> Result<()> {
     let provider = TestProvider::new(vec![TestProvider::text_response_with_usage(
         "cached",
         Usage {
+            served_speed: None,
             input_tokens: 180,
             output_tokens: 50,
             cached_input_tokens: 20,
@@ -692,6 +695,7 @@ async fn root_span_emits_aggregated_cached_token_attributes() -> Result<()> {
     let provider = TestProvider::new(vec![TestProvider::text_response_with_usage(
         "cached",
         Usage {
+            served_speed: None,
             input_tokens: 180,
             output_tokens: 50,
             cached_input_tokens: 20,
@@ -744,6 +748,7 @@ async fn turn_span_emits_cached_token_attributes() -> Result<()> {
     let provider = TestProvider::new(vec![TestProvider::text_response_with_usage(
         "cached",
         Usage {
+            served_speed: None,
             input_tokens: 180,
             output_tokens: 50,
             cached_input_tokens: 20,
@@ -2172,6 +2177,7 @@ async fn llm_span_emits_stream_lifecycle_events() -> Result<()> {
             block_index: 0,
         },
         StreamDelta::Usage(Usage {
+            served_speed: None,
             input_tokens: 1,
             output_tokens: 2,
             cached_input_tokens: 0,
@@ -2367,6 +2373,7 @@ async fn root_span_emits_context_window_exceeded_event() -> Result<()> {
         model: "test-model".to_string(),
         stop_reason: Some(StopReason::ModelContextWindowExceeded),
         usage: Usage {
+            served_speed: None,
             input_tokens: 0,
             output_tokens: 0,
             cached_input_tokens: 0,
@@ -2916,6 +2923,7 @@ mod metrics {
                 block_index: 0,
             },
             StreamDelta::Usage(Usage {
+                served_speed: None,
                 input_tokens: 1,
                 output_tokens: 3,
                 cached_input_tokens: 0,
@@ -3161,6 +3169,7 @@ mod metrics {
                     model: "test-model".to_string(),
                     stop_reason: Some(StopReason::EndTurn),
                     usage: Usage {
+                        served_speed: None,
                         input_tokens: 0,
                         output_tokens: 0,
                         cached_input_tokens: 0,
@@ -3200,6 +3209,7 @@ mod metrics {
                 model: "test-model".to_string(),
                 stop_reason: Some(StopReason::EndTurn),
                 usage: Usage {
+                    served_speed: None,
                     input_tokens: 5,
                     output_tokens: 10,
                     cached_input_tokens: 0,
@@ -3613,6 +3623,7 @@ impl LlmProvider for CloneableTestProvider {
                 model: "test-model".to_string(),
                 stop_reason: Some(StopReason::EndTurn),
                 usage: Usage {
+                    served_speed: None,
                     input_tokens: 0,
                     output_tokens: 0,
                     cached_input_tokens: 0,
@@ -3750,6 +3761,7 @@ async fn subagent_invoke_agent_links_to_parent_turn() -> Result<()> {
             model: "test-model".to_string(),
             stop_reason: Some(StopReason::EndTurn),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 5,
                 output_tokens: 10,
                 cached_input_tokens: 0,

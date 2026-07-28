@@ -230,6 +230,7 @@ fn multi_tool_use_response(ids_and_names: &[(&str, &str)]) -> ChatOutcome {
         model: "test-model".to_string(),
         stop_reason: Some(StopReason::ToolUse),
         usage: Usage {
+            served_speed: None,
             input_tokens: 5,
             output_tokens: 5,
             cached_input_tokens: 0,
@@ -247,6 +248,7 @@ fn text_response(text: &str) -> ChatOutcome {
         model: "test-model".to_string(),
         stop_reason: Some(StopReason::EndTurn),
         usage: Usage {
+            served_speed: None,
             input_tokens: 5,
             output_tokens: 5,
             cached_input_tokens: 0,

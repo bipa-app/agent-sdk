@@ -248,6 +248,7 @@ async fn interleaved_text_and_tool_deltas_suspend_with_balanced_history() -> Res
             block_index: 2,
         },
         StreamDelta::Usage(agent_sdk_foundation::llm::Usage {
+            served_speed: None,
             input_tokens: 30,
             output_tokens: 20,
             cached_input_tokens: 0,
@@ -659,6 +660,7 @@ async fn stream_ends_without_done_is_retried_then_completes() -> Result<()> {
                 block_index: 0,
             },
             StreamDelta::Usage(agent_sdk_foundation::llm::Usage {
+                served_speed: None,
                 input_tokens: 5,
                 output_tokens: 4,
                 cached_input_tokens: 0,

@@ -290,6 +290,7 @@ mod tests {
             model: "test".to_string(),
             stop_reason: None,
             usage: Usage {
+                served_speed: None,
                 input_tokens: 0,
                 output_tokens: 0,
                 cached_input_tokens: 0,
@@ -316,6 +317,7 @@ mod tests {
             model: "test".to_string(),
             stop_reason: None,
             usage: Usage {
+                served_speed: None,
                 input_tokens: 0,
                 output_tokens: 0,
                 cached_input_tokens: 0,
@@ -348,6 +350,7 @@ mod tests {
             model: "test".to_string(),
             stop_reason: None,
             usage: Usage {
+                served_speed: None,
                 input_tokens: 0,
                 output_tokens: 0,
                 cached_input_tokens: 0,
@@ -387,6 +390,7 @@ mod tests {
             model: "test".to_string(),
             stop_reason: None,
             usage: Usage {
+                served_speed: None,
                 input_tokens: 0,
                 output_tokens: 0,
                 cached_input_tokens: 0,
@@ -423,6 +427,7 @@ mod tests {
             model: "test".to_owned(),
             stop_reason: None,
             usage: Usage {
+                served_speed: None,
                 input_tokens: 0,
                 output_tokens: 0,
                 cached_input_tokens: 0,

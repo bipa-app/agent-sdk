@@ -476,6 +476,7 @@ pub async fn collect_stream(mut stream: StreamBox<'_>, model: String) -> Result<
 
     // Extract usage and stop_reason before consuming the accumulator
     let usage = accumulator.take_usage().unwrap_or(Usage {
+        served_speed: None,
         input_tokens: 0,
         output_tokens: 0,
         cached_input_tokens: 0,

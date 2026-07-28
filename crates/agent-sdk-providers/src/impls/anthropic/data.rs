@@ -6,7 +6,8 @@
 
 use crate::streaming::{StreamDelta, StreamErrorKind};
 use agent_sdk_foundation::llm::{
-    ChatRequest, Content, ContentBlock, ContentSource, Message, Role, StopReason, Usage,
+    ChatRequest, Content, ContentBlock, ContentSource, Message, Role, ServedSpeed, SpeedTier,
+    StopReason, Usage,
 };
 use serde::{Deserialize, Serialize};
 
@@ -310,6 +311,11 @@ pub struct ApiUsage {
     pub cache_creation_input: u32,
     #[serde(default, rename = "cache_read_input_tokens")]
     pub cache_read_input: u32,
+    /// Which speed tier actually served the request. Only present when the
+    /// account has fast mode enabled; absent on Vertex and on every model
+    /// without a premium tier.
+    #[serde(default)]
+    pub speed: Option<SpeedTier>,
 }
 
 impl ApiUsage {
@@ -323,6 +329,14 @@ impl ApiUsage {
 
     pub const fn cache_creation_input_tokens(&self) -> u32 {
         self.cache_creation_input
+    }
+
+    /// The served tier as a foldable reading, when the API reported one.
+    pub const fn served_speed(&self) -> Option<ServedSpeed> {
+        match self.speed {
+            Some(tier) => Some(ServedSpeed::Uniform(tier)),
+            None => None,
+        }
     }
 }
 
@@ -348,6 +362,8 @@ pub struct SseMessageStartUsage {
     pub cache_creation: u32,
     #[serde(default, rename = "cache_read_input_tokens")]
     pub cache_read: u32,
+    #[serde(default)]
+    pub speed: Option<SpeedTier>,
 }
 
 impl SseMessageStartUsage {
@@ -361,6 +377,13 @@ impl SseMessageStartUsage {
 
     pub const fn cache_creation_input_tokens(&self) -> u32 {
         self.cache_creation
+    }
+
+    pub const fn served_speed(&self) -> Option<ServedSpeed> {
+        match self.speed {
+            Some(tier) => Some(ServedSpeed::Uniform(tier)),
+            None => None,
+        }
     }
 }
 
@@ -422,6 +445,11 @@ pub struct SseMessageDeltaData {
 #[derive(Deserialize)]
 pub struct SseMessageDeltaUsage {
     pub output_tokens: u32,
+    /// Anthropic documents `usage.speed` on the non-streaming response; the
+    /// streaming shape is not spelled out, so it is read from both
+    /// `message_start` and `message_delta` and whichever reports it wins.
+    #[serde(default)]
+    pub speed: Option<SpeedTier>,
 }
 
 // ============================================================================
@@ -830,12 +858,62 @@ fn parse_stream_error_event(data: &str) -> (String, StreamErrorKind) {
 }
 
 /// Parse an SSE event block and return the corresponding `StreamDelta`.
+/// Usage a streaming response accumulates as its SSE events arrive.
+///
+/// Grouped into one struct rather than passed as loose `&mut` counters: the
+/// served tier would have pushed [`parse_sse_event`] past clippy's argument
+/// ceiling, and these fields are one cohesive reading anyway.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SseUsageState {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cached_input_tokens: u32,
+    pub cache_creation_input_tokens: u32,
+    pub served_speed: Option<ServedSpeed>,
+}
+
+impl SseUsageState {
+    /// The reading as a foundation [`Usage`].
+    #[must_use]
+    pub const fn to_usage(&self) -> Usage {
+        Usage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cached_input_tokens: self.cached_input_tokens,
+            cache_creation_input_tokens: self.cache_creation_input_tokens,
+            served_speed: self.served_speed,
+        }
+    }
+}
+
+/// Fold a `message_start` frame's input-token counts and served tier into the
+/// running usage state.
+fn apply_message_start_usage(event_type: &str, data: &str, usage: &mut SseUsageState) {
+    match serde_json::from_str::<SseMessageStart>(data) {
+        Ok(event) => {
+            usage.cached_input_tokens = event.message.usage.cached_input_tokens();
+            usage.cache_creation_input_tokens = event.message.usage.cache_creation_input_tokens();
+            usage.input_tokens = event.message.usage.total_input_tokens();
+            usage.served_speed =
+                ServedSpeed::merge(usage.served_speed, event.message.usage.served_speed());
+        }
+        Err(error) => log_sse_parse_error(event_type, data, &error),
+    }
+}
+
+/// Fold a `message_delta` frame's output-token count and served tier into the
+/// running usage state.
+fn apply_message_delta_usage(event: &SseMessageDelta, usage: &mut SseUsageState) {
+    usage.output_tokens = event.usage.output_tokens;
+    usage.served_speed = ServedSpeed::merge(
+        usage.served_speed,
+        event.usage.speed.map(ServedSpeed::Uniform),
+    );
+}
+
 pub fn parse_sse_event(
     event_block: &str,
-    input_tokens: &mut u32,
-    output_tokens: &mut u32,
-    cached_input_tokens: &mut u32,
-    cache_creation_input_tokens: &mut u32,
+    usage: &mut SseUsageState,
     tool_ids: &mut std::collections::HashMap<usize, String>,
     pending_stop_reason: &mut Option<StopReason>,
 ) -> Option<StreamDelta> {
@@ -845,16 +923,7 @@ pub fn parse_sse_event(
 
     match event_type.as_str() {
         "message_start" => {
-            // Extract input tokens from message_start
-            match serde_json::from_str::<SseMessageStart>(&data) {
-                Ok(event) => {
-                    *cached_input_tokens = event.message.usage.cached_input_tokens();
-                    *cache_creation_input_tokens =
-                        event.message.usage.cache_creation_input_tokens();
-                    *input_tokens = event.message.usage.total_input_tokens();
-                }
-                Err(error) => log_sse_parse_error(&event_type, &data, &error),
-            }
+            apply_message_start_usage(&event_type, &data, usage);
             None
         }
         "content_block_start" => {
@@ -919,7 +988,7 @@ pub fn parse_sse_event(
         "message_delta" => {
             match serde_json::from_str::<SseMessageDelta>(&data) {
                 Ok(event) => {
-                    *output_tokens = event.usage.output_tokens;
+                    apply_message_delta_usage(&event, usage);
                     // Store the stop reason for emission in message_stop,
                     // ensuring Usage is emitted before Done.
                     *pending_stop_reason = event.delta.stop_reason.as_ref().map(map_stop_reason);
@@ -935,12 +1004,7 @@ pub fn parse_sse_event(
             // Emit Usage — the caller is responsible for emitting Done
             // with the pending_stop_reason afterwards, ensuring consumers
             // always receive token counts before the stream ends.
-            Some(StreamDelta::Usage(Usage {
-                input_tokens: *input_tokens,
-                output_tokens: *output_tokens,
-                cached_input_tokens: *cached_input_tokens,
-                cache_creation_input_tokens: *cache_creation_input_tokens,
-            }))
+            Some(StreamDelta::Usage(usage.to_usage()))
         }
         "error" => {
             // Anthropic can stream a TERMINAL `error` event mid-stream
@@ -1079,6 +1143,81 @@ mod tests {
         assert!(json.contains("\"model\":\"claude-3-5-sonnet\""));
         // anthropic_version should be skipped when None
         assert!(!json.contains("anthropic_version"));
+    }
+
+    #[test]
+    fn served_speed_is_read_from_the_non_streaming_usage() -> anyhow::Result<()> {
+        let usage: ApiUsage =
+            serde_json::from_str(r#"{"input_tokens":8,"output_tokens":12,"speed":"fast"}"#)?;
+        assert_eq!(
+            usage.served_speed(),
+            Some(ServedSpeed::Uniform(SpeedTier::Fast))
+        );
+
+        // A model without a premium tier omits the field entirely, which must
+        // read as "not reported" rather than defaulting to standard.
+        let usage: ApiUsage = serde_json::from_str(r#"{"input_tokens":8,"output_tokens":12}"#)?;
+        assert_eq!(usage.served_speed(), None);
+
+        // A request that asked for fast and got standard back is the downgrade
+        // this field exists to surface.
+        let usage: ApiUsage =
+            serde_json::from_str(r#"{"input_tokens":8,"output_tokens":12,"speed":"standard"}"#)?;
+        assert_eq!(
+            usage.served_speed(),
+            Some(ServedSpeed::Uniform(SpeedTier::Standard))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_carries_the_served_tier_into_the_usage_delta() {
+        let mut usage = SseUsageState::default();
+        let mut tool_ids = std::collections::HashMap::new();
+        let mut pending = None;
+
+        // Anthropic documents `usage.speed` on the non-streaming response only,
+        // so both terminal-usage frames are read and whichever reports it wins.
+        parse_sse_event(
+            "event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":12,\"speed\":\"fast\"}}\n\n",
+            &mut usage,
+            &mut tool_ids,
+            &mut pending,
+        );
+        assert_eq!(
+            usage.served_speed,
+            Some(ServedSpeed::Uniform(SpeedTier::Fast))
+        );
+
+        let delta = parse_sse_event(
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            &mut usage,
+            &mut tool_ids,
+            &mut pending,
+        );
+        match delta {
+            Some(StreamDelta::Usage(usage)) => assert_eq!(
+                usage.served_speed,
+                Some(ServedSpeed::Uniform(SpeedTier::Fast)),
+                "the tier must survive into the emitted Usage delta",
+            ),
+            other => panic!("expected a Usage delta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn streaming_reports_no_tier_when_the_api_sends_none() {
+        let mut usage = SseUsageState::default();
+        let mut tool_ids = std::collections::HashMap::new();
+        let mut pending = None;
+
+        parse_sse_event(
+            "event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":12}}\n\n",
+            &mut usage,
+            &mut tool_ids,
+            &mut pending,
+        );
+        assert_eq!(usage.served_speed, None);
     }
 
     #[test]
@@ -1378,21 +1517,10 @@ mod tests {
         let event = r#"event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#;
 
-        let mut input_tokens = 0;
-        let mut output_tokens = 0;
-        let mut cached_input_tokens = 0;
-        let mut cache_creation_input_tokens = 0;
+        let mut usage = SseUsageState::default();
         let mut tool_ids = std::collections::HashMap::new();
         let mut pending_stop_reason = None;
-        let delta = parse_sse_event(
-            event,
-            &mut input_tokens,
-            &mut output_tokens,
-            &mut cached_input_tokens,
-            &mut cache_creation_input_tokens,
-            &mut tool_ids,
-            &mut pending_stop_reason,
-        );
+        let delta = parse_sse_event(event, &mut usage, &mut tool_ids, &mut pending_stop_reason);
 
         assert!(matches!(
             delta,
@@ -1405,21 +1533,10 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
         let event = r#"event: content_block_start
 data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_123","name":"read_file"}}"#;
 
-        let mut input_tokens = 0;
-        let mut output_tokens = 0;
-        let mut cached_input_tokens = 0;
-        let mut cache_creation_input_tokens = 0;
+        let mut usage = SseUsageState::default();
         let mut tool_ids = std::collections::HashMap::new();
         let mut pending_stop_reason = None;
-        let delta = parse_sse_event(
-            event,
-            &mut input_tokens,
-            &mut output_tokens,
-            &mut cached_input_tokens,
-            &mut cache_creation_input_tokens,
-            &mut tool_ids,
-            &mut pending_stop_reason,
-        );
+        let delta = parse_sse_event(event, &mut usage, &mut tool_ids, &mut pending_stop_reason);
 
         assert!(matches!(
             delta,
@@ -1435,24 +1552,13 @@ data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use"
         let event = r#"event: content_block_delta
 data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#;
 
-        let mut input_tokens = 0;
-        let mut output_tokens = 0;
-        let mut cached_input_tokens = 0;
-        let mut cache_creation_input_tokens = 0;
+        let mut usage = SseUsageState::default();
         // Pre-populate tool_ids as if we received the tool_use_start event
         let mut tool_ids = std::collections::HashMap::new();
         tool_ids.insert(1, "toolu_123".to_string());
         let mut pending_stop_reason = None;
 
-        let delta = parse_sse_event(
-            event,
-            &mut input_tokens,
-            &mut output_tokens,
-            &mut cached_input_tokens,
-            &mut cache_creation_input_tokens,
-            &mut tool_ids,
-            &mut pending_stop_reason,
-        );
+        let delta = parse_sse_event(event, &mut usage, &mut tool_ids, &mut pending_stop_reason);
 
         // Verify the tool ID is correctly looked up
         assert!(matches!(
@@ -1467,26 +1573,15 @@ data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta"
         let event = r#"event: message_start
 data: {"type":"message_start","message":{"id":"msg_123","type":"message","role":"assistant","content":[],"model":"claude-3-5-sonnet","usage":{"input_tokens":150,"cache_creation_input_tokens":10,"cache_read_input_tokens":20}}}"#;
 
-        let mut input_tokens = 0;
-        let mut output_tokens = 0;
-        let mut cached_input_tokens = 0;
-        let mut cache_creation_input_tokens = 0;
+        let mut usage = SseUsageState::default();
         let mut tool_ids = std::collections::HashMap::new();
         let mut pending_stop_reason = None;
-        let delta = parse_sse_event(
-            event,
-            &mut input_tokens,
-            &mut output_tokens,
-            &mut cached_input_tokens,
-            &mut cache_creation_input_tokens,
-            &mut tool_ids,
-            &mut pending_stop_reason,
-        );
+        let delta = parse_sse_event(event, &mut usage, &mut tool_ids, &mut pending_stop_reason);
 
         assert!(delta.is_none());
-        assert_eq!(input_tokens, 180);
-        assert_eq!(cached_input_tokens, 20);
-        assert_eq!(cache_creation_input_tokens, 10);
+        assert_eq!(usage.input_tokens, 180);
+        assert_eq!(usage.cached_input_tokens, 20);
+        assert_eq!(usage.cache_creation_input_tokens, 10);
     }
 
     #[test]
@@ -1494,26 +1589,15 @@ data: {"type":"message_start","message":{"id":"msg_123","type":"message","role":
         let event = r#"event: message_delta
 data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42}}"#;
 
-        let mut input_tokens = 0;
-        let mut output_tokens = 0;
-        let mut cached_input_tokens = 0;
-        let mut cache_creation_input_tokens = 0;
+        let mut usage = SseUsageState::default();
         let mut tool_ids = std::collections::HashMap::new();
         let mut pending_stop_reason = None;
-        let delta = parse_sse_event(
-            event,
-            &mut input_tokens,
-            &mut output_tokens,
-            &mut cached_input_tokens,
-            &mut cache_creation_input_tokens,
-            &mut tool_ids,
-            &mut pending_stop_reason,
-        );
+        let delta = parse_sse_event(event, &mut usage, &mut tool_ids, &mut pending_stop_reason);
 
         // message_delta no longer emits Done directly; it stores the stop
         // reason for the caller to emit after Usage in message_stop.
         assert!(delta.is_none());
-        assert_eq!(output_tokens, 42);
+        assert_eq!(usage.output_tokens, 42);
         assert!(matches!(pending_stop_reason, Some(StopReason::EndTurn)));
     }
 
@@ -1522,21 +1606,16 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"outpu
         let event = r#"event: message_stop
 data: {"type":"message_stop"}"#;
 
-        let mut input_tokens = 180;
-        let mut output_tokens = 50;
-        let mut cached_input_tokens = 20;
-        let mut cache_creation_input_tokens = 10;
+        let mut usage = SseUsageState {
+            input_tokens: 180,
+            output_tokens: 50,
+            cached_input_tokens: 20,
+            cache_creation_input_tokens: 10,
+            served_speed: None,
+        };
         let mut tool_ids = std::collections::HashMap::new();
         let mut pending_stop_reason = None;
-        let delta = parse_sse_event(
-            event,
-            &mut input_tokens,
-            &mut output_tokens,
-            &mut cached_input_tokens,
-            &mut cache_creation_input_tokens,
-            &mut tool_ids,
-            &mut pending_stop_reason,
-        );
+        let delta = parse_sse_event(event, &mut usage, &mut tool_ids, &mut pending_stop_reason);
 
         assert!(matches!(
             delta,
@@ -1545,6 +1624,7 @@ data: {"type":"message_stop"}"#;
                 output_tokens: 50,
                 cached_input_tokens: 20,
                 cache_creation_input_tokens: 10,
+                served_speed: None,
             }))
         ));
     }
@@ -1564,21 +1644,10 @@ data: {"type":"message_stop"}"#;
     fn test_sse_signature_delta_parsing_with_multiline_data_and_crlf() {
         let event = "event: content_block_delta\r\ndata: {\"type\":\"content_block_delta\",\r\ndata: \"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_123\"}}";
 
-        let mut input_tokens = 0;
-        let mut output_tokens = 0;
-        let mut cached_input_tokens = 0;
-        let mut cache_creation_input_tokens = 0;
+        let mut usage = SseUsageState::default();
         let mut tool_ids = std::collections::HashMap::new();
         let mut pending_stop_reason = None;
-        let delta = parse_sse_event(
-            event,
-            &mut input_tokens,
-            &mut output_tokens,
-            &mut cached_input_tokens,
-            &mut cache_creation_input_tokens,
-            &mut tool_ids,
-            &mut pending_stop_reason,
-        );
+        let delta = parse_sse_event(event, &mut usage, &mut tool_ids, &mut pending_stop_reason);
 
         assert!(matches!(
             delta,
@@ -1631,21 +1700,10 @@ data: {"type":"message_stop"}"#;
         let event = r#"event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_123"}}"#;
 
-        let mut input_tokens = 0;
-        let mut output_tokens = 0;
-        let mut cached_input_tokens = 0;
-        let mut cache_creation_input_tokens = 0;
+        let mut usage = SseUsageState::default();
         let mut tool_ids = std::collections::HashMap::new();
         let mut pending_stop_reason = None;
-        let delta = parse_sse_event(
-            event,
-            &mut input_tokens,
-            &mut output_tokens,
-            &mut cached_input_tokens,
-            &mut cache_creation_input_tokens,
-            &mut tool_ids,
-            &mut pending_stop_reason,
-        );
+        let delta = parse_sse_event(event, &mut usage, &mut tool_ids, &mut pending_stop_reason);
 
         assert!(matches!(
             delta,
@@ -1657,10 +1715,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta",
     fn parse_error_event(event: &str) -> Option<StreamDelta> {
         parse_sse_event(
             event,
-            &mut 0,
-            &mut 0,
-            &mut 0,
-            &mut 0,
+            &mut SseUsageState::default(),
             &mut std::collections::HashMap::new(),
             &mut None,
         )

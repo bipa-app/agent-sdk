@@ -44,6 +44,7 @@ impl LlmProvider for DemoProvider {
             model: "demo-model".to_string(),
             stop_reason: Some(StopReason::EndTurn),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 8,
                 output_tokens: 12,
                 cached_input_tokens: 0,

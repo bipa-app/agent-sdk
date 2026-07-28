@@ -91,6 +91,7 @@ impl LlmProvider for MockTextProvider {
             model: "mock-model".into(),
             stop_reason: Some(StopReason::EndTurn),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 100,
                 output_tokens: 50,
                 cached_input_tokens: 10,
@@ -159,6 +160,7 @@ impl LlmProvider for MockToolCallProvider {
             model: "mock-model".into(),
             stop_reason: Some(self.stop_reason),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 120,
                 output_tokens: 60,
                 cached_input_tokens: 15,
@@ -3677,6 +3679,7 @@ impl LlmProvider for FlakyProvider {
             model: "mock-model".into(),
             stop_reason: Some(StopReason::EndTurn),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 100,
                 output_tokens: 50,
                 cached_input_tokens: 10,
@@ -3760,7 +3763,7 @@ impl LlmProvider for OfflineThenSuccessProvider {
                 delta: "continued after reconnect".to_owned(),
                 block_index: 0,
             });
-            yield Ok(StreamDelta::Usage(Usage {
+            yield Ok(StreamDelta::Usage(Usage { served_speed: None,
                 input_tokens: 10,
                 output_tokens: 3,
                 cached_input_tokens: 0,
@@ -4362,6 +4365,7 @@ impl LlmProvider for ScriptedProvider {
                 model: "mock-model".into(),
                 stop_reason: Some(StopReason::EndTurn),
                 usage: Usage {
+                    served_speed: None,
                     input_tokens: 100,
                     output_tokens: 50,
                     cached_input_tokens: 10,
@@ -4752,6 +4756,7 @@ impl LlmProvider for CapturingProvider {
             model: "mock-model".into(),
             stop_reason: Some(StopReason::EndTurn),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 10,
                 output_tokens: 5,
                 cached_input_tokens: 0,
@@ -4930,6 +4935,7 @@ impl LlmProvider for SteeringCaptureProvider {
             model: "mock-model".into(),
             stop_reason: Some(StopReason::EndTurn),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 90,
                 output_tokens: 30,
                 cached_input_tokens: 5,
@@ -5454,6 +5460,7 @@ impl LlmProvider for SteeringRedirectProvider {
             model: "mock-model".into(),
             stop_reason: Some(StopReason::ToolUse),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 80,
                 output_tokens: 40,
                 cached_input_tokens: 0,
@@ -8788,6 +8795,7 @@ impl LlmProvider for BoundaryFailProvider {
             model: "mock-model".into(),
             stop_reason: Some(StopReason::EndTurn),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 100,
                 output_tokens: 50,
                 cached_input_tokens: 10,
@@ -8830,6 +8838,7 @@ impl LlmProvider for SecondWaveProvider<'_> {
             model: "mock-model".into(),
             stop_reason: Some(StopReason::EndTurn),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 100,
                 output_tokens: 50,
                 cached_input_tokens: 10,
@@ -8870,6 +8879,7 @@ impl LlmProvider for TextThenToolProvider<'_> {
                 model: "mock-model".into(),
                 stop_reason: Some(StopReason::EndTurn),
                 usage: Usage {
+                    served_speed: None,
                     input_tokens: 10,
                     output_tokens: 5,
                     cached_input_tokens: 0,
@@ -8888,6 +8898,7 @@ impl LlmProvider for TextThenToolProvider<'_> {
             model: "mock-model".into(),
             stop_reason: Some(StopReason::ToolUse),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 10,
                 output_tokens: 5,
                 cached_input_tokens: 0,
@@ -9712,6 +9723,7 @@ impl LlmProvider for RoutedBackend {
             model: self.name.to_owned(),
             stop_reason: Some(StopReason::EndTurn),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 10,
                 output_tokens: 5,
                 cached_input_tokens: 0,
@@ -9799,7 +9811,7 @@ impl LlmProvider for RoutelessStreamProvider {
                 delta: "plain answer".to_owned(),
                 block_index: 0,
             });
-            yield Ok(StreamDelta::Usage(Usage {
+            yield Ok(StreamDelta::Usage(Usage { served_speed: None,
                 input_tokens: 10,
                 output_tokens: 5,
                 cached_input_tokens: 0,

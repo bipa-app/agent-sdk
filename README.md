@@ -657,10 +657,31 @@ is expedited. Two caveats worth designing around:
   speeds do not share cached prefixes.
 - **A premium request can still be served at standard speed and billed at standard rates** —
   Anthropic does this on `claude-opus-4-6`, and OpenAI downgrades under a sharp traffic ramp.
-  Both report the tier they actually used; surfacing that in `Usage` is not implemented yet.
+  Check `usage.served_speed` to find out which tier actually ran.
 
 `SpeedTier::Standard` is not the same as leaving the tier unset on OpenAI: it sends
 `service_tier: "default"` to override a project configured to default to priority.
+
+### Checking which tier you got
+
+`Usage::served_speed` reports the tier the provider says it used — `None` when it reported
+none, which is the normal case for models with no premium tier:
+
+```rust
+use agent_sdk::{ServedSpeed, SpeedTier};
+
+match response.usage.served_speed {
+    Some(ServedSpeed::Uniform(SpeedTier::Fast)) => {} // got what we paid for
+    Some(ServedSpeed::Uniform(SpeedTier::Standard)) => {} // downgraded, billed standard
+    Some(ServedSpeed::Mixed) => {} // a multi-call turn where some calls were downgraded
+    _ => {} // provider reported no tier
+}
+```
+
+`Mixed` exists because a `Usage` is not always one response: the agent loop folds each call's
+reading into a running total, and a turn that mixes an expedited call with a downgraded one has
+no single tier. Folding it to "unknown" would make a real downgrade look identical to a provider
+that never reported a tier, so disagreement gets its own variant.
 
 ## Lifecycle Hooks
 

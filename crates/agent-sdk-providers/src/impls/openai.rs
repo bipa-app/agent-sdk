@@ -45,8 +45,8 @@ use std::collections::HashMap;
 use super::openai_reasoning::{
     OpenAIAllowedToolsMode, OpenAIApiSurface, OpenAIPromptCacheMode, OpenAIPromptCacheTtl,
     OpenAIReasoningConfig, OpenAIReasoningEffort, OpenAITextVerbosity, OpenAIToolChoice,
-    is_gpt56_model, legacy_reasoning_effort, service_tier_wire_value, validate_reasoning_config,
-    validate_tool_choice,
+    is_gpt56_model, legacy_reasoning_effort, served_speed_from_service_tier,
+    service_tier_wire_value, validate_reasoning_config, validate_tool_choice,
 };
 use super::openai_responses::OpenAIResponsesProvider;
 use super::openai_schema::normalize_strict_schema;
@@ -1476,6 +1476,7 @@ fn process_sse_data(data: &str) -> Vec<SseProcessResult> {
     // tokens are billed whether or not the turn survives.
     if let Some(u) = chunk.usage {
         results.push(SseProcessResult::Usage(Usage {
+            served_speed: served_speed_from_service_tier(chunk.service_tier.as_deref()),
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
             cached_input_tokens: u
@@ -1628,6 +1629,7 @@ fn decode_chat_response(
         model: api_response.model,
         stop_reason,
         usage: Usage {
+            served_speed: served_speed_from_service_tier(api_response.service_tier.as_deref()),
             input_tokens: api_response.usage.prompt_tokens,
             output_tokens: api_response.usage.completion_tokens,
             cached_input_tokens: api_response
@@ -2307,6 +2309,11 @@ struct ApiChatResponse {
     choices: Vec<ApiChoice>,
     model: String,
     usage: ApiUsage,
+    /// Tier that actually served the request. `OpenAI` echoes this back and
+    /// can report `default` for a request that asked for `priority` — a
+    /// downgrade under a sharp traffic ramp, billed at standard rates.
+    #[serde(default)]
+    service_tier: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2382,6 +2389,10 @@ struct SseChunk {
     choices: Vec<SseChoice>,
     #[serde(default)]
     usage: Option<SseUsage>,
+    /// Tier that served this chunk, echoed the same way as on the
+    /// non-streaming response.
+    #[serde(default)]
+    service_tier: Option<String>,
     /// In-band failure. `OpenAI`-compatible routes (`OpenRouter` among them)
     /// answer 200 and report the failure as a chunk carrying this object, so
     /// the HTTP status never sees it.
@@ -3792,6 +3803,7 @@ mod tests {
                 output_tokens: 7,
                 cached_input_tokens: 10,
                 cache_creation_input_tokens: 6,
+                served_speed: None,
             })]
         ));
     }

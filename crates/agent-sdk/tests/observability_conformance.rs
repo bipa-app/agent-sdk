@@ -542,6 +542,7 @@ async fn test_metrics_emitted_b3() -> Result<()> {
             model: "test-model".to_string(),
             stop_reason: Some(agent_sdk::llm::StopReason::EndTurn),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 5,
                 output_tokens: 10,
                 cached_input_tokens: 0,

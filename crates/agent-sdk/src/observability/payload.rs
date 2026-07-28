@@ -464,6 +464,7 @@ mod tests {
             model: "test-model".to_string(),
             stop_reason: Some(StopReason::EndTurn),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 10,
                 output_tokens: 5,
                 cached_input_tokens: 0,
@@ -490,6 +491,7 @@ mod tests {
             model: "test-model".to_string(),
             stop_reason: Some(StopReason::ToolUse),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 10,
                 output_tokens: 5,
                 cached_input_tokens: 0,
@@ -620,6 +622,7 @@ mod tests {
             model: "m".to_string(),
             stop_reason: Some(StopReason::EndTurn),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 0,
                 output_tokens: 0,
                 cached_input_tokens: 0,

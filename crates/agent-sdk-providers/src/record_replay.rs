@@ -729,6 +729,7 @@ mod tests {
             model: "inner-model".to_owned(),
             stop_reason: Some(StopReason::EndTurn),
             usage: Usage {
+                served_speed: None,
                 input_tokens: 7,
                 output_tokens: 3,
                 cached_input_tokens: 0,
