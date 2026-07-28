@@ -225,7 +225,7 @@ fn environment_types() {
 fn provider_trait_and_streaming() {
     use agent_sdk::llm::{
         ChatOutcome, ChatRequest, ChatResponse, ContentBlock, ContentSource, Effort, LlmProvider,
-        StreamAccumulator, StreamDelta, ThinkingConfig, ThinkingMode,
+        SpeedTier, StreamAccumulator, StreamDelta, ThinkingConfig, ThinkingMode,
     };
 
     fn _assert_provider(_p: &dyn LlmProvider) {}
@@ -236,6 +236,7 @@ fn provider_trait_and_streaming() {
         _effort: Effort,
         _tc: ThinkingConfig,
         _tm: ThinkingMode,
+        _speed: SpeedTier,
     ) {
     }
     fn _assert_chat(_req: ChatRequest, _res: ChatResponse, _out: ChatOutcome) {}

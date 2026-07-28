@@ -31,6 +31,11 @@ pub struct ApiMessagesRequest<'a> {
     pub thinking: Option<ApiThinkingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_config: Option<ApiOutputConfig>,
+    /// Fast mode opt-in (`"fast"`). Only ever `Some` on the first-party
+    /// Anthropic API: fast mode is not offered on Vertex, which shares these
+    /// request types, so leaving it `None` keeps it off the Vertex wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anthropic_version: Option<&'a str>,
 }
@@ -1065,6 +1070,7 @@ mod tests {
             stream: true,
             thinking: None,
             output_config: None,
+            speed: None,
             anthropic_version: None,
         };
 
@@ -1073,6 +1079,33 @@ mod tests {
         assert!(json.contains("\"model\":\"claude-3-5-sonnet\""));
         // anthropic_version should be skipped when None
         assert!(!json.contains("anthropic_version"));
+    }
+
+    #[test]
+    fn test_api_request_speed_field() {
+        let messages = vec![];
+        let mut request = ApiMessagesRequest {
+            model: Some("claude-opus-5"),
+            max_tokens: 1024,
+            system: None,
+            messages: &messages,
+            tools: None,
+            tool_choice: None,
+            stream: false,
+            thinking: None,
+            output_config: None,
+            speed: Some("fast"),
+            anthropic_version: None,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"speed\":\"fast\""), "{json}");
+
+        // Omitted entirely on the standard path, so the request body a Vertex
+        // or standard-speed call sends is byte-identical to before fast mode.
+        request.speed = None;
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("speed"), "{json}");
     }
 
     #[test]
@@ -1088,6 +1121,7 @@ mod tests {
             stream: false,
             thinking: None,
             output_config: None,
+            speed: None,
             anthropic_version: Some("vertex-2023-10-16"),
         };
 

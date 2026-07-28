@@ -13,7 +13,7 @@ use crate::streaming::{
 #[cfg(test)]
 use agent_sdk_foundation::llm::ChatResponse;
 use agent_sdk_foundation::llm::{
-    ChatOutcome, ChatRequest, Content, ContentBlock, Effort, ResponseFormat, StopReason,
+    ChatOutcome, ChatRequest, Content, ContentBlock, Effort, ResponseFormat, SpeedTier, StopReason,
     ThinkingConfig, ThinkingMode, ToolChoice, Usage,
 };
 use anyhow::{Context, Result};
@@ -1815,6 +1815,29 @@ impl LlmProvider for OpenAICodexResponsesProvider {
 
     fn configured_thinking(&self) -> Option<&ThinkingConfig> {
         self.thinking.as_ref()
+    }
+
+    /// Reject premium speed tiers with the reason, rather than inheriting the
+    /// generic refusal.
+    ///
+    /// There is no speed tier to buy on this surface: the `ChatGPT` Codex
+    /// backend serves a Plus/Pro subscription, not per-token API billing, so it has no
+    /// equivalent of `OpenAI`'s `service_tier` or Anthropic's fast mode. A
+    /// caller who wants priority processing needs an API-key provider
+    /// ([`OpenAIProvider`](super::openai::OpenAIProvider) or
+    /// [`OpenAIResponsesProvider`](super::openai_responses::OpenAIResponsesProvider)).
+    fn validate_speed_tier(&self, speed: Option<SpeedTier>) -> Result<()> {
+        if !speed.is_some_and(SpeedTier::is_premium) {
+            return Ok(());
+        }
+        Err(anyhow::anyhow!(
+            "a premium speed tier is not available for provider={} model={}: \
+             the ChatGPT Codex backend bills through a subscription and offers \
+             no priority-processing tier — use an OpenAI API-key provider for \
+             service_tier=priority",
+            self.provider(),
+            self.model()
+        ))
     }
 }
 
@@ -5171,6 +5194,29 @@ mod tests {
             "no websocket upgrade may be attempted when the env var forces HTTP-only",
         );
         assert_eq!(http_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn codex_refuses_a_premium_speed_tier_with_the_subscription_reason() {
+        // There is no tier to buy on a ChatGPT subscription. Inheriting the
+        // generic refusal would leave the caller guessing; name the reason and
+        // the surface that does support priority.
+        let provider = OpenAICodexResponsesProvider::codex("test-key-not-a-secret".to_owned());
+
+        let error = provider
+            .validate_speed_tier(Some(SpeedTier::Fast))
+            .expect_err("a premium tier must be refused");
+        let message = error.to_string();
+        assert!(message.contains("subscription"), "{message}");
+        assert!(message.contains("service_tier=priority"), "{message}");
+    }
+
+    #[test]
+    fn codex_allows_the_standard_tier() -> anyhow::Result<()> {
+        let provider = OpenAICodexResponsesProvider::codex("test-key-not-a-secret".to_owned());
+        provider.validate_speed_tier(None)?;
+        provider.validate_speed_tier(Some(SpeedTier::Standard))?;
+        Ok(())
     }
 
     #[tokio::test]

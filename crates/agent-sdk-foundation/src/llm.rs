@@ -286,6 +286,44 @@ impl CacheConfig {
     }
 }
 
+/// Inference speed tier — the "pay a premium for lower latency" knob.
+///
+/// Providers expose this under different names for different mechanisms, so
+/// only the shared economics are modelled here: [`Self::Fast`] costs more per
+/// token and is expected to return sooner.
+///
+/// - Anthropic calls it *fast mode* (`speed: "fast"`): the same model weights
+///   on a faster inference configuration, up to 2.5x the output tokens per
+///   second. Supported only on Opus 5 and Opus 4.8.
+/// - `OpenAI` calls it *priority processing* (`service_tier: "priority"`):
+///   queue priority for lower, more consistent latency.
+///
+/// Neither mechanism changes model behaviour or capabilities. Because both
+/// providers can serve a premium request at standard speed — and bill it at
+/// standard rates — a requested tier is not a guarantee; see
+/// [`LlmProvider::validate_speed_tier`](https://docs.rs/agent-sdk-providers)
+/// for how unsupported combinations are rejected up front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum SpeedTier {
+    /// The provider's normal inference path at standard pricing.
+    #[default]
+    Standard,
+    /// The provider's premium low-latency path at premium pricing.
+    Fast,
+}
+
+impl SpeedTier {
+    /// Whether this tier asks for the premium low-latency path.
+    ///
+    /// Prefer this over matching on the variant so that a future intermediate
+    /// tier does not silently read as standard at every call site.
+    #[must_use]
+    pub const fn is_premium(self) -> bool {
+        matches!(self, Self::Fast)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
     pub system: String,
@@ -923,6 +961,13 @@ pub fn balance_tool_results(messages: &[Message], cancel_text: &str) -> Vec<Mess
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speed_tier_defaults_to_standard_and_only_fast_is_premium() {
+        assert_eq!(SpeedTier::default(), SpeedTier::Standard);
+        assert!(!SpeedTier::Standard.is_premium());
+        assert!(SpeedTier::Fast.is_premium());
+    }
 
     #[test]
     fn chat_request_new_defaults_then_setters() {

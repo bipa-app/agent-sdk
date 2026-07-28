@@ -6,7 +6,8 @@
 #[cfg(feature = "anthropic")]
 use agent_sdk_foundation::llm::ToolChoice;
 use agent_sdk_foundation::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, ContentBlock, ThinkingConfig, ThinkingMode, Usage,
+    ChatOutcome, ChatRequest, ChatResponse, ContentBlock, SpeedTier, ThinkingConfig, ThinkingMode,
+    Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -286,6 +287,50 @@ pub trait LlmProvider: Send + Sync {
         }
 
         Ok(())
+    }
+
+    /// Provider-owned speed tier, when the caller configured one.
+    ///
+    /// `None` means the provider never opted in and every request runs on the
+    /// standard path.
+    fn configured_speed(&self) -> Option<SpeedTier> {
+        None
+    }
+
+    /// Validate a speed tier against the provider/model.
+    ///
+    /// The default implementation rejects every premium tier, so a provider
+    /// only serves one after opting in explicitly. Refusing is the safe
+    /// default: a premium tier the provider cannot honour would otherwise be
+    /// dropped at the wire boundary, and the caller would silently get
+    /// standard latency from a request they believe is expedited.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested tier is not available for the
+    /// active provider/model.
+    fn validate_speed_tier(&self, speed: Option<SpeedTier>) -> Result<()> {
+        match speed {
+            None => Ok(()),
+            Some(tier) if !tier.is_premium() => Ok(()),
+            Some(_) => Err(anyhow::anyhow!(
+                "a premium speed tier is not supported for provider={} model={}",
+                self.provider(),
+                self.model()
+            )),
+        }
+    }
+
+    /// Resolve the effective speed tier for a request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the resolved tier is not available for the active
+    /// provider/model.
+    fn resolve_speed_tier(&self) -> Result<Option<SpeedTier>> {
+        let speed = self.configured_speed();
+        self.validate_speed_tier(speed)?;
+        Ok(speed)
     }
 
     /// Resolve the effective thinking configuration for a request.

@@ -25,7 +25,7 @@ pub use audit::{AuditProvenance, ToolAuditOutcome, ToolAuditRecord, ToolAuditRec
 pub use events::{AgentEvent, AgentEventEnvelope, SequenceCounter, TerminalReason};
 pub use llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, ContentSource, Effort, Message,
-    Role, StopReason, ThinkingConfig, ThinkingMode, Tool, Usage,
+    Role, SpeedTier, StopReason, ThinkingConfig, ThinkingMode, Tool, Usage,
 };
 pub use privacy::{
     REDACTED_MARKER, RedactionLevel, RedactionPolicy, redact_error, redact_for_observability,
