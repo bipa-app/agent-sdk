@@ -1,0 +1,7 @@
+{
+  "sessionId": "<SESSION_ID>",
+  "prompt": [
+    { "type": "text", "text": "/status now" },
+    { "type": "text", "text": "[Context]\nchannel: 7e3d…\nreply-to: event abc123" }
+  ]
+}
