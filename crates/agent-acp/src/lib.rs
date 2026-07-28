@@ -65,10 +65,16 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+pub mod backend;
+pub mod run;
 pub mod server;
 pub mod session;
 pub mod wire;
 
+pub use backend::{
+    AcpBackend, AcpRunHandle, BackendError, BackendPromptHandler, EventStream, RunEvent,
+    RunStreamItem,
+};
 pub use server::{
     AcpServer, AgentInfo, PromptError, PromptHandler, PromptRequest, UpdateSink, UpdateSinkClosed,
 };

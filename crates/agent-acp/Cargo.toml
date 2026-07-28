@@ -21,6 +21,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
+agent-sdk-foundation = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
@@ -32,6 +33,7 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 env_logger = { workspace = true }
+tokio-stream = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "time"] }
 
 [lints]
