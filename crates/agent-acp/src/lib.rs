@@ -72,8 +72,8 @@ pub mod session;
 pub mod wire;
 
 pub use backend::{
-    AcpBackend, AcpRunHandle, BackendError, BackendPromptHandler, EventStream, RunEvent,
-    RunStreamItem,
+    AcpBackend, AcpRunHandle, BackendError, BackendPromptHandler, BackendTaskStatus, EventStream,
+    RunEvent, RunStreamItem,
 };
 pub use server::{
     AcpServer, AgentInfo, PromptError, PromptHandler, PromptRequest, UpdateSink, UpdateSinkClosed,
