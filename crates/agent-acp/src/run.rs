@@ -14,6 +14,11 @@
 //!   free by the suppression below. A `RetentionGap` is fatal instead: the
 //!   journal pruned events this turn needed, so continuity cannot be
 //!   proven. Backends REPORT both; recovery policy lives here.
+//! - **Content attribution (ENG-9422)** — content events stamped with a
+//!   foreign `emitter_task_id` are dropped: a cancelled predecessor's
+//!   salvage flush can land deltas after OUR `Start`, and without the
+//!   attribution check they would render inside our answer. Unattributed
+//!   content (pre-attribution journals) still streams.
 //! - **Task-scoped completion (C-d)** — the turn is a two-phase machine:
 //!   `AwaitingStart` (nothing streams; only OUR task's `Start` advances)
 //!   then `Streaming`. A terminal event resolves the prompt only when its
@@ -106,11 +111,15 @@ enum Phase {
 /// consolidated `Text` form is not re-emitted.
 fn map_event(event: &AgentEvent, delta_seen: &mut HashSet<String>) -> Mapped {
     match event {
-        AgentEvent::TextDelta { message_id, delta } => {
+        AgentEvent::TextDelta {
+            message_id, delta, ..
+        } => {
             delta_seen.insert(message_id.clone());
             Mapped::Update(chunk(delta))
         }
-        AgentEvent::Text { message_id, text } => {
+        AgentEvent::Text {
+            message_id, text, ..
+        } => {
             if delta_seen.contains(message_id) {
                 Mapped::Ignore
             } else {
@@ -263,9 +272,17 @@ pub(crate) async fn run_prompt<B: AcpBackend + ?Sized>(
 
                         match map_event(&ev.event, &mut delta_seen) {
                             Mapped::Update(update) => {
-                                // Content events carry no attribution;
-                                // the phase gate is what keeps a late
-                                // predecessor's text out of OUR prompt.
+                                // Content attribution (ENG-9422): a
+                                // cancelled predecessor's salvage flush
+                                // can commit deltas AFTER our Start —
+                                // attributed content from another task
+                                // is dropped. Unattributed content
+                                // (pre-attribution journals, embedded
+                                // runs) streams as before; for those the
+                                // phase gate is the only protection.
+                                if is_foreign {
+                                    continue;
+                                }
                                 if phase == Phase::Streaming {
                                     updates
                                         .session_update(update)

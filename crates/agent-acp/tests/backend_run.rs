@@ -343,6 +343,41 @@ async fn stale_predecessor_terminals_and_text_never_touch_the_prompt() {
     assert_eq!(response["result"]["stopReason"], json!("end_turn"));
 }
 
+/// ENG-9422 acceptance: the exact salvage-flush interleaving — a
+/// cancelled predecessor's late deltas commit AFTER our `Start`, and
+/// attribution (not phase) is what keeps them out of our answer.
+/// Unattributed content (pre-attribution journals) must keep streaming.
+#[tokio::test]
+async fn stale_attributed_deltas_after_our_start_never_stream() {
+    let backend = Arc::new(MockBackend::new(
+        0,
+        vec![vec![
+            ev(0, start_event(TASK)),
+            // Start(B) → late TextDelta(A): the race from the card.
+            ev(
+                1,
+                AgentEvent::text_delta("m0", "stale-salvage").with_emitter_task_id(PREDECESSOR),
+            ),
+            ev(
+                2,
+                AgentEvent::text_delta("m1", "ours").with_emitter_task_id(TASK),
+            ),
+            // Old-journal compatibility: unattributed content streams.
+            ev(3, AgentEvent::text_delta("m1", " and compat")),
+            ev(4, done_event(Some(TASK))),
+        ]],
+    ));
+    let mut client = Client::start(Arc::clone(&backend));
+    let (notifications, response) = client.handshake_and_prompt().await;
+
+    assert_eq!(
+        chunk_texts(&notifications),
+        vec!["ours", " and compat"],
+        "a predecessor-attributed delta must never render; unattributed content must"
+    );
+    assert_eq!(response["result"]["stopReason"], json!("end_turn"));
+}
+
 /// C-d acceptance: an UNATTRIBUTED terminal while streaming is reconciled
 /// against the task's durable status — still running means it was not
 /// ours, and the turn continues to its real terminal.
