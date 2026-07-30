@@ -625,6 +625,9 @@ fn apply_subagent_wait_outcome(
     false
 }
 
+// The ENG-9422 `..` pattern (fmt insists on three lines) tipped this one
+// line over the limit; same call as the provider impls' allows.
+#[allow(clippy::too_many_lines)]
 async fn replay_subagent_events<Ctx: Send + Sync + 'static>(
     event_store: &Arc<dyn EventStore>,
     thread_id: &ThreadId,
@@ -635,7 +638,9 @@ async fn replay_subagent_events<Ctx: Send + Sync + 'static>(
 ) -> Result<()> {
     for envelope in event_store.get_events(thread_id).await? {
         match envelope.event {
-            AgentEvent::Text { message_id, text } => {
+            AgentEvent::Text {
+                message_id, text, ..
+            } => {
                 // Keep only the last assistant message's text. A new message id
                 // means a new assistant message, so reset the accumulator;
                 // multiple text blocks within one message still concatenate.
@@ -1881,6 +1886,7 @@ mod tests {
                 authority.wrap(AgentEvent::Text {
                     message_id: "msg_after_error".to_string(),
                     text: "should not be appended".to_string(),
+                    emitter_task_id: None,
                 }),
             )
             .await?;
@@ -1917,6 +1923,7 @@ mod tests {
                 authority.wrap(AgentEvent::Text {
                     message_id: "m1".to_string(),
                     text: "Let me check the repo...".to_string(),
+                    emitter_task_id: None,
                 }),
             )
             .await?;
@@ -1928,6 +1935,7 @@ mod tests {
                 authority.wrap(AgentEvent::Text {
                     message_id: "m2".to_string(),
                     text: "Final answer ".to_string(),
+                    emitter_task_id: None,
                 }),
             )
             .await?;
@@ -1938,6 +1946,7 @@ mod tests {
                 authority.wrap(AgentEvent::Text {
                     message_id: "m2".to_string(),
                     text: "part two".to_string(),
+                    emitter_task_id: None,
                 }),
             )
             .await?;

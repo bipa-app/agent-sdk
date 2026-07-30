@@ -111,7 +111,9 @@ mod tests {
         assert_eq!(envelope.sequence, 42);
         assert_eq!(envelope.timestamp, timestamp);
         match &envelope.event {
-            AgentEvent::Text { message_id, text } => {
+            AgentEvent::Text {
+                message_id, text, ..
+            } => {
                 assert_eq!(message_id, "msg_1");
                 assert_eq!(text, "hello");
             }

@@ -1498,7 +1498,11 @@ async fn run_boundary_injection_call(
     // to blocks positionally within ONE response, so ids from two responses
     // cannot be carried in a single `ContentIds` without colliding by block
     // index — and dropping them is how the pre-injection text went missing.
-    let content_events = build_content_events(&acc.streamed.response, &acc.streamed.content_ids);
+    let content_events = build_content_events(
+        &acc.streamed.response,
+        &inputs.bootstrap.task_id,
+        &acc.streamed.content_ids,
+    );
     if !content_events.is_empty() {
         acc.committed_events.extend(
             deps.event_repo
@@ -4202,6 +4206,9 @@ async fn poll_stream_item(
     }
 }
 
+// Linear streaming loop; the ENG-9422 attribution arg tipped it one line
+// over the limit (same call as the provider impls' allows).
+#[allow(clippy::too_many_lines)]
 async fn call_llm_once_inner(
     provider: &dyn LlmProvider,
     request: ChatRequest,
@@ -4290,7 +4297,12 @@ async fn call_llm_once_inner(
             beaconed_usage = usage.clone();
         }
 
-        match buffer_stream_delta(&delta, &mut content_ids, &mut pending_deltas) {
+        match buffer_stream_delta(
+            &delta,
+            &attempt.task_id,
+            &mut content_ids,
+            &mut pending_deltas,
+        ) {
             DeltaStep::Skip => continue,
             DeltaStep::Buffered => {}
             DeltaStep::Fail(outcome, error) => {
@@ -4379,6 +4391,7 @@ enum DeltaStep {
 /// ids on first non-empty content.
 fn buffer_stream_delta(
     delta: &StreamDelta,
+    task_id: &AgentTaskId,
     content_ids: &mut ContentIds,
     pending_deltas: &mut Vec<AgentEvent>,
 ) -> DeltaStep {
@@ -4394,10 +4407,14 @@ fn buffer_stream_delta(
                 return DeltaStep::Skip;
             }
             let message_id = content_ids.text_id_for(*block_index);
-            pending_deltas.push(AgentEvent::text_delta(
-                message_id.to_string(),
-                text_chunk.clone(),
-            ));
+            // Attributed at construction (ENG-9422): the salvage flush
+            // commits a cancelled attempt's buffered deltas, and those
+            // can land AFTER the successor's Start — attribution is what
+            // lets readers keep them out of the successor's answer.
+            pending_deltas.push(
+                AgentEvent::text_delta(message_id.to_string(), text_chunk.clone())
+                    .with_emitter_task_id(task_id.as_str()),
+            );
             DeltaStep::Buffered
         }
         StreamDelta::ThinkingDelta {
@@ -4408,10 +4425,10 @@ fn buffer_stream_delta(
                 return DeltaStep::Skip;
             }
             let thinking_id = content_ids.thinking_id_for(*block_index);
-            pending_deltas.push(AgentEvent::thinking_delta(
-                thinking_id.to_string(),
-                thinking_chunk.clone(),
-            ));
+            pending_deltas.push(
+                AgentEvent::thinking_delta(thinking_id.to_string(), thinking_chunk.clone())
+                    .with_emitter_task_id(task_id.as_str()),
+            );
             DeltaStep::Buffered
         }
         StreamDelta::Error { message, kind } => {
@@ -4806,7 +4823,11 @@ fn build_close_params(
 /// block-index ordering.  This lets us match each non-empty
 /// `Text` / `Thinking` block to its id positionally without needing
 /// the `block_index` attached to each [`llm::ContentBlock`].
-fn build_content_events(response: &llm::ChatResponse, content_ids: &ContentIds) -> Vec<AgentEvent> {
+fn build_content_events(
+    response: &llm::ChatResponse,
+    task_id: &AgentTaskId,
+    content_ids: &ContentIds,
+) -> Vec<AgentEvent> {
     let mut text_iter = content_ids.text_ids.values();
     let mut thinking_iter = content_ids.thinking_ids.values();
 
@@ -4814,12 +4835,15 @@ fn build_content_events(response: &llm::ChatResponse, content_ids: &ContentIds) 
         .content
         .iter()
         .filter_map(|block| match block {
-            llm::ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => thinking_iter
-                .next()
-                .map(|id| AgentEvent::thinking(id.to_string(), thinking)),
-            llm::ContentBlock::Text { text } if !text.is_empty() => text_iter
-                .next()
-                .map(|id| AgentEvent::text(id.to_string(), text)),
+            llm::ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
+                thinking_iter.next().map(|id| {
+                    AgentEvent::thinking(id.to_string(), thinking)
+                        .with_emitter_task_id(task_id.as_str())
+                })
+            }
+            llm::ContentBlock::Text { text } if !text.is_empty() => text_iter.next().map(|id| {
+                AgentEvent::text(id.to_string(), text).with_emitter_task_id(task_id.as_str())
+            }),
             _ => None,
         })
         .collect()
@@ -4859,7 +4883,7 @@ fn build_turn_complete_events(params: TurnCompleteEventsParams<'_>) -> Vec<Agent
         duration,
         content_ids,
     } = params;
-    let mut events = build_content_events(response, content_ids);
+    let mut events = build_content_events(response, task_id, content_ids);
     if response.stop_reason == Some(llm::StopReason::Refusal) {
         // The refusal text is the first text block, so reuse the id
         // that streaming assigned to that block.  If the model refused
@@ -5007,7 +5031,7 @@ async fn suspend_at_tool_boundary(
 
     // Build content events (Thinking) from the tool-call response so
     // replay observers see the model's reasoning before tool dispatch.
-    let content_events = build_content_events(&response, &close_ctx.content_ids);
+    let content_events = build_content_events(&response, task_id, &close_ctx.content_ids);
 
     // Build ToolCallStart events before continuation is moved.
     let tool_call_events = build_tool_call_start_events(&continuation);
@@ -6509,7 +6533,7 @@ async fn suspend_resumed_turn(
     let specs = child_spawn_specs_for_response(&response, &inputs);
 
     // Build content events (Thinking) from the resume response.
-    let content_events = build_content_events(&response, close.content_ids);
+    let content_events = build_content_events(&response, task_id, close.content_ids);
 
     // Build ToolCallStart events before continuation is moved.
     let tool_call_events = build_tool_call_start_events(&new_continuation);
@@ -7587,7 +7611,7 @@ async fn repark_after_steering_exchange(
     // reply. No `TurnComplete` / `Done` — the mission turn is still
     // parked. No `ToolCallStart` for the re-attach batch — those are
     // synthetic re-bindings, not new tool starts.
-    let content_events = build_content_events(&response, &content_ids);
+    let content_events = build_content_events(&response, &inputs.bootstrap.task_id, &content_ids);
     let committed_events = if content_events.is_empty() {
         Vec::new()
     } else {

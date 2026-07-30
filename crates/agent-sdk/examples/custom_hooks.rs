@@ -211,6 +211,7 @@ async fn main() -> anyhow::Result<()> {
             AgentEvent::Text {
                 message_id: _,
                 text,
+                ..
             } => {
                 println!("Agent: {text}");
             }

@@ -131,10 +131,7 @@ async fn main() -> anyhow::Result<()> {
                     println!("[{name} failed]: {}\n", result.output);
                 }
             }
-            AgentEvent::Text {
-                message_id: _,
-                text,
-            } => {
+            AgentEvent::Text { text, .. } => {
                 println!("Agent: {text}\n");
             }
             AgentEvent::Done { total_turns, .. } => {
