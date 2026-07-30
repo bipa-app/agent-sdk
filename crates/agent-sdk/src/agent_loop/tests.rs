@@ -5229,9 +5229,9 @@ async fn streaming_retry_uses_fresh_message_id_per_attempt() -> anyhow::Result<(
     let deltas: Vec<(String, String)> = events
         .iter()
         .filter_map(|e| match &e.event {
-            AgentEvent::TextDelta { message_id, delta } => {
-                Some((message_id.clone(), delta.clone()))
-            }
+            AgentEvent::TextDelta {
+                message_id, delta, ..
+            } => Some((message_id.clone(), delta.clone())),
             _ => None,
         })
         .collect();

@@ -3565,30 +3565,36 @@ fn map_message_event_payload(event: &AgentEvent) -> RpcResult<Option<pb::event_e
             turn: map_u64(*turn, "turn")?,
             emitter_task_id: emitter_task_id.clone(),
         }))),
-        AgentEvent::Thinking { message_id, text } => Ok(Some(pb::event_envelope::Event::Thinking(
+        AgentEvent::Thinking {
+            message_id, text, ..
+        } => Ok(Some(pb::event_envelope::Event::Thinking(
             pb::ThinkingEvent {
                 message_id: message_id.clone(),
                 text: text.clone(),
             },
         ))),
-        AgentEvent::ThinkingDelta { message_id, delta } => Ok(Some(
-            pb::event_envelope::Event::ThinkingDelta(pb::ThinkingDeltaEvent {
+        AgentEvent::ThinkingDelta {
+            message_id, delta, ..
+        } => Ok(Some(pb::event_envelope::Event::ThinkingDelta(
+            pb::ThinkingDeltaEvent {
                 message_id: message_id.clone(),
                 delta: delta.clone(),
-            }),
-        )),
-        AgentEvent::TextDelta { message_id, delta } => Ok(Some(
-            pb::event_envelope::Event::TextDelta(pb::TextDeltaEvent {
+            },
+        ))),
+        AgentEvent::TextDelta {
+            message_id, delta, ..
+        } => Ok(Some(pb::event_envelope::Event::TextDelta(
+            pb::TextDeltaEvent {
                 message_id: message_id.clone(),
                 delta: delta.clone(),
-            }),
-        )),
-        AgentEvent::Text { message_id, text } => {
-            Ok(Some(pb::event_envelope::Event::Text(pb::TextEvent {
-                message_id: message_id.clone(),
-                text: text.clone(),
-            })))
-        }
+            },
+        ))),
+        AgentEvent::Text {
+            message_id, text, ..
+        } => Ok(Some(pb::event_envelope::Event::Text(pb::TextEvent {
+            message_id: message_id.clone(),
+            text: text.clone(),
+        }))),
         AgentEvent::Refusal { message_id, text } => {
             Ok(Some(pb::event_envelope::Event::Refusal(pb::RefusalEvent {
                 message_id: message_id.clone(),
@@ -8387,6 +8393,7 @@ mod tests {
                 AgentEvent::TextDelta {
                     message_id: "probe".into(),
                     delta: "still streaming".into(),
+                    emitter_task_id: None,
                 },
                 OffsetDateTime::now_utc(),
             )

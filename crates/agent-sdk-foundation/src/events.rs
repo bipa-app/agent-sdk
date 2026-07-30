@@ -155,16 +155,44 @@ pub enum AgentEvent {
     },
 
     /// Agent is "thinking" - complete thinking text after stream ends
-    Thinking { message_id: String, text: String },
+    Thinking {
+        message_id: String,
+        text: String,
+        /// Durable task whose execution produced this content. See
+        /// [`AgentEvent::with_emitter_task_id`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emitter_task_id: Option<String>,
+    },
 
     /// A thinking delta for streaming thinking content
-    ThinkingDelta { message_id: String, delta: String },
+    ThinkingDelta {
+        message_id: String,
+        delta: String,
+        /// Durable task whose execution produced this content. See
+        /// [`AgentEvent::with_emitter_task_id`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emitter_task_id: Option<String>,
+    },
 
     /// A text delta for streaming responses
-    TextDelta { message_id: String, delta: String },
+    TextDelta {
+        message_id: String,
+        delta: String,
+        /// Durable task whose execution produced this content. See
+        /// [`AgentEvent::with_emitter_task_id`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emitter_task_id: Option<String>,
+    },
 
     /// Complete text block from the agent
-    Text { message_id: String, text: String },
+    Text {
+        message_id: String,
+        text: String,
+        /// Durable task whose execution produced this content. See
+        /// [`AgentEvent::with_emitter_task_id`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emitter_task_id: Option<String>,
+    },
 
     /// Agent is about to call a tool
     ToolCallStart {
@@ -454,16 +482,19 @@ impl AgentEvent {
         }
     }
 
-    /// Attribute a lifecycle event to the durable task whose execution
+    /// Attribute an event to the durable task whose execution
     /// committed it (the task id in its string form).
     ///
-    /// Only the lifecycle variants (`Start`, `TurnComplete`, `Done`,
-    /// `BudgetExceeded`, `Error`, `Cancelled`) carry the attribution;
-    /// every other variant is returned unchanged. Attribution is
-    /// therefore always the emitter's own identity, never a successor's:
-    /// a cancelled root's late salvage commit still names the cancelled
-    /// root, which is what lets a reader tell a superseded frame apart
-    /// from the thread's live one.
+    /// The lifecycle variants (`Start`, `TurnComplete`, `Done`,
+    /// `BudgetExceeded`, `Error`, `Cancelled`) and the content variants
+    /// (`Thinking`, `ThinkingDelta`, `TextDelta`, `Text`) carry the
+    /// attribution; every other variant is returned unchanged.
+    /// Attribution is always the emitter's own identity, never a
+    /// successor's: a cancelled root's late salvage commit — content
+    /// included — still names the cancelled root, which is what lets a
+    /// reader tell a superseded frame apart from the thread's live one
+    /// (and lets the ACP run loop drop a predecessor's stale deltas
+    /// instead of rendering them inside the successor's answer).
     ///
     /// Runs without a durable task behind them (the embedded SDK loop)
     /// leave the field `None`, as do events journaled before the field
@@ -492,6 +523,18 @@ impl AgentEvent {
             }
             | Self::Cancelled {
                 emitter_task_id, ..
+            }
+            | Self::Thinking {
+                emitter_task_id, ..
+            }
+            | Self::ThinkingDelta {
+                emitter_task_id, ..
+            }
+            | Self::TextDelta {
+                emitter_task_id, ..
+            }
+            | Self::Text {
+                emitter_task_id, ..
             } => *emitter_task_id = Some(task_id),
             _ => {}
         }
@@ -499,7 +542,7 @@ impl AgentEvent {
     }
 
     /// The durable task that committed this event, when the event is a
-    /// lifecycle variant that was stamped. See
+    /// lifecycle or content variant that was stamped. See
     /// [`AgentEvent::with_emitter_task_id`].
     #[must_use]
     pub fn emitter_task_id(&self) -> Option<&str> {
@@ -524,6 +567,18 @@ impl AgentEvent {
             }
             | Self::Cancelled {
                 emitter_task_id, ..
+            }
+            | Self::Thinking {
+                emitter_task_id, ..
+            }
+            | Self::ThinkingDelta {
+                emitter_task_id, ..
+            }
+            | Self::TextDelta {
+                emitter_task_id, ..
+            }
+            | Self::Text {
+                emitter_task_id, ..
             } => emitter_task_id.as_deref(),
             _ => None,
         }
@@ -543,6 +598,7 @@ impl AgentEvent {
         Self::Thinking {
             message_id: message_id.into(),
             text: text.into(),
+            emitter_task_id: None,
         }
     }
 
@@ -551,6 +607,7 @@ impl AgentEvent {
         Self::ThinkingDelta {
             message_id: message_id.into(),
             delta: delta.into(),
+            emitter_task_id: None,
         }
     }
 
@@ -559,6 +616,7 @@ impl AgentEvent {
         Self::TextDelta {
             message_id: message_id.into(),
             delta: delta.into(),
+            emitter_task_id: None,
         }
     }
 
@@ -567,6 +625,7 @@ impl AgentEvent {
         Self::Text {
             message_id: message_id.into(),
             text: text.into(),
+            emitter_task_id: None,
         }
     }
 
@@ -998,7 +1057,9 @@ mod tests {
         let seq = SequenceCounter::new();
         let envelope = AgentEventEnvelope::wrap(AgentEvent::text("msg_42", "content"), &seq);
         match &envelope.event {
-            AgentEvent::Text { message_id, text } => {
+            AgentEvent::Text {
+                message_id, text, ..
+            } => {
                 assert_eq!(message_id, "msg_42");
                 assert_eq!(text, "content");
             }
@@ -1088,7 +1149,9 @@ mod tests {
         assert_eq!(restored.sequence, original.sequence);
         assert_eq!(restored.timestamp, original.timestamp);
         match &restored.event {
-            AgentEvent::Text { message_id, text } => {
+            AgentEvent::Text {
+                message_id, text, ..
+            } => {
                 assert_eq!(message_id, "msg_1");
                 assert_eq!(text, "hello");
             }
@@ -1382,18 +1445,22 @@ mod tests {
             AgentEvent::Thinking {
                 message_id: "m".into(),
                 text: "t".into(),
+                emitter_task_id: None,
             },
             AgentEvent::ThinkingDelta {
                 message_id: "m".into(),
                 delta: "d".into(),
+                emitter_task_id: None,
             },
             AgentEvent::TextDelta {
                 message_id: "m".into(),
                 delta: "d".into(),
+                emitter_task_id: None,
             },
             AgentEvent::Text {
                 message_id: "m".into(),
                 text: "t".into(),
+                emitter_task_id: None,
             },
         ]
     }
@@ -1601,18 +1668,31 @@ mod tests {
     }
 
     #[test]
-    fn with_emitter_task_id_leaves_non_lifecycle_variants_untouched() -> serde_json::Result<()> {
-        // Attribution is a lifecycle-only contract: content and tool
-        // frames pair with the surrounding `Start` by adjacency and
-        // carry no id of their own.
+    fn with_emitter_task_id_covers_content_but_not_tool_frames() -> serde_json::Result<()> {
+        // Attribution covers lifecycle AND content variants (ENG-9422:
+        // adjacency pairing broke exactly when a cancelled attempt's
+        // salvage flush landed deltas after the successor's Start).
         let text = AgentEvent::text("m", "hi").with_emitter_task_id("task-42");
-        assert_eq!(text.emitter_task_id(), None);
+        assert_eq!(text.emitter_task_id(), Some("task-42"));
 
-        let json = serde_json::to_value(&text)?;
+        // Unattributed content stays byte-identical on the wire.
+        let bare = AgentEvent::text("m", "hi");
+        let json = serde_json::to_value(&bare)?;
         assert!(
             json.get("emitter_task_id").is_none(),
-            "non-lifecycle variants must not grow the key: {json}"
+            "unattributed content must not grow the key: {json}"
         );
+
+        // Tool frames still pair by their own call id, not attribution.
+        let tool = AgentEvent::tool_call_start(
+            "t1",
+            "grep",
+            "Grep",
+            serde_json::json!({}),
+            ToolTier::Observe,
+        )
+        .with_emitter_task_id("task-42");
+        assert_eq!(tool.emitter_task_id(), None);
         Ok(())
     }
 

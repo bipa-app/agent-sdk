@@ -305,6 +305,29 @@ async fn interleaved_text_and_tool_deltas_suspend_with_balanced_history() -> Res
     );
     assert_contiguous(&journal);
 
+    // ENG-9422: streamed AND consolidated content is attributed to the
+    // emitting task (same id the Start event names), so readers can drop
+    // a stale predecessor's deltas instead of rendering them.
+    let turn_task = journal
+        .iter()
+        .find_map(|e| match &e.event {
+            AgentEvent::Start { .. } => e.event.emitter_task_id().map(str::to_owned),
+            _ => None,
+        })
+        .expect("Start carries the turn's task id");
+    for envelope in &journal {
+        if matches!(
+            envelope.event,
+            AgentEvent::TextDelta { .. } | AgentEvent::Text { .. }
+        ) {
+            assert_eq!(
+                envelope.event.emitter_task_id(),
+                Some(turn_task.as_str()),
+                "content event not attributed to its emitting task"
+            );
+        }
+    }
+
     Ok(())
 }
 

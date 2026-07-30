@@ -405,7 +405,9 @@ mod tests {
             .await?;
 
         match &committed.event {
-            AgentEvent::Text { message_id, text } => {
+            AgentEvent::Text {
+                message_id, text, ..
+            } => {
                 assert_eq!(message_id, "msg_42");
                 assert_eq!(text, "content");
             }
