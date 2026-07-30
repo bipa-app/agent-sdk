@@ -14,7 +14,7 @@ use crate::streaming::{
 use agent_sdk_foundation::llm::ChatResponse;
 use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, Content, ContentBlock, Effort, ResponseFormat, SpeedTier, StopReason,
-    ThinkingConfig, ThinkingMode, ToolChoice, Usage,
+    ThinkingConfig, ThinkingDisplay, ThinkingMode, ToolChoice, Usage,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -2291,9 +2291,16 @@ fn output_contains_refusal(output: &[ApiOutputItem]) -> bool {
 }
 
 fn build_api_reasoning(thinking: Option<&ThinkingConfig>) -> Option<ApiReasoning> {
-    thinking
-        .and_then(resolve_reasoning_effort)
-        .map(|effort| ApiReasoning { effort })
+    let config = thinking?;
+    let effort = resolve_reasoning_effort(config);
+    let summary = match config.display {
+        ThinkingDisplay::Summarized => Some("detailed"),
+        ThinkingDisplay::Omitted => None,
+    };
+    if effort.is_none() && summary.is_none() {
+        return None;
+    }
+    Some(ApiReasoning { effort, summary })
 }
 
 const fn resolve_reasoning_effort(config: &ThinkingConfig) -> Option<ReasoningEffort> {
@@ -3087,7 +3094,10 @@ fn codex_tool_choice(tool_choice: Option<&ToolChoice>) -> ApiToolChoice {
 
 #[derive(Clone, PartialEq, Serialize)]
 struct ApiReasoning {
-    effort: ReasoningEffort,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<ReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<&'static str>,
 }
 
 #[derive(Clone, PartialEq, Serialize)]
@@ -3525,7 +3535,7 @@ mod tests {
     fn test_build_api_reasoning_uses_explicit_effort() {
         let reasoning =
             build_api_reasoning(Some(&ThinkingConfig::adaptive_with_effort(Effort::Low))).unwrap();
-        assert!(matches!(reasoning.effort, ReasoningEffort::Low));
+        assert!(matches!(reasoning.effort, Some(ReasoningEffort::Low)));
     }
 
     #[test]
@@ -3538,7 +3548,7 @@ mod tests {
             let reasoning = build_api_reasoning(Some(&config)).unwrap();
             assert_eq!(
                 reasoning.effort,
-                ReasoningEffort::XHigh,
+                Some(ReasoningEffort::XHigh),
                 "a configured effort must never be cancelled by the mode",
             );
         }
@@ -3547,6 +3557,28 @@ mod tests {
     #[test]
     fn test_build_api_reasoning_omits_adaptive_without_effort() {
         assert!(build_api_reasoning(Some(&ThinkingConfig::adaptive())).is_none());
+    }
+
+    #[test]
+    fn test_build_api_reasoning_summarized_without_effort_requests_summary() {
+        let config = ThinkingConfig::adaptive().with_display(ThinkingDisplay::Summarized);
+        let reasoning = build_api_reasoning(Some(&config)).unwrap();
+        assert!(reasoning.effort.is_none());
+        assert_eq!(reasoning.summary, Some("detailed"));
+        assert_eq!(
+            serde_json::to_value(&reasoning).unwrap(),
+            serde_json::json!({"summary": "detailed"})
+        );
+    }
+
+    #[test]
+    fn test_build_api_reasoning_omitted_display_serializes_effort_only() {
+        let reasoning =
+            build_api_reasoning(Some(&ThinkingConfig::adaptive_with_effort(Effort::High))).unwrap();
+        assert_eq!(
+            serde_json::to_value(&reasoning).unwrap(),
+            serde_json::json!({"effort": "high"})
+        );
     }
 
     #[test]
@@ -3660,6 +3692,63 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"store\":false"));
         assert!(json.contains("\"stream\":true"));
+    }
+
+    #[test]
+    fn test_request_serialization_carries_reasoning_summary_when_summarized() {
+        let thinking = ThinkingConfig::adaptive_with_effort(Effort::High)
+            .with_display(ThinkingDisplay::Summarized);
+        let request = ApiStreamingRequest {
+            model: MODEL_GPT53_CODEX.to_string(),
+            instructions: "system".to_string(),
+            input: Vec::new(),
+            tools: None,
+            max_output_tokens: None,
+            reasoning: build_api_reasoning(Some(&thinking)),
+            tool_choice: Some(ApiToolChoice::Mode("auto")),
+            parallel_tool_calls: None,
+            store: false,
+            text: None,
+            include: None,
+            prompt_cache_key: None,
+            stream: true,
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            json["reasoning"],
+            serde_json::json!({"effort": "high", "summary": "detailed"})
+        );
+
+        let websocket_json = serde_json::to_value(ApiWebsocketRequest::from(&request)).unwrap();
+        assert_eq!(
+            websocket_json["reasoning"],
+            serde_json::json!({"effort": "high", "summary": "detailed"})
+        );
+    }
+
+    #[test]
+    fn test_request_serialization_omits_summary_by_default() {
+        let request = ApiStreamingRequest {
+            model: MODEL_GPT53_CODEX.to_string(),
+            instructions: "system".to_string(),
+            input: Vec::new(),
+            tools: None,
+            max_output_tokens: None,
+            reasoning: build_api_reasoning(Some(&ThinkingConfig::adaptive_with_effort(
+                Effort::Medium,
+            ))),
+            tool_choice: Some(ApiToolChoice::Mode("auto")),
+            parallel_tool_calls: None,
+            store: false,
+            text: None,
+            include: None,
+            prompt_cache_key: None,
+            stream: true,
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["reasoning"], serde_json::json!({"effort": "medium"}));
     }
 
     #[test]

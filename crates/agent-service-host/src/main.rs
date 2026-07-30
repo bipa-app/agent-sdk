@@ -44,6 +44,7 @@ fn main() -> Result<()> {
         max_tokens: 4096,
         tools: Vec::new(),
         thinking: ThinkingPolicy::default(),
+        thinking_display: None,
         tools_fn: None,
         policy: RuntimePolicy::server_default(),
     };

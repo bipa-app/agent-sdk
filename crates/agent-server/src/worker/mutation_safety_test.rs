@@ -246,6 +246,7 @@ fn sample_definition() -> AgentDefinition {
             },
         ],
         thinking: ThinkingPolicy::default(),
+        thinking_display: None,
         tools_fn: None,
         policy: RuntimePolicy::server_default(),
     }

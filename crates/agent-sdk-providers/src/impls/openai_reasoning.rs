@@ -6,7 +6,9 @@
 //! context. These additive types preserve those wire values without changing
 //! the public foundation structs used by every provider.
 
-use agent_sdk_foundation::llm::{Effort, ServedSpeed, SpeedTier, ThinkingConfig, ThinkingMode};
+use agent_sdk_foundation::llm::{
+    Effort, ServedSpeed, SpeedTier, ThinkingConfig, ThinkingDisplay, ThinkingMode,
+};
 use anyhow::{Result, bail};
 use serde::Serialize;
 
@@ -366,6 +368,14 @@ impl OpenAIReasoningConfig {
         self.effort = effort;
         self
     }
+
+    pub(crate) const fn with_optional_summary(
+        mut self,
+        summary: Option<OpenAIReasoningSummary>,
+    ) -> Self {
+        self.summary = summary;
+        self
+    }
 }
 
 pub(crate) const fn is_gpt56_model(model: &str) -> bool {
@@ -491,13 +501,27 @@ pub(crate) fn validate_reasoning_config(model: &str, config: &OpenAIReasoningCon
         );
     }
 
-    if model == "gpt-5.3-codex"
-        && (config.mode().is_some() || config.context().is_some() || config.summary().is_some())
-    {
-        bail!("reasoning mode, context, and summary controls are not supported for model={model}");
+    if model == "gpt-5.3-codex" && (config.mode().is_some() || config.context().is_some()) {
+        bail!("reasoning mode and context controls are not supported for model={model}");
+    }
+
+    if config.summary().is_some() && !supports_reasoning_summary(model) {
+        bail!("reasoning summary controls are not supported for model={model}");
     }
 
     Ok(())
+}
+
+/// Whether `model` accepts the `reasoning.summary` request control.
+///
+/// A display *preference* (a legacy [`ThinkingConfig`] with
+/// `ThinkingDisplay::Summarized`) is only translated into a summary
+/// request when this holds; an explicit
+/// [`OpenAIReasoningConfig::with_summary`] on an unsupported model still
+/// fails validation loudly.
+#[must_use]
+pub fn supports_reasoning_summary(model: &str) -> bool {
+    model != "gpt-5.3-codex"
 }
 
 pub(crate) fn validate_tool_choice(
@@ -559,6 +583,15 @@ pub(crate) const fn legacy_reasoning_effort(
         } else {
             OpenAIReasoningEffort::XHigh
         }),
+    }
+}
+
+pub(crate) const fn legacy_reasoning_summary(
+    config: &ThinkingConfig,
+) -> Option<OpenAIReasoningSummary> {
+    match config.display {
+        ThinkingDisplay::Summarized => Some(OpenAIReasoningSummary::Auto),
+        ThinkingDisplay::Omitted => None,
     }
 }
 
@@ -642,6 +675,16 @@ mod tests {
             legacy_reasoning_effort(&max),
             Some(OpenAIReasoningEffort::Max)
         );
+    }
+
+    #[test]
+    fn legacy_summary_follows_the_display_preference() {
+        let summarized = ThinkingConfig::adaptive().with_display(ThinkingDisplay::Summarized);
+        assert_eq!(
+            legacy_reasoning_summary(&summarized),
+            Some(OpenAIReasoningSummary::Auto)
+        );
+        assert_eq!(legacy_reasoning_summary(&ThinkingConfig::adaptive()), None);
     }
 
     #[test]

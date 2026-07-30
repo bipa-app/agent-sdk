@@ -4304,6 +4304,7 @@ mod tests {
             max_tokens: 512,
             tools,
             thinking: ThinkingPolicy::default(),
+            thinking_display: None,
             tools_fn: None,
             policy: RuntimePolicy::server_default(),
         }

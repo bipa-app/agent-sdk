@@ -24,8 +24,8 @@ use super::openai_reasoning::{
     OpenAIAllowedToolsMode, OpenAIPromptCacheMode, OpenAIPromptCacheTtl, OpenAIReasoningConfig,
     OpenAIReasoningContext, OpenAIReasoningEffort, OpenAIReasoningMode, OpenAIReasoningSummary,
     OpenAITextVerbosity, OpenAIToolChoice, is_gpt56_model, legacy_reasoning_effort,
-    served_speed_from_service_tier, service_tier_wire_value, validate_reasoning_config,
-    validate_tool_choice,
+    legacy_reasoning_summary, served_speed_from_service_tier, service_tier_wire_value,
+    supports_reasoning_summary, validate_reasoning_config, validate_tool_choice,
 };
 use super::openai_schema::normalize_strict_schema;
 
@@ -255,14 +255,25 @@ impl OpenAIResponsesProvider {
             None
         };
 
+        let legacy_summary = |thinking: &ThinkingConfig| {
+            supports_reasoning_summary(&self.model)
+                .then(|| legacy_reasoning_summary(thinking))
+                .flatten()
+        };
         let config = match (self.reasoning.clone(), legacy.as_ref()) {
             (Some(config), Some(thinking)) => {
-                Some(config.with_optional_effort(legacy_reasoning_effort(thinking)))
+                let summary = config.summary().or_else(|| legacy_summary(thinking));
+                Some(
+                    config
+                        .with_optional_effort(legacy_reasoning_effort(thinking))
+                        .with_optional_summary(summary),
+                )
             }
             (Some(config), None) => Some(config),
             (None, Some(thinking)) => Some(
                 OpenAIReasoningConfig::new()
-                    .with_optional_effort(legacy_reasoning_effort(thinking)),
+                    .with_optional_effort(legacy_reasoning_effort(thinking))
+                    .with_optional_summary(legacy_summary(thinking)),
             ),
             (None, None) => None,
         };
@@ -2111,7 +2122,7 @@ struct ApiStreamResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_sdk_foundation::llm::{CacheConfig, CacheTtl, Message};
+    use agent_sdk_foundation::llm::{CacheConfig, CacheTtl, Message, ThinkingDisplay};
     use anyhow::{Context as _, bail};
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers};
 
@@ -2238,6 +2249,49 @@ mod tests {
         let config = OpenAIReasoningConfig::new()
             .with_optional_effort(legacy_reasoning_effort(&ThinkingConfig::adaptive()));
         assert!(build_api_reasoning(Some(&config)).is_none());
+    }
+
+    #[test]
+    fn test_legacy_summarized_display_requests_auto_summary() -> anyhow::Result<()> {
+        let thinking = ThinkingConfig::adaptive().with_display(ThinkingDisplay::Summarized);
+        let provider = OpenAIResponsesProvider::gpt56("test-key".to_string());
+        let config = provider
+            .resolve_openai_reasoning(Some(&thinking))?
+            .context("expected a reasoning config")?;
+        assert_eq!(config.summary(), Some(OpenAIReasoningSummary::Auto));
+        assert!(config.effort().is_none());
+
+        let reasoning = build_api_reasoning(Some(&config))
+            .context("summary alone must keep the reasoning object")?;
+        assert_eq!(
+            serde_json::to_value(reasoning)?,
+            serde_json::json!({"summary": "auto"})
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_explicit_summary_wins_over_legacy_display() -> anyhow::Result<()> {
+        let thinking = ThinkingConfig::adaptive().with_display(ThinkingDisplay::Summarized);
+        let provider = OpenAIResponsesProvider::gpt56("test-key".to_string()).with_reasoning(
+            OpenAIReasoningConfig::new().with_summary(OpenAIReasoningSummary::Detailed),
+        );
+        let config = provider
+            .resolve_openai_reasoning(Some(&thinking))?
+            .context("expected a reasoning config")?;
+        assert_eq!(config.summary(), Some(OpenAIReasoningSummary::Detailed));
+        Ok(())
+    }
+
+    #[test]
+    fn test_legacy_omitted_display_requests_no_summary() -> anyhow::Result<()> {
+        let provider = OpenAIResponsesProvider::gpt56("test-key".to_string());
+        let config = provider
+            .resolve_openai_reasoning(Some(&ThinkingConfig::adaptive()))?
+            .context("expected a reasoning config")?;
+        assert!(config.summary().is_none());
+        assert!(build_api_reasoning(Some(&config)).is_none());
+        Ok(())
     }
 
     #[test]

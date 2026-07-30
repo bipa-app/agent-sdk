@@ -215,6 +215,7 @@ mod tests {
             max_tokens: 4096,
             tools: Vec::new(),
             thinking: ThinkingPolicy::default(),
+            thinking_display: None,
             tools_fn: None,
             policy: RuntimePolicy::server_default(),
         }
@@ -618,6 +619,7 @@ mod tests {
             thinking: ThinkingPolicy::Enabled {
                 budget_tokens: 1000,
             },
+            thinking_display: None,
             policy: RuntimePolicy {
                 max_attempts: 5,
                 strict_durability: false,

@@ -352,6 +352,7 @@ impl VertexProvider {
                 parts: vec![ApiPart::Text {
                     text: request.system.clone(),
                     thought_signature: None,
+                    thought: None,
                 }],
             })
         };
@@ -657,6 +658,7 @@ fn build_gemini_system_instruction(system: &str) -> Option<ApiContent> {
             parts: vec![ApiPart::Text {
                 text: system.to_owned(),
                 thought_signature: None,
+                thought: None,
             }],
         })
     }

@@ -243,6 +243,7 @@ impl LlmProvider for GeminiProvider {
                 parts: vec![ApiPart::Text {
                     text: request.system.clone(),
                     thought_signature: None,
+                    thought: None,
                 }],
             })
         };
@@ -411,6 +412,7 @@ impl LlmProvider for GeminiProvider {
                     parts: vec![ApiPart::Text {
                         text: request.system.clone(),
                         thought_signature: None,
+                        thought: None,
                     }],
                 })
             };

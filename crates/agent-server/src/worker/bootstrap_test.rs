@@ -76,6 +76,7 @@ fn sample_definition() -> AgentDefinition {
         max_tokens: 4096,
         tools: sample_tools(),
         thinking: ThinkingPolicy::Disabled,
+        thinking_display: None,
         tools_fn: None,
         policy: RuntimePolicy::server_default(),
     }
@@ -250,6 +251,7 @@ async fn registry_resolves_per_thread_override() -> anyhow::Result<()> {
         thinking: ThinkingPolicy::Adaptive {
             effort: Some(Effort::Max),
         },
+        thinking_display: None,
         policy: RuntimePolicy {
             tool_runtime: ToolRuntime::External,
             strict_durability: true,

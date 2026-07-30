@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use agent_sdk_foundation::ToolRuntime;
-use agent_sdk_foundation::llm::{Effort, Tool};
+use agent_sdk_foundation::llm::{Effort, ThinkingDisplay, Tool};
 use serde::{Deserialize, Serialize};
 
 // ─────────────────────────────────────────────────────────────────────
@@ -161,6 +161,12 @@ pub struct AgentDefinition {
     pub tools_fn: Option<ToolsFn>,
     /// Extended thinking configuration.
     pub thinking: ThinkingPolicy,
+    /// How thinking content is returned when [`thinking`](Self::thinking)
+    /// enables it. `None` preserves the SDK constructor default
+    /// ([`ThinkingDisplay::Omitted`]); `Some(ThinkingDisplay::Summarized)`
+    /// asks the provider for human-readable reasoning summaries.
+    #[serde(default)]
+    pub thinking_display: Option<ThinkingDisplay>,
 
     // ── Execution policy ─────────────────────────────────────────
     /// Server-owned execution policy.
@@ -190,6 +196,7 @@ impl std::fmt::Debug for AgentDefinition {
                 &self.tools_fn.as_ref().map_or("None", |_| "Some(<closure>)"),
             )
             .field("thinking", &self.thinking)
+            .field("thinking_display", &self.thinking_display)
             .field("policy", &self.policy)
             .finish()
     }
@@ -205,6 +212,7 @@ impl PartialEq for AgentDefinition {
             && self.max_tokens == other.max_tokens
             && self.tools == other.tools
             && self.thinking == other.thinking
+            && self.thinking_display == other.thinking_display
             && self.policy == other.policy
     }
 }
@@ -253,6 +261,7 @@ mod tests {
             tools,
             tools_fn: None,
             thinking: ThinkingPolicy::default(),
+            thinking_display: None,
             policy: RuntimePolicy::default(),
         }
     }
@@ -328,6 +337,30 @@ mod tests {
         let resolved = restored.resolve_tools(None);
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].name, "persistent");
+    }
+
+    #[test]
+    fn definition_without_thinking_display_deserializes_to_none() {
+        // Definitions persisted before the field existed must keep
+        // loading, resolving to the SDK constructor default.
+        let mut json =
+            serde_json::to_value(definition_with_static_tools(Vec::new())).expect("serialize");
+        json.as_object_mut()
+            .expect("object")
+            .remove("thinking_display");
+        let restored: AgentDefinition = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(restored.thinking_display, None);
+    }
+
+    #[test]
+    fn definition_thinking_display_round_trips() {
+        let def = AgentDefinition {
+            thinking_display: Some(ThinkingDisplay::Summarized),
+            ..definition_with_static_tools(Vec::new())
+        };
+        let json = serde_json::to_string(&def).expect("serialize");
+        let restored: AgentDefinition = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.thinking_display, Some(ThinkingDisplay::Summarized));
     }
 
     #[test]

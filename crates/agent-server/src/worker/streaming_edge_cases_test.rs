@@ -76,6 +76,7 @@ fn definition() -> AgentDefinition {
         }],
         max_tokens: 1024,
         thinking: ThinkingPolicy::Disabled,
+        thinking_display: None,
         tools_fn: None,
         policy: RuntimePolicy::server_default(),
     }

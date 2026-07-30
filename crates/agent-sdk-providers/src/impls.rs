@@ -46,7 +46,7 @@ pub use openai_codex_responses::OpenAICodexResponsesProvider;
 pub use openai_reasoning::{
     OpenAIAllowedToolsMode, OpenAIApiSurface, OpenAIPromptCacheMode, OpenAIPromptCacheTtl,
     OpenAIReasoningConfig, OpenAIReasoningContext, OpenAIReasoningEffort, OpenAIReasoningMode,
-    OpenAIReasoningSummary, OpenAITextVerbosity, OpenAIToolChoice,
+    OpenAIReasoningSummary, OpenAITextVerbosity, OpenAIToolChoice, supports_reasoning_summary,
 };
 #[cfg(feature = "openai")]
 pub use openai_responses::OpenAIResponsesProvider;

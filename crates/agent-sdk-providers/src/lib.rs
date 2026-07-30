@@ -103,7 +103,7 @@ pub use impls::{
     OpenAIAllowedToolsMode, OpenAIApiSurface, OpenAIPromptCacheMode, OpenAIPromptCacheTtl,
     OpenAIProvider, OpenAIReasoningConfig, OpenAIReasoningContext, OpenAIReasoningEffort,
     OpenAIReasoningMode, OpenAIReasoningSummary, OpenAIResponsesProvider, OpenAITextVerbosity,
-    OpenAIToolChoice,
+    OpenAIToolChoice, supports_reasoning_summary,
 };
 
 // Model capabilities
