@@ -54,10 +54,15 @@ pub enum RunStreamItem {
     /// `StreamEvent::Event(Box<CommittedEvent>)`).
     Event(Box<RunEvent>),
     /// The stream lost contiguity and can no longer guarantee gap-free
-    /// delivery; the consumer must reopen from its last yielded sequence.
-    /// (Reopen is owned by the run loop and lands in ENG-9402; in this
-    /// milestone it resolves the prompt as an error.)
+    /// delivery. The run loop — never the backend — recovers by reopening
+    /// from its last yielded sequence (contract C-c).
     Lagged,
+    /// The journal has PRUNED events in the range this stream needed:
+    /// unlike [`RunStreamItem::Lagged`], no reopen can restore
+    /// continuity. The run loop fails the prompt loudly. Backends that
+    /// cannot distinguish retention loss from transient lag should
+    /// prefer `Lagged` only when a reopen can genuinely recover.
+    RetentionGap,
 }
 
 /// Boxed stream of committed events from a backend.
@@ -78,6 +83,28 @@ impl BackendError {
             message: message.into(),
         }
     }
+}
+
+/// A submitted task's durable status, as the backend's store sees it
+/// (contract C-d's reconciliation source of truth).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendTaskStatus {
+    /// Anything non-terminal: pending, queued, running, parked on a
+    /// confirmation — the turn may still produce events.
+    Running,
+    /// The task completed; the turn is over even if its terminal event
+    /// never reached this stream.
+    Completed,
+    /// The task was cancelled.
+    Cancelled,
+    /// The task failed, with the store's recorded error when there is
+    /// one. A task can reach this status WITHOUT a journal `Error`
+    /// event (crash between the status write and the commit) — which is
+    /// exactly why the run loop polls status on stall.
+    Failed {
+        /// The error the store recorded for the failure, if any.
+        error: Option<String>,
+    },
 }
 
 /// An agent runtime the ACP transport can drive.
@@ -123,6 +150,23 @@ pub trait AcpBackend: Send + Sync + 'static {
     /// A [`BackendError`] here is logged, not fatal — the run loop keeps
     /// draining the stream either way.
     async fn cancel(&self, thread_id: &str, task_id: &str) -> Result<(), BackendError>;
+
+    /// Report the durable status of a submitted task (contract C-d).
+    ///
+    /// The run loop calls this to reconcile: when the stream stalls, and
+    /// when an UNATTRIBUTED terminal event arrives mid-stream. It is the
+    /// only authority allowed to close a turn without an attributed
+    /// terminal event.
+    ///
+    /// # Errors
+    ///
+    /// A [`BackendError`] here is logged and retried on the next stall
+    /// tick, never fatal on its own.
+    async fn task_status(
+        &self,
+        thread_id: &str,
+        task_id: &str,
+    ) -> Result<BackendTaskStatus, BackendError>;
 }
 
 /// Bridges an [`AcpBackend`] into the wire server's [`PromptHandler`] seam.
