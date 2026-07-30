@@ -202,6 +202,7 @@ fn sample_definition() -> AgentDefinition {
         max_tokens: 1024,
         tools: Vec::new(),
         thinking: ThinkingPolicy::default(),
+        thinking_display: None,
         tools_fn: None,
         policy: RuntimePolicy::server_default(),
     }
@@ -4543,6 +4544,7 @@ async fn pending_tool_tier_uses_per_turn_tools_fn_not_static_list() -> Result<()
             tier: agent_sdk_foundation::ToolTier::Observe,
         }],
         thinking: ThinkingPolicy::default(),
+        thinking_display: None,
         // Per-turn override (consulted because the task carries
         // caller_metadata): bash is hardened to Confirm.
         tools_fn: Some(Arc::new(|_ctx| {

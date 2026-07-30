@@ -591,19 +591,36 @@ impl StreamAccumulator {
     pub fn into_content_blocks(self) -> Vec<ContentBlock> {
         let mut blocks: Vec<(usize, ContentBlock)> = Vec::new();
 
-        // Add thinking blocks with their indices, attaching signatures
+        // Add thinking blocks with their indices, attaching signatures.
+        // An empty-text block is kept when it carries a signature: with
+        // `ThinkingDisplay::Omitted` the provider streams only the
+        // signature, and dropping it forfeits multi-turn reasoning
+        // continuity on the echo-back path.
         let mut signatures = self.thinking_signatures;
         for (idx, thinking) in self.thinking_blocks.into_iter().enumerate() {
-            if !thinking.is_empty() {
-                let signature = signatures.remove(&idx).filter(|s| !s.is_empty());
-                blocks.push((
-                    idx,
-                    ContentBlock::Thinking {
-                        thinking,
-                        signature,
-                    },
-                ));
+            let signature = signatures.remove(&idx).filter(|s| !s.is_empty());
+            if thinking.is_empty() && signature.is_none() {
+                continue;
             }
+            blocks.push((
+                idx,
+                ContentBlock::Thinking {
+                    thinking,
+                    signature,
+                },
+            ));
+        }
+        for (idx, signature) in signatures {
+            if signature.is_empty() {
+                continue;
+            }
+            blocks.push((
+                idx,
+                ContentBlock::Thinking {
+                    thinking: String::new(),
+                    signature: Some(signature),
+                },
+            ));
         }
 
         // Add redacted thinking blocks
@@ -768,6 +785,53 @@ mod tests {
             &blocks[0],
             ContentBlock::Thinking { thinking, signature }
             if thinking == "Reasoning" && signature.as_deref() == Some("sig_123")
+        ));
+    }
+
+    #[test]
+    fn accumulator_keeps_signed_thinking_block_with_empty_text() {
+        let mut acc = StreamAccumulator::new();
+
+        acc.apply(&StreamDelta::SignatureDelta {
+            delta: "sig_omitted".to_string(),
+            block_index: 0,
+        });
+        acc.apply(&StreamDelta::TextDelta {
+            delta: "answer".to_string(),
+            block_index: 1,
+        });
+
+        let blocks = acc.into_content_blocks();
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(
+            &blocks[0],
+            ContentBlock::Thinking { thinking, signature }
+            if thinking.is_empty() && signature.as_deref() == Some("sig_omitted")
+        ));
+        assert!(matches!(
+            &blocks[1],
+            ContentBlock::Text { text } if text == "answer"
+        ));
+    }
+
+    #[test]
+    fn accumulator_drops_unsigned_empty_thinking_block() {
+        let mut acc = StreamAccumulator::new();
+
+        acc.apply(&StreamDelta::ThinkingDelta {
+            delta: String::new(),
+            block_index: 0,
+        });
+        acc.apply(&StreamDelta::TextDelta {
+            delta: "answer".to_string(),
+            block_index: 1,
+        });
+
+        let blocks = acc.into_content_blocks();
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(
+            &blocks[0],
+            ContentBlock::Text { text } if text == "answer"
         ));
     }
 

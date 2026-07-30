@@ -269,6 +269,7 @@ fn sample_definition() -> AgentDefinition {
         max_tokens: 1024,
         tools: Vec::new(),
         thinking: ThinkingPolicy::default(),
+        thinking_display: None,
         tools_fn: None,
         policy: RuntimePolicy::server_default(),
     }

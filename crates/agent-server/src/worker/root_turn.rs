@@ -2629,7 +2629,11 @@ async fn build_chat_request(
             }
             Some(cfg)
         }
-    };
+    }
+    .map(|cfg| match definition.thinking_display {
+        Some(display) => cfg.with_display(display),
+        None => cfg,
+    });
 
     // Resolve tool list: `tools_fn` takes precedence over `tools` when
     // set AND caller_metadata is present, enabling per-turn filtering

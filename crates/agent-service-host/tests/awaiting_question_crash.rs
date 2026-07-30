@@ -120,6 +120,7 @@ fn crash_test_definition() -> AgentDefinition {
             tier: ToolTier::Observe,
         }],
         thinking: ThinkingPolicy::default(),
+        thinking_display: None,
         tools_fn: None,
         policy: RuntimePolicy::server_default(),
     }

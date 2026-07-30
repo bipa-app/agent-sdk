@@ -45,6 +45,10 @@ pub enum ApiPart {
         /// Thought signature may appear with text in Gemini 3 models
         #[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
         thought_signature: Option<String>,
+        /// Set by Gemini on thought-summary parts when `includeThoughts` is
+        /// requested; never serialized on our own outbound parts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thought: Option<bool>,
     },
     InlineData {
         #[serde(rename = "inlineData")]
@@ -159,6 +163,9 @@ pub struct ApiGenerationConfig {
 #[serde(rename_all = "camelCase")]
 pub struct ApiThinkingConfig {
     pub thinking_level: &'static str,
+    /// `Some(true)` asks Gemini to return human-readable thought summaries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_thoughts: Option<bool>,
 }
 
 /// Map an agent-sdk `ThinkingConfig` to the Gemini API thinking level.
@@ -171,7 +178,11 @@ pub struct ApiThinkingConfig {
 pub const fn map_thinking_config(
     config: &agent_sdk_foundation::llm::ThinkingConfig,
 ) -> ApiThinkingConfig {
-    use agent_sdk_foundation::llm::{Effort, ThinkingMode};
+    use agent_sdk_foundation::llm::{Effort, ThinkingDisplay, ThinkingMode};
+    let include_thoughts = match config.display {
+        ThinkingDisplay::Summarized => Some(true),
+        ThinkingDisplay::Omitted => None,
+    };
     // If an explicit effort is set, use it directly
     if let Some(effort) = config.effort {
         let level = match effort {
@@ -182,6 +193,7 @@ pub const fn map_thinking_config(
         };
         return ApiThinkingConfig {
             thinking_level: level,
+            include_thoughts,
         };
     }
     let level = match &config.mode {
@@ -200,6 +212,7 @@ pub const fn map_thinking_config(
     };
     ApiThinkingConfig {
         thinking_level: level,
+        include_thoughts,
     }
 }
 
@@ -501,6 +514,7 @@ pub fn build_api_contents(messages: &[agent_sdk_foundation::llm::Message]) -> Ve
             Content::Text(text) => vec![ApiPart::Text {
                 text: text.clone(),
                 thought_signature: None,
+                thought: None,
             }],
             Content::Blocks(blocks) => {
                 let mut parts = Vec::new();
@@ -510,6 +524,7 @@ pub fn build_api_contents(messages: &[agent_sdk_foundation::llm::Message]) -> Ve
                             parts.push(ApiPart::Text {
                                 text: text.clone(),
                                 thought_signature: None,
+                                thought: None,
                             });
                         }
                         ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {}
@@ -602,8 +617,20 @@ pub fn build_content_blocks(content: &ApiContent) -> Vec<ContentBlock> {
 
     for part in &content.parts {
         match part {
-            ApiPart::Text { text, .. } => {
-                if !text.is_empty() {
+            ApiPart::Text {
+                text,
+                thought_signature,
+                thought,
+            } => {
+                if text.is_empty() {
+                    continue;
+                }
+                if *thought == Some(true) {
+                    blocks.push(ContentBlock::Thinking {
+                        thinking: text.clone(),
+                        signature: thought_signature.clone(),
+                    });
+                } else {
                     blocks.push(ContentBlock::Text { text: text.clone() });
                 }
             }
@@ -753,11 +780,20 @@ fn gemini_stream_terminal(saw_finish_reason: bool, stop_reason: Option<StopReaso
     }
 }
 
+/// Which streamed block kind the Gemini parser is currently inside.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum GeminiStreamPhase {
+    #[default]
+    Idle,
+    Text,
+    Thinking,
+}
+
 /// Mutable accumulator state threaded through the Gemini SSE stream parser.
 #[derive(Default)]
 struct GeminiStreamState {
     block_index: usize,
-    in_text_block: bool,
+    phase: GeminiStreamPhase,
     saw_function_call: bool,
     saw_finish_reason: bool,
     usage: Option<Usage>,
@@ -792,26 +828,51 @@ fn process_gemini_response(
     // content may be empty on safety-blocked responses
     for part in &candidate.content.parts {
         match part {
-            ApiPart::Text { text, .. } if !text.is_empty() => {
+            ApiPart::Text {
+                text,
+                thought_signature,
+                thought,
+            } if !text.is_empty() => {
                 // Gemini sends complete text parts per SSE event (not
                 // incremental deltas like Anthropic). Keep the same block_index
-                // for consecutive text parts so the StreamAccumulator appends
-                // them into one text block.
-                if !state.in_text_block {
-                    state.in_text_block = true;
+                // for consecutive parts of the same kind so the
+                // StreamAccumulator appends them into one block, but give
+                // thought-summary parts and visible answer parts distinct
+                // indices so they consolidate into separate Thinking and Text
+                // blocks.
+                if *thought == Some(true) {
+                    if state.phase == GeminiStreamPhase::Text {
+                        state.block_index += 1;
+                    }
+                    state.phase = GeminiStreamPhase::Thinking;
+                    deltas.push(StreamDelta::ThinkingDelta {
+                        delta: text.clone(),
+                        block_index: state.block_index,
+                    });
+                    if let Some(signature) = thought_signature {
+                        deltas.push(StreamDelta::SignatureDelta {
+                            delta: signature.clone(),
+                            block_index: state.block_index,
+                        });
+                    }
+                } else {
+                    if state.phase == GeminiStreamPhase::Thinking {
+                        state.block_index += 1;
+                    }
+                    state.phase = GeminiStreamPhase::Text;
+                    deltas.push(StreamDelta::TextDelta {
+                        delta: text.clone(),
+                        block_index: state.block_index,
+                    });
                 }
-                deltas.push(StreamDelta::TextDelta {
-                    delta: text.clone(),
-                    block_index: state.block_index,
-                });
             }
             ApiPart::FunctionCall {
                 function_call,
                 thought_signature,
             } => {
-                // Switching away from text — advance index.
-                if state.in_text_block {
-                    state.in_text_block = false;
+                // Switching away from text or thinking — advance index.
+                if state.phase != GeminiStreamPhase::Idle {
+                    state.phase = GeminiStreamPhase::Idle;
                     state.block_index += 1;
                 }
                 state.saw_function_call = true;
@@ -935,6 +996,7 @@ mod tests {
             parts: vec![ApiPart::Text {
                 text: "Hello!".to_string(),
                 thought_signature: None,
+                thought: None,
             }],
         };
 
@@ -948,6 +1010,7 @@ mod tests {
         let part = ApiPart::Text {
             text: "Hello, world!".to_string(),
             thought_signature: None,
+            thought: None,
         };
 
         let json = serde_json::to_string(&part).unwrap_or_default();
@@ -1022,6 +1085,7 @@ mod tests {
             max_output_tokens: Some(65536),
             thinking_config: Some(ApiThinkingConfig {
                 thinking_level: "HIGH",
+                include_thoughts: None,
             }),
             response_mime_type: None,
             response_schema: None,
@@ -1030,6 +1094,36 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap_or_default();
         assert!(json.contains("\"thinkingConfig\""));
         assert!(json.contains("\"thinkingLevel\":\"HIGH\""));
+        assert!(!json.contains("includeThoughts"));
+    }
+
+    #[test]
+    fn test_api_generation_config_with_thinking_summaries() {
+        let config = ApiGenerationConfig {
+            max_output_tokens: Some(65536),
+            thinking_config: Some(ApiThinkingConfig {
+                thinking_level: "HIGH",
+                include_thoughts: Some(true),
+            }),
+            response_mime_type: None,
+            response_schema: None,
+        };
+
+        let json = serde_json::to_string(&config).unwrap_or_default();
+        assert!(json.contains("\"includeThoughts\":true"));
+    }
+
+    #[test]
+    fn test_map_thinking_config_summarized_requests_thought_summaries() {
+        use agent_sdk_foundation::llm::{ThinkingConfig, ThinkingDisplay};
+
+        let config = ThinkingConfig::adaptive().with_display(ThinkingDisplay::Summarized);
+        let api = map_thinking_config(&config);
+        assert_eq!(api.include_thoughts, Some(true));
+
+        let default_display = ThinkingConfig::adaptive();
+        let api = map_thinking_config(&default_display);
+        assert_eq!(api.include_thoughts, None);
     }
 
     #[test]
@@ -1078,6 +1172,7 @@ mod tests {
             parts: vec![ApiPart::Text {
                 text: "Hello".to_string(),
                 thought_signature: None,
+                thought: None,
             }],
         }];
         let request = ApiGenerateContentRequest {
@@ -1294,6 +1389,7 @@ mod tests {
             parts: vec![ApiPart::Text {
                 text: "Hello!".to_string(),
                 thought_signature: None,
+                thought: None,
             }],
         };
 
@@ -1318,6 +1414,81 @@ mod tests {
         let blocks = build_content_blocks(&content);
         assert_eq!(blocks.len(), 1);
         assert!(matches!(&blocks[0], ContentBlock::ToolUse { name, .. } if name == "read_file"));
+    }
+
+    #[test]
+    fn test_api_part_thought_deserialization() {
+        let json = r#"{"text":"Reasoning summary","thought":true,"thoughtSignature":"sig"}"#;
+        let part: ApiPart =
+            serde_json::from_str(json).unwrap_or_else(|e| panic!("parse failed: {e}"));
+        match part {
+            ApiPart::Text {
+                text,
+                thought_signature,
+                thought,
+            } => {
+                assert_eq!(text, "Reasoning summary");
+                assert_eq!(thought, Some(true));
+                assert_eq!(thought_signature.as_deref(), Some("sig"));
+            }
+            _ => panic!("Expected Text part"),
+        }
+    }
+
+    #[test]
+    fn test_build_content_blocks_thought_part_becomes_thinking() {
+        let content = ApiContent {
+            role: Some("model".to_string()),
+            parts: vec![
+                ApiPart::Text {
+                    text: "Weighing options.".to_string(),
+                    thought_signature: Some("sig".to_string()),
+                    thought: Some(true),
+                },
+                ApiPart::Text {
+                    text: "Final answer.".to_string(),
+                    thought_signature: None,
+                    thought: None,
+                },
+            ],
+        };
+
+        let blocks = build_content_blocks(&content);
+        assert_eq!(blocks.len(), 2);
+        match &blocks[0] {
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => {
+                assert_eq!(thinking, "Weighing options.");
+                assert_eq!(signature.as_deref(), Some("sig"));
+            }
+            _ => panic!("Expected Thinking block"),
+        }
+        assert!(matches!(&blocks[1], ContentBlock::Text { text } if text == "Final answer."));
+    }
+
+    #[test]
+    fn test_build_content_blocks_skips_empty_thought_part() {
+        let content = ApiContent {
+            role: Some("model".to_string()),
+            parts: vec![
+                ApiPart::Text {
+                    text: String::new(),
+                    thought_signature: None,
+                    thought: Some(true),
+                },
+                ApiPart::Text {
+                    text: "Answer".to_string(),
+                    thought_signature: None,
+                    thought: None,
+                },
+            ],
+        };
+
+        let blocks = build_content_blocks(&content);
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "Answer"));
     }
 
     #[test]
@@ -1417,6 +1588,80 @@ mod tests {
             }
             _ => panic!("Expected FunctionCall part"),
         }
+    }
+
+    #[test]
+    fn test_process_gemini_response_routes_thoughts_to_distinct_block() {
+        let mut state = GeminiStreamState::default();
+        let chunk: ApiGenerateContentResponse = serde_json::from_str(
+            r#"{"candidates":[{"content":{"role":"model","parts":[
+                {"text":"Planning the answer.","thought":true,"thoughtSignature":"sig"},
+                {"text":"Hello!"}
+            ]}}]}"#,
+        )
+        .unwrap_or_else(|e| panic!("parse failed: {e}"));
+
+        let deltas = process_gemini_response(&mut state, chunk);
+        assert_eq!(deltas.len(), 3);
+        assert!(matches!(
+            &deltas[0],
+            StreamDelta::ThinkingDelta { delta, block_index: 0 } if delta == "Planning the answer."
+        ));
+        assert!(matches!(
+            &deltas[1],
+            StreamDelta::SignatureDelta { delta, block_index: 0 } if delta == "sig"
+        ));
+        assert!(matches!(
+            &deltas[2],
+            StreamDelta::TextDelta { delta, block_index: 1 } if delta == "Hello!"
+        ));
+    }
+
+    #[test]
+    fn test_process_gemini_response_text_only_keeps_block_zero() {
+        let mut state = GeminiStreamState::default();
+        let parse = |json: &str| -> ApiGenerateContentResponse {
+            serde_json::from_str(json).unwrap_or_else(|e| panic!("parse failed: {e}"))
+        };
+        let first =
+            parse(r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"Hel"}]}}]}"#);
+        let second =
+            parse(r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"lo"}]}}]}"#);
+
+        let mut deltas = process_gemini_response(&mut state, first);
+        deltas.extend(process_gemini_response(&mut state, second));
+
+        assert_eq!(deltas.len(), 2);
+        assert!(matches!(
+            &deltas[0],
+            StreamDelta::TextDelta { delta, block_index: 0 } if delta == "Hel"
+        ));
+        assert!(matches!(
+            &deltas[1],
+            StreamDelta::TextDelta { delta, block_index: 0 } if delta == "lo"
+        ));
+    }
+
+    #[test]
+    fn test_process_gemini_response_function_call_after_thought_advances_index() {
+        let mut state = GeminiStreamState::default();
+        let chunk: ApiGenerateContentResponse = serde_json::from_str(
+            r#"{"candidates":[{"content":{"role":"model","parts":[
+                {"text":"Deciding which tool to call.","thought":true},
+                {"functionCall":{"name":"get_weather","args":{"location":"NYC"}}}
+            ]}}]}"#,
+        )
+        .unwrap_or_else(|e| panic!("parse failed: {e}"));
+
+        let deltas = process_gemini_response(&mut state, chunk);
+        assert!(matches!(
+            &deltas[0],
+            StreamDelta::ThinkingDelta { block_index: 0, .. }
+        ));
+        assert!(matches!(
+            &deltas[1],
+            StreamDelta::ToolUseStart { name, block_index: 1, .. } if name == "get_weather"
+        ));
     }
 
     // ===================
