@@ -986,6 +986,71 @@ mod tests {
         Ok(())
     }
 
+    /// Durable subagent spawn hands the child ROOT the root-turn retry
+    /// budget on every backend.
+    ///
+    /// Regression for a backend divergence: the SQL stores spawned child
+    /// roots with `DEFAULT_MAX_ATTEMPTS` (1) while the in-memory
+    /// reference used the server policy budget (3). With a budget of 1,
+    /// a single expired lease — one heartbeat starved past the lease TTL
+    /// under store contention — terminally killed a running worker tree
+    /// as `lease_expired_budget_exhausted` instead of requeueing it.
+    async fn test_child_root_spawn_retry_budget(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
+    ) -> Result<()> {
+        let (_parent, invocation, child_root) =
+            spawn_subagent_fixture(task_store, thread_store, "conformance-child-budget").await?;
+
+        assert_eq!(
+            child_root.max_attempts,
+            AgentTask::DEFAULT_ROOT_MAX_ATTEMPTS,
+            "child roots are root turns and take the root-turn budget",
+        );
+        const {
+            assert!(
+                AgentTask::DEFAULT_ROOT_MAX_ATTEMPTS > 1,
+                "a single expired lease must never terminally kill a durable child root",
+            );
+        }
+        assert_eq!(
+            invocation.max_attempts,
+            AgentTask::DEFAULT_MAX_ATTEMPTS,
+            "the invocation row keeps the leaf default (parity with the in-memory store)",
+        );
+
+        // Behavior at the seam: the child root's FIRST expired lease
+        // requeues it (the crash-recovery contract) instead of failing
+        // it closed.
+        task_store
+            .try_acquire_task(
+                &child_root.id,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(10),
+                t_plus(3),
+            )
+            .await?
+            .context("child root must be acquirable")?;
+        let records = task_store.release_expired_leases(t_plus(11)).await?;
+        let record = records
+            .iter()
+            .find(|record| record.id == child_root.id)
+            .context("sweep must classify the expired child root")?;
+        assert!(
+            matches!(record.action, RecoveryAction::Requeue),
+            "first lease expiry must requeue, got {:?}",
+            record.action,
+        );
+        let requeued = task_store
+            .get(&child_root.id)
+            .await?
+            .context("child root exists")?;
+        assert_eq!(requeued.status, TaskStatus::Pending);
+        assert_eq!(requeued.attempt, 1);
+        Ok(())
+    }
+
     /// R2 steering wake: `enqueue_steering_resume` parks the parent in a
     /// steering `ready_to_resume` state, `repark_after_steering` re-binds
     /// the survivor under a dense `spawn_index` and re-parks in
@@ -2426,6 +2491,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_child_root_spawn_retry_budget() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_child_root_spawn_retry_budget(s.task.as_ref(), s.thread.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_steering_wake() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_steering_wake_and_repark(s.task.as_ref()).await
@@ -2714,6 +2785,13 @@ mod tests {
     async fn conformance_sqlite_child_spawn() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_child_spawn_and_resume(&store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_child_root_spawn_retry_budget() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_child_root_spawn_retry_budget(&store, &store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -3226,6 +3304,15 @@ mod tests {
             return Ok(());
         };
         test_child_spawn_and_resume(&store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_child_root_spawn_retry_budget() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_child_root_spawn_retry_budget(&store, &store).await
     }
 
     #[cfg(feature = "postgres")]

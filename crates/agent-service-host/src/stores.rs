@@ -615,7 +615,7 @@ impl StoreRegistry {
         definition_registry: Arc<dyn AgentDefinitionRegistry>,
     ) -> Result<Self> {
         let database_url = config.sqlite_database_url()?;
-        let durable_store = build_sqlite_store(&database_url)?;
+        let durable_store = build_sqlite_store(&database_url, config.sqlite_max_connections()?)?;
         let tool_audit_store: Arc<dyn ToolAuditEventStore> = Arc::new(
             RedactingToolAuditEventStore::baseline(durable_store.clone()),
         );
@@ -766,7 +766,10 @@ fn build_postgres_store(config: &PostgresStorageConfig) -> Result<Arc<PostgresDu
 }
 
 #[cfg(feature = "sqlite")]
-fn build_sqlite_store(database_url: &str) -> Result<Arc<SqliteDurableStore>> {
+fn build_sqlite_store(
+    database_url: &str,
+    max_connections: Option<u32>,
+) -> Result<Arc<SqliteDurableStore>> {
     // SqliteDurableStore::connect is async (runs PRAGMAs and
     // migrations), but `from_config` is a sync constructor.  We
     // cannot call `Handle::block_on` directly inside an active
@@ -776,13 +779,14 @@ fn build_sqlite_store(database_url: &str) -> Result<Arc<SqliteDurableStore>> {
     // OS thread with its own current_thread runtime works
     // regardless of the caller's runtime flavor (or absence of one).
     let url = database_url.to_owned();
+    let max_connections = max_connections.unwrap_or(SqliteDurableStore::DEFAULT_MAX_CONNECTIONS);
     std::thread::spawn(move || -> Result<Arc<SqliteDurableStore>> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .context("build tokio runtime for sqlite store bootstrap")?
             .block_on(async {
-                SqliteDurableStore::connect(&url)
+                SqliteDurableStore::connect_with_max_connections(&url, max_connections)
                     .await
                     .map(Arc::new)
                     .context("connect sqlite durable store")
@@ -921,6 +925,7 @@ mod tests {
         let config = StorageConfig {
             backend: StorageBackend::Sqlite {
                 path: Some(tmp.path().display().to_string()),
+                max_connections: None,
             },
             ..StorageConfig::default()
         };
