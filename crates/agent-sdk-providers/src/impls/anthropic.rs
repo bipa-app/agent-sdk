@@ -1382,6 +1382,38 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn budget_rejection_list_matches_registry_flag() {
+        // The provider's private adaptive-only list and the public
+        // registry flag must never drift: callers promote budget-mode
+        // preferences based on the flag, and the provider rejects
+        // budget requests based on the list.
+        for model in [
+            MODEL_HAIKU_35,
+            MODEL_SONNET_35,
+            MODEL_SONNET_4,
+            MODEL_OPUS_4,
+            MODEL_HAIKU_45,
+            MODEL_SONNET_45,
+            MODEL_SONNET_46,
+            MODEL_SONNET_5,
+            MODEL_OPUS_46,
+            MODEL_OPUS_47,
+            MODEL_OPUS_48,
+            MODEL_OPUS_5,
+            MODEL_FABLE_5,
+        ] {
+            let provider = AnthropicProvider::new("test-key", model);
+            let flag = crate::model_capabilities::get_model_capabilities("anthropic", model)
+                .is_some_and(|caps| caps.rejects_budget_thinking);
+            assert_eq!(
+                provider.is_adaptive_thinking_model(),
+                flag,
+                "provider list and registry flag disagree for {model}",
+            );
+        }
+    }
+
     #[tokio::test]
     async fn list_models_follows_pagination_across_pages() -> anyhow::Result<()> {
         use wiremock::matchers::{method, path, query_param, query_param_is_missing};
