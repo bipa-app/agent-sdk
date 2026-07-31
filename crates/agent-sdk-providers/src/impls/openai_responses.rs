@@ -560,6 +560,8 @@ impl LlmProvider for OpenAIResponsesProvider {
                 std::collections::HashMap::new();
             let mut message_state_markers: std::collections::HashMap<usize, serde_json::Value> =
                 std::collections::HashMap::new();
+            let mut streamed_summary_blocks: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
             let mut refused = false;
 
             while let Some(chunk_result) = stream.next().await {
@@ -735,11 +737,25 @@ impl LlmProvider for OpenAIResponsesProvider {
                             "response.reasoning.delta"
                             | "response.reasoning_summary_text.delta" => {
                                 if let Some(delta) = event.delta {
+                                    let block_index =
+                                        reasoning_summary_block_index(event.output_index);
+                                    streamed_summary_blocks.insert(block_index);
                                     yield Ok(StreamDelta::ThinkingDelta {
                                         delta,
-                                        block_index: reasoning_summary_block_index(
-                                            event.output_index,
-                                        ),
+                                        block_index,
+                                    });
+                                }
+                            }
+                            // A new summary section after streamed summary
+                            // text: join with a blank line so consecutive
+                            // markdown sections don't run together.
+                            "response.reasoning_summary_part.added" => {
+                                let block_index =
+                                    reasoning_summary_block_index(event.output_index);
+                                if streamed_summary_blocks.contains(&block_index) {
+                                    yield Ok(StreamDelta::ThinkingDelta {
+                                        delta: "\n\n".to_owned(),
+                                        block_index,
                                     });
                                 }
                             }
@@ -2989,6 +3005,33 @@ mod tests {
 
         assert_eq!(kind, StreamErrorKind::InvalidRequest);
         assert!(!kind.is_recoverable());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn summary_part_boundaries_join_sections_with_a_blank_line() -> anyhow::Result<()> {
+        let body = concat!(
+            "data: {\"type\":\"response.reasoning_summary_part.added\",\"output_index\":0}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\"delta\":\"**First**\"}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_part.added\",\"output_index\":0}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\"delta\":\"**Second**\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let deltas = stream_deltas(body).await?;
+        let thinking: String = deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                StreamDelta::ThinkingDelta { delta, block_index } if *block_index == 1 => {
+                    Some(delta.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            thinking, "**First**\n\n**Second**",
+            "the first section opens without a separator; later sections join with a blank line",
+        );
         Ok(())
     }
 
