@@ -358,6 +358,71 @@ async fn test_tool_execution() -> anyhow::Result<()> {
 
     Ok(())
 }
+/// The loop-level budget contract: an over-budget tool result is spilled
+/// byte-identical to the thread's artifact store BEFORE it is journaled as
+/// `tool_call_end`, and the inline result carries the bounded head + tail
+/// window plus the `[raw output: artifact://<id>]` recovery footer.
+#[tokio::test]
+async fn test_over_budget_tool_output_spills_to_artifact_store() -> anyhow::Result<()> {
+    let big_message = "0123456789abcdef\n".repeat(8 * 1024);
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("tool_1", "echo", json!({"message": big_message})),
+        MockProvider::text_response("Done"),
+    ]);
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .event_store(new_event_store())
+        .build();
+
+    let dir = tempfile::tempdir()?;
+    let store = Arc::new(
+        crate::artifacts::ArtifactStore::new(dir.path().join("artifacts"))
+            .with_inline_budget(4 * 1024),
+    );
+
+    let (_, events) = run_recorded(
+        &agent,
+        ThreadId::new(),
+        AgentInput::Text("Run echo".to_string()),
+        ToolContext::new(()).with_artifact_store(Arc::clone(&store)),
+    )
+    .await?;
+
+    let result = events
+        .iter()
+        .find_map(|e| match &e.event {
+            AgentEvent::ToolCallEnd { result, .. } => Some(result.clone()),
+            _ => None,
+        })
+        .context("expected a tool_call_end event")?;
+
+    // The journaled (client-visible) result is bounded and recoverable.
+    assert!(
+        result.output.len() <= store.inline_budget(),
+        "journaled output must respect the shared budget (got {} bytes)",
+        result.output.len()
+    );
+    assert!(result.output.starts_with("Echo: 0123456789abcdef"));
+    assert!(result.output.contains("bytes elided"));
+    assert!(
+        result
+            .output
+            .ends_with(&crate::artifacts::artifact_footer(0)),
+        "journaled output must end with the recovery footer: {}",
+        &result.output[result.output.len().saturating_sub(120)..]
+    );
+
+    // The spill file holds the full pre-truncation stream, byte-identical.
+    let artifact_path = store.resolve(0)?;
+    let spilled = std::fs::read_to_string(&artifact_path)?;
+    assert_eq!(spilled, format!("Echo: {big_message}"));
+    Ok(())
+}
 
 /// A read-only tool whose `execute` blocks on a shared [`tokio::sync::Barrier`]
 /// until `party_size` concurrent invocations have arrived. Used to prove the

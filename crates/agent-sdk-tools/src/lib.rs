@@ -14,9 +14,11 @@
 //! | [`stores`]      | Persistence traits for messages, state, events, and tool executions |
 //! | [`environment`] | Filesystem / process environment abstraction |
 //! | [`seed`]        | Durable reconstruction types (`ToolContextSeed`, `ExecutionContextFactory`) |
+//! | [`artifacts`]   | Spill storage + shared inline output budget for oversized tool output |
 
 #![forbid(unsafe_code)]
 
+pub mod artifacts;
 pub mod audit;
 pub mod authority;
 pub mod environment;
@@ -26,6 +28,10 @@ pub mod stores;
 pub mod tools;
 
 // Convenience re-exports
+pub use artifacts::{
+    ARTIFACT_URI_SCHEME, ArtifactStorage, ArtifactStore, DEFAULT_INLINE_OUTPUT_BUDGET_BYTES,
+    SavedArtifact, artifact_footer, artifact_uri,
+};
 pub use audit::{NoopAuditSink, ToolAuditSink};
 pub use authority::{EventAuthority, LocalEventAuthority};
 pub use environment::{Environment, ExecResult, FileEntry, GrepMatch, NullEnvironment};

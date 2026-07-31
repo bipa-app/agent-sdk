@@ -479,8 +479,12 @@ where
 {
     let tier = listen_tool.tier();
     let controls = ToolBoundaryControls::from_tool_context(ctx.tool_context);
-    let result =
-        match execute_with_idempotency(ctx.execution_store, pending, ctx.thread_id, async {
+    let result = match execute_with_idempotency(
+        ctx.execution_store,
+        ctx.tool_context.artifact_store(),
+        pending,
+        ctx.thread_id,
+        async {
             race_boundary_result(
                 &controls,
                 tool_start,
@@ -493,26 +497,27 @@ where
                 )),
             )
             .await
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                emit_audit(
-                    ctx.audit_sink,
-                    ctx.provenance,
-                    pending,
-                    tier,
-                    ctx.turn,
-                    ToolAuditOutcome::PersistenceFailed {
-                        result: None,
-                        error: error.message.clone(),
-                    },
-                )
-                .await;
-                return ToolExecutionOutcome::Error(error);
-            }
-        };
+        },
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            emit_audit(
+                ctx.audit_sink,
+                ctx.provenance,
+                pending,
+                tier,
+                ctx.turn,
+                ToolAuditOutcome::PersistenceFailed {
+                    result: None,
+                    error: error.message.clone(),
+                },
+            )
+            .await;
+            return ToolExecutionOutcome::Error(error);
+        }
+    };
     ctx.hooks.post_tool_use(&pending.name, &result).await;
     emit_audit(
         ctx.audit_sink,
@@ -870,6 +875,7 @@ where
     let tier = async_tool.tier();
     let result = match execute_with_idempotency(
         ctx.execution_store,
+        ctx.tool_context.artifact_store(),
         pending,
         ctx.thread_id,
         // `execute_async_tool` already composes panic isolation inside
@@ -1139,8 +1145,12 @@ where
     let tier = tool.tier();
     let tool_start = Instant::now();
     let controls = ToolBoundaryControls::from_tool_context(ctx.tool_context);
-    let result =
-        match execute_with_idempotency(ctx.execution_store, pending, ctx.thread_id, async {
+    let result = match execute_with_idempotency(
+        ctx.execution_store,
+        ctx.tool_context.artifact_store(),
+        pending,
+        ctx.thread_id,
+        async {
             race_boundary_result(
                 &controls,
                 tool_start,
@@ -1150,26 +1160,27 @@ where
                 )),
             )
             .await
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                emit_audit(
-                    ctx.audit_sink,
-                    ctx.provenance,
-                    pending,
-                    tier,
-                    ctx.turn,
-                    ToolAuditOutcome::PersistenceFailed {
-                        result: None,
-                        error: error.message.clone(),
-                    },
-                )
-                .await;
-                return ToolExecutionOutcome::Error(error);
-            }
-        };
+        },
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            emit_audit(
+                ctx.audit_sink,
+                ctx.provenance,
+                pending,
+                tier,
+                ctx.turn,
+                ToolAuditOutcome::PersistenceFailed {
+                    result: None,
+                    error: error.message.clone(),
+                },
+            )
+            .await;
+            return ToolExecutionOutcome::Error(error);
+        }
+    };
     ctx.hooks.post_tool_use(&pending.name, &result).await;
     emit_audit(
         ctx.audit_sink,
@@ -1701,6 +1712,7 @@ where
         let controls = ToolBoundaryControls::from_tool_context(ctx.tool_context);
         return execute_with_idempotency(
             ctx.execution_store,
+            ctx.tool_context.artifact_store(),
             awaiting_tool,
             ctx.thread_id,
             async {
@@ -1724,6 +1736,7 @@ where
     if let Some(async_tool) = ctx.tools.get_async(&awaiting_tool.name) {
         return execute_with_idempotency(
             ctx.execution_store,
+            ctx.tool_context.artifact_store(),
             awaiting_tool,
             ctx.thread_id,
             // `execute_async_tool` already composes panic isolation inside
@@ -1748,6 +1761,7 @@ where
         let controls = ToolBoundaryControls::from_tool_context(ctx.tool_context);
         return execute_with_idempotency(
             ctx.execution_store,
+            ctx.tool_context.artifact_store(),
             awaiting_tool,
             ctx.thread_id,
             async {
