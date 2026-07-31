@@ -130,6 +130,7 @@ pub mod failpoints;
 #[doc(hidden)]
 pub use fail as __fail_reexport;
 
+pub mod context_estimate;
 pub mod journal;
 #[cfg(feature = "otel")]
 pub mod observability;
