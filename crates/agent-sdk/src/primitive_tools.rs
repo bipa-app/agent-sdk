@@ -96,6 +96,21 @@ where
     }
 }
 
+pub(super) fn deserialize_optional_usize_from_string_or_int<'de, D>(
+    deserializer: D,
+) -> Result<Option<usize>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<StringOrUsize>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(StringOrUsize::Number(value)) => Ok(Some(value)),
+        Some(StringOrUsize::String(value)) => parse_numeric_string(&value)
+            .map(Some)
+            .map_err(de::Error::custom),
+    }
+}
+
 /// Truncate a string to at most `max_bytes` without splitting a multi-byte
 /// UTF-8 character. Returns the original string when it already fits.
 pub(crate) fn truncate_str(s: &str, max_bytes: usize) -> &str {
