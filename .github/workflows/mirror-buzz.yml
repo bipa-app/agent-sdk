@@ -1,0 +1,37 @@
+name: mirror-to-buzz
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: mirror-to-buzz
+  cancel-in-progress: true
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install nak (pinned)
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/nak" https://github.com/fiatjaf/nak/releases/download/v0.20.2/nak-v0.20.2-linux-amd64
+          echo "424db88043d26d9c2f1cbd2d9bc06582c39526f91f8e5523590439d4257da087  $RUNNER_TEMP/nak" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/nak"
+      - name: Mirror main to buzz.bipa.app
+        env:
+          BUZZ_MIRROR_KEY: ${{ secrets.BUZZ_MIRROR_KEY }}
+        run: |
+          set -euo pipefail
+          OWNER=52a2347ee366f21d53e9bb89120133dbd85926a3bfbc8ba10ca2be4bcf2c9ba6
+          URL="https://buzz.bipa.app/git/${OWNER}/agent-sdk"
+          # NIP-98 token: URL-locked to this repo, valid for ±60s — minted
+          # immediately before the push so the window cannot expire mid-run.
+          AUTH=$("$RUNNER_TEMP/nak" event --sec "$BUZZ_MIRROR_KEY" -k 27235 -c "" \
+                  -t "u=${URL}" -t method=POST | base64 -w0)
+          # --force: buzz is a one-way read replica of GitHub; drift loses.
+          git -c http.extraHeader="Authorization: Nostr ${AUTH}" \
+              push --force "$URL" "HEAD:refs/heads/main"
