@@ -105,6 +105,8 @@ mod compaction_integration_test;
 #[cfg(test)]
 mod confirmation_test;
 #[cfg(test)]
+mod context_estimate_worker_test;
+#[cfg(test)]
 mod event_commit_test;
 #[cfg(test)]
 mod event_system_regression_test;

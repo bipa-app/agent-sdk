@@ -3865,14 +3865,30 @@ async fn call_llm_once(
     thread_id: &agent_sdk_foundation::ThreadId,
     now: OffsetDateTime,
 ) -> Result<OnceOutcome, StreamAttemptError> {
-    #[cfg(feature = "otel")]
-    {
-        call_llm_once_instrumented(provider, request, attempt, evidence, deps, thread_id, now).await
+    // Publish the pending occupancy snapshot BEFORE the provider sees
+    // the request, so live gauges move at dispatch instead of at the
+    // attempt close (ENG-9510). Settled calls re-anchor on billed
+    // usage; failed/cancelled calls fall back to the previous anchor.
+    let request_estimate = crate::context_estimate::estimate_chat_request(&request);
+    crate::context_estimate::live().on_dispatch(thread_id, request_estimate);
+    let result = {
+        #[cfg(feature = "otel")]
+        {
+            call_llm_once_instrumented(provider, request, attempt, evidence, deps, thread_id, now)
+                .await
+        }
+        #[cfg(not(feature = "otel"))]
+        {
+            call_llm_once_inner(provider, request, attempt, evidence, deps, thread_id, now).await
+        }
+    };
+    match &result {
+        Ok(outcome) => {
+            crate::context_estimate::live().on_settled(thread_id, &outcome.response.usage);
+        }
+        Err(_) => crate::context_estimate::live().on_aborted(thread_id),
     }
-    #[cfg(not(feature = "otel"))]
-    {
-        call_llm_once_inner(provider, request, attempt, evidence, deps, thread_id, now).await
-    }
+    result
 }
 
 /// Bracket [`call_llm_once_inner`] with the `chat {model}` CLIENT span
