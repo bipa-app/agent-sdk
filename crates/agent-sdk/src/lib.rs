@@ -449,6 +449,7 @@ pub mod observability;
 // ── Re-export modules from workspace crates ──────────────────────────
 // These thin modules delegate to the extracted crates so that
 // `use agent_sdk::llm::*` etc. keep working for downstream users.
+pub mod artifacts;
 mod authority;
 mod environment;
 mod events;
@@ -503,6 +504,10 @@ pub use stores::{
 };
 // Durable, single-file SQLite-backed store implementing all four store traits.
 // Behind the `sqlite` feature so the default build pulls no SQLite dependency.
+pub use artifacts::{
+    ARTIFACT_URI_SCHEME, ArtifactStorage, ArtifactStore, DEFAULT_INLINE_OUTPUT_BUDGET_BYTES,
+    SavedArtifact, artifact_footer, artifact_uri,
+};
 #[cfg(feature = "sqlite")]
 #[cfg_attr(docsrs, doc(cfg(feature = "sqlite")))]
 pub use stores::sqlite::SqliteStore;

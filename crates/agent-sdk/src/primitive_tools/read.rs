@@ -123,7 +123,7 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for ReadToo
         })
     }
 
-    async fn execute(&self, _ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {
+    async fn execute(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {
         let input: ReadInput = ReadInput::deserialize(&input)
             .with_context(|| format!("Invalid input for read tool: {input}"))?;
 
@@ -133,6 +133,13 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for ReadToo
 
         if input.limit == Some(0) {
             return Ok(ToolResult::error("limit must be greater than zero"));
+        }
+
+        if let Some(spec) = input
+            .path
+            .strip_prefix(agent_sdk_tools::artifacts::ARTIFACT_URI_SCHEME)
+        {
+            return read_artifact(ctx.artifact_store(), spec, &input).await;
         }
 
         let path = self.ctx.environment.resolve_path(&input.path);
@@ -221,6 +228,105 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for ReadToo
 
         Ok(ToolResult::success(collected.join("\n")))
     }
+}
+
+/// Read back a spilled artifact addressed as `artifact://<id>[:<selector>]`.
+///
+/// Selectors are 1-indexed line windows: `:N` (from line N), `:N-M`
+/// (inclusive range), or `:N+K` (K lines starting at N). Without a selector
+/// the `offset`/`limit` inputs window the read; a full read of an artifact
+/// larger than the inline budget is refused with a pointer to selectors so
+/// the recovered bytes are not immediately re-spilled.
+async fn read_artifact(
+    store: Option<&Arc<agent_sdk_tools::artifacts::ArtifactStore>>,
+    spec: &str,
+    input: &ReadInput,
+) -> Result<ToolResult> {
+    let Some(store) = store else {
+        return Ok(ToolResult::error(
+            "artifact storage is not configured for this session",
+        ));
+    };
+    let (id_part, selector) = match spec.split_once(':') {
+        Some((id_part, selector)) => (id_part, Some(selector)),
+        None => (spec, None),
+    };
+    let Ok(id) = id_part.parse::<u64>() else {
+        return Ok(ToolResult::error(format!(
+            "artifact ID must be numeric, got: '{id_part}'"
+        )));
+    };
+    let (offset, limit, explicit_limit) = match selector.map(parse_line_selector) {
+        Some(Ok((offset, limit))) => (offset, limit, limit != usize::MAX),
+        Some(Err(reason)) => {
+            return Ok(ToolResult::error(format!(
+                "invalid artifact selector ':{sel}': {reason} (use :N, :N-M, or :N+K)",
+                sel = selector.unwrap_or_default()
+            )));
+        }
+        None => (
+            input.offset,
+            input.limit.unwrap_or(DEFAULT_LIMIT),
+            input.limit.is_some(),
+        ),
+    };
+
+    let path = match store.resolve(id) {
+        Ok(path) => path,
+        Err(error) => return Ok(ToolResult::error(format!("{error:#}"))),
+    };
+    let bytes = tokio::fs::read(&path)
+        .await
+        .with_context(|| format!("Failed to read artifact {}", path.display()))?;
+
+    let windowed = selector.is_some() || offset != 1 || explicit_limit;
+    if !windowed && bytes.len() > store.inline_budget() {
+        return Ok(ToolResult::error(format!(
+            "artifact {id} is {} bytes; read a window with \
+             artifact://{id}:START-END or offset/limit instead of the full stream",
+            bytes.len()
+        )));
+    }
+
+    let byte_budget = if explicit_limit {
+        TOTAL_BYTE_BUDGET_FLOOR.max(limit.saturating_mul(BYTES_PER_REQUESTED_LINE))
+    } else {
+        TOTAL_BYTE_BUDGET_FLOOR
+    };
+    let content = String::from_utf8_lossy(&bytes);
+    let collected = read_lines(&content, offset, limit, byte_budget);
+    if collected.is_empty() {
+        return Ok(ToolResult::error("offset exceeds artifact length"));
+    }
+    Ok(ToolResult::success(collected.join("\n")))
+}
+
+/// Parse a `read` line selector: `N`, `N-M` (inclusive), or `N+K`.
+///
+/// Returns the equivalent 1-indexed `(offset, limit)` window; `N` alone
+/// reads to the end of the artifact.
+fn parse_line_selector(selector: &str) -> Result<(usize, usize), &'static str> {
+    let parse_line = |raw: &str| -> Result<usize, &'static str> {
+        match raw.parse::<usize>() {
+            Ok(0) => Err("line numbers are 1-indexed"),
+            Ok(value) => Ok(value),
+            Err(_) => Err("expected a positive line number"),
+        }
+    };
+    if let Some((start, end)) = selector.split_once('-') {
+        let start = parse_line(start)?;
+        let end = parse_line(end)?;
+        if end < start {
+            return Err("range end is before its start");
+        }
+        return Ok((start, end - start + 1));
+    }
+    if let Some((start, count)) = selector.split_once('+') {
+        let start = parse_line(start)?;
+        let count = parse_line(count)?;
+        return Ok((start, count));
+    }
+    Ok((parse_line(selector)?, usize::MAX))
 }
 
 fn read_lines(content: &str, offset: usize, limit: usize, byte_budget: usize) -> Vec<String> {
@@ -882,5 +988,190 @@ mod tests {
     #[test]
     fn truncate_line_short_unchanged() {
         assert_eq!(truncate_line("short"), "short");
+    }
+    // ── artifact:// read-back ────────────────────────────────────────
+
+    fn artifact_ctx(store: Arc<agent_sdk_tools::artifacts::ArtifactStore>) -> ToolContext<()> {
+        ToolContext::new(()).with_artifact_store(store)
+    }
+
+    fn artifact_fixture() -> anyhow::Result<(
+        tempfile::TempDir,
+        Arc<agent_sdk_tools::artifacts::ArtifactStore>,
+        u64,
+    )> {
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(agent_sdk_tools::artifacts::ArtifactStore::new(
+            dir.path().join("artifacts"),
+        ));
+        let content: String = (1..=100).fold(String::new(), |mut acc, n| {
+            use std::fmt::Write as _;
+            let _ = writeln!(acc, "line {n}");
+            acc
+        });
+        let saved = store.save("bash", &content)?;
+        Ok((dir, store, saved.id))
+    }
+
+    #[tokio::test]
+    async fn reads_artifact_with_offset_and_limit() -> anyhow::Result<()> {
+        let (_dir, store, id) = artifact_fixture()?;
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &artifact_ctx(store),
+                json!({"path": format!("artifact://{id}"), "offset": 5, "limit": 2}),
+            )
+            .await?;
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.starts_with("L5: line 5\nL6: line 6"));
+        assert!(result.output.contains("showing lines 5-6 of 101"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_artifact_with_range_selector() -> anyhow::Result<()> {
+        let (_dir, store, id) = artifact_fixture()?;
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &artifact_ctx(store),
+                json!({"path": format!("artifact://{id}:10-12")}),
+            )
+            .await?;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result
+                .output
+                .starts_with("L10: line 10\nL11: line 11\nL12: line 12")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_artifact_with_count_selector() -> anyhow::Result<()> {
+        let (_dir, store, id) = artifact_fixture()?;
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &artifact_ctx(store),
+                json!({"path": format!("artifact://{id}:99+2")}),
+            )
+            .await?;
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.starts_with("L99: line 99\nL100: line 100"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn artifact_round_trip_recovers_spilled_bytes() -> anyhow::Result<()> {
+        // Spill via the budget path, then read the recovered window back —
+        // the full loop the footer promises.
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(agent_sdk_tools::artifacts::ArtifactStore::new(
+            dir.path().join("artifacts"),
+        ));
+        let full: String = (1..=20_000).fold(String::new(), |mut acc, n| {
+            use std::fmt::Write as _;
+            let _ = writeln!(acc, "row {n}");
+            acc
+        });
+        let mut spilled = ToolResult::success(full.clone());
+        let saved = store
+            .apply_inline_budget(&mut spilled, "bash")?
+            .expect("must spill");
+        assert!(
+            spilled
+                .output
+                .ends_with(&agent_sdk_tools::artifacts::artifact_footer(saved.id))
+        );
+
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &artifact_ctx(store),
+                json!({"path": format!("artifact://{}:9999-10001", saved.id)}),
+            )
+            .await?;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            result.output,
+            "L9999: row 9999\nL10000: row 10000\nL10001: row 10001\n\
+             ... [showing lines 9999-10001 of 20001; use offset/limit to read more]"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn full_read_of_oversized_artifact_suggests_selectors() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(agent_sdk_tools::artifacts::ArtifactStore::new(
+            dir.path().join("artifacts"),
+        ));
+        let saved = store.save("bash", &"x\n".repeat(60 * 1024))?;
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &artifact_ctx(store),
+                json!({"path": format!("artifact://{}", saved.id)}),
+            )
+            .await?;
+        assert!(!result.success);
+        assert!(result.output.contains("read a window"), "{}", result.output);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn artifact_errors_are_actionable() -> anyhow::Result<()> {
+        let (_dir, store, id) = artifact_fixture()?;
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+
+        // No store configured.
+        let result = tool
+            .execute(&tool_ctx(), json!({"path": "artifact://0"}))
+            .await?;
+        assert!(!result.success);
+        assert!(result.output.contains("not configured"));
+
+        // Unknown ID names the available ones.
+        let result = tool
+            .execute(
+                &artifact_ctx(Arc::clone(&store)),
+                json!({"path": "artifact://42"}),
+            )
+            .await?;
+        assert!(!result.success);
+        assert!(
+            result.output.contains("available IDs: 0"),
+            "{}",
+            result.output
+        );
+
+        // Non-numeric ID.
+        let result = tool
+            .execute(
+                &artifact_ctx(Arc::clone(&store)),
+                json!({"path": "artifact://latest"}),
+            )
+            .await?;
+        assert!(!result.success);
+        assert!(result.output.contains("must be numeric"));
+
+        // Malformed selector.
+        let result = tool
+            .execute(
+                &artifact_ctx(store),
+                json!({"path": format!("artifact://{id}:9-3")}),
+            )
+            .await?;
+        assert!(!result.success);
+        assert!(result.output.contains("range end is before its start"));
+        Ok(())
     }
 }

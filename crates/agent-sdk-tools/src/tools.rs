@@ -327,6 +327,14 @@ pub struct ToolContext<Ctx> {
     /// observe the [cooperative-cancel contract](Tool#cooperative-cancellation)
     /// so the timeout actually reclaims them.
     tool_timeout: Option<std::time::Duration>,
+    /// Optional per-thread spill store enforcing the shared inline output
+    /// budget on tool results (see [`crate::artifacts`]).
+    ///
+    /// When set, the agent loop spills over-budget tool output to this
+    /// store and splices the `[raw output: artifact://<id>]` recovery
+    /// footer into the inline result; the `read` tool resolves
+    /// `artifact://<id>` URIs against the same store.
+    artifact_store: Option<Arc<crate::artifacts::ArtifactStore>>,
 }
 
 impl<Ctx> ToolContext<Ctx> {
@@ -342,6 +350,7 @@ impl<Ctx> ToolContext<Ctx> {
             cancel_token: None,
             subagent_semaphore: None,
             tool_timeout: None,
+            artifact_store: None,
         }
     }
 
@@ -371,6 +380,7 @@ impl<Ctx> ToolContext<Ctx> {
             cancel_token: Some(deps.cancel_token),
             subagent_semaphore: deps.subagent_semaphore,
             tool_timeout: None,
+            artifact_store: None,
         }
     }
 
@@ -492,6 +502,22 @@ impl<Ctx> ToolContext<Ctx> {
     #[must_use]
     pub fn subagent_semaphore(&self) -> Option<Arc<tokio::sync::Semaphore>> {
         self.subagent_semaphore.clone()
+    }
+
+    /// Attach the per-thread artifact spill store.
+    #[must_use]
+    pub fn with_artifact_store(mut self, store: Arc<crate::artifacts::ArtifactStore>) -> Self {
+        self.artifact_store = Some(store);
+        self
+    }
+
+    /// Get the per-thread artifact spill store (if set).
+    ///
+    /// The agent loop consults this to enforce the shared inline output
+    /// budget; the `read` tool consults it to resolve `artifact://` URIs.
+    #[must_use]
+    pub const fn artifact_store(&self) -> Option<&Arc<crate::artifacts::ArtifactStore>> {
+        self.artifact_store.as_ref()
     }
 }
 
