@@ -3448,7 +3448,11 @@ async fn wait_out_connectivity_loss(params: RecoverableRetryParams<'_>) -> Resul
             Some(final_msg.clone()),
         )
         .await;
-        bail!("{final_msg}");
+        // Typed like every other provider-failure exit so durable
+        // runtimes can classify it (terminal-reason mapping AND the
+        // host's weather-requeue of ReadyToResume roots) instead of
+        // parsing prose.
+        return Err(root_stream_failure(kind, final_msg));
     }
     let starts_streak = !retry.in_connectivity_streak;
     retry.in_connectivity_streak = true;
