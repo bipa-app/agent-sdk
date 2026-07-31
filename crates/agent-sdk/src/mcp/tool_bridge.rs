@@ -15,6 +15,12 @@ use super::transport::McpTransport;
 /// Maximum length for MCP tool descriptions to prevent oversized prompt injection.
 const MAX_DESCRIPTION_LENGTH: usize = 2000;
 
+/// Maximum bytes of MCP tool output forwarded into the LLM transcript.
+/// MCP servers can return up to the transport cap (16 MiB over HTTP) and
+/// the bridge used to pass that through verbatim — one fat response
+/// polluted the context on every subsequent turn until compaction.
+const MAX_OUTPUT_BYTES: usize = 50 * 1024;
+
 /// Bridge an MCP tool to the SDK Tool trait.
 ///
 /// This wrapper allows MCP tools to be used as regular SDK tools.
@@ -142,7 +148,7 @@ impl<T: McpTransport + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for McpToo
         let result = self.client.call_tool(&self.definition.name, input).await?;
 
         // Convert MCP content to output string
-        let output = format_mcp_content(&result.content);
+        let output = cap_mcp_output(format_mcp_content(&result.content));
 
         // Preserve the structured result as `data`. On the (unexpected)
         // serialization failure, log it rather than silently substituting null.
@@ -223,6 +229,44 @@ fn format_mcp_content(content: &[McpContent]) -> String {
     }
 
     output.trim_end().to_string()
+}
+
+/// Cap MCP output at [`MAX_OUTPUT_BYTES`], preserving head and tail on
+/// UTF-8 char boundaries with a marker describing the elided span.
+///
+/// Two-thirds head, one-third tail: the head usually carries the primary
+/// payload, the tail the trailing summary/error context. The marker is
+/// honest about recovery: until an artifact-spill substrate exists the
+/// elided middle bytes are DESTROYED, so the only way back is re-running
+/// the tool with narrower arguments.
+fn cap_mcp_output(output: String) -> String {
+    if output.len() <= MAX_OUTPUT_BYTES {
+        return output;
+    }
+    let head_budget = MAX_OUTPUT_BYTES / 3 * 2;
+    let tail_budget = MAX_OUTPUT_BYTES - head_budget;
+    let mut head_end = head_budget;
+    while head_end > 0 && !output.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = output.len() - tail_budget;
+    while tail_start < output.len() && !output.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    // The windows can only overlap for a tiny MAX value; the 50 KiB budget
+    // keeps them well separated, but guard against it anyway.
+    if tail_start <= head_end {
+        return output;
+    }
+    let elided = tail_start - head_end;
+    format!(
+        "{head}\n\n[MCP tool output truncated: {elided} of {total} bytes elided to stay within \
+         {MAX_OUTPUT_BYTES} bytes (head and tail kept). The elided middle is NOT recoverable — \
+         re-run the tool with narrower arguments if you need it.]\n\n{tail}",
+        head = &output[..head_end],
+        total = output.len(),
+        tail = &output[tail_start..],
+    )
 }
 
 /// Register all tools from an MCP client into a tool registry.
@@ -373,6 +417,58 @@ mod tests {
         let content: Vec<McpContent> = vec![];
         let output = format_mcp_content(&content);
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn cap_passes_small_output_through_untouched() {
+        let output = "small result".to_string();
+        assert_eq!(cap_mcp_output(output.clone()), output);
+    }
+
+    #[test]
+    fn cap_bounds_16mib_class_output_keeping_head_and_tail() {
+        // 16 MiB-class payload: the HTTP transport cap is the only other
+        // bound, and it used to flow into the transcript verbatim.
+        let total = 16 * 1024 * 1024;
+        let mut huge = String::with_capacity(total);
+        huge.push_str("HEAD-SENTINEL ");
+        while huge.len() < total - 14 {
+            huge.push_str("0123456789abcdef");
+        }
+        huge.push_str(" TAIL-SENTINEL");
+        let original_len = huge.len();
+
+        let capped = cap_mcp_output(huge);
+
+        assert!(
+            capped.len() < MAX_OUTPUT_BYTES + 512,
+            "capped output must stay near the {MAX_OUTPUT_BYTES}-byte cap, got {}",
+            capped.len()
+        );
+        assert!(capped.starts_with("HEAD-SENTINEL "), "head must survive");
+        assert!(capped.ends_with(" TAIL-SENTINEL"), "tail must survive");
+        assert!(
+            capped.contains(&format!("of {original_len} bytes elided")),
+            "marker must name the elided span"
+        );
+        assert!(
+            capped.contains("NOT recoverable"),
+            "marker must be honest that the middle is destroyed"
+        );
+        assert!(
+            capped.contains("re-run the tool with narrower arguments"),
+            "marker must tell the model how to recover"
+        );
+    }
+
+    #[test]
+    fn cap_respects_utf8_boundaries() {
+        // Multibyte content straddling both cut points must not panic or
+        // split a char.
+        let huge = "é".repeat(MAX_OUTPUT_BYTES);
+        let capped = cap_mcp_output(huge);
+        assert!(capped.len() < MAX_OUTPUT_BYTES + 512);
+        assert!(capped.contains("bytes elided"));
     }
 
     #[test]

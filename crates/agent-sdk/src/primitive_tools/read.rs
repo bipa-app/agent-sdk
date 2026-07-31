@@ -16,6 +16,18 @@ const LINE_TRUNCATION_MARKER: &str = "... [line truncated]";
 /// Default maximum number of lines to return.
 const DEFAULT_LIMIT: usize = 2000;
 
+/// Total-byte floor for a read's inline output (50 KiB). A read with a
+/// defaulted `limit` is bounded by this alone; an explicit `limit` widens
+/// the budget to `limit * BYTES_PER_REQUESTED_LINE` so a deliberately
+/// large request still fits. Nothing is lost either way — the file stays
+/// on disk and the truncation notice names the continuation offset.
+const TOTAL_BYTE_BUDGET_FLOOR: usize = 50 * 1024;
+
+/// Per-line byte allowance used to scale the total budget with an
+/// explicit `limit` (a formatted line is at most `MAX_LINE_LENGTH` content
+/// bytes plus the `L{n}: ` prefix and truncation marker).
+const BYTES_PER_REQUESTED_LINE: usize = 512;
+
 /// Maximum size (in bytes) of a text file the tool will read into memory.
 /// Larger files are rejected to avoid loading multi-GB files / dumping huge
 /// payloads into the model context.
@@ -49,20 +61,19 @@ struct ReadInput {
         deserialize_with = "super::deserialize_usize_from_string_or_int"
     )]
     offset: usize,
-    /// Maximum number of lines to return; defaults to 2000.
+    /// Maximum number of lines to return; defaults to 2000. Passing it
+    /// explicitly also widens the total byte budget (see
+    /// [`TOTAL_BYTE_BUDGET_FLOOR`]).
     #[serde(
-        default = "defaults::limit",
-        deserialize_with = "super::deserialize_usize_from_string_or_int"
+        default,
+        deserialize_with = "super::deserialize_optional_usize_from_string_or_int"
     )]
-    limit: usize,
+    limit: Option<usize>,
 }
 
 mod defaults {
     pub const fn offset() -> usize {
         1
-    }
-    pub const fn limit() -> usize {
-        super::DEFAULT_LIMIT
     }
 }
 
@@ -105,7 +116,7 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for ReadToo
                         {"type": "integer"},
                         {"type": "string", "pattern": "^[0-9]+$"}
                     ],
-                    "description": "Maximum number of lines to return. Accepts either an integer or a numeric string. Default: 2000"
+                    "description": "Maximum number of lines to return. Accepts either an integer or a numeric string. Default: 2000. Output is also byte-budgeted: 50KB by default, or limit*512 bytes when limit is set explicitly; a budgeted read ends with a notice naming the continuation offset."
                 }
             },
             "required": ["path"]
@@ -120,7 +131,7 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for ReadToo
             return Ok(ToolResult::error("offset must be a 1-indexed line number"));
         }
 
-        if input.limit == 0 {
+        if input.limit == Some(0) {
             return Ok(ToolResult::error("limit must be greater than zero"));
         }
 
@@ -188,9 +199,21 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for ReadToo
             )));
         }
 
-        // Text files: lossy UTF-8, line numbers, truncation.
+        // Text files: lossy UTF-8, line numbers, truncation. The byte
+        // budget scales only with an EXPLICIT limit: a defaulted read is
+        // bounded at the floor so a 2000-line log cannot dump ~1MB into
+        // the context, while a caller that deliberately asks for N lines
+        // gets room for them.
+        let byte_budget = input.limit.map_or(TOTAL_BYTE_BUDGET_FLOOR, |limit| {
+            TOTAL_BYTE_BUDGET_FLOOR.max(limit.saturating_mul(BYTES_PER_REQUESTED_LINE))
+        });
         let content = String::from_utf8_lossy(&bytes);
-        let collected = read_lines(&content, input.offset, input.limit);
+        let collected = read_lines(
+            &content,
+            input.offset,
+            input.limit.unwrap_or(DEFAULT_LIMIT),
+            byte_budget,
+        );
 
         if collected.is_empty() {
             return Ok(ToolResult::error("offset exceeds file length"));
@@ -200,11 +223,13 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for ReadToo
     }
 }
 
-fn read_lines(content: &str, offset: usize, limit: usize) -> Vec<String> {
+fn read_lines(content: &str, offset: usize, limit: usize, byte_budget: usize) -> Vec<String> {
     let total_lines = content.split('\n').count();
     let mut collected = Vec::new();
     let mut line_number = 0usize;
     let mut last_emitted = 0usize;
+    let mut emitted_bytes = 0usize;
+    let mut budget_reached = false;
 
     for raw_line in content.split('\n') {
         line_number += 1;
@@ -220,13 +245,28 @@ fn read_lines(content: &str, offset: usize, limit: usize) -> Vec<String> {
         // Strip trailing \r for CRLF files
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         let display = truncate_line(line);
-        collected.push(format!("L{line_number}: {display}"));
+        let formatted = format!("L{line_number}: {display}");
+        // +1 for the joining newline. Always emit at least one line so a
+        // budget smaller than a single line cannot yield an empty success.
+        if !collected.is_empty() && emitted_bytes + formatted.len() + 1 > byte_budget {
+            budget_reached = true;
+            break;
+        }
+        emitted_bytes += formatted.len() + 1;
+        collected.push(formatted);
         last_emitted = line_number;
     }
 
     // Unlike a silent stop, tell the model the file continues so it can read
     // further with offset/limit instead of assuming it saw everything.
-    if !collected.is_empty() && last_emitted < total_lines {
+    if budget_reached {
+        // No bytes are destroyed — the file is intact on disk; the notice
+        // names the budget and the exact continuation point.
+        collected.push(format!(
+            "... [read byte budget of {byte_budget} bytes reached: showing lines {offset}-{last_emitted} of {total_lines}; continue with offset={next} (an explicit limit widens the budget to limit*{BYTES_PER_REQUESTED_LINE} bytes)]",
+            next = last_emitted + 1
+        ));
+    } else if !collected.is_empty() && last_emitted < total_lines {
         collected.push(format!(
             "... [showing lines {offset}-{last_emitted} of {total_lines}; use offset/limit to read more]"
         ));
@@ -601,7 +641,7 @@ mod tests {
 
     #[test]
     fn read_lines_basic() {
-        let lines = read_lines("alpha\nbeta\ngamma", 1, 2000);
+        let lines = read_lines("alpha\nbeta\ngamma", 1, 2000, TOTAL_BYTE_BUDGET_FLOOR);
         assert_eq!(
             lines,
             vec![
@@ -614,7 +654,7 @@ mod tests {
 
     #[test]
     fn read_lines_with_offset_and_limit() {
-        let lines = read_lines("a\nb\nc\nd\ne", 2, 2);
+        let lines = read_lines("a\nb\nc\nd\ne", 2, 2, TOTAL_BYTE_BUDGET_FLOOR);
         assert_eq!(
             lines,
             vec![
@@ -627,7 +667,7 @@ mod tests {
 
     #[test]
     fn read_lines_no_continuation_marker_when_complete() {
-        let lines = read_lines("a\nb\nc", 1, 2000);
+        let lines = read_lines("a\nb\nc", 1, 2000, TOTAL_BYTE_BUDGET_FLOOR);
         assert_eq!(
             lines,
             vec![
@@ -640,8 +680,99 @@ mod tests {
 
     #[test]
     fn read_lines_offset_past_end_returns_empty() {
-        let lines = read_lines("only", 5, 10);
+        let lines = read_lines("only", 5, 10, TOTAL_BYTE_BUDGET_FLOOR);
         assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn read_lines_byte_budget_stops_with_notice_and_continuation() {
+        // 40 lines of 100 bytes each = ~4.3KB formatted; an 1KB budget
+        // stops early with the notice naming budget + continuation offset.
+        let content = vec!["x".repeat(100); 40].join("\n");
+        let lines = read_lines(&content, 1, 2000, 1024);
+
+        let notice = lines.last().expect("notice line");
+        assert!(
+            notice.contains("read byte budget of 1024 bytes reached"),
+            "notice must name the budget: {notice}"
+        );
+        assert!(
+            notice.contains("of 40"),
+            "notice must name the total line count: {notice}"
+        );
+        let emitted = lines.len() - 1;
+        assert!(emitted < 40, "budget must stop before the line limit");
+        assert!(
+            notice.contains(&format!("continue with offset={}", emitted + 1)),
+            "notice must name the exact continuation offset: {notice}"
+        );
+        let body_bytes: usize = lines[..emitted].iter().map(|l| l.len() + 1).sum();
+        assert!(body_bytes <= 1024, "emitted body must fit the budget");
+    }
+
+    #[test]
+    fn read_lines_always_emits_at_least_one_line() {
+        // A budget smaller than one formatted line must not yield an
+        // empty read (which the caller reports as offset-past-end).
+        let content = "y".repeat(200);
+        let lines = read_lines(&content, 1, 2000, 8);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("L1: "));
+    }
+
+    #[tokio::test]
+    async fn default_read_of_oversized_file_is_byte_budgeted() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        // ~80KB over 200 lines: under the old behavior the whole file
+        // (well past 50KB) landed inline because 200 < 2000 lines.
+        let content = vec!["z".repeat(400); 200].join("\n");
+        fs.write_file("big.log", &content).await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(&tool_ctx(), json!({"path": "/workspace/big.log"}))
+            .await?;
+
+        assert!(result.success);
+        assert!(
+            result.output.len() < 52 * 1024,
+            "inline output must stay near the 50KB floor, got {} bytes",
+            result.output.len()
+        );
+        assert!(
+            result
+                .output
+                .contains(&format!("read byte budget of {} bytes reached", 50 * 1024)),
+            "output must carry the budget notice: …{}",
+            &result.output[result.output.len().saturating_sub(300)..]
+        );
+        assert!(result.output.contains("continue with offset="));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_limit_widens_the_byte_budget() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        // Same ~80KB file: an explicit limit of 300 lines widens the
+        // budget to 300*512 = 150KB, so the read completes in full.
+        let content = vec!["z".repeat(400); 200].join("\n");
+        fs.write_file("big.log", &content).await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({"path": "/workspace/big.log", "limit": 300}),
+            )
+            .await?;
+
+        assert!(result.success);
+        assert!(
+            !result.output.contains("read byte budget"),
+            "explicit-limit read within its widened budget must not truncate"
+        );
+        assert!(result.output.contains("L200: "));
+        Ok(())
     }
 
     #[test]
