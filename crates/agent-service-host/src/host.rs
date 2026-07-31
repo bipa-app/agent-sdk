@@ -65,8 +65,8 @@ use agent_server::journal::task::{
 };
 use agent_server::journal::task_state::TaskState;
 use agent_server::worker::{
-    ActivityBeacon, AgentDefinitionRegistry, FailRootTurnParams, RootTurnOutcome,
-    SubagentProgressSnapshot, SubagentTaskOutcome, ToolTaskOutcome,
+    ActivityBeacon, AgentDefinitionRegistry, FailRootTurnParams, RootStreamFailure,
+    RootTurnOutcome, SubagentProgressSnapshot, SubagentTaskOutcome, ToolTaskOutcome,
     best_effort_close_open_attempts, build_parent_progress_event, canonical_subagent_name,
     execute_subagent_task, fail_root_turn_leaving_attempts_open_with_reason,
     fail_root_turn_with_reason, guarded_tool_execution, pause_tool_for_confirmation,
@@ -2456,9 +2456,13 @@ async fn handle_root_turn_outcome(
 /// cascade, so failing here would strand those workers and orphan their
 /// eventual results. Such a failure is reverted to the pre-wake parked
 /// state (see [`revert_failed_steering_wake`]) so the ordinary fan-in
-/// resumes the mission when the children finish. Any other failure — or
-/// a revert that itself fails — marks the root `Failed` and promotes the
-/// next queued root.
+/// resumes the mission when the children finish. A non-steering
+/// resume-from-children exchange killed by transient provider weather
+/// is REQUEUED with bounded budget (see
+/// [`requeue_weather_failed_resume`]) so the children's finished
+/// results are joined by a later attempt instead of stranded. Any
+/// other failure — or a revert/requeue that itself fails — marks the
+/// root `Failed` and promotes the next queued root.
 async fn fail_or_revert_root_task(
     stores: &StoreRegistry,
     task: &AgentTask,
@@ -2480,6 +2484,29 @@ async fn fail_or_revert_root_task(
                     "steering wake revert failed; falling back to failing the root task",
                 );
                 // Fall through to the ordinary fail path.
+            }
+        }
+    }
+    if is_weather_failed_child_resume(task, err) {
+        match requeue_weather_failed_resume(stores, task, err, now).await {
+            Ok(true) => {
+                let new_events =
+                    newly_committed_events(stores, &task.thread_id, error_watermark).await?;
+                publish_events(stores, &new_events);
+                return Ok(());
+            }
+            Ok(false) => {
+                // Budget exhausted or no longer owned — fall through to
+                // the terminal path, which re-checks ownership itself.
+            }
+            Err(requeue_err) => {
+                warn!(
+                    task_id = %task.id,
+                    thread_id = %task.thread_id,
+                    weather_error = %err,
+                    requeue_error = %requeue_err,
+                    "weather-failed resume requeue failed; falling back to failing the root task",
+                );
             }
         }
     }
@@ -2653,6 +2680,98 @@ async fn requeue_collided_root_task(
                 task_id = %task.id,
                 thread_id = %task.thread_id,
                 "turn-slot collision: retry budget exhausted; failing the root task",
+            );
+            Ok(false)
+        }
+        RequeueOutcome::NotOwned => Ok(false),
+    }
+}
+
+/// `true` when a non-steering resume-from-children exchange died on
+/// transient provider weather — the one failure shape where terminal
+/// failure strands work that ALREADY finished.
+///
+/// The task must be a [`TaskState::ReadyToResume`] continuation (its
+/// children completed durably; the failed exchange only had to join
+/// their results), and the error chain must carry a typed
+/// [`RootStreamFailure`] whose kind is recoverable (rate limit, server
+/// error, connection loss). Deterministic failures — context overflow,
+/// invalid requests, config errors — keep the terminal path: re-running
+/// them would fail identically and burn budget.
+///
+/// Steering resumes are excluded; they have their own revert path
+/// ([`revert_failed_steering_wake`]) because their children are still
+/// RUNNING.
+fn is_weather_failed_child_resume(task: &AgentTask, err: &anyhow::Error) -> bool {
+    if !matches!(task.state, TaskState::ReadyToResume { .. }) || task.state.is_steering_resume() {
+        return false;
+    }
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<RootStreamFailure>())
+        .is_some_and(|failure| failure.kind.is_recoverable())
+}
+
+/// Requeue a parked parent whose resume-from-children exchange died on
+/// provider weather, so the finished child work is joined by a later
+/// attempt instead of stranded behind a terminal `Failed` (audit F5 /
+/// bip ENG-9471: ~60 root failures whose children had already computed
+/// their results).
+///
+/// [`AgentTaskStore::requeue_owned_task`] applies the sweep-identical
+/// [`AgentTask::release_lease`] accounting: the `ReadyToResume` state —
+/// and with it the continuation carrying the children's results — is
+/// preserved, and `attempt` is bumped so a provider that stays broken
+/// exhausts the row's bounded budget rather than looping forever (the
+/// historical ~30s "resume root task from durable child results"
+/// infinite loop is exactly what unbounded re-parking produced; see the
+/// recovery-matrix notes). Each durable pass re-runs the full in-turn
+/// retry ladder — including the unbounded, free connectivity wait — so
+/// the bounded budget only limits "reachable but broken" weather.
+///
+/// Returns `Ok(true)` when the row was requeued; `Ok(false)` when the
+/// budget is exhausted or ownership moved on — the caller falls through
+/// to the terminal path, which surfaces the REAL weather error.
+async fn requeue_weather_failed_resume(
+    stores: &StoreRegistry,
+    task: &AgentTask,
+    err: &anyhow::Error,
+    now: time::OffsetDateTime,
+) -> Result<bool> {
+    let (worker_id, lease_id) = running_lease(task)?;
+    // Boundary for the abandoned resume attempt, committed atomically
+    // with the release (same contract as the collision requeue): marked
+    // RECOVERABLE so frontends render a retry, not a terminal failure.
+    let boundary = agent_sdk_foundation::events::AgentEvent::error(
+        format!(
+            "provider weather interrupted the resume from durable child results; \
+             requeueing the resume ({err:#})"
+        ),
+        true,
+    )
+    .with_emitter_task_id(task.id.as_str());
+    let outcome = stores
+        .task_store
+        .requeue_owned_task(&task.id, &worker_id, &lease_id, Some(boundary), now)
+        .await
+        .context("requeue weather-failed resume")?;
+    match outcome {
+        RequeueOutcome::Requeued(row) => {
+            warn!(
+                task_id = %task.id,
+                thread_id = %task.thread_id,
+                attempt = row.attempt,
+                max_attempts = row.max_attempts,
+                error = %err,
+                "provider weather killed a resume-from-children exchange; \
+                 requeued the parked resume instead of stranding finished child work",
+            );
+            Ok(true)
+        }
+        RequeueOutcome::BudgetExhausted => {
+            warn!(
+                task_id = %task.id,
+                thread_id = %task.thread_id,
+                "weather-failed resume: retry budget exhausted; failing the root task",
             );
             Ok(false)
         }
@@ -4342,6 +4461,226 @@ mod tests {
 
         let row = stores.task_store.get(&id).await?.context("row")?;
         assert_eq!(row.status, TaskStatus::Failed);
+        Ok(())
+    }
+
+    /// Seed a root that is RUNNING a resume-from-children exchange: the
+    /// root suspends on one tool child, the child completes (fan-in
+    /// stamps `ReadyToResume` with the child's results), and a worker
+    /// re-acquires the parent. This is exactly the task shape the
+    /// weather-requeue arm guards.
+    async fn seed_running_ready_to_resume_root(
+        stores: &StoreRegistry,
+        thread_name: &str,
+        max_attempts: u32,
+    ) -> Result<AgentTask> {
+        use agent_server::journal::task::ChildSpawnSpec;
+
+        let now = time::OffsetDateTime::now_utc();
+        let thread = agent_sdk_foundation::ThreadId::from_string(thread_name);
+        let root = AgentTask::new_root_turn(thread.clone(), now, max_attempts);
+        let id = root.id.clone();
+        stores.task_store.submit_root_turn(root).await?;
+        let worker = WorkerId::from_string("w-resume-seed");
+        let lease = LeaseId::from_string("l-resume-seed");
+        stores
+            .task_store
+            .try_acquire_task(
+                &id,
+                worker.clone(),
+                lease.clone(),
+                now + time::Duration::seconds(600),
+                now,
+            )
+            .await?
+            .context("acquire fresh root")?;
+        let payload = pending_call_suspension_with_tier(&thread, "bash", ToolTier::Observe);
+        let (_parent, children) = stores
+            .task_store
+            .spawn_tool_children(
+                &id,
+                &worker,
+                &lease,
+                vec![ChildSpawnSpec { max_attempts: 1 }],
+                payload,
+                None,
+                Vec::new(),
+                now,
+            )
+            .await?;
+        let child = children.first().context("one tool child")?;
+        let cw = WorkerId::from_string("w-resume-child");
+        let cl = LeaseId::from_string("l-resume-child");
+        stores
+            .task_store
+            .try_acquire_task(
+                &child.id,
+                cw.clone(),
+                cl.clone(),
+                now + time::Duration::seconds(600),
+                now,
+            )
+            .await?
+            .context("acquire tool child")?;
+        stores
+            .task_store
+            .complete_task(&child.id, &cw, &cl, now)
+            .await?;
+        let reacquired = stores
+            .task_store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w-resume-run"),
+                LeaseId::from_string("l-resume-run"),
+                now + time::Duration::seconds(600),
+                now,
+            )
+            .await?
+            .context("re-acquire resumed root")?;
+        anyhow::ensure!(
+            matches!(reacquired.state, TaskState::ReadyToResume { .. }),
+            "fixture must produce a ReadyToResume continuation, got {:?}",
+            reacquired.state,
+        );
+        Ok(reacquired)
+    }
+
+    /// Build the exact error shape a weather-killed resume produces:
+    /// the typed [`RootStreamFailure`] under the retry-exhaustion
+    /// message under the resume-entry-point context.
+    fn weather_resume_error(
+        kind: agent_sdk_providers::streaming::StreamErrorKind,
+    ) -> anyhow::Error {
+        anyhow::Error::new(RootStreamFailure { kind })
+            .context("LLM stream error after 3 retries (kind=ServerError): stream died")
+            .context("resume root task from durable child results")
+    }
+
+    /// ENG-9471 / audit F5: provider weather during a resume-from-
+    /// children exchange must REQUEUE the parked resume (children's
+    /// finished results preserved in the continuation) instead of
+    /// terminally failing the root and stranding the completed work.
+    #[tokio::test]
+    async fn weather_failed_resume_requeues_instead_of_stranding_children() -> Result<()> {
+        let config = ServiceConfig::default();
+        let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
+        let stores = host.stores().clone();
+
+        let acquired = seed_running_ready_to_resume_root(&stores, "t-weather-requeue", 3).await?;
+        let attempt_before = acquired.attempt;
+
+        let error =
+            weather_resume_error(agent_sdk_providers::streaming::StreamErrorKind::ServerError);
+        fail_or_revert_root_task(
+            &stores,
+            &acquired,
+            &error,
+            0,
+            time::OffsetDateTime::now_utc(),
+        )
+        .await?;
+
+        let row = stores.task_store.get(&acquired.id).await?.context("row")?;
+        assert_eq!(
+            row.status,
+            TaskStatus::Pending,
+            "a weather-failed resume must requeue, not fail; got {:?} ({:?})",
+            row.status,
+            row.last_error,
+        );
+        assert!(
+            matches!(row.state, TaskState::ReadyToResume { .. }),
+            "the continuation carrying the children's results must survive the requeue",
+        );
+        assert_eq!(
+            row.attempt,
+            attempt_before + 1,
+            "the requeue must consume bounded budget (sweep-identical accounting)",
+        );
+        assert!(row.worker_id.is_none() && row.lease_id.is_none());
+
+        // The abandoned exchange gets a RECOVERABLE boundary event.
+        let events = stores.event_repo.get_events(&acquired.thread_id).await?;
+        let boundary = events
+            .iter()
+            .find_map(|committed| match &committed.event {
+                agent_sdk_foundation::events::AgentEvent::Error {
+                    message,
+                    recoverable,
+                    ..
+                } => Some((message.clone(), *recoverable)),
+                _ => None,
+            })
+            .context("weather requeue must commit an Error boundary event")?;
+        assert!(boundary.1, "the boundary must be recoverable");
+        assert!(boundary.0.contains("provider weather"));
+        Ok(())
+    }
+
+    /// The weather requeue inherits the row's bounded budget: with
+    /// nothing left to spend the terminal path runs and the REAL
+    /// weather error (not a generic budget message) is recorded.
+    #[tokio::test]
+    async fn weather_failed_resume_with_exhausted_budget_fails_terminally() -> Result<()> {
+        let config = ServiceConfig::default();
+        let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
+        let stores = host.stores().clone();
+
+        let acquired = seed_running_ready_to_resume_root(&stores, "t-weather-capped", 1).await?;
+
+        let error =
+            weather_resume_error(agent_sdk_providers::streaming::StreamErrorKind::ServerError);
+        fail_or_revert_root_task(
+            &stores,
+            &acquired,
+            &error,
+            0,
+            time::OffsetDateTime::now_utc(),
+        )
+        .await?;
+
+        let row = stores.task_store.get(&acquired.id).await?.context("row")?;
+        assert_eq!(row.status, TaskStatus::Failed);
+        assert!(
+            row.last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("resume root task from durable child results"),
+            "the terminal error must be the real weather error, got {:?}",
+            row.last_error,
+        );
+        Ok(())
+    }
+
+    /// Deterministic resume failures (invalid request, config errors,
+    /// context overflow) keep the terminal path — re-running them would
+    /// fail identically.
+    #[tokio::test]
+    async fn deterministic_resume_failure_keeps_terminal_path() -> Result<()> {
+        let config = ServiceConfig::default();
+        let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
+        let stores = host.stores().clone();
+
+        let acquired =
+            seed_running_ready_to_resume_root(&stores, "t-weather-deterministic", 3).await?;
+
+        let error =
+            weather_resume_error(agent_sdk_providers::streaming::StreamErrorKind::InvalidRequest);
+        fail_or_revert_root_task(
+            &stores,
+            &acquired,
+            &error,
+            0,
+            time::OffsetDateTime::now_utc(),
+        )
+        .await?;
+
+        let row = stores.task_store.get(&acquired.id).await?.context("row")?;
+        assert_eq!(
+            row.status,
+            TaskStatus::Failed,
+            "a non-recoverable resume failure must not requeue",
+        );
         Ok(())
     }
 
