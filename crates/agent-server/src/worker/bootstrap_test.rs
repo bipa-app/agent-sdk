@@ -257,6 +257,7 @@ async fn registry_resolves_per_thread_override() -> anyhow::Result<()> {
             strict_durability: true,
             max_attempts: 5,
             streaming: true,
+            child_join_policy: crate::ChildJoinPolicy::default(),
         },
     };
 

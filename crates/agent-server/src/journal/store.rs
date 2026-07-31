@@ -214,7 +214,7 @@ use agent_sdk_foundation::{
     ContinuationEnvelope, ListenExecutionContext, QuestionAnswer, QuestionPayload, TerminalReason,
     ThreadId, TokenUsage,
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
@@ -274,6 +274,12 @@ pub struct ToolChildSpawn {
     /// [`AgentTaskStore::spawn_tool_children`].
     pub spec: ChildSpawnSpec,
 }
+/// Existing child rebound to a pending-tool-call slot in a new batch.
+#[derive(Clone, Debug)]
+pub struct ReattachedChild {
+    pub child_id: AgentTaskId,
+    pub spawn_index: u32,
+}
 
 /// Input struct for [`AgentTaskStore::spawn_mixed_children`].
 ///
@@ -306,6 +312,8 @@ pub struct MixedChildrenSpawn {
     pub subagents: Vec<SubagentInvocationSpawn>,
     /// Tool-runtime children to persist, in input order.
     pub tool_children: Vec<ToolChildSpawn>,
+    /// Existing children rebound atomically alongside newly spawned work.
+    pub reattach: Vec<ReattachedChild>,
     /// The one parent suspension shared by every child in the batch.
     pub payload: SuspensionPayload,
     /// Trace parent stamped on the tool children (subagent invocations
@@ -360,11 +368,60 @@ pub fn validate_mixed_children_spawn(spawn: &MixedChildrenSpawn) -> Result<()> {
         .iter()
         .map(|child| child.spawn_index)
         .collect();
-    validate_mixed_slot_coverage(
+    if spawn.reattach.is_empty() {
+        return validate_mixed_slot_coverage(
+            &subagent_slots,
+            &tool_slots,
+            spawn.payload.continuation.payload.pending_tool_calls.len(),
+        );
+    }
+    let reattach_slots: Vec<u32> = spawn
+        .reattach
+        .iter()
+        .map(|child| child.spawn_index)
+        .collect();
+    validate_reattached_slot_coverage(
         &subagent_slots,
         &tool_slots,
+        &reattach_slots,
         spawn.payload.continuation.payload.pending_tool_calls.len(),
     )
+}
+
+/// Validate exact pending-slot coverage when existing children are reattached.
+///
+/// # Errors
+/// Returns an error when a slot is out of bounds, duplicated, or the
+/// combined children do not cover every pending tool call.
+pub fn validate_reattached_slot_coverage(
+    subagent_slots: &[u32],
+    tool_slots: &[u32],
+    reattach_slots: &[u32],
+    pending_tool_calls: usize,
+) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for index in subagent_slots
+        .iter()
+        .chain(tool_slots)
+        .chain(reattach_slots)
+        .copied()
+    {
+        let slot = usize::try_from(index).context("spawn rejected: spawn_index exceeds usize")?;
+        ensure!(
+            slot < pending_tool_calls,
+            "spawn rejected: spawn_index {slot} out of bounds for {pending_tool_calls} pending tool calls"
+        );
+        ensure!(
+            seen.insert(index),
+            "spawn rejected: duplicate spawn_index {index} in attached batch"
+        );
+    }
+    ensure!(
+        seen.len() == pending_tool_calls,
+        "spawn rejected: attached batch covers {} of {pending_tool_calls} pending tool calls",
+        seen.len()
+    );
+    Ok(())
 }
 
 /// Validate the slot partition of a mixed batch on its own, before any
@@ -441,19 +498,20 @@ pub fn validate_mixed_slot_coverage(
 pub fn mixed_child_ids_in_slot_order(
     subagents: &[(AgentTask, AgentTask)],
     tool_children: &[AgentTask],
+    reattached: &[AgentTask],
 ) -> Result<Vec<AgentTaskId>> {
     let mut by_slot: Vec<(u32, AgentTaskId)> =
-        Vec::with_capacity(subagents.len() + tool_children.len());
+        Vec::with_capacity(subagents.len() + tool_children.len() + reattached.len());
     for (invocation, _child_root) in subagents {
         let slot = invocation
             .spawn_index
             .context("spawn rejected: subagent invocation missing spawn_index")?;
         by_slot.push((slot, invocation.id.clone()));
     }
-    for child in tool_children {
+    for child in tool_children.iter().chain(reattached) {
         let slot = child
             .spawn_index
-            .context("spawn rejected: tool child missing spawn_index")?;
+            .context("spawn rejected: attached child missing spawn_index")?;
         by_slot.push((slot, child.id.clone()));
     }
     by_slot.sort_unstable_by_key(|(slot, _)| *slot);
@@ -1693,10 +1751,9 @@ pub trait AgentTaskStore: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<Option<AgentTask>>;
 
-    /// Re-park a running steering exchange (a
-    /// [`crate::journal::TaskState::ReadyToResume`] row whose `steering`
-    /// payload is set) on the still-running children, updating each
-    /// re-attach child's
+    /// Re-park a running child-results exchange (a
+    /// [`crate::journal::TaskState::ReadyToResume`] row) on the still-running
+    /// children, updating each re-attach child's
     /// `spawn_index` to its position in the new continuation's
     /// `pending_tool_calls` and transitioning the parent back to
     /// [`TaskStatus::WaitingOnChildren`] (or straight to
@@ -1706,8 +1763,8 @@ pub trait AgentTaskStore: Send + Sync {
     /// A successful call, under a single write:
     ///
     /// 1. CAS-checks the parent exists, is in [`TaskStatus::Running`],
-    ///    is owned by `(worker, lease)`, and carries a steering
-    ///    `ReadyToResume` state (non-empty `steering`).
+    ///    is owned by `(worker, lease)`, and carries a child-results
+    ///    `ReadyToResume` state.
     /// 2. Rewrites `reattach[i].spawn_index = i` for every re-attach
     ///    child so the ordinary fan-in aggregation maps them onto the
     ///    new continuation's tool-use ids.
@@ -1726,8 +1783,8 @@ pub trait AgentTaskStore: Send + Sync {
     ///   `parent_id`.
     /// - `repark rejected: not running` / `worker mismatch` / `lease
     ///   mismatch` — CAS failure.
-    /// - `repark rejected: not a steering resume` — the row is running
-    ///   but not in `SteeringResume`.
+    /// - `repark rejected: not a child resume` — the row is running
+    ///   without a `ReadyToResume` state.
     /// - `repark rejected: re-attach child … missing` — a `reattach`
     ///   id is not a child of the parent.
     /// - Row-level errors from [`AgentTask::repark_after_steering`].
@@ -3574,6 +3631,45 @@ impl Inner {
         }
         Ok(children)
     }
+
+    fn build_reattached_children(
+        &self,
+        parent_id: &AgentTaskId,
+        reattach: &[ReattachedChild],
+        now: OffsetDateTime,
+    ) -> Result<Vec<AgentTask>> {
+        let mut children = Vec::with_capacity(reattach.len());
+        let mut child_ids = BTreeSet::new();
+        for attached in reattach {
+            ensure!(
+                child_ids.insert(attached.child_id.clone()),
+                "spawn rejected: duplicate re-attach child {}",
+                attached.child_id
+            );
+            let mut child = self
+                .by_id
+                .get(&attached.child_id)
+                .cloned()
+                .with_context(|| {
+                    format!(
+                        "spawn rejected: re-attach child {} missing",
+                        attached.child_id
+                    )
+                })?;
+            ensure!(
+                child.parent_id.as_ref() == Some(parent_id),
+                "spawn rejected: re-attach child {} is not a child of {parent_id}",
+                attached.child_id
+            );
+            child.spawn_index = Some(attached.spawn_index);
+            child.updated_at = now;
+            child
+                .validate()
+                .context("spawn rejected: re-attach child validate failed")?;
+            children.push(child);
+        }
+        Ok(children)
+    }
 }
 
 #[async_trait]
@@ -4509,9 +4605,9 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                 ));
             }
         }
-        if !old.state.is_steering_resume() {
+        if !matches!(old.state, TaskState::ReadyToResume { .. }) {
             return Err(anyhow!(
-                "repark rejected: task {parent_id} is not a steering resume"
+                "repark rejected: task {parent_id} is not a child resume"
             ));
         }
 
@@ -4538,16 +4634,19 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                 .context("repark rejected: re-attach child validate failed")?;
             updated_children.push(child);
         }
+        let live = updated_children
+            .iter()
+            .filter(|child| !child.status.is_terminal())
+            .count();
+        let live = u32::try_from(live).context("repark rejected: live child count exceeds u32")?;
         // spawn_index is not an indexed field, so a plain primary-key
         // overwrite keeps every secondary index consistent.
         for child in updated_children {
             inner.by_id.insert(child.id.clone(), child);
         }
 
-        // Live count is journal-authoritative (matches the completion
-        // path's recompute): a re-attach child that finished during the
-        // steering LLM call is already terminal here and excluded.
-        let live = inner.count_live_children(parent_id);
+        // A re-attach child that finished during the LLM call is already
+        // terminal here and excluded.
         let reparked = old
             .clone()
             .repark_after_steering(live, payload, reattach, now)
@@ -4921,6 +5020,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             delivered_injection_ids,
             subagents,
             tool_children,
+            reattach,
             payload,
             child_otel_traceparent,
         } = spawn;
@@ -4955,14 +5055,25 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             child_otel_traceparent.as_deref(),
             now,
         )?;
-        let child_ids = mixed_child_ids_in_slot_order(&prepared, &tool_rows)?;
-
+        let reattached_rows = inner.build_reattached_children(parent_id, &reattach, now)?;
+        let child_ids = mixed_child_ids_in_slot_order(&prepared, &tool_rows, &reattached_rows)?;
         let child_count =
             u32::try_from(child_ids.len()).context("spawn rejected: child count exceeds u32")?;
+        let live_children = prepared
+            .iter()
+            .map(|(invocation, _)| invocation)
+            .chain(tool_rows.iter())
+            .chain(reattached_rows.iter())
+            .filter(|child| !child.status.is_terminal())
+            .count();
+        let live_children =
+            u32::try_from(live_children).context("spawn rejected: live child count exceeds u32")?;
         let new_parent = old_parent
             .clone()
             .wait_on_children(child_count, payload, child_ids, now)
-            .context("spawn rejected: wait_on_children transition failed")?;
+            .context("spawn rejected: wait_on_children transition failed")?
+            .recompute_pending_children(live_children, now)
+            .context("spawn rejected: recompute_pending_children transition failed")?;
 
         // All validation passed — apply mutations.
         inner.rebalance_after_row_change(&old_parent, &new_parent);
@@ -4982,6 +5093,9 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         for child in &tool_rows {
             inner.add_to_indexes(child);
             inner.by_id.insert(child.id.clone(), child.clone());
+        }
+        for child in reattached_rows {
+            inner.by_id.insert(child.id.clone(), child);
         }
 
         inner.complete_injection_rows(&delivered_injection_ids, now)?;
@@ -6125,6 +6239,7 @@ mod tests {
                             SuspensionPayload {
                                 continuation: sample_continuation("t1"),
                                 suspended_messages: Vec::new(),
+                                child_join_policy: crate::ChildJoinPolicy::default(),
                             },
                             Vec::new(),
                             t_plus(2),
@@ -6447,6 +6562,7 @@ mod tests {
                     SuspensionPayload {
                         continuation: sample_continuation("t-admission"),
                         suspended_messages: Vec::new(),
+                        child_join_policy: crate::ChildJoinPolicy::default(),
                     },
                     None,
                     Vec::new(),
@@ -7151,6 +7267,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t1"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 Vec::new(),
                 t_plus(7),
@@ -7329,6 +7446,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-wait"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 Vec::new(),
                 t_plus(2),
@@ -7648,6 +7766,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("b"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 Vec::new(),
                 t_plus(3),
@@ -8206,6 +8325,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t1"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 Vec::new(),
                 t_plus(3),
@@ -8365,6 +8485,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-pause-children"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 t_plus(2),
             )
@@ -8446,6 +8567,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-invisible-target"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 t_plus(2),
             )
@@ -8517,6 +8639,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-scan-invisible"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 t_plus(2),
             )
@@ -8575,6 +8698,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-cas"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 t_plus(2),
             )
@@ -8593,6 +8717,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-cas"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 t_plus(3),
             )
@@ -8674,6 +8799,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-pending"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 t_plus(1),
             )
@@ -8834,6 +8960,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-round-trip"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 t_plus(2),
             )
@@ -8934,6 +9061,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-json-children"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 t_plus(2),
             )
@@ -8983,6 +9111,7 @@ mod tests {
             continuation: Box::new(sample_continuation("t-bad-2")),
             suspended_messages: Vec::new(),
             child_ids: Vec::new(),
+            child_join_policy: crate::ChildJoinPolicy::default(),
         };
         let err = bad.validate().unwrap_err();
         assert!(
@@ -9803,6 +9932,7 @@ mod tests {
                     payload: SuspensionPayload {
                         continuation: sample_continuation(thread_name),
                         suspended_messages: Vec::new(),
+                        child_join_policy: crate::ChildJoinPolicy::default(),
                     },
                     child_caller_metadata: None,
                 },
@@ -9860,6 +9990,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-spawn"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),
@@ -9926,6 +10057,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-spawn-cas"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),
@@ -9947,6 +10079,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-spawn-cas"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),
@@ -9996,6 +10129,7 @@ mod tests {
                     payload: SuspensionPayload {
                         continuation: sample_continuation("t-subagent-spawn"),
                         suspended_messages: Vec::new(),
+                        child_join_policy: crate::ChildJoinPolicy::default(),
                     },
                     child_caller_metadata: None,
                 },
@@ -10077,6 +10211,7 @@ mod tests {
                     payload: SuspensionPayload {
                         continuation: sample_continuation("t-subagent-spawn-cas"),
                         suspended_messages: Vec::new(),
+                        child_join_policy: crate::ChildJoinPolicy::default(),
                     },
                     child_caller_metadata: None,
                 },
@@ -10104,6 +10239,7 @@ mod tests {
                     payload: SuspensionPayload {
                         continuation: sample_continuation("t-subagent-spawn-cas"),
                         suspended_messages: Vec::new(),
+                        child_join_policy: crate::ChildJoinPolicy::default(),
                     },
                     child_caller_metadata: None,
                 },
@@ -10156,6 +10292,7 @@ mod tests {
                 payload: SuspensionPayload {
                     continuation: sample_continuation("t-subagent-batch"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 child_caller_metadata: None,
             })
@@ -10172,6 +10309,7 @@ mod tests {
                     payload: SuspensionPayload {
                         continuation: sample_continuation("t-subagent-batch"),
                         suspended_messages: Vec::new(),
+                        child_join_policy: crate::ChildJoinPolicy::default(),
                     },
                     events: test_spawn_events(3),
                 },
@@ -10253,6 +10391,7 @@ mod tests {
                     payload: SuspensionPayload {
                         continuation: sample_continuation("t-subagent-batch-empty"),
                         suspended_messages: Vec::new(),
+                        child_join_policy: crate::ChildJoinPolicy::default(),
                     },
                     events: test_spawn_events(0),
                 },
@@ -10314,6 +10453,7 @@ mod tests {
         let payload = SuspensionPayload {
             continuation: continuation_with_slots(name, slots),
             suspended_messages: Vec::new(),
+            child_join_policy: crate::ChildJoinPolicy::default(),
         };
         let subagents = subagent_threads
             .into_iter()
@@ -10338,6 +10478,7 @@ mod tests {
             delivered_injection_ids: Vec::new(),
             subagents,
             tool_children,
+            reattach: Vec::new(),
             payload,
             child_otel_traceparent: None,
         }
@@ -10464,6 +10605,7 @@ mod tests {
                 payload: SuspensionPayload {
                     continuation: sample_continuation("t-subagent-batch-dup"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 child_caller_metadata: None,
             },
@@ -10475,6 +10617,7 @@ mod tests {
                 payload: SuspensionPayload {
                     continuation: sample_continuation("t-subagent-batch-dup"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 child_caller_metadata: None,
             },
@@ -10491,6 +10634,7 @@ mod tests {
                     payload: SuspensionPayload {
                         continuation: sample_continuation("t-subagent-batch-dup"),
                         suspended_messages: Vec::new(),
+                        child_join_policy: crate::ChildJoinPolicy::default(),
                     },
                     events: test_spawn_events(2),
                 },
@@ -10531,6 +10675,7 @@ mod tests {
                 payload: SuspensionPayload {
                     continuation: sample_continuation("t-subagent-batch-cas"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 child_caller_metadata: None,
             }]
@@ -10547,6 +10692,7 @@ mod tests {
                     payload: SuspensionPayload {
                         continuation: sample_continuation("t-subagent-batch-cas"),
                         suspended_messages: Vec::new(),
+                        child_join_policy: crate::ChildJoinPolicy::default(),
                     },
                     events: test_spawn_events(1),
                 },
@@ -10592,6 +10738,7 @@ mod tests {
                     payload: SuspensionPayload {
                         continuation: sample_continuation("t-subagent-terminal"),
                         suspended_messages: Vec::new(),
+                        child_join_policy: crate::ChildJoinPolicy::default(),
                     },
                     child_caller_metadata: None,
                 },
@@ -10741,6 +10888,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-spawn-pending"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),
@@ -10775,6 +10923,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-leaf"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),
@@ -10809,6 +10958,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-leaf"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),
@@ -10838,6 +10988,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-empty"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),
@@ -10879,6 +11030,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-scan-children"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),
@@ -10941,6 +11093,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-complete"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),
@@ -11038,6 +11191,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation(thread_name),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),
@@ -11231,6 +11385,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-resume-budget"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),
@@ -11316,6 +11471,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-partial"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),
@@ -11379,6 +11535,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-recompute"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),
@@ -11449,6 +11606,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-cc-cas"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),
@@ -11528,6 +11686,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-fail"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),
@@ -11619,6 +11778,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-mixed"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),
@@ -11703,6 +11863,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-late-complete"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),
@@ -11784,6 +11945,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-tree"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),
@@ -11867,6 +12029,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-tree-live"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),
@@ -11955,6 +12118,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-tree-idem"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),
@@ -11999,6 +12163,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-tree-waiting"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),
@@ -12779,6 +12944,7 @@ mod tests {
                     payload: SuspensionPayload {
                         continuation: sample_continuation("t-nested-gp-child"),
                         suspended_messages: Vec::new(),
+                        child_join_policy: crate::ChildJoinPolicy::default(),
                     },
                     child_caller_metadata: None,
                 },
@@ -13023,6 +13189,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-journal"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),
@@ -13141,6 +13308,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-empty-counter"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),
@@ -13546,6 +13714,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-conc-batch"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),
@@ -13616,6 +13785,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-conc-mix"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),
@@ -14011,6 +14181,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation(name),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),
@@ -14082,7 +14253,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repark_after_steering_rejects_bad_cas_and_non_steering_state() -> Result<()> {
+    async fn repark_after_steering_rejects_bad_cas_and_non_resume_state() -> Result<()> {
         let store = InMemoryAgentTaskStore::new();
         let (parked, c0, c1) = parked_with_two_children(&store, "t-steer-cas").await?;
         store
@@ -14111,6 +14282,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-steer-cas"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 vec![c0.id.clone(), c1.id.clone()],
                 t_plus(12),
@@ -14121,7 +14293,7 @@ mod tests {
             "wrong lease must be rejected",
         );
 
-        // A genuinely running root (state None) is not a steering resume.
+        // A genuinely running root (state None) is not a child resume.
         let (running_root, w2, l2) = running_root_for_spawn(&store, "t-not-steer").await?;
         let err = store
             .repark_after_steering(
@@ -14131,14 +14303,15 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-not-steer"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 Vec::new(),
                 t_plus(13),
             )
             .await;
         assert!(
-            format!("{:#}", err.unwrap_err()).contains("not a steering resume"),
-            "non-steering running row must be rejected",
+            format!("{:#}", err.unwrap_err()).contains("not a child resume"),
+            "non-resume running row must be rejected",
         );
         Ok(())
     }
@@ -14189,6 +14362,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation("t-steer-ready"),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 vec![c1.id.clone(), c0.id.clone()],
                 t_plus(21),

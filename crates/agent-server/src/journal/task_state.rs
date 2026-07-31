@@ -68,7 +68,7 @@ use agent_sdk_foundation::{
 use serde::{Deserialize, Serialize};
 
 use super::task::TaskStatus;
-use crate::worker::subagent::EffectiveSubagentSpec;
+use crate::worker::{definition::ChildJoinPolicy, subagent::EffectiveSubagentSpec};
 
 /// Durable linkage owned by a `subagent` invocation task.
 ///
@@ -136,6 +136,9 @@ pub enum TaskState {
         /// children from prior suspension rounds.
         #[serde(default)]
         child_ids: Vec<super::task::AgentTaskId>,
+        /// Completion condition for this child batch.
+        #[serde(default)]
+        child_join_policy: ChildJoinPolicy,
     },
 
     /// Durable state for a task that has paused on
@@ -275,6 +278,9 @@ pub enum TaskState {
         /// aggregation path reads only the current round's children.
         #[serde(default)]
         child_ids: Vec<super::task::AgentTaskId>,
+        /// Completion condition retained across partial resume cycles.
+        #[serde(default)]
+        child_join_policy: ChildJoinPolicy,
         /// Opaque steering content the host drained from its mailbox
         /// and handed to a steering wake. **Empty** for an ordinary
         /// child fan-in; **non-empty** marks an early steering resume
@@ -413,6 +419,19 @@ impl TaskState {
                 child_ids
             }
             _ => &[],
+        }
+    }
+    /// Completion condition for a durable child batch.
+    #[must_use]
+    pub const fn child_join_policy(&self) -> ChildJoinPolicy {
+        match self {
+            Self::WaitingOnChildren {
+                child_join_policy, ..
+            }
+            | Self::ReadyToResume {
+                child_join_policy, ..
+            } => *child_join_policy,
+            _ => ChildJoinPolicy::All,
         }
     }
 
@@ -610,6 +629,7 @@ mod tests {
             continuation: Box::new(envelope.clone()),
             suspended_messages: Vec::new(),
             child_ids: Vec::new(),
+            child_join_policy: crate::ChildJoinPolicy::default(),
         };
         assert_eq!(state.required_status(), Some(TaskStatus::WaitingOnChildren));
         let inner = state.continuation().expect("continuation present");
@@ -681,6 +701,7 @@ mod tests {
             continuation: Box::new(sample_continuation()),
             suspended_messages: Vec::new(),
             child_ids: Vec::new(),
+            child_join_policy: crate::ChildJoinPolicy::default(),
         };
         let json = serde_json::to_string(&waiting)?;
         let recovered: TaskState = serde_json::from_str(&json)?;
@@ -749,6 +770,7 @@ mod tests {
             continuation: Box::new(sample_continuation()),
             suspended_messages: Vec::new(),
             child_ids: Vec::new(),
+            child_join_policy: crate::ChildJoinPolicy::default(),
             steering: Vec::new(),
         };
         let json = serde_json::to_string(&ready)?;
@@ -768,6 +790,7 @@ mod tests {
             continuation: Box::new(sample_continuation()),
             suspended_messages: Vec::new(),
             child_ids: Vec::new(),
+            child_join_policy: crate::ChildJoinPolicy::default(),
             steering: Vec::new(),
         };
 
@@ -775,6 +798,34 @@ mod tests {
         assert!(state.is_compatible_with_status(TaskStatus::Running));
         assert!(!state.is_compatible_with_status(TaskStatus::Queued));
         assert_eq!(state.compatible_statuses_label(), "Pending or Running");
+    }
+
+    #[test]
+    fn durable_child_states_without_join_policy_default_to_wait_all() -> Result<()> {
+        for state in [
+            TaskState::WaitingOnChildren {
+                continuation: Box::new(sample_continuation()),
+                suspended_messages: Vec::new(),
+                child_ids: Vec::new(),
+                child_join_policy: ChildJoinPolicy::All,
+            },
+            TaskState::ReadyToResume {
+                continuation: Box::new(sample_continuation()),
+                suspended_messages: Vec::new(),
+                child_ids: Vec::new(),
+                child_join_policy: ChildJoinPolicy::All,
+                steering: Vec::new(),
+            },
+        ] {
+            let mut value = serde_json::to_value(state)?;
+            value
+                .as_object_mut()
+                .context("task state object")?
+                .remove("child_join_policy");
+            let restored: TaskState = serde_json::from_value(value)?;
+            assert_eq!(restored.child_join_policy(), ChildJoinPolicy::All);
+        }
+        Ok(())
     }
 
     #[test]
@@ -790,6 +841,7 @@ mod tests {
             continuation: Box::new(sample_continuation()),
             suspended_messages: Vec::new(),
             child_ids: Vec::new(),
+            child_join_policy: crate::ChildJoinPolicy::default(),
         })?;
         assert_eq!(
             waiting_value["kind"],
@@ -819,6 +871,7 @@ mod tests {
             continuation: Box::new(sample_continuation()),
             suspended_messages: Vec::new(),
             child_ids: Vec::new(),
+            child_join_policy: crate::ChildJoinPolicy::default(),
             steering: Vec::new(),
         })?;
         assert_eq!(ready_value["kind"], serde_json::json!("ready_to_resume"));

@@ -25,6 +25,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
+use std::collections::BTreeSet;
 use time::OffsetDateTime;
 
 use agent_server::journal::checkpoint::{
@@ -61,9 +62,9 @@ use agent_server::journal::relay::{
 use agent_server::journal::retention::{RetentionCursor, RetentionStore};
 use agent_server::journal::store::{
     AgentTaskStore, CancelTreeOutcome, ChildProbe, MixedChildrenSpawn, QuestionAnswerApplied,
-    QuestionPause, RequeueOutcome, SpawnedMixedChildren, SubagentBatchSpawn,
+    QuestionPause, ReattachedChild, RequeueOutcome, SpawnedMixedChildren, SubagentBatchSpawn,
     SubagentInvocationSpawn, SubmitDisposition, SubmitRootTurnError, SubmitRootTurnOutcome,
-    SubmitRootTurnParams, apply_question_answer, apply_question_pause,
+    SubmitRootTurnParams, ToolChildSpawn, apply_question_answer, apply_question_pause,
     mixed_child_ids_in_slot_order, new_mixed_tool_child, submitted_task_disposition,
     validate_mixed_children_spawn,
 };
@@ -75,7 +76,7 @@ use agent_server::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskKind, TaskStatus,
     WorkerId,
 };
-use agent_server::journal::task_state::SubagentInvocationState;
+use agent_server::journal::task_state::{SubagentInvocationState, TaskState};
 use agent_server::journal::thread::{
     PurgeReceipt, PurgeSeed, Thread, ThreadNotFound, ThreadOperation, ThreadStatus,
 };
@@ -2632,6 +2633,65 @@ async fn prepare_subagent_batch_rows_tx(
     Ok(prepared)
 }
 
+/// Shared by [`AgentTaskStore::spawn_mixed_children`]: builds the new
+/// tool-runtime rows and resolves the re-attached survivors.
+///
+/// Nothing is written here: the caller commits the rows only after the
+/// parent transition succeeds, so a rejection on any entry leaves the
+/// transaction free of partial fan-out.
+async fn prepare_mixed_tool_and_reattach_rows_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    old_parent: &AgentTask,
+    parent_id: &AgentTaskId,
+    tool_children: &[ToolChildSpawn],
+    reattach: Vec<ReattachedChild>,
+    child_otel_traceparent: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<(Vec<AgentTask>, Vec<AgentTask>)> {
+    let mut tool_rows: Vec<AgentTask> = Vec::with_capacity(tool_children.len());
+    for tool in tool_children {
+        let child = new_mixed_tool_child(old_parent, tool, child_otel_traceparent, now)?;
+        let existing = SqliteDurableStore::load_task_tx(tx, &child.id).await?;
+        if existing.is_some() {
+            return Err(anyhow!(
+                "spawn rejected: child id {} already exists",
+                child.id
+            ));
+        }
+        tool_rows.push(child);
+    }
+
+    let mut reattached_rows = Vec::with_capacity(reattach.len());
+    let mut reattached_ids = BTreeSet::new();
+    for attached in reattach {
+        ensure!(
+            reattached_ids.insert(attached.child_id.clone()),
+            "spawn rejected: duplicate re-attach child {}",
+            attached.child_id
+        );
+        let mut child = SqliteDurableStore::load_task_tx(tx, &attached.child_id)
+            .await?
+            .with_context(|| {
+                format!(
+                    "spawn rejected: re-attach child {} missing",
+                    attached.child_id
+                )
+            })?;
+        ensure!(
+            child.parent_id.as_ref() == Some(parent_id),
+            "spawn rejected: re-attach child {} is not a child of {parent_id}",
+            attached.child_id
+        );
+        child.spawn_index = Some(attached.spawn_index);
+        child.updated_at = now;
+        child
+            .validate()
+            .context("spawn rejected: re-attach child validate failed")?;
+        reattached_rows.push(child);
+    }
+    Ok((tool_rows, reattached_rows))
+}
+
 #[async_trait]
 impl AgentTaskStore for SqliteDurableStore {
     fn atomic_subagent_spawn_committer(&self) -> Option<&dyn AtomicSubagentSpawnCommitter> {
@@ -3532,14 +3592,15 @@ impl AgentTaskStore for SqliteDurableStore {
                 ));
             }
         }
-        if !old.state.is_steering_resume() {
+        if !matches!(old.state, TaskState::ReadyToResume { .. }) {
             return Err(anyhow!(
-                "repark rejected: task {parent_id} is not a steering resume"
+                "repark rejected: task {parent_id} is not a child resume"
             ));
         }
 
         // Re-index the re-attach children to dense spawn_index
         // positions matching the new continuation's tool-use order.
+        let mut live = 0_u32;
         for (idx, child_id) in reattach.iter().enumerate() {
             let mut child = Self::load_task_tx(&mut tx, child_id)
                 .await?
@@ -3555,13 +3616,16 @@ impl AgentTaskStore for SqliteDurableStore {
             child
                 .validate()
                 .context("repark rejected: re-attach child validate failed")?;
+            if !child.status.is_terminal() {
+                live = live
+                    .checked_add(1)
+                    .context("repark rejected: live child count exceeds u32")?;
+            }
             Self::update_task_tx(&mut tx, &child).await?;
         }
 
-        // Journal-authoritative live count (matches the completion
-        // path): a re-attach child that finished during the steering
-        // LLM call is already terminal and excluded.
-        let live = Self::load_live_child_count_tx(&mut tx, parent_id).await?;
+        // A re-attach child that finished during the LLM call is already
+        // terminal here and excluded.
         let reparked = old
             .clone()
             .repark_after_steering(live, payload, reattach, now)
@@ -3903,6 +3967,7 @@ impl AgentTaskStore for SqliteDurableStore {
             delivered_injection_ids,
             subagents,
             tool_children,
+            reattach,
             payload,
             child_otel_traceparent,
         } = spawn;
@@ -3932,28 +3997,34 @@ impl AgentTaskStore for SqliteDurableStore {
 
         let prepared = prepare_subagent_batch_rows_tx(&mut tx, &old_parent, subagents, now).await?;
 
-        let mut tool_rows: Vec<AgentTask> = Vec::with_capacity(tool_children.len());
-        for tool in &tool_children {
-            let child =
-                new_mixed_tool_child(&old_parent, tool, child_otel_traceparent.as_deref(), now)?;
-            let existing = Self::load_task_tx(&mut tx, &child.id).await?;
-            if existing.is_some() {
-                return Err(anyhow!(
-                    "spawn rejected: child id {} already exists",
-                    child.id
-                ));
-            }
-            tool_rows.push(child);
-        }
-
-        let child_ids = mixed_child_ids_in_slot_order(&prepared, &tool_rows)?;
-
+        let (tool_rows, reattached_rows) = prepare_mixed_tool_and_reattach_rows_tx(
+            &mut tx,
+            &old_parent,
+            parent_id,
+            &tool_children,
+            reattach,
+            child_otel_traceparent.as_deref(),
+            now,
+        )
+        .await?;
+        let child_ids = mixed_child_ids_in_slot_order(&prepared, &tool_rows, &reattached_rows)?;
         let child_count =
             u32::try_from(child_ids.len()).context("spawn rejected: child count exceeds u32")?;
+        let live_children = prepared
+            .iter()
+            .map(|(invocation, _)| invocation)
+            .chain(tool_rows.iter())
+            .chain(reattached_rows.iter())
+            .filter(|child| !child.status.is_terminal())
+            .count();
+        let live_children =
+            u32::try_from(live_children).context("spawn rejected: live child count exceeds u32")?;
         let new_parent = old_parent
             .clone()
             .wait_on_children(child_count, payload, child_ids, now)
-            .context("spawn rejected: wait_on_children transition failed")?;
+            .context("spawn rejected: wait_on_children transition failed")?
+            .recompute_pending_children(live_children, now)
+            .context("spawn rejected: recompute_pending_children transition failed")?;
 
         Self::update_task_tx(&mut tx, &new_parent).await?;
         for (invocation, child_root) in &prepared {
@@ -3962,6 +4033,9 @@ impl AgentTaskStore for SqliteDurableStore {
         }
         for child in &tool_rows {
             Self::insert_task_tx(&mut tx, child).await?;
+        }
+        for child in &reattached_rows {
+            Self::update_task_tx(&mut tx, child).await?;
         }
 
         agent_server::fail_point!("atomic_spawn_batch.after_rows");
@@ -6753,6 +6827,7 @@ INSERT INTO agent_sdk_turn_attempts (
                             response_content: Vec::new(),
                         }),
                         suspended_messages: Vec::new(),
+                        child_join_policy: agent_server::ChildJoinPolicy::default(),
                     },
                     questions: vec![QuestionPayload {
                         tool_call_id: "question-call".into(),

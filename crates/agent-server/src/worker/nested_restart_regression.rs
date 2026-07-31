@@ -402,6 +402,7 @@ fn parent_suspension_payload(parent_thread: &ThreadId, tool_id: &str) -> Suspens
                 json!({ "task": "Investigate durable reuse" }),
             ),
         ],
+        child_join_policy: crate::ChildJoinPolicy::default(),
     }
 }
 

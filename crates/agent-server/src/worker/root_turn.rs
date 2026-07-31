@@ -55,7 +55,7 @@ use uuid::Uuid;
 
 use super::activity::{ActivityBeacon, ActivityTrackingEventRepo};
 use super::connectivity::ConnectivityWaitRegistry;
-use super::definition::{AgentDefinition, ThinkingPolicy};
+use super::definition::{AgentDefinition, ChildJoinPolicy, ThinkingPolicy};
 use crate::journal::checkpoint::CheckpointKind;
 use crate::journal::checkpoint_store::CheckpointStore;
 use crate::journal::commit::{
@@ -67,7 +67,7 @@ use crate::journal::event_notifier::EventNotifier;
 use crate::journal::event_repository::EventRepository;
 use crate::journal::execution_context::RootWorkerInputs;
 use crate::journal::message_store::MessageProjectionStore;
-use crate::journal::store::{AgentTaskStore, QuestionPause};
+use crate::journal::store::{AgentTaskStore, QuestionPause, ReattachedChild};
 use crate::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskStatus, WorkerId,
 };
@@ -841,6 +841,7 @@ pub async fn revert_steering_wake(
     let payload = SuspensionPayload {
         continuation,
         suspended_messages: parent.state.suspended_messages().to_vec(),
+        child_join_policy: parent.state.child_join_policy(),
     };
     // The original child ids, in spawn order — the re-park re-indexes
     // them to the continuation's original `pending_tool_calls`, i.e. the
@@ -5071,6 +5072,7 @@ async fn suspend_at_tool_boundary(
                 payload: SuspensionPayload {
                     continuation,
                     suspended_messages,
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 draft,
                 questions,
@@ -5099,17 +5101,21 @@ async fn suspend_at_tool_boundary(
     let payload = SuspensionPayload {
         continuation,
         suspended_messages,
+        child_join_policy: inputs.definition().policy.child_join_policy,
     };
     let (parent_task, child_tasks) = apply_batch_routing(
         &inputs,
         deps,
-        routing,
-        SuspendedBatch {
-            payload,
-            delivered_injection_ids: close_ctx.delivered_injections.clone(),
+        BatchRoutingApplication {
+            routing,
+            batch: SuspendedBatch {
+                payload,
+                delivered_injection_ids: close_ctx.delivered_injections.clone(),
+            },
+            specs,
+            reattach: Vec::new(),
+            tool_children_context: "spawn tool children",
         },
-        specs,
-        "spawn tool children",
         now,
     )
     .await?;
@@ -5373,6 +5379,7 @@ async fn spawn_mixed_batch_children(
             delivered_injection_ids,
             subagents,
             tool_children,
+            reattach: Vec::new(),
             payload,
             child_otel_traceparent: child_tool_traceparent(deps, &inputs.bootstrap.task_id).await,
         },
@@ -5426,6 +5433,132 @@ struct SuspendedBatch {
     delivered_injection_ids: Vec<AgentTaskId>,
 }
 
+struct BatchRoutingApplication {
+    routing: super::subagent_spawn_selector::BatchRouting,
+    batch: SuspendedBatch,
+    specs: Vec<ChildSpawnSpec>,
+    reattach: Vec<ReattachedChild>,
+    tool_children_context: &'static str,
+}
+async fn apply_reattached_batch_routing(
+    inputs: &RootWorkerInputs,
+    deps: &RootTurnDeps<'_>,
+    routing: super::subagent_spawn_selector::BatchRouting,
+    batch: SuspendedBatch,
+    specs: Vec<ChildSpawnSpec>,
+    reattach: Vec<ReattachedChild>,
+    now: OffsetDateTime,
+) -> Result<(AgentTask, Vec<AgentTask>)> {
+    let SuspendedBatch {
+        payload,
+        delivered_injection_ids,
+    } = batch;
+    let (subagents, tool_children) = match routing {
+        super::subagent_spawn_selector::BatchRouting::AllTools => {
+            let tools = specs
+                .into_iter()
+                .enumerate()
+                .map(|(index, spec)| {
+                    Ok(crate::journal::store::ToolChildSpawn {
+                        spawn_index: u32::try_from(index)
+                            .context("tool spawn_index exceeds u32")?,
+                        spec,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            (Vec::new(), tools)
+        }
+        super::subagent_spawn_selector::BatchRouting::SingleSubagent { spawn_index, plan } => (
+            vec![reattached_subagent_entry(spawn_index, &plan)?],
+            Vec::new(),
+        ),
+        super::subagent_spawn_selector::BatchRouting::MultiSubagent { plans } => (
+            plans
+                .into_iter()
+                .map(|(index, plan)| reattached_subagent_entry(index, &plan))
+                .collect::<Result<Vec<_>>>()?,
+            Vec::new(),
+        ),
+        super::subagent_spawn_selector::BatchRouting::Mixed {
+            plans,
+            tool_indices,
+        } => {
+            let subagents = plans
+                .into_iter()
+                .map(|(index, plan)| reattached_subagent_entry(index, &plan))
+                .collect::<Result<Vec<_>>>()?;
+            let tool_children = tool_indices
+                .into_iter()
+                .map(|index| {
+                    let spec = specs
+                        .get(index)
+                        .copied()
+                        .with_context(|| format!("tool spawn_index {index} has no spawn spec"))?;
+                    Ok(crate::journal::store::ToolChildSpawn {
+                        spawn_index: u32::try_from(index)
+                            .context("tool spawn_index exceeds u32")?,
+                        spec,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            (subagents, tool_children)
+        }
+    };
+    let invocation_deps = super::subagent::SubagentInvocationDeps {
+        task_store: deps.task_store,
+        thread_store: deps.thread_store,
+        event_repo: deps.event_repo,
+    };
+    let spawned = Box::pin(super::subagent::spawn_mixed_children_invocations(
+        &inputs.bootstrap.task_id,
+        &inputs.bootstrap.worker_id,
+        &inputs.bootstrap.lease_id,
+        super::subagent::MixedChildrenRequest {
+            delivered_injection_ids,
+            subagents,
+            tool_children,
+            reattach,
+            payload,
+            child_otel_traceparent: child_tool_traceparent(deps, &inputs.bootstrap.task_id).await,
+        },
+        &invocation_deps,
+        now,
+    ))
+    .await
+    .context("spawn attached batch children")?;
+    let mut children: Vec<AgentTask> = spawned
+        .invocations
+        .into_iter()
+        .map(|invocation| invocation.invocation_task)
+        .collect();
+    children.extend(spawned.tool_children);
+    children.sort_by_key(|child| child.spawn_index);
+    deps.wake_workers_for_batch();
+    Ok((spawned.parent_task, children))
+}
+
+fn reattached_subagent_entry(
+    spawn_index: usize,
+    plan: &super::subagent_spawn_selector::SubagentSpawnPlan,
+) -> Result<super::subagent::SubagentBatchEntry> {
+    Ok(super::subagent::SubagentBatchEntry {
+        child_thread_id: plan.child_thread_id.clone(),
+        spec: plan.spec.clone(),
+        child_root_input: plan.child_root_input.clone(),
+        spawn_index: u32::try_from(spawn_index).context("subagent spawn_index exceeds u32")?,
+        child_caller_metadata: plan.child_caller_metadata.clone(),
+    })
+}
+
+fn invocation_tasks(
+    invocations: Vec<super::subagent::SpawnedSubagentInvocation>,
+) -> Vec<AgentTask> {
+    invocations
+        .into_iter()
+        .map(|invocation| invocation.invocation_task)
+        .collect()
+}
+
 /// Drive the routing match arm common to both `suspend_at_tool_boundary`
 /// (initial suspend) and `suspend_resumed_turn` (post-resume re-suspend).
 ///
@@ -5452,16 +5585,35 @@ struct SuspendedBatch {
 async fn apply_batch_routing(
     inputs: &RootWorkerInputs,
     deps: &RootTurnDeps<'_>,
-    routing: super::subagent_spawn_selector::BatchRouting,
-    batch: SuspendedBatch,
-    specs: Vec<ChildSpawnSpec>,
-    tool_children_context: &'static str,
+    application: BatchRoutingApplication,
     now: OffsetDateTime,
 ) -> Result<(AgentTask, Vec<AgentTask>)> {
+    let BatchRoutingApplication {
+        routing,
+        batch,
+        specs,
+        reattach,
+        tool_children_context,
+    } = application;
     let SuspendedBatch {
         payload,
         delivered_injection_ids,
     } = batch;
+    if !reattach.is_empty() {
+        return apply_reattached_batch_routing(
+            inputs,
+            deps,
+            routing,
+            SuspendedBatch {
+                payload,
+                delivered_injection_ids,
+            },
+            specs,
+            reattach,
+            now,
+        )
+        .await;
+    }
     let task_id = &inputs.bootstrap.task_id;
     let spawned = match routing {
         super::subagent_spawn_selector::BatchRouting::SingleSubagent { spawn_index, plan } => {
@@ -5487,11 +5639,7 @@ async fn apply_batch_routing(
                 now,
             )
             .await?;
-            let invocation_tasks = batch
-                .invocations
-                .into_iter()
-                .map(|inv| inv.invocation_task)
-                .collect();
+            let invocation_tasks = invocation_tasks(batch.invocations);
             (batch.parent_task, invocation_tasks)
         }
         super::subagent_spawn_selector::BatchRouting::Mixed {
@@ -5511,11 +5659,7 @@ async fn apply_batch_routing(
                 now,
             )
             .await?;
-            let mut children: Vec<AgentTask> = batch
-                .invocations
-                .into_iter()
-                .map(|inv| inv.invocation_task)
-                .collect();
+            let mut children = invocation_tasks(batch.invocations);
             children.extend(batch.tool_children);
             children.sort_by_key(|child| child.spawn_index);
             (batch.parent_task, children)
@@ -6592,6 +6736,7 @@ async fn suspend_resumed_turn(
                 payload: SuspensionPayload {
                     continuation: new_continuation,
                     suspended_messages: new_suspended,
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 draft,
                 questions,
@@ -6619,17 +6764,21 @@ async fn suspend_resumed_turn(
     let payload = SuspensionPayload {
         continuation: new_continuation,
         suspended_messages: new_suspended,
+        child_join_policy: inputs.definition().policy.child_join_policy,
     };
     let (parent_task, child_tasks) = apply_batch_routing(
         &inputs,
         deps,
-        routing,
-        SuspendedBatch {
-            payload,
-            delivered_injection_ids: close.delivered_injections.to_vec(),
+        BatchRoutingApplication {
+            routing,
+            batch: SuspendedBatch {
+                payload,
+                delivered_injection_ids: close.delivered_injections.to_vec(),
+            },
+            specs,
+            reattach: Vec::new(),
+            tool_children_context: "re-spawn tool children on resume",
         },
-        specs,
-        "re-spawn tool children on resume",
         now,
     )
     .await?;
@@ -6882,33 +7031,48 @@ pub async fn resume_from_children(
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<RootTurnOutcome> {
-    // 1. Extract continuation and suspended messages.
-    let (continuation, suspended_messages) = match &parent.state {
+    let (continuation, suspended_messages, child_ids, child_join_policy) = match &parent.state {
         TaskState::ReadyToResume {
             continuation,
             suspended_messages,
+            child_ids,
+            child_join_policy,
             ..
-        } => (continuation.payload.clone(), suspended_messages.clone()),
+        } => (
+            continuation.payload.clone(),
+            suspended_messages.clone(),
+            child_ids.clone(),
+            *child_join_policy,
+        ),
         other => bail!(
             "resume_from_children requires ReadyToResume state, got {:?}",
             std::mem::discriminant(other),
         ),
     };
-
-    // 2. Aggregate child outcomes from the journal.
-    let child_results = aggregate_child_outcomes(parent, &continuation, deps.task_store)
+    let interim = build_steering_interim(&continuation, &child_ids, deps.task_store)
         .await
-        .context("aggregate child outcomes for resume")?;
-
-    // 3. Delegate to the existing resume path. Box-pin the call so
-    //    `resume_from_children`'s own future stays under the
-    //    `clippy::large_futures` threshold — same pattern
-    //    `execute_root_turn` uses for `execute_root_turn_inner`.
+        .context("build child resume fan-in")?;
+    if !interim.surviving.is_empty() {
+        return Box::pin(run_steering_exchange(
+            inputs,
+            SteeringExchange {
+                continuation,
+                suspended_messages,
+                steering: Vec::new(),
+                interim,
+                child_join_policy,
+            },
+            provider,
+            deps,
+            now,
+        ))
+        .await;
+    }
     Box::pin(resume_root_turn(
         inputs,
         continuation,
         suspended_messages,
-        child_results,
+        interim.interim_results,
         provider,
         deps,
         now,
@@ -7037,6 +7201,8 @@ struct SteeringExchange {
     steering: Vec<llm::ContentBlock>,
     /// Interim fan-in plan (results for every pending id + survivors).
     interim: SteeringInterim,
+    /// Join policy retained when survivors are reattached.
+    child_join_policy: ChildJoinPolicy,
 }
 
 /// Interim fan-in plan built at steering-wake time.
@@ -7162,29 +7328,28 @@ fn build_steering_reattach(
     Ok((pending, blocks))
 }
 
-/// Build the combined assistant message re-parked into history: the
-/// model's answer (text / thinking only — any tool-use it emitted is
-/// dropped, since a steering reply is text and the re-park owns the
-/// tool-use batch) followed by the synthetic re-attach `ToolUse`
-/// blocks.
+/// Build the assistant message re-parked into history: the model's
+/// response followed by synthetic re-attach tool uses.
+///
+/// When the stop reason refused dispatch (`keep_response_tool_use ==
+/// false`) the response's own `ToolUse` blocks are dropped: no child owns
+/// them, so persisting them would leave ownerless tool-use ids in the
+/// replay history.
 fn build_steering_assistant_message(
     response: &llm::ChatResponse,
     reattach_blocks: Vec<llm::ContentBlock>,
+    keep_response_tool_use: bool,
 ) -> llm::Message {
-    let mut blocks: Vec<llm::ContentBlock> = response
-        .content
-        .iter()
-        .filter(|block| {
-            matches!(
-                block,
-                llm::ContentBlock::Text { .. }
-                    | llm::ContentBlock::Thinking { .. }
-                    | llm::ContentBlock::RedactedThinking { .. }
-                    | llm::ContentBlock::OpaqueReasoning { .. }
-            )
-        })
-        .cloned()
-        .collect();
+    let mut blocks: Vec<llm::ContentBlock> = if keep_response_tool_use {
+        response.content.clone()
+    } else {
+        response
+            .content
+            .iter()
+            .filter(|block| !matches!(block, llm::ContentBlock::ToolUse { .. }))
+            .cloned()
+            .collect()
+    };
     blocks.extend(reattach_blocks);
     llm::Message {
         role: llm::Role::Assistant,
@@ -7196,6 +7361,7 @@ fn build_steering_assistant_message(
 /// re-issued pending tool calls, keep the same turn number (the mission
 /// turn has not completed).
 fn build_steering_continuation(
+    inputs: &RootWorkerInputs,
     prior: &AgentContinuation,
     response: &llm::ChatResponse,
     reattach_pending: Vec<PendingToolCallInfo>,
@@ -7209,12 +7375,18 @@ fn build_steering_continuation(
         total_usage: total_usage.clone(),
         ..prior.state.clone()
     };
+    let resolved_tools = inputs
+        .bootstrap
+        .definition
+        .resolve_tools(inputs.bootstrap.task.caller_metadata.as_ref());
+    let mut pending_tool_calls = extract_pending_tool_calls(response, &resolved_tools);
+    pending_tool_calls.extend(reattach_pending);
     ContinuationEnvelope::wrap(AgentContinuation {
         thread_id: prior.thread_id.clone(),
         turn: prior.turn,
         total_usage,
         turn_usage,
-        pending_tool_calls: reattach_pending,
+        pending_tool_calls,
         awaiting_index: 0,
         completed_results: Vec::new(),
         state: updated_state,
@@ -7272,17 +7444,21 @@ pub async fn resume_for_steering(
     // non-empty `steering` payload (the overload that keeps the durable
     // `kind` unchanged). An empty steering payload is an ordinary
     // fan-in and must go through `resume_from_children` instead.
-    let (continuation, suspended_messages, child_ids, steering) = match &parent.state {
+    let (continuation, suspended_messages, child_ids, steering, child_join_policy) = match &parent
+        .state
+    {
         TaskState::ReadyToResume {
             continuation,
             suspended_messages,
             child_ids,
+            child_join_policy,
             steering,
         } if !steering.is_empty() => (
             continuation.payload.clone(),
             suspended_messages.clone(),
             child_ids.clone(),
             steering.clone(),
+            *child_join_policy,
         ),
         other => bail!(
             "resume_for_steering requires a ReadyToResume state with a steering payload, got {:?}",
@@ -7304,6 +7480,7 @@ pub async fn resume_for_steering(
             suspended_messages,
             steering,
             interim,
+            child_join_policy,
         },
         provider,
         deps,
@@ -7324,6 +7501,7 @@ async fn run_steering_exchange(
         suspended_messages,
         steering,
         interim,
+        child_join_policy,
     } = exchange;
 
     // Stage the interim fan-in + steering note and run one bounded LLM
@@ -7410,6 +7588,7 @@ async fn run_steering_exchange(
         SteeringRepark {
             continuation,
             suspended_messages,
+            child_join_policy,
             steering_message,
             surviving: interim.surviving,
             response,
@@ -7552,6 +7731,7 @@ async fn stage_and_call_steering_llm(
 struct SteeringRepark {
     continuation: AgentContinuation,
     suspended_messages: Vec<llm::Message>,
+    child_join_policy: ChildJoinPolicy,
     steering_message: llm::Message,
     surviving: Vec<SurvivingChild>,
     response: llm::ChatResponse,
@@ -7560,6 +7740,119 @@ struct SteeringRepark {
     /// The successful attempt's own usage, for its audit row.
     success_usage: llm::Usage,
     evidence: AttemptEvidence,
+}
+
+struct PreparedSteeringRepark {
+    routing: Option<super::subagent_spawn_selector::BatchRouting>,
+    payload: SuspensionPayload,
+    specs: Vec<ChildSpawnSpec>,
+    reattach: Vec<ReattachedChild>,
+    suspended_messages: Vec<llm::Message>,
+    events: Vec<AgentEvent>,
+}
+
+async fn prepare_steering_repark(
+    inputs: &RootWorkerInputs,
+    deps: &RootTurnDeps<'_>,
+    repark: SteeringRepark,
+    now: OffsetDateTime,
+) -> Result<PreparedSteeringRepark> {
+    let SteeringRepark {
+        continuation: prior,
+        suspended_messages,
+        child_join_policy,
+        steering_message,
+        surviving,
+        response,
+        content_ids,
+        attempt,
+        success_usage,
+        evidence,
+    } = repark;
+    close_attempt_or_propagate_already_closed(
+        &attempt,
+        &response,
+        &success_usage,
+        &evidence,
+        deps,
+        "close attempt on child re-park",
+        now,
+    )
+    .await?;
+
+    let mut continuation = build_steering_continuation(inputs, &prior, &response, Vec::new());
+    let routing = if response_requests_tool_dispatch(&response) {
+        Some(
+            classify_batch_for_inputs(inputs, deps, &continuation)
+                .await
+                .context("classify child-resume tool batch")?,
+        )
+    } else {
+        // The stop reason refused dispatch (MaxTokens truncation,
+        // StopSequence, EndTurn-with-tool-use, unknown): no child will
+        // ever own these tool calls, and the no-routing re-park below
+        // re-indexes survivors densely from 0. Keeping the emitted
+        // slots would bind survivors to the wrong indices and leave
+        // ownerless pending calls that wedge the next wake, so drop
+        // them — pending becomes the re-attach batch only.
+        if !continuation.payload.pending_tool_calls.is_empty() {
+            log::warn!(
+                "dropping {} undispatched tool_use call(s) from steering re-park \
+                 (stop reason {:?} refuses dispatch)",
+                continuation.payload.pending_tool_calls.len(),
+                response.stop_reason,
+            );
+            continuation.payload.pending_tool_calls.clear();
+        }
+        None
+    };
+    let specs = child_spawn_specs_for_response(&response, inputs);
+    let mut events = build_content_events(&response, &inputs.bootstrap.task_id, &content_ids);
+    if routing.is_some() {
+        events.extend(build_tool_call_start_events(&continuation));
+    }
+
+    let (reattach_pending, reattach_blocks) =
+        build_steering_reattach(&prior, &surviving).context("build child re-attach bindings")?;
+    let emitted_count = continuation.payload.pending_tool_calls.len();
+    let reattach = surviving
+        .iter()
+        .enumerate()
+        .map(|(index, child)| {
+            let combined_index = emitted_count
+                .checked_add(index)
+                .context("re-attach spawn_index exceeds usize")?;
+            Ok(ReattachedChild {
+                child_id: child.child_id.clone(),
+                spawn_index: u32::try_from(combined_index)
+                    .context("re-attach spawn_index exceeds u32")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    continuation
+        .payload
+        .pending_tool_calls
+        .extend(reattach_pending);
+
+    let assistant_message =
+        build_steering_assistant_message(&response, reattach_blocks, routing.is_some());
+    let mut suspended = Vec::with_capacity(suspended_messages.len() + 2);
+    suspended.extend(suspended_messages);
+    suspended.push(steering_message);
+    suspended.push(assistant_message);
+    let payload = SuspensionPayload {
+        continuation,
+        suspended_messages: suspended.clone(),
+        child_join_policy,
+    };
+    Ok(PreparedSteeringRepark {
+        routing,
+        payload,
+        specs,
+        reattach,
+        suspended_messages: suspended,
+        events,
+    })
 }
 
 /// Re-park a running steering exchange on the still-running children:
@@ -7573,101 +7866,69 @@ async fn repark_after_steering_exchange(
     repark: SteeringRepark,
     now: OffsetDateTime,
 ) -> Result<RootTurnOutcome> {
-    let SteeringRepark {
-        continuation,
+    let PreparedSteeringRepark {
+        routing,
+        payload,
+        specs,
+        reattach,
         suspended_messages,
-        steering_message,
-        surviving,
-        response,
-        content_ids,
-        attempt,
-        success_usage,
-        evidence,
-    } = repark;
+        events,
+    } = prepare_steering_repark(inputs, deps, repark, now).await?;
     let thread_id = &inputs.bootstrap.thread_id;
-
-    if response.has_tool_use() {
-        log::warn!(
-            "steering resume on thread {thread_id}: model emitted tool_use in a steering \
-             reply; dropping it — a steering exchange is bounded to a reply and the re-park \
-             owns the tool-use batch. Directives take effect at the next fan-in.",
-        );
-    }
-
-    // Close the attempt — the LLM call itself succeeded.
-    close_attempt_or_propagate_already_closed(
-        &attempt,
-        &response,
-        &success_usage,
-        &evidence,
-        deps,
-        "close attempt on steering re-park",
-        now,
-    )
-    .await?;
-
-    let (reattach_pending, reattach_blocks) = build_steering_reattach(&continuation, &surviving)
-        .context("build steering re-attach bindings")?;
-    let reattach_child_ids: Vec<AgentTaskId> =
-        surviving.iter().map(|c| c.child_id.clone()).collect();
-
-    let assistant_message = build_steering_assistant_message(&response, reattach_blocks);
-    let new_continuation = build_steering_continuation(&continuation, &response, reattach_pending);
-
-    // Full replay history for the re-parked continuation: original
-    // suspended messages + interim/steering user message + combined
-    // assistant answer with the re-attach batch.
-    let mut new_suspended = Vec::with_capacity(suspended_messages.len() + 2);
-    new_suspended.extend(suspended_messages);
-    new_suspended.push(steering_message);
-    new_suspended.push(assistant_message);
-
-    let payload = SuspensionPayload {
-        continuation: new_continuation,
-        suspended_messages: new_suspended.clone(),
-    };
-    let reparked = deps
-        .task_store
-        .repark_after_steering(
-            &inputs.bootstrap.task_id,
-            &inputs.bootstrap.worker_id,
-            &inputs.bootstrap.lease_id,
-            payload,
-            reattach_child_ids,
+    let (parent_task, child_tasks) = if let Some(routing) = routing {
+        apply_batch_routing(
+            inputs,
+            deps,
+            BatchRoutingApplication {
+                routing,
+                batch: SuspendedBatch {
+                    payload,
+                    delivered_injection_ids: Vec::new(),
+                },
+                specs,
+                reattach,
+                tool_children_context: "spawn tools while re-attaching children",
+            },
             now,
         )
-        .await
-        .context("re-park parent after steering exchange")?;
+        .await?
+    } else {
+        let child_ids = reattach.into_iter().map(|child| child.child_id).collect();
+        let parent = deps
+            .task_store
+            .repark_after_steering(
+                &inputs.bootstrap.task_id,
+                &inputs.bootstrap.worker_id,
+                &inputs.bootstrap.lease_id,
+                payload,
+                child_ids,
+                now,
+            )
+            .await
+            .context("re-park parent after partial child resume")?;
+        (parent, Vec::new())
+    };
 
-    // Refresh the projection draft with the re-parked transcript so a
-    // recovery before the next fan-in surfaces the full history.
     snapshot_suspension_draft(
         deps,
         thread_id,
         &inputs.bootstrap.task_id,
-        new_suspended,
+        suspended_messages,
         now,
-        "refresh steering re-park draft",
+        "refresh child re-park draft",
     )
     .await;
-
-    // Commit the answer's content events so the user sees the mid-wave
-    // reply. No `TurnComplete` / `Done` — the mission turn is still
-    // parked. No `ToolCallStart` for the re-attach batch — those are
-    // synthetic re-bindings, not new tool starts.
-    let content_events = build_content_events(&response, &inputs.bootstrap.task_id, &content_ids);
-    let committed_events = if content_events.is_empty() {
+    let committed_events = if events.is_empty() {
         Vec::new()
     } else {
         deps.event_repo
-            .commit_event_batch(thread_id, content_events, now)
+            .commit_event_batch(thread_id, events, now)
             .await
-            .context("commit steering answer content events")?
+            .context("commit child-resume suspension events")?
     };
-
     Ok(RootTurnOutcome::Suspended {
-        parent_task: reparked,
-        child_tasks: Vec::new(),
+        parent_task,
+        child_tasks,
         committed_events,
     })
 }

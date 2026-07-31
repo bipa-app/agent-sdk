@@ -191,6 +191,7 @@ async fn seed_awaiting_question(store: &SqliteDurableStore) -> Result<AgentTaskI
                         response_content: Vec::new(),
                     }),
                     suspended_messages: suspended_messages(),
+                    child_join_policy: agent_server::ChildJoinPolicy::default(),
                 },
                 questions: vec![question_payload()],
                 events: Vec::new(),

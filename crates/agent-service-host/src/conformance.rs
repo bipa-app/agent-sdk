@@ -124,6 +124,7 @@ mod tests {
                 },
             ),
             suspended_messages: vec![],
+            child_join_policy: agent_server::ChildJoinPolicy::default(),
         }
     }
 
@@ -950,6 +951,7 @@ mod tests {
                 },
             ),
             suspended_messages: vec![],
+            child_join_policy: agent_server::ChildJoinPolicy::default(),
         };
         let (parent, children) = task_store
             .spawn_tool_children(
@@ -2137,6 +2139,7 @@ mod tests {
                 },
             ),
             suspended_messages: vec![],
+            child_join_policy: agent_server::ChildJoinPolicy::default(),
         };
         let (_parent, children) = task_store
             .spawn_tool_children(
@@ -2221,6 +2224,7 @@ mod tests {
                 },
             ),
             suspended_messages: vec![],
+            child_join_policy: agent_server::ChildJoinPolicy::default(),
         };
         let (_parent, children) = task_store
             .spawn_tool_children(

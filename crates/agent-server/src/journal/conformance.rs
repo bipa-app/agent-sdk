@@ -902,6 +902,7 @@ fn empty_suspension(thread: &ThreadId) -> SuspensionPayload {
             },
         ),
         suspended_messages: vec![],
+        child_join_policy: crate::ChildJoinPolicy::default(),
     }
 }
 
@@ -1081,6 +1082,7 @@ fn mixed_batch_spawn(
         delivered_injection_ids: Vec::new(),
         subagents,
         tool_children,
+        reattach: Vec::new(),
         payload,
         child_otel_traceparent: None,
     })
