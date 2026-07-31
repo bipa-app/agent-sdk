@@ -1095,6 +1095,14 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                     });
                                                 }
                                             }
+                                            "response.reasoning_summary_part.added" => {
+                                                if let Some(delta) = summary_part_separator(
+                                                    &streamed_reasoning_summaries,
+                                                    event.output_index,
+                                                ) {
+                                                    yield Ok(delta);
+                                                }
+                                            }
                                             "response.function_call_arguments.delta" => {
                                                 let block_index = event
                                                     .output_index
@@ -1322,6 +1330,14 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                                     output_index,
                                                                 )),
                                                         });
+                                                    }
+                                                }
+                                                "response.reasoning_summary_part.added" => {
+                                                    if let Some(delta) = summary_part_separator(
+                                                        &streamed_reasoning_summaries,
+                                                        event.output_index,
+                                                    ) {
+                                                        yield Ok(delta);
                                                     }
                                                 }
                                                 "response.function_call_arguments.delta" => {
@@ -1689,6 +1705,14 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                             output_index,
                                         )),
                                     });
+                                }
+                            }
+                            "response.reasoning_summary_part.added" => {
+                                if let Some(delta) = summary_part_separator(
+                                    &streamed_reasoning_summaries,
+                                    event.output_index,
+                                ) {
+                                    yield Ok(delta);
                                 }
                             }
                             "response.function_call_arguments.delta" => {
@@ -2470,18 +2494,45 @@ fn output_item_stream_deltas(
                 block_index,
             }];
             if include_summary {
-                let summary_block_index = block_index.saturating_add(1);
-                deltas.extend(reasoning_summary_texts(fields).into_iter().map(|delta| {
-                    StreamDelta::ThinkingDelta {
-                        delta,
-                        block_index: summary_block_index,
-                    }
-                }));
+                let summary =
+                    reasoning_summary_texts(fields).join(REASONING_SUMMARY_PART_SEPARATOR);
+                if !summary.is_empty() {
+                    deltas.push(StreamDelta::ThinkingDelta {
+                        delta: summary,
+                        block_index: block_index.saturating_add(1),
+                    });
+                }
             }
             deltas
         }
         ApiOutputItem::FunctionCall { .. } | ApiOutputItem::Unknown => Vec::new(),
     }
+}
+
+/// Separator between consecutive reasoning-summary sections.
+///
+/// The Responses stream announces each summary section with a
+/// `response.reasoning_summary_part.added` boundary and streams the
+/// section text without any joining whitespace; concatenating the
+/// sections verbatim runs their markdown together
+/// (`…handling****Refining…`). Matches the blank line the `OpenAI`
+/// clients render between sections.
+const REASONING_SUMMARY_PART_SEPARATOR: &str = "\n\n";
+
+/// A separator [`StreamDelta::ThinkingDelta`] when a new summary
+/// section opens after this reasoning item already streamed summary
+/// text; `None` for the first section.
+fn summary_part_separator(
+    streamed_reasoning_summaries: &HashSet<usize>,
+    output_index: Option<usize>,
+) -> Option<StreamDelta> {
+    let output_index = output_index.unwrap_or(0);
+    streamed_reasoning_summaries
+        .contains(&output_index)
+        .then(|| StreamDelta::ThinkingDelta {
+            delta: REASONING_SUMMARY_PART_SEPARATOR.to_owned(),
+            block_index: reasoning_summary_block_index(Some(output_index)),
+        })
 }
 
 fn accumulate_completed_tool_call(
@@ -4471,6 +4522,40 @@ mod tests {
                 if data["encrypted_content"] == "ciphertext" && thinking == "Checked."
         ));
         Ok(())
+    }
+
+    #[test]
+    fn reasoning_summary_parts_join_with_blank_line_on_replay() -> anyhow::Result<()> {
+        let reasoning: ApiOutputItem = serde_json::from_value(serde_json::json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "encrypted_content": "ciphertext",
+            "summary": [
+                {"type": "summary_text", "text": "**First**"},
+                {"type": "summary_text", "text": "**Second**"}
+            ]
+        }))?;
+        let deltas = output_item_stream_deltas(&reasoning, 0, true);
+        assert_eq!(deltas.len(), 2);
+        assert!(matches!(
+            &deltas[1],
+            StreamDelta::ThinkingDelta { delta, block_index }
+                if delta == "**First**\n\n**Second**" && *block_index == 1
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn summary_part_separator_emits_only_after_streamed_text() {
+        let mut streamed = HashSet::new();
+        assert!(summary_part_separator(&streamed, Some(0)).is_none());
+        streamed.insert(0);
+        assert!(matches!(
+            summary_part_separator(&streamed, Some(0)),
+            Some(StreamDelta::ThinkingDelta { delta, block_index })
+                if delta == "\n\n" && block_index == 1
+        ));
+        assert!(summary_part_separator(&streamed, Some(1)).is_none());
     }
 
     #[test]
