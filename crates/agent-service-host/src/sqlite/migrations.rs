@@ -97,11 +97,15 @@ const PURGE_SEED_AT_FENCE_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/sqlite/0019_purge_seed_at_fence.sql"
 ));
+const APPEND_ONLY_COMPACTIONS_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/sqlite/0020_append_only_compactions.sql"
+));
 
 /// `sqlx`-managed migration bundle for the `SQLite` durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/sqlite");
 
-const MIGRATIONS: [SqliteMigration; 18] = [
+const MIGRATIONS: [SqliteMigration; 19] = [
     SqliteMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -191,6 +195,11 @@ const MIGRATIONS: [SqliteMigration; 18] = [
         version: "0019",
         summary: "purge seed persists at fence time for stable crash-retry identity",
         sql: PURGE_SEED_AT_FENCE_SQL,
+    },
+    SqliteMigration {
+        version: "0020",
+        summary: "append-only compaction entries on message heads",
+        sql: APPEND_ONLY_COMPACTIONS_SQL,
     },
 ];
 

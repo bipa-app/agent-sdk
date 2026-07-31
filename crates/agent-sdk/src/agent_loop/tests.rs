@@ -4719,6 +4719,7 @@ impl ContextCompactor for ShrinkCompactor {
             new_count: 1,
             original_tokens: 1_000,
             new_tokens: 10,
+            retained_count: 0,
             llm_usage: crate::types::TokenUsage::default(),
         })
     }

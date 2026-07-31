@@ -308,6 +308,7 @@ struct StoredCompactionResult {
     new_count: usize,
     original_tokens: usize,
     new_tokens: usize,
+    retained_count: usize,
     /// Provider-billed usage of the summarization call(s); see
     /// [`crate::context::CompactionResult::llm_usage`].
     llm_usage: TokenUsage,
@@ -511,6 +512,7 @@ where
         new_count: result.new_count,
         original_tokens: result.original_tokens,
         new_tokens: result.new_tokens,
+        retained_count: result.retained_count,
         llm_usage: result.llm_usage,
     };
 
@@ -518,7 +520,12 @@ where
     record_compaction_result(&mut compaction_span, &stored_result, trigger);
 
     if let Err(error) = message_store
-        .replace_history(thread_id, stored_result.messages.clone())
+        .append_compaction(
+            thread_id,
+            stored_result.messages.clone(),
+            stored_result.original_count,
+            stored_result.retained_count,
+        )
         .await
     {
         #[cfg(feature = "otel")]

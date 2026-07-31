@@ -219,7 +219,10 @@ pub async fn recover_thread(
         .await
         .context("recover: load message projection")?
     {
-        Some(projection) => (projection.messages, projection.draft_messages),
+        Some(projection) => {
+            let context_history = projection.context_history();
+            (context_history, projection.draft_messages)
+        }
         None => (Vec::new(), Vec::new()),
     };
 

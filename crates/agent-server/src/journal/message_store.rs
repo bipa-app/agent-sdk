@@ -3,10 +3,9 @@
 //! The [`MessageProjectionStore`] trait is the sole write surface for
 //! the per-thread message projection. Its key design properties:
 //!
-//! 1. **No raw `update()`** — all mutations flow through named entry
-//!    points (`commit_messages`, `replace_history`, `set_draft`,
-//!    `clear_draft`) so callers cannot bypass the projection's
-//!    transition guards.
+//! 1. **Named transitions only** — all mutations flow through
+//!    `commit_messages`, `append_compaction`, `replace_history`, `set_draft`,
+//!    and `clear_draft`.
 //! 2. **Committed history is turn-bounded** — `commit_messages` and
 //!    `replace_history` are called only at turn completion, keeping
 //!    the committed projection consistent with the latest completed
@@ -29,8 +28,9 @@
 //!
 //! | Entry point | What it mutates | Guard |
 //! |-------------|----------------|-------|
-//! | [`MessageProjectionStore::commit_messages`] | Appends committed messages, bumps version | Non-empty batch |
-//! | [`MessageProjectionStore::replace_history`] | Swaps entire committed history, bumps version | — |
+//! | [`MessageProjectionStore::commit_messages`] | Appends raw committed messages, bumps version | Non-empty batch |
+//! | [`MessageProjectionStore::append_compaction`] | Appends a range-addressed effective-view entry, bumps version | Source/retention shape |
+//! | [`MessageProjectionStore::replace_history`] | Explicit non-compaction full swap, bumps version | — |
 //! | [`MessageProjectionStore::set_draft`] | Replaces the in-flight draft, bumps version | — |
 //! | [`MessageProjectionStore::clear_draft`] | Drops the in-flight draft, bumps version | — |
 //! | [`MessageProjectionStore::get_or_create`] | Creates row with empty history and empty draft | Idempotent |
@@ -78,10 +78,11 @@ pub trait MessageProjectionStore: Send + Sync {
     /// Returns an error if the underlying store cannot be queried.
     async fn get(&self, thread_id: &ThreadId) -> Result<Option<MessageProjection>>;
 
-    /// Return the committed message history for a thread.
+    /// Return the effective LLM message history for a thread.
     ///
-    /// Convenience method: returns `Vec::new()` if the thread has no
-    /// projection yet.
+    /// The raw transcript remains in [`MessageProjection::messages`]; when a
+    /// compaction entry exists this returns its replacement prefix followed by
+    /// the retained raw tail. Returns `Vec::new()` when no projection exists.
     ///
     /// # Errors
     /// Returns an error if the underlying store cannot be queried.
@@ -110,11 +111,10 @@ pub trait MessageProjectionStore: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<MessageProjection>;
 
-    /// Replace the entire committed history atomically.
+    /// Explicitly replace the raw committed history atomically.
     ///
-    /// Used for context compaction: the old history is discarded and
-    /// the new one takes its place. The swap happens under the write
-    /// lock so readers never see partial state.
+    /// Compaction callers must use [`Self::append_compaction`]. This entry
+    /// point remains for non-compaction repair/import flows.
     ///
     /// Returns the projection as persisted.
     ///
@@ -124,6 +124,23 @@ pub trait MessageProjectionStore: Send + Sync {
         &self,
         thread_id: &ThreadId,
         messages: Vec<llm::Message>,
+        now: OffsetDateTime,
+    ) -> Result<MessageProjection>;
+    /// Append a compaction boundary while preserving every committed message.
+    ///
+    /// `result_messages` is the compactor's effective output;
+    /// `retained_message_count` identifies its unchanged trailing slice.
+    /// Implementations persist the entry and clear any draft atomically.
+    ///
+    /// # Errors
+    /// Returns an error when the compaction source shape does not match the
+    /// current effective projection or the underlying store cannot be written.
+    async fn append_compaction(
+        &self,
+        thread_id: &ThreadId,
+        result_messages: Vec<llm::Message>,
+        source_message_count: usize,
+        retained_message_count: usize,
         now: OffsetDateTime,
     ) -> Result<MessageProjection>;
 
@@ -230,7 +247,7 @@ impl MessageProjectionStore for InMemoryMessageProjectionStore {
         let result = inner
             .by_thread
             .get(thread_id)
-            .map(|p| p.messages.clone())
+            .map(MessageProjection::context_history)
             .unwrap_or_default();
         drop(inner);
         Ok(result)
@@ -265,6 +282,29 @@ impl MessageProjectionStore for InMemoryMessageProjectionStore {
             .entry(thread_id.clone())
             .or_insert_with(|| MessageProjection::new(thread_id.clone(), now));
         let updated = projection.clone().replace_history(messages, now);
+        *projection = updated.clone();
+        drop(inner);
+        Ok(updated)
+    }
+    async fn append_compaction(
+        &self,
+        thread_id: &ThreadId,
+        result_messages: Vec<llm::Message>,
+        source_message_count: usize,
+        retained_message_count: usize,
+        now: OffsetDateTime,
+    ) -> Result<MessageProjection> {
+        let mut inner = self.inner.write().await;
+        let projection = inner
+            .by_thread
+            .entry(thread_id.clone())
+            .or_insert_with(|| MessageProjection::new(thread_id.clone(), now));
+        let updated = projection.clone().append_compaction(
+            result_messages,
+            source_message_count,
+            retained_message_count,
+            now,
+        )?;
         *projection = updated.clone();
         drop(inner);
         Ok(updated)

@@ -450,35 +450,39 @@ ON CONFLICT (thread_id) DO UPDATE SET
         // Bootstrap with `draft_messages_json = NULL` — a fresh
         // thread has no in-flight turn. The full upsert path below
         // populates the column once a suspension boundary fires.
-        sqlx::query!(
+        sqlx::query(
             r"
 INSERT INTO agent_sdk_message_heads (
     thread_id,
     history_json,
     draft_messages_json,
+    compactions_json,
     version,
     created_at,
     updated_at
-) VALUES ($1, $2, NULL, $3, $4, $5)
+) VALUES ($1, $2, NULL, NULL, $3, $4, $5)
 ON CONFLICT (thread_id) DO NOTHING
 ",
-            thread_key(thread_id),
-            json_to_value(&Vec::<llm::Message>::new(), "empty message history")?,
-            0_i64,
-            now,
-            now,
         )
+        .bind(thread_key(thread_id))
+        .bind(json_to_value(
+            &Vec::<llm::Message>::new(),
+            "empty message history",
+        )?)
+        .bind(0_i64)
+        .bind(now)
+        .bind(now)
         .execute(&mut **tx)
         .await
         .with_context(|| format!("bootstrap message head {thread_id}"))?;
 
-        let record = sqlx::query_as!(
-            MessageHeadRecord,
+        let record = sqlx::query_as::<_, MessageHeadRecord>(
             r"
 SELECT
     thread_id,
     history_json,
     draft_messages_json,
+    compactions_json,
     version,
     created_at,
     updated_at
@@ -486,8 +490,8 @@ FROM agent_sdk_message_heads
 WHERE thread_id = $1
 FOR UPDATE
 ",
-            thread_key(thread_id),
         )
+        .bind(thread_key(thread_id))
         .fetch_one(&mut **tx)
         .await
         .with_context(|| format!("lock message head {thread_id}"))?;
@@ -498,21 +502,21 @@ FOR UPDATE
         &self,
         thread_id: &ThreadId,
     ) -> Result<Option<MessageProjection>> {
-        let record = sqlx::query_as!(
-            MessageHeadRecord,
+        let record = sqlx::query_as::<_, MessageHeadRecord>(
             r"
 SELECT
     thread_id,
     history_json,
     draft_messages_json,
+    compactions_json,
     version,
     created_at,
     updated_at
 FROM agent_sdk_message_heads
 WHERE thread_id = $1
 ",
-            thread_key(thread_id),
         )
+        .bind(thread_key(thread_id))
         .fetch_optional(&self.pool)
         .await
         .with_context(|| format!("get message head {thread_id}"))?;
@@ -535,30 +539,41 @@ WHERE thread_id = $1
                 "message head draft messages",
             )?)
         };
-        sqlx::query!(
+        let compactions_json = if projection.compactions.is_empty() {
+            None
+        } else {
+            Some(json_to_value(
+                &projection.compactions,
+                "message head compactions",
+            )?)
+        };
+        sqlx::query(
             r"
 INSERT INTO agent_sdk_message_heads (
     thread_id,
     history_json,
     draft_messages_json,
+    compactions_json,
     version,
     created_at,
     updated_at
-) VALUES ($1, $2, $3, $4, $5, $6)
+) VALUES ($1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT (thread_id) DO UPDATE SET
     history_json = EXCLUDED.history_json,
     draft_messages_json = EXCLUDED.draft_messages_json,
+    compactions_json = EXCLUDED.compactions_json,
     version = EXCLUDED.version,
     created_at = EXCLUDED.created_at,
     updated_at = EXCLUDED.updated_at
 ",
-            thread_key(&projection.thread_id),
-            json_to_value(&projection.messages, "message head history")?,
-            draft_messages_json,
-            i64_from_u64(projection.version, "message head version")?,
-            projection.created_at,
-            projection.updated_at,
         )
+        .bind(thread_key(&projection.thread_id))
+        .bind(json_to_value(&projection.messages, "message head history")?)
+        .bind(draft_messages_json)
+        .bind(compactions_json)
+        .bind(i64_from_u64(projection.version, "message head version")?)
+        .bind(projection.created_at)
+        .bind(projection.updated_at)
         .execute(&mut **tx)
         .await
         .with_context(|| format!("upsert message head {}", projection.thread_id))?;
@@ -4985,7 +5000,7 @@ impl MessageProjectionStore for PostgresDurableStore {
         Ok(self
             .get_message_head_pool(thread_id)
             .await?
-            .map(|projection| projection.messages)
+            .map(|projection| projection.context_history())
             .unwrap_or_default())
     }
 
@@ -5016,6 +5031,27 @@ impl MessageProjectionStore for PostgresDurableStore {
         let updated = projection.replace_history(messages, now);
         Self::upsert_message_head_tx(&mut tx, &updated).await?;
         tx.commit().await.context("commit replace_history")?;
+        Ok(updated)
+    }
+    async fn append_compaction(
+        &self,
+        thread_id: &ThreadId,
+        result_messages: Vec<llm::Message>,
+        source_message_count: usize,
+        retained_message_count: usize,
+        now: OffsetDateTime,
+    ) -> Result<MessageProjection> {
+        let mut tx = self.begin().await?;
+        Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
+        let projection = Self::lock_message_head_tx(&mut tx, thread_id, now).await?;
+        let updated = projection.append_compaction(
+            result_messages,
+            source_message_count,
+            retained_message_count,
+            now,
+        )?;
+        Self::upsert_message_head_tx(&mut tx, &updated).await?;
+        tx.commit().await.context("commit append_compaction")?;
         Ok(updated)
     }
 
@@ -6707,6 +6743,7 @@ struct MessageHeadRecord {
     /// Populated by the worker at every tool-boundary suspension and
     /// cleared atomically by the completed-turn transaction.
     draft_messages_json: Option<serde_json::Value>,
+    compactions_json: Option<serde_json::Value>,
     version: i64,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
@@ -6720,10 +6757,15 @@ impl TryFrom<MessageHeadRecord> for MessageProjection {
             Some(value) => json_from_value(value, "message head draft messages")?,
             None => Vec::new(),
         };
+        let compactions = match record.compactions_json {
+            Some(value) => json_from_value(value, "message head compactions")?,
+            None => Vec::new(),
+        };
         Ok(Self {
             thread_id: ThreadId::from_string(record.thread_id),
             messages: json_from_value(record.history_json, "message head history")?,
             draft_messages,
+            compactions,
             version: u64_from_i64(record.version, "message head version")?,
             created_at: record.created_at,
             updated_at: record.updated_at,

@@ -29,6 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `agent-service-host`, with a written feasibility recommendation.
 
 ### Changed
+- Compaction now appends range-addressed lineage entries and rebuilds the
+  effective LLM view without deleting committed transcript messages.
+
 
 - MSRV pinned to **1.91** (the verified buildable floor for the published
   crates; the merged MCP transport uses `const Duration::from_mins`).

@@ -25,33 +25,23 @@
 //!
 //! # Durability contract
 //!
-//! Both helpers mutate the durable
-//! [`MessageProjectionStore`](crate::journal::message_store::MessageProjectionStore)
-//! before they touch the in-memory staged buffer:
+//! Both helpers append a durable compaction entry before they touch the
+//! in-memory staged buffer:
 //!
-//! 1. `MessageProjectionStore::replace_history` rewrites the projection
-//!    head transactionally (per the `replace_history` contract in
-//!    `crates/agent-server/src/journal/message_store.rs`). After this
-//!    write completes, every future attempt — including a fresh attempt
-//!    after lease expiry — recovers from the compacted history.
-//! 2. The in-memory [`StagedMessageStore`] is then re-pointed to the
-//!    same compacted vector via its `replace_history` impl, which now
-//!    also resets `seed_len` so the post-compaction commit path
-//!    appends only the delta produced *after* the compaction (the
-//!    LLM response, the `buffer_turn_messages` fresh user prompt,
-//!    etc.) rather than blindly re-appending the whole compacted
-//!    history.
-//! 3. A [`agent_sdk_foundation::events::AgentEvent::ContextCompacted`] event
-//!    is committed to the durable event repository so subscribers
-//!    (TUI, desktop, observability) can surface the compaction in
-//!    their transcripts. The event uses the same shape the legacy
-//!    in-process loop emits.
+//! 1. `MessageProjectionStore::append_compaction` preserves every committed
+//!    message, folds any recovery draft into that raw transcript, and appends a
+//!    range-addressed replacement prefix atomically.
+//! 2. `MessageProjectionStore::get_history` rebuilds the effective LLM view
+//!    from the latest replacement prefix plus the retained raw tail. The
+//!    in-memory [`StagedMessageStore`] is re-pointed to that same view and resets
+//!    `seed_len`, so the post-compaction commit appends only later deltas.
+//! 3. A [`agent_sdk_foundation::events::AgentEvent::ContextCompacted`] event is
+//!    committed so renderers can collapse the compacted span while the full raw
+//!    transcript remains addressable through the projection snapshot.
 //!
-//! Step 1 is the load-bearing one: if the host crashes between the
-//! projection rewrite and the staged-buffer rewrite, recovery picks
-//! up the compacted projection and the next attempt resumes from
-//! there. The staged buffer is process-local and discarded across
-//! restarts, so a half-applied rewrite is never durable.
+//! If the host crashes after step 1, recovery rebuilds the compacted LLM view
+//! from the append-only projection. The staged buffer is process-local and is
+//! discarded across restarts.
 
 use std::sync::Arc;
 
@@ -219,25 +209,15 @@ async fn apply_compaction(
         .context("compactor.compact_history failed")?;
 
     deps.message_store
-        .replace_history(thread_id, result.messages.clone(), now)
+        .append_compaction(
+            thread_id,
+            result.messages.clone(),
+            result.original_count,
+            result.retained_count,
+            now,
+        )
         .await
-        .context("replace durable projection history")?;
-
-    // Drop the in-flight draft once the projection has been rewritten.
-    //
-    // On the resume path the draft can hold the same suspended /
-    // tool-result messages that a reactive (overflow-driven) compaction
-    // just folded into the committed projection. Leaving it in place
-    // would make `recover_thread` fold those messages in twice — once
-    // via the compacted projection, once via the raw draft. Clearing it
-    // here keeps that path duplication-safe. The draft is purely a
-    // recovery aid (reconstructable from the parent's ReadyToResume
-    // state), so dropping it is harmless on every other path; the
-    // pre-call resume compaction re-sets a fresh draft immediately
-    // afterwards. Best-effort: a clear failure must not poison the turn.
-    if let Err(error) = deps.message_store.clear_draft(thread_id, now).await {
-        log::warn!("failed to clear draft after compaction for thread {thread_id}: {error:#}");
-    }
+        .context("append durable compaction entry")?;
 
     staged_messages
         .replace_history(thread_id, result.messages.clone())

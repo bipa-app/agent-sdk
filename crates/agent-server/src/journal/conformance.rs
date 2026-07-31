@@ -655,6 +655,24 @@ mod in_memory_bundle {
         ) -> Result<MessageProjection> {
             self.message.replace_history(thread_id, messages, now).await
         }
+        async fn append_compaction(
+            &self,
+            thread_id: &ThreadId,
+            result_messages: Vec<agent_sdk_foundation::llm::Message>,
+            source_message_count: usize,
+            retained_message_count: usize,
+            now: OffsetDateTime,
+        ) -> Result<MessageProjection> {
+            self.message
+                .append_compaction(
+                    thread_id,
+                    result_messages,
+                    source_message_count,
+                    retained_message_count,
+                    now,
+                )
+                .await
+        }
         async fn set_draft(
             &self,
             thread_id: &ThreadId,

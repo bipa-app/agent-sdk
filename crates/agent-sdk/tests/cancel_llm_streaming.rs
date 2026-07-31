@@ -404,6 +404,7 @@ impl ContextCompactor for BlockingCompactor {
             new_count: 1,
             original_tokens: 1_000_000,
             new_tokens: 10,
+            retained_count: 0,
             llm_usage: TokenUsage::default(),
         })
     }
