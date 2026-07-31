@@ -198,6 +198,14 @@ pub struct ModelCapabilities {
     pub pricing: Option<Pricing>,
     pub supports_thinking: bool,
     pub supports_adaptive_thinking: bool,
+    /// The model rejects `ThinkingMode::Enabled { budget_tokens }` (the
+    /// API returns 400). Adaptive thinking and provider-default thinking
+    /// (a bare effort via `ThinkingConfig::default_with_effort`, no
+    /// `thinking` object) both remain valid — the model does NOT require
+    /// an adaptive request. Callers holding a budget-mode preference must
+    /// switch to one of those shapes before dispatch or the provider
+    /// fails the request in `validate_thinking_config`.
+    pub rejects_budget_thinking: bool,
     pub source_url: &'static str,
     pub source_status: SourceStatus,
     pub notes: Option<&'static str>,
@@ -249,6 +257,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(10.0, 50.0).with_notes("Anthropic Fable 5 official pricing: $10 input / $50 output per 1M tokens.")),
         supports_thinking: true,
         supports_adaptive_thinking: true,
+        rejects_budget_thinking: true,
         source_url: ANTHROPIC_MODELS_URL,
         source_status: SourceStatus::Official,
         notes: Some("Fable 5 is adaptive-only: adaptive thinking is always on (applies even when `thinking` is unset) and `ThinkingMode::Enabled { budget_tokens }` is rejected by the Anthropic API. The SDK fails fast in validate_thinking_config. Raw chain of thought is never returned — thinking blocks arrive empty (the SDK requests thinking display=omitted). Safety classifiers may decline a request with stop_reason=refusal on an HTTP 200."),
@@ -261,6 +270,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(5.0, 25.0).with_notes("Anthropic Opus 5 official pricing: $5 input / $25 output per 1M tokens. Fast mode (`speed: \"fast\"`, not implemented by this SDK) is billed at $10/$50. Uses the Opus 4.7 tokenizer, which produces ~30% more tokens than Opus 4.6 and earlier for the same text.")),
         supports_thinking: true,
         supports_adaptive_thinking: true,
+        rejects_budget_thinking: true,
         source_url: ANTHROPIC_MODELS_URL,
         source_status: SourceStatus::Official,
         notes: Some("Opus 5 rejects budget thinking — extended thinking (`thinking.type: \"enabled\"`) is not offered, so `ThinkingMode::Enabled { budget_tokens }` returns 400 from the Anthropic API (the SDK fails fast in validate_thinking_config). Adaptive is supported but optional: an effort level can be sent without it via `ThinkingConfig::default_with_effort`. When effort is unset the Claude API defaults to `high`."),
@@ -273,6 +283,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(5.0, 25.0).with_notes("Anthropic Opus 4.8 pricing matches the Opus 4.6 tier ($5/$25 per 1M); verify exact current SKU mapping before billing-critical use.")),
         supports_thinking: true,
         supports_adaptive_thinking: true,
+        rejects_budget_thinking: true,
         source_url: ANTHROPIC_MODELS_URL,
         source_status: SourceStatus::Derived,
         notes: Some("Opus 4.8 rejects budget thinking — `ThinkingMode::Enabled { budget_tokens }` returns 400 from the Anthropic API (the SDK fails fast in validate_thinking_config). Adaptive is supported but optional: an effort level can be sent without it via `ThinkingConfig::default_with_effort`."),
@@ -285,6 +296,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(5.0, 25.0).with_notes("Anthropic Opus 4.7 pricing matches the Opus 4.6 tier ($5/$25 per 1M); verify exact current SKU mapping before billing-critical use.")),
         supports_thinking: true,
         supports_adaptive_thinking: true,
+        rejects_budget_thinking: true,
         source_url: ANTHROPIC_MODELS_URL,
         source_status: SourceStatus::Derived,
         notes: Some("Opus 4.7 rejects budget thinking — `ThinkingMode::Enabled { budget_tokens }` returns 400 from the Anthropic API (the SDK fails fast in validate_thinking_config). Adaptive is supported but optional: an effort level can be sent without it via `ThinkingConfig::default_with_effort`."),
@@ -297,6 +309,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(5.0, 25.0).with_notes("Anthropic Opus 4.6 pricing from bundled Claude API guidance; verify exact current SKU mapping before billing-critical use.")),
         supports_thinking: true,
         supports_adaptive_thinking: true,
+        rejects_budget_thinking: true,
         source_url: ANTHROPIC_MODELS_URL,
         source_status: SourceStatus::Derived,
         notes: Some("Current Anthropic docs show this model alongside 200K/128K markers."),
@@ -309,6 +322,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(3.0, 15.0).with_notes("Anthropic Sonnet 5 standard pricing $3/$15 per 1M; introductory $2/$10 through 2026-08-31. A new tokenizer produces ~30% more tokens than Sonnet 4.6, so equivalent-text cost differs even at unchanged per-token rates.")),
         supports_thinking: true,
         supports_adaptive_thinking: true,
+        rejects_budget_thinking: true,
         source_url: ANTHROPIC_MODELS_URL,
         source_status: SourceStatus::Official,
         notes: Some("Sonnet 5 is adaptive-only: adaptive thinking is on by default (applies even when `thinking` is unset) and `ThinkingMode::Enabled { budget_tokens }` returns 400 from the Anthropic API — same as Opus 4.8. Non-default sampling params (temperature/top_p/top_k) also return 400 (constraint inherited from Opus 4.7). Uses a new tokenizer (~30% more tokens than Sonnet 4.6)."),
@@ -321,6 +335,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(3.0, 15.0).with_notes("Anthropic Sonnet tier pricing; verify exact current SKU mapping before billing-critical use.")),
         supports_thinking: true,
         supports_adaptive_thinking: true,
+        rejects_budget_thinking: true,
         source_url: ANTHROPIC_MODELS_URL,
         source_status: SourceStatus::Derived,
         notes: Some("Anthropic docs list Sonnet 4.6; user confirmed adaptive thinking support."),
@@ -333,6 +348,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(3.0, 15.0).with_notes("Anthropic Sonnet tier pricing; verify exact current SKU mapping before billing-critical use.")),
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: ANTHROPIC_MODELS_URL,
         source_status: SourceStatus::Derived,
         notes: None,
@@ -345,6 +361,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(1.0, 5.0).with_notes("Anthropic Haiku tier pricing; verify exact current SKU mapping before billing-critical use.")),
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: ANTHROPIC_MODELS_URL,
         source_status: SourceStatus::Derived,
         notes: None,
@@ -357,6 +374,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(3.0, 15.0).with_notes("Anthropic Sonnet tier pricing; verify exact current SKU mapping before billing-critical use.")),
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: ANTHROPIC_MODELS_URL,
         source_status: SourceStatus::Derived,
         notes: None,
@@ -369,6 +387,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(15.0, 75.0).with_notes("Anthropic Opus tier pricing; verify exact current SKU mapping before billing-critical use.")),
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: ANTHROPIC_MODELS_URL,
         source_status: SourceStatus::Derived,
         notes: None,
@@ -381,6 +400,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(3.0, 15.0).with_notes("Anthropic Sonnet tier pricing; verify exact current SKU mapping before billing-critical use.")),
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: ANTHROPIC_MODELS_URL,
         source_status: SourceStatus::Derived,
         notes: None,
@@ -393,6 +413,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(1.0, 5.0).with_notes("Anthropic Haiku tier pricing; verify exact current SKU mapping before billing-critical use.")),
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: ANTHROPIC_MODELS_URL,
         source_status: SourceStatus::Derived,
         notes: None,
@@ -408,6 +429,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         )),
         supports_thinking: true,
         supports_adaptive_thinking: true,
+        rejects_budget_thinking: false,
         source_url: OPENAI_GPT56_SOL_URL,
         source_status: SourceStatus::Official,
         notes: Some("Official alias for GPT-5.6 Sol."),
@@ -422,6 +444,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         )),
         supports_thinking: true,
         supports_adaptive_thinking: true,
+        rejects_budget_thinking: false,
         source_url: OPENAI_GPT56_SOL_URL,
         source_status: SourceStatus::Official,
         notes: Some("Supports Chat Completions and Responses, 1.05M context, and 128K max output."),
@@ -436,6 +459,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         )),
         supports_thinking: true,
         supports_adaptive_thinking: true,
+        rejects_budget_thinking: false,
         source_url: OPENAI_GPT56_TERRA_URL,
         source_status: SourceStatus::Official,
         notes: Some("Supports Chat Completions and Responses, 1.05M context, and 128K max output."),
@@ -450,6 +474,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         )),
         supports_thinking: true,
         supports_adaptive_thinking: true,
+        rejects_budget_thinking: false,
         source_url: OPENAI_GPT56_LUNA_URL,
         source_status: SourceStatus::Official,
         notes: Some("Supports Chat Completions and Responses, 1.05M context, and 128K max output."),
@@ -462,6 +487,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat_with_cached(2.50, 15.0, 0.25)),
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: OPENAI_GPT54_URL,
         source_status: SourceStatus::Official,
         notes: Some("OpenAI model docs list 1.05M context, 128K max output, and reasoning.effort support."),
@@ -474,6 +500,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat_with_cached(1.50, 6.0, 0.375)),
         supports_thinking: true,
         supports_adaptive_thinking: true,
+        rejects_budget_thinking: false,
         source_url: OPENAI_GPT53_CODEX_URL,
         source_status: SourceStatus::Official,
         notes: Some("OpenAI model docs list Responses-only access, a 272K maximum input, 128K maximum output, and reasoning.effort levels."),
@@ -486,6 +513,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat_with_cached(1.25, 10.0, 0.125)),
         supports_thinking: false,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: OPENAI_PRICING_URL,
         source_status: SourceStatus::Official,
         notes: Some("Pricing verified from OpenAI pricing page. Context/max output still need clean extraction from models docs."),
@@ -498,6 +526,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat_with_cached(0.125, 1.0, 0.0125)),
         supports_thinking: false,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: OPENAI_PRICING_URL,
         source_status: SourceStatus::Official,
         notes: Some("Pricing verified from OpenAI pricing page. Context/max output still need clean extraction from models docs."),
@@ -510,6 +539,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat_with_cached(0.025, 0.20, 0.0025)),
         supports_thinking: false,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: OPENAI_PRICING_URL,
         source_status: SourceStatus::Official,
         notes: Some("Pricing verified from OpenAI pricing page. Context/max output still need clean extraction from models docs."),
@@ -522,6 +552,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: None,
         supports_thinking: false,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: OPENAI_MODELS_URL,
         source_status: SourceStatus::Unverified,
         notes: Some("Model exists in OpenAI docs, but pricing was not extracted from the official pricing page in this pass."),
@@ -534,6 +565,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: None,
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: OPENAI_MODELS_URL,
         source_status: SourceStatus::Unverified,
         notes: Some("Model exists in OpenAI docs, but pricing was not extracted from the official pricing page in this pass."),
@@ -546,6 +578,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(21.0, 168.0)),
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: OPENAI_GPT52_PRO_URL,
         source_status: SourceStatus::Official,
         notes: Some("Responses-only pro model. Supports medium, high, and xhigh reasoning effort."),
@@ -558,6 +591,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: None,
         supports_thinking: false,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: OPENAI_MODELS_URL,
         source_status: SourceStatus::Unverified,
         notes: Some("Model presence confirmed from OpenAI docs; pricing not yet extracted in this pass."),
@@ -570,6 +604,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(1.0, 4.0)),
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: OPENAI_PRICING_URL,
         source_status: SourceStatus::Official,
         notes: Some("Pricing verified from OpenAI pricing page. Context/max output still need clean extraction from models docs."),
@@ -582,6 +617,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(0.55, 2.20)),
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: OPENAI_PRICING_URL,
         source_status: SourceStatus::Official,
         notes: Some("Pricing verified from OpenAI pricing page. Context/max output still need clean extraction from models docs."),
@@ -594,6 +630,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(0.55, 2.20)),
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: OPENAI_PRICING_URL,
         source_status: SourceStatus::Official,
         notes: Some("Pricing verified from OpenAI pricing page. Context/max output still need clean extraction from models docs."),
@@ -606,6 +643,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(7.50, 30.0)),
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: OPENAI_PRICING_URL,
         source_status: SourceStatus::Official,
         notes: Some("Pricing verified from OpenAI pricing page. Context/max output still need clean extraction from models docs."),
@@ -618,6 +656,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(0.55, 2.20)),
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: OPENAI_PRICING_URL,
         source_status: SourceStatus::Official,
         notes: Some("Pricing verified from OpenAI pricing page. Context/max output still need clean extraction from models docs."),
@@ -630,6 +669,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(1.0, 4.0)),
         supports_thinking: false,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: OPENAI_PRICING_URL,
         source_status: SourceStatus::Official,
         notes: Some("Pricing verified from OpenAI pricing page. Context window from model family docs/notes."),
@@ -642,6 +682,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(0.20, 0.80)),
         supports_thinking: false,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: OPENAI_PRICING_URL,
         source_status: SourceStatus::Official,
         notes: Some("Pricing verified from OpenAI pricing page. Context window from model family docs/notes."),
@@ -654,6 +695,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(0.05, 0.20)),
         supports_thinking: false,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: OPENAI_PRICING_URL,
         source_status: SourceStatus::Official,
         notes: Some("Pricing verified from OpenAI pricing page. Context window from model family docs/notes."),
@@ -666,6 +708,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(1.25, 5.0)),
         supports_thinking: false,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: OPENAI_PRICING_URL,
         source_status: SourceStatus::Official,
         notes: Some("Pricing verified from OpenAI pricing page. Context/max output from existing runtime assumptions."),
@@ -678,6 +721,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(0.075, 0.30)),
         supports_thinking: false,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: OPENAI_PRICING_URL,
         source_status: SourceStatus::Official,
         notes: Some("Pricing verified from OpenAI pricing page. Context/max output from existing runtime assumptions."),
@@ -691,6 +735,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(2.0, 12.0).with_notes("Official pricing for prompts <= 200K tokens. For prompts > 200K, pricing increases to $4 input / $18 output per 1M tokens.")),
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: GOOGLE_PRICING_URL,
         source_status: SourceStatus::Official,
         notes: Some("Pricing sourced from Gemini 3.1 Pro Preview docs."),
@@ -703,6 +748,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(2.0, 12.0).with_notes("Legacy alias retained for compatibility. For prompts > 200K, pricing increases to $4 input / $18 output per 1M tokens.")),
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: GOOGLE_PRICING_URL,
         source_status: SourceStatus::Derived,
         notes: Some("Legacy Gemini 3.1 Pro alias retained for compatibility; prefer gemini-3.1-pro-preview."),
@@ -715,6 +761,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: None,
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: GOOGLE_MODELS_URL,
         source_status: SourceStatus::Unverified,
         notes: Some("Model presence confirmed from Google docs, but pricing was not extracted in this pass."),
@@ -727,6 +774,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: None,
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: GOOGLE_MODELS_URL,
         source_status: SourceStatus::Unverified,
         notes: Some("Model presence confirmed from Google docs, but pricing was not extracted in this pass."),
@@ -739,6 +787,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: None,
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: GOOGLE_MODELS_URL,
         source_status: SourceStatus::Derived,
         notes: Some("Legacy Gemini 3.0 Flash model retained for compatibility; prefer gemini-3-flash-preview."),
@@ -751,6 +800,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: None,
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: GOOGLE_MODELS_URL,
         source_status: SourceStatus::Unverified,
         notes: Some("Model presence confirmed from Google docs, but pricing was not extracted in this pass."),
@@ -763,6 +813,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(0.30, 2.50).with_notes("Official text/image/video pricing. Audio input is priced separately at $1.00 / 1M tokens.")),
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: GOOGLE_PRICING_URL,
         source_status: SourceStatus::Official,
         notes: Some("Official docs state output pricing includes thinking tokens."),
@@ -775,6 +826,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: None,
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: GOOGLE_MODELS_URL,
         source_status: SourceStatus::Unverified,
         notes: Some("Model presence confirmed from Google docs, but pricing was not extracted in this pass."),
@@ -787,6 +839,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(0.10, 0.40).with_notes("Official text/image/video pricing. Audio input is priced separately at $0.70 / 1M tokens.")),
         supports_thinking: false,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: GOOGLE_PRICING_URL,
         source_status: SourceStatus::Official,
         notes: None,
@@ -799,6 +852,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(0.075, 0.30)),
         supports_thinking: false,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: GOOGLE_PRICING_URL,
         source_status: SourceStatus::Official,
         notes: None,
@@ -814,6 +868,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(0.98, 3.08).with_notes("OpenRouter rate for z-ai/glm-5.1: input $0.98/M, output $3.08/M.")),
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: OPENROUTER_GLM51_URL,
         source_status: SourceStatus::Derived,
         notes: Some("GLM-5.1 (z.ai/Zhipu) via OpenRouter slug. Reasoning/thinking model; context 203K (=202,752). max_output 128K from z.ai GLM-5.1 docs, sized generously for hidden reasoning + answer. Released ~Apr 7, 2026."),
@@ -826,6 +881,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(1.0, 3.2).with_notes("Native z.ai pricing: input $1.0/M, output $3.2/M (higher than the OpenRouter GLM-5 rate of $0.60/$1.92).")),
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: ZAI_GLM5_PRICING_URL,
         source_status: SourceStatus::Derived,
         notes: Some("Native z.ai constructor model string `glm-5`. Reasoning/thinking model; 200K context, 128K (131072) max output per docs.z.ai/guides/llm/glm-5. Native pricing used for the native route. Released ~Feb 11, 2026."),
@@ -838,6 +894,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(0.684, 3.42).with_notes("OpenRouter rate for moonshotai/kimi-k2.6: input $0.684/M, output $3.42/M.")),
         supports_thinking: false,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: OPENROUTER_KIMI_K26_URL,
         source_status: SourceStatus::Derived,
         notes: Some("Exact OpenRouter slug (note the dot). Hybrid model marketed/used as a non-reasoning coding+multimodal model, so supports_thinking=false (use moonshotai/kimi-k2-thinking for the dedicated reasoning model). Context 262,144; 65536 is a generous app-side completion budget within the window."),
@@ -850,6 +907,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(0.4, 1.9).with_notes("OpenRouter rate for moonshotai/kimi-k2.5: input $0.40/M, output $1.90/M.")),
         supports_thinking: false,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: OPENROUTER_KIMI_K25_URL,
         source_status: SourceStatus::Derived,
         notes: Some("OpenRouter route for the model the native constructor names 'kimi-k2.5'. Treated as non-reasoning (visual-coding + agentic tool-calling) on OpenRouter. Context 262,144; 32768 is a generous app-side completion budget within the window."),
@@ -862,6 +920,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(0.6, 3.0).with_notes("Native Moonshot estimate from Artificial Analysis (~$0.58 in / $3.00 out); input rounded up to $0.60 to stay conservative for budget reservation.")),
         supports_thinking: false,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: KIMI_K25_AA_URL,
         source_status: SourceStatus::Unverified,
         notes: Some("Exact native model_id used by the native constructor (Moonshot platform.kimi.ai base_url). Native pricing not on the first-party table (only k2.6 is enumerated); figures derived from Artificial Analysis. Context 262,144; 32768 is a generous within-window completion budget."),
@@ -874,6 +933,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(0.6, 2.5).with_notes("Cross-provider median for kimi-k2-thinking (OpenRouter/Artificial Analysis): input $0.60/M, output $2.50/M, used as a conservative native estimate.")),
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: OPENROUTER_KIMI_K2_THINKING_URL,
         source_status: SourceStatus::Unverified,
         notes: Some("Exact native model_id used by the native constructor; a REASONING model (emits hidden chain-of-thought before the answer). Native Moonshot base_url. First-party pricing could not be isolated; figures are the cross-provider median. Context 262,144; max_output 131072 sized generously for reasoning tokens, within the window."),
@@ -886,6 +946,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(0.44, 0.87).with_notes("OpenRouter effective post-promo rate ($0.435 in rounded up to $0.44 / $0.87 out). Pre-promo regular rate was $1.74/$3.48.")),
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: OPENROUTER_DEEPSEEK_V4_PRO_URL,
         source_status: SourceStatus::Derived,
         notes: Some("Primary model named in forge config; exact OpenRouter slug. Large MoE (1.6T total / 49B active), released 2026-04-24. Reasoning/thinking model; DeepSeek returns the answer in `content` and chain-of-thought in a separate `reasoning_content` field, which must be echoed back in subsequent thinking-mode turns or the API returns 400. Max output 384K (DeepSeek ceiling), sized generously for reasoning."),
@@ -898,6 +959,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat_with_cached(0.44, 0.87, 0.003_625).with_notes("Official DeepSeek pricing: input cache-MISS $0.435/M (rounded up to $0.44), cache-HIT $0.003625/M, output $0.87/M.")),
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: DEEPSEEK_PRICING_URL,
         source_status: SourceStatus::Derived,
         notes: Some("Native DeepSeek API model id 'deepseek-v4-pro' (no vendor prefix). 1M context, 384K max output. Reasoning/thinking model; separate `reasoning_content` that must be echoed back in multi-turn thinking-mode requests or you get a 400. Legacy ids deepseek-reasoner/deepseek-chat now map to V4-FLASH, not Pro."),
@@ -910,6 +972,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(0.15, 0.28).with_notes("DeepSeek list rate rounded up ($0.14 in -> $0.15 / $0.28 out) used instead of OpenRouter's lower fluctuating effective rate so consumers never under-reserve budget.")),
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: OPENROUTER_DEEPSEEK_V4_FLASH_URL,
         source_status: SourceStatus::Derived,
         notes: Some("Sibling V4 model (cheaper routing target). Efficiency MoE (284B total / 13B active), released 2026-04-24. Reasoning/thinking model with the same reasoning_content split + mandatory pass-back-or-400 behavior as V4 Pro. Max output 384K per DeepSeek docs."),
@@ -922,6 +985,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat_with_cached(0.14, 0.28, 0.002_8).with_notes("Official DeepSeek pricing: input cache-MISS $0.14/M, cache-HIT $0.0028/M, output $0.28/M.")),
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: DEEPSEEK_PRICING_URL,
         source_status: SourceStatus::Derived,
         notes: Some("Native DeepSeek API model id 'deepseek-v4-flash'. 1M context, 384K max output. Reasoning/thinking model; same content/reasoning_content split and mandatory pass-back in thinking mode. Legacy aliases deepseek-chat/deepseek-reasoner now resolve to this Flash model."),
@@ -934,6 +998,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat_with_cached(0.3, 1.2, 0.03).with_notes("Native MiniMax first-party pricing: input $0.30/M, output $1.20/M, cache-read input $0.03/M (platform.minimax.io PAYG).")),
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: MINIMAX_PRICING_URL,
         source_status: SourceStatus::Derived,
         notes: Some("Native agent-sdk constructor model string 'MiniMax-M2.5' (api.minimax.io, OpenAI-compatible). Reasoning/thinking model; emits chain-of-thought in <think>...</think> tags and supports interleaved thinking. Context 204,800; max_output 131072 sized generously for hidden reasoning + answer within the window."),
@@ -946,6 +1011,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         pricing: Some(Pricing::flat(0.15, 1.15).with_notes("OpenRouter rate for minimax/minimax-m2.5: input $0.15/M, output $1.15/M (lower than MiniMax's $0.30/$1.20 first-party rate; OpenRouter prices can fluctuate, so reserve conservatively).")),
         supports_thinking: true,
         supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
         source_url: OPENROUTER_MINIMAX_M25_URL,
         source_status: SourceStatus::Derived,
         notes: Some("OpenRouter slug 'minimax/minimax-m2.5' (same M2.5 weights as native). Reasoning/thinking model. Context 204,800; max_output 131072 sized generously for hidden reasoning tokens before the answer."),
@@ -1095,6 +1161,54 @@ mod tests {
     fn test_lookup_anthropic_sonnet_45_disables_adaptive_thinking() {
         let caps = get_model_capabilities("anthropic", "claude-sonnet-4-5-20250929").unwrap();
         assert!(!caps.supports_adaptive_thinking);
+    }
+
+    #[test]
+    fn budget_rejecting_anthropic_models_carry_the_flag() {
+        for model in [
+            "claude-fable-5",
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-5",
+            "claude-sonnet-4-6",
+        ] {
+            let caps = get_model_capabilities("anthropic", model).unwrap();
+            assert!(
+                caps.rejects_budget_thinking,
+                "{model} rejects budget thinking and must carry the flag"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_budget_thinking_implies_adaptive_is_available() {
+        for caps in MODEL_CAPABILITIES {
+            if caps.rejects_budget_thinking {
+                assert!(
+                    caps.supports_adaptive_thinking,
+                    "{}/{} rejects budget thinking but does not support adaptive — \
+                     callers would have no thinking-object shape to promote to",
+                    caps.provider, caps.model_id,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn budget_capable_models_do_not_carry_the_flag() {
+        for (provider, model) in [
+            ("anthropic", "claude-sonnet-4-5-20250929"),
+            ("anthropic", "claude-haiku-4-5-20251001"),
+            ("openai", "gpt-5.6-sol"),
+        ] {
+            let caps = get_model_capabilities(provider, model).unwrap();
+            assert!(
+                !caps.rejects_budget_thinking,
+                "{provider}/{model} accepts budget-style thinking config"
+            );
+        }
     }
 
     #[test]
