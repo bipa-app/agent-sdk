@@ -221,6 +221,29 @@ impl ServiceHost {
                 "storage.postgres.max_connections must be > 0"
             );
         }
+        if let super::config::StorageBackend::Sqlite {
+            max_connections: Some(max_connections),
+            ..
+        } = config.storage.backend
+        {
+            anyhow::ensure!(
+                max_connections > 0,
+                "storage sqlite max_connections must be > 0"
+            );
+            // A pool below the worker fan-out starves lease heartbeats at
+            // pool-acquire under load (heartbeat waits out long journal
+            // reads for a free connection, the lease expires beneath a
+            // live execution). Not a hard error — single-purpose hosts
+            // may size down deliberately — but always worth a warning.
+            if max_connections < u32::try_from(config.worker.pool_size).unwrap_or(u32::MAX) {
+                warn!(
+                    sqlite_max_connections = max_connections,
+                    worker_pool_size = config.worker.pool_size,
+                    "sqlite pool is smaller than the worker pool; lease heartbeats \
+                     can starve at pool-acquire under fan-out load",
+                );
+            }
+        }
         if config.wakeup.enabled {
             anyhow::ensure!(
                 config.wakeup.fallback_interval_secs > 0,

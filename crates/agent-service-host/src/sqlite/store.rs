@@ -126,11 +126,27 @@ impl SqliteDurableStore {
         Self { pool }
     }
 
+    /// Default pooled connections for a file-backed database when the
+    /// caller does not size the pool explicitly.
+    ///
+    /// Deliberately small: it predates configurable sizing and stays the
+    /// compatibility default for one-off handles (CLI helpers, auxiliary
+    /// readers). A `ServiceHost` deployment MUST size the pool to its
+    /// worker fan-out via [`Self::connect_with_max_connections`] — with a
+    /// pool far below the worker count, long journal reads queue every
+    /// other caller at pool-acquire, and a starved lease heartbeat that
+    /// waits out the acquire queue expires the lease under a live
+    /// execution (observed in production as `sqlx` slow-acquire warnings
+    /// followed by `lease_expired_budget_exhausted` task failures).
+    pub const DEFAULT_MAX_CONNECTIONS: u32 = 4;
+
     /// Connect to a `SQLite` database and apply the durable-core migrations.
     ///
     /// The `database_url` is a `SQLite` connection string. Use
     /// `"sqlite::memory:"` for an ephemeral in-memory database (useful
     /// for tests) or a file path like `"sqlite:///path/to/agent-sdk.db"`.
+    /// The pool is sized at [`Self::DEFAULT_MAX_CONNECTIONS`]; hosts with
+    /// a worker pool use [`Self::connect_with_max_connections`].
     ///
     /// For file-backed databases, WAL mode is enabled at connection time
     /// for concurrent read access. In-memory databases do not support WAL
@@ -143,6 +159,29 @@ impl SqliteDurableStore {
     /// Returns an error if the pool cannot be created, WAL mode cannot be
     /// activated on a file-backed database, or migrations fail.
     pub async fn connect(database_url: &str) -> Result<Self> {
+        Self::connect_with_max_connections(database_url, Self::DEFAULT_MAX_CONNECTIONS).await
+    }
+
+    /// [`Self::connect`] with an explicit pool ceiling for file-backed
+    /// databases.
+    ///
+    /// Under WAL mode readers run concurrently and only the single
+    /// writer serialises (bounded by `PRAGMA busy_timeout`), so the pool
+    /// ceiling should track the number of concurrent CALLERS — worker
+    /// tasks, sweeps, transports — not a write-parallelism estimate.
+    /// An in-memory database always uses one connection regardless of
+    /// `max_connections` (`SQLite` in-memory databases are per-connection).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `max_connections` is zero, the pool cannot be
+    /// created, WAL mode cannot be activated on a file-backed database,
+    /// or migrations fail.
+    pub async fn connect_with_max_connections(
+        database_url: &str,
+        max_connections: u32,
+    ) -> Result<Self> {
+        ensure!(max_connections > 0, "sqlite max_connections must be > 0");
         let is_memory = database_url.contains(":memory:");
 
         let pool = SqlitePoolOptions::new()
@@ -150,7 +189,7 @@ impl SqliteDurableStore {
             // single connection so migrations and queries share the
             // same schema. File-backed databases can use multiple
             // connections under WAL mode.
-            .max_connections(if is_memory { 1 } else { 4 })
+            .max_connections(if is_memory { 1 } else { max_connections })
             .after_connect(move |conn, _meta| {
                 Box::pin(async move {
                     // WAL mode: only attempt on file-backed databases.
@@ -1994,7 +2033,14 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
             params.spawn.child_root_input.clone(),
             params.spawn.child_caller_metadata.clone(),
             params.now,
-            AgentTask::DEFAULT_MAX_ATTEMPTS,
+            // Child roots are ROOT TURNS and take the root-turn budget —
+            // parity with the in-memory reference store, which spawns them
+            // with `RuntimePolicy::server_default().max_attempts` (== this
+            // constant, locked by a test). With `DEFAULT_MAX_ATTEMPTS` (1)
+            // a single expired lease — one heartbeat starved past the
+            // lease TTL under store contention — terminally killed a
+            // running worker tree (`lease_expired_budget_exhausted`).
+            AgentTask::DEFAULT_ROOT_MAX_ATTEMPTS,
         );
         ensure!(
             Self::load_task_tx(&mut tx, &child_root.id).await?.is_none(),
@@ -2540,7 +2586,8 @@ async fn prepare_subagent_batch_rows_tx(
             child_root_input,
             child_caller_metadata,
             now,
-            AgentTask::DEFAULT_MAX_ATTEMPTS,
+            // Root-turn budget: see `spawn_subagent_batch_tx`'s child root.
+            AgentTask::DEFAULT_ROOT_MAX_ATTEMPTS,
         );
         let existing = SqliteDurableStore::load_task_tx(tx, &child_root.id).await?;
         if existing.is_some() {
@@ -3713,7 +3760,8 @@ impl AgentTaskStore for SqliteDurableStore {
             child_root_input,
             child_caller_metadata,
             now,
-            AgentTask::DEFAULT_MAX_ATTEMPTS,
+            // Root-turn budget: see `spawn_subagent_batch_tx`'s child root.
+            AgentTask::DEFAULT_ROOT_MAX_ATTEMPTS,
         );
         let existing = Self::load_task_tx(&mut tx, &child_root.id).await?;
         if existing.is_some() {
@@ -6813,6 +6861,38 @@ INSERT INTO agent_sdk_turn_attempts (
             error: None,
             now: t_plus(secs),
         })
+    }
+
+    #[tokio::test]
+    async fn connect_with_max_connections_sizes_the_file_pool() -> Result<()> {
+        let tmp = tempfile::NamedTempFile::new()?;
+        let url = format!("sqlite:{}?mode=rwc", tmp.path().display());
+
+        let store = SqliteDurableStore::connect_with_max_connections(&url, 16).await?;
+        assert_eq!(store.pool().options().get_max_connections(), 16);
+
+        // The compatibility constructor keeps the conservative default.
+        let default_store = SqliteDurableStore::connect(&url).await?;
+        assert_eq!(
+            default_store.pool().options().get_max_connections(),
+            SqliteDurableStore::DEFAULT_MAX_CONNECTIONS,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connect_with_max_connections_keeps_memory_single_connection() -> Result<()> {
+        // SQLite in-memory databases are per-connection; a wider pool
+        // would split the schema across invisible databases.
+        let store = SqliteDurableStore::connect_with_max_connections("sqlite::memory:", 16).await?;
+        assert_eq!(store.pool().options().get_max_connections(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connect_with_zero_max_connections_is_rejected() {
+        let result = SqliteDurableStore::connect_with_max_connections("sqlite::memory:", 0).await;
+        assert!(result.is_err(), "zero-sized pool must be refused");
     }
 
     #[tokio::test]

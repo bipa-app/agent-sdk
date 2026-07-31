@@ -2074,7 +2074,12 @@ FOR UPDATE
             params.spawn.child_root_input.clone(),
             params.spawn.child_caller_metadata.clone(),
             params.now,
-            AgentTask::DEFAULT_MAX_ATTEMPTS,
+            // Child roots are ROOT TURNS and take the root-turn budget —
+            // parity with the in-memory reference store (which spawns them
+            // with `RuntimePolicy::server_default().max_attempts`). With
+            // `DEFAULT_MAX_ATTEMPTS` (1) a single expired lease terminally
+            // killed a running worker tree.
+            AgentTask::DEFAULT_ROOT_MAX_ATTEMPTS,
         );
         ensure_spawn_task_id_available_tx(&mut tx, &child_root.id, "child root").await?;
         let invocation = AgentTask::new_subagent_invocation(
@@ -2662,7 +2667,8 @@ async fn prepare_subagent_batch_rows_tx(
             child_root_input,
             child_caller_metadata,
             now,
-            AgentTask::DEFAULT_MAX_ATTEMPTS,
+            // Root-turn budget: see `spawn_subagent_invocation_tx`'s child root.
+            AgentTask::DEFAULT_ROOT_MAX_ATTEMPTS,
         );
         ensure_spawn_task_id_available_tx(tx, &child_root.id, "child root").await?;
 
@@ -4118,7 +4124,8 @@ FOR UPDATE SKIP LOCKED
             child_root_input,
             child_caller_metadata,
             now,
-            AgentTask::DEFAULT_MAX_ATTEMPTS,
+            // Root-turn budget: see `spawn_subagent_invocation_tx`'s child root.
+            AgentTask::DEFAULT_ROOT_MAX_ATTEMPTS,
         );
         ensure_spawn_task_id_available_tx(&mut tx, &child_root.id, "child root").await?;
 

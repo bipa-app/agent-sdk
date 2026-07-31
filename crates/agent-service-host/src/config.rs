@@ -134,6 +134,18 @@ pub enum StorageBackend {
         /// - macOS: `~/Library/Application Support/agent-sdk/agent-sdk.db`
         /// - Windows: `%LOCALAPPDATA%\agent-sdk\agent-sdk.db`
         path: Option<String>,
+        /// Maximum pooled connections for a file-backed database.
+        ///
+        /// Under WAL mode readers run concurrently and the single writer
+        /// serialises on `PRAGMA busy_timeout`, so this should track the
+        /// number of concurrent CALLERS — size it at least
+        /// `worker.pool_size` plus headroom for sweeps and transports. A
+        /// pool far below the worker count starves lease heartbeats at
+        /// pool-acquire under fan-out load, expiring leases beneath live
+        /// executions. `None` keeps the conservative
+        /// [`crate::sqlite::SqliteDurableStore::DEFAULT_MAX_CONNECTIONS`].
+        #[serde(default)]
+        max_connections: Option<u32>,
     },
 }
 
@@ -238,7 +250,7 @@ impl StorageConfig {
     /// Returns an error if the backend is not `sqlite`.
     pub fn sqlite_database_url(&self) -> Result<String> {
         match &self.backend {
-            StorageBackend::Sqlite { path } => {
+            StorageBackend::Sqlite { path, .. } => {
                 let db_path = if let Some(path) = path {
                     std::path::PathBuf::from(path)
                 } else {
@@ -253,6 +265,20 @@ impl StorageConfig {
                 Ok(sqlite_url(&db_path))
             }
             _ => bail!("sqlite_database_url is only valid when storage.backend=sqlite"),
+        }
+    }
+
+    /// Return the configured `SQLite` pool ceiling when the backend is
+    /// selected, or `None` to use the store's conservative default.
+    ///
+    /// # Errors
+    /// Returns an error if the backend is not `sqlite`.
+    pub fn sqlite_max_connections(&self) -> Result<Option<u32>> {
+        match &self.backend {
+            StorageBackend::Sqlite {
+                max_connections, ..
+            } => Ok(*max_connections),
+            _ => bail!("sqlite_max_connections is only valid when storage.backend=sqlite"),
         }
     }
 }
@@ -884,7 +910,10 @@ storage:
         let config = ServiceConfig::from_yaml_str(yaml)?;
         assert!(matches!(
             config.storage.backend,
-            StorageBackend::Sqlite { path: None }
+            StorageBackend::Sqlite {
+                path: None,
+                max_connections: None,
+            }
         ));
         Ok(())
     }
@@ -898,8 +927,12 @@ storage:
 "#;
         let config = ServiceConfig::from_yaml_str(yaml)?;
         match &config.storage.backend {
-            StorageBackend::Sqlite { path } => {
+            StorageBackend::Sqlite {
+                path,
+                max_connections,
+            } => {
                 assert_eq!(path.as_deref(), Some("/tmp/test.db"));
+                assert_eq!(*max_connections, None, "absent field defaults to None");
             }
             other => panic!("expected Sqlite, got {other:?}"),
         }
@@ -917,11 +950,27 @@ storage:
         let re_yaml = serde_yaml::to_string(&config)?;
         let re_config = ServiceConfig::from_yaml_str(&re_yaml)?;
         match &re_config.storage.backend {
-            StorageBackend::Sqlite { path } => {
+            StorageBackend::Sqlite { path, .. } => {
                 assert_eq!(path.as_deref(), Some("/data/agent-sdk.db"));
             }
             other => panic!("expected Sqlite, got {other:?}"),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_backend_max_connections_yaml_round_trip() -> Result<()> {
+        let yaml = r#"
+storage:
+  backend: !sqlite
+    path: "/data/agent-sdk.db"
+    max_connections: 24
+"#;
+        let config = ServiceConfig::from_yaml_str(yaml)?;
+        assert_eq!(config.storage.sqlite_max_connections()?, Some(24));
+        let re_yaml = serde_yaml::to_string(&config)?;
+        let re_config = ServiceConfig::from_yaml_str(&re_yaml)?;
+        assert_eq!(re_config.storage.sqlite_max_connections()?, Some(24));
         Ok(())
     }
 
