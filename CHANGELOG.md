@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   effective LLM view without deleting committed transcript messages.
 - Auto-compaction prunes artifact-backed and superseded read outputs before
   summarization, and threshold decisions use journaled billed usage when present.
+- MCP output, shell output, and durable subagent finals now share the lossless
+  inline-budget artifact spill path. Hosts can run liveness-aware deterministic
+  expiry and per-thread quota sweeps without deleting referenced artifacts.
 
 
 - MSRV pinned to **1.91** (the verified buildable floor for the published

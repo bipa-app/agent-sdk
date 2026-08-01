@@ -2880,6 +2880,9 @@ async fn execute_tool_task(
         publish_events(stores, &committed_events);
         return Ok(());
     }
+    let artifact_store_guard = runtime
+        .artifact_store(&bootstrap.thread_id)
+        .context("hold artifact store through durable tool completion")?;
 
     let guarded_deps = GuardedExecutionDeps {
         task_store: stores.task_store.as_ref(),
@@ -2889,6 +2892,7 @@ async fn execute_tool_task(
     let effect_class = classify_tool_effect(&bootstrap.tool_call);
     let exec_bootstrap = bootstrap.clone();
     let tool_executor = Arc::clone(runtime.tool_executor());
+    let executor_artifact_store = artifact_store_guard.clone();
     let outcome = guarded_tool_execution(
         bootstrap,
         &guarded_deps,
@@ -2898,16 +2902,46 @@ async fn execute_tool_task(
             let tool_executor = Arc::clone(&tool_executor);
             let exec_bootstrap = exec_bootstrap.clone();
             let cancel = cancel.clone();
+            let artifact_store = executor_artifact_store.clone();
             async move {
-                tool_executor
-                    .execute_tool_call(&exec_bootstrap, collector, cancel)
-                    .await
+                let mut result = tool_executor
+                    .execute_tool_call(&exec_bootstrap, collector, cancel, artifact_store.clone())
+                    .await;
+                if let Ok(tool_result) = &mut result {
+                    agent_sdk::enforce_inline_budget(
+                        tool_result,
+                        artifact_store.as_deref(),
+                        &exec_bootstrap.tool_call.name,
+                    );
+                }
+                result
             }
         },
         now,
     )
     .await;
 
+    let result = finish_tool_task_execution(
+        outcome,
+        &task,
+        stores,
+        runtime.as_ref(),
+        &worker_id,
+        &lease_id,
+    )
+    .await;
+    drop(artifact_store_guard);
+    result
+}
+
+async fn finish_tool_task_execution(
+    outcome: Result<ToolTaskOutcome>,
+    task: &AgentTask,
+    stores: &StoreRegistry,
+    runtime: &ExecutionRuntime,
+    worker_id: &WorkerId,
+    lease_id: &LeaseId,
+) -> Result<()> {
     match outcome {
         Ok(
             ToolTaskOutcome::Completed {
@@ -2947,13 +2981,7 @@ async fn execute_tool_task(
             let failed_at = time::OffsetDateTime::now_utc();
             stores
                 .task_store
-                .fail_task(
-                    &task.id,
-                    &worker_id,
-                    &lease_id,
-                    format!("{err:#}"),
-                    failed_at,
-                )
+                .fail_task(&task.id, worker_id, lease_id, format!("{err:#}"), failed_at)
                 .await
                 .context("fail tool task after guarded execution error")?;
             Ok(())
@@ -2982,7 +3010,12 @@ async fn execute_subagent_task_entry(
         }
     };
 
-    match execute_subagent_task(bootstrap, &stores.subagent_result_deps(), now).await {
+    let artifact_store_guard = runtime
+        .artifact_store(&bootstrap.thread_id)
+        .context("hold artifact store through durable subagent completion")?;
+    let result_deps = stores.subagent_result_deps(artifact_store_guard.as_deref());
+    let outcome = execute_subagent_task(bootstrap, &result_deps, now).await;
+    let result = match outcome {
         Ok(SubagentTaskOutcome {
             committed_events,
             parent_task,
@@ -3021,7 +3054,9 @@ async fn execute_subagent_task_entry(
                 .context("fail subagent task after materialization error")?;
             Ok(())
         }
-    }
+    };
+    drop(artifact_store_guard);
+    result
 }
 
 async fn fail_root_task(
@@ -6002,6 +6037,7 @@ mod tests {
             _bootstrap: &agent_server::worker::ToolTaskBootstrap,
             _collector: agent_server::worker::ToolEventCollector,
             _cancel: tokio_util::sync::CancellationToken,
+            _artifact_store: Option<Arc<agent_sdk::ArtifactStore>>,
         ) -> Result<agent_sdk_foundation::ToolResult> {
             if let Ok(mut starts) = self.starts.lock() {
                 starts.push(std::time::Instant::now());
@@ -7321,6 +7357,7 @@ mod tests {
             _bootstrap: &agent_server::worker::ToolTaskBootstrap,
             _collector: agent_server::worker::ToolEventCollector,
             _cancel: tokio_util::sync::CancellationToken,
+            _artifact_store: Option<Arc<agent_sdk::ArtifactStore>>,
         ) -> Result<agent_sdk_foundation::ToolResult> {
             let ran_at = time::OffsetDateTime::now_utc();
             if let Ok(mut slot) = self.executed_at.lock() {
@@ -8255,6 +8292,7 @@ mod tests {
             _bootstrap: &agent_server::worker::ToolTaskBootstrap,
             _collector: agent_server::worker::ToolEventCollector,
             cancel: tokio_util::sync::CancellationToken,
+            _artifact_store: Option<Arc<agent_sdk::ArtifactStore>>,
         ) -> Result<agent_sdk_foundation::ToolResult> {
             self.started.fetch_add(1, Ordering::SeqCst);
             cancel.cancelled().await;
@@ -8826,6 +8864,9 @@ mod tests {
         /// this must be the instant the transition HAPPENED, not one the
         /// caller captured at task entry (before a possibly very long run).
         fail_task_now: Arc<std::sync::Mutex<Option<time::OffsetDateTime>>>,
+        artifact_store_at_completion:
+            Option<Arc<std::sync::Mutex<Option<std::sync::Weak<agent_sdk::ArtifactStore>>>>>,
+        artifact_store_alive_at_completion: std::sync::atomic::AtomicBool,
     }
 
     impl FlakyTaskStore {
@@ -8839,12 +8880,28 @@ mod tests {
                 list_children_stall_ms: AtomicUsize::new(0),
                 probe_started: Arc::new(tokio::sync::Notify::new()),
                 fail_task_now: Arc::new(std::sync::Mutex::new(None)),
+                artifact_store_at_completion: None,
+                artifact_store_alive_at_completion: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
         /// The instant the last `fail_task` was stamped with, if any.
         fn recorded_fail_now(&self) -> Option<time::OffsetDateTime> {
             self.fail_task_now.lock().ok().and_then(|slot| *slot)
+        }
+        fn observing_artifact_store(
+            mut self,
+            artifact_store: Arc<
+                std::sync::Mutex<Option<std::sync::Weak<agent_sdk::ArtifactStore>>>,
+            >,
+        ) -> Self {
+            self.artifact_store_at_completion = Some(artifact_store);
+            self
+        }
+
+        fn artifact_store_was_alive_at_completion(&self) -> bool {
+            self.artifact_store_alive_at_completion
+                .load(Ordering::SeqCst)
         }
 
         /// Make every `list_children` call (the subtree probe's expansion
@@ -9223,6 +9280,15 @@ mod tests {
             result: serde_json::Value,
             now: time::OffsetDateTime,
         ) -> Result<(AgentTask, Option<AgentTask>)> {
+            let artifact_store_alive = self
+                .artifact_store_at_completion
+                .as_ref()
+                .and_then(|seen| seen.lock().ok())
+                .and_then(|seen| seen.as_ref().cloned())
+                .and_then(|store| store.upgrade())
+                .is_some();
+            self.artifact_store_alive_at_completion
+                .store(artifact_store_alive, Ordering::SeqCst);
             self.inner
                 .complete_task_with_result(task_id, worker, lease, result, now)
                 .await
@@ -9311,6 +9377,199 @@ mod tests {
         async fn clear(&self) -> Result<()> {
             self.inner.clear().await
         }
+    }
+
+    struct OversizedRegistryTool {
+        output: String,
+        store_seen: Arc<std::sync::Mutex<Option<std::sync::Weak<agent_sdk::ArtifactStore>>>>,
+    }
+
+    impl agent_sdk_tools::tools::Tool<()> for OversizedRegistryTool {
+        type Name = agent_sdk_tools::tools::DynamicToolName;
+
+        fn name(&self) -> Self::Name {
+            agent_sdk_tools::tools::DynamicToolName::new("probe")
+        }
+
+        fn display_name(&self) -> &'static str {
+            "Oversized probe"
+        }
+
+        fn description(&self) -> &'static str {
+            "Returns a deliberately oversized result"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn tier(&self) -> ToolTier {
+            ToolTier::Observe
+        }
+
+        async fn execute(
+            &self,
+            ctx: &agent_sdk_tools::tools::ToolContext<()>,
+            _input: serde_json::Value,
+        ) -> Result<agent_sdk_foundation::ToolResult> {
+            let actual = ctx
+                .artifact_store()
+                .context("registry ToolContext must receive the host artifact store")?;
+            *self
+                .store_seen
+                .lock()
+                .map_err(|_| anyhow::anyhow!("artifact store observation lock poisoned"))? =
+                Some(Arc::downgrade(actual));
+            Ok(agent_sdk_foundation::ToolResult::success_with_data(
+                self.output.clone(),
+                serde_json::json!({"raw": self.output.clone()}),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_registry_tool_spills_before_durable_commit_and_holds_guard() -> Result<()> {
+        use std::io::Read as _;
+
+        let temp = tempfile::tempdir()?;
+        let storage = Arc::new(
+            agent_sdk::ArtifactStorage::new(temp.path().join("artifacts"))
+                .with_inline_budget(1_024),
+        );
+        let original = "registry-host-output\n".repeat(512);
+        let store_seen = Arc::new(std::sync::Mutex::new(None));
+        let mut tool_registry = agent_sdk_tools::tools::ToolRegistry::<()>::new();
+        tool_registry.register(OversizedRegistryTool {
+            output: original.clone(),
+            store_seen: Arc::clone(&store_seen),
+        });
+        let tool_executor =
+            crate::registry_tool_executor::RegistryToolExecutor::with_default_factory(
+                Arc::new(tool_registry),
+                (),
+            );
+        let provider = Arc::new(SubagentScriptProvider::new());
+        let resolver = Arc::new(StaticProviderResolver::new());
+        resolver.set_fallback(provider)?;
+        let runtime = Arc::new(
+            ExecutionRuntime::new(
+                resolver,
+                Arc::new(tool_executor),
+                Arc::new(AllowAllConfirmationPolicy),
+            )
+            .with_artifact_storage(Arc::clone(&storage)),
+        );
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(probe_definition()));
+        let host = ServiceHost::new(ServiceConfig::default(), registry, Arc::clone(&runtime))?;
+        let stores = host.stores().clone();
+
+        let parent_thread = agent_sdk_foundation::ThreadId::from_string("t-artifact-registry");
+        let (child_root, tool_child, acquired) =
+            acquire_probe_tool_child(&stores, &parent_thread).await?;
+
+        let observing_store = Arc::new(
+            FlakyTaskStore::new(Arc::clone(&stores.task_store))
+                .observing_artifact_store(store_seen),
+        );
+        let mut observing_stores = stores.clone();
+        observing_stores.task_store = Arc::clone(&observing_store) as Arc<dyn AgentTaskStore>;
+
+        Box::pin(execute_tool_task(
+            acquired,
+            &observing_stores,
+            runtime,
+            &CancellationToken::new(),
+            &ActivityBeacon::new(),
+        ))
+        .await?;
+
+        assert!(
+            observing_store.artifact_store_was_alive_at_completion(),
+            "the original host Arc guard must remain alive through complete_task_with_result"
+        );
+        let completed = stores
+            .task_store
+            .get(&tool_child.id)
+            .await?
+            .context("completed tool task")?;
+        let durable: agent_sdk_foundation::ToolResult = serde_json::from_value(
+            completed
+                .result_payload
+                .context("completed tool result payload")?,
+        )?;
+        assert!(
+            durable.output.len() <= 1_024,
+            "the durable result must already be bounded"
+        );
+        let artifact_id = durable
+            .output
+            .strip_suffix(']')
+            .and_then(|output| output.rsplit_once("[raw output: artifact://"))
+            .and_then(|(_, id)| id.parse::<u64>().ok())
+            .context("the exact recovery footer must be committed")?;
+        assert!(
+            durable.data.is_none(),
+            "structured data must not retain a second raw oversized copy"
+        );
+
+        let recovered_store = storage.for_thread(&child_root.thread_id)?;
+        let mut recovered = String::new();
+        recovered_store
+            .resolve(artifact_id)?
+            .read_to_string(&mut recovered)?;
+        assert_eq!(recovered, original, "artifact recovery must be byte-exact");
+        Ok(())
+    }
+    async fn acquire_probe_tool_child(
+        stores: &StoreRegistry,
+        parent_thread: &agent_sdk_foundation::ThreadId,
+    ) -> Result<(AgentTask, AgentTask, AgentTask)> {
+        let at = time::OffsetDateTime::now_utc();
+        let (_parent, _invocation, child_root) =
+            persist_subagent_fixture(stores, parent_thread, 30 * 60 * 1_000, at).await?;
+        let root_worker = WorkerId::from_string("w-artifact-root");
+        let root_lease = LeaseId::new();
+        stores
+            .task_store
+            .try_acquire_task(
+                &child_root.id,
+                root_worker.clone(),
+                root_lease.clone(),
+                at + time::Duration::minutes(10),
+                at,
+            )
+            .await?
+            .context("child root must acquire before parking")?;
+        let (_parked, children) = stores
+            .task_store
+            .spawn_tool_children(
+                &child_root.id,
+                &root_worker,
+                &root_lease,
+                vec![agent_server::journal::task::ChildSpawnSpec { max_attempts: 3 }],
+                pending_call_suspension_with_tier(
+                    &child_root.thread_id,
+                    "probe",
+                    ToolTier::Observe,
+                ),
+                None,
+                Vec::new(),
+                at,
+            )
+            .await?;
+        let tool_child = children.into_iter().next().context("one tool child")?;
+        let acquired = stores
+            .task_store
+            .try_acquire_task(
+                &tool_child.id,
+                WorkerId::from_string("w-artifact-tool"),
+                LeaseId::new(),
+                at + time::Duration::minutes(10),
+                at,
+            )
+            .await?
+            .context("tool child must acquire")?;
+        Ok((child_root, tool_child, acquired))
     }
 
     /// Build a fixture whose child root is Running under `(worker,

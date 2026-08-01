@@ -407,7 +407,6 @@ async fn test_over_budget_tool_output_spills_to_artifact_store() -> anyhow::Resu
         "journaled output must respect the shared budget (got {} bytes)",
         result.output.len()
     );
-    assert!(result.output.starts_with("Echo: 0123456789abcdef"));
     assert!(result.output.contains("bytes elided"));
     assert!(
         result
@@ -418,8 +417,9 @@ async fn test_over_budget_tool_output_spills_to_artifact_store() -> anyhow::Resu
     );
 
     // The spill file holds the full pre-truncation stream, byte-identical.
-    let artifact_path = store.resolve(0)?;
-    let spilled = std::fs::read_to_string(&artifact_path)?;
+    let mut artifact_file = store.resolve(0)?;
+    let mut spilled = String::new();
+    std::io::Read::read_to_string(&mut artifact_file, &mut spilled)?;
     assert_eq!(spilled, format!("Echo: {big_message}"));
     Ok(())
 }

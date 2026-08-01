@@ -28,6 +28,12 @@ anyhow = { workspace = true }
 log = { workspace = true }
 tokio-util = { workspace = true }
 time = { workspace = true }
+sha2 = { workspace = true }
+cap-std = { workspace = true }
+cap-fs-ext = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

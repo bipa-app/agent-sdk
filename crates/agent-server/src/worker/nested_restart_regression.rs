@@ -298,6 +298,7 @@ impl TestStores {
             thread_store: &self.threads,
             message_store: &self.messages,
             event_repo: &self.events,
+            artifact_store: None,
         }
     }
 

@@ -245,6 +245,7 @@ impl TestStores {
             thread_store: &self.threads,
             message_store: &self.messages,
             event_repo: &self.events,
+            artifact_store: None,
         }
     }
 }
@@ -876,6 +877,7 @@ async fn completion_surfaces_parent_progress_commit_failures() -> Result<()> {
             thread_store: &stores.threads,
             message_store: &stores.messages,
             event_repo: &failing_events,
+            artifact_store: None,
         },
         t_plus(10),
     )

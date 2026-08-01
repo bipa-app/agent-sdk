@@ -99,6 +99,8 @@ pub struct HostDependencies {
     pub cancel_token: CancellationToken,
     /// Optional concurrency limiter for subagent spawning.
     pub subagent_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    /// Per-thread lossless overflow storage for tool results.
+    pub artifact_store: Option<Arc<crate::artifacts::ArtifactStore>>,
 }
 
 // ---------------------------------------------------------------------------

@@ -423,6 +423,7 @@ mod tests {
             event_store: std::sync::Arc::clone(&store) as _,
             cancel_token: CancellationToken::new(),
             subagent_semaphore: None,
+            artifact_store: None,
         };
 
         let ctx: ToolContext<()> = ToolContext::from_seed(&seed, (), deps);
@@ -479,6 +480,7 @@ mod tests {
             event_store: std::sync::Arc::clone(&store) as _,
             cancel_token: CancellationToken::new(),
             subagent_semaphore: None,
+            artifact_store: None,
         };
         let ctx_1: ToolContext<()> = ToolContext::from_seed(&seed_1, (), deps_1);
 
@@ -509,6 +511,7 @@ mod tests {
             event_store: std::sync::Arc::clone(&store) as _,
             cancel_token: CancellationToken::new(),
             subagent_semaphore: None,
+            artifact_store: None,
         };
         let ctx_2: ToolContext<()> = ToolContext::from_seed(&seed_2, (), deps_2);
 

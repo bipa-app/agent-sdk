@@ -559,14 +559,23 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
     // lease, so by the time it returns this value is stale by the whole
     // execution. It must never be reused as a transition instant (ADR-0003 I3).
     let started_at = OffsetDateTime::now_utc();
-    let outcome = resume_confirmed_tool_with_abort_grace(
-        &stores,
-        &runtime,
-        bootstrap,
-        &drive_cancel,
-        started_at,
-    )
-    .await;
+    let artifact_store_guard = runtime.artifact_store(&thread_id);
+    let outcome = match &artifact_store_guard {
+        Ok(artifact_store) => {
+            resume_confirmed_tool_with_abort_grace(
+                &stores,
+                &runtime,
+                bootstrap,
+                &drive_cancel,
+                artifact_store.clone(),
+                started_at,
+            )
+            .await
+        }
+        Err(error) => Some(Err(anyhow::anyhow!(
+            "hold artifact store through durable confirmed-tool completion: {error:#}"
+        ))),
+    };
 
     heartbeat_cancel.cancel();
     if let Err(join_err) = heartbeat_handle.await {
@@ -600,6 +609,7 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
             );
         }
     }
+    drop(artifact_store_guard);
 
     match crate::host::committed_events_from(stores.event_repo.as_ref(), &thread_id, watermark)
         .await
@@ -627,6 +637,7 @@ async fn resume_confirmed_tool_with_abort_grace(
     runtime: &Arc<ExecutionRuntime>,
     bootstrap: agent_server::worker::ToolTaskBootstrap,
     drive_cancel: &CancellationToken,
+    artifact_store: Option<Arc<agent_sdk::ArtifactStore>>,
     now: OffsetDateTime,
 ) -> Option<Result<ConfirmationResumeOutcome>> {
     let task_id = bootstrap.task_id.clone();
@@ -634,6 +645,7 @@ async fn resume_confirmed_tool_with_abort_grace(
     let executor_bootstrap = bootstrap.clone();
     let tool_executor = Arc::clone(runtime.tool_executor());
     let exec_cancel = drive_cancel.clone();
+    let executor_artifact_store = artifact_store;
     let deps = GuardedExecutionDeps {
         task_store: stores.task_store.as_ref(),
         intent_store: stores.execution_intent_store.as_ref(),
@@ -649,10 +661,24 @@ async fn resume_confirmed_tool_with_abort_grace(
             let tool_executor = Arc::clone(&tool_executor);
             let executor_bootstrap = executor_bootstrap.clone();
             let cancel = exec_cancel.clone();
+            let artifact_store = executor_artifact_store.clone();
             async move {
-                tool_executor
-                    .execute_tool_call(&executor_bootstrap, collector, cancel)
-                    .await
+                let mut result = tool_executor
+                    .execute_tool_call(
+                        &executor_bootstrap,
+                        collector,
+                        cancel,
+                        artifact_store.clone(),
+                    )
+                    .await;
+                if let Ok(tool_result) = &mut result {
+                    agent_sdk::enforce_inline_budget(
+                        tool_result,
+                        artifact_store.as_deref(),
+                        &executor_bootstrap.tool_call.name,
+                    );
+                }
+                result
             }
         },
         now,
@@ -4272,6 +4298,7 @@ mod tests {
     struct ProgressToolExecutor {
         result: ToolResult,
         emit_progress: bool,
+        artifact_store_seen: Option<Arc<Mutex<Option<std::sync::Weak<agent_sdk::ArtifactStore>>>>>,
     }
 
     #[async_trait]
@@ -4281,7 +4308,13 @@ mod tests {
             bootstrap: &agent_server::ToolTaskBootstrap,
             collector: agent_server::worker::ToolEventCollector,
             _cancel: CancellationToken,
+            artifact_store: Option<Arc<agent_sdk::ArtifactStore>>,
         ) -> Result<ToolResult> {
+            if let (Some(seen), Some(store)) = (&self.artifact_store_seen, &artifact_store)
+                && let Ok(mut seen) = seen.lock()
+            {
+                *seen = Some(Arc::downgrade(store));
+            }
             if self.emit_progress {
                 collector.emit(AgentEvent::tool_progress(
                     &bootstrap.tool_call.id,
@@ -5837,7 +5870,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_daemon_confirms_tool_and_resumes_root_turn() -> Result<()> {
+    async fn confirmed_resume_spills_before_durable_commit_and_holds_guard() -> Result<()> {
         let transfer_tool = Tool {
             name: "transfer".into(),
             description: "Transfer funds".into(),
@@ -5852,92 +5885,180 @@ mod tests {
         let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(vec![
             transfer_tool,
         ])));
-        let runtime = runtime_with(
-            Arc::new(ScriptedProvider::new(vec![
-                tool_use_response(
-                    "resp_confirm_1",
-                    "tool_call_1",
-                    "transfer",
-                    json!({"amount": 42}),
-                ),
-                text_response("resp_confirm_2", "transfer complete"),
-            ])),
-            Arc::new(ProgressToolExecutor {
-                result: ToolResult::success("transfer ok"),
-                emit_progress: true,
-            }),
-        )?;
-        let daemon = LocalDaemon::start(ServiceConfig::default(), registry, runtime).await?;
+        let temp = tempfile::tempdir()?;
+        let artifact_storage = Arc::new(
+            agent_sdk::ArtifactStorage::new(temp.path().join("artifacts"))
+                .with_inline_budget(1_024),
+        );
+        let original = "confirmed-resume-output\n".repeat(512);
+        let artifact_store_seen = Arc::new(Mutex::new(None));
+        let artifact_store_alive_at_completion =
+            Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let committed_result = Arc::new(Mutex::new(None));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_use_response(
+                "resp_confirm_1",
+                "tool_call_1",
+                "transfer",
+                json!({"amount": 42}),
+            ),
+            text_response("resp_confirm_2", "transfer complete"),
+        ]));
+        let executor = Arc::new(ProgressToolExecutor {
+            result: ToolResult::success_with_data(
+                original.clone(),
+                json!({"raw": original.clone()}),
+            ),
+            emit_progress: true,
+            artifact_store_seen: Some(Arc::clone(&artifact_store_seen)),
+        });
+        let resolver = Arc::new(StaticProviderResolver::new());
+        resolver.set_fallback(provider)?;
+        let runtime = Arc::new(
+            ExecutionRuntime::new(resolver, executor, Arc::new(AllowAllConfirmationPolicy))
+                .with_artifact_storage(Arc::clone(&artifact_storage)),
+        );
+        let decorator_store_seen = Arc::clone(&artifact_store_seen);
+        let decorator_store_alive = Arc::clone(&artifact_store_alive_at_completion);
+        let decorator_result = Arc::clone(&committed_result);
+        let daemon = LocalDaemon::start_with_store_decorator(
+            ServiceConfig::default(),
+            registry,
+            runtime,
+            move |mut stores| {
+                stores.task_store = Arc::new(CountingTaskStore {
+                    inner: Arc::clone(&stores.task_store),
+                    complete_calls: Arc::new(AtomicUsize::new(0)),
+                    complete_with_result_calls: Arc::new(AtomicUsize::new(0)),
+                    submit_root_turn_idempotent_calls: Arc::new(AtomicUsize::new(0)),
+                    fail_get: false,
+                    artifact_store_seen: Some(decorator_store_seen),
+                    artifact_store_alive_at_completion: Some(decorator_store_alive),
+                    committed_result: Some(decorator_result),
+                });
+                stores
+            },
+        )
+        .await?;
 
-        let result = async {
-            let (mut control, mut events) = connect_clients(&daemon.endpoint()).await?;
-            let thread_id = create_thread(&mut control, "create-confirm-thread").await?;
-            let _task = submit_text_work(
-                &mut control,
-                "submit-confirm-turn",
-                &thread_id,
-                "transfer 42",
-            )
-            .await?;
-            let mut stream = open_stream(
-                &mut events,
-                &thread_id,
-                None,
-                pb::FollowMode::ReplayAndFollow,
-            )
-            .await?;
-            let (mut items, replay_after) = collect_until_confirmation(&mut stream).await?;
-
-            let awaiting_confirmation =
-                wait_for_awaiting_confirmation(&control, &thread_id).await?;
-
-            let decision = control
-                .decide_confirmation(pb::DecideConfirmationRequest {
-                    request_id: "approve-confirmation".into(),
-                    thread_id: thread_id.clone(),
-                    task_id: awaiting_confirmation.task_id.clone(),
-                    decision: Some(pb::ConfirmationDecision {
-                        decision: Some(pb::confirmation_decision::Decision::Approved(
-                            pb::ApprovedConfirmation {},
-                        )),
-                    }),
-                })
-                .await
-                .context("decide_confirmation rpc")?
-                .into_inner();
-            assert!(decision.task.is_some(), "decision response missing task");
-            drop(stream);
-
-            if let Err(error) = wait_for_completed_tasks(&control, &thread_id).await {
-                let tasks =
-                    list_thread_tasks(&mut control, &thread_id, "after completion timeout").await?;
-                bail!("confirmation flow did not complete: {error:#}; tasks: {tasks:?}");
-            }
-
-            let mut replay_stream = open_stream(
-                &mut events,
-                &thread_id,
-                Some(replay_after),
-                pb::FollowMode::ReplayOnly,
-            )
-            .await?;
-            items.extend(collect_until_closed(&mut replay_stream).await?);
-            assert_confirmation_event_order(&items)?;
-
-            let tasks = list_thread_tasks(&mut control, &thread_id, "rpc").await?;
-            assert_eq!(tasks.len(), 2);
-            assert!(
-                tasks
-                    .iter()
-                    .all(|task| task.status == pb::TaskStatus::Completed as i32),
-                "not every task completed after confirmation flow",
-            );
-            Ok(())
-        }
+        let result = run_confirmed_resume_artifact_flow(
+            &daemon,
+            artifact_storage.as_ref(),
+            &original,
+            artifact_store_alive_at_completion.as_ref(),
+            committed_result.as_ref(),
+        )
         .await;
-
         daemon.stop().await?;
         result
+    }
+
+    async fn run_confirmed_resume_artifact_flow(
+        daemon: &LocalDaemon,
+        artifact_storage: &agent_sdk::ArtifactStorage,
+        original: &str,
+        artifact_store_alive_at_completion: &std::sync::atomic::AtomicBool,
+        committed_result: &Mutex<Option<serde_json::Value>>,
+    ) -> Result<()> {
+        use std::io::Read as _;
+
+        let (mut control, mut events) = connect_clients(&daemon.endpoint()).await?;
+        let thread_id = create_thread(&mut control, "create-confirm-thread").await?;
+        let _task = submit_text_work(
+            &mut control,
+            "submit-confirm-turn",
+            &thread_id,
+            "transfer 42",
+        )
+        .await?;
+        let mut stream = open_stream(
+            &mut events,
+            &thread_id,
+            None,
+            pb::FollowMode::ReplayAndFollow,
+        )
+        .await?;
+        let (mut items, replay_after) = collect_until_confirmation(&mut stream).await?;
+
+        let awaiting_confirmation = wait_for_awaiting_confirmation(&control, &thread_id).await?;
+
+        let decision = control
+            .decide_confirmation(pb::DecideConfirmationRequest {
+                request_id: "approve-confirmation".into(),
+                thread_id: thread_id.clone(),
+                task_id: awaiting_confirmation.task_id.clone(),
+                decision: Some(pb::ConfirmationDecision {
+                    decision: Some(pb::confirmation_decision::Decision::Approved(
+                        pb::ApprovedConfirmation {},
+                    )),
+                }),
+            })
+            .await
+            .context("decide_confirmation rpc")?
+            .into_inner();
+        assert!(decision.task.is_some(), "decision response missing task");
+        drop(stream);
+
+        if let Err(error) = wait_for_completed_tasks(&control, &thread_id).await {
+            let tasks =
+                list_thread_tasks(&mut control, &thread_id, "after completion timeout").await?;
+            bail!("confirmation flow did not complete: {error:#}; tasks: {tasks:?}");
+        }
+
+        let mut replay_stream = open_stream(
+            &mut events,
+            &thread_id,
+            Some(replay_after),
+            pb::FollowMode::ReplayOnly,
+        )
+        .await?;
+        items.extend(collect_until_closed(&mut replay_stream).await?);
+        assert_confirmation_event_order(&items)?;
+
+        let tasks = list_thread_tasks(&mut control, &thread_id, "rpc").await?;
+        assert_eq!(tasks.len(), 2);
+        assert!(
+            tasks
+                .iter()
+                .all(|task| task.status == pb::TaskStatus::Completed as i32),
+            "not every task completed after confirmation flow",
+        );
+        assert!(
+            artifact_store_alive_at_completion.load(Ordering::SeqCst),
+            "the confirmed-drive Arc guard must remain alive through durable completion"
+        );
+        let durable: ToolResult = serde_json::from_value(
+            committed_result
+                .lock()
+                .map_err(|_| anyhow!("committed result lock poisoned"))?
+                .clone()
+                .context("confirmed tool result must reach durable completion")?,
+        )?;
+        assert!(
+            durable.output.len() <= 1_024,
+            "the confirmed durable result must already be bounded"
+        );
+        let artifact_id = durable
+            .output
+            .strip_suffix(']')
+            .and_then(|output| output.rsplit_once("[raw output: artifact://"))
+            .and_then(|(_, id)| id.parse::<u64>().ok())
+            .context("the exact recovery footer must be committed")?;
+        assert!(
+            durable.data.is_none(),
+            "structured data must not retain a second raw oversized copy"
+        );
+        let sdk_thread = agent_sdk_foundation::ThreadId::from_string(thread_id);
+        let recovered_store = artifact_storage.for_thread(&sdk_thread)?;
+        let mut recovered = String::new();
+        recovered_store
+            .resolve(artifact_id)?
+            .read_to_string(&mut recovered)?;
+        assert_eq!(
+            recovered, original,
+            "confirmed output recovery must be byte-exact"
+        );
+        Ok(())
     }
 
     // ── Store-decorator hook (issue #301) ──────────────────────────
@@ -5957,6 +6078,9 @@ mod tests {
         complete_with_result_calls: Arc<AtomicUsize>,
         submit_root_turn_idempotent_calls: Arc<AtomicUsize>,
         fail_get: bool,
+        artifact_store_seen: Option<Arc<Mutex<Option<std::sync::Weak<agent_sdk::ArtifactStore>>>>>,
+        artifact_store_alive_at_completion: Option<Arc<std::sync::atomic::AtomicBool>>,
+        committed_result: Option<Arc<Mutex<Option<serde_json::Value>>>>,
     }
 
     #[async_trait]
@@ -6264,6 +6388,23 @@ mod tests {
         ) -> Result<(AgentTask, Option<AgentTask>)> {
             self.complete_with_result_calls
                 .fetch_add(1, Ordering::SeqCst);
+            if let (Some(seen), Some(alive)) = (
+                &self.artifact_store_seen,
+                &self.artifact_store_alive_at_completion,
+            ) {
+                let is_alive = seen
+                    .lock()
+                    .ok()
+                    .and_then(|seen| seen.as_ref().cloned())
+                    .and_then(|store| store.upgrade())
+                    .is_some();
+                alive.store(is_alive, Ordering::SeqCst);
+            }
+            if let Some(committed_result) = &self.committed_result
+                && let Ok(mut slot) = committed_result.lock()
+            {
+                *slot = Some(result.clone());
+            }
             self.inner
                 .complete_task_with_result(task_id, worker, lease, result, now)
                 .await
@@ -6371,6 +6512,7 @@ mod tests {
             Arc::new(ProgressToolExecutor {
                 result: ToolResult::success("lookup ok"),
                 emit_progress: false,
+                artifact_store_seen: None,
             }),
         )?;
 
@@ -6391,6 +6533,9 @@ mod tests {
                     complete_with_result_calls: decorator_complete_with_result_calls,
                     submit_root_turn_idempotent_calls: decorator_submit_calls,
                     fail_get: false,
+                    artifact_store_seen: None,
+                    artifact_store_alive_at_completion: None,
+                    committed_result: None,
                 });
                 stores
             },
@@ -7859,6 +8004,7 @@ mod tests {
             _bootstrap: &agent_server::ToolTaskBootstrap,
             _collector: agent_server::worker::ToolEventCollector,
             cancel: CancellationToken,
+            _artifact_store: Option<Arc<agent_sdk::ArtifactStore>>,
         ) -> Result<ToolResult> {
             self.started
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -8725,6 +8871,9 @@ mod tests {
             complete_with_result_calls: Arc::new(AtomicUsize::new(0)),
             submit_root_turn_idempotent_calls: Arc::new(AtomicUsize::new(0)),
             fail_get: true,
+            artifact_store_seen: None,
+            artifact_store_alive_at_completion: None,
+            committed_result: None,
         });
         Arc::new(shared)
     }

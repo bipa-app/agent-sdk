@@ -243,6 +243,7 @@ async fn executes_read_tool_end_to_end() -> anyhow::Result<()> {
             &bootstrap,
             ToolEventCollector::new(),
             CancellationToken::new(),
+            None,
         )
         .await?;
 
@@ -280,6 +281,7 @@ async fn executes_primitive_todo_and_tool_families_through_v2() -> anyhow::Resul
             &make_bootstrap(&thread, "read", &json!({"path": "/workspace/notes.txt"})),
             ToolEventCollector::new(),
             CancellationToken::new(),
+            None,
         )
         .await?;
     assert!(result.success, "primitive read should succeed");
@@ -295,6 +297,7 @@ async fn executes_primitive_todo_and_tool_families_through_v2() -> anyhow::Resul
             &make_bootstrap(&thread, "todo_write", &todos),
             ToolEventCollector::new(),
             CancellationToken::new(),
+            None,
         )
         .await?;
     assert!(result.success, "todo_write should succeed");
@@ -304,6 +307,7 @@ async fn executes_primitive_todo_and_tool_families_through_v2() -> anyhow::Resul
             &make_bootstrap(&thread, "todo_read", &json!({})),
             ToolEventCollector::new(),
             CancellationToken::new(),
+            None,
         )
         .await?;
     assert!(result.success, "todo_read should succeed");
@@ -327,6 +331,7 @@ async fn unknown_tool_name_returns_dispatch_error() {
             &bootstrap,
             ToolEventCollector::new(),
             CancellationToken::new(),
+            None,
         )
         .await
         .expect_err("unknown tool must fail");
@@ -352,6 +357,7 @@ async fn execute_tool_call_uses_effective_input_and_parent_metadata() -> anyhow:
             &bootstrap,
             ToolEventCollector::new(),
             CancellationToken::new(),
+            None,
         )
         .await?;
 

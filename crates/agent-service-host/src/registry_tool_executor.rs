@@ -92,6 +92,12 @@ where
         Self::new(registry, Arc::new(DefaultContextFactory), app)
     }
 }
+struct DispatchContext {
+    seed: ToolContextSeed,
+    collector: ToolEventCollector,
+    cancel: CancellationToken,
+    artifact_store: Option<Arc<agent_sdk::ArtifactStore>>,
+}
 
 impl<Ctx> RegistryToolExecutor<Ctx>
 where
@@ -108,21 +114,18 @@ where
         tool_name: &str,
         tool_call_id: &str,
         input: serde_json::Value,
-        seed: ToolContextSeed,
-        collector: ToolEventCollector,
-        cancel: CancellationToken,
+        context: DispatchContext,
     ) -> Result<ToolResult> {
         #[cfg(feature = "otel")]
         {
-            self.dispatch_instrumented(tool_name, tool_call_id, input, seed, collector, cancel)
+            self.dispatch_instrumented(tool_name, tool_call_id, input, context)
                 .await
         }
         #[cfg(not(feature = "otel"))]
         {
             // Only the `execute_tool` span (otel path) consumes the id.
             let _ = tool_call_id;
-            self.dispatch_inner(tool_name, input, seed, collector, cancel)
-                .await
+            self.dispatch_inner(tool_name, input, context).await
         }
     }
 
@@ -134,9 +137,7 @@ where
         &self,
         tool_name: &str,
         input: serde_json::Value,
-        seed: ToolContextSeed,
-        collector: ToolEventCollector,
-        cancel: CancellationToken,
+        context: DispatchContext,
     ) -> Result<ToolResult> {
         let tool = self
             .registry
@@ -144,13 +145,13 @@ where
             .ok_or_else(|| anyhow!("tool '{tool_name}' is not registered on this host runtime"))?;
 
         let deps = HostDependencies {
-            event_store: Arc::new(CollectorEventStore::new(collector)),
-            cancel_token: cancel,
+            event_store: Arc::new(CollectorEventStore::new(context.collector)),
+            cancel_token: context.cancel,
             subagent_semaphore: None,
+            artifact_store: context.artifact_store,
         };
 
-        let ctx = self.factory.build(&seed, self.app.clone(), deps);
-
+        let ctx = self.factory.build(&context.seed, self.app.clone(), deps);
         tool.execute(&ctx, input).await
     }
 
@@ -174,9 +175,7 @@ where
         tool_name: &str,
         tool_call_id: &str,
         input: serde_json::Value,
-        seed: ToolContextSeed,
-        collector: ToolEventCollector,
-        cancel: CancellationToken,
+        context: DispatchContext,
     ) -> Result<ToolResult> {
         use agent_sdk::observability::loop_instrument::{
             ToolSpanOutcome, ToolSpanParams, build_tool_span, finish_tool_span,
@@ -203,9 +202,7 @@ where
         });
 
         let started_at = std::time::Instant::now();
-        let result = self
-            .dispatch_inner(tool_name, input, seed, collector, cancel)
-            .await;
+        let result = self.dispatch_inner(tool_name, input, context).await;
         let duration_ms = u64::try_from(started_at.elapsed().as_millis()).ok();
 
         match &result {
@@ -260,6 +257,7 @@ where
         bootstrap: &ToolTaskBootstrap,
         collector: ToolEventCollector,
         cancel: CancellationToken,
+        artifact_store: Option<Arc<agent_sdk::ArtifactStore>>,
     ) -> Result<ToolResult> {
         let seed = tool_context_seed(bootstrap)?;
 
@@ -267,9 +265,12 @@ where
             &bootstrap.tool_call.name,
             &bootstrap.tool_call.id,
             bootstrap.tool_call.effective_input.clone(),
-            seed,
-            collector,
-            cancel,
+            DispatchContext {
+                seed,
+                collector,
+                cancel,
+                artifact_store,
+            },
         );
 
         // Re-parent the `execute_tool` span under the turn's root
@@ -372,6 +373,14 @@ mod tests {
         registry.register(EchoTool { emit });
         RegistryToolExecutor::with_default_factory(Arc::new(registry), ())
     }
+    fn dispatch_context(seed: ToolContextSeed, collector: ToolEventCollector) -> DispatchContext {
+        DispatchContext {
+            seed,
+            collector,
+            cancel: CancellationToken::new(),
+            artifact_store: None,
+        }
+    }
 
     #[tokio::test]
     async fn dispatch_runs_registered_tool() -> Result<()> {
@@ -383,14 +392,15 @@ mod tests {
                 "echo",
                 "call-echo-1",
                 json!({"text": "hello"}),
-                ToolContextSeed {
-                    thread_id: ThreadId::from_string("t-dispatch"),
-                    turn: 3,
-                    sequence_offset: 0,
-                    metadata: std::collections::HashMap::new(),
-                },
-                collector.clone(),
-                CancellationToken::new(),
+                dispatch_context(
+                    ToolContextSeed {
+                        thread_id: ThreadId::from_string("t-dispatch"),
+                        turn: 3,
+                        sequence_offset: 0,
+                        metadata: std::collections::HashMap::new(),
+                    },
+                    collector.clone(),
+                ),
             )
             .await?;
 
@@ -410,14 +420,15 @@ mod tests {
                 "echo",
                 "call-echo-2",
                 json!({"text": "x"}),
-                ToolContextSeed {
-                    thread_id: ThreadId::from_string("t-progress"),
-                    turn: 1,
-                    sequence_offset: 0,
-                    metadata: std::collections::HashMap::new(),
-                },
-                collector.clone(),
-                CancellationToken::new(),
+                dispatch_context(
+                    ToolContextSeed {
+                        thread_id: ThreadId::from_string("t-progress"),
+                        turn: 1,
+                        sequence_offset: 0,
+                        metadata: std::collections::HashMap::new(),
+                    },
+                    collector.clone(),
+                ),
             )
             .await?;
 
@@ -438,14 +449,15 @@ mod tests {
                 "not_registered",
                 "call-unknown",
                 json!({}),
-                ToolContextSeed {
-                    thread_id: ThreadId::from_string("t-unknown"),
-                    turn: 1,
-                    sequence_offset: 0,
-                    metadata: std::collections::HashMap::new(),
-                },
-                ToolEventCollector::new(),
-                CancellationToken::new(),
+                dispatch_context(
+                    ToolContextSeed {
+                        thread_id: ThreadId::from_string("t-unknown"),
+                        turn: 1,
+                        sequence_offset: 0,
+                        metadata: std::collections::HashMap::new(),
+                    },
+                    ToolEventCollector::new(),
+                ),
             )
             .await
             .expect_err("unknown tool should fail dispatch");

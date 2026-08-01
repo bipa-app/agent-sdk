@@ -4,61 +4,141 @@
 //! - `LocalFileSystem` - Standard filesystem operations using `std::fs`
 //! - `InMemoryFileSystem` - In-memory filesystem for testing
 
-use crate::environment::{self, Environment, ExecResult, FileEntry, GrepMatch};
+use crate::environment::{
+    self, Environment, ExecResult, ExecSinkSpec, ExecStreamCapture, ExecStreamResult, FileEntry,
+    GrepMatch, HARD_MAX_EXEC_CAPTURE_WINDOW_BYTES, HARD_MAX_EXEC_SPOOL_BYTES_PER_STREAM,
+};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::RwLock;
+use tokio::process::Command;
 
-/// Maximum bytes captured from a single `exec` output stream before the rest is
-/// drained and discarded. Bounds in-process memory for verbose commands.
 const MAX_EXEC_OUTPUT_BYTES: usize = 1024 * 1024;
 
 /// Maximum size of a file that recursive grep will read into memory. Larger
 /// files (typically build artifacts / media) are skipped rather than loaded.
 const MAX_GREP_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Read an async stream into memory, capping the retained bytes at
-/// [`MAX_EXEC_OUTPUT_BYTES`]. Bytes past the cap are drained (so the child's
-/// pipe never blocks) but discarded. Returns the captured bytes and whether
-/// truncation occurred.
-async fn read_capped<R>(mut reader: R) -> std::io::Result<(Vec<u8>, bool)>
+pub fn create_private_exec_spool() -> Result<File> {
+    let path = std::env::temp_dir().join(format!(
+        ".agent-sdk-exec-{}.spool",
+        uuid::Uuid::new_v4().as_simple()
+    ));
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x1 | 0x2 | 0x4;
+        const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+        options
+            .share_mode(FILE_SHARE_READ_WRITE_DELETE)
+            .custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
+    }
+
+    let file = options
+        .open(&path)
+        .context("failed to create private process spool")?;
+
+    #[cfg(not(windows))]
+    std::fs::remove_file(&path).context("failed to unlink private process spool")?;
+
+    Ok(file)
+}
+
+async fn capture_process_stream<R>(
+    mut reader: R,
+    spool: File,
+    head_bytes: usize,
+    tail_bytes: usize,
+    max_bytes: u64,
+    stream: &'static str,
+    kill: tokio::sync::mpsc::UnboundedSender<()>,
+) -> Result<ExecStreamCapture>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let mut captured = Vec::new();
-    let mut chunk = [0u8; 8192];
-    let mut truncated = false;
+    let mut spool = tokio::fs::File::from_std(spool);
+    let mut head = Vec::with_capacity(head_bytes);
+    let mut tail = VecDeque::with_capacity(tail_bytes);
+    let mut chunk = [0_u8; 8192];
+    let mut total_bytes = 0_u64;
+    let mut failure = None;
+
     loop {
-        let read = reader.read(&mut chunk).await?;
+        let read = match reader.read(&mut chunk).await {
+            Ok(read) => read,
+            Err(error) => {
+                let _ = kill.send(());
+                return Err(
+                    anyhow::Error::new(error).context(format!("failed to read process {stream}"))
+                );
+            }
+        };
         if read == 0 {
             break;
         }
-        if captured.len() < MAX_EXEC_OUTPUT_BYTES {
-            let remaining = MAX_EXEC_OUTPUT_BYTES - captured.len();
-            let take = remaining.min(read);
-            captured.extend_from_slice(&chunk[..take]);
-            if take < read {
-                truncated = true;
-            }
+
+        total_bytes = total_bytes
+            .checked_add(u64::try_from(read).context("process stream length overflowed u64")?)
+            .context("process stream length overflowed u64")?;
+
+        let window_offset = if head.len() < head_bytes {
+            let take = (head_bytes - head.len()).min(read);
+            head.extend_from_slice(&chunk[..take]);
+            take
         } else {
-            truncated = true;
+            0
+        };
+        if tail_bytes > 0 && window_offset < read {
+            tail.extend(&chunk[window_offset..read]);
+            if tail.len() > tail_bytes {
+                tail.drain(..tail.len() - tail_bytes);
+            }
+        }
+
+        if failure.is_none() {
+            if total_bytes > max_bytes {
+                failure = Some(anyhow::anyhow!(
+                    "{stream} exceeded the {max_bytes}-byte process spool limit; command was terminated and output was not returned"
+                ));
+                let _ = kill.send(());
+            } else if let Err(error) = spool.write_all(&chunk[..read]).await {
+                failure = Some(
+                    anyhow::Error::new(error)
+                        .context(format!("failed to write private {stream} spool")),
+                );
+                let _ = kill.send(());
+            }
         }
     }
-    Ok((captured, truncated))
-}
 
-/// Render captured exec output as lossy UTF-8, appending a truncation marker
-/// when the byte cap was hit.
-fn render_capped_output(bytes: &[u8], truncated: bool) -> String {
-    let mut text = String::from_utf8_lossy(bytes).into_owned();
-    if truncated {
-        text.push_str("\n[output truncated: exceeded 1 MiB cap]");
+    if let Some(error) = failure {
+        return Err(error);
     }
-    text
+    spool
+        .flush()
+        .await
+        .with_context(|| format!("failed to flush private {stream} spool"))?;
+
+    Ok(ExecStreamCapture {
+        head,
+        tail: tail.into(),
+        total_bytes,
+        spool: spool.into_std().await,
+    })
 }
 
 /// Local filesystem implementation using `std::fs`
@@ -213,15 +293,54 @@ impl Environment for LocalFileSystem {
     }
 
     async fn exec(&self, command: &str, timeout_ms: Option<u64>) -> Result<ExecResult> {
-        use std::process::Stdio;
-        use tokio::process::Command;
+        let streamed = self
+            .exec_streamed(
+                command,
+                timeout_ms,
+                ExecSinkSpec {
+                    stdout: create_private_exec_spool()?,
+                    stderr: create_private_exec_spool()?,
+                    head_bytes: MAX_EXEC_OUTPUT_BYTES,
+                    tail_bytes: 0,
+                    max_bytes_per_stream: MAX_EXEC_OUTPUT_BYTES as u64,
+                },
+            )
+            .await?;
+        let stdout = streamed
+            .stdout
+            .complete_bytes()
+            .context("stdout exceeded the bounded legacy process capture")?;
+        let stderr = streamed
+            .stderr
+            .complete_bytes()
+            .context("stderr exceeded the bounded legacy process capture")?;
+        Ok(ExecResult {
+            stdout: String::from_utf8(stdout).context(
+                "stdout was not valid UTF-8; binary output was withheld without lossy conversion",
+            )?,
+            stderr: String::from_utf8(stderr).context(
+                "stderr was not valid UTF-8; binary output was withheld without lossy conversion",
+            )?,
+            exit_code: streamed.exit_code,
+        })
+    }
+
+    async fn exec_streamed(
+        &self,
+        command: &str,
+        timeout_ms: Option<u64>,
+        sinks: ExecSinkSpec,
+    ) -> Result<ExecStreamResult> {
+        anyhow::ensure!(
+            sinks.head_bytes <= HARD_MAX_EXEC_CAPTURE_WINDOW_BYTES
+                && sinks.tail_bytes <= HARD_MAX_EXEC_CAPTURE_WINDOW_BYTES,
+            "process capture windows exceed the {HARD_MAX_EXEC_CAPTURE_WINDOW_BYTES}-byte hard limit"
+        );
+        let max_bytes_per_stream = sinks
+            .max_bytes_per_stream
+            .min(HARD_MAX_EXEC_SPOOL_BYTES_PER_STREAM);
 
         let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(120_000));
-
-        // `kill_on_drop(true)` ensures the child is reclaimed if this future is
-        // dropped (the agent loop's cancel/timeout boundary) or if our own
-        // timeout fires — otherwise the spawned `sh -c <command>` would keep
-        // running and mutating the world after we report a failure.
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(command)
@@ -234,36 +353,53 @@ impl Environment for LocalFileSystem {
 
         let stdout = child.stdout.take().context("missing stdout pipe")?;
         let stderr = child.stderr.take().context("missing stderr pipe")?;
-
-        // Read stdout/stderr with a byte cap so a chatty or hostile command
-        // (e.g. `cat large.bin`, `yes`) cannot exhaust memory before the
-        // higher-level truncation runs.
-        let run = async {
-            let (out, err, status) =
-                tokio::join!(read_capped(stdout), read_capped(stderr), child.wait());
-            anyhow::Ok((out?, err?, status?))
+        let (kill_tx, mut kill_rx) = tokio::sync::mpsc::unbounded_channel();
+        let kill_keepalive = kill_tx.clone();
+        let stdout_capture = capture_process_stream(
+            stdout,
+            sinks.stdout,
+            sinks.head_bytes,
+            sinks.tail_bytes,
+            max_bytes_per_stream,
+            "stdout",
+            kill_tx.clone(),
+        );
+        let stderr_capture = capture_process_stream(
+            stderr,
+            sinks.stderr,
+            sinks.head_bytes,
+            sinks.tail_bytes,
+            max_bytes_per_stream,
+            "stderr",
+            kill_tx,
+        );
+        let supervisor = async move {
+            let _kill_keepalive = kill_keepalive;
+            tokio::select! {
+                status = child.wait() => Ok(Some(status?)),
+                _ = kill_rx.recv() => {
+                    let _ = child.start_kill();
+                    Ok(Some(child.wait().await?))
+                }
+                () = tokio::time::sleep(timeout) => {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    Ok::<_, std::io::Error>(None)
+                }
+            }
         };
 
-        // Bind the result first so the (child-borrowing) timeout future is
-        // dropped before we touch `child` again in the timeout arm.
-        let outcome = tokio::time::timeout(timeout, Box::pin(run)).await;
+        let (stdout, stderr, status) = tokio::join!(stdout_capture, stderr_capture, supervisor);
+        let status = status.context("Failed to wait for command")?;
+        let Some(status) = status else {
+            anyhow::bail!("Command timed out after {}ms", timeout.as_millis());
+        };
 
-        match outcome {
-            Ok(joined) => {
-                let ((stdout_bytes, stdout_truncated), (stderr_bytes, stderr_truncated), status) =
-                    joined.context("Failed to execute command")?;
-                Ok(ExecResult {
-                    stdout: render_capped_output(&stdout_bytes, stdout_truncated),
-                    stderr: render_capped_output(&stderr_bytes, stderr_truncated),
-                    exit_code: status.code().unwrap_or(-1),
-                })
-            }
-            Err(_elapsed) => {
-                // Reclaim the child eagerly (kill_on_drop is the backstop).
-                let _ = child.start_kill();
-                anyhow::bail!("Command timed out after {}ms", timeout.as_millis())
-            }
-        }
+        Ok(ExecStreamResult {
+            stdout: stdout?,
+            stderr: stderr?,
+            exit_code: status.code().unwrap_or(-1),
+        })
     }
 
     fn root(&self) -> &str {
@@ -852,6 +988,35 @@ mod tests {
         std::env::temp_dir().join(format!("agent_sdk_fs_{tag}_{}_{nanos}", std::process::id()))
     }
 
+    fn assert_zero_spool(file: &mut File, expected_bytes: u64) -> Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        file.seek(SeekFrom::Start(0))?;
+        let mut total = 0_u64;
+        let mut chunk = [1_u8; 8192];
+        loop {
+            let read = file.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            assert!(chunk[..read].iter().all(|byte| *byte == 0));
+            total += read as u64;
+        }
+        assert_eq!(total, expected_bytes);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_private_exec_spool_is_anonymous_and_owner_only() -> Result<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let spool = create_private_exec_spool()?;
+        assert_eq!(spool.metadata()?.permissions().mode() & 0o777, 0o600);
+        assert_eq!(spool.metadata()?.nlink(), 0);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_exec_timeout_kills_child_no_leak() -> Result<()> {
         let tmp = unique_temp_dir("exec_leak");
@@ -882,30 +1047,116 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_exec_caps_large_output() -> Result<()> {
-        let tmp = unique_temp_dir("exec_cap");
+    async fn test_exec_rejects_large_output_without_unbounded_capture() -> Result<()> {
+        let tmp = unique_temp_dir("exec_output");
         tokio::fs::create_dir_all(&tmp).await?;
         let fs = LocalFileSystem::new(tmp.clone());
 
-        // Emit ~2 MB, well over the 1 MiB cap.
-        let result = fs
+        let error = fs
             .exec(
                 "dd if=/dev/zero bs=1000000 count=2 2>/dev/null",
                 Some(10_000),
             )
+            .await
+            .err()
+            .context("oversized output must fail closed")?;
+        assert!(format!("{error:#}").contains("exceeded"));
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_exec_streams_multimegabyte_raw_output_into_bounded_windows() -> Result<()> {
+        const STDOUT_BYTES: u64 = 2 * 1024 * 1024;
+        const STDERR_BYTES: u64 = 3 * 1024 * 1024;
+        const WINDOW_BYTES: usize = 4096;
+
+        let tmp = unique_temp_dir("exec_streamed_output");
+        tokio::fs::create_dir_all(&tmp).await?;
+        let fs = LocalFileSystem::new(tmp.clone());
+        let mut result = fs
+            .exec_streamed(
+                "dd if=/dev/zero bs=1048576 count=2 2>/dev/null; \
+                 dd if=/dev/zero bs=1048576 count=3 1>&2 2>/dev/null",
+                Some(10_000),
+                ExecSinkSpec {
+                    stdout: create_private_exec_spool()?,
+                    stderr: create_private_exec_spool()?,
+                    head_bytes: WINDOW_BYTES,
+                    tail_bytes: WINDOW_BYTES,
+                    max_bytes_per_stream: 4 * 1024 * 1024,
+                },
+            )
             .await?;
 
-        assert!(
-            result.stdout.contains("[output truncated"),
-            "expected truncation marker in capped output"
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout.total_bytes, STDOUT_BYTES);
+        assert_eq!(result.stderr.total_bytes, STDERR_BYTES);
+        assert_eq!(
+            result.stdout.head.len() + result.stdout.tail.len(),
+            WINDOW_BYTES * 2
         );
-        // Captured bytes are bounded near the cap (not the full 2 MiB).
+        assert_eq!(
+            result.stderr.head.len() + result.stderr.tail.len(),
+            WINDOW_BYTES * 2
+        );
+        assert_eq!(result.stdout.spool.metadata()?.len(), STDOUT_BYTES);
+        assert_eq!(result.stderr.spool.metadata()?.len(), STDERR_BYTES);
+        assert_zero_spool(&mut result.stdout.spool, STDOUT_BYTES)?;
+        assert_zero_spool(&mut result.stderr.spool, STDERR_BYTES)?;
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_exec_spool_cap_terminates_child_without_marker_leak() -> Result<()> {
+        let tmp = unique_temp_dir("exec_spool_cap");
+        tokio::fs::create_dir_all(&tmp).await?;
+        let marker = tmp.join("marker.txt");
+        let fs = LocalFileSystem::new(tmp.clone());
+        let command = format!(
+            "dd if=/dev/zero bs=65536 count=2 2>/dev/null; sleep 1; touch '{}'",
+            marker.display()
+        );
+        let error = fs
+            .exec_streamed(
+                &command,
+                Some(10_000),
+                ExecSinkSpec {
+                    stdout: create_private_exec_spool()?,
+                    stderr: create_private_exec_spool()?,
+                    head_bytes: 1024,
+                    tail_bytes: 1024,
+                    max_bytes_per_stream: 16 * 1024,
+                },
+            )
+            .await
+            .err()
+            .context("spool cap must fail explicitly")?;
+
+        assert!(format!("{error:#}").contains("spool limit"));
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         assert!(
-            result.stdout.len() <= MAX_EXEC_OUTPUT_BYTES + 64,
-            "captured output exceeded the cap: {} bytes",
-            result.stdout.len()
+            !tokio::fs::try_exists(&marker).await.unwrap_or(false),
+            "child process leaked after spool cap"
         );
 
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_exec_rejects_non_utf8_without_lossy_conversion() -> Result<()> {
+        let tmp = unique_temp_dir("exec_binary");
+        tokio::fs::create_dir_all(&tmp).await?;
+        let fs = LocalFileSystem::new(tmp.clone());
+        let error = fs
+            .exec("printf '\\377\\376'", Some(10_000))
+            .await
+            .err()
+            .context("binary output must fail closed")?;
+        assert!(format!("{error:#}").contains("not valid UTF-8"));
         let _ = tokio::fs::remove_dir_all(&tmp).await;
         Ok(())
     }

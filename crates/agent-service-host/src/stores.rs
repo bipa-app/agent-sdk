@@ -272,7 +272,7 @@ enum RegistryBackend {
     #[cfg(feature = "postgres")]
     Postgres(PostgresBackend),
     #[cfg(feature = "sqlite")]
-    Sqlite,
+    Sqlite(Arc<SqliteDurableStore>),
 }
 
 #[cfg(feature = "postgres")]
@@ -510,7 +510,7 @@ impl StoreRegistry {
             #[cfg(feature = "postgres")]
             RegistryBackend::Postgres(backend) => backend.initialize().await,
             #[cfg(feature = "sqlite")]
-            RegistryBackend::Sqlite => {
+            RegistryBackend::Sqlite(_) => {
                 // Migrations are applied during connect().
                 Ok(())
             }
@@ -525,7 +525,7 @@ impl StoreRegistry {
             #[cfg(feature = "postgres")]
             RegistryBackend::Postgres(_) => "postgres",
             #[cfg(feature = "sqlite")]
-            RegistryBackend::Sqlite => "sqlite",
+            RegistryBackend::Sqlite(_) => "sqlite",
         }
     }
 
@@ -537,7 +537,7 @@ impl StoreRegistry {
             #[cfg(feature = "postgres")]
             RegistryBackend::Postgres(_) => &POSTGRES_SURFACES,
             #[cfg(feature = "sqlite")]
-            RegistryBackend::Sqlite => &SQLITE_SURFACES,
+            RegistryBackend::Sqlite(_) => &SQLITE_SURFACES,
         }
     }
 
@@ -630,11 +630,11 @@ impl StoreRegistry {
             execution_intent_store: durable_store.clone(),
             tool_audit_store,
             outbox_store: durable_store.clone(),
-            retention_store: durable_store,
+            retention_store: durable_store.clone(),
             definition_registry,
             event_notifier: Arc::new(EventNotifier::new()),
             confirm_drive_cancels: Arc::new(ConfirmDriveCancels::default()),
-            backend: RegistryBackend::Sqlite,
+            backend: RegistryBackend::Sqlite(durable_store),
         })
     }
 
@@ -654,7 +654,19 @@ impl StoreRegistry {
             RegistryBackend::Postgres(backend) => Some(backend.store.pool()),
             RegistryBackend::InMemory => None,
             #[cfg(feature = "sqlite")]
-            RegistryBackend::Sqlite => None,
+            RegistryBackend::Sqlite(_) => None,
+        }
+    }
+
+    /// Borrow the already-open `SQLite` connection pool.
+    #[cfg(feature = "sqlite")]
+    #[must_use]
+    pub fn sqlite_pool(&self) -> Option<&sqlx::SqlitePool> {
+        match &self.backend {
+            RegistryBackend::Sqlite(store) => Some(store.pool()),
+            RegistryBackend::InMemory => None,
+            #[cfg(feature = "postgres")]
+            RegistryBackend::Postgres(_) => None,
         }
     }
 
@@ -734,12 +746,16 @@ impl StoreRegistry {
     /// Build [`agent_server::SubagentResultDeps`] for invocation-task
     /// materialization.
     #[must_use]
-    pub fn subagent_result_deps(&self) -> agent_server::SubagentResultDeps<'_> {
+    pub fn subagent_result_deps<'a>(
+        &'a self,
+        artifact_store: Option<&'a agent_sdk::ArtifactStore>,
+    ) -> agent_server::SubagentResultDeps<'a> {
         agent_server::SubagentResultDeps {
             task_store: self.task_store.as_ref(),
             thread_store: self.thread_store.as_ref(),
             message_store: self.message_store.as_ref(),
             event_repo: self.event_repo.as_ref(),
+            artifact_store,
         }
     }
 }
