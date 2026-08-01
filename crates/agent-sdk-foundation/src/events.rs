@@ -93,6 +93,25 @@ pub enum TerminalReason {
     Unknown,
 }
 
+/// Why a daemon changed the OAuth account serving a provider request.
+///
+/// The unknown sink keeps durable journal rows readable when a newer producer
+/// introduces another reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AccountRotationReason {
+    /// The provider returned a typed rate-limit response.
+    RateLimited,
+    /// The provider rejected the active account after refresh was exhausted.
+    AuthenticationFailed,
+    /// The active account could not refresh before the request was dispatched.
+    RefreshFailed,
+    /// A reason introduced by a newer producer.
+    #[serde(other)]
+    Unknown,
+}
+
 /// Events emitted by the agent loop during execution.
 /// These are streamed to the client for real-time UI updates.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -364,6 +383,40 @@ pub enum AgentEvent {
         success: bool,
         /// Last error when the retry budget ran out.
         final_error: Option<String>,
+    },
+
+    /// A provider request succeeded after moving from one OAuth account to
+    /// another. Emitted only after the replacement account has produced a
+    /// successful response, never while merely considering a candidate.
+    AccountRotation {
+        /// Stable provider identifier such as `anthropic`.
+        provider: String,
+        /// Bounded opaque local identifier or safe display label.
+        from_account: String,
+        /// Bounded opaque local identifier or safe display label.
+        to_account: String,
+        /// Account-local failure which initiated the handoff.
+        reason: AccountRotationReason,
+        /// Provider Retry-After, rounded up and capped by the host.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_seconds: Option<u32>,
+    },
+
+    /// Every OAuth account for one provider is temporarily unavailable.
+    ///
+    /// The retry delay is the longest remaining per-account Retry-After so a
+    /// consumer can preserve retryable semantics and render an honest
+    /// countdown without parsing provider log text.
+    AccountPoolExhausted {
+        /// Stable provider identifier such as `anthropic`.
+        provider: String,
+        /// Number of accounts considered unavailable in the pool.
+        account_count: u32,
+        /// Account-local failure which exhausted the pool.
+        reason: AccountRotationReason,
+        /// Longest remaining Retry-After, rounded up and capped by the host.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_seconds: Option<u32>,
     },
 
     /// The model refused the request (safety/policy).
@@ -1157,6 +1210,88 @@ mod tests {
             }
             other => panic!("expected Text, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn account_pool_events_roundtrip_their_stable_wire_shape() {
+        let rotation = AgentEvent::AccountRotation {
+            provider: "anthropic".to_owned(),
+            from_account: "account-a".to_owned(),
+            to_account: "account-b".to_owned(),
+            reason: AccountRotationReason::RateLimited,
+            retry_after_seconds: Some(42),
+        };
+        let json = serde_json::to_value(&rotation).expect("serialize rotation");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "account_rotation",
+                "provider": "anthropic",
+                "from_account": "account-a",
+                "to_account": "account-b",
+                "reason": "rate_limited",
+                "retry_after_seconds": 42,
+            })
+        );
+        let restored: AgentEvent =
+            serde_json::from_value(json).expect("deserialize rotation");
+        assert!(matches!(
+            restored,
+            AgentEvent::AccountRotation {
+                reason: AccountRotationReason::RateLimited,
+                retry_after_seconds: Some(42),
+                ..
+            }
+        ));
+
+        let exhausted = AgentEvent::AccountPoolExhausted {
+            provider: "anthropic".to_owned(),
+            account_count: 3,
+            reason: AccountRotationReason::RateLimited,
+            retry_after_seconds: Some(90),
+        };
+        let json = serde_json::to_value(&exhausted).expect("serialize exhaustion");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "account_pool_exhausted",
+                "provider": "anthropic",
+                "account_count": 3,
+                "reason": "rate_limited",
+                "retry_after_seconds": 90,
+            })
+        );
+        let restored: AgentEvent =
+            serde_json::from_value(json).expect("deserialize exhaustion");
+        assert!(matches!(
+            restored,
+            AgentEvent::AccountPoolExhausted {
+                account_count: 3,
+                retry_after_seconds: Some(90),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn account_rotation_reason_has_a_forward_compatible_unknown_sink() {
+        let event: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "account_rotation",
+            "provider": "anthropic",
+            "from_account": "account-a",
+            "to_account": "account-b",
+            "reason": "provider_policy",
+        }))
+        .expect("unknown reason remains replayable");
+
+        assert!(matches!(
+            event,
+            AgentEvent::AccountRotation {
+                reason: AccountRotationReason::Unknown,
+                retry_after_seconds: None,
+                ..
+            }
+        ));
     }
 
     #[test]
