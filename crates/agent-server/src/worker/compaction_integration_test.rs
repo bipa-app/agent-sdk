@@ -695,6 +695,188 @@ async fn prompt_too_long_without_config_still_goes_fatal() -> Result<()> {
     Ok(())
 }
 
+async fn close_success_attempt(
+    fixtures: &Fixtures,
+    task_id: &crate::journal::task::AgentTaskId,
+    request_blob: serde_json::Value,
+    input_tokens: u32,
+    closed_at: OffsetDateTime,
+) -> Result<()> {
+    use crate::journal::turn_attempt::{CloseAttemptParams, OpenAttemptParams, TurnAttemptOutcome};
+    use crate::journal::turn_attempt_store::TurnAttemptStore;
+    use agent_sdk_foundation::audit::AuditProvenance;
+
+    let attempt = fixtures
+        .attempts
+        .open_attempt(OpenAttemptParams {
+            task_id: task_id.clone(),
+            attempt_number: 1,
+            provenance: AuditProvenance::new("mock", "mock-model"),
+            request_blob,
+            now: closed_at - Duration::seconds(1),
+            otel_trace_id: None,
+            otel_span_id: None,
+        })
+        .await?;
+    fixtures
+        .attempts
+        .close_attempt(
+            &attempt.id,
+            CloseAttemptParams {
+                response_blob: serde_json::json!({}),
+                response_id: None,
+                response_model: None,
+                stop_reason: Some(StopReason::EndTurn),
+                outcome: TurnAttemptOutcome::Success,
+                input_tokens,
+                output_tokens: 10,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                route_provider: None,
+                thinking_mode: None,
+                thinking_budget_tokens: None,
+                thinking_effort: None,
+            },
+            closed_at,
+        )
+        .await?;
+    Ok(())
+}
+
+/// A billed Success attempt that PREDATES the latest durable compaction
+/// boundary must not re-trigger compaction: after a prune-only compaction the
+/// message count is unchanged, so without the fence the stale 90k reading
+/// would fire a fresh (billed) summarization on an already-under-threshold
+/// history after a failure, cancel, or daemon restart.
+#[tokio::test]
+async fn stale_measured_usage_before_compaction_does_not_retrigger() -> Result<()> {
+    use crate::journal::staged::StagedMessageStore;
+
+    let fixtures = Fixtures::new();
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+
+    // Billed Success at t+5, long before the compaction boundary at t+10.
+    close_success_attempt(
+        &fixtures,
+        &task.id,
+        serde_json::json!({ "messages": [] }),
+        90_000,
+        t0() + Duration::seconds(5),
+    )
+    .await?;
+
+    let mut history = Vec::with_capacity(24);
+    for index in 0..12 {
+        history.push(Message::user(format!("u-{index}")));
+        history.push(Message::assistant(format!("a-{index}")));
+    }
+    fixtures
+        .messages
+        .commit_messages(&thread_id(), history.clone(), t0())
+        .await?;
+    fixtures
+        .messages
+        .append_compaction(
+            &thread_id(),
+            history.clone(),
+            history.len(),
+            0,
+            t0() + Duration::seconds(10),
+        )
+        .await?;
+
+    let cfg = CompactionConfig::default().with_threshold_tokens(50_000);
+    let scripted = Arc::new(ScriptedProvider::new(Vec::new()));
+    let provider: Arc<dyn LlmProvider> = scripted.clone();
+    let deps = fixtures.deps_with_compaction(&cfg, &provider);
+    let staged = StagedMessageStore::new(thread_id(), history);
+
+    super::compaction::maybe_compact_staged_history(
+        &deps,
+        &staged,
+        &thread_id(),
+        t0() + Duration::seconds(20),
+    )
+    .await?;
+
+    assert_eq!(
+        scripted.calls(),
+        0,
+        "a stale pre-compaction measurement must not buy a billed summarization",
+    );
+    let projection = fixtures
+        .messages
+        .get(&thread_id())
+        .await?
+        .context("projection")?;
+    assert_eq!(projection.compactions.len(), 1);
+    Ok(())
+}
+
+/// History buffered AFTER the last billed attempt (wait-any child results,
+/// steering injections) must count toward the proactive trigger: the anchor
+/// alone reads stale-low and would defer to one wasted provider round-trip in
+/// overflow recovery.
+#[tokio::test]
+async fn history_appended_after_measured_attempt_triggers_proactively() -> Result<()> {
+    use crate::journal::staged::StagedMessageStore;
+
+    let fixtures = Fixtures::new();
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+
+    // Billed Success covering only the first 2 staged messages, well under
+    // the threshold.
+    close_success_attempt(
+        &fixtures,
+        &task.id,
+        serde_json::json!({ "messages": ["u-0", "a-0"] }),
+        1_000,
+        t0() + Duration::seconds(5),
+    )
+    .await?;
+
+    let mut history = vec![Message::user("u-0"), Message::assistant("a-0")];
+    for index in 0..22 {
+        history.push(Message::user(format!(
+            "buffered-child-result-{index}: {}",
+            "y".repeat(30_000)
+        )));
+    }
+    fixtures
+        .messages
+        .commit_messages(&thread_id(), history.clone(), t0() + Duration::seconds(6))
+        .await?;
+
+    let cfg = CompactionConfig::default().with_threshold_tokens(50_000);
+    let scripted = Arc::new(ScriptedProvider::new(vec![ok_response(
+        "[summary] buffered child results folded",
+    )]));
+    let provider: Arc<dyn LlmProvider> = scripted.clone();
+    let deps = fixtures.deps_with_compaction(&cfg, &provider);
+    let staged = StagedMessageStore::new(thread_id(), history);
+
+    super::compaction::maybe_compact_staged_history(
+        &deps,
+        &staged,
+        &thread_id(),
+        t0() + Duration::seconds(20),
+    )
+    .await?;
+
+    assert_eq!(
+        scripted.calls(),
+        1,
+        "freshly appended history must trigger proactive compaction, not overflow recovery",
+    );
+    let projection = fixtures
+        .messages
+        .get(&thread_id())
+        .await?
+        .context("projection")?;
+    assert_eq!(projection.compactions.len(), 1);
+    Ok(())
+}
+
 fn event_kind(event: &AgentEvent) -> &'static str {
     match event {
         AgentEvent::Start { .. } => "start",
