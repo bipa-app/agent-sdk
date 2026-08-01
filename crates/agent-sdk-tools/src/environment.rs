@@ -2,6 +2,7 @@ use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
+use std::fs::File;
 use std::path::{Component, Path, PathBuf};
 
 /// Entry in a directory listing
@@ -36,6 +37,101 @@ impl ExecResult {
     pub const fn success(&self) -> bool {
         self.exit_code == 0
     }
+}
+
+/// Absolute per-stream disk bound, even when a caller supplies a looser cap.
+pub const HARD_MAX_EXEC_SPOOL_BYTES_PER_STREAM: u64 = 512 * 1024 * 1024;
+
+/// Absolute per-window memory bound for process stdout and stderr.
+pub const HARD_MAX_EXEC_CAPTURE_WINDOW_BYTES: usize = 1024 * 1024;
+/// Pre-opened private files and finite capture limits for streamed execution.
+///
+/// Implementations must write every accepted stdout/stderr byte to the
+/// corresponding spool while retaining only the requested in-memory windows.
+/// A stream that exceeds `max_bytes_per_stream` must fail explicitly.
+#[derive(Debug)]
+pub struct ExecSinkSpec {
+    pub stdout: File,
+    pub stderr: File,
+    pub head_bytes: usize,
+    pub tail_bytes: usize,
+    pub max_bytes_per_stream: u64,
+}
+
+/// One process stream captured without retaining its full contents in memory.
+#[derive(Debug)]
+pub struct ExecStreamCapture {
+    pub head: Vec<u8>,
+    pub tail: Vec<u8>,
+    pub total_bytes: u64,
+    pub spool: File,
+}
+
+impl ExecStreamCapture {
+    /// Reconstruct the stream only when the bounded windows contain every byte.
+    #[must_use]
+    pub fn complete_bytes(&self) -> Option<Vec<u8>> {
+        let captured = self.head.len().checked_add(self.tail.len())?;
+        if u64::try_from(captured).ok()? != self.total_bytes {
+            return None;
+        }
+        let mut bytes = Vec::with_capacity(captured);
+        bytes.extend_from_slice(&self.head);
+        bytes.extend_from_slice(&self.tail);
+        Some(bytes)
+    }
+}
+
+/// Result from command execution whose raw streams remain available in spools.
+#[derive(Debug)]
+pub struct ExecStreamResult {
+    pub stdout: ExecStreamCapture,
+    pub stderr: ExecStreamCapture,
+    pub exit_code: i32,
+}
+
+impl ExecStreamResult {
+    #[must_use]
+    pub const fn success(&self) -> bool {
+        self.exit_code == 0
+    }
+}
+
+fn capture_buffered_stream(
+    bytes: &[u8],
+    mut spool: File,
+    head_bytes: usize,
+    tail_bytes: usize,
+    max_bytes: u64,
+    stream: &str,
+) -> Result<ExecStreamCapture> {
+    use std::io::Write;
+
+    let total_bytes = u64::try_from(bytes.len()).context("process stream length overflowed u64")?;
+    ensure!(
+        total_bytes <= max_bytes,
+        "{stream} exceeded the {max_bytes}-byte process spool limit; command output was not returned"
+    );
+
+    let head_len = head_bytes.min(bytes.len());
+    let remaining = bytes.len() - head_len;
+    let tail_len = tail_bytes.min(remaining);
+    let head = bytes[..head_len].to_vec();
+    let tail = bytes[bytes.len() - tail_len..].to_vec();
+
+    spool
+        .write_all(bytes)
+        .with_context(|| format!("failed to write private {stream} spool"))?;
+    spool
+        .flush()
+        .with_context(|| format!("failed to flush private {stream} spool"))?;
+
+    Ok(ExecStreamCapture {
+        head,
+        tail,
+        total_bytes,
+        spool,
+    })
 }
 
 /// Environment abstraction for file and command operations.
@@ -135,6 +231,53 @@ pub trait Environment: Send + Sync {
     /// Returns an error if command execution is not supported or fails.
     async fn exec(&self, _command: &str, _timeout_ms: Option<u64>) -> Result<ExecResult> {
         anyhow::bail!("Command execution not supported in this environment")
+    }
+
+    /// Execute a shell command while preserving raw streams in bounded spools.
+    ///
+    /// Custom environments remain source-compatible: the default delegates to
+    /// [`Environment::exec`] and transfers its already-buffered strings into
+    /// the supplied spools. Streaming implementations should override this
+    /// method so process pipes never accumulate unbounded output in memory.
+    ///
+    /// # Errors
+    /// Returns an error if execution, spooling, or a finite stream limit fails.
+    async fn exec_streamed(
+        &self,
+        command: &str,
+        timeout_ms: Option<u64>,
+        sinks: ExecSinkSpec,
+    ) -> Result<ExecStreamResult> {
+        ensure!(
+            sinks.head_bytes <= HARD_MAX_EXEC_CAPTURE_WINDOW_BYTES
+                && sinks.tail_bytes <= HARD_MAX_EXEC_CAPTURE_WINDOW_BYTES,
+            "process capture windows exceed the {HARD_MAX_EXEC_CAPTURE_WINDOW_BYTES}-byte hard limit"
+        );
+        let max_bytes_per_stream = sinks
+            .max_bytes_per_stream
+            .min(HARD_MAX_EXEC_SPOOL_BYTES_PER_STREAM);
+        let result = self.exec(command, timeout_ms).await?;
+        let stdout = capture_buffered_stream(
+            result.stdout.as_bytes(),
+            sinks.stdout,
+            sinks.head_bytes,
+            sinks.tail_bytes,
+            max_bytes_per_stream,
+            "stdout",
+        )?;
+        let stderr = capture_buffered_stream(
+            result.stderr.as_bytes(),
+            sinks.stderr,
+            sinks.head_bytes,
+            sinks.tail_bytes,
+            max_bytes_per_stream,
+            "stderr",
+        )?;
+        Ok(ExecStreamResult {
+            stdout,
+            stderr,
+            exit_code: result.exit_code,
+        })
     }
 
     /// Get the root/working directory for this environment

@@ -380,7 +380,7 @@ impl<Ctx> ToolContext<Ctx> {
             cancel_token: Some(deps.cancel_token),
             subagent_semaphore: deps.subagent_semaphore,
             tool_timeout: None,
-            artifact_store: None,
+            artifact_store: deps.artifact_store,
         }
     }
 

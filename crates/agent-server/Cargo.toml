@@ -73,6 +73,7 @@ async-stream = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 proptest = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

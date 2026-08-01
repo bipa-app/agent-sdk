@@ -29,12 +29,18 @@ pub mod tools;
 
 // Convenience re-exports
 pub use artifacts::{
-    ARTIFACT_URI_SCHEME, ArtifactStorage, ArtifactStore, DEFAULT_INLINE_OUTPUT_BUDGET_BYTES,
-    SavedArtifact, artifact_footer, artifact_uri,
+    ARTIFACT_URI_SCHEME, ArtifactRetentionPolicy, ArtifactRetentionSnapshot, ArtifactStorage,
+    ArtifactStore, ArtifactSweepFence, ArtifactSweepReport, ArtifactThreadRetention,
+    DEFAULT_INLINE_OUTPUT_BUDGET_BYTES, SavedArtifact, artifact_footer, artifact_thread_key,
+    artifact_uri, cap_inline_from_windows, enforce_inline_budget,
 };
 pub use audit::{NoopAuditSink, ToolAuditSink};
 pub use authority::{EventAuthority, LocalEventAuthority};
-pub use environment::{Environment, ExecResult, FileEntry, GrepMatch, NullEnvironment};
+pub use environment::{
+    Environment, ExecResult, ExecSinkSpec, ExecStreamCapture, ExecStreamResult, FileEntry,
+    GrepMatch, HARD_MAX_EXEC_CAPTURE_WINDOW_BYTES, HARD_MAX_EXEC_SPOOL_BYTES_PER_STREAM,
+    NullEnvironment,
+};
 pub use hooks::{AgentHooks, AllowAllHooks, DefaultHooks, LoggingHooks, ToolDecision};
 pub use seed::{DefaultContextFactory, ExecutionContextFactory, HostDependencies, ToolContextSeed};
 pub use stores::{

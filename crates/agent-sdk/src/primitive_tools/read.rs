@@ -3,6 +3,7 @@ use crate::{Environment, PrimitiveToolName, Tool, ToolContext, ToolResult, ToolT
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::io::Read;
 use std::sync::Arc;
 
 use super::PrimitiveToolContext;
@@ -271,34 +272,148 @@ async fn read_artifact(
         ),
     };
 
-    let path = match store.resolve(id) {
-        Ok(path) => path,
-        Err(error) => return Ok(ToolResult::error(format!("{error:#}"))),
-    };
-    let bytes = tokio::fs::read(&path)
-        .await
-        .with_context(|| format!("Failed to read artifact {}", path.display()))?;
-
     let windowed = selector.is_some() || offset != 1 || explicit_limit;
-    if !windowed && bytes.len() > store.inline_budget() {
-        return Ok(ToolResult::error(format!(
-            "artifact {id} is {} bytes; read a window with \
-             artifact://{id}:START-END or offset/limit instead of the full stream",
-            bytes.len()
-        )));
-    }
-
-    let byte_budget = if explicit_limit {
-        TOTAL_BYTE_BUDGET_FLOOR.max(limit.saturating_mul(BYTES_PER_REQUESTED_LINE))
-    } else {
-        TOTAL_BYTE_BUDGET_FLOOR
+    let inline_budget = store.inline_budget();
+    let byte_budget = TOTAL_BYTE_BUDGET_FLOOR.min(inline_budget);
+    let store = Arc::clone(store);
+    let collected = tokio::task::spawn_blocking(move || {
+        let file = match store.resolve(id) {
+            Ok(file) => file,
+            Err(error) => return Ok(Err(format!("{error:#}"))),
+        };
+        let artifact_bytes = file
+            .metadata()
+            .context("inspecting artifact before read")?
+            .len();
+        if !windowed
+            && artifact_bytes > u64::try_from(inline_budget).context("inline budget exceeds u64")?
+        {
+            return Ok(Err(format!(
+                "artifact {id} is {artifact_bytes} bytes; read a window with \
+                 artifact://{id}:START-END or offset/limit instead of the full stream"
+            )));
+        }
+        stream_artifact_lines(file, offset, limit, byte_budget).map(Ok)
+    })
+    .await
+    .context("joining artifact read")??;
+    let collected = match collected {
+        Ok(collected) => collected,
+        Err(error) => return Ok(ToolResult::error(error)),
     };
-    let content = String::from_utf8_lossy(&bytes);
-    let collected = read_lines(&content, offset, limit, byte_budget);
     if collected.is_empty() {
         return Ok(ToolResult::error("offset exceeds artifact length"));
     }
     Ok(ToolResult::success(collected.join("\n")))
+}
+struct ArtifactLineWindow {
+    offset: usize,
+    limit: usize,
+    byte_budget: usize,
+    emitted_bytes: usize,
+    last_emitted: usize,
+    budget_reached: bool,
+    collected: Vec<String>,
+}
+
+impl ArtifactLineWindow {
+    fn push(&mut self, line_number: usize, raw_line: &[u8], line_truncated: bool) {
+        if line_number < self.offset || self.collected.len() >= self.limit || self.budget_reached {
+            return;
+        }
+        let raw_line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        let line = String::from_utf8_lossy(raw_line);
+        let display = if line_truncated {
+            format!(
+                "{}{LINE_TRUNCATION_MARKER}",
+                super::truncate_str(&line, MAX_LINE_LENGTH)
+            )
+        } else {
+            truncate_line(&line)
+        };
+        let formatted = format!("L{line_number}: {display}");
+        let payload_budget = self.byte_budget.saturating_sub(512);
+        if !self.collected.is_empty()
+            && self.emitted_bytes.saturating_add(formatted.len() + 1) > payload_budget
+        {
+            self.budget_reached = true;
+            return;
+        }
+        self.emitted_bytes = self.emitted_bytes.saturating_add(formatted.len() + 1);
+        self.collected.push(formatted);
+        self.last_emitted = line_number;
+    }
+
+    const fn is_complete(&self) -> bool {
+        self.budget_reached || self.collected.len() >= self.limit
+    }
+
+    fn finish(mut self, more_lines_may_follow: bool) -> Vec<String> {
+        if self.budget_reached {
+            self.collected.push(format!(
+                "... [read byte budget of {budget} bytes reached: showing lines {offset}-{last}; more lines may follow; continue with artifact line offset {next}]",
+                budget = self.byte_budget,
+                offset = self.offset,
+                last = self.last_emitted,
+                next = self.last_emitted.saturating_add(1),
+            ));
+        } else if more_lines_may_follow && !self.collected.is_empty() {
+            self.collected.push(format!(
+                "... [showing lines {offset}-{last}; more lines may follow; continue with artifact line offset {next}]",
+                offset = self.offset,
+                last = self.last_emitted,
+                next = self.last_emitted.saturating_add(1),
+            ));
+        }
+        self.collected
+    }
+}
+
+fn stream_artifact_lines(
+    mut source: impl Read,
+    offset: usize,
+    limit: usize,
+    byte_budget: usize,
+) -> Result<Vec<String>> {
+    let mut window = ArtifactLineWindow {
+        offset,
+        limit,
+        byte_budget,
+        emitted_bytes: 0,
+        last_emitted: 0,
+        budget_reached: false,
+        collected: Vec::new(),
+    };
+    let mut line_number = 1_usize;
+    let mut line = Vec::with_capacity(MAX_LINE_LENGTH + 4);
+    let mut line_truncated = false;
+    let mut chunk = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        let read = source
+            .read(chunk.as_mut())
+            .context("reading artifact stream")?;
+        if read == 0 {
+            window.push(line_number, &line, line_truncated);
+            return Ok(window.finish(false));
+        }
+        for byte in &chunk[..read] {
+            if *byte == b'\n' {
+                window.push(line_number, &line, line_truncated);
+                if window.is_complete() {
+                    return Ok(window.finish(true));
+                }
+                line_number = line_number.saturating_add(1);
+                line.clear();
+                line_truncated = false;
+            } else if line_number >= offset && !window.is_complete() {
+                if line.len() < MAX_LINE_LENGTH + 4 {
+                    line.push(*byte);
+                } else {
+                    line_truncated = true;
+                }
+            }
+        }
+    }
 }
 
 /// Parse a `read` line selector: `N`, `N-M` (inclusive), or `N+K`.
@@ -316,10 +431,11 @@ fn parse_line_selector(selector: &str) -> Result<(usize, usize), &'static str> {
     if let Some((start, end)) = selector.split_once('-') {
         let start = parse_line(start)?;
         let end = parse_line(end)?;
-        if end < start {
-            return Err("range end is before its start");
-        }
-        return Ok((start, end - start + 1));
+        return end
+            .checked_sub(start)
+            .and_then(|width| width.checked_add(1))
+            .map(|limit| (start, limit))
+            .ok_or("range end is before its start or too large");
     }
     if let Some((start, count)) = selector.split_once('+') {
         let start = parse_line(start)?;
@@ -1013,6 +1129,39 @@ mod tests {
         Ok((dir, store, saved.id))
     }
 
+    struct CountingReader {
+        source: std::io::Cursor<Vec<u8>>,
+        bytes_read: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let read = self.source.read(buffer)?;
+            self.bytes_read
+                .fetch_add(read, std::sync::atomic::Ordering::Relaxed);
+            Ok(read)
+        }
+    }
+
+    #[test]
+    fn prefix_artifact_window_stops_before_consuming_eof() -> anyhow::Result<()> {
+        let content = format!("first\n{}", "later\n".repeat(100_000)).into_bytes();
+        let content_len = content.len();
+        let bytes_read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reader = CountingReader {
+            source: std::io::Cursor::new(content),
+            bytes_read: Arc::clone(&bytes_read),
+        };
+        let result = stream_artifact_lines(reader, 1, 1, 1024)?;
+        assert_eq!(result.first().map(String::as_str), Some("L1: first"));
+        assert!(result.join("\n").contains("more lines may follow"));
+        assert!(
+            bytes_read.load(std::sync::atomic::Ordering::Relaxed) < content_len,
+            "prefix recovery must not scan to EOF"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn reads_artifact_with_offset_and_limit() -> anyhow::Result<()> {
         let (_dir, store, id) = artifact_fixture()?;
@@ -1026,7 +1175,7 @@ mod tests {
             .await?;
         assert!(result.success, "{}", result.output);
         assert!(result.output.starts_with("L5: line 5\nL6: line 6"));
-        assert!(result.output.contains("showing lines 5-6 of 101"));
+        assert!(result.output.contains("showing lines 5-6"));
         Ok(())
     }
 
@@ -1101,7 +1250,7 @@ mod tests {
         assert_eq!(
             result.output,
             "L9999: row 9999\nL10000: row 10000\nL10001: row 10001\n\
-             ... [showing lines 9999-10001 of 20001; use offset/limit to read more]"
+             ... [showing lines 9999-10001; more lines may follow; continue with artifact line offset 10002]"
         );
         Ok(())
     }
@@ -1123,6 +1272,35 @@ mod tests {
             .await?;
         assert!(!result.success);
         assert!(result.output.contains("read a window"), "{}", result.output);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn artifact_recovery_clamps_adversarial_limits_to_inline_budget() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(
+            agent_sdk_tools::artifacts::ArtifactStore::new(dir.path().join("artifacts"))
+                .with_inline_budget(1024),
+        );
+        let saved = store.save("mcp", &"recovery-line\n".repeat(100_000))?;
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        for input in [
+            json!({"path": format!("artifact://{}:1+{}", saved.id, usize::MAX)}),
+            json!({"path": format!("artifact://{}:1-{}", saved.id, usize::MAX)}),
+            json!({
+                "path": format!("artifact://{}", saved.id),
+                "offset": 1,
+                "limit": usize::MAX
+            }),
+        ] {
+            let result = tool
+                .execute(&artifact_ctx(Arc::clone(&store)), input)
+                .await?;
+            assert!(result.success, "{}", result.output);
+            assert!(result.output.len() <= store.inline_budget());
+            assert!(result.output.contains("continue with artifact line offset"));
+        }
         Ok(())
     }
 

@@ -125,6 +125,7 @@ async fn run_call(
             &bootstrap,
             ToolEventCollector::new(),
             CancellationToken::new(),
+            None,
         )
         .await?;
 

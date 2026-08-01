@@ -492,7 +492,11 @@ pub use types::{
 };
 
 // agent-sdk-tools (via thin modules)
-pub use environment::{Environment, ExecResult, FileEntry, GrepMatch, NullEnvironment};
+pub use environment::{
+    Environment, ExecResult, ExecSinkSpec, ExecStreamCapture, ExecStreamResult, FileEntry,
+    GrepMatch, HARD_MAX_EXEC_CAPTURE_WINDOW_BYTES, HARD_MAX_EXEC_SPOOL_BYTES_PER_STREAM,
+    NullEnvironment,
+};
 pub use hooks::{
     AgentHooks, AllowAllHooks, DefaultHooks, LoggingHooks, NoopAuditSink, RequestDecision,
     ResponseDecision, ToolAuditSink, ToolDecision,
@@ -505,8 +509,10 @@ pub use stores::{
 // Durable, single-file SQLite-backed store implementing all four store traits.
 // Behind the `sqlite` feature so the default build pulls no SQLite dependency.
 pub use artifacts::{
-    ARTIFACT_URI_SCHEME, ArtifactStorage, ArtifactStore, DEFAULT_INLINE_OUTPUT_BUDGET_BYTES,
-    SavedArtifact, artifact_footer, artifact_uri,
+    ARTIFACT_URI_SCHEME, ArtifactRetentionPolicy, ArtifactRetentionSnapshot, ArtifactStorage,
+    ArtifactStore, ArtifactSweepFence, ArtifactSweepReport, ArtifactThreadRetention,
+    DEFAULT_INLINE_OUTPUT_BUDGET_BYTES, SavedArtifact, artifact_footer, artifact_thread_key,
+    artifact_uri, cap_inline_from_windows, enforce_inline_budget,
 };
 #[cfg(feature = "sqlite")]
 #[cfg_attr(docsrs, doc(cfg(feature = "sqlite")))]

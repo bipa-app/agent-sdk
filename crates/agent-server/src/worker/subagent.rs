@@ -33,6 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use agent_sdk_foundation::audit::AuditProvenance;
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::{ThreadId, TokenUsage, ToolResult, ToolTier, llm};
+use agent_sdk_tools::{ArtifactStore, DEFAULT_INLINE_OUTPUT_BUDGET_BYTES};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -1196,6 +1197,7 @@ pub struct SubagentResultDeps<'a> {
     pub thread_store: &'a dyn ThreadStore,
     pub message_store: &'a dyn MessageProjectionStore,
     pub event_repo: &'a dyn EventRepository,
+    pub artifact_store: Option<&'a ArtifactStore>,
 }
 
 /// Successful completion of a `subagent` invocation task.
@@ -1325,7 +1327,8 @@ async fn execute_subagent_task_inner(
     now: OffsetDateTime,
 ) -> Result<SubagentTaskOutcome> {
     let subagent_result = materialize_terminal_subagent_result(&bootstrap, deps, now).await?;
-    let tool_result = build_parent_tool_result(&subagent_result).context("build tool result")?;
+    let tool_result = build_parent_tool_result(&subagent_result, deps.artifact_store)
+        .context("build tool result")?;
     let result_payload =
         serde_json::to_value(&tool_result).context("serialize subagent tool result")?;
     let (invocation_task, parent_task) = deps
@@ -2165,23 +2168,43 @@ fn child_root_error(child_root: &AgentTask) -> Option<String> {
     }
 }
 
-fn build_parent_tool_result(result: &SubagentResult) -> Result<ToolResult> {
-    let data = serde_json::to_value(result).context("serialize SubagentResult")?;
-    let output = if result.summary.success {
-        result.final_response.clone()
-    } else {
+fn build_parent_tool_result(
+    result: &SubagentResult,
+    artifact_store: Option<&ArtifactStore>,
+) -> Result<ToolResult> {
+    let output = if result.final_response.is_empty() {
         result
             .error_details
             .clone()
-            .unwrap_or_else(|| "subagent execution failed".to_owned())
+            .unwrap_or_else(|| "Subagent execution failed".to_owned())
+    } else {
+        result.final_response.clone()
     };
-    Ok(ToolResult {
+    let mut tool_result = ToolResult {
         success: result.summary.success,
         output,
-        data: Some(data),
+        data: None,
         documents: Vec::new(),
         duration_ms: Some(result.summary.duration_ms),
-    })
+    };
+    let spilled = if let Some(store) = artifact_store {
+        store
+            .apply_inline_budget(&mut tool_result, "subagent")
+            .context("spill subagent final response")?
+            .is_some()
+    } else {
+        ensure!(
+            tool_result.output.len() <= DEFAULT_INLINE_OUTPUT_BUDGET_BYTES,
+            "subagent final response exceeds inline budget without artifact storage"
+        );
+        false
+    };
+    let mut structured = result.clone();
+    if spilled {
+        structured.final_response.clear();
+    }
+    tool_result.data = Some(serde_json::to_value(structured).context("serialize SubagentResult")?);
+    Ok(tool_result)
 }
 
 /// Everything one `SubagentProgress` frame reports about a child.
@@ -2478,4 +2501,71 @@ fn ensure_confirm_tier_subagent_tool(
         tool_call.name,
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod artifact_budget_tests {
+    use super::*;
+
+    #[test]
+    fn structured_subagent_result_does_not_duplicate_final_response() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = ArtifactStore::new(temp.path().join("artifacts")).with_inline_budget(1024);
+        let final_response = "subagent-final-\n".repeat(128 * 1024);
+        let result = SubagentResult {
+            final_response: final_response.clone(),
+            summary: SubagentSummary {
+                success: true,
+                total_turns: 3,
+                tool_count: 7,
+                total_usage: TokenUsage::default(),
+                duration_ms: 42,
+            },
+            child_thread_id: ThreadId::from_string("child-thread"),
+            child_root_task_id: AgentTaskId::from_string("child-root-task"),
+            subagent_task_id: AgentTaskId::from_string("subagent-task"),
+            error_details: None,
+        };
+
+        let tool_result = build_parent_tool_result(&result, Some(&store))?;
+        assert!(tool_result.output.len() <= store.inline_budget());
+        assert!(
+            tool_result
+                .output
+                .ends_with(&agent_sdk_tools::artifact_footer(0))
+        );
+        let mut spilled = String::new();
+        std::io::Read::read_to_string(&mut store.resolve(0)?, &mut spilled)?;
+        assert_eq!(spilled.as_bytes(), final_response.as_bytes());
+        let data = tool_result
+            .data
+            .context("subagent result data must remain structured")?;
+        let structured: SubagentResult =
+            serde_json::from_value(data).context("decode structured subagent result")?;
+        assert!(structured.final_response.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn over_budget_final_without_artifact_store_is_rejected() -> Result<()> {
+        let result = SubagentResult {
+            final_response: "x".repeat(DEFAULT_INLINE_OUTPUT_BUDGET_BYTES + 1),
+            summary: SubagentSummary {
+                success: true,
+                total_turns: 1,
+                tool_count: 0,
+                total_usage: TokenUsage::default(),
+                duration_ms: 1,
+            },
+            child_thread_id: ThreadId::from_string("child-thread"),
+            child_root_task_id: AgentTaskId::from_string("child-root-task"),
+            subagent_task_id: AgentTaskId::from_string("subagent-task"),
+            error_details: None,
+        };
+        let Err(error) = build_parent_tool_result(&result, None) else {
+            anyhow::bail!("storeless overflow unexpectedly succeeded");
+        };
+        assert!(error.to_string().contains("without artifact storage"));
+        Ok(())
+    }
 }

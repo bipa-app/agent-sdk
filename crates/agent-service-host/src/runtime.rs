@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use agent_sdk::context::CompactionConfig;
-use agent_sdk_foundation::{PendingToolCallInfo, ToolResult};
+use agent_sdk_foundation::{PendingToolCallInfo, ThreadId, ToolResult};
 use agent_sdk_providers::LlmProvider;
 use agent_server::journal::WakeupSignal;
 use agent_server::worker::{
@@ -38,6 +38,7 @@ pub trait ToolCallExecutor: Send + Sync {
         bootstrap: &ToolTaskBootstrap,
         collector: ToolEventCollector,
         cancel: CancellationToken,
+        artifact_store: Option<Arc<agent_sdk::ArtifactStore>>,
     ) -> Result<ToolResult>;
 }
 
@@ -62,6 +63,7 @@ pub struct ExecutionRuntime {
     /// hosts keep today's "no automatic compaction" behaviour
     /// unchanged.
     compaction_config: Option<CompactionConfig>,
+    artifact_storage: Option<Arc<agent_sdk::ArtifactStorage>>,
     /// Shared worker-pool wakeup signal, attached by
     /// [`crate::host::ServiceHost::run`] before the worker pool spawns
     /// so the worker execution paths can nudge a parked worker the
@@ -97,6 +99,7 @@ impl ExecutionRuntime {
             confirmation_policy,
             subagent_spawn_selector: Arc::new(NoopSubagentSpawnSelector),
             compaction_config: None,
+            artifact_storage: None,
             wakeup_signal: OnceLock::new(),
             connectivity_waits: agent_server::worker::ConnectivityWaitRegistry::new(),
         }
@@ -143,6 +146,13 @@ impl ExecutionRuntime {
         self
     }
 
+    /// Share the host artifact authority with durable subagent completion.
+    #[must_use]
+    pub fn with_artifact_storage(mut self, storage: Arc<agent_sdk::ArtifactStorage>) -> Self {
+        self.artifact_storage = Some(storage);
+        self
+    }
+
     /// The live connectivity-wait registry shared by every execution this
     /// runtime drives. Hosts clone the handle to observe which threads are
     /// parked waiting out an offline provider.
@@ -174,6 +184,20 @@ impl ExecutionRuntime {
     #[must_use]
     pub const fn compaction_config(&self) -> Option<&CompactionConfig> {
         self.compaction_config.as_ref()
+    }
+
+    /// Resolve the parent thread's spill store when artifact storage is configured.
+    ///
+    /// # Errors
+    /// Returns an error when the shared store cache is unavailable.
+    pub fn artifact_store(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Result<Option<Arc<agent_sdk::ArtifactStore>>> {
+        self.artifact_storage
+            .as_ref()
+            .map(|storage| storage.for_thread(thread_id))
+            .transpose()
     }
 
     /// Install the shared worker-pool [`WakeupSignal`].
@@ -217,6 +241,7 @@ impl ToolCallExecutor for NoopToolExecutor {
         bootstrap: &ToolTaskBootstrap,
         _collector: ToolEventCollector,
         _cancel: CancellationToken,
+        _artifact_store: Option<Arc<agent_sdk::ArtifactStore>>,
     ) -> Result<ToolResult> {
         Err(anyhow!(
             "tool '{}' is not configured on this host runtime",

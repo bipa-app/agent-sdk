@@ -17,10 +17,10 @@ use time::OffsetDateTime;
 /// shared inline output budget is enforced once, before the result is
 /// committed to the execution store, audited, journaled as
 /// `tool_call_end`, or appended to the transcript. Over-budget output is
-/// spilled byte-identical to `artifact_store` and replaced inline by a
+/// passed byte-identical to `artifact_store` and replaced inline by a
 /// bounded head + tail window plus the `[raw output: artifact://<id>]`
-/// recovery footer. Without a store the result passes through unchanged
-/// (per-tool caps remain the only bound).
+/// recovery footer. A missing or failed store produces a bounded, explicit
+/// failure result rather than an unbounded transcript or fake truncation.
 pub(super) async fn execute_with_idempotency<Fut>(
     execution_store: Option<&Arc<dyn ToolExecutionStore>>,
     artifact_store: Option<&Arc<ArtifactStore>>,
@@ -34,14 +34,11 @@ where
     let started_at = OffsetDateTime::now_utc();
     record_execution_start(execution_store, pending, thread_id, started_at).await;
     let mut result = execute.await;
-    if let (Ok(tool_result), Some(store)) = (&mut result, artifact_store)
-        && let Err(error) = store.apply_inline_budget(tool_result, &pending.name)
-    {
-        // A failed spill never destroys bytes: the result passes through
-        // uncapped, exactly as if no store were configured.
-        warn!(
-            "Failed to spill over-budget tool output; returning it inline (tool_call_id={}, tool_name={}, error={error:#})",
-            pending.id, pending.name
+    if let Ok(tool_result) = &mut result {
+        agent_sdk_tools::artifacts::enforce_inline_budget(
+            tool_result,
+            artifact_store.map(AsRef::as_ref),
+            &pending.name,
         );
     }
     if let Ok(tool_result) = &result {
