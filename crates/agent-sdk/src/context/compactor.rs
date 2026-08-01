@@ -24,6 +24,8 @@ const SUMMARY_ACKNOWLEDGMENT: &str =
 const MAX_TOOL_RESULT_CHARS: usize = 500;
 const TRUNCATED_SUMMARY_MARKER: &str =
     "\n\n[summary truncated: exceeded the configured summary_max_tokens budget]";
+const RECENT_TOOL_OUTPUT_PROTECTION_TOKENS: usize = 40_000;
+const PRUNED_TOOL_RESULT_PREFIX: &str = "[Tool result content elided;";
 
 /// Trait for context compaction strategies.
 ///
@@ -256,6 +258,127 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
                     .iter()
                     .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
         )
+    }
+    /// Extract the spill-substrate recovery URI from a tool result.
+    ///
+    /// Only the exact trailing footer `[raw output: artifact://<id>]` counts:
+    /// an arbitrary `artifact://` mention inside output bytes is quoted
+    /// content, not proof that these bytes were spilled and are recoverable.
+    fn artifact_recovery_uri(content: &str) -> Option<&str> {
+        let trimmed = content.trim_end();
+        let footer_start = trimmed.rfind("[raw output: artifact://")?;
+        let footer = &trimmed[footer_start..];
+        if footer_start + footer.len() != trimmed.len() {
+            return None;
+        }
+        let uri_with_bracket = footer.strip_prefix("[raw output: ")?;
+        let uri = uri_with_bracket.strip_suffix(']')?;
+        let id = uri.strip_prefix("artifact://")?;
+        (!id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit())).then_some(uri)
+    }
+
+    fn prune_tool_outputs(messages: &mut [Message]) -> Option<usize> {
+        let mut tool_uses = std::collections::HashMap::new();
+        for message in messages.iter() {
+            if message.role != Role::Assistant {
+                continue;
+            }
+            let Content::Blocks(blocks) = &message.content else {
+                continue;
+            };
+            for block in blocks {
+                if let ContentBlock::ToolUse {
+                    id, name, input, ..
+                } = block
+                {
+                    let read_path = if name == "read" {
+                        input
+                            .get("path")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|path| !path.is_empty() && !path.contains("://"))
+                    } else {
+                        None
+                    };
+                    tool_uses.insert(id.as_str(), read_path);
+                }
+            }
+        }
+
+        let mut recent_output_tokens = 0usize;
+        let mut seen_read_paths = std::collections::HashSet::new();
+        let mut replacements = Vec::new();
+
+        for (message_index, message) in messages.iter().enumerate().rev() {
+            let Content::Blocks(blocks) = &message.content else {
+                continue;
+            };
+            for (block_index, block) in blocks.iter().enumerate().rev() {
+                let ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } = block
+                else {
+                    continue;
+                };
+
+                let protected = recent_output_tokens < RECENT_TOOL_OUTPUT_PROTECTION_TOKENS;
+                recent_output_tokens =
+                    recent_output_tokens.saturating_add(TokenEstimator::estimate_block(block));
+
+                let Some(read_path) = tool_uses.get(tool_use_id.as_str()).copied() else {
+                    continue;
+                };
+                let superseded = read_path.is_some_and(|path| seen_read_paths.contains(path));
+                let already_pruned = content.starts_with(PRUNED_TOOL_RESULT_PREFIX);
+
+                if (!protected || superseded) && !already_pruned {
+                    let notice = Self::artifact_recovery_uri(content).map_or_else(
+                        || {
+                            read_path.filter(|_| superseded).map(|path| {
+                                format!(
+                                    "{PRUNED_TOOL_RESULT_PREFIX} superseded by a newer read of \
+                                     {path}]"
+                                )
+                            })
+                        },
+                        |uri| {
+                            Some(format!(
+                                "{PRUNED_TOOL_RESULT_PREFIX} recover original output at {uri}]"
+                            ))
+                        },
+                    );
+                    if let Some(notice) = notice {
+                        replacements.push((message_index, block_index, notice));
+                    }
+                }
+
+                if is_error != &Some(true)
+                    && let Some(path) = read_path
+                {
+                    seen_read_paths.insert(path);
+                }
+            }
+        }
+
+        drop(seen_read_paths);
+        drop(tool_uses);
+
+        let mut newest_pruned_message = None;
+        for (message_index, block_index, notice) in replacements {
+            let Content::Blocks(blocks) = &mut messages[message_index].content else {
+                continue;
+            };
+            if let ContentBlock::ToolResult { content, .. } = &mut blocks[block_index] {
+                *content = notice;
+                newest_pruned_message = Some(
+                    newest_pruned_message
+                        .map_or(message_index, |current: usize| current.max(message_index)),
+                );
+            }
+        }
+
+        newest_pruned_message
     }
 
     /// Shift split point backwards until a `tool_use`/`tool_result` pair is not
@@ -776,6 +899,24 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
     ) -> Result<CompactionResult, FailedCompaction> {
         let original_count = messages.len();
         let original_tokens = self.estimate_tokens(&messages);
+        let newest_pruned_message = Self::prune_tool_outputs(&mut messages);
+        let pruned_tokens =
+            newest_pruned_message.map_or(original_tokens, |_| self.estimate_tokens(&messages));
+
+        if let Some(pruned_index) = newest_pruned_message
+            && pruned_tokens <= self.config.threshold_tokens
+        {
+            let new_count = messages.len();
+            return Ok(CompactionResult {
+                messages,
+                original_count,
+                new_count,
+                original_tokens,
+                new_tokens: pruned_tokens,
+                retained_count: new_count.saturating_sub(pruned_index.saturating_add(1)),
+                llm_usage: TokenUsage::default(),
+            });
+        }
 
         // Histories carrying provider-owned opaque reasoning (OpenAI
         // Responses encrypted items) compact like any other: the summary
@@ -787,13 +928,16 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
 
         // Ensure we have enough messages to compact
         if messages.len() <= self.config.retain_recent {
+            let new_count = messages.len();
             return Ok(CompactionResult {
                 messages,
                 original_count,
-                new_count: original_count,
+                new_count,
                 original_tokens,
-                new_tokens: original_tokens,
-                retained_count: original_count,
+                new_tokens: pruned_tokens,
+                retained_count: newest_pruned_message.map_or(new_count, |pruned_index| {
+                    new_count.saturating_sub(pruned_index.saturating_add(1))
+                }),
                 llm_usage: TokenUsage::default(),
             });
         }
@@ -820,7 +964,12 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
                     llm_usage: failure.usage,
                 })?;
 
-        let retained_count = to_keep.len();
+        let retained_count =
+            if newest_pruned_message.is_some_and(|message_index| message_index >= split_point) {
+                0
+            } else {
+                to_keep.len()
+            };
         // Build new message history
         let mut new_messages = Vec::with_capacity(2 + to_keep.len());
 
@@ -2070,5 +2219,326 @@ mod tests {
         assert_eq!(result.llm_usage.input_tokens, 100);
         assert_eq!(result.llm_usage.output_tokens, 50);
         Ok(())
+    }
+    fn spilled_output(body: &str, artifact_id: u64) -> String {
+        format!("{body}\n[raw output: artifact://{artifact_id}]")
+    }
+
+    fn push_tool_pair(
+        messages: &mut Vec<Message>,
+        id: &str,
+        name: &str,
+        path: Option<&str>,
+        result: String,
+    ) {
+        push_tool_pair_with_error(messages, id, name, path, result, None);
+    }
+
+    fn push_tool_pair_with_error(
+        messages: &mut Vec<Message>,
+        id: &str,
+        name: &str,
+        path: Option<&str>,
+        result: String,
+        is_error: Option<bool>,
+    ) {
+        let input = path.map_or_else(
+            || serde_json::json!({}),
+            |path| serde_json::json!({ "path": path }),
+        );
+        messages.push(Message {
+            role: Role::Assistant,
+            content: Content::Blocks(vec![ContentBlock::ToolUse {
+                id: id.to_string(),
+                name: name.to_string(),
+                input,
+                thought_signature: None,
+            }]),
+        });
+        messages.push(Message {
+            role: Role::User,
+            content: Content::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: id.to_string(),
+                content: result,
+                is_error,
+            }]),
+        });
+    }
+
+    fn tool_result_content<'a>(messages: &'a [Message], id: &str) -> Option<&'a str> {
+        messages.iter().find_map(|message| {
+            let Content::Blocks(blocks) = &message.content else {
+                return None;
+            };
+            blocks.iter().find_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } if tool_use_id == id => Some(content.as_str()),
+                _ => None,
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn prune_sufficient_returns_without_provider_call_and_keeps_artifact_uri() -> Result<()> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(MockProvider::new_with_request_log(
+            "unused summary",
+            requests.clone(),
+        ));
+        let config = CompactionConfig::default()
+            .with_threshold_tokens(45_000)
+            .with_retain_recent(2)
+            .with_min_messages(1);
+        let compactor = LlmContextCompactor::new(provider, config);
+        let mut messages = Vec::new();
+        push_tool_pair(
+            &mut messages,
+            "old-artifact",
+            "bash",
+            None,
+            spilled_output(&"x".repeat(39_000), 41),
+        );
+        push_tool_pair(
+            &mut messages,
+            "recent-output",
+            "bash",
+            None,
+            "r".repeat(160_000),
+        );
+
+        let result = compactor.compact_history(messages).await?;
+
+        let recorded = requests
+            .lock()
+            .map_err(|_| anyhow::anyhow!("request log poisoned"))?;
+        assert!(recorded.is_empty());
+        drop(recorded);
+        assert_eq!(result.llm_usage.input_tokens, 0);
+        assert_eq!(result.retained_count, 2);
+        assert!(result.new_tokens <= 45_000);
+        let notice = tool_result_content(&result.messages, "old-artifact")
+            .context("pruned artifact result missing")?;
+        assert!(notice.starts_with(PRUNED_TOOL_RESULT_PREFIX));
+        assert!(notice.contains("recover original output at artifact://41]"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_receives_pruned_prefix_and_tail_pruning_disables_retention() -> Result<()> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(MockProvider::new_with_request_log(
+            "summary",
+            requests.clone(),
+        ));
+        let config = CompactionConfig::default()
+            .with_threshold_tokens(1)
+            .with_retain_recent(4)
+            .with_min_messages(1)
+            .with_max_retained_tail_tokens(100_000);
+        let compactor = LlmContextCompactor::new(provider, config);
+        let mut messages = Vec::new();
+        push_tool_pair(
+            &mut messages,
+            "prefix-artifact",
+            "bash",
+            None,
+            spilled_output(&"p".repeat(4_000), 7),
+        );
+        push_tool_pair(
+            &mut messages,
+            "tail-artifact",
+            "bash",
+            None,
+            spilled_output(&"t".repeat(4_000), 8),
+        );
+        push_tool_pair(
+            &mut messages,
+            "recent-output",
+            "bash",
+            None,
+            "r".repeat(160_000),
+        );
+
+        let result = compactor.compact_history(messages).await?;
+
+        let recorded = requests
+            .lock()
+            .map_err(|_| anyhow::anyhow!("request log poisoned"))?;
+        assert_eq!(recorded.len(), 1);
+        assert!(recorded[0].contains(PRUNED_TOOL_RESULT_PREFIX));
+        assert!(recorded[0].contains("recover original output at artifact://7]"));
+        assert!(!recorded[0].contains(&"p".repeat(501)));
+        drop(recorded);
+        assert_eq!(result.retained_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn older_read_of_same_non_uri_path_is_superseded() -> Result<()> {
+        let mut messages = Vec::new();
+        push_tool_pair(
+            &mut messages,
+            "old-read",
+            "read",
+            Some("src/lib.rs"),
+            "old file snapshot".to_string(),
+        );
+        push_tool_pair(
+            &mut messages,
+            "new-read",
+            "read",
+            Some("src/lib.rs"),
+            "n".repeat(160_000),
+        );
+
+        let newest_pruned = LlmContextCompactor::<MockProvider>::prune_tool_outputs(&mut messages);
+
+        assert_eq!(newest_pruned, Some(1));
+        let old_notice =
+            tool_result_content(&messages, "old-read").context("old read result missing")?;
+        assert!(old_notice.contains("superseded by a newer read of src/lib.rs"));
+        assert_eq!(
+            tool_result_content(&messages, "new-read"),
+            Some("n".repeat(160_000).as_str())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recent_artifact_backed_output_remains_protected() {
+        let original = "artifact://spill/recent\nrecent details".to_string();
+        let mut messages = Vec::new();
+        push_tool_pair(
+            &mut messages,
+            "recent-artifact",
+            "bash",
+            None,
+            original.clone(),
+        );
+
+        let newest_pruned = LlmContextCompactor::<MockProvider>::prune_tool_outputs(&mut messages);
+
+        assert_eq!(newest_pruned, None);
+        assert_eq!(
+            tool_result_content(&messages, "recent-artifact"),
+            Some(original.as_str())
+        );
+    }
+
+    #[test]
+    fn quoted_artifact_mention_is_not_treated_as_recoverable_spill() {
+        let original = format!(
+            "grep results quoting a footer: [raw output: artifact://12]\n{}",
+            "q".repeat(200_000)
+        );
+        let mut messages = Vec::new();
+        push_tool_pair(&mut messages, "quoted-uri", "bash", None, original.clone());
+        push_tool_pair(
+            &mut messages,
+            "recent-output",
+            "bash",
+            None,
+            "r".repeat(160_000),
+        );
+
+        let newest_pruned = LlmContextCompactor::<MockProvider>::prune_tool_outputs(&mut messages);
+
+        assert_eq!(newest_pruned, None);
+        assert_eq!(
+            tool_result_content(&messages, "quoted-uri"),
+            Some(original.as_str()),
+            "a mid-content artifact mention is quoted bytes, not a spill footer",
+        );
+    }
+
+    #[test]
+    fn true_trailing_footer_is_recovered_even_when_body_quotes_other_uris() -> Result<()> {
+        let original = format!(
+            "body quoting [raw output: artifact://99] early\n{}\n[raw output: artifact://23]",
+            "b".repeat(200_000)
+        );
+        let mut messages = Vec::new();
+        push_tool_pair(&mut messages, "spilled", "bash", None, original);
+        push_tool_pair(
+            &mut messages,
+            "recent-output",
+            "bash",
+            None,
+            "r".repeat(160_000),
+        );
+
+        let newest_pruned = LlmContextCompactor::<MockProvider>::prune_tool_outputs(&mut messages);
+
+        assert_eq!(newest_pruned, Some(1));
+        let notice = tool_result_content(&messages, "spilled").context("spilled result missing")?;
+        assert!(notice.starts_with(PRUNED_TOOL_RESULT_PREFIX));
+        assert!(
+            notice.contains("recover original output at artifact://23]"),
+            "recovery must point at the trailing footer, not the first mention: {notice}",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_newer_read_does_not_supersede_older_successful_read() {
+        let mut messages = Vec::new();
+        push_tool_pair(
+            &mut messages,
+            "old-read",
+            "read",
+            Some("src/lib.rs"),
+            "old file snapshot".to_string(),
+        );
+        push_tool_pair_with_error(
+            &mut messages,
+            "failed-read",
+            "read",
+            Some("src/lib.rs"),
+            "No such file or directory".to_string(),
+            Some(true),
+        );
+        push_tool_pair(&mut messages, "aging", "bash", None, "a".repeat(160_000));
+
+        let newest_pruned = LlmContextCompactor::<MockProvider>::prune_tool_outputs(&mut messages);
+
+        assert_eq!(
+            newest_pruned, None,
+            "a failed read must not supersede the last good snapshot",
+        );
+        assert_eq!(
+            tool_result_content(&messages, "old-read"),
+            Some("old file snapshot"),
+        );
+    }
+
+    #[test]
+    fn failed_newer_read_never_supersedes_inside_the_protected_window() {
+        let mut messages = Vec::new();
+        push_tool_pair(
+            &mut messages,
+            "old-read",
+            "read",
+            Some("src/lib.rs"),
+            "old file snapshot".to_string(),
+        );
+        push_tool_pair_with_error(
+            &mut messages,
+            "failed-read",
+            "read",
+            Some("src/lib.rs"),
+            "permission denied".to_string(),
+            Some(true),
+        );
+
+        let newest_pruned = LlmContextCompactor::<MockProvider>::prune_tool_outputs(&mut messages);
+
+        assert_eq!(newest_pruned, None);
+        assert_eq!(
+            tool_result_content(&messages, "old-read"),
+            Some("old file snapshot"),
+        );
     }
 }

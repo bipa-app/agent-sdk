@@ -53,8 +53,80 @@ use anyhow::{Context, Result};
 use time::OffsetDateTime;
 
 use crate::journal::staged::StagedMessageStore;
+use crate::journal::turn_attempt::TurnAttemptOutcome;
 
 use super::root_turn::RootTurnDeps;
+struct MeasuredAnchor {
+    tokens: usize,
+    request_message_count: Option<usize>,
+}
+
+fn trigger_tokens(measured: Option<usize>, estimated_fallback: usize) -> (usize, &'static str) {
+    measured.map_or((estimated_fallback, "estimated_fallback"), |tokens| {
+        (tokens, "measured")
+    })
+}
+
+/// Latest successful billed attempt, ignoring anything billed before the
+/// newest durable compaction boundary: those attempts measured a history
+/// that no longer exists, and trusting them would re-trigger compaction on
+/// an already-compacted (or prune-only-compacted) projection.
+async fn latest_measured_anchor(
+    deps: &RootTurnDeps<'_>,
+    thread_id: &agent_sdk_foundation::ThreadId,
+    ignore_closed_at_or_before: Option<OffsetDateTime>,
+) -> Result<Option<MeasuredAnchor>> {
+    let tasks = deps
+        .task_store
+        .list_by_thread(thread_id)
+        .await
+        .context("list thread tasks for measured compaction trigger")?;
+    let mut latest: Option<(OffsetDateTime, MeasuredAnchor)> = None;
+    for task in tasks {
+        let attempts = deps
+            .attempt_store
+            .list_by_task(&task.id)
+            .await
+            .context("list turn attempts for measured compaction trigger")?;
+        for attempt in attempts {
+            if attempt.outcome != Some(TurnAttemptOutcome::Success) {
+                continue;
+            }
+            let Some(closed_at) = attempt.closed_at else {
+                continue;
+            };
+            if ignore_closed_at_or_before.is_some_and(|fence| closed_at <= fence) {
+                continue;
+            }
+            let total = u64::from(attempt.input_tokens.unwrap_or(0))
+                .saturating_add(u64::from(attempt.output_tokens.unwrap_or(0)))
+                .saturating_add(u64::from(attempt.cached_input_tokens.unwrap_or(0)))
+                .saturating_add(u64::from(attempt.cache_creation_input_tokens.unwrap_or(0)));
+            if total == 0 {
+                continue;
+            }
+            let tokens = usize::try_from(total).map_or(usize::MAX, |value| value);
+            if latest
+                .as_ref()
+                .is_none_or(|(latest_at, _)| closed_at > *latest_at)
+            {
+                let request_message_count = attempt
+                    .request_blob
+                    .get("messages")
+                    .and_then(serde_json::Value::as_array)
+                    .map(Vec::len);
+                latest = Some((
+                    closed_at,
+                    MeasuredAnchor {
+                        tokens,
+                        request_message_count,
+                    },
+                ));
+            }
+        }
+    }
+    Ok(latest.map(|(_, anchor)| anchor))
+}
 
 /// Run a pre-call compaction pass against the staged history when the
 /// host has wired a [`agent_sdk::context::CompactionConfig`] and the
@@ -114,13 +186,43 @@ pub async fn maybe_compact_staged_history(
 
     let compactor =
         LlmContextCompactor::<dyn LlmProvider>::new(Arc::clone(provider_arc), cfg.clone());
-    if !compactor.needs_compaction(&history) {
+    if !cfg.auto_compact || history.len() < cfg.min_messages_for_compaction {
+        return Ok(());
+    }
+    let last_compaction_at = deps
+        .message_store
+        .get(thread_id)
+        .await
+        .context("read projection for measured-trigger compaction fence")?
+        .and_then(|projection| {
+            projection
+                .compactions
+                .last()
+                .map(|boundary| boundary.created_at)
+        });
+    let measured = latest_measured_anchor(deps, thread_id, last_compaction_at)
+        .await?
+        .map(|anchor| {
+            // The anchor prices the request it was billed for; anything the
+            // staged history gained afterwards (buffered wait-any child
+            // results, injected steering) is measured by the estimator so
+            // fresh bytes trigger proactively instead of via overflow
+            // recovery.
+            let appended = anchor
+                .request_message_count
+                .and_then(|count| history.get(count..))
+                .map_or(0, |suffix| compactor.estimate_tokens(suffix));
+            anchor.tokens.saturating_add(appended)
+        });
+    let (trigger_tokens, trigger_source) =
+        trigger_tokens(measured, compactor.estimate_tokens(&history));
+    if trigger_tokens <= cfg.threshold_tokens {
         return Ok(());
     }
 
     log::info!(
         "Pre-call auto-compaction triggered (thread={thread_id}, message_count={}, \
-         threshold_tokens={})",
+         trigger_tokens={trigger_tokens}, trigger_source={trigger_source}, threshold_tokens={})",
         history.len(),
         cfg.threshold_tokens,
     );
@@ -296,5 +398,20 @@ mod tests {
         assert!(!is_prompt_too_long_error("rate limited"));
         assert!(!is_prompt_too_long_error("transport error"));
         assert!(!is_prompt_too_long_error(""));
+    }
+
+    #[test]
+    fn measured_usage_prevents_large_window_estimator_regression() {
+        let (tokens, source) = trigger_tokens(Some(88_000), 1_200_000);
+        assert_eq!(tokens, 88_000);
+        assert_eq!(source, "measured");
+        assert!(tokens <= 1_000_000);
+    }
+
+    #[test]
+    fn estimator_is_used_only_before_measured_usage_exists() {
+        let (tokens, source) = trigger_tokens(None, 120_000);
+        assert_eq!(tokens, 120_000);
+        assert_eq!(source, "estimated_fallback");
     }
 }

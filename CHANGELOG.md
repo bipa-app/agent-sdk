@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Compaction now appends range-addressed lineage entries and rebuilds the
   effective LLM view without deleting committed transcript messages.
+- Auto-compaction prunes artifact-backed and superseded read outputs before
+  summarization, and threshold decisions use journaled billed usage when present.
 
 
 - MSRV pinned to **1.91** (the verified buildable floor for the published
