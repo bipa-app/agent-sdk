@@ -36,6 +36,8 @@ mod compactor;
 mod config;
 mod estimator;
 
-pub use compactor::{CompactionResult, ContextCompactor, FailedCompaction, LlmContextCompactor};
-pub use config::CompactionConfig;
+pub use compactor::{
+    CompactionPurpose, CompactionResult, ContextCompactor, FailedCompaction, LlmContextCompactor,
+};
+pub use config::{CompactionConfig, CompactionEngine};
 pub use estimator::TokenEstimator;

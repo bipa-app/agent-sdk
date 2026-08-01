@@ -26,11 +26,11 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use agent_sdk::context::CompactionConfig;
+use agent_sdk::context::{CompactionConfig, CompactionEngine};
 use agent_sdk_foundation::ThreadId;
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, ContentBlock, Message, StopReason, Usage,
+    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Message, StopReason, Usage,
 };
 use agent_sdk_providers::LlmProvider;
 use anyhow::{Context, Result};
@@ -66,6 +66,7 @@ use crate::worker::root_turn::{RootTurnDeps, RootTurnOutcome, execute_root_turn}
 struct ScriptedProvider {
     responses: Mutex<Vec<ChatOutcome>>,
     call_count: AtomicUsize,
+    requests: Mutex<Vec<ChatRequest>>,
 }
 
 impl ScriptedProvider {
@@ -73,18 +74,43 @@ impl ScriptedProvider {
         Self {
             responses: Mutex::new(responses),
             call_count: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
         }
     }
 
     fn calls(&self) -> usize {
         self.call_count.load(Ordering::SeqCst)
     }
+
+    fn prompts(&self) -> Result<Vec<String>> {
+        let requests = self
+            .requests
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ScriptedProvider request mutex poisoned"))?;
+        Ok(requests
+            .iter()
+            .map(|request| {
+                request
+                    .messages
+                    .iter()
+                    .find_map(|message| match &message.content {
+                        Content::Text(text) => Some(text.clone()),
+                        Content::Blocks(_) => None,
+                    })
+                    .unwrap_or_default()
+            })
+            .collect())
+    }
 }
 
 #[async_trait]
 impl LlmProvider for ScriptedProvider {
-    async fn chat(&self, _: ChatRequest) -> Result<ChatOutcome> {
+    async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
+        self.requests
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ScriptedProvider request mutex poisoned"))?
+            .push(request);
         let mut responses = self
             .responses
             .lock()
@@ -286,7 +312,9 @@ async fn pre_call_threshold_triggers_compaction() -> Result<()> {
     .await?;
 
     // Tiny threshold so the seeded history is guaranteed over budget.
-    let cfg = CompactionConfig::default().with_threshold_tokens(10);
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::PruneFirst)
+        .with_threshold_tokens(10);
 
     // Provider script:
     //   call 1 → compactor summarisation
@@ -331,6 +359,13 @@ async fn pre_call_threshold_triggers_compaction() -> Result<()> {
     // Provider was called twice: once by the compactor, once by the
     // turn. The compactor consumed the summarisation slot first.
     assert_eq!(scripted.calls(), 2);
+    assert!(
+        scripted
+            .prompts()?
+            .first()
+            .is_some_and(|prompt| prompt.contains("Compaction purpose: pre-spawn.")),
+        "auto compaction must select the pre-spawn prompt",
+    );
 
     let context = fixtures.messages.get_history(&thread_id()).await?;
     assert!(
@@ -461,7 +496,9 @@ async fn prompt_too_long_triggers_emergency_compaction_and_retry() -> Result<()>
 
     // High threshold so the pre-call check does NOT fire — we want
     // the post-failure path to be the one that runs compaction.
-    let cfg = CompactionConfig::default().with_threshold_tokens(usize::MAX);
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::PruneFirst)
+        .with_threshold_tokens(usize::MAX);
 
     let scripted = Arc::new(ScriptedProvider::new(vec![
         // Original turn: provider rejects with the exact Anthropic
@@ -502,6 +539,13 @@ async fn prompt_too_long_triggers_emergency_compaction_and_retry() -> Result<()>
 
     // 3 calls: rejection, compactor, retry.
     assert_eq!(scripted.calls(), 3);
+    assert!(
+        scripted
+            .prompts()?
+            .iter()
+            .any(|prompt| prompt.contains("Compaction purpose: overflow recovery.")),
+        "overflow recovery must select the overflow prompt",
+    );
 
     // Compaction event committed.
     let events = fixtures.events.get_events(&thread_id()).await?;
@@ -572,7 +616,9 @@ async fn prompt_too_long_recovers_history_carrying_opaque_reasoning() -> Result<
 
     // High threshold so the pre-call check does NOT fire — only the
     // post-failure overflow path may compact.
-    let cfg = CompactionConfig::default().with_threshold_tokens(usize::MAX);
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::PruneFirst)
+        .with_threshold_tokens(usize::MAX);
 
     let scripted = Arc::new(ScriptedProvider::new(vec![
         // The exact prose the Responses API returns on context overflow.
@@ -743,6 +789,72 @@ async fn close_success_attempt(
     Ok(())
 }
 
+#[tokio::test]
+async fn legacy_engine_flag_off_uses_estimated_trigger_and_generic_prompt() -> Result<()> {
+    use crate::journal::staged::StagedMessageStore;
+
+    let fixtures = Fixtures::new();
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    close_success_attempt(
+        &fixtures,
+        &task.id,
+        serde_json::json!({ "messages": vec!["covered"; 24] }),
+        100,
+        t0() + Duration::seconds(5),
+    )
+    .await?;
+
+    let mut history = Vec::with_capacity(24);
+    for index in 0..12 {
+        history.push(Message::user(format!(
+            "legacy-user-{index}: {}",
+            "x".repeat(30_000)
+        )));
+        history.push(Message::assistant(format!(
+            "legacy-assistant-{index}: {}",
+            "y".repeat(30_000)
+        )));
+    }
+    fixtures
+        .messages
+        .commit_messages(&thread_id(), history.clone(), t0() + Duration::seconds(6))
+        .await?;
+
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::Legacy)
+        .with_threshold_tokens(50_000);
+    let scripted = Arc::new(ScriptedProvider::new(vec![ok_response(
+        "[legacy summary]",
+    )]));
+    let provider: Arc<dyn LlmProvider> = scripted.clone();
+    let deps = fixtures.deps_with_compaction(&cfg, &provider);
+    let staged = StagedMessageStore::new(thread_id(), history);
+
+    super::compaction::maybe_compact_staged_history(
+        &deps,
+        &staged,
+        &thread_id(),
+        t0() + Duration::seconds(20),
+    )
+    .await?;
+
+    assert_eq!(scripted.calls(), 1);
+    assert!(
+        scripted
+            .prompts()?
+            .first()
+            .is_some_and(|prompt| !prompt.contains("Compaction purpose:")),
+        "flag-off fallback must retain the generic legacy prompt",
+    );
+    let projection = fixtures
+        .messages
+        .get(&thread_id())
+        .await?
+        .context("projection")?;
+    assert_eq!(projection.compactions.len(), 1);
+    Ok(())
+}
+
 /// A billed Success attempt that PREDATES the latest durable compaction
 /// boundary must not re-trigger compaction: after a prune-only compaction the
 /// message count is unchanged, so without the fence the stale 90k reading
@@ -785,7 +897,9 @@ async fn stale_measured_usage_before_compaction_does_not_retrigger() -> Result<(
         )
         .await?;
 
-    let cfg = CompactionConfig::default().with_threshold_tokens(50_000);
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::PruneFirst)
+        .with_threshold_tokens(50_000);
     let scripted = Arc::new(ScriptedProvider::new(Vec::new()));
     let provider: Arc<dyn LlmProvider> = scripted.clone();
     let deps = fixtures.deps_with_compaction(&cfg, &provider);
@@ -847,7 +961,9 @@ async fn history_appended_after_measured_attempt_triggers_proactively() -> Resul
         .commit_messages(&thread_id(), history.clone(), t0() + Duration::seconds(6))
         .await?;
 
-    let cfg = CompactionConfig::default().with_threshold_tokens(50_000);
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::PruneFirst)
+        .with_threshold_tokens(50_000);
     let scripted = Arc::new(ScriptedProvider::new(vec![ok_response(
         "[summary] buffered child results folded",
     )]));

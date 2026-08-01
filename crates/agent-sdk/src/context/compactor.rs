@@ -6,6 +6,7 @@ use crate::llm::{
 };
 use crate::types::TokenUsage;
 use anyhow::{Context, Result};
+use std::borrow::Cow;
 use async_trait::async_trait;
 use std::fmt::Write;
 use std::sync::Arc;
@@ -18,6 +19,18 @@ const COMPACTION_SYSTEM_PROMPT: &str = "You are a precise summarizer. Your task 
 const COMPACTION_SUMMARY_PROMPT_PREFIX: &str = "Summarize this conversation concisely, preserving:\n- Key decisions and conclusions reached\n- Important file paths, code changes, and technical details\n- Current task context and what has been accomplished\n- Any pending items, errors encountered, or next steps\n\nBe specific about technical details (file names, function names, error messages) as these\nare critical for continuing the work.\n\nConversation:\n";
 const COMPACTION_SUMMARY_PROMPT_SUFFIX: &str =
     "Provide a concise summary (aim for 500-1000 words):";
+const USER_REQUESTED_SYSTEM_PROMPT: &str = "You are compacting a coding session because the user explicitly requested it. Produce a durable handoff that honors the user's goal and preserves enough technical detail to continue immediately.";
+const USER_REQUESTED_PROMPT_PREFIX: &str = "Compaction purpose: user-requested.\n\nSummarize the conversation with these sections:\n## Goal\n## Progress\n## Key decisions and constraints\n## Next steps\n## Critical context\n\nPreserve exact file paths, symbols, commands, errors, and every `[raw output: artifact://<id>]` recovery reference. State `(none)` for an empty section.\n\nConversation:\n";
+const USER_REQUESTED_PROMPT_SUFFIX: &str =
+    "Return only the structured user-requested compaction summary.";
+const OVERFLOW_SYSTEM_PROMPT: &str = "You are recovering a coding session whose prompt exceeded the provider context window. Minimize the summary while preserving every fact required to retry safely and continue without repeating completed work.";
+const OVERFLOW_PROMPT_PREFIX: &str = "Compaction purpose: overflow recovery.\n\nCreate a recovery summary that prioritizes:\n- The user's active goal and non-negotiable constraints\n- Completed changes and their exact locations\n- Current errors, failed attempts, and the next safe action\n- Live tool/subagent state and data needed for the retry\n- Every `[raw output: artifact://<id>]` recovery reference verbatim\n\nDiscard conversational filler and never invent progress.\n\nConversation:\n";
+const OVERFLOW_PROMPT_SUFFIX: &str =
+    "Return only the minimal overflow-recovery summary needed for a safe retry.";
+const PRE_SPAWN_SYSTEM_PROMPT: &str = "You are preparing compact context immediately before the next model invocation. Preserve the active execution state so the next invocation can act without re-reading the full transcript.";
+const PRE_SPAWN_PROMPT_PREFIX: &str = "Compaction purpose: pre-spawn.\n\nPrepare continuation context that preserves:\n- The user's current goal, acceptance criteria, and explicit boundaries\n- Work completed, work in progress, and the next concrete action\n- Exact files, symbols, commands, errors, decisions, and unresolved questions\n- Active tool/subagent state and every `[raw output: artifact://<id>]` recovery reference verbatim\n\nPrefer dense factual bullets over narrative and never claim unobserved work.\n\nConversation:\n";
+const PRE_SPAWN_PROMPT_SUFFIX: &str =
+    "Return only the pre-spawn continuation context.";
 const COMPACT_EMPTY_SUMMARY: &str = "No additional context was available to summarize; the previous messages were already compacted.";
 const SUMMARY_ACKNOWLEDGMENT: &str =
     "I understand the context from the summary. Let me continue from where we left off.";
@@ -26,6 +39,39 @@ const TRUNCATED_SUMMARY_MARKER: &str =
     "\n\n[summary truncated: exceeded the configured summary_max_tokens budget]";
 const RECENT_TOOL_OUTPUT_PROTECTION_TOKENS: usize = 40_000;
 const PRUNED_TOOL_RESULT_PREFIX: &str = "[Tool result content elided;";
+
+/// Why a compaction is running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionPurpose {
+    /// The user explicitly invoked a compaction command.
+    UserRequested,
+    /// A provider rejected the prompt for exceeding its context window.
+    Overflow,
+    /// Automatic maintenance immediately before the next model invocation.
+    PreSpawn,
+}
+
+impl CompactionPurpose {
+    const fn prompts(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::UserRequested => (
+                USER_REQUESTED_SYSTEM_PROMPT,
+                USER_REQUESTED_PROMPT_PREFIX,
+                USER_REQUESTED_PROMPT_SUFFIX,
+            ),
+            Self::Overflow => (
+                OVERFLOW_SYSTEM_PROMPT,
+                OVERFLOW_PROMPT_PREFIX,
+                OVERFLOW_PROMPT_SUFFIX,
+            ),
+            Self::PreSpawn => (
+                PRE_SPAWN_SYSTEM_PROMPT,
+                PRE_SPAWN_PROMPT_PREFIX,
+                PRE_SPAWN_PROMPT_SUFFIX,
+            ),
+        }
+    }
+}
 
 /// Trait for context compaction strategies.
 ///
@@ -215,6 +261,13 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
         self.summary_prompt_prefix = summary_prompt_prefix.into();
         self.summary_prompt_suffix = summary_prompt_suffix.into();
         self
+    }
+
+    /// Select the prompt set for the compaction trigger.
+    #[must_use]
+    pub fn with_purpose(self, purpose: CompactionPurpose) -> Self {
+        let (system, prefix, suffix) = purpose.prompts();
+        self.with_prompts(system, prefix, suffix)
     }
 
     /// If `content` is a previously inserted compaction summary, return its
@@ -561,6 +614,29 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
         retained_start
     }
 
+    fn tool_result_for_summary(content: &str) -> Cow<'_, str> {
+        if content.chars().count() <= MAX_TOOL_RESULT_CHARS {
+            return Cow::Borrowed(content);
+        }
+
+        let (body, recovery_uri) = Self::artifact_recovery_uri(content).map_or(
+            (content, None),
+            |uri| {
+                let footer_start = content.rfind("[raw output: ").unwrap_or(content.len());
+                (&content[..footer_start], Some(uri))
+            },
+        );
+        let prefix: String = body.chars().take(MAX_TOOL_RESULT_CHARS).collect();
+        recovery_uri.map_or_else(
+            || Cow::Owned(format!("{prefix}... (truncated)")),
+            |uri| {
+                Cow::Owned(format!(
+                    "{prefix}... (truncated)\n[raw output: {uri}]"
+                ))
+            },
+        )
+    }
+
     /// Format messages for summarization.
     ///
     /// Borrows each message rather than taking a slice of owned values so the
@@ -615,14 +691,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
                                 } else {
                                     "success"
                                 };
-                                // Truncate long tool results (Unicode-safe; avoid slicing mid-codepoint)
-                                let truncated = if content.chars().count() > MAX_TOOL_RESULT_CHARS {
-                                    let prefix: String =
-                                        content.chars().take(MAX_TOOL_RESULT_CHARS).collect();
-                                    format!("{prefix}... (truncated)")
-                                } else {
-                                    content.clone()
-                                };
+                                let truncated = Self::tool_result_for_summary(content);
                                 let _ = writeln!(output, "[Tool result ({status}): {truncated}]");
                             }
                             ContentBlock::Image { source } => {
@@ -899,7 +968,11 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
     ) -> Result<CompactionResult, FailedCompaction> {
         let original_count = messages.len();
         let original_tokens = self.estimate_tokens(&messages);
-        let newest_pruned_message = Self::prune_tool_outputs(&mut messages);
+        let newest_pruned_message = self
+            .config
+            .uses_prune_first_engine()
+            .then(|| Self::prune_tool_outputs(&mut messages))
+            .flatten();
         let pruned_tokens =
             newest_pruned_message.map_or(original_tokens, |_| self.estimate_tokens(&messages));
 
@@ -2066,6 +2139,53 @@ mod tests {
         ]
     }
 
+    #[tokio::test]
+    async fn purpose_selects_user_overflow_and_pre_spawn_prompts() -> Result<()> {
+        for (purpose, marker) in [
+            (CompactionPurpose::UserRequested, "Compaction purpose: user-requested."),
+            (CompactionPurpose::Overflow, "Compaction purpose: overflow recovery."),
+            (CompactionPurpose::PreSpawn, "Compaction purpose: pre-spawn."),
+        ] {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let provider = Arc::new(MockProvider::new_with_request_log(
+                "summary",
+                Arc::clone(&requests),
+            ));
+            let compactor = LlmContextCompactor::new(
+                provider,
+                CompactionConfig::default().with_retain_recent(2),
+            )
+            .with_purpose(purpose);
+
+            compactor
+                .compact_history(summarizable_messages())
+                .await?;
+
+            let recorded = requests
+                .lock()
+                .map_err(|_| anyhow::anyhow!("request log poisoned"))?;
+            let prompt = recorded.first().context("missing summarization request")?;
+            assert!(
+                prompt.contains(marker),
+                "purpose {purpose:?} selected the wrong prompt: {prompt}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn summary_truncation_preserves_exact_artifact_recovery_footer() {
+        let content = format!(
+            "{}\n[raw output: artifact://77]",
+            "large-output".repeat(100)
+        );
+        let rendered = LlmContextCompactor::<MockProvider>::tool_result_for_summary(&content);
+
+        assert!(rendered.contains("... (truncated)"));
+        assert!(rendered.ends_with("[raw output: artifact://77]"));
+        assert_eq!(rendered.matches("[raw output: artifact://77]").count(), 1);
+    }
+
     struct BlockRequestHooks;
 
     #[async_trait]
@@ -2282,6 +2402,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_engine_skips_prune_first_and_uses_summarization_fallback() -> Result<()> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(MockProvider::new_with_request_log(
+            "legacy summary",
+            Arc::clone(&requests),
+        ));
+        let config = CompactionConfig::default()
+            .with_engine(super::super::CompactionEngine::Legacy)
+            .with_threshold_tokens(45_000)
+            .with_retain_recent(2)
+            .with_min_messages(1);
+        let compactor = LlmContextCompactor::new(provider, config);
+        let mut messages = Vec::new();
+        push_tool_pair(
+            &mut messages,
+            "old-artifact",
+            "bash",
+            None,
+            spilled_output(&"x".repeat(39_000), 41),
+        );
+        push_tool_pair(
+            &mut messages,
+            "recent-output",
+            "bash",
+            None,
+            "r".repeat(160_000),
+        );
+
+        let result = compactor.compact_history(messages).await?;
+
+        let recorded = requests
+            .lock()
+            .map_err(|_| anyhow::anyhow!("request log poisoned"))?;
+        assert_eq!(recorded.len(), 1);
+        assert!(recorded[0].contains("[raw output: artifact://41]"));
+        assert!(!recorded[0].contains(PRUNED_TOOL_RESULT_PREFIX));
+        assert_eq!(result.llm_usage.input_tokens, 100);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn prune_sufficient_returns_without_provider_call_and_keeps_artifact_uri() -> Result<()> {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let provider = Arc::new(MockProvider::new_with_request_log(
@@ -2289,6 +2450,7 @@ mod tests {
             requests.clone(),
         ));
         let config = CompactionConfig::default()
+            .with_engine(crate::context::CompactionEngine::PruneFirst)
             .with_threshold_tokens(45_000)
             .with_retain_recent(2)
             .with_min_messages(1);
@@ -2334,6 +2496,7 @@ mod tests {
             requests.clone(),
         ));
         let config = CompactionConfig::default()
+            .with_engine(crate::context::CompactionEngine::PruneFirst)
             .with_threshold_tokens(1)
             .with_retain_recent(4)
             .with_min_messages(1)

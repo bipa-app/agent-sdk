@@ -9,7 +9,9 @@ use super::types::{
 };
 
 use crate::authority::EventAuthority;
-use crate::context::{CompactionConfig, ContextCompactor, LlmContextCompactor};
+use crate::context::{
+    CompactionConfig, CompactionPurpose, ContextCompactor, LlmContextCompactor,
+};
 use crate::events::AgentEvent;
 use crate::hooks::{AgentHooks, ToolAuditSink};
 use crate::llm::{
@@ -270,8 +272,13 @@ where
         // Attach the run's hooks so the summarization call passes the same
         // pre_llm_request / on_llm_response guardrails as regular turns.
         let default_compactor =
-            LlmContextCompactor::new(Arc::clone(provider), compact_config.clone())
-                .with_guardrail_hooks(Arc::clone(hooks));
+            LlmContextCompactor::new(Arc::clone(provider), compact_config.clone());
+        let default_compactor = if compact_config.uses_prune_first_engine() {
+            default_compactor.with_purpose(CompactionPurpose::PreSpawn)
+        } else {
+            default_compactor
+        }
+        .with_guardrail_hooks(Arc::clone(hooks));
         if default_compactor.needs_compaction(&messages) {
             debug!(
                 "Context compaction triggered (turn={}, message_count={})",
@@ -1933,8 +1940,13 @@ where
         // Attach the run's hooks so the summarization call passes the same
         // pre_llm_request / on_llm_response guardrails as regular turns.
         let default_compactor =
-            LlmContextCompactor::new(Arc::clone(provider), compaction_config.clone())
-                .with_guardrail_hooks(Arc::clone(hooks));
+            LlmContextCompactor::new(Arc::clone(provider), compaction_config.clone());
+        let default_compactor = if compaction_config.uses_prune_first_engine() {
+            default_compactor.with_purpose(CompactionPurpose::Overflow)
+        } else {
+            default_compactor
+        }
+        .with_guardrail_hooks(Arc::clone(hooks));
         compact_history_and_store(
             &default_compactor,
             history,

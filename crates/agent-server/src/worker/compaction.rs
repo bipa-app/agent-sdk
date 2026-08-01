@@ -45,7 +45,7 @@
 
 use std::sync::Arc;
 
-use agent_sdk::context::{ContextCompactor, LlmContextCompactor};
+use agent_sdk::context::{CompactionPurpose, ContextCompactor, LlmContextCompactor};
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_providers::LlmProvider;
 use agent_sdk_tools::stores::MessageStore;
@@ -186,45 +186,50 @@ pub async fn maybe_compact_staged_history(
 
     let compactor =
         LlmContextCompactor::<dyn LlmProvider>::new(Arc::clone(provider_arc), cfg.clone());
+    let compactor = if cfg.uses_prune_first_engine() {
+        compactor.with_purpose(CompactionPurpose::PreSpawn)
+    } else {
+        compactor
+    };
     if !cfg.auto_compact || history.len() < cfg.min_messages_for_compaction {
         return Ok(());
     }
-    let last_compaction_at = deps
-        .message_store
-        .get(thread_id)
-        .await
-        .context("read projection for measured-trigger compaction fence")?
-        .and_then(|projection| {
-            projection
-                .compactions
-                .last()
-                .map(|boundary| boundary.created_at)
-        });
-    let measured = latest_measured_anchor(deps, thread_id, last_compaction_at)
-        .await?
-        .map(|anchor| {
-            // The anchor prices the request it was billed for; anything the
-            // staged history gained afterwards (buffered wait-any child
-            // results, injected steering) is measured by the estimator so
-            // fresh bytes trigger proactively instead of via overflow
-            // recovery.
-            let appended = anchor
-                .request_message_count
-                .and_then(|count| history.get(count..))
-                .map_or(0, |suffix| compactor.estimate_tokens(suffix));
-            anchor.tokens.saturating_add(appended)
-        });
-    let (trigger_tokens, trigger_source) =
-        trigger_tokens(measured, compactor.estimate_tokens(&history));
+    let (trigger_tokens, trigger_source) = if cfg.uses_prune_first_engine() {
+        let last_compaction_at = deps
+            .message_store
+            .get(thread_id)
+            .await
+            .context("read projection for measured-trigger compaction fence")?
+            .and_then(|projection| {
+                projection
+                    .compactions
+                    .last()
+                    .map(|boundary| boundary.created_at)
+            });
+        let measured = latest_measured_anchor(deps, thread_id, last_compaction_at)
+            .await?
+            .map(|anchor| {
+                let appended = anchor
+                    .request_message_count
+                    .and_then(|count| history.get(count..))
+                    .map_or(0, |suffix| compactor.estimate_tokens(suffix));
+                anchor.tokens.saturating_add(appended)
+            });
+        trigger_tokens(measured, compactor.estimate_tokens(&history))
+    } else {
+        (compactor.estimate_tokens(&history), "legacy_estimated")
+    };
     if trigger_tokens <= cfg.threshold_tokens {
         return Ok(());
     }
 
     log::info!(
         "Pre-call auto-compaction triggered (thread={thread_id}, message_count={}, \
-         trigger_tokens={trigger_tokens}, trigger_source={trigger_source}, threshold_tokens={})",
+         trigger_tokens={trigger_tokens}, trigger_source={trigger_source}, threshold_tokens={}, \
+         engine={:?}, purpose=pre_spawn)",
         history.len(),
         cfg.threshold_tokens,
+        cfg.engine,
     );
     apply_compaction(deps, staged_messages, &compactor, history, thread_id, now)
         .await
@@ -283,11 +288,17 @@ pub async fn compact_after_overflow(
 
     let compactor =
         LlmContextCompactor::<dyn LlmProvider>::new(Arc::clone(provider_arc), cfg.clone());
+    let compactor = if cfg.uses_prune_first_engine() {
+        compactor.with_purpose(CompactionPurpose::Overflow)
+    } else {
+        compactor
+    };
 
     log::warn!(
         "Provider rejected turn with prompt-too-long; attempting emergency \
-         compaction (thread={thread_id}, message_count={})",
+         compaction (thread={thread_id}, message_count={}, engine={:?}, purpose=overflow)",
         history.len(),
+        cfg.engine,
     );
     apply_compaction(deps, staged_messages, &compactor, history, thread_id, now)
         .await

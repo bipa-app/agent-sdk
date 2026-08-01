@@ -25,6 +25,21 @@ const fn default_max_retained_tail_tokens() -> usize {
 const fn default_summary_max_tokens() -> usize {
     DEFAULT_SUMMARY_MAX_TOKENS
 }
+fn default_compaction_engine() -> CompactionEngine {
+    CompactionEngine::Legacy
+}
+
+/// Compaction implementation selected by the host.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionEngine {
+    /// Summarize the selected prefix without pruning and use estimated triggers.
+    #[default]
+    Legacy,
+    /// Prune recoverable tool output first and let the host use measured triggers.
+    PruneFirst,
+}
+
 
 /// Configuration for context compaction.
 ///
@@ -86,6 +101,13 @@ pub struct CompactionConfig {
     /// Default: 4,096
     #[serde(default = "default_summary_max_tokens")]
     pub summary_max_tokens: usize,
+
+    /// Compaction implementation selected by the host.
+    ///
+    /// The new engine is explicit until its host completes the ENG-9528 soak.
+    /// Existing hosts therefore retain legacy behavior by default.
+    #[serde(default = "default_compaction_engine")]
+    pub engine: CompactionEngine,
 }
 
 impl Default for CompactionConfig {
@@ -97,6 +119,7 @@ impl Default for CompactionConfig {
             auto_compact: true,
             max_retained_tail_tokens: DEFAULT_MAX_RETAINED_TAIL_TOKENS,
             summary_max_tokens: DEFAULT_SUMMARY_MAX_TOKENS,
+            engine: CompactionEngine::Legacy,
         }
     }
 }
@@ -152,6 +175,19 @@ impl CompactionConfig {
         self.summary_max_tokens = tokens;
         self
     }
+
+    /// Select the compaction implementation.
+    #[must_use]
+    pub const fn with_engine(mut self, engine: CompactionEngine) -> Self {
+        self.engine = engine;
+        self
+    }
+
+    /// Whether prune-first compaction and measured host triggers are enabled.
+    #[must_use]
+    pub const fn uses_prune_first_engine(&self) -> bool {
+        matches!(self.engine, CompactionEngine::PruneFirst)
+    }
 }
 
 #[cfg(test)]
@@ -170,6 +206,7 @@ mod tests {
             DEFAULT_MAX_RETAINED_TAIL_TOKENS
         );
         assert_eq!(config.summary_max_tokens, DEFAULT_SUMMARY_MAX_TOKENS);
+        assert_eq!(config.engine, CompactionEngine::Legacy);
     }
 
     #[test]
@@ -180,7 +217,8 @@ mod tests {
             .with_min_messages(10)
             .with_auto_compact(false)
             .with_max_retained_tail_tokens(40_000)
-            .with_summary_max_tokens(8_000);
+            .with_summary_max_tokens(8_000)
+            .with_engine(CompactionEngine::PruneFirst);
 
         assert_eq!(config.threshold_tokens, 50_000);
         assert_eq!(config.retain_recent, 5);
@@ -188,6 +226,7 @@ mod tests {
         assert!(!config.auto_compact);
         assert_eq!(config.max_retained_tail_tokens, 40_000);
         assert_eq!(config.summary_max_tokens, 8_000);
+        assert_eq!(config.engine, CompactionEngine::PruneFirst);
     }
 
     #[test]
@@ -210,6 +249,7 @@ mod tests {
             DEFAULT_MAX_RETAINED_TAIL_TOKENS
         );
         assert_eq!(config.summary_max_tokens, DEFAULT_SUMMARY_MAX_TOKENS);
+        assert_eq!(config.engine, CompactionEngine::Legacy);
 
         Ok(())
     }
