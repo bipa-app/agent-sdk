@@ -1233,8 +1233,7 @@ mod tests {
                 "retry_after_seconds": 42,
             })
         );
-        let restored: AgentEvent =
-            serde_json::from_value(json).expect("deserialize rotation");
+        let restored: AgentEvent = serde_json::from_value(json).expect("deserialize rotation");
         assert!(matches!(
             restored,
             AgentEvent::AccountRotation {
@@ -1261,8 +1260,7 @@ mod tests {
                 "retry_after_seconds": 90,
             })
         );
-        let restored: AgentEvent =
-            serde_json::from_value(json).expect("deserialize exhaustion");
+        let restored: AgentEvent = serde_json::from_value(json).expect("deserialize exhaustion");
         assert!(matches!(
             restored,
             AgentEvent::AccountPoolExhausted {
