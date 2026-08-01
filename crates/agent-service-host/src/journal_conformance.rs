@@ -43,6 +43,7 @@ mod tests {
         );
         for case in [
             "mixed_batch_spawns_subagents_and_tools",
+            "attached_tool_batch_accepts_empty_spawn_events",
             "mixed_batch_child_ids_follow_slot_order",
             "mixed_batch_losing_cas_spawns_nothing",
             "mixed_batch_rejects_cancelled_parent",
