@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `structured_output` example.
 - **Python binding spike** (`bindings/`) — a thin gRPC client over the durable
   `agent-service-host`, with a written feasibility recommendation.
+- Typed `AccountRotation` and `AccountPoolExhausted` journal events let hosts
+  surface successful OAuth account handoffs and Retry-After-faithful pool
+  exhaustion without parsing provider error text.
 
 ### Changed
 - Compaction now appends range-addressed lineage entries and rebuilds the

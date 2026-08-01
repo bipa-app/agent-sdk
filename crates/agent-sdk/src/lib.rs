@@ -483,7 +483,7 @@ pub use agent_sdk_foundation::privacy::{
     REDACTED_MARKER, RedactionLevel, RedactionPolicy, redact_error, redact_for_observability,
     redact_string, redact_value,
 };
-pub use events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
+pub use events::{AccountRotationReason, AgentEvent, AgentEventEnvelope, SequenceCounter};
 pub use types::{
     AgentConfig, AgentError, AgentInput, AgentRunState, AgentState, BudgetLimitKind,
     ExecutionStatus, ExternalToolResult, PendingToolCallInfo, RetryConfig, RunOptions, ThreadId,
