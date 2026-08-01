@@ -44,7 +44,7 @@ use agent_server::journal::event_repository::EventRepository;
 use agent_server::journal::execution_intent::{ExecutionIntent, ExecutionIntentStore, OperationId};
 use agent_server::journal::fork_transaction::{AtomicForkCommitter, ForkCommitParams};
 use agent_server::journal::idempotency::{IdempotencyClaim, IdempotencyKind, IdempotencyRecord};
-use agent_server::journal::message::MessageProjection;
+use agent_server::journal::message::{CompactionEntry, MessageProjection};
 use agent_server::journal::message_store::MessageProjectionStore;
 use agent_server::journal::outbox::{
     NewOutboxRow, OutboxRow, OutboxRowId, OutboxStatus, OutboxStore, kind_payload_invariants_hold,
@@ -473,7 +473,7 @@ ON CONFLICT (thread_id) DO UPDATE SET
     ) -> Result<MessageProjection> {
         let record = sqlx::query_as::<_, MessageHeadRecord>(
             r"
-SELECT thread_id, history_json, draft_messages_json, version, created_at, updated_at
+SELECT thread_id, history_json, draft_messages_json, compactions_json, version, created_at, updated_at
 FROM agent_sdk_message_heads
 WHERE thread_id = ?1
 ",
@@ -500,8 +500,8 @@ WHERE thread_id = ?1
             // draft once a suspension boundary fires.
             sqlx::query(
                 r"
-INSERT INTO agent_sdk_message_heads (thread_id, history_json, draft_messages_json, version, created_at, updated_at)
-VALUES (?1, ?2, NULL, ?3, ?4, ?5)
+INSERT INTO agent_sdk_message_heads (thread_id, history_json, draft_messages_json, compactions_json, version, created_at, updated_at)
+VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?5)
 ON CONFLICT (thread_id) DO NOTHING
 ",
             )
@@ -523,7 +523,7 @@ ON CONFLICT (thread_id) DO NOTHING
     ) -> Result<Option<MessageProjection>> {
         let record = sqlx::query_as::<_, MessageHeadRecord>(
             r"
-SELECT thread_id, history_json, draft_messages_json, version, created_at, updated_at
+SELECT thread_id, history_json, draft_messages_json, compactions_json, version, created_at, updated_at
 FROM agent_sdk_message_heads
 WHERE thread_id = ?1
 ",
@@ -552,24 +552,34 @@ WHERE thread_id = ?1
                 "message head draft messages",
             )?)
         };
+        let compactions_json = if projection.compactions.is_empty() {
+            None
+        } else {
+            Some(json_to_value(
+                &projection.compactions,
+                "message head compactions",
+            )?)
+        };
         let version = i64_from_u64(projection.version, "message head version")?;
-        sqlx::query!(
+        sqlx::query(
             r"
-INSERT INTO agent_sdk_message_heads (thread_id, history_json, draft_messages_json, version, created_at, updated_at)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+INSERT INTO agent_sdk_message_heads (thread_id, history_json, draft_messages_json, compactions_json, version, created_at, updated_at)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
 ON CONFLICT (thread_id) DO UPDATE SET
     history_json = excluded.history_json,
     draft_messages_json = excluded.draft_messages_json,
+    compactions_json = excluded.compactions_json,
     version = excluded.version,
     updated_at = excluded.updated_at
 ",
-            thread_id_key,
-            history_json,
-            draft_messages_json,
-            version,
-            projection.created_at,
-            projection.updated_at,
         )
+        .bind(thread_id_key)
+        .bind(history_json)
+        .bind(draft_messages_json)
+        .bind(compactions_json)
+        .bind(version)
+        .bind(projection.created_at)
+        .bind(projection.updated_at)
         .execute(&mut **tx)
         .await
         .context("upsert message head")?;
@@ -4604,7 +4614,7 @@ impl MessageProjectionStore for SqliteDurableStore {
         Ok(self
             .get_message_head_pool(thread_id)
             .await?
-            .map(|p| p.messages)
+            .map(|projection| projection.context_history())
             .unwrap_or_default())
     }
 
@@ -4635,6 +4645,28 @@ impl MessageProjectionStore for SqliteDurableStore {
         let updated = projection.replace_history(messages, now);
         Self::upsert_message_head_tx(&mut tx, &updated).await?;
         tx.commit().await.context("commit replace_history")?;
+        Ok(updated)
+    }
+
+    async fn append_compaction(
+        &self,
+        thread_id: &ThreadId,
+        result_messages: Vec<llm::Message>,
+        source_message_count: usize,
+        retained_message_count: usize,
+        now: OffsetDateTime,
+    ) -> Result<MessageProjection> {
+        let mut tx = self.begin().await?;
+        Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
+        let projection = Self::get_message_head_tx(&mut tx, thread_id, now).await?;
+        let updated = projection.append_compaction(
+            result_messages,
+            source_message_count,
+            retained_message_count,
+            now,
+        )?;
+        Self::upsert_message_head_tx(&mut tx, &updated).await?;
+        tx.commit().await.context("commit append_compaction")?;
         Ok(updated)
     }
 
@@ -5759,6 +5791,7 @@ struct MessageHeadRecord {
     /// Populated by the worker at every tool-boundary suspension and
     /// cleared atomically by `commit_completed_turn_atomic_inner`.
     draft_messages_json: Option<serde_json::Value>,
+    compactions_json: Option<serde_json::Value>,
     version: i64,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
@@ -5767,19 +5800,39 @@ struct MessageHeadRecord {
 impl TryFrom<MessageHeadRecord> for MessageProjection {
     type Error = anyhow::Error;
     fn try_from(r: MessageHeadRecord) -> Result<Self> {
+        let messages: Vec<llm::Message> = json_from_value(r.history_json, "message head history")?;
         let draft_messages = match r.draft_messages_json {
             Some(value) => json_from_value(value, "message head draft messages")?,
             None => Vec::new(),
         };
+        let mut compactions: Vec<CompactionEntry> = match r.compactions_json {
+            Some(value) => json_from_value(value, "message head compactions")?,
+            None => Vec::new(),
+        };
+        if !compaction_lineage_matches_history(&compactions, messages.len()) {
+            compactions = Vec::new();
+        }
         Ok(Self {
             thread_id: ThreadId::from_string(r.thread_id),
-            messages: json_from_value(r.history_json, "message head history")?,
+            messages,
             draft_messages,
+            compactions,
             version: u64_from_i64(r.version, "message head version")?,
             created_at: r.created_at,
             updated_at: r.updated_at,
         })
     }
+}
+
+fn compaction_lineage_matches_history(compactions: &[CompactionEntry], history_len: usize) -> bool {
+    let mut expected_start = 0;
+    compactions.iter().all(|entry| {
+        let matches = entry.compacted_start == expected_start
+            && entry.compacted_end >= entry.compacted_start
+            && entry.compacted_end <= history_len;
+        expected_start = entry.compacted_end;
+        matches
+    })
 }
 
 #[derive(Debug, FromRow)]
@@ -8451,6 +8504,170 @@ INSERT INTO agent_sdk_turn_attempts (
                 "{label}: an idle beat must neither advance nor clear activity",
             );
         }
+
+        Ok(())
+    }
+
+    async fn seed_compacted_sqlite_thread(
+        store: &SqliteDurableStore,
+        thread_id: &ThreadId,
+    ) -> Result<Vec<agent_sdk_foundation::llm::Message>> {
+        use agent_sdk_foundation::llm;
+        use agent_server::journal::message_store::MessageProjectionStore;
+
+        let raw_messages = vec![
+            llm::Message::user("first"),
+            llm::Message::assistant("second"),
+            llm::Message::user("third"),
+        ];
+        MessageProjectionStore::commit_messages(store, thread_id, raw_messages.clone(), t0())
+            .await?;
+        let compacted = MessageProjectionStore::append_compaction(
+            store,
+            thread_id,
+            vec![llm::Message::assistant("summary"), raw_messages[2].clone()],
+            raw_messages.len(),
+            1,
+            t_plus(1),
+        )
+        .await?;
+        assert_eq!(compacted.compactions.len(), 1);
+        Ok(raw_messages)
+    }
+
+    #[tokio::test]
+    async fn explicit_replace_history_invalidates_compaction_lineage() -> Result<()> {
+        use agent_sdk_foundation::llm;
+        use agent_server::journal::message_store::MessageProjectionStore;
+
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+        let thread_id = ThreadId::from_string("t-sqlite-compaction-explicit-replace");
+        let raw_messages = seed_compacted_sqlite_thread(&store, &thread_id).await?;
+
+        let replacement = vec![
+            llm::Message::user("replacement"),
+            llm::Message::assistant("replacement answer"),
+            llm::Message::user("replacement tail"),
+        ];
+        assert_eq!(
+            replacement.len(),
+            raw_messages.len(),
+            "the explicit replace regression must not rely on the shrink trigger",
+        );
+        let replaced = MessageProjectionStore::replace_history(
+            &store,
+            &thread_id,
+            replacement.clone(),
+            t_plus(2),
+        )
+        .await?;
+        assert!(
+            replaced.compactions.is_empty(),
+            "the explicit destructive API must clear lineage in its row write",
+        );
+        let reloaded = MessageProjectionStore::get(&store, &thread_id)
+            .await?
+            .context("replaced projection")?;
+        assert!(reloaded.compactions.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_shrink_upsert_clears_stale_compaction_lineage() -> Result<()> {
+        use agent_sdk_foundation::llm;
+        use agent_server::journal::message_store::MessageProjectionStore;
+
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+        let thread_id = ThreadId::from_string("t-sqlite-compaction-upgrade-fence");
+        seed_compacted_sqlite_thread(&store, &thread_id).await?;
+
+        let appended = MessageProjectionStore::commit_messages(
+            &store,
+            &thread_id,
+            vec![llm::Message::user("new tail")],
+            t_plus(3),
+        )
+        .await?;
+        let compacted = MessageProjectionStore::append_compaction(
+            &store,
+            &thread_id,
+            vec![
+                llm::Message::assistant("new summary"),
+                appended.messages[3].clone(),
+            ],
+            appended.context_history().len(),
+            1,
+            t_plus(4),
+        )
+        .await?;
+        assert_eq!(compacted.compactions.len(), 2);
+        let lineage_preserved = MessageProjectionStore::commit_messages(
+            &store,
+            &thread_id,
+            vec![llm::Message::assistant("post-compaction tail")],
+            t_plus(5),
+        )
+        .await?;
+        assert_eq!(lineage_preserved.compactions.len(), 2);
+        let stale_compactions_json = serde_json::to_value(&lineage_preserved.compactions)
+            .context("encode stale compaction fixture")?;
+
+        // This is the pre-compaction writer's UPSERT shape: it shortens
+        // history but does not know that compactions_json exists.
+        let legacy_replacement = vec![llm::Message::user("legacy replacement")];
+        sqlx::query(
+            r"
+INSERT INTO agent_sdk_message_heads (
+    thread_id, history_json, draft_messages_json, version, created_at, updated_at
+) VALUES (?1, ?2, NULL, ?3, ?4, ?5)
+ON CONFLICT (thread_id) DO UPDATE SET
+    history_json = excluded.history_json,
+    draft_messages_json = excluded.draft_messages_json,
+    version = excluded.version,
+    updated_at = excluded.updated_at
+",
+        )
+        .bind(super::thread_key(&thread_id))
+        .bind(serde_json::to_value(&legacy_replacement)?)
+        .bind(99_i64)
+        .bind(t0())
+        .bind(t_plus(6))
+        .execute(&store.pool)
+        .await
+        .context("simulate legacy sqlite message-head upsert")?;
+
+        let persisted_compactions: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT compactions_json FROM agent_sdk_message_heads WHERE thread_id = ?1",
+        )
+        .bind(super::thread_key(&thread_id))
+        .fetch_one(&store.pool)
+        .await
+        .context("read sqlite compaction lineage after legacy shrink")?;
+        assert!(
+            persisted_compactions.is_none(),
+            "the migration trigger must clear stale lineage atomically",
+        );
+
+        // Rows left stale before the fence was installed must still be
+        // recoverable: the decoder discards an out-of-range lineage and
+        // exposes the intact raw replacement.
+        sqlx::query(
+            "UPDATE agent_sdk_message_heads SET compactions_json = ?1 WHERE thread_id = ?2",
+        )
+        .bind(stale_compactions_json)
+        .bind(super::thread_key(&thread_id))
+        .execute(&store.pool)
+        .await
+        .context("restore stale sqlite lineage fixture")?;
+        let safely_decoded = MessageProjectionStore::get(&store, &thread_id)
+            .await?
+            .context("decode sqlite head with stale lineage")?;
+        assert!(safely_decoded.compactions.is_empty());
+        assert_eq!(safely_decoded.messages.len(), legacy_replacement.len());
+        assert_eq!(
+            safely_decoded.context_history().len(),
+            legacy_replacement.len(),
+        );
 
         Ok(())
     }

@@ -39,6 +39,7 @@ use crate::journal::turn_attempt::{
 use crate::journal::turn_attempt_store::{InMemoryTurnAttemptStore, TurnAttemptStore};
 use crate::worker::bootstrap::WorkerBootstrapContext;
 use crate::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
+use agent_sdk::context::CompactionConfig;
 use agent_sdk_foundation::audit::AuditProvenance;
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::llm::{
@@ -353,6 +354,18 @@ impl TestStores {
             wakeup: None,
             activity: None,
             connectivity_waits: None,
+        }
+    }
+
+    fn deps_with_compaction<'a>(
+        &'a self,
+        config: &'a CompactionConfig,
+        provider: &'a Arc<dyn LlmProvider>,
+    ) -> RootTurnDeps<'a> {
+        RootTurnDeps {
+            compaction_config: Some(config),
+            compaction_provider: Some(provider),
+            ..self.deps()
         }
     }
 }
@@ -1287,6 +1300,130 @@ async fn resume_text_only_end_to_end() -> Result<()> {
     assert!(attempts[0].is_closed());
     assert!(attempts[1].is_closed());
 
+    Ok(())
+}
+
+async fn resume_with_compaction_fixture(
+    stores: &TestStores,
+) -> Result<(Box<crate::journal::commit::CommitOutcome>, usize)> {
+    let child_results = vec![(
+        "call_1".to_owned(),
+        agent_sdk_foundation::ToolResult::success("file1.txt"),
+    )];
+    let (parent, continuation, suspended_messages) = Box::pin(suspend_and_complete_children(
+        stores,
+        vec![(
+            "call_1".into(),
+            "bash".into(),
+            serde_json::json!({"command": "ls"}),
+        )],
+        &child_results,
+    ))
+    .await?;
+    let expected_source_count = suspended_messages.len() + 1;
+
+    let before = stores
+        .messages
+        .get(&thread_a())
+        .await?
+        .context("projection after suspension")?;
+    assert_eq!(
+        before.draft_messages.len(),
+        suspended_messages.len(),
+        "precondition: suspension draft is persisted",
+    );
+
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent.id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            t_plus(20),
+        )
+        .await?
+        .context("re-acquire parent")?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap_with_tools(acquired),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(20),
+    )
+    .await?;
+    assert!(
+        inputs
+            .staged_stores
+            .messages
+            .get_history(&thread_a())
+            .await?
+            .is_empty(),
+        "resume starts from the committed-only seed before restaging the draft",
+    );
+
+    let config = CompactionConfig::default()
+        .with_threshold_tokens(1)
+        .with_min_messages(2)
+        .with_retain_recent(1);
+    let compactor_impl = Arc::new(MockTextProvider::new("[resume summary]"));
+    let compactor: Arc<dyn LlmProvider> = compactor_impl.clone();
+    let deps = stores.deps_with_compaction(&config, &compactor);
+    let resume_provider = MockTextProvider::new("resume completed");
+
+    let outcome = Box::pin(resume_root_turn(
+        inputs,
+        continuation,
+        suspended_messages,
+        child_results,
+        &resume_provider,
+        &deps,
+        t_plus(25),
+    ))
+    .await
+    .context("resume with compaction")?;
+    let RootTurnOutcome::Completed { commit, .. } = outcome else {
+        panic!("expected compacted resume to complete");
+    };
+    assert_eq!(compactor_impl.calls(), 1);
+    assert_eq!(resume_provider.calls(), 1);
+    Ok((commit, expected_source_count))
+}
+
+#[tokio::test]
+async fn resume_compacts_exact_persisted_draft_and_checkpoints_effective_view() -> Result<()> {
+    let stores = TestStores::new();
+    let (commit, expected_source_count) = resume_with_compaction_fixture(&stores).await?;
+    let projection = stores
+        .messages
+        .get(&thread_a())
+        .await?
+        .context("projection after compacted resume")?;
+    assert_eq!(projection.compactions.len(), 1);
+    assert_eq!(
+        projection.compactions[0].source_message_count, expected_source_count,
+        "compactor source must include the persisted suspension plus completed results",
+    );
+    assert!(
+        projection.draft_messages.is_empty(),
+        "append_compaction must atomically fold and clear the exact resumed draft",
+    );
+    assert_eq!(
+        projection.messages.len(),
+        expected_source_count + 1,
+        "raw transcript must preserve the folded draft and append the final assistant",
+    );
+    let effective = projection.context_history();
+    assert_eq!(
+        serde_json::to_value(&commit.checkpoint.messages)?,
+        serde_json::to_value(&effective)?,
+        "checkpoint (and therefore fork seed) must use the effective compacted view",
+    );
+    assert_ne!(
+        serde_json::to_value(&commit.checkpoint.messages)?,
+        serde_json::to_value(&projection.messages)?,
+        "checkpoint must not resurrect the raw compacted prefix",
+    );
     Ok(())
 }
 

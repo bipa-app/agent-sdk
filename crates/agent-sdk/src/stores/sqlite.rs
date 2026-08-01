@@ -71,7 +71,7 @@ const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// On-disk format version stamped into `PRAGMA user_version`. Bump when the
 /// table layout changes and add a migration path in [`SqliteStore::open`].
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// Schema applied on open. `CREATE TABLE IF NOT EXISTS` makes opening an
 /// existing database a no-op, which is exactly the resume path.
@@ -83,6 +83,16 @@ CREATE TABLE IF NOT EXISTS agent_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_agent_messages_thread
     ON agent_messages (thread_id, id);
+CREATE TABLE IF NOT EXISTS agent_compactions (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id            TEXT NOT NULL,
+    compacted_start      INTEGER NOT NULL,
+    compacted_end        INTEGER NOT NULL,
+    replacement_json     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_compactions_thread
+    ON agent_compactions (thread_id, id);
+
 
 CREATE TABLE IF NOT EXISTS agent_states (
     thread_id TEXT PRIMARY KEY,
@@ -175,7 +185,7 @@ impl SqliteStore {
         }
         conn.execute_batch(SCHEMA)
             .context("failed to initialize sqlite store schema")?;
-        if version == 0 {
+        if version < SCHEMA_VERSION {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)
                 .context("failed to stamp sqlite user_version")?;
         }
@@ -261,7 +271,29 @@ impl MessageStore for SqliteStore {
                 let payload = row.context("failed to read message row")?;
                 messages.push(serde_json::from_str(&payload).context("failed to decode message")?);
             }
-            Ok(messages)
+            let compaction: Option<(i64, String)> = conn
+                .query_row(
+                    "SELECT compacted_end, replacement_json
+                     FROM agent_compactions WHERE thread_id = ?1 ORDER BY id DESC LIMIT 1",
+                    params![thread],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .context("failed to read latest compaction")?;
+            let Some((compacted_end, replacement_json)) = compaction else {
+                return Ok(messages);
+            };
+            let compacted_end =
+                usize::try_from(compacted_end).context("compacted_end is negative")?;
+            anyhow::ensure!(
+                compacted_end <= messages.len(),
+                "compaction boundary {compacted_end} exceeds transcript length {}",
+                messages.len()
+            );
+            let mut history: Vec<llm::Message> = serde_json::from_str(&replacement_json)
+                .context("failed to decode compaction replacement")?;
+            history.extend(messages.into_iter().skip(compacted_end));
+            Ok(history)
         })
         .await
     }
@@ -269,11 +301,20 @@ impl MessageStore for SqliteStore {
     async fn clear(&self, thread_id: &ThreadId) -> Result<()> {
         let thread = thread_id.0.clone();
         self.with_conn(move |conn| {
-            conn.execute(
+            let tx = conn
+                .transaction()
+                .context("failed to begin clear transaction")?;
+            tx.execute(
                 "DELETE FROM agent_messages WHERE thread_id = ?1",
                 params![thread],
             )
             .context("failed to clear messages")?;
+            tx.execute(
+                "DELETE FROM agent_compactions WHERE thread_id = ?1",
+                params![thread],
+            )
+            .context("failed to clear compactions")?;
+            tx.commit().context("failed to commit clear transaction")?;
             Ok(())
         })
         .await
@@ -313,6 +354,11 @@ impl MessageStore for SqliteStore {
                 params![thread],
             )
             .context("failed to clear existing messages")?;
+            tx.execute(
+                "DELETE FROM agent_compactions WHERE thread_id = ?1",
+                params![thread],
+            )
+            .context("failed to clear compactions")?;
             for payload in payloads {
                 tx.execute(
                     "INSERT INTO agent_messages (thread_id, payload) VALUES (?1, ?2)",
@@ -326,8 +372,102 @@ impl MessageStore for SqliteStore {
         })
         .await
     }
-}
 
+    async fn append_compaction(
+        &self,
+        thread_id: &ThreadId,
+        messages: Vec<llm::Message>,
+        source_message_count: usize,
+        retained_message_count: usize,
+    ) -> Result<()> {
+        if retained_message_count > messages.len() {
+            anyhow::bail!(
+                "compaction retained {retained_message_count} messages from a {}-message result",
+                messages.len()
+            );
+        }
+        let thread = thread_id.0.clone();
+        self.with_conn(move |conn| {
+            let tx = conn
+                .transaction()
+                .context("failed to begin append_compaction transaction")?;
+            let raw_count: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_messages WHERE thread_id = ?1",
+                    params![thread],
+                    |row| row.get(0),
+                )
+                .context("failed to count raw messages")?;
+            let raw_count = usize::try_from(raw_count).context("message count is negative")?;
+            let previous: Option<(i64, String)> = tx
+                .query_row(
+                    "SELECT compacted_end, replacement_json
+                     FROM agent_compactions WHERE thread_id = ?1 ORDER BY id DESC LIMIT 1",
+                    params![thread],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .context("failed to read previous compaction")?;
+            let (prior_boundary, prior_replacement_count) = match previous {
+                Some((boundary, replacement)) => (
+                    usize::try_from(boundary).context("compaction boundary is negative")?,
+                    serde_json::from_str::<Vec<llm::Message>>(&replacement)
+                        .context("failed to decode previous compaction")?
+                        .len(),
+                ),
+                None => (0, 0),
+            };
+            let visible_raw_count = raw_count.saturating_sub(prior_boundary);
+            let available = prior_replacement_count.saturating_add(visible_raw_count);
+            anyhow::ensure!(
+                source_message_count == available,
+                "compaction source count mismatch: store exposes {available}, compactor saw {source_message_count}"
+            );
+            let retained_raw_count = retained_message_count.min(visible_raw_count);
+            let compacted_end = raw_count.saturating_sub(retained_raw_count);
+            let replacement_count = messages.len().saturating_sub(retained_raw_count);
+            let replacement_json = serde_json::to_string(
+                &messages.into_iter().take(replacement_count).collect::<Vec<_>>(),
+            )
+            .context("failed to encode compaction replacement")?;
+            tx.execute(
+                "INSERT INTO agent_compactions (
+                    thread_id, compacted_start, compacted_end, replacement_json
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    thread,
+                    i64::try_from(prior_boundary).context("compaction start exceeds i64")?,
+                    i64::try_from(compacted_end).context("compaction end exceeds i64")?,
+                    replacement_json
+                ],
+            )
+            .context("failed to append compaction")?;
+            tx.commit()
+                .context("failed to commit append_compaction transaction")?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_transcript(&self, thread_id: &ThreadId) -> Result<Vec<llm::Message>> {
+        let thread = thread_id.0.clone();
+        self.with_conn(move |conn| {
+            let mut stmt = conn
+                .prepare("SELECT payload FROM agent_messages WHERE thread_id = ?1 ORDER BY id")
+                .context("failed to prepare transcript query")?;
+            let rows = stmt
+                .query_map(params![thread], |row| row.get::<_, String>(0))
+                .context("failed to read transcript")?;
+            let mut messages = Vec::new();
+            for row in rows {
+                let payload = row.context("failed to read message row")?;
+                messages.push(serde_json::from_str(&payload).context("failed to decode message")?);
+            }
+            Ok(messages)
+        })
+        .await
+    }
+}
 #[async_trait]
 impl StateStore for SqliteStore {
     async fn save(&self, state: &AgentState) -> Result<()> {

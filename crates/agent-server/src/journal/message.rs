@@ -66,6 +66,32 @@ use time::OffsetDateTime;
 pub enum MessageProjectionError {
     #[error("cannot commit an empty message batch")]
     EmptyCommit,
+    #[error(
+        "compaction source count mismatch: projection exposes {available} messages, compactor saw {provided}"
+    )]
+    CompactionSourceMismatch { available: usize, provided: usize },
+    #[error(
+        "compaction retained {retained} messages, but the compacted result contains only {result_count}"
+    )]
+    InvalidCompactionRetention {
+        retained: usize,
+        result_count: usize,
+    },
+}
+/// One append-only compaction boundary in a message projection.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CompactionEntry {
+    /// First raw committed message newly covered by this compaction.
+    pub compacted_start: usize,
+    /// First raw committed message retained verbatim after this compaction.
+    pub compacted_end: usize,
+    /// Synthetic context prefix replacing the compacted raw range for LLM calls.
+    pub replacement_messages: Vec<llm::Message>,
+    /// Number of messages in the effective source view seen by the compactor.
+    pub source_message_count: usize,
+    /// When this compaction entry was appended.
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -74,11 +100,10 @@ pub enum MessageProjectionError {
 
 /// One row in the `message_projection` table.
 ///
-/// Holds the committed message history for a single thread. The
-/// history is modified exclusively through [`Self::append_committed`]
-/// and [`Self::replace_history`], both of which are called by the
-/// store's entry points under a write lock. No other code path may
-/// modify the messages.
+/// [`Self::messages`] is the append-only raw transcript.
+/// [`Self::compactions`] records range-addressed effective-view prefixes;
+/// [`Self::context_history`] rebuilds the LLM-facing view without rewriting
+/// raw messages.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MessageProjection {
     /// The thread this projection belongs to.
@@ -96,6 +121,10 @@ pub struct MessageProjection {
     /// they decode with an empty draft slot.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub draft_messages: Vec<llm::Message>,
+    /// Append-only compaction lineage. Raw committed messages remain in
+    /// [`Self::messages`]; the latest entry selects the effective LLM view.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compactions: Vec<CompactionEntry>,
     /// Monotonically increasing version, bumped on every mutation.
     pub version: u64,
     /// When this projection row was first created.
@@ -114,6 +143,7 @@ impl MessageProjection {
             thread_id,
             messages: Vec::new(),
             draft_messages: Vec::new(),
+            compactions: Vec::new(),
             version: 0,
             created_at: now,
             updated_at: now,
@@ -142,32 +172,99 @@ impl MessageProjection {
         Ok(self)
     }
 
-    /// Replace the entire message history atomically, dropping any
-    /// in-flight draft.
+    /// Explicitly replace the raw history for non-compaction repair/import paths.
     ///
-    /// Used for context compaction and orphaned-tool_use backfill: the
-    /// caller replaces all committed messages with a condensed summary or
-    /// a balanced history. This is a full swap — the old history is
-    /// discarded and the new one takes its place.
-    ///
-    /// The in-flight draft is cleared in the same operation. The draft is
-    /// a snapshot taken *relative to the old committed history*; once that
-    /// history is replaced, the draft is stale, and — because callers fold
-    /// the draft into `messages` before replacing — leaving it would make
-    /// [`super::thread_recover::recover_thread`] fold the same messages in
-    /// twice. Clearing it here (rather than via a separate `clear_draft`
-    /// call) closes the crash window where a replace succeeds but the
-    /// follow-up clear does not, leaving a draft that double-folds.
-    ///
-    /// Unlike [`Self::append_committed`], an empty replacement is
-    /// allowed (clears the history).
+    /// Compaction must use [`Self::append_compaction`]. A replacement invalidates
+    /// prior compaction boundaries and drops the in-flight draft atomically.
+    /// Empty replacements are allowed.
     #[must_use]
     pub fn replace_history(mut self, messages: Vec<llm::Message>, now: OffsetDateTime) -> Self {
         self.messages = messages;
         self.draft_messages = Vec::new();
+        self.compactions = Vec::new();
         self.version += 1;
         self.updated_at = now;
         self
+    }
+    /// Append a compaction entry without deleting or rewriting committed messages.
+    ///
+    /// `result_messages` is the compactor's effective output and
+    /// `retained_message_count` is its unchanged trailing slice. Any recovery
+    /// draft folded into the source view is first appended to the raw transcript,
+    /// then cleared atomically with the compaction entry.
+    ///
+    /// # Errors
+    /// Returns [`MessageProjectionError::CompactionSourceMismatch`] when the
+    /// caller compacted a stale projection, or
+    /// [`MessageProjectionError::InvalidCompactionRetention`] when the retained
+    /// count exceeds the result length.
+    pub fn append_compaction(
+        mut self,
+        result_messages: Vec<llm::Message>,
+        source_message_count: usize,
+        retained_message_count: usize,
+        now: OffsetDateTime,
+    ) -> Result<Self, MessageProjectionError> {
+        let prior_boundary = self
+            .compactions
+            .last()
+            .map_or(0, |entry| entry.compacted_end);
+        let visible_raw_count = self.messages.len().saturating_sub(prior_boundary);
+        let available = self
+            .compactions
+            .last()
+            .map_or(0, |entry| entry.replacement_messages.len())
+            .saturating_add(visible_raw_count)
+            .saturating_add(self.draft_messages.len());
+        if source_message_count != available {
+            return Err(MessageProjectionError::CompactionSourceMismatch {
+                available,
+                provided: source_message_count,
+            });
+        }
+        if retained_message_count > result_messages.len() {
+            return Err(MessageProjectionError::InvalidCompactionRetention {
+                retained: retained_message_count,
+                result_count: result_messages.len(),
+            });
+        }
+
+        self.messages.append(&mut self.draft_messages);
+        let visible_raw_count = self.messages.len().saturating_sub(prior_boundary);
+        let retained_raw_count = retained_message_count.min(visible_raw_count);
+        let compacted_end = self.messages.len().saturating_sub(retained_raw_count);
+        let replacement_count = result_messages.len().saturating_sub(retained_raw_count);
+        let replacement_messages = result_messages
+            .into_iter()
+            .take(replacement_count)
+            .collect();
+        self.compactions.push(CompactionEntry {
+            compacted_start: prior_boundary,
+            compacted_end,
+            replacement_messages,
+            source_message_count,
+            created_at: now,
+        });
+        self.version += 1;
+        self.updated_at = now;
+        Ok(self)
+    }
+
+    /// Effective history sent to the LLM.
+    #[must_use]
+    pub fn context_history(&self) -> Vec<llm::Message> {
+        let Some(entry) = self.compactions.last() else {
+            return self.messages.clone();
+        };
+        let mut history = Vec::with_capacity(
+            entry
+                .replacement_messages
+                .len()
+                .saturating_add(self.messages.len().saturating_sub(entry.compacted_end)),
+        );
+        history.extend(entry.replacement_messages.iter().cloned());
+        history.extend(self.messages[entry.compacted_end..].iter().cloned());
+        history
     }
 
     /// Replace the in-flight draft messages.
@@ -533,6 +630,91 @@ mod tests {
         let recovered: MessageProjection = serde_json::from_value(legacy)?;
         assert!(!recovered.has_draft());
         assert_eq!(recovered.messages.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn append_compaction_preserves_originals_and_builds_effective_history() -> anyhow::Result<()> {
+        let originals = vec![
+            llm::Message::user("old user"),
+            llm::Message::assistant("old assistant"),
+            llm::Message::user("recent user"),
+            llm::Message::assistant("recent assistant"),
+        ];
+        let p = MessageProjection::new(thread_id(), t0()).append_committed(originals, t_plus(1))?;
+        let raw_count = p.message_count();
+        let p = p.append_compaction(
+            vec![
+                llm::Message::user("[summary]"),
+                llm::Message::assistant("continue"),
+                llm::Message::user("recent user"),
+                llm::Message::assistant("recent assistant"),
+            ],
+            4,
+            2,
+            t_plus(2),
+        )?;
+
+        assert_eq!(p.message_count(), raw_count);
+        assert_eq!(p.compactions.len(), 1);
+        assert_eq!(p.compactions[0].compacted_start, 0);
+        assert_eq!(p.compactions[0].compacted_end, 2);
+        let raw_text: Vec<_> = p
+            .messages
+            .iter()
+            .filter_map(|message| match &message.content {
+                llm::Content::Text(text) => Some(text.as_str()),
+                llm::Content::Blocks(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            raw_text,
+            [
+                "old user",
+                "old assistant",
+                "recent user",
+                "recent assistant"
+            ]
+        );
+        let context_text: Vec<_> = p
+            .context_history()
+            .into_iter()
+            .filter_map(|message| match message.content {
+                llm::Content::Text(text) => Some(text),
+                llm::Content::Blocks(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            context_text,
+            ["[summary]", "continue", "recent user", "recent assistant"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn append_compaction_folds_and_clears_the_counted_draft_atomically() -> anyhow::Result<()> {
+        let committed = vec![llm::Message::user("committed")];
+        let draft = vec![
+            llm::Message::assistant("draft assistant"),
+            llm::Message::user("draft tool result"),
+        ];
+        let p = MessageProjection::new(thread_id(), t0()).append_committed(committed, t_plus(1))?;
+        let p = p.set_draft(draft, t_plus(2));
+        let compacted = vec![llm::Message::assistant("[summary including draft]")];
+        let p = p.append_compaction(compacted.clone(), 3, 0, t_plus(3))?;
+
+        assert_eq!(
+            p.messages.len(),
+            3,
+            "draft must move into the raw transcript"
+        );
+        assert!(p.draft_messages.is_empty());
+        assert_eq!(p.compactions.len(), 1);
+        assert_eq!(p.compactions[0].source_message_count, 3);
+        assert_eq!(
+            serde_json::to_value(p.context_history())?,
+            serde_json::to_value(compacted)?,
+        );
         Ok(())
     }
 

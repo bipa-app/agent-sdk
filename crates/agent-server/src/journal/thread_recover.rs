@@ -198,44 +198,43 @@ pub async fn recover_thread(
     //    The projection row may not exist yet (very first turn never
     //    wrote anything), in which case both are empty.
     //
-    //    Reading the committed history straight from the projection
+    //    Reading the effective history straight from the projection
     //    (rather than the checkpoint's frozen `messages` snapshot)
     //    is what makes auto-compaction durable across attempts: when
-    //    the worker rewrites the projection via
-    //    `MessageProjectionStore::replace_history` mid-turn (a
-    //    non-commit mutation), the checkpoint is still at the
-    //    pre-compaction snapshot, but the projection holds the
-    //    canonical compacted head. Recovering from the projection
-    //    means a fresh attempt after lease expiry — or a brand-new
-    //    turn after a failed-but-already-compacted prior attempt —
-    //    picks up the compacted state instead of replaying the
-    //    pre-compaction history that just blew the context window.
-    //    The checkpoint is still load-bearing for the agent-state
-    //    snapshot and the turn_number consistency guard, but the
-    //    `messages` field is now treated as a snapshot artifact, not
-    //    the recovery source of truth.
-    let (committed_messages, draft_messages) = match message_store
+    //    the worker appends compaction lineage mid-turn, the checkpoint
+    //    still holds the pre-compaction snapshot, but the projection
+    //    exposes the canonical compacted view. A fresh attempt after
+    //    lease expiry — or a new turn after a failed-but-compacted
+    //    attempt — therefore does not replay the context that overflowed.
+    //    The checkpoint remains load-bearing for agent state and the
+    //    turn-number consistency guard.
+    let (has_projection, committed_messages, draft_messages) = match message_store
         .get(thread_id)
         .await
         .context("recover: load message projection")?
     {
-        Some(projection) => (projection.messages, projection.draft_messages),
-        None => (Vec::new(), Vec::new()),
+        Some(projection) => {
+            let context_history = projection.context_history();
+            (true, context_history, projection.draft_messages)
+        }
+        None => (false, Vec::new(), Vec::new()),
     };
 
-    // 4. Fresh thread — no checkpoints to load. The draft may still
-    //    be populated if the very first turn suspended and then
-    //    failed before any commit, so it's included in `messages`
-    //    even on the no-checkpoint path.
+    // 4. Fresh thread — no checkpoints to load. A projection can still carry
+    //    effective history here: pre-call compaction may have atomically folded
+    //    a first turn's recovery draft into the append-only raw transcript
+    //    before that turn later failed. Treating `committed_turns == 0` as
+    //    "projection history is empty" would discard that compacted recovery
+    //    source because `append_compaction` correctly cleared the draft.
     if thread.committed_turns == 0 {
+        let mut messages = committed_messages.clone();
+        messages.extend(draft_messages.iter().cloned());
         return Ok(ThreadRecoveryView {
             thread,
-            messages: draft_messages.clone(),
+            messages,
             agent_state_snapshot: serde_json::Value::Null,
             latest_checkpoint: None,
-            // No committed turns yet — the committed head is empty; the
-            // draft (if any) lives only in `messages`/`draft_messages`.
-            committed_messages: Vec::new(),
+            committed_messages,
             draft_messages,
             next_turn_number: 1,
         });
@@ -267,24 +266,15 @@ pub async fn recover_thread(
     }
 
     // 7. Build the merged message list. Source of truth: the
-    //    projection's committed `messages` (pre-compaction OR post-
-    //    compaction, whichever is current), followed by the
-    //    in-flight draft. Falls back to the checkpoint's frozen
-    //    snapshot only when the projection row is missing — which
-    //    shouldn't happen for a thread with `committed_turns > 0`
-    //    (the commit path always writes the projection before the
-    //    checkpoint), but keeps recovery robust against rare
-    //    storage divergence.
+    //    projection's effective history followed by the in-flight draft.
+    //    Falls back to the checkpoint snapshot only when the projection row
+    //    is absent. Presence, rather than non-emptiness, is the discriminator:
+    //    an explicitly empty effective view is still authoritative.
     let next_turn = thread.committed_turns + 1;
-    // Committed head: the projection's current `messages` (post-
-    // compaction when a mid-turn `replace_history` ran), or the
-    // checkpoint's frozen snapshot only when the projection row is
-    // missing. Captured before folding in the draft so it can seed
-    // resume attempts without the draft (see `committed_messages`).
-    let committed_head = if committed_messages.is_empty() {
-        checkpoint.messages.clone()
-    } else {
+    let committed_head = if has_projection {
         committed_messages
+    } else {
+        checkpoint.messages.clone()
     };
     let mut messages = committed_head.clone();
     messages.extend(draft_messages.iter().cloned());
@@ -470,6 +460,47 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn recover_fresh_thread_after_draft_compaction_uses_effective_projection() -> Result<()> {
+        let s = Stores::new();
+        let draft = vec![
+            llm::Message::user("interrupted first turn"),
+            llm::Message::assistant("work completed before failure"),
+        ];
+        s.messages
+            .set_draft(&thread_a(), draft.clone(), t0())
+            .await
+            .context("seed first-turn draft")?;
+        let compacted = vec![llm::Message::assistant("[summary of interrupted work]")];
+        s.messages
+            .append_compaction(&thread_a(), compacted.clone(), draft.len(), 0, t_plus(1))
+            .await
+            .context("append first-turn compaction")?;
+
+        let view = recover_thread(
+            &thread_a(),
+            &s.threads,
+            &s.checkpoints,
+            &s.messages,
+            t_plus(2),
+        )
+        .await
+        .context("recover compacted first turn")?;
+
+        assert_eq!(view.thread.committed_turns, 0);
+        assert_eq!(
+            serde_json::to_value(&view.messages)?,
+            serde_json::to_value(&compacted)?,
+        );
+        assert_eq!(
+            serde_json::to_value(&view.committed_messages)?,
+            serde_json::to_value(&compacted)?,
+        );
+        assert!(view.draft_messages.is_empty());
+        assert!(view.latest_checkpoint.is_none());
+        Ok(())
+    }
+
     // ── Single-turn recovery ─────────────────────────────────────
 
     #[tokio::test]
@@ -638,9 +669,9 @@ mod tests {
 
     // ── Compaction durability ────────────────────────────────────
 
-    /// After a mid-turn `replace_history` rewrites the projection head
-    /// (auto-compaction), `recover_thread` must expose the COMPACTED
-    /// projection as `committed_messages` — the resume seed — while
+    /// After a mid-turn append-only compaction adds lineage to the projection,
+    /// `recover_thread` must expose the effective compacted view as
+    /// `committed_messages` — the resume seed — while
     /// `latest_checkpoint.messages` stays at the frozen pre-compaction
     /// snapshot. This is the invariant that stops a resumed turn from
     /// re-compacting the same over-threshold history every tool round.
@@ -668,12 +699,13 @@ mod tests {
             .context("recover before compaction")?;
         assert_eq!(before.committed_messages.len(), 2);
 
-        // Mid-turn auto-compaction rewrites the projection head only.
+        // Mid-turn auto-compaction appends lineage while preserving the raw
+        // projection transcript.
         let compacted = vec![llm::Message::user("[summary of turn 1]")];
         s.messages
-            .replace_history(&thread_a(), compacted.clone(), t_plus(2))
+            .append_compaction(&thread_a(), compacted.clone(), 2, 0, t_plus(2))
             .await
-            .context("replace_history (compaction)")?;
+            .context("append compaction")?;
 
         let after = recover_thread(&thread_a(), &s.threads, &s.checkpoints, &s.messages, t0())
             .await

@@ -85,6 +85,8 @@ pub struct CompactionResult {
     pub original_tokens: usize,
     /// Estimated tokens after compaction.
     pub new_tokens: usize,
+    /// Number of trailing source messages retained byte-for-byte.
+    pub retained_count: usize,
     /// Provider-billed usage of the summarization LLM call(s) that produced
     /// this result (zero when compaction completed without an LLM call).
     ///
@@ -791,6 +793,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
                 new_count: original_count,
                 original_tokens,
                 new_tokens: original_tokens,
+                retained_count: original_count,
                 llm_usage: TokenUsage::default(),
             });
         }
@@ -817,6 +820,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
                     llm_usage: failure.usage,
                 })?;
 
+        let retained_count = to_keep.len();
         // Build new message history
         let mut new_messages = Vec::with_capacity(2 + to_keep.len());
 
@@ -849,6 +853,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
             new_count,
             original_tokens,
             new_tokens,
+            retained_count,
             llm_usage,
         })
     }

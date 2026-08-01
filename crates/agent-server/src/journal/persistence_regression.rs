@@ -10,10 +10,10 @@
 //!    interrupts any step, recovery must see a consistent view based on
 //!    the last fully-committed turn.
 //!
-//! 2. **Compaction / `replace_history`** — context compaction rewrites
-//!    the message projection without touching checkpoints. Recovery
-//!    must still produce a coherent view. The checkpoint retains the
-//!    raw snapshot; the message projection carries the compacted form.
+//! 2. **Append-only compaction lineage** — context compaction preserves the
+//!    raw transcript while changing the effective projection view. Recovery
+//!    must follow that effective view; completed checkpoints remain frozen
+//!    snapshots until the next turn commits.
 //!
 //! 3. **Restart invariants** — across simulated restart boundaries
 //!    (fresh store instances loaded from the same durable state),
@@ -476,14 +476,14 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════════
-    // 2. COMPACTION AND replace_history REGRESSIONS
+    // 2. APPEND-ONLY COMPACTION REGRESSIONS
     // ════════════════════════════════════════════════════════════════
     //
-    // Verify that context compaction (replace_history) preserves
-    // coherent checkpoint state and that recovery still works.
+    // Verify that compaction lineage preserves coherent checkpoint state and
+    // that recovery follows the effective projection.
 
-    /// `replace_history` changes the message projection but does not
-    /// affect the checkpoint. The checkpoint retains the raw history.
+    /// `append_compaction` changes the effective projection view but does not
+    /// affect the existing checkpoint. The checkpoint retains its prior snapshot.
     #[tokio::test]
     async fn compaction_does_not_modify_checkpoint_history() -> Result<()> {
         let s = Stores::new();
@@ -513,16 +513,18 @@ mod tests {
             .context("checkpoint")?;
         assert_eq!(pre_checkpoint.messages.len(), 3);
 
-        // Run compaction: replace the 3-message history with a
-        // 1-message summary.
+        // Append compaction lineage: the 3-message raw history remains
+        // recoverable while the effective view becomes a 1-message summary.
         s.messages
-            .replace_history(
+            .append_compaction(
                 &thread_id,
                 vec![llm::Message::user("[Summary of turns 1-3]")],
+                3,
+                0,
                 t_plus(10),
             )
             .await
-            .context("replace_history")?;
+            .context("append compaction")?;
 
         // Message projection shows the compacted form.
         let post_history = s.messages.get_history(&thread_id).await?;
@@ -546,14 +548,13 @@ mod tests {
     /// The previous contract — recovery reads checkpoint.messages —
     /// was the load-bearing bug behind the compaction-recovery
     /// regression: when the daemon
-    /// worker rewrote the projection mid-turn (a non-commit mutation
+    /// worker appended projection lineage mid-turn (a non-commit mutation
     /// driven by auto-compaction) and the turn then failed before
     /// committing, the next attempt re-read the stale checkpoint
     /// snapshot and tripped the same context-window error that
-    /// triggered the compaction. Switching recovery to read the
-    /// projection makes mid-turn `replace_history` durable across
-    /// attempts; the checkpoint remains the source of truth for the
-    /// agent-state snapshot and the turn-number consistency guard.
+    /// triggered compaction. Recovery must instead read the effective
+    /// projection; the checkpoint remains the source of truth for the
+    /// agent-state snapshot and turn-number consistency guard.
     #[tokio::test]
     async fn recovery_after_compaction_returns_projection_history() -> Result<()> {
         let s = Stores::new();
@@ -588,11 +589,13 @@ mod tests {
         .await
         .context("turn 2")?;
 
-        // Compact the projection.
+        // Compact the effective projection without replacing raw history.
         s.messages
-            .replace_history(
+            .append_compaction(
                 &thread_id,
                 vec![llm::Message::user("[Compacted summary]")],
+                4,
+                0,
                 t_plus(10),
             )
             .await
@@ -648,9 +651,15 @@ mod tests {
         .await
         .context("turn 2")?;
 
-        // Compact: replace 3 messages with 1 summary.
+        // Compact 3 effective messages to 1 summary; raw history is retained.
         s.messages
-            .replace_history(&thread_id, vec![llm::Message::user("[Summary]")], t_plus(5))
+            .append_compaction(
+                &thread_id,
+                vec![llm::Message::user("[Summary]")],
+                3,
+                0,
+                t_plus(5),
+            )
             .await
             .context("compact")?;
 
@@ -702,8 +711,8 @@ mod tests {
         Ok(())
     }
 
-    /// Clearing the message projection via `replace_history` with an
-    /// empty vec does not affect thread aggregate or checkpoints.
+    /// An explicitly empty effective view does not affect the thread aggregate
+    /// or existing checkpoints, and remains authoritative during recovery.
     #[tokio::test]
     async fn empty_compaction_preserves_thread_and_checkpoint_state() -> Result<()> {
         let s = Stores::new();
@@ -720,11 +729,11 @@ mod tests {
         .await
         .context("commit")?;
 
-        // Clear messages entirely.
+        // Compact the effective view to empty while retaining raw history.
         s.messages
-            .replace_history(&thread_id, vec![], t_plus(5))
+            .append_compaction(&thread_id, Vec::new(), 1, 0, t_plus(5))
             .await
-            .context("clear")?;
+            .context("compact to empty")?;
 
         // Thread unaffected.
         let thread = s.threads.get(&thread_id).await?.context("thread")?;
@@ -738,9 +747,9 @@ mod tests {
             .context("ckpt")?;
         assert_eq!(ckpt.messages.len(), 1);
 
-        // Recovery still works from checkpoint.
+        // Recovery follows the explicitly empty effective projection.
         let view = s.recover(&thread_id).await.context("recover")?;
-        assert_eq!(view.messages.len(), 1, "recovery reads from checkpoint");
+        assert!(view.messages.is_empty());
         Ok(())
     }
 
@@ -777,7 +786,7 @@ mod tests {
 
         // Compact only thread A.
         s.messages
-            .replace_history(&thread_a, vec![], t_plus(10))
+            .append_compaction(&thread_a, Vec::new(), 1, 0, t_plus(10))
             .await
             .context("compact A")?;
 
@@ -789,8 +798,11 @@ mod tests {
         let view_a = s.recover(&thread_a).await.context("recover A")?;
         let view_b = s.recover(&thread_b).await.context("recover B")?;
 
-        assert_eq!(view_a.messages.len(), 1, "A: from checkpoint");
-        assert_eq!(view_b.messages.len(), 2, "B: from checkpoint");
+        assert!(
+            view_a.messages.is_empty(),
+            "A: explicitly empty effective view"
+        );
+        assert_eq!(view_b.messages.len(), 2, "B: unchanged projection");
         Ok(())
     }
 
@@ -816,9 +828,11 @@ mod tests {
         let pre_version = pre.version;
 
         s.messages
-            .replace_history(
+            .append_compaction(
                 &thread_id,
                 vec![llm::Message::user("[compacted]")],
+                1,
+                0,
                 t_plus(5),
             )
             .await
@@ -1149,11 +1163,13 @@ mod tests {
         assert_eq!(view1.thread.committed_turns, 2);
         assert_eq!(view1.messages.len(), 4);
 
-        // Phase 2: Compaction.
+        // Phase 2: append-only compaction.
         s.messages
-            .replace_history(
+            .append_compaction(
                 &thread_id,
                 vec![llm::Message::user("[Summary of turns 1-2]")],
+                4,
+                0,
                 t_plus(10),
             )
             .await

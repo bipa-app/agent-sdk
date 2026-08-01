@@ -2674,11 +2674,11 @@ async fn build_chat_request(
 /// [`USER_CANCELLED_TOOL_RESULT`](agent_sdk_foundation::llm::USER_CANCELLED_TOOL_RESULT)
 /// error result.
 ///
-/// The repair is written through to the durable projection (mirroring the
-/// pre-call compaction rewrite: `replace_history` + `clear_draft`) rather
-/// than patched into the outgoing request, so the thread is balanced the
-/// moment it is next loaded and an orphaned `tool_use` can never reach a
-/// provider. No-op when the recovered history is already balanced.
+/// The repair is written through to the durable projection rather than patched
+/// into the outgoing request, so the thread is balanced the moment it is next
+/// loaded and an orphaned `tool_use` can never reach a provider. This is an
+/// explicit non-compaction repair; compaction uses append-only lineage.
+/// No-op when the recovered history is already balanced.
 async fn backfill_orphaned_tool_results(
     deps: &RootTurnDeps<'_>,
     staged_messages: &crate::journal::staged::StagedMessageStore,
@@ -5786,6 +5786,34 @@ async fn snapshot_suspension_draft(
     }
 }
 
+/// Persist the resumed in-flight transcript before compaction is allowed to
+/// inspect it.
+///
+/// Draft snapshots are normally best-effort recovery aids. Once a compactor is
+/// wired, however, the draft is also part of the projection source validated by
+/// `append_compaction`; letting this write fail and then calling the summarizer
+/// would guarantee a post-provider source mismatch. In that mode the write is
+/// therefore a required precondition. Hosts without active compaction preserve
+/// the existing best-effort suspension contract.
+async fn persist_resume_draft_for_compaction(
+    deps: &RootTurnDeps<'_>,
+    thread_id: &agent_sdk_foundation::ThreadId,
+    task_id: &AgentTaskId,
+    draft_snapshot: Vec<llm::Message>,
+    now: OffsetDateTime,
+    label: &'static str,
+) -> Result<()> {
+    if deps.compaction_config.is_some() && deps.compaction_provider.is_some() {
+        deps.message_store
+            .set_draft(thread_id, draft_snapshot, now)
+            .await
+            .context("persist resume draft required for compaction")?;
+    } else {
+        snapshot_suspension_draft(deps, thread_id, task_id, draft_snapshot, now, label).await;
+    }
+    Ok(())
+}
+
 /// Build a [`ContinuationEnvelope`] capturing the state at the tool
 /// boundary.
 ///
@@ -6078,30 +6106,9 @@ pub async fn resume_root_turn(
             agent_sdk::observability::loop_instrument::remote_parent_context(&trace, &span)
         });
 
-    // 2. Pre-call auto-compaction — run BEFORE buffering the in-flight
-    //    suspended messages + tool results. The staged seed here is the
-    //    COMMITTED-ONLY checkpoint history (the resume path seeds via
-    //    `from_recovery_view_committed_only`), so compacting now keeps
-    //    the durable `replace_history` rewrite restricted to committed
-    //    messages. The uncommitted in-flight transcript never enters the
-    //    committed projection, so a later permanent failure + recovery
-    //    can't fold it in twice — once via the compacted projection and
-    //    once via the raw draft. No-op when `deps.compaction_config` is
-    //    `None`. (Reactive overflow compaction still folds the in-flight
-    //    transcript in, but `apply_compaction` clears the draft so that
-    //    path is duplication-safe too.)
-    super::compaction::maybe_compact_staged_history(
-        deps,
-        &inputs.staged_stores.messages,
-        thread_id,
-        now,
-    )
-    .await
-    .context("pre-call auto-compaction (resume path)")?;
-
-    // 3. Buffer the suspended messages (user prompt + assistant with
-    //    tool calls) and tool-result messages into the staged stores,
-    //    on top of the (possibly compacted) committed seed.
+    // 2. Buffer the suspended messages (user prompt + assistant with tool
+    //    calls), completed tool results, and boundary injections on top of the
+    //    committed-only resume seed.
     buffer_resume_messages(
         &inputs.staged_stores.messages,
         &inputs.staged_stores.state,
@@ -6121,16 +6128,15 @@ pub async fn resume_root_turn(
             .context("append boundary injection")?;
     }
 
-    // 4. Refresh the projection's draft slot with the completed child
-    //    results so recovery surfaces the full in-flight transcript.
-    //    Best-effort: the draft is purely a recovery aid that degrades
-    //    to committed-history-only, and the in-flight transcript is
-    //    independently reconstructable from the parent's ReadyToResume
-    //    state, so a transient store error must not abort an otherwise
-    //    healthy resume (matches the suspend paths' draft contract).
+    // 3. Refresh the projection draft before either proactive or reactive
+    //    compaction can run. The staged source is now exactly
+    //    `[effective committed head] + [persisted resumed draft]`, so
+    //    `append_compaction` can atomically fold and clear that same draft
+    //    without making a paid provider call only to reject the result on a
+    //    source-count mismatch.
     let mut resumed_draft = build_resumed_draft_messages(&suspended_messages, &child_results);
     resumed_draft.extend(injected.messages.clone());
-    snapshot_suspension_draft(
+    persist_resume_draft_for_compaction(
         deps,
         thread_id,
         &inputs.bootstrap.task_id,
@@ -6138,7 +6144,20 @@ pub async fn resume_root_turn(
         now,
         "refresh draft with completed child results before resume LLM call",
     )
-    .await;
+    .await
+    .context("persist exact resume compaction source")?;
+
+    // 4. Pre-call auto-compaction. This must run after the resumed draft is
+    //    staged and persisted: the projection transition validates and folds
+    //    the complete effective source, including completed tool results.
+    super::compaction::maybe_compact_staged_history(
+        deps,
+        &inputs.staged_stores.messages,
+        thread_id,
+        now,
+    )
+    .await
+    .context("pre-call auto-compaction (resume path)")?;
 
     // 5. Build the chat request from staged history. `resume_input` is
     //    a resume sentinel whose `into_message()` returns `None`, so
@@ -7409,8 +7428,8 @@ async fn run_steering_exchange(
 /// the streamed turn (response + content ids + successful attempt).
 ///
 /// Mirrors the resume path's setup: no fresh `Start` event (the
-/// original turn's `Start` anchors replay), pre-call auto-compaction on
-/// the committed-only seed, and the resume sentinel user input so
+/// original turn's `Start` anchors replay), exact persisted-draft
+/// compaction after staging, and the resume sentinel user input so
 /// `build_chat_request` appends no extra prompt.
 async fn stage_and_call_steering_llm(
     inputs: &RootWorkerInputs,
@@ -7444,20 +7463,8 @@ async fn stage_and_call_steering_llm(
             agent_sdk::observability::loop_instrument::remote_parent_context(&trace, &span)
         });
 
-    // Pre-call auto-compaction on the committed-only seed (same
-    // contract as the resume path). No-op when unconfigured.
-    super::compaction::maybe_compact_staged_history(
-        deps,
-        &inputs.staged_stores.messages,
-        thread_id,
-        now,
-    )
-    .await
-    .context("pre-call auto-compaction (steering resume path)")?;
-
     // Buffer suspended messages + the interim-results-and-steering user
-    // message on top of the committed seed, and refresh the recovery
-    // draft with the full in-flight transcript.
+    // message on top of the committed-only seed.
     for msg in suspended_messages {
         inputs
             .staged_stores
@@ -7478,9 +7485,12 @@ async fn stage_and_call_steering_llm(
         .save(state)
         .await
         .context("save continuation agent state (steering)")?;
+
+    // Persist the complete steering draft before compaction so the provider
+    // source and the atomically folded projection source are identical.
     let mut draft = suspended_messages.to_vec();
     draft.push(steering_message.clone());
-    snapshot_suspension_draft(
+    persist_resume_draft_for_compaction(
         deps,
         thread_id,
         &inputs.bootstrap.task_id,
@@ -7488,7 +7498,17 @@ async fn stage_and_call_steering_llm(
         now,
         "snapshot steering resume draft",
     )
-    .await;
+    .await
+    .context("persist exact steering compaction source")?;
+
+    super::compaction::maybe_compact_staged_history(
+        deps,
+        &inputs.staged_stores.messages,
+        thread_id,
+        now,
+    )
+    .await
+    .context("pre-call auto-compaction (steering resume path)")?;
 
     let chat_request = build_chat_request(
         definition,

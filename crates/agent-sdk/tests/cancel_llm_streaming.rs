@@ -70,6 +70,26 @@ impl MessageStore for SharedStore {
     async fn replace_history(&self, thread_id: &ThreadId, messages: Vec<Message>) -> Result<()> {
         self.0.replace_history(thread_id, messages).await
     }
+    async fn append_compaction(
+        &self,
+        thread_id: &ThreadId,
+        messages: Vec<Message>,
+        source_message_count: usize,
+        retained_message_count: usize,
+    ) -> Result<()> {
+        self.0
+            .append_compaction(
+                thread_id,
+                messages,
+                source_message_count,
+                retained_message_count,
+            )
+            .await
+    }
+
+    async fn get_transcript(&self, thread_id: &ThreadId) -> Result<Vec<Message>> {
+        self.0.get_transcript(thread_id).await
+    }
 }
 
 #[async_trait]
@@ -404,6 +424,7 @@ impl ContextCompactor for BlockingCompactor {
             new_count: 1,
             original_tokens: 1_000_000,
             new_tokens: 10,
+            retained_count: 0,
             llm_usage: TokenUsage::default(),
         })
     }

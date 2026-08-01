@@ -318,7 +318,12 @@ async fn pre_call_threshold_triggers_compaction() -> Result<()> {
     )
     .await?;
 
-    let RootTurnOutcome::Completed { response_text, .. } = outcome else {
+    let RootTurnOutcome::Completed {
+        response_text,
+        commit,
+        ..
+    } = outcome
+    else {
         panic!("expected Completed turn");
     };
     assert_eq!(response_text, "Hello after compaction");
@@ -327,20 +332,39 @@ async fn pre_call_threshold_triggers_compaction() -> Result<()> {
     // turn. The compactor consumed the summarisation slot first.
     assert_eq!(scripted.calls(), 2);
 
-    // The durable projection got rewritten by the pre-call compaction
-    // (1 summary + 0..N retained recent messages). The exact summary
-    // length depends on the compactor's retain logic, so we only
-    // assert the *committed* history shrank from the seeded 24-message
-    // shape. The fresh turn's user prompt + assistant reply land in
-    // `draft_messages` rather than the committed projection because
-    // this fixture's thread never advances `committed_turns` (no
-    // checkpoint is created until a real `commit_completed_turn`),
-    // which is the path under exercise here.
-    let durable = fixtures.messages.get_history(&thread_id()).await?;
+    let context = fixtures.messages.get_history(&thread_id()).await?;
     assert!(
-        durable.len() < 24,
-        "expected committed projection to shrink after compaction, found {} messages",
-        durable.len(),
+        context.len() < 24,
+        "expected effective context to shrink after compaction, found {} messages",
+        context.len(),
+    );
+    let projection = fixtures
+        .messages
+        .get(&thread_id())
+        .await?
+        .context("projection should exist after compaction")?;
+    assert_eq!(
+        projection.messages.len(),
+        26,
+        "append-only compaction must preserve 24 originals before appending the fresh turn",
+    );
+    assert_eq!(projection.compactions.len(), 1);
+    assert!(
+        projection.draft_messages.is_empty(),
+        "persisted draft must be folded and cleared by append_compaction",
+    );
+    let entry = &projection.compactions[0];
+    assert_eq!(
+        entry.source_message_count, 24,
+        "the compactor must see the exact projection source including all 24 draft messages",
+    );
+    assert_eq!(entry.compacted_start, 0);
+    assert!(entry.compacted_end > entry.compacted_start);
+    assert!(entry.compacted_end <= projection.messages.len());
+    assert_eq!(
+        serde_json::to_value(&commit.checkpoint.messages)?,
+        serde_json::to_value(&context)?,
+        "checkpoint and fork consumers must inherit the effective compacted view",
     );
 
     // A `ContextCompacted` event was committed so subscribers (TUI,

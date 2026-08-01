@@ -411,16 +411,17 @@ pub async fn commit_completed_turn(
         .await
         .context("commit: append messages")?;
 
-    // 4. Create the checkpoint with the *full* accumulated history,
-    //    not the delta — recovery must be able to restore the thread
-    //    to this turn without replaying prior turns.
-    //
+    // 4. Create the checkpoint with the *full effective* accumulated history,
+    //    not the append-only raw transcript and not merely this turn's delta.
+    //    Recovery and fork consumers must inherit the same compacted view the
+    //    provider saw; the raw transcript remains recoverable from the message
+    //    projection together with its compaction lineage.
     let checkpoint = checkpoint_store
         .commit_checkpoint(NewCheckpointParams {
             thread_id: params.thread_id.clone(),
             turn_number: thread.committed_turns,
             task_id: params.task_id,
-            messages: updated_projection.messages,
+            messages: updated_projection.context_history(),
             agent_state_snapshot: params.agent_state_snapshot,
             turn_usage: params.turn_usage,
             kind: params.checkpoint_kind,
@@ -751,6 +752,114 @@ mod tests {
             "turn 2 checkpoint: full history"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checkpoint_and_fork_seed_follow_effective_view_after_compaction() -> Result<()> {
+        let s = Stores::new();
+        let task1 = AgentTaskId::from_string("task_compacted_turn-1");
+        let task2 = AgentTaskId::from_string("task_compacted_turn-2");
+        let attempt1 = s.open_attempt(&task1, 1).await;
+        let attempt2 = s.open_attempt(&task2, 1).await;
+        let original = sample_messages();
+
+        commit_completed_turn(
+            CompletedTurnCommit {
+                delivered_injection_ids: Vec::new(),
+                checkpoint_kind: CheckpointKind::FullTurn,
+                thread_id: thread_a(),
+                task_id: task1,
+                expected_turn: 1,
+                turn_attempt_id: attempt1,
+                close_attempt_params: sample_close_params(),
+                messages: original.clone(),
+                turn_usage: usage(100, 50),
+                agent_state_snapshot: serde_json::json!({"turn": 1}),
+                events: Vec::new(),
+                outbox_max_attempts: 3,
+                owner_guard: None,
+                now: t_plus(1),
+            },
+            &s.tasks,
+            &s.threads,
+            &s.messages,
+            &s.attempts,
+            &s.checkpoints,
+            &s.events,
+        )
+        .await
+        .context("commit pre-compaction turn")?;
+
+        let summary = llm::Message::assistant("[summary of turn 1]");
+        s.messages
+            .append_compaction(
+                &thread_a(),
+                vec![summary.clone()],
+                original.len(),
+                0,
+                t_plus(2),
+            )
+            .await
+            .context("append compaction lineage")?;
+
+        let new_message = llm::Message::user("turn 2");
+        let outcome = commit_completed_turn(
+            CompletedTurnCommit {
+                delivered_injection_ids: Vec::new(),
+                checkpoint_kind: CheckpointKind::FullTurn,
+                thread_id: thread_a(),
+                task_id: task2,
+                expected_turn: 2,
+                turn_attempt_id: attempt2,
+                close_attempt_params: sample_close_params(),
+                messages: vec![new_message.clone()],
+                turn_usage: usage(10, 5),
+                agent_state_snapshot: serde_json::json!({"turn": 2}),
+                events: Vec::new(),
+                outbox_max_attempts: 3,
+                owner_guard: None,
+                now: t_plus(3),
+            },
+            &s.tasks,
+            &s.threads,
+            &s.messages,
+            &s.attempts,
+            &s.checkpoints,
+            &s.events,
+        )
+        .await
+        .context("commit post-compaction turn")?;
+
+        let projection = s
+            .messages
+            .get(&thread_a())
+            .await?
+            .context("projection after compacted commit")?;
+        assert_eq!(
+            projection.messages.len(),
+            original.len() + 1,
+            "raw transcript must retain the compacted source and append turn 2",
+        );
+        let effective = projection.context_history();
+        assert_eq!(
+            serde_json::to_value(&outcome.checkpoint.messages)?,
+            serde_json::to_value(&effective)?,
+            "checkpoint must snapshot the effective compacted view",
+        );
+        assert_eq!(
+            serde_json::to_value(&outcome.checkpoint.messages)?,
+            serde_json::to_value(vec![summary, new_message])?,
+        );
+
+        // `fork_thread` seeds both the destination projection and checkpoint
+        // from the selected checkpoint's messages. Keeping this fork input
+        // effective prevents the fork from resurrecting the compacted prefix.
+        let fork_seed = outcome.checkpoint.messages.clone();
+        assert_eq!(
+            serde_json::to_value(fork_seed)?,
+            serde_json::to_value(effective)?,
+        );
         Ok(())
     }
 

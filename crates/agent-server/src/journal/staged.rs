@@ -56,30 +56,25 @@ use super::thread_recover::ThreadRecoveryView;
 
 /// In-memory [`MessageStore`] that buffers all mutations during a turn.
 ///
-/// Seeded with the committed message history from the latest checkpoint
-/// (or empty for a fresh thread). Appends and replacements accumulate
-/// in memory and never touch durable storage.
+/// Seeded with the effective committed history plus any persisted recovery
+/// draft. The committed prefix is tracked separately so the draft remains a
+/// commit-time delta unless compaction folds it into the durable raw
+/// transcript first.
 ///
 /// The commit path calls [`Self::drain_messages`] to consume the
-/// buffered history.
+/// uncommitted suffix.
 pub struct StagedMessageStore {
     thread_id: ThreadId,
     messages: RwLock<Vec<llm::Message>>,
-    /// Number of seed messages from the checkpoint. `drain_messages`
-    /// returns only messages appended *after* the seed so the commit
-    /// path can safely append the delta to the durable projection.
+    /// Boundary between the durable effective seed and the uncommitted suffix.
+    /// `drain_messages` returns only messages after this boundary so the commit
+    /// path can append the delta to the durable projection.
     ///
     /// Re-points to the new history length whenever
-    /// [`MessageStore::replace_history`] is invoked: replacing the
-    /// history is conceptually "the new committed seed is THIS",
-    /// so any subsequent appends within the same attempt are the
-    /// delta the commit path needs to forward to the durable
-    /// projection. Without this update a mid-attempt rewrite (e.g.
-    /// the daemon worker's auto-compaction path that calls
-    /// `replace_history` after `MessageProjectionStore::replace_history`
-    /// rewrote the projection) would leave `seed_len` pointing past
-    /// the buffer's tail, and `drain_messages` would silently swallow
-    /// every new message added during the rest of the turn.
+    /// [`MessageStore::replace_history`] is invoked. Auto-compaction first
+    /// appends durable lineage (atomically folding any draft), then replaces
+    /// this process-local view with the compacted result. Subsequent appends are
+    /// therefore the only delta still owed to the projection.
     seed_len: RwLock<usize>,
 }
 
@@ -93,6 +88,30 @@ impl StagedMessageStore {
             messages: RwLock::new(seed_messages),
             seed_len: RwLock::new(seed_len),
         }
+    }
+
+    /// Create a staged store whose visible history includes an uncommitted
+    /// suffix.
+    ///
+    /// `committed_seed_len` is the length of the durable effective head. Any
+    /// messages after that boundary (notably a persisted recovery draft) must
+    /// be returned by [`Self::drain_messages`] if the turn completes without
+    /// first compacting them into the projection.
+    fn with_committed_seed_len(
+        thread_id: ThreadId,
+        messages: Vec<llm::Message>,
+        committed_seed_len: usize,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            committed_seed_len <= messages.len(),
+            "committed staged seed length ({committed_seed_len}) exceeds visible history ({})",
+            messages.len(),
+        );
+        Ok(Self {
+            thread_id,
+            messages: RwLock::new(messages),
+            seed_len: RwLock::new(committed_seed_len),
+        })
     }
 
     /// Drain only the **newly appended** messages for the commit path.
@@ -321,9 +340,11 @@ impl StagedStores {
     ///
     /// # Seeding rules
     ///
-    /// - **Messages**: seeded from `view.messages` (the committed
-    ///   history from the latest checkpoint, or empty for a fresh
-    ///   thread).
+    /// - **Messages**: exposes `view.messages` (the effective committed
+    ///   projection plus any recovery draft), while only
+    ///   `view.committed_messages` is marked as the durable seed. The draft
+    ///   therefore remains in the commit delta unless compaction atomically
+    ///   folds it into the raw transcript.
     /// - **Agent state**: if the view has a non-null
     ///   `agent_state_snapshot`, it is deserialized into [`AgentState`].
     ///   Otherwise a fresh [`AgentState`] is created for the thread
@@ -334,7 +355,11 @@ impl StagedStores {
     /// Returns an error if the `agent_state_snapshot` cannot be
     /// deserialized into [`AgentState`].
     pub fn from_recovery_view(view: &ThreadRecoveryView) -> Result<Self> {
-        Self::from_recovery_view_with_messages(view, view.messages.clone())
+        Self::from_recovery_view_with_messages(
+            view,
+            view.messages.clone(),
+            view.committed_messages.len(),
+        )
     }
 
     /// Construct staged stores from a recovery view, but seed messages
@@ -350,25 +375,29 @@ impl StagedStores {
     /// Seeds from [`ThreadRecoveryView::committed_messages`] (the
     /// message projection's committed head), NOT the checkpoint's
     /// frozen `messages` snapshot. The distinction is load-bearing:
-    /// when a mid-turn auto-compaction rewrites the projection via
-    /// `replace_history`, the checkpoint still holds the
-    /// pre-compaction history — so seeding from the checkpoint makes
-    /// every tool-round resume re-read the same over-threshold history
-    /// and re-compact it from scratch (a per-round summarization loop).
-    /// The projection head reflects the compaction, so a resume picks
-    /// up the compacted state and does not re-compact.
+    /// when mid-turn auto-compaction appends lineage to the projection,
+    /// the checkpoint still holds the pre-compaction history. Seeding from
+    /// that frozen checkpoint would make every tool-round resume re-read the
+    /// same over-threshold history and re-compact it from scratch. The
+    /// projection head reflects the effective compaction view, so a resume
+    /// picks up that state and does not re-compact.
     ///
     /// # Errors
     ///
     /// Returns an error if the `agent_state_snapshot` cannot be
     /// deserialized into [`AgentState`].
     pub fn from_recovery_view_committed_only(view: &ThreadRecoveryView) -> Result<Self> {
-        Self::from_recovery_view_with_messages(view, view.committed_messages.clone())
+        Self::from_recovery_view_with_messages(
+            view,
+            view.committed_messages.clone(),
+            view.committed_messages.len(),
+        )
     }
 
     fn from_recovery_view_with_messages(
         view: &ThreadRecoveryView,
         messages: Vec<llm::Message>,
+        committed_seed_len: usize,
     ) -> Result<Self> {
         let thread_id = view.thread.thread_id.clone();
 
@@ -390,7 +419,11 @@ impl StagedStores {
         };
 
         Ok(Self {
-            messages: StagedMessageStore::new(thread_id.clone(), messages),
+            messages: StagedMessageStore::with_committed_seed_len(
+                thread_id.clone(),
+                messages,
+                committed_seed_len,
+            )?,
             state: StagedStateStore::new(thread_id, Some(seed_state)),
         })
     }
@@ -640,6 +673,44 @@ mod tests {
         assert_eq!(state.turn_count, 3);
         assert_eq!(state.total_usage.input_tokens, 500);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execute_view_exposes_but_does_not_seed_persisted_draft() -> Result<()> {
+        let committed = vec![llm::Message::user("committed")];
+        let draft = vec![llm::Message::assistant("persisted draft")];
+        let mut visible = committed.clone();
+        visible.extend(draft.clone());
+        let view = ThreadRecoveryView {
+            thread: super::super::thread::Thread::new(thread_a(), time::OffsetDateTime::now_utc()),
+            messages: visible.clone(),
+            agent_state_snapshot: serde_json::Value::Null,
+            latest_checkpoint: None,
+            committed_messages: committed,
+            draft_messages: draft.clone(),
+            next_turn_number: 1,
+        };
+
+        let staged = StagedStores::from_recovery_view(&view)?;
+        assert_eq!(
+            serde_json::to_value(staged.messages.get_history(&thread_a()).await?)?,
+            serde_json::to_value(visible)?,
+            "the provider source must include the persisted draft",
+        );
+
+        staged
+            .messages
+            .append(&thread_a(), llm::Message::user("new turn"))
+            .await?;
+        let drained = staged.messages.drain_messages()?;
+        let mut expected = draft;
+        expected.push(llm::Message::user("new turn"));
+        assert_eq!(
+            serde_json::to_value(drained)?,
+            serde_json::to_value(expected)?,
+            "the commit delta must retain the draft instead of treating it as committed seed",
+        );
         Ok(())
     }
 

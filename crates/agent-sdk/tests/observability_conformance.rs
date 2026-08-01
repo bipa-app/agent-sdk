@@ -972,6 +972,26 @@ impl MessageStore for SharedStore {
     ) -> Result<()> {
         self.0.replace_history(thread_id, messages).await
     }
+    async fn append_compaction(
+        &self,
+        thread_id: &ThreadId,
+        messages: Vec<agent_sdk::llm::Message>,
+        source_message_count: usize,
+        retained_message_count: usize,
+    ) -> Result<()> {
+        self.0
+            .append_compaction(
+                thread_id,
+                messages,
+                source_message_count,
+                retained_message_count,
+            )
+            .await
+    }
+
+    async fn get_transcript(&self, thread_id: &ThreadId) -> Result<Vec<agent_sdk::llm::Message>> {
+        self.0.get_transcript(thread_id).await
+    }
 }
 
 #[async_trait]
