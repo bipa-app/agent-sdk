@@ -1417,6 +1417,113 @@ async fn case_mixed_batch_rejects_uncovered_slot<S: JournalStore>(store: &S) -> 
     );
     Ok(())
 }
+// ── attached batch: tool-only continuation emits no spawn event ─────
+
+/// A wait-any parent can resume while one child is still live, attach
+/// that child to the next continuation, and spawn only ordinary tool
+/// children beside it. No new subagent exists in that transition, so the
+/// durable backends must accept an empty subagent-start event batch.
+async fn case_attached_tool_batch_accepts_empty_spawn_events<S: JournalStore>(
+    store: &S,
+) -> Result<()> {
+    let thread = tid("conf-attached-tool-only");
+    let fixture = mixed_batch_fixture(store, &thread, 0).await?;
+    let mut first_suspension = empty_suspension(&thread);
+    first_suspension.child_join_policy = crate::ChildJoinPolicy::Any;
+    let (_parked, first_children) = AgentTaskStore::spawn_tool_children(
+        store,
+        &fixture.parent_id,
+        &fixture.worker,
+        &fixture.lease,
+        vec![ChildSpawnSpec::new(3), ChildSpawnSpec::new(3)],
+        first_suspension,
+        None,
+        Vec::new(),
+        t_plus(2),
+    )
+    .await?;
+
+    let child_worker = WorkerId::new();
+    let child_lease = LeaseId::new();
+    AgentTaskStore::try_acquire_task(
+        store,
+        &first_children[0].id,
+        child_worker.clone(),
+        child_lease.clone(),
+        t_plus(600),
+        t_plus(3),
+    )
+    .await?
+    .context("first tool child must acquire")?;
+    AgentTaskStore::complete_task(
+        store,
+        &first_children[0].id,
+        &child_worker,
+        &child_lease,
+        t_plus(4),
+    )
+    .await?;
+
+    let resumed_worker = WorkerId::new();
+    let resumed_lease = LeaseId::new();
+    AgentTaskStore::try_acquire_task(
+        store,
+        &fixture.parent_id,
+        resumed_worker.clone(),
+        resumed_lease.clone(),
+        t_plus(600),
+        t_plus(5),
+    )
+    .await?
+    .context("wait-any parent must resume after its first child")?;
+
+    let spawn = crate::journal::store::MixedChildrenSpawn {
+        delivered_injection_ids: Vec::new(),
+        subagents: Vec::new(),
+        tool_children: vec![crate::journal::store::ToolChildSpawn {
+            spawn_index: 0,
+            spec: ChildSpawnSpec::new(3),
+        }],
+        reattach: vec![crate::journal::store::ReattachedChild {
+            child_id: first_children[1].id.clone(),
+            spawn_index: 1,
+        }],
+        payload: suspension_with_pending_tools(&thread, 2),
+        child_otel_traceparent: None,
+    };
+    let spawned = AgentTaskStore::spawn_mixed_children(
+        store,
+        &fixture.parent_id,
+        &resumed_worker,
+        &resumed_lease,
+        spawn,
+        Vec::new(),
+        t_plus(6),
+    )
+    .await
+    .context("attached tool-only batch must accept zero subagent start events")?;
+
+    ensure!(
+        spawned.committed_events.is_empty(),
+        "a tool-only attached batch must not invent subagent start events"
+    );
+    ensure!(
+        spawned.parent.status == TaskStatus::WaitingOnChildren,
+        "the parent must wait on the reattached and newly spawned tool children"
+    );
+    let children = AgentTaskStore::list_children(store, &fixture.parent_id).await?;
+    let mut live_slots: Vec<u32> = children
+        .iter()
+        .filter(|child| !child.status.is_terminal())
+        .filter_map(|child| child.spawn_index)
+        .collect();
+    live_slots.sort_unstable();
+    ensure!(
+        live_slots == vec![0, 1],
+        "attached tool children must cover both continuation slots, got {live_slots:?}"
+    );
+    Ok(())
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // Report
@@ -1528,6 +1635,9 @@ pub async fn run_journal_store_conformance<S: JournalStore + Clone + 'static>(
 
     case_mixed_batch_spawns_subagents_and_tools(store).await?;
     report.passed("mixed_batch_spawns_subagents_and_tools");
+
+    case_attached_tool_batch_accepts_empty_spawn_events(store).await?;
+    report.passed("attached_tool_batch_accepts_empty_spawn_events");
 
     case_mixed_batch_child_ids_follow_slot_order(store).await?;
     report.passed("mixed_batch_child_ids_follow_slot_order");

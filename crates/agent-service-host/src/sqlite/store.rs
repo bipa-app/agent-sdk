@@ -1726,11 +1726,10 @@ LIMIT 1
         Ok(())
     }
 
-    /// Commit the per-entry `SubagentProgress` start events on the
-    /// parent journal (one batch + one advisory) and each child
-    /// thread's `ThreadCreated` (one event + advisory per child),
-    /// inside the caller's spawn transaction — a crash can never
-    /// persist spawned rows without their events.
+    /// Commit each new subagent's `SubagentProgress` start event on the
+    /// parent journal and each new child thread's `ThreadCreated` event
+    /// inside the caller's spawn transaction. Attached tool-only batches
+    /// have neither and therefore commit no event batch or advisory.
     async fn insert_spawn_started_events_tx(
         tx: &mut Transaction<'_, Sqlite>,
         parent_thread: &ThreadId,
@@ -1744,15 +1743,21 @@ LIMIT 1
                 event, invocation, child_root,
             )?);
         }
-        let start_seq = Self::next_event_sequence_tx(tx, parent_thread).await?;
-        let committed = Self::insert_events_tx(tx, parent_thread, started, start_seq, now).await?;
-        Self::insert_thread_events_outbox_row_tx(
-            tx,
-            &committed,
-            DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
-            now,
-        )
-        .await?;
+        let committed = if started.is_empty() {
+            Vec::new()
+        } else {
+            let start_seq = Self::next_event_sequence_tx(tx, parent_thread).await?;
+            let committed =
+                Self::insert_events_tx(tx, parent_thread, started, start_seq, now).await?;
+            Self::insert_thread_events_outbox_row_tx(
+                tx,
+                &committed,
+                DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+                now,
+            )
+            .await?;
+            committed
+        };
         for (_, child_root) in prepared {
             Self::insert_child_created_tx(tx, &child_root.thread_id, now).await?;
         }

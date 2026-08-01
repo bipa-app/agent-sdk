@@ -2755,11 +2755,10 @@ impl InMemoryAgentTaskStore {
         Ok(markers)
     }
 
-    /// Commit the per-entry `SubagentProgress` start events (parent
-    /// journal) and each child thread's `ThreadCreated` through the
-    /// wired marker sink, mirroring what the durable backends commit
-    /// inside their spawn transaction. Bare stores (no sink) commit
-    /// rows only — in-memory state has no crash story to protect.
+    /// Commit each new subagent's `SubagentProgress` start event on the
+    /// parent journal and each new child thread's `ThreadCreated` event
+    /// through the wired marker sink. Attached tool-only batches have
+    /// neither and commit no event batch. Bare stores commit rows only.
     async fn commit_spawn_started_events(
         &self,
         parent_thread: &ThreadId,
@@ -2776,14 +2775,19 @@ impl InMemoryAgentTaskStore {
                 event, invocation, child_root,
             )?);
         }
-        let committed = sink
-            .event_repo
-            .commit_event_batch(parent_thread, started, now)
-            .await
-            .context("commit subagent start events")?;
-        if let Some(last) = committed.last() {
-            Self::insert_marker_advisory(sink, last, now).await?;
-        }
+        let committed = if started.is_empty() {
+            Vec::new()
+        } else {
+            let committed = sink
+                .event_repo
+                .commit_event_batch(parent_thread, started, now)
+                .await
+                .context("commit subagent start events")?;
+            if let Some(last) = committed.last() {
+                Self::insert_marker_advisory(sink, last, now).await?;
+            }
+            committed
+        };
         for (_, child_root) in prepared {
             let child_created = sink
                 .event_repo
