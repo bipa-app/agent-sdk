@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-foundation-v0.16.0...agent-sdk-foundation-v0.17.0) - 2026-08-01
+
+### Added
+
+- *(events)* add account pool transition events ([#429](https://github.com/bipa-app/agent-sdk/pull/429))
+- *(events)* attribute content events to their emitting task (ENG-9422) ([#414](https://github.com/bipa-app/agent-sdk/pull/414))
+
+### Other
+
+- *(events)* format account pool fixtures ([#430](https://github.com/bipa-app/agent-sdk/pull/430))
+
 ## [0.16.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-foundation-v0.15.0...agent-sdk-foundation-v0.16.0) - 2026-07-28
 
 ### Added

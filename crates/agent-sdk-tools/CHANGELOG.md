@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-tools-v0.16.0...agent-sdk-tools-v0.17.0) - 2026-08-01
+
+### Added
+
+- add lossless artifact budget retention ([#428](https://github.com/bipa-app/agent-sdk/pull/428))
+- *(compaction)* preserve append-only transcript lineage (ENG-9526) ([#425](https://github.com/bipa-app/agent-sdk/pull/425))
+- *(tools,sdk)* artifact spill substrate — shared inline output budget with byte-identical overflow storage ([#420](https://github.com/bipa-app/agent-sdk/pull/420))
+
 ## [0.16.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-tools-v0.15.0...agent-sdk-tools-v0.16.0) - 2026-07-28
 
 ### Added
