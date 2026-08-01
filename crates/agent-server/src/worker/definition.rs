@@ -70,6 +70,16 @@ pub enum ThinkingPolicy {
 // ─────────────────────────────────────────────────────────────────────
 // Runtime policy
 // ─────────────────────────────────────────────────────────────────────
+/// When a parked parent becomes runnable again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildJoinPolicy {
+    /// Resume only after every child in the current batch settles.
+    #[default]
+    All,
+    /// Resume after the first child in the current batch settles.
+    Any,
+}
 
 /// Server-owned execution policy governing how a turn is run.
 ///
@@ -86,6 +96,9 @@ pub struct RuntimePolicy {
     pub max_attempts: u32,
     /// Enable streaming LLM responses.
     pub streaming: bool,
+    /// Child completion condition used for durable fan-in.
+    #[serde(default)]
+    pub child_join_policy: ChildJoinPolicy,
 }
 
 impl RuntimePolicy {
@@ -98,6 +111,7 @@ impl RuntimePolicy {
             strict_durability: true,
             max_attempts: 3,
             streaming: false,
+            child_join_policy: ChildJoinPolicy::All,
         }
     }
 }
@@ -361,6 +375,25 @@ mod tests {
         let json = serde_json::to_string(&def).expect("serialize");
         let restored: AgentDefinition = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored.thinking_display, Some(ThinkingDisplay::Summarized));
+    }
+
+    #[test]
+    fn child_join_policy_is_stable_and_old_runtime_policy_defaults_to_all() {
+        assert_eq!(
+            serde_json::to_string(&ChildJoinPolicy::All).expect("serialize all"),
+            "\"all\"",
+        );
+        assert_eq!(
+            serde_json::to_string(&ChildJoinPolicy::Any).expect("serialize any"),
+            "\"any\"",
+        );
+
+        let mut json = serde_json::to_value(RuntimePolicy::server_default()).expect("serialize");
+        json.as_object_mut()
+            .expect("runtime policy object")
+            .remove("child_join_policy");
+        let restored: RuntimePolicy = serde_json::from_value(json).expect("deserialize old policy");
+        assert_eq!(restored.child_join_policy, ChildJoinPolicy::All);
     }
 
     #[test]

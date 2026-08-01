@@ -345,6 +345,7 @@ fn parent_suspension_payload(thread_id: &ThreadId) -> SuspensionPayload {
                 json!({"task":"Investigate durable reuse"}),
             ),
         ],
+        child_join_policy: crate::ChildJoinPolicy::default(),
     }
 }
 

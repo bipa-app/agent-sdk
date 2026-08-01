@@ -181,6 +181,7 @@ fn make_bootstrap(
             continuation: Box::new(continuation),
             suspended_messages: Vec::new(),
             child_ids: vec![child_id.clone()],
+            child_join_policy: agent_server::ChildJoinPolicy::default(),
         },
         attempt: 0,
         max_attempts: 3,

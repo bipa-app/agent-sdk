@@ -38,7 +38,7 @@ use crate::journal::turn_attempt::{
 };
 use crate::journal::turn_attempt_store::{InMemoryTurnAttemptStore, TurnAttemptStore};
 use crate::worker::bootstrap::WorkerBootstrapContext;
-use crate::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
+use crate::worker::definition::{AgentDefinition, ChildJoinPolicy, RuntimePolicy, ThinkingPolicy};
 use agent_sdk::context::CompactionConfig;
 use agent_sdk_foundation::audit::AuditProvenance;
 use agent_sdk_foundation::events::AgentEvent;
@@ -5116,6 +5116,23 @@ fn find_tool_result<'a>(
     None
 }
 
+fn count_tool_results(messages: &[agent_sdk_foundation::llm::Message], id: &str) -> usize {
+    messages
+        .iter()
+        .filter_map(|message| match &message.content {
+            agent_sdk_foundation::llm::Content::Blocks(blocks) => Some(blocks),
+            agent_sdk_foundation::llm::Content::Text(_) => None,
+        })
+        .flatten()
+        .filter(|block| {
+            matches!(
+                block,
+                ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id
+            )
+        })
+        .count()
+}
+
 fn messages_contain_text(messages: &[agent_sdk_foundation::llm::Message], needle: &str) -> bool {
     messages.iter().any(|message| {
         matches!(
@@ -5140,9 +5157,18 @@ async fn suspend_leaving_children_running(
     stores: &TestStores,
     tool_calls: Vec<(String, String, serde_json::Value)>,
 ) -> Result<(AgentTask, Vec<AgentTask>)> {
+    suspend_leaving_children_running_with_policy(stores, tool_calls, ChildJoinPolicy::All).await
+}
+
+async fn suspend_leaving_children_running_with_policy(
+    stores: &TestStores,
+    tool_calls: Vec<(String, String, serde_json::Value)>,
+    child_join_policy: ChildJoinPolicy,
+) -> Result<(AgentTask, Vec<AgentTask>)> {
     let provider = MockToolCallProvider::new(tool_calls);
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
-    let bootstrap = sample_bootstrap_with_tools(task);
+    let mut bootstrap = sample_bootstrap_with_tools(task);
+    bootstrap.definition.policy.child_join_policy = child_join_policy;
     let inputs = build_root_worker_inputs(
         bootstrap,
         &stores.threads,
@@ -5365,6 +5391,134 @@ async fn assert_survivor_fanin_delivers(
     Ok(())
 }
 
+async fn resume_wait_any_wave(
+    stores: &TestStores,
+    parent_id: &AgentTaskId,
+    acquire_at: time::OffsetDateTime,
+    resume_at: time::OffsetDateTime,
+    response: &str,
+) -> Result<(AgentTask, Vec<agent_sdk_foundation::llm::Message>)> {
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            parent_id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            acquire_at,
+        )
+        .await?
+        .context("acquire partial resume")?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap_with_tools(acquired.clone()),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        acquire_at,
+    )
+    .await?;
+    let provider = SteeringCaptureProvider::new(response);
+    let outcome =
+        resume_from_children(inputs, &acquired, &provider, &stores.deps(), resume_at).await?;
+    let RootTurnOutcome::Suspended {
+        parent_task,
+        child_tasks,
+        ..
+    } = outcome
+    else {
+        panic!("partial wait-any resume must re-park");
+    };
+    assert!(child_tasks.is_empty());
+    Ok((parent_task, provider.captured()))
+}
+
+#[tokio::test]
+async fn wait_any_resumes_each_wave_without_redelivering_settled_results() -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
+        &stores,
+        vec![
+            bash_call("call_0"),
+            bash_call("call_1"),
+            bash_call("call_2"),
+        ],
+        ChildJoinPolicy::Any,
+    ))
+    .await?;
+    assert_eq!(children.len(), 3);
+
+    complete_child_at(
+        &stores,
+        &children[0],
+        &ok_result("done-0"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+    let first_ready = stores.tasks.get(&parent.id).await?.context("first ready")?;
+    assert_eq!(first_ready.status, TaskStatus::Pending);
+    assert_eq!(first_ready.pending_child_count, 0);
+
+    let (first_repark, first_messages) = resume_wait_any_wave(
+        &stores,
+        &parent.id,
+        t_plus(10),
+        t_plus(15),
+        "First result received.",
+    )
+    .await?;
+    assert_eq!(find_tool_result(&first_messages, "call_0"), Some("done-0"));
+    assert!(
+        find_tool_result(&first_messages, "call_1")
+            .context("running result for call_1")?
+            .contains("running")
+    );
+    assert_eq!(first_repark.pending_child_count, 2);
+    assert!(matches!(
+        &first_repark.state,
+        TaskState::WaitingOnChildren {
+            child_join_policy: ChildJoinPolicy::Any,
+            ..
+        }
+    ));
+
+    complete_child_at(
+        &stores,
+        &children[1],
+        &ok_result("done-1"),
+        t_plus(20),
+        t_plus(21),
+    )
+    .await?;
+    let second_ready = stores
+        .tasks
+        .get(&parent.id)
+        .await?
+        .context("second ready")?;
+    assert_eq!(second_ready.status, TaskStatus::Pending);
+    assert_eq!(second_ready.pending_child_count, 0);
+
+    let (second_repark, captured) = resume_wait_any_wave(
+        &stores,
+        &parent.id,
+        t_plus(22),
+        t_plus(25),
+        "Second result received.",
+    )
+    .await?;
+    assert_eq!(
+        count_tool_results(&captured, "call_0"),
+        1,
+        "the first settled result is retained in history, not delivered again",
+    );
+    assert_eq!(
+        find_tool_result(&captured, &derive_reattach_tool_use_id("call_1")),
+        Some("done-1"),
+    );
+    assert_eq!(second_repark.pending_child_count, 1);
+    Ok(())
+}
+
 #[tokio::test]
 async fn steering_wake_child_completing_concurrently_does_not_double_resume() -> Result<()> {
     let stores = TestStores::new();
@@ -5569,13 +5723,27 @@ async fn steering_wake_restart_between_wake_and_repark_resumes_cleanly() -> Resu
 struct SteeringRedirectProvider {
     text: String,
     tool_call: (String, String, serde_json::Value),
+    stop_reason: StopReason,
 }
 
 impl SteeringRedirectProvider {
     fn new(text: &str, id: &str, name: &str, input: serde_json::Value) -> Self {
+        Self::with_stop_reason(text, id, name, input, StopReason::ToolUse)
+    }
+
+    /// A reply carrying `tool_use` under an arbitrary stop reason —
+    /// models a truncated/refused dispatch (`MaxTokens`, `EndTurn`, …).
+    fn with_stop_reason(
+        text: &str,
+        id: &str,
+        name: &str,
+        input: serde_json::Value,
+        stop_reason: StopReason,
+    ) -> Self {
         Self {
             text: text.to_owned(),
             tool_call: (id.to_owned(), name.to_owned(), input),
+            stop_reason,
         }
     }
 }
@@ -5597,7 +5765,7 @@ impl LlmProvider for SteeringRedirectProvider {
                 },
             ],
             model: "mock-model".into(),
-            stop_reason: Some(StopReason::ToolUse),
+            stop_reason: Some(self.stop_reason),
             usage: Usage {
                 served_speed: None,
                 input_tokens: 80,
@@ -5615,6 +5783,316 @@ impl LlmProvider for SteeringRedirectProvider {
     fn provider(&self) -> &'static str {
         "mock"
     }
+}
+
+fn messages_contain_tool_use_id(messages: &[agent_sdk_foundation::llm::Message], id: &str) -> bool {
+    messages.iter().any(|message| {
+        matches!(
+            &message.content,
+            agent_sdk_foundation::llm::Content::Blocks(blocks)
+                if blocks.iter().any(|block| matches!(
+                    block,
+                    ContentBlock::ToolUse { id: block_id, .. } if block_id == id
+                ))
+        )
+    })
+}
+
+/// Acquire the woken parent and run one exchange whose reply carries
+/// `tool_use` under a dispatch-refusing stop reason, asserting the
+/// outcome re-parks without spawning anything.
+async fn resume_undispatched_wave(
+    stores: &TestStores,
+    parent_id: &AgentTaskId,
+    stop_reason: StopReason,
+    steering: bool,
+    acquire_at: time::OffsetDateTime,
+    resume_at: time::OffsetDateTime,
+) -> Result<AgentTask> {
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            parent_id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            acquire_at,
+        )
+        .await?
+        .context("acquire woken parent")?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap_with_tools(acquired.clone()),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        acquire_at,
+    )
+    .await?;
+    let provider = SteeringRedirectProvider::with_stop_reason(
+        "truncated mid-thought",
+        "stray_call",
+        "bash",
+        serde_json::json!({"command": "never dispatched"}),
+        stop_reason,
+    );
+    let outcome = if steering {
+        resume_for_steering(inputs, &acquired, &provider, &stores.deps(), resume_at).await?
+    } else {
+        resume_from_children(inputs, &acquired, &provider, &stores.deps(), resume_at).await?
+    };
+    let RootTurnOutcome::Suspended {
+        parent_task,
+        child_tasks,
+        ..
+    } = outcome
+    else {
+        panic!("expected Suspended re-park for {stop_reason:?}");
+    };
+    assert!(
+        child_tasks.is_empty(),
+        "undispatched tool_use must spawn nothing"
+    );
+    Ok(parent_task)
+}
+
+/// Complete the survivor, run the final fan-in, and assert the next
+/// wake succeeds with the REAL result while the stray undispatched
+/// call never reaches the replayed history.
+async fn assert_final_fanin_has_no_stray(
+    stores: &TestStores,
+    parent_id: &AgentTaskId,
+    survivor: &AgentTask,
+    reattach_id: &str,
+    stop_reason: StopReason,
+) -> Result<()> {
+    complete_child_at(
+        stores,
+        survivor,
+        &ok_result("done-1"),
+        t_plus(50),
+        t_plus(55),
+    )
+    .await?;
+    let final_acq = stores
+        .tasks
+        .try_acquire_task(
+            parent_id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            t_plus(60),
+        )
+        .await?
+        .context("acquire for final fan-in")?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap_with_tools(final_acq.clone()),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(60),
+    )
+    .await?;
+    let final_provider = SteeringCaptureProvider::new("All finished.");
+    let outcome = resume_from_children(
+        inputs,
+        &final_acq,
+        &final_provider,
+        &stores.deps(),
+        t_plus(65),
+    )
+    .await?;
+    assert!(
+        matches!(outcome, RootTurnOutcome::Completed { .. }),
+        "next wake must complete ({stop_reason:?})",
+    );
+    let msgs = final_provider.captured();
+    assert_eq!(find_tool_result(&msgs, reattach_id), Some("done-1"));
+    assert!(
+        !messages_contain_tool_use_id(&msgs, "stray_call"),
+        "undispatched tool_use must not be replayed ({stop_reason:?})",
+    );
+    Ok(())
+}
+
+/// Regression (review P1): an exchange reply carrying `tool_use` under
+/// a stop reason that refuses dispatch must NOT keep the undispatched
+/// calls. The no-routing re-park re-indexes survivors densely from 0,
+/// so stray emitted slots would misbind survivors and leave ownerless
+/// pending ids that wedge the next wake.
+async fn assert_steering_repark_drops_undispatched_tool_use(stop_reason: StopReason) -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running(
+        &stores,
+        vec![bash_call("call_0"), bash_call("call_1")],
+    ))
+    .await?;
+    complete_child_at(
+        &stores,
+        &children[0],
+        &ok_result("done-0"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+
+    stores
+        .tasks
+        .enqueue_steering_resume(
+            &parent.id,
+            vec![ContentBlock::Text {
+                text: "status?".into(),
+            }],
+            t_plus(20),
+        )
+        .await?
+        .context("woken")?;
+    let parent_task = Box::pin(resume_undispatched_wave(
+        &stores,
+        &parent.id,
+        stop_reason,
+        true,
+        t_plus(21),
+        t_plus(25),
+    ))
+    .await?;
+    assert_eq!(parent_task.pending_child_count, 1);
+    let reattach_id = derive_reattach_tool_use_id("call_1");
+    match &parent_task.state {
+        TaskState::WaitingOnChildren {
+            continuation,
+            child_ids,
+            ..
+        } => {
+            assert_eq!(child_ids.as_slice(), std::slice::from_ref(&children[1].id));
+            let pending = &continuation.payload.pending_tool_calls;
+            assert_eq!(
+                pending.len(),
+                1,
+                "pending must be the re-attach batch only ({stop_reason:?}): {pending:?}",
+            );
+            assert_eq!(pending[0].id, reattach_id);
+        }
+        other => panic!("expected WaitingOnChildren re-park, got {other:?}"),
+    }
+    let survivor = stores
+        .tasks
+        .get(&children[1].id)
+        .await?
+        .context("survivor")?;
+    assert_eq!(
+        survivor.spawn_index,
+        Some(0),
+        "survivor must bind the dense slot ({stop_reason:?})",
+    );
+
+    // Next wake succeeds with the survivor's REAL result; the stray
+    // undispatched call never reaches the replayed history.
+    Box::pin(assert_final_fanin_has_no_stray(
+        &stores,
+        &parent.id,
+        &children[1],
+        &reattach_id,
+        stop_reason,
+    ))
+    .await
+}
+
+#[tokio::test]
+async fn steering_repark_drops_undispatched_tool_use_for_each_refusing_stop_reason() -> Result<()> {
+    for stop_reason in [
+        StopReason::MaxTokens,
+        StopReason::StopSequence,
+        StopReason::EndTurn,
+        StopReason::Unknown,
+    ] {
+        Box::pin(assert_steering_repark_drops_undispatched_tool_use(
+            stop_reason,
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn wait_any_partial_resume_drops_undispatched_tool_use_and_next_wave_succeeds() -> Result<()>
+{
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
+        &stores,
+        vec![
+            bash_call("call_0"),
+            bash_call("call_1"),
+            bash_call("call_2"),
+        ],
+        ChildJoinPolicy::Any,
+    ))
+    .await?;
+    complete_child_at(
+        &stores,
+        &children[0],
+        &ok_result("done-0"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+
+    let parent_task = Box::pin(resume_undispatched_wave(
+        &stores,
+        &parent.id,
+        StopReason::MaxTokens,
+        false,
+        t_plus(10),
+        t_plus(15),
+    ))
+    .await?;
+    assert_eq!(parent_task.pending_child_count, 2);
+    match &parent_task.state {
+        TaskState::WaitingOnChildren { continuation, .. } => {
+            let pending = &continuation.payload.pending_tool_calls;
+            assert_eq!(
+                pending.len(),
+                2,
+                "pending must be the re-attach batch only: {pending:?}",
+            );
+            assert_eq!(pending[0].id, derive_reattach_tool_use_id("call_1"));
+            assert_eq!(pending[1].id, derive_reattach_tool_use_id("call_2"));
+        }
+        other => panic!("expected WaitingOnChildren re-park, got {other:?}"),
+    }
+    let survivor_1 = stores
+        .tasks
+        .get(&children[1].id)
+        .await?
+        .context("survivor 1")?;
+    let survivor_2 = stores
+        .tasks
+        .get(&children[2].id)
+        .await?
+        .context("survivor 2")?;
+    assert_eq!(survivor_1.spawn_index, Some(0));
+    assert_eq!(survivor_2.spawn_index, Some(1));
+
+    // The next settle wakes the next wave cleanly - nothing lost.
+    complete_child_at(
+        &stores,
+        &children[1],
+        &ok_result("done-1"),
+        t_plus(20),
+        t_plus(21),
+    )
+    .await?;
+    let (second_repark, captured) =
+        resume_wait_any_wave(&stores, &parent.id, t_plus(22), t_plus(25), "Second wave.").await?;
+    assert_eq!(
+        find_tool_result(&captured, &derive_reattach_tool_use_id("call_1")),
+        Some("done-1"),
+    );
+    assert!(
+        !messages_contain_tool_use_id(&captured, "stray_call"),
+        "undispatched tool_use must not be replayed",
+    );
+    assert_eq!(second_repark.pending_child_count, 1);
+    Ok(())
 }
 
 /// Regression (MUST-FIX #1): when every child is terminal at exchange
@@ -5717,6 +6195,7 @@ async fn steering_wake_all_terminal_tool_use_spawns_followup_wave_not_completes(
             continuation,
             suspended_messages,
             child_ids,
+            ..
         } => {
             // The new wave binds the steering response's tool_use id.
             let pending = &continuation.payload.pending_tool_calls;
@@ -7064,6 +7543,7 @@ async fn cancelled_event_derives_usage_from_parked_continuation() -> Result<()> 
             SuspensionPayload {
                 continuation,
                 suspended_messages: Vec::new(),
+                child_join_policy: crate::ChildJoinPolicy::default(),
             },
             None,
             Vec::new(),
@@ -8219,6 +8699,95 @@ async fn mixed_batch_spawns_subagent_slot_and_tool_child_in_one_turn() -> Result
     assert_eq!(child_root.status, TaskStatus::Pending);
     assert_eq!(child_root.thread_id, linkage.child_thread_id);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn partial_resume_atomically_reattaches_survivor_and_spawns_mixed_batch() -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
+        &stores,
+        vec![bash_call("old_0"), bash_call("old_1")],
+        ChildJoinPolicy::Any,
+    ))
+    .await?;
+    complete_child_at(
+        &stores,
+        &children[0],
+        &ok_result("old-done"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent.id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            t_plus(10),
+        )
+        .await?
+        .context("acquire partial resume")?;
+    let mut bootstrap = sample_bootstrap_with_tools(acquired.clone());
+    bootstrap.definition = sample_definition_with_subagent_tools();
+    bootstrap.definition.policy.child_join_policy = ChildJoinPolicy::Any;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(10),
+    )
+    .await?;
+    let selector = MixedSpawnSelector;
+    let mut deps = stores.deps();
+    deps.subagent_spawn_selector = Some(&selector);
+    let provider = MockToolCallProvider::new(subagent_then_tool_calls());
+
+    let outcome = resume_from_children(inputs, &acquired, &provider, &deps, t_plus(15)).await?;
+    let RootTurnOutcome::Suspended {
+        parent_task,
+        child_tasks,
+        ..
+    } = outcome
+    else {
+        panic!("partial resume with tool calls must suspend");
+    };
+    assert_eq!(child_tasks.len(), 2);
+    assert_eq!(child_tasks[0].kind, TaskKind::Subagent);
+    assert_eq!(child_tasks[0].spawn_index, Some(0));
+    assert_eq!(child_tasks[1].kind, TaskKind::ToolRuntime);
+    assert_eq!(child_tasks[1].spawn_index, Some(1));
+    assert_eq!(parent_task.pending_child_count, 3);
+
+    let survivor = stores
+        .tasks
+        .get(&children[1].id)
+        .await?
+        .context("survivor remains attached")?;
+    assert_eq!(survivor.status, TaskStatus::Pending);
+    assert_eq!(survivor.spawn_index, Some(2));
+    match &parent_task.state {
+        TaskState::WaitingOnChildren {
+            continuation,
+            child_ids,
+            child_join_policy,
+            ..
+        } => {
+            assert_eq!(*child_join_policy, ChildJoinPolicy::Any);
+            assert_eq!(child_ids.len(), 3);
+            assert_eq!(child_ids[2], survivor.id);
+            let pending = &continuation.payload.pending_tool_calls;
+            assert_eq!(pending.len(), 3);
+            assert_eq!(pending[0].id, "call_sub");
+            assert_eq!(pending[1].id, "call_bash");
+            assert_eq!(pending[2].id, derive_reattach_tool_use_id("old_1"));
+        }
+        other => panic!("expected atomic mixed re-park, got {other:?}"),
+    }
     Ok(())
 }
 

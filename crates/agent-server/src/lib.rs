@@ -199,12 +199,12 @@ pub use agent_sdk_tools::{
 /// recheck.
 pub use worker::{
     AgentDefinition, AgentDefinitionRegistry, BatchRouting, CONFIRMATION_POLICY_DENIED_PREFIX,
-    CONFIRMATION_REJECTED_PREFIX, CONFIRMATION_TIMEOUT_PREFIX, ConfirmationDecision,
-    ConfirmationDecisionOutcome, ConfirmationPolicy, ConfirmationResumeOutcome,
-    EffectiveSubagentCapabilities, EffectiveSubagentMcpPolicy, EffectiveSubagentSpec,
-    InMemoryAgentDefinitionRegistry, InheritedSubagentConstraints, InheritedSubagentPolicy,
-    NoopSubagentSpawnSelector, PolicyVerdict, RootTurnDeps, RootTurnOutcome, RuntimePolicy,
-    ServerSubagentSpawnPolicy, SpawnedSubagentInvocation, SubagentCapabilityProfile,
+    CONFIRMATION_REJECTED_PREFIX, CONFIRMATION_TIMEOUT_PREFIX, ChildJoinPolicy,
+    ConfirmationDecision, ConfirmationDecisionOutcome, ConfirmationPolicy,
+    ConfirmationResumeOutcome, EffectiveSubagentCapabilities, EffectiveSubagentMcpPolicy,
+    EffectiveSubagentSpec, InMemoryAgentDefinitionRegistry, InheritedSubagentConstraints,
+    InheritedSubagentPolicy, NoopSubagentSpawnSelector, PolicyVerdict, RootTurnDeps,
+    RootTurnOutcome, RuntimePolicy, ServerSubagentSpawnPolicy, SpawnedSubagentInvocation,
     SubagentCapabilityRequest, SubagentInvocationDeps, SubagentMcpRequest, SubagentResult,
     SubagentResultDeps, SubagentSandboxMode, SubagentSandboxPolicy, SubagentSpawnDecision,
     SubagentSpawnPolicy, SubagentSpawnRequest, SubagentSpawnSelector, SubagentSummary,

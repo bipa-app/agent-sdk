@@ -4116,6 +4116,7 @@ mod tests {
                                 thought_signature: None,
                             }]),
                         ],
+                        child_join_policy: agent_server::ChildJoinPolicy::default(),
                     },
                     questions: vec![QuestionPayload {
                         tool_call_id: "dispatch-question".into(),
@@ -4473,6 +4474,7 @@ mod tests {
         stores: &StoreRegistry,
         thread_name: &str,
         max_attempts: u32,
+        child_join_policy: agent_server::worker::ChildJoinPolicy,
     ) -> Result<AgentTask> {
         use agent_server::journal::task::ChildSpawnSpec;
 
@@ -4494,7 +4496,8 @@ mod tests {
             )
             .await?
             .context("acquire fresh root")?;
-        let payload = pending_call_suspension_with_tier(&thread, "bash", ToolTier::Observe);
+        let mut payload = pending_call_suspension_with_tier(&thread, "bash", ToolTier::Observe);
+        payload.child_join_policy = child_join_policy;
         let (_parent, children) = stores
             .task_store
             .spawn_tool_children(
@@ -4566,7 +4569,13 @@ mod tests {
         let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
         let stores = host.stores().clone();
 
-        let acquired = seed_running_ready_to_resume_root(&stores, "t-weather-requeue", 3).await?;
+        let acquired = seed_running_ready_to_resume_root(
+            &stores,
+            "t-weather-requeue",
+            3,
+            agent_server::worker::ChildJoinPolicy::Any,
+        )
+        .await?;
         let attempt_before = acquired.attempt;
 
         let error =
@@ -4591,6 +4600,10 @@ mod tests {
         assert!(
             matches!(row.state, TaskState::ReadyToResume { .. }),
             "the continuation carrying the children's results must survive the requeue",
+        );
+        assert_eq!(
+            row.state.child_join_policy(),
+            agent_server::worker::ChildJoinPolicy::Any,
         );
         assert_eq!(
             row.attempt,
@@ -4626,7 +4639,13 @@ mod tests {
         let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
         let stores = host.stores().clone();
 
-        let acquired = seed_running_ready_to_resume_root(&stores, "t-weather-capped", 1).await?;
+        let acquired = seed_running_ready_to_resume_root(
+            &stores,
+            "t-weather-capped",
+            1,
+            agent_server::worker::ChildJoinPolicy::All,
+        )
+        .await?;
 
         let error =
             weather_resume_error(agent_sdk_providers::streaming::StreamErrorKind::ServerError);
@@ -4661,8 +4680,13 @@ mod tests {
         let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
         let stores = host.stores().clone();
 
-        let acquired =
-            seed_running_ready_to_resume_root(&stores, "t-weather-deterministic", 3).await?;
+        let acquired = seed_running_ready_to_resume_root(
+            &stores,
+            "t-weather-deterministic",
+            3,
+            agent_server::worker::ChildJoinPolicy::All,
+        )
+        .await?;
 
         let error =
             weather_resume_error(agent_sdk_providers::streaming::StreamErrorKind::InvalidRequest);
@@ -6839,6 +6863,7 @@ mod tests {
                 },
             ),
             suspended_messages: vec![],
+            child_join_policy: agent_server::ChildJoinPolicy::default(),
         }
     }
 

@@ -82,6 +82,7 @@ use uuid::Uuid;
 
 use super::recovery::FailureReason;
 use super::task_state::{SubagentInvocationState, TaskState};
+use crate::worker::definition::ChildJoinPolicy;
 
 // ─────────────────────────────────────────────────────────────────────
 // Identity newtypes
@@ -221,6 +222,7 @@ impl fmt::Display for LeaseId {
 pub struct SuspensionPayload {
     pub continuation: ContinuationEnvelope,
     pub suspended_messages: Vec<agent_sdk_foundation::llm::Message>,
+    pub child_join_policy: ChildJoinPolicy,
 }
 
 /// Input struct for [`super::store::AgentTaskStore::spawn_tool_children`].
@@ -1484,6 +1486,7 @@ impl AgentTask {
             continuation: Box::new(payload.continuation),
             suspended_messages: payload.suspended_messages,
             child_ids,
+            child_join_policy: payload.child_join_policy,
         };
         // ADR-0003 I3. Parking ENDS this row's heartbeat, so every activity
         // bump since the last tick would otherwise be discarded — and this is
@@ -1520,42 +1523,15 @@ impl AgentTask {
     /// # Errors
     /// Returns [`TaskSchemaError::InvalidTransition`] if the task is not in
     /// [`TaskStatus::WaitingOnChildren`].
-    pub fn child_resolved(mut self, now: OffsetDateTime) -> Result<Self, TaskSchemaError> {
+    pub fn child_resolved(self, now: OffsetDateTime) -> Result<Self, TaskSchemaError> {
         if self.status != TaskStatus::WaitingOnChildren {
             return Err(TaskSchemaError::InvalidTransition {
                 from: self.status,
                 to: TaskStatus::Pending,
             });
         }
-        self.pending_child_count = self.pending_child_count.saturating_sub(1);
-        if self.pending_child_count == 0 {
-            self.status = TaskStatus::Pending;
-            // Phase 4.5: move the continuation and suspended messages
-            // from WaitingOnChildren into ReadyToResume so the worker
-            // that acquires this parent can resume the turn from
-            // durable state. The old approach wiped the payload here;
-            // now we preserve it through the Pending transition.
-            self.state = match self.state {
-                TaskState::WaitingOnChildren {
-                    continuation,
-                    suspended_messages,
-                    child_ids,
-                } => TaskState::ReadyToResume {
-                    continuation,
-                    suspended_messages,
-                    child_ids,
-                    // A child fan-in carries no steering note.
-                    steering: Vec::new(),
-                },
-                // Defensive: if state is somehow not WaitingOnChildren,
-                // clear it. This shouldn't happen because the status
-                // guard above ensures we are in WaitingOnChildren.
-                other => other,
-            };
-        }
-        self.updated_at = now;
-        self.validate()?;
-        Ok(self)
+        let live_children = self.pending_child_count.saturating_sub(1);
+        self.recompute_pending_children(live_children, now)
     }
 
     /// Authoritatively replace the parent's `pending_child_count` with
@@ -1591,9 +1567,13 @@ impl AgentTask {
                 to: TaskStatus::Pending,
             });
         }
-        self.pending_child_count = live_children;
-        if live_children == 0 {
+        let should_resume = match self.state.child_join_policy() {
+            ChildJoinPolicy::All => live_children == 0,
+            ChildJoinPolicy::Any => live_children < self.pending_child_count,
+        };
+        if should_resume {
             self.status = TaskStatus::Pending;
+            self.pending_child_count = 0;
             // Phase 4.5: preserve the continuation and suspended
             // messages so the resume path can rebuild the turn from
             // durable state. Subagent invocations preserve their
@@ -1604,10 +1584,12 @@ impl AgentTask {
                     continuation,
                     suspended_messages,
                     child_ids,
+                    child_join_policy,
                 } => TaskState::ReadyToResume {
                     continuation,
                     suspended_messages,
                     child_ids,
+                    child_join_policy,
                     // A child fan-in carries no steering note.
                     steering: Vec::new(),
                 },
@@ -1616,6 +1598,8 @@ impl AgentTask {
                 }
                 other => other,
             };
+        } else {
+            self.pending_child_count = live_children;
         }
         self.updated_at = now;
         self.validate()?;
@@ -1659,6 +1643,7 @@ impl AgentTask {
             continuation,
             suspended_messages,
             child_ids,
+            child_join_policy,
         } = self.state
         else {
             return Err(TaskSchemaError::InvalidTransition {
@@ -1680,6 +1665,7 @@ impl AgentTask {
             continuation,
             suspended_messages,
             child_ids,
+            child_join_policy,
             steering,
         };
         self.updated_at = now;
@@ -1729,25 +1715,30 @@ impl AgentTask {
         self.lease_id = None;
         self.lease_expires_at = None;
         self.last_heartbeat_at = None;
-        if live_children > 0 {
+        let should_resume = match payload.child_join_policy {
+            ChildJoinPolicy::All => live_children == 0,
+            ChildJoinPolicy::Any => {
+                usize::try_from(live_children).is_ok_and(|live| live < child_ids.len())
+            }
+        };
+        if should_resume {
+            self.status = TaskStatus::Pending;
+            self.pending_child_count = 0;
+            self.state = TaskState::ReadyToResume {
+                continuation: Box::new(payload.continuation),
+                suspended_messages: payload.suspended_messages,
+                child_ids,
+                child_join_policy: payload.child_join_policy,
+                steering: Vec::new(),
+            };
+        } else {
             self.status = TaskStatus::WaitingOnChildren;
             self.pending_child_count = live_children;
             self.state = TaskState::WaitingOnChildren {
                 continuation: Box::new(payload.continuation),
                 suspended_messages: payload.suspended_messages,
                 child_ids,
-            };
-        } else {
-            self.status = TaskStatus::Pending;
-            self.pending_child_count = 0;
-            // Empty `steering` → an ordinary fan-in on the next
-            // acquisition (`resume_from_children`), since every
-            // re-attach child is already terminal.
-            self.state = TaskState::ReadyToResume {
-                continuation: Box::new(payload.continuation),
-                suspended_messages: payload.suspended_messages,
-                child_ids,
-                steering: Vec::new(),
+                child_join_policy: payload.child_join_policy,
             };
         }
         // ADR-0003 I3. A re-park drops the lease and ends the heartbeat on
@@ -2584,6 +2575,7 @@ mod tests {
             continuation: Box::new(sample_continuation()),
             suspended_messages: Vec::new(),
             child_ids: Vec::new(),
+            child_join_policy: crate::ChildJoinPolicy::default(),
             steering: Vec::new(),
         };
 
@@ -2772,6 +2764,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation(),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 Vec::new(),
                 t_plus(2),
@@ -2811,6 +2804,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation(),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 Vec::new(),
                 t_plus(2),
@@ -2844,6 +2838,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation(),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 Vec::new(),
                 t_plus(2),
@@ -2882,6 +2877,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation(),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 Vec::new(),
                 t_plus(2),
@@ -2899,6 +2895,119 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn wait_all_remains_parked_until_no_child_is_live() -> Result<()> {
+        let running = fresh_root()
+            .mark_running(
+                WorkerId::from_string("w1"),
+                LeaseId::from_string("l1"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .context("running")?;
+        let waiting = running
+            .wait_on_children(
+                3,
+                SuspensionPayload {
+                    continuation: sample_continuation(),
+                    suspended_messages: Vec::new(),
+                    child_join_policy: ChildJoinPolicy::All,
+                },
+                Vec::new(),
+                t_plus(2),
+            )
+            .context("wait")?;
+        let after_one = waiting
+            .child_resolved(t_plus(3))
+            .context("resolve one child")?;
+        assert_eq!(after_one.status, TaskStatus::WaitingOnChildren);
+        assert_eq!(after_one.pending_child_count, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn wait_any_becomes_ready_after_first_terminal_child() -> Result<()> {
+        let running = fresh_root()
+            .mark_running(
+                WorkerId::from_string("w1"),
+                LeaseId::from_string("l1"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .context("running")?;
+        let waiting = running
+            .wait_on_children(
+                3,
+                SuspensionPayload {
+                    continuation: sample_continuation(),
+                    suspended_messages: Vec::new(),
+                    child_join_policy: ChildJoinPolicy::Any,
+                },
+                Vec::new(),
+                t_plus(2),
+            )
+            .context("wait")?;
+        let ready = waiting
+            .child_resolved(t_plus(3))
+            .context("resolve one child")?;
+        assert_eq!(ready.status, TaskStatus::Pending);
+        assert_eq!(ready.pending_child_count, 0);
+        assert!(matches!(
+            ready.state,
+            TaskState::ReadyToResume {
+                child_join_policy: ChildJoinPolicy::Any,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn wait_any_repark_is_immediately_ready_when_a_survivor_settled_in_flight() -> Result<()> {
+        let running = fresh_root()
+            .mark_running(
+                WorkerId::from_string("w1"),
+                LeaseId::from_string("l1"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .context("running")?;
+        let payload = SuspensionPayload {
+            continuation: sample_continuation(),
+            suspended_messages: Vec::new(),
+            child_join_policy: ChildJoinPolicy::Any,
+        };
+        let resumed = running
+            .wait_on_children(2, payload.clone(), Vec::new(), t_plus(2))
+            .context("wait")?
+            .child_resolved(t_plus(3))
+            .context("first wake")?
+            .mark_running(
+                WorkerId::from_string("w2"),
+                LeaseId::from_string("l2"),
+                t_plus(60),
+                t_plus(4),
+            )
+            .context("acquire resume")?;
+        let reparked = resumed
+            .repark_after_steering(
+                1,
+                payload,
+                vec![AgentTaskId::new(), AgentTaskId::new()],
+                t_plus(5),
+            )
+            .context("repark")?;
+        assert_eq!(reparked.status, TaskStatus::Pending);
+        assert_eq!(reparked.pending_child_count, 0);
+        assert!(matches!(
+            reparked.state,
+            TaskState::ReadyToResume {
+                child_join_policy: ChildJoinPolicy::Any,
+                ..
+            }
+        ));
+        Ok(())
+    }
     #[test]
     fn recompute_pending_children_with_zero_live_count_resumes_parent() -> Result<()> {
         // Zero live children is the resume trigger — status flips back
@@ -2918,6 +3027,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation(),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 Vec::new(),
                 t_plus(2),
@@ -2951,6 +3061,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation(),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 Vec::new(),
                 t_plus(2),
@@ -2995,6 +3106,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation(),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 Vec::new(),
                 t_plus(2),
@@ -3116,6 +3228,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation(),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 Vec::new(),
                 t_plus(2),
@@ -3199,6 +3312,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation(),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 Vec::new(),
                 t_plus(2),
@@ -3390,6 +3504,7 @@ mod tests {
                 SuspensionPayload {
                     continuation: sample_continuation(),
                     suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
                 },
                 Vec::new(),
                 t_plus(2),
@@ -3492,6 +3607,7 @@ mod tests {
             SuspensionPayload {
                 continuation: sample_continuation(),
                 suspended_messages: Vec::new(),
+                child_join_policy: crate::ChildJoinPolicy::default(),
             },
             Vec::new(),
             t_plus(2),
@@ -3608,6 +3724,7 @@ mod tests {
         SuspensionPayload {
             continuation: sample_continuation(),
             suspended_messages: Vec::new(),
+            child_join_policy: crate::ChildJoinPolicy::default(),
         }
     }
 

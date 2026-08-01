@@ -4624,6 +4624,7 @@ mod tests {
                     payload: SuspensionPayload {
                         continuation,
                         suspended_messages: Vec::new(),
+                        child_join_policy: agent_server::ChildJoinPolicy::default(),
                     },
                     child_caller_metadata: None,
                 },
@@ -7694,6 +7695,7 @@ mod tests {
                     payload: SuspensionPayload {
                         continuation,
                         suspended_messages: Vec::new(),
+                        child_join_policy: agent_server::ChildJoinPolicy::default(),
                     },
                     questions: vec![question],
                     events: Vec::new(),
@@ -8110,6 +8112,7 @@ mod tests {
                 SuspensionPayload {
                     continuation,
                     suspended_messages: Vec::new(),
+                    child_join_policy: agent_server::ChildJoinPolicy::default(),
                 },
                 None,
                 Vec::new(),

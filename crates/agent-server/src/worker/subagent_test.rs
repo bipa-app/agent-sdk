@@ -845,6 +845,7 @@ fn parent_suspension_payload_with_tier(
             },
         ),
         suspended_messages: Vec::new(),
+        child_join_policy: crate::ChildJoinPolicy::default(),
     }
 }
 
@@ -955,6 +956,7 @@ fn parent_suspension_payload_with_tools(
             },
         ),
         suspended_messages: Vec::new(),
+        child_join_policy: crate::ChildJoinPolicy::default(),
     }
 }
 
@@ -1545,6 +1547,7 @@ fn mixed_suspension_payload(
             },
         ),
         suspended_messages: Vec::new(),
+        child_join_policy: crate::ChildJoinPolicy::default(),
     }
 }
 
@@ -1606,6 +1609,7 @@ async fn spawn_mixed_creates_subagents_and_tool_children_under_one_parent() -> R
             delivered_injection_ids: Vec::new(),
             subagents: mixed_subagent_entries(&tasks)?,
             tool_children: mixed_tool_children(tasks.len(), 3)?,
+            reattach: Vec::new(),
             payload,
             child_otel_traceparent: None,
         },
@@ -1690,6 +1694,7 @@ async fn spawn_mixed_rejects_losing_cas_without_partial_spawn() -> Result<()> {
             delivered_injection_ids: Vec::new(),
             subagents: mixed_subagent_entries(&tasks)?,
             tool_children: mixed_tool_children(tasks.len(), 2)?,
+            reattach: Vec::new(),
             payload,
             child_otel_traceparent: None,
         },
@@ -1740,6 +1745,7 @@ async fn spawn_mixed_rejects_uncovered_pending_tool_call() -> Result<()> {
             delivered_injection_ids: Vec::new(),
             subagents: mixed_subagent_entries(&tasks)?,
             tool_children: mixed_tool_children(tasks.len(), 2)?,
+            reattach: Vec::new(),
             payload,
             child_otel_traceparent: None,
         },
@@ -1799,6 +1805,7 @@ async fn spawn_mixed_rejects_bad_tool_slot_without_orphaning_child_threads() -> 
                 spawn_index: 7, // out of range — only 2 pending tool calls
                 spec: crate::journal::ChildSpawnSpec::new(3),
             }],
+            reattach: Vec::new(),
             payload,
             child_otel_traceparent: None,
         },
@@ -1870,6 +1877,7 @@ async fn spawn_mixed_records_child_ids_in_slot_order_when_interleaved() -> Resul
                 spawn_index: 0,
                 spec: crate::journal::ChildSpawnSpec::new(3),
             }],
+            reattach: Vec::new(),
             payload,
             child_otel_traceparent: None,
         },
@@ -2013,6 +2021,7 @@ async fn spawn_mixed_rejects_duplicate_child_thread_without_orphaning_projection
             delivered_injection_ids: Vec::new(),
             subagents,
             tool_children: mixed_tool_children(tasks.len(), 3)?,
+            reattach: Vec::new(),
             payload,
             child_otel_traceparent: None,
         },

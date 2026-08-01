@@ -432,6 +432,7 @@ mod tests {
                     SuspensionPayload {
                         continuation: sample_continuation(),
                         suspended_messages: Vec::new(),
+                        child_join_policy: crate::ChildJoinPolicy::default(),
                     },
                     Vec::new(),
                     t_plus(160),
@@ -457,6 +458,7 @@ mod tests {
                     SuspensionPayload {
                         continuation: sample_continuation(),
                         suspended_messages: Vec::new(),
+                        child_join_policy: crate::ChildJoinPolicy::default(),
                     },
                     vec![agent_sdk_foundation::QuestionPayload {
                         tool_call_id: "question-call".into(),
@@ -767,6 +769,7 @@ mod tests {
             SuspensionPayload {
                 continuation: sample_continuation(),
                 suspended_messages: Vec::new(),
+                child_join_policy: crate::ChildJoinPolicy::default(),
             },
             Vec::new(),
             t_plus(2),

@@ -39,13 +39,14 @@ use time::OffsetDateTime;
 
 use crate::journal::commit::DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS;
 use crate::journal::message_store::MessageProjectionStore;
-use crate::journal::store::SubagentBatchSpawn;
+use crate::journal::store::{SubagentBatchSpawn, validate_reattached_slot_coverage};
 use crate::journal::subagent_spawn_transaction::{SubagentSpawnCommit, SubagentSpawnEvent};
 use crate::journal::task::SubmittedInputItem;
 use crate::journal::{
     AgentTask, AgentTaskId, AgentTaskStore, CommittedEvent, EventRepository, LeaseId,
-    MixedChildrenSpawn, SpawnedMixedChildren, SubagentInvocationSpawn, SuspensionPayload, TaskKind,
-    TaskStatus, Thread, ThreadStore, ToolChildSpawn, WorkerId, validate_mixed_slot_coverage,
+    MixedChildrenSpawn, ReattachedChild, SpawnedMixedChildren, SubagentInvocationSpawn,
+    SuspensionPayload, TaskKind, TaskStatus, Thread, ThreadStore, ToolChildSpawn, WorkerId,
+    validate_mixed_slot_coverage,
 };
 
 /// Typed durable request to spawn a subagent.
@@ -1954,11 +1955,38 @@ pub struct MixedChildrenRequest {
     pub subagents: Vec<SubagentBatchEntry>,
     /// Tool-runtime children to persist, in input order.
     pub tool_children: Vec<ToolChildSpawn>,
+    /// Existing children rebound into the combined pending-call batch.
+    pub reattach: Vec<ReattachedChild>,
     /// The one parent suspension shared by every child in the batch.
     pub payload: SuspensionPayload,
     /// Trace parent stamped on the tool children so their
     /// `execute_tool` spans nest under the turn's root span.
     pub child_otel_traceparent: Option<String>,
+}
+
+fn validate_mixed_request_slots(
+    payload: &SuspensionPayload,
+    subagents: &[SubagentBatchEntry],
+    tool_children: &[ToolChildSpawn],
+    reattach: &[ReattachedChild],
+) -> Result<()> {
+    let subagent_slots: Vec<u32> = subagents.iter().map(|entry| entry.spawn_index).collect();
+    let tool_slots: Vec<u32> = tool_children.iter().map(|tool| tool.spawn_index).collect();
+    if reattach.is_empty() {
+        validate_mixed_slot_coverage(
+            &subagent_slots,
+            &tool_slots,
+            payload.continuation.payload.pending_tool_calls.len(),
+        )
+    } else {
+        let reattach_slots: Vec<u32> = reattach.iter().map(|child| child.spawn_index).collect();
+        validate_reattached_slot_coverage(
+            &subagent_slots,
+            &tool_slots,
+            &reattach_slots,
+            payload.continuation.payload.pending_tool_calls.len(),
+        )
+    }
 }
 
 /// Persist a mixed batch — N durable subagent invocations plus M
@@ -2004,6 +2032,7 @@ pub async fn spawn_mixed_children_invocations(
         delivered_injection_ids,
         mut subagents,
         tool_children,
+        reattach,
         payload,
         child_otel_traceparent,
     } = request;
@@ -2013,13 +2042,7 @@ pub async fn spawn_mixed_children_invocations(
     // own validation runs inside its transaction, which rolls back only
     // the rows it wrote: a child-thread projection created out here
     // would survive a late rejection as an orphan.
-    let subagent_slots: Vec<u32> = subagents.iter().map(|entry| entry.spawn_index).collect();
-    let tool_slots: Vec<u32> = tool_children.iter().map(|tool| tool.spawn_index).collect();
-    validate_mixed_slot_coverage(
-        &subagent_slots,
-        &tool_slots,
-        payload.continuation.payload.pending_tool_calls.len(),
-    )?;
+    validate_mixed_request_slots(&payload, &subagents, &tool_children, &reattach)?;
     let pending_tools_by_entry = validate_batch_spawns(&payload, &subagents)?;
 
     let child_threads = materialize_batch_child_threads(&mut subagents, deps, now).await?;
@@ -2047,6 +2070,7 @@ pub async fn spawn_mixed_children_invocations(
                 delivered_injection_ids,
                 subagents: spawns,
                 tool_children,
+                reattach,
                 payload,
                 child_otel_traceparent,
             },

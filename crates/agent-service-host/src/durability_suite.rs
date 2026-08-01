@@ -134,6 +134,7 @@ mod tests {
                 },
             ),
             suspended_messages: vec![],
+            child_join_policy: agent_server::ChildJoinPolicy::default(),
         }
     }
 

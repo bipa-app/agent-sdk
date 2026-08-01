@@ -25,6 +25,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
+use std::collections::BTreeSet;
 use time::OffsetDateTime;
 
 use agent_server::journal::checkpoint::{
@@ -62,7 +63,7 @@ use agent_server::journal::relay::{
 use agent_server::journal::retention::{RetentionCursor, RetentionStore};
 use agent_server::journal::store::{
     AgentTaskStore, CancelTreeOutcome, ChildProbe, MixedChildrenSpawn, QuestionAnswerApplied,
-    QuestionPause, RequeueOutcome, SpawnedMixedChildren, SubagentBatchSpawn,
+    QuestionPause, ReattachedChild, RequeueOutcome, SpawnedMixedChildren, SubagentBatchSpawn,
     SubagentInvocationSpawn, SubmitDisposition, SubmitRootIdempotency, SubmitRootTurnError,
     SubmitRootTurnOutcome, SubmitRootTurnParams, apply_question_answer, apply_question_pause,
     mixed_child_ids_in_slot_order, new_mixed_tool_child, submitted_task_disposition,
@@ -76,7 +77,7 @@ use agent_server::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, SuspensionPayload,
     TaskKind, TaskStatus, WorkerId,
 };
-use agent_server::journal::task_state::SubagentInvocationState;
+use agent_server::journal::task_state::{SubagentInvocationState, TaskState};
 use agent_server::journal::thread::{
     PurgeReceipt, PurgeSeed, Thread, ThreadNotFound, ThreadOperation, ThreadStatus,
 };
@@ -2820,6 +2821,43 @@ LIMIT 1
     record.map(AgentTask::try_from).transpose()
 }
 
+async fn prepare_reattached_rows_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    parent_id: &AgentTaskId,
+    reattach: Vec<ReattachedChild>,
+    now: OffsetDateTime,
+) -> Result<Vec<AgentTask>> {
+    let mut rows = Vec::with_capacity(reattach.len());
+    let mut ids = BTreeSet::new();
+    for attached in reattach {
+        ensure!(
+            ids.insert(attached.child_id.clone()),
+            "spawn rejected: duplicate re-attach child {}",
+            attached.child_id
+        );
+        let mut child = PostgresDurableStore::load_task_tx(tx, &attached.child_id, true)
+            .await?
+            .with_context(|| {
+                format!(
+                    "spawn rejected: re-attach child {} missing",
+                    attached.child_id
+                )
+            })?;
+        ensure!(
+            child.parent_id.as_ref() == Some(parent_id),
+            "spawn rejected: re-attach child {} is not a child of {parent_id}",
+            attached.child_id
+        );
+        child.spawn_index = Some(attached.spawn_index);
+        child.updated_at = now;
+        child
+            .validate()
+            .context("spawn rejected: re-attach child validate failed")?;
+        rows.push(child);
+    }
+    Ok(rows)
+}
+
 #[async_trait]
 impl AgentTaskStore for PostgresDurableStore {
     fn atomic_subagent_spawn_committer(&self) -> Option<&dyn AtomicSubagentSpawnCommitter> {
@@ -3903,14 +3941,15 @@ FOR UPDATE SKIP LOCKED
                 ));
             }
         }
-        if !old.state.is_steering_resume() {
+        if !matches!(old.state, TaskState::ReadyToResume { .. }) {
             return Err(anyhow!(
-                "repark rejected: task {parent_id} is not a steering resume"
+                "repark rejected: task {parent_id} is not a child resume"
             ));
         }
 
         // Re-index the re-attach children to dense spawn_index
         // positions matching the new continuation's tool-use order.
+        let mut live = 0_u32;
         for (idx, child_id) in reattach.iter().enumerate() {
             let mut child = Self::load_task_tx(&mut tx, child_id, true)
                 .await?
@@ -3926,13 +3965,16 @@ FOR UPDATE SKIP LOCKED
             child
                 .validate()
                 .context("repark rejected: re-attach child validate failed")?;
+            if !child.status.is_terminal() {
+                live = live
+                    .checked_add(1)
+                    .context("repark rejected: live child count exceeds u32")?;
+            }
             Self::update_task_tx(&mut tx, &child).await?;
         }
 
-        // Journal-authoritative live count (matches the completion
-        // path): a re-attach child that finished during the steering
-        // LLM call is already terminal and excluded.
-        let live = Self::load_live_child_count_tx(&mut tx, parent_id).await?;
+        // A re-attach child that finished during the LLM call is already
+        // terminal here and excluded.
         let reparked = old
             .clone()
             .repark_after_steering(live, payload, reattach, now)
@@ -4259,6 +4301,7 @@ FOR UPDATE SKIP LOCKED
             delivered_injection_ids,
             subagents,
             tool_children,
+            reattach,
             payload,
             child_otel_traceparent,
         } = spawn;
@@ -4298,14 +4341,25 @@ FOR UPDATE SKIP LOCKED
             tool_rows.push(child);
         }
 
-        let child_ids = mixed_child_ids_in_slot_order(&prepared, &tool_rows)?;
-
+        let reattached_rows = prepare_reattached_rows_tx(&mut tx, parent_id, reattach, now).await?;
+        let child_ids = mixed_child_ids_in_slot_order(&prepared, &tool_rows, &reattached_rows)?;
         let child_count =
             u32::try_from(child_ids.len()).context("spawn rejected: child count exceeds u32")?;
+        let live_children = prepared
+            .iter()
+            .map(|(invocation, _)| invocation)
+            .chain(tool_rows.iter())
+            .chain(reattached_rows.iter())
+            .filter(|child| !child.status.is_terminal())
+            .count();
+        let live_children =
+            u32::try_from(live_children).context("spawn rejected: live child count exceeds u32")?;
         let new_parent = old_parent
             .clone()
             .wait_on_children(child_count, payload, child_ids, now)
-            .context("spawn rejected: wait_on_children transition failed")?;
+            .context("spawn rejected: wait_on_children transition failed")?
+            .recompute_pending_children(live_children, now)
+            .context("spawn rejected: recompute_pending_children transition failed")?;
         Self::update_task_tx(&mut tx, &new_parent).await?;
         for (invocation, child_root) in &prepared {
             Self::insert_task_tx(&mut tx, invocation).await?;
@@ -4313,6 +4367,9 @@ FOR UPDATE SKIP LOCKED
         }
         for child in &tool_rows {
             Self::insert_task_tx(&mut tx, child).await?;
+        }
+        for child in &reattached_rows {
+            Self::update_task_tx(&mut tx, child).await?;
         }
 
         agent_server::fail_point!("atomic_spawn_batch.after_rows");
