@@ -3264,6 +3264,28 @@ impl MessageStore for FailAtAppendStore {
     async fn clear(&self, thread_id: &ThreadId) -> anyhow::Result<()> {
         self.inner.clear(thread_id).await
     }
+    async fn append_compaction(
+        &self,
+        thread_id: &ThreadId,
+        messages: Vec<crate::llm::Message>,
+        source_message_count: usize,
+        retained_message_count: usize,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .append_compaction(
+                thread_id,
+                messages,
+                source_message_count,
+                retained_message_count,
+            )
+            .await
+    }
+    async fn get_transcript(
+        &self,
+        thread_id: &ThreadId,
+    ) -> anyhow::Result<Vec<crate::llm::Message>> {
+        self.inner.get_transcript(thread_id).await
+    }
 }
 
 #[tokio::test]

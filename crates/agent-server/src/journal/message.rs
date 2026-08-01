@@ -691,6 +691,33 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn append_compaction_folds_and_clears_the_counted_draft_atomically() -> anyhow::Result<()> {
+        let committed = vec![llm::Message::user("committed")];
+        let draft = vec![
+            llm::Message::assistant("draft assistant"),
+            llm::Message::user("draft tool result"),
+        ];
+        let p = MessageProjection::new(thread_id(), t0()).append_committed(committed, t_plus(1))?;
+        let p = p.set_draft(draft, t_plus(2));
+        let compacted = vec![llm::Message::assistant("[summary including draft]")];
+        let p = p.append_compaction(compacted.clone(), 3, 0, t_plus(3))?;
+
+        assert_eq!(
+            p.messages.len(),
+            3,
+            "draft must move into the raw transcript"
+        );
+        assert!(p.draft_messages.is_empty());
+        assert_eq!(p.compactions.len(), 1);
+        assert_eq!(p.compactions[0].source_message_count, 3);
+        assert_eq!(
+            serde_json::to_value(p.context_history())?,
+            serde_json::to_value(compacted)?,
+        );
+        Ok(())
+    }
+
     // ── wire format ───────────────────────────────────────────────
 
     #[test]

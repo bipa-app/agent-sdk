@@ -318,7 +318,12 @@ async fn pre_call_threshold_triggers_compaction() -> Result<()> {
     )
     .await?;
 
-    let RootTurnOutcome::Completed { response_text, .. } = outcome else {
+    let RootTurnOutcome::Completed {
+        response_text,
+        commit,
+        ..
+    } = outcome
+    else {
         panic!("expected Completed turn");
     };
     assert_eq!(response_text, "Hello after compaction");
@@ -344,10 +349,23 @@ async fn pre_call_threshold_triggers_compaction() -> Result<()> {
         "append-only compaction must preserve 24 originals before appending the fresh turn",
     );
     assert_eq!(projection.compactions.len(), 1);
+    assert!(
+        projection.draft_messages.is_empty(),
+        "persisted draft must be folded and cleared by append_compaction",
+    );
     let entry = &projection.compactions[0];
+    assert_eq!(
+        entry.source_message_count, 24,
+        "the compactor must see the exact projection source including all 24 draft messages",
+    );
     assert_eq!(entry.compacted_start, 0);
     assert!(entry.compacted_end > entry.compacted_start);
     assert!(entry.compacted_end <= projection.messages.len());
+    assert_eq!(
+        serde_json::to_value(&commit.checkpoint.messages)?,
+        serde_json::to_value(&context)?,
+        "checkpoint and fork consumers must inherit the effective compacted view",
+    );
 
     // A `ContextCompacted` event was committed so subscribers (TUI,
     // desktop) can render the compaction in their transcripts.

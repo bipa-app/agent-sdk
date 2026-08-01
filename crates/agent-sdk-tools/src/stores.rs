@@ -266,10 +266,15 @@ pub trait ToolExecutionStore: Send + Sync {
 }
 
 #[derive(Default)]
+struct InMemoryMessageState {
+    messages: HashMap<String, Vec<llm::Message>>,
+    compactions: HashMap<String, Vec<MessageCompaction>>,
+}
+
+#[derive(Default)]
 struct InMemoryStoreInner {
-    messages: RwLock<HashMap<String, Vec<llm::Message>>>,
+    message_state: RwLock<InMemoryMessageState>,
     states: RwLock<HashMap<String, AgentState>>,
-    compactions: RwLock<HashMap<String, Vec<MessageCompaction>>>,
 }
 
 /// In-memory implementation of `MessageStore` and `StateStore`.
@@ -338,10 +343,11 @@ impl InMemoryEventStore {
 impl MessageStore for InMemoryStore {
     async fn append(&self, thread_id: &ThreadId, message: llm::Message) -> Result<()> {
         self.inner
-            .messages
+            .message_state
             .write()
             .ok()
             .context("lock poisoned")?
+            .messages
             .entry(thread_id.0.clone())
             .or_default()
             .push(message);
@@ -349,49 +355,49 @@ impl MessageStore for InMemoryStore {
     }
 
     async fn get_history(&self, thread_id: &ThreadId) -> Result<Vec<llm::Message>> {
-        let raw = {
-            let messages = self.inner.messages.read().ok().context("lock poisoned")?;
-            messages.get(&thread_id.0).cloned().unwrap_or_default()
-        };
-        let latest = {
-            let compactions = self
-                .inner
-                .compactions
-                .read()
-                .ok()
-                .context("lock poisoned")?;
-            compactions
-                .get(&thread_id.0)
-                .and_then(|entries| entries.last())
-                .cloned()
-        };
-        let Some(entry) = latest else {
-            return Ok(raw);
-        };
-        let mut history = Vec::with_capacity(
-            entry
-                .replacement_messages
-                .len()
-                .saturating_add(raw.len().saturating_sub(entry.compacted_end)),
-        );
-        history.extend(entry.replacement_messages.iter().cloned());
-        history.extend(raw[entry.compacted_end..].iter().cloned());
+        let state = self
+            .inner
+            .message_state
+            .read()
+            .ok()
+            .context("lock poisoned")?;
+        let raw = state
+            .messages
+            .get(&thread_id.0)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let history = state
+            .compactions
+            .get(&thread_id.0)
+            .and_then(|entries| entries.last())
+            .map_or_else(
+                || raw.to_vec(),
+                |entry| {
+                    let mut history = Vec::with_capacity(
+                        entry
+                            .replacement_messages
+                            .len()
+                            .saturating_add(raw.len().saturating_sub(entry.compacted_end)),
+                    );
+                    history.extend(entry.replacement_messages.iter().cloned());
+                    history.extend(raw[entry.compacted_end..].iter().cloned());
+                    history
+                },
+            );
+        drop(state);
         Ok(history)
     }
 
     async fn clear(&self, thread_id: &ThreadId) -> Result<()> {
-        self.inner
-            .messages
+        let mut state = self
+            .inner
+            .message_state
             .write()
             .ok()
-            .context("lock poisoned")?
-            .remove(&thread_id.0);
-        self.inner
-            .compactions
-            .write()
-            .ok()
-            .context("lock poisoned")?
-            .remove(&thread_id.0);
+            .context("lock poisoned")?;
+        state.messages.remove(&thread_id.0);
+        state.compactions.remove(&thread_id.0);
+        drop(state);
         Ok(())
     }
 
@@ -400,20 +406,18 @@ impl MessageStore for InMemoryStore {
         thread_id: &ThreadId,
         messages: Vec<llm::Message>,
     ) -> Result<()> {
-        self.inner
-            .messages
+        let mut state = self
+            .inner
+            .message_state
             .write()
             .ok()
-            .context("lock poisoned")?
-            .insert(thread_id.0.clone(), messages);
-        self.inner
-            .compactions
-            .write()
-            .ok()
-            .context("lock poisoned")?
-            .remove(&thread_id.0);
+            .context("lock poisoned")?;
+        state.messages.insert(thread_id.0.clone(), messages);
+        state.compactions.remove(&thread_id.0);
+        drop(state);
         Ok(())
     }
+
     async fn append_compaction(
         &self,
         thread_id: &ThreadId,
@@ -427,19 +431,16 @@ impl MessageStore for InMemoryStore {
                 messages.len()
             );
         }
-        let raw_messages = {
-            let raw = self.inner.messages.read().ok().context("lock poisoned")?;
-            raw.get(&thread_id.0).cloned().unwrap_or_default()
-        };
-        let mut compactions = self
+        let mut state = self
             .inner
-            .compactions
+            .message_state
             .write()
             .ok()
             .context("lock poisoned")?;
-        let entries = compactions.entry(thread_id.0.clone()).or_default();
+        let raw_message_count = state.messages.get(&thread_id.0).map_or(0, Vec::len);
+        let entries = state.compactions.entry(thread_id.0.clone()).or_default();
         let prior_boundary = entries.last().map_or(0, |entry| entry.compacted_end);
-        let visible_raw_count = raw_messages.len().saturating_sub(prior_boundary);
+        let visible_raw_count = raw_message_count.saturating_sub(prior_boundary);
         let available = entries
             .last()
             .map_or(0, |entry| entry.replacement_messages.len())
@@ -449,20 +450,29 @@ impl MessageStore for InMemoryStore {
             "compaction source count mismatch: store exposes {available}, compactor saw {source_message_count}"
         );
         let retained_raw_count = retained_message_count.min(visible_raw_count);
-        let compacted_end = raw_messages.len().saturating_sub(retained_raw_count);
+        let compacted_end = raw_message_count.saturating_sub(retained_raw_count);
         let replacement_count = messages.len().saturating_sub(retained_raw_count);
         entries.push(MessageCompaction {
             compacted_start: prior_boundary,
             compacted_end,
             replacement_messages: messages.into_iter().take(replacement_count).collect(),
         });
-        drop(compactions);
+        drop(state);
         Ok(())
     }
 
     async fn get_transcript(&self, thread_id: &ThreadId) -> Result<Vec<llm::Message>> {
-        let messages = self.inner.messages.read().ok().context("lock poisoned")?;
-        Ok(messages.get(&thread_id.0).cloned().unwrap_or_default())
+        let state = self
+            .inner
+            .message_state
+            .read()
+            .ok()
+            .context("lock poisoned")?;
+        Ok(state
+            .messages
+            .get(&thread_id.0)
+            .cloned()
+            .unwrap_or_default())
     }
 }
 
@@ -939,6 +949,86 @@ mod tests {
             .await?;
         assert_eq!(store.get_history(&thread_id).await?.len(), 4);
         assert_eq!(store.get_transcript(&thread_id).await?.len(), 4);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn history_snapshot_is_atomic_with_clear_and_replace() -> Result<()> {
+        const ITERATIONS: usize = 20_000;
+
+        let store = Arc::new(InMemoryStore::new());
+        let thread_id = ThreadId::new();
+        let replacement = vec![
+            Message::user("old"),
+            Message::assistant("old reply"),
+            Message::user("recent"),
+        ];
+        store
+            .replace_history(&thread_id, replacement.clone())
+            .await?;
+        store
+            .append_compaction(
+                &thread_id,
+                vec![
+                    Message::user("[summary]"),
+                    Message::assistant("continue"),
+                    Message::user("recent"),
+                ],
+                3,
+                1,
+            )
+            .await?;
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let writer_store = Arc::clone(&store);
+        let writer_thread_id = thread_id.clone();
+        let writer_barrier = Arc::clone(&barrier);
+        let writer = tokio::spawn(async move {
+            writer_barrier.wait().await;
+            for _ in 0..ITERATIONS {
+                writer_store.clear(&writer_thread_id).await?;
+                writer_store
+                    .replace_history(&writer_thread_id, replacement.clone())
+                    .await?;
+                writer_store
+                    .append_compaction(
+                        &writer_thread_id,
+                        vec![
+                            Message::user("[summary]"),
+                            Message::assistant("continue"),
+                            Message::user("recent"),
+                        ],
+                        3,
+                        1,
+                    )
+                    .await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+
+        let reader_store = Arc::clone(&store);
+        let reader_thread_id = thread_id;
+        let reader_barrier = Arc::clone(&barrier);
+        let reader = tokio::spawn(async move {
+            reader_barrier.wait().await;
+            for _ in 0..ITERATIONS {
+                let history = reader_store.get_history(&reader_thread_id).await?;
+                assert!(
+                    history.is_empty() || history.len() == 3,
+                    "history must be one complete snapshot, got {} messages",
+                    history.len()
+                );
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+
+        barrier.wait().await;
+        writer
+            .await
+            .context("message-state writer task panicked")??;
+        reader
+            .await
+            .context("message-state reader task panicked")??;
         Ok(())
     }
 
