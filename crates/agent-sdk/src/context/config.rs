@@ -38,6 +38,8 @@ pub enum CompactionEngine {
     Legacy,
     /// Prune recoverable tool output first and let the host use measured triggers.
     PruneFirst,
+    /// Deterministic local transcript rendering with an exact source archive.
+    Snapcompact,
 }
 
 /// Configuration for context compaction.
@@ -187,6 +189,12 @@ impl CompactionConfig {
     pub const fn uses_prune_first_engine(&self) -> bool {
         matches!(self.engine, CompactionEngine::PruneFirst)
     }
+
+    /// Whether deterministic local Snapcompact rendering is enabled.
+    #[must_use]
+    pub const fn uses_snapcompact_engine(&self) -> bool {
+        matches!(self.engine, CompactionEngine::Snapcompact)
+    }
 }
 
 #[cfg(test)]
@@ -250,6 +258,22 @@ mod tests {
         assert_eq!(config.summary_max_tokens, DEFAULT_SUMMARY_MAX_TOKENS);
         assert_eq!(config.engine, CompactionEngine::Legacy);
 
+        Ok(())
+    }
+
+    #[test]
+    fn snapcompact_engine_serde_round_trip() -> anyhow::Result<()> {
+        let json = serde_json::to_string(&CompactionEngine::Snapcompact)?;
+        assert_eq!(json, r#""snapcompact""#);
+        assert_eq!(
+            serde_json::from_str::<CompactionEngine>(&json)?,
+            CompactionEngine::Snapcompact
+        );
+        assert!(
+            CompactionConfig::default()
+                .with_engine(CompactionEngine::Snapcompact)
+                .uses_snapcompact_engine()
+        );
         Ok(())
     }
 }

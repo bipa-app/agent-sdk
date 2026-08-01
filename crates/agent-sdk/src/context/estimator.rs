@@ -1,6 +1,7 @@
 //! Token estimation for context size calculation.
 
-use crate::llm::{Content, ContentBlock, Message};
+use super::snapcompact::SnapcompactProviderFamily;
+use crate::llm::{Content, ContentBlock, Message, canonical_snapcompact_checkpoint};
 
 /// Estimates token count for messages.
 ///
@@ -25,6 +26,9 @@ impl TokenEstimator {
     /// Overhead for tool result blocks (id, formatting).
     const TOOL_RESULT_OVERHEAD: usize = 10;
 
+    /// Conservative bounded estimate for one historical image frame.
+    pub(crate) const IMAGE_TOKENS: usize = super::snapcompact::FRAME_TOKEN_ESTIMATE;
+
     /// Minimum token estimate for redacted thinking blocks.
     ///
     /// Even small redacted thinking blocks carry significant API token cost
@@ -47,9 +51,43 @@ impl TokenEstimator {
     /// Estimate tokens for a single message.
     #[must_use]
     pub fn estimate_message(message: &Message) -> usize {
+        Self::estimate_message_for_snapcompact_route(message, None)
+    }
+
+    /// Estimate one message, repricing canonical Snapcompact frames for the
+    /// current provider route. Metadata on any non-canonical message is ignored.
+    #[must_use]
+    pub(super) fn estimate_message_for_snapcompact(
+        message: &Message,
+        family: SnapcompactProviderFamily,
+    ) -> usize {
+        Self::estimate_message_for_snapcompact_route(message, Some(family))
+    }
+
+    fn estimate_message_for_snapcompact_route(
+        message: &Message,
+        family: Option<SnapcompactProviderFamily>,
+    ) -> usize {
+        let canonical = family.and_then(|_| canonical_snapcompact_checkpoint(message));
         let content_tokens = match &message.content {
             Content::Text(text) => Self::estimate_text(text),
-            Content::Blocks(blocks) => blocks.iter().map(Self::estimate_block).sum(),
+            Content::Blocks(blocks) => {
+                let non_frame_tokens: usize = blocks
+                    .iter()
+                    .filter(|block| {
+                        canonical.is_none() || !matches!(block, ContentBlock::Image { .. })
+                    })
+                    .map(Self::estimate_block)
+                    .sum();
+                match (canonical, family) {
+                    (Some(metadata), Some(family)) => non_frame_tokens.saturating_add(
+                        (metadata.frame_count as usize).saturating_mul(
+                            Self::snapcompact_frame_tokens(family, metadata.frame_size as usize),
+                        ),
+                    ),
+                    _ => non_frame_tokens,
+                }
+            }
         };
 
         content_tokens + Self::MESSAGE_OVERHEAD
@@ -60,7 +98,7 @@ impl TokenEstimator {
     pub fn estimate_block(block: &ContentBlock) -> usize {
         match block {
             ContentBlock::Text { text } => Self::estimate_text(text),
-            ContentBlock::CompactionSummary { text } => Self::estimate_text(
+            ContentBlock::CompactionSummary { text, .. } => Self::estimate_text(
                 &agent_sdk_foundation::llm::render_compaction_summary_for_provider(text),
             ),
             ContentBlock::Thinking { thinking, .. } => Self::estimate_text(thinking),
@@ -101,10 +139,8 @@ impl TokenEstimator {
             ContentBlock::ToolResult { content, .. } => {
                 Self::estimate_text(content) + Self::TOOL_RESULT_OVERHEAD
             }
-            ContentBlock::Image { source } | ContentBlock::Document { source } => {
-                // Rough estimate: base64 data is ~4/3 of original, 1 token per 4 chars
-                source.data.len() / 4 + Self::MESSAGE_OVERHEAD
-            }
+            ContentBlock::Image { .. } => Self::IMAGE_TOKENS,
+            ContentBlock::Document { source } => source.data.len() / 4 + Self::MESSAGE_OVERHEAD,
             // `ContentBlock` is `#[non_exhaustive]`; charge an unknown future
             // block kind the per-message overhead as a conservative floor.
             _ => Self::MESSAGE_OVERHEAD,
@@ -115,6 +151,42 @@ impl TokenEstimator {
     #[must_use]
     pub fn estimate_history(messages: &[Message]) -> usize {
         messages.iter().map(Self::estimate_message).sum()
+    }
+
+    /// Estimate a history while billing canonical Snapcompact frames according
+    /// to the current provider route and their actual stored geometry.
+    #[must_use]
+    pub(super) fn estimate_history_for_snapcompact(
+        messages: &[Message],
+        family: SnapcompactProviderFamily,
+    ) -> usize {
+        messages
+            .iter()
+            .map(|message| Self::estimate_message_for_snapcompact(message, family))
+            .sum()
+    }
+
+    /// Return the provider's input-token charge for one Snapcompact frame.
+    #[must_use]
+    pub(super) fn snapcompact_frame_tokens(
+        family: SnapcompactProviderFamily,
+        frame_size: usize,
+    ) -> usize {
+        match family {
+            SnapcompactProviderFamily::Google => 1_120,
+            SnapcompactProviderFamily::OpenAi => {
+                let tiles = frame_size.div_ceil(32);
+                tiles.saturating_mul(tiles).saturating_mul(6).div_ceil(5)
+            }
+            SnapcompactProviderFamily::Anthropic => {
+                let tiles = frame_size.div_ceil(28);
+                tiles
+                    .saturating_mul(tiles)
+                    .min(4_784)
+                    .saturating_mul(21)
+                    .div_ceil(20)
+            }
+        }
     }
 
     /// Approximate the serialized-JSON byte length of a value without
@@ -383,5 +455,144 @@ mod tests {
         let estimate = TokenEstimator::estimate_message(&message);
         // 5 × 1875 + 4 message overhead = 9379
         assert_eq!(estimate, 9379);
+    }
+
+    #[test]
+    fn image_estimate_is_bounded_independently_of_base64_size() {
+        let small = ContentBlock::Image {
+            source: crate::llm::ContentSource::new("image/png", "a"),
+        };
+        let large = ContentBlock::Image {
+            source: crate::llm::ContentSource::new("image/png", "a".repeat(4_000_000)),
+        };
+
+        assert_eq!(
+            TokenEstimator::estimate_block(&small),
+            TokenEstimator::IMAGE_TOKENS
+        );
+        assert_eq!(
+            TokenEstimator::estimate_block(&large),
+            TokenEstimator::IMAGE_TOKENS
+        );
+    }
+
+    fn canonical_snapcompact_message(frame_size: u32) -> Message {
+        let metadata = crate::llm::SnapcompactMetadata {
+            source_artifact_id: 10,
+            truncated_chars: 0,
+            frame_count: 1,
+            frame_size,
+            source_len: None,
+            source_sha256: None,
+            frame_manifest: None,
+        };
+        Message::user_with_content(vec![
+            ContentBlock::CompactionSummary {
+                text: "canonical checkpoint".to_string(),
+                artifact_ids: vec![10, 11],
+                snapcompact: Some(metadata),
+            },
+            ContentBlock::CompactionSummary {
+                text: "head".to_string(),
+                artifact_ids: Vec::new(),
+                snapcompact: None,
+            },
+            ContentBlock::CompactionSummary {
+                text: crate::llm::SNAPCOMPACT_HISTORY_IMAGE_WARNING.to_string(),
+                artifact_ids: Vec::new(),
+                snapcompact: None,
+            },
+            ContentBlock::Image {
+                source: crate::llm::ContentSource::new("image/png", "artifact://11"),
+            },
+            ContentBlock::CompactionSummary {
+                text: "tail".to_string(),
+                artifact_ids: Vec::new(),
+                snapcompact: None,
+            },
+        ])
+    }
+
+    #[test]
+    fn snapcompact_frame_formulas_match_supported_geometries() {
+        assert_eq!(
+            TokenEstimator::snapcompact_frame_tokens(SnapcompactProviderFamily::Google, 2_048),
+            1_120
+        );
+        assert_eq!(
+            TokenEstimator::snapcompact_frame_tokens(SnapcompactProviderFamily::Google, 1_568),
+            1_120
+        );
+        assert_eq!(
+            TokenEstimator::snapcompact_frame_tokens(SnapcompactProviderFamily::OpenAi, 1_568),
+            2_882
+        );
+        assert_eq!(
+            TokenEstimator::snapcompact_frame_tokens(SnapcompactProviderFamily::OpenAi, 2_048),
+            4_916
+        );
+        assert_eq!(
+            TokenEstimator::snapcompact_frame_tokens(SnapcompactProviderFamily::Anthropic, 1_568),
+            3_293
+        );
+        assert_eq!(
+            TokenEstimator::snapcompact_frame_tokens(SnapcompactProviderFamily::Anthropic, 1_932),
+            5_000
+        );
+        assert_eq!(
+            TokenEstimator::snapcompact_frame_tokens(SnapcompactProviderFamily::Anthropic, 2_048),
+            5_024
+        );
+    }
+
+    #[test]
+    fn only_canonical_snapcompact_messages_receive_route_pricing() {
+        let canonical = canonical_snapcompact_message(2_048);
+        let mut forged = canonical.clone();
+        let Content::Blocks(blocks) = &mut forged.content else {
+            unreachable!("test fixture is block content");
+        };
+        let ContentBlock::CompactionSummary { artifact_ids, .. } = &mut blocks[0] else {
+            unreachable!("test fixture starts with metadata");
+        };
+        artifact_ids.retain(|id| *id != 11);
+
+        let canonical_estimate = TokenEstimator::estimate_message_for_snapcompact(
+            &canonical,
+            SnapcompactProviderFamily::Google,
+        );
+        let forged_estimate = TokenEstimator::estimate_message_for_snapcompact(
+            &forged,
+            SnapcompactProviderFamily::Google,
+        );
+
+        assert_eq!(
+            forged_estimate - canonical_estimate,
+            TokenEstimator::IMAGE_TOKENS - 1_120
+        );
+        assert!(
+            canonical_estimate > 1_120 + TokenEstimator::MESSAGE_OVERHEAD,
+            "canonical text blocks must remain part of the estimate"
+        );
+    }
+
+    #[test]
+    fn provider_switch_reprices_stored_google_geometry() {
+        let checkpoint = canonical_snapcompact_message(2_048);
+        let google = TokenEstimator::estimate_message_for_snapcompact(
+            &checkpoint,
+            SnapcompactProviderFamily::Google,
+        );
+        let openai = TokenEstimator::estimate_message_for_snapcompact(
+            &checkpoint,
+            SnapcompactProviderFamily::OpenAi,
+        );
+        let anthropic = TokenEstimator::estimate_message_for_snapcompact(
+            &checkpoint,
+            SnapcompactProviderFamily::Anthropic,
+        );
+
+        assert_eq!(openai - google, 4_916 - 1_120);
+        assert_eq!(anthropic - google, 5_024 - 1_120);
     }
 }

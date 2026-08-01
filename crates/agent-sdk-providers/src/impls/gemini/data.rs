@@ -488,10 +488,12 @@ impl ApiUsageMetadata {
 // Conversion Functions
 // ============================================================================
 
-pub fn build_api_contents(messages: &[agent_sdk_foundation::llm::Message]) -> Vec<ApiContent> {
-    // Build a mapping of tool_use_id -> function_name from all messages
-    let mut tool_names: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+/// Map every `tool_use_id` in `messages` to its function name so tool
+/// results can be rendered as Gemini `functionResponse` parts.
+fn collect_tool_names(
+    messages: &[agent_sdk_foundation::llm::Message],
+) -> std::collections::HashMap<String, String> {
+    let mut tool_names = std::collections::HashMap::new();
     for msg in messages {
         if let Content::Blocks(blocks) = &msg.content {
             for block in blocks {
@@ -501,6 +503,11 @@ pub fn build_api_contents(messages: &[agent_sdk_foundation::llm::Message]) -> Ve
             }
         }
     }
+    tool_names
+}
+
+pub fn build_api_contents(messages: &[agent_sdk_foundation::llm::Message]) -> Vec<ApiContent> {
+    let tool_names = collect_tool_names(messages);
 
     let mut contents = Vec::new();
 
@@ -520,7 +527,8 @@ pub fn build_api_contents(messages: &[agent_sdk_foundation::llm::Message]) -> Ve
                 let mut parts = Vec::new();
                 for block in blocks {
                     match block {
-                        ContentBlock::Text { text } | ContentBlock::CompactionSummary { text } => {
+                        ContentBlock::Text { text }
+                        | ContentBlock::CompactionSummary { text, .. } => {
                             let text = if matches!(block, ContentBlock::CompactionSummary { .. }) {
                                 agent_sdk_foundation::llm::render_compaction_summary_for_provider(
                                     text,

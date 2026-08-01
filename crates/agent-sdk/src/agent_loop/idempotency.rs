@@ -16,11 +16,11 @@ use time::OffsetDateTime;
 /// listen, and confirmation-resume execution funnels through here, so the
 /// shared inline output budget is enforced once, before the result is
 /// committed to the execution store, audited, journaled as
-/// `tool_call_end`, or appended to the transcript. Over-budget output is
-/// passed byte-identical to `artifact_store` and replaced inline by a
-/// bounded head + tail window plus the `[raw output: artifact://<id>]`
-/// recovery footer. A missing or failed store produces a bounded, explicit
-/// failure result rather than an unbounded transcript or fake truncation.
+/// `tool_call_end`, or appended to the transcript. Output-only spills remain
+/// byte-identical; results with structured data or documents spill as one
+/// serialized recovery envelope. A missing or failed store produces a bounded,
+/// explicit failure result rather than an unbounded transcript or fake
+/// truncation.
 pub(super) async fn execute_with_idempotency<Fut>(
     execution_store: Option<&Arc<dyn ToolExecutionStore>>,
     artifact_store: Option<&Arc<ArtifactStore>>,

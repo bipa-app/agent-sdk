@@ -10,7 +10,7 @@
 //! in memory:
 //!
 //! - [`StagedMessageStore`] — seeded from checkpoint messages, buffers
-//!   appends and replace-history calls until commit.
+//!   appends, atomic repairs, and replace-history calls until commit.
 //! - [`StagedStateStore`] — seeded from the checkpoint's agent-state
 //!   snapshot (deserialized into [`AgentState`]), buffers saves until
 //!   commit.
@@ -227,6 +227,50 @@ impl MessageStore for StagedMessageStore {
         let new_len = messages.len();
         *self.messages.write().ok().context("lock poisoned")? = messages;
         *self.seed_len.write().ok().context("lock poisoned")? = new_len;
+        Ok(())
+    }
+
+    async fn append_repair(
+        &self,
+        thread_id: &ThreadId,
+        repair_message: llm::Message,
+        balanced_messages: Vec<llm::Message>,
+        source_message_count: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            thread_id == &self.thread_id,
+            "staged message store bound to thread {}, got {}",
+            self.thread_id,
+            thread_id,
+        );
+        let mut messages = self.messages.write().ok().context("lock poisoned")?;
+        anyhow::ensure!(
+            source_message_count == messages.len(),
+            "repair source count mismatch: staged store exposes {}, repair saw {source_message_count}",
+            messages.len(),
+        );
+        let expected_balanced_len = messages
+            .len()
+            .checked_add(1)
+            .context("staged repair source length overflow")?;
+        anyhow::ensure!(
+            balanced_messages.len() == expected_balanced_len,
+            "repair projection mismatch: expected {expected_balanced_len} balanced messages, got {}",
+            balanced_messages.len(),
+        );
+        let expected = serde_json::to_value((&*messages, &repair_message))
+            .context("encode expected staged repair projection")?;
+        let actual = serde_json::to_value((
+            &balanced_messages[..source_message_count],
+            &balanced_messages[source_message_count],
+        ))
+        .context("encode supplied staged repair projection")?;
+        anyhow::ensure!(
+            actual == expected,
+            "repair projection mismatch: balanced history must equal the current staged history plus exactly the repair message",
+        );
+        messages.push(repair_message);
+        drop(messages);
         Ok(())
     }
 }
@@ -502,6 +546,97 @@ mod tests {
         let history = store.get_history(&thread_a()).await?;
         assert!(history.is_empty());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn staged_append_repair_balances_history_and_preserves_repair_delta() -> Result<()> {
+        let seed = vec![llm::Message::assistant_with_tool_use(
+            None,
+            "call_1",
+            "bash",
+            serde_json::json!({"command": "pwd"}),
+        )];
+        let repair = llm::orphaned_tool_result_message(&seed, llm::USER_CANCELLED_TOOL_RESULT)
+            .context("expected orphan repair message")?;
+        let balanced = llm::balance_tool_results(&seed, llm::USER_CANCELLED_TOOL_RESULT);
+        let store = StagedMessageStore::new(thread_a(), seed.clone());
+
+        store
+            .append_repair(&thread_a(), repair.clone(), balanced.clone(), seed.len())
+            .await?;
+
+        let history = store.get_history(&thread_a()).await?;
+        assert_eq!(
+            serde_json::to_value(&history)?,
+            serde_json::to_value(&balanced)?,
+            "the visible staged history must be provider-balanced",
+        );
+        assert_eq!(
+            serde_json::to_value(llm::balance_tool_results(
+                &history,
+                llm::USER_CANCELLED_TOOL_RESULT,
+            ))?,
+            serde_json::to_value(&history)?,
+            "balancing the repaired history must be a no-op",
+        );
+
+        let expected_delta = vec![repair];
+        assert_eq!(
+            serde_json::to_value(store.snapshot_appended_messages()?)?,
+            serde_json::to_value(&expected_delta)?,
+            "the non-consuming commit snapshot must contain only the repair",
+        );
+        assert_eq!(
+            serde_json::to_value(store.drain_messages()?)?,
+            serde_json::to_value(expected_delta)?,
+            "the commit drain must contain only the repair",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn staged_append_repair_rejects_wrong_thread_stale_source_and_inexact_history()
+    -> Result<()> {
+        let seed = sample_messages();
+        let repair = llm::Message::user("synthetic repair");
+        let mut balanced = seed.clone();
+        balanced.push(repair.clone());
+        let store = StagedMessageStore::new(thread_a(), seed.clone());
+
+        let wrong_thread = store
+            .append_repair(&thread_b(), repair.clone(), balanced.clone(), seed.len())
+            .await
+            .unwrap_err();
+        assert!(wrong_thread.to_string().contains("bound to thread"));
+
+        let stale_source = store
+            .append_repair(
+                &thread_a(),
+                repair.clone(),
+                balanced,
+                seed.len().saturating_sub(1),
+            )
+            .await
+            .unwrap_err();
+        assert!(stale_source.to_string().contains("source count mismatch"));
+
+        let mut inexact = seed.clone();
+        inexact.push(llm::Message::user("different repair"));
+        let inexact_history = store
+            .append_repair(&thread_a(), repair, inexact, seed.len())
+            .await
+            .unwrap_err();
+        assert!(inexact_history.to_string().contains("projection mismatch"));
+        assert_eq!(
+            serde_json::to_value(store.get_history(&thread_a()).await?)?,
+            serde_json::to_value(seed)?,
+            "failed repairs must not mutate the staged history",
+        );
+        assert!(
+            store.snapshot_appended_messages()?.is_empty(),
+            "failed repairs must not create a commit delta",
+        );
         Ok(())
     }
 

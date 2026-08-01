@@ -239,6 +239,26 @@ where
     fn route(&self) -> &str {
         self.capable.route()
     }
+
+    /// Pre-dispatch image pricing and limits come from the representative
+    /// capable tier, but classification may select a heterogeneous fast or
+    /// advanced tier. Dynamic model routing therefore never opts in.
+    fn supports_historical_image_blocks(&self) -> bool {
+        false
+    }
+
+    /// A request may route to any tier, so the budget is the most
+    /// restrictive tier budget; unknown (`None`) anywhere keeps the router
+    /// unknown so consumers stay conservative.
+    fn max_request_attachment_bytes(&self) -> Option<u64> {
+        [
+            self.fast.max_request_attachment_bytes(),
+            self.capable.max_request_attachment_bytes(),
+            self.advanced.max_request_attachment_bytes(),
+        ]
+        .into_iter()
+        .try_fold(u64::MAX, |min, budget| budget.map(|bytes| min.min(bytes)))
+    }
 }
 
 const CLASSIFICATION_SYSTEM: &str = r"You are a task complexity classifier. Analyze the user's request and classify it as one of: SIMPLE, MODERATE, or COMPLEX.
@@ -342,6 +362,7 @@ mod tests {
     struct StaticProvider {
         name: &'static str,
         reply: &'static str,
+        supports_historical_images: bool,
     }
 
     #[async_trait]
@@ -371,6 +392,27 @@ mod tests {
         fn provider(&self) -> &'static str {
             self.name
         }
+
+        fn supports_historical_image_blocks(&self) -> bool {
+            self.supports_historical_images
+        }
+    }
+
+    #[test]
+    fn historical_images_stay_disabled_for_dynamic_model_routing() {
+        let capable = |name: &'static str| StaticProvider {
+            name,
+            reply: "MODERATE",
+            supports_historical_images: true,
+        };
+        let router = ModelRouter::new(
+            capable("classifier"),
+            capable("fast"),
+            capable("capable"),
+            capable("advanced"),
+        );
+
+        assert!(!router.supports_historical_image_blocks());
     }
 
     /// A request classified `SIMPLE` streams from the `fast` tier, and the
@@ -382,18 +424,22 @@ mod tests {
             StaticProvider {
                 name: "classifier",
                 reply: "SIMPLE",
+                supports_historical_images: false,
             },
             StaticProvider {
                 name: "fast-tier",
                 reply: "quick answer",
+                supports_historical_images: false,
             },
             StaticProvider {
                 name: "capable-tier",
                 reply: "unused",
+                supports_historical_images: false,
             },
             StaticProvider {
                 name: "advanced-tier",
                 reply: "unused",
+                supports_historical_images: false,
             },
         );
         assert_eq!(LlmProvider::route(&router), "capable-tier");

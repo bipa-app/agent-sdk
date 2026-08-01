@@ -427,6 +427,8 @@ pub mod context;
 mod filesystem;
 pub mod primitive_tools;
 pub mod reminders;
+#[doc(hidden)]
+pub mod request_artifact_hydration;
 pub mod subagent;
 pub mod todo;
 pub mod user_interaction;

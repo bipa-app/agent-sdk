@@ -16,6 +16,17 @@ const GEMINI_MAX_INLINE_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 const OPENAI_MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const OPENAI_MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
 
+// `LlmProvider::max_request_attachment_bytes` sources, kept beside the
+// validator caps above so the two can never drift apart silently.
+/// Anthropic's aggregate decoded request-attachment budget.
+pub const ANTHROPIC_MAX_REQUEST_ATTACHMENT_BYTES: u64 =
+    ANTHROPIC_MAX_INLINE_ATTACHMENT_BYTES as u64;
+/// Gemini's aggregate decoded request-attachment budget.
+pub const GEMINI_MAX_REQUEST_ATTACHMENT_BYTES: u64 = GEMINI_MAX_INLINE_ATTACHMENT_BYTES as u64;
+/// `OpenAI` documents only per-item caps, so its aggregate borrows the smallest
+/// cross-family aggregate (Gemini's) as a conservative bound.
+pub const CONSERVATIVE_MAX_REQUEST_ATTACHMENT_BYTES: u64 = GEMINI_MAX_REQUEST_ATTACHMENT_BYTES;
+
 const SUPPORTED_IMAGE_MEDIA_TYPES: &[&str] =
     &["image/jpeg", "image/png", "image/gif", "image/webp"];
 const SUPPORTED_DOCUMENT_MEDIA_TYPES: &[&str] = &["application/pdf"];

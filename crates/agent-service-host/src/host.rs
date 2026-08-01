@@ -9434,8 +9434,6 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_registry_tool_spills_before_durable_commit_and_holds_guard() -> Result<()> {
-        use std::io::Read as _;
-
         let temp = tempfile::tempdir()?;
         let storage = Arc::new(
             agent_sdk::ArtifactStorage::new(temp.path().join("artifacts"))
@@ -9518,11 +9516,18 @@ mod tests {
         );
 
         let recovered_store = storage.for_thread(&child_root.thread_id)?;
-        let mut recovered = String::new();
-        recovered_store
-            .resolve(artifact_id)?
-            .read_to_string(&mut recovered)?;
-        assert_eq!(recovered, original, "artifact recovery must be byte-exact");
+        let recovered: agent_sdk_foundation::ToolResult =
+            serde_json::from_reader(recovered_store.resolve(artifact_id)?)?;
+        assert_eq!(
+            recovered.output, original,
+            "recovery envelope must preserve output byte-exact"
+        );
+        assert_eq!(
+            recovered.data,
+            Some(serde_json::json!({"raw": original})),
+            "recovery envelope must preserve structured data exactly once"
+        );
+        assert!(recovered.documents.is_empty());
         Ok(())
     }
     async fn acquire_probe_tool_child(

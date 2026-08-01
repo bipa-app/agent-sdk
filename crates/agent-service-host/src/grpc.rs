@@ -776,21 +776,27 @@ impl GrpcControlService {
         for message in &params.messages {
             if let agent_sdk_foundation::llm::Content::Blocks(blocks) = &message.content {
                 for block in blocks {
-                    if let agent_sdk_foundation::llm::ContentBlock::ToolResult {
-                        content,
-                        artifact,
-                        ..
-                    } = block
-                    {
-                        if let Some(artifact) = artifact {
-                            ids.insert(artifact.id);
-                        } else if let Some(store) = source_store.as_deref()
-                            && let Some(id) = store
-                                .verified_legacy_inline_artifact_id(content)
-                                .map_err(internal_status("verifying legacy artifact footer"))?
-                        {
-                            ids.insert(id);
+                    match block {
+                        agent_sdk_foundation::llm::ContentBlock::CompactionSummary {
+                            artifact_ids,
+                            ..
+                        } => ids.extend(artifact_ids.iter().copied()),
+                        agent_sdk_foundation::llm::ContentBlock::ToolResult {
+                            content,
+                            artifact,
+                            ..
+                        } => {
+                            if let Some(artifact) = artifact {
+                                ids.insert(artifact.id);
+                            } else if let Some(store) = source_store.as_deref()
+                                && let Some(id) = store
+                                    .verified_legacy_inline_artifact_id(content)
+                                    .map_err(internal_status("verifying legacy artifact footer"))?
+                            {
+                                ids.insert(id);
+                            }
                         }
+                        _ => {}
                     }
                 }
             }
@@ -3450,7 +3456,7 @@ fn map_content_block(block: &ContentBlock) -> RpcResult<pb::ConversationContentB
         ContentBlock::Text { text } => {
             pb::conversation_content_block::Block::Text(pb::TextBlock { text: text.clone() })
         }
-        ContentBlock::CompactionSummary { text } => {
+        ContentBlock::CompactionSummary { text, .. } => {
             // Provenance is internal projection metadata; public clients see
             // the durable summary prose as an ordinary transcript text block.
             pb::conversation_content_block::Block::Text(pb::TextBlock { text: text.clone() })
@@ -4316,6 +4322,23 @@ mod tests {
         assert!(matches!(
             blocks.items.first().and_then(|item| item.block.as_ref()),
             Some(pb::conversation_content_block::Block::Text(text)) if text.text == "visible"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn map_message_keeps_summary_artifact_ids_internal() -> Result<()> {
+        let message =
+            llm::Message::compaction_summary_with_artifact_ids("visible summary", vec![4, 9]);
+        let mapped = map_message(&message).map_err(|error| anyhow!(error.to_string()))?;
+        let Some(pb::conversation_message::Content::Blocks(blocks)) = mapped.content else {
+            bail!("summary should map to a public block list");
+        };
+        assert!(matches!(
+            blocks.items.as_slice(),
+            [pb::ConversationContentBlock {
+                block: Some(pb::conversation_content_block::Block::Text(text)),
+            }] if text.text == "visible summary"
         ));
         Ok(())
     }
@@ -6022,8 +6045,6 @@ mod tests {
         artifact_store_alive_at_completion: &std::sync::atomic::AtomicBool,
         committed_result: &Mutex<Option<serde_json::Value>>,
     ) -> Result<()> {
-        use std::io::Read as _;
-
         let (mut control, mut events) = connect_clients(&daemon.endpoint()).await?;
         let thread_id = create_thread(&mut control, "create-confirm-thread").await?;
         let _task = submit_text_work(
@@ -6086,9 +6107,22 @@ mod tests {
             "not every task completed after confirmation flow",
         );
         assert!(
-            artifact_store_alive_at_completion.load(Ordering::SeqCst),
-            "the confirmed-drive Arc guard must remain alive through durable completion"
+            artifact_store_alive_at_completion.load(std::sync::atomic::Ordering::SeqCst),
+            "the artifact store guard must still be held when the confirmed result commits"
         );
+        assert_confirmed_durable_result(artifact_storage, thread_id, original, committed_result)?;
+        Ok(())
+    }
+
+    /// Assert the confirmed durable result is bounded, carries the exact
+    /// recovery footer, and the spilled artifact preserves the full
+    /// output byte-exact.
+    fn assert_confirmed_durable_result(
+        artifact_storage: &agent_sdk::ArtifactStorage,
+        thread_id: String,
+        original: &str,
+        committed_result: &Mutex<Option<serde_json::Value>>,
+    ) -> Result<()> {
         let durable: ToolResult = serde_json::from_value(
             committed_result
                 .lock()
@@ -6110,16 +6144,23 @@ mod tests {
             durable.data.is_none(),
             "structured data must not retain a second raw oversized copy"
         );
+        assert!(
+            durable.documents.is_empty(),
+            "documents must not bypass the durable result budget"
+        );
         let sdk_thread = agent_sdk_foundation::ThreadId::from_string(thread_id);
         let recovered_store = artifact_storage.for_thread(&sdk_thread)?;
-        let mut recovered = String::new();
-        recovered_store
-            .resolve(artifact_id)?
-            .read_to_string(&mut recovered)?;
+        let recovered: ToolResult = serde_json::from_reader(recovered_store.resolve(artifact_id)?)?;
         assert_eq!(
-            recovered, original,
-            "confirmed output recovery must be byte-exact"
+            recovered.output, original,
+            "recovery envelope must preserve the full output byte-exact"
         );
+        assert_eq!(
+            recovered.data,
+            Some(json!({"raw": original})),
+            "recovery envelope must preserve structured data exactly once"
+        );
+        assert!(recovered.documents.is_empty());
         Ok(())
     }
 
@@ -7171,6 +7212,147 @@ mod tests {
 
         daemon.stop().await?;
         result
+    }
+
+    #[tokio::test]
+    async fn fork_copies_artifact_referenced_only_by_compacted_checkpoint_summary() -> Result<()> {
+        use std::io::Read as _;
+
+        let temp = tempfile::tempdir()?;
+        let artifact_storage = Arc::new(agent_sdk::ArtifactStorage::new(
+            temp.path().join("artifacts"),
+        ));
+        let source = ThreadId::from_string("compact-artifact-source");
+        let destination = ThreadId::from_string("compact-artifact-destination");
+        let source_store = artifact_storage.for_thread(&source)?;
+        let original = "old spilled tool bytes\n".repeat(10_000);
+        let saved = source_store.save("bash", &original)?;
+
+        let provider = Arc::new(ScriptedProvider::new(vec![text_response(
+            "resp_compact_artifact",
+            "Compacted checkpoint summary.",
+        )]));
+        let compacted_messages =
+            compact_history_with_spilled_artifact(Arc::clone(&provider), source_store, saved.id)
+                .await?;
+
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
+            Vec::new(),
+        )));
+        let stores = StoreRegistry::in_memory(registry);
+        let resolver = Arc::new(StaticProviderResolver::new());
+        resolver.set_fallback(provider)?;
+        let runtime = Arc::new(
+            ExecutionRuntime::new(
+                resolver,
+                Arc::new(NoopToolExecutor),
+                Arc::new(AllowAllConfirmationPolicy),
+            )
+            .with_artifact_storage(Arc::clone(&artifact_storage)),
+        );
+        let shared = Arc::new(GrpcShared::new(
+            stores,
+            runtime,
+            HealthSurface::shared(),
+            CancellationToken::new(),
+            time::Duration::seconds(30),
+            std::time::Duration::from_secs(10),
+            AdmissionConfig::default(),
+        ));
+        shared
+            .stores
+            .thread_store
+            .get_or_create(&source, OffsetDateTime::UNIX_EPOCH)
+            .await?;
+        let mut checkpoint = close_gate_checkpoint(&source, "compact-artifact-task", 1);
+        checkpoint.messages = compacted_messages;
+        shared
+            .stores
+            .checkpoint_store
+            .commit_checkpoint(checkpoint)
+            .await?;
+        assert!(
+            shared
+                .stores
+                .event_repo
+                .get_events(&source)
+                .await?
+                .iter()
+                .all(|event| !matches!(event.event, AgentEvent::ToolCallEnd { .. })),
+            "source ToolCallEnd events are intentionally absent after retention pruning"
+        );
+
+        let service = GrpcControlService { shared };
+        service
+            .copy_thread_state(
+                &source,
+                &destination,
+                1,
+                Some(ThreadCreation::Fork {
+                    source_thread_id: source.clone(),
+                    fork_after_committed_turns: 1,
+                }),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .await?;
+
+        let mut recovered = Vec::new();
+        artifact_storage
+            .for_thread(&destination)?
+            .resolve(saved.id)?
+            .read_to_end(&mut recovered)?;
+        assert_eq!(
+            recovered,
+            original.as_bytes(),
+            "forked artifact must resolve byte-exact from summary metadata alone"
+        );
+        Ok(())
+    }
+
+    /// Compact a five-message history whose middle tool result references
+    /// a spilled artifact, asserting the artifact reference survives only
+    /// in the checkpoint summary metadata. Returns the compacted history.
+    async fn compact_history_with_spilled_artifact(
+        provider: Arc<ScriptedProvider>,
+        source_store: Arc<agent_sdk::ArtifactStore>,
+        saved_id: u64,
+    ) -> Result<Vec<llm::Message>> {
+        use agent_sdk::context::{CompactionConfig, ContextCompactor, LlmContextCompactor};
+
+        let compactor = LlmContextCompactor::new(
+            provider,
+            CompactionConfig::default()
+                .with_retain_recent(2)
+                .with_min_messages(1),
+        )
+        .with_artifact_store(source_store);
+        let compacted = compactor
+            .compact_history(vec![
+                llm::Message::user("old request ".repeat(200)),
+                llm::Message {
+                    role: llm::Role::User,
+                    content: llm::Content::Blocks(vec![ContentBlock::ToolResult {
+                        tool_use_id: "old-spilled-tool".to_owned(),
+                        content: format!("[raw output: artifact://{saved_id}]"),
+                        artifact: Some(agent_sdk_foundation::ToolResultArtifact { id: saved_id }),
+                        is_error: None,
+                    }]),
+                },
+                llm::Message::assistant("old response ".repeat(200)),
+                llm::Message::assistant("recent response"),
+                llm::Message::user("recent request"),
+            ])
+            .await?;
+        assert!(matches!(
+            &compacted.messages[0].content,
+            llm::Content::Blocks(blocks)
+                if matches!(
+                    blocks.as_slice(),
+                    [ContentBlock::CompactionSummary { artifact_ids, .. }]
+                        if artifact_ids == &[saved_id]
+                )
+        ));
+        Ok(compacted.messages)
     }
 
     /// AC3: fork is idempotent under the same `request_id`. A retry

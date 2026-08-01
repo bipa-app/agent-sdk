@@ -182,6 +182,7 @@ pub struct StreamScriptProvider {
     steps: RwLock<Vec<StreamScriptStep>>,
     call_count: AtomicUsize,
     probe_results: RwLock<std::collections::VecDeque<bool>>,
+    requests: RwLock<Vec<ChatRequest>>,
 }
 
 impl StreamScriptProvider {
@@ -190,6 +191,7 @@ impl StreamScriptProvider {
             steps: RwLock::new(steps),
             call_count: AtomicUsize::new(0),
             probe_results: RwLock::new(std::collections::VecDeque::new()),
+            requests: RwLock::new(Vec::new()),
         }
     }
 
@@ -202,6 +204,16 @@ impl StreamScriptProvider {
             scripted.extend(probes);
         }
         self
+    }
+
+    pub fn recorded_requests(&self) -> anyhow::Result<Vec<ChatRequest>> {
+        use anyhow::Context as _;
+        Ok(self
+            .requests
+            .read()
+            .ok()
+            .context("requests lock poisoned")?
+            .clone())
     }
 }
 
@@ -221,7 +233,10 @@ impl crate::llm::LlmProvider for StreamScriptProvider {
             .unwrap_or(true)
     }
 
-    fn chat_stream(&self, _request: ChatRequest) -> StreamBox<'_> {
+    fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
+        if let Ok(mut requests) = self.requests.write() {
+            requests.push(request);
+        }
         let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
         let step = self
             .steps

@@ -89,20 +89,21 @@ pub trait MessageStore: Send + Sync {
     ) -> Result<()> {
         anyhow::bail!("message store does not support append-only compaction")
     }
-    /// Append synthetic recovery evidence to the raw transcript and atomically
-    /// install the balanced effective projection.
+    /// Repair orphaned tool-use history with a balanced effective projection.
+    ///
+    /// The compatibility default replaces history. Append-only stores can
+    /// override this method to retain the synthetic repair evidence separately.
     ///
     /// # Errors
-    /// Returns an error when append-only repair is unsupported, stale, or
-    /// cannot be persisted atomically.
+    /// Returns an error if the balanced history cannot be installed.
     async fn append_repair(
         &self,
-        _thread_id: &ThreadId,
+        thread_id: &ThreadId,
         _repair_message: llm::Message,
-        _balanced_messages: Vec<llm::Message>,
+        balanced_messages: Vec<llm::Message>,
         _source_message_count: usize,
     ) -> Result<()> {
-        anyhow::bail!("message store does not support append-only repair")
+        self.replace_history(thread_id, balanced_messages).await
     }
 
     /// Return the unabridged committed transcript.
@@ -606,6 +607,23 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
                 messages,
                 source_message_count,
                 retained_message_count,
+            )
+            .await
+    }
+
+    async fn append_repair(
+        &self,
+        thread_id: &ThreadId,
+        repair_message: llm::Message,
+        balanced_messages: Vec<llm::Message>,
+        source_message_count: usize,
+    ) -> Result<()> {
+        (**self)
+            .append_repair(
+                thread_id,
+                repair_message,
+                balanced_messages,
+                source_message_count,
             )
             .await
     }

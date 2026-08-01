@@ -3,7 +3,7 @@ use crate::{Environment, PrimitiveToolName, Tool, ToolContext, ToolResult, ToolT
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
 use super::PrimitiveToolContext;
@@ -38,6 +38,15 @@ const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
 /// base64-encoded and attached. Kept smaller than `MAX_FILE_BYTES` because
 /// base64 inflates the payload (~1.33x) before it reaches the model context.
 const MAX_MEDIA_BYTES: usize = 5 * 1024 * 1024;
+/// Maximum size of a magic-sniffed artifact media attachment. Artifact
+/// recovery is intentionally separate from the smaller filesystem-media cap:
+/// providers accept larger recovered images/PDFs, but metadata is checked
+/// before allocating their backing buffer.
+const MAX_ARTIFACT_MEDIA_BYTES: usize = 32 * 1024 * 1024;
+
+/// Hard ceiling for raw or base64 artifact-window output, further restricted
+/// by the artifact store's configured inline budget.
+const MAX_ARTIFACT_BYTE_WINDOW_OUTPUT_BYTES: usize = 512 * 1024;
 
 pub struct ReadTool<E: Environment> {
     ctx: PrimitiveToolContext<E>,
@@ -90,7 +99,7 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for ReadToo
     }
 
     fn description(&self) -> &'static str {
-        "Read text files with 1-indexed line numbers. Also supports images (PNG/JPEG/GIF/WebP) and PDF documents."
+        "Read numbered text lines, supported media documents, and bounded artifact:// byte windows. Artifact selectors: lines=N, lines=N-M, lines=N+K (1-based lines); bytes=START+COUNT (exact UTF-8, 0-based bytes); base64=START+COUNT (exact arbitrary bytes)."
     }
 
     fn tier(&self) -> ToolTier {
@@ -103,7 +112,7 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for ReadToo
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to read"
+                    "description": "Filesystem path or artifact://ID[:SELECTOR]. Artifact selectors are :lines=N, :lines=N-M, or :lines=N+K for 1-based line windows; :bytes=START+COUNT for exact UTF-8 raw bytes; and :base64=START+COUNT for exact arbitrary bytes. Byte offsets are 0-based and counts are positive. Legacy :N, :N-M, and :N+K line selectors remain accepted. Unwindowed magic-sniffed artifact PNG/JPEG/GIF/WebP/PDF media can be attached up to 32MiB; filesystem media remains capped at 5MiB. Raw/base64 encoded output must fit both the artifact store inline budget and the 512KiB byte-window output cap."
                 },
                 "offset": {
                     "anyOf": [
@@ -233,11 +242,39 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for ReadToo
 
 /// Read back a spilled artifact addressed as `artifact://<id>[:<selector>]`.
 ///
-/// Selectors are 1-indexed line windows: `:N` (from line N), `:N-M`
-/// (inclusive range), or `:N+K` (K lines starting at N). Without a selector
-/// the `offset`/`limit` inputs window the read; a full read of an artifact
-/// larger than the inline budget is refused with a pointer to selectors so
-/// the recovered bytes are not immediately re-spilled.
+/// Line selectors are `:lines=N`, `:lines=N-M` (inclusive), and
+/// `:lines=N+K`; the historical forms without `lines=` remain accepted.
+/// Exact byte windows are `:bytes=START+COUNT` for UTF-8 output and
+/// `:base64=START+COUNT` for arbitrary bytes. Byte offsets are zero-based.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArtifactSelector {
+    Lines {
+        offset: usize,
+        limit: usize,
+    },
+    Bytes {
+        start: u64,
+        count: usize,
+        encoding: ArtifactByteEncoding,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArtifactByteEncoding {
+    Utf8,
+    Base64,
+}
+
+enum ArtifactRead {
+    Text(Vec<String>),
+    Raw(String),
+    Base64(String),
+    Media {
+        media_type: &'static str,
+        bytes: Vec<u8>,
+    },
+}
+
 async fn read_artifact(
     store: Option<&Arc<agent_sdk_tools::artifacts::ArtifactStore>>,
     spec: &str,
@@ -248,7 +285,7 @@ async fn read_artifact(
             "artifact storage is not configured for this session",
         ));
     };
-    let (id_part, selector) = match spec.split_once(':') {
+    let (id_part, selector_text) = match spec.split_once(':') {
         Some((id_part, selector)) => (id_part, Some(selector)),
         None => (spec, None),
     };
@@ -257,14 +294,21 @@ async fn read_artifact(
             "artifact ID must be numeric, got: '{id_part}'"
         )));
     };
-    let (offset, limit, explicit_limit) = match selector.map(parse_line_selector) {
-        Some(Ok((offset, limit))) => (offset, limit, limit != usize::MAX),
+    let selector = match selector_text.map(parse_artifact_selector) {
+        Some(Ok(selector)) => Some(selector),
         Some(Err(reason)) => {
             return Ok(ToolResult::error(format!(
-                "invalid artifact selector ':{sel}': {reason} (use :N, :N-M, or :N+K)",
-                sel = selector.unwrap_or_default()
+                "invalid artifact selector ':{sel}': {reason}; use \
+                 :lines=N, :lines=N-M, :lines=N+K, :bytes=START+COUNT, or \
+                 :base64=START+COUNT",
+                sel = selector_text.unwrap_or_default()
             )));
         }
+        None => None,
+    };
+    let (offset, limit, explicit_limit) = match selector {
+        Some(ArtifactSelector::Lines { offset, limit }) => (offset, limit, limit != usize::MAX),
+        Some(ArtifactSelector::Bytes { .. }) => (1, DEFAULT_LIMIT, false),
         None => (
             input.offset,
             input.limit.unwrap_or(DEFAULT_LIMIT),
@@ -272,12 +316,13 @@ async fn read_artifact(
         ),
     };
 
-    let windowed = selector.is_some() || offset != 1 || explicit_limit;
+    let line_windowed = selector.is_some() || offset != 1 || explicit_limit;
     let inline_budget = store.inline_budget();
-    let byte_budget = TOTAL_BYTE_BUDGET_FLOOR.min(inline_budget);
+    let line_byte_budget = TOTAL_BYTE_BUDGET_FLOOR.min(inline_budget);
+    let window_output_cap = inline_budget.min(MAX_ARTIFACT_BYTE_WINDOW_OUTPUT_BYTES);
     let store = Arc::clone(store);
-    let collected = tokio::task::spawn_blocking(move || {
-        let file = match store.resolve(id) {
+    let read = tokio::task::spawn_blocking(move || {
+        let mut file = match store.resolve(id) {
             Ok(file) => file,
             Err(error) => return Ok(Err(format!("{error:#}"))),
         };
@@ -285,31 +330,204 @@ async fn read_artifact(
             .metadata()
             .context("inspecting artifact before read")?
             .len();
-        if !windowed
-            && artifact_bytes > u64::try_from(inline_budget).context("inline budget exceeds u64")?
+
+        if let Some(ArtifactSelector::Bytes {
+            start,
+            count,
+            encoding,
+        }) = selector
         {
-            return Ok(Err(format!(
-                "artifact {id} is {artifact_bytes} bytes; read a window with \
-                 artifact://{id}:START-END or offset/limit instead of the full stream"
-            )));
+            return read_artifact_byte_window(
+                file,
+                artifact_bytes,
+                id,
+                start,
+                count,
+                encoding,
+                window_output_cap,
+            );
         }
-        stream_artifact_lines(file, offset, limit, byte_budget).map(Ok)
+
+        if !line_windowed
+            && let Some(result) =
+                full_artifact_read_guard(&mut file, artifact_bytes, id, inline_budget)?
+        {
+            return Ok(result);
+        }
+        stream_artifact_lines(file, id, offset, limit, line_byte_budget, window_output_cap)
+            .map(ArtifactRead::Text)
+            .map(Ok)
     })
     .await
     .context("joining artifact read")??;
-    let collected = match collected {
-        Ok(collected) => collected,
-        Err(error) => return Ok(ToolResult::error(error)),
-    };
-    if collected.is_empty() {
-        return Ok(ToolResult::error("offset exceeds artifact length"));
+    match read {
+        Ok(ArtifactRead::Media { media_type, bytes }) => Ok(ToolResult::success(format!(
+            "Read {media_type} artifact: 'artifact://{id}'"
+        ))
+        .with_documents(vec![ContentSource::new(media_type, base64_encode(&bytes))])),
+        Ok(ArtifactRead::Text(collected)) => {
+            if collected.is_empty() {
+                return Ok(ToolResult::error("offset exceeds artifact length"));
+            }
+            Ok(ToolResult::success(collected.join("\n")))
+        }
+        Ok(ArtifactRead::Raw(text) | ArtifactRead::Base64(text)) => Ok(ToolResult::success(text)),
+        Err(error) => Ok(ToolResult::error(error)),
     }
-    Ok(ToolResult::success(collected.join("\n")))
 }
+
+fn artifact_media_capacity(artifact_bytes: u64) -> std::result::Result<usize, String> {
+    let limit = u64::try_from(MAX_ARTIFACT_MEDIA_BYTES)
+        .map_err(|_| "attachment limit cannot be represented as u64".to_string())?;
+    if artifact_bytes > limit {
+        return Err(format!(
+            "is {artifact_bytes} bytes, which exceeds the \
+             {MAX_ARTIFACT_MEDIA_BYTES}-byte attachment limit"
+        ));
+    }
+    usize::try_from(artifact_bytes)
+        .map_err(|_| format!("length {artifact_bytes} cannot be represented as usize"))
+}
+
+/// Guard a full (non-windowed) artifact read: recover media artifacts as
+/// provider attachments and refuse oversized text artifacts before line
+/// streaming. Magic detection deliberately precedes the inline/full-read
+/// refusal: recovered media has its own provider attachment cap.
+fn full_artifact_read_guard(
+    file: &mut std::fs::File,
+    artifact_bytes: u64,
+    id: u64,
+    inline_budget: usize,
+) -> Result<Option<std::result::Result<ArtifactRead, String>>> {
+    if let Some(media_type) = sniff_media_type(file)? {
+        let capacity = match artifact_media_capacity(artifact_bytes) {
+            Ok(capacity) => capacity,
+            Err(error) => return Ok(Some(Err(format!("media artifact {id} {error}")))),
+        };
+        let mut bytes = Vec::with_capacity(capacity);
+        file.take(
+            u64::try_from(MAX_ARTIFACT_MEDIA_BYTES)
+                .context("artifact media byte limit exceeds u64")?
+                .saturating_add(1),
+        )
+        .read_to_end(&mut bytes)
+        .context("reading media artifact")?;
+        if bytes.len() > MAX_ARTIFACT_MEDIA_BYTES {
+            return Ok(Some(Err(format!(
+                "media artifact {id} grew beyond the \
+                 {MAX_ARTIFACT_MEDIA_BYTES}-byte attachment limit"
+            ))));
+        }
+        return Ok(Some(Ok(ArtifactRead::Media { media_type, bytes })));
+    }
+    if artifact_bytes > u64::try_from(inline_budget).context("inline budget exceeds u64")? {
+        return Ok(Some(Err(format!(
+            "artifact {id} is {artifact_bytes} bytes; read a window with \
+             artifact://{id}:lines=START-END (or offset/limit), an exact UTF-8 \
+             byte window with artifact://{id}:bytes=START+COUNT, or arbitrary \
+             bytes with artifact://{id}:base64=START+COUNT"
+        ))));
+    }
+    Ok(None)
+}
+
+fn read_artifact_byte_window(
+    mut file: std::fs::File,
+    artifact_bytes: u64,
+    id: u64,
+    start: u64,
+    count: usize,
+    encoding: ArtifactByteEncoding,
+    output_cap: usize,
+) -> Result<std::result::Result<ArtifactRead, String>> {
+    let encoded_len = match encoding {
+        ArtifactByteEncoding::Utf8 => count,
+        ArtifactByteEncoding::Base64 => match base64_encoded_len(count) {
+            Some(length) => length,
+            None => {
+                return Ok(Err(format!(
+                    "base64 byte count {count} overflows its encoded length"
+                )));
+            }
+        },
+    };
+    if encoded_len > output_cap {
+        let max_count = match encoding {
+            ArtifactByteEncoding::Utf8 => output_cap,
+            ArtifactByteEncoding::Base64 => max_base64_input_bytes(output_cap),
+        };
+        let mode = match encoding {
+            ArtifactByteEncoding::Utf8 => "raw UTF-8",
+            ArtifactByteEncoding::Base64 => "base64",
+        };
+        return Ok(Err(format!(
+            "{mode} artifact window encodes to {encoded_len} bytes, exceeding the \
+             {output_cap}-byte output cap; request COUNT<={max_count}"
+        )));
+    }
+
+    let count_u64 = u64::try_from(count).context("artifact byte count exceeds u64")?;
+    let Some(end) = start.checked_add(count_u64) else {
+        return Ok(Err(format!(
+            "artifact byte window START+COUNT overflows: {start}+{count}"
+        )));
+    };
+    if end > artifact_bytes {
+        return Ok(Err(format!(
+            "artifact://{id} exact byte window [{start}, {end}) exceeds artifact length \
+             {artifact_bytes}; lower START or COUNT"
+        )));
+    }
+
+    file.seek(SeekFrom::Start(start))
+        .context("seeking to artifact byte window")?;
+    let mut bytes = vec![0_u8; count];
+    file.read_exact(&mut bytes)
+        .context("reading exact artifact byte window")?;
+    match encoding {
+        ArtifactByteEncoding::Utf8 => match String::from_utf8(bytes) {
+            Ok(text) => Ok(Ok(ArtifactRead::Raw(text))),
+            Err(error) => {
+                let invalid = error.utf8_error();
+                let artifact_offset =
+                    start.saturating_add(usize_to_u64_saturating(invalid.valid_up_to()));
+                Ok(Err(format!(
+                    "artifact://{id}:bytes={start}+{count} is not valid UTF-8 at window byte \
+                     {window_offset} (artifact byte {artifact_offset}); START and START+COUNT \
+                     must be UTF-8 character boundaries and all selected bytes must be valid \
+                     UTF-8. Use artifact://{id}:base64={start}+{count} for arbitrary bytes",
+                    window_offset = invalid.valid_up_to(),
+                )))
+            }
+        },
+        ArtifactByteEncoding::Base64 => Ok(Ok(ArtifactRead::Base64(base64_encode(&bytes)))),
+    }
+}
+
+const fn base64_encoded_len(input_bytes: usize) -> Option<usize> {
+    match input_bytes.checked_add(2) {
+        Some(rounded) => match (rounded / 3).checked_mul(4) {
+            Some(length) => Some(length),
+            None => None,
+        },
+        None => None,
+    }
+}
+
+const fn max_base64_input_bytes(output_cap: usize) -> usize {
+    (output_cap / 4).saturating_mul(3)
+}
+
+fn usize_to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 struct ArtifactLineWindow {
+    artifact_id: u64,
     offset: usize,
     limit: usize,
     byte_budget: usize,
+    continuation_output_cap: usize,
     emitted_bytes: usize,
     last_emitted: usize,
     budget_reached: bool,
@@ -317,19 +535,29 @@ struct ArtifactLineWindow {
 }
 
 impl ArtifactLineWindow {
-    fn push(&mut self, line_number: usize, raw_line: &[u8], line_truncated: bool) {
+    fn push(
+        &mut self,
+        line_number: usize,
+        raw_prefix: &[u8],
+        raw_line_bytes: usize,
+        line_start_byte: u64,
+        ends_with_cr: bool,
+    ) {
         if line_number < self.offset || self.collected.len() >= self.limit || self.budget_reached {
             return;
         }
-        let raw_line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
-        let line = String::from_utf8_lossy(raw_line);
-        let display = if line_truncated {
-            format!(
-                "{}{LINE_TRUNCATION_MARKER}",
-                super::truncate_str(&line, MAX_LINE_LENGTH)
+        let content_bytes = raw_line_bytes.saturating_sub(usize::from(ends_with_cr));
+        let captured = &raw_prefix[..raw_prefix.len().min(content_bytes)];
+        let display = if content_bytes > MAX_LINE_LENGTH {
+            artifact_truncated_line(
+                captured,
+                content_bytes,
+                line_start_byte,
+                self.artifact_id,
+                self.continuation_output_cap,
             )
         } else {
-            truncate_line(&line)
+            truncate_line(&String::from_utf8_lossy(captured))
         };
         let formatted = format!("L{line_number}: {display}");
         let payload_budget = self.byte_budget.saturating_sub(512);
@@ -351,17 +579,21 @@ impl ArtifactLineWindow {
     fn finish(mut self, more_lines_may_follow: bool) -> Vec<String> {
         if self.budget_reached {
             self.collected.push(format!(
-                "... [read byte budget of {budget} bytes reached: showing lines {offset}-{last}; more lines may follow; continue with artifact line offset {next}]",
+                "... [read byte budget of {budget} bytes reached: showing lines {offset}-{last}; \
+                 more lines may follow; continue with artifact://{id}:lines={next}]",
                 budget = self.byte_budget,
                 offset = self.offset,
                 last = self.last_emitted,
+                id = self.artifact_id,
                 next = self.last_emitted.saturating_add(1),
             ));
         } else if more_lines_may_follow && !self.collected.is_empty() {
             self.collected.push(format!(
-                "... [showing lines {offset}-{last}; more lines may follow; continue with artifact line offset {next}]",
+                "... [showing lines {offset}-{last}; more lines may follow; continue with \
+                 artifact://{id}:lines={next}]",
                 offset = self.offset,
                 last = self.last_emitted,
+                id = self.artifact_id,
                 next = self.last_emitted.saturating_add(1),
             ));
         }
@@ -369,57 +601,186 @@ impl ArtifactLineWindow {
     }
 }
 
+fn artifact_truncated_line(
+    captured: &[u8],
+    content_bytes: usize,
+    line_start_byte: u64,
+    artifact_id: u64,
+    output_cap: usize,
+) -> String {
+    let (display, consumed, encoding) = valid_utf8_prefix_len(captured, MAX_LINE_LENGTH)
+        .map_or_else(
+            || {
+                (
+                    super::truncate_str(&String::from_utf8_lossy(captured), MAX_LINE_LENGTH)
+                        .to_owned(),
+                    0,
+                    ArtifactByteEncoding::Base64,
+                )
+            },
+            |consumed| {
+                (
+                    String::from_utf8_lossy(&captured[..consumed]).into_owned(),
+                    consumed,
+                    ArtifactByteEncoding::Utf8,
+                )
+            },
+        );
+    let remaining = content_bytes.saturating_sub(consumed);
+    let max_count = match encoding {
+        ArtifactByteEncoding::Utf8 => output_cap,
+        ArtifactByteEncoding::Base64 => max_base64_input_bytes(output_cap),
+    };
+    let candidate_count = remaining.min(max_count);
+    let (mode, count) = match encoding {
+        ArtifactByteEncoding::Utf8 => {
+            let continuation =
+                &captured[consumed..captured.len().min(consumed.saturating_add(candidate_count))];
+            match valid_utf8_prefix_len(continuation, candidate_count) {
+                Some(0) | None => ("base64", remaining.min(max_base64_input_bytes(output_cap))),
+                Some(count) => ("bytes", count),
+            }
+        }
+        ArtifactByteEncoding::Base64 => ("base64", candidate_count),
+    };
+    let start = line_start_byte.saturating_add(usize_to_u64_saturating(consumed));
+    format!(
+        "{display}... [line truncated after {consumed} of {content_bytes} bytes; \
+         {remaining} bytes remain; continue with exact next window \
+         artifact://{artifact_id}:{mode}={start}+{count}]"
+    )
+}
+
+fn valid_utf8_prefix_len(bytes: &[u8], maximum: usize) -> Option<usize> {
+    let candidate = &bytes[..bytes.len().min(maximum)];
+    match std::str::from_utf8(candidate) {
+        Ok(_) => Some(candidate.len()),
+        Err(error) if error.error_len().is_none() => Some(error.valid_up_to()),
+        Err(_) => None,
+    }
+}
+
 fn stream_artifact_lines(
     mut source: impl Read,
+    artifact_id: u64,
     offset: usize,
     limit: usize,
     byte_budget: usize,
+    continuation_output_cap: usize,
 ) -> Result<Vec<String>> {
     let mut window = ArtifactLineWindow {
+        artifact_id,
         offset,
         limit,
         byte_budget,
+        continuation_output_cap,
         emitted_bytes: 0,
         last_emitted: 0,
         budget_reached: false,
         collected: Vec::new(),
     };
+    let capture_limit = MAX_LINE_LENGTH
+        .saturating_add(continuation_output_cap)
+        .saturating_add(4);
     let mut line_number = 1_usize;
-    let mut line = Vec::with_capacity(MAX_LINE_LENGTH + 4);
-    let mut line_truncated = false;
+    let mut line = Vec::with_capacity(capture_limit);
+    let mut line_bytes = 0_usize;
+    let mut line_start_byte = 0_u64;
+    let mut absolute_byte = 0_u64;
+    let mut ends_with_cr = false;
     let mut chunk = vec![0_u8; 64 * 1024].into_boxed_slice();
     loop {
         let read = source
             .read(chunk.as_mut())
             .context("reading artifact stream")?;
         if read == 0 {
-            window.push(line_number, &line, line_truncated);
+            window.push(
+                line_number,
+                &line,
+                line_bytes,
+                line_start_byte,
+                ends_with_cr,
+            );
             return Ok(window.finish(false));
         }
         for byte in &chunk[..read] {
             if *byte == b'\n' {
-                window.push(line_number, &line, line_truncated);
+                window.push(
+                    line_number,
+                    &line,
+                    line_bytes,
+                    line_start_byte,
+                    ends_with_cr,
+                );
                 if window.is_complete() {
                     return Ok(window.finish(true));
                 }
                 line_number = line_number.saturating_add(1);
                 line.clear();
-                line_truncated = false;
-            } else if line_number >= offset && !window.is_complete() {
-                if line.len() < MAX_LINE_LENGTH + 4 {
+                line_bytes = 0;
+                ends_with_cr = false;
+                line_start_byte = absolute_byte.saturating_add(1);
+            } else {
+                line_bytes = line_bytes.saturating_add(1);
+                ends_with_cr = *byte == b'\r';
+                if line_number >= offset && !window.is_complete() && line.len() < capture_limit {
                     line.push(*byte);
-                } else {
-                    line_truncated = true;
                 }
             }
+            absolute_byte = absolute_byte.saturating_add(1);
         }
     }
 }
 
+fn parse_artifact_selector(selector: &str) -> Result<ArtifactSelector, &'static str> {
+    if let Some(lines) = selector.strip_prefix("lines=") {
+        let (offset, limit) = parse_line_selector(lines)?;
+        return Ok(ArtifactSelector::Lines { offset, limit });
+    }
+    if let Some(bytes) = selector.strip_prefix("bytes=") {
+        let (start, count) = parse_byte_selector(bytes)?;
+        return Ok(ArtifactSelector::Bytes {
+            start,
+            count,
+            encoding: ArtifactByteEncoding::Utf8,
+        });
+    }
+    if let Some(bytes) = selector.strip_prefix("base64=") {
+        let (start, count) = parse_byte_selector(bytes)?;
+        return Ok(ArtifactSelector::Bytes {
+            start,
+            count,
+            encoding: ArtifactByteEncoding::Base64,
+        });
+    }
+    if selector.contains('=') {
+        return Err("unknown selector kind");
+    }
+    let (offset, limit) = parse_line_selector(selector)?;
+    Ok(ArtifactSelector::Lines { offset, limit })
+}
+
+fn parse_byte_selector(selector: &str) -> Result<(u64, usize), &'static str> {
+    let Some((start, count)) = selector.split_once('+') else {
+        return Err("byte selectors require START+COUNT");
+    };
+    let start = start
+        .parse::<u64>()
+        .map_err(|_| "byte START must be a non-negative integer")?;
+    let count = count
+        .parse::<usize>()
+        .map_err(|_| "byte COUNT must be a positive integer")?;
+    if count == 0 {
+        return Err("byte COUNT must be greater than zero");
+    }
+    let count_u64 = u64::try_from(count).map_err(|_| "byte COUNT exceeds u64")?;
+    start
+        .checked_add(count_u64)
+        .ok_or("byte START+COUNT overflows")?;
+    Ok((start, count))
+}
+
 /// Parse a `read` line selector: `N`, `N-M` (inclusive), or `N+K`.
-///
-/// Returns the equivalent 1-indexed `(offset, limit)` window; `N` alone
-/// reads to the end of the artifact.
 fn parse_line_selector(selector: &str) -> Result<(usize, usize), &'static str> {
     let parse_line = |raw: &str| -> Result<usize, &'static str> {
         match raw.parse::<usize>() {
@@ -505,6 +866,39 @@ fn truncate_line(line: &str) -> String {
             "{}{LINE_TRUNCATION_MARKER}",
             super::truncate_str(line, MAX_LINE_LENGTH)
         )
+    }
+}
+
+fn sniff_media_type(file: &mut std::fs::File) -> Result<Option<&'static str>> {
+    let mut prefix = [0_u8; 12];
+    let mut read = 0;
+    while read < prefix.len() {
+        let count = file
+            .read(&mut prefix[read..])
+            .context("reading artifact media signature")?;
+        if count == 0 {
+            break;
+        }
+        read += count;
+    }
+    file.seek(SeekFrom::Start(0))
+        .context("rewinding artifact after media detection")?;
+    Ok(detect_media_magic(&prefix[..read]))
+}
+
+pub fn detect_media_magic(prefix: &[u8]) -> Option<&'static str> {
+    if prefix.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if prefix.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if prefix.starts_with(b"GIF87a") || prefix.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if prefix.len() >= 12 && &prefix[..4] == b"RIFF" && &prefix[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if prefix.starts_with(b"%PDF-") {
+        Some("application/pdf")
+    } else {
+        None
     }
 }
 
@@ -1129,6 +1523,96 @@ mod tests {
         Ok((dir, store, saved.id))
     }
 
+    #[tokio::test]
+    async fn unwindowed_png_artifact_returns_byte_identical_document() -> anyhow::Result<()> {
+        use base64::Engine as _;
+
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(agent_sdk_tools::artifacts::ArtifactStore::new(
+            dir.path().join("artifacts"),
+        ));
+        let png = b"\x89PNG\r\n\x1a\nsnapcompact attachment bytes".to_vec();
+        let saved = store.save_streamed(
+            "snapcompact-attachment",
+            &mut std::io::Cursor::new(png.as_slice()),
+        )?;
+        let tool = create_test_tool(
+            Arc::new(InMemoryFileSystem::new("/workspace")),
+            AgentCapabilities::full_access(),
+        );
+
+        let result = tool
+            .execute(
+                &artifact_ctx(store),
+                json!({"path": format!("artifact://{}", saved.id)}),
+            )
+            .await?;
+
+        assert!(result.success, "{}", result.output);
+        let [document] = result.documents.as_slice() else {
+            anyhow::bail!("media artifact read must return one document");
+        };
+        assert_eq!(document.media_type, "image/png");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&document.data)
+            .context("decoding recovered PNG")?;
+        assert_eq!(decoded, png);
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_media_size_boundaries_are_separate_from_filesystem_media() {
+        let twenty_mib = 20_u64 * 1024 * 1024;
+        let thirty_two_mib = 32_u64 * 1024 * 1024;
+
+        assert_eq!(artifact_media_capacity(twenty_mib), Ok(20 * 1024 * 1024));
+        assert_eq!(
+            artifact_media_capacity(thirty_two_mib),
+            Ok(MAX_ARTIFACT_MEDIA_BYTES)
+        );
+        assert!(
+            artifact_media_capacity(thirty_two_mib + 1)
+                .is_err_and(|error| error.contains("attachment limit"))
+        );
+        assert_eq!(MAX_MEDIA_BYTES, 5 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn rejects_over_32_mib_media_artifact_before_allocation() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(agent_sdk_tools::artifacts::ArtifactStore::new(
+            dir.path().join("artifacts"),
+        ));
+        let mut png = std::io::Cursor::new(&b"\x89PNG\r\n\x1a\n"[..]);
+        let saved = store.save_streamed("snapcompact-attachment", &mut png)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&saved.path)?
+            .set_len(usize_to_u64_saturating(
+                MAX_ARTIFACT_MEDIA_BYTES.saturating_add(1),
+            ))?;
+        let tool = create_test_tool(
+            Arc::new(InMemoryFileSystem::new("/workspace")),
+            AgentCapabilities::full_access(),
+        );
+
+        let result = tool
+            .execute(
+                &artifact_ctx(store),
+                json!({"path": format!("artifact://{}", saved.id)}),
+            )
+            .await?;
+
+        assert!(!result.success);
+        assert!(
+            result.output.contains("attachment limit"),
+            "{}",
+            result.output
+        );
+        assert!(result.documents.is_empty());
+        Ok(())
+    }
+
     struct CountingReader {
         source: std::io::Cursor<Vec<u8>>,
         bytes_read: Arc<std::sync::atomic::AtomicUsize>,
@@ -1152,7 +1636,7 @@ mod tests {
             source: std::io::Cursor::new(content),
             bytes_read: Arc::clone(&bytes_read),
         };
-        let result = stream_artifact_lines(reader, 1, 1, 1024)?;
+        let result = stream_artifact_lines(reader, 0, 1, 1, 1024, 1024)?;
         assert_eq!(result.first().map(String::as_str), Some("L1: first"));
         assert!(result.join("\n").contains("more lines may follow"));
         assert!(
@@ -1187,7 +1671,7 @@ mod tests {
         let result = tool
             .execute(
                 &artifact_ctx(store),
-                json!({"path": format!("artifact://{id}:10-12")}),
+                json!({"path": format!("artifact://{id}:lines=10-12")}),
             )
             .await?;
         assert!(result.success, "{}", result.output);
@@ -1207,11 +1691,212 @@ mod tests {
         let result = tool
             .execute(
                 &artifact_ctx(store),
-                json!({"path": format!("artifact://{id}:99+2")}),
+                json!({"path": format!("artifact://{id}:lines=99+2")}),
             )
             .await?;
         assert!(result.success, "{}", result.output);
         assert!(result.output.starts_with("L99: line 99\nL100: line 100"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn long_utf8_artifact_line_reassembles_from_exact_raw_windows() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(agent_sdk_tools::artifacts::ArtifactStore::new(
+            dir.path().join("artifacts"),
+        ));
+        let line = "λ".repeat(60 * 1024);
+        assert!(line.len() > 100 * 1024);
+        let saved = store.save("snapcompact-summary", &line)?;
+        let tool = create_test_tool(
+            Arc::new(InMemoryFileSystem::new("/workspace")),
+            AgentCapabilities::full_access(),
+        );
+
+        let result = tool
+            .execute(
+                &artifact_ctx(Arc::clone(&store)),
+                json!({"path": format!("artifact://{}:lines=1+1", saved.id)}),
+            )
+            .await?;
+        assert!(result.success, "{}", result.output);
+        let numbered = result
+            .output
+            .strip_prefix("L1: ")
+            .context("missing first artifact line prefix")?;
+        let (displayed_prefix, _) = numbered
+            .split_once("... [line truncated after")
+            .context("missing exact long-line continuation marker")?;
+        let mut recovered = displayed_prefix.as_bytes().to_vec();
+        let window_cap = store
+            .inline_budget()
+            .min(MAX_ARTIFACT_BYTE_WINDOW_OUTPUT_BYTES);
+        let first_count = (line.len() - recovered.len()).min(window_cap);
+        assert!(
+            result.output.contains(&format!(
+                "artifact://{}:bytes={}+{}",
+                saved.id,
+                recovered.len(),
+                first_count
+            )),
+            "{}",
+            result.output
+        );
+
+        while recovered.len() < line.len() {
+            let start = recovered.len();
+            let count = (line.len() - start).min(window_cap);
+            let chunk = tool
+                .execute(
+                    &artifact_ctx(Arc::clone(&store)),
+                    json!({
+                        "path": format!("artifact://{}:bytes={start}+{count}", saved.id)
+                    }),
+                )
+                .await?;
+            assert!(chunk.success, "{}", chunk.output);
+            assert_eq!(chunk.output.len(), count);
+            recovered.extend_from_slice(chunk.output.as_bytes());
+        }
+
+        assert_eq!(recovered, line.as_bytes());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn binary_artifact_reassembles_from_exact_base64_windows() -> anyhow::Result<()> {
+        use base64::Engine as _;
+
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(agent_sdk_tools::artifacts::ArtifactStore::new(
+            dir.path().join("artifacts"),
+        ));
+        let original: Vec<u8> = (0_u8..=u8::MAX).cycle().take(150 * 1024 + 7).collect();
+        let saved =
+            store.save_streamed("binary", &mut std::io::Cursor::new(original.as_slice()))?;
+        let tool = create_test_tool(
+            Arc::new(InMemoryFileSystem::new("/workspace")),
+            AgentCapabilities::full_access(),
+        );
+        let output_cap = store
+            .inline_budget()
+            .min(MAX_ARTIFACT_BYTE_WINDOW_OUTPUT_BYTES);
+        let input_cap = max_base64_input_bytes(output_cap);
+        let mut recovered = Vec::with_capacity(original.len());
+
+        while recovered.len() < original.len() {
+            let start = recovered.len();
+            let count = (original.len() - start).min(input_cap);
+            let result = tool
+                .execute(
+                    &artifact_ctx(Arc::clone(&store)),
+                    json!({
+                        "path": format!("artifact://{}:base64={start}+{count}", saved.id)
+                    }),
+                )
+                .await?;
+            assert!(result.success, "{}", result.output);
+            assert_eq!(
+                result.output.len(),
+                base64_encoded_len(count).unwrap_or_default()
+            );
+            recovered.extend(
+                base64::engine::general_purpose::STANDARD
+                    .decode(&result.output)
+                    .context("decoding exact artifact byte window")?,
+            );
+        }
+
+        assert_eq!(recovered, original);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_invalid_artifact_selectors() {
+        for selector in [
+            "",
+            "lines=0",
+            "bytes=1-2",
+            "bytes=0+0",
+            "base64=0",
+            "base64=0+0",
+            "raw=0+1",
+            "bytes=18446744073709551615+1",
+        ] {
+            assert!(
+                parse_artifact_selector(selector).is_err(),
+                "selector should be rejected: {selector}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_byte_windows_report_utf8_range_and_output_errors() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(agent_sdk_tools::artifacts::ArtifactStore::new(
+            dir.path().join("artifacts"),
+        ));
+        let saved = store.save("utf8", "aéz")?;
+        let tool = create_test_tool(
+            Arc::new(InMemoryFileSystem::new("/workspace")),
+            AgentCapabilities::full_access(),
+        );
+
+        for selector in ["bytes=1+1", "bytes=2+1"] {
+            let result = tool
+                .execute(
+                    &artifact_ctx(Arc::clone(&store)),
+                    json!({"path": format!("artifact://{}:{selector}", saved.id)}),
+                )
+                .await?;
+            assert!(!result.success);
+            assert!(
+                result.output.contains("not valid UTF-8"),
+                "{}",
+                result.output
+            );
+            assert!(
+                result.output.contains("character boundaries"),
+                "{}",
+                result.output
+            );
+            assert!(result.output.contains(":base64="), "{}", result.output);
+        }
+
+        let output_cap = store
+            .inline_budget()
+            .min(MAX_ARTIFACT_BYTE_WINDOW_OUTPUT_BYTES);
+        let oversized = tool
+            .execute(
+                &artifact_ctx(Arc::clone(&store)),
+                json!({
+                    "path": format!(
+                        "artifact://{}:bytes=0+{}",
+                        saved.id,
+                        output_cap.saturating_add(1)
+                    )
+                }),
+            )
+            .await?;
+        assert!(!oversized.success);
+        assert!(
+            oversized.output.contains("output cap"),
+            "{}",
+            oversized.output
+        );
+
+        let beyond_end = tool
+            .execute(
+                &artifact_ctx(store),
+                json!({"path": format!("artifact://{}:base64=3+2", saved.id)}),
+            )
+            .await?;
+        assert!(!beyond_end.success);
+        assert!(
+            beyond_end.output.contains("exceeds artifact length"),
+            "{}",
+            beyond_end.output
+        );
         Ok(())
     }
 
@@ -1243,14 +1928,18 @@ mod tests {
         let result = tool
             .execute(
                 &artifact_ctx(store),
-                json!({"path": format!("artifact://{}:9999-10001", saved.id)}),
+                json!({"path": format!("artifact://{}:lines=9999-10001", saved.id)}),
             )
             .await?;
         assert!(result.success, "{}", result.output);
         assert_eq!(
             result.output,
-            "L9999: row 9999\nL10000: row 10000\nL10001: row 10001\n\
-             ... [showing lines 9999-10001; more lines may follow; continue with artifact line offset 10002]"
+            format!(
+                "L9999: row 9999\nL10000: row 10000\nL10001: row 10001\n\
+                 ... [showing lines 9999-10001; more lines may follow; continue with \
+                 artifact://{}:lines=10002]",
+                saved.id
+            )
         );
         Ok(())
     }
@@ -1299,7 +1988,7 @@ mod tests {
                 .await?;
             assert!(result.success, "{}", result.output);
             assert!(result.output.len() <= store.inline_budget());
-            assert!(result.output.contains("continue with artifact line offset"));
+            assert!(result.output.contains(":lines="));
         }
         Ok(())
     }

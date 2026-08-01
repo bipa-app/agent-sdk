@@ -1320,6 +1320,14 @@ impl LlmProvider for AnthropicProvider {
         "anthropic"
     }
 
+    fn supports_historical_image_blocks(&self) -> bool {
+        true
+    }
+
+    fn max_request_attachment_bytes(&self) -> Option<u64> {
+        Some(crate::attachments::ANTHROPIC_MAX_REQUEST_ATTACHMENT_BYTES)
+    }
+
     fn configured_thinking(&self) -> Option<&ThinkingConfig> {
         self.thinking.as_ref()
     }

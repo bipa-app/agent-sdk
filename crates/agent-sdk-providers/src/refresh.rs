@@ -305,6 +305,14 @@ where
         self.template.capabilities()
     }
 
+    fn supports_historical_image_blocks(&self) -> bool {
+        self.template.supports_historical_image_blocks()
+    }
+
+    fn max_request_attachment_bytes(&self) -> Option<u64> {
+        self.template.max_request_attachment_bytes()
+    }
+
     fn validate_thinking_config(&self, thinking: Option<&ThinkingConfig>) -> Result<()> {
         self.template.validate_thinking_config(thinking)
     }
@@ -446,6 +454,10 @@ mod tests {
             StructuredOutputSupport::Native
         }
 
+        fn supports_historical_image_blocks(&self) -> bool {
+            true
+        }
+
         fn validate_thinking_config(&self, thinking: Option<&ThinkingConfig>) -> Result<()> {
             if thinking.is_some() {
                 Err(anyhow::anyhow!("mock rejects thinking"))
@@ -531,6 +543,7 @@ mod tests {
             wrapped.structured_output_support(),
             StructuredOutputSupport::Native
         );
+        assert!(wrapped.supports_historical_image_blocks());
         assert!(
             wrapped
                 .validate_thinking_config(Some(&ThinkingConfig::adaptive()))

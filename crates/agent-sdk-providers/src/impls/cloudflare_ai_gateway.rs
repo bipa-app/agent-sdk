@@ -324,6 +324,22 @@ impl LlmProvider for CloudflareAIGatewayProvider {
         }
     }
 
+    /// The wrapper reports `cloudflare-ai-gateway` as its provider identity,
+    /// while its static inner route may use Anthropic, Gemini, or `OpenAI` image
+    /// accounting. Until the trait exposes that accounting profile, the gateway
+    /// cannot safely opt into historical images.
+    fn supports_historical_image_blocks(&self) -> bool {
+        false
+    }
+
+    fn max_request_attachment_bytes(&self) -> Option<u64> {
+        match &self.inner {
+            Inner::Anthropic(p) => p.max_request_attachment_bytes(),
+            Inner::OpenAI(p) => p.max_request_attachment_bytes(),
+            Inner::Gemini(p) => p.max_request_attachment_bytes(),
+        }
+    }
+
     fn capabilities(&self) -> Option<&'static ModelCapabilities> {
         match &self.inner {
             Inner::Anthropic(p) => p.capabilities(),
@@ -445,6 +461,18 @@ mod tests {
         let p = CloudflareAIGatewayProvider::gemini_pro("t", "a", "g");
         let caps = p.capabilities().unwrap();
         assert_eq!(caps.provider, "gemini");
+    }
+
+    #[test]
+    fn historical_images_stay_disabled_without_an_inner_accounting_profile() {
+        let anthropic = CloudflareAIGatewayProvider::anthropic_sonnet("t", "a", "g");
+        assert!(!anthropic.supports_historical_image_blocks());
+
+        let gemini = CloudflareAIGatewayProvider::gemini_pro("t", "a", "g");
+        assert!(!gemini.supports_historical_image_blocks());
+
+        let openai = CloudflareAIGatewayProvider::openai_gpt54("t", "a", "g");
+        assert!(!openai.supports_historical_image_blocks());
     }
 
     #[test]

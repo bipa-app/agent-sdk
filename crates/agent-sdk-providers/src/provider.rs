@@ -252,6 +252,26 @@ pub trait LlmProvider: Send + Sync {
         }
     }
 
+    /// Whether this exact provider/model/API surface can replay historical images.
+    ///
+    /// The safe default is `false`: wrappers and compatibility endpoints must
+    /// opt in only when every route they may select preserves image blocks.
+    fn supports_historical_image_blocks(&self) -> bool {
+        false
+    }
+
+    /// Largest aggregate decoded attachment payload one request to this
+    /// provider may carry, in bytes, when known.
+    ///
+    /// `None` is the SAFE default for wrappers and unknown routes: consumers
+    /// budgeting attachments (Snapcompact) map `None` onto the smallest
+    /// cross-family aggregate (20 MiB) instead of assuming unlimited room.
+    /// Composite providers must report the most restrictive inner budget and
+    /// stay `None` when any inner route is unknown.
+    fn max_request_attachment_bytes(&self) -> Option<u64> {
+        None
+    }
+
     /// Validate a thinking configuration against the provider/model capabilities.
     ///
     /// # Errors

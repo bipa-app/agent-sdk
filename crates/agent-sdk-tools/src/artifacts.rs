@@ -1,9 +1,9 @@
-//! Session-scoped artifact spill storage for oversized tool output.
+//! Session-scoped artifact spill storage for oversized tool results.
 //!
-//! Truncation must never destroy bytes. Every tool result that would exceed
-//! the shared inline output budget is mirrored **byte-identical** to a file
-//! under a per-thread artifacts directory, and the inline text is replaced by
-//! a bounded head + tail window plus a recovery footer:
+//! Output-only results are mirrored byte-identical. Results with structured
+//! data or documents are stored as one serialized recovery envelope so no
+//! attacker-controlled auxiliary field can bypass the shared transcript
+//! budget. Inline text is replaced by a bounded head + tail window plus:
 //!
 //! ```text
 //! <head>
@@ -54,9 +54,8 @@ const STALE_PARTIAL_MAX_AGE: Duration = Duration::from_hours(24);
 
 const ARTIFACT_ALLOCATOR_MARKER: &str = ".id-watermark";
 const ARTIFACT_ALLOCATOR_RECORD_BYTES: usize = 21;
-/// A tool result whose `output` exceeds this many bytes is spilled to the
-/// artifact store and replaced inline by a head + tail window and the
-/// recovery footer.
+/// A tool result whose output plus serialized auxiliary payload exceeds this
+/// many bytes is spilled to the artifact store.
 pub const DEFAULT_INLINE_OUTPUT_BUDGET_BYTES: usize = 50 * 1024;
 
 /// Smallest accepted inline budget. Below this the head/tail windows and the
@@ -78,8 +77,88 @@ pub fn artifact_footer(id: u64) -> String {
     format!("[raw output: {ARTIFACT_URI_SCHEME}{id}]")
 }
 
-/// Enforce the shared transcript budget with a truthful bounded fail-closed
-/// result when lossless artifact persistence is unavailable.
+#[derive(Default)]
+struct SerializedByteCounter {
+    bytes: usize,
+}
+
+impl Write for SerializedByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(buf.len())
+            .ok_or_else(|| std::io::Error::other("serialized tool result size overflow"))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_json_bytes<T: serde::Serialize + ?Sized>(value: &T) -> Option<usize> {
+    let mut counter = SerializedByteCounter::default();
+    serde_json::to_writer(&mut counter, value)
+        .ok()
+        .map(|()| counter.bytes)
+}
+
+fn meaningful_auxiliary_payload(result: &ToolResult) -> bool {
+    result.data.as_ref().is_some_and(|data| !data.is_null()) || !result.documents.is_empty()
+}
+
+fn inline_payload_bytes(result: &ToolResult) -> usize {
+    let data_bytes = result
+        .data
+        .as_ref()
+        .filter(|data| !data.is_null())
+        .map_or(0, |data| serialized_json_bytes(data).unwrap_or(usize::MAX));
+    let document_bytes = if result.documents.is_empty() {
+        0
+    } else {
+        serialized_json_bytes(&result.documents).unwrap_or(usize::MAX)
+    };
+    result
+        .output
+        .len()
+        .saturating_add(data_bytes)
+        .saturating_add(document_bytes)
+}
+
+fn clear_auxiliary_payload(result: &mut ToolResult) {
+    result.data = None;
+    result.documents.clear();
+}
+
+fn requested_source_artifacts(
+    source_dir: &Dir,
+    artifact_ids: &BTreeSet<u64>,
+) -> Result<BTreeMap<u64, OsString>> {
+    let source_artifacts = unique_artifacts_by_id(source_dir)?;
+    let mut missing: Vec<u64> = artifact_ids
+        .iter()
+        .filter(|id| !source_artifacts.contains_key(id))
+        .copied()
+        .take(21)
+        .collect();
+    if !missing.is_empty() {
+        let has_more = missing.len() > 20;
+        missing.truncate(20);
+        let listed = missing
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "source artifact IDs unavailable: {listed}{}",
+            if has_more { ", ..." } else { "" }
+        );
+    }
+    Ok(source_artifacts)
+}
+
+/// Enforce the shared tool-result payload budget with a truthful bounded
+/// fail-closed result when lossless artifact persistence is unavailable.
 pub fn enforce_inline_budget(
     result: &mut ToolResult,
     store: Option<&ArtifactStore>,
@@ -90,10 +169,11 @@ pub fn enforce_inline_budget(
         ArtifactStore::inline_budget,
     );
     // Host-provided/custom tools do not own spill provenance. Clear every
-    // caller claim first, then re-mint only a byte-exact canonical claim
-    // produced by the SDK's streaming spill path.
+    // caller claim first, then re-mint only a canonical claim produced by the
+    // SDK spill boundary.
     let claimed_artifact = result.artifact.take();
-    if result.output.len() <= budget {
+    let original_bytes = inline_payload_bytes(result);
+    if original_bytes <= budget {
         if let (Some(store), Some(artifact)) = (store, claimed_artifact)
             && let Ok(mut file) = store.resolve(artifact.id)
             && let Ok(metadata) = file.metadata()
@@ -110,8 +190,6 @@ pub fn enforce_inline_budget(
         }
         return None;
     }
-    let original_bytes = result.output.len();
-    result.data = None;
     if let Some(store) = store {
         return match store.apply_inline_budget(result, tool_name) {
             Ok(saved) => saved,
@@ -119,20 +197,24 @@ pub fn enforce_inline_budget(
                 log::warn!("artifact spill failed for tool {tool_name}: {error:#}");
                 result.success = false;
                 result.output = format!(
-                    "Tool output was {original_bytes} bytes, but lossless artifact persistence \
-                     failed. The output was not placed in the transcript; re-run the tool with \
-                     narrower output."
+                    "Tool result payload was {original_bytes} bytes, but lossless artifact \
+                     persistence failed. The payload was not placed in the transcript; re-run \
+                     the tool with narrower output."
                 );
+                result.artifact = None;
+                clear_auxiliary_payload(result);
                 None
             }
         };
     }
     result.success = false;
     result.output = format!(
-        "Tool output was {original_bytes} bytes, but no artifact store is configured. \
-         The output was not placed in the transcript; configure artifact storage or \
-         re-run the tool with narrower output."
+        "Tool result payload was {original_bytes} bytes, but no artifact store is configured. \
+         The payload was not placed in the transcript; configure artifact storage or re-run \
+         the tool with narrower output."
     );
+    result.artifact = None;
+    clear_auxiliary_payload(result);
     None
 }
 
@@ -144,6 +226,20 @@ pub struct SavedArtifact {
     /// Backing file (`<dir>/<id>.<tool>.log`).
     pub path: PathBuf,
 }
+
+/// Typed admission failure: the per-thread artifact byte quota cannot admit
+/// the payload. Downcast this from an error chain to distinguish a durable
+/// resource-limit rejection from transient I/O failures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArtifactQuotaExceeded;
+
+impl std::fmt::Display for ArtifactQuotaExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("artifact storage quota exceeded")
+    }
+}
+
+impl std::error::Error for ArtifactQuotaExceeded {}
 
 /// Per-thread facts that make artifacts ineligible for retention.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -345,12 +441,12 @@ impl ArtifactStore {
                 content_bytes = content_bytes
                     .checked_add(u64::try_from(read).context("artifact chunk exceeds u64")?)
                     .context("artifact content length exceeds u64")?;
-                anyhow::ensure!(
-                    existing_bytes
-                        .checked_add(content_bytes)
-                        .is_some_and(|total| total <= self.max_bytes_per_thread),
-                    "artifact storage quota exceeded"
-                );
+                if existing_bytes
+                    .checked_add(content_bytes)
+                    .is_none_or(|total| total > self.max_bytes_per_thread)
+                {
+                    return Err(ArtifactQuotaExceeded.into());
+                }
                 temp.write_all(&buffer[..read])
                     .context("writing staged artifact")?;
             }
@@ -391,6 +487,101 @@ impl ArtifactStore {
                 Err(error)
             }
         }
+    }
+
+    /// Persist several in-memory artifacts as one admission and publication batch.
+    ///
+    /// Every payload is staged and quota-checked before any final artifact name
+    /// becomes visible. A publication failure removes every staged and published
+    /// file from this batch; allocated IDs remain burned.
+    ///
+    /// # Errors
+    /// Returns an error when quota admission, staging, syncing, or publication fails.
+    pub fn save_batch(&self, items: &[(&str, &[u8])]) -> Result<Vec<SavedArtifact>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _operation_guard = self
+            .operation_gate
+            .lock()
+            .map_err(|_| anyhow!("artifact operation lock poisoned"))?;
+        let dir = self.cap_dir()?;
+        let _allocation_lock = lock_artifact_directory(&dir)?;
+        let existing_bytes = artifact_bytes(&dir)?;
+        let batch_bytes = items.iter().try_fold(0_u64, |total, (_, bytes)| {
+            total.checked_add(u64::try_from(bytes.len()).ok()?)
+        });
+        if batch_bytes
+            .and_then(|batch| existing_bytes.checked_add(batch))
+            .is_none_or(|total| total > self.max_bytes_per_thread)
+        {
+            return Err(ArtifactQuotaExceeded.into());
+        }
+
+        let mut staged = Vec::with_capacity(items.len());
+        let mut published = Vec::with_capacity(items.len());
+        let result = (|| -> Result<Vec<SavedArtifact>> {
+            for (tool_name, bytes) in items {
+                let sequence = self.acquisitions.fetch_add(1, Ordering::Relaxed);
+                let temp_name = format!(".partial-batch-{}-{sequence}.log", std::process::id());
+                let mut options = OpenOptions::new();
+                options
+                    .write(true)
+                    .create_new(true)
+                    .follow(FollowSymlinks::No);
+                #[cfg(unix)]
+                options.mode(0o600);
+                let mut file = dir
+                    .open_with(&temp_name, &options)
+                    .context("creating staged batch artifact")?;
+                file.write_all(bytes)
+                    .context("writing staged batch artifact")?;
+                file.sync_all().context("syncing staged batch artifact")?;
+                drop(file);
+                staged.push((temp_name, sanitize_tool_name(tool_name)));
+            }
+            let mut saved = Vec::with_capacity(staged.len());
+            for (temp_name, tool_name) in &staged {
+                let mut id = reserve_artifact_id(&dir)?;
+                if id == 0 {
+                    id = reserve_artifact_id(&dir)?;
+                }
+                let name = loop {
+                    let name = format!("{id}.{tool_name}.log");
+                    match dir.hard_link(temp_name, &dir, &name) {
+                        Ok(()) => break name,
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                            id = reserve_artifact_id(&dir)?;
+                        }
+                        Err(error) => {
+                            return Err(error).context("publishing staged batch artifact");
+                        }
+                    }
+                };
+                published.push(name.clone());
+                saved.push(SavedArtifact {
+                    id,
+                    path: self.dir.join(name),
+                });
+            }
+            for (temp_name, _) in &staged {
+                dir.remove_file(temp_name)
+                    .context("removing staged batch artifact")?;
+            }
+            sync_directory(&dir)
+                .with_context(|| format!("syncing artifacts dir {}", self.dir.display()))?;
+            Ok(saved)
+        })();
+        if result.is_err() {
+            for (temp_name, _) in &staged {
+                let _ = dir.remove_file(temp_name);
+            }
+            for name in &published {
+                let _ = dir.remove_file(name);
+            }
+            let _ = sync_directory(&dir);
+        }
+        result
     }
 
     /// Open an artifact ID through a stable directory capability.
@@ -443,6 +634,39 @@ impl ArtifactStore {
                 listed.join(", ")
             ))
         }
+    }
+
+    /// Delete the backing file(s) of a previously published artifact ID.
+    ///
+    /// Best-effort reclamation for artifacts whose owning operation failed or
+    /// was cancelled before any durable reference to them existed (e.g. a
+    /// Snapcompact batch abandoned by a rejected compaction). The ID stays
+    /// burned — the allocator watermark is never rewound. Removing an ID with
+    /// no backing file is a no-op.
+    ///
+    /// # Errors
+    /// Returns an error when the directory cannot be inspected or a backing
+    /// file cannot be removed.
+    pub fn remove_saved(&self, id: u64) -> Result<()> {
+        let _operation_guard = self
+            .operation_gate
+            .lock()
+            .map_err(|_| anyhow!("artifact operation lock poisoned"))?;
+        let dir = self.cap_dir()?;
+        let _allocation_lock = lock_artifact_directory(&dir)?;
+        let mut removed = false;
+        for (found_id, name) in list_artifacts(&dir)? {
+            if found_id == id {
+                dir.remove_file(&name)
+                    .with_context(|| format!("removing artifact {id}"))?;
+                removed = true;
+            }
+        }
+        if removed {
+            sync_directory(&dir)
+                .with_context(|| format!("syncing artifacts dir {}", self.dir.display()))?;
+        }
+        Ok(())
     }
     /// Recover a legacy footer claim only when it byte-for-byte matches this
     /// store's canonical bounded rendering of the claimed durable artifact.
@@ -504,16 +728,17 @@ impl ArtifactStore {
         Ok(None)
     }
 
-    /// Enforce the shared inline budget on a tool result.
+    /// Enforce the shared inline budget over output plus serialized structured
+    /// data and documents.
     ///
-    /// Over-budget output is spilled byte-identical to the store and the
-    /// inline text is replaced by a bounded head + tail window, an elision
-    /// marker, and the [`artifact_footer`] recovery URI.
+    /// Output-only results retain the historical byte-exact raw artifact. When
+    /// auxiliary payload is present, the artifact is one serialized
+    /// [`ToolResult`] recovery envelope; the inline result keeps bounded output
+    /// plus its recovery URI and clears the auxiliary fields.
     ///
     /// # Errors
-    /// Returns an error when the spill write fails; `result` is left
-    /// untouched so callers can propagate the failure without destroying
-    /// output bytes.
+    /// Returns an error when serialization or spill writing fails; auxiliary
+    /// payload and output remain available to the caller for error handling.
     pub fn apply_inline_budget(
         &self,
         result: &mut ToolResult,
@@ -522,11 +747,19 @@ impl ArtifactStore {
         // Never trust caller-supplied provenance. Only this spill boundary may
         // attach an artifact ID, and only after a successful durable write.
         result.artifact = None;
-        if result.output.len() <= self.inline_budget {
+        let payload_bytes = inline_payload_bytes(result);
+        if payload_bytes <= self.inline_budget {
             return Ok(None);
         }
-        let saved = self.save(tool_name, &result.output)?;
-        result.data = None;
+        let has_auxiliary_payload = meaningful_auxiliary_payload(result);
+        let saved = if has_auxiliary_payload {
+            let envelope = serde_json::to_string(result)
+                .context("serializing tool result recovery envelope")?;
+            self.save(tool_name, &envelope)?
+        } else {
+            self.save(tool_name, &result.output)?
+        };
+        clear_auxiliary_payload(result);
         result.output = cap_inline_output(&result.output, self.inline_budget, saved.id);
         result.artifact = Some(ToolResultArtifact { id: saved.id });
         Ok(Some(saved))
@@ -557,7 +790,7 @@ pub struct ArtifactSweepFence {
 struct FencedArtifactThread {
     key: String,
     dir: Arc<Dir>,
-    _store: Arc<ArtifactStore>,
+    store: Arc<ArtifactStore>,
     activity_lock: Option<std::fs::File>,
     allocation_lock: Option<std::fs::File>,
 }
@@ -593,6 +826,38 @@ impl ArtifactSweepFence {
             sync_directory(&thread.dir).context("syncing artifact directory after sweep")?;
         }
         Ok(report)
+    }
+
+    /// Read-only legacy-footer verification against a fenced thread
+    /// directory.
+    ///
+    /// The retention snapshot MUST use this instead of
+    /// [`ArtifactStorage::for_thread`] while the fence is alive:
+    /// `for_thread` blocks on the shared activity lock the fence holds
+    /// exclusively (a same-process self-deadlock) and would also mark the
+    /// store live, defeating the sweep's inactivity detection.
+    ///
+    /// Returns `Ok(None)` for a thread the fence did not capture; such
+    /// directories were created after the fence and are protected wholesale
+    /// by [`ArtifactRetentionSnapshot::protect_unknown_threads`].
+    ///
+    /// # Errors
+    /// Returns an error when the fenced store cannot inspect its artifacts.
+    pub fn verified_legacy_inline_artifact_id(
+        &self,
+        thread_id: &ThreadId,
+        inline: &str,
+    ) -> Result<Option<u64>> {
+        let hashed_key = artifact_thread_key(thread_id);
+        let legacy_key = legacy_artifact_thread_key(thread_id);
+        let Some(thread) = self
+            .threads
+            .iter()
+            .find(|thread| thread.key == hashed_key || thread.key == legacy_key)
+        else {
+            return Ok(None);
+        };
+        thread.store.verified_legacy_inline_artifact_id(inline)
     }
 }
 
@@ -704,7 +969,23 @@ impl ArtifactStorage {
             source_thread_id != destination_thread_id,
             "cannot copy an artifact namespace onto itself"
         );
+        if artifact_ids.is_empty() {
+            return Ok(());
+        }
         let source = self.for_thread(source_thread_id)?;
+        {
+            let _source_operation = source
+                .operation_gate
+                .lock()
+                .map_err(|_| anyhow!("source artifact operation lock poisoned"))?;
+            let source_dir = source.cap_dir()?;
+            let _source_allocation = lock_artifact_directory(&source_dir)?;
+            requested_source_artifacts(&source_dir, artifact_ids)?;
+        }
+
+        // Construct the destination only after the source-only preflight
+        // succeeds. The second validation below closes the race between this
+        // phase and acquiring the ordered source/destination lock pair.
         let destination = self.for_thread(destination_thread_id)?;
         let source_first = source.dir <= destination.dir;
         let (_first_operation, _second_operation) = if source_first {
@@ -745,12 +1026,15 @@ impl ArtifactStorage {
         };
 
         let source_next = ensure_allocator_next(&source_dir)?;
+        let source_artifacts = requested_source_artifacts(&source_dir, artifact_ids)?;
+
+        // Only mutate the destination after every requested source ID has
+        // been proven present under the source namespace lock.
         let destination_next = ensure_allocator_next(&destination_dir)?;
         if destination_next < source_next {
             // Seed the destination fence before publishing any copied ID.
             persist_allocator_next(&destination_dir, source_next)?;
         }
-        let source_artifacts = unique_artifacts_by_id(&source_dir)?;
         let destination_artifacts = unique_artifacts_by_id(&destination_dir)?;
         let mut admitted_bytes = artifact_bytes(&destination_dir)?;
         for (id, source_name) in source_artifacts {
@@ -868,7 +1152,7 @@ impl ArtifactStorage {
             threads.push(FencedArtifactThread {
                 key,
                 dir,
-                _store: store,
+                store,
                 activity_lock,
                 allocation_lock,
             });
@@ -1520,8 +1804,8 @@ fn artifact_files_equal(
     let mut right = right_dir
         .open_with(right_name, &options)
         .context("opening destination artifact for comparison")?;
-    let mut left_buffer = [0_u8; 64 * 1024];
-    let mut right_buffer = [0_u8; 64 * 1024];
+    let mut left_buffer = [0_u8; 8 * 1024];
+    let mut right_buffer = [0_u8; 8 * 1024];
     loop {
         let left_read = left
             .read(&mut left_buffer)
@@ -1529,7 +1813,10 @@ fn artifact_files_equal(
         let right_read = right
             .read(&mut right_buffer)
             .context("reading destination artifact for comparison")?;
-        if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
+        if left_read != right_read {
+            return Ok(false);
+        }
+        if left_buffer[..left_read] != right_buffer[..left_read] {
             return Ok(false);
         }
         if left_read == 0 {
@@ -1736,6 +2023,86 @@ mod tests {
     }
 
     #[test]
+    fn null_and_empty_auxiliary_payload_do_not_force_a_spill() -> Result<()> {
+        let (_dir, store) = temp_store();
+        let original = "x".repeat(store.inline_budget());
+        let mut result = ToolResult::success(original.clone());
+        result.data = Some(serde_json::Value::Null);
+
+        assert!(
+            store
+                .apply_inline_budget(&mut result, "empty-aux")?
+                .is_none()
+        );
+        assert_eq!(result.output, original);
+        assert_eq!(result.data, Some(serde_json::Value::Null));
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_auxiliary_payload_spills_one_full_recovery_envelope() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ArtifactStore::new(dir.path().join("artifacts")).with_inline_budget(1024);
+        let mut result = ToolResult::success_with_data(
+            "visible output",
+            serde_json::json!({
+                "structured": "s".repeat(8 * 1024)
+            }),
+        )
+        .with_documents(vec![agent_sdk_foundation::llm::ContentSource::new(
+            "image/png",
+            "A".repeat(8 * 1024),
+        )]);
+        let original = result.clone();
+
+        let saved = store
+            .apply_inline_budget(&mut result, "mcp")?
+            .expect("auxiliary payload must count toward the shared budget");
+        let recovered: ToolResult = serde_json::from_slice(&std::fs::read(&saved.path)?)?;
+        assert_eq!(recovered.output, original.output);
+        assert_eq!(recovered.data, original.data);
+        assert_eq!(recovered.documents.len(), 1);
+        assert_eq!(recovered.documents[0].data, original.documents[0].data);
+        assert!(
+            recovered.artifact.is_none(),
+            "the recovery envelope predates the SDK-minted reference"
+        );
+
+        assert!(result.data.is_none());
+        assert!(result.documents.is_empty());
+        assert_eq!(result.artifact, Some(ToolResultArtifact { id: saved.id }));
+        assert!(result.output.ends_with(&artifact_footer(saved.id)));
+        assert!(
+            serde_json::to_vec(&result)?.len() <= store.inline_budget() + 256,
+            "sanitized durable ToolResult must remain bounded"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_auxiliary_payload_without_store_fails_closed_and_bounded() -> Result<()> {
+        let mut result = ToolResult::success_with_data(
+            "visible",
+            serde_json::json!({
+                "structured": "s".repeat(128 * 1024)
+            }),
+        )
+        .with_documents(vec![agent_sdk_foundation::llm::ContentSource::new(
+            "application/octet-stream",
+            "A".repeat(128 * 1024),
+        )]);
+
+        assert!(enforce_inline_budget(&mut result, None, "untrusted").is_none());
+        assert!(!result.success);
+        assert!(result.data.is_none());
+        assert!(result.documents.is_empty());
+        assert!(result.artifact.is_none());
+        assert!(result.output.len() < 512);
+        assert!(serde_json::to_vec(&result)?.len() < 1024);
+        Ok(())
+    }
+
+    #[test]
     fn inline_boundary_strips_short_third_party_artifact_claim() -> Result<()> {
         let (_dir, store) = temp_store();
         let saved = store.save("bash", "unrelated durable bytes")?;
@@ -1911,6 +2278,105 @@ mod tests {
         let second = store.save("grep", "two")?;
         assert_eq!(first.id, 0);
         assert_eq!(second.id, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn save_batch_returns_ordered_positive_unique_ids_and_exact_bytes() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ArtifactStore::new(dir.path().join("artifacts"));
+        let items: [(&str, &[u8]); 2] = [
+            ("first", b"\0first batch bytes"),
+            ("second", b"second batch bytes\xff"),
+        ];
+
+        let saved = store.save_batch(&items)?;
+        let ids: Vec<_> = saved.iter().map(|artifact| artifact.id).collect();
+        assert_eq!(saved.len(), items.len());
+        assert!(ids.iter().all(|id| *id > 0), "batch IDs must be positive");
+        assert!(
+            ids.windows(2).all(|pair| pair[0] < pair[1]),
+            "batch IDs must preserve allocation order"
+        );
+        assert_eq!(
+            ids.iter().copied().collect::<BTreeSet<_>>().len(),
+            items.len(),
+            "every batch item must receive a unique ID"
+        );
+
+        for (artifact, (_, expected)) in saved.iter().zip(items) {
+            let mut resolved = store.resolve(artifact.id)?;
+            let mut actual = Vec::new();
+            resolved.read_to_end(&mut actual)?;
+            assert_eq!(actual, expected, "resolved bytes must preserve input order");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn save_batch_quota_overflow_publishes_no_artifacts() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ArtifactStore::new(dir.path().join("artifacts"))
+            .with_inline_budget(1024)
+            .with_max_bytes_per_thread(1024);
+        let first = vec![b'a'; 600];
+        let second = vec![b'b'; 600];
+        let items: [(&str, &[u8]); 2] =
+            [("first", first.as_slice()), ("second", second.as_slice())];
+
+        let Err(error) = store.save_batch(&items) else {
+            anyhow::bail!("over-quota batch unexpectedly succeeded");
+        };
+        assert!(error.to_string().contains("quota exceeded"));
+        for requested_id in [1, 2] {
+            assert!(
+                store.resolve(requested_id).is_err(),
+                "rejected batch output {requested_id} must not resolve"
+            );
+        }
+
+        let mut regular_finals = Vec::new();
+        for entry in std::fs::read_dir(store.dir())? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() && !entry.file_name().to_string_lossy().starts_with('.')
+            {
+                regular_finals.push(entry.file_name());
+            }
+        }
+        assert!(
+            regular_finals.is_empty(),
+            "quota rejection must publish no regular artifact files: {regular_finals:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn save_batch_preserves_legacy_zero_and_starts_with_positive_ids() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ArtifactStore::new(dir.path().join("artifacts"));
+        let legacy = store.save("legacy", "legacy zero bytes")?;
+        assert_eq!(legacy.id, 0);
+        let items: [(&str, &[u8]); 2] = [
+            ("first", b"first batch bytes"),
+            ("second", b"second batch bytes"),
+        ];
+
+        let saved = store.save_batch(&items)?;
+        assert!(
+            saved.iter().all(|artifact| artifact.id > 0),
+            "batch must not reuse legacy ID zero"
+        );
+
+        let mut legacy_resolved = store.resolve(legacy.id)?;
+        let mut legacy_bytes = Vec::new();
+        legacy_resolved.read_to_end(&mut legacy_bytes)?;
+        assert_eq!(legacy_bytes, b"legacy zero bytes");
+        for (artifact, (_, expected)) in saved.iter().zip(items) {
+            let mut resolved = store.resolve(artifact.id)?;
+            let mut actual = Vec::new();
+            resolved.read_to_end(&mut actual)?;
+            assert_eq!(actual, expected);
+        }
         Ok(())
     }
 
@@ -2517,12 +2983,57 @@ mod tests {
         );
         storage.copy_thread_artifacts(&source, &destination, &BTreeSet::from([saved.id]))?;
         let destination_store = storage.for_thread(&destination)?;
-        let mut forked = destination_store.resolve(saved.id)?;
-        let mut forked_exact = Vec::new();
-        forked.read_to_end(&mut forked_exact)?;
+        let mut copied = destination_store.resolve(saved.id)?;
+        let mut copied_exact = Vec::new();
+        copied.read_to_end(&mut copied_exact)?;
         assert_eq!(
-            forked_exact, bytes,
+            copied_exact, bytes,
             "verified legacy reference survives fork"
+        );
+        Ok(())
+    }
+    #[test]
+    fn fence_verifies_legacy_footers_without_reacquiring_the_store() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = ArtifactStorage::new(dir.path().join("artifacts")).with_inline_budget(1_024);
+        let thread = ThreadId::from_string("fence-legacy-verify");
+        let inline = {
+            let store = storage.for_thread(&thread)?;
+            let bytes = vec![b'f'; 4_096];
+            let saved = store.save_streamed("bash", &mut std::io::Cursor::new(&bytes))?;
+            let head = String::from_utf8_lossy(&bytes[..1_024]);
+            let tail = String::from_utf8_lossy(&bytes[bytes.len() - 1_024..]);
+            cap_inline_from_windows(
+                &head,
+                &tail,
+                bytes.len() as u64,
+                store.inline_budget(),
+                saved.id,
+            )
+        };
+
+        // The store handle above is dropped, so the fence holds the thread's
+        // activity lock exclusively. `ArtifactStorage::for_thread` here would
+        // block forever on the shared activity lock (the self-deadlock this
+        // API exists to prevent); verification must run through the fence.
+        let fence = storage.begin_sweep()?;
+        let verified = fence.verified_legacy_inline_artifact_id(&thread, &inline)?;
+        assert!(
+            verified.is_some(),
+            "fenced verification must resolve the canonical footer"
+        );
+        let forged = inline.replacen('f', "g", 1);
+        assert_eq!(
+            fence.verified_legacy_inline_artifact_id(&thread, &forged)?,
+            None
+        );
+        assert_eq!(
+            fence.verified_legacy_inline_artifact_id(
+                &ThreadId::from_string("never-fenced"),
+                &inline
+            )?,
+            None,
+            "a thread the fence did not capture is protected wholesale, not verified"
         );
         Ok(())
     }
@@ -2556,6 +3067,46 @@ mod tests {
     }
 
     #[test]
+    fn fork_copy_missing_requested_id_fails_before_destination_mutation() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = ArtifactStorage::new(dir.path().join("artifacts"));
+        let source = ThreadId::from_string("fork-source-missing");
+        let destination = ThreadId::from_string("fork-destination-missing");
+        let destination_path = storage.root().join(artifact_thread_key(&destination));
+        assert!(!destination_path.exists());
+        let existing = storage.for_thread(&source)?.save("bash", "source bytes")?;
+        let missing = existing.id + 100;
+
+        let error = storage
+            .copy_thread_artifacts(
+                &source,
+                &destination,
+                &BTreeSet::from([existing.id, missing]),
+            )
+            .expect_err("a missing requested source artifact must fail closed");
+        assert!(
+            error.to_string().contains(&missing.to_string()),
+            "bounded diagnostic should identify the missing ID: {error:#}"
+        );
+        assert!(
+            !destination_path.exists(),
+            "missing-ID preflight must not create the destination namespace"
+        );
+
+        let destination_store = storage.for_thread(&destination)?;
+        assert!(
+            destination_store.resolve(existing.id).is_err(),
+            "an all-or-nothing validation failure must publish no artifacts"
+        );
+        let fresh = destination_store.save("bash", "destination bytes")?;
+        assert_eq!(
+            fresh.id, 0,
+            "failed copy must not seed the destination allocator watermark"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn spill_failure_leaves_output_untouched() {
         // Root the store at a path that cannot be a directory.
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2570,5 +3121,20 @@ mod tests {
             result.output, original,
             "failed spill must not destroy bytes"
         );
+    }
+
+    #[test]
+    fn remove_saved_deletes_backing_file_and_keeps_the_id_burned() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ArtifactStore::new(dir.path());
+        let first = store.save("tool", "orphaned content")?;
+
+        store.remove_saved(first.id)?;
+
+        assert!(store.resolve(first.id).is_err());
+        store.remove_saved(first.id)?;
+        let second = store.save("tool", "next content")?;
+        assert!(second.id > first.id, "a removed ID must never be reissued");
+        Ok(())
     }
 }

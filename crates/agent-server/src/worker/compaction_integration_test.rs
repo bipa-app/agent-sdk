@@ -22,9 +22,11 @@
 //! deterministic mock providers — no live network — so they run in
 //! the default `nextest` set.
 
+use std::io::Read;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration as StdDuration;
 
 use agent_sdk::context::{CompactionConfig, CompactionEngine};
 use agent_sdk_foundation::ThreadId;
@@ -33,10 +35,13 @@ use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Message, StopReason, Usage,
 };
 use agent_sdk_providers::LlmProvider;
+use agent_sdk_tools::stores::MessageStore;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use time::Duration;
 use time::OffsetDateTime;
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 use crate::journal::checkpoint_store::InMemoryCheckpointStore;
 use crate::journal::event_notifier::EventNotifier;
@@ -46,7 +51,9 @@ use crate::journal::message_store::{InMemoryMessageProjectionStore, MessageProje
 use crate::journal::store::{AgentTaskStore, InMemoryAgentTaskStore};
 use crate::journal::task::{AgentTask, LeaseId, WorkerId};
 use crate::journal::thread_store::InMemoryThreadStore;
-use crate::journal::turn_attempt_store::InMemoryTurnAttemptStore;
+use crate::journal::turn_attempt::TurnAttemptOutcome;
+use crate::journal::turn_attempt_store::{InMemoryTurnAttemptStore, TurnAttemptStore};
+use crate::worker::activity::ActivityBeacon;
 use crate::worker::bootstrap::WorkerBootstrapContext;
 use crate::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
 use crate::worker::root_turn::{RootTurnDeps, RootTurnOutcome, execute_root_turn};
@@ -66,6 +73,7 @@ use crate::worker::root_turn::{RootTurnDeps, RootTurnOutcome, execute_root_turn}
 struct ScriptedProvider {
     responses: Mutex<Vec<ChatOutcome>>,
     call_count: AtomicUsize,
+    supports_historical_images: bool,
     requests: Mutex<Vec<ChatRequest>>,
 }
 
@@ -74,7 +82,15 @@ impl ScriptedProvider {
         Self {
             responses: Mutex::new(responses),
             call_count: AtomicUsize::new(0),
+            supports_historical_images: false,
             requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn image_capable(responses: Vec<ChatOutcome>) -> Self {
+        Self {
+            supports_historical_images: true,
+            ..Self::new(responses)
         }
     }
 
@@ -100,6 +116,13 @@ impl ScriptedProvider {
                     .unwrap_or_default()
             })
             .collect())
+    }
+
+    fn captured_requests(&self) -> Result<Vec<ChatRequest>> {
+        self.requests
+            .lock()
+            .map(|requests| requests.clone())
+            .map_err(|_| anyhow::anyhow!("ScriptedProvider request mutex poisoned"))
     }
 }
 
@@ -128,6 +151,80 @@ impl LlmProvider for ScriptedProvider {
     fn provider(&self) -> &'static str {
         "mock"
     }
+
+    fn supports_historical_image_blocks(&self) -> bool {
+        self.supports_historical_images
+    }
+}
+
+struct BlockingProvider {
+    call_count: AtomicUsize,
+    started: Notify,
+}
+
+impl BlockingProvider {
+    fn new() -> Self {
+        Self {
+            call_count: AtomicUsize::new(0),
+            started: Notify::new(),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.call_count.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl LlmProvider for BlockingProvider {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        self.call_count.fetch_add(1, Ordering::SeqCst);
+        self.started.notify_one();
+        std::future::pending::<Result<ChatOutcome>>().await
+    }
+
+    fn model(&self) -> &'static str {
+        "blocking-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "blocking"
+    }
+}
+
+struct CancelOnResponseProvider {
+    cancel: CancellationToken,
+    call_count: AtomicUsize,
+}
+
+impl CancelOnResponseProvider {
+    fn new(cancel: CancellationToken) -> Self {
+        Self {
+            cancel,
+            call_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.call_count.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl LlmProvider for CancelOnResponseProvider {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        self.call_count.fetch_add(1, Ordering::SeqCst);
+        self.cancel.cancel();
+        Ok(ok_response("[summary completed before cancellation fence]"))
+    }
+
+    fn model(&self) -> &'static str {
+        "cancel-on-response-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "cancel-on-response"
+    }
 }
 
 fn ok_response(text: &str) -> ChatOutcome {
@@ -142,6 +239,24 @@ fn ok_response(text: &str) -> ChatOutcome {
             served_speed: None,
             input_tokens: 100,
             output_tokens: 50,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        },
+    })
+}
+
+fn zero_usage_response(text: &str) -> ChatOutcome {
+    ChatOutcome::Success(ChatResponse {
+        id: "msg_mock_zero_usage".into(),
+        content: vec![ContentBlock::Text {
+            text: text.to_owned(),
+        }],
+        model: "mock-model".into(),
+        stop_reason: Some(StopReason::EndTurn),
+        usage: Usage {
+            served_speed: None,
+            input_tokens: 0,
+            output_tokens: 0,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
         },
@@ -286,6 +401,300 @@ async fn seed_projection_history(
     Ok(())
 }
 
+fn read_artifact_bytes(store: &agent_sdk::ArtifactStore, artifact_id: u64) -> Result<Vec<u8>> {
+    let mut file = store
+        .resolve(artifact_id)
+        .with_context(|| format!("resolve artifact {artifact_id}"))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("read artifact {artifact_id}"))?;
+    Ok(bytes)
+}
+
+/// Audit shape for the local Snapcompact turn: a zero-usage
+/// `context_compaction` attempt followed by the billed main call.
+async fn assert_snapcompact_audit_attempts(
+    fixtures: &Fixtures,
+    task_id: &crate::journal::task::AgentTaskId,
+) -> Result<()> {
+    let attempts = fixtures.attempts.list_by_task(task_id).await?;
+    assert_eq!(
+        attempts.len(),
+        2,
+        "local compaction and the main call must keep distinct audit attempts",
+    );
+    assert_eq!(attempts[0].outcome, Some(TurnAttemptOutcome::Success));
+    assert_eq!(attempts[0].input_tokens, Some(0));
+    assert_eq!(attempts[0].output_tokens, Some(0));
+    assert_eq!(attempts[0].cached_input_tokens, Some(0));
+    assert_eq!(attempts[0].cache_creation_input_tokens, Some(0));
+    assert_eq!(
+        attempts[0]
+            .response_blob
+            .as_ref()
+            .and_then(|blob| blob.get("operation"))
+            .and_then(serde_json::Value::as_str),
+        Some("context_compaction"),
+    );
+    assert_eq!(attempts[1].input_tokens, Some(100));
+    assert_eq!(attempts[1].output_tokens, Some(50));
+    Ok(())
+}
+
+/// The raw committed projection must preserve every seeded message
+/// byte-for-byte and record exactly one compaction entry covering them.
+async fn assert_snapcompact_promoted_projection(
+    fixtures: &Fixtures,
+    seeded_history: &[Message],
+) -> Result<()> {
+    let seeded_len = seeded_history.len();
+    let projection = fixtures
+        .messages
+        .get(&thread_id())
+        .await?
+        .context("projection after Snapcompact root turn")?;
+    assert_eq!(
+        projection.messages.len(),
+        seeded_len + 2,
+        "raw committed history must preserve every old message and append the fresh turn",
+    );
+    assert_eq!(
+        &projection.messages[..seeded_len],
+        seeded_history,
+        "compaction must promote the seeded draft without rewriting any raw message",
+    );
+    assert!(matches!(
+        &projection.messages[0].content,
+        Content::Text(text) if text.contains("user-0: old-transcript-body")
+    ));
+    assert!(matches!(
+        &projection.messages[seeded_len - 1].content,
+        Content::Text(text) if text.contains("assistant-5: old-transcript-body")
+    ));
+    assert!(projection.draft_messages.is_empty());
+    assert_eq!(projection.compactions.len(), 1);
+    let entry = &projection.compactions[0];
+    assert_eq!(entry.compacted_start, 0);
+    assert_eq!(entry.compacted_end, seeded_len);
+    assert_eq!(entry.source_message_count, seeded_len);
+    assert!(entry.generated_summary);
+    Ok(())
+}
+
+/// The effective checkpoint must persist exact artifact URIs (source +
+/// PNG frames), and the captured main provider request must carry those
+/// frames hydrated back to inline base64. Returns the effective history
+/// for follow-up staging checks.
+async fn assert_snapcompact_checkpoint_and_hydration(
+    fixtures: &Fixtures,
+    artifact_store: &agent_sdk::ArtifactStore,
+    scripted: &ScriptedProvider,
+) -> Result<Vec<Message>> {
+    use agent_sdk_foundation::llm::canonical_snapcompact_checkpoint;
+    use base64::Engine as _;
+
+    let effective = fixtures.messages.get_history(&thread_id()).await?;
+    let checkpoint = effective
+        .first()
+        .context("effective projection must start with a Snapcompact checkpoint")?;
+    let metadata = canonical_snapcompact_checkpoint(checkpoint)
+        .context("effective projection did not start with a canonical Snapcompact checkpoint")?;
+    assert!(
+        metadata.frame_count > 0,
+        "large repeated history must render at least one frame",
+    );
+    let Content::Blocks(stored_blocks) = &checkpoint.content else {
+        anyhow::bail!("canonical Snapcompact checkpoint must use blocks");
+    };
+    let ContentBlock::CompactionSummary { artifact_ids, .. } = &stored_blocks[0] else {
+        anyhow::bail!("canonical Snapcompact checkpoint must start with its summary");
+    };
+    assert_eq!(
+        artifact_ids.len(),
+        metadata.frame_count as usize + 1,
+        "checkpoint must retain exactly its source and frame artifacts",
+    );
+    assert!(artifact_ids.contains(&metadata.source_artifact_id));
+
+    let source_bytes = read_artifact_bytes(artifact_store, metadata.source_artifact_id)?;
+    let source_text = String::from_utf8(source_bytes)?;
+    assert!(source_text.contains("user-0: old-transcript-body"));
+    assert!(source_text.contains("assistant-5: old-transcript-body"));
+
+    let mut stored_frame_ids = Vec::new();
+    for block in stored_blocks {
+        let ContentBlock::Image { source } = block else {
+            continue;
+        };
+        let artifact_id = source
+            .data
+            .strip_prefix("artifact://")
+            .context("stored Snapcompact frame must be an exact artifact URI")?
+            .parse::<u64>()?;
+        assert_eq!(source.data, format!("artifact://{artifact_id}"));
+        assert!(!source.data.contains("base64"));
+        assert!(artifact_ids.contains(&artifact_id));
+        let frame = read_artifact_bytes(artifact_store, artifact_id)?;
+        assert!(frame.starts_with(b"\x89PNG\r\n\x1a\n"));
+        stored_frame_ids.push(artifact_id);
+    }
+    assert_eq!(stored_frame_ids.len(), metadata.frame_count as usize);
+
+    let requests = scripted.captured_requests()?;
+    assert_eq!(requests.len(), 1);
+    let provider_checkpoint = requests[0]
+        .messages
+        .iter()
+        .find(|message| {
+            matches!(
+                &message.content,
+                Content::Blocks(blocks)
+                    if blocks.iter().any(|block| matches!(
+                        block,
+                        ContentBlock::CompactionSummary {
+                            snapcompact: Some(_),
+                            ..
+                        }
+                    ))
+            )
+        })
+        .context("main provider request must contain the Snapcompact checkpoint")?;
+    let Content::Blocks(provider_blocks) = &provider_checkpoint.content else {
+        anyhow::bail!("provider checkpoint must use blocks");
+    };
+    let provider_frames: Vec<_> = provider_blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Image { source } => Some(source),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(provider_frames.len(), stored_frame_ids.len());
+    for (source, artifact_id) in provider_frames.iter().zip(&stored_frame_ids) {
+        assert!(!source.data.starts_with("artifact://"));
+        let decoded = base64::engine::general_purpose::STANDARD.decode(source.data.as_bytes())?;
+        assert!(decoded.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert_eq!(decoded, read_artifact_bytes(artifact_store, *artifact_id)?);
+    }
+    Ok(effective)
+}
+
+/// Freshly measured main-call usage must prevent an immediate
+/// Snapcompact re-trigger against the just-compacted history.
+async fn assert_no_immediate_snapcompact_retrigger(
+    deps: &RootTurnDeps<'_>,
+    fixtures: &Fixtures,
+    scripted: &ScriptedProvider,
+    effective: Vec<Message>,
+) -> Result<()> {
+    let staged = crate::journal::staged::StagedMessageStore::new(thread_id(), effective);
+    let immediate = super::compaction::maybe_compact_staged_history(
+        deps,
+        &staged,
+        &thread_id(),
+        t0() + Duration::seconds(2),
+    )
+    .await?;
+    assert!(
+        !immediate.completed && !immediate.applied,
+        "fresh measured main usage must prevent an immediate Snapcompact loop",
+    );
+    assert_eq!(immediate.llm_usage.input_tokens, 0);
+    assert_eq!(immediate.llm_usage.output_tokens, 0);
+    assert_eq!(scripted.calls(), 1);
+    assert_eq!(
+        fixtures
+            .messages
+            .get(&thread_id())
+            .await?
+            .context("projection after immediate trigger check")?
+            .compactions
+            .len(),
+        1,
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapcompact_auto_compaction_persists_uris_and_hydrates_main_request() -> Result<()> {
+    const SEEDED_TURNS: usize = 6;
+    const THRESHOLD_TOKENS: usize = 20_000;
+
+    let fixtures = Fixtures::new();
+    let old_body = "old-transcript-body ".repeat(4_000);
+    seed_projection_history(&fixtures.messages, &thread_id(), SEEDED_TURNS, &old_body).await?;
+    let seeded_history = fixtures
+        .messages
+        .get(&thread_id())
+        .await?
+        .context("seeded projection")?
+        .draft_messages;
+
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::Snapcompact)
+        .with_threshold_tokens(THRESHOLD_TOKENS)
+        .with_retain_recent(0)
+        .with_min_messages(1);
+    let scripted = Arc::new(ScriptedProvider::image_capable(vec![ok_response(
+        "main response after local compaction",
+    )]));
+    let provider: Arc<dyn LlmProvider> = scripted.clone();
+    let artifact_dir = tempfile::tempdir()?;
+    let artifact_store = Arc::new(agent_sdk::ArtifactStore::new(
+        artifact_dir.path().join("t-compaction-integration"),
+    ));
+    let mut deps = fixtures.deps_with_compaction(&cfg, &provider);
+    deps.compaction_artifact_store = Some(&artifact_store);
+
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    let task_id = task.id.clone();
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &fixtures.threads,
+        &fixtures.checkpoints,
+        &fixtures.messages,
+        t0(),
+    )
+    .await?;
+    let fresh_prompt = format!("current-request-marker {}", "n".repeat(100_000));
+
+    let outcome = execute_root_turn(
+        inputs,
+        &fresh_prompt,
+        provider.as_ref(),
+        &deps,
+        t0() + Duration::seconds(1),
+    )
+    .await?;
+    let RootTurnOutcome::Completed {
+        response_text,
+        commit,
+        ..
+    } = outcome
+    else {
+        anyhow::bail!("Snapcompact root turn did not complete");
+    };
+    assert_eq!(response_text, "main response after local compaction");
+    assert_eq!(
+        scripted.calls(),
+        1,
+        "local Snapcompact must not spend a summarizer provider call",
+    );
+
+    assert_snapcompact_audit_attempts(&fixtures, &task_id).await?;
+    assert_eq!(commit.thread.total_usage.input_tokens, 100);
+    assert_eq!(commit.thread.total_usage.output_tokens, 50);
+
+    assert_snapcompact_promoted_projection(&fixtures, &seeded_history).await?;
+
+    let effective =
+        assert_snapcompact_checkpoint_and_hydration(&fixtures, &artifact_store, &scripted).await?;
+
+    assert_no_immediate_snapcompact_retrigger(&deps, &fixtures, &scripted, effective).await?;
+
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────
@@ -329,6 +738,7 @@ async fn pre_call_threshold_triggers_compaction() -> Result<()> {
     let deps = fixtures.deps_with_compaction(&cfg, &provider);
 
     let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    let task_id = task.id.clone();
     let inputs = build_root_worker_inputs(
         sample_bootstrap(task),
         &fixtures.threads,
@@ -367,7 +777,42 @@ async fn pre_call_threshold_triggers_compaction() -> Result<()> {
             .is_some_and(|prompt| prompt.contains("Compaction purpose: pre-spawn.")),
         "auto compaction must select the pre-spawn prompt",
     );
+    let attempts = fixtures.attempts.list_by_task(&task_id).await?;
+    assert_eq!(
+        attempts.len(),
+        2,
+        "compaction and chat each own one attempt"
+    );
+    assert_eq!(attempts[0].outcome, Some(TurnAttemptOutcome::Success));
+    assert_eq!(attempts[0].input_tokens, Some(100));
+    assert_eq!(attempts[0].output_tokens, Some(50));
+    assert_eq!(
+        attempts[0]
+            .response_blob
+            .as_ref()
+            .and_then(|blob| blob.get("operation"))
+            .and_then(serde_json::Value::as_str),
+        Some("context_compaction"),
+    );
+    assert_eq!(attempts[1].input_tokens, Some(100));
+    assert_eq!(attempts[1].output_tokens, Some(50));
+    assert_eq!(commit.thread.total_usage.input_tokens, 200);
+    assert_eq!(commit.thread.total_usage.output_tokens, 100);
 
+    assert_precall_compacted_projection(&fixtures, &commit).await?;
+
+    assert_precall_compaction_events(&fixtures).await?;
+
+    Ok(())
+}
+
+/// The pre-call trigger must shrink the effective context, keep the raw
+/// projection append-only, record one compaction entry, and hand the
+/// compacted view to checkpoint/fork consumers.
+async fn assert_precall_compacted_projection(
+    fixtures: &Fixtures,
+    commit: &crate::journal::CommitOutcome,
+) -> Result<()> {
     let context = fixtures.messages.get_history(&thread_id()).await?;
     assert!(
         context.len() < 24,
@@ -402,9 +847,13 @@ async fn pre_call_threshold_triggers_compaction() -> Result<()> {
         serde_json::to_value(&context)?,
         "checkpoint and fork consumers must inherit the effective compacted view",
     );
+    Ok(())
+}
 
-    // A `ContextCompacted` event was committed so subscribers (TUI,
-    // desktop) can render the compaction in their transcripts.
+/// A `ContextCompacted` event was committed so subscribers (TUI,
+/// desktop) can render the compaction in their transcripts, and
+/// reopening after compaction must not duplicate lifecycle events.
+async fn assert_precall_compaction_events(fixtures: &Fixtures) -> Result<()> {
     let events = fixtures.events.get_events(&thread_id()).await?;
     assert!(
         events
@@ -416,7 +865,428 @@ async fn pre_call_threshold_triggers_compaction() -> Result<()> {
             .map(|e| event_kind(&e.event))
             .collect::<Vec<_>>(),
     );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.event, AgentEvent::UserInput { .. }))
+            .count(),
+        1,
+        "reopening after compaction must not duplicate user input",
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.event, AgentEvent::Start { .. }))
+            .count(),
+        1,
+        "reopening after compaction must not duplicate turn start",
+    );
+    Ok(())
+}
 
+#[tokio::test]
+async fn zero_usage_completed_compaction_keeps_distinct_attempts() -> Result<()> {
+    let fixtures = Fixtures::new();
+    seed_projection_history(&fixtures.messages, &thread_id(), 12, &"q".repeat(200)).await?;
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::Legacy)
+        .with_threshold_tokens(10);
+    let scripted = Arc::new(ScriptedProvider::new(vec![
+        zero_usage_response("[summary with omitted usage]"),
+        ok_response("main response"),
+    ]));
+    let provider: Arc<dyn LlmProvider> = scripted.clone();
+    let deps = fixtures.deps_with_compaction(&cfg, &provider);
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    let task_id = task.id.clone();
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &fixtures.threads,
+        &fixtures.checkpoints,
+        &fixtures.messages,
+        t0(),
+    )
+    .await?;
+
+    let outcome = execute_root_turn(
+        inputs,
+        "main request",
+        provider.as_ref(),
+        &deps,
+        t0() + Duration::seconds(1),
+    )
+    .await?;
+    let RootTurnOutcome::Completed { commit, .. } = outcome else {
+        panic!("zero-usage compaction should still continue to the main call");
+    };
+    assert_eq!(scripted.calls(), 2);
+
+    let mut attempts = fixtures.attempts.list_by_task(&task_id).await?;
+    attempts.sort_by_key(|attempt| attempt.attempt_number);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].outcome, Some(TurnAttemptOutcome::Success));
+    assert_eq!(attempts[0].input_tokens, Some(0));
+    assert_eq!(attempts[0].output_tokens, Some(0));
+    assert_eq!(
+        attempts[0]
+            .response_blob
+            .as_ref()
+            .and_then(|blob| blob.get("operation"))
+            .and_then(serde_json::Value::as_str),
+        Some("context_compaction"),
+    );
+    assert!(
+        attempts[1]
+            .response_blob
+            .as_ref()
+            .is_some_and(|blob| blob.get("operation").is_none()),
+        "main response must close a distinct non-compaction attempt",
+    );
+    assert_eq!(attempts[1].input_tokens, Some(100));
+    assert_eq!(attempts[1].output_tokens, Some(50));
+    assert_eq!(commit.thread.total_usage.input_tokens, 100);
+    assert_eq!(commit.thread.total_usage.output_tokens, 50);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_during_summarization_leaves_compaction_state_unchanged() -> Result<()> {
+    use crate::journal::staged::StagedMessageStore;
+
+    let fixtures = Fixtures::new();
+    let id = thread_id();
+    let mut history = Vec::with_capacity(24);
+    for index in 0..12 {
+        history.push(Message::user(format!("user-{index}: {}", "x".repeat(200))));
+        history.push(Message::assistant(format!(
+            "assistant-{index}: {}",
+            "x".repeat(200)
+        )));
+    }
+    fixtures
+        .messages
+        .commit_messages(&id, history.clone(), t0())
+        .await?;
+    let staged = StagedMessageStore::new(id.clone(), history.clone());
+    let projection_before = fixtures
+        .messages
+        .get(&id)
+        .await?
+        .context("projection should exist before cancellation")?;
+
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::Legacy)
+        .with_threshold_tokens(10);
+    {
+        let blocking = Arc::new(BlockingProvider::new());
+        let provider: Arc<dyn LlmProvider> = blocking.clone();
+        let cancel = CancellationToken::new();
+        let mut deps = fixtures.deps_with_compaction(&cfg, &provider);
+        deps.cancel = Some(&cancel);
+
+        let compaction = super::compaction::maybe_compact_staged_history(
+            &deps,
+            &staged,
+            &id,
+            t0() + Duration::seconds(1),
+        );
+        tokio::pin!(compaction);
+        tokio::select! {
+            () = blocking.started.notified() => {}
+            result = &mut compaction => {
+                panic!(
+                    "pre-call compaction completed before the blocking provider was cancelled: \
+                     {result:?}"
+                );
+            }
+        }
+
+        cancel.cancel();
+        tokio::time::timeout(StdDuration::from_millis(250), &mut compaction)
+            .await
+            .context("cancelled pre-call compaction did not stop promptly")??;
+        assert_eq!(blocking.calls(), 1);
+    }
+
+    {
+        let blocking = Arc::new(BlockingProvider::new());
+        let provider: Arc<dyn LlmProvider> = blocking.clone();
+        let cancel = CancellationToken::new();
+        let mut deps = fixtures.deps_with_compaction(&cfg, &provider);
+        deps.cancel = Some(&cancel);
+
+        let compaction = super::compaction::compact_after_overflow(
+            &deps,
+            &staged,
+            &id,
+            t0() + Duration::seconds(2),
+        );
+        tokio::pin!(compaction);
+        tokio::select! {
+            () = blocking.started.notified() => {}
+            result = &mut compaction => {
+                panic!(
+                    "overflow compaction completed before the blocking provider was cancelled: \
+                     {result:?}"
+                );
+            }
+        }
+
+        cancel.cancel();
+        let applied = tokio::time::timeout(StdDuration::from_millis(250), &mut compaction)
+            .await
+            .context("cancelled overflow compaction did not stop promptly")??;
+        assert!(
+            !applied.applied,
+            "cancelled overflow compaction must report no recovery"
+        );
+        assert_eq!(blocking.calls(), 1);
+    }
+    assert_cancelled_compaction_state_unchanged(
+        &fixtures,
+        &staged,
+        &id,
+        &history,
+        &projection_before,
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// A cancelled compaction must leave every durable and staged surface
+/// untouched: staged history, durable messages, draft, compaction
+/// entries, and the event log.
+async fn assert_cancelled_compaction_state_unchanged(
+    fixtures: &Fixtures,
+    staged: &crate::journal::staged::StagedMessageStore,
+    id: &ThreadId,
+    history: &[Message],
+    projection_before: &crate::MessageProjection,
+) -> Result<()> {
+    assert_eq!(
+        serde_json::to_value(staged.get_history(id).await?)?,
+        serde_json::to_value(history)?,
+        "cancelled compaction must not rewrite staged history",
+    );
+
+    let projection_after = fixtures
+        .messages
+        .get(id)
+        .await?
+        .context("projection should remain after cancellation")?;
+    assert_eq!(
+        serde_json::to_value(&projection_after.messages)?,
+        serde_json::to_value(&projection_before.messages)?,
+        "cancelled compaction must not mutate durable messages",
+    );
+    assert_eq!(
+        serde_json::to_value(&projection_after.draft_messages)?,
+        serde_json::to_value(&projection_before.draft_messages)?,
+        "cancelled compaction must not fold or clear the durable draft",
+    );
+    assert_eq!(
+        projection_after.compactions.len(),
+        projection_before.compactions.len(),
+        "cancelled compaction must not append a durable compaction entry",
+    );
+
+    let events = fixtures.events.get_events(&thread_id()).await?;
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event.event, AgentEvent::ContextCompacted { .. })),
+        "cancelled compaction must not commit ContextCompacted",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn completed_compaction_cancel_race_audits_usage_without_applying() -> Result<()> {
+    let fixtures = Fixtures::new();
+    seed_projection_history(&fixtures.messages, &thread_id(), 12, &"r".repeat(200)).await?;
+    let projection_before = fixtures
+        .messages
+        .get(&thread_id())
+        .await?
+        .context("projection before cancellation race")?;
+
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::Legacy)
+        .with_threshold_tokens(10);
+    let cancel = CancellationToken::new();
+    let scripted = Arc::new(CancelOnResponseProvider::new(cancel.clone()));
+    let provider: Arc<dyn LlmProvider> = scripted.clone();
+    let activity = ActivityBeacon::new();
+    let mut deps = fixtures.deps_with_compaction(&cfg, &provider);
+    deps.cancel = Some(&cancel);
+    deps.activity = Some(&activity);
+
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    let task_id = task.id.clone();
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &fixtures.threads,
+        &fixtures.checkpoints,
+        &fixtures.messages,
+        t0(),
+    )
+    .await?;
+    let error = execute_root_turn(
+        inputs,
+        "cancel while summarizing",
+        provider.as_ref(),
+        &deps,
+        t0() + Duration::seconds(1),
+    )
+    .await
+    .err()
+    .context("cancellation race should stop the turn")?;
+    assert!(
+        super::root_turn::is_root_turn_cancelled(&error),
+        "completed-response cancellation must retain the typed cancel marker: {error:#}",
+    );
+    assert_eq!(scripted.calls(), 1);
+
+    let attempts = fixtures.attempts.list_by_task(&task_id).await?;
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].outcome, Some(TurnAttemptOutcome::Success));
+    assert_eq!(attempts[0].input_tokens, Some(100));
+    assert_eq!(attempts[0].output_tokens, Some(50));
+    assert_eq!(
+        attempts[0]
+            .response_blob
+            .as_ref()
+            .and_then(|blob| blob.get("applied"))
+            .and_then(serde_json::Value::as_bool),
+        Some(false),
+    );
+    let live_usage = activity.usage();
+    assert_eq!(live_usage.input_tokens, 100);
+    assert_eq!(live_usage.output_tokens, 50);
+
+    let projection_after = fixtures
+        .messages
+        .get(&thread_id())
+        .await?
+        .context("projection after cancellation race")?;
+    assert_eq!(
+        serde_json::to_value(&projection_after.messages)?,
+        serde_json::to_value(&projection_before.messages)?,
+    );
+    assert_eq!(
+        serde_json::to_value(&projection_after.draft_messages)?,
+        serde_json::to_value(&projection_before.draft_messages)?,
+    );
+    assert_eq!(
+        projection_after.compactions.len(),
+        projection_before.compactions.len(),
+    );
+    let events = fixtures.events.get_events(&thread_id()).await?;
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event.event, AgentEvent::ContextCompacted { .. })),
+        "cancellation fence must suppress ContextCompacted",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn no_progress_compaction_usage_stays_on_failed_attempt_only() -> Result<()> {
+    let fixtures = Fixtures::new();
+    seed_projection_history(&fixtures.messages, &thread_id(), 12, &"n".repeat(200)).await?;
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::Legacy)
+        .with_threshold_tokens(10);
+    let failing = Arc::new(ScriptedProvider::new(vec![ok_response(
+        &"z".repeat(20_000),
+    )]));
+    let failing_provider: Arc<dyn LlmProvider> = failing.clone();
+    let deps = fixtures.deps_with_compaction(&cfg, &failing_provider);
+
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    let task_id = task.id.clone();
+    let first_inputs = build_root_worker_inputs(
+        sample_bootstrap(task.clone()),
+        &fixtures.threads,
+        &fixtures.checkpoints,
+        &fixtures.messages,
+        t0(),
+    )
+    .await?;
+    let failure = execute_root_turn(
+        first_inputs,
+        "trigger no progress",
+        failing_provider.as_ref(),
+        &deps,
+        t0() + Duration::seconds(1),
+    )
+    .await
+    .err()
+    .context("oversized summary should fail compaction")?;
+    assert!(
+        format!("{failure:#}").contains("Compaction made no progress"),
+        "unexpected compaction failure: {failure:#}",
+    );
+    assert_eq!(failing.calls(), 1);
+
+    let failed_attempts = fixtures.attempts.list_by_task(&task_id).await?;
+    assert_eq!(failed_attempts.len(), 1);
+    assert_eq!(
+        failed_attempts[0].outcome,
+        Some(TurnAttemptOutcome::ServerError),
+    );
+    assert_eq!(failed_attempts[0].input_tokens, Some(100));
+    assert_eq!(failed_attempts[0].output_tokens, Some(50));
+    assert_eq!(
+        fixtures
+            .messages
+            .get(&thread_id())
+            .await?
+            .context("projection after failed compaction")?
+            .compactions
+            .len(),
+        0,
+    );
+
+    let retry = Arc::new(ScriptedProvider::new(vec![ok_response("retry succeeded")]));
+    let retry_provider: Arc<dyn LlmProvider> = retry.clone();
+    let mut retry_deps = fixtures.deps_with_compaction(&cfg, &retry_provider);
+    retry_deps.compaction_config = None;
+    retry_deps.compaction_provider = None;
+    let retry_inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &fixtures.threads,
+        &fixtures.checkpoints,
+        &fixtures.messages,
+        t0(),
+    )
+    .await?;
+    let retry_outcome = execute_root_turn(
+        retry_inputs,
+        "trigger no progress",
+        retry_provider.as_ref(),
+        &retry_deps,
+        t0() + Duration::seconds(2),
+    )
+    .await?;
+    let RootTurnOutcome::Completed { commit, .. } = retry_outcome else {
+        panic!("retry should complete");
+    };
+    assert_eq!(
+        commit.thread.total_usage.input_tokens, 100,
+        "failed compaction usage belongs only to its attempt row",
+    );
+    assert_eq!(commit.thread.total_usage.output_tokens, 50);
+
+    let mut attempts = fixtures.attempts.list_by_task(&task_id).await?;
+    attempts.sort_by_key(|attempt| attempt.attempt_number);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].input_tokens, Some(100));
+    assert_eq!(attempts[0].output_tokens, Some(50));
+    assert_eq!(attempts[1].input_tokens, Some(100));
+    assert_eq!(attempts[1].output_tokens, Some(50));
     Ok(())
 }
 
@@ -515,6 +1385,7 @@ async fn prompt_too_long_triggers_emergency_compaction_and_retry() -> Result<()>
     let deps = fixtures.deps_with_compaction(&cfg, &provider);
 
     let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    let task_id = task.id.clone();
     let inputs = build_root_worker_inputs(
         sample_bootstrap(task),
         &fixtures.threads,
@@ -533,7 +1404,12 @@ async fn prompt_too_long_triggers_emergency_compaction_and_retry() -> Result<()>
     )
     .await?;
 
-    let RootTurnOutcome::Completed { response_text, .. } = outcome else {
+    let RootTurnOutcome::Completed {
+        response_text,
+        commit,
+        ..
+    } = outcome
+    else {
         panic!("expected Completed turn after emergency compaction");
     };
     assert_eq!(response_text, "Hello after recovery");
@@ -547,6 +1423,33 @@ async fn prompt_too_long_triggers_emergency_compaction_and_retry() -> Result<()>
             .any(|prompt| prompt.contains("Compaction purpose: overflow recovery.")),
         "overflow recovery must select the overflow prompt",
     );
+    let mut attempts = fixtures.attempts.list_by_task(&task_id).await?;
+    attempts.sort_by_key(|attempt| attempt.attempt_number);
+    assert_eq!(
+        attempts.len(),
+        3,
+        "overflow rejection, compaction, and retry each own one attempt",
+    );
+    assert_eq!(
+        attempts[0].outcome,
+        Some(TurnAttemptOutcome::InvalidRequest),
+    );
+    assert_eq!(attempts[0].input_tokens, Some(0));
+    assert_eq!(attempts[1].outcome, Some(TurnAttemptOutcome::Success));
+    assert_eq!(attempts[1].input_tokens, Some(100));
+    assert_eq!(attempts[1].output_tokens, Some(50));
+    assert_eq!(
+        attempts[1]
+            .response_blob
+            .as_ref()
+            .and_then(|blob| blob.get("operation"))
+            .and_then(serde_json::Value::as_str),
+        Some("context_compaction"),
+    );
+    assert_eq!(attempts[2].input_tokens, Some(100));
+    assert_eq!(attempts[2].output_tokens, Some(50));
+    assert_eq!(commit.thread.total_usage.input_tokens, 200);
+    assert_eq!(commit.thread.total_usage.output_tokens, 100);
 
     // Compaction event committed.
     let events = fixtures.events.get_events(&thread_id()).await?;
@@ -852,6 +1755,75 @@ async fn legacy_engine_flag_off_uses_estimated_trigger_and_generic_prompt() -> R
         .await?
         .context("projection")?;
     assert_eq!(projection.compactions.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapcompact_measured_trigger_wins_over_large_estimate() -> Result<()> {
+    use crate::journal::staged::StagedMessageStore;
+
+    let fixtures = Fixtures::new();
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    close_success_attempt(
+        &fixtures,
+        &task.id,
+        serde_json::json!({ "messages": vec!["covered"; 24] }),
+        100,
+        t0() + Duration::seconds(5),
+    )
+    .await?;
+
+    let mut history = Vec::with_capacity(24);
+    for index in 0..12 {
+        history.push(Message::user(format!(
+            "measured-user-{index}: {}",
+            "x".repeat(30_000),
+        )));
+        history.push(Message::assistant(format!(
+            "measured-assistant-{index}: {}",
+            "y".repeat(30_000),
+        )));
+    }
+    fixtures
+        .messages
+        .commit_messages(&thread_id(), history.clone(), t0() + Duration::seconds(6))
+        .await?;
+
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::Snapcompact)
+        .with_threshold_tokens(50_000);
+    let scripted = Arc::new(ScriptedProvider::image_capable(Vec::new()));
+    let provider: Arc<dyn LlmProvider> = scripted.clone();
+    let artifact_dir = tempfile::tempdir()?;
+    let artifact_store = Arc::new(agent_sdk::ArtifactStore::new(
+        artifact_dir.path().join("measured-snapcompact"),
+    ));
+    let mut deps = fixtures.deps_with_compaction(&cfg, &provider);
+    deps.compaction_artifact_store = Some(&artifact_store);
+    let staged = StagedMessageStore::new(thread_id(), history);
+
+    let outcome = super::compaction::maybe_compact_staged_history(
+        &deps,
+        &staged,
+        &thread_id(),
+        t0() + Duration::seconds(20),
+    )
+    .await?;
+
+    assert!(
+        !outcome.completed && !outcome.applied,
+        "Snapcompact must trust fresh measured usage instead of the larger estimate",
+    );
+    assert_eq!(scripted.calls(), 0);
+    assert!(
+        fixtures
+            .messages
+            .get(&thread_id())
+            .await?
+            .context("projection after measured Snapcompact check")?
+            .compactions
+            .is_empty(),
+    );
     Ok(())
 }
 

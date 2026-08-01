@@ -1314,12 +1314,18 @@ async fn resume_with_compaction_fixture(
         "call_1".to_owned(),
         agent_sdk_foundation::ToolResult::success("file1.txt"),
     )];
+    // The summarized slice must be large enough that replacing it with the
+    // typed summary message (fixed ~100-token overhead) shrinks effective
+    // occupancy; a tiny history would trip the compactor's deliberate
+    // no-progress guard. Bulk goes in the tool INPUT, and retain_recent=0
+    // below folds the whole pair into the summary — pair safety otherwise
+    // pins the fresh tool_use/tool_result pair in the retained tail.
     let (parent, continuation, suspended_messages) = Box::pin(suspend_and_complete_children(
         stores,
         vec![(
             "call_1".into(),
             "bash".into(),
-            serde_json::json!({"command": "ls"}),
+            serde_json::json!({"command": format!("ls {}", "very/deep/path ".repeat(400))}),
         )],
         &child_results,
     ))
@@ -1369,7 +1375,7 @@ async fn resume_with_compaction_fixture(
     let config = CompactionConfig::default()
         .with_threshold_tokens(1)
         .with_min_messages(2)
-        .with_retain_recent(1);
+        .with_retain_recent(0);
     let compactor_impl = Arc::new(MockTextProvider::new("[resume summary]"));
     let compactor: Arc<dyn LlmProvider> = compactor_impl.clone();
     let deps = stores.deps_with_compaction(&config, &compactor);

@@ -53,6 +53,7 @@ log = { workspace = true }
 url = { workspace = true }
 tokio-util = { workspace = true }
 base64 = { workspace = true }
+png = { workspace = true }
 opentelemetry = { workspace = true, optional = true }
 # Maintained YAML parser — only the `skills` loader uses it (frontmatter).
 serde_yaml_ng = { workspace = true, optional = true }

@@ -378,12 +378,7 @@ impl OpenAIReasoningConfig {
     }
 }
 
-pub(crate) const fn is_gpt56_model(model: &str) -> bool {
-    matches!(
-        model.as_bytes(),
-        b"gpt-5.6" | b"gpt-5.6-sol" | b"gpt-5.6-terra" | b"gpt-5.6-luna"
-    )
-}
+pub(crate) use crate::model_features::is_gpt56_model;
 
 /// `service_tier` value selecting `OpenAI` priority processing.
 pub(crate) const SERVICE_TIER_PRIORITY: &str = "priority";

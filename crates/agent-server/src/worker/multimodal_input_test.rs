@@ -38,7 +38,7 @@ use crate::journal::checkpoint_store::InMemoryCheckpointStore;
 use crate::journal::event_notifier::EventNotifier;
 use crate::journal::event_repository::{EventRepository, InMemoryEventRepository};
 use crate::journal::execution_context::build_root_worker_inputs;
-use crate::journal::message_store::InMemoryMessageProjectionStore;
+use crate::journal::message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
 use crate::journal::store::{AgentTaskStore, InMemoryAgentTaskStore};
 use crate::journal::task::{AgentTask, LeaseId, WorkerId};
 use crate::journal::thread_store::InMemoryThreadStore;
@@ -180,6 +180,15 @@ impl Stores {
             activity: None,
             connectivity_waits: None,
         }
+    }
+
+    fn deps_with_artifact_store<'a>(
+        &'a self,
+        store: &'a Arc<agent_sdk::ArtifactStore>,
+    ) -> RootTurnDeps<'a> {
+        let mut deps = self.deps();
+        deps.compaction_artifact_store = Some(store);
+        deps
     }
 }
 
@@ -366,5 +375,111 @@ async fn text_only_string_input_still_works() -> Result<()> {
         &blocks[0],
         ContentBlock::Text { text } if text == "hello"
     ));
+    Ok(())
+}
+
+fn snapcompact_checkpoint(
+    store: &agent_sdk::ArtifactStore,
+) -> Result<(agent_sdk_foundation::llm::Message, u64)> {
+    let mut reserved = &b"reserved artifact zero"[..];
+    assert_eq!(store.save_streamed("reserved", &mut reserved)?.id, 0);
+    let mut source = &b"daemon exact source"[..];
+    let source_id = store.save_streamed("snapcompact-source", &mut source)?.id;
+    let mut png = &b"\x89PNG\r\n\x1a\ndaemon-provider-frame"[..];
+    let frame_id = store.save_streamed("snapcompact-frame", &mut png)?.id;
+    let metadata = agent_sdk_foundation::llm::SnapcompactMetadata {
+        source_artifact_id: source_id,
+        truncated_chars: 21,
+        frame_count: 1,
+        frame_size: 1_932,
+        source_len: None,
+        source_sha256: None,
+        frame_manifest: None,
+    };
+    Ok((
+        agent_sdk_foundation::llm::Message::user_with_content(vec![
+            ContentBlock::CompactionSummary {
+                text: "daemon exact-source summary".to_owned(),
+                artifact_ids: vec![source_id, frame_id],
+                snapcompact: Some(metadata),
+            },
+            ContentBlock::CompactionSummary {
+                text: "head recovery".to_owned(),
+                artifact_ids: Vec::new(),
+                snapcompact: None,
+            },
+            ContentBlock::CompactionSummary {
+                text: agent_sdk_foundation::llm::SNAPCOMPACT_HISTORY_IMAGE_WARNING.to_owned(),
+                artifact_ids: Vec::new(),
+                snapcompact: None,
+            },
+            ContentBlock::Image {
+                source: ContentSource::new("image/png", format!("artifact://{frame_id}")),
+            },
+            ContentBlock::CompactionSummary {
+                text: "tail recovery".to_owned(),
+                artifact_ids: Vec::new(),
+                snapcompact: None,
+            },
+        ]),
+        frame_id,
+    ))
+}
+
+fn first_image_data(messages: &[agent_sdk_foundation::llm::Message]) -> Option<&str> {
+    messages.iter().find_map(|message| match &message.content {
+        Content::Blocks(blocks) => blocks.iter().find_map(|block| match block {
+            ContentBlock::Image { source } => Some(source.data.as_str()),
+            _ => None,
+        }),
+        Content::Text(_) => None,
+    })
+}
+
+#[tokio::test]
+async fn daemon_dispatch_hydrates_uri_checkpoint_without_mutating_projection() -> Result<()> {
+    use base64::Engine as _;
+
+    let stores = Stores::new();
+    let provider = CapturingProvider::new("continued from checkpoint");
+    let dir = tempfile::tempdir()?;
+    let artifact_store = Arc::new(agent_sdk::ArtifactStore::new(dir.path()));
+    let (checkpoint, frame_id) = snapcompact_checkpoint(&artifact_store)?;
+    stores
+        .messages
+        .set_draft(&thread_id(), vec![checkpoint], t0())
+        .await?;
+    let task = create_and_acquire_root_task(&stores.tasks, &thread_id()).await?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let deps = stores.deps_with_artifact_store(&artifact_store);
+
+    let outcome = execute_root_turn(
+        inputs,
+        "continue after daemon restart",
+        &provider,
+        &deps,
+        t0() + Duration::seconds(1),
+    )
+    .await?;
+    assert!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+    let captured = provider.captured();
+    assert_eq!(captured.len(), 1);
+    let encoded = first_image_data(&captured[0].messages)
+        .context("provider request must contain hydrated checkpoint frame")?;
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD.decode(encoded)?,
+        b"\x89PNG\r\n\x1a\ndaemon-provider-frame"
+    );
+
+    let durable = stores.messages.get_history(&thread_id()).await?;
+    let durable_uri = format!("artifact://{frame_id}");
+    assert_eq!(first_image_data(&durable), Some(durable_uri.as_str()));
     Ok(())
 }

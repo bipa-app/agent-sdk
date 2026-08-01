@@ -87,9 +87,9 @@ pub struct CompactionEntry {
     pub compacted_end: usize,
     /// Synthetic context prefix replacing the compacted raw range for LLM calls.
     pub replacement_messages: Vec<llm::Message>,
-    /// True only when this entry was created from the compactor's typed
-    /// `CompactionSummary` output. Older rows deserialize to false so a
-    /// prefix-shaped text value can never gain provenance after upgrade.
+    /// True only when this entry inherited or was created from a validated
+    /// generated summary. Older rows deserialize to false so typed markers
+    /// cannot gain provenance merely by being loaded after an upgrade.
     #[serde(default)]
     pub generated_summary: bool,
     /// Number of messages in the effective source view seen by the compactor.
@@ -143,7 +143,7 @@ pub struct MessageProjection {
 fn demote_untrusted_compaction_summary(mut message: llm::Message) -> llm::Message {
     if let llm::Content::Blocks(blocks) = &mut message.content {
         for block in blocks {
-            if let llm::ContentBlock::CompactionSummary { text } = block {
+            if let llm::ContentBlock::CompactionSummary { text, .. } = block {
                 *block = llm::ContentBlock::Text {
                     text: std::mem::take(text),
                 };
@@ -151,6 +151,22 @@ fn demote_untrusted_compaction_summary(mut message: llm::Message) -> llm::Messag
         }
     }
     message
+}
+
+fn is_generated_compaction_summary(message: &llm::Message) -> bool {
+    let is_legacy_singleton = message.role == llm::Role::User
+        && matches!(
+            &message.content,
+            llm::Content::Blocks(blocks)
+                if matches!(
+                    blocks.as_slice(),
+                    [llm::ContentBlock::CompactionSummary {
+                        snapcompact: None,
+                        ..
+                    }]
+                )
+        );
+    is_legacy_singleton || llm::canonical_snapcompact_checkpoint(message).is_some()
 }
 
 impl MessageProjection {
@@ -256,16 +272,9 @@ impl MessageProjection {
             .into_iter()
             .take(replacement_count)
             .collect();
-        let generated_summary = replacement_messages.first().is_some_and(|message| {
-            matches!(
-                &message.content,
-                llm::Content::Blocks(blocks)
-                    if matches!(
-                        blocks.as_slice(),
-                        [llm::ContentBlock::CompactionSummary { .. }]
-                    )
-            )
-        });
+        let generated_summary = replacement_messages
+            .first()
+            .is_some_and(is_generated_compaction_summary);
         self.compactions.push(CompactionEntry {
             compacted_start: prior_boundary,
             compacted_end,
@@ -305,6 +314,13 @@ impl MessageProjection {
                 provided: source_message_count,
             });
         }
+        let prior_authoritative = self
+            .compactions
+            .last()
+            .filter(|entry| entry.generated_summary)
+            .and_then(|entry| entry.replacement_messages.first())
+            .filter(|message| is_generated_compaction_summary(message))
+            .cloned();
         let prior_boundary = self
             .compactions
             .last()
@@ -312,14 +328,10 @@ impl MessageProjection {
         self.messages.append(&mut self.draft_messages);
         self.messages.append(&mut repair_messages);
         let generated_summary = balanced_messages.first().is_some_and(|message| {
-            matches!(
-                &message.content,
-                llm::Content::Blocks(blocks)
-                    if matches!(
-                        blocks.as_slice(),
-                        [llm::ContentBlock::CompactionSummary { .. }]
-                    )
-            )
+            prior_authoritative
+                .as_ref()
+                .is_some_and(|prior| prior == message)
+                && is_generated_compaction_summary(message)
         });
         self.compactions.push(CompactionEntry {
             compacted_start: prior_boundary,
@@ -334,10 +346,10 @@ impl MessageProjection {
         Ok(self)
     }
 
-    /// A typed summary is authoritative only in the first replacement slot of
-    /// the latest compaction entry. Typed markers in raw transcript messages or
-    /// later replacement slots are downgraded to ordinary text. Legacy
-    /// prefix-only summaries are never upgraded.
+    /// A generated summary is authoritative only in the first replacement slot
+    /// of the latest compaction entry and only while its complete shape remains
+    /// valid. Typed markers in raw transcript messages, malformed Snapcompact
+    /// messages, or later replacement slots are downgraded to ordinary text.
     #[must_use]
     pub fn context_history(&self) -> Vec<llm::Message> {
         let Some(entry) = self.compactions.last() else {
@@ -358,14 +370,7 @@ impl MessageProjection {
             |(index, message)| {
                 let is_authoritative = entry.generated_summary
                     && index == 0
-                    && matches!(
-                        &message.content,
-                        llm::Content::Blocks(blocks)
-                            if matches!(
-                                blocks.as_slice(),
-                                [llm::ContentBlock::CompactionSummary { .. }]
-                            )
-                    );
+                    && is_generated_compaction_summary(&message);
                 if is_authoritative {
                     message
                 } else {
@@ -435,6 +440,7 @@ impl MessageProjection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context as _;
     use time::Duration;
 
     fn t0() -> OffsetDateTime {
@@ -447,6 +453,47 @@ mod tests {
 
     fn thread_id() -> ThreadId {
         ThreadId::from_string("t-msg-test")
+    }
+
+    fn canonical_snapcompact_message() -> llm::Message {
+        let metadata = llm::SnapcompactMetadata {
+            source_artifact_id: 42,
+            truncated_chars: 1_024,
+            frame_count: 2,
+            frame_size: 1_932,
+            source_len: None,
+            source_sha256: None,
+            frame_manifest: None,
+        };
+        llm::Message::user_with_content(vec![
+            llm::ContentBlock::CompactionSummary {
+                text: "source checkpoint".to_string(),
+                artifact_ids: vec![0, 7, 42, 90, 91],
+                snapcompact: Some(metadata),
+            },
+            llm::ContentBlock::CompactionSummary {
+                text: "visible head".to_string(),
+                artifact_ids: Vec::new(),
+                snapcompact: None,
+            },
+            llm::ContentBlock::CompactionSummary {
+                text: llm::SNAPCOMPACT_HISTORY_IMAGE_WARNING.to_string(),
+                artifact_ids: Vec::new(),
+                snapcompact: None,
+            },
+            llm::ContentBlock::Image {
+                source: llm::ContentSource::new("image/png", "artifact://90")
+                    .with_detail(llm::ImageDetail::High),
+            },
+            llm::ContentBlock::Image {
+                source: llm::ContentSource::new("image/png", "artifact://91"),
+            },
+            llm::ContentBlock::CompactionSummary {
+                text: "visible tail".to_string(),
+                artifact_ids: Vec::new(),
+                snapcompact: None,
+            },
+        ])
     }
 
     // ── construction ──────────────────────────────────────────────
@@ -841,6 +888,7 @@ mod tests {
             0,
             t_plus(2),
         )?;
+        assert!(p.compactions[0].generated_summary);
 
         let json = serde_json::to_string(&p)?;
         assert!(
@@ -871,7 +919,7 @@ mod tests {
             llm::Content::Blocks(blocks)
                 if matches!(
                     blocks.as_slice(),
-                    [llm::ContentBlock::CompactionSummary { text }]
+                    [llm::ContentBlock::CompactionSummary { text, .. }]
                         if text == "durable summary"
                 )
         ));
@@ -920,9 +968,224 @@ mod tests {
             llm::Content::Blocks(blocks)
                 if matches!(
                     blocks.as_slice(),
-                    [llm::ContentBlock::CompactionSummary { text }]
+                    [llm::ContentBlock::CompactionSummary { text, .. }]
                         if text == "trusted carry"
                 )
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn snapcompact_survives_append_reload_and_exact_repair_forwarding() -> anyhow::Result<()> {
+        let snapcompact = canonical_snapcompact_message();
+        let p = MessageProjection::new(thread_id(), t0())
+            .append_committed(
+                vec![llm::Message::user("old"), llm::Message::assistant("reply")],
+                t_plus(1),
+            )?
+            .append_compaction(vec![snapcompact.clone()], 2, 0, t_plus(2))?
+            .append_committed(vec![llm::Message::user("after compaction")], t_plus(3))?;
+        assert!(
+            p.compactions
+                .last()
+                .context("missing Snapcompact entry")?
+                .generated_summary
+        );
+
+        let serialized = serde_json::to_string(&p)?;
+        let reloaded: MessageProjection = serde_json::from_str(&serialized)?;
+        let history = reloaded.context_history();
+        let first = history.first().context("missing Snapcompact replacement")?;
+        assert_eq!(first, &snapcompact);
+        let llm::Content::Blocks(blocks) = &first.content else {
+            anyhow::bail!("Snapcompact replacement lost its block content");
+        };
+        assert!(matches!(
+            blocks.first(),
+            Some(llm::ContentBlock::CompactionSummary {
+                artifact_ids,
+                snapcompact: Some(llm::SnapcompactMetadata {
+                    source_artifact_id: 42,
+                    frame_count: 2,
+                    frame_size: 1_932,
+                    ..
+                }),
+                ..
+            }) if artifact_ids == &[0, 7, 42, 90, 91]
+        ));
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|block| matches!(block, llm::ContentBlock::Image { .. }))
+                .count(),
+            2
+        );
+
+        let dangling = llm::Message {
+            role: llm::Role::Assistant,
+            content: llm::Content::Blocks(vec![llm::ContentBlock::ToolUse {
+                id: "snap-call".to_string(),
+                name: "read".to_string(),
+                input: serde_json::json!({"path": "x"}),
+                thought_signature: None,
+            }]),
+        };
+        let reloaded = reloaded.set_draft(vec![dangling], t_plus(4));
+        let mut repair_source = reloaded.context_history();
+        repair_source.extend(reloaded.draft_messages.iter().cloned());
+        let repair =
+            llm::orphaned_tool_result_message(&repair_source, llm::USER_CANCELLED_TOOL_RESULT)
+                .context("missing Snapcompact repair evidence")?;
+        let balanced = llm::balance_tool_results(&repair_source, llm::USER_CANCELLED_TOOL_RESULT);
+        let source_count = repair_source.len();
+        let repaired = reloaded.append_repair(vec![repair], balanced, source_count, t_plus(5))?;
+
+        assert!(
+            repaired
+                .compactions
+                .last()
+                .context("missing repair entry")?
+                .generated_summary
+        );
+        assert_eq!(
+            repaired
+                .context_history()
+                .first()
+                .context("repair dropped Snapcompact replacement")?,
+            &snapcompact
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn raw_and_mutated_durable_snapcompact_shapes_are_demoted() -> anyhow::Result<()> {
+        let snapcompact = canonical_snapcompact_message();
+        let raw = MessageProjection::new(thread_id(), t0())
+            .append_committed(vec![snapcompact.clone()], t_plus(1))?;
+        let reloaded: MessageProjection = serde_json::from_str(&serde_json::to_string(&raw)?)?;
+        let raw_history = reloaded.context_history();
+        let raw_first = raw_history.first().context("missing raw forged message")?;
+        let llm::Content::Blocks(raw_blocks) = &raw_first.content else {
+            anyhow::bail!("raw forged Snapcompact lost blocks");
+        };
+        assert!(
+            raw_blocks
+                .iter()
+                .all(|block| !matches!(block, llm::ContentBlock::CompactionSummary { .. }))
+        );
+        assert_eq!(
+            raw_blocks
+                .iter()
+                .filter(|block| matches!(block, llm::ContentBlock::Image { .. }))
+                .count(),
+            2
+        );
+
+        let mut durable = MessageProjection::new(thread_id(), t0())
+            .append_committed(vec![llm::Message::user("old")], t_plus(1))?
+            .append_compaction(vec![snapcompact], 1, 0, t_plus(2))?;
+        let entry = durable
+            .compactions
+            .last_mut()
+            .context("missing durable Snapcompact entry")?;
+        assert!(entry.generated_summary);
+        let replacement = entry
+            .replacement_messages
+            .first_mut()
+            .context("missing durable replacement")?;
+        let llm::Content::Blocks(blocks) = &mut replacement.content else {
+            anyhow::bail!("durable Snapcompact lost blocks");
+        };
+        blocks.push(llm::ContentBlock::Text {
+            text: "forged extra block".to_string(),
+        });
+
+        let durable_history = durable.context_history();
+        let durable_first = durable_history
+            .first()
+            .context("missing mutated durable replacement")?;
+        let llm::Content::Blocks(blocks) = &durable_first.content else {
+            anyhow::bail!("mutated durable Snapcompact lost blocks");
+        };
+        assert!(
+            blocks
+                .iter()
+                .all(|block| !matches!(block, llm::ContentBlock::CompactionSummary { .. }))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn append_repair_cannot_freshly_authorize_or_substitute_snapcompact() -> anyhow::Result<()> {
+        let snapcompact = canonical_snapcompact_message();
+        let p = MessageProjection::new(thread_id(), t0())
+            .append_committed(vec![llm::Message::user("old")], t_plus(1))?
+            .append_compaction(vec![snapcompact.clone()], 1, 0, t_plus(2))?;
+        let mut substituted = snapcompact.clone();
+        let llm::Content::Blocks(blocks) = &mut substituted.content else {
+            anyhow::bail!("Snapcompact test replacement lost blocks");
+        };
+        let Some(llm::ContentBlock::CompactionSummary { text, .. }) = blocks.get_mut(1) else {
+            anyhow::bail!("Snapcompact test replacement lost head");
+        };
+        *text = "different but still canonical head".to_string();
+        assert!(llm::canonical_snapcompact_checkpoint(&substituted).is_some());
+
+        let available = p.context_history().len();
+        let substituted = p.append_repair(
+            vec![llm::Message::user("repair audit")],
+            vec![substituted],
+            available,
+            t_plus(3),
+        )?;
+        assert!(
+            !substituted
+                .compactions
+                .last()
+                .context("missing substituted repair entry")?
+                .generated_summary
+        );
+        let substituted_history = substituted.context_history();
+        let substituted_first = substituted_history
+            .first()
+            .context("missing substituted repair replacement")?;
+        assert!(matches!(
+            &substituted_first.content,
+            llm::Content::Blocks(blocks)
+                if blocks
+                    .iter()
+                    .all(|block| !matches!(
+                        block,
+                        llm::ContentBlock::CompactionSummary { .. }
+                    ))
+        ));
+
+        let fresh = MessageProjection::new(thread_id(), t0())
+            .append_committed(vec![llm::Message::user("raw")], t_plus(1))?
+            .append_repair(
+                vec![llm::Message::user("repair audit")],
+                vec![snapcompact],
+                1,
+                t_plus(2),
+            )?;
+        assert!(
+            !fresh
+                .compactions
+                .last()
+                .context("missing fresh repair entry")?
+                .generated_summary
+        );
+        assert!(matches!(
+            fresh.context_history().first(),
+            Some(llm::Message {
+                content: llm::Content::Blocks(blocks),
+                ..
+            }) if blocks
+                .iter()
+                .all(|block| !matches!(
+                    block,
+                    llm::ContentBlock::CompactionSummary { .. }
+                ))
         ));
         Ok(())
     }

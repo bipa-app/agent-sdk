@@ -10119,3 +10119,193 @@ async fn stalled_stream_retries_even_with_zero_transient_budget() -> anyhow::Res
     );
     Ok(())
 }
+
+fn provider_hydration_checkpoint(store: &crate::ArtifactStore) -> anyhow::Result<(Message, u64)> {
+    let mut reserved = &b"reserved artifact zero"[..];
+    assert_eq!(store.save_streamed("reserved", &mut reserved)?.id, 0);
+    let mut source = &b"snapcompact exact source"[..];
+    let source_id = store.save_streamed("snapcompact-source", &mut source)?.id;
+    let mut png = &b"\x89PNG\r\n\x1a\nprovider-hydration-frame"[..];
+    let frame_id = store.save_streamed("snapcompact-frame", &mut png)?.id;
+    let metadata = crate::llm::SnapcompactMetadata {
+        source_artifact_id: source_id,
+        truncated_chars: 17,
+        frame_count: 1,
+        frame_size: 1_932,
+        source_len: None,
+        source_sha256: None,
+        frame_manifest: None,
+    };
+    Ok((
+        Message::user_with_content(vec![
+            ContentBlock::CompactionSummary {
+                text: "exact-source summary".to_owned(),
+                artifact_ids: vec![source_id, frame_id],
+                snapcompact: Some(metadata),
+            },
+            ContentBlock::CompactionSummary {
+                text: "head recovery".to_owned(),
+                artifact_ids: Vec::new(),
+                snapcompact: None,
+            },
+            ContentBlock::CompactionSummary {
+                text: crate::llm::SNAPCOMPACT_HISTORY_IMAGE_WARNING.to_owned(),
+                artifact_ids: Vec::new(),
+                snapcompact: None,
+            },
+            ContentBlock::Image {
+                source: crate::llm::ContentSource::new(
+                    "image/png",
+                    format!("artifact://{frame_id}"),
+                ),
+            },
+            ContentBlock::CompactionSummary {
+                text: "tail recovery".to_owned(),
+                artifact_ids: Vec::new(),
+                snapcompact: None,
+            },
+        ]),
+        frame_id,
+    ))
+}
+
+fn captured_frame_data(request: &ChatRequest) -> anyhow::Result<&str> {
+    request
+        .messages
+        .iter()
+        .find_map(|message| match &message.content {
+            Content::Blocks(blocks) => blocks.iter().find_map(|block| match block {
+                ContentBlock::Image { source } => Some(source.data.as_str()),
+                _ => None,
+            }),
+            Content::Text(_) => None,
+        })
+        .context("provider request must contain the Snapcompact frame")
+}
+
+#[tokio::test]
+async fn resumed_uri_projection_hydrates_every_non_streaming_attempt_only_for_provider()
+-> anyhow::Result<()> {
+    use base64::Engine as _;
+
+    let dir = tempfile::tempdir()?;
+    let artifact_store = Arc::new(crate::ArtifactStore::new(dir.path()));
+    let (checkpoint, frame_id) = provider_hydration_checkpoint(&artifact_store)?;
+    let provider = MockProvider::new(vec![
+        ChatOutcome::ServerError("retry hydrated request".to_owned()),
+        MockProvider::text_response("done"),
+    ]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .config(AgentConfig {
+            retry: RetryConfig {
+                max_retries: 1,
+                base_delay_ms: 0,
+                max_delay_ms: 0,
+            },
+            ..Default::default()
+        })
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+    agent
+        .message_store
+        .replace_history(&thread_id, vec![checkpoint])
+        .await?;
+
+    let (state, _) = run_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("continue after restart".to_owned()),
+        ToolContext::new(()).with_artifact_store(Arc::clone(&artifact_store)),
+    )
+    .await?;
+    assert!(matches!(state, AgentRunState::Done { .. }));
+    let requests = agent.provider.recorded_requests()?;
+    assert_eq!(
+        requests.len(),
+        2,
+        "retry must hydrate each provider attempt"
+    );
+    for request in &requests {
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD.decode(captured_frame_data(request)?)?,
+            b"\x89PNG\r\n\x1a\nprovider-hydration-frame"
+        );
+    }
+
+    let durable = agent.message_store.get_history(&thread_id).await?;
+    let durable_request = ChatRequest::new("", durable);
+    assert_eq!(
+        captured_frame_data(&durable_request)?,
+        format!("artifact://{frame_id}")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn uri_checkpoint_hydrates_every_streaming_retry_attempt() -> anyhow::Result<()> {
+    use base64::Engine as _;
+
+    let dir = tempfile::tempdir()?;
+    let artifact_store = Arc::new(crate::ArtifactStore::new(dir.path()));
+    let (checkpoint, frame_id) = provider_hydration_checkpoint(&artifact_store)?;
+    let provider = StreamScriptProvider::new(vec![
+        StreamScriptStep::Frames(vec![StreamDelta::Error {
+            message: "retry hydrated stream".to_owned(),
+            kind: StreamErrorKind::ServerError,
+        }]),
+        StreamScriptStep::Frames(vec![
+            StreamDelta::TextDelta {
+                delta: "done".to_owned(),
+                block_index: 0,
+            },
+            StreamDelta::Done {
+                stop_reason: Some(StopReason::EndTurn),
+                served_route: None,
+            },
+        ]),
+    ]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .config(AgentConfig {
+            streaming: true,
+            retry: RetryConfig {
+                max_retries: 1,
+                base_delay_ms: 0,
+                max_delay_ms: 0,
+            },
+            ..Default::default()
+        })
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+    agent
+        .message_store
+        .replace_history(&thread_id, vec![checkpoint])
+        .await?;
+
+    let (state, _) = run_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("continue immediately after compaction".to_owned()),
+        ToolContext::new(()).with_artifact_store(Arc::clone(&artifact_store)),
+    )
+    .await?;
+    assert!(matches!(state, AgentRunState::Done { .. }));
+    let requests = agent.provider.recorded_requests()?;
+    assert_eq!(requests.len(), 2, "stream retry must hydrate each attempt");
+    for request in &requests {
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD.decode(captured_frame_data(request)?)?,
+            b"\x89PNG\r\n\x1a\nprovider-hydration-frame"
+        );
+    }
+    let durable = agent.message_store.get_history(&thread_id).await?;
+    let durable_request = ChatRequest::new("", durable);
+    assert_eq!(
+        captured_frame_data(&durable_request)?,
+        format!("artifact://{frame_id}")
+    );
+    Ok(())
+}

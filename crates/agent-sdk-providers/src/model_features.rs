@@ -465,6 +465,29 @@ pub const fn supported_model_features() -> &'static [ModelFeatures] {
     MODEL_FEATURES
 }
 
+/// True for every GPT-5.6 family model ID.
+///
+/// Lives here (ungated module) because both the `openai` and `openai-codex`
+/// features classify these models without implying each other.
+#[cfg(any(feature = "openai", feature = "openai-codex"))]
+pub(crate) const fn is_gpt56_model(model: &str) -> bool {
+    matches!(
+        model.as_bytes(),
+        b"gpt-5.6" | b"gpt-5.6-sol" | b"gpt-5.6-terra" | b"gpt-5.6-luna"
+    )
+}
+
+/// True when `model` accepts the Responses API's `detail: original` image
+/// rendering for historical transcript frames.
+#[cfg(any(feature = "openai", feature = "openai-codex"))]
+pub(crate) fn supports_responses_original_image_detail(model: &str) -> bool {
+    model == "gpt-5.4"
+        || (is_gpt56_model(model)
+            && get_model_features(model).is_some_and(|features| {
+                features.api_surfaces.contains(&ModelApiSurface::Responses)
+            }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

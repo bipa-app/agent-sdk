@@ -115,6 +115,22 @@ impl<T: McpTransport> McpToolBridge<T> {
     }
 }
 
+fn recoverable_mcp_data(content: &[McpContent]) -> Result<Option<Value>, serde_json::Error> {
+    #[derive(serde::Serialize)]
+    struct RecoverableContent<'a> {
+        content: Vec<&'a McpContent>,
+    }
+
+    let content: Vec<&McpContent> = content
+        .iter()
+        .filter(|item| matches!(item, McpContent::Image { .. }))
+        .collect();
+    if content.is_empty() {
+        return Ok(None);
+    }
+    serde_json::to_value(RecoverableContent { content }).map(Some)
+}
+
 impl<T: McpTransport + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for McpToolBridge<T> {
     type Name = DynamicToolName;
 
@@ -144,12 +160,14 @@ impl<T: McpTransport + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for McpToo
         // Convert MCP content to output string
         let output = format_mcp_content(&result.content);
 
-        // Preserve the structured result as `data`. On the (unexpected)
-        // serialization failure, log it rather than silently substituting null.
-        let data = match serde_json::to_value(&result) {
-            Ok(value) => Some(value),
+        // Text and resource content is already represented in `output`; keep
+        // only payload that the formatted transcript cannot recover (currently
+        // image bytes). Generic ToolResult budget enforcement spills this
+        // structured content together with output when the total is oversized.
+        let data = match recoverable_mcp_data(&result.content) {
+            Ok(value) => value,
             Err(err) => {
-                log::warn!("failed to serialize MCP tool result to JSON: {err}");
+                log::warn!("failed to serialize recoverable MCP tool content to JSON: {err}");
                 None
             }
         };
@@ -393,6 +411,50 @@ mod tests {
         assert_eq!(std::fs::read(&saved.path)?, raw.as_bytes());
         assert!(result.output.len() <= store.inline_budget());
         assert!(result.output.ends_with(&crate::artifact_footer(saved.id)));
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_text_is_not_duplicated_and_large_image_data_spills_with_output() -> Result<()> {
+        let text = "unique-mcp-text\n".repeat(16 * 1024);
+        let image = "A".repeat(128 * 1024);
+        let content = vec![
+            McpContent::Text { text },
+            McpContent::Resource {
+                uri: "file:///recoverable-from-output".to_owned(),
+                mime_type: Some("text/plain".to_owned()),
+                text: Some("resource text already in output".to_owned()),
+            },
+            McpContent::Image {
+                data: image.clone(),
+                mime_type: "image/png".to_owned(),
+            },
+        ];
+        let output = format_mcp_content(&content);
+        let data = recoverable_mcp_data(&content)?.context("image data should be retained")?;
+        let encoded_data = serde_json::to_string(&data)?;
+        assert!(!encoded_data.contains("unique-mcp-text"));
+        assert!(!encoded_data.contains("resource text already in output"));
+        assert!(encoded_data.contains(&image));
+
+        let dir = tempfile::tempdir()?;
+        let store =
+            crate::ArtifactStore::new(dir.path().join("artifacts")).with_inline_budget(4096);
+        let mut result = ToolResult::success_with_data(output.clone(), data.clone());
+        let saved = crate::enforce_inline_budget(&mut result, Some(&store), "mcp_fetch")
+            .context("combined MCP payload must spill")?;
+
+        let recovered: ToolResult = serde_json::from_slice(&std::fs::read(&saved.path)?)?;
+        assert_eq!(recovered.output, output);
+        assert_eq!(recovered.data, Some(data));
+        assert!(recovered.documents.is_empty());
+        assert!(result.data.is_none());
+        assert!(result.documents.is_empty());
+        assert!(result.output.ends_with(&crate::artifact_footer(saved.id)));
+        assert!(
+            serde_json::to_vec(&result)?.len() <= store.inline_budget() + 256,
+            "post-enforcement MCP ToolResult must remain bounded"
+        );
         Ok(())
     }
 

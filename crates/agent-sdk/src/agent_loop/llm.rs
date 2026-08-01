@@ -1,7 +1,8 @@
 use super::helpers::{calculate_backoff_delay, send_event};
 use super::types::{
     CONNECTIVITY_PROBE_MIN_DELAY, LLM_CALL_TOTAL_TIMEOUT, LLM_STREAM_INACTIVITY_TIMEOUT,
-    LlmEventContext, LlmOutcome, LlmStreamIds, MAX_REACHABLE_CONNECTIVITY_FAILURES, StreamError,
+    LlmEventContext, LlmOutcome, LlmStreamIdSlots, LlmStreamIds,
+    MAX_REACHABLE_CONNECTIVITY_FAILURES, StreamError,
 };
 use crate::events::AgentEvent;
 use crate::hooks::{AgentHooks, RequestDecision, ResponseDecision};
@@ -231,19 +232,40 @@ enum ProviderCall {
 async fn chat_or_cancel<P, H>(
     provider: &Arc<P>,
     request: &ChatRequest,
+    artifact_store: Option<&Arc<crate::ArtifactStore>>,
     event_ctx: &LlmEventContext<'_, H>,
 ) -> ProviderCall
 where
     P: LlmProvider,
     H: AgentHooks,
 {
+    if event_ctx.cancel_token.is_cancelled() {
+        return ProviderCall::Cancelled;
+    }
+    let request = match crate::request_artifact_hydration::hydrate_request_artifact_sources(
+        request,
+        artifact_store.cloned(),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(error) => {
+            return ProviderCall::Error(AgentError::new(
+                format!("Failed to hydrate provider request artifacts: {error:#}"),
+                false,
+            ));
+        }
+    };
+    if event_ctx.cancel_token.is_cancelled() {
+        return ProviderCall::Cancelled;
+    }
     tokio::select! {
         biased;
         () = event_ctx.cancel_token.cancelled() => {
             log::info!("LLM call cancelled (turn={})", event_ctx.turn);
             ProviderCall::Cancelled
         }
-        res = tokio::time::timeout(LLM_CALL_TOTAL_TIMEOUT, provider.chat(request.clone())) => match res {
+        res = tokio::time::timeout(LLM_CALL_TOTAL_TIMEOUT, provider.chat(request)) => match res {
             Ok(Ok(outcome)) => ProviderCall::Outcome(outcome),
             Ok(Err(e)) => ProviderCall::Error(AgentError::new(format!("LLM error: {e}"), false)),
             Err(_elapsed) => {
@@ -268,6 +290,7 @@ where
 pub(super) async fn call_llm_with_retry<P, H>(
     provider: &Arc<P>,
     request: ChatRequest,
+    artifact_store: Option<&Arc<crate::ArtifactStore>>,
     config: &AgentConfig,
     event_ctx: &LlmEventContext<'_, H>,
     #[cfg(feature = "otel")] mut span_observer: Option<LlmSpanObserver<'_>>,
@@ -280,7 +303,7 @@ where
     let mut attempt = 0u32;
 
     loop {
-        let outcome = match chat_or_cancel(provider, &request, event_ctx).await {
+        let outcome = match chat_or_cancel(provider, &request, artifact_store, event_ctx).await {
             ProviderCall::Outcome(outcome) => outcome,
             ProviderCall::Cancelled => return (LlmOutcome::Cancelled(ZERO_USAGE), attempt),
             ProviderCall::Error(error) => return (LlmOutcome::Error(error), attempt),
@@ -733,16 +756,20 @@ where
 pub(super) async fn call_llm_streaming<P, H>(
     provider: &Arc<P>,
     request: ChatRequest,
+    artifact_store: Option<&Arc<crate::ArtifactStore>>,
     config: &AgentConfig,
     event_ctx: &LlmEventContext<'_, H>,
-    message_id: &mut String,
-    thinking_id: &mut String,
+    stream_id_slots: LlmStreamIdSlots<'_>,
     #[cfg(feature = "otel")] mut span_observer: Option<LlmSpanObserver<'_>>,
 ) -> (LlmOutcome, u32)
 where
     P: LlmProvider,
     H: AgentHooks,
 {
+    let LlmStreamIdSlots {
+        message_id,
+        thinking_id,
+    } = stream_id_slots;
     let max_retries = config.retry.max_retries;
     let mut retry = StreamingRetryState::new();
 
@@ -754,6 +781,7 @@ where
         let result = process_stream(
             provider,
             &request,
+            artifact_store,
             event_ctx,
             stream_ids,
             #[cfg(feature = "otel")]
@@ -833,6 +861,7 @@ where
 async fn process_stream<P, H>(
     provider: &Arc<P>,
     request: &ChatRequest,
+    artifact_store: Option<&Arc<crate::ArtifactStore>>,
     event_ctx: &LlmEventContext<'_, H>,
     stream_ids: LlmStreamIds<'_>,
     #[cfg(feature = "otel")] mut span_observer: Option<&mut LlmSpanObserver<'_>>,
@@ -841,7 +870,14 @@ where
     P: LlmProvider,
     H: AgentHooks,
 {
-    let mut stream = std::pin::pin!(provider.chat_stream(request.clone()));
+    if event_ctx.cancel_token.is_cancelled() {
+        return Err(StreamError::Cancelled(ZERO_USAGE));
+    }
+    let request = hydrate_stream_request(request, artifact_store).await?;
+    if event_ctx.cancel_token.is_cancelled() {
+        return Err(StreamError::Cancelled(ZERO_USAGE));
+    }
+    let mut stream = std::pin::pin!(provider.chat_stream(request));
     let mut accumulator = StreamAccumulator::new();
     let mut delta_count: u64 = 0;
     // `chunk_timing` advances once per *content* delta: the first content
@@ -959,6 +995,24 @@ where
         provider.model(),
         delta_count,
     ))
+}
+
+/// Hydrate artifact-backed attachment sources for one streaming attempt,
+/// mapping hydration failures onto [`StreamError::Fatal`].
+async fn hydrate_stream_request(
+    request: &ChatRequest,
+    artifact_store: Option<&Arc<crate::ArtifactStore>>,
+) -> Result<ChatRequest, StreamError> {
+    crate::request_artifact_hydration::hydrate_request_artifact_sources(
+        request,
+        artifact_store.cloned(),
+    )
+    .await
+    .map_err(|error| {
+        StreamError::Fatal(format!(
+            "Failed to hydrate provider request artifacts: {error:#}"
+        ))
+    })
 }
 
 /// Per-stream chunk-latency bookkeeping for the `OTel` `GenAI`

@@ -225,13 +225,17 @@ impl RootTurnDeps<'_> {
     }
 
     fn note_stream_usage(&self, usage: &llm::Usage) {
+        self.note_token_usage(&TokenUsage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        });
+    }
+
+    pub(crate) fn note_token_usage(&self, usage: &TokenUsage) {
         if let Some(activity) = self.activity {
-            activity.record_usage(&TokenUsage {
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                cached_input_tokens: usage.cached_input_tokens,
-                cache_creation_input_tokens: usage.cache_creation_input_tokens,
-            });
+            activity.record_usage(usage);
         }
     }
 
@@ -1546,6 +1550,7 @@ async fn run_boundary_injection_call(
         provider,
         chat_request,
         initial_attempt: attempt,
+        initial_abandoned_usage: ZERO_ATTEMPT_USAGE,
         deps,
         thread_id,
         now,
@@ -1789,14 +1794,17 @@ async fn execute_root_turn_inner(
     //     so the durable projection can be safely rewritten without
     //     duplicating the user prompt at commit time. No-op when
     //     `deps.compaction_config` is `None`.
-    super::compaction::maybe_compact_staged_history(
+    let prepared = prepare_pre_call_compaction(PreCallCompactionParams {
+        inputs: &inputs,
+        definition,
+        attempt_audit_prompt: &audit_prompt,
+        initial_attempt: attempt,
         deps,
-        &inputs.staged_stores.messages,
         thread_id,
         now,
-    )
-    .await
-    .context("pre-call auto-compaction")?;
+        error_context: "pre-call auto-compaction",
+    })
+    .await?;
 
     // 3. Build, send LLM request, and resolve the outcome — closing
     //    the attempt on any non-success path.  `call_llm` allocates
@@ -1820,7 +1828,8 @@ async fn execute_root_turn_inner(
         attempt_audit_prompt: &audit_prompt,
         provider,
         chat_request,
-        initial_attempt: attempt,
+        initial_attempt: prepared.attempt,
+        initial_abandoned_usage: prepared.abandoned_usage,
         deps,
         thread_id,
         now,
@@ -2522,6 +2531,18 @@ const fn response_token_usage(response: &llm::ChatResponse) -> TokenUsage {
     }
 }
 
+const fn token_usage_as_llm_usage(usage: &TokenUsage) -> llm::Usage {
+    llm::Usage {
+        served_speed: None,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cached_input_tokens: usage.cached_input_tokens,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+    }
+}
+
+const COMPACTION_AUDIT_PROMPT: &str = "<context-compaction>";
+
 // ─────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────
@@ -2581,6 +2602,133 @@ async fn open_attempt(
         })
         .await
         .context("open_attempt via store")
+}
+
+async fn close_compaction_attempt(
+    attempt: &TurnAttempt,
+    outcome: TurnAttemptOutcome,
+    usage: &TokenUsage,
+    applied: bool,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<()> {
+    deps.attempt_store
+        .close_attempt(
+            &attempt.id,
+            CloseAttemptParams {
+                response_blob: serde_json::json!({
+                    "operation": "context_compaction",
+                    "applied": applied,
+                }),
+                response_id: None,
+                response_model: None,
+                stop_reason: None,
+                outcome,
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cached_input_tokens: usage.cached_input_tokens,
+                cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                route_provider: deps
+                    .compaction_provider
+                    .map(|provider| provider.provider().to_owned()),
+                thinking_mode: None,
+                thinking_budget_tokens: None,
+                thinking_effort: None,
+            },
+            now,
+        )
+        .await
+        .map(|_| ())
+        .context("close context-compaction attempt")
+}
+
+struct PreCallCompactionParams<'a> {
+    inputs: &'a RootWorkerInputs,
+    definition: &'a AgentDefinition,
+    attempt_audit_prompt: &'a str,
+    initial_attempt: TurnAttempt,
+    deps: &'a RootTurnDeps<'a>,
+    thread_id: &'a agent_sdk_foundation::ThreadId,
+    now: OffsetDateTime,
+    error_context: &'static str,
+}
+
+struct PreparedLlmAttempt {
+    attempt: TurnAttempt,
+    abandoned_usage: llm::Usage,
+}
+
+async fn prepare_pre_call_compaction(
+    params: PreCallCompactionParams<'_>,
+) -> Result<PreparedLlmAttempt> {
+    let PreCallCompactionParams {
+        inputs,
+        definition,
+        attempt_audit_prompt,
+        initial_attempt,
+        deps,
+        thread_id,
+        now,
+        error_context,
+    } = params;
+    let outcome = match super::compaction::maybe_compact_staged_history(
+        deps,
+        &inputs.staged_stores.messages,
+        thread_id,
+        now,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(failure) => {
+            close_compaction_attempt(
+                &initial_attempt,
+                TurnAttemptOutcome::ServerError,
+                &failure.llm_usage,
+                false,
+                deps,
+                OffsetDateTime::now_utc(),
+            )
+            .await?;
+            return Err(failure.error.context(error_context));
+        }
+    };
+
+    if !outcome.completed {
+        return Ok(PreparedLlmAttempt {
+            attempt: initial_attempt,
+            abandoned_usage: ZERO_ATTEMPT_USAGE,
+        });
+    }
+
+    close_compaction_attempt(
+        &initial_attempt,
+        TurnAttemptOutcome::Success,
+        &outcome.llm_usage,
+        outcome.applied,
+        deps,
+        OffsetDateTime::now_utc(),
+    )
+    .await?;
+    if deps.is_cancelled() {
+        return Err(anyhow::Error::new(RootTurnCancelledMarker)
+            .context("root turn cancelled after completed pre-call compaction"));
+    }
+
+    let attempt = open_attempt(
+        inputs,
+        definition,
+        attempt_audit_prompt,
+        deps.attempt_store,
+        OffsetDateTime::now_utc(),
+        None,
+    )
+    .await
+    .context("open chat attempt after pre-call compaction")?;
+    Ok(PreparedLlmAttempt {
+        attempt,
+        abandoned_usage: token_usage_as_llm_usage(&outcome.llm_usage),
+    })
 }
 
 /// Load the root `invoke_agent` span's `(trace_id, span_id)` for a turn
@@ -3053,6 +3201,9 @@ pub(crate) struct LlmRetryParams<'a> {
     /// Initial [`TurnAttempt`] opened by the caller before streaming
     /// begins.  Subsequent attempts are minted by the wrapper.
     pub(crate) initial_attempt: TurnAttempt,
+    /// Provider-billed usage already closed on attempts before the first chat
+    /// dispatch in this loop (currently proactive compaction).
+    pub(crate) initial_abandoned_usage: llm::Usage,
     /// Store handles for committing delta events, closing failed
     /// attempts, and emitting `AutoRetryStart` / `AutoRetryEnd`.
     pub(crate) deps: &'a RootTurnDeps<'a>,
@@ -3199,6 +3350,7 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
         provider,
         mut chat_request,
         initial_attempt,
+        initial_abandoned_usage,
         deps,
         thread_id,
         now,
@@ -3212,12 +3364,10 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
     // bug behind unlimited retries. Mirrors
     // `agent_sdk::agent_loop::types::MAX_COMPACTION_RETRIES`.
     let mut compaction_retries: u32 = 0;
-    // Usage billed by attempts that failed recoverably before this turn
-    // eventually succeeded. Each such attempt's audit row bills its own tokens
-    // (row-level ledger); this carries the same tokens to the turn-level ledger,
-    // which is derived solely from the successful response — so folding here
-    // includes both attempts without double-counting against the rows.
-    let mut abandoned_usage = ZERO_ATTEMPT_USAGE;
+    // Usage billed by closed attempts before or during this retry loop.
+    // Each attempt row bills its own tokens; this accumulator carries the same
+    // spend to the eventual turn/thread aggregate exactly once.
+    let mut abandoned_usage = initial_abandoned_usage;
 
     loop {
         // Built before the gate, not inside `call_llm_once`: evidence is a
@@ -3272,21 +3422,21 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
                 .await?;
             }
             Err(StreamAttemptError::Fatal { message, kind }) => {
-                if let Some(next_attempt) =
-                    try_recover_with_compaction(PromptTooLongRecoveryParams {
-                        message: &message,
-                        chat_request: &mut chat_request,
-                        user_input,
-                        attempt_audit_prompt,
-                        compaction_retries: &mut compaction_retries,
-                        inputs,
-                        definition,
-                        deps,
-                        thread_id,
-                    })
-                    .await?
+                if let Some(recovery) = try_recover_with_compaction(PromptTooLongRecoveryParams {
+                    message: &message,
+                    chat_request: &mut chat_request,
+                    user_input,
+                    attempt_audit_prompt,
+                    compaction_retries: &mut compaction_retries,
+                    inputs,
+                    definition,
+                    deps,
+                    thread_id,
+                })
+                .await?
                 {
-                    attempt = next_attempt;
+                    add_attempt_usage(&mut abandoned_usage, &recovery.abandoned_usage);
+                    attempt = recovery.attempt;
                     continue;
                 }
                 return Err(root_stream_failure(kind, message));
@@ -3638,6 +3788,11 @@ struct PromptTooLongRecoveryParams<'a> {
     thread_id: &'a agent_sdk_foundation::ThreadId,
 }
 
+struct CompactionRecovery {
+    attempt: TurnAttempt,
+    abandoned_usage: llm::Usage,
+}
+
 /// Detect a `prompt is too long`-class fatal error, run an emergency
 /// compaction against the durable projection + staged buffer, rebuild
 /// the chat request from the compacted history, and open a fresh
@@ -3651,7 +3806,7 @@ struct PromptTooLongRecoveryParams<'a> {
 /// caller must surface.
 async fn try_recover_with_compaction(
     params: PromptTooLongRecoveryParams<'_>,
-) -> Result<Option<TurnAttempt>> {
+) -> Result<Option<CompactionRecovery>> {
     let PromptTooLongRecoveryParams {
         message,
         chat_request,
@@ -3680,16 +3835,55 @@ async fn try_recover_with_compaction(
          compaction before retry",
         *compaction_retries,
     );
-    let did_compact = super::compaction::compact_after_overflow(
-        deps,
-        &inputs.staged_stores.messages,
-        thread_id,
+
+    let compaction_attempt = open_attempt(
+        inputs,
+        definition,
+        COMPACTION_AUDIT_PROMPT,
+        deps.attempt_store,
         now_compact,
+        None,
     )
     .await
-    .context("emergency compaction after prompt-too-long")?;
+    .context("open overflow-compaction attempt")?;
+    let outcome =
+        run_overflow_compaction(deps, inputs, thread_id, &compaction_attempt, now_compact).await?;
 
-    if !did_compact {
+    let completed_usage = token_usage_as_llm_usage(&outcome.llm_usage);
+    if outcome.completed {
+        close_compaction_attempt(
+            &compaction_attempt,
+            TurnAttemptOutcome::Success,
+            &outcome.llm_usage,
+            outcome.applied,
+            deps,
+            OffsetDateTime::now_utc(),
+        )
+        .await?;
+        if deps.is_cancelled() {
+            return Err(anyhow::Error::new(RootTurnCancelledMarker)
+                .context("root turn cancelled after completed overflow compaction"));
+        }
+    }
+
+    if !outcome.applied {
+        if deps.is_cancelled() && !outcome.completed {
+            return Ok(Some(CompactionRecovery {
+                attempt: compaction_attempt,
+                abandoned_usage: ZERO_ATTEMPT_USAGE,
+            }));
+        }
+        if !outcome.completed {
+            close_compaction_attempt(
+                &compaction_attempt,
+                TurnAttemptOutcome::ServerError,
+                &outcome.llm_usage,
+                false,
+                deps,
+                OffsetDateTime::now_utc(),
+            )
+            .await?;
+        }
         return Ok(None);
     }
 
@@ -3723,7 +3917,46 @@ async fn try_recover_with_compaction(
     .await
     .context("open retry turn attempt after emergency compaction")?;
 
-    Ok(Some(next_attempt))
+    Ok(Some(CompactionRecovery {
+        attempt: next_attempt,
+        abandoned_usage: completed_usage,
+    }))
+}
+
+/// Run the emergency compaction for [`try_recover_with_compaction`],
+/// closing the audit attempt as a server error when compaction itself
+/// fails.
+async fn run_overflow_compaction(
+    deps: &RootTurnDeps<'_>,
+    inputs: &RootWorkerInputs,
+    thread_id: &agent_sdk_foundation::ThreadId,
+    compaction_attempt: &TurnAttempt,
+    now_compact: OffsetDateTime,
+) -> Result<super::compaction::CompactionOutcome> {
+    match super::compaction::compact_after_overflow(
+        deps,
+        &inputs.staged_stores.messages,
+        thread_id,
+        now_compact,
+    )
+    .await
+    {
+        Ok(outcome) => Ok(outcome),
+        Err(failure) => {
+            close_compaction_attempt(
+                compaction_attempt,
+                TurnAttemptOutcome::ServerError,
+                &failure.llm_usage,
+                false,
+                deps,
+                OffsetDateTime::now_utc(),
+            )
+            .await?;
+            Err(failure
+                .error
+                .context("emergency compaction after prompt-too-long"))
+        }
+    }
 }
 
 /// Clamp a provider-supplied retry delay to [`STREAM_MAX_RETRY_AFTER_MS`].
@@ -3878,6 +4111,43 @@ async fn call_llm_once(
     thread_id: &agent_sdk_foundation::ThreadId,
     now: OffsetDateTime,
 ) -> Result<OnceOutcome, StreamAttemptError> {
+    let request = match agent_sdk::request_artifact_hydration::hydrate_request_artifact_sources(
+        &request,
+        deps.compaction_artifact_store.cloned(),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(error) => {
+            close_attempt_with(
+                attempt,
+                TurnAttemptOutcome::InvalidRequest,
+                &ZERO_ATTEMPT_USAGE,
+                Some(evidence),
+                deps.attempt_store,
+                OffsetDateTime::now_utc(),
+            )
+            .await;
+            return Err(StreamAttemptError::Fatal {
+                message: format!("Failed to hydrate provider request artifacts: {error:#}"),
+                kind: StreamErrorKind::InvalidRequest,
+            });
+        }
+    };
+    if deps.is_cancelled() {
+        close_attempt_with(
+            attempt,
+            TurnAttemptOutcome::Cancelled,
+            &ZERO_ATTEMPT_USAGE,
+            Some(evidence),
+            deps.attempt_store,
+            OffsetDateTime::now_utc(),
+        )
+        .await;
+        return Err(StreamAttemptError::Cancelled {
+            message: "root turn cancelled during provider request hydration".to_owned(),
+        });
+    }
     // Publish the pending occupancy snapshot BEFORE the provider sees
     // the request, so live gauges move at dispatch instead of at the
     // attempt close (ENG-9510). Settled calls re-anchor on billed
@@ -6302,14 +6572,17 @@ pub async fn resume_root_turn(
     // 4. Pre-call auto-compaction. This must run after the resumed draft is
     //    staged and persisted: the projection transition validates and folds
     //    the complete effective source, including completed tool results.
-    super::compaction::maybe_compact_staged_history(
+    let prepared = prepare_pre_call_compaction(PreCallCompactionParams {
+        inputs: &inputs,
+        definition,
+        attempt_audit_prompt: &resume_audit,
+        initial_attempt: attempt,
         deps,
-        &inputs.staged_stores.messages,
         thread_id,
         now,
-    )
-    .await
-    .context("pre-call auto-compaction (resume path)")?;
+        error_context: "pre-call auto-compaction (resume path)",
+    })
+    .await?;
 
     // 5. Build the chat request from staged history. `resume_input` is
     //    a resume sentinel whose `into_message()` returns `None`, so
@@ -6340,7 +6613,8 @@ pub async fn resume_root_turn(
         attempt_audit_prompt: &resume_audit,
         provider,
         chat_request,
-        initial_attempt: attempt,
+        initial_attempt: prepared.attempt,
+        initial_abandoned_usage: prepared.abandoned_usage,
         deps,
         thread_id,
         now,
@@ -7693,14 +7967,17 @@ async fn stage_and_call_steering_llm(
     .await
     .context("persist exact steering compaction source")?;
 
-    super::compaction::maybe_compact_staged_history(
+    let prepared = prepare_pre_call_compaction(PreCallCompactionParams {
+        inputs,
+        definition,
+        attempt_audit_prompt: &resume_audit,
+        initial_attempt: attempt,
         deps,
-        &inputs.staged_stores.messages,
         thread_id,
         now,
-    )
-    .await
-    .context("pre-call auto-compaction (steering resume path)")?;
+        error_context: "pre-call auto-compaction (steering resume path)",
+    })
+    .await?;
 
     let chat_request = build_chat_request(
         definition,
@@ -7719,7 +7996,8 @@ async fn stage_and_call_steering_llm(
         attempt_audit_prompt: &resume_audit,
         provider,
         chat_request,
-        initial_attempt: attempt,
+        initial_attempt: prepared.attempt,
+        initial_abandoned_usage: prepared.abandoned_usage,
         deps,
         thread_id,
         now,
