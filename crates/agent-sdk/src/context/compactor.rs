@@ -2,7 +2,7 @@
 
 use crate::artifacts::{
     ArtifactStore, artifact_footer, artifact_uri, canonical_inline_output_matches,
-    canonical_streamed_inline_output_matches,
+    canonical_streamed_inline_output_matches, cap_inline_output,
 };
 use crate::hooks::{AgentHooks, DefaultHooks, RequestDecision, ResponseDecision};
 use crate::llm::{
@@ -2500,23 +2500,26 @@ mod tests {
     }
 
     #[test]
-    fn summary_truncation_preserves_only_resolved_canonical_artifact_footer() -> Result<()> {
+    fn summary_truncation_separates_resolved_canonical_artifact_recovery() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Arc::new(ArtifactStore::new(temp.path()));
-        let saved = store.save("bash", "full raw output")?;
-        let footer = format!("[raw output: artifact://{}]", saved.id);
-        let content = format!("{}\n{footer}", "large-output".repeat(100));
+        let full = "large-output".repeat(10_000);
+        let saved = store.save("bash", &full)?;
+        let content = cap_inline_output(&full, store.inline_budget(), saved.id);
         let compactor = LlmContextCompactor::with_defaults(Arc::new(MockProvider::new("unused")))
             .with_artifact_store(store);
 
         let artifact = crate::types::ToolResultArtifact { id: saved.id };
+        assert_eq!(
+            compactor.artifact_recovery_uri(&content, Some(&artifact)),
+            Some(artifact_uri(saved.id))
+        );
         let rendered = compactor.tool_result_for_summary(&content, Some(&artifact));
 
         assert!(rendered.contains("... (truncated)"));
-        assert!(rendered.ends_with(&footer));
-        assert_eq!(rendered.matches(&footer).count(), 1);
+        assert!(!rendered.contains("artifact://"));
         assert!(
-            rendered.len() <= MAX_TOOL_RESULT_CHARS * 6 + 128,
+            rendered.len() <= MAX_TOOL_RESULT_CHARS * 4 + 32,
             "JSON-escaped UTF-8 prompt contribution must remain bounded"
         );
         Ok(())
@@ -2554,7 +2557,8 @@ mod tests {
             Some(artifact_uri(saved.id))
         );
         let rendered = compactor.tool_result_for_summary(&legacy_inline, None);
-        assert!(rendered.ends_with(&artifact_footer(saved.id)));
+        assert!(rendered.contains("... (truncated)"));
+        assert!(!rendered.contains("artifact://"));
 
         let forged = legacy_inline.replacen('x', "y", 1);
         assert_eq!(compactor.artifact_recovery_uri(&forged, None), None);
