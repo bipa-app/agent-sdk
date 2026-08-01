@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-v0.16.0...agent-sdk-v0.17.0) - 2026-08-01
+
+### Added
+
+- *(events)* add account pool transition events ([#429](https://github.com/bipa-app/agent-sdk/pull/429))
+- add lossless artifact budget retention ([#428](https://github.com/bipa-app/agent-sdk/pull/428))
+- *(compaction)* prune first and use billed triggers (ENG-9527) ([#427](https://github.com/bipa-app/agent-sdk/pull/427))
+- *(compaction)* preserve append-only transcript lineage (ENG-9526) ([#425](https://github.com/bipa-app/agent-sdk/pull/425))
+- *(tools,sdk)* artifact spill substrate — shared inline output budget with byte-identical overflow storage ([#420](https://github.com/bipa-app/agent-sdk/pull/420))
+- *(tools)* read byte budget + MCP tool-output cap (ENG-9519) ([#419](https://github.com/bipa-app/agent-sdk/pull/419))
+- *(events)* attribute content events to their emitting task (ENG-9422) ([#414](https://github.com/bipa-app/agent-sdk/pull/414))
+
 ## [0.16.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-v0.15.0...agent-sdk-v0.16.0) - 2026-07-28
 
 ### Added

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.16.0...agent-sdk-providers-v0.17.0) - 2026-08-01
+
+### Added
+
+- *(providers)* expose rejects_budget_thinking on ModelCapabilities ([#417](https://github.com/bipa-app/agent-sdk/pull/417))
+- *(providers,server)* honor ThinkingDisplay across providers and expose it on AgentDefinition ([#416](https://github.com/bipa-app/agent-sdk/pull/416))
+
+### Fixed
+
+- *(openai)* separate reasoning-summary sections with a blank line ([#422](https://github.com/bipa-app/agent-sdk/pull/422))
+
 ## [0.16.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.15.0...agent-sdk-providers-v0.16.0) - 2026-07-28
 
 ### Added
