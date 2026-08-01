@@ -673,6 +673,24 @@ mod in_memory_bundle {
                 )
                 .await
         }
+        async fn append_repair(
+            &self,
+            thread_id: &ThreadId,
+            repair_messages: Vec<agent_sdk_foundation::llm::Message>,
+            balanced_messages: Vec<agent_sdk_foundation::llm::Message>,
+            source_message_count: usize,
+            now: OffsetDateTime,
+        ) -> Result<MessageProjection> {
+            self.message
+                .append_repair(
+                    thread_id,
+                    repair_messages,
+                    balanced_messages,
+                    source_message_count,
+                    now,
+                )
+                .await
+        }
         async fn set_draft(
             &self,
             thread_id: &ThreadId,

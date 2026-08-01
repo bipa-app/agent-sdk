@@ -144,6 +144,20 @@ pub trait MessageProjectionStore: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<MessageProjection>;
 
+    /// Atomically append raw orphan-repair evidence, clear the recovered draft,
+    /// and select a balanced effective projection without rewriting history.
+    ///
+    /// # Errors
+    /// Returns an error for stale source shape or persistence failure.
+    async fn append_repair(
+        &self,
+        thread_id: &ThreadId,
+        repair_messages: Vec<llm::Message>,
+        balanced_messages: Vec<llm::Message>,
+        source_message_count: usize,
+        now: OffsetDateTime,
+    ) -> Result<MessageProjection>;
+
     /// Replace the in-flight draft messages for `thread_id`.
     ///
     /// Called by the worker at every tool-boundary suspension with
@@ -303,6 +317,30 @@ impl MessageProjectionStore for InMemoryMessageProjectionStore {
             result_messages,
             source_message_count,
             retained_message_count,
+            now,
+        )?;
+        *projection = updated.clone();
+        drop(inner);
+        Ok(updated)
+    }
+
+    async fn append_repair(
+        &self,
+        thread_id: &ThreadId,
+        repair_messages: Vec<llm::Message>,
+        balanced_messages: Vec<llm::Message>,
+        source_message_count: usize,
+        now: OffsetDateTime,
+    ) -> Result<MessageProjection> {
+        let mut inner = self.inner.write().await;
+        let projection = inner
+            .by_thread
+            .entry(thread_id.clone())
+            .or_insert_with(|| MessageProjection::new(thread_id.clone(), now));
+        let updated = projection.clone().append_repair(
+            repair_messages,
+            balanced_messages,
+            source_message_count,
             now,
         )?;
         *projection = updated.clone();

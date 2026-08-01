@@ -29,8 +29,8 @@
 //! shares active per-thread stores within one process.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::OsString;
-use std::io::{Read, Write};
+use std::ffi::{OsStr, OsString};
+use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
@@ -52,6 +52,8 @@ use sha2::{Digest, Sha256};
 const DEFAULT_MAX_ARTIFACT_BYTES_PER_THREAD: u64 = 512 * 1024 * 1024;
 const STALE_PARTIAL_MAX_AGE: Duration = Duration::from_hours(24);
 
+const ARTIFACT_ALLOCATOR_MARKER: &str = ".id-watermark";
+const ARTIFACT_ALLOCATOR_RECORD_BYTES: usize = 21;
 /// A tool result whose `output` exceeds this many bytes is spilled to the
 /// artifact store and replaced inline by a head + tail window and the
 /// recovery footer.
@@ -87,7 +89,25 @@ pub fn enforce_inline_budget(
         DEFAULT_INLINE_OUTPUT_BUDGET_BYTES,
         ArtifactStore::inline_budget,
     );
+    // Host-provided/custom tools do not own spill provenance. Clear every
+    // caller claim first, then re-mint only a byte-exact canonical claim
+    // produced by the SDK's streaming spill path.
+    let claimed_artifact = result.artifact.take();
     if result.output.len() <= budget {
+        if let (Some(store), Some(artifact)) = (store, claimed_artifact)
+            && let Ok(mut file) = store.resolve(artifact.id)
+            && let Ok(metadata) = file.metadata()
+            && canonical_streamed_inline_output_matches(
+                &mut file,
+                metadata.len(),
+                &result.output,
+                budget,
+                artifact.id,
+            )
+            .unwrap_or(false)
+        {
+            result.artifact = Some(artifact);
+        }
         return None;
     }
     let original_bytes = result.output.len();
@@ -338,16 +358,15 @@ impl ArtifactStore {
             drop(temp);
 
             let file_stem_tool = sanitize_tool_name(tool_name);
-            let mut id = scan_next_id(&dir)
-                .with_context(|| format!("scanning artifacts dir {}", self.dir.display()))?;
+            // Reserve durably before publication. A failed publish burns an ID
+            // rather than allowing a later artifact to impersonate it.
+            let mut id = reserve_artifact_id(&dir)?;
             let name = loop {
                 let name = format!("{id}.{file_stem_tool}.log");
                 match dir.hard_link(&temp_name, &dir, &name) {
                     Ok(()) => break name,
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                        id = id
-                            .checked_add(1)
-                            .context("artifact ID space exhausted after allocation collision")?;
+                        id = reserve_artifact_id(&dir)?;
                     }
                     Err(error) => return Err(error).context("publishing staged artifact"),
                 }
@@ -424,6 +443,65 @@ impl ArtifactStore {
                 listed.join(", ")
             ))
         }
+    }
+    /// Recover a legacy footer claim only when it byte-for-byte matches this
+    /// store's canonical bounded rendering of the claimed durable artifact.
+    ///
+    /// This is the compatibility seam for journal rows written before typed
+    /// `ToolResultArtifact` provenance existed. Syntax alone is never trusted.
+    ///
+    /// # Errors
+    /// Returns an error only when a present artifact cannot be inspected.
+    pub fn verified_legacy_inline_artifact_id(&self, inline: &str) -> Result<Option<u64>> {
+        const PREFIX: &str = "[raw output: artifact://";
+        let mut remaining = inline;
+        while let Some(start) = remaining.find(PREFIX) {
+            let digits = &remaining[start + PREFIX.len()..];
+            let Some(end) = digits.find(']') else {
+                return Ok(None);
+            };
+            let candidate = &digits[..end];
+            remaining = &digits[end + 1..];
+            if candidate.is_empty() || !candidate.bytes().all(|byte| byte.is_ascii_digit()) {
+                continue;
+            }
+            let Ok(id) = candidate.parse::<u64>() else {
+                continue;
+            };
+            let Ok(mut file) = self.resolve(id) else {
+                continue;
+            };
+            let total_bytes = file
+                .metadata()
+                .with_context(|| format!("inspecting legacy artifact {id}"))?
+                .len();
+            let streamed_matches = canonical_streamed_inline_output_matches(
+                &mut file,
+                total_bytes,
+                inline,
+                self.inline_budget,
+                id,
+            )?;
+            let inline_matches = if streamed_matches {
+                false
+            } else {
+                canonical_inline_output_matches(
+                    &mut file,
+                    total_bytes,
+                    inline,
+                    self.inline_budget,
+                    id,
+                )
+                // Invalid UTF-8 cannot be a standard string-backed spill. It
+                // may still be a streamed spill (checked above); otherwise
+                // the claim is simply unverified rather than a sweep outage.
+                .unwrap_or(false)
+            };
+            if streamed_matches || inline_matches {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
     }
 
     /// Enforce the shared inline budget on a tool result.
@@ -607,6 +685,105 @@ impl ArtifactStorage {
         Ok(store)
     }
 
+    /// Copy the source artifacts referenced at a fork boundary into the
+    /// unexposed destination while preserving IDs and the allocator fence.
+    ///
+    /// Re-driving a partial copy is idempotent only when every colliding ID is
+    /// byte-identical. Any conflicting destination bytes fail closed.
+    ///
+    /// # Errors
+    /// Returns an error on quota overflow, ambiguous/colliding IDs, or any
+    /// durability failure.
+    pub fn copy_thread_artifacts(
+        &self,
+        source_thread_id: &ThreadId,
+        destination_thread_id: &ThreadId,
+        artifact_ids: &BTreeSet<u64>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            source_thread_id != destination_thread_id,
+            "cannot copy an artifact namespace onto itself"
+        );
+        let source = self.for_thread(source_thread_id)?;
+        let destination = self.for_thread(destination_thread_id)?;
+        let source_first = source.dir <= destination.dir;
+        let (_first_operation, _second_operation) = if source_first {
+            (
+                source
+                    .operation_gate
+                    .lock()
+                    .map_err(|_| anyhow!("source artifact operation lock poisoned"))?,
+                destination
+                    .operation_gate
+                    .lock()
+                    .map_err(|_| anyhow!("destination artifact operation lock poisoned"))?,
+            )
+        } else {
+            (
+                destination
+                    .operation_gate
+                    .lock()
+                    .map_err(|_| anyhow!("destination artifact operation lock poisoned"))?,
+                source
+                    .operation_gate
+                    .lock()
+                    .map_err(|_| anyhow!("source artifact operation lock poisoned"))?,
+            )
+        };
+        let source_dir = source.cap_dir()?;
+        let destination_dir = destination.cap_dir()?;
+        let (_first_allocation, _second_allocation) = if source_first {
+            (
+                lock_artifact_directory(&source_dir)?,
+                lock_artifact_directory(&destination_dir)?,
+            )
+        } else {
+            (
+                lock_artifact_directory(&destination_dir)?,
+                lock_artifact_directory(&source_dir)?,
+            )
+        };
+
+        let source_next = ensure_allocator_next(&source_dir)?;
+        let destination_next = ensure_allocator_next(&destination_dir)?;
+        if destination_next < source_next {
+            // Seed the destination fence before publishing any copied ID.
+            persist_allocator_next(&destination_dir, source_next)?;
+        }
+        let source_artifacts = unique_artifacts_by_id(&source_dir)?;
+        let destination_artifacts = unique_artifacts_by_id(&destination_dir)?;
+        let mut admitted_bytes = artifact_bytes(&destination_dir)?;
+        for (id, source_name) in source_artifacts {
+            if !artifact_ids.contains(&id) {
+                continue;
+            }
+            if let Some(destination_name) = destination_artifacts.get(&id) {
+                anyhow::ensure!(
+                    artifact_files_equal(
+                        &source_dir,
+                        &source_name,
+                        &destination_dir,
+                        destination_name,
+                    )?,
+                    "destination artifact {id} collides with different bytes"
+                );
+                continue;
+            }
+            let source_len = artifact_file_len(&source_dir, &source_name)?;
+            admitted_bytes = admitted_bytes
+                .checked_add(source_len)
+                .context("forked artifact quota byte count overflow")?;
+            anyhow::ensure!(
+                admitted_bytes <= destination.max_bytes_per_thread,
+                "forked artifact namespace exceeds destination quota"
+            );
+            source_dir
+                .hard_link(&source_name, &destination_dir, &source_name)
+                .with_context(|| format!("copying fork artifact {id}"))?;
+        }
+        sync_directory(&destination_dir).context("syncing forked artifact namespace")
+    }
+
     /// Fence all existing thread directories before the host captures its
     /// durable liveness/reference snapshot. New writers take a shared activity
     /// lock; this pass holds the exclusive lock through deletion.
@@ -685,6 +862,9 @@ impl ArtifactStorage {
             } else {
                 None
             };
+            if allocation_lock.is_some() {
+                ensure_allocator_next(&dir)?;
+            }
             threads.push(FencedArtifactThread {
                 key,
                 dir,
@@ -884,6 +1064,115 @@ pub fn cap_inline_output(full: &str, budget: usize, artifact_id: u64) -> String 
     )
 }
 
+/// Compare a legacy inline spill boundary with the durable artifact without
+/// buffering or scanning the artifact body.
+///
+/// The comparison reproduces [`cap_inline_output`] from bounded head and tail
+/// windows. At most roughly 85% of `budget` is read and allocated regardless
+/// of artifact size.
+///
+/// # Errors
+/// Returns an error when seeking, reading, sizing, or UTF-8 validation fails.
+pub fn canonical_inline_output_matches<R: Read + Seek>(
+    reader: &mut R,
+    total_bytes: u64,
+    inline: &str,
+    budget: usize,
+    artifact_id: u64,
+) -> Result<bool> {
+    let total = usize::try_from(total_bytes).context("artifact size exceeds usize")?;
+    let head_budget = budget.saturating_mul(3) / 5;
+    let tail_budget = budget / 4;
+
+    let head_read_len = total.min(head_budget.saturating_add(1));
+    let mut head = vec![0_u8; head_read_len];
+    reader
+        .seek(SeekFrom::Start(0))
+        .context("seeking artifact head")?;
+    reader
+        .read_exact(&mut head)
+        .context("reading artifact head")?;
+    let head_end = if head_budget >= total {
+        total
+    } else {
+        let mut boundary = head_budget;
+        while boundary > 0 && head[boundary] & 0b1100_0000 == 0b1000_0000 {
+            boundary -= 1;
+        }
+        boundary
+    };
+
+    let tail_nominal = total.saturating_sub(tail_budget);
+    let tail_len = total.saturating_sub(tail_nominal);
+    let mut tail = vec![0_u8; tail_len];
+    reader
+        .seek(SeekFrom::Start(
+            u64::try_from(tail_nominal).context("artifact tail offset exceeds u64")?,
+        ))
+        .context("seeking artifact tail")?;
+    reader
+        .read_exact(&mut tail)
+        .context("reading artifact tail")?;
+    let mut tail_offset = 0;
+    while tail_offset < tail.len() && tail[tail_offset] & 0b1100_0000 == 0b1000_0000 {
+        tail_offset += 1;
+    }
+    let tail_start = tail_nominal.saturating_add(tail_offset);
+
+    let head = std::str::from_utf8(&head[..head_end]).context("artifact head is not UTF-8")?;
+    let footer = artifact_footer(artifact_id);
+    if tail_start <= head_end {
+        return Ok(format!("{head}\n{footer}") == inline);
+    }
+    let tail = std::str::from_utf8(&tail[tail_offset..]).context("artifact tail is not UTF-8")?;
+    let elided = tail_start - head_end;
+    Ok(format!("{head}\n[... {elided} bytes elided ...]\n{tail}\n{footer}") == inline)
+}
+
+/// Compare the bounded output produced by [`cap_inline_from_windows`] with its
+/// durable artifact while reading only bounded head and tail windows.
+///
+/// The bash capture path converts each raw window with `from_utf8_lossy`
+/// before applying its display budget. Reproduce that order exactly so invalid
+/// UTF-8 remains verifiable without weakening the byte-exact artifact check.
+///
+/// # Errors
+/// Returns an error when seeking, reading, or sizing fails.
+pub fn canonical_streamed_inline_output_matches<R: Read + Seek>(
+    reader: &mut R,
+    total_bytes: u64,
+    inline: &str,
+    budget: usize,
+    artifact_id: u64,
+) -> Result<bool> {
+    let total = usize::try_from(total_bytes).context("artifact size exceeds usize")?;
+    let window_bytes = budget.max(MIN_INLINE_OUTPUT_BUDGET_BYTES);
+    let head_len = total.min(window_bytes);
+    let mut head = vec![0_u8; head_len];
+    reader
+        .seek(SeekFrom::Start(0))
+        .context("seeking streamed artifact head")?;
+    reader
+        .read_exact(&mut head)
+        .context("reading streamed artifact head")?;
+
+    let tail_len = total.min(window_bytes);
+    let tail_start = total.saturating_sub(tail_len);
+    let mut tail = vec![0_u8; tail_len];
+    reader
+        .seek(SeekFrom::Start(
+            u64::try_from(tail_start).context("streamed artifact tail offset exceeds u64")?,
+        ))
+        .context("seeking streamed artifact tail")?;
+    reader
+        .read_exact(&mut tail)
+        .context("reading streamed artifact tail")?;
+
+    let head = String::from_utf8_lossy(&head);
+    let tail = String::from_utf8_lossy(&tail);
+    Ok(cap_inline_from_windows(&head, &tail, total_bytes, budget, artifact_id) == inline)
+}
+
 /// Render already-captured head and tail windows with the canonical footer.
 #[must_use]
 pub fn cap_inline_from_windows(
@@ -1079,6 +1368,99 @@ fn scan_next_id(dir: &Dir) -> Result<u64> {
     })
 }
 
+/// Read the latest complete fixed-width allocator record without scanning an
+/// attacker-sized marker. A non-empty marker with no valid record fails closed.
+fn read_allocator_next(dir: &Dir) -> Result<Option<u64>> {
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let mut file = match dir.open_with(ARTIFACT_ALLOCATOR_MARKER, &options) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("opening artifact allocator marker"),
+    };
+    let len = file
+        .metadata()
+        .context("inspecting artifact allocator marker")?
+        .len();
+    if len == 0 {
+        anyhow::bail!("artifact allocator marker is empty");
+    }
+    let tail_len = usize::try_from(len.min((ARTIFACT_ALLOCATOR_RECORD_BYTES * 3) as u64))
+        .context("allocator marker tail exceeds usize")?;
+    file.seek(SeekFrom::End(
+        -i64::try_from(tail_len).context("allocator marker tail exceeds i64")?,
+    ))
+    .context("seeking artifact allocator marker")?;
+    let mut tail = vec![0_u8; tail_len];
+    file.read_exact(&mut tail)
+        .context("reading artifact allocator marker")?;
+    let tail = std::str::from_utf8(&tail).context("artifact allocator marker is not UTF-8")?;
+    tail.lines()
+        .rev()
+        .find_map(|line| {
+            (line.len() == ARTIFACT_ALLOCATOR_RECORD_BYTES - 1
+                && line.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| line.parse::<u64>().ok())
+            .flatten()
+        })
+        .map(Some)
+        .ok_or_else(|| anyhow!("artifact allocator marker has no complete record"))
+}
+
+/// Append and fsync one allocator high-watermark record.
+fn persist_allocator_next(dir: &Dir, next: u64) -> Result<()> {
+    let record = format!("{next:020}\n");
+    anyhow::ensure!(
+        record.len() == ARTIFACT_ALLOCATOR_RECORD_BYTES,
+        "artifact allocator ID exceeds fixed-width marker"
+    );
+    let mut options = OpenOptions::new();
+    options
+        .write(true)
+        .append(true)
+        .create(true)
+        .follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut marker = dir
+        .open_with(ARTIFACT_ALLOCATOR_MARKER, &options)
+        .context("opening artifact allocator marker for append")?;
+    marker
+        .write_all(record.as_bytes())
+        .context("appending artifact allocator marker")?;
+    marker
+        .sync_all()
+        .context("syncing artifact allocator marker")?;
+    sync_directory(dir).context("syncing artifact allocator directory")
+}
+
+/// Migrate a legacy directory once and reconcile the durable watermark with
+/// any externally restored artifacts.
+fn ensure_allocator_next(dir: &Dir) -> Result<u64> {
+    let scanned = scan_next_id(dir)?;
+    match read_allocator_next(dir) {
+        Ok(Some(marked)) => {
+            let next = marked.max(scanned);
+            if next != marked {
+                persist_allocator_next(dir, next)?;
+            }
+            Ok(next)
+        }
+        Ok(None) => {
+            persist_allocator_next(dir, scanned)?;
+            Ok(scanned)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn reserve_artifact_id(dir: &Dir) -> Result<u64> {
+    let id = ensure_allocator_next(dir)?;
+    let next = id.checked_add(1).context("artifact ID space exhausted")?;
+    persist_allocator_next(dir, next)?;
+    Ok(id)
+}
+
 /// Every regular artifact-looking entry in `dir`, represented only by its
 /// handle-relative name so later metadata and deletion remain confined.
 fn list_artifacts(dir: &Dir) -> Result<Vec<(u64, OsString)>> {
@@ -1098,6 +1480,64 @@ fn list_artifacts(dir: &Dir) -> Result<Vec<(u64, OsString)>> {
     }
     Ok(artifacts)
 }
+fn artifact_file_len(dir: &Dir, name: &OsStr) -> Result<u64> {
+    let metadata = dir
+        .symlink_metadata(name)
+        .context("inspecting artifact file")?;
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "artifact namespace contains a non-regular entry"
+    );
+    Ok(metadata.len())
+}
+
+fn unique_artifacts_by_id(dir: &Dir) -> Result<BTreeMap<u64, OsString>> {
+    let mut by_id = BTreeMap::new();
+    for (id, name) in list_artifacts(dir)? {
+        artifact_file_len(dir, &name)?;
+        anyhow::ensure!(
+            by_id.insert(id, name).is_none(),
+            "artifact {id} is ambiguous: multiple backing files exist"
+        );
+    }
+    Ok(by_id)
+}
+
+fn artifact_files_equal(
+    left_dir: &Dir,
+    left_name: &OsStr,
+    right_dir: &Dir,
+    right_name: &OsStr,
+) -> Result<bool> {
+    if artifact_file_len(left_dir, left_name)? != artifact_file_len(right_dir, right_name)? {
+        return Ok(false);
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let mut left = left_dir
+        .open_with(left_name, &options)
+        .context("opening source artifact for comparison")?;
+    let mut right = right_dir
+        .open_with(right_name, &options)
+        .context("opening destination artifact for comparison")?;
+    let mut left_buffer = [0_u8; 64 * 1024];
+    let mut right_buffer = [0_u8; 64 * 1024];
+    loop {
+        let left_read = left
+            .read(&mut left_buffer)
+            .context("reading source artifact for comparison")?;
+        let right_read = right
+            .read(&mut right_buffer)
+            .context("reading destination artifact for comparison")?;
+        if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
+    }
+}
+
 fn artifact_bytes(dir: &Dir) -> Result<u64> {
     let mut total = 0_u64;
     for entry in dir
@@ -1291,6 +1731,125 @@ mod tests {
         assert!(
             list_artifacts(&dir)?.is_empty(),
             "no spill file may be created"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inline_boundary_strips_short_third_party_artifact_claim() -> Result<()> {
+        let (_dir, store) = temp_store();
+        let saved = store.save("bash", "unrelated durable bytes")?;
+        let mut result = ToolResult::success("short output");
+        result.artifact = Some(ToolResultArtifact { id: saved.id });
+
+        assert!(enforce_inline_budget(&mut result, Some(&store), "third-party").is_none());
+        assert_eq!(result.output, "short output");
+        assert!(
+            result.artifact.is_none(),
+            "a resolving ID cannot authorize unrelated caller output"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inline_boundary_remints_exact_streaming_spill_provenance() -> Result<()> {
+        let (_dir, store) = temp_store();
+        let full = "streamed output\n".repeat(store.inline_budget());
+        let saved = store.save("bash", &full)?;
+        let output = cap_inline_from_windows(
+            &full,
+            &full,
+            u64::try_from(full.len())?,
+            store.inline_budget(),
+            saved.id,
+        );
+        let mut result = ToolResult::success(output.clone());
+        result.artifact = Some(ToolResultArtifact { id: saved.id });
+
+        assert!(enforce_inline_budget(&mut result, Some(&store), "bash").is_none());
+        assert_eq!(result.output, output);
+        assert_eq!(result.artifact, Some(ToolResultArtifact { id: saved.id }));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_verification_reads_only_bounded_windows_of_large_artifact() -> Result<()> {
+        struct CountingRepeatingReader {
+            len: u64,
+            position: u64,
+            bytes_read: usize,
+        }
+
+        impl Read for CountingRepeatingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let remaining = self.len.saturating_sub(self.position);
+                let read = usize::try_from(remaining)
+                    .unwrap_or(usize::MAX)
+                    .min(buffer.len());
+                buffer[..read].fill(b'x');
+                self.position = self.position.saturating_add(read as u64);
+                self.bytes_read = self.bytes_read.saturating_add(read);
+                Ok(read)
+            }
+        }
+
+        impl Seek for CountingRepeatingReader {
+            fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+                let position = match position {
+                    SeekFrom::Start(position) => i128::from(position),
+                    SeekFrom::End(offset) => i128::from(self.len) + i128::from(offset),
+                    SeekFrom::Current(offset) => i128::from(self.position) + i128::from(offset),
+                };
+                if !(0..=i128::from(self.len)).contains(&position) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "seek outside repeating reader",
+                    ));
+                }
+                self.position = u64::try_from(position).expect("validated non-negative u64");
+                Ok(self.position)
+            }
+        }
+
+        let total = 64_u64 * 1024 * 1024;
+        let budget = DEFAULT_INLINE_OUTPUT_BUDGET_BYTES;
+        let artifact_id = 7;
+        let head_budget = budget * 3 / 5;
+        let tail_budget = budget / 4;
+        let elided = usize::try_from(total)? - head_budget - tail_budget;
+        let canonical = format!(
+            "{}\n[... {elided} bytes elided ...]\n{}\n{}",
+            "x".repeat(head_budget),
+            "x".repeat(tail_budget),
+            artifact_footer(artifact_id),
+        );
+        let max_read = head_budget + 1 + tail_budget;
+        let mut reader = CountingRepeatingReader {
+            len: total,
+            position: 0,
+            bytes_read: 0,
+        };
+        assert!(canonical_inline_output_matches(
+            &mut reader,
+            total,
+            &canonical,
+            budget,
+            artifact_id,
+        )?);
+        assert!(reader.bytes_read <= max_read);
+
+        let forged = canonical.replacen('x', "y", 1);
+        reader.bytes_read = 0;
+        assert!(!canonical_inline_output_matches(
+            &mut reader,
+            total,
+            &forged,
+            budget,
+            artifact_id,
+        )?);
+        assert!(
+            reader.bytes_read <= max_read,
+            "forged valid-ID footer must not trigger an artifact-sized read"
         );
         Ok(())
     }
@@ -1884,6 +2443,115 @@ mod tests {
         assert_eq!(second.files_removed, 1);
         let thread_dir = open_confined_dir(&root.join(key), false)?;
         assert!(list_artifacts(&thread_dir)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn allocator_never_reuses_deleted_ids_after_restart() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("artifacts");
+        let thread = ThreadId::from_string("durable-watermark");
+        let storage = ArtifactStorage::new(&root);
+        let first = storage.for_thread(&thread)?.save("bash", "first")?;
+        assert_eq!(first.id, 0);
+        std::fs::remove_file(&first.path)?;
+        drop(storage);
+
+        let restarted = ArtifactStorage::new(&root);
+        let second = restarted.for_thread(&thread)?.save("bash", "second")?;
+        assert_eq!(second.id, 1, "a deleted ID must remain permanently burned");
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_footer_verification_handles_lossy_utf8_but_rejects_forgery() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = ArtifactStorage::new(dir.path().join("artifacts")).with_inline_budget(1_024);
+        let source = ThreadId::from_string("legacy-source");
+        let destination = ThreadId::from_string("legacy-destination");
+        let store = storage.for_thread(&source)?;
+        let mut bytes = vec![b'x'; 4_096];
+        bytes[100] = 0xff;
+        bytes[4_000] = 0xfe;
+        let saved = store.save_streamed("bash", &mut std::io::Cursor::new(&bytes))?;
+        let head = String::from_utf8_lossy(&bytes[..1_024]);
+        let tail = String::from_utf8_lossy(&bytes[bytes.len() - 1_024..]);
+        let inline = cap_inline_from_windows(
+            &head,
+            &tail,
+            bytes.len() as u64,
+            store.inline_budget(),
+            saved.id,
+        );
+
+        let mut verifier_file = store.resolve(saved.id)?;
+        assert!(
+            canonical_streamed_inline_output_matches(
+                &mut verifier_file,
+                bytes.len() as u64,
+                &inline,
+                store.inline_budget(),
+                saved.id,
+            )?,
+            "lossy streamed rendering must reproduce exactly"
+        );
+        assert_eq!(
+            store.verified_legacy_inline_artifact_id(&inline)?,
+            Some(saved.id)
+        );
+        assert!(inline.contains('\u{fffd}'));
+        let mut reopened = store.resolve(saved.id)?;
+        let mut exact = Vec::new();
+        reopened.read_to_end(&mut exact)?;
+        assert_eq!(
+            exact, bytes,
+            "durable artifact keeps original invalid bytes"
+        );
+
+        let forged = inline.replacen('x', "y", 1);
+        assert_eq!(store.verified_legacy_inline_artifact_id(&forged)?, None);
+        assert_eq!(
+            store.verified_legacy_inline_artifact_id(&artifact_footer(saved.id))?,
+            None,
+            "footer syntax without the canonical window is not provenance"
+        );
+        storage.copy_thread_artifacts(&source, &destination, &BTreeSet::from([saved.id]))?;
+        let destination_store = storage.for_thread(&destination)?;
+        let mut forked = destination_store.resolve(saved.id)?;
+        let mut forked_exact = Vec::new();
+        forked.read_to_end(&mut forked_exact)?;
+        assert_eq!(
+            forked_exact, bytes,
+            "verified legacy reference survives fork"
+        );
+        Ok(())
+    }
+    #[test]
+    fn fork_copy_is_reference_scoped_and_seeds_allocator_watermark() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = ArtifactStorage::new(dir.path().join("artifacts"));
+        let source = ThreadId::from_string("fork-source");
+        let destination = ThreadId::from_string("fork-destination");
+        let source_store = storage.for_thread(&source)?;
+        let before = source_store.save("bash", "before-boundary")?;
+        let after = source_store.save("bash", "post-boundary-secret")?;
+
+        storage.copy_thread_artifacts(&source, &destination, &BTreeSet::from([before.id]))?;
+        let destination_store = storage.for_thread(&destination)?;
+        let mut copied = String::new();
+        destination_store
+            .resolve(before.id)?
+            .read_to_string(&mut copied)?;
+        assert_eq!(copied, "before-boundary");
+        assert!(
+            destination_store.resolve(after.id).is_err(),
+            "an unreferenced post-boundary artifact must not enter the fork"
+        );
+        let fresh = destination_store.save("bash", "fork-local")?;
+        assert!(
+            fresh.id > after.id,
+            "fork allocator must seed above the source high watermark"
+        );
         Ok(())
     }
 

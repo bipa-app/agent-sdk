@@ -89,6 +89,21 @@ pub trait MessageStore: Send + Sync {
     ) -> Result<()> {
         anyhow::bail!("message store does not support append-only compaction")
     }
+    /// Append synthetic recovery evidence to the raw transcript and atomically
+    /// install the balanced effective projection.
+    ///
+    /// # Errors
+    /// Returns an error when append-only repair is unsupported, stale, or
+    /// cannot be persisted atomically.
+    async fn append_repair(
+        &self,
+        _thread_id: &ThreadId,
+        _repair_message: llm::Message,
+        _balanced_messages: Vec<llm::Message>,
+        _source_message_count: usize,
+    ) -> Result<()> {
+        anyhow::bail!("message store does not support append-only repair")
+    }
 
     /// Return the unabridged committed transcript.
     ///
@@ -457,6 +472,51 @@ impl MessageStore for InMemoryStore {
             compacted_end,
             replacement_messages: messages.into_iter().take(replacement_count).collect(),
         });
+        drop(state);
+        Ok(())
+    }
+
+    async fn append_repair(
+        &self,
+        thread_id: &ThreadId,
+        repair_message: llm::Message,
+        balanced_messages: Vec<llm::Message>,
+        source_message_count: usize,
+    ) -> Result<()> {
+        let mut state = self
+            .inner
+            .message_state
+            .write()
+            .ok()
+            .context("lock poisoned")?;
+        let raw_message_count = state.messages.get(&thread_id.0).map_or(0, Vec::len);
+        let latest = state
+            .compactions
+            .get(&thread_id.0)
+            .and_then(|entries| entries.last());
+        let prior_boundary = latest.map_or(0, |entry| entry.compacted_end);
+        let visible_raw_count = raw_message_count.saturating_sub(prior_boundary);
+        let available = latest
+            .map_or(0, |entry| entry.replacement_messages.len())
+            .saturating_add(visible_raw_count);
+        anyhow::ensure!(
+            source_message_count == available,
+            "repair source count mismatch: store exposes {available}, repair saw {source_message_count}"
+        );
+        state
+            .messages
+            .entry(thread_id.0.clone())
+            .or_default()
+            .push(repair_message);
+        state
+            .compactions
+            .entry(thread_id.0.clone())
+            .or_default()
+            .push(MessageCompaction {
+                compacted_start: prior_boundary,
+                compacted_end: raw_message_count.saturating_add(1),
+                replacement_messages: balanced_messages,
+            });
         drop(state);
         Ok(())
     }

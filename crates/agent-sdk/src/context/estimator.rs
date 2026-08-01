@@ -59,9 +59,10 @@ impl TokenEstimator {
     #[must_use]
     pub fn estimate_block(block: &ContentBlock) -> usize {
         match block {
-            ContentBlock::Text { text } | ContentBlock::CompactionSummary { text } => {
-                Self::estimate_text(text)
-            }
+            ContentBlock::Text { text } => Self::estimate_text(text),
+            ContentBlock::CompactionSummary { text } => Self::estimate_text(
+                &agent_sdk_foundation::llm::render_compaction_summary_for_provider(text),
+            ),
             ContentBlock::Thinking { thinking, .. } => Self::estimate_text(thinking),
             ContentBlock::RedactedThinking { data } => {
                 // The data field is a base64-encoded encrypted blob whose size

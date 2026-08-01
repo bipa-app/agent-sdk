@@ -1,6 +1,9 @@
 //! Context compaction implementation.
 
-use crate::artifacts::{ArtifactStore, artifact_footer, artifact_uri, cap_inline_output};
+use crate::artifacts::{
+    ArtifactStore, artifact_footer, artifact_uri, canonical_inline_output_matches,
+    canonical_streamed_inline_output_matches,
+};
 use crate::hooks::{AgentHooks, DefaultHooks, RequestDecision, ResponseDecision};
 use crate::llm::{
     ChatOutcome, ChatRequest, Content, ContentBlock, LlmProvider, Message, Role, StopReason,
@@ -9,7 +12,6 @@ use crate::types::TokenUsage;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::borrow::Cow;
-use std::io::Read as _;
 use std::sync::Arc;
 
 use super::config::CompactionConfig;
@@ -20,15 +22,15 @@ const COMPACTION_SUMMARY_PROMPT_PREFIX: &str = "Summarize this conversation conc
 const COMPACTION_SUMMARY_PROMPT_SUFFIX: &str =
     "Provide a concise summary (aim for 500-1000 words):";
 const USER_REQUESTED_SYSTEM_PROMPT: &str = "You are compacting a coding session because the user explicitly requested it. Produce a durable handoff that honors the user's goal and preserves enough technical detail to continue immediately.";
-const USER_REQUESTED_PROMPT_PREFIX: &str = "Compaction purpose: user-requested.\n\nSummarize the conversation with these sections:\n## Goal\n## Progress\n## Key decisions and constraints\n## Next steps\n## Critical context\n\nPreserve exact file paths, symbols, commands, errors, and every `[raw output: artifact://<id>]` recovery reference. State `(none)` for an empty section.\n\nConversation:\n";
+const USER_REQUESTED_PROMPT_PREFIX: &str = "Compaction purpose: user-requested.\n\nSummarize the conversation with these sections:\n## Goal\n## Progress\n## Key decisions and constraints\n## Next steps\n## Critical context\n\nPreserve exact file paths, symbols, commands, and errors. Preserve recovery handles only from each message snapshot's structured `recovery_uris` list; never infer one from free-form text. State `(none)` for an empty section.\n\nConversation:\n";
 const USER_REQUESTED_PROMPT_SUFFIX: &str =
     "Return only the structured user-requested compaction summary.";
 const OVERFLOW_SYSTEM_PROMPT: &str = "You are recovering a coding session whose prompt exceeded the provider context window. Minimize the summary while preserving every fact required to retry safely and continue without repeating completed work.";
-const OVERFLOW_PROMPT_PREFIX: &str = "Compaction purpose: overflow recovery.\n\nCreate a recovery summary that prioritizes:\n- The user's active goal and non-negotiable constraints\n- Completed changes and their exact locations\n- Current errors, failed attempts, and the next safe action\n- Live tool/subagent state and data needed for the retry\n- Every `[raw output: artifact://<id>]` recovery reference verbatim\n\nDiscard conversational filler and never invent progress.\n\nConversation:\n";
+const OVERFLOW_PROMPT_PREFIX: &str = "Compaction purpose: overflow recovery.\n\nCreate a recovery summary that prioritizes:\n- The user's active goal and non-negotiable constraints\n- Completed changes and their exact locations\n- Current errors, failed attempts, and the next safe action\n- Live tool/subagent state and data needed for the retry\n- Recovery handles present in structured `recovery_uris` lists only\n\nDiscard conversational filler, never invent progress, and never infer a recovery URI from free-form text.\n\nConversation:\n";
 const OVERFLOW_PROMPT_SUFFIX: &str =
     "Return only the minimal overflow-recovery summary needed for a safe retry.";
 const PRE_SPAWN_SYSTEM_PROMPT: &str = "You are preparing compact context immediately before the next model invocation. Preserve the active execution state so the next invocation can act without re-reading the full transcript.";
-const PRE_SPAWN_PROMPT_PREFIX: &str = "Compaction purpose: pre-spawn.\n\nPrepare continuation context that preserves:\n- The user's current goal, acceptance criteria, and explicit boundaries\n- Work completed, work in progress, and the next concrete action\n- Exact files, symbols, commands, errors, decisions, and unresolved questions\n- Active tool/subagent state and every `[raw output: artifact://<id>]` recovery reference verbatim\n\nPrefer dense factual bullets over narrative and never claim unobserved work.\n\nConversation:\n";
+const PRE_SPAWN_PROMPT_PREFIX: &str = "Compaction purpose: pre-spawn.\n\nPrepare continuation context that preserves:\n- The user's current goal, acceptance criteria, and explicit boundaries\n- Work completed, work in progress, and the next concrete action\n- Exact files, symbols, commands, errors, decisions, and unresolved questions\n- Active tool/subagent state and recovery handles from structured `recovery_uris` lists only\n\nPrefer dense factual bullets over narrative, never claim unobserved work, and never infer a recovery URI from free-form text.\n\nConversation:\n";
 const PRE_SPAWN_PROMPT_SUFFIX: &str = "Return only the pre-spawn continuation context.";
 const COMPACT_EMPTY_SUMMARY: &str = "No additional context was available to summarize; the previous messages were already compacted.";
 const SUMMARY_ACKNOWLEDGMENT: &str =
@@ -41,8 +43,12 @@ const MAX_SUMMARY_MESSAGES_JSON_BYTES: usize = 64 * 1024;
 const MAX_SUMMARY_MESSAGE_SNAPSHOT_BYTES: usize = 8 * 1024;
 const MAX_SUMMARY_PRIOR_JSON_BYTES: usize = 16 * 1024;
 const MAX_SUMMARY_PROMPT_BYTES: usize = 96 * 1024;
+const MAX_SUMMARY_OUTPUT_BYTES: usize = 64 * 1024;
+const SUMMARY_OUTPUT_BYTES_PER_TOKEN: usize = 8;
 const SUMMARY_INPUT_TRUNCATED: &str = "... [summary input truncated at deterministic byte cap]";
-
+const MAX_SUMMARY_FIELD_BYTES: usize = 1024;
+const MAX_SUMMARY_BLOCKS_PER_MESSAGE: usize = 64;
+const UNTRUSTED_RECOVERY_CLAIM: &str = "[untrusted artifact recovery claim omitted]";
 struct BoundedWriter {
     bytes: Vec<u8>,
     limit: usize,
@@ -73,14 +79,12 @@ impl std::io::Write for BoundedWriter {
             self.truncated = true;
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
-                "summary snapshot limit reached",
+                "summary field limit reached",
             ));
         }
         let written = remaining.min(buf.len());
         self.bytes.extend_from_slice(&buf[..written]);
-        if written < buf.len() {
-            self.truncated = true;
-        }
+        self.truncated |= written < buf.len();
         Ok(written)
     }
 
@@ -93,29 +97,32 @@ impl std::io::Write for BoundedWriter {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum SummaryBlockView<'a> {
     Text {
-        text: &'a str,
+        text: Cow<'a, str>,
     },
     PriorCompactionSummary {
-        text: &'a str,
+        text: Cow<'a, str>,
     },
     Thinking {
-        text: &'a str,
+        text: Cow<'a, str>,
     },
     RedactedThinking,
     OpaqueReasoningOmitted,
     ToolUse {
-        name: &'a str,
-        input: &'a serde_json::Value,
+        name: Cow<'a, str>,
+        input_json: Cow<'a, str>,
     },
     ToolResult {
         status: &'static str,
         content: Cow<'a, str>,
     },
     Image {
-        media_type: &'a str,
+        media_type: Cow<'a, str>,
     },
     Document {
-        media_type: &'a str,
+        media_type: Cow<'a, str>,
+    },
+    InputTruncated {
+        reason: &'static str,
     },
     Unrecognized,
 }
@@ -373,12 +380,12 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
     ///
     /// Ordinary text that imitates a historical summary prefix is deliberately
     /// not recognized: transcript text never gains carry-forward semantics.
-    fn extract_summary_text(content: &Content) -> Option<String> {
+    fn extract_summary_text(content: &Content) -> Option<&str> {
         let Content::Blocks(blocks) = content else {
             return None;
         };
         blocks.iter().find_map(|block| match block {
-            ContentBlock::CompactionSummary { text } => Some(text.clone()),
+            ContentBlock::CompactionSummary { text } => Some(text.as_str()),
             _ => None,
         })
     }
@@ -413,25 +420,39 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
         artifact: Option<&crate::types::ToolResultArtifact>,
     ) -> Option<String> {
         let store = self.artifact_store.as_ref()?;
-        if let Some(artifact) = artifact {
-            store.resolve(artifact.id).ok()?;
-            return Some(artifact_uri(artifact.id));
-        }
-
-        let footer_start = content.rfind("[raw output: artifact://")?;
-        let footer = &content[footer_start..];
-        let id_text = footer
-            .strip_prefix("[raw output: artifact://")?
-            .strip_suffix(']')?;
-        let id = id_text.parse::<u64>().ok()?;
-        if footer != artifact_footer(id) {
-            return None;
-        }
+        let id = if let Some(artifact) = artifact {
+            artifact.id
+        } else {
+            let footer_start = content.rfind("[raw output: artifact://")?;
+            let footer = &content[footer_start..];
+            let id_text = footer
+                .strip_prefix("[raw output: artifact://")?
+                .strip_suffix(']')?;
+            let id = id_text.parse::<u64>().ok()?;
+            if footer != artifact_footer(id) {
+                return None;
+            }
+            id
+        };
         let mut file = store.resolve(id).ok()?;
-        let mut full = String::new();
-        file.read_to_string(&mut full).ok()?;
-        let expected = cap_inline_output(&full, store.inline_budget(), id);
-        (expected == content).then(|| artifact_uri(id))
+        let total_bytes = file.metadata().ok()?.len();
+        let exact = canonical_inline_output_matches(
+            &mut file,
+            total_bytes,
+            content,
+            store.inline_budget(),
+            id,
+        )
+        .unwrap_or(false)
+            || canonical_streamed_inline_output_matches(
+                &mut file,
+                total_bytes,
+                content,
+                store.inline_budget(),
+                id,
+            )
+            .unwrap_or(false);
+        exact.then(|| artifact_uri(id))
     }
 
     fn prune_tool_outputs(messages: &mut [Message]) -> Option<usize> {
@@ -706,6 +727,34 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
         retained_start
     }
 
+    fn scrub_recovery_claims(text: &str) -> Cow<'_, str> {
+        const PREFIX: &str = "[raw output: artifact://";
+        if !text.contains(PREFIX) {
+            return Cow::Borrowed(text);
+        }
+
+        let mut scrubbed = String::with_capacity(text.len().min(MAX_SUMMARY_FIELD_BYTES));
+        let mut rest = text;
+        while let Some(start) = rest.find(PREFIX) {
+            scrubbed.push_str(&rest[..start]);
+            scrubbed.push_str(UNTRUSTED_RECOVERY_CLAIM);
+            let claim = &rest[start + PREFIX.len()..];
+            rest = claim
+                .find(']')
+                .map_or("", |end| &claim[end.saturating_add(1)..]);
+        }
+        scrubbed.push_str(rest);
+        Cow::Owned(scrubbed)
+    }
+
+    fn bounded_untrusted_text(text: &str, limit: usize) -> Cow<'_, str> {
+        if text.len() <= limit {
+            return Self::scrub_recovery_claims(text);
+        }
+        let bounded = Self::bounded_utf8(text, limit);
+        Cow::Owned(Self::scrub_recovery_claims(&bounded).into_owned())
+    }
+
     fn tool_result_for_summary<'a>(
         &self,
         content: &'a str,
@@ -721,14 +770,15 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
             })
             .unwrap_or(content)
             .trim_end_matches(['\r', '\n']);
-        if body.chars().count() <= MAX_TOOL_RESULT_CHARS && recovery_uri.is_none() {
-            return Cow::Borrowed(content);
-        }
-        let prefix: String = body.chars().take(MAX_TOOL_RESULT_CHARS).collect();
-        recovery_uri.map_or_else(
-            || Cow::Owned(format!("{prefix}... (truncated)")),
-            |uri| Cow::Owned(format!("{prefix}... (truncated)\n[raw output: {uri}]")),
-        )
+        let mut chars = body.chars();
+        let prefix: String = chars.by_ref().take(MAX_TOOL_RESULT_CHARS).collect();
+        let truncated = chars.next().is_some();
+        let scrubbed = Self::scrub_recovery_claims(&prefix).into_owned();
+        Cow::Owned(if truncated {
+            format!("{scrubbed}... (truncated)")
+        } else {
+            scrubbed
+        })
     }
 
     /// Build a sanitized, borrowing view of one transcript message.
@@ -739,51 +789,84 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
         };
         let mut recovery_uris = Vec::new();
         let blocks = match &message.content {
-            Content::Text(text) => vec![SummaryBlockView::Text { text }],
-            Content::Blocks(blocks) => blocks
-                .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => SummaryBlockView::Text { text },
-                    ContentBlock::CompactionSummary { text } => {
-                        SummaryBlockView::PriorCompactionSummary { text }
-                    }
-                    ContentBlock::Thinking { thinking, .. } => {
-                        SummaryBlockView::Thinking { text: thinking }
-                    }
-                    ContentBlock::RedactedThinking { .. } => SummaryBlockView::RedactedThinking,
-                    ContentBlock::OpaqueReasoning { .. } => {
-                        SummaryBlockView::OpaqueReasoningOmitted
-                    }
-                    ContentBlock::ToolUse { name, input, .. } => {
-                        SummaryBlockView::ToolUse { name, input }
-                    }
-                    ContentBlock::ToolResult {
-                        content,
-                        artifact,
-                        is_error,
-                        ..
-                    } => {
-                        if let Some(uri) = self.artifact_recovery_uri(content, artifact.as_ref()) {
-                            recovery_uris.push(uri);
+            Content::Text(text) => vec![SummaryBlockView::Text {
+                text: Self::bounded_untrusted_text(text, MAX_SUMMARY_FIELD_BYTES),
+            }],
+            Content::Blocks(blocks) => {
+                let mut summary_blocks: Vec<_> = blocks
+                    .iter()
+                    .take(MAX_SUMMARY_BLOCKS_PER_MESSAGE)
+                    .map(|block| match block {
+                        ContentBlock::Text { text } => SummaryBlockView::Text {
+                            text: Self::bounded_untrusted_text(text, MAX_SUMMARY_FIELD_BYTES),
+                        },
+                        ContentBlock::CompactionSummary { text } => {
+                            SummaryBlockView::PriorCompactionSummary {
+                                text: Self::bounded_untrusted_text(text, MAX_SUMMARY_FIELD_BYTES),
+                            }
                         }
-                        SummaryBlockView::ToolResult {
-                            status: if is_error.unwrap_or(false) {
-                                "error"
-                            } else {
-                                "success"
-                            },
-                            content: self.tool_result_for_summary(content, artifact.as_ref()),
+                        ContentBlock::Thinking { thinking, .. } => SummaryBlockView::Thinking {
+                            text: Self::bounded_untrusted_text(thinking, MAX_SUMMARY_FIELD_BYTES),
+                        },
+                        ContentBlock::RedactedThinking { .. } => SummaryBlockView::RedactedThinking,
+                        ContentBlock::OpaqueReasoning { .. } => {
+                            SummaryBlockView::OpaqueReasoningOmitted
                         }
-                    }
-                    ContentBlock::Image { source } => SummaryBlockView::Image {
-                        media_type: &source.media_type,
-                    },
-                    ContentBlock::Document { source } => SummaryBlockView::Document {
-                        media_type: &source.media_type,
-                    },
-                    _ => SummaryBlockView::Unrecognized,
-                })
-                .collect(),
+                        ContentBlock::ToolUse { name, input, .. } => {
+                            let mut writer = BoundedWriter::new(MAX_SUMMARY_FIELD_BYTES);
+                            let _ = serde_json::to_writer(&mut writer, input);
+                            let (mut input_json, truncated) = writer.finish();
+                            if truncated {
+                                input_json.push_str(SUMMARY_INPUT_TRUNCATED);
+                            }
+                            let input_json = Self::scrub_recovery_claims(&input_json).into_owned();
+                            SummaryBlockView::ToolUse {
+                                name: Self::bounded_untrusted_text(name, MAX_SUMMARY_FIELD_BYTES),
+                                input_json: Cow::Owned(input_json),
+                            }
+                        }
+                        ContentBlock::ToolResult {
+                            content,
+                            artifact,
+                            is_error,
+                            ..
+                        } => {
+                            if let Some(uri) =
+                                self.artifact_recovery_uri(content, artifact.as_ref())
+                            {
+                                recovery_uris.push(uri);
+                            }
+                            SummaryBlockView::ToolResult {
+                                status: if is_error.unwrap_or(false) {
+                                    "error"
+                                } else {
+                                    "success"
+                                },
+                                content: self.tool_result_for_summary(content, artifact.as_ref()),
+                            }
+                        }
+                        ContentBlock::Image { source } => SummaryBlockView::Image {
+                            media_type: Self::bounded_untrusted_text(
+                                &source.media_type,
+                                MAX_SUMMARY_FIELD_BYTES,
+                            ),
+                        },
+                        ContentBlock::Document { source } => SummaryBlockView::Document {
+                            media_type: Self::bounded_untrusted_text(
+                                &source.media_type,
+                                MAX_SUMMARY_FIELD_BYTES,
+                            ),
+                        },
+                        _ => SummaryBlockView::Unrecognized,
+                    })
+                    .collect();
+                if blocks.len() > MAX_SUMMARY_BLOCKS_PER_MESSAGE {
+                    summary_blocks.push(SummaryBlockView::InputTruncated {
+                        reason: "message block cap reached",
+                    });
+                }
+                summary_blocks
+            }
         };
         SummaryMessageView {
             role,
@@ -796,6 +879,9 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
     /// deterministic and bounded. Each message is an escaped JSON snapshot, so
     /// a cap reached halfway through arbitrary text/tool JSON cannot create a
     /// role or delimiter boundary.
+    /// Format messages as a valid JSON array whose total encoded size is
+    /// deterministic and bounded. Each record remains valid structured JSON
+    /// even when an individual message or the aggregate transcript is cut.
     fn format_messages_for_summary<'a>(
         &self,
         messages: impl IntoIterator<Item = &'a Message>,
@@ -807,21 +893,28 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
 
         for message in messages {
             let view = self.summary_message_view(message);
-            let mut writer = BoundedWriter::new(MAX_SUMMARY_MESSAGE_SNAPSHOT_BYTES);
-            let _ = serde_json::to_writer(&mut writer, &view);
-            let (mut snapshot, truncated) = writer.finish();
+            let mut snapshot = serde_json::to_string(&view).unwrap_or_else(|_| "{}".to_string());
+            let truncated = snapshot.len() > MAX_SUMMARY_MESSAGE_SNAPSHOT_BYTES;
             if truncated {
-                snapshot.push_str(SUMMARY_INPUT_TRUNCATED);
+                snapshot = serde_json::json!({
+                    "role": view.role,
+                    "blocks": [{
+                        "kind": "input_truncated",
+                        "reason": "message snapshot byte cap reached",
+                    }],
+                    "recovery_uris": &view.recovery_uris,
+                })
+                .to_string();
             }
             let record = serde_json::json!({
                 "kind": "message_snapshot",
                 "json": snapshot,
                 "truncated": truncated,
-                "recovery_uris": view.recovery_uris,
+                "recovery_uris": &view.recovery_uris,
             })
             .to_string();
             let separator = usize::from(!first);
-            let reserve = 96; // closing bracket + explicit tail marker record
+            let reserve = 96;
             if output
                 .len()
                 .saturating_add(separator)
@@ -863,11 +956,13 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
         bounded
     }
 
-    fn bounded_prior_summaries(prior_summaries: &[String]) -> Vec<String> {
+    fn bounded_prior_summaries(prior_summaries: &[&str]) -> Vec<String> {
         let mut bounded = Vec::new();
         let mut encoded_bytes = 2usize;
         for summary in prior_summaries {
-            let text = Self::bounded_utf8(summary, 2 * 1024);
+            // Bound before scrubbing so a legacy multi-megabyte summary cannot
+            // force a proportional recovery allocation.
+            let text = Self::bounded_untrusted_text(summary, 2 * 1024).into_owned();
             let encoded = serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".to_string());
             if encoded_bytes
                 .saturating_add(encoded.len())
@@ -893,7 +988,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
 
     /// Build the summarization prompt from an explicitly untrusted, globally
     /// bounded JSON transcript envelope.
-    fn build_summary_prompt(&self, prior_summaries: &[String], messages_text: &str) -> String {
+    fn build_summary_prompt(&self, prior_summaries: &[&str], messages_text: &str) -> String {
         let messages = serde_json::from_str::<serde_json::Value>(messages_text).unwrap_or_default();
         let envelope = serde_json::json!({
             "prior_compaction_summaries": Self::bounded_prior_summaries(prior_summaries),
@@ -908,8 +1003,16 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
             envelope,
             Self::bounded_utf8(&self.summary_prompt_suffix, 4 * 1024),
         );
-        debug_assert!(prompt.len() <= MAX_SUMMARY_PROMPT_BYTES);
+        assert!(
+            prompt.len() <= MAX_SUMMARY_PROMPT_BYTES,
+            "bounded summary prompt exceeded its hard byte ceiling"
+        );
         prompt
+    }
+    fn summary_output_byte_limit(max_tokens: usize) -> usize {
+        max_tokens
+            .saturating_mul(SUMMARY_OUTPUT_BYTES_PER_TOKEN)
+            .min(MAX_SUMMARY_OUTPUT_BYTES)
     }
 
     /// Run a single summarization LLM call, applying the configured
@@ -978,6 +1081,23 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
                     cached_input_tokens: response.usage.cached_input_tokens,
                     cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
                 };
+                let output_limit = Self::summary_output_byte_limit(max_tokens);
+                let Some(text) = response.first_text() else {
+                    return Err(SummarizationFailure {
+                        error: anyhow::anyhow!("No text in summarization response"),
+                        usage,
+                    });
+                };
+                if text.len() > output_limit {
+                    return Err(SummarizationFailure {
+                        error: anyhow::anyhow!(
+                            "Summarization response exceeded the local output cap \
+                             ({0} > {output_limit} UTF-8 bytes)",
+                            text.len()
+                        ),
+                        usage,
+                    });
+                }
                 // Output guardrail: a rejected summary aborts the compaction
                 // attempt so it is never persisted. `RetryWithFeedback` is
                 // deliberately NOT retried here — the compactor has no
@@ -1009,12 +1129,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
                     }
                 }
                 let truncated = response.stop_reason == Some(StopReason::MaxTokens);
-                let Some(text) = response.first_text().map(String::from) else {
-                    return Err(SummarizationFailure {
-                        error: anyhow::anyhow!("No text in summarization response"),
-                        usage,
-                    });
-                };
+                let text = text.to_string();
                 Ok(SummarizationCall {
                     text,
                     truncated,
@@ -1057,7 +1172,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
         // forward) from fresh messages (which still need summarizing). Prior
         // summaries used to be filtered out and silently dropped, destroying
         // all context from before the previous compaction.
-        let mut prior_summaries: Vec<String> = Vec::new();
+        let mut prior_summaries: Vec<&str> = Vec::new();
         let mut fresh: Vec<&Message> = Vec::new();
         for message in messages {
             if let Some(text) = Self::extract_summary_text(&message.content) {
@@ -1075,7 +1190,10 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
             if prior_summaries.is_empty() {
                 return Ok((COMPACT_EMPTY_SUMMARY.to_string(), TokenUsage::default()));
             }
-            return Ok((prior_summaries.join("\n\n"), TokenUsage::default()));
+            return Ok((
+                Self::bounded_prior_summaries(&prior_summaries).join("\n\n"),
+                TokenUsage::default(),
+            ));
         }
 
         let messages_text = self.format_messages_for_summary(fresh.iter().copied());
@@ -1151,6 +1269,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
             newest_pruned_message.map_or(original_tokens, |_| self.estimate_tokens(&messages));
 
         if let Some(pruned_index) = newest_pruned_message
+            && pruned_tokens < original_tokens
             && pruned_tokens <= self.config.threshold_tokens
         {
             let new_count = messages.len();
@@ -1173,24 +1292,23 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
         // compaction — and the retained tail keeps its blocks byte-for-byte
         // so recent turns replay exactly.
 
-        // Ensure we have enough messages to compact
-        if messages.len() <= self.config.retain_recent {
-            let new_count = messages.len();
-            return Ok(CompactionResult {
-                messages,
-                original_count,
-                new_count,
-                original_tokens,
-                new_tokens: pruned_tokens,
-                retained_count: newest_pruned_message.map_or(new_count, |pruned_index| {
-                    new_count.saturating_sub(pruned_index.saturating_add(1))
-                }),
+        // A triggered compaction must summarize even a short, oversized
+        // history. Dynamically reduce the retained tail so at least the newest
+        // user/assistant pair can be replaced when the configured tail is
+        // larger than the entire transcript.
+        if messages.is_empty() {
+            return Err(FailedCompaction {
+                error: anyhow::anyhow!("Compaction made no progress: history is empty"),
                 llm_usage: TokenUsage::default(),
             });
         }
+        let effective_retain_recent = self
+            .config
+            .retain_recent
+            .min(messages.len().saturating_sub(2));
 
         // Split messages: old messages to summarize, recent messages to keep
-        let mut split_point = messages.len().saturating_sub(self.config.retain_recent);
+        let mut split_point = messages.len().saturating_sub(effective_retain_recent);
         split_point = Self::split_point_preserves_tool_pairs_with_cap(
             &messages,
             split_point,
@@ -1242,6 +1360,15 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
 
         let new_count = new_messages.len();
         let new_tokens = self.estimate_tokens(&new_messages);
+        if new_tokens >= original_tokens {
+            return Err(FailedCompaction {
+                error: anyhow::anyhow!(
+                    "Compaction made no progress: effective occupancy would be \
+                     {new_tokens} tokens (original {original_tokens})"
+                ),
+                llm_usage,
+            });
+        }
 
         Ok(CompactionResult {
             messages: new_messages,

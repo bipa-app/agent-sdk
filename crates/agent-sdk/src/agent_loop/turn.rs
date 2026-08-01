@@ -152,6 +152,7 @@ pub(super) async fn load_turn_messages<P, H, M>(
         turn,
         provider,
         message_store,
+        artifact_store,
         compaction_config,
         compactor,
         event_store,
@@ -192,6 +193,7 @@ where
         turn,
         provider,
         message_store,
+        artifact_store,
         thread_id,
         compaction_config,
         compactor,
@@ -209,6 +211,7 @@ struct MaybeCompactParams<'a, P, H, M> {
     provider: &'a Arc<P>,
     message_store: &'a Arc<M>,
     thread_id: &'a ThreadId,
+    artifact_store: Option<&'a Arc<crate::ArtifactStore>>,
     compaction_config: Option<&'a CompactionConfig>,
     compactor: Option<&'a Arc<dyn ContextCompactor>>,
     event_store: &'a Arc<dyn EventStore>,
@@ -223,6 +226,7 @@ async fn maybe_compact_messages<P, H, M>(
         turn,
         provider,
         message_store,
+        artifact_store,
         thread_id,
         compaction_config,
         compactor,
@@ -273,6 +277,11 @@ where
             LlmContextCompactor::new(Arc::clone(provider), compact_config.clone());
         let default_compactor = if compact_config.uses_prune_first_engine() {
             default_compactor.with_purpose(CompactionPurpose::PreSpawn)
+        } else {
+            default_compactor
+        };
+        let default_compactor = if let Some(store) = artifact_store {
+            default_compactor.with_artifact_store(Arc::clone(store))
         } else {
             default_compactor
         }
@@ -1903,6 +1912,7 @@ pub(super) async fn compact_after_context_overflow<P, H, M>(
     compactor: Option<&Arc<dyn ContextCompactor>>,
     message_store: &Arc<M>,
     thread_id: &ThreadId,
+    artifact_store: Option<&Arc<crate::ArtifactStore>>,
     cancel_token: &CancellationToken,
 ) -> OverflowCompaction
 where
@@ -1944,6 +1954,11 @@ where
             default_compactor.with_purpose(CompactionPurpose::Overflow)
         } else {
             default_compactor
+        };
+        let default_compactor = if let Some(store) = artifact_store {
+            default_compactor.with_artifact_store(Arc::clone(store))
+        } else {
+            default_compactor
         }
         .with_guardrail_hooks(Arc::clone(hooks));
         compact_history_and_store(
@@ -1981,6 +1996,7 @@ struct OverflowRecoveryParams<'a, P, H, M> {
     provider: &'a Arc<P>,
     hooks: &'a Arc<H>,
     message_store: &'a Arc<M>,
+    artifact_store: Option<&'a Arc<crate::ArtifactStore>>,
     compaction_config: Option<&'a CompactionConfig>,
     compactor: Option<&'a Arc<dyn ContextCompactor>>,
     /// Run provenance, used to price the emergency compaction's usage.
@@ -2005,6 +2021,7 @@ pub(super) async fn handle_turn_stop_reason<P, H, M>(
         ctx,
         provider,
         message_store,
+        artifact_store,
         compaction_config,
         compactor,
         event_store,
@@ -2080,6 +2097,7 @@ where
                     provider,
                     hooks,
                     message_store,
+                    artifact_store,
                     compaction_config,
                     compactor,
                     provenance,
@@ -2126,6 +2144,7 @@ async fn handle_context_window_exceeded<P, H, M>(
         provider,
         hooks,
         message_store,
+        artifact_store,
         compaction_config,
         compactor,
         provenance,
@@ -2190,6 +2209,7 @@ where
             compactor,
             message_store,
             &ctx.thread_id,
+            artifact_store,
             cancel_token,
         )
         .await
@@ -2247,6 +2267,7 @@ async fn try_recover_prompt_too_long<P, H, M>(
         provider,
         hooks,
         message_store,
+        artifact_store,
         compaction_config,
         compactor,
         provenance,
@@ -2283,6 +2304,7 @@ where
             compactor,
             message_store,
             &ctx.thread_id,
+            artifact_store,
             cancel_token,
         )
         .await
@@ -2692,6 +2714,7 @@ where
             turn: turn_number,
             provider,
             message_store,
+            artifact_store: tool_context.artifact_store(),
             compaction_config,
             compactor,
             event_store,
@@ -2743,6 +2766,7 @@ where
         state_store,
         compaction_config,
         compactor,
+        artifact_store: tool_context.artifact_store(),
         event_store,
         hooks,
         authority,
@@ -2804,6 +2828,7 @@ struct TurnLlmRequestParams<'a, P, H, M, S> {
     state_store: &'a Arc<S>,
     compaction_config: Option<&'a CompactionConfig>,
     compactor: Option<&'a Arc<dyn ContextCompactor>>,
+    artifact_store: Option<&'a Arc<crate::ArtifactStore>>,
     event_store: &'a Arc<dyn EventStore>,
     hooks: &'a Arc<H>,
     authority: &'a Arc<dyn EventAuthority>,
@@ -2838,6 +2863,7 @@ async fn request_turn_response<P, H, M, S>(
         state_store,
         compaction_config,
         compactor,
+        artifact_store,
         event_store,
         hooks,
         authority,
@@ -2928,6 +2954,7 @@ where
                     provider,
                     hooks,
                     message_store,
+                    artifact_store,
                     compaction_config,
                     compactor,
                     provenance,
@@ -3486,6 +3513,7 @@ where
         ctx,
         provider,
         message_store,
+        artifact_store: tool_context.artifact_store(),
         compaction_config,
         compactor,
         event_store,

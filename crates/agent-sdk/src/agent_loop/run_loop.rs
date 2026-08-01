@@ -2832,10 +2832,20 @@ where
         warn!(
             "Detected orphaned tool_use blocks — synthesizing cancelled tool results for recovery"
         );
+        let repair_message = crate::llm::orphaned_tool_result_message(
+            &history,
+            crate::llm::USER_CANCELLED_TOOL_RESULT,
+        )
+        .ok_or_else(|| {
+            AgentError::new(
+                "Orphan recovery found no synthetic tool results to append",
+                false,
+            )
+        })?;
         let balanced =
             crate::llm::balance_tool_results(&history, crate::llm::USER_CANCELLED_TOOL_RESULT);
         message_store
-            .replace_history(thread_id, balanced)
+            .append_repair(thread_id, repair_message, balanced, history.len())
             .await
             .map_err(|e| {
                 AgentError::new(

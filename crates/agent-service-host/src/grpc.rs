@@ -762,6 +762,55 @@ impl GrpcControlService {
         Ok(())
     }
 
+    fn fork_artifact_ids(
+        &self,
+        source_thread_id: &ThreadId,
+        params: &ForkCommitParams,
+    ) -> Result<BTreeSet<u64>, Status> {
+        let mut ids = BTreeSet::new();
+        let source_store = self
+            .shared
+            .runtime
+            .artifact_store(source_thread_id)
+            .map_err(internal_status("opening source artifact namespace"))?;
+        for message in &params.messages {
+            if let agent_sdk_foundation::llm::Content::Blocks(blocks) = &message.content {
+                for block in blocks {
+                    if let agent_sdk_foundation::llm::ContentBlock::ToolResult {
+                        content,
+                        artifact,
+                        ..
+                    } = block
+                    {
+                        if let Some(artifact) = artifact {
+                            ids.insert(artifact.id);
+                        } else if let Some(store) = source_store.as_deref()
+                            && let Some(id) = store
+                                .verified_legacy_inline_artifact_id(content)
+                                .map_err(internal_status("verifying legacy artifact footer"))?
+                        {
+                            ids.insert(id);
+                        }
+                    }
+                }
+            }
+        }
+        for event in &params.events {
+            if let AgentEvent::ToolCallEnd { result, .. } = event {
+                if let Some(artifact) = &result.artifact {
+                    ids.insert(artifact.id);
+                } else if let Some(store) = source_store.as_deref()
+                    && let Some(id) = store
+                        .verified_legacy_inline_artifact_id(&result.output)
+                        .map_err(internal_status("verifying legacy event artifact footer"))?
+                {
+                    ids.insert(id);
+                }
+            }
+        }
+        Ok(ids)
+    }
+
     /// Copy the source thread's durable state onto the freshly-minted
     /// destination thread, cut at the chosen turn boundary.
     ///
@@ -804,6 +853,13 @@ impl GrpcControlService {
         let params = self
             .build_fork_commit_params(source_thread_id, new_thread_id, fork_after, creation, now)
             .await?;
+        if fork_after > 0 {
+            let artifact_ids = self.fork_artifact_ids(source_thread_id, &params)?;
+            self.shared
+                .runtime
+                .copy_thread_artifacts(source_thread_id, new_thread_id, &artifact_ids)
+                .map_err(internal_status("copying fork artifact namespace"))?;
+        }
         let requested_message_count = params.messages.len() as u64;
         // `events[0]` is the destination's ThreadCreated; the response's
         // `event_count` counts only the source events re-committed, so
@@ -3392,6 +3448,11 @@ fn map_message(message: &llm::Message) -> RpcResult<pb::ConversationMessage> {
 fn map_content_block(block: &ContentBlock) -> RpcResult<pb::ConversationContentBlock> {
     let block = match block {
         ContentBlock::Text { text } => {
+            pb::conversation_content_block::Block::Text(pb::TextBlock { text: text.clone() })
+        }
+        ContentBlock::CompactionSummary { text } => {
+            // Provenance is internal projection metadata; public clients see
+            // the durable summary prose as an ordinary transcript text block.
             pb::conversation_content_block::Block::Text(pb::TextBlock { text: text.clone() })
         }
         ContentBlock::Thinking {

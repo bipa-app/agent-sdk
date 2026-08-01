@@ -660,6 +660,9 @@ pub(super) struct TurnMessageLoadParams<'a, P, H, M> {
     pub(super) turn: usize,
     pub(super) provider: &'a Arc<P>,
     pub(super) message_store: &'a Arc<M>,
+    /// Per-thread durable spill namespace used to preserve typed artifact
+    /// provenance while building compacted context.
+    pub(super) artifact_store: Option<&'a Arc<crate::ArtifactStore>>,
     pub(super) compaction_config: Option<&'a CompactionConfig>,
     pub(super) compactor: Option<&'a Arc<dyn ContextCompactor>>,
     pub(super) event_store: &'a Arc<dyn EventStore>,
@@ -813,6 +816,7 @@ pub(super) struct TurnStopReasonParams<'a, P, H, M> {
     pub(super) ctx: &'a mut TurnContext,
     pub(super) provider: &'a Arc<P>,
     pub(super) message_store: &'a Arc<M>,
+    pub(super) artifact_store: Option<&'a Arc<crate::ArtifactStore>>,
     pub(super) compaction_config: Option<&'a CompactionConfig>,
     pub(super) compactor: Option<&'a Arc<dyn ContextCompactor>>,
     pub(super) event_store: &'a Arc<dyn EventStore>,

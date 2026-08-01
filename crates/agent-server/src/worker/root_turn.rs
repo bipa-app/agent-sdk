@@ -2700,22 +2700,25 @@ async fn backfill_orphaned_tool_results(
         return Ok(());
     }
 
+    let repair_message =
+        llm::orphaned_tool_result_message(&history, llm::USER_CANCELLED_TOOL_RESULT)
+            .context("orphan backfill produced no synthetic repair message")?;
     let balanced = llm::balance_tool_results(&history, llm::USER_CANCELLED_TOOL_RESULT);
-    log::warn!(
-        "thread {thread_id}: closing {} unanswered tool_use block(s) with cancelled results",
-        balanced.len().saturating_sub(history.len()),
-    );
+    log::warn!("thread {thread_id}: closing unanswered tool_use blocks with cancelled results");
 
-    // Durable projection: fold the balanced history into the committed
-    // head. `replace_history` atomically drops the in-flight draft in the
-    // same transaction (the draft is exactly what we just folded in), so
-    // there is no window where a crash leaves a stale draft to double-fold.
-    // `recover_thread` treats the committed projection as the source of
-    // truth, so the next load sees a balanced thread.
+    // Append the synthetic evidence to the raw transcript and install the
+    // balanced effective projection in one durable transition. This preserves
+    // prior compaction lineage and clears the recovered draft atomically.
     deps.message_store
-        .replace_history(thread_id, balanced.clone(), now)
+        .append_repair(
+            thread_id,
+            vec![repair_message],
+            balanced.clone(),
+            history.len(),
+            now,
+        )
         .await
-        .context("persist balanced projection history")?;
+        .context("persist balanced append-only repair")?;
 
     // In-memory staged buffer the request is built from.
     staged_messages
