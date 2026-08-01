@@ -514,10 +514,12 @@ fn build_api_message_content(content: &Content, role_label: &str) -> Option<ApiM
 
 fn build_api_content_block(block: &ContentBlock, role_label: &str) -> Option<ApiContentBlockInput> {
     match block {
-        ContentBlock::Text { text } => Some(ApiContentBlockInput::Text {
-            text: text.clone(),
-            cache_control: None,
-        }),
+        ContentBlock::Text { text } | ContentBlock::CompactionSummary { text } => {
+            Some(ApiContentBlockInput::Text {
+                text: text.clone(),
+                cache_control: None,
+            })
+        }
         ContentBlock::Thinking {
             thinking,
             signature,
@@ -547,6 +549,7 @@ fn build_api_content_block(block: &ContentBlock, role_label: &str) -> Option<Api
             tool_use_id,
             content,
             is_error,
+            ..
         } => Some(ApiContentBlockInput::ToolResult {
             tool_use_id: tool_use_id.clone(),
             content: content.clone(),

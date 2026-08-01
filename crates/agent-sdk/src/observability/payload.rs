@@ -182,6 +182,7 @@ impl PayloadRedactor {
                 tool_use_id,
                 content,
                 is_error,
+                ..
             } => {
                 let mut part = json!({
                     "type": "tool_call_response",
@@ -329,6 +330,7 @@ mod tests {
             content: Content::Blocks(vec![ContentBlock::ToolResult {
                 tool_use_id: "call_1".to_string(),
                 content: "result data".to_string(),
+                artifact: None,
                 is_error: None,
             }]),
         };
@@ -347,6 +349,7 @@ mod tests {
                 ContentBlock::ToolResult {
                     tool_use_id: "call_1".to_string(),
                     content: "screenshot taken".to_string(),
+                    artifact: None,
                     is_error: None,
                 },
                 ContentBlock::Image {
@@ -509,6 +512,7 @@ mod tests {
             content: Content::Blocks(vec![ContentBlock::ToolResult {
                 tool_use_id: "call_1".to_string(),
                 content: "failed".to_string(),
+                artifact: None,
                 is_error: Some(true),
             }]),
         };
@@ -572,6 +576,7 @@ mod tests {
             content: Content::Blocks(vec![ContentBlock::ToolResult {
                 tool_use_id: "c1".to_string(),
                 content: "charged card 4111 1111 1111 1111 successfully".to_string(),
+                artifact: None,
                 is_error: None,
             }]),
         };

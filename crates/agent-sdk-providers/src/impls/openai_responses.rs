@@ -947,7 +947,7 @@ fn append_block_input(items: &mut Vec<ApiInputItem>, role: ApiRole, blocks: &[Co
 
     for block in blocks {
         match block {
-            ContentBlock::Text { text } => {
+            ContentBlock::Text { text } | ContentBlock::CompactionSummary { text } => {
                 content_parts.push(ApiInputContent::text(role, text.clone()));
             }
             ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {}

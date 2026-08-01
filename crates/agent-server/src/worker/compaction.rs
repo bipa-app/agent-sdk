@@ -191,6 +191,11 @@ pub async fn maybe_compact_staged_history(
     } else {
         compactor
     };
+    let compactor = if let Some(store) = deps.compaction_artifact_store {
+        compactor.with_artifact_store(Arc::clone(store))
+    } else {
+        compactor
+    };
     if !cfg.auto_compact || history.len() < cfg.min_messages_for_compaction {
         return Ok(());
     }
@@ -290,6 +295,11 @@ pub async fn compact_after_overflow(
         LlmContextCompactor::<dyn LlmProvider>::new(Arc::clone(provider_arc), cfg.clone());
     let compactor = if cfg.uses_prune_first_engine() {
         compactor.with_purpose(CompactionPurpose::Overflow)
+    } else {
+        compactor
+    };
+    let compactor = if let Some(store) = deps.compaction_artifact_store {
+        compactor.with_artifact_store(Arc::clone(store))
     } else {
         compactor
     };

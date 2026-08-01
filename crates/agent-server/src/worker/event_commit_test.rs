@@ -129,6 +129,7 @@ impl TestStores {
             subagent_spawn_selector: None,
             compaction_config: None,
             compaction_provider: None,
+            compaction_artifact_store: None,
             cancel: None,
             wakeup: None,
             activity: None,
@@ -480,6 +481,7 @@ async fn tool_completion_emits_tool_call_end() -> Result<()> {
             Ok(ToolResult {
                 success: true,
                 output: "hi".into(),
+                artifact: None,
                 data: None,
                 documents: Vec::new(),
                 duration_ms: None,
@@ -641,6 +643,7 @@ async fn execute_child_and_resume(
             Ok(ToolResult {
                 success: true,
                 output: "ok".into(),
+                artifact: None,
                 data: None,
                 documents: Vec::new(),
                 duration_ms: None,

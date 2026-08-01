@@ -1906,7 +1906,7 @@ fn append_block_input(items: &mut Vec<ApiInputItem>, role: ApiRole, blocks: &[Co
 
     for block in blocks {
         match block {
-            ContentBlock::Text { text } => {
+            ContentBlock::Text { text } | ContentBlock::CompactionSummary { text } => {
                 let part = if matches!(role, ApiRole::Assistant) {
                     ApiInputContent::OutputText { text: text.clone() }
                 } else {

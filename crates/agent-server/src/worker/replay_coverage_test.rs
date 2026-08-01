@@ -120,6 +120,7 @@ impl TestStores {
             subagent_spawn_selector: None,
             compaction_config: None,
             compaction_provider: None,
+            compaction_artifact_store: None,
             cancel: None,
             wakeup: None,
             activity: None,

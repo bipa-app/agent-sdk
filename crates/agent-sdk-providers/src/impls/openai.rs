@@ -1705,7 +1705,9 @@ fn append_block_messages(
 
     for block in blocks {
         match block {
-            ContentBlock::Text { text } => text_parts.push(text.clone()),
+            ContentBlock::Text { text } | ContentBlock::CompactionSummary { text } => {
+                text_parts.push(text.clone());
+            }
             ContentBlock::Thinking { thinking, .. } => {
                 // DeepSeek-style thinking-mode multi-turn requires the prior
                 // assistant reasoning_content to be echoed back on a tool-call

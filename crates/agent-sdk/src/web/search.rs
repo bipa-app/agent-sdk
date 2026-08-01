@@ -144,6 +144,7 @@ where
         Ok(ToolResult {
             success: true,
             output,
+            artifact: None,
             data,
             documents: Vec::new(),
             duration_ms: None,

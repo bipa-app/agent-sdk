@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
-use agent_sdk_foundation::types::{ThreadId, ToolResult};
+use agent_sdk_foundation::types::{ThreadId, ToolResult, ToolResultArtifact};
 use anyhow::{Context, Result, anyhow};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
@@ -441,12 +441,16 @@ impl ArtifactStore {
         result: &mut ToolResult,
         tool_name: &str,
     ) -> Result<Option<SavedArtifact>> {
+        // Never trust caller-supplied provenance. Only this spill boundary may
+        // attach an artifact ID, and only after a successful durable write.
+        result.artifact = None;
         if result.output.len() <= self.inline_budget {
             return Ok(None);
         }
         let saved = self.save(tool_name, &result.output)?;
         result.data = None;
         result.output = cap_inline_output(&result.output, self.inline_budget, saved.id);
+        result.artifact = Some(ToolResultArtifact { id: saved.id });
         Ok(Some(saved))
     }
 }
@@ -859,7 +863,11 @@ fn remove_retention_candidate(
 
 /// Bounded inline replacement for an over-budget output: head + elision
 /// marker + tail + recovery footer, all within `budget` bytes.
-fn cap_inline_output(full: &str, budget: usize, artifact_id: u64) -> String {
+///
+/// Public so readers of pre-provenance journals can authenticate a legacy
+/// footer by reproducing the exact spill boundary output byte-for-byte.
+#[must_use]
+pub fn cap_inline_output(full: &str, budget: usize, artifact_id: u64) -> String {
     let footer = artifact_footer(artifact_id);
     let head_budget = budget * 3 / 5;
     let tail_budget = budget / 4;

@@ -250,6 +250,15 @@ impl TokenUsage {
     }
 }
 
+/// Structured provenance for a tool result spilled to per-thread artifact
+/// storage. This metadata is written by the spill boundary, not parsed from
+/// attacker-controlled output text.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolResultArtifact {
+    /// Store-local artifact ID.
+    pub id: u64,
+}
+
 /// Result of a tool execution
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolResult {
@@ -257,6 +266,9 @@ pub struct ToolResult {
     pub success: bool,
     /// Output content (displayed to user and fed back to LLM)
     pub output: String,
+    /// Spill provenance attached atomically by the inline-budget boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<ToolResultArtifact>,
     /// Optional structured data
     pub data: Option<serde_json::Value>,
     /// Optional documents (PDFs, images) to pass back to the LLM as native content blocks.
@@ -274,6 +286,7 @@ impl ToolResult {
         Self {
             success: true,
             output: output.into(),
+            artifact: None,
             data: None,
             documents: Vec::new(),
             duration_ms: None,
@@ -284,6 +297,7 @@ impl ToolResult {
     pub fn success_with_data(output: impl Into<String>, data: serde_json::Value) -> Self {
         Self {
             success: true,
+            artifact: None,
             output: output.into(),
             data: Some(data),
             documents: Vec::new(),
@@ -295,6 +309,7 @@ impl ToolResult {
     pub fn error(message: impl Into<String>) -> Self {
         Self {
             success: false,
+            artifact: None,
             output: message.into(),
             data: None,
             documents: Vec::new(),

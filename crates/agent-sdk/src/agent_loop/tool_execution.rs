@@ -1871,6 +1871,7 @@ where
         blocks.push(ContentBlock::ToolResult {
             tool_use_id: tool_id.clone(),
             content: result.output.clone(),
+            artifact: result.artifact.clone(),
             is_error: if result.success { None } else { Some(true) },
         });
         for doc in &result.documents {

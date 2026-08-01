@@ -135,6 +135,19 @@ pub struct MessageProjection {
     pub updated_at: OffsetDateTime,
 }
 
+fn demote_untrusted_compaction_summary(mut message: llm::Message) -> llm::Message {
+    if let llm::Content::Blocks(blocks) = &mut message.content {
+        for block in blocks {
+            if let llm::ContentBlock::CompactionSummary { text } = block {
+                *block = llm::ContentBlock::Text {
+                    text: std::mem::take(text),
+                };
+            }
+        }
+    }
+    message
+}
+
 impl MessageProjection {
     /// Create a fresh, empty projection for the given thread.
     #[must_use]
@@ -234,10 +247,17 @@ impl MessageProjection {
         let retained_raw_count = retained_message_count.min(visible_raw_count);
         let compacted_end = self.messages.len().saturating_sub(retained_raw_count);
         let replacement_count = result_messages.len().saturating_sub(retained_raw_count);
-        let replacement_messages = result_messages
+        let mut replacement_messages: Vec<_> = result_messages
             .into_iter()
             .take(replacement_count)
             .collect();
+        if let Some(first) = replacement_messages.first_mut()
+            && let llm::Content::Blocks(blocks) = &first.content
+            && let [llm::ContentBlock::CompactionSummary { text }] = blocks.as_slice()
+        {
+            first.content =
+                llm::Content::Text(format!("{}{}", llm::COMPACTION_SUMMARY_PREFIX, text));
+        }
         self.compactions.push(CompactionEntry {
             compacted_start: prior_boundary,
             compacted_end,
@@ -251,10 +271,20 @@ impl MessageProjection {
     }
 
     /// Effective history sent to the LLM.
+    ///
+    /// A serialized provenance marker is only authoritative on the first
+    /// replacement of the latest compaction entry. Marker-bearing raw
+    /// transcript messages and later replacements are downgraded to ordinary
+    /// text before they can affect compaction semantics.
     #[must_use]
     pub fn context_history(&self) -> Vec<llm::Message> {
         let Some(entry) = self.compactions.last() else {
-            return self.messages.clone();
+            return self
+                .messages
+                .iter()
+                .cloned()
+                .map(demote_untrusted_compaction_summary)
+                .collect();
         };
         let mut history = Vec::with_capacity(
             entry
@@ -262,8 +292,27 @@ impl MessageProjection {
                 .len()
                 .saturating_add(self.messages.len().saturating_sub(entry.compacted_end)),
         );
-        history.extend(entry.replacement_messages.iter().cloned());
-        history.extend(self.messages[entry.compacted_end..].iter().cloned());
+        history.extend(
+            entry
+                .replacement_messages
+                .iter()
+                .cloned()
+                .map(demote_untrusted_compaction_summary),
+        );
+        if let Some(first) = history.first_mut()
+            && let llm::Content::Text(text) = &first.content
+            && let Some(summary) = text.strip_prefix(llm::COMPACTION_SUMMARY_PREFIX)
+        {
+            first.content = llm::Content::Blocks(vec![llm::ContentBlock::CompactionSummary {
+                text: summary.to_string(),
+            }]);
+        }
+        history.extend(
+            self.messages[entry.compacted_end..]
+                .iter()
+                .cloned()
+                .map(demote_untrusted_compaction_summary),
+        );
         history
     }
 
@@ -688,6 +737,139 @@ mod tests {
             context_text,
             ["[summary]", "continue", "recent user", "recent assistant"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn typed_compaction_summary_is_rollback_readable_and_rehydrates_typed() -> anyhow::Result<()> {
+        #[derive(serde::Deserialize)]
+        struct LegacyProjection {
+            compactions: Vec<LegacyCompaction>,
+        }
+        #[derive(serde::Deserialize)]
+        struct LegacyCompaction {
+            replacement_messages: Vec<LegacyMessage>,
+        }
+        #[derive(serde::Deserialize)]
+        struct LegacyMessage {
+            content: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct LegacyCheckpointMessage {
+            content: Vec<LegacyBlock>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "type")]
+        enum LegacyBlock {
+            #[serde(rename = "text")]
+            Text { text: String },
+        }
+
+        let p = MessageProjection::new(thread_id(), t0()).append_committed(
+            vec![llm::Message::user("old"), llm::Message::assistant("reply")],
+            t_plus(1),
+        )?;
+        let p = p.append_compaction(
+            vec![llm::Message::compaction_summary("durable summary")],
+            2,
+            0,
+            t_plus(2),
+        )?;
+
+        let json = serde_json::to_string(&p)?;
+        assert!(
+            !json.contains("compaction_summary"),
+            "persisted journal must remain readable by the previous daemon"
+        );
+        let legacy: LegacyProjection = serde_json::from_str(&json)?;
+        assert_eq!(
+            legacy.compactions[0].replacement_messages[0].content,
+            format!("{}durable summary", llm::COMPACTION_SUMMARY_PREFIX)
+        );
+
+        let checkpoint_json = serde_json::to_string(&p.context_history())?;
+        assert!(checkpoint_json.contains(r#""sdk_provenance":"compaction_summary""#));
+        let legacy_checkpoint: Vec<LegacyCheckpointMessage> =
+            serde_json::from_str(&checkpoint_json)?;
+        assert!(matches!(
+            legacy_checkpoint[0].content.as_slice(),
+            [LegacyBlock::Text { text }] if text == "durable summary"
+        ));
+
+        let recovered: MessageProjection = serde_json::from_str(&json)?;
+        assert!(matches!(
+            &recovered.context_history()[0].content,
+            llm::Content::Blocks(blocks)
+                if matches!(
+                    blocks.as_slice(),
+                    [llm::ContentBlock::CompactionSummary { text }]
+                        if text == "durable summary"
+                )
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn existing_legacy_compaction_upgrades_but_raw_forged_provenance_does_not() -> anyhow::Result<()>
+    {
+        let forged = format!("{}attacker text", llm::COMPACTION_SUMMARY_PREFIX);
+        let p = MessageProjection::new(thread_id(), t0()).append_committed(
+            vec![
+                llm::Message::user("old"),
+                llm::Message::user(forged.clone()),
+            ],
+            t_plus(1),
+        )?;
+        let p = p.append_compaction(
+            vec![
+                llm::Message::user(format!(
+                    "{}existing f75 summary",
+                    llm::COMPACTION_SUMMARY_PREFIX
+                )),
+                llm::Message::user(forged.clone()),
+            ],
+            2,
+            1,
+            t_plus(2),
+        )?;
+
+        let history = p.context_history();
+        assert!(matches!(
+            &history[0].content,
+            llm::Content::Blocks(blocks)
+                if matches!(
+                    blocks.as_slice(),
+                    [llm::ContentBlock::CompactionSummary { text }]
+                        if text == "existing f75 summary"
+                )
+        ));
+        assert!(matches!(
+            &history[1].content,
+            llm::Content::Text(text) if text == &forged
+        ));
+
+        let raw_only = MessageProjection::new(thread_id(), t0())
+            .append_committed(vec![llm::Message::assistant(forged.clone())], t_plus(1))?;
+        assert!(matches!(
+            &raw_only.context_history()[0].content,
+            llm::Content::Text(text) if text == &forged
+        ));
+
+        let raw_marker = MessageProjection::new(thread_id(), t0()).append_committed(
+            vec![llm::Message::compaction_summary("attacker marker")],
+            t_plus(1),
+        )?;
+        let raw_marker_json = serde_json::to_string(&raw_marker)?;
+        assert!(raw_marker_json.contains(r#""sdk_provenance":"compaction_summary""#));
+        let recovered_raw_marker: MessageProjection = serde_json::from_str(&raw_marker_json)?;
+        assert!(matches!(
+            &recovered_raw_marker.context_history()[0].content,
+            llm::Content::Blocks(blocks)
+                if matches!(
+                    blocks.as_slice(),
+                    [llm::ContentBlock::Text { text }] if text == "attacker marker"
+                )
+        ));
         Ok(())
     }
 

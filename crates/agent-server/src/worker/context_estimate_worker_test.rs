@@ -136,6 +136,7 @@ async fn worker_publishes_estimate_at_dispatch_and_anchors_on_settle() -> Result
         subagent_spawn_selector: None,
         compaction_config: None,
         compaction_provider: None,
+        compaction_artifact_store: None,
         cancel: None,
         wakeup: None,
         activity: None,

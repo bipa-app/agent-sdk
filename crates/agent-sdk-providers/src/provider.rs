@@ -519,6 +519,7 @@ pub async fn collect_stream(mut stream: StreamBox<'_>, model: String) -> Result<
                 tool_use_id,
                 content: result_content,
                 is_error,
+                ..
             } => {
                 log::debug!(
                     "  content_block[{}]: ToolResult tool_use_id={} is_error={:?} content_len={}",

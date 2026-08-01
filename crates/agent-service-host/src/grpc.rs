@@ -3421,6 +3421,7 @@ fn map_content_block(block: &ContentBlock) -> RpcResult<pb::ConversationContentB
             tool_use_id,
             content,
             is_error,
+            ..
         } => pb::conversation_content_block::Block::ToolResult(pb::ToolResultBlock {
             tool_use_id: tool_use_id.clone(),
             content: content.clone(),
@@ -8012,6 +8013,7 @@ mod tests {
                 () = cancel.cancelled() => Ok(ToolResult {
                     success: false,
                     output: "aborted before side effect".into(),
+                    artifact: None,
                     data: None,
                     documents: Vec::new(),
                     duration_ms: None,

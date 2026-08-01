@@ -2377,11 +2377,15 @@ async fn execute_root_task(
         // and fresh-turn execution alike — the arms only choose the
         // resume entry point.
         let selector = runtime.subagent_spawn_selector();
+        let compaction_artifact_store = runtime
+            .artifact_store(&task.thread_id)
+            .context("resolve compaction artifact store")?;
         let mut deps = stores.root_turn_deps_with_selector_and_compaction(
             selector.as_ref(),
             runtime.compaction_config(),
             runtime.compaction_config().map(|_| &provider),
         );
+        deps.compaction_artifact_store = compaction_artifact_store.as_ref();
         deps.cancel = Some(cancel);
         deps.wakeup = runtime.wakeup_signal();
         deps.wire_activity(activity, &tracked_event_repo);
@@ -8299,6 +8303,7 @@ mod tests {
             Ok(agent_sdk_foundation::ToolResult {
                 success: false,
                 output: "hung probe aborted".into(),
+                artifact: None,
                 data: None,
                 documents: Vec::new(),
                 duration_ms: None,

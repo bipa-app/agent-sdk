@@ -459,6 +459,9 @@ impl ChatRequest {
     }
 }
 
+/// Legacy on-disk marker used for rollback-readable compaction entries.
+pub const COMPACTION_SUMMARY_PREFIX: &str = "[Previous conversation summary]\n\n";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
@@ -471,6 +474,16 @@ impl Message {
         Self {
             role: Role::User,
             content: Content::Text(text.into()),
+        }
+    }
+    /// Create an SDK-generated compaction summary with backward-compatible
+    /// structural provenance. Older decoders see an ordinary `type: "text"`
+    /// block and ignore the marker; current decoders retain typed identity.
+    #[must_use]
+    pub fn compaction_summary(text: impl Into<String>) -> Self {
+        Self {
+            role: Role::User,
+            content: Content::Blocks(vec![ContentBlock::CompactionSummary { text: text.into() }]),
         }
     }
 
@@ -532,6 +545,7 @@ impl Message {
             content: Content::Blocks(vec![ContentBlock::ToolResult {
                 tool_use_id: tool_use_id.into(),
                 content: content.into(),
+                artifact: None,
                 is_error: if is_error { Some(true) } else { None },
             }]),
         }
@@ -558,7 +572,9 @@ impl Content {
         match self {
             Self::Text(s) => Some(s),
             Self::Blocks(blocks) => blocks.iter().find_map(|b| match b {
-                ContentBlock::Text { text } => Some(text.as_str()),
+                ContentBlock::Text { text } | ContentBlock::CompactionSummary { text } => {
+                    Some(text.as_str())
+                }
                 _ => None,
             }),
         }
@@ -581,14 +597,23 @@ impl ContentSource {
         }
     }
 }
-
+/// A provider-compatible content block.
+///
+/// `CompactionSummary` uses a backward-compatible wire encoding:
+/// `{"type":"text","text":"...","sdk_provenance":"compaction_summary"}`.
+/// Previous decoders ignore the extra field and see ordinary text. Current
+/// decoders recover structural identity; durable projections still authorize
+/// that identity only at an authoritative compaction replacement boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[serde(into = "ContentBlockWire", from = "ContentBlockWire")]
 #[non_exhaustive]
 pub enum ContentBlock {
-    #[serde(rename = "text")]
-    Text { text: String },
-
+    Text {
+        text: String,
+    },
+    CompactionSummary {
+        text: String,
+    },
     #[serde(rename = "thinking")]
     Thinking {
         thinking: String,
@@ -598,7 +623,9 @@ pub enum ContentBlock {
     },
 
     #[serde(rename = "redacted_thinking")]
-    RedactedThinking { data: String },
+    RedactedThinking {
+        data: String,
+    },
 
     /// Provider-owned reasoning state that must be replayed exactly on a
     /// later request, but must never be interpreted or surfaced by the SDK.
@@ -628,15 +655,166 @@ pub enum ContentBlock {
     ToolResult {
         tool_use_id: String,
         content: String,
+        /// Structured spill provenance. Never infer this from `content`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact: Option<crate::types::ToolResultArtifact>,
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
 
     #[serde(rename = "image")]
-    Image { source: ContentSource },
+    Image {
+        source: ContentSource,
+    },
 
     #[serde(rename = "document")]
+    Document {
+        source: ContentSource,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type")]
+enum ContentBlockWire {
+    #[serde(rename = "text")]
+    Text {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sdk_provenance: Option<String>,
+    },
+    #[serde(rename = "thinking")]
+    Thinking {
+        thinking: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking { data: String },
+    #[serde(rename = "opaque_reasoning")]
+    OpaqueReasoning {
+        provider: String,
+        data: serde_json::Value,
+    },
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
+    },
+    #[serde(rename = "tool_result")]
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact: Option<crate::types::ToolResultArtifact>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        is_error: Option<bool>,
+    },
+    #[serde(rename = "image")]
+    Image { source: ContentSource },
+    #[serde(rename = "document")]
     Document { source: ContentSource },
+}
+
+impl From<ContentBlock> for ContentBlockWire {
+    fn from(block: ContentBlock) -> Self {
+        match block {
+            ContentBlock::Text { text } => Self::Text {
+                text,
+                sdk_provenance: None,
+            },
+            ContentBlock::CompactionSummary { text } => Self::Text {
+                text,
+                sdk_provenance: Some("compaction_summary".to_string()),
+            },
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => Self::Thinking {
+                thinking,
+                signature,
+            },
+            ContentBlock::RedactedThinking { data } => Self::RedactedThinking { data },
+            ContentBlock::OpaqueReasoning { provider, data } => {
+                Self::OpaqueReasoning { provider, data }
+            }
+            ContentBlock::ToolUse {
+                id,
+                name,
+                input,
+                thought_signature,
+            } => Self::ToolUse {
+                id,
+                name,
+                input,
+                thought_signature,
+            },
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                artifact,
+                is_error,
+            } => Self::ToolResult {
+                tool_use_id,
+                content,
+                artifact,
+                is_error,
+            },
+            ContentBlock::Image { source } => Self::Image { source },
+            ContentBlock::Document { source } => Self::Document { source },
+        }
+    }
+}
+
+impl From<ContentBlockWire> for ContentBlock {
+    fn from(block: ContentBlockWire) -> Self {
+        match block {
+            ContentBlockWire::Text {
+                text,
+                sdk_provenance,
+            } if sdk_provenance.as_deref() == Some("compaction_summary") => {
+                Self::CompactionSummary { text }
+            }
+            ContentBlockWire::Text { text, .. } => Self::Text { text },
+            ContentBlockWire::Thinking {
+                thinking,
+                signature,
+            } => Self::Thinking {
+                thinking,
+                signature,
+            },
+            ContentBlockWire::RedactedThinking { data } => Self::RedactedThinking { data },
+            ContentBlockWire::OpaqueReasoning { provider, data } => {
+                Self::OpaqueReasoning { provider, data }
+            }
+            ContentBlockWire::ToolUse {
+                id,
+                name,
+                input,
+                thought_signature,
+            } => Self::ToolUse {
+                id,
+                name,
+                input,
+                thought_signature,
+            },
+            ContentBlockWire::ToolResult {
+                tool_use_id,
+                content,
+                artifact,
+                is_error,
+            } => Self::ToolResult {
+                tool_use_id,
+                content,
+                artifact,
+                is_error,
+            },
+            ContentBlockWire::Image { source } => Self::Image { source },
+            ContentBlockWire::Document { source } => Self::Document { source },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -991,6 +1169,7 @@ pub fn balance_tool_results(messages: &[Message], cancel_text: &str) -> Vec<Mess
             .map(|id| ContentBlock::ToolResult {
                 tool_use_id: (*id).to_owned(),
                 content: cancel_text.to_owned(),
+                artifact: None,
                 is_error: Some(true),
             })
             .collect();
@@ -1219,6 +1398,7 @@ mod tests {
         let none = serde_json::to_value(ContentBlock::ToolResult {
             tool_use_id: "t".into(),
             content: "out".into(),
+            artifact: None,
             is_error: None,
         })?;
         assert_eq!(
@@ -1229,6 +1409,7 @@ mod tests {
         let some = serde_json::to_value(ContentBlock::ToolResult {
             tool_use_id: "t".into(),
             content: "out".into(),
+            artifact: None,
             is_error: Some(true),
         })?;
         assert_eq!(
@@ -1292,6 +1473,7 @@ mod tests {
             ContentBlock::ToolResult {
                 tool_use_id: "t".into(),
                 content: "c".into(),
+                artifact: None,
                 is_error: Some(true),
             },
             ContentBlock::Image {
@@ -1443,6 +1625,7 @@ mod tests {
             .map(|id| ContentBlock::ToolResult {
                 tool_use_id: (*id).to_string(),
                 content: "answered".to_string(),
+                artifact: None,
                 is_error: None,
             })
             .collect();
@@ -1496,6 +1679,7 @@ mod tests {
                     tool_use_id,
                     content,
                     is_error: Some(true),
+                    ..
                 } if content == USER_CANCELLED_TOOL_RESULT => Some(tool_use_id.as_str()),
                 _ => None,
             })

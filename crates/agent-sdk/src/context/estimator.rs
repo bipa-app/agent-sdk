@@ -59,7 +59,9 @@ impl TokenEstimator {
     #[must_use]
     pub fn estimate_block(block: &ContentBlock) -> usize {
         match block {
-            ContentBlock::Text { text } => Self::estimate_text(text),
+            ContentBlock::Text { text } | ContentBlock::CompactionSummary { text } => {
+                Self::estimate_text(text)
+            }
             ContentBlock::Thinking { thinking, .. } => Self::estimate_text(thinking),
             ContentBlock::RedactedThinking { data } => {
                 // The data field is a base64-encoded encrypted blob whose size
@@ -87,9 +89,9 @@ impl TokenEstimator {
                 // Estimate the serialized JSON length without actually
                 // serializing: `needs_compaction` runs before every LLM call,
                 // so allocating a String per tool-use block on every round-trip
-                // is O(n^2) over a session. The recursive estimator also avoids
-                // the silent 0-byte underestimate that `to_string(..)
-                // .unwrap_or_default()` produced on a serialization failure.
+                // is O(n^2) over a session.
+                // The recursive estimator also avoids the silent 0-byte
+                // underestimate from a failed JSON serialization.
                 let input_len = Self::estimate_json_len(input);
                 Self::estimate_text(name)
                     + input_len.div_ceil(Self::CHARS_PER_TOKEN)
@@ -241,6 +243,7 @@ mod tests {
             content: Content::Blocks(vec![ContentBlock::ToolResult {
                 tool_use_id: "tool_123".to_string(),
                 content: "File contents here...".to_string(), // 21 chars = 6 tokens
+                artifact: None,
                 is_error: None,
             }]),
         };

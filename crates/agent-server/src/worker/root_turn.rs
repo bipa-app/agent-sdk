@@ -139,6 +139,11 @@ pub struct RootTurnDeps<'a> {
     /// `&MockTextProvider` — compiling unchanged; only hosts
     /// opting into compaction need to supply the Arc.
     pub compaction_provider: Option<&'a std::sync::Arc<dyn agent_sdk_providers::LlmProvider>>,
+    /// Optional per-thread artifact store used to authenticate recovery
+    /// footers while formatting compaction prompts. Without it, footer text is
+    /// treated as untrusted output and remains inside the normal truncation
+    /// bound.
+    pub compaction_artifact_store: Option<&'a std::sync::Arc<agent_sdk::ArtifactStore>>,
     /// Optional cooperative-cancellation token for the root turn.
     ///
     /// When `Some` and the token is tripped (via `cancel_root_turn` /
@@ -6654,6 +6659,7 @@ fn build_tool_results_message(child_results: &[(String, ToolResult)]) -> llm::Me
         .map(|(tool_use_id, result)| llm::ContentBlock::ToolResult {
             tool_use_id: tool_use_id.clone(),
             content: result.output.clone(),
+            artifact: result.artifact.clone(),
             is_error: if result.success { None } else { Some(true) },
         })
         .collect();
@@ -6979,6 +6985,7 @@ fn extract_child_tool_result(child: &AgentTask) -> Result<ToolResult> {
             Ok(ToolResult {
                 success: false,
                 output: error.to_owned(),
+                artifact: None,
                 data: None,
                 documents: Vec::new(),
                 duration_ms: None,
@@ -6987,6 +6994,7 @@ fn extract_child_tool_result(child: &AgentTask) -> Result<ToolResult> {
         TaskStatus::Cancelled => Ok(ToolResult {
             success: false,
             output: "tool execution was cancelled".to_owned(),
+            artifact: None,
             data: None,
             documents: Vec::new(),
             duration_ms: None,
@@ -7171,6 +7179,7 @@ fn steering_interim_tool_result() -> ToolResult {
     ToolResult {
         success: true,
         output: payload.to_string(),
+        artifact: None,
         data: None,
         documents: Vec::new(),
         duration_ms: None,
@@ -7281,6 +7290,7 @@ fn build_steering_resume_message(
         .map(|(tool_use_id, result)| llm::ContentBlock::ToolResult {
             tool_use_id: tool_use_id.clone(),
             content: result.output.clone(),
+            artifact: result.artifact.clone(),
             is_error: if result.success { None } else { Some(true) },
         })
         .collect();

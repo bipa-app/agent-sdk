@@ -9,9 +9,7 @@ use super::types::{
 };
 
 use crate::authority::EventAuthority;
-use crate::context::{
-    CompactionConfig, CompactionPurpose, ContextCompactor, LlmContextCompactor,
-};
+use crate::context::{CompactionConfig, CompactionPurpose, ContextCompactor, LlmContextCompactor};
 use crate::events::AgentEvent;
 use crate::hooks::{AgentHooks, ToolAuditSink};
 use crate::llm::{
@@ -813,6 +811,7 @@ pub(super) fn log_chat_request(request: &ChatRequest) {
                             tool_use_id,
                             content,
                             is_error,
+                            ..
                         } => {
                             debug!(
                                 "    block[{block_idx}]: ToolResult(tool_use_id={tool_use_id}, is_error={is_error:?}, content_len={})",

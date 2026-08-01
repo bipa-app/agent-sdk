@@ -25,7 +25,7 @@ const fn default_max_retained_tail_tokens() -> usize {
 const fn default_summary_max_tokens() -> usize {
     DEFAULT_SUMMARY_MAX_TOKENS
 }
-fn default_compaction_engine() -> CompactionEngine {
+const fn default_compaction_engine() -> CompactionEngine {
     CompactionEngine::Legacy
 }
 
@@ -39,7 +39,6 @@ pub enum CompactionEngine {
     /// Prune recoverable tool output first and let the host use measured triggers.
     PruneFirst,
 }
-
 
 /// Configuration for context compaction.
 ///

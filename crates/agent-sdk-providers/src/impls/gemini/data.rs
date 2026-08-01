@@ -520,7 +520,7 @@ pub fn build_api_contents(messages: &[agent_sdk_foundation::llm::Message]) -> Ve
                 let mut parts = Vec::new();
                 for block in blocks {
                     match block {
-                        ContentBlock::Text { text } => {
+                        ContentBlock::Text { text } | ContentBlock::CompactionSummary { text } => {
                             parts.push(ApiPart::Text {
                                 text: text.clone(),
                                 thought_signature: None,
@@ -559,6 +559,7 @@ pub fn build_api_contents(messages: &[agent_sdk_foundation::llm::Message]) -> Ve
                             tool_use_id,
                             content,
                             is_error,
+                            artifact: _,
                         } => {
                             let func_name = tool_names
                                 .get(tool_use_id)

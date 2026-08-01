@@ -157,6 +157,7 @@ impl<T: McpTransport + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for McpToo
         Ok(ToolResult {
             success: !result.is_error,
             output,
+            artifact: None,
             data,
             documents: Vec::new(),
             duration_ms: None,

@@ -226,6 +226,7 @@ impl Fixtures {
             subagent_spawn_selector: None,
             compaction_config: Some(config),
             compaction_provider: Some(provider),
+            compaction_artifact_store: None,
             cancel: None,
             wakeup: None,
             activity: None,
@@ -705,6 +706,7 @@ async fn prompt_too_long_without_config_still_goes_fatal() -> Result<()> {
         subagent_spawn_selector: None,
         compaction_config: None,
         compaction_provider: None,
+        compaction_artifact_store: None,
         cancel: None,
         wakeup: None,
         activity: None,
@@ -823,9 +825,7 @@ async fn legacy_engine_flag_off_uses_estimated_trigger_and_generic_prompt() -> R
     let cfg = CompactionConfig::default()
         .with_engine(CompactionEngine::Legacy)
         .with_threshold_tokens(50_000);
-    let scripted = Arc::new(ScriptedProvider::new(vec![ok_response(
-        "[legacy summary]",
-    )]));
+    let scripted = Arc::new(ScriptedProvider::new(vec![ok_response("[legacy summary]")]));
     let provider: Arc<dyn LlmProvider> = scripted.clone();
     let deps = fixtures.deps_with_compaction(&cfg, &provider);
     let staged = StagedMessageStore::new(thread_id(), history);

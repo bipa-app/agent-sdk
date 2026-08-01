@@ -488,6 +488,7 @@ where
             let error_result = ToolResult {
                 success: false,
                 output: error_msg.clone(),
+                artifact: None,
                 data: None,
                 documents: Vec::new(),
                 duration_ms: None,

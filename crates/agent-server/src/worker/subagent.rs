@@ -2183,6 +2183,7 @@ fn build_parent_tool_result(
     let mut tool_result = ToolResult {
         success: result.summary.success,
         output,
+        artifact: None,
         data: None,
         documents: Vec::new(),
         duration_ms: Some(result.summary.duration_ms),

@@ -4233,6 +4233,7 @@ mod tests {
                     tool_use_id,
                     content,
                     is_error: Some(true),
+                    ..
                 } if content == crate::llm::USER_CANCELLED_TOOL_RESULT => {
                     Some(tool_use_id.as_str())
                 }
