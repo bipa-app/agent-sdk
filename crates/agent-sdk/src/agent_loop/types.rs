@@ -660,6 +660,9 @@ pub(super) struct TurnMessageLoadParams<'a, P, H, M> {
     pub(super) turn: usize,
     pub(super) provider: &'a Arc<P>,
     pub(super) message_store: &'a Arc<M>,
+    /// Per-thread durable spill namespace used to preserve typed artifact
+    /// provenance while building compacted context.
+    pub(super) artifact_store: Option<&'a Arc<crate::ArtifactStore>>,
     pub(super) compaction_config: Option<&'a CompactionConfig>,
     pub(super) compactor: Option<&'a Arc<dyn ContextCompactor>>,
     pub(super) event_store: &'a Arc<dyn EventStore>,
@@ -674,6 +677,8 @@ pub(super) struct TurnMessageLoadParams<'a, P, H, M> {
 pub(super) struct LlmCallParams<'a, P, H> {
     pub(super) provider: &'a Arc<P>,
     pub(super) request: crate::llm::ChatRequest,
+    /// Current thread's sole artifact namespace for ephemeral request hydration.
+    pub(super) artifact_store: Option<&'a Arc<crate::ArtifactStore>>,
     pub(super) config: &'a AgentConfig,
     pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) hooks: &'a Arc<H>,
@@ -710,6 +715,14 @@ pub(super) struct LlmEventContext<'a, H> {
 pub(super) struct LlmStreamIds<'a> {
     pub(super) message_id: &'a str,
     pub(super) thinking_id: &'a str,
+}
+
+/// Mutable stream-id slots owned by the turn; the streaming retry loop
+/// regenerates both ids for every retry attempt so each attempt's deltas
+/// land under a distinct id.
+pub(super) struct LlmStreamIdSlots<'a> {
+    pub(super) message_id: &'a mut String,
+    pub(super) thinking_id: &'a mut String,
 }
 
 pub(super) struct ProcessedTurnResponse {
@@ -813,6 +826,7 @@ pub(super) struct TurnStopReasonParams<'a, P, H, M> {
     pub(super) ctx: &'a mut TurnContext,
     pub(super) provider: &'a Arc<P>,
     pub(super) message_store: &'a Arc<M>,
+    pub(super) artifact_store: Option<&'a Arc<crate::ArtifactStore>>,
     pub(super) compaction_config: Option<&'a CompactionConfig>,
     pub(super) compactor: Option<&'a Arc<dyn ContextCompactor>>,
     pub(super) event_store: &'a Arc<dyn EventStore>,

@@ -256,6 +256,7 @@ fn tool_result_message(
         .map(|(tool_use_id, result)| ContentBlock::ToolResult {
             tool_use_id: tool_use_id.clone(),
             content: result.output.clone(),
+            artifact: None,
             is_error: if result.success { None } else { Some(true) },
         })
         .collect();
@@ -350,6 +351,7 @@ impl TestStores {
             subagent_spawn_selector: None,
             compaction_config: None,
             compaction_provider: None,
+            compaction_artifact_store: None,
             cancel: None,
             wakeup: None,
             activity: None,
@@ -365,6 +367,7 @@ impl TestStores {
         RootTurnDeps {
             compaction_config: Some(config),
             compaction_provider: Some(provider),
+            compaction_artifact_store: None,
             ..self.deps()
         }
     }
@@ -1201,6 +1204,7 @@ async fn resume_text_only_end_to_end() -> Result<()> {
         agent_sdk_foundation::ToolResult {
             success: true,
             output: "file1.txt\nfile2.txt".to_owned(),
+            artifact: None,
             data: None,
             documents: Vec::new(),
             duration_ms: Some(50),
@@ -1310,12 +1314,18 @@ async fn resume_with_compaction_fixture(
         "call_1".to_owned(),
         agent_sdk_foundation::ToolResult::success("file1.txt"),
     )];
+    // The summarized slice must be large enough that replacing it with the
+    // typed summary message (fixed ~100-token overhead) shrinks effective
+    // occupancy; a tiny history would trip the compactor's deliberate
+    // no-progress guard. Bulk goes in the tool INPUT, and retain_recent=0
+    // below folds the whole pair into the summary — pair safety otherwise
+    // pins the fresh tool_use/tool_result pair in the retained tail.
     let (parent, continuation, suspended_messages) = Box::pin(suspend_and_complete_children(
         stores,
         vec![(
             "call_1".into(),
             "bash".into(),
-            serde_json::json!({"command": "ls"}),
+            serde_json::json!({"command": format!("ls {}", "very/deep/path ".repeat(400))}),
         )],
         &child_results,
     ))
@@ -1365,7 +1375,7 @@ async fn resume_with_compaction_fixture(
     let config = CompactionConfig::default()
         .with_threshold_tokens(1)
         .with_min_messages(2)
-        .with_retain_recent(1);
+        .with_retain_recent(0);
     let compactor_impl = Arc::new(MockTextProvider::new("[resume summary]"));
     let compactor: Arc<dyn LlmProvider> = compactor_impl.clone();
     let deps = stores.deps_with_compaction(&config, &compactor);
@@ -1436,6 +1446,7 @@ async fn resume_checkpoint_contains_correct_agent_state() -> Result<()> {
         agent_sdk_foundation::ToolResult {
             success: true,
             output: "done".to_owned(),
+            artifact: None,
             data: None,
             documents: Vec::new(),
             duration_ms: None,
@@ -1518,6 +1529,7 @@ async fn resume_with_tool_calls_re_suspends() -> Result<()> {
         agent_sdk_foundation::ToolResult {
             success: true,
             output: "result".to_owned(),
+            artifact: None,
             data: None,
             documents: Vec::new(),
             duration_ms: None,
@@ -1632,6 +1644,7 @@ async fn resume_with_failed_tool_result() -> Result<()> {
         agent_sdk_foundation::ToolResult {
             success: false,
             output: "permission denied".to_owned(),
+            artifact: None,
             data: None,
             documents: Vec::new(),
             duration_ms: Some(10),
@@ -1701,6 +1714,7 @@ async fn resume_multiple_tool_results() -> Result<()> {
             agent_sdk_foundation::ToolResult {
                 success: true,
                 output: "/home/user".to_owned(),
+                artifact: None,
                 data: None,
                 documents: Vec::new(),
                 duration_ms: None,
@@ -1711,6 +1725,7 @@ async fn resume_multiple_tool_results() -> Result<()> {
             agent_sdk_foundation::ToolResult {
                 success: true,
                 output: "contents of /x".to_owned(),
+                artifact: None,
                 data: None,
                 documents: Vec::new(),
                 duration_ms: None,
@@ -1850,6 +1865,7 @@ async fn ready_to_resume_state_survives_acquisition() -> Result<()> {
         agent_sdk_foundation::ToolResult {
             success: true,
             output: "ok".to_owned(),
+            artifact: None,
             data: None,
             documents: Vec::new(),
             duration_ms: None,
@@ -2038,6 +2054,7 @@ async fn failed_resumed_turn_does_not_leak_continuation() -> Result<()> {
         agent_sdk_foundation::ToolResult {
             success: true,
             output: "ok".to_owned(),
+            artifact: None,
             data: None,
             documents: Vec::new(),
             duration_ms: None,
@@ -2159,6 +2176,7 @@ async fn failed_resumed_turn_preserves_in_flight_history_via_draft() -> Result<(
         agent_sdk_foundation::ToolResult {
             success: true,
             output: "ok".to_owned(),
+            artifact: None,
             data: None,
             documents: Vec::new(),
             duration_ms: None,
@@ -2578,6 +2596,7 @@ async fn regression_tool_suspension_and_resume_completion() -> Result<()> {
         agent_sdk_foundation::ToolResult {
             success: true,
             output: "hello world".to_owned(),
+            artifact: None,
             data: None,
             documents: Vec::new(),
             duration_ms: Some(25),
@@ -2669,6 +2688,7 @@ async fn regression_re_suspension_child_retry_budget() -> Result<()> {
         agent_sdk_foundation::ToolResult {
             success: true,
             output: "result".to_owned(),
+            artifact: None,
             data: None,
             documents: Vec::new(),
             duration_ms: None,
@@ -2749,6 +2769,7 @@ async fn resume_llm_error_does_not_leak_staged_writes() -> Result<()> {
         agent_sdk_foundation::ToolResult {
             success: true,
             output: "ok".to_owned(),
+            artifact: None,
             data: None,
             documents: Vec::new(),
             duration_ms: None,
@@ -2986,6 +3007,7 @@ async fn aggregate_all_successful_children() -> Result<()> {
             agent_sdk_foundation::ToolResult {
                 success: true,
                 output: "result_a".to_owned(),
+                artifact: None,
                 data: None,
                 documents: Vec::new(),
                 duration_ms: Some(10),
@@ -2996,6 +3018,7 @@ async fn aggregate_all_successful_children() -> Result<()> {
             agent_sdk_foundation::ToolResult {
                 success: true,
                 output: "result_b".to_owned(),
+                artifact: None,
                 data: None,
                 documents: Vec::new(),
                 duration_ms: Some(20),
@@ -3123,6 +3146,7 @@ async fn aggregate_mixed_success_and_failure() -> Result<()> {
     let success_result = agent_sdk_foundation::ToolResult {
         success: true,
         output: "/home/user".to_owned(),
+        artifact: None,
         data: None,
         documents: Vec::new(),
         duration_ms: Some(5),
@@ -3207,6 +3231,7 @@ async fn resume_from_children_end_to_end() -> Result<()> {
         agent_sdk_foundation::ToolResult {
             success: true,
             output: "file1.txt\nfile2.txt".to_owned(),
+            artifact: None,
             data: None,
             documents: Vec::new(),
             duration_ms: Some(50),
@@ -3449,6 +3474,7 @@ async fn resume_from_children_re_suspends_on_tool_calls() -> Result<()> {
         agent_sdk_foundation::ToolResult {
             success: true,
             output: "first result".to_owned(),
+            artifact: None,
             data: None,
             documents: Vec::new(),
             duration_ms: None,
@@ -3529,6 +3555,7 @@ async fn result_payload_round_trips_through_json() -> Result<()> {
     let original_result = agent_sdk_foundation::ToolResult {
         success: true,
         output: "round-trip test".to_owned(),
+        artifact: None,
         data: Some(serde_json::json!({"key": "value"})),
         documents: Vec::new(),
         duration_ms: Some(42),
@@ -3653,6 +3680,7 @@ fn ok_result(output: &str) -> agent_sdk_foundation::ToolResult {
     agent_sdk_foundation::ToolResult {
         success: true,
         output: output.to_owned(),
+        artifact: None,
         data: None,
         documents: Vec::new(),
         duration_ms: Some(10),
@@ -4925,6 +4953,7 @@ fn cancelled_result_ids(messages: &[agent_sdk_foundation::llm::Message]) -> Vec<
                     tool_use_id,
                     content,
                     is_error: Some(true),
+                    ..
                 } = block
                     && content == USER_CANCELLED_TOOL_RESULT
                 {
@@ -6802,6 +6831,7 @@ async fn resume_mid_stream_cancel_commits_tool_results_and_clears_draft() -> Res
         agent_sdk_foundation::ToolResult {
             success: true,
             output: "file1.txt\nfile2.txt".to_owned(),
+            artifact: None,
             data: None,
             documents: Vec::new(),
             duration_ms: Some(50),
@@ -8835,6 +8865,7 @@ async fn mixed_batch_tool_child_executes_and_fans_in() -> Result<()> {
             Ok(agent_sdk_foundation::ToolResult {
                 success: true,
                 output: "ok".to_owned(),
+                artifact: None,
                 data: None,
                 documents: Vec::new(),
                 duration_ms: Some(1),

@@ -449,6 +449,79 @@ impl MessageStore for SqliteStore {
         .await
     }
 
+    async fn append_repair(
+        &self,
+        thread_id: &ThreadId,
+        repair_message: llm::Message,
+        balanced_messages: Vec<llm::Message>,
+        source_message_count: usize,
+    ) -> Result<()> {
+        let thread = thread_id.0.clone();
+        let repair_payload =
+            serde_json::to_string(&repair_message).context("failed to encode repair message")?;
+        let replacement_json = serde_json::to_string(&balanced_messages)
+            .context("failed to encode repair projection")?;
+        self.with_conn(move |conn| {
+            let tx = conn
+                .transaction()
+                .context("failed to begin append_repair transaction")?;
+            let raw_count: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_messages WHERE thread_id = ?1",
+                    params![thread],
+                    |row| row.get(0),
+                )
+                .context("failed to count raw messages")?;
+            let raw_count = usize::try_from(raw_count).context("message count is negative")?;
+            let previous: Option<(i64, String)> = tx
+                .query_row(
+                    "SELECT compacted_end, replacement_json
+                     FROM agent_compactions WHERE thread_id = ?1 ORDER BY id DESC LIMIT 1",
+                    params![thread],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .context("failed to read previous projection")?;
+            let (prior_boundary, prior_replacement_count) = match previous {
+                Some((boundary, replacement)) => (
+                    usize::try_from(boundary).context("projection boundary is negative")?,
+                    serde_json::from_str::<Vec<llm::Message>>(&replacement)
+                        .context("failed to decode previous projection")?
+                        .len(),
+                ),
+                None => (0, 0),
+            };
+            let available = prior_replacement_count
+                .saturating_add(raw_count.saturating_sub(prior_boundary));
+            anyhow::ensure!(
+                source_message_count == available,
+                "repair source count mismatch: store exposes {available}, repair saw {source_message_count}"
+            );
+            tx.execute(
+                "INSERT INTO agent_messages (thread_id, payload) VALUES (?1, ?2)",
+                params![thread, repair_payload],
+            )
+            .context("failed to append repair evidence")?;
+            tx.execute(
+                "INSERT INTO agent_compactions (
+                    thread_id, compacted_start, compacted_end, replacement_json
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    thread,
+                    i64::try_from(prior_boundary).context("repair start exceeds i64")?,
+                    i64::try_from(raw_count.saturating_add(1))
+                        .context("repair end exceeds i64")?,
+                    replacement_json
+                ],
+            )
+            .context("failed to append repair projection")?;
+            tx.commit()
+                .context("failed to commit append_repair transaction")?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn get_transcript(&self, thread_id: &ThreadId) -> Result<Vec<llm::Message>> {
         let thread = thread_id.0.clone();
         self.with_conn(move |conn| {

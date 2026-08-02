@@ -6,7 +6,7 @@
 //! tests, local daemons, and future production binaries can supply
 //! execution behavior without coupling the host to a specific stack.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use agent_sdk::context::CompactionConfig;
@@ -198,6 +198,24 @@ impl ExecutionRuntime {
             .as_ref()
             .map(|storage| storage.for_thread(thread_id))
             .transpose()
+    }
+
+    /// Snapshot only source artifacts referenced at the fork boundary before
+    /// the destination becomes visible. No-op when storage is disabled.
+    ///
+    /// # Errors
+    /// Returns an error when any artifact cannot be copied durably or an ID
+    /// collides with different destination bytes.
+    pub fn copy_thread_artifacts(
+        &self,
+        source_thread_id: &ThreadId,
+        destination_thread_id: &ThreadId,
+        artifact_ids: &BTreeSet<u64>,
+    ) -> Result<()> {
+        if let Some(storage) = &self.artifact_storage {
+            storage.copy_thread_artifacts(source_thread_id, destination_thread_id, artifact_ids)?;
+        }
+        Ok(())
     }
 
     /// Install the shared worker-pool [`WakeupSignal`].

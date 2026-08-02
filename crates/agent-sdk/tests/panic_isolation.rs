@@ -163,6 +163,22 @@ impl MessageStore for SharedStore {
             )
             .await
     }
+    async fn append_repair(
+        &self,
+        thread_id: &ThreadId,
+        repair_message: Message,
+        balanced_messages: Vec<Message>,
+        source_message_count: usize,
+    ) -> Result<()> {
+        self.0
+            .append_repair(
+                thread_id,
+                repair_message,
+                balanced_messages,
+                source_message_count,
+            )
+            .await
+    }
 
     async fn get_transcript(&self, thread_id: &ThreadId) -> Result<Vec<Message>> {
         self.0.get_transcript(thread_id).await

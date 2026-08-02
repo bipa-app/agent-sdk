@@ -252,6 +252,13 @@ impl LlmProvider for RecordReplayProvider {
         }
     }
 
+    /// The wrapper reports `record-replay` as its provider identity rather than
+    /// the live inner route's image accounting profile, and replay mode has no
+    /// inner provider. Record/replay therefore cannot safely opt in.
+    fn supports_historical_image_blocks(&self) -> bool {
+        false
+    }
+
     fn model(&self) -> &str {
         &self.model
     }
@@ -685,6 +692,7 @@ mod tests {
         model: &'static str,
         chat_outcome: ChatOutcome,
         deltas: Vec<StreamDelta>,
+        supports_historical_images: bool,
     }
 
     #[async_trait]
@@ -713,6 +721,10 @@ mod tests {
 
         fn model(&self) -> &str {
             self.model
+        }
+
+        fn supports_historical_image_blocks(&self) -> bool {
+            self.supports_historical_images
         }
 
         fn provider(&self) -> &'static str {
@@ -781,6 +793,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn historical_images_stay_disabled_without_an_inner_accounting_profile() {
+        let inner = Arc::new(InnerProvider {
+            model: "inner-model",
+            chat_outcome: success_outcome("unused"),
+            deltas: Vec::new(),
+            supports_historical_images: true,
+        });
+        let recorder = RecordReplayProvider::record(inner, temp_cassette_path());
+
+        assert!(!recorder.supports_historical_image_blocks());
+    }
+
     #[tokio::test]
     async fn chat_round_trips_through_cassette() -> Result<()> {
         let path = temp_cassette_path();
@@ -788,6 +813,7 @@ mod tests {
             model: "inner-model",
             chat_outcome: success_outcome("recorded answer"),
             deltas: Vec::new(),
+            supports_historical_images: false,
         });
 
         // Record.
@@ -801,6 +827,7 @@ mod tests {
         let player = RecordReplayProvider::replay(&path)?;
         assert_eq!(player.mode(), RecordReplayMode::Replay);
         assert_eq!(player.model(), "inner-model");
+        assert!(!player.supports_historical_image_blocks());
         let replayed = player.chat(request()).await?;
         match replayed {
             ChatOutcome::Success(response) => {
@@ -828,6 +855,7 @@ mod tests {
             model: "inner-model",
             chat_outcome: success_outcome("x"),
             deltas: Vec::new(),
+            supports_historical_images: false,
         });
 
         // Record mode delegates discovery to the inner provider instead of
@@ -870,6 +898,7 @@ mod tests {
                     served_route: None,
                 },
             ],
+            supports_historical_images: false,
         });
 
         // Record the stream (pass-through).
@@ -916,6 +945,7 @@ mod tests {
                 stop_reason: Some(StopReason::EndTurn),
                 served_route: Some("gateway-x".to_owned()),
             }],
+            supports_historical_images: false,
         });
 
         let recorder = RecordReplayProvider::record(inner, &path);
@@ -1016,6 +1046,7 @@ mod tests {
                     kind: StreamErrorKind::RateLimited(Some(Duration::from_secs(30))),
                 },
             ],
+            supports_historical_images: false,
         });
 
         let recorder = RecordReplayProvider::record(inner, &path);

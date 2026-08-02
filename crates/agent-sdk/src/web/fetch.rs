@@ -285,6 +285,7 @@ where
             Ok(content) => Ok(ToolResult {
                 success: true,
                 output: content,
+                artifact: None,
                 data: Some(json!({ "url": url })),
                 documents: Vec::new(),
                 duration_ms: None,
@@ -292,6 +293,7 @@ where
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: format!("Failed to fetch URL: {e}"),
+                artifact: None,
                 data: Some(json!({ "url": url, "error": e.to_string() })),
                 documents: Vec::new(),
                 duration_ms: None,

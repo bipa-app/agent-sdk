@@ -242,6 +242,23 @@ impl LlmProvider for FallbackProvider {
     fn route(&self) -> &str {
         self.primary.route()
     }
+
+    /// Pre-dispatch image pricing and limits come from the representative
+    /// primary route, but a request may be served by a heterogeneous fallback.
+    /// Static wrappers delegate this capability; dynamic fallback never opts in.
+    fn supports_historical_image_blocks(&self) -> bool {
+        false
+    }
+
+    /// The chain may dispatch any request to any inner provider, so the
+    /// budget is the most restrictive inner budget — and unknown (`None`)
+    /// anywhere keeps the whole chain unknown so consumers stay conservative.
+    fn max_request_attachment_bytes(&self) -> Option<u64> {
+        self.ordered()
+            .iter()
+            .map(|provider| provider.max_request_attachment_bytes())
+            .try_fold(u64::MAX, |min, budget| budget.map(|bytes| min.min(bytes)))
+    }
 }
 
 #[cfg(test)]
@@ -262,6 +279,7 @@ mod tests {
         results: Mutex<std::collections::VecDeque<Result<ChatOutcome>>>,
         stream_deltas: Mutex<Vec<Result<StreamDelta>>>,
         calls: AtomicUsize,
+        supports_historical_images: bool,
     }
 
     impl ScriptedProvider {
@@ -271,6 +289,7 @@ mod tests {
                 results: Mutex::new(results.into()),
                 stream_deltas: Mutex::new(Vec::new()),
                 calls: AtomicUsize::new(0),
+                supports_historical_images: false,
             })
         }
 
@@ -280,6 +299,17 @@ mod tests {
                 results: Mutex::new(std::collections::VecDeque::new()),
                 stream_deltas: Mutex::new(deltas),
                 calls: AtomicUsize::new(0),
+                supports_historical_images: false,
+            })
+        }
+
+        fn image_capable(name: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                name,
+                results: Mutex::new(std::collections::VecDeque::new()),
+                stream_deltas: Mutex::new(Vec::new()),
+                calls: AtomicUsize::new(0),
+                supports_historical_images: true,
             })
         }
 
@@ -336,6 +366,10 @@ mod tests {
         fn provider(&self) -> &'static str {
             self.name
         }
+
+        fn supports_historical_image_blocks(&self) -> bool {
+            self.supports_historical_images
+        }
     }
 
     fn success(text: &str) -> ChatOutcome {
@@ -358,6 +392,50 @@ mod tests {
 
     fn request() -> ChatRequest {
         ChatRequest::new("sys", vec![agent_sdk_foundation::llm::Message::user("hi")])
+    }
+
+    #[test]
+    fn historical_images_stay_disabled_for_dynamic_fallbacks() {
+        let all_capable = FallbackProvider::new(ScriptedProvider::image_capable("primary"))
+            .with_fallback(ScriptedProvider::image_capable("secondary"));
+        assert!(!all_capable.supports_historical_image_blocks());
+
+        let mixed = FallbackProvider::new(ScriptedProvider::image_capable("primary"))
+            .with_fallback(ScriptedProvider::chat_only("secondary", Vec::new()));
+        assert!(!mixed.supports_historical_image_blocks());
+    }
+
+    #[test]
+    fn attachment_budget_is_unknown_when_any_inner_route_is_unknown() {
+        let chain = FallbackProvider::new(ScriptedProvider::image_capable("primary"))
+            .with_fallback(ScriptedProvider::image_capable("secondary"));
+        assert_eq!(chain.max_request_attachment_bytes(), None);
+    }
+
+    #[cfg(all(feature = "anthropic", feature = "gemini"))]
+    #[test]
+    fn attachment_budget_composes_the_most_restrictive_inner_route() {
+        use crate::impls::{AnthropicProvider, GeminiProvider};
+
+        let anthropic = Arc::new(AnthropicProvider::new("test-key", "claude-sonnet-5"));
+        assert_eq!(
+            anthropic.max_request_attachment_bytes(),
+            Some(crate::attachments::ANTHROPIC_MAX_REQUEST_ATTACHMENT_BYTES)
+        );
+        let chain = FallbackProvider::new(anthropic)
+            .with_fallback(Arc::new(GeminiProvider::new("test-key", "gemini-2.5-pro")));
+        assert_eq!(
+            chain.max_request_attachment_bytes(),
+            Some(crate::attachments::GEMINI_MAX_REQUEST_ATTACHMENT_BYTES),
+            "the chain must budget for its most restrictive route"
+        );
+
+        let with_unknown = FallbackProvider::new(Arc::new(AnthropicProvider::new(
+            "test-key",
+            "claude-sonnet-5",
+        )))
+        .with_fallback(ScriptedProvider::image_capable("unknown"));
+        assert_eq!(with_unknown.max_request_attachment_bytes(), None);
     }
 
     #[tokio::test]

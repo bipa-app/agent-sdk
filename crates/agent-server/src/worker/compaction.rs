@@ -45,7 +45,10 @@
 
 use std::sync::Arc;
 
-use agent_sdk::context::{ContextCompactor, LlmContextCompactor};
+use agent_sdk::context::{
+    CompactionPurpose, ContextCompactor, FailedCompaction, LlmContextCompactor,
+};
+use agent_sdk_foundation::TokenUsage;
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_providers::LlmProvider;
 use agent_sdk_tools::stores::MessageStore;
@@ -56,6 +59,69 @@ use crate::journal::staged::StagedMessageStore;
 use crate::journal::turn_attempt::TurnAttemptOutcome;
 
 use super::root_turn::RootTurnDeps;
+
+#[derive(Debug, Clone)]
+pub(crate) struct CompactionOutcome {
+    pub(crate) completed: bool,
+    pub(crate) applied: bool,
+    pub(crate) llm_usage: TokenUsage,
+}
+
+impl CompactionOutcome {
+    fn not_run() -> Self {
+        Self {
+            completed: false,
+            applied: false,
+            llm_usage: TokenUsage::default(),
+        }
+    }
+}
+#[derive(Debug)]
+pub(crate) struct CompactionFailure {
+    pub(crate) error: anyhow::Error,
+    pub(crate) llm_usage: TokenUsage,
+}
+
+impl CompactionFailure {
+    fn with_context(self, context: &'static str) -> Self {
+        Self {
+            error: self.error.context(context),
+            llm_usage: self.llm_usage,
+        }
+    }
+}
+
+impl From<anyhow::Error> for CompactionFailure {
+    fn from(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            llm_usage: TokenUsage::default(),
+        }
+    }
+}
+
+impl std::fmt::Display for CompactionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, formatter)
+    }
+}
+
+impl std::error::Error for CompactionFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error.as_ref())
+    }
+}
+
+impl From<FailedCompaction> for CompactionFailure {
+    fn from(failure: FailedCompaction) -> Self {
+        Self {
+            error: failure.error,
+            llm_usage: failure.llm_usage,
+        }
+    }
+}
+
+type CompactionResult<T> = std::result::Result<T, CompactionFailure>;
 struct MeasuredAnchor {
     tokens: usize,
     request_message_count: Option<usize>,
@@ -148,6 +214,9 @@ async fn latest_measured_anchor(
 /// [`crate::RootTurnDeps::compaction_provider`]). No-op when the
 /// threshold is not crossed.
 ///
+/// Cancellation while the summarisation call is in flight is a successful
+/// no-op: no durable projection, staged history, or event is mutated.
+///
 /// # Errors
 ///
 /// Returns an error if the compactor's LLM call fails, or if either
@@ -157,26 +226,26 @@ async fn latest_measured_anchor(
 /// it as a turn failure so the next attempt can re-try (or, if the
 /// problem was transient, recover from the just-compacted projection
 /// once a future attempt re-bootstraps).
-pub async fn maybe_compact_staged_history(
+pub(crate) async fn maybe_compact_staged_history(
     deps: &RootTurnDeps<'_>,
     staged_messages: &StagedMessageStore,
     thread_id: &agent_sdk_foundation::ThreadId,
     now: OffsetDateTime,
-) -> Result<()> {
+) -> CompactionResult<CompactionOutcome> {
     // Cooperative cancellation: skip the (billed) summarisation LLM call
     // when the root turn has already been cancelled.
     if deps.is_cancelled() {
-        return Ok(());
+        return Ok(CompactionOutcome::not_run());
     }
     let Some(cfg) = deps.compaction_config else {
-        return Ok(());
+        return Ok(CompactionOutcome::not_run());
     };
     let Some(provider_arc) = deps.compaction_provider else {
         log::debug!(
             "maybe_compact_staged_history: compaction_config set but compaction_provider \
              missing on RootTurnDeps; skipping pre-call check"
         );
-        return Ok(());
+        return Ok(CompactionOutcome::not_run());
     };
 
     let history = staged_messages
@@ -186,49 +255,65 @@ pub async fn maybe_compact_staged_history(
 
     let compactor =
         LlmContextCompactor::<dyn LlmProvider>::new(Arc::clone(provider_arc), cfg.clone());
+    let compactor = if cfg.uses_prune_first_engine() {
+        compactor.with_purpose(CompactionPurpose::PreSpawn)
+    } else {
+        compactor
+    };
+    let compactor = if let Some(store) = deps.compaction_artifact_store {
+        compactor.with_artifact_store(Arc::clone(store))
+    } else {
+        compactor
+    };
+    let compactor = if let Some(cancel) = deps.cancel {
+        compactor.with_cancellation(cancel.clone())
+    } else {
+        compactor
+    };
     if !cfg.auto_compact || history.len() < cfg.min_messages_for_compaction {
-        return Ok(());
+        return Ok(CompactionOutcome::not_run());
     }
-    let last_compaction_at = deps
-        .message_store
-        .get(thread_id)
-        .await
-        .context("read projection for measured-trigger compaction fence")?
-        .and_then(|projection| {
-            projection
-                .compactions
-                .last()
-                .map(|boundary| boundary.created_at)
-        });
-    let measured = latest_measured_anchor(deps, thread_id, last_compaction_at)
-        .await?
-        .map(|anchor| {
-            // The anchor prices the request it was billed for; anything the
-            // staged history gained afterwards (buffered wait-any child
-            // results, injected steering) is measured by the estimator so
-            // fresh bytes trigger proactively instead of via overflow
-            // recovery.
-            let appended = anchor
-                .request_message_count
-                .and_then(|count| history.get(count..))
-                .map_or(0, |suffix| compactor.estimate_tokens(suffix));
-            anchor.tokens.saturating_add(appended)
-        });
     let (trigger_tokens, trigger_source) =
-        trigger_tokens(measured, compactor.estimate_tokens(&history));
+        if cfg.uses_prune_first_engine() || cfg.uses_snapcompact_engine() {
+            let last_compaction_at = deps
+                .message_store
+                .get(thread_id)
+                .await
+                .context("read projection for measured-trigger compaction fence")?
+                .and_then(|projection| {
+                    projection
+                        .compactions
+                        .last()
+                        .map(|boundary| boundary.created_at)
+                });
+            let measured = latest_measured_anchor(deps, thread_id, last_compaction_at)
+                .await?
+                .map(|anchor| {
+                    let appended = anchor
+                        .request_message_count
+                        .and_then(|count| history.get(count..))
+                        .map_or(0, |suffix| compactor.estimate_tokens(suffix));
+                    anchor.tokens.saturating_add(appended)
+                });
+            trigger_tokens(measured, compactor.estimate_tokens(&history))
+        } else {
+            (compactor.estimate_tokens(&history), "legacy_estimated")
+        };
     if trigger_tokens <= cfg.threshold_tokens {
-        return Ok(());
+        return Ok(CompactionOutcome::not_run());
     }
 
     log::info!(
         "Pre-call auto-compaction triggered (thread={thread_id}, message_count={}, \
-         trigger_tokens={trigger_tokens}, trigger_source={trigger_source}, threshold_tokens={})",
+         trigger_tokens={trigger_tokens}, trigger_source={trigger_source}, threshold_tokens={}, \
+         engine={:?}, purpose=pre_spawn)",
         history.len(),
         cfg.threshold_tokens,
+        cfg.engine,
     );
     apply_compaction(deps, staged_messages, &compactor, history, thread_id, now)
         .await
-        .context("pre-call compaction")
+        .map_err(|failure| failure.with_context("pre-call compaction"))
 }
 
 /// Run a post-failure compaction pass after the provider rejected a
@@ -236,11 +321,10 @@ pub async fn maybe_compact_staged_history(
 /// [`is_prompt_too_long_error`]).
 ///
 /// Caller is responsible for matching the error first; this helper
-/// always attempts compaction when invoked. Returns `Ok(())` after the
-/// projection + staged buffer have been rewritten (the caller then
-/// rebuilds the chat request from the now-compacted staged history
-/// and retries the LLM call), or an error if the compaction itself
-/// fails.
+/// always attempts compaction when invoked. The outcome carries whether the
+/// projection was applied and the exact provider-billed usage. An unapplied
+/// result means configuration was absent or cancellation won before the
+/// durable append.
 ///
 /// No-op when `deps.compaction_config` is `None` or
 /// `deps.compaction_provider` is `None`.
@@ -251,26 +335,26 @@ pub async fn maybe_compact_staged_history(
 /// rewrite fails. The caller must treat that as a fatal turn error —
 /// retrying without rewriting the history would just hit the same
 /// `prompt is too long` rejection.
-pub async fn compact_after_overflow(
+pub(crate) async fn compact_after_overflow(
     deps: &RootTurnDeps<'_>,
     staged_messages: &StagedMessageStore,
     thread_id: &agent_sdk_foundation::ThreadId,
     now: OffsetDateTime,
-) -> Result<bool> {
+) -> CompactionResult<CompactionOutcome> {
     // Cooperative cancellation: skip emergency compaction (and its LLM
     // call) on an already-cancelled turn; the caller bails on `false`.
     if deps.is_cancelled() {
-        return Ok(false);
+        return Ok(CompactionOutcome::not_run());
     }
     let Some(cfg) = deps.compaction_config else {
-        return Ok(false);
+        return Ok(CompactionOutcome::not_run());
     };
     let Some(provider_arc) = deps.compaction_provider else {
         log::warn!(
             "compact_after_overflow: compaction_config set but compaction_provider missing; \
              cannot recover (thread={thread_id})"
         );
-        return Ok(false);
+        return Ok(CompactionOutcome::not_run());
     };
 
     let history = staged_messages
@@ -278,25 +362,48 @@ pub async fn compact_after_overflow(
         .await
         .context("read staged history for overflow recovery")?;
     if history.is_empty() {
-        return Ok(false);
+        return Ok(CompactionOutcome::not_run());
     }
 
     let compactor =
         LlmContextCompactor::<dyn LlmProvider>::new(Arc::clone(provider_arc), cfg.clone());
+    let compactor = if cfg.uses_prune_first_engine() {
+        compactor.with_purpose(CompactionPurpose::Overflow)
+    } else {
+        compactor
+    };
+    let compactor = if let Some(store) = deps.compaction_artifact_store {
+        compactor.with_artifact_store(Arc::clone(store))
+    } else {
+        compactor
+    };
+    let compactor = if let Some(cancel) = deps.cancel {
+        compactor.with_cancellation(cancel.clone())
+    } else {
+        compactor
+    };
 
     log::warn!(
         "Provider rejected turn with prompt-too-long; attempting emergency \
-         compaction (thread={thread_id}, message_count={})",
+         compaction (thread={thread_id}, message_count={}, engine={:?}, purpose=overflow)",
         history.len(),
+        cfg.engine,
     );
     apply_compaction(deps, staged_messages, &compactor, history, thread_id, now)
         .await
-        .context("overflow recovery compaction")?;
-    Ok(true)
+        .map_err(|failure| failure.with_context("overflow recovery compaction"))
 }
 
-/// Inner shared body — runs the compactor, rewrites the projection,
-/// rewrites the staged buffer, emits the `ContextCompacted` event.
+/// Inner shared body — runs the compactor and returns `false` if cancellation
+/// wins. An applied result appends the projection compaction, rewrites the
+/// staged buffer, and emits the `ContextCompacted` event.
+///
+/// The cancel arm drops the compaction future, but the Snapcompact
+/// `spawn_blocking` worker it started keeps running detached. The callers
+/// wire the same [`RootTurnDeps::cancel`] token into the compactor via
+/// `with_cancellation`, so the already-tripped token doubles as a publish
+/// fence inside that worker: no artifact batch is published after this arm
+/// wins, instead of the batch landing as an unreferenced orphan.
 async fn apply_compaction(
     deps: &RootTurnDeps<'_>,
     staged_messages: &StagedMessageStore,
@@ -304,11 +411,42 @@ async fn apply_compaction(
     history: Vec<agent_sdk_foundation::llm::Message>,
     thread_id: &agent_sdk_foundation::ThreadId,
     now: OffsetDateTime,
-) -> Result<()> {
-    let result = compactor
-        .compact_history(history)
-        .await
-        .context("compactor.compact_history failed")?;
+) -> CompactionResult<CompactionOutcome> {
+    let compact = compactor.compact_history_with_usage(history);
+    let completed = if let Some(cancel) = deps.cancel {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Ok(CompactionOutcome::not_run()),
+            result = compact => result,
+        }
+    } else {
+        compact.await
+    };
+
+    let result = match completed {
+        Ok(result) => {
+            deps.note_token_usage(&result.llm_usage);
+            result
+        }
+        Err(failure) => {
+            deps.note_token_usage(&failure.llm_usage);
+            return Err(CompactionFailure::from(failure)
+                .with_context("compactor.compact_history_with_usage failed"));
+        }
+    };
+    let llm_usage = result.llm_usage.clone();
+
+    // Provider usage becomes live-accounted before cancellation or any
+    // durability decision. If cancellation completed in the same scheduler
+    // turn as the response, the attempt still owns these billed tokens while
+    // projection, staged history, and events remain untouched.
+    if deps.is_cancelled() {
+        return Ok(CompactionOutcome {
+            completed: true,
+            applied: false,
+            llm_usage,
+        });
+    }
 
     deps.message_store
         .append_compaction(
@@ -319,12 +457,20 @@ async fn apply_compaction(
             now,
         )
         .await
-        .context("append durable compaction entry")?;
+        .context("append durable compaction entry")
+        .map_err(|error| CompactionFailure {
+            error,
+            llm_usage: llm_usage.clone(),
+        })?;
 
     staged_messages
         .replace_history(thread_id, result.messages.clone())
         .await
-        .context("replace staged buffer history")?;
+        .context("replace staged buffer history")
+        .map_err(|error| CompactionFailure {
+            error,
+            llm_usage: llm_usage.clone(),
+        })?;
 
     let event = AgentEvent::context_compacted(
         result.original_count,
@@ -336,7 +482,11 @@ async fn apply_compaction(
         .event_repo
         .commit_event(thread_id, event, now)
         .await
-        .context("commit ContextCompacted event")?;
+        .context("commit ContextCompacted event")
+        .map_err(|error| CompactionFailure {
+            error,
+            llm_usage: llm_usage.clone(),
+        })?;
     deps.event_notifier.notify(std::slice::from_ref(&committed));
 
     log::info!(
@@ -347,7 +497,11 @@ async fn apply_compaction(
         result.original_tokens,
         result.new_tokens,
     );
-    Ok(())
+    Ok(CompactionOutcome {
+        completed: true,
+        applied: true,
+        llm_usage,
+    })
 }
 
 /// True when an error message indicates the prompt exceeds the model's context window.

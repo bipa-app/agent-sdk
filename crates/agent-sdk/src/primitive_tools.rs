@@ -22,6 +22,7 @@ pub use edit::EditTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use read::ReadTool;
+pub(crate) use read::detect_media_magic;
 pub use write::WriteTool;
 
 use crate::{AgentCapabilities, Environment};

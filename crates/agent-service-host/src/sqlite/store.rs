@@ -4749,6 +4749,28 @@ impl MessageProjectionStore for SqliteDurableStore {
         Ok(updated)
     }
 
+    async fn append_repair(
+        &self,
+        thread_id: &ThreadId,
+        repair_messages: Vec<llm::Message>,
+        balanced_messages: Vec<llm::Message>,
+        source_message_count: usize,
+        now: OffsetDateTime,
+    ) -> Result<MessageProjection> {
+        let mut tx = self.begin().await?;
+        Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
+        let projection = Self::get_message_head_tx(&mut tx, thread_id, now).await?;
+        let updated = projection.append_repair(
+            repair_messages,
+            balanced_messages,
+            source_message_count,
+            now,
+        )?;
+        Self::upsert_message_head_tx(&mut tx, &updated).await?;
+        tx.commit().await.context("commit append_repair")?;
+        Ok(updated)
+    }
+
     async fn set_draft(
         &self,
         thread_id: &ThreadId,

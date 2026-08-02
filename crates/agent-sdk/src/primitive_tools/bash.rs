@@ -7,6 +7,7 @@ use crate::{
     DEFAULT_INLINE_OUTPUT_BUDGET_BYTES, Environment, PrimitiveToolName, Tool, ToolContext,
     ToolResult, ToolTier, cap_inline_from_windows,
 };
+use agent_sdk_foundation::types::ToolResultArtifact;
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -171,11 +172,13 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for BashToo
             Ok(saved) => {
                 let output =
                     cap_inline_from_windows(&head, &tail, total_bytes, inline_budget, saved.id);
-                Ok(if success {
+                let mut tool_result = if success {
                     ToolResult::success(output)
                 } else {
                     ToolResult::error(output)
-                })
+                };
+                tool_result.artifact = Some(ToolResultArtifact { id: saved.id });
+                Ok(tool_result)
             }
             Err(error) => {
                 log::warn!("bash artifact spill failed: {error:#}");
@@ -848,7 +851,7 @@ mod tests {
         );
         let tool = BashTool::new(environment, AgentCapabilities::full_access());
         let ctx = ToolContext::new(()).with_artifact_store(Arc::clone(&store));
-        let result = tool
+        let mut result = tool
             .execute(
                 &ctx,
                 json!({
@@ -863,6 +866,12 @@ mod tests {
         assert!(result.output.len() <= store.inline_budget());
         let id = artifact_id_from_footer(&result.output)?;
         assert!(result.output.ends_with(&crate::artifact_footer(id)));
+        assert!(crate::enforce_inline_budget(&mut result, Some(&store), "bash").is_none());
+        assert_eq!(
+            result.artifact,
+            Some(ToolResultArtifact { id }),
+            "the central boundary must preserve content-bound Bash provenance"
+        );
 
         let mut artifact = store.resolve(id)?;
         let expected_len = STDOUT_BYTES

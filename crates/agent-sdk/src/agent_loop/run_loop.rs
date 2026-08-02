@@ -2832,10 +2832,20 @@ where
         warn!(
             "Detected orphaned tool_use blocks — synthesizing cancelled tool results for recovery"
         );
+        let repair_message = crate::llm::orphaned_tool_result_message(
+            &history,
+            crate::llm::USER_CANCELLED_TOOL_RESULT,
+        )
+        .ok_or_else(|| {
+            AgentError::new(
+                "Orphan recovery found no synthetic tool results to append",
+                false,
+            )
+        })?;
         let balanced =
             crate::llm::balance_tool_results(&history, crate::llm::USER_CANCELLED_TOOL_RESULT);
         message_store
-            .replace_history(thread_id, balanced)
+            .append_repair(thread_id, repair_message, balanced, history.len())
             .await
             .map_err(|e| {
                 AgentError::new(
@@ -4175,6 +4185,51 @@ mod tests {
         Message::assistant_with_content(blocks)
     }
 
+    #[derive(Default)]
+    struct RequiredMethodsMessageStore {
+        histories: tokio::sync::RwLock<std::collections::HashMap<ThreadId, Vec<Message>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MessageStore for RequiredMethodsMessageStore {
+        async fn append(&self, thread_id: &ThreadId, message: Message) -> anyhow::Result<()> {
+            self.histories
+                .write()
+                .await
+                .entry(thread_id.clone())
+                .or_default()
+                .push(message);
+            Ok(())
+        }
+
+        async fn get_history(&self, thread_id: &ThreadId) -> anyhow::Result<Vec<Message>> {
+            Ok(self
+                .histories
+                .read()
+                .await
+                .get(thread_id)
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        async fn clear(&self, thread_id: &ThreadId) -> anyhow::Result<()> {
+            self.histories.write().await.remove(thread_id);
+            Ok(())
+        }
+
+        async fn replace_history(
+            &self,
+            thread_id: &ThreadId,
+            messages: Vec<Message>,
+        ) -> anyhow::Result<()> {
+            self.histories
+                .write()
+                .await
+                .insert(thread_id.clone(), messages);
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn recover_orphaned_tool_use_is_noop_when_balanced() -> anyhow::Result<()> {
         use crate::stores::InMemoryStore;
@@ -4233,6 +4288,7 @@ mod tests {
                     tool_use_id,
                     content,
                     is_error: Some(true),
+                    ..
                 } if content == crate::llm::USER_CANCELLED_TOOL_RESULT => {
                     Some(tool_use_id.as_str())
                 }
@@ -4261,6 +4317,57 @@ mod tests {
         let history = store.get_history(&thread).await?;
         assert_eq!(history.len(), 2, "a synthetic results message is appended");
         assert!(!crate::llm::has_unbalanced_tool_use(&history));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn orphan_recovery_uses_required_replace_history_and_accepts_next_input()
+    -> anyhow::Result<()> {
+        use crate::stores::InMemoryStore;
+
+        let message_store = Arc::new(RequiredMethodsMessageStore::default());
+        let state_store = Arc::new(InMemoryStore::new());
+        let thread = ThreadId::new();
+        message_store
+            .append(&thread, assistant_with_tool_uses(&["orphan"]))
+            .await?;
+
+        let audit_sink: Arc<dyn crate::hooks::ToolAuditSink> =
+            Arc::new(crate::hooks::NoopAuditSink);
+        let provenance = AuditProvenance::new("test", "test");
+        let initialized = initialize_from_input(
+            AgentInput::Text("next input".to_string()),
+            &thread,
+            &message_store,
+            &state_store,
+            None,
+            &audit_sink,
+            &provenance,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error.message))?;
+
+        assert_eq!(initialized.turn, 0);
+        let history = message_store.get_history(&thread).await?;
+        assert_eq!(
+            history.len(),
+            3,
+            "recovery projection must be installed before the next input",
+        );
+        assert!(
+            !crate::llm::has_unbalanced_tool_use(&history),
+            "next input must leave provider-acceptable history",
+        );
+        assert!(
+            matches!(
+                &history[2],
+                Message {
+                    role: crate::llm::Role::User,
+                    content: Content::Text(text),
+                } if text == "next input"
+            ),
+            "the input following recovery must be appended",
+        );
         Ok(())
     }
 

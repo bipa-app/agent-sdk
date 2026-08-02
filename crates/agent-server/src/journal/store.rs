@@ -14217,6 +14217,7 @@ mod tests {
         let result = agent_sdk_foundation::ToolResult {
             success: true,
             output: output.to_owned(),
+            artifact: None,
             data: None,
             documents: Vec::new(),
             duration_ms: None,

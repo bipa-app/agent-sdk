@@ -2377,11 +2377,15 @@ async fn execute_root_task(
         // and fresh-turn execution alike — the arms only choose the
         // resume entry point.
         let selector = runtime.subagent_spawn_selector();
+        let compaction_artifact_store = runtime
+            .artifact_store(&task.thread_id)
+            .context("resolve compaction artifact store")?;
         let mut deps = stores.root_turn_deps_with_selector_and_compaction(
             selector.as_ref(),
             runtime.compaction_config(),
             runtime.compaction_config().map(|_| &provider),
         );
+        deps.compaction_artifact_store = compaction_artifact_store.as_ref();
         deps.cancel = Some(cancel);
         deps.wakeup = runtime.wakeup_signal();
         deps.wire_activity(activity, &tracked_event_repo);
@@ -8299,6 +8303,7 @@ mod tests {
             Ok(agent_sdk_foundation::ToolResult {
                 success: false,
                 output: "hung probe aborted".into(),
+                artifact: None,
                 data: None,
                 documents: Vec::new(),
                 duration_ms: None,
@@ -9429,8 +9434,6 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_registry_tool_spills_before_durable_commit_and_holds_guard() -> Result<()> {
-        use std::io::Read as _;
-
         let temp = tempfile::tempdir()?;
         let storage = Arc::new(
             agent_sdk::ArtifactStorage::new(temp.path().join("artifacts"))
@@ -9513,11 +9516,18 @@ mod tests {
         );
 
         let recovered_store = storage.for_thread(&child_root.thread_id)?;
-        let mut recovered = String::new();
-        recovered_store
-            .resolve(artifact_id)?
-            .read_to_string(&mut recovered)?;
-        assert_eq!(recovered, original, "artifact recovery must be byte-exact");
+        let recovered: agent_sdk_foundation::ToolResult =
+            serde_json::from_reader(recovered_store.resolve(artifact_id)?)?;
+        assert_eq!(
+            recovered.output, original,
+            "recovery envelope must preserve output byte-exact"
+        );
+        assert_eq!(
+            recovered.data,
+            Some(serde_json::json!({"raw": original})),
+            "recovery envelope must preserve structured data exactly once"
+        );
+        assert!(recovered.documents.is_empty());
         Ok(())
     }
     async fn acquire_probe_tool_child(

@@ -428,6 +428,7 @@ async fn emit_confirmation_tool_call_end(
     let error_result = ToolResult {
         success: false,
         output: error,
+        artifact: None,
         data: None,
         documents: Vec::new(),
         duration_ms: None,
@@ -520,6 +521,7 @@ where
         let error_result = ToolResult {
             success: false,
             output: error,
+            artifact: None,
             data: None,
             documents: Vec::new(),
             duration_ms: None,

@@ -300,6 +300,16 @@ impl LlmProvider for VertexProvider {
         "vertex"
     }
 
+    fn supports_historical_image_blocks(&self) -> bool {
+        true
+    }
+
+    /// Vertex serves both Claude and Gemini models; the Gemini aggregate is
+    /// the more restrictive of the two, so it bounds every Vertex route.
+    fn max_request_attachment_bytes(&self) -> Option<u64> {
+        Some(crate::attachments::GEMINI_MAX_REQUEST_ATTACHMENT_BYTES)
+    }
+
     fn configured_thinking(&self) -> Option<&ThinkingConfig> {
         self.thinking.as_ref()
     }

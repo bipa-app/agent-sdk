@@ -3,13 +3,13 @@ use super::llm::{call_llm_streaming, call_llm_with_retry};
 use super::tool_execution::{append_tool_results, execute_tool_call};
 use super::types::{
     ExecuteTurnParameters, InternalTurnResult, LlmCallParams, LlmEventContext, LlmOutcome,
-    ProcessedTurnResponse, ToolBatchExecutionParams, ToolCallExecutionContext,
+    LlmStreamIdSlots, ProcessedTurnResponse, ToolBatchExecutionParams, ToolCallExecutionContext,
     ToolExecutionOutcome, ToolOutcomeContext, TurnCompletionParams, TurnContext,
     TurnMessageLoadParams, TurnResponseProcessingParams, TurnStopReasonParams, TurnToolPhaseParams,
 };
 
 use crate::authority::EventAuthority;
-use crate::context::{CompactionConfig, ContextCompactor, LlmContextCompactor};
+use crate::context::{CompactionConfig, CompactionPurpose, ContextCompactor, LlmContextCompactor};
 use crate::events::AgentEvent;
 use crate::hooks::{AgentHooks, ToolAuditSink};
 use crate::llm::{
@@ -152,6 +152,7 @@ pub(super) async fn load_turn_messages<P, H, M>(
         turn,
         provider,
         message_store,
+        artifact_store,
         compaction_config,
         compactor,
         event_store,
@@ -193,6 +194,7 @@ where
         provider,
         message_store,
         thread_id,
+        artifact_store,
         compaction_config,
         compactor,
         event_store,
@@ -209,6 +211,7 @@ struct MaybeCompactParams<'a, P, H, M> {
     provider: &'a Arc<P>,
     message_store: &'a Arc<M>,
     thread_id: &'a ThreadId,
+    artifact_store: Option<&'a Arc<crate::ArtifactStore>>,
     compaction_config: Option<&'a CompactionConfig>,
     compactor: Option<&'a Arc<dyn ContextCompactor>>,
     event_store: &'a Arc<dyn EventStore>,
@@ -223,6 +226,7 @@ async fn maybe_compact_messages<P, H, M>(
         turn,
         provider,
         message_store,
+        artifact_store,
         thread_id,
         compaction_config,
         compactor,
@@ -270,8 +274,18 @@ where
         // Attach the run's hooks so the summarization call passes the same
         // pre_llm_request / on_llm_response guardrails as regular turns.
         let default_compactor =
-            LlmContextCompactor::new(Arc::clone(provider), compact_config.clone())
-                .with_guardrail_hooks(Arc::clone(hooks));
+            LlmContextCompactor::new(Arc::clone(provider), compact_config.clone());
+        let default_compactor = if compact_config.uses_prune_first_engine() {
+            default_compactor.with_purpose(CompactionPurpose::PreSpawn)
+        } else {
+            default_compactor
+        };
+        let default_compactor = if let Some(store) = artifact_store {
+            default_compactor.with_artifact_store(Arc::clone(store))
+        } else {
+            default_compactor
+        }
+        .with_guardrail_hooks(Arc::clone(hooks));
         if default_compactor.needs_compaction(&messages) {
             debug!(
                 "Context compaction triggered (turn={}, message_count={})",
@@ -806,6 +820,7 @@ pub(super) fn log_chat_request(request: &ChatRequest) {
                             tool_use_id,
                             content,
                             is_error,
+                            ..
                         } => {
                             debug!(
                                 "    block[{block_idx}]: ToolResult(tool_use_id={tool_use_id}, is_error={is_error:?}, content_len={})",
@@ -863,6 +878,7 @@ pub(super) async fn request_llm_response<P, H>(
     LlmCallParams {
         provider,
         request,
+        artifact_store,
         config,
         event_store,
         hooks,
@@ -902,35 +918,37 @@ where
     let request_model_for_metrics = provider.model().to_string();
     #[cfg(feature = "otel")]
     let llm_started_at = std::time::Instant::now();
+    #[cfg(feature = "otel")]
+    let span_observer = Some(super::llm::LlmSpanObserver {
+        span: &mut llm_span,
+        provider_name: provider_name_for_observer,
+        request_model: &request_model_for_metrics,
+    });
 
     let (result, retry_count) = if config.streaming {
         call_llm_streaming(
             provider,
             request,
+            artifact_store,
             config,
             &event_ctx,
-            message_id,
-            thinking_id,
+            LlmStreamIdSlots {
+                message_id,
+                thinking_id,
+            },
             #[cfg(feature = "otel")]
-            Some(super::llm::LlmSpanObserver {
-                span: &mut llm_span,
-                provider_name: provider_name_for_observer,
-                request_model: &request_model_for_metrics,
-            }),
+            span_observer,
         )
         .await
     } else {
         call_llm_with_retry(
             provider,
             request,
+            artifact_store,
             config,
             &event_ctx,
             #[cfg(feature = "otel")]
-            Some(super::llm::LlmSpanObserver {
-                span: &mut llm_span,
-                provider_name: provider_name_for_observer,
-                request_model: &request_model_for_metrics,
-            }),
+            span_observer,
         )
         .await
     };
@@ -1890,14 +1908,28 @@ pub(super) enum OverflowCompaction {
     },
 }
 
-pub(super) async fn compact_after_context_overflow<P, H, M>(
-    provider: &Arc<P>,
-    hooks: &Arc<H>,
-    compaction_config: &CompactionConfig,
-    compactor: Option<&Arc<dyn ContextCompactor>>,
-    message_store: &Arc<M>,
-    thread_id: &ThreadId,
-    cancel_token: &CancellationToken,
+struct OverflowCompactionParams<'a, P, H, M> {
+    provider: &'a Arc<P>,
+    hooks: &'a Arc<H>,
+    compaction_config: &'a CompactionConfig,
+    compactor: Option<&'a Arc<dyn ContextCompactor>>,
+    message_store: &'a Arc<M>,
+    thread_id: &'a ThreadId,
+    artifact_store: Option<&'a Arc<crate::ArtifactStore>>,
+    cancel_token: &'a CancellationToken,
+}
+
+async fn compact_after_context_overflow<P, H, M>(
+    OverflowCompactionParams {
+        provider,
+        hooks,
+        compaction_config,
+        compactor,
+        message_store,
+        thread_id,
+        artifact_store,
+        cancel_token,
+    }: OverflowCompactionParams<'_, P, H, M>,
 ) -> OverflowCompaction
 where
     P: LlmProvider,
@@ -1933,8 +1965,18 @@ where
         // Attach the run's hooks so the summarization call passes the same
         // pre_llm_request / on_llm_response guardrails as regular turns.
         let default_compactor =
-            LlmContextCompactor::new(Arc::clone(provider), compaction_config.clone())
-                .with_guardrail_hooks(Arc::clone(hooks));
+            LlmContextCompactor::new(Arc::clone(provider), compaction_config.clone());
+        let default_compactor = if compaction_config.uses_prune_first_engine() {
+            default_compactor.with_purpose(CompactionPurpose::Overflow)
+        } else {
+            default_compactor
+        };
+        let default_compactor = if let Some(store) = artifact_store {
+            default_compactor.with_artifact_store(Arc::clone(store))
+        } else {
+            default_compactor
+        }
+        .with_guardrail_hooks(Arc::clone(hooks));
         compact_history_and_store(
             &default_compactor,
             history,
@@ -1970,6 +2012,7 @@ struct OverflowRecoveryParams<'a, P, H, M> {
     provider: &'a Arc<P>,
     hooks: &'a Arc<H>,
     message_store: &'a Arc<M>,
+    artifact_store: Option<&'a Arc<crate::ArtifactStore>>,
     compaction_config: Option<&'a CompactionConfig>,
     compactor: Option<&'a Arc<dyn ContextCompactor>>,
     /// Run provenance, used to price the emergency compaction's usage.
@@ -1994,6 +2037,7 @@ pub(super) async fn handle_turn_stop_reason<P, H, M>(
         ctx,
         provider,
         message_store,
+        artifact_store,
         compaction_config,
         compactor,
         event_store,
@@ -2069,6 +2113,7 @@ where
                     provider,
                     hooks,
                     message_store,
+                    artifact_store,
                     compaction_config,
                     compactor,
                     provenance,
@@ -2115,6 +2160,7 @@ async fn handle_context_window_exceeded<P, H, M>(
         provider,
         hooks,
         message_store,
+        artifact_store,
         compaction_config,
         compactor,
         provenance,
@@ -2172,15 +2218,16 @@ where
         ));
     }
     if let Some(compact_config) = compaction_config {
-        match compact_after_context_overflow(
+        match compact_after_context_overflow(OverflowCompactionParams {
             provider,
             hooks,
-            compact_config,
+            compaction_config: compact_config,
             compactor,
             message_store,
-            &ctx.thread_id,
+            thread_id: &ctx.thread_id,
+            artifact_store,
             cancel_token,
-        )
+        })
         .await
         {
             OverflowCompaction::Done(compaction_usage) => {
@@ -2236,6 +2283,7 @@ async fn try_recover_prompt_too_long<P, H, M>(
         provider,
         hooks,
         message_store,
+        artifact_store,
         compaction_config,
         compactor,
         provenance,
@@ -2265,15 +2313,16 @@ where
             "Prompt too long, attempting emergency context compaction (turn={}, retry={})",
             ctx.turn, ctx.compaction_retries
         );
-        match compact_after_context_overflow(
+        match compact_after_context_overflow(OverflowCompactionParams {
             provider,
             hooks,
-            compact_config,
+            compaction_config: compact_config,
             compactor,
             message_store,
-            &ctx.thread_id,
+            thread_id: &ctx.thread_id,
+            artifact_store,
             cancel_token,
-        )
+        })
         .await
         {
             OverflowCompaction::Done(compaction_usage) => {
@@ -2681,6 +2730,7 @@ where
             turn: turn_number,
             provider,
             message_store,
+            artifact_store: tool_context.artifact_store(),
             compaction_config,
             compactor,
             event_store,
@@ -2732,6 +2782,7 @@ where
         state_store,
         compaction_config,
         compactor,
+        artifact_store: tool_context.artifact_store(),
         event_store,
         hooks,
         authority,
@@ -2793,6 +2844,7 @@ struct TurnLlmRequestParams<'a, P, H, M, S> {
     state_store: &'a Arc<S>,
     compaction_config: Option<&'a CompactionConfig>,
     compactor: Option<&'a Arc<dyn ContextCompactor>>,
+    artifact_store: Option<&'a Arc<crate::ArtifactStore>>,
     event_store: &'a Arc<dyn EventStore>,
     hooks: &'a Arc<H>,
     authority: &'a Arc<dyn EventAuthority>,
@@ -2827,6 +2879,7 @@ async fn request_turn_response<P, H, M, S>(
         state_store,
         compaction_config,
         compactor,
+        artifact_store,
         event_store,
         hooks,
         authority,
@@ -2875,6 +2928,7 @@ where
     let (llm_outcome, response_decision) = request_llm_response(LlmCallParams {
         provider,
         request,
+        artifact_store,
         config,
         event_store,
         hooks,
@@ -2900,12 +2954,7 @@ where
             // any attempt abandoned by a retry before it), so those tokens are
             // committed at the same anchor a completed turn uses — a cancelled
             // run still reports what it spent.
-            let turn_usage = TokenUsage {
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                cached_input_tokens: usage.cached_input_tokens,
-                cache_creation_input_tokens: usage.cache_creation_input_tokens,
-            };
+            let turn_usage = cancelled_turn_usage(&usage);
             fold_llm_usage(ctx, provenance, &turn_usage);
             return Err(InternalTurnResult::Cancelled { turn_usage });
         }
@@ -2917,6 +2966,7 @@ where
                     provider,
                     hooks,
                     message_store,
+                    artifact_store,
                     compaction_config,
                     compactor,
                     provenance,
@@ -2963,6 +3013,17 @@ where
         message_id,
         thinking_id,
     })
+}
+
+/// Project the provider-billed streaming usage of a cancelled call onto the
+/// turn-level [`TokenUsage`] shape.
+const fn cancelled_turn_usage(usage: &crate::llm::Usage) -> TokenUsage {
+    TokenUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cached_input_tokens: usage.cached_input_tokens,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+    }
 }
 
 struct ResponseGuardrailParams<'a, H, M, S> {
@@ -3475,6 +3536,7 @@ where
         ctx,
         provider,
         message_store,
+        artifact_store: tool_context.artifact_store(),
         compaction_config,
         compactor,
         event_store,

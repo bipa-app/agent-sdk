@@ -89,6 +89,22 @@ pub trait MessageStore: Send + Sync {
     ) -> Result<()> {
         anyhow::bail!("message store does not support append-only compaction")
     }
+    /// Repair orphaned tool-use history with a balanced effective projection.
+    ///
+    /// The compatibility default replaces history. Append-only stores can
+    /// override this method to retain the synthetic repair evidence separately.
+    ///
+    /// # Errors
+    /// Returns an error if the balanced history cannot be installed.
+    async fn append_repair(
+        &self,
+        thread_id: &ThreadId,
+        _repair_message: llm::Message,
+        balanced_messages: Vec<llm::Message>,
+        _source_message_count: usize,
+    ) -> Result<()> {
+        self.replace_history(thread_id, balanced_messages).await
+    }
 
     /// Return the unabridged committed transcript.
     ///
@@ -461,6 +477,51 @@ impl MessageStore for InMemoryStore {
         Ok(())
     }
 
+    async fn append_repair(
+        &self,
+        thread_id: &ThreadId,
+        repair_message: llm::Message,
+        balanced_messages: Vec<llm::Message>,
+        source_message_count: usize,
+    ) -> Result<()> {
+        let mut state = self
+            .inner
+            .message_state
+            .write()
+            .ok()
+            .context("lock poisoned")?;
+        let raw_message_count = state.messages.get(&thread_id.0).map_or(0, Vec::len);
+        let latest = state
+            .compactions
+            .get(&thread_id.0)
+            .and_then(|entries| entries.last());
+        let prior_boundary = latest.map_or(0, |entry| entry.compacted_end);
+        let visible_raw_count = raw_message_count.saturating_sub(prior_boundary);
+        let available = latest
+            .map_or(0, |entry| entry.replacement_messages.len())
+            .saturating_add(visible_raw_count);
+        anyhow::ensure!(
+            source_message_count == available,
+            "repair source count mismatch: store exposes {available}, repair saw {source_message_count}"
+        );
+        state
+            .messages
+            .entry(thread_id.0.clone())
+            .or_default()
+            .push(repair_message);
+        state
+            .compactions
+            .entry(thread_id.0.clone())
+            .or_default()
+            .push(MessageCompaction {
+                compacted_start: prior_boundary,
+                compacted_end: raw_message_count.saturating_add(1),
+                replacement_messages: balanced_messages,
+            });
+        drop(state);
+        Ok(())
+    }
+
     async fn get_transcript(&self, thread_id: &ThreadId) -> Result<Vec<llm::Message>> {
         let state = self
             .inner
@@ -546,6 +607,23 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
                 messages,
                 source_message_count,
                 retained_message_count,
+            )
+            .await
+    }
+
+    async fn append_repair(
+        &self,
+        thread_id: &ThreadId,
+        repair_message: llm::Message,
+        balanced_messages: Vec<llm::Message>,
+        source_message_count: usize,
+    ) -> Result<()> {
+        (**self)
+            .append_repair(
+                thread_id,
+                repair_message,
+                balanced_messages,
+                source_message_count,
             )
             .await
     }

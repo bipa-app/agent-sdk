@@ -70,6 +70,9 @@ failpoints = ["dep:fail", "fail/failpoints"]
 agent-sdk-providers = { workspace = true, features = ["openai"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 async-stream = { workspace = true }
+# The compaction/multimodal integration tests decode artifact-backed frame
+# payloads to assert byte-exact hydration; base64 is test-only here.
+base64 = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 proptest = { workspace = true }

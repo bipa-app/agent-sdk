@@ -1098,9 +1098,10 @@ where
                         success: false,
                         output: format!(
                             "Cannot spawn subagent '{}': maximum concurrent subagent limit reached. \
-                             Try again when another subagent completes.",
+                         Try again when another subagent completes.",
                             self.config.name
                         ),
+                        artifact: None,
                         data: None,
                         documents: Vec::new(),
                         duration_ms: Some(0),
@@ -1132,6 +1133,7 @@ where
         Ok(ToolResult {
             success: result.success,
             output: result.final_response.clone(),
+            artifact: None,
             data: Some(serde_json::to_value(&result).unwrap_or_default()),
             documents: Vec::new(),
             duration_ms: Some(result.duration_ms),

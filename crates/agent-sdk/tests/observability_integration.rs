@@ -192,6 +192,22 @@ impl MessageStore for SharedStore {
             )
             .await
     }
+    async fn append_repair(
+        &self,
+        thread_id: &ThreadId,
+        repair_message: Message,
+        balanced_messages: Vec<Message>,
+        source_message_count: usize,
+    ) -> Result<()> {
+        self.0
+            .append_repair(
+                thread_id,
+                repair_message,
+                balanced_messages,
+                source_message_count,
+            )
+            .await
+    }
 
     async fn get_transcript(&self, thread_id: &ThreadId) -> Result<Vec<Message>> {
         self.0.get_transcript(thread_id).await
@@ -397,11 +413,18 @@ async fn wait_for_run(
 }
 
 async fn seed_compaction_history(store: &SharedStore, thread_id: &ThreadId) -> Result<()> {
+    // Large enough that replacing the summarized prefix with the typed
+    // summary message (fixed ~100-token overhead) genuinely shrinks
+    // occupancy; a tiny prefix would trip the compactor's no-progress guard
+    // and route the span down the error path.
     store
-        .append(thread_id, Message::user("Previous request"))
+        .append(thread_id, Message::user("Previous request ".repeat(200)))
         .await?;
     store
-        .append(thread_id, Message::assistant("Previous response"))
+        .append(
+            thread_id,
+            Message::assistant("Previous response ".repeat(200)),
+        )
         .await?;
     Ok(())
 }
