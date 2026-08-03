@@ -23,11 +23,13 @@ log = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
+# Featureless on purpose: only `tonic::metadata` is used here, and asking for
+# `transport` would add the gRPC server half to every consumer.
 tonic = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 
 [lints]

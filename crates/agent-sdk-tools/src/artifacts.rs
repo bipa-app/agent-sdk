@@ -38,6 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
+use agent_sdk_foundation::llm::sha256_hex;
 use agent_sdk_foundation::types::{ThreadId, ToolResult, ToolResultArtifact};
 use anyhow::{Context, Result, anyhow};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
@@ -45,7 +46,6 @@ use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 #[cfg(unix)]
 use cap_std::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-use sha2::{Digest, Sha256};
 
 /// The shared inline output budget: one knob for every tool kind.
 ///
@@ -1164,7 +1164,7 @@ impl ArtifactStorage {
 /// Stable directory key used by [`ArtifactStorage`] and host retention snapshots.
 #[must_use]
 pub fn artifact_thread_key(thread_id: &ThreadId) -> String {
-    format!("t-{:x}", Sha256::digest(thread_id.0.as_bytes()))
+    format!("t-{}", sha256_hex(thread_id.0.as_bytes()))
 }
 
 fn sanitize_path_component(component: &str) -> String {

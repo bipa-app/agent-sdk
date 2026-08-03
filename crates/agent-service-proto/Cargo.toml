@@ -11,15 +11,16 @@ license = "MIT"
 publish = false
 build = "build.rs"
 
+# Excluded from the workspace, so these are kept in lockstep with the root by hand.
 [dependencies]
-prost = "0.14.3"
-prost-types = "0.14.3"
-tonic = { version = "0.14.5", features = ["transport"] }
-tonic-prost = "0.14.5"
+prost = { version = "0.14.4", default-features = false, features = ["derive", "std"] }
+prost-types = { version = "0.14.4", default-features = false, features = ["std"] }
+tonic = { version = "0.14.6", default-features = false, features = ["router", "transport", "codegen"] }
+tonic-prost = { version = "0.14.6", default-features = false }
 
 [build-dependencies]
-tonic-prost-build = "0.14.5"
-protoc-bin-vendored = "3"
+tonic-prost-build = { version = "0.14.6", default-features = false }
+protoc-bin-vendored = { version = "3.2.0", default-features = false }
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -17,6 +17,7 @@
 //! | Cloudflare AI Gateway | [`impls::cloudflare_ai_gateway`] | Proxy wrapper |
 
 #![forbid(unsafe_code)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 // The attachment-validation helpers are only ever called from a provider
 // impl (each gated behind its provider feature), so the whole module is dead
@@ -67,6 +68,8 @@ pub(crate) mod retry_hints;
 pub mod router;
 pub mod search;
 pub mod streaming;
+#[cfg(feature = "structured-output")]
+#[cfg_attr(docsrs, doc(cfg(feature = "structured-output")))]
 pub mod structured;
 
 // Convenience re-exports — provider trait and streaming
@@ -79,6 +82,8 @@ pub use record_replay::{RecordReplayMode, RecordReplayProvider};
 pub use refresh::{RefreshingProvider, is_unauthorized_error};
 pub use router::{ModelRouter, ModelTier, TaskComplexity};
 pub use streaming::{StreamAccumulator, StreamBox, StreamDelta};
+#[cfg(feature = "structured-output")]
+#[cfg_attr(docsrs, doc(cfg(feature = "structured-output")))]
 pub use structured::{
     StructuredConfig, StructuredOutput, StructuredOutputError, StructuredStream,
     StructuredStreamUpdate, run_structured, run_structured_stream,

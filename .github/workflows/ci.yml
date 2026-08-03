@@ -231,6 +231,8 @@ jobs:
           - "--no-default-features --features gemini"
           - "--no-default-features --features vertex"
           - "--no-default-features --features cloudflare"
+          # Rows above cover `structured-output` OFF; this one covers it ON.
+          - "--no-default-features --features anthropic,structured-output"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

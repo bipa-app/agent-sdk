@@ -18,13 +18,12 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 agent-sdk-foundation = { workspace = true }
-tokio = { workspace = true }
-tokio-stream = { workspace = true }
+tokio = { workspace = true, features = ["rt", "io-util"] }
 async-trait = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-jsonschema = { workspace = true }
+jsonschema = { workspace = true, optional = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
@@ -41,11 +40,14 @@ tokio-tungstenite = { workspace = true, optional = true }
 
 [features]
 # Anthropic is the default provider so the common case works out of the box.
-default = ["anthropic"]
+default = ["anthropic", "structured-output"]
 anthropic = []
+# Separable because `jsonschema` costs ~30 crates. Default-on: switching it off
+# is source-breaking for `run_structured` callers.
+structured-output = ["dep:jsonschema"]
 openai = []
 # The Codex / ChatGPT provider speaks WebSocket; gate the transport dep here.
-openai-codex = ["dep:tokio-tungstenite"]
+openai-codex = ["dep:tokio-tungstenite", "tokio/net"]
 gemini = []
 # The Vertex provider reuses the Anthropic model constants and the Gemini
 # request/response codec, so it requires both of those providers.
@@ -65,7 +67,7 @@ record-replay = []
 model-discovery = []
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util", "net", "io-util"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "test-util", "net", "io-util"] }
 wiremock = { workspace = true }
 # Tier-C live smoke constructs a `Tool` whose `tier` is the core
 # `ToolTier` enum (not re-exported through the `llm` glob).

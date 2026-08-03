@@ -20,15 +20,16 @@ agent-sdk-providers = { workspace = true }
 #
 # LAYERING FOLLOW-UP (deferred — large refactor): this crate documents itself as
 # "built on the narrow SDK crates ... rather than the public-facing façade", yet
-# depending on `agent-sdk` (with default features) inverts that boundary and
-# forces the in-process loop + primitive tools + subagent code into the
-# provider-agnostic server engine and host. The fix is to move the `context`
+# depending on `agent-sdk` at all inverts that boundary and pulls the in-process
+# loop + primitive tools + subagent code into the provider-agnostic server
+# engine and host. `default-features = false` keeps it from also voting on the
+# façade's provider/structured-output features for downstream consumers (see the
+# workspace pin), but the real fix is to move the `context`
 # compactor/config/estimator (and the `loop_instrument` span helpers under
 # `otel`) into `agent-sdk-providers` or a new narrow crate and re-export from the
-# façade, then drop this dependency. Tracked separately; out of scope for the
-# docs/CI sweep.
-agent-sdk = { workspace = true }
-tokio = { workspace = true }
+# façade, then drop this dependency. Tracked separately.
+agent-sdk = { workspace = true, default-features = false }
+tokio = { workspace = true, features = ["rt", "macros"] }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
@@ -68,7 +69,7 @@ failpoints = ["dep:fail", "fail/failpoints"]
 # construction. The workspace pins `default-features = false`, so the `openai`
 # feature has to be requested here rather than inherited.
 agent-sdk-providers = { workspace = true, features = ["openai"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "test-util"] }
 async-stream = { workspace = true }
 # The compaction/multimodal integration tests decode artifact-backed frame
 # payloads to assert byte-exact hydration; base64 is test-only here.

@@ -499,9 +499,9 @@ mod tests {
             bind_queue: true,
             ..AmqpTaskWakeupConsumerConfig::default()
         };
-        let yaml = serde_yaml::to_string(&config).context("serialise")?;
+        let yaml = serde_yaml_ng::to_string(&config).context("serialise")?;
         let parsed: AmqpTaskWakeupConsumerConfig =
-            serde_yaml::from_str(&yaml).context("round trip")?;
+            serde_yaml_ng::from_str(&yaml).context("round trip")?;
         assert_eq!(parsed.queue, config.queue);
         assert_eq!(parsed.consumer_tag_prefix, config.consumer_tag_prefix);
         assert!(parsed.declare_queue);

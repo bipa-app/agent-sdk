@@ -25,7 +25,7 @@ time = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 proptest = { workspace = true }
 proptest-state-machine = { workspace = true }
 insta = { workspace = true }
