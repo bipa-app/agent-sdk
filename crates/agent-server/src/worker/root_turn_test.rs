@@ -5059,6 +5059,72 @@ async fn fresh_turn_backfills_orphaned_tool_use_durably() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn fresh_turn_repairs_duplicated_question_resume_durably() -> Result<()> {
+    use agent_sdk_foundation::llm::{self, Message};
+
+    let stores = TestStores::new();
+    let thread = thread_a();
+    let suspended = vec![
+        Message::user("Which environment?"),
+        Message::assistant_with_tool_use(
+            None,
+            "question-call-1",
+            "ask_user",
+            serde_json::json!({"question": "Which environment?"}),
+        ),
+    ];
+    let answer = Message::tool_result("question-call-1", "User answered: Staging", false);
+    let mut poisoned = suspended.clone();
+    poisoned.extend(suspended.clone());
+    poisoned.push(answer.clone());
+    assert!(!llm::is_provider_valid_tool_sequence(&poisoned));
+    stores.messages.set_draft(&thread, poisoned, t0()).await?;
+
+    let task = create_and_acquire_task(&stores.tasks, &thread).await?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let provider = CapturingProvider::new();
+    let outcome = execute_root_turn(
+        inputs,
+        "Continue after the answer",
+        &provider,
+        &stores.deps(),
+        t_plus(5),
+    )
+    .await?;
+    assert!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+
+    let request_messages = provider.captured()?;
+    assert!(llm::is_provider_valid_tool_sequence(&request_messages));
+    assert_eq!(request_messages.len(), 4);
+    assert_eq!(
+        serde_json::to_value(&request_messages[..2])?,
+        serde_json::to_value(&suspended)?,
+        "the suspended prefix must survive exactly once",
+    );
+    assert_eq!(
+        serde_json::to_value(&request_messages[2])?,
+        serde_json::to_value(answer)?,
+    );
+
+    let durable = stores.messages.get_history(&thread).await?;
+    assert!(llm::is_provider_valid_tool_sequence(&durable));
+    let projection = stores
+        .messages
+        .get(&thread)
+        .await?
+        .context("projection exists")?;
+    assert!(!projection.has_draft());
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Phase 5.5: steering wake (R2)
 // ─────────────────────────────────────────────────────────────────────
@@ -6500,6 +6566,33 @@ fn provider_valid_split_balanced_round_commits_in_full() {
     let (prefix, suffix) = provider_valid_split(messages);
     assert_eq!(prefix.len(), 3, "a balanced round commits in full");
     assert!(suffix.is_empty());
+}
+
+#[test]
+fn provider_valid_split_refuses_duplicated_suspended_prefix() {
+    let suspended = vec![
+        agent_sdk_foundation::llm::Message::user("Which environment?"),
+        agent_sdk_foundation::llm::Message::assistant_with_tool_use(
+            None,
+            "question-call-1",
+            "ask_user",
+            serde_json::json!({"question": "Which environment?"}),
+        ),
+    ];
+    let mut messages = suspended.clone();
+    messages.extend(suspended);
+    messages.push(agent_sdk_foundation::llm::Message::tool_result(
+        "question-call-1",
+        "User answered: Staging",
+        false,
+    ));
+
+    let (prefix, suffix) = provider_valid_split(messages);
+    assert_eq!(prefix.len(), 1);
+    assert_eq!(suffix.len(), 4);
+    assert!(agent_sdk_foundation::llm::is_provider_valid_tool_sequence(
+        &prefix
+    ));
 }
 
 #[test]
@@ -10124,8 +10217,91 @@ async fn answer_question_rejects_partial_and_unknown_batches() -> Result<()> {
     Ok(())
 }
 
+fn assert_persisted_question_draft(
+    persisted_draft: &[agent_sdk_foundation::llm::Message],
+) -> Result<()> {
+    let [persisted_user, persisted_ask] = persisted_draft else {
+        bail!("expected persisted [user, assistant ask_user] draft, got {persisted_draft:?}");
+    };
+    assert_eq!(persisted_user.role, Role::User);
+    assert_eq!(persisted_ask.role, Role::Assistant);
+    let agent_sdk_foundation::llm::Content::Blocks(persisted_ask_blocks) = &persisted_ask.content
+    else {
+        bail!("persisted assistant question must use content blocks");
+    };
+    let [
+        ContentBlock::ToolUse {
+            id: persisted_ask_id,
+            name: persisted_ask_name,
+            ..
+        },
+    ] = persisted_ask_blocks.as_slice()
+    else {
+        bail!("persisted assistant message must contain exactly one tool_use");
+    };
+    assert_eq!(persisted_ask_id, "question-call-1");
+    assert_eq!(persisted_ask_name, "ask_user");
+    Ok(())
+}
+
+fn assert_question_resume_request(
+    request_messages: &[agent_sdk_foundation::llm::Message],
+    persisted_draft: &[agent_sdk_foundation::llm::Message],
+) -> Result<()> {
+    let [request_user, request_ask, request_answer] = request_messages else {
+        bail!(
+            "resume provider must receive exactly [user, assistant tool_use, user tool_result], got {request_messages:?}"
+        );
+    };
+    assert_eq!(
+        serde_json::to_value([request_user, request_ask])?,
+        serde_json::to_value(persisted_draft)?,
+        "the suspended prefix must appear exactly once",
+    );
+    assert_eq!(request_user.role, Role::User);
+    assert_eq!(request_ask.role, Role::Assistant);
+    assert_eq!(request_answer.role, Role::User);
+
+    let agent_sdk_foundation::llm::Content::Blocks(request_ask_blocks) = &request_ask.content
+    else {
+        bail!("resumed assistant question must use content blocks");
+    };
+    let [
+        ContentBlock::ToolUse {
+            id: request_ask_id,
+            name: request_ask_name,
+            ..
+        },
+    ] = request_ask_blocks.as_slice()
+    else {
+        bail!("resumed assistant message must contain exactly one tool_use");
+    };
+    assert_eq!(request_ask_id, "question-call-1");
+    assert_eq!(request_ask_name, "ask_user");
+
+    let agent_sdk_foundation::llm::Content::Blocks(request_answer_blocks) = &request_answer.content
+    else {
+        bail!("resumed answer must use content blocks");
+    };
+    let [
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+            ..
+        },
+    ] = request_answer_blocks.as_slice()
+    else {
+        bail!("resumed user message must contain exactly one tool_result");
+    };
+    assert_eq!(tool_use_id, "question-call-1");
+    assert_eq!(content, "User answered: Staging");
+    assert_ne!(*is_error, Some(true));
+    Ok(())
+}
+
 #[tokio::test]
-async fn persisted_question_answer_survives_reacquire_without_reasking() -> Result<()> {
+async fn answered_question_resume_replays_persisted_draft_once_in_provider_order() -> Result<()> {
     let stores = TestStores::new();
     let parent = suspend_durable_question(&stores).await?;
     let answered = stores
@@ -10138,6 +10314,21 @@ async fn persisted_question_answer_survives_reacquire_without_reasking() -> Resu
         )
         .await?;
     assert!(matches!(answered.state, TaskState::AnsweredQuestion { .. }));
+
+    // This is the production crash shape: the uncommitted projection draft
+    // and AnsweredQuestion both retain the same suspended prompt/tool-use pair.
+    let projection = stores
+        .messages
+        .get(&thread_a())
+        .await?
+        .context("answered question projection")?;
+    let persisted_draft = projection.draft_messages;
+    assert_eq!(
+        serde_json::to_value(&persisted_draft)?,
+        serde_json::to_value(answered.state.suspended_messages())?,
+        "projection draft and AnsweredQuestion must carry the same suspended messages",
+    );
+    assert_persisted_question_draft(&persisted_draft)?;
 
     // This reacquisition is the boot boundary after a process dies after the
     // answer commit but before it starts the resume LLM call.
@@ -10160,10 +10351,13 @@ async fn persisted_question_answer_survives_reacquire_without_reasking() -> Resu
         t_plus(3),
     )
     .await?;
-    let provider = MockTextProvider::new("deploying to staging");
+    let provider = CapturingProvider::new();
     let outcome =
         resume_from_question(inputs, &acquired, &provider, &stores.deps(), t_plus(4)).await?;
     assert!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+
+    let request_messages = provider.captured()?;
+    assert_question_resume_request(&request_messages, &persisted_draft)?;
 
     let history = stores.messages.get_history(&thread_a()).await?;
     assert!(

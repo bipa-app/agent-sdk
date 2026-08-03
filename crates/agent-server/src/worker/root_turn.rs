@@ -658,7 +658,7 @@ async fn fail_root_turn_inner(
 /// `TaskState` to `None`; the durable message-projection draft slot
 /// survives, so a re-seeded suffix (the dropped trailing
 /// `assistant + tool_use`) is closed by the next turn's
-/// `backfill_orphaned_tool_results`.
+/// `repair_provider_tool_history`.
 ///
 /// The terminal [`AgentEvent::Cancelled`] marker is committed by
 /// [`AgentTaskStore::cancel_tree`] itself, atomically with the
@@ -1012,23 +1012,17 @@ pub fn terminal_reason_for_root_error(error: &anyhow::Error) -> TerminalReason {
         })
 }
 
-/// Split `messages` into `(committable prefix, retained suffix)` per the
-/// provider-validity rule: the prefix is the largest leading slice with
-/// no assistant `tool_use` block left unanswered by a `tool_result`
-/// within that same slice.
+/// Split `messages` into `(committable prefix, retained suffix)`.
 ///
-/// Walks back from the tail while
-/// [`llm::has_unbalanced_tool_use`](agent_sdk_foundation::llm::has_unbalanced_tool_use)
-/// holds, so the returned prefix is always a provider-legal request
-/// history — it ends on a user message (a bare prompt or a tool-results
-/// message), which every provider accepts. Messages are moved, never
-/// mutated or re-ordered: text, `tool_use`, `tool_result`, `thinking`
-/// (+ signature), and `redacted_thinking` blocks commit byte-verbatim.
+/// The prefix is the largest leading slice with provider-valid tool-call
+/// ordering. Messages are moved without mutation or reordering, so a cancelled
+/// turn cannot commit malformed history that every later provider request
+/// would reject.
 pub(crate) fn provider_valid_split(
     mut messages: Vec<llm::Message>,
 ) -> (Vec<llm::Message>, Vec<llm::Message>) {
     let mut n = messages.len();
-    while n > 0 && llm::has_unbalanced_tool_use(&messages[..n]) {
+    while n > 0 && !llm::is_provider_valid_tool_sequence(&messages[..n]) {
         n -= 1;
     }
     let suffix = messages.split_off(n);
@@ -1379,7 +1373,7 @@ async fn best_effort_commit_parked_cancel(
 
     // Re-seed the draft with the dropped trailing `assistant + tool_use`
     // (the commit cleared the slot in-transaction). The next turn's
-    // `backfill_orphaned_tool_results` closes it with
+    // `repair_provider_tool_history` closes it with
     // `USER_CANCELLED_TOOL_RESULT` without duplicating the committed
     // prefix. Best-effort — a crash here loses only that trailing
     // message, strictly better than today.
@@ -1782,9 +1776,9 @@ async fn execute_root_turn_inner(
     //     durably now (not patched into the outgoing request), so an
     //     orphaned `tool_use` can never reach a provider and the thread
     //     is balanced the moment it is next loaded.
-    backfill_orphaned_tool_results(deps, &inputs.staged_stores.messages, thread_id, now)
+    repair_provider_tool_history(deps, &inputs.staged_stores.messages, thread_id, now)
         .await
-        .context("pre-call orphaned tool_use backfill")?;
+        .context("pre-call provider tool history repair")?;
 
     // 2.5 Pre-call auto-compaction.
     //
@@ -2751,6 +2745,31 @@ async fn load_root_span_ids(
     )
 }
 
+/// Assemble and validate the messages for every root provider call.
+///
+/// Fresh inputs append their typed text/media blocks; resume inputs append
+/// nothing because staged history already carries the suspended exchange. Both
+/// initial calls and emergency-compaction retries use this boundary.
+async fn assemble_provider_request_messages(
+    staged_messages: &crate::journal::staged::StagedMessageStore,
+    thread_id: &agent_sdk_foundation::ThreadId,
+    user_input: &super::user_input::UserInput,
+) -> Result<Vec<llm::Message>> {
+    let mut messages = staged_messages
+        .get_history(thread_id)
+        .await
+        .context("get staged history")?;
+    if let Some(message) = user_input.clone().into_message() {
+        messages.push(message);
+    }
+    if let Some(index) = llm::provider_tool_sequence_error_index(&messages) {
+        bail!(
+            "refusing provider request for thread {thread_id}: invalid tool_use/tool_result sequence at message index {index}"
+        );
+    }
+    Ok(messages)
+}
+
 async fn build_chat_request(
     definition: &AgentDefinition,
     staged_messages: &crate::journal::staged::StagedMessageStore,
@@ -2758,20 +2777,8 @@ async fn build_chat_request(
     user_input: &super::user_input::UserInput,
     caller_metadata: Option<&serde_json::Value>,
 ) -> Result<ChatRequest> {
-    // Get existing message history from staged store.
-    let mut messages = staged_messages
-        .get_history(thread_id)
-        .await
-        .context("get staged history")?;
-
-    // Append the new user message. `user_input` carries the typed
-    // block list (text + image + document) so the wire format
-    // preserves binary attachments end-to-end. Resume inputs (which
-    // have no fresh user prompt) skip the append because the staged
-    // store already contains every relevant message.
-    if let Some(message) = user_input.clone().into_message() {
-        messages.push(message);
-    }
+    let messages =
+        assemble_provider_request_messages(staged_messages, thread_id, user_input).await?;
 
     let thinking = match &definition.thinking {
         ThinkingPolicy::Disabled => None,
@@ -2815,25 +2822,40 @@ async fn build_chat_request(
     })
 }
 
-/// Durably close any `tool_use` loop left open in the recovered history
-/// before a fresh turn builds its request.
+const DUPLICATED_RESUME_REPAIR: &str =
+    "[SDK_PROVIDER_HISTORY_REPAIR_V1]\nRemoved one exact duplicated suspended-message replay.";
+
+fn remove_duplicated_resume_replay(history: &[llm::Message]) -> Option<Vec<llm::Message>> {
+    let invalid_index = llm::provider_tool_sequence_error_index(history)?;
+    let second_start = invalid_index.checked_add(1)?;
+
+    for width in 1..=second_start {
+        let second_end = second_start.checked_add(width)?;
+        if second_end > history.len() {
+            break;
+        }
+        let first_start = second_start - width;
+        if history[first_start..second_start] != history[second_start..second_end] {
+            continue;
+        }
+
+        let mut repaired = Vec::with_capacity(history.len() - width);
+        repaired.extend_from_slice(&history[..second_start]);
+        repaired.extend_from_slice(&history[second_end..]);
+        if llm::is_provider_valid_tool_sequence(&repaired) {
+            return Some(repaired);
+        }
+    }
+
+    None
+}
+
+/// Repair globally unanswered calls and the exact duplicated suspended-message
+/// replay written by pre-fix `AnsweredQuestion` resumes.
 ///
-/// [`recover_thread`] deliberately preserves the raw suspension draft (its
-/// module doc delegates "dangling tool-use repair" to the caller). That
-/// draft may end in an assistant `tool_use` whose `tool_result`s never
-/// landed — the user answered one question and cancelled the rest, or the
-/// prior turn was cancelled / abandoned. Because a fresh root turn only
-/// runs once the prior turn on the thread is terminal, no result is
-/// legitimately pending, so every unanswered `tool_use` is closed with a
-/// [`USER_CANCELLED_TOOL_RESULT`](agent_sdk_foundation::llm::USER_CANCELLED_TOOL_RESULT)
-/// error result.
-///
-/// The repair is written through to the durable projection rather than patched
-/// into the outgoing request, so the thread is balanced the moment it is next
-/// loaded and an orphaned `tool_use` can never reach a provider. This is an
-/// explicit non-compaction repair; compaction uses append-only lineage.
-/// No-op when the recovered history is already balanced.
-async fn backfill_orphaned_tool_results(
+/// Raw repair evidence and the provider-valid effective projection are
+/// persisted atomically, so reloading the thread cannot restore the poison.
+async fn repair_provider_tool_history(
     deps: &RootTurnDeps<'_>,
     staged_messages: &crate::journal::staged::StagedMessageStore,
     thread_id: &agent_sdk_foundation::ThreadId,
@@ -2842,37 +2864,47 @@ async fn backfill_orphaned_tool_results(
     let history = staged_messages
         .get_history(thread_id)
         .await
-        .context("read staged history for orphan backfill")?;
-
-    if !llm::has_unbalanced_tool_use(&history) {
+        .context("read staged history for provider repair")?;
+    let has_unanswered_tool_use = llm::has_unbalanced_tool_use(&history);
+    if !has_unanswered_tool_use && llm::provider_tool_sequence_error_index(&history).is_none() {
         return Ok(());
     }
 
-    let repair_message =
-        llm::orphaned_tool_result_message(&history, llm::USER_CANCELLED_TOOL_RESULT)
-            .context("orphan backfill produced no synthetic repair message")?;
-    let balanced = llm::balance_tool_results(&history, llm::USER_CANCELLED_TOOL_RESULT);
-    log::warn!("thread {thread_id}: closing unanswered tool_use blocks with cancelled results");
+    let mut repaired = history.clone();
+    let mut repair_evidence = Vec::new();
+    if has_unanswered_tool_use {
+        let repair_message =
+            llm::orphaned_tool_result_message(&repaired, llm::USER_CANCELLED_TOOL_RESULT)
+                .context("orphan backfill produced no synthetic repair message")?;
+        repaired = llm::balance_tool_results(&repaired, llm::USER_CANCELLED_TOOL_RESULT);
+        repair_evidence.push(repair_message);
+        log::warn!("thread {thread_id}: closing unanswered tool_use blocks with cancelled results");
+    }
 
-    // Append the synthetic evidence to the raw transcript and install the
-    // balanced effective projection in one durable transition. This preserves
-    // prior compaction lineage and clears the recovered draft atomically.
+    if let Some(index) = llm::provider_tool_sequence_error_index(&repaired) {
+        repaired = remove_duplicated_resume_replay(&repaired).with_context(|| {
+            format!(
+                "thread {thread_id}: invalid tool_use/tool_result sequence at message index {index} has no safe repair"
+            )
+        })?;
+        repair_evidence.push(llm::Message::user(DUPLICATED_RESUME_REPAIR));
+        log::warn!("thread {thread_id}: removing duplicated suspended-message replay");
+    }
+
     deps.message_store
         .append_repair(
             thread_id,
-            vec![repair_message],
-            balanced.clone(),
+            repair_evidence,
+            repaired.clone(),
             history.len(),
             now,
         )
         .await
-        .context("persist balanced append-only repair")?;
-
-    // In-memory staged buffer the request is built from.
+        .context("persist provider-valid append-only repair")?;
     staged_messages
-        .replace_history(thread_id, balanced)
+        .replace_history(thread_id, repaired)
         .await
-        .context("replace staged buffer with balanced history")?;
+        .context("replace staged buffer with provider-valid history")?;
 
     Ok(())
 }
@@ -3895,16 +3927,10 @@ async fn try_recover_with_compaction(
     // via `buffer_turn_messages` after a successful turn). For the
     // resume path `user_input.into_message()` returns `None` and the
     // staged buffer already contains everything the LLM needs.
-    let mut messages = inputs
-        .staged_stores
-        .messages
-        .get_history(thread_id)
-        .await
-        .context("read staged history after emergency compaction")?;
-    if let Some(message) = user_input.clone().into_message() {
-        messages.push(message);
-    }
-    chat_request.messages = messages;
+    chat_request.messages =
+        assemble_provider_request_messages(&inputs.staged_stores.messages, thread_id, user_input)
+            .await
+            .context("rebuild provider request after emergency compaction")?;
 
     let next_attempt = open_attempt(
         inputs,

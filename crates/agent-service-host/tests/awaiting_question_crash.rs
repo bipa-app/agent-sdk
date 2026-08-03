@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use agent_sdk_foundation::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, StopReason, Tool, Usage,
+    self, ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, StopReason, Tool, Usage,
 };
 use agent_sdk_foundation::{
     AgentContinuation, AgentEvent, AgentState, ContinuationEnvelope, PendingToolCallInfo,
@@ -45,24 +45,28 @@ fn question_payload() -> QuestionPayload {
 }
 
 struct AnswerCheckingProvider {
-    saw_persisted_answer: AtomicBool,
+    saw_valid_persisted_answer: AtomicBool,
 }
 
 impl AnswerCheckingProvider {
     const fn new() -> Self {
         Self {
-            saw_persisted_answer: AtomicBool::new(false),
+            saw_valid_persisted_answer: AtomicBool::new(false),
         }
     }
 
-    fn saw_persisted_answer(&self) -> bool {
-        self.saw_persisted_answer.load(Ordering::SeqCst)
+    fn saw_valid_persisted_answer(&self) -> bool {
+        self.saw_valid_persisted_answer.load(Ordering::SeqCst)
     }
 }
 
 #[async_trait]
 impl LlmProvider for AnswerCheckingProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
+        ensure!(
+            llm::is_provider_valid_tool_sequence(&request.messages),
+            "boot resume sent a provider-invalid message sequence"
+        );
         let answer_applied = request.messages.iter().any(|message| {
             matches!(
                 &message.content,
@@ -79,7 +83,8 @@ impl LlmProvider for AnswerCheckingProvider {
             answer_applied,
             "boot resume did not apply the persisted question answer"
         );
-        self.saw_persisted_answer.store(true, Ordering::SeqCst);
+        self.saw_valid_persisted_answer
+            .store(true, Ordering::SeqCst);
         Ok(ChatOutcome::Success(ChatResponse {
             id: "crash-resume-response".into(),
             content: vec![ContentBlock::Text {
@@ -391,8 +396,8 @@ async fn assert_boot_resumes_answer(
         "boot did not complete the answered turn"
     );
     ensure!(
-        provider.saw_persisted_answer(),
-        "resume provider never received the persisted answer"
+        provider.saw_valid_persisted_answer(),
+        "resume provider never received a valid request with the persisted answer"
     );
     let question_events = EventRepository::get_events(&boot, &acquired.thread_id)
         .await?

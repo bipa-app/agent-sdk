@@ -371,6 +371,25 @@ impl TaskState {
         matches!(self, Self::None)
     }
 
+    /// Whether root execution must seed staged stores from committed history
+    /// only because the runnable resume path replays this state's suspended
+    /// messages itself.
+    ///
+    /// This match is intentionally exhaustive: every new durable state must
+    /// decide whether recovering the projection draft would duplicate history
+    /// that its resume dispatcher appends.
+    #[must_use]
+    pub(crate) const fn requires_committed_only_execution_seed(&self) -> bool {
+        match self {
+            Self::ReadyToResume { .. } | Self::AnsweredQuestion { .. } => true,
+            Self::None
+            | Self::WaitingOnChildren { .. }
+            | Self::AwaitingConfirmation { .. }
+            | Self::AwaitingQuestion { .. }
+            | Self::SubagentInvocation { .. } => false,
+        }
+    }
+
     /// Borrow the [`ContinuationEnvelope`] embedded in a paused state,
     /// if any. Returns `None` for [`TaskState::None`] and
     /// [`TaskState::SubagentInvocation`].
