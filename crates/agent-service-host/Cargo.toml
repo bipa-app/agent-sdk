@@ -14,7 +14,10 @@ name = "agent-service-host"
 path = "src/main.rs"
 
 [features]
-default = ["postgres", "amqp"]
+default = ["postgres", "amqp", "tls-native-tls"]
+# TLS backend for the Postgres/AMQP clients; mixing both makes sqlx compile both.
+tls-native-tls = ["sqlx/tls-native-tls", "lapin?/native-tls", "agent-sdk/tls-native-tls", "agent-sdk-providers/tls-native-tls"]
+tls-rustls = ["sqlx/tls-rustls-aws-lc-rs", "lapin?/rustls", "agent-sdk/tls-rustls", "agent-sdk-providers/tls-rustls"]
 postgres = ["sqlx/postgres"]
 sqlite = ["sqlx/sqlite"]
 amqp = ["dep:lapin"]

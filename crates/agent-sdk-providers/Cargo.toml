@@ -28,7 +28,8 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 reqwest = { workspace = true }
-native-tls = { workspace = true }
+native-tls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
 async-stream = { workspace = true }
 bytes = { workspace = true }
 base64 = { workspace = true }
@@ -40,7 +41,13 @@ tokio-tungstenite = { workspace = true, optional = true }
 
 [features]
 # Anthropic is the default provider so the common case works out of the box.
-default = ["anthropic", "structured-output"]
+default = ["anthropic", "structured-output", "tls-native-tls"]
+
+# ── TLS backend (pick exactly one) ─────────────────────────────────────
+# The backend is the consumer's call: an app already on rustls should not be
+# made to link OpenSSL too. Selecting neither leaves reqwest without TLS.
+tls-native-tls = ["dep:native-tls", "reqwest/native-tls", "tokio-tungstenite?/native-tls"]
+tls-rustls = ["dep:rustls", "reqwest/rustls", "tokio-tungstenite?/rustls-tls-native-roots"]
 anthropic = []
 # Separable because `jsonschema` costs ~30 crates. Default-on: switching it off
 # is source-breaking for `run_structured` callers.
@@ -68,6 +75,8 @@ model-discovery = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "test-util", "net", "io-util"] }
+# Server side of the TLS-rejection test; independent of the client's backend.
+native-tls = { workspace = true }
 wiremock = { workspace = true }
 # Tier-C live smoke constructs a `Tool` whose `tier` is the core
 # `ToolTier` enum (not re-exported through the `llm` glob).

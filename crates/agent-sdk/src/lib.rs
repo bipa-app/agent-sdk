@@ -401,12 +401,30 @@
 //! | `skills`       | No  | `serde_yaml_ng` | [`skills`] markdown skill loader |
 //! | `sqlite`       | No  | `rusqlite` (bundled) | Durable single-file [`SqliteStore`] session store |
 //! | `otel`         | No  | `opentelemetry` | OpenTelemetry tracing instrumentation |
+//! | `tls-native-tls` | **Yes** | `native-tls` (OpenSSL/Schannel/Secure Transport) | TLS backend for HTTP + WebSocket |
+//! | `tls-rustls`   | No  | `rustls` (aws-lc-rs) | TLS backend for HTTP + WebSocket |
 //!
 //! A minimal Anthropic-only build pulls no WebSocket, HTML, or YAML crates:
 //!
 //! ```toml
-//! agent-sdk = { version = "0.9", default-features = false, features = ["anthropic"] }
+//! agent-sdk = { version = "0.9", default-features = false, features = ["anthropic", "tls-native-tls"] }
 //! ```
+//!
+//! # Choosing a TLS backend
+//!
+//! `tls-native-tls` and `tls-rustls` select the stack used for provider HTTP
+//! and WebSocket traffic. The default is native-tls; pick `tls-rustls` when the
+//! surrounding application already speaks rustls, so it links one TLS
+//! implementation rather than two:
+//!
+//! ```toml
+//! agent-sdk = { version = "0.9", default-features = false, features = ["anthropic", "tls-rustls"] }
+//! ```
+//!
+//! `tls-rustls` additionally enables rustls' `prefer-post-quantum` hybrid key
+//! exchange, which reqwest otherwise turns off. Selecting neither backend
+//! compiles, but leaves no TLS in `reqwest`, so every `https://` request fails
+//! at runtime — a binary must choose one.
 //!
 //! When `otel` is enabled, the SDK emits OpenTelemetry spans for agent
 //! invocations, turns, LLM requests, tool execution, subagent runs, MCP
