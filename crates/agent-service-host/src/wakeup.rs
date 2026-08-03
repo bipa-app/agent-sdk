@@ -379,7 +379,7 @@ amqp_consumer:
     bind_queue: true
 ";
         let config: WakeupConfig =
-            serde_yaml::from_str(yaml).context("parse wakeup config yaml")?;
+            serde_yaml_ng::from_str(yaml).context("parse wakeup config yaml")?;
         assert!(config.enabled);
         assert_eq!(config.fallback_interval_secs, 20);
         #[cfg(feature = "amqp")]

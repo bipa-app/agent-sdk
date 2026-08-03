@@ -667,10 +667,20 @@ pub struct SnapcompactIntegrity {
 }
 
 /// Lowercase hex SHA-256 of `bytes`.
+///
+/// Hand-rolled hex: `digest 0.11` returns a `hybrid_array::Array`, which has no
+/// `LowerHex` impl.
 #[must_use]
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest as _;
-    format!("{:x}", sha2::Sha256::digest(bytes))
+    use std::fmt::Write as _;
+
+    let digest = sha2::Sha256::digest(bytes);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// Computes the integrity pins for a Snapcompact source and its rendered

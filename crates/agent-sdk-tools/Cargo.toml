@@ -18,8 +18,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 agent-sdk-foundation = { workspace = true }
-tokio = { workspace = true }
-tokio-stream = { workspace = true }
+tokio = { workspace = true, features = ["process", "io-util", "rt"] }
 async-trait = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
@@ -28,7 +27,6 @@ anyhow = { workspace = true }
 log = { workspace = true }
 tokio-util = { workspace = true }
 time = { workspace = true }
-sha2 = { workspace = true }
 cap-std = { workspace = true }
 cap-fs-ext = { workspace = true }
 
@@ -36,7 +34,7 @@ cap-fs-ext = { workspace = true }
 windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 tempfile = { workspace = true }
 
 [lints]

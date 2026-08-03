@@ -683,9 +683,11 @@ pub use agent_sdk_providers::{
 // Schema-validated structured output (Phase 13): the [`ResponseFormat`] request
 // field, the bounded re-prompt runner, and its typed result/error.
 pub use agent_sdk_foundation::llm::ResponseFormat;
+pub use agent_sdk_providers::StructuredOutputSupport;
+#[cfg(feature = "structured-output")]
+#[cfg_attr(docsrs, doc(cfg(feature = "structured-output")))]
 pub use agent_sdk_providers::{
-    StructuredConfig, StructuredOutput, StructuredOutputError, StructuredOutputSupport,
-    run_structured,
+    StructuredConfig, StructuredOutput, StructuredOutputError, run_structured,
 };
 
 // ── Advanced / server-internal contract types ───────────────────────

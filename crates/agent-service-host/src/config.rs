@@ -102,7 +102,7 @@ impl ServiceConfig {
     /// # Errors
     /// Returns an error if the YAML is malformed.
     pub fn from_yaml_str(yaml: &str) -> Result<Self> {
-        serde_yaml::from_str(yaml).context("parsing service config YAML")
+        serde_yaml_ng::from_str(yaml).context("parsing service config YAML")
     }
 }
 
@@ -773,7 +773,7 @@ mod tests {
     #[test]
     fn default_config_round_trips_through_yaml() -> Result<()> {
         let original = ServiceConfig::default();
-        let yaml = serde_yaml::to_string(&original)?;
+        let yaml = serde_yaml_ng::to_string(&original)?;
         let recovered = ServiceConfig::from_yaml_str(&yaml)?;
 
         // Spot-check key defaults survived the round trip.
@@ -893,7 +893,7 @@ retention:
         assert_eq!(config.retention.checkpoint_max_per_thread, Some(100));
 
         // Re-serialize and re-parse to prove stability.
-        let re_yaml = serde_yaml::to_string(&config)?;
+        let re_yaml = serde_yaml_ng::to_string(&config)?;
         let re_config = ServiceConfig::from_yaml_str(&re_yaml)?;
         assert_eq!(re_config.worker.pool_size, 8);
         Ok(())
@@ -901,7 +901,7 @@ retention:
 
     #[test]
     fn sqlite_backend_minimal_yaml() -> Result<()> {
-        // serde_yaml 0.9 uses YAML tags for struct enum variants.
+        // serde_yaml_ng uses YAML tags for struct enum variants.
         let yaml = r"
 storage:
   backend: !sqlite
@@ -947,7 +947,7 @@ storage:
     path: "/data/agent-sdk.db"
 "#;
         let config = ServiceConfig::from_yaml_str(yaml)?;
-        let re_yaml = serde_yaml::to_string(&config)?;
+        let re_yaml = serde_yaml_ng::to_string(&config)?;
         let re_config = ServiceConfig::from_yaml_str(&re_yaml)?;
         match &re_config.storage.backend {
             StorageBackend::Sqlite { path, .. } => {
@@ -968,7 +968,7 @@ storage:
 "#;
         let config = ServiceConfig::from_yaml_str(yaml)?;
         assert_eq!(config.storage.sqlite_max_connections()?, Some(24));
-        let re_yaml = serde_yaml::to_string(&config)?;
+        let re_yaml = serde_yaml_ng::to_string(&config)?;
         let re_config = ServiceConfig::from_yaml_str(&re_yaml)?;
         assert_eq!(re_config.storage.sqlite_max_connections()?, Some(24));
         Ok(())
@@ -1068,7 +1068,7 @@ relay:
         assert_eq!(threshold.soft, 250);
         assert_eq!(threshold.hard, 5_000);
 
-        let re_yaml = serde_yaml::to_string(&config)?;
+        let re_yaml = serde_yaml_ng::to_string(&config)?;
         let re_config = ServiceConfig::from_yaml_str(&re_yaml)?;
         let recovered = re_config
             .relay
@@ -1143,7 +1143,7 @@ watch:
 
         // Round-trip the parsed config through YAML to prove the
         // serializer produces input the parser accepts.
-        let re_yaml = serde_yaml::to_string(&config)?;
+        let re_yaml = serde_yaml_ng::to_string(&config)?;
         let re_config = ServiceConfig::from_yaml_str(&re_yaml)?;
         assert!(re_config.watch.enabled);
         assert!(re_config.watch.amqp_consumer.enabled);
@@ -1184,7 +1184,7 @@ admission:
         assert_eq!(config.admission.max_submit_item_bytes, Some(1024));
         assert_eq!(config.admission.max_decoding_message_bytes, 65536);
 
-        let re_yaml = serde_yaml::to_string(&config)?;
+        let re_yaml = serde_yaml_ng::to_string(&config)?;
         let re_config = ServiceConfig::from_yaml_str(&re_yaml)?;
         assert_eq!(re_config.admission.max_queued_roots_per_thread, Some(8));
         Ok(())
@@ -1320,7 +1320,7 @@ observability:
         );
         assert!(config.observability.capture_payloads);
 
-        let re_yaml = serde_yaml::to_string(&config)?;
+        let re_yaml = serde_yaml_ng::to_string(&config)?;
         let re_config = ServiceConfig::from_yaml_str(&re_yaml)?;
         assert!(re_config.observability.enabled);
         assert_eq!(

@@ -38,121 +38,125 @@ agent-sdk-macros = { path = "crates/agent-sdk-macros", version = "0.17.0" }
 # façade) decide which provider impls compile. Crates that only use the
 # `LlmProvider` trait / streaming types pull no concrete provider at all.
 agent-sdk-providers = { path = "crates/agent-sdk-providers", version = "0.17.0", default-features = false }
-agent-sdk = { path = "crates/agent-sdk", version = "0.17.0" }
+# Load-bearing: taking the façade's defaults here would pin `anthropic` +
+# `structured-output` on downstream, making their own opt-out inert.
+agent-sdk = { path = "crates/agent-sdk", version = "0.17.0", default-features = false }
 agent-sdk-otel = { path = "crates/agent-sdk-otel", version = "0.17.0" }
 agent-server = { path = "crates/agent-server", version = "0.8.0" }
 agent-service-host = { path = "crates/agent-service-host", version = "0.8.0" }
-tokio = { version = "1.52.0", features = ["sync", "fs", "process", "time", "macros"] }
-tokio-stream = "0.1"
-async-trait = "0.1"
-futures = "0.3"
-prost = "0.14.3"
-prost-types = "0.14.3"
-tonic = { version = "0.14.5", features = ["transport"] }
-tonic-prost = "0.14.5"
-tonic-prost-build = "0.14.5"
-tonic-health = "0.14.5"
-tower = { version = "0.5", default-features = false }
-http = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-cap-std = "4"
-cap-fs-ext = "4"
-windows-sys = "0.61"
+tokio = { version = "1.53.1", default-features = false, features = ["sync", "time"] }
+tokio-stream = { version = "0.1.19", default-features = false }
+async-trait = { version = "0.1.91", default-features = false }
+futures = { version = "0.3.33", default-features = false, features = ["std", "async-await"] }
+prost = { version = "0.14.4", default-features = false, features = ["derive", "std"] }
+prost-types = { version = "0.14.4", default-features = false, features = ["std"] }
+# Featureless: tonic's default `transport` drags axum + the hyper server into
+# every consumer. Only the gRPC servers ask for it.
+tonic = { version = "0.14.6", default-features = false }
+tonic-prost = { version = "0.14.6", default-features = false }
+tonic-prost-build = { version = "0.14.6", default-features = false }
+tonic-health = { version = "0.14.6", default-features = false }
+tower = { version = "0.5.3", default-features = false }
+http = { version = "1.5.0", default-features = false, features = ["std"] }
+serde = { version = "1.0.229", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
+sha2 = { version = "0.11.0", default-features = false, features = ["alloc"] }
+cap-std = { version = "4.0.2", default-features = false }
+cap-fs-ext = { version = "4.0.2", default-features = false, features = ["std"] }
+windows-sys = { version = "0.61.2", default-features = false }
 # JSON Schema validation for structured / typed output (Phase 13). Default
 # features pull in HTTP/file `$ref` resolution (and a second reqwest);
 # structured output validates self-contained schemas locally, so those are
 # disabled. NOTE (coordination): Phase 13·B may also reference this entry for
 # typed tool-argument validation — keep the version/feature set in sync at
 # merge.
-jsonschema = { version = "0.46", default-features = false }
-# `serde_yaml` (0.9.34+deprecated) is unmaintained. It is being phased out:
-# the `agent-sdk` skills loader now uses the maintained `serde_yaml_ng` fork
-# behind the `skills` feature. The remaining use is the internal,
-# unpublished `agent-service-host` config/broker plumbing (not part of the
-# public `agent-sdk` dependency tree); migrating it is tracked as follow-up.
-serde_yaml = "0.9"
-# Maintained, API-compatible successor to the deprecated `serde_yaml`.
-# Used only behind the `agent-sdk` `skills` feature (YAML frontmatter parsing).
-serde_yaml_ng = "0.10"
-anyhow = "1"
-thiserror = "2"
-regex = { version = "1.12.3", default-features = false, features = ["std", "unicode-perl"] }
-glob = { version = "0.3", default-features = false }
-uuid = { version = "1", features = ["v4", "v7", "serde"] }
-time = { version = "0.3", features = ["serde", "std", "formatting", "parsing"] }
+jsonschema = { version = "0.49.3", default-features = false }
+serde_yaml_ng = { version = "0.10.0", default-features = false }
+anyhow = { version = "1.0.104", default-features = false, features = ["std"] }
+thiserror = { version = "2.0.19", default-features = false, features = ["std"] }
+# No `perf`: short patterns, never over large haystacks.
+regex = { version = "1.13.1", default-features = false, features = ["std", "unicode-perl"] }
+glob = { version = "0.3.4", default-features = false }
+uuid = { version = "1.24.0", default-features = false, features = ["std", "v4", "v7", "serde"] }
+time = { version = "0.3.55", default-features = false, features = ["serde", "std", "formatting", "parsing"] }
 # Use one native TLS stack across HTTP, WebSocket, AMQP, and SQLx clients.
 # Reqwest's `default-tls` selects AWS-LC in 0.13, adding a large native build
 # even for SQLite-only service hosts.
-reqwest = { version = "0.13.2", features = ["gzip", "json", "query", "native-tls", "stream", "http2"], default-features = false }
+# No `system-proxy`: it only reads OS-level settings; `HTTP_PROXY` still works.
+reqwest = { version = "0.13.4", default-features = false, features = ["gzip", "json", "query", "native-tls", "stream", "http2"] }
 # Exists solely so provider error classification can `downcast_ref` into
 # reqwest's error chain; the downcast only matches while this resolves to the
 # same semver-compatible native-tls release reqwest links. If the versions
 # ever diverge, TLS policy rejections stop classifying as bounded errors
 # (`tls_certificate_rejection_is_bounded_server_error` pins this).
-native-tls = "0.2"
-async-stream = "0.3"
-bytes = "1"
-log = { version = "0.4", features = ["kv_std"] }
-url = "2"
-tokio-util = "0.7"
-html2text = "0.17.1"
-base64 = "0.22"
-tokio-tungstenite = { version = "0.29.0", features = ["connect", "handshake", "native-tls"] }
+native-tls = { version = "0.2.18", default-features = false }
+async-stream = { version = "0.3.6", default-features = false }
+bytes = { version = "1.12.1", default-features = false, features = ["std"] }
+log = { version = "0.4.33", default-features = false, features = ["kv_std"] }
+url = { version = "2.5.8", default-features = false, features = ["std"] }
+tokio-util = { version = "0.7.19", default-features = false }
+html2text = { version = "0.17.1", default-features = false }
+base64 = { version = "0.23.0", default-features = false, features = ["std"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "native-tls"] }
 opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "rt-tokio"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace", "metrics"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-native-tls", "migrate", "macros", "time", "json"] }
+tracing = { version = "0.1.44", default-features = false, features = ["std", "attributes"] }
+# Keep `tracing-log`: it is what makes `init()` install a `LogTracer`. Without
+# it the host silently drops every `log::` record the SDK crates emit.
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt", "ansi", "smallvec", "tracing-log", "env-filter", "json"] }
 # Lightweight, synchronous SQLite driver for the embedded single-file durable
 # session store (`agent-sdk`'s `sqlite` feature). The `bundled` feature compiles
 # a vendored SQLite amalgamation so consumers need no system SQLite. Calls are
 # wrapped in `spawn_blocking` since the driver is synchronous; this keeps the
 # SDK's default build off the heavier async `sqlx` stack.
-rusqlite = { version = "0.39", default-features = false, features = ["bundled"] }
-lapin = { version = "4.4.0", default-features = false, features = ["native-tls", "tokio"] }
-clap = { version = "4", features = ["derive"] }
-png = "0.18"
+# Held at 0.39: 0.40 wants libsqlite3-sys 0.38, sqlx-sqlite 0.9 caps it below
+# that, and both `links = "sqlite3"`. Bump when sqlx accepts 0.38.
+rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }
+lapin = { version = "4.10.0", default-features = false, features = ["native-tls", "tokio"] }
+clap = { version = "4.6.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions", "color"] }
+png = { version = "0.18.1", default-features = false }
 
 # Proc-macro toolchain for the Phase 13·E ergonomics crate
 # (`agent-sdk-macros`). `syn` pulls the full grammar so derives can read
 # generics, where-clauses, and attribute exprs; `#[tool(...)]` attributes are
 # parsed by hand with `syn` (rather than a third-party attribute-derive crate
 # whose generated code trips the workspace's `-D warnings` clippy lints).
-syn = { version = "2", features = ["full", "extra-traits"] }
-quote = "1"
-proc-macro2 = "1"
+syn = { version = "3.0.3", default-features = false, features = ["derive", "parsing", "printing", "proc-macro", "clone-impls", "full", "extra-traits"] }
+quote = { version = "1.0.47", default-features = false, features = ["proc-macro"] }
+proc-macro2 = { version = "1.0.107", default-features = false, features = ["proc-macro"] }
 # Optional JSON-Schema derivation from a typed `Input` — the opt-in sugar over
 # 13·B's user-declared-JSON baseline (`#[tool(schema = "derive")]`). Kept
 # behind the macro crate's `schema-derive` feature so the baseline pulls no
 # extra deps.
-schemars = "1"
+schemars = { version = "1.2.2", default-features = false, features = ["derive", "std"] }
 
 # dev
-tempfile = "3"
-env_logger = "0.11"
-proptest = "1"
-proptest-state-machine = "0.4"
-insta = { version = "1", features = ["json"] }
+tempfile = { version = "3.27.0", default-features = false }
+env_logger = { version = "0.11.11", default-features = false, features = ["auto-color", "humantime"] }
+proptest = { version = "1.11.0", default-features = false, features = ["std", "bit-set", "fork", "timeout"] }
+proptest-state-machine = { version = "0.8.0", default-features = false }
+insta = { version = "1.48.0", default-features = false, features = ["json"] }
 # Exhaustive concurrency-permutation model checker. Only
 # compiled under `RUSTFLAGS="--cfg loom"`; never part of a normal build.
-loom = "0.7"
+loom = { version = "0.7.2", default-features = false }
 # Provider Tier-B deterministic integration tests: a local HTTP server
 # that replays scripted / recorded-and-redacted SSE fixtures (cassettes)
 # so the streaming decode + accumulate path is exercised end-to-end with
 # zero live network and zero API keys.  `wiremock` is HTTP-client-version
 # agnostic (it is just a server), so it composes with the SDK's
 # `reqwest 0.13` provider clients without a second reqwest in the tree.
-wiremock = "0.6"
+wiremock = { version = "0.6.5", default-features = false }
 # Compile-fail / UI tests for the proc-macros: asserts that a derive with a
 # missing required attribute fails to compile with a helpful diagnostic.
-trybuild = "1"
+trybuild = { version = "1.0.120", default-features = false }
 
 # Crash-injection failpoints (tikv `fail-rs`). Kept out of the default
 # feature set on every crate so production builds never compile it in;
 # `fail_point!` is a no-op unless a crate's `failpoints` feature pulls
 # this in with its own `failpoints` feature enabled.
-fail = "0.5"
+fail = { version = "0.5.1", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -26,11 +26,10 @@ path = "src/main.rs"
 doc = false
 
 [dependencies]
-agent-sdk = { workspace = true, features = ["openai", "gemini", "vertex", "cloudflare"] }
+agent-sdk = { workspace = true, features = ["anthropic", "openai", "gemini", "vertex", "cloudflare"] }
 anyhow = { workspace = true }
-async-trait = { workspace = true }
 clap = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "io-util"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "io-std", "io-util"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

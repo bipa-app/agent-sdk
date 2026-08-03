@@ -34,8 +34,7 @@ agent-sdk-macros = { workspace = true }
 # in (and re-exported through `__macro_support`) under the `macros-schema`
 # feature.
 schemars = { workspace = true, optional = true }
-tokio = { workspace = true }
-tokio-stream = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "fs", "io-util", "process"] }
 async-trait = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
@@ -47,7 +46,6 @@ glob = { workspace = true }
 uuid = { workspace = true }
 time = { workspace = true }
 reqwest = { workspace = true }
-async-stream = { workspace = true }
 bytes = { workspace = true }
 log = { workspace = true }
 url = { workspace = true }
@@ -68,7 +66,7 @@ rusqlite = { workspace = true, optional = true }
 # The common case is an Anthropic agent, so `anthropic` is the only default
 # provider. Everything else (other providers, web/MCP/skills tools) is
 # opt-in so a minimal consumer does not pay for WebSocket, HTML, or YAML deps.
-default = ["anthropic"]
+default = ["anthropic", "structured-output"]
 
 # ── Providers (forward to the providers crate's matching feature) ──────
 anthropic = ["agent-sdk-providers/anthropic"]
@@ -77,6 +75,11 @@ openai-codex = ["agent-sdk-providers/openai-codex"]
 gemini = ["agent-sdk-providers/gemini"]
 vertex = ["agent-sdk-providers/vertex"]
 cloudflare = ["agent-sdk-providers/cloudflare"]
+
+# ── Structured output ──────────────────────────────────────────────────
+# Schema-validated structured output ([`run_structured`], [`ResponseFormat`]).
+# On by default; switching it off sheds the ~30-crate `jsonschema` validator.
+structured-output = ["agent-sdk-providers/structured-output"]
 
 # ── Model discovery (dynamic capability/pricing catalog) ───────────────
 # Third-party model feed (models.dev / OpenRouter) plus the layered
@@ -89,8 +92,8 @@ model-discovery = ["agent-sdk-providers/model-discovery"]
 # ── Tools (gate optional modules + their heavy deps) ───────────────────
 # Web search + fetch tools; `html2text` renders fetched pages.
 web = ["dep:html2text"]
-# Model Context Protocol client.
-mcp = []
+# Model Context Protocol client; the HTTP/SSE transport needs tokio's `net`.
+mcp = ["tokio/net"]
 # Skill/command loading from markdown; `serde_yaml_ng` parses frontmatter.
 skills = ["dep:serde_yaml_ng"]
 # Embedded single-file durable session store (`SqliteStore`). Pulls a
@@ -111,7 +114,8 @@ otel = ["opentelemetry"]
 macros-schema = ["dep:schemars", "agent-sdk-macros/schema-derive"]
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "test-util"] }
+async-stream = { workspace = true }
 env_logger = { workspace = true }
 tempfile = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }

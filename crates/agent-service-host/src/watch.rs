@@ -297,7 +297,7 @@ amqp_consumer:
     bind_queue: true
 ";
         let config: ThreadEventsWatchConfig =
-            serde_yaml::from_str(yaml).context("parse watch config yaml")?;
+            serde_yaml_ng::from_str(yaml).context("parse watch config yaml")?;
         assert!(config.enabled);
         #[cfg(feature = "amqp")]
         {

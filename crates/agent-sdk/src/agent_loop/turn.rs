@@ -2055,7 +2055,7 @@ where
 {
     match stop_reason {
         Some(StopReason::EndTurn) => {
-            info!("Agent completed (end_turn) (turn={})", ctx.turn);
+            debug!("Agent completed (end_turn) (turn={})", ctx.turn);
             InternalTurnResult::Done
         }
         Some(StopReason::ToolUse) => {

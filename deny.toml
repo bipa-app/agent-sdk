@@ -25,14 +25,7 @@ all-features = true
 db-urls = ["https://github.com/rustsec/advisory-db"]
 # Yanked crates fail the build so a release never depends on one.
 yanked = "deny"
-ignore = [
-    # `serde_yaml` (0.9.34+deprecated) is unmaintained (RUSTSEC-2024-0320).
-    # It is NOT in the published `agent-sdk` tree — it remains only in the
-    # internal, unpublished `agent-service-host` config plumbing (see the
-    # note in the workspace Cargo.toml). The public surface uses the
-    # maintained `serde_yaml_ng` fork. Tracked for removal as a follow-up.
-    "RUSTSEC-2024-0320",
-]
+ignore = []
 
 [licenses]
 # SPDX identifiers we accept. All permissive / weak-copyleft licenses common
