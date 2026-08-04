@@ -152,15 +152,17 @@ fn usage_update(turn: usize, usage: &TokenUsage) -> Value {
     })
 }
 
-/// SDK built-ins covered by the ACP integration. Keeping this as data makes
-/// additions easy to audit and guarantees unknown or remotely supplied tool
-/// names remain safe.
+/// Tool-name → ACP kind. Two audiences share it: the SDK's built-ins and
+/// every tool satoshi (the first production backend) registers. Kept as
+/// data so additions are easy to audit. Mutating and managing tools are
+/// deliberately absent — they, and anything else unknown (remote MCP
+/// tools, future registrations), fall through to `other`, never a panic.
 const TOOL_KIND_TABLE: &[(&str, &str)] = &[
+    // SDK built-ins.
     ("read", "read"),
     ("notebook_read", "read"),
     ("glob", "search"),
     ("grep", "search"),
-    ("web_search", "search"),
     ("bash", "execute"),
     ("write", "execute"),
     ("edit", "execute"),
@@ -170,6 +172,51 @@ const TOOL_KIND_TABLE: &[(&str, &str)] = &[
     ("todo_read", "think"),
     ("todo_write", "think"),
     ("ask_user", "think"),
+    // Registered by both the SDK and satoshi.
+    ("web_search", "search"),
+    // Satoshi reads: logs, documents, schemas, graph and scratch state.
+    ("analytics_describe_table", "read"),
+    ("analytics_list_tables", "read"),
+    ("check_integration_health", "read"),
+    ("fraud_source_schema", "read"),
+    ("get_document", "read"),
+    ("get_employee_work", "read"),
+    ("get_okr_status", "read"),
+    ("get_rock_detail", "read"),
+    ("get_skill_versions", "read"),
+    ("get_team_alignment", "read"),
+    ("graph_context_pack", "read"),
+    ("graph_get", "read"),
+    ("graph_neighbors", "read"),
+    ("investigation_list", "read"),
+    ("investigation_read", "read"),
+    ("list_scheduled_tasks", "read"),
+    ("list_skills", "read"),
+    ("load_skill", "read"),
+    ("parse_document", "read"),
+    ("pg_describe_table", "read"),
+    ("pg_list_tables", "read"),
+    ("read_logs", "read"),
+    ("read_pdf", "read"),
+    ("scratch_read", "read"),
+    // Satoshi searches and recalls.
+    ("conversation_recall", "search"),
+    ("deep_research", "search"),
+    ("graph_search", "search"),
+    ("investigation_search", "search"),
+    ("knowledge_recall", "search"),
+    ("search_knowledge", "search"),
+    // Satoshi code and query execution.
+    ("analytics_query", "execute"),
+    ("execute_code", "execute"),
+    ("fraud_execute_code", "execute"),
+    ("fraud_source_query", "execute"),
+    ("pg_query", "execute"),
+    ("rlm", "execute"),
+    ("sandbox_coding_agent", "execute"),
+    // Satoshi fetching and deliberation.
+    ("fetch_page", "fetch"),
+    ("advisor", "think"),
 ];
 
 fn tool_kind(name: &str) -> &'static str {
@@ -408,5 +455,93 @@ mod tests {
         }
         assert_eq!(tool_kind("remote_mcp_tool"), "other");
         assert_eq!(tool_kind(""), "other");
+    }
+
+    /// Every tool name satoshi registers, with the coarse ACP kind this
+    /// slice assigns it. Mutating and managing tools stay `other` on
+    /// purpose; everything with a specific kind must classify to it.
+    const SATOSHI_TOOL_KINDS: &[(&str, &str)] = &[
+        ("advisor", "think"),
+        ("analytics_describe_table", "read"),
+        ("analytics_list_tables", "read"),
+        ("analytics_query", "execute"),
+        ("bash", "execute"),
+        ("buzz_send_message", "other"),
+        ("check_integration_health", "read"),
+        ("conversation_recall", "search"),
+        ("create_integration_skill", "other"),
+        ("create_objective", "other"),
+        ("create_scheduled_task", "other"),
+        ("deep_research", "search"),
+        ("delete_skill", "other"),
+        ("disable_skill", "other"),
+        ("enable_skill", "other"),
+        ("execute_code", "execute"),
+        ("fetch_page", "fetch"),
+        ("fraud_artifact", "other"),
+        ("fraud_complete_run", "other"),
+        ("fraud_execute_code", "execute"),
+        ("fraud_source_capture", "other"),
+        ("fraud_source_export", "other"),
+        ("fraud_source_query", "execute"),
+        ("fraud_source_schema", "read"),
+        ("get_document", "read"),
+        ("get_employee_work", "read"),
+        ("get_okr_status", "read"),
+        ("get_rock_detail", "read"),
+        ("get_skill_versions", "read"),
+        ("get_team_alignment", "read"),
+        ("graph_context_pack", "read"),
+        ("graph_get", "read"),
+        ("graph_neighbors", "read"),
+        ("graph_search", "search"),
+        ("investigation_edit", "other"),
+        ("investigation_list", "read"),
+        ("investigation_move", "other"),
+        ("investigation_read", "read"),
+        ("investigation_search", "search"),
+        ("investigation_write", "other"),
+        ("knowledge_forget", "other"),
+        ("knowledge_recall", "search"),
+        ("knowledge_remember", "other"),
+        ("linear_create_cycle", "other"),
+        ("linear_create_initiative", "other"),
+        ("linear_create_issue", "other"),
+        ("linear_create_project", "other"),
+        ("linear_update_issue", "other"),
+        ("list_scheduled_tasks", "read"),
+        ("list_skills", "read"),
+        ("load_skill", "read"),
+        ("manage_scheduled_task", "other"),
+        ("parse_document", "read"),
+        ("pg_describe_table", "read"),
+        ("pg_list_tables", "read"),
+        ("pg_query", "execute"),
+        ("read_logs", "read"),
+        ("read_pdf", "read"),
+        ("record_snapshot", "other"),
+        ("rlm", "execute"),
+        ("rollback_skill_version", "other"),
+        ("sandbox_coding_agent", "execute"),
+        ("scratch_read", "read"),
+        ("scratch_write", "other"),
+        ("search_knowledge", "search"),
+        ("slack_send_message", "other"),
+        ("store_integration_secret", "other"),
+        ("submit_integration_approval", "other"),
+        ("web_search", "search"),
+    ];
+
+    #[test]
+    fn kind_table_covers_every_satoshi_registered_tool() {
+        const VALID_KINDS: [&str; 6] = ["read", "search", "execute", "fetch", "think", "other"];
+        for (name, kind) in SATOSHI_TOOL_KINDS {
+            let mapped = tool_kind(name);
+            assert_eq!(mapped, *kind, "wrong ACP kind for {name}");
+            assert!(
+                VALID_KINDS.contains(&mapped),
+                "{name} mapped outside the coarse kind set: {mapped}"
+            );
+        }
     }
 }
