@@ -232,9 +232,11 @@ let record = sqlx::query!(
 let count = record.cnt.unwrap_or(0);
 ```
 
-### Local Postgres via Docker Compose
+### Local Postgres
 
-A Postgres 18 instance is available via `compose.yml`:
+A Postgres 18 container, driven by `scripts/postgres18-dev.sh`. It uses
+whichever container runtime is on PATH; set `AGENT_SDK_CONTAINER_RUNTIME` to
+choose explicitly. No compose provider is needed:
 
 ```bash
 # Start Postgres

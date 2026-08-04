@@ -19,7 +19,7 @@ without a real production endpoint.
 ```
 
 That's a thin wrapper around
-`docker compose -f dev/observability/langfuse/docker-compose.yml up -d`
+`<runtime> compose -f dev/observability/langfuse/docker-compose.yml up -d`
 — use whichever you prefer; the bytes are identical. The first boot
 pulls Postgres, ClickHouse, Redis, MinIO, the Langfuse web/worker, and
 the OTel collector. Allow ~30 s for `langfuse-web` to finish its
@@ -83,7 +83,7 @@ running). To target only the Langfuse stack, the underlying primitive
 is:
 
 ```bash
-docker compose -f dev/observability/langfuse/docker-compose.yml down
+<runtime> compose -f dev/observability/langfuse/docker-compose.yml down
 ```
 
 Add `-v` to drop the named volumes
@@ -113,7 +113,7 @@ Then, from your project root:
 ```bash
 agent-sdk doctor                 # checks docker, ports 4000/4317/4318
 agent-sdk local-langfuse init    # writes ./dev/observability/langfuse/{docker-compose.yml,otel-collector.yaml,LANGFUSE.md}
-agent-sdk local-langfuse up      # docker compose up -d (read this file before running)
+agent-sdk local-langfuse up      # compose up -d (read this file before running)
 ```
 
 `agent-sdk local-langfuse init --force` overwrites an existing copy when
@@ -134,13 +134,13 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 cargo run -p <your-binary>
 
 - **Port `4000`, `4317`, or `4318` already bound.** Another Langfuse stack
   or collector probably has the port. Run
-  `docker compose ls` to confirm — the Compose project name is
+  `compose ls` to confirm — the Compose project name is
   `agent-sdk-langfuse`. Stop the conflicting stack or remap the host ports
   in `docker-compose.yml`.
-- **Trace never lands.** Check `docker compose logs otel-collector` — the
+- **Trace never lands.** Check `compose logs otel-collector` — the
   `debug` exporter prints every batch it forwards. If the batch is leaving
   the collector but never reaches Langfuse, check
-  `docker compose logs langfuse-web` for `4xx`s on
+  `compose logs langfuse-web` for `4xx`s on
   `/api/public/otel/v1/traces`. The Basic-auth header in
   `otel-collector.yaml` must match the project's `pk-lf-…:sk-lf-…`
   credentials; the bundled value is base64 of

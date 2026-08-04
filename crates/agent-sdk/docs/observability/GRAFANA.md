@@ -95,7 +95,7 @@ To drop the Grafana volumes (Tempo blocks, Prometheus TSDB, Grafana
 local config) and start clean on the next boot:
 
 ```bash
-docker compose -f dev/observability/grafana/docker-compose.yml down -v
+<runtime> compose -f dev/observability/grafana/docker-compose.yml down -v
 ```
 
 The named volumes are `agent_sdk_grafana_tempo`,
@@ -105,7 +105,7 @@ The named volumes are `agent_sdk_grafana_tempo`,
 
 - **Port `4317` / `4318` already bound.** The Langfuse stack and the
   Grafana stack both want those ports — only one collector can hold
-  them at a time. Run `docker compose ls` to see which project is
+  them at a time. Run `compose ls` to see which project is
   active. If you need both, use `./dev/observability/up.sh both`,
   which owns the port arbitration for you.
 - **Grafana port `3001` already bound.** Some other tool (Storybook,
@@ -124,10 +124,10 @@ The named volumes are `agent_sdk_grafana_tempo`,
   on a 10 s window, and Prometheus scrapes every 15 s, so the first
   sample lands ~25 s after the SDK records it. If a query still shows
   nothing after a minute, check
-  `docker compose -f dev/observability/grafana/docker-compose.yml logs otel-collector`
+  `<runtime> compose -f dev/observability/grafana/docker-compose.yml logs otel-collector`
   for `prometheus exporter` errors.
 - **Trace appears in Tempo but not Langfuse during `both`.** Confirm
   the Langfuse stack has finished migrating
-  (`docker compose -f dev/observability/langfuse/docker-compose.yml logs langfuse-web`)
+  (`<runtime> compose -f dev/observability/langfuse/docker-compose.yml logs langfuse-web`)
   and that the collector resolved `host.docker.internal:4000`
-  (`docker compose -f dev/observability/grafana/docker-compose.yml logs otel-collector`).
+  (`<runtime> compose -f dev/observability/grafana/docker-compose.yml logs otel-collector`).

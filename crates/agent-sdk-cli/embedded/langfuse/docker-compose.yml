@@ -3,7 +3,7 @@ name: agent-sdk-langfuse
 # Local Langfuse stack for testing the `agent-sdk` OTLP exporter.
 #
 # Bring it up with:
-#   docker compose -f dev/observability/langfuse/docker-compose.yml up -d
+#   <runtime> compose -f dev/observability/langfuse/docker-compose.yml up -d
 #
 # UI:                 http://localhost:4000
 # Login:              otel@example.com / changeme123

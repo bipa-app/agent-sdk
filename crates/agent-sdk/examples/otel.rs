@@ -15,7 +15,7 @@
 //!
 //! The repo ships a local Langfuse + `OTel` collector stack at
 //! `dev/observability/langfuse/docker-compose.yml`. Bring it up with
-//! `docker compose -f dev/observability/langfuse/docker-compose.yml up -d`,
+//! `<runtime> compose -f dev/observability/langfuse/docker-compose.yml up -d`,
 //! then export `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317`. See
 //! `crates/agent-sdk/docs/observability/LANGFUSE.md` for the 2-minute
 //! setup walkthrough.

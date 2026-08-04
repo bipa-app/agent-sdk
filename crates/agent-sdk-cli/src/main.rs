@@ -27,7 +27,7 @@ use commands::{agent, doctor, local_langfuse};
     about = "Developer-experience CLI for the Agent SDK",
     long_about = "Materializes the local Langfuse + OTel collector stack into a downstream \
                   consumer's working tree, plus environment sanity checks. Read-only by \
-                  default — `up`/`down` shell out to `docker compose` and only fire when \
+                  default — `up`/`down` shell out to `<runtime> compose` and only fire when \
                   you ask them to.",
     propagate_version = true
 )]

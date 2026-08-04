@@ -41,8 +41,9 @@ cargo build
 
 The Postgres-backed service-host code uses `sqlx` compile-time checked
 queries and commits `.sqlx` metadata for offline builds. The repo ships
-with a local Postgres 18 Docker Compose setup in `compose.yml` and a
-helper script at `scripts/postgres18-dev.sh`.
+with a local Postgres 18 helper at `scripts/postgres18-dev.sh`, which
+drives a single container directly using whichever container runtime is
+on PATH (`AGENT_SDK_CONTAINER_RUNTIME` selects one explicitly).
 
 The helper respects `SQLX_DEV_CARGO_HOME` if you need to point SQLx prep
 at a specific Cargo cache; otherwise it falls back to the current

@@ -4,7 +4,7 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::{Command, ExitStatus, Stdio};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
@@ -18,11 +18,11 @@ use crate::embed::{
 pub enum Action {
     /// Materialize the compose stack into `<dest>` (creates the dir).
     Init(InitArgs),
-    /// Run `docker compose -f <dest>/docker-compose.yml up -d`.
+    /// Run `<runtime> compose -f <dest>/docker-compose.yml up -d`.
     Up(DestArgs),
-    /// Run `docker compose -f <dest>/docker-compose.yml down`.
+    /// Run `<runtime> compose -f <dest>/docker-compose.yml down`.
     Down(DownArgs),
-    /// Run `docker compose -f <dest>/docker-compose.yml ps`.
+    /// Run `<runtime> compose -f <dest>/docker-compose.yml ps`.
     Status(DestArgs),
 }
 
@@ -51,7 +51,7 @@ pub struct DownArgs {
     #[arg(long, default_value = DEFAULT_DEST_REL)]
     pub dest: PathBuf,
 
-    /// Pass `-v` to `docker compose down` so the named volumes are
+    /// Pass `-v` to `compose down` so the named volumes are
     /// dropped (resets the local Langfuse database on next boot).
     #[arg(long)]
     pub volumes: bool,
@@ -105,21 +105,21 @@ fn init(args: InitArgs) -> Result<()> {
 
 fn up(args: &DestArgs) -> Result<()> {
     let compose_path = compose_path(&args.dest)?;
-    run_docker_compose(&compose_path, ["up", "-d"])
+    run_compose(&compose_path, ["up", "-d"])
 }
 
 fn down(args: &DownArgs) -> Result<()> {
     let compose_path = compose_path(&args.dest)?;
     if args.volumes {
-        run_docker_compose(&compose_path, ["down", "-v"])
+        run_compose(&compose_path, ["down", "-v"])
     } else {
-        run_docker_compose(&compose_path, ["down"])
+        run_compose(&compose_path, ["down"])
     }
 }
 
 fn status(args: &DestArgs) -> Result<()> {
     let compose_path = compose_path(&args.dest)?;
-    run_docker_compose(&compose_path, ["ps"])
+    run_compose(&compose_path, ["ps"])
 }
 
 fn compose_path(dest: &Path) -> Result<PathBuf> {
@@ -133,21 +133,59 @@ fn compose_path(dest: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn run_docker_compose<I, S>(compose_path: &Path, args: I) -> Result<()>
+/// The compose invocation to use, as `(program, leading args)`.
+///
+/// Probes the known runtimes in order; `AGENT_SDK_CONTAINER_RUNTIME` selects
+/// one explicitly. Standalone `podman-compose` / `docker-compose` are tried
+/// last, since a runtime does not necessarily ship the `compose` subcommand.
+pub fn compose_command() -> Result<(String, Vec<String>)> {
+    let probe = |program: &str, args: &[&str]| -> bool {
+        Command::new(program)
+            .args(args)
+            .arg("version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+
+    let runtimes: Vec<String> = match std::env::var("AGENT_SDK_CONTAINER_RUNTIME") {
+        Ok(explicit) if !explicit.is_empty() => vec![explicit],
+        _ => vec!["podman".to_owned(), "docker".to_owned()],
+    };
+    for runtime in &runtimes {
+        if probe(runtime, &["compose"]) {
+            return Ok((runtime.clone(), vec!["compose".to_owned()]));
+        }
+    }
+    for standalone in ["podman-compose", "docker-compose"] {
+        if probe(standalone, &[]) {
+            return Ok((standalone.to_owned(), Vec::new()));
+        }
+    }
+    bail!(
+        "no working compose provider found (tried: podman compose, docker compose, \
+         podman-compose, docker-compose). Install one, or set \
+         AGENT_SDK_CONTAINER_RUNTIME."
+    )
+}
+
+fn run_compose<I, S>(compose_path: &Path, args: I) -> Result<()>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut cmd = Command::new("docker");
-    cmd.arg("compose").arg("-f").arg(compose_path);
+    let (program, leading) = compose_command()?;
+    let mut cmd = Command::new(&program);
+    cmd.args(&leading).arg("-f").arg(compose_path);
     for a in args {
         cmd.arg(a);
     }
     let status: ExitStatus = cmd
         .status()
-        .context("spawning `docker` (is Docker installed and on PATH?)")?;
+        .with_context(|| format!("spawning `{program}`"))?;
     if !status.success() {
-        bail!("`docker compose` exited with {status}");
+        bail!("`{program} compose` exited with {status}");
     }
     Ok(())
 }

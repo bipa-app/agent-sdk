@@ -27,16 +27,27 @@ pub use DoctorArgs as Args;
 pub fn run(args: DoctorArgs) -> Result<()> {
     let mut failures: Vec<String> = Vec::new();
 
-    let docker_ok = check_command("docker", &["--version"]);
-    report("docker", &docker_ok);
-    if let Err(msg) = &docker_ok {
-        failures.push(format!("docker missing: {msg}"));
+    // Report whichever runtime the stack commands will actually pick, rather
+    // than asserting one specific implementation.
+    let runtime_ok = ["podman", "docker"]
+        .into_iter()
+        .find_map(|runtime| {
+            check_command(runtime, &["--version"])
+                .ok()
+                .map(|version| format!("{runtime}: {version}"))
+        })
+        .ok_or_else(|| "neither podman nor docker found on PATH".to_owned());
+    report("container runtime", &runtime_ok);
+    if let Err(msg) = &runtime_ok {
+        failures.push(format!("container runtime missing: {msg}"));
     }
 
-    let compose_ok = check_command("docker", &["compose", "version"]);
-    report("docker compose", &compose_ok);
+    let compose_ok = super::local_langfuse::compose_command()
+        .map(|(program, _)| program)
+        .map_err(|error| error.to_string());
+    report("compose provider", &compose_ok);
     if let Err(msg) = &compose_ok {
-        failures.push(format!("docker compose missing: {msg}"));
+        failures.push(format!("compose provider missing: {msg}"));
     }
 
     for port in REQUIRED_PORTS {
