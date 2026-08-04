@@ -6,9 +6,14 @@
 pub(crate) mod data;
 
 use crate::attachments::validate_request_attachments;
-use crate::provider::LlmProvider;
+use crate::provider::{
+    EmbeddingError, LlmProvider, read_bounded_embedding_body, validate_embedding_request,
+    validate_embedding_vector,
+};
 use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind, reqwest_error_delta};
-use agent_sdk_foundation::llm::{ChatOutcome, ChatRequest, ChatResponse, ThinkingConfig};
+use agent_sdk_foundation::llm::{
+    ChatOutcome, ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, ThinkingConfig,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use data::{
@@ -375,6 +380,69 @@ impl LlmProvider for GeminiProvider {
         }))
     }
 
+    async fn embed(
+        &self,
+        request: EmbeddingRequest,
+    ) -> std::result::Result<EmbeddingResponse, EmbeddingError> {
+        validate_embedding_request(&request)?;
+        let model_id = gemini_embedding_model_id(&request.model)?;
+        let model_name = format!("models/{model_id}");
+        let requested_dimensions = request.dimensions;
+        let requests = request
+            .inputs
+            .iter()
+            .map(|input| ApiEmbedContentRequest {
+                model: &model_name,
+                content: ApiEmbeddingContent {
+                    parts: [ApiEmbeddingPart { text: input }],
+                },
+                embed_content_config: requested_dimensions.map(|dimensions| {
+                    ApiEmbedContentConfig {
+                        output_dimensionality: dimensions.get(),
+                    }
+                }),
+            })
+            .collect();
+        let api_request = ApiBatchEmbedContentsRequest { requests };
+
+        let builder = self
+            .client
+            .post(format!(
+                "{}/models/{model_id}:batchEmbedContents",
+                self.base_url
+            ))
+            .header("Content-Type", "application/json")
+            .timeout(std::time::Duration::from_secs(CHAT_READ_TIMEOUT_SECS));
+        let response = self
+            .apply_auth(builder)
+            .json(&api_request)
+            .send()
+            .await
+            .map_err(|_| EmbeddingError::Transport)?;
+        let status = response.status();
+        let retry_after = (status == StatusCode::TOO_MANY_REQUESTS)
+            .then(|| crate::http::retry_after_from_headers(response.headers()))
+            .flatten();
+        let bytes = read_bounded_embedding_body(response).await?;
+
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = retry_after.or_else(|| {
+                crate::retry_hints::google_retry_delay(&String::from_utf8_lossy(&bytes))
+            });
+            return Err(EmbeddingError::RateLimited { retry_after });
+        }
+        if !status.is_success() {
+            return Err(EmbeddingError::Api {
+                status: status.as_u16(),
+            });
+        }
+        decode_gemini_embedding_response(
+            &bytes,
+            request.inputs.len(),
+            requested_dimensions,
+        )
+    }
+
     fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
         let served_route = self.route().to_owned();
         Box::pin(async_stream::stream! {
@@ -558,6 +626,94 @@ impl LlmProvider for GeminiProvider {
     fn configured_thinking(&self) -> Option<&ThinkingConfig> {
         self.thinking.as_ref()
     }
+}
+
+fn gemini_embedding_model_id(model: &str) -> std::result::Result<&str, EmbeddingError> {
+    let model_id = model.strip_prefix("models/").unwrap_or(model);
+    if model_id.is_empty()
+        || model_id.chars().any(|character| {
+            character.is_ascii_control()
+                || character.is_ascii_whitespace()
+                || matches!(character, '/' | '?' | '#' | '\\' | '%')
+        })
+    {
+        return Err(EmbeddingError::InvalidRequest {
+            message: "model must be a single safe path segment".to_owned(),
+        });
+    }
+    Ok(model_id)
+}
+
+#[derive(serde::Serialize)]
+struct ApiBatchEmbedContentsRequest<'a> {
+    requests: Vec<ApiEmbedContentRequest<'a>>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiEmbedContentRequest<'a> {
+    model: &'a str,
+    content: ApiEmbeddingContent<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embed_content_config: Option<ApiEmbedContentConfig>,
+}
+
+#[derive(serde::Serialize)]
+struct ApiEmbeddingContent<'a> {
+    parts: [ApiEmbeddingPart<'a>; 1],
+}
+
+#[derive(serde::Serialize)]
+struct ApiEmbeddingPart<'a> {
+    text: &'a str,
+}
+
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiEmbedContentConfig {
+    output_dimensionality: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct ApiBatchEmbedContentsResponse {
+    embeddings: Vec<ApiContentEmbedding>,
+}
+
+#[derive(serde::Deserialize)]
+struct ApiContentEmbedding {
+    values: Vec<f32>,
+}
+
+fn decode_gemini_embedding_response(
+    bytes: &[u8],
+    expected_count: usize,
+    requested_dimensions: Option<std::num::NonZeroU32>,
+) -> std::result::Result<EmbeddingResponse, EmbeddingError> {
+    let api_response: ApiBatchEmbedContentsResponse =
+        serde_json::from_slice(bytes).map_err(|_| EmbeddingError::InvalidResponse {
+            message: "body is not valid batch embeddings JSON".to_owned(),
+        })?;
+    if api_response.embeddings.len() != expected_count {
+        return Err(EmbeddingError::InvalidResponse {
+            message: format!(
+                "response has {} vectors for {expected_count} inputs",
+                api_response.embeddings.len()
+            ),
+        });
+    }
+
+    let mut expected_dimension = None;
+    let mut vectors = Vec::with_capacity(expected_count);
+    for (index, embedding) in api_response.embeddings.into_iter().enumerate() {
+        expected_dimension = Some(validate_embedding_vector(
+            index,
+            &embedding.values,
+            expected_dimension,
+            requested_dimensions,
+        )?);
+        vectors.push(embedding.values);
+    }
+    Ok(EmbeddingResponse { vectors })
 }
 
 /// A raw Gemini model row, kept un-filtered so the `generateContent` filter can

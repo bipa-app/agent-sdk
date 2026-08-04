@@ -51,14 +51,16 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use agent_sdk_foundation::llm::{ChatOutcome, ChatRequest, ThinkingConfig};
+use agent_sdk_foundation::llm::{
+    ChatOutcome, ChatRequest, EmbeddingRequest, EmbeddingResponse, ThinkingConfig,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
 use tokio::sync::Mutex;
 
 use crate::model_capabilities::ModelCapabilities;
-use crate::provider::{LlmProvider, StructuredOutputSupport};
+use crate::provider::{EmbeddingError, LlmProvider, StructuredOutputSupport};
 use crate::streaming::{StreamBox, StreamDelta, UsageCarry};
 
 /// Wraps a provider with host-driven credential refresh on 401.
@@ -178,6 +180,27 @@ where
             }
         }
         Ok(outcome)
+    }
+
+    async fn embed(
+        &self,
+        request: EmbeddingRequest,
+    ) -> std::result::Result<EmbeddingResponse, EmbeddingError> {
+        let result = self.snapshot().await.embed(request.clone()).await;
+        if matches!(
+            &result,
+            Err(EmbeddingError::Api {
+                status: 401
+            })
+        ) {
+            match self.run_refresh().await {
+                Ok(()) => return self.snapshot().await.embed(request).await,
+                Err(_) => {
+                    log::warn!("RefreshingProvider refresh after embedding 401 failed");
+                }
+            }
+        }
+        result
     }
 
     fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {

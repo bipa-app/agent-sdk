@@ -334,6 +334,58 @@ impl SpeedTier {
     }
 }
 
+/// Maximum number of inputs accepted by one provider-agnostic embedding request.
+pub const MAX_EMBEDDING_BATCH_SIZE: usize = 256;
+
+/// Maximum UTF-8 byte length of one embedding input.
+pub const MAX_EMBEDDING_INPUT_BYTES: usize = 1024 * 1024;
+
+/// Maximum aggregate UTF-8 byte length of all inputs in one embedding request.
+pub const MAX_EMBEDDING_TOTAL_INPUT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Maximum embedding vector dimension accepted from a request or response.
+pub const MAX_EMBEDDING_DIMENSIONS: u32 = 65_536;
+
+/// Maximum encoded response body accepted from an embeddings endpoint.
+pub const MAX_EMBEDDING_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+/// A bounded batch of text inputs to embed with an explicit model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingRequest {
+    /// Model identifier sent to the embeddings endpoint.
+    pub model: String,
+    /// Texts to embed, in caller-defined order.
+    pub inputs: Vec<String>,
+    /// Requested output dimension, or the model's native dimension when absent.
+    pub dimensions: Option<std::num::NonZeroU32>,
+}
+
+impl EmbeddingRequest {
+    /// Build an embedding request using the model's native output dimension.
+    #[must_use]
+    pub fn new(model: impl Into<String>, inputs: Vec<String>) -> Self {
+        Self {
+            model: model.into(),
+            inputs,
+            dimensions: None,
+        }
+    }
+
+    /// Request a specific non-zero output dimension.
+    #[must_use]
+    pub fn with_dimensions(mut self, dimensions: std::num::NonZeroU32) -> Self {
+        self.dimensions = Some(dimensions);
+        self
+    }
+}
+
+/// Provider-independent embedding vectors in the same order as the request inputs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EmbeddingResponse {
+    /// Validated vectors reordered to match [`EmbeddingRequest::inputs`].
+    pub vectors: Vec<Vec<f32>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
     pub system: String,

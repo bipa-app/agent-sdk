@@ -14,12 +14,14 @@
 
 use std::sync::Arc;
 
-use agent_sdk_foundation::llm::{ChatOutcome, ChatRequest};
+use agent_sdk_foundation::llm::{
+    ChatOutcome, ChatRequest, EmbeddingRequest, EmbeddingResponse,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
 
-use crate::provider::LlmProvider;
+use crate::provider::{EmbeddingError, LlmProvider};
 use crate::streaming::{StreamBox, StreamDelta, UsageCarry};
 
 /// Whether a delta commits the stream to the provider that produced it.
@@ -139,6 +141,15 @@ impl LlmProvider for FallbackProvider {
         Ok(ChatOutcome::ServerError(
             "FallbackProvider: no providers configured".to_owned(),
         ))
+    }
+
+    /// Delegate embeddings to the primary provider. Chat failover classification
+    /// does not apply to this independently typed operation.
+    async fn embed(
+        &self,
+        request: EmbeddingRequest,
+    ) -> std::result::Result<EmbeddingResponse, EmbeddingError> {
+        self.primary.embed(request).await
     }
 
     fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {

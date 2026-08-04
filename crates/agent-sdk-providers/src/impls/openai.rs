@@ -24,14 +24,17 @@
 
 use crate::attachments::request_has_attachments;
 use crate::model_features::{ModelApiSurface, get_model_features};
-use crate::provider::LlmProvider;
+use crate::provider::{
+    EmbeddingError, LlmProvider, read_bounded_embedding_body, validate_embedding_request,
+    validate_embedding_vector,
+};
 use crate::streaming::{
     SseLineBuffer, StreamBox, StreamDelta, StreamErrorKind, reqwest_body_error_delta,
     reqwest_error_delta,
 };
 use agent_sdk_foundation::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, ImageDetail, SpeedTier,
-    StopReason, ThinkingConfig, ToolChoice, Usage,
+    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, EmbeddingRequest,
+    EmbeddingResponse, ImageDetail, SpeedTier, StopReason, ThinkingConfig, ToolChoice, Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -740,6 +743,28 @@ impl OpenAIProvider {
             }
         }
     }
+    async fn send_embedding_request(
+        &self,
+        api_request: &ApiEmbeddingRequest<'_>,
+    ) -> std::result::Result<(StatusCode, Vec<u8>, Option<std::time::Duration>), EmbeddingError>
+    {
+        let builder = self
+            .client
+            .post(format!("{}/embeddings", self.base_url))
+            .header("Content-Type", "application/json");
+        let response = self
+            .apply_headers(builder)
+            .json(api_request)
+            .send()
+            .await
+            .map_err(|_| EmbeddingError::Transport)?;
+        let status = response.status();
+        let retry_after = (status == StatusCode::TOO_MANY_REQUESTS)
+            .then(|| crate::http::retry_after_from_headers(response.headers()))
+            .flatten();
+        let bytes = read_bounded_embedding_body(response).await?;
+        Ok((status, bytes, retry_after))
+    }
 
     /// Build the `OpenAIResponsesProvider` used for the transparent Responses-API
     /// reroute, forwarding this provider's pooled client, thinking config, speed
@@ -880,6 +905,29 @@ impl LlmProvider for OpenAIProvider {
         );
 
         decode_chat_response(status, &bytes, retry_after)
+    }
+
+    async fn embed(
+        &self,
+        request: EmbeddingRequest,
+    ) -> std::result::Result<EmbeddingResponse, EmbeddingError> {
+        validate_embedding_request(&request)?;
+        let expected_count = request.inputs.len();
+        let requested_dimensions = request.dimensions;
+        let api_request = ApiEmbeddingRequest {
+            model: &request.model,
+            input: &request.inputs,
+            dimensions: requested_dimensions.map(std::num::NonZeroU32::get),
+            encoding_format: "float",
+        };
+        let (status, bytes, retry_after) = self.send_embedding_request(&api_request).await?;
+        decode_embedding_response(
+            status,
+            &bytes,
+            retry_after,
+            expected_count,
+            requested_dimensions,
+        )
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1612,6 +1660,80 @@ fn fallback_stream_stop_reason(
     }
 }
 
+fn decode_embedding_response(
+    status: StatusCode,
+    bytes: &[u8],
+    retry_after: Option<std::time::Duration>,
+    expected_count: usize,
+    requested_dimensions: Option<std::num::NonZeroU32>,
+) -> std::result::Result<EmbeddingResponse, EmbeddingError> {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = retry_after
+            .or_else(|| crate::retry_hints::openai_retry_delay(&String::from_utf8_lossy(bytes)));
+        return Err(EmbeddingError::RateLimited { retry_after });
+    }
+    if !status.is_success() {
+        return Err(EmbeddingError::Api {
+            status: status.as_u16(),
+        });
+    }
+
+    let api_response: ApiEmbeddingResponse =
+        serde_json::from_slice(bytes).map_err(|_| EmbeddingError::InvalidResponse {
+            message: "body is not valid embeddings JSON".to_owned(),
+        })?;
+    if api_response.model.trim().is_empty() {
+        return Err(EmbeddingError::InvalidResponse {
+            message: "response model must not be empty".to_owned(),
+        });
+    }
+    if api_response.data.len() != expected_count {
+        return Err(EmbeddingError::InvalidResponse {
+            message: format!(
+                "response has {} vectors for {expected_count} inputs",
+                api_response.data.len()
+            ),
+        });
+    }
+
+    let mut dimension = None;
+    let mut vectors: Vec<Option<Vec<f32>>> =
+        std::iter::repeat_with(|| None).take(expected_count).collect();
+    for item in api_response.data {
+        if item.index >= expected_count {
+            return Err(EmbeddingError::InvalidResponse {
+                message: format!(
+                    "response index {} is outside the {expected_count}-input batch",
+                    item.index
+                ),
+            });
+        }
+        if vectors[item.index].is_some() {
+            return Err(EmbeddingError::InvalidResponse {
+                message: format!("response index {} is duplicated", item.index),
+            });
+        }
+        dimension = Some(validate_embedding_vector(
+            item.index,
+            &item.embedding,
+            dimension,
+            requested_dimensions,
+        )?);
+        vectors[item.index] = Some(item.embedding);
+    }
+
+    let vectors = vectors
+        .into_iter()
+        .enumerate()
+        .map(|(index, vector)| {
+            vector.ok_or_else(|| EmbeddingError::InvalidResponse {
+                message: format!("response index {index} is missing"),
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(EmbeddingResponse { vectors })
+}
+
 /// Map an HTTP status + body into a [`ChatOutcome`], parsing the success body
 /// into a [`ChatResponse`].
 fn decode_chat_response(
@@ -1994,6 +2116,14 @@ fn build_content_blocks(message: &ApiResponseMessage) -> Vec<ContentBlock> {
 // ============================================================================
 // API Request Types
 // ============================================================================
+#[derive(Serialize)]
+struct ApiEmbeddingRequest<'a> {
+    model: &'a str,
+    input: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<u32>,
+    encoding_format: &'static str,
+}
 
 #[derive(Serialize)]
 struct ApiChatRequest<'a> {
@@ -2337,6 +2467,18 @@ struct ApiFunction {
 // ============================================================================
 // API Response Types
 // ============================================================================
+
+#[derive(Deserialize)]
+struct ApiEmbeddingResponse {
+    data: Vec<ApiEmbedding>,
+    model: String,
+}
+
+#[derive(Deserialize)]
+struct ApiEmbedding {
+    index: usize,
+    embedding: Vec<f32>,
+}
 
 #[derive(Deserialize)]
 struct ApiChatResponse {

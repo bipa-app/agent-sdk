@@ -6,13 +6,16 @@
 #[cfg(feature = "anthropic")]
 use agent_sdk_foundation::llm::ToolChoice;
 use agent_sdk_foundation::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, ContentBlock, SpeedTier, ThinkingConfig, ThinkingMode,
-    Usage,
+    ChatOutcome, ChatRequest, ChatResponse, ContentBlock, EmbeddingRequest, EmbeddingResponse,
+    MAX_EMBEDDING_BATCH_SIZE, MAX_EMBEDDING_DIMENSIONS, MAX_EMBEDDING_INPUT_BYTES,
+    MAX_EMBEDDING_RESPONSE_BYTES, MAX_EMBEDDING_TOTAL_INPUT_BYTES, SpeedTier, ThinkingConfig,
+    ThinkingMode, Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::model_capabilities::{
     ModelCapabilities, default_max_output_tokens, get_model_capabilities,
@@ -56,10 +59,192 @@ pub struct ModelInfo {
     pub max_output_tokens: Option<u32>,
 }
 
+/// Failures surfaced by the provider-agnostic embeddings operation.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum EmbeddingError {
+    /// The selected provider does not implement embeddings.
+    #[error("embeddings are not supported for provider {provider}")]
+    Unsupported { provider: &'static str },
+    /// The SDK rejected the request before dispatch.
+    #[error("invalid embedding request: {message}")]
+    InvalidRequest { message: String },
+    /// The HTTP request could not be dispatched or read. Transport details are
+    /// intentionally omitted so credential-bearing URLs cannot enter diagnostics.
+    #[error("embedding request failed")]
+    Transport,
+    /// The provider rate-limited the request.
+    #[error("embedding request was rate limited")]
+    RateLimited {
+        retry_after: Option<std::time::Duration>,
+    },
+    /// The provider rejected or failed the request.
+    #[error("embedding provider returned HTTP {status}")]
+    Api { status: u16 },
+    /// The encoded response exceeded the SDK's public safety bound.
+    #[error("embedding response exceeds the {limit}-byte limit")]
+    ResponseTooLarge { limit: usize },
+    /// The provider returned a success body that violates the embeddings contract.
+    #[error("invalid embedding response: {message}")]
+    InvalidResponse { message: String },
+}
+
+pub(crate) fn validate_embedding_request(
+    request: &EmbeddingRequest,
+) -> std::result::Result<(), EmbeddingError> {
+    if request.model.trim().is_empty() {
+        return Err(EmbeddingError::InvalidRequest {
+            message: "model must not be empty".to_owned(),
+        });
+    }
+    if request.inputs.is_empty() {
+        return Err(EmbeddingError::InvalidRequest {
+            message: "inputs must not be empty".to_owned(),
+        });
+    }
+    if request.inputs.len() > MAX_EMBEDDING_BATCH_SIZE {
+        return Err(EmbeddingError::InvalidRequest {
+            message: format!(
+                "batch has {} inputs; maximum is {MAX_EMBEDDING_BATCH_SIZE}",
+                request.inputs.len()
+            ),
+        });
+    }
+    if request
+        .dimensions
+        .is_some_and(|dimensions| dimensions.get() > MAX_EMBEDDING_DIMENSIONS)
+    {
+        return Err(EmbeddingError::InvalidRequest {
+            message: format!("dimensions exceed the maximum of {MAX_EMBEDDING_DIMENSIONS}"),
+        });
+    }
+
+    let mut total_input_bytes = 0usize;
+    for input in &request.inputs {
+        if input.is_empty() {
+            return Err(EmbeddingError::InvalidRequest {
+                message: "inputs must not contain empty text".to_owned(),
+            });
+        }
+        if input.len() > MAX_EMBEDDING_INPUT_BYTES {
+            return Err(EmbeddingError::InvalidRequest {
+                message: format!("an input exceeds the {MAX_EMBEDDING_INPUT_BYTES}-byte limit"),
+            });
+        }
+        total_input_bytes =
+            total_input_bytes
+                .checked_add(input.len())
+                .ok_or_else(|| EmbeddingError::InvalidRequest {
+                    message: "aggregate input length overflowed".to_owned(),
+                })?;
+        if total_input_bytes > MAX_EMBEDDING_TOTAL_INPUT_BYTES {
+            return Err(EmbeddingError::InvalidRequest {
+                message: format!(
+                    "aggregate input exceeds the {MAX_EMBEDDING_TOTAL_INPUT_BYTES}-byte limit"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_embedding_vector(
+    index: usize,
+    vector: &[f32],
+    expected_dimension: Option<u32>,
+    requested_dimensions: Option<std::num::NonZeroU32>,
+) -> std::result::Result<u32, EmbeddingError> {
+    if vector.iter().any(|value| !value.is_finite()) {
+        return Err(EmbeddingError::InvalidResponse {
+            message: format!("response vector {index} contains a non-finite value"),
+        });
+    }
+    let dimension =
+        u32::try_from(vector.len()).map_err(|_| EmbeddingError::InvalidResponse {
+            message: format!("response vector {index} dimension is too large"),
+        })?;
+    if dimension == 0 {
+        return Err(EmbeddingError::InvalidResponse {
+            message: format!("response vector {index} has zero dimensions"),
+        });
+    }
+    if dimension > MAX_EMBEDDING_DIMENSIONS {
+        return Err(EmbeddingError::InvalidResponse {
+            message: format!(
+                "response vector {index} exceeds {MAX_EMBEDDING_DIMENSIONS} dimensions"
+            ),
+        });
+    }
+    if let Some(requested) = requested_dimensions
+        && requested.get() != dimension
+    {
+        return Err(EmbeddingError::InvalidResponse {
+            message: format!(
+                "response vector {index} has {dimension} dimensions, not the requested {}",
+                requested.get()
+            ),
+        });
+    }
+    if let Some(expected) = expected_dimension
+        && expected != dimension
+    {
+        return Err(EmbeddingError::InvalidResponse {
+            message: format!(
+                "response vector {index} has {dimension} dimensions, not {expected}"
+            ),
+        });
+    }
+    Ok(dimension)
+}
+
+pub(crate) async fn read_bounded_embedding_body(
+    response: reqwest::Response,
+) -> std::result::Result<Vec<u8>, EmbeddingError> {
+    if response.content_length().is_some_and(|length| {
+        usize::try_from(length).map_or(true, |length| length > MAX_EMBEDDING_RESPONSE_BYTES)
+    }) {
+        return Err(EmbeddingError::ResponseTooLarge {
+            limit: MAX_EMBEDDING_RESPONSE_BYTES,
+        });
+    }
+
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| EmbeddingError::Transport)?;
+        if chunk.len() > MAX_EMBEDDING_RESPONSE_BYTES.saturating_sub(bytes.len()) {
+            return Err(EmbeddingError::ResponseTooLarge {
+                limit: MAX_EMBEDDING_RESPONSE_BYTES,
+            });
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     /// Non-streaming chat completion.
     async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome>;
+
+    /// Embed a bounded batch of text inputs.
+    ///
+    /// Providers that do not support embeddings retain source compatibility via
+    /// this default and return an actionable typed error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EmbeddingError::Unsupported`] by default. Implementations
+    /// return the other typed variants for invalid requests, transport/API
+    /// failures, safety-bound violations, and malformed responses.
+    async fn embed(
+        &self,
+        _request: EmbeddingRequest,
+    ) -> std::result::Result<EmbeddingResponse, EmbeddingError> {
+        Err(EmbeddingError::Unsupported {
+            provider: self.provider(),
+        })
+    }
 
     /// List the models the provider currently exposes, queried live from the
     /// provider's own model-listing endpoint.

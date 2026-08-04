@@ -676,8 +676,10 @@ macro_rules! tool {
 
 // agent-sdk-providers (via thin modules)
 pub use llm::{
-    ContentBlock, ContentSource, Effort, LlmProvider, ServedSpeed, SpeedTier, ThinkingConfig,
-    ThinkingMode,
+    ContentBlock, ContentSource, Effort, EmbeddingError, EmbeddingRequest, EmbeddingResponse,
+    LlmProvider, MAX_EMBEDDING_BATCH_SIZE, MAX_EMBEDDING_DIMENSIONS, MAX_EMBEDDING_INPUT_BYTES,
+    MAX_EMBEDDING_RESPONSE_BYTES, MAX_EMBEDDING_TOTAL_INPUT_BYTES, ServedSpeed, SpeedTier,
+    ThinkingConfig, ThinkingMode,
 };
 pub use model_capabilities::{
     ModelCapabilities, PricePoint, Pricing, SourceStatus, get_model_capabilities,
