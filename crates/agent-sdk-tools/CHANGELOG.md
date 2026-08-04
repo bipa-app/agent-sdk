@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-tools-v0.17.0...agent-sdk-tools-v0.18.0) - 2026-08-04
+
+### Added
+
+- *(compaction)* Snapcompact engine, cutover, and hardening (ENG-9528) ([#433](https://github.com/bipa-app/agent-sdk/pull/433))
+
+### Other
+
+- *(deps)* update every dependency and pin explicit feature sets ([#435](https://github.com/bipa-app/agent-sdk/pull/435))
+
 ## [0.17.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-tools-v0.16.0...agent-sdk-tools-v0.17.0) - 2026-08-01
 
 ### Added
