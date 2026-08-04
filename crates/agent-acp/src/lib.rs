@@ -66,6 +66,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod backend;
+mod mapper;
 pub mod run;
 pub mod server;
 pub mod session;
