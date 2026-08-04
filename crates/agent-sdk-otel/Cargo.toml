@@ -17,6 +17,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
+# No TLS feature: this is a library, so the backend is the final binary's call.
 agent-sdk = { workspace = true, features = ["otel"] }
 anyhow = { workspace = true }
 log = { workspace = true }

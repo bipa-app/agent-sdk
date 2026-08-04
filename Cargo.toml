@@ -79,17 +79,16 @@ regex = { version = "1.13.1", default-features = false, features = ["std", "unic
 glob = { version = "0.3.4", default-features = false }
 uuid = { version = "1.24.0", default-features = false, features = ["std", "v4", "v7", "serde"] }
 time = { version = "0.3.55", default-features = false, features = ["serde", "std", "formatting", "parsing"] }
-# Use one native TLS stack across HTTP, WebSocket, AMQP, and SQLx clients.
-# Reqwest's `default-tls` selects AWS-LC in 0.13, adding a large native build
-# even for SQLite-only service hosts.
+# No TLS backend: the `tls-native-tls` / `tls-rustls` features add one.
 # No `system-proxy`: it only reads OS-level settings; `HTTP_PROXY` still works.
-reqwest = { version = "0.13.4", default-features = false, features = ["gzip", "json", "query", "native-tls", "stream", "http2"] }
-# Exists solely so provider error classification can `downcast_ref` into
-# reqwest's error chain; the downcast only matches while this resolves to the
-# same semver-compatible native-tls release reqwest links. If the versions
-# ever diverge, TLS policy rejections stop classifying as bounded errors
+reqwest = { version = "0.13.4", default-features = false, features = ["gzip", "json", "query", "stream", "http2"] }
+# Both exist so error classification can `downcast_ref` into reqwest's chain;
+# each only matches while it resolves to the release reqwest links
 # (`tls_certificate_rejection_is_bounded_server_error` pins this).
 native-tls = { version = "0.2.18", default-features = false }
+# `prefer-post-quantum` is a rustls default that reqwest disables; naming it
+# here unifies it back on.
+rustls = { version = "0.23.43", default-features = false, features = ["std", "tls12", "logging", "aws_lc_rs", "prefer-post-quantum"] }
 async-stream = { version = "0.3.6", default-features = false }
 bytes = { version = "1.12.1", default-features = false, features = ["std"] }
 log = { version = "0.4.33", default-features = false, features = ["kv_std"] }
@@ -97,11 +96,11 @@ url = { version = "2.5.8", default-features = false, features = ["std"] }
 tokio-util = { version = "0.7.19", default-features = false }
 html2text = { version = "0.17.1", default-features = false }
 base64 = { version = "0.23.0", default-features = false, features = ["std"] }
-tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "native-tls"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"] }
 opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "rt-tokio"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace", "metrics"] }
-sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-native-tls", "migrate", "macros", "time", "json"] }
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "migrate", "macros", "time", "json"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std", "attributes"] }
 # Keep `tracing-log`: it is what makes `init()` install a `LogTracer`. Without
 # it the host silently drops every `log::` record the SDK crates emit.
@@ -114,7 +113,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 # Held at 0.39: 0.40 wants libsqlite3-sys 0.38, sqlx-sqlite 0.9 caps it below
 # that, and both `links = "sqlite3"`. Bump when sqlx accepts 0.38.
 rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }
-lapin = { version = "4.10.0", default-features = false, features = ["native-tls", "tokio"] }
+lapin = { version = "4.10.0", default-features = false, features = ["tokio"] }
 clap = { version = "4.6.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions", "color"] }
 png = { version = "0.18.1", default-features = false }
 

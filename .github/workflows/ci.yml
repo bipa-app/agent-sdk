@@ -78,6 +78,14 @@ jobs:
       # keys, no live network. Tier-C live smoke is `#[ignore]`'d here and
       # runs only in the nightly `live-smoke` job below.
       - run: cargo nextest run --workspace --all-features --profile ci
+      # `--all-features` compiles both TLS backends, and the feature-matrix job
+      # only `cargo check`s the rustls one — so without this the rustls-only
+      # error-unwrap path in `is_tls_backend_error` never actually runs in CI.
+      - name: Test providers with rustls as the only TLS backend
+        run: >-
+          cargo nextest run --profile ci -p agent-sdk-providers
+          --no-default-features
+          --features anthropic,openai,gemini,structured-output,tls-rustls
 
   postgres:
     name: Postgres integration
@@ -233,6 +241,8 @@ jobs:
           - "--no-default-features --features cloudflare"
           # Rows above cover `structured-output` OFF; this one covers it ON.
           - "--no-default-features --features anthropic,structured-output"
+          - "--no-default-features --features anthropic,tls-rustls"
+          - "--no-default-features --features anthropic,tls-native-tls,tls-rustls"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -259,6 +269,7 @@ jobs:
         features:
           - "--no-default-features --features sqlite"
           - "--no-default-features --features postgres"
+          - "--no-default-features --features postgres,amqp,tls-rustls"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

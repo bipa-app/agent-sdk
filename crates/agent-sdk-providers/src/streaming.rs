@@ -315,7 +315,7 @@ fn is_tls_rejection(error: &reqwest::Error) -> bool {
     }
     let mut source = std::error::Error::source(error);
     while let Some(cause) = source {
-        if cause.downcast_ref::<native_tls::Error>().is_some() {
+        if is_tls_backend_error(cause) {
             let message = cause.to_string().to_ascii_lowercase();
             let transport_death = ["eof", "close", "reset", "broken pipe", "timed out"]
                 .iter()
@@ -323,6 +323,37 @@ fn is_tls_rejection(error: &reqwest::Error) -> bool {
             return !transport_death;
         }
         source = cause.source();
+    }
+    false
+}
+
+/// `true` when `cause` is a handshake error from the selected TLS backend.
+fn is_tls_backend_error(cause: &(dyn std::error::Error + 'static)) -> bool {
+    // With no backend selected nothing reaches a handshake, so `cause` goes
+    // unused. Bind it rather than reach for an `#[allow(...)]`. (`drop` would
+    // trip `dropping_references` — `cause` is a reference.)
+    #[cfg(not(any(feature = "tls-native-tls", feature = "tls-rustls")))]
+    let _ = cause;
+
+    #[cfg(feature = "tls-native-tls")]
+    if cause.downcast_ref::<native_tls::Error>().is_some() {
+        return true;
+    }
+    // rustls nests its error two `io::Error`s deep, and `source()` steps over an
+    // `io::Error` to the *inner* error's source — never the inner error itself.
+    // So the chain walk never reaches it; unwrap `get_ref()` instead.
+    #[cfg(feature = "tls-rustls")]
+    {
+        let mut probe = Some(cause);
+        while let Some(error) = probe {
+            if error.is::<rustls::Error>() {
+                return true;
+            }
+            probe = error
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::get_ref)
+                .map(|inner| inner as &(dyn std::error::Error + 'static));
+        }
     }
     false
 }
@@ -1161,9 +1192,10 @@ mod tests {
     /// A live TLS peer that fails certificate validation is a policy
     /// rejection, not an outage — waiting for connectivity cannot fix it, so
     /// it must stay on the bounded path. The server presents a self-signed
-    /// certificate the client refuses; the assertion also pins the
-    /// `native_tls::Error` downcast in `is_tls_rejection` against a version
-    /// drift between reqwest's native-tls and the workspace's.
+    /// certificate the client refuses; the assertion also pins the downcast in
+    /// `is_tls_rejection` against a version drift between reqwest's TLS backend
+    /// and the workspace's. Runs under either backend: the server is always
+    /// native-tls, which only has to *present* the cert.
     #[tokio::test]
     async fn tls_certificate_rejection_is_bounded_server_error() -> anyhow::Result<()> {
         const SELF_SIGNED_CERT_PEM: &[u8] = b"-----BEGIN CERTIFICATE-----

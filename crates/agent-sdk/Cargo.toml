@@ -66,7 +66,7 @@ rusqlite = { workspace = true, optional = true }
 # The common case is an Anthropic agent, so `anthropic` is the only default
 # provider. Everything else (other providers, web/MCP/skills tools) is
 # opt-in so a minimal consumer does not pay for WebSocket, HTML, or YAML deps.
-default = ["anthropic", "structured-output"]
+default = ["anthropic", "structured-output", "tls-native-tls"]
 
 # ── Providers (forward to the providers crate's matching feature) ──────
 anthropic = ["agent-sdk-providers/anthropic"]
@@ -75,6 +75,11 @@ openai-codex = ["agent-sdk-providers/openai-codex"]
 gemini = ["agent-sdk-providers/gemini"]
 vertex = ["agent-sdk-providers/vertex"]
 cloudflare = ["agent-sdk-providers/cloudflare"]
+
+# ── TLS backend (pick exactly one) ─────────────────────────────────────
+# Forwarded from `agent-sdk-providers`, plus this crate's own `reqwest`.
+tls-native-tls = ["agent-sdk-providers/tls-native-tls", "reqwest/native-tls"]
+tls-rustls = ["agent-sdk-providers/tls-rustls", "reqwest/rustls"]
 
 # ── Structured output ──────────────────────────────────────────────────
 # Schema-validated structured output ([`run_structured`], [`ResponseFormat`]).
