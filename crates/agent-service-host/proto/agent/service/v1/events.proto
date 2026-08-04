@@ -389,6 +389,36 @@ message AutoRetryEndEvent {
   optional string final_error = 3;
 }
 
+// Why the daemon changed or exhausted the OAuth account serving a provider
+// request. UNKNOWN preserves events produced with a reason this consumer does
+// not yet understand.
+enum AccountRotationReason {
+  ACCOUNT_ROTATION_REASON_UNSPECIFIED = 0;
+  ACCOUNT_ROTATION_REASON_RATE_LIMITED = 1;
+  ACCOUNT_ROTATION_REASON_AUTHENTICATION_FAILED = 2;
+  ACCOUNT_ROTATION_REASON_REFRESH_FAILED = 3;
+  ACCOUNT_ROTATION_REASON_UNKNOWN = 4;
+}
+
+// A provider request succeeded after moving to another OAuth account.
+message AccountRotationEvent {
+  string provider = 1;
+  // Bounded opaque local identifier or safe display label.
+  string from_account = 2;
+  // Bounded opaque local identifier or safe display label.
+  string to_account = 3;
+  AccountRotationReason reason = 4;
+  optional uint32 retry_after_seconds = 5;
+}
+
+// Every OAuth account for one provider is temporarily unavailable.
+message AccountPoolExhaustedEvent {
+  string provider = 1;
+  uint32 account_count = 2;
+  AccountRotationReason reason = 3;
+  optional uint32 retry_after_seconds = 4;
+}
+
 // A single committed event in per-thread sequence order.
 message EventEnvelope {
   string event_id = 1;
@@ -418,6 +448,8 @@ message EventEnvelope {
     CancelledEvent cancelled = 28;
     ThreadCreatedEvent thread_created = 29;
     QuestionAskedEvent question_asked = 30;
+    AccountRotationEvent account_rotation = 31;
+    AccountPoolExhaustedEvent account_pool_exhausted = 32;
   }
 }
 

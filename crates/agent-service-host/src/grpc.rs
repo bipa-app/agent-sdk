@@ -3853,6 +3853,55 @@ fn map_terminal_reason(reason: &agent_sdk_foundation::TerminalReason) -> pb::Ter
     }
 }
 
+const fn map_account_rotation_reason(
+    reason: agent_sdk_foundation::AccountRotationReason,
+) -> pb::AccountRotationReason {
+    use agent_sdk_foundation::AccountRotationReason;
+
+    match reason {
+        AccountRotationReason::RateLimited => pb::AccountRotationReason::RateLimited,
+        AccountRotationReason::AuthenticationFailed => {
+            pb::AccountRotationReason::AuthenticationFailed
+        }
+        AccountRotationReason::RefreshFailed => pb::AccountRotationReason::RefreshFailed,
+        _ => pb::AccountRotationReason::Unknown,
+    }
+}
+
+fn map_account_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelope::Event> {
+    match event {
+        AgentEvent::AccountRotation {
+            provider,
+            from_account,
+            to_account,
+            reason,
+            retry_after_seconds,
+        } => Ok(pb::event_envelope::Event::AccountRotation(
+            pb::AccountRotationEvent {
+                provider: provider.clone(),
+                from_account: from_account.clone(),
+                to_account: to_account.clone(),
+                reason: map_account_rotation_reason(*reason).into(),
+                retry_after_seconds: *retry_after_seconds,
+            },
+        )),
+        AgentEvent::AccountPoolExhausted {
+            provider,
+            account_count,
+            reason,
+            retry_after_seconds,
+        } => Ok(pb::event_envelope::Event::AccountPoolExhausted(
+            pb::AccountPoolExhaustedEvent {
+                provider: provider.clone(),
+                account_count: *account_count,
+                reason: map_account_rotation_reason(*reason).into(),
+                retry_after_seconds: *retry_after_seconds,
+            },
+        )),
+        _ => Err(Status::internal("unsupported account event variant").into()),
+    }
+}
+
 fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelope::Event> {
     match event {
         AgentEvent::TurnComplete {
@@ -3923,6 +3972,9 @@ fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelo
             emitter_task_id: emitter_task_id.clone(),
             reason: reason.as_ref().map(map_terminal_reason),
         })),
+        AgentEvent::AccountRotation { .. } | AgentEvent::AccountPoolExhausted { .. } => {
+            map_account_event_payload(event)
+        }
         AgentEvent::ContextCompacted {
             original_count,
             new_count,
@@ -4276,8 +4328,8 @@ mod tests {
         ChatOutcome, ChatRequest, ChatResponse, StopReason, Tool, Usage,
     };
     use agent_sdk_foundation::{
-        AgentContinuation, AgentState, ContinuationEnvelope, ListenExecutionContext,
-        PendingToolCallInfo, QuestionAnswer, QuestionPayload,
+        AccountRotationReason, AgentContinuation, AgentState, ContinuationEnvelope,
+        ListenExecutionContext, PendingToolCallInfo, QuestionAnswer, QuestionPayload,
     };
     use agent_sdk_providers::LlmProvider;
     #[cfg(feature = "postgres")]
@@ -8848,6 +8900,69 @@ mod tests {
             .await?
             .into_inner();
         assert_eq!(ok.cancelled_task_ids, vec![task_id]);
+        Ok(())
+    }
+
+    #[test]
+    fn account_rotation_reason_maps_every_foundation_variant() {
+        assert_eq!(
+            map_account_rotation_reason(AccountRotationReason::RateLimited),
+            pb::AccountRotationReason::RateLimited,
+        );
+        assert_eq!(
+            map_account_rotation_reason(AccountRotationReason::AuthenticationFailed),
+            pb::AccountRotationReason::AuthenticationFailed,
+        );
+        assert_eq!(
+            map_account_rotation_reason(AccountRotationReason::RefreshFailed),
+            pb::AccountRotationReason::RefreshFailed,
+        );
+        assert_eq!(
+            map_account_rotation_reason(AccountRotationReason::Unknown),
+            pb::AccountRotationReason::Unknown,
+        );
+    }
+
+    #[test]
+    fn account_rotation_projects_exact_wire_fields() -> Result<()> {
+        let payload = map_event_payload(&AgentEvent::AccountRotation {
+            provider: "anthropic".to_owned(),
+            from_account: "acct-primary".to_owned(),
+            to_account: "acct-secondary".to_owned(),
+            reason: AccountRotationReason::AuthenticationFailed,
+            retry_after_seconds: Some(37),
+        })?;
+
+        let EventPayload::AccountRotation(rotation) = payload else {
+            bail!("AccountRotation must map to an AccountRotation event");
+        };
+        assert_eq!(rotation.provider, "anthropic");
+        assert_eq!(rotation.from_account, "acct-primary");
+        assert_eq!(rotation.to_account, "acct-secondary");
+        assert_eq!(
+            rotation.reason(),
+            pb::AccountRotationReason::AuthenticationFailed,
+        );
+        assert_eq!(rotation.retry_after_seconds, Some(37));
+        Ok(())
+    }
+
+    #[test]
+    fn account_pool_exhausted_projects_unknown_reason_without_retry_after() -> Result<()> {
+        let payload = map_event_payload(&AgentEvent::AccountPoolExhausted {
+            provider: "openai".to_owned(),
+            account_count: 4,
+            reason: AccountRotationReason::Unknown,
+            retry_after_seconds: None,
+        })?;
+
+        let EventPayload::AccountPoolExhausted(exhausted) = payload else {
+            bail!("AccountPoolExhausted must map to an AccountPoolExhausted event");
+        };
+        assert_eq!(exhausted.provider, "openai");
+        assert_eq!(exhausted.account_count, 4);
+        assert_eq!(exhausted.reason(), pb::AccountRotationReason::Unknown,);
+        assert_eq!(exhausted.retry_after_seconds, None);
         Ok(())
     }
 
