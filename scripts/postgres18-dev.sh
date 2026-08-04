@@ -3,8 +3,9 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-compose_file="$repo_root/compose.yml"
-service="postgres18"
+container="agent-sdk-postgres18"
+volume="agent-sdk-postgres18-data"
+image="postgres:18"
 database_url="postgres://agent_sdk:agent_sdk@127.0.0.1:55432/agent_sdk"
 cargo_home="${SQLX_DEV_CARGO_HOME:-${CARGO_HOME:-${TMPDIR:-/tmp}/agent-sdk-cargo-home}}"
 
@@ -12,13 +13,48 @@ cd "$repo_root"
 mkdir -p "$cargo_home"
 export CARGO_HOME="$cargo_home"
 
-run_compose() {
-  docker compose -f "$compose_file" "$@"
+# Any OCI runtime; `AGENT_SDK_CONTAINER_RUNTIME` selects one explicitly.
+#
+# Drives one container directly rather than through `compose`: a compose
+# provider is a separate install that no runtime guarantees, and a single
+# Postgres is not worth that dependency.
+runtime() {
+  if [ -n "${AGENT_SDK_CONTAINER_RUNTIME:-}" ]; then
+    printf '%s\n' "$AGENT_SDK_CONTAINER_RUNTIME"
+  elif command -v podman >/dev/null 2>&1; then
+    printf 'podman\n'
+  elif command -v docker >/dev/null 2>&1; then
+    printf 'docker\n'
+  else
+    echo "error: need podman or docker on PATH (or set AGENT_SDK_CONTAINER_RUNTIME)" >&2
+    exit 1
+  fi
+}
+rt="$(runtime)"
+
+container_exists() {
+  "$rt" container inspect "$container" >/dev/null 2>&1
+}
+
+start_postgres() {
+  if container_exists; then
+    # Already created: start it if stopped, otherwise leave it alone.
+    "$rt" start "$container" >/dev/null 2>&1 || true
+    return
+  fi
+  "$rt" volume create "$volume" >/dev/null 2>&1 || true
+  "$rt" run -d --name "$container" \
+    -e POSTGRES_DB=agent_sdk \
+    -e POSTGRES_USER=agent_sdk \
+    -e POSTGRES_PASSWORD=agent_sdk \
+    -p 55432:5432 \
+    -v "$volume:/var/lib/postgresql" \
+    "$image" >/dev/null
 }
 
 wait_for_postgres() {
-  run_compose up -d "$service"
-  until run_compose exec -T "$service" pg_isready -U agent_sdk -d agent_sdk >/dev/null 2>&1; do
+  start_postgres
+  until "$rt" exec "$container" pg_isready -U agent_sdk -d agent_sdk >/dev/null 2>&1; do
     sleep 1
   done
 }
@@ -43,17 +79,19 @@ command="${1:-}"
 
 case "$command" in
   up)
-    run_compose up -d "$service"
+    start_postgres
     ;;
   down)
-    run_compose down
+    # Stop and remove the container; the named volume survives, so `up` after
+    # `down` resumes with the same data.
+    "$rt" rm -f "$container" >/dev/null 2>&1 || true
     ;;
   wait)
     wait_for_postgres
     ;;
   psql)
     wait_for_postgres
-    run_compose exec "$service" psql -U agent_sdk -d agent_sdk
+    "$rt" exec -it "$container" psql -U agent_sdk -d agent_sdk
     ;;
   url)
     printf '%s\n' "$database_url"

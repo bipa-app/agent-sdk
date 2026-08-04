@@ -162,7 +162,7 @@ A self-contained Langfuse + OTel collector compose stack lives at
 `dev/observability/langfuse/`. From this repo:
 
 ```bash
-docker compose -f dev/observability/langfuse/docker-compose.yml up -d
+<runtime> compose -f dev/observability/langfuse/docker-compose.yml up -d
 ```
 
 For a downstream consumer (e.g. `bip`) the workspace ships a small CLI

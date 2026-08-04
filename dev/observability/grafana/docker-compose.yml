@@ -9,7 +9,7 @@ name: agent-sdk-grafana
 # collector scaled to zero.
 #
 # Bring it up directly with:
-#   docker compose -f dev/observability/grafana/docker-compose.yml up -d
+#   <runtime> compose -f dev/observability/grafana/docker-compose.yml up -d
 #
 # Tempo HTTP:    http://localhost:3200
 # Prometheus:    http://localhost:9090

@@ -52,27 +52,48 @@ URLs (when up):
 USAGE
 }
 
+# Any OCI runtime; `AGENT_SDK_CONTAINER_RUNTIME` selects one explicitly.
+# These stacks are genuinely multi-service, so unlike the single Postgres in
+# `scripts/postgres18-dev.sh` they do need a compose provider, which is a
+# separate install.
+COMPOSE=()
 require_compose() {
-  if ! command -v docker >/dev/null 2>&1; then
-    echo "error: docker not found on PATH" >&2
-    exit 1
+  [ ${#COMPOSE[@]} -gt 0 ] && return 0
+  local candidates rt
+  if [ -n "${AGENT_SDK_CONTAINER_RUNTIME:-}" ]; then
+    candidates=("${AGENT_SDK_CONTAINER_RUNTIME}")
+  else
+    candidates=(podman docker)
   fi
-  if ! docker compose version >/dev/null 2>&1; then
-    echo "error: docker compose plugin not available" >&2
-    exit 1
-  fi
+  for rt in "${candidates[@]}"; do
+    command -v "$rt" >/dev/null 2>&1 || continue
+    if "$rt" compose version >/dev/null 2>&1; then
+      COMPOSE=("$rt" compose)
+      return 0
+    fi
+  done
+  for rt in podman-compose docker-compose; do
+    if command -v "$rt" >/dev/null 2>&1; then
+      COMPOSE=("$rt")
+      return 0
+    fi
+  done
+  echo "error: no working compose provider found." >&2
+  echo "       tried: podman compose, docker compose, podman-compose, docker-compose" >&2
+  echo "       install one, or set AGENT_SDK_CONTAINER_RUNTIME." >&2
+  exit 1
 }
 
 up_langfuse() {
   require_compose
   echo ">> bringing up Langfuse stack (project: agent-sdk-langfuse)"
-  docker compose -f "${LANGFUSE_COMPOSE}" up -d
+  "${COMPOSE[@]}" -f "${LANGFUSE_COMPOSE}" up -d
 }
 
 up_grafana() {
   require_compose
   echo ">> bringing up Grafana stack (project: agent-sdk-grafana)"
-  docker compose -f "${GRAFANA_COMPOSE}" up -d
+  "${COMPOSE[@]}" -f "${GRAFANA_COMPOSE}" up -d
 }
 
 up_both() {
@@ -81,19 +102,19 @@ up_both() {
   # `--scale otel-collector=0` keeps the Langfuse collector dormant so
   # the Grafana stack's collector can own the OTLP host ports and fan
   # out to Langfuse via host.docker.internal:4000.
-  docker compose -f "${LANGFUSE_COMPOSE}" up -d --scale otel-collector=0
+  "${COMPOSE[@]}" -f "${LANGFUSE_COMPOSE}" up -d --scale otel-collector=0
 
   echo ">> bringing up Grafana stack with Langfuse fan-out enabled"
   LANGFUSE_OTLP_ENDPOINT="${LANGFUSE_OTLP_ENDPOINT:-${LANGFUSE_OTLP_ENDPOINT_DEFAULT}}" \
-    docker compose -f "${GRAFANA_COMPOSE}" up -d
+    "${COMPOSE[@]}" -f "${GRAFANA_COMPOSE}" up -d
 }
 
 down_all() {
   require_compose
   echo ">> stopping Grafana stack (if running)"
-  docker compose -f "${GRAFANA_COMPOSE}" down || true
+  "${COMPOSE[@]}" -f "${GRAFANA_COMPOSE}" down || true
   echo ">> stopping Langfuse stack (if running)"
-  docker compose -f "${LANGFUSE_COMPOSE}" down || true
+  "${COMPOSE[@]}" -f "${LANGFUSE_COMPOSE}" down || true
 }
 
 main() {

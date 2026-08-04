@@ -33,11 +33,11 @@ If `storage.postgres.database_url` is omitted, the host falls back to
 
 ## Local prerequisites
 
-For local development, `compose.yml` starts a compatible Postgres
-instance:
+For local development, the helper script starts a compatible Postgres
+instance using whichever container runtime is on PATH:
 
 ```bash
-docker compose up postgres18
+scripts/postgres18-dev.sh up
 ```
 
 Default connection string:
