@@ -3854,6 +3854,7 @@ mod tests {
             thinking: ThinkingPolicy::default(),
             thinking_display: None,
             tools_fn: None,
+            tool_input_sanitizer: None,
             policy: RuntimePolicy::server_default(),
         }
     }
@@ -4543,7 +4544,7 @@ mod tests {
                 &id,
                 &worker,
                 &lease,
-                vec![ChildSpawnSpec { max_attempts: 1 }],
+                vec![ChildSpawnSpec::new(1)],
                 payload,
                 None,
                 Vec::new(),
@@ -7455,7 +7456,7 @@ mod tests {
                 &child_root.id,
                 &worker,
                 &lease,
-                vec![agent_server::journal::task::ChildSpawnSpec { max_attempts: 3 }],
+                vec![agent_server::journal::task::ChildSpawnSpec::new(3)],
                 pending_call_suspension_with_tier(
                     &child_root.thread_id,
                     "probe",
@@ -8350,7 +8351,7 @@ mod tests {
                 &child_root.id,
                 &worker,
                 &lease,
-                vec![ChildSpawnSpec { max_attempts: 3 }],
+                vec![ChildSpawnSpec::new(3)],
                 pending_call_suspension(&child_root.thread_id, "probe"),
                 None,
                 Vec::new(),
@@ -9567,7 +9568,7 @@ mod tests {
                 &child_root.id,
                 &root_worker,
                 &root_lease,
-                vec![agent_server::journal::task::ChildSpawnSpec { max_attempts: 3 }],
+                vec![agent_server::journal::task::ChildSpawnSpec::new(3)],
                 pending_call_suspension_with_tier(
                     &child_root.thread_id,
                     "probe",

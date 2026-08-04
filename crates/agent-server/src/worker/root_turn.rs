@@ -34,6 +34,8 @@
 //! [`spawn_tool_children`]: crate::journal::store::AgentTaskStore::spawn_tool_children
 //! [`TaskState::WaitingOnChildren`]: crate::journal::task_state::TaskState::WaitingOnChildren
 
+#[cfg(test)]
+use agent_sdk_foundation::ThreadId;
 use agent_sdk_foundation::audit::AuditProvenance;
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::llm::{self, ChatRequest};
@@ -55,7 +57,10 @@ use uuid::Uuid;
 
 use super::activity::{ActivityBeacon, ActivityTrackingEventRepo};
 use super::connectivity::ConnectivityWaitRegistry;
-use super::definition::{AgentDefinition, ChildJoinPolicy, ThinkingPolicy};
+use super::definition::{
+    AgentDefinition, ChildJoinPolicy, ThinkingPolicy, ToolInputPreflightContext,
+    ToolInputPreflightOutcome, ToolInputSanitizer,
+};
 use crate::journal::checkpoint::CheckpointKind;
 use crate::journal::checkpoint_store::CheckpointStore;
 use crate::journal::commit::{
@@ -5306,6 +5311,96 @@ async fn guard_against_duplicate_suspension(
     Ok(())
 }
 
+struct PreflightCompletion {
+    pending_index: usize,
+    result: ToolResult,
+}
+
+fn preflight_tool_inputs(
+    response: &mut llm::ChatResponse,
+    sanitizer: Option<&ToolInputSanitizer>,
+    context: &ToolInputPreflightContext<'_>,
+) -> Result<Vec<PreflightCompletion>> {
+    let Some(sanitizer) = sanitizer else {
+        return Ok(Vec::new());
+    };
+    let mut pending_index = 0;
+    let mut completions = Vec::new();
+    for block in &mut response.content {
+        if let llm::ContentBlock::ToolUse { name, input, .. } = block {
+            let outcome = sanitizer(context, name, input).with_context(|| {
+                format!("pre-suspension input preflight failed for tool {name}")
+            })?;
+            if let ToolInputPreflightOutcome::Complete(result) = outcome {
+                completions.push(PreflightCompletion {
+                    pending_index,
+                    result,
+                });
+            }
+            pending_index += 1;
+        }
+    }
+    Ok(completions)
+}
+
+fn attach_precompleted_results(
+    specs: &mut [ChildSpawnSpec],
+    completions: &[PreflightCompletion],
+) -> Result<()> {
+    for completion in completions {
+        let spec = specs
+            .get_mut(completion.pending_index)
+            .context("preflight completion has no matching child spec")?;
+        spec.precompleted_result = Some(
+            serde_json::to_value(&completion.result)
+                .context("serialize preflight tool result for atomic spawn")?,
+        );
+    }
+    Ok(())
+}
+
+fn preflight_end_events(
+    preflight_calls: &[(usize, PendingToolCallInfo, ToolResult)],
+) -> Vec<AgentEvent> {
+    preflight_calls
+        .iter()
+        .map(|(_, call, result)| {
+            AgentEvent::tool_call_end(&call.id, &call.name, &call.display_name, result.clone())
+        })
+        .collect()
+}
+
+fn complete_preflight_children(
+    deps: &RootTurnDeps<'_>,
+    parent_task: AgentTask,
+    child_tasks: Vec<AgentTask>,
+    preflight_calls: Vec<(usize, PendingToolCallInfo, ToolResult)>,
+) -> Result<(AgentTask, Vec<AgentTask>)> {
+    let had_preflight = !preflight_calls.is_empty();
+    for (pending_index, _call, result) in preflight_calls {
+        let child = child_tasks
+            .get(pending_index)
+            .context("preflight completion has no matching child task")?;
+        ensure!(
+            child.status == TaskStatus::Completed,
+            "preflight child entered store as {:?}, expected Completed",
+            child.status
+        );
+        let expected =
+            serde_json::to_value(&result).context("serialize expected preflight tool result")?;
+        ensure!(
+            child.result_payload.as_ref() == Some(&expected),
+            "preflight child durable result does not match its completion"
+        );
+    }
+    if had_preflight {
+        // The spawn primitive publishes the precompleted boundary under its
+        // own task/event transaction before returning this parent.
+        deps.wake_workers_for_batch();
+    }
+    Ok((parent_task, child_tasks))
+}
+
 /// Suspend execution at the tool boundary.
 ///
 /// Called when the LLM response contains tool-use blocks. This path:
@@ -5323,7 +5418,7 @@ async fn guard_against_duplicate_suspension(
 async fn suspend_at_tool_boundary(
     inputs: RootWorkerInputs,
     user_input: &super::user_input::UserInput,
-    response: llm::ChatResponse,
+    mut response: llm::ChatResponse,
     attempt: TurnAttempt,
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
@@ -5335,6 +5430,15 @@ async fn suspend_at_tool_boundary(
     // own attempt before the winner's already-committed tool ids look like
     // hostile history collisions. This guard never admits a new suspension.
     guard_against_duplicate_suspension(&inputs, &attempt, deps, &close_ctx, now).await?;
+    let preflight_context = ToolInputPreflightContext {
+        thread_id: &inputs.bootstrap.thread_id,
+        caller_metadata: inputs.bootstrap.task.caller_metadata.as_ref(),
+    };
+    let preflight_completions = preflight_tool_inputs(
+        &mut response,
+        inputs.definition().tool_input_sanitizer(),
+        &preflight_context,
+    )?;
 
     let continuation = build_continuation(&inputs, &response)
         .await
@@ -5359,7 +5463,7 @@ async fn suspend_at_tool_boundary(
         initial_suspended_messages(&close_ctx.staged_prefix, user_input, &response);
 
     // 4. One child task per tool call, inheriting the configured retry budget.
-    let specs = child_spawn_specs_for_response(&response, &inputs);
+    let mut specs = child_spawn_specs_for_response(&response, &inputs);
 
     // Build content events (Thinking) from the tool-call response so
     // replay observers see the model's reasoning before tool dispatch.
@@ -5368,37 +5472,69 @@ async fn suspend_at_tool_boundary(
     // Build ToolCallStart events before continuation is moved.
     let tool_call_events = build_tool_call_start_events(&continuation);
 
-    if let Some(questions) = durable_questions(&continuation) {
-        let draft = suspended_messages.clone();
-        let mut events = content_events;
-        events.extend(tool_call_events);
-        return park_initial_question(
-            &inputs,
-            deps,
-            QuestionSuspension {
-                payload: SuspensionPayload {
-                    continuation,
-                    suspended_messages,
-                    child_join_policy: crate::ChildJoinPolicy::default(),
+    if preflight_completions.is_empty() {
+        if let Some(questions) = durable_questions(&continuation) {
+            let draft = suspended_messages.clone();
+            let mut events = content_events;
+            events.extend(tool_call_events);
+            return park_initial_question(
+                &inputs,
+                deps,
+                QuestionSuspension {
+                    payload: SuspensionPayload {
+                        continuation,
+                        suspended_messages,
+                        child_join_policy: crate::ChildJoinPolicy::default(),
+                    },
+                    draft,
+                    questions,
+                    events,
+                    delivered_injections: close_ctx.delivered_injections.clone(),
                 },
-                draft,
-                questions,
-                events,
-                delivered_injections: close_ctx.delivered_injections.clone(),
-            },
-            close_ctx,
-            now,
-        )
-        .await;
+                close_ctx,
+                now,
+            )
+            .await;
+        }
     }
+
+    let preflight_calls = preflight_completions
+        .iter()
+        .map(|completion| {
+            let call = continuation
+                .payload
+                .pending_tool_calls
+                .get(completion.pending_index)
+                .context("preflight completion index is outside pending tool calls")?;
+            Ok((
+                completion.pending_index,
+                call.clone(),
+                completion.result.clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    attach_precompleted_results(&mut specs, &preflight_completions)?;
 
     // 4.b Consult the per-call subagent-spawn selector (if wired).
     //     A `SingleSubagent` / `MultiSubagent` verdict re-routes
     //     section 5 onto `spawn_subagent_invocation` /
     //     `spawn_subagent_batch_invocations`; everything else falls
     //     through to the regular `spawn_tool_children` path.
-    let routing =
-        classify_batch_for_inputs(&inputs, deps, &continuation.payload.pending_tool_calls).await?;
+    let routing = classify_batch_for_inputs(
+        &inputs,
+        deps,
+        &continuation.payload.pending_tool_calls,
+        &preflight_calls,
+    )
+    .await?;
+    let mut suspension_events = content_events;
+    suspension_events.extend(tool_call_events);
+    let mut boundary_events = if preflight_calls.is_empty() {
+        Vec::new()
+    } else {
+        suspension_events.clone()
+    };
+    boundary_events.extend(preflight_end_events(&preflight_calls));
 
     // 5. Atomically spawn children and park the parent.
     //
@@ -5411,7 +5547,7 @@ async fn suspend_at_tool_boundary(
         suspended_messages,
         child_join_policy: inputs.definition().policy.child_join_policy,
     };
-    let (parent_task, child_tasks) = apply_batch_routing(
+    let (parent_task, child_tasks, atomic_committed) = apply_batch_routing(
         &inputs,
         deps,
         BatchRoutingApplication {
@@ -5419,10 +5555,12 @@ async fn suspend_at_tool_boundary(
             batch: SuspendedBatch {
                 payload,
                 delivered_injection_ids: close_ctx.delivered_injections.clone(),
+                boundary_events,
             },
             specs,
             reattach: Vec::new(),
             tool_children_context: "spawn tool children",
+            wake_workers: preflight_calls.is_empty(),
         },
         now,
     )
@@ -5441,20 +5579,20 @@ async fn suspend_at_tool_boundary(
     )
     .await;
 
-    // `Start` was committed by `execute_root_turn` before streaming so
-    // the per-delta TextDelta / ThinkingDelta events have a parent in
-    // the journal.  This batch carries only the consolidated content
-    // events (Thinking) plus the ToolCallStart events emitted AFTER
-    // spawn_tool_children.  Since spawn_tool_children is CAS-guarded
-    // (only the lease-holder can succeed), only the winning worker
-    // writes these events.
-    let mut suspension_events = content_events;
-    suspension_events.extend(tool_call_events);
-    let suspension_committed = deps
-        .event_repo
-        .commit_event_batch(&inputs.bootstrap.thread_id, suspension_events, now)
-        .await
-        .context("commit suspension events")?;
+    // Preflight-completed children can make the parent runnable as soon as
+    // they are published. Their ToolCallEnd events were therefore committed
+    // in the same boundary transaction as the children and ToolCallStart.
+    let suspension_committed = if preflight_calls.is_empty() {
+        deps.event_repo
+            .commit_event_batch(&inputs.bootstrap.thread_id, suspension_events, now)
+            .await
+            .context("commit suspension events")?
+    } else {
+        atomic_committed
+    };
+
+    let (parent_task, child_tasks) =
+        complete_preflight_children(deps, parent_task, child_tasks, preflight_calls)?;
 
     // Prepend the durable per-turn admission events (`UserInput`
     // when present + `Start`) committed before streaming so the
@@ -5497,11 +5635,12 @@ async fn classify_batch_for_inputs(
     inputs: &RootWorkerInputs,
     deps: &RootTurnDeps<'_>,
     pending: &[PendingToolCallInfo],
+    preflight_calls: &[(usize, PendingToolCallInfo, ToolResult)],
 ) -> Result<super::subagent_spawn_selector::BatchRouting> {
     let Some(selector) = deps.subagent_spawn_selector else {
         return Ok(super::subagent_spawn_selector::BatchRouting::AllTools);
     };
-    let decisions = selector
+    let mut decisions = selector
         .decide(&inputs.bootstrap.thread_id, pending)
         .await
         .with_context(|| {
@@ -5518,6 +5657,12 @@ async fn classify_batch_for_inputs(
             inputs.bootstrap.thread_id,
         );
         return Ok(super::subagent_spawn_selector::BatchRouting::AllTools);
+    }
+    for (pending_index, _, _) in preflight_calls {
+        let decision = decisions
+            .get_mut(*pending_index)
+            .context("preflight completion index is outside routing decisions")?;
+        *decision = super::subagent_spawn_selector::SubagentSpawnDecision::SpawnAsTool;
     }
     Ok(super::subagent_spawn_selector::classify_batch(decisions))
 }
@@ -5638,6 +5783,7 @@ async fn spawn_mixed_batch_children(
     routing: MixedRoutingInputs,
     payload: SuspensionPayload,
     delivered_injection_ids: Vec<AgentTaskId>,
+    boundary_events: Vec<AgentEvent>,
     now: OffsetDateTime,
 ) -> Result<super::subagent::SpawnedMixedBatch> {
     let MixedRoutingInputs {
@@ -5661,9 +5807,10 @@ async fn spawn_mixed_batch_children(
 
     let mut tool_children = Vec::with_capacity(tool_indices.len());
     for index in tool_indices {
-        let spec = *specs
+        let spec = specs
             .get(index)
-            .with_context(|| format!("tool spawn_index {index} has no child spawn spec"))?;
+            .with_context(|| format!("tool spawn_index {index} has no child spawn spec"))?
+            .clone();
         tool_children.push(crate::journal::store::ToolChildSpawn {
             spawn_index: u32::try_from(index).context("tool spawn_index exceeds u32")?,
             spec,
@@ -5684,6 +5831,7 @@ async fn spawn_mixed_batch_children(
         &inputs.bootstrap.lease_id,
         super::subagent::MixedChildrenRequest {
             delivered_injection_ids,
+            boundary_events,
             subagents,
             tool_children,
             reattach: Vec::new(),
@@ -5738,6 +5886,7 @@ async fn child_tool_traceparent(deps: &RootTurnDeps<'_>, task_id: &AgentTaskId) 
 struct SuspendedBatch {
     payload: SuspensionPayload,
     delivered_injection_ids: Vec<AgentTaskId>,
+    boundary_events: Vec<AgentEvent>,
 }
 
 struct BatchRoutingApplication {
@@ -5746,6 +5895,7 @@ struct BatchRoutingApplication {
     specs: Vec<ChildSpawnSpec>,
     reattach: Vec<ReattachedChild>,
     tool_children_context: &'static str,
+    wake_workers: bool,
 }
 async fn apply_reattached_batch_routing(
     inputs: &RootWorkerInputs,
@@ -5754,11 +5904,13 @@ async fn apply_reattached_batch_routing(
     batch: SuspendedBatch,
     specs: Vec<ChildSpawnSpec>,
     reattach: Vec<ReattachedChild>,
+    wake_workers: bool,
     now: OffsetDateTime,
-) -> Result<(AgentTask, Vec<AgentTask>)> {
+) -> Result<(AgentTask, Vec<AgentTask>, Vec<CommittedEvent>)> {
     let SuspendedBatch {
         payload,
         delivered_injection_ids,
+        boundary_events,
     } = batch;
     let (subagents, tool_children) = match routing {
         super::subagent_spawn_selector::BatchRouting::AllTools => {
@@ -5799,7 +5951,7 @@ async fn apply_reattached_batch_routing(
                 .map(|index| {
                     let spec = specs
                         .get(index)
-                        .copied()
+                        .cloned()
                         .with_context(|| format!("tool spawn_index {index} has no spawn spec"))?;
                     Ok(crate::journal::store::ToolChildSpawn {
                         spawn_index: u32::try_from(index)
@@ -5822,6 +5974,7 @@ async fn apply_reattached_batch_routing(
         &inputs.bootstrap.lease_id,
         super::subagent::MixedChildrenRequest {
             delivered_injection_ids,
+            boundary_events,
             subagents,
             tool_children,
             reattach,
@@ -5840,8 +5993,10 @@ async fn apply_reattached_batch_routing(
         .collect();
     children.extend(spawned.tool_children);
     children.sort_by_key(|child| child.spawn_index);
-    deps.wake_workers_for_batch();
-    Ok((spawned.parent_task, children))
+    if wake_workers {
+        deps.wake_workers_for_batch();
+    }
+    Ok((spawned.parent_task, children, spawned.committed_events))
 }
 
 fn reattached_subagent_entry(
@@ -5894,19 +6049,21 @@ async fn apply_batch_routing(
     deps: &RootTurnDeps<'_>,
     application: BatchRoutingApplication,
     now: OffsetDateTime,
-) -> Result<(AgentTask, Vec<AgentTask>)> {
+) -> Result<(AgentTask, Vec<AgentTask>, Vec<CommittedEvent>)> {
     let BatchRoutingApplication {
         routing,
         batch,
         specs,
         reattach,
         tool_children_context,
+        wake_workers,
     } = application;
     let SuspendedBatch {
         payload,
         delivered_injection_ids,
+        boundary_events,
     } = batch;
-    if !reattach.is_empty() {
+    if !reattach.is_empty() || !boundary_events.is_empty() {
         return apply_reattached_batch_routing(
             inputs,
             deps,
@@ -5914,9 +6071,11 @@ async fn apply_batch_routing(
             SuspendedBatch {
                 payload,
                 delivered_injection_ids,
+                boundary_events,
             },
             specs,
             reattach,
+            wake_workers,
             now,
         )
         .await;
@@ -5934,7 +6093,11 @@ async fn apply_batch_routing(
                 now,
             )
             .await?;
-            (spawned.parent_task, vec![spawned.invocation_task])
+            (
+                spawned.parent_task,
+                vec![spawned.invocation_task],
+                Vec::new(),
+            )
         }
         super::subagent_spawn_selector::BatchRouting::MultiSubagent { plans } => {
             let batch = spawn_multi_subagent_invocations(
@@ -5947,7 +6110,7 @@ async fn apply_batch_routing(
             )
             .await?;
             let invocation_tasks = invocation_tasks(batch.invocations);
-            (batch.parent_task, invocation_tasks)
+            (batch.parent_task, invocation_tasks, Vec::new())
         }
         super::subagent_spawn_selector::BatchRouting::Mixed {
             plans,
@@ -5963,17 +6126,45 @@ async fn apply_batch_routing(
                 },
                 payload,
                 delivered_injection_ids,
+                boundary_events,
                 now,
             )
             .await?;
             let mut children = invocation_tasks(batch.invocations);
             children.extend(batch.tool_children);
             children.sort_by_key(|child| child.spawn_index);
-            (batch.parent_task, children)
+            (batch.parent_task, children, batch.committed_events)
+        }
+        super::subagent_spawn_selector::BatchRouting::AllTools if !boundary_events.is_empty() => {
+            // Preflight-completed tools need the same atomic row+event gate as
+            // mixed batches; otherwise the parent can resume before its
+            // ToolCallEnd is durable. Reuse the mixed primitive with zero
+            // subagents rather than widening the legacy tool-only API.
+            let tool_indices = (0..specs.len()).collect();
+            let batch = spawn_mixed_batch_children(
+                inputs,
+                deps,
+                MixedRoutingInputs {
+                    plans: Vec::new(),
+                    tool_indices,
+                    specs,
+                },
+                payload,
+                delivered_injection_ids,
+                boundary_events,
+                now,
+            )
+            .await?;
+            (
+                batch.parent_task,
+                batch.tool_children,
+                batch.committed_events,
+            )
         }
         super::subagent_spawn_selector::BatchRouting::AllTools => {
             let child_otel_traceparent = child_tool_traceparent(deps, task_id).await;
-            deps.task_store
+            let (parent, children) = deps
+                .task_store
                 .spawn_tool_children(
                     task_id,
                     &inputs.bootstrap.worker_id,
@@ -5985,7 +6176,8 @@ async fn apply_batch_routing(
                     now,
                 )
                 .await
-                .context(tool_children_context)?
+                .context(tool_children_context)?;
+            (parent, children, Vec::new())
         }
     };
 
@@ -5994,7 +6186,9 @@ async fn apply_batch_routing(
     // tick instead of the next `acquisition_interval` poll, and so every
     // child of the batch starts together rather than staggered across
     // successive ticks. The ticker remains the lost-wakeup backstop.
-    deps.wake_workers_for_batch();
+    if wake_workers {
+        deps.wake_workers_for_batch();
+    }
     Ok(spawned)
 }
 
@@ -7076,13 +7270,22 @@ fn build_resumed_draft_messages(
 async fn suspend_resumed_turn(
     inputs: RootWorkerInputs,
     prior: ResumeSuspension<'_>,
-    response: llm::ChatResponse,
+    mut response: llm::ChatResponse,
     attempt: TurnAttempt,
     close: ResumeCloseContext<'_>,
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<RootTurnOutcome> {
     let task_id = &inputs.bootstrap.task_id;
+    let preflight_context = ToolInputPreflightContext {
+        thread_id: &inputs.bootstrap.thread_id,
+        caller_metadata: inputs.bootstrap.task.caller_metadata.as_ref(),
+    };
+    let preflight_completions = preflight_tool_inputs(
+        &mut response,
+        inputs.definition().tool_input_sanitizer(),
+        &preflight_context,
+    )?;
 
     // Validate before closing this attempt: malformed provider identities must
     // not leave a successful attempt row without matching durable suspension.
@@ -7115,47 +7318,77 @@ async fn suspend_resumed_turn(
     new_suspended.push(build_full_assistant_message(&response));
 
     // One child task per new tool call, inheriting the configured retry budget.
-    let specs = child_spawn_specs_for_response(&response, &inputs);
+    let mut specs = child_spawn_specs_for_response(&response, &inputs);
 
     // Build content events (Thinking) from the resume response.
     let content_events = build_content_events(&response, task_id, close.content_ids);
 
     // Build ToolCallStart events before continuation is moved.
     let tool_call_events = build_tool_call_start_events(&new_continuation);
-
-    if let Some(questions) = durable_questions(&new_continuation) {
-        let draft = new_suspended.clone();
-        let mut events = content_events;
-        events.extend(tool_call_events);
-        let (parent_task, committed_events) = park_on_question(
-            &inputs,
-            deps,
-            QuestionSuspension {
-                payload: SuspensionPayload {
-                    continuation: new_continuation,
-                    suspended_messages: new_suspended,
-                    child_join_policy: crate::ChildJoinPolicy::default(),
+    if preflight_completions.is_empty() {
+        if let Some(questions) = durable_questions(&new_continuation) {
+            let draft = new_suspended.clone();
+            let mut events = content_events;
+            events.extend(tool_call_events);
+            let (parent_task, committed_events) = park_on_question(
+                &inputs,
+                deps,
+                QuestionSuspension {
+                    payload: SuspensionPayload {
+                        continuation: new_continuation,
+                        suspended_messages: new_suspended,
+                        child_join_policy: crate::ChildJoinPolicy::default(),
+                    },
+                    draft,
+                    questions,
+                    events,
+                    delivered_injections: close.delivered_injections.to_vec(),
                 },
-                draft,
-                questions,
-                events,
-                delivered_injections: close.delivered_injections.to_vec(),
-            },
-            now,
-        )
-        .await?;
-        return Ok(RootTurnOutcome::Suspended {
-            parent_task,
-            child_tasks: Vec::new(),
-            committed_events,
-        });
+                now,
+            )
+            .await?;
+            return Ok(RootTurnOutcome::Suspended {
+                parent_task,
+                child_tasks: Vec::new(),
+                committed_events,
+            });
+        }
     }
+
+    let preflight_calls = preflight_completions
+        .iter()
+        .map(|completion| {
+            let call = new_continuation
+                .payload
+                .pending_tool_calls
+                .get(completion.pending_index)
+                .context("preflight completion index is outside pending tool calls")?;
+            Ok((
+                completion.pending_index,
+                call.clone(),
+                completion.result.clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    attach_precompleted_results(&mut specs, &preflight_completions)?;
 
     // Consult the per-call subagent-spawn selector — same contract
     // as `suspend_at_tool_boundary`.
-    let routing =
-        classify_batch_for_inputs(&inputs, deps, &new_continuation.payload.pending_tool_calls)
-            .await?;
+    let routing = classify_batch_for_inputs(
+        &inputs,
+        deps,
+        &new_continuation.payload.pending_tool_calls,
+        &preflight_calls,
+    )
+    .await?;
+    let mut suspension_events = content_events;
+    suspension_events.extend(tool_call_events);
+    let mut boundary_events = if preflight_calls.is_empty() {
+        Vec::new()
+    } else {
+        suspension_events.clone()
+    };
+    boundary_events.extend(preflight_end_events(&preflight_calls));
 
     // Clone the new accumulated `suspended_messages` so we can mirror
     // them into the projection's draft slot once the spawn succeeds.
@@ -7166,7 +7399,7 @@ async fn suspend_resumed_turn(
         suspended_messages: new_suspended,
         child_join_policy: inputs.definition().policy.child_join_policy,
     };
-    let (parent_task, child_tasks) = apply_batch_routing(
+    let (parent_task, child_tasks, atomic_committed) = apply_batch_routing(
         &inputs,
         deps,
         BatchRoutingApplication {
@@ -7174,10 +7407,12 @@ async fn suspend_resumed_turn(
             batch: SuspendedBatch {
                 payload,
                 delivered_injection_ids: close.delivered_injections.to_vec(),
+                boundary_events,
             },
             specs,
             reattach: Vec::new(),
             tool_children_context: "re-spawn tool children on resume",
+            wake_workers: preflight_calls.is_empty(),
         },
         now,
     )
@@ -7197,17 +7432,18 @@ async fn suspend_resumed_turn(
     )
     .await;
 
-    // Commit content events (Thinking) followed by ToolCallStart events.
-    let mut suspension_events = content_events;
-    suspension_events.extend(tool_call_events);
-    let committed_events = if suspension_events.is_empty() {
-        Vec::new()
-    } else {
+    // A preflight-completed child can wake the parent immediately, so
+    // its boundary events were committed with the spawn.
+    let committed_events = if preflight_calls.is_empty() {
         deps.event_repo
             .commit_event_batch(&inputs.bootstrap.thread_id, suspension_events, now)
             .await
-            .context("commit resume suspension events")?
+            .context("commit resumed suspension events")?
+    } else {
+        atomic_committed
     };
+    let (parent_task, child_tasks) =
+        complete_preflight_children(deps, parent_task, child_tasks, preflight_calls)?;
 
     Ok(RootTurnOutcome::Suspended {
         parent_task,
@@ -7993,7 +8229,6 @@ async fn run_steering_exchange(
             continuation,
             suspended_messages,
             child_join_policy,
-            steering_message,
             surviving: interim.surviving,
             response,
             content_ids,
@@ -8140,7 +8375,6 @@ struct SteeringRepark {
     continuation: AgentContinuation,
     suspended_messages: Vec<llm::Message>,
     child_join_policy: ChildJoinPolicy,
-    steering_message: llm::Message,
     surviving: Vec<SurvivingChild>,
     response: llm::ChatResponse,
     content_ids: ContentIds,
@@ -8157,6 +8391,7 @@ struct PreparedSteeringRepark {
     reattach: Vec<ReattachedChild>,
     suspended_messages: Vec<llm::Message>,
     events: Vec<AgentEvent>,
+    preflight_calls: Vec<(usize, PendingToolCallInfo, ToolResult)>,
 }
 
 async fn prepare_steering_repark(
@@ -8169,17 +8404,29 @@ async fn prepare_steering_repark(
         continuation: prior,
         suspended_messages,
         child_join_policy,
-        steering_message,
         surviving,
-        response,
+        mut response,
         content_ids,
         attempt,
         success_usage,
         evidence,
     } = repark;
+    let dispatch_provider_tools = response_requests_tool_dispatch(&response);
+    let preflight_context = ToolInputPreflightContext {
+        thread_id: &inputs.bootstrap.thread_id,
+        caller_metadata: inputs.bootstrap.task.caller_metadata.as_ref(),
+    };
+    let preflight_completions = if dispatch_provider_tools {
+        preflight_tool_inputs(
+            &mut response,
+            inputs.definition().tool_input_sanitizer(),
+            &preflight_context,
+        )?
+    } else {
+        Vec::new()
+    };
 
     let mut continuation = build_steering_continuation(inputs, &prior, &response, Vec::new());
-    let dispatch_provider_tools = response_requests_tool_dispatch(&response);
     if !dispatch_provider_tools {
         // The stop reason refused dispatch (MaxTokens truncation,
         // StopSequence, EndTurn-with-tool-use, unknown): no child will
@@ -8240,12 +8487,28 @@ async fn prepare_steering_repark(
         now,
     )
     .await?;
+    let preflight_calls = preflight_completions
+        .iter()
+        .map(|completion| {
+            let call = continuation
+                .payload
+                .pending_tool_calls
+                .get(completion.pending_index)
+                .context("preflight completion index is outside pending tool calls")?;
+            Ok((
+                completion.pending_index,
+                call.clone(),
+                completion.result.clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let routing = if dispatch_provider_tools {
         Some(
             classify_batch_for_inputs(
                 inputs,
                 deps,
                 &continuation.payload.pending_tool_calls[..emitted_count],
+                &preflight_calls,
             )
             .await
             .context("classify child-resume tool batch")?,
@@ -8253,13 +8516,13 @@ async fn prepare_steering_repark(
     } else {
         None
     };
-    let specs = child_spawn_specs_for_response(&response, inputs);
+    let mut specs = child_spawn_specs_for_response(&response, inputs);
+    attach_precompleted_results(&mut specs, &preflight_completions)?;
 
     let assistant_message =
         build_steering_assistant_message(&response, reattach_blocks, routing.is_some());
     let mut suspended = Vec::with_capacity(suspended_messages.len() + 2);
     suspended.extend(suspended_messages);
-    suspended.push(steering_message);
     suspended.push(assistant_message);
     let payload = SuspensionPayload {
         continuation,
@@ -8273,6 +8536,7 @@ async fn prepare_steering_repark(
         reattach,
         suspended_messages: suspended,
         events,
+        preflight_calls,
     })
 }
 
@@ -8294,9 +8558,16 @@ async fn repark_after_steering_exchange(
         reattach,
         suspended_messages,
         events,
+        preflight_calls,
     } = prepare_steering_repark(inputs, deps, repark, now).await?;
+    let mut boundary_events = if preflight_calls.is_empty() {
+        Vec::new()
+    } else {
+        events.clone()
+    };
+    boundary_events.extend(preflight_end_events(&preflight_calls));
     let thread_id = &inputs.bootstrap.thread_id;
-    let (parent_task, child_tasks) = if let Some(routing) = routing {
+    let (parent_task, child_tasks, atomic_committed) = if let Some(routing) = routing {
         apply_batch_routing(
             inputs,
             deps,
@@ -8304,11 +8575,13 @@ async fn repark_after_steering_exchange(
                 routing,
                 batch: SuspendedBatch {
                     payload,
+                    boundary_events,
                     delivered_injection_ids: Vec::new(),
                 },
                 specs,
                 reattach,
                 tool_children_context: "spawn tools while re-attaching children",
+                wake_workers: preflight_calls.is_empty(),
             },
             now,
         )
@@ -8327,7 +8600,7 @@ async fn repark_after_steering_exchange(
             )
             .await
             .context("re-park parent after partial child resume")?;
-        (parent, Vec::new())
+        (parent, Vec::new(), Vec::new())
     };
 
     snapshot_suspension_draft(
@@ -8339,14 +8612,20 @@ async fn repark_after_steering_exchange(
         "refresh child re-park draft",
     )
     .await;
-    let committed_events = if events.is_empty() {
-        Vec::new()
+    let committed_events = if preflight_calls.is_empty() {
+        if events.is_empty() {
+            Vec::new()
+        } else {
+            deps.event_repo
+                .commit_event_batch(thread_id, events, now)
+                .await
+                .context("commit child-resume suspension events")?
+        }
     } else {
-        deps.event_repo
-            .commit_event_batch(thread_id, events, now)
-            .await
-            .context("commit child-resume suspension events")?
+        atomic_committed
     };
+    let (parent_task, child_tasks) =
+        complete_preflight_children(deps, parent_task, child_tasks, preflight_calls)?;
     Ok(RootTurnOutcome::Suspended {
         parent_task,
         child_tasks,
@@ -8730,5 +9009,92 @@ mod tests {
                 "terminal stop reason {stop_reason:?} must not authorize tool dispatch"
             );
         }
+    }
+
+    fn tool_response(input: serde_json::Value) -> llm::ChatResponse {
+        llm::ChatResponse {
+            id: "msg_tool".to_owned(),
+            content: vec![llm::ContentBlock::ToolUse {
+                id: "tool_1".to_owned(),
+                name: "browser".to_owned(),
+                input,
+                thought_signature: None,
+            }],
+            model: "test-model".to_owned(),
+            stop_reason: Some(llm::StopReason::ToolUse),
+            usage: llm::Usage {
+                served_speed: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn tool_input_sanitizer_mutates_before_continuation_construction() -> Result<()> {
+        let mut response = tool_response(serde_json::json!({
+            "action": "open",
+            "url": "https://example.com/?signed=secret"
+        }));
+        let thread_id = ThreadId("thread-a".to_owned());
+        let context = ToolInputPreflightContext {
+            thread_id: &thread_id,
+            caller_metadata: None,
+        };
+        let expected_thread_id = thread_id.clone();
+        let sanitizer = move |context: &ToolInputPreflightContext<'_>,
+                              name: &str,
+                              input: &mut serde_json::Value|
+              -> Result<ToolInputPreflightOutcome> {
+            assert_eq!(context.thread_id, &expected_thread_id);
+            assert_eq!(name, "browser");
+            input["url"] = serde_json::json!("https://example.com/");
+            Ok(ToolInputPreflightOutcome::Allow)
+        };
+
+        assert!(preflight_tool_inputs(&mut response, Some(&sanitizer), &context)?.is_empty());
+        let llm::ContentBlock::ToolUse { input, .. } = &response.content[0] else {
+            unreachable!("fixture contains a tool use")
+        };
+        assert_eq!(input["url"], "https://example.com/");
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_completion_scrubs_input_and_returns_typed_result() -> Result<()> {
+        let mut response = tool_response(serde_json::json!({
+            "action": "open",
+            "url": "https://example.com/?signed=secret"
+        }));
+        let thread_id = ThreadId("thread-a".to_owned());
+        let context = ToolInputPreflightContext {
+            thread_id: &thread_id,
+            caller_metadata: None,
+        };
+        let sanitizer = |_context: &ToolInputPreflightContext<'_>,
+                         _name: &str,
+                         input: &mut serde_json::Value|
+         -> Result<ToolInputPreflightOutcome> {
+            *input = serde_json::json!({"rejected": true});
+            Ok(ToolInputPreflightOutcome::Complete(ToolResult {
+                success: false,
+                output: "NO_BROWSER_HOST: no host owns this thread".to_owned(),
+                data: Some(serde_json::json!({"code": "NO_BROWSER_HOST"})),
+                documents: Vec::new(),
+                artifact: None,
+                duration_ms: None,
+            }))
+        };
+
+        let completions = preflight_tool_inputs(&mut response, Some(&sanitizer), &context)?;
+        assert_eq!(completions.len(), 1);
+        assert!(!completions[0].result.success);
+        let llm::ContentBlock::ToolUse { input, .. } = &response.content[0] else {
+            unreachable!("fixture contains a tool use")
+        };
+        assert_eq!(input, &serde_json::json!({"rejected": true}));
+        Ok(())
     }
 }

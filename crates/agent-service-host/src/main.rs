@@ -46,6 +46,7 @@ fn main() -> Result<()> {
         thinking: ThinkingPolicy::default(),
         thinking_display: None,
         tools_fn: None,
+        tool_input_sanitizer: None,
         policy: RuntimePolicy::server_default(),
     };
     let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(default_definition));

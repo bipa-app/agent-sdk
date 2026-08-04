@@ -38,7 +38,10 @@ use crate::journal::turn_attempt::{
 };
 use crate::journal::turn_attempt_store::{InMemoryTurnAttemptStore, TurnAttemptStore};
 use crate::worker::bootstrap::WorkerBootstrapContext;
-use crate::worker::definition::{AgentDefinition, ChildJoinPolicy, RuntimePolicy, ThinkingPolicy};
+use crate::worker::definition::{
+    AgentDefinition, ChildJoinPolicy, RuntimePolicy, ThinkingPolicy, ToolInputPreflightContext,
+    ToolInputPreflightOutcome,
+};
 use agent_sdk::context::CompactionConfig;
 use agent_sdk_foundation::audit::AuditProvenance;
 use agent_sdk_foundation::events::AgentEvent;
@@ -205,6 +208,7 @@ fn sample_definition() -> AgentDefinition {
         thinking: ThinkingPolicy::default(),
         thinking_display: None,
         tools_fn: None,
+        tool_input_sanitizer: None,
         policy: RuntimePolicy::server_default(),
     }
 }
@@ -724,6 +728,268 @@ async fn terminal_stop_reason_with_tool_blocks_commits_without_child_dispatch() 
         "terminal response history must remain balanced: {history:?}"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn preflight_completion_is_typed_skips_confirmation_and_resumes_same_turn() -> Result<()> {
+    let stores = TestStores::new();
+    let provider = MockToolCallProvider::single(
+        "call_signed",
+        "browser",
+        serde_json::json!({"action": "open", "url": "https://example.com/?signed=secret"}),
+    );
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let reject_signed_url = |context: &ToolInputPreflightContext<'_>,
+                             name: &str,
+                             input: &mut serde_json::Value|
+     -> Result<ToolInputPreflightOutcome> {
+        assert_eq!(context.thread_id, &thread_a());
+        if name == "browser"
+            && input
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|url| url.contains('?'))
+        {
+            *input = serde_json::json!({"rejected": true});
+            return Ok(ToolInputPreflightOutcome::Complete(
+                agent_sdk_foundation::ToolResult {
+                    success: false,
+                    output: "NO_BROWSER_HOST: no host owns this thread".to_owned(),
+                    data: Some(serde_json::json!({"code": "NO_BROWSER_HOST"})),
+                    documents: Vec::new(),
+                    artifact: None,
+                    duration_ms: None,
+                },
+            ));
+        }
+        Ok(ToolInputPreflightOutcome::Allow)
+    };
+    let mut bootstrap = sample_bootstrap_with_tools(task);
+    bootstrap.definition = bootstrap
+        .definition
+        .with_tool_input_sanitizer(Arc::new(reject_signed_url));
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let deps = stores.deps();
+
+    let outcome = execute_root_turn(inputs, "open it", &provider, &deps, t_plus(5)).await?;
+    let RootTurnOutcome::Suspended {
+        parent_task,
+        child_tasks,
+        committed_events,
+    } = outcome
+    else {
+        panic!("preflight completion must suspend for same-turn resume")
+    };
+    assert_eq!(parent_task.status, TaskStatus::Pending);
+    assert!(matches!(parent_task.state, TaskState::ReadyToResume { .. }));
+    assert_eq!(child_tasks.len(), 1);
+    assert_eq!(child_tasks[0].status, TaskStatus::Completed);
+    let durable_result: agent_sdk_foundation::ToolResult = serde_json::from_value(
+        child_tasks[0]
+            .result_payload
+            .clone()
+            .context("preflight child result")?,
+    )?;
+    assert!(!durable_result.success);
+    assert_eq!(
+        durable_result
+            .data
+            .as_ref()
+            .and_then(|data| data["code"].as_str()),
+        Some("NO_BROWSER_HOST")
+    );
+    assert!(committed_events.iter().any(|event| matches!(
+        &event.event,
+        AgentEvent::ToolCallEnd { id, result, .. }
+            if id == "call_signed"
+                && !result.success
+                && result.data.as_ref().and_then(|data| data["code"].as_str())
+                    == Some("NO_BROWSER_HOST")
+    )));
+    let start_index = committed_events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.event,
+                AgentEvent::ToolCallStart { id, .. } if id == "call_signed"
+            )
+        })
+        .context("preflight completion must commit ToolCallStart")?;
+    let end_index = committed_events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.event,
+                AgentEvent::ToolCallEnd { id, .. } if id == "call_signed"
+            )
+        })
+        .context("preflight completion must commit ToolCallEnd")?;
+    assert!(
+        start_index < end_index,
+        "precompleted child must not publish ToolCallEnd before ToolCallStart"
+    );
+    assert!(
+        !committed_events
+            .iter()
+            .any(|event| matches!(&event.event, AgentEvent::ToolRequiresConfirmation { .. }))
+    );
+
+    let projection = stores
+        .messages
+        .get(&thread_a())
+        .await?
+        .context("projection after preflight completion")?;
+    let draft = serde_json::to_string(&projection.draft_messages)?;
+    assert!(!draft.contains("signed=secret"));
+    assert!(draft.contains(r#""rejected":true"#));
+
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &task_id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            t_plus(10),
+        )
+        .await?
+        .context("re-acquire preflight-completed parent")?;
+    let acquired_parent = acquired.clone();
+    let resume_inputs = build_root_worker_inputs(
+        sample_bootstrap_with_tools(acquired),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(10),
+    )
+    .await?;
+    let resume_provider = MockTextProvider::new("Browser is unavailable.");
+    let resumed = resume_from_children(
+        resume_inputs,
+        &acquired_parent,
+        &resume_provider,
+        &stores.deps(),
+        t_plus(15),
+    )
+    .await?;
+    assert!(matches!(resumed, RootTurnOutcome::Completed { .. }));
+    let history = serde_json::to_string(&stores.messages.get_history(&thread_a()).await?)?;
+    assert!(!history.contains("signed=secret"));
+    assert!(history.contains("NO_BROWSER_HOST"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn preflight_completion_in_mixed_batch_commits_starts_before_end() -> Result<()> {
+    let stores = TestStores::new();
+    let provider = MockToolCallProvider::new(vec![
+        (
+            "call_browser".into(),
+            "browser".into(),
+            serde_json::json!({"action": "screenshot"}),
+        ),
+        (
+            "call_bash".into(),
+            "bash".into(),
+            serde_json::json!({"command": "pwd"}),
+        ),
+    ]);
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let complete_browser = |_: &ToolInputPreflightContext<'_>,
+                            name: &str,
+                            _: &mut serde_json::Value|
+     -> Result<ToolInputPreflightOutcome> {
+        if name == "browser" {
+            return Ok(ToolInputPreflightOutcome::Complete(
+                agent_sdk_foundation::ToolResult {
+                    success: false,
+                    output: "NO_BROWSER_HOST: no host owns this thread".to_owned(),
+                    data: Some(serde_json::json!({"code": "NO_BROWSER_HOST"})),
+                    documents: Vec::new(),
+                    artifact: None,
+                    duration_ms: None,
+                },
+            ));
+        }
+        Ok(ToolInputPreflightOutcome::Allow)
+    };
+    let mut bootstrap = sample_bootstrap_with_tools(task);
+    bootstrap.definition = bootstrap
+        .definition
+        .with_tool_input_sanitizer(Arc::new(complete_browser));
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let deps = stores.deps();
+
+    let outcome = execute_root_turn(inputs, "inspect it", &provider, &deps, t_plus(5)).await?;
+    let RootTurnOutcome::Suspended {
+        parent_task,
+        child_tasks,
+        committed_events,
+    } = outcome
+    else {
+        panic!("mixed preflight batch must suspend")
+    };
+    assert_eq!(parent_task.status, TaskStatus::WaitingOnChildren);
+    assert_eq!(child_tasks.len(), 2);
+    assert_eq!(child_tasks[0].status, TaskStatus::Completed);
+    assert!(!child_tasks[1].status.is_terminal());
+
+    let browser_start = committed_events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.event,
+                AgentEvent::ToolCallStart { id, .. } if id == "call_browser"
+            )
+        })
+        .context("browser ToolCallStart")?;
+    let bash_start = committed_events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.event,
+                AgentEvent::ToolCallStart { id, .. } if id == "call_bash"
+            )
+        })
+        .context("bash ToolCallStart")?;
+    let browser_end = committed_events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.event,
+                AgentEvent::ToolCallEnd { id, .. } if id == "call_browser"
+            )
+        })
+        .context("browser ToolCallEnd")?;
+    assert_eq!(
+        committed_events
+            .iter()
+            .filter(|event| matches!(
+                &event.event,
+                AgentEvent::ToolCallEnd { id, .. } if id == "call_browser"
+            ))
+            .count(),
+        1,
+        "preflight completion must be journaled exactly once"
+    );
+    assert!(browser_start < browser_end);
+    assert!(bash_start < browser_end);
     Ok(())
 }
 
@@ -4782,6 +5048,7 @@ async fn pending_tool_tier_uses_per_turn_tools_fn_not_static_list() -> Result<()
                 tier: agent_sdk_foundation::ToolTier::Confirm,
             }]
         })),
+        tool_input_sanitizer: None,
         policy: RuntimePolicy::server_default(),
     };
 

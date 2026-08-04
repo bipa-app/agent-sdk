@@ -4115,6 +4115,9 @@ FOR UPDATE SKIP LOCKED
             child.spawn_index =
                 Some(u32::try_from(idx).context("spawn rejected: batch index exceeds u32::MAX")?);
             child.otel_traceparent.clone_from(&child_otel_traceparent);
+            child = spec
+                .apply_precompletion(child, &old_parent.id, idx, now)
+                .context("spawn rejected: precomplete child")?;
             let existing = Self::load_task_tx(&mut tx, &child.id, false).await?;
             if existing.is_some()
                 || children
@@ -4299,6 +4302,7 @@ FOR UPDATE SKIP LOCKED
         validate_mixed_children_spawn(&spawn)?;
         let MixedChildrenSpawn {
             delivered_injection_ids,
+            boundary_events,
             subagents,
             tool_children,
             reattach,
@@ -4312,6 +4316,9 @@ FOR UPDATE SKIP LOCKED
                 subagents.len()
             ));
         }
+        let has_precompleted = tool_children
+            .iter()
+            .any(|tool| tool.spec.precompleted_result.is_some());
 
         let mut tx = self.begin().await?;
 
@@ -4354,12 +4361,23 @@ FOR UPDATE SKIP LOCKED
             .count();
         let live_children =
             u32::try_from(live_children).context("spawn rejected: live child count exceeds u32")?;
-        let new_parent = old_parent
+        let waiting_parent = old_parent
             .clone()
             .wait_on_children(child_count, payload, child_ids, now)
-            .context("spawn rejected: wait_on_children transition failed")?
-            .recompute_pending_children(live_children, now)
-            .context("spawn rejected: recompute_pending_children transition failed")?;
+            .context("spawn rejected: wait_on_children transition failed")?;
+        let new_parent = if has_precompleted {
+            waiting_parent
+                .defer_precompleted_children_publication()
+                .context("spawn rejected: defer precompleted child publication")?
+                .publish_precompleted_children()
+                .context("spawn rejected: release precompleted child publication")?
+                .recompute_pending_children(live_children, now)
+                .context("spawn rejected: publish precompleted children")?
+        } else {
+            waiting_parent
+                .recompute_pending_children(live_children, now)
+                .context("spawn rejected: recompute_pending_children transition failed")?
+        };
         Self::update_task_tx(&mut tx, &new_parent).await?;
         for (invocation, child_root) in &prepared {
             Self::insert_task_tx(&mut tx, invocation).await?;
@@ -4374,14 +4392,37 @@ FOR UPDATE SKIP LOCKED
 
         agent_server::fail_point!("atomic_spawn_batch.after_rows");
 
-        let committed = Self::insert_spawn_started_events_tx(
-            &mut tx,
-            &new_parent.thread_id,
-            &prepared,
-            events,
-            now,
-        )
-        .await?;
+        let mut committed = if boundary_events.is_empty() {
+            Vec::new()
+        } else {
+            let start_seq = Self::next_event_sequence_tx(&mut tx, &new_parent.thread_id).await?;
+            let committed = Self::insert_events_tx(
+                &mut tx,
+                &new_parent.thread_id,
+                boundary_events,
+                start_seq,
+                now,
+            )
+            .await?;
+            Self::insert_thread_events_outbox_row_tx(
+                &mut tx,
+                &committed,
+                DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+                now,
+            )
+            .await?;
+            committed
+        };
+        committed.extend(
+            Self::insert_spawn_started_events_tx(
+                &mut tx,
+                &new_parent.thread_id,
+                &prepared,
+                events,
+                now,
+            )
+            .await?,
+        );
         Self::complete_injections_tx(&mut tx, &delivered_injection_ids, now).await?;
         tx.commit().await.context("commit spawn_mixed_children")?;
         Ok(SpawnedMixedChildren {

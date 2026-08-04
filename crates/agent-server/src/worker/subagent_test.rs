@@ -1607,6 +1607,7 @@ async fn spawn_mixed_creates_subagents_and_tool_children_under_one_parent() -> R
         &lease,
         MixedChildrenRequest {
             delivered_injection_ids: Vec::new(),
+            boundary_events: Vec::new(),
             subagents: mixed_subagent_entries(&tasks)?,
             tool_children: mixed_tool_children(tasks.len(), 3)?,
             reattach: Vec::new(),
@@ -1692,6 +1693,7 @@ async fn spawn_mixed_rejects_losing_cas_without_partial_spawn() -> Result<()> {
         &LeaseId::from_string("l-stale"),
         MixedChildrenRequest {
             delivered_injection_ids: Vec::new(),
+            boundary_events: Vec::new(),
             subagents: mixed_subagent_entries(&tasks)?,
             tool_children: mixed_tool_children(tasks.len(), 2)?,
             reattach: Vec::new(),
@@ -1743,6 +1745,7 @@ async fn spawn_mixed_rejects_uncovered_pending_tool_call() -> Result<()> {
         &lease,
         MixedChildrenRequest {
             delivered_injection_ids: Vec::new(),
+            boundary_events: Vec::new(),
             subagents: mixed_subagent_entries(&tasks)?,
             tool_children: mixed_tool_children(tasks.len(), 2)?,
             reattach: Vec::new(),
@@ -1800,6 +1803,7 @@ async fn spawn_mixed_rejects_bad_tool_slot_without_orphaning_child_threads() -> 
         &lease,
         MixedChildrenRequest {
             delivered_injection_ids: Vec::new(),
+            boundary_events: Vec::new(),
             subagents,
             tool_children: vec![ToolChildSpawn {
                 spawn_index: 7, // out of range — only 2 pending tool calls
@@ -1872,6 +1876,7 @@ async fn spawn_mixed_records_child_ids_in_slot_order_when_interleaved() -> Resul
         &lease,
         MixedChildrenRequest {
             delivered_injection_ids: Vec::new(),
+            boundary_events: Vec::new(),
             subagents,
             tool_children: vec![ToolChildSpawn {
                 spawn_index: 0,
@@ -2019,6 +2024,7 @@ async fn spawn_mixed_rejects_duplicate_child_thread_without_orphaning_projection
         &lease,
         MixedChildrenRequest {
             delivered_injection_ids: Vec::new(),
+            boundary_events: Vec::new(),
             subagents,
             tool_children: mixed_tool_children(tasks.len(), 3)?,
             reattach: Vec::new(),

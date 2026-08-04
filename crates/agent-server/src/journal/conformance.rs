@@ -1098,6 +1098,7 @@ fn mixed_batch_spawn(
         .collect();
     Ok(crate::journal::store::MixedChildrenSpawn {
         delivered_injection_ids: Vec::new(),
+        boundary_events: Vec::new(),
         subagents,
         tool_children,
         reattach: Vec::new(),
@@ -1216,6 +1217,58 @@ async fn case_mixed_batch_spawns_subagents_and_tools<S: JournalStore>(store: &S)
             "tool child must stay on the parent thread"
         );
     }
+    Ok(())
+}
+
+/// A preflight-completed tool is published in the same durable transaction
+/// as its ToolCallEnd boundary. Reloading the parent must therefore expose
+/// only the post-publication count and never a reopenable barrier flag.
+async fn case_precompleted_boundary_is_published_before_spawn_returns<S: JournalStore>(
+    store: &S,
+) -> Result<()> {
+    let thread = tid("conf-precompleted-boundary");
+    let fixture = mixed_batch_fixture(store, &thread, 0).await?;
+    let payload = suspension_with_pending_tools(&thread, 2);
+    let mut spawn = mixed_batch_spawn(&fixture, payload, &[], &[0, 1])?;
+    let preflight = agent_sdk_foundation::ToolResult::success("rejected before dispatch");
+    spawn.tool_children[0].spec =
+        ChildSpawnSpec::new(1).with_precompleted_result(serde_json::to_value(&preflight)?);
+    spawn.boundary_events.push(AgentEvent::tool_call_end(
+        "conf-preflight-call",
+        "browser",
+        "Browser",
+        preflight,
+    ));
+
+    let spawned = AgentTaskStore::spawn_mixed_children(
+        store,
+        &fixture.parent_id,
+        &fixture.worker,
+        &fixture.lease,
+        spawn,
+        Vec::new(),
+        t_plus(2),
+    )
+    .await
+    .context("atomic precompleted spawn must succeed")?;
+    ensure!(
+        spawned.parent.status == TaskStatus::WaitingOnChildren
+            && spawned.parent.pending_child_count == 1
+            && !spawned.parent.has_unpublished_precompleted_children(),
+        "spawn must return the published post-boundary parent, got {:?}",
+        spawned.parent
+    );
+
+    let reloaded = AgentTaskStore::get(store, &fixture.parent_id)
+        .await?
+        .context("published parent must reload")?;
+    ensure!(
+        reloaded.id == spawned.parent.id
+            && reloaded.status == spawned.parent.status
+            && reloaded.pending_child_count == spawned.parent.pending_child_count
+            && !reloaded.has_unpublished_precompleted_children(),
+        "reloaded parent must not expose an unpublished precompletion barrier"
+    );
     Ok(())
 }
 
@@ -1497,6 +1550,7 @@ async fn case_attached_tool_batch_accepts_empty_spawn_events<S: JournalStore>(
 
     let spawn = crate::journal::store::MixedChildrenSpawn {
         delivered_injection_ids: Vec::new(),
+        boundary_events: Vec::new(),
         subagents: Vec::new(),
         tool_children: vec![crate::journal::store::ToolChildSpawn {
             spawn_index: 0,
@@ -1656,6 +1710,8 @@ pub async fn run_journal_store_conformance<S: JournalStore + Clone + 'static>(
 
     case_attached_tool_batch_accepts_empty_spawn_events(store).await?;
     report.passed("attached_tool_batch_accepts_empty_spawn_events");
+    case_precompleted_boundary_is_published_before_spawn_returns(store).await?;
+    report.passed("precompleted_boundary_is_published_before_spawn_returns");
 
     case_mixed_batch_child_ids_follow_slot_order(store).await?;
     report.passed("mixed_batch_child_ids_follow_slot_order");
@@ -1867,10 +1923,7 @@ async fn case_delete_cascades_main_to_subkeys<S: JournalStore>(store: &S) -> Res
         &root.id,
         &worker,
         &lease,
-        vec![
-            ChildSpawnSpec { max_attempts: 3 },
-            ChildSpawnSpec { max_attempts: 3 },
-        ],
+        vec![ChildSpawnSpec::new(3), ChildSpawnSpec::new(3)],
         empty_suspension(&thread),
         None,
         Vec::new(),
@@ -1954,9 +2007,9 @@ async fn case_subkey_vs_main_count_separation<S: JournalStore>(store: &S) -> Res
         &worker,
         &lease,
         vec![
-            ChildSpawnSpec { max_attempts: 3 },
-            ChildSpawnSpec { max_attempts: 3 },
-            ChildSpawnSpec { max_attempts: 3 },
+            ChildSpawnSpec::new(3),
+            ChildSpawnSpec::new(3),
+            ChildSpawnSpec::new(3),
         ],
         empty_suspension(&thread),
         None,

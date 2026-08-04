@@ -111,6 +111,7 @@ fn make_bootstrap_with_context(
             suspended_messages: Vec::new(),
             child_ids: vec![child_id.clone()],
             child_join_policy: agent_server::ChildJoinPolicy::default(),
+            precompleted_children_unpublished: false,
         },
         attempt: 0,
         max_attempts: 3,

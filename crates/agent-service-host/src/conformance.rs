@@ -925,7 +925,10 @@ mod tests {
             )
             .await?;
 
-        let spec = ChildSpawnSpec { max_attempts: 3 };
+        let spec = ChildSpawnSpec {
+            max_attempts: 3,
+            precompleted_result: None,
+        };
         let payload = SuspensionPayload {
             continuation: agent_sdk_foundation::ContinuationEnvelope::wrap(
                 agent_sdk_foundation::AgentContinuation {
@@ -1081,10 +1084,7 @@ mod tests {
                 &root.id,
                 &worker,
                 &lease,
-                vec![
-                    ChildSpawnSpec { max_attempts: 3 },
-                    ChildSpawnSpec { max_attempts: 3 },
-                ],
+                vec![ChildSpawnSpec::new(3), ChildSpawnSpec::new(3)],
                 suspension_payload(tid),
                 None,
                 Vec::new(),
@@ -1199,10 +1199,7 @@ mod tests {
                 &root.id,
                 &worker,
                 &lease,
-                vec![
-                    ChildSpawnSpec { max_attempts: 3 },
-                    ChildSpawnSpec { max_attempts: 3 },
-                ],
+                vec![ChildSpawnSpec::new(3), ChildSpawnSpec::new(3)],
                 suspension_payload(tid),
                 None,
                 Vec::new(),
@@ -1718,7 +1715,7 @@ mod tests {
                 &plain_id,
                 &worker,
                 &lease,
-                vec![ChildSpawnSpec { max_attempts: 3 }],
+                vec![ChildSpawnSpec::new(3)],
                 suspension_payload(tid),
                 None,
                 Vec::new(),
@@ -1789,10 +1786,7 @@ mod tests {
                 &parent_id,
                 &worker,
                 &lease,
-                vec![
-                    ChildSpawnSpec { max_attempts: 3 },
-                    ChildSpawnSpec { max_attempts: 3 },
-                ],
+                vec![ChildSpawnSpec::new(3), ChildSpawnSpec::new(3)],
                 suspension_payload(tid),
                 None,
                 Vec::new(),
@@ -2146,7 +2140,7 @@ mod tests {
                 &parent.id,
                 &pw,
                 &pl,
-                vec![ChildSpawnSpec { max_attempts: 1 }],
+                vec![ChildSpawnSpec::new(1)],
                 payload,
                 None,
                 Vec::new(),
@@ -2198,7 +2192,10 @@ mod tests {
             )
             .await?;
 
-        let spec = ChildSpawnSpec { max_attempts: 3 };
+        let spec = ChildSpawnSpec {
+            max_attempts: 3,
+            precompleted_result: None,
+        };
         let payload = SuspensionPayload {
             continuation: agent_sdk_foundation::ContinuationEnvelope::wrap(
                 agent_sdk_foundation::AgentContinuation {

@@ -308,6 +308,9 @@ pub struct MixedChildrenSpawn {
     /// Queued→Completed inside the same store write as the spawn, so
     /// "suspension durable" and "injections delivered" are one fact.
     pub delivered_injection_ids: Vec<AgentTaskId>,
+    /// Parent-thread boundary events (Thinking + tool call starts) committed
+    /// before any precompleted child can wake the parent.
+    pub boundary_events: Vec<AgentEvent>,
     /// Durable subagent invocations to persist, in input order.
     pub subagents: Vec<SubagentInvocationSpawn>,
     /// Tool-runtime children to persist, in input order.
@@ -368,6 +371,19 @@ pub fn validate_mixed_children_spawn(spawn: &MixedChildrenSpawn) -> Result<()> {
         .iter()
         .map(|child| child.spawn_index)
         .collect();
+    // The atomic preflight path deliberately reuses this transaction with
+    // only tool children so their boundary ToolCallEnd events cannot be
+    // overtaken by a resumed parent. Ordinary callers still require a true
+    // mixed partition below.
+    if spawn.subagents.is_empty() && spawn.reattach.is_empty() && !spawn.boundary_events.is_empty()
+    {
+        return validate_reattached_slot_coverage(
+            &[],
+            &tool_slots,
+            &[],
+            spawn.payload.continuation.payload.pending_tool_calls.len(),
+        );
+    }
     if spawn.reattach.is_empty() {
         return validate_mixed_slot_coverage(
             &subagent_slots,
@@ -538,7 +554,15 @@ pub fn new_mixed_tool_child(
             .context("spawn rejected: new_child failed")?;
     child.spawn_index = Some(tool.spawn_index);
     child.otel_traceparent = child_otel_traceparent.map(ToOwned::to_owned);
-    Ok(child)
+    tool.spec
+        .apply_precompletion(
+            child,
+            &parent.id,
+            usize::try_from(tool.spawn_index)
+                .context("spawn rejected: spawn index exceeds usize")?,
+            now,
+        )
+        .context("spawn rejected: precomplete mixed child")
 }
 
 /// The idempotency key a [`AgentTaskStore::submit_root_turn_idempotent`]
@@ -2812,13 +2836,15 @@ impl InMemoryAgentTaskStore {
         &self,
         parent_thread: &ThreadId,
         prepared: &[(AgentTask, AgentTask)],
+        mut boundary_events: Vec<AgentEvent>,
         events: Vec<SubagentSpawnEvent>,
         now: OffsetDateTime,
     ) -> Result<Vec<CommittedEvent>> {
         let Some(sink) = &self.marker_sink else {
             return Ok(Vec::new());
         };
-        let mut started = Vec::with_capacity(events.len());
+        let mut started = Vec::with_capacity(boundary_events.len() + events.len());
+        started.append(&mut boundary_events);
         for (event, (invocation, child_root)) in events.into_iter().zip(prepared) {
             started.push(started_event_from_invocation(
                 event, invocation, child_root,
@@ -4855,6 +4881,9 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             // `invoke_agent` span (not the inherited inbound client span)
             // so its `execute_tool` span nests under the turn.
             child.otel_traceparent.clone_from(&child_otel_traceparent);
+            child = spec
+                .apply_precompletion(child, &old_parent.id, idx, now)
+                .context("spawn rejected: precomplete child")?;
             if inner.by_id.contains_key(&child.id)
                 || children.iter().any(|existing| existing.id == child.id)
             {
@@ -5054,7 +5083,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
 
         drop(inner);
         let committed = self
-            .commit_spawn_started_events(&new_parent.thread_id, &prepared, events, now)
+            .commit_spawn_started_events(&new_parent.thread_id, &prepared, Vec::new(), events, now)
             .await?;
         Ok((new_parent, prepared, committed))
     }
@@ -5071,6 +5100,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         validate_mixed_children_spawn(&spawn)?;
         let MixedChildrenSpawn {
             delivered_injection_ids,
+            boundary_events,
             subagents,
             tool_children,
             reattach,
@@ -5084,6 +5114,9 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                 subagents.len()
             ));
         }
+        let has_precompleted = tool_children
+            .iter()
+            .any(|tool| tool.spec.precompleted_result.is_some());
 
         self.guard_task_thread(parent_id, super::thread::ThreadOperation::Spawn)
             .await?;
@@ -5121,12 +5154,19 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             .count();
         let live_children =
             u32::try_from(live_children).context("spawn rejected: live child count exceeds u32")?;
-        let new_parent = old_parent
+        let waiting_parent = old_parent
             .clone()
             .wait_on_children(child_count, payload, child_ids, now)
-            .context("spawn rejected: wait_on_children transition failed")?
-            .recompute_pending_children(live_children, now)
-            .context("spawn rejected: recompute_pending_children transition failed")?;
+            .context("spawn rejected: wait_on_children transition failed")?;
+        let new_parent = if has_precompleted {
+            waiting_parent
+                .defer_precompleted_children_publication()
+                .context("spawn rejected: defer precompleted child publication")?
+        } else {
+            waiting_parent
+                .recompute_pending_children(live_children, now)
+                .context("spawn rejected: recompute_pending_children transition failed")?
+        };
 
         // All validation passed — apply mutations.
         inner.rebalance_after_row_change(&old_parent, &new_parent);
@@ -5153,13 +5193,35 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
 
         inner.complete_injection_rows(&delivered_injection_ids, now)?;
 
-        drop(inner);
         let committed = self
-            .commit_spawn_started_events(&new_parent.thread_id, &prepared, events, now)
+            .commit_spawn_started_events(
+                &new_parent.thread_id,
+                &prepared,
+                boundary_events,
+                events,
+                now,
+            )
             .await?;
+        // Keep the task-store write fence until boundary events are durable.
+        // Once the batch commit succeeds, release the precompletion barrier
+        // under the same lock before any child completion can interleave.
+        let published_parent = if has_precompleted {
+            let parent = new_parent
+                .clone()
+                .publish_precompleted_children()
+                .context("spawn rejected: release precompleted child publication")?
+                .recompute_pending_children(live_children, now)
+                .context("spawn rejected: publish precompleted children")?;
+            inner.rebalance_after_row_change(&new_parent, &parent);
+            inner.by_id.insert(parent.id.clone(), parent.clone());
+            parent
+        } else {
+            new_parent
+        };
+        drop(inner);
         Ok(SpawnedMixedChildren {
             committed_events: committed,
-            parent: new_parent,
+            parent: published_parent,
             subagents: prepared,
             tool_children: tool_rows,
         })
@@ -9310,6 +9372,7 @@ mod tests {
             suspended_messages: Vec::new(),
             child_ids: Vec::new(),
             child_join_policy: crate::ChildJoinPolicy::default(),
+            precompleted_children_unpublished: false,
         };
         let err = bad.validate().unwrap_err();
         assert!(
@@ -10241,6 +10304,71 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn atomic_precompleted_event_publish_leaves_no_reopenable_barrier() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) =
+            running_root_for_spawn(&store, "t-precompleted-event-barrier").await?;
+        let parent_id = parent.id.clone();
+        let preflight = agent_sdk_foundation::ToolResult::success("rejected before dispatch");
+        let mut spawn = mixed_spawn_for(
+            "t-precompleted-event-barrier",
+            vec![thread("t-precompleted-placeholder")],
+            &[1],
+        );
+        spawn.subagents.clear();
+        spawn.tool_children.insert(
+            0,
+            ToolChildSpawn {
+                spawn_index: 0,
+                spec: ChildSpawnSpec::new(1)
+                    .with_precompleted_result(serde_json::to_value(&preflight)?),
+            },
+        );
+        spawn.boundary_events.push(AgentEvent::tool_call_end(
+            "call-preflight",
+            "browser",
+            "Browser",
+            preflight,
+        ));
+
+        let spawned = store
+            .spawn_mixed_children(&parent_id, &worker, &lease, spawn, Vec::new(), t_plus(2))
+            .await?;
+        assert_eq!(spawned.parent.status, TaskStatus::WaitingOnChildren);
+        assert_eq!(spawned.parent.pending_child_count, 1);
+        assert!(!spawned.parent.has_unpublished_precompleted_children());
+        assert_eq!(spawned.tool_children[0].status, TaskStatus::Completed);
+        assert_eq!(spawned.tool_children[1].status, TaskStatus::Pending);
+
+        let child_worker = WorkerId::from_string("w-live-sibling");
+        let child_lease = LeaseId::from_string("l-live-sibling");
+        store
+            .try_acquire_task(
+                &spawned.tool_children[1].id,
+                child_worker.clone(),
+                child_lease.clone(),
+                t_plus(30),
+                t_plus(3),
+            )
+            .await?
+            .context("acquire live sibling")?;
+        let (_, parent_after_live_completion) = store
+            .complete_task_with_result(
+                &spawned.tool_children[1].id,
+                &child_worker,
+                &child_lease,
+                serde_json::json!({"live": "completed"}),
+                t_plus(4),
+            )
+            .await?;
+        let resumed = parent_after_live_completion.context("parent transition")?;
+        assert_eq!(resumed.status, TaskStatus::Pending);
+        assert_eq!(resumed.pending_child_count, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn spawn_tool_children_rejects_wrong_worker_or_lease() -> Result<()> {
         let store = InMemoryAgentTaskStore::new();
         let (parent, worker, lease) = running_root_for_spawn(&store, "t-spawn-cas").await?;
@@ -10674,6 +10802,7 @@ mod tests {
             .collect();
         MixedChildrenSpawn {
             delivered_injection_ids: Vec::new(),
+            boundary_events: Vec::new(),
             subagents,
             tool_children,
             reattach: Vec::new(),

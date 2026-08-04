@@ -139,6 +139,11 @@ pub enum TaskState {
         /// Completion condition for this child batch.
         #[serde(default)]
         child_join_policy: ChildJoinPolicy,
+        /// True only between the atomic child-row insert and publication of
+        /// the precompleted child's durable boundary event. While set, a
+        /// concurrently completing live sibling must not wake the parent.
+        #[serde(default)]
+        precompleted_children_unpublished: bool,
     },
 
     /// Durable state for a task that has paused on
@@ -649,6 +654,7 @@ mod tests {
             suspended_messages: Vec::new(),
             child_ids: Vec::new(),
             child_join_policy: crate::ChildJoinPolicy::default(),
+            precompleted_children_unpublished: false,
         };
         assert_eq!(state.required_status(), Some(TaskStatus::WaitingOnChildren));
         let inner = state.continuation().expect("continuation present");
@@ -721,6 +727,7 @@ mod tests {
             suspended_messages: Vec::new(),
             child_ids: Vec::new(),
             child_join_policy: crate::ChildJoinPolicy::default(),
+            precompleted_children_unpublished: false,
         };
         let json = serde_json::to_string(&waiting)?;
         let recovered: TaskState = serde_json::from_str(&json)?;
@@ -827,6 +834,7 @@ mod tests {
                 suspended_messages: Vec::new(),
                 child_ids: Vec::new(),
                 child_join_policy: ChildJoinPolicy::All,
+                precompleted_children_unpublished: false,
             },
             TaskState::ReadyToResume {
                 continuation: Box::new(sample_continuation()),
@@ -861,6 +869,7 @@ mod tests {
             suspended_messages: Vec::new(),
             child_ids: Vec::new(),
             child_join_policy: crate::ChildJoinPolicy::default(),
+            precompleted_children_unpublished: false,
         })?;
         assert_eq!(
             waiting_value["kind"],
