@@ -899,6 +899,67 @@ async fn duplicate_suspension_loser_bills_its_own_attempt_row() -> Result<()> {
 }
 
 #[tokio::test]
+async fn duplicate_question_suspension_loser_bills_its_own_attempt_row() -> Result<()> {
+    let stores = TestStores::new();
+    let provider = MockToolCallProvider::single(
+        "question-call-1",
+        "ask_user",
+        serde_json::json!({"question": "Which environment?"}),
+    );
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let inputs_winner = build_root_worker_inputs(
+        sample_bootstrap(task.clone()),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let inputs_loser = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    let winner = execute_root_turn(
+        inputs_winner,
+        "Deploy",
+        &provider,
+        &stores.deps(),
+        t_plus(5),
+    )
+    .await?;
+    let RootTurnOutcome::Suspended { parent_task, .. } = winner else {
+        bail!("the winning worker must suspend")
+    };
+    assert_eq!(parent_task.status, TaskStatus::AwaitingQuestion);
+
+    let loser_error =
+        execute_root_turn(inputs_loser, "Deploy", &provider, &stores.deps(), t_plus(6))
+            .await
+            .expect_err("the duplicate question suspension must bail");
+    assert!(
+        loser_error.to_string().contains("duplicate suspension"),
+        "expected the idempotency-guard bail, got {loser_error:#}",
+    );
+
+    let mut attempts = stores.attempts.list_by_task(&task_id).await?;
+    attempts.sort_by_key(|attempt| attempt.opened_at);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].outcome, Some(TurnAttemptOutcome::Success));
+    assert_eq!(attempts[0].input_tokens, Some(120));
+    assert_eq!(attempts[0].output_tokens, Some(60));
+    assert_eq!(attempts[1].outcome, Some(TurnAttemptOutcome::Cancelled));
+    assert_eq!(attempts[1].input_tokens, Some(120));
+    assert_eq!(attempts[1].output_tokens, Some(60));
+    Ok(())
+}
+
+#[tokio::test]
 async fn tool_suspension_multiple_tool_calls() -> Result<()> {
     let stores = TestStores::new();
     let provider = MockToolCallProvider::new(vec![

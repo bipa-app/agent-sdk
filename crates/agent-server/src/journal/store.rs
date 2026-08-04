@@ -1032,6 +1032,37 @@ pub fn apply_question_pause(
         .context("question pause rejected: await_question transition failed")
 }
 
+const MAX_DURABLE_QUESTION_TOOL_CALL_ID_BYTES: usize = 96;
+
+fn validate_parked_question_identities<'a>(
+    task_id: &AgentTaskId,
+    questions: &'a [QuestionPayload],
+) -> Result<std::collections::BTreeSet<&'a str>> {
+    ensure!(
+        !questions.is_empty(),
+        "answer_question rejected: task {task_id} has an empty parked question batch"
+    );
+    let mut ids = std::collections::BTreeSet::new();
+    for (index, question) in questions.iter().enumerate() {
+        let id = question.tool_call_id.as_str();
+        ensure!(
+            !id.is_empty(),
+            "answer_question rejected: task {task_id} has an empty parked question id at index {index}"
+        );
+        let id_bytes = id.len();
+        ensure!(
+            id_bytes <= MAX_DURABLE_QUESTION_TOOL_CALL_ID_BYTES,
+            "answer_question rejected: task {task_id} has a parked question id at index {index} \
+             that is {id_bytes} UTF-8 bytes; maximum is {MAX_DURABLE_QUESTION_TOOL_CALL_ID_BYTES}"
+        );
+        ensure!(
+            ids.insert(id),
+            "answer_question rejected: task {task_id} has duplicate parked question id {id:?}"
+        );
+    }
+    Ok(ids)
+}
+
 /// Shared guard cascade + transition for persisting an answer batch.
 ///
 /// Single source of truth for replay, conflict, batch-matching, and the
@@ -1041,9 +1072,10 @@ pub fn apply_question_pause(
 /// # Errors
 /// Returns [`QuestionAnswerConflict`] when a different batch was already
 /// persisted, [`QuestionAnswerMismatch`] when the batch does not resolve
-/// the parked questions one-to-one, and a plain error when the task is
-/// not awaiting a question (a client retrying a delivered answer must
-/// reuse its original `request_id`, which replays at the RPC layer).
+/// the parked questions one-to-one, a plain error when a legacy parked batch
+/// has malformed identities, and a plain error when the task is not awaiting
+/// a question (a client retrying a delivered answer must reuse its original
+/// `request_id`, which replays at the RPC layer).
 pub fn apply_question_answer(
     old: &AgentTask,
     receipt_id: &str,
@@ -1078,16 +1110,33 @@ pub fn apply_question_answer(
             "answer_question rejected: task {id} is awaiting a question without a durable payload"
         ));
     };
-    let mut remaining: std::collections::BTreeSet<&str> =
-        questions.iter().map(|q| q.tool_call_id.as_str()).collect();
-    let mut unknown = Vec::new();
+    // Fail closed on malformed rows written before provider identity
+    // validation existed. In particular, build neither a collapsed set
+    // comparison nor a runnable AnsweredQuestion row from duplicate ids.
+    let parked_ids = validate_parked_question_identities(id, questions)?;
+    let mut answer_ids = std::collections::BTreeSet::new();
+    let mut invalid_answer_identity = false;
     for entry in answers {
-        if !remaining.remove(entry.tool_call_id.as_str()) {
-            unknown.push(entry.tool_call_id.clone());
-        }
+        let answer_id = entry.tool_call_id.as_str();
+        invalid_answer_identity |=
+            answer_id.is_empty() || answer_id.len() > MAX_DURABLE_QUESTION_TOOL_CALL_ID_BYTES;
+        answer_ids.insert(answer_id);
     }
-    let missing: Vec<String> = remaining.into_iter().map(str::to_owned).collect();
-    if !missing.is_empty() || !unknown.is_empty() {
+    if questions.len() != answers.len()
+        || answer_ids.len() != answers.len()
+        || invalid_answer_identity
+        || parked_ids != answer_ids
+    {
+        // Preserve the established mismatch detail for valid parked state and
+        // malformed client answer batches.
+        let mut remaining = parked_ids;
+        let mut unknown = Vec::new();
+        for entry in answers {
+            if !remaining.remove(entry.tool_call_id.as_str()) {
+                unknown.push(entry.tool_call_id.clone());
+            }
+        }
+        let missing: Vec<String> = remaining.into_iter().map(str::to_owned).collect();
         return Err(QuestionAnswerMismatch {
             task_id: id.clone(),
             missing,
@@ -5580,6 +5629,151 @@ mod tests {
             stop_reason: None,
             response_content: Vec::new(),
         })
+    }
+
+    fn question_payload(tool_call_id: &str) -> QuestionPayload {
+        QuestionPayload {
+            tool_call_id: tool_call_id.to_owned(),
+            question: "Which environment?".to_owned(),
+            header: None,
+            options: Vec::new(),
+            multi_select: false,
+        }
+    }
+
+    fn question_answer(tool_call_id: &str) -> QuestionAnswer {
+        QuestionAnswer {
+            tool_call_id: tool_call_id.to_owned(),
+            answer: "Production".to_owned(),
+        }
+    }
+
+    fn awaiting_question_with_ids(ids: &[&str]) -> Result<AgentTask> {
+        let name = "t-question-identity";
+        let running = fresh_root(name).mark_running(
+            WorkerId::from_string("w-question"),
+            LeaseId::from_string("l-question"),
+            t_plus(60),
+            t_plus(1),
+        )?;
+        Ok(running.await_question(
+            SuspensionPayload {
+                continuation: sample_continuation(name),
+                suspended_messages: Vec::new(),
+                child_join_policy: crate::ChildJoinPolicy::default(),
+            },
+            ids.iter().map(|id| question_payload(id)).collect(),
+            t_plus(2),
+        )?)
+    }
+
+    #[test]
+    fn answer_question_rejects_a_legacy_empty_parked_id() -> Result<()> {
+        let task = awaiting_question_with_ids(&[""])?;
+        let error = apply_question_answer(&task, "receipt-1", &[question_answer("")], t_plus(3))
+            .err()
+            .context("an empty legacy parked id must fail closed")?;
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "answer_question rejected: task {} has an empty parked question id at index 0",
+                task.id
+            )
+        );
+        assert!(matches!(task.state, TaskState::AwaitingQuestion { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn answer_question_rejects_a_legacy_oversized_parked_id() -> Result<()> {
+        let oversized = "é".repeat(49);
+        let task = awaiting_question_with_ids(&[oversized.as_str()])?;
+        let error = apply_question_answer(
+            &task,
+            "receipt-1",
+            &[question_answer(oversized.as_str())],
+            t_plus(3),
+        )
+        .err()
+        .context("an oversized legacy parked id must fail closed")?;
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "answer_question rejected: task {} has a parked question id at index 0 \
+                 that is 98 UTF-8 bytes; maximum is 96",
+                task.id
+            )
+        );
+        assert!(matches!(task.state, TaskState::AwaitingQuestion { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn answer_question_rejects_duplicate_legacy_parked_ids_before_cardinality_collapse()
+    -> Result<()> {
+        let task = awaiting_question_with_ids(&["call-1", "call-1"])?;
+        let error =
+            apply_question_answer(&task, "receipt-1", &[question_answer("call-1")], t_plus(3))
+                .err()
+                .context("duplicate legacy parked ids must fail before set/cardinality collapse")?;
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "answer_question rejected: task {} has duplicate parked question id \"call-1\"",
+                task.id
+            )
+        );
+        assert!(matches!(task.state, TaskState::AwaitingQuestion { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn answer_question_rejects_malformed_answer_identities_before_set_comparison() -> Result<()> {
+        let task = awaiting_question_with_ids(&["call-1", "call-2"])?;
+        let oversized = "é".repeat(49);
+        let cases = [
+            vec![question_answer(""), question_answer("call-2")],
+            vec![
+                question_answer(oversized.as_str()),
+                question_answer("call-2"),
+            ],
+            vec![question_answer("call-1"), question_answer("call-1")],
+        ];
+        for answers in cases {
+            let error = apply_question_answer(&task, "receipt-1", &answers, t_plus(3))
+                .err()
+                .context("malformed answer identities must fail closed")?;
+            assert!(
+                error.downcast_ref::<QuestionAnswerMismatch>().is_some(),
+                "valid parked state must retain the established mismatch error: {error:#}"
+            );
+        }
+        assert!(matches!(task.state, TaskState::AwaitingQuestion { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn answer_question_preserves_valid_distinct_legacy_state() -> Result<()> {
+        let boundary = "é".repeat(48);
+        let task = awaiting_question_with_ids(&["call-1", boundary.as_str()])?;
+        let answers = vec![
+            question_answer("call-1"),
+            question_answer(boundary.as_str()),
+        ];
+        let applied = apply_question_answer(&task, "receipt-1", &answers, t_plus(3))?;
+        let QuestionAnswerApplied::Answered(answered) = applied else {
+            panic!("a fresh valid answer batch cannot replay");
+        };
+        assert_eq!(answered.status, TaskStatus::Pending);
+        let TaskState::AnsweredQuestion {
+            answers: stored_answers,
+            ..
+        } = answered.state
+        else {
+            panic!("valid answer batch must persist AnsweredQuestion");
+        };
+        assert_eq!(stored_answers, answers);
+        Ok(())
     }
 
     /// Sample listen/execute prepared operation paired with the

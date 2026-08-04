@@ -47,7 +47,7 @@ use agent_sdk_tools::stores::{MessageStore, StateStore};
 use anyhow::{Context, Result, bail, ensure};
 use futures::StreamExt;
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
@@ -5263,10 +5263,9 @@ fn initial_suspended_messages(
     messages
 }
 
-/// Idempotency guard: re-read the task from the durable store to
-/// detect if a prior worker already completed this suspension (e.g.
-/// our lease expired between `spawn_tool_children` and returning the
-/// result, and another worker re-acquired and completed the flow).
+/// Idempotency guard: re-read the task from the durable store to detect if a
+/// prior worker already parked this turn on children or a durable question
+/// while this worker's lease expired and the task was re-acquired.
 async fn guard_against_duplicate_suspension(
     inputs: &RootWorkerInputs,
     attempt: &TurnAttempt,
@@ -5282,7 +5281,10 @@ async fn guard_against_duplicate_suspension(
         .context("re-read task for suspension idempotency check")?
         .context("task disappeared during suspension")?;
 
-    if current_task.status == TaskStatus::WaitingOnChildren {
+    if matches!(
+        current_task.status,
+        TaskStatus::WaitingOnChildren | TaskStatus::AwaitingQuestion
+    ) {
         // Close the attempt opened at the start of execute_root_turn so it
         // doesn't remain permanently unclosed in the audit trail. Unlike the
         // pre-stream synthetic closes (which bill zero because nothing
@@ -5299,10 +5301,7 @@ async fn guard_against_duplicate_suspension(
             now,
         )
         .await;
-        bail!(
-            "task {task_id} already transitioned to WaitingOnChildren; \
-             skipping duplicate suspension",
-        );
+        bail!("task {task_id} already transitioned; skipping duplicate suspension");
     }
     Ok(())
 }
@@ -5331,7 +5330,16 @@ async fn suspend_at_tool_boundary(
     close_ctx: TurnCloseContext,
 ) -> Result<RootTurnOutcome> {
     let task_id = &inputs.bootstrap.task_id;
+
+    // A losing worker in the duplicate-suspension race must close and bill its
+    // own attempt before the winner's already-committed tool ids look like
+    // hostile history collisions. This guard never admits a new suspension.
     guard_against_duplicate_suspension(&inputs, &attempt, deps, &close_ctx, now).await?;
+
+    let continuation = build_continuation(&inputs, &response)
+        .await
+        .context("build continuation for tool suspension")?;
+    validate_pending_tool_call_identities_for_turn(&continuation, &inputs, deps).await?;
 
     // 1. Close the turn attempt — the LLM call itself succeeded.
     close_attempt_or_propagate_already_closed(
@@ -5344,11 +5352,6 @@ async fn suspend_at_tool_boundary(
         now,
     )
     .await?;
-
-    // 2. Build the continuation envelope from current state + response.
-    let continuation = build_continuation(&inputs, &response)
-        .await
-        .context("build continuation for tool suspension")?;
 
     // Capture the staged prefix + prompt + assistant tool-use response
     // for durable resume.
@@ -5394,7 +5397,8 @@ async fn suspend_at_tool_boundary(
     //     section 5 onto `spawn_subagent_invocation` /
     //     `spawn_subagent_batch_invocations`; everything else falls
     //     through to the regular `spawn_tool_children` path.
-    let routing = classify_batch_for_inputs(&inputs, deps, &continuation).await?;
+    let routing =
+        classify_batch_for_inputs(&inputs, deps, &continuation.payload.pending_tool_calls).await?;
 
     // 5. Atomically spawn children and park the parent.
     //
@@ -5492,12 +5496,11 @@ async fn suspend_at_tool_boundary(
 async fn classify_batch_for_inputs(
     inputs: &RootWorkerInputs,
     deps: &RootTurnDeps<'_>,
-    continuation: &ContinuationEnvelope,
+    pending: &[PendingToolCallInfo],
 ) -> Result<super::subagent_spawn_selector::BatchRouting> {
     let Some(selector) = deps.subagent_spawn_selector else {
         return Ok(super::subagent_spawn_selector::BatchRouting::AllTools);
     };
-    let pending = &continuation.payload.pending_tool_calls;
     let decisions = selector
         .decide(&inputs.bootstrap.thread_id, pending)
         .await
@@ -6045,6 +6048,91 @@ fn child_spawn_specs_for_response(
     (0..tool_call_count)
         .map(|_| ChildSpawnSpec::new(child_max_attempts))
         .collect()
+}
+
+const MAX_TOOL_CALL_ID_BYTES: usize = 96;
+
+/// Validate provider-supplied identities before a pending tool batch can
+/// reach child specs, routing, durable questions, or journal mutation.
+///
+/// The durable projection's raw transcript is checked in addition to the
+/// staged effective view. Compaction may remove an older tool use from the
+/// provider-facing view while intentionally retaining it in
+/// [`crate::journal::message::MessageProjection::messages`]; reusing that id
+/// would still make durable answer/result pairing ambiguous.
+async fn validate_pending_tool_call_identities_for_turn(
+    continuation: &ContinuationEnvelope,
+    inputs: &RootWorkerInputs,
+    deps: &RootTurnDeps<'_>,
+) -> Result<()> {
+    validate_pending_tool_call_identities(
+        continuation,
+        &inputs.staged_stores.messages,
+        deps.message_store,
+        &inputs.bootstrap.thread_id,
+    )
+    .await
+    .context("validate pending tool-call identities")
+}
+
+async fn validate_pending_tool_call_identities(
+    continuation: &ContinuationEnvelope,
+    staged_messages: &crate::journal::staged::StagedMessageStore,
+    message_store: &dyn MessageProjectionStore,
+    thread_id: &agent_sdk_foundation::ThreadId,
+) -> Result<()> {
+    let projection = message_store
+        .get(thread_id)
+        .await
+        .context("load raw tool-call identity history")?;
+    let staged = staged_messages
+        .snapshot_messages()
+        .context("snapshot staged tool-call identity history")?;
+
+    let mut historical_ids = BTreeSet::new();
+    for message in projection
+        .iter()
+        .flat_map(|projection| {
+            projection
+                .messages
+                .iter()
+                .chain(projection.draft_messages.iter())
+        })
+        .chain(staged.iter())
+    {
+        let llm::Content::Blocks(blocks) = &message.content else {
+            continue;
+        };
+        for block in blocks {
+            if let llm::ContentBlock::ToolUse { id, .. } = block {
+                historical_ids.insert(id.as_str());
+            }
+        }
+    }
+
+    let mut batch_ids = BTreeSet::new();
+    for (index, tool_call) in continuation.payload.pending_tool_calls.iter().enumerate() {
+        let id = tool_call.id.as_str();
+        ensure!(
+            !id.is_empty(),
+            "pending tool call id at batch index {index} is empty"
+        );
+        // `str::len` is the encoded UTF-8 byte length, not the character count.
+        let id_bytes = id.len();
+        ensure!(
+            id_bytes <= MAX_TOOL_CALL_ID_BYTES,
+            "pending tool call id at batch index {index} is {id_bytes} UTF-8 bytes; maximum is {MAX_TOOL_CALL_ID_BYTES}",
+        );
+        ensure!(
+            !historical_ids.contains(id),
+            "pending tool call id {id:?} at batch index {index} collides with earlier tool-use history"
+        );
+        ensure!(
+            batch_ids.insert(id),
+            "pending tool call id {id:?} at batch index {index} duplicates another id in this pending batch"
+        );
+    }
+    Ok(())
 }
 
 /// Materialize the [`AgentEvent::ToolCallStart`] vector from a
@@ -6996,6 +7084,12 @@ async fn suspend_resumed_turn(
 ) -> Result<RootTurnOutcome> {
     let task_id = &inputs.bootstrap.task_id;
 
+    // Validate before closing this attempt: malformed provider identities must
+    // not leave a successful attempt row without matching durable suspension.
+    let new_continuation = build_resume_continuation(&inputs, prior.continuation, &response)
+        .context("build resume continuation")?;
+    validate_pending_tool_call_identities_for_turn(&new_continuation, &inputs, deps).await?;
+
     // Close the turn attempt — the LLM call succeeded.
     close_attempt_or_propagate_already_closed(
         &attempt,
@@ -7007,11 +7101,6 @@ async fn suspend_resumed_turn(
         now,
     )
     .await?;
-
-    // Build a new continuation that accumulates usage from the prior
-    // continuation plus the new response.
-    let new_continuation = build_resume_continuation(&inputs, prior.continuation, &response)
-        .context("build resume continuation")?;
 
     // Build suspended messages that capture the FULL conversation
     // through this point: the caller-supplied replay-history prefix
@@ -7064,7 +7153,9 @@ async fn suspend_resumed_turn(
 
     // Consult the per-call subagent-spawn selector — same contract
     // as `suspend_at_tool_boundary`.
-    let routing = classify_batch_for_inputs(&inputs, deps, &new_continuation).await?;
+    let routing =
+        classify_batch_for_inputs(&inputs, deps, &new_continuation.payload.pending_tool_calls)
+            .await?;
 
     // Clone the new accumulated `suspended_messages` so we can mirror
     // them into the projection's draft slot once the spawn succeeds.
@@ -8086,25 +8177,10 @@ async fn prepare_steering_repark(
         success_usage,
         evidence,
     } = repark;
-    close_attempt_or_propagate_already_closed(
-        &attempt,
-        &response,
-        &success_usage,
-        &evidence,
-        deps,
-        "close attempt on child re-park",
-        now,
-    )
-    .await?;
 
     let mut continuation = build_steering_continuation(inputs, &prior, &response, Vec::new());
-    let routing = if response_requests_tool_dispatch(&response) {
-        Some(
-            classify_batch_for_inputs(inputs, deps, &continuation)
-                .await
-                .context("classify child-resume tool batch")?,
-        )
-    } else {
+    let dispatch_provider_tools = response_requests_tool_dispatch(&response);
+    if !dispatch_provider_tools {
         // The stop reason refused dispatch (MaxTokens truncation,
         // StopSequence, EndTurn-with-tool-use, unknown): no child will
         // ever own these tool calls, and the no-routing re-park below
@@ -8121,11 +8197,9 @@ async fn prepare_steering_repark(
             );
             continuation.payload.pending_tool_calls.clear();
         }
-        None
-    };
-    let specs = child_spawn_specs_for_response(&response, inputs);
+    }
     let mut events = build_content_events(&response, &inputs.bootstrap.task_id, &content_ids);
-    if routing.is_some() {
+    if dispatch_provider_tools {
         events.extend(build_tool_call_start_events(&continuation));
     }
 
@@ -8150,6 +8224,36 @@ async fn prepare_steering_repark(
         .payload
         .pending_tool_calls
         .extend(reattach_pending);
+
+    // Re-attachment adds synthetic pending identities after routing the
+    // provider-emitted calls. Revalidate the combined durable batch before
+    // any journal mutation so a provider id cannot collide with a re-issued
+    // child id.
+    validate_pending_tool_call_identities_for_turn(&continuation, inputs, deps).await?;
+    close_attempt_or_propagate_already_closed(
+        &attempt,
+        &response,
+        &success_usage,
+        &evidence,
+        deps,
+        "close attempt on child re-park",
+        now,
+    )
+    .await?;
+    let routing = if dispatch_provider_tools {
+        Some(
+            classify_batch_for_inputs(
+                inputs,
+                deps,
+                &continuation.payload.pending_tool_calls[..emitted_count],
+            )
+            .await
+            .context("classify child-resume tool batch")?,
+        )
+    } else {
+        None
+    };
+    let specs = child_spawn_specs_for_response(&response, inputs);
 
     let assistant_message =
         build_steering_assistant_message(&response, reattach_blocks, routing.is_some());
@@ -8253,7 +8357,126 @@ async fn repark_after_steering_exchange(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journal::message_store::InMemoryMessageProjectionStore;
     use agent_sdk_providers::OpenAIProvider;
+
+    fn identity_continuation(
+        thread_id: &agent_sdk_foundation::ThreadId,
+        ids: &[&str],
+    ) -> ContinuationEnvelope {
+        let pending_tool_calls = ids
+            .iter()
+            .map(|id| PendingToolCallInfo {
+                id: (*id).to_owned(),
+                name: "bash".to_owned(),
+                display_name: "Bash".to_owned(),
+                tier: ToolTier::Observe,
+                input: serde_json::json!({"command": "true"}),
+                effective_input: serde_json::json!({"command": "true"}),
+                listen_context: None,
+            })
+            .collect();
+        ContinuationEnvelope::wrap(AgentContinuation {
+            thread_id: thread_id.clone(),
+            turn: 1,
+            total_usage: TokenUsage::default(),
+            turn_usage: TokenUsage::default(),
+            pending_tool_calls,
+            awaiting_index: 0,
+            completed_results: Vec::new(),
+            state: AgentState::new(thread_id.clone()),
+            response_id: None,
+            stop_reason: None,
+            response_content: Vec::new(),
+        })
+    }
+
+    fn historical_tool_use(id: &str) -> llm::Message {
+        llm::Message {
+            role: llm::Role::Assistant,
+            content: llm::Content::Blocks(vec![llm::ContentBlock::ToolUse {
+                id: id.to_owned(),
+                name: "bash".to_owned(),
+                input: serde_json::json!({"command": "true"}),
+                thought_signature: None,
+            }]),
+        }
+    }
+
+    async fn validate_identity_fixture(
+        ids: &[&str],
+        raw_history: Vec<llm::Message>,
+        staged_history: Vec<llm::Message>,
+    ) -> Result<()> {
+        let thread_id = agent_sdk_foundation::ThreadId::from_string("thread_identity_validation");
+        let durable = InMemoryMessageProjectionStore::new();
+        if !raw_history.is_empty() {
+            durable
+                .commit_messages(&thread_id, raw_history, OffsetDateTime::UNIX_EPOCH)
+                .await?;
+        }
+        let staged =
+            crate::journal::staged::StagedMessageStore::new(thread_id.clone(), staged_history);
+        validate_pending_tool_call_identities(
+            &identity_continuation(&thread_id, ids),
+            &staged,
+            &durable,
+            &thread_id,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn pending_tool_call_identity_rejects_an_empty_id() {
+        let error = validate_identity_fixture(&[""], Vec::new(), Vec::new())
+            .await
+            .expect_err("an empty pending tool-call id must be rejected");
+        assert!(error.to_string().contains("batch index 0 is empty"));
+    }
+
+    #[tokio::test]
+    async fn pending_tool_call_identity_rejects_an_id_over_96_utf8_bytes() {
+        let oversized = "é".repeat(49);
+        let error = validate_identity_fixture(&[oversized.as_str()], Vec::new(), Vec::new())
+            .await
+            .expect_err("an oversized pending tool-call id must be rejected");
+        assert!(error.to_string().contains("98 UTF-8 bytes; maximum is 96"));
+    }
+
+    #[tokio::test]
+    async fn pending_tool_call_identity_rejects_duplicates_within_the_batch() {
+        let error = validate_identity_fixture(&["call-1", "call-1"], Vec::new(), Vec::new())
+            .await
+            .expect_err("duplicate pending tool-call ids must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("duplicates another id in this pending batch")
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_tool_call_identity_accepts_valid_distinct_ids() -> Result<()> {
+        let boundary = "é".repeat(48);
+        validate_identity_fixture(&["call-1", boundary.as_str()], Vec::new(), Vec::new()).await
+    }
+
+    #[tokio::test]
+    async fn pending_tool_call_identity_rejects_raw_and_staged_history_collisions() {
+        for (raw_history, staged_history) in [
+            (vec![historical_tool_use("call-1")], Vec::new()),
+            (Vec::new(), vec![historical_tool_use("call-1")]),
+        ] {
+            let error = validate_identity_fixture(&["call-1"], raw_history, staged_history)
+                .await
+                .expect_err("a pending id retained in history must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains("collides with earlier tool-use history")
+            );
+        }
+    }
 
     /// Two **real** providers that differ only in the endpoint they are
     /// pointed at. Both are the same struct and both answer `"openai"` from
