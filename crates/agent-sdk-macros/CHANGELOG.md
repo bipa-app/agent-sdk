@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-macros-v0.17.0...agent-sdk-macros-v0.18.0) - 2026-08-04
+
+### Other
+
+- update Cargo.toml dependencies
+
 ## [0.13.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-macros-v0.12.0...agent-sdk-macros-v0.13.0) - 2026-07-14
 
 ### Other
