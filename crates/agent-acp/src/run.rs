@@ -44,6 +44,10 @@
 //! - **Cancel forwarding** — `session/cancel` cancels the token; the loop
 //!   signals the backend once and keeps draining until OUR terminal
 //!   commits. Cancellation is an edge, not an exit.
+//! - **Write-keyed keepalives** — the keepalive deadline resets only when
+//!   an outbound frame is written to the client. Stream items that map to
+//!   nothing (drop-listed, foreign, pre-`Start`) leave it alone; buzz-acp
+//!   times out on stdout idle, so read-side activity proves nothing.
 //! - **Single resolution, by construction** — the prompt's outcome IS this
 //!   function's return value. There is no out-of-band resolution channel,
 //!   callback, or shared cell that could fire twice; every terminal path
@@ -81,8 +85,11 @@ const TERMINAL_STATUS_CONFIRMATIONS: u32 = 2;
 /// cannot spin the loop through instant lag-reopen cycles.
 const LAG_REOPEN_DELAY: Duration = Duration::from_millis(200);
 
-/// Emit activity well inside buzz-acp's idle window while the backend is
-/// silent. Every real stream item postpones this deadline.
+/// Emit activity well inside buzz-acp's idle window while the CLIENT sees
+/// nothing. Only writing an outbound frame postpones this deadline: buzz-acp
+/// kills turns on stdout idle, so stream items that map to nothing
+/// (drop-listed retries, foreign traffic, pre-`Start` events) must not push
+/// it back — a chatty-but-unmapped backend would otherwise starve stdout.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The turn's completion machine (contract C-d). Resolution is not a
@@ -143,6 +150,7 @@ async fn handle_event<B: AcpBackend + ?Sized>(
     backend: &B,
     handle: &AcpRunHandle,
     updates: &UpdateSink,
+    keepalive: Pin<&mut tokio::time::Sleep>,
     phase: &mut Phase,
     mapper: &mut EventMapper,
     event: &AgentEvent,
@@ -172,6 +180,9 @@ async fn handle_event<B: AcpBackend + ?Sized>(
                     .session_update(update)
                     .await
                     .map_err(|error| PromptError::new(error.to_string()))?;
+                // An outbound frame reached the client — THAT is what
+                // postpones the keepalive, not reading a stream item.
+                reset_keepalive(keepalive);
             }
             Ok(None)
         }
@@ -251,7 +262,6 @@ pub(crate) async fn run_prompt<B: AcpBackend + ?Sized>(
                         "event stream ended without a terminal event",
                     ));
                 };
-                reset_keepalive(keepalive.as_mut());
                 match item {
                     RunStreamItem::Lagged => {
                         // C-c: reopen strictly after the last event we
@@ -288,6 +298,7 @@ pub(crate) async fn run_prompt<B: AcpBackend + ?Sized>(
                             backend,
                             handle,
                             updates,
+                            keepalive.as_mut(),
                             &mut phase,
                             &mut mapper,
                             &event.event,

@@ -658,6 +658,55 @@ async fn keepalive_is_emitted_during_scripted_ninety_second_silence() {
     assert_eq!(response["result"]["stopReason"], json!("end_turn"));
 }
 
+/// Stream traffic that maps to NOTHING must not postpone the keepalive:
+/// buzz-acp kills turns on stdout idle, so the deadline is keyed to
+/// outbound writes, not stream reads. Drop-listed retry noise every 25
+/// virtual seconds keeps the loop busy while the client sees nothing —
+/// a keepalive must still land inside the 90s window.
+#[tokio::test(start_paused = true)]
+async fn dropped_stream_items_do_not_postpone_keepalives() {
+    let backend = Arc::new(MockBackend::new(0, vec![vec![ev(0, start_event(TASK))]]).hold_open());
+    let mut client = Client::start(Arc::clone(&backend));
+    let session_id = client.handshake().await;
+    client
+        .send(
+            json!({"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{
+                "sessionId": session_id, "prompt": [{"type":"text","text":"go"}],
+            }}),
+        )
+        .await;
+    wait_for_live_stream(&backend).await;
+    tokio::task::yield_now().await;
+
+    for sequence in 1..=4 {
+        tokio::time::advance(Duration::from_secs(25)).await;
+        let retry = AgentEvent::AutoRetryStart {
+            attempt: 1,
+            max_attempts: 3,
+            delay_ms: 10,
+            error_message: "provider flaked".to_owned(),
+        };
+        assert!(backend.send_live(ev(sequence, retry)));
+        tokio::task::yield_now().await;
+    }
+
+    let update = client.next_message().await;
+    assert_eq!(
+        update["params"]["update"]["sessionUpdate"],
+        json!("keepalive"),
+        "silent-to-the-client stream traffic must not starve the keepalive"
+    );
+
+    assert!(backend.send_live(ev(5, done_event(Some(TASK)))));
+    let (notifications, response) = client.until_response(2).await;
+    assert!(
+        notifications
+            .iter()
+            .all(|message| message["params"]["update"]["sessionUpdate"] == json!("keepalive"))
+    );
+    assert_eq!(response["result"]["stopReason"], json!("end_turn"));
+}
+
 #[tokio::test(start_paused = true)]
 async fn active_streaming_for_ninety_seconds_emits_no_keepalive() {
     let backend = Arc::new(MockBackend::new(0, vec![vec![ev(0, start_event(TASK))]]).hold_open());
