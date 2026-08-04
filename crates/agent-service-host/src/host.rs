@@ -6718,7 +6718,7 @@ mod tests {
         want: TaskStatus,
         max_polls: usize,
     ) -> Result<AgentTask> {
-        let mut last_seen: Option<TaskStatus> = None;
+        let mut last_seen: Option<AgentTask> = None;
         for _ in 0..max_polls {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             let row = stores
@@ -6729,9 +6729,13 @@ mod tests {
             if row.status == want {
                 return Ok(row);
             }
-            last_seen = Some(row.status);
+            last_seen = Some(row);
         }
-        bail!("task {task_id} never reached {want:?}; last observed {last_seen:?}");
+        let last_status = last_seen.as_ref().map(|task| task.status);
+        let last_error = last_seen.and_then(|task| task.last_error);
+        bail!(
+            "task {task_id} never reached {want:?}; last observed {last_status:?}; last error {last_error:?}"
+        );
     }
 
     /// Find the single root-turn task of `thread_id`.
@@ -6878,6 +6882,8 @@ mod tests {
         tool_name: &str,
         tier: ToolTier,
     ) -> agent_server::journal::task::SuspensionPayload {
+        let call_id = format!("call_{tool_name}");
+        let input = serde_json::json!({ "task": HANG_CHILD_TASK });
         agent_server::journal::task::SuspensionPayload {
             continuation: agent_sdk_foundation::ContinuationEnvelope::wrap(
                 agent_sdk_foundation::AgentContinuation {
@@ -6886,12 +6892,12 @@ mod tests {
                     total_usage: agent_sdk_foundation::TokenUsage::default(),
                     turn_usage: agent_sdk_foundation::TokenUsage::default(),
                     pending_tool_calls: vec![agent_sdk_foundation::PendingToolCallInfo {
-                        id: format!("call_{tool_name}"),
+                        id: call_id.clone(),
                         name: tool_name.to_owned(),
                         display_name: tool_name.to_owned(),
                         tier,
-                        input: serde_json::json!({ "task": HANG_CHILD_TASK }),
-                        effective_input: serde_json::json!({ "task": HANG_CHILD_TASK }),
+                        input: input.clone(),
+                        effective_input: input.clone(),
                         listen_context: None,
                     }],
                     awaiting_index: 0,
@@ -6902,7 +6908,12 @@ mod tests {
                     response_content: vec![],
                 },
             ),
-            suspended_messages: vec![],
+            suspended_messages: vec![
+                agent_sdk_foundation::llm::Message::user("coordinate the helpers"),
+                agent_sdk_foundation::llm::Message::assistant_with_tool_use(
+                    None, call_id, tool_name, input,
+                ),
+            ],
             child_join_policy: agent_server::ChildJoinPolicy::default(),
         }
     }

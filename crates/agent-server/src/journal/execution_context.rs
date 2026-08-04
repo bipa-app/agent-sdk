@@ -40,7 +40,6 @@ use time::OffsetDateTime;
 
 use super::checkpoint_store::CheckpointStore;
 use super::staged::StagedStores;
-use super::task_state::TaskState;
 use super::thread_recover::{ThreadRecoveryView, recover_thread};
 use super::thread_store::ThreadStore;
 use crate::worker::bootstrap::WorkerBootstrapContext;
@@ -138,12 +137,14 @@ pub async fn build_root_worker_inputs(
     // 2. Validate task is bound to the bootstrap thread.
     ensure_thread_match(&bootstrap.thread_id, &bootstrap.task.thread_id)?;
 
-    // 3. Seed staged stores from the recovery view. ReadyToResume
-    //    tasks must start from committed checkpoint history only:
-    //    their task state already contains the suspended messages and
-    //    child results that `resume_root_turn` appends in provider-
-    //    valid order.
-    let staged_stores = if matches!(bootstrap.task.state, TaskState::ReadyToResume { .. }) {
+    // 3. Seed staged stores from the recovery view. Runnable resume states
+    //    that replay their own suspended messages must not also recover the
+    //    projection draft containing those messages.
+    let staged_stores = if bootstrap
+        .task
+        .state
+        .requires_committed_only_execution_seed()
+    {
         StagedStores::from_recovery_view_committed_only(&recovery_view)
     } else {
         StagedStores::from_recovery_view(&recovery_view)

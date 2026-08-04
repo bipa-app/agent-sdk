@@ -1391,16 +1391,115 @@ pub fn render_compaction_summary_for_provider(text: &str) -> String {
 fn all_answered_tool_use_ids(messages: &[Message]) -> std::collections::HashSet<&str> {
     messages.iter().flat_map(message_tool_result_ids).collect()
 }
+/// Return the first message index that violates provider tool-call ordering.
+///
+/// Every tool call must have exactly one result in the immediately following
+/// user message. Duplicate ids, misplaced results, and result messages that do
+/// not match the preceding assistant call are rejected.
+#[must_use]
+pub fn provider_tool_sequence_error_index(messages: &[Message]) -> Option<usize> {
+    let mut seen_tool_uses = std::collections::HashSet::new();
+    let mut seen_tool_results = std::collections::HashSet::new();
+
+    for (index, message) in messages.iter().enumerate() {
+        let blocks = match &message.content {
+            Content::Text(_) => &[][..],
+            Content::Blocks(blocks) => blocks.as_slice(),
+        };
+        let mut tool_use_count = 0;
+
+        for block in blocks {
+            if let ContentBlock::ToolUse { id, .. } = block {
+                tool_use_count += 1;
+                if message.role != Role::Assistant || !seen_tool_uses.insert(id.as_str()) {
+                    return Some(index);
+                }
+            }
+        }
+
+        if tool_use_count > 0 {
+            let Some(next) = messages.get(index + 1) else {
+                return Some(index);
+            };
+            let next_blocks = match &next.content {
+                Content::Text(_) => &[][..],
+                Content::Blocks(blocks) => blocks.as_slice(),
+            };
+            let result_count = next_blocks
+                .iter()
+                .filter(|block| matches!(block, ContentBlock::ToolResult { .. }))
+                .count();
+            if next.role != Role::User || result_count != tool_use_count {
+                return Some(index);
+            }
+            for block in blocks {
+                if let ContentBlock::ToolUse { id, .. } = block
+                    && next_blocks
+                        .iter()
+                        .filter(|next_block| {
+                            matches!(
+                                next_block,
+                                ContentBlock::ToolResult { tool_use_id, .. }
+                                    if tool_use_id == id
+                            )
+                        })
+                        .count()
+                        != 1
+                {
+                    return Some(index);
+                }
+            }
+        }
+
+        for block in blocks {
+            let ContentBlock::ToolResult { tool_use_id, .. } = block else {
+                continue;
+            };
+            if message.role != Role::User || !seen_tool_results.insert(tool_use_id.as_str()) {
+                return Some(index);
+            }
+            let Some(previous) = index
+                .checked_sub(1)
+                .and_then(|previous| messages.get(previous))
+            else {
+                return Some(index);
+            };
+            let previous_blocks = match &previous.content {
+                Content::Text(_) => &[][..],
+                Content::Blocks(blocks) => blocks.as_slice(),
+            };
+            if previous.role != Role::Assistant
+                || previous_blocks
+                    .iter()
+                    .filter(|previous_block| {
+                        matches!(
+                            previous_block,
+                            ContentBlock::ToolUse { id, .. } if id == tool_use_id
+                        )
+                    })
+                    .count()
+                    != 1
+            {
+                return Some(index);
+            }
+        }
+    }
+
+    None
+}
+
+/// Whether `messages` satisfy [`provider_tool_sequence_error_index`].
+#[must_use]
+pub fn is_provider_valid_tool_sequence(messages: &[Message]) -> bool {
+    provider_tool_sequence_error_index(messages).is_none()
+}
 
 /// True when `messages` contains a `tool_use` block whose id is not
 /// answered by any `tool_result` block anywhere in the conversation.
 ///
-/// This is exactly the condition the Anthropic Messages API rejects with
-/// *"`tool_use` ids were found without `tool_result` blocks immediately
-/// after"*. It arises whenever a turn is interrupted after the assistant
-/// `tool_use` was persisted but before every result was recorded — most
-/// commonly when the user answers one of several questions and cancels
-/// the rest, or cancels a tool mid-flight.
+/// This detects globally unanswered calls for orphan repair. It does not
+/// validate immediate adjacency, one-to-one pairing, or id uniqueness; use
+/// [`is_provider_valid_tool_sequence`] before sending a provider request.
 #[must_use]
 pub fn has_unbalanced_tool_use(messages: &[Message]) -> bool {
     let answered = all_answered_tool_use_ids(messages);
@@ -2412,6 +2511,10 @@ mod tests {
             !has_unbalanced_tool_use(messages),
             "expected balanced history, found an orphaned tool_use",
         );
+        assert!(
+            is_provider_valid_tool_sequence(messages),
+            "balanced history must also be provider-valid",
+        );
     }
 
     #[test]
@@ -2549,5 +2652,36 @@ mod tests {
             !matches!(a_results[0], ContentBlock::ToolResult { content, .. } if content == USER_CANCELLED_TOOL_RESULT),
             "the real successful result must not be relabelled cancelled",
         );
+    }
+
+    #[test]
+    fn provider_sequence_rejects_duplicated_suspended_prefix() {
+        let messages = vec![
+            Message::user("Which checkout?"),
+            assistant_tool_uses(&["question-call-1"]),
+            Message::user("Which checkout?"),
+            assistant_tool_uses(&["question-call-1"]),
+            tool_results(&["question-call-1"]),
+        ];
+
+        assert!(
+            !has_unbalanced_tool_use(&messages),
+            "the later result makes the duplicated history look globally answered",
+        );
+        assert!(
+            !is_provider_valid_tool_sequence(&messages),
+            "the first tool_use is not answered immediately and the id is duplicated",
+        );
+        assert_eq!(provider_tool_sequence_error_index(&messages), Some(1));
+    }
+
+    #[test]
+    fn provider_sequence_rejects_duplicate_results_in_one_message() {
+        let messages = vec![
+            assistant_tool_uses(&["question-call-1"]),
+            tool_results(&["question-call-1", "question-call-1"]),
+        ];
+
+        assert_eq!(provider_tool_sequence_error_index(&messages), Some(0));
     }
 }
