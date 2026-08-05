@@ -44,23 +44,29 @@
 //! - **Cancel forwarding** — `session/cancel` cancels the token; the loop
 //!   signals the backend once and keeps draining until OUR terminal
 //!   commits. Cancellation is an edge, not an exit.
+//! - **Write-keyed keepalives** — the keepalive deadline resets only when
+//!   an outbound frame is written to the client. Stream items that map to
+//!   nothing (drop-listed, foreign, pre-`Start`) leave it alone; buzz-acp
+//!   times out on stdout idle, so read-side activity proves nothing.
 //! - **Single resolution, by construction** — the prompt's outcome IS this
 //!   function's return value. There is no out-of-band resolution channel,
 //!   callback, or shared cell that could fire twice; every terminal path
 //!   is a `return`.
 //!
-//! Milestone scope: text deltas + terminals. Thinking, tool calls,
-//! subagent lifecycle, and plan synthesis land in M2 (ENG-9404…9406).
+//! Mapper scope: text/thinking deltas, consolidated-content dedupe, tool
+//! lifecycle, turn usage, keepalives, and terminals. Subagent, plan, and
+//! permission mapping land in later slices.
 
-use std::collections::HashSet;
+use std::pin::Pin;
 use std::time::Duration;
 
 use agent_sdk_foundation::AgentEvent;
 use futures::StreamExt;
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::{AcpBackend, AcpRunHandle, BackendTaskStatus, RunStreamItem};
+use crate::mapper::{EventMapper, Mapped};
 use crate::server::{PromptError, UpdateSink};
 use crate::wire::StopReason;
 
@@ -79,18 +85,12 @@ const TERMINAL_STATUS_CONFIRMATIONS: u32 = 2;
 /// cannot spin the loop through instant lag-reopen cycles.
 const LAG_REOPEN_DELAY: Duration = Duration::from_millis(200);
 
-/// Outcome of mapping a single committed event.
-#[derive(Debug, PartialEq, Eq)]
-enum Mapped {
-    /// Emit a `session/update` payload.
-    Update(Value),
-    /// The turn is over with this stop reason.
-    Terminal(StopReason),
-    /// The turn failed; resolve the prompt as a JSON-RPC error.
-    Fail(String),
-    /// Not mapped in this milestone.
-    Ignore,
-}
+/// Emit activity well inside buzz-acp's idle window while the CLIENT sees
+/// nothing. Only writing an outbound frame postpones this deadline: buzz-acp
+/// kills turns on stdout idle, so stream items that map to nothing
+/// (drop-listed retries, foreign traffic, pre-`Start` events) must not push
+/// it back — a chatty-but-unmapped backend would otherwise starve stdout.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The turn's completion machine (contract C-d). Resolution is not a
 /// state: resolving IS returning from [`run_prompt`].
@@ -105,87 +105,121 @@ enum Phase {
     Streaming,
 }
 
-/// Map one event to its wire effect.
-///
-/// `delta_seen` tracks message ids that streamed as deltas, so their
-/// consolidated `Text` form is not re-emitted.
-fn map_event(event: &AgentEvent, delta_seen: &mut HashSet<String>) -> Mapped {
-    match event {
-        AgentEvent::TextDelta {
-            message_id, delta, ..
-        } => {
-            delta_seen.insert(message_id.clone());
-            Mapped::Update(chunk(delta))
-        }
-        AgentEvent::Text {
-            message_id, text, ..
-        } => {
-            if delta_seen.contains(message_id) {
-                Mapped::Ignore
-            } else {
-                Mapped::Update(chunk(text))
-            }
-        }
-        AgentEvent::Done { .. } => Mapped::Terminal(StopReason::EndTurn),
-        AgentEvent::Cancelled { .. } => Mapped::Terminal(StopReason::Cancelled),
-        AgentEvent::Refusal { .. } => Mapped::Terminal(StopReason::Refusal),
-        AgentEvent::BudgetExceeded { .. } => Mapped::Terminal(StopReason::MaxTokens),
-        AgentEvent::Error { message, .. } => Mapped::Fail(message.clone()),
-        // Thinking/tool/subagent/plan/etc.: deliberately unmapped until M2.
-        _ => Mapped::Ignore,
-    }
-}
-
-fn chunk(text: &str) -> Value {
-    json!({
-        "sessionUpdate": "agent_message_chunk",
-        "content": { "type": "text", "text": text },
-    })
-}
-
 /// Resolve the prompt from the task's durable STATUS (no journal event).
 fn resolve_from_status(status: BackendTaskStatus) -> Result<StopReason, PromptError> {
     match status {
         BackendTaskStatus::Completed => Ok(StopReason::EndTurn),
         BackendTaskStatus::Cancelled => Ok(StopReason::Cancelled),
-        BackendTaskStatus::Failed { error } => {
-            Err(PromptError::new(error.unwrap_or_else(|| {
-                "task failed without a recorded error".to_owned()
-            })))
-        }
+        BackendTaskStatus::Failed { error } => resolve_failed_status(error),
         BackendTaskStatus::Running => Err(PromptError::new(
             "resolve_from_status called with a non-terminal status (loop bug)",
         )),
     }
 }
 
-/// An UNATTRIBUTED terminal (or error) arrived while streaming: only OUR
-/// task's durable status may close the turn (contract C-d). `None` means
-/// the event was not ours — keep streaming.
+fn resolve_failed_status(error: Option<String>) -> Result<StopReason, PromptError> {
+    let Some(error) = error else {
+        return Err(PromptError::new("task failed without a recorded error"));
+    };
+    Err(PromptError::new(error))
+}
+
+/// An unattributed terminal arrived while streaming. Only the submitted
+/// task's durable status may close the turn; `None` keeps streaming.
 async fn reconcile_unattributed<B: AcpBackend + ?Sized>(
     backend: &B,
     handle: &AcpRunHandle,
-) -> Option<Result<StopReason, PromptError>> {
+) -> Result<Option<StopReason>, PromptError> {
     match backend
         .task_status(&handle.thread_id, &handle.task_id)
         .await
     {
-        Ok(BackendTaskStatus::Running) => None,
-        Ok(status) => Some(resolve_from_status(status)),
-        Err(e) => {
+        Ok(BackendTaskStatus::Running) => Ok(None),
+        Ok(status) => resolve_from_status(status).map(Some),
+        Err(error) => {
             log::warn!(
                 "acp: status probe after an unattributed terminal failed \
-                 (stall poll will retry): {e}"
+                 (stall poll will retry): {error}"
             );
-            None
+            Ok(None)
         }
     }
 }
 
+async fn handle_event<B: AcpBackend + ?Sized>(
+    backend: &B,
+    handle: &AcpRunHandle,
+    updates: &UpdateSink,
+    keepalive: Pin<&mut tokio::time::Sleep>,
+    phase: &mut Phase,
+    mapper: &mut EventMapper,
+    event: &AgentEvent,
+) -> Result<Option<StopReason>, PromptError> {
+    let is_ours = event.emitter_task_id() == Some(handle.task_id.as_str());
+    let is_foreign = event
+        .emitter_task_id()
+        .is_some_and(|task_id| task_id != handle.task_id);
+
+    if matches!(event, AgentEvent::Start { .. }) {
+        if is_ours && *phase == Phase::AwaitingStart {
+            *phase = Phase::Streaming;
+        }
+        return Ok(None);
+    }
+
+    // Drop foreign content before mapping so its message id cannot poison the
+    // consolidated-content dedupe state for the submitted task.
+    if is_foreign {
+        return Ok(None);
+    }
+
+    match mapper.map(event) {
+        Mapped::Update(update) => {
+            if *phase == Phase::Streaming {
+                updates
+                    .session_update(update)
+                    .await
+                    .map_err(|error| PromptError::new(error.to_string()))?;
+                // An outbound frame reached the client — THAT is what
+                // postpones the keepalive, not reading a stream item.
+                reset_keepalive(keepalive);
+            }
+            Ok(None)
+        }
+        Mapped::Terminal(reason) => {
+            if is_ours {
+                return Ok(Some(reason));
+            }
+            if *phase == Phase::AwaitingStart {
+                return Ok(None);
+            }
+            reconcile_unattributed(backend, handle).await
+        }
+        Mapped::Fail(message) => {
+            if is_ours {
+                return Err(PromptError::new(message));
+            }
+            if *phase == Phase::AwaitingStart {
+                return Ok(None);
+            }
+            reconcile_unattributed(backend, handle).await
+        }
+        Mapped::Ignore => Ok(None),
+    }
+}
+
+fn reset_keepalive(keepalive: Pin<&mut tokio::time::Sleep>) {
+    keepalive.reset(tokio::time::Instant::now() + KEEPALIVE_INTERVAL);
+}
+
+async fn emit_keepalive(updates: &UpdateSink) -> Result<(), PromptError> {
+    updates
+        .session_update(json!({ "sessionUpdate": "keepalive" }))
+        .await
+        .map_err(|error| PromptError::new(error.to_string()))
+}
+
 /// Drive one submitted turn to completion.
-// One linear select loop: splitting it further would scatter the C-c/C-d
-// state machine across helpers (same call as the provider impls).
-#[allow(clippy::too_many_lines)]
 pub(crate) async fn run_prompt<B: AcpBackend + ?Sized>(
     backend: &B,
     handle: &AcpRunHandle,
@@ -200,7 +234,7 @@ pub(crate) async fn run_prompt<B: AcpBackend + ?Sized>(
         .map_err(|e| PromptError::new(e.message))?;
 
     let mut last_yielded: Option<u64> = None;
-    let mut delta_seen: HashSet<String> = HashSet::new();
+    let mut mapper = EventMapper::default();
     let mut cancel_forwarded = false;
     let mut phase = Phase::AwaitingStart;
     let mut terminal_status_streak: u32 = 0;
@@ -208,6 +242,9 @@ pub(crate) async fn run_prompt<B: AcpBackend + ?Sized>(
     let mut stall = tokio::time::interval(STALL_POLL_INTERVAL);
     stall.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     stall.tick().await; // interval's first tick is immediate — skip it.
+
+    let keepalive = tokio::time::sleep(KEEPALIVE_INTERVAL);
+    tokio::pin!(keepalive);
 
     loop {
         tokio::select! {
@@ -249,79 +286,33 @@ pub(crate) async fn run_prompt<B: AcpBackend + ?Sized>(
                              continuity cannot be proven, failing the prompt",
                         ));
                     }
-                    RunStreamItem::Event(ev) => {
-                        if last_yielded.is_some_and(|last| ev.sequence <= last) {
+                    RunStreamItem::Event(event) => {
+                        if last_yielded.is_some_and(|last| event.sequence <= last) {
                             continue;
                         }
-                        last_yielded = Some(ev.sequence);
-                        // Stream progress: any in-flight journal commit
-                        // clearly still flows, so restart the status grace.
+                        last_yielded = Some(event.sequence);
+                        // Stream progress resets the grace for an in-flight
+                        // terminal journal commit.
                         terminal_status_streak = 0;
-
-                        // Contract C-d: attribution decides everything.
-                        let is_ours = ev.event.emitter_task_id() == Some(handle.task_id.as_str());
-                        let is_foreign =
-                            ev.event.emitter_task_id().is_some_and(|t| t != handle.task_id);
-
-                        if matches!(ev.event, AgentEvent::Start { .. }) {
-                            if is_ours && phase == Phase::AwaitingStart {
-                                phase = Phase::Streaming;
-                            }
-                            continue;
-                        }
-
-                        match map_event(&ev.event, &mut delta_seen) {
-                            Mapped::Update(update) => {
-                                // Content attribution (ENG-9422): a
-                                // cancelled predecessor's salvage flush
-                                // can commit deltas AFTER our Start —
-                                // attributed content from another task
-                                // is dropped. Unattributed content
-                                // (pre-attribution journals, embedded
-                                // runs) streams as before; for those the
-                                // phase gate is the only protection.
-                                if is_foreign {
-                                    continue;
-                                }
-                                if phase == Phase::Streaming {
-                                    updates
-                                        .session_update(update)
-                                        .await
-                                        .map_err(|e| PromptError::new(e.to_string()))?;
-                                }
-                            }
-                            Mapped::Terminal(reason) => {
-                                if is_ours {
-                                    return Ok(reason);
-                                }
-                                if is_foreign || phase == Phase::AwaitingStart {
-                                    // A predecessor's late terminal (or a
-                                    // salvage commit): never ours to act on.
-                                    continue;
-                                }
-                                if let Some(resolution) =
-                                    reconcile_unattributed(backend, handle).await
-                                {
-                                    return resolution;
-                                }
-                            }
-                            Mapped::Fail(message) => {
-                                if is_ours {
-                                    return Err(PromptError::new(message));
-                                }
-                                if is_foreign || phase == Phase::AwaitingStart {
-                                    continue;
-                                }
-                                if let Some(resolution) =
-                                    reconcile_unattributed(backend, handle).await
-                                {
-                                    return resolution;
-                                }
-                            }
-                            Mapped::Ignore => {}
+                        if let Some(reason) = handle_event(
+                            backend,
+                            handle,
+                            updates,
+                            keepalive.as_mut(),
+                            &mut phase,
+                            &mut mapper,
+                            &event.event,
+                        )
+                        .await?
+                        {
+                            return Ok(reason);
                         }
                     }
                 }
+            }
+            () = &mut keepalive => {
+                emit_keepalive(updates).await?;
+                reset_keepalive(keepalive.as_mut());
             }
             _ = stall.tick() => {
                 // Bounded stall reconciliation: a task can reach a terminal
@@ -351,115 +342,6 @@ pub(crate) async fn run_prompt<B: AcpBackend + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_sdk_foundation::{ThreadId, TokenUsage};
-    use std::time::Duration;
-
-    fn done() -> AgentEvent {
-        AgentEvent::Done {
-            thread_id: ThreadId::from_string("t".to_owned()),
-            total_turns: 1,
-            total_usage: TokenUsage::default(),
-            duration: Duration::from_millis(1),
-            estimated_cost_usd: None,
-            emitter_task_id: None,
-        }
-    }
-
-    #[test]
-    fn golden_text_delta_maps_to_agent_message_chunk() {
-        let mut seen = HashSet::new();
-        let mapped = map_event(&AgentEvent::text_delta("m1", "hel"), &mut seen);
-        let Mapped::Update(update) = mapped else {
-            panic!("expected update");
-        };
-        assert_eq!(update["sessionUpdate"], json!("agent_message_chunk"));
-        assert_eq!(update["content"]["text"], json!("hel"));
-        assert!(seen.contains("m1"));
-    }
-
-    #[test]
-    fn golden_consolidated_text_dedupes_against_its_deltas() {
-        let mut seen = HashSet::new();
-        let _ = map_event(&AgentEvent::text_delta("m1", "a"), &mut seen);
-        assert_eq!(
-            map_event(&AgentEvent::text("m1", "ab"), &mut seen),
-            Mapped::Ignore,
-            "consolidated Text after its deltas must not re-emit"
-        );
-        // A message that never streamed deltas emits its full text once.
-        let Mapped::Update(update) = map_event(&AgentEvent::text("m2", "whole"), &mut seen) else {
-            panic!("expected update");
-        };
-        assert_eq!(update["content"]["text"], json!("whole"));
-    }
-
-    #[test]
-    fn golden_terminals_map_to_their_stop_reasons() {
-        let mut seen = HashSet::new();
-        assert_eq!(
-            map_event(&done(), &mut seen),
-            Mapped::Terminal(StopReason::EndTurn)
-        );
-        assert_eq!(
-            map_event(
-                &AgentEvent::Cancelled {
-                    turn: 1,
-                    usage: TokenUsage::default(),
-                    reason: None,
-                    emitter_task_id: None,
-                },
-                &mut seen
-            ),
-            Mapped::Terminal(StopReason::Cancelled)
-        );
-        assert_eq!(
-            map_event(&AgentEvent::refusal("m1", None), &mut seen),
-            Mapped::Terminal(StopReason::Refusal)
-        );
-        assert_eq!(
-            map_event(
-                &AgentEvent::BudgetExceeded {
-                    thread_id: ThreadId::from_string("t".to_owned()),
-                    total_turns: 1,
-                    total_usage: TokenUsage::default(),
-                    duration: Duration::from_millis(1),
-                    estimated_cost_usd: None,
-                    limit: agent_sdk_foundation::types::BudgetLimitKind::TotalTokens,
-                    emitter_task_id: None,
-                },
-                &mut seen
-            ),
-            Mapped::Terminal(StopReason::MaxTokens)
-        );
-        assert_eq!(
-            map_event(&AgentEvent::error("boom", false), &mut seen),
-            Mapped::Fail("boom".to_owned())
-        );
-    }
-
-    #[test]
-    fn golden_out_of_scope_variants_are_ignored_in_m0() {
-        let mut seen = HashSet::new();
-        assert_eq!(
-            map_event(&AgentEvent::thinking_delta("m1", "hmm"), &mut seen),
-            Mapped::Ignore,
-            "thinking mapping is M2 (ENG-9404)"
-        );
-        assert_eq!(
-            map_event(
-                &AgentEvent::tool_call_start(
-                    "t1",
-                    "grep",
-                    "Grep",
-                    json!({}),
-                    agent_sdk_foundation::ToolTier::Observe,
-                ),
-                &mut seen
-            ),
-            Mapped::Ignore,
-            "tool mapping is M2 (ENG-9404)"
-        );
-    }
 
     #[test]
     fn status_resolution_maps_every_terminal_shape() {
@@ -471,13 +353,18 @@ mod tests {
             resolve_from_status(BackendTaskStatus::Cancelled),
             Ok(StopReason::Cancelled)
         ));
-        let err = resolve_from_status(BackendTaskStatus::Failed {
+        let error = resolve_from_status(BackendTaskStatus::Failed {
             error: Some("boom".to_owned()),
-        })
-        .expect_err("failed status is a prompt error");
-        assert!(err.message.contains("boom"));
-        let err = resolve_from_status(BackendTaskStatus::Failed { error: None })
-            .expect_err("failed status is a prompt error");
-        assert!(err.message.contains("without a recorded error"));
+        });
+        let Err(error) = error else {
+            panic!("failed status must be a prompt error");
+        };
+        assert!(error.message.contains("boom"));
+
+        let error = resolve_from_status(BackendTaskStatus::Failed { error: None });
+        let Err(error) = error else {
+            panic!("failed status must be a prompt error");
+        };
+        assert!(error.message.contains("without a recorded error"));
     }
 }

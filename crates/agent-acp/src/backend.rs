@@ -8,9 +8,9 @@
 //! ([`crate::run`]), so every backend implementation inherits the same
 //! correctness behavior.
 //!
-//! In this milestone the loop maps text deltas and terminal events only;
-//! thinking/tool/subagent/plan mapping and lag-reopen land in later cards
-//! (ENG-9402, ENG-9404…9406).
+//! The loop maps text and thinking content, tool lifecycle, usage, keepalives,
+//! and terminal events. Subagent, plan, and permission mapping land in later
+//! slices.
 
 use std::sync::Arc;
 
