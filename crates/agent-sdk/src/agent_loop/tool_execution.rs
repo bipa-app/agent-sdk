@@ -1862,10 +1862,12 @@ where
         return Ok(());
     }
 
-    // Build tool result blocks, followed by any native binary attachments the
-    // tool wants to pass back to the LLM (e.g. PDFs or images).
-    // All blocks for a single agent turn are batched into one user message so
-    // the Anthropic API receives them together, as required.
+    // Build tool result blocks, then any native binary attachments the
+    // tools want to pass back to the LLM (e.g. PDFs or images).
+    // All blocks for a single agent turn are batched into one user message,
+    // and EVERY tool_result block must precede any other content in it —
+    // Anthropic rejects a request whose tool_use ids are not answered by
+    // immediately following tool_result blocks.
     let mut blocks: Vec<ContentBlock> = Vec::new();
     for (tool_id, result) in tool_results {
         blocks.push(ContentBlock::ToolResult {
@@ -1874,6 +1876,8 @@ where
             artifact: result.artifact.clone(),
             is_error: if result.success { None } else { Some(true) },
         });
+    }
+    for (_, result) in tool_results {
         for doc in &result.documents {
             if doc.media_type.starts_with("image/") {
                 blocks.push(ContentBlock::Image {

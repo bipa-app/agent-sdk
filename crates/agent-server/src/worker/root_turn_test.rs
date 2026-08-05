@@ -58,7 +58,10 @@ use agent_sdk_foundation::{
 /// the same user message as its `ToolResult` block, exactly like the
 /// in-process loop's `append_tool_results` — dropping them silences
 /// every multimodal tool result on the daemon path (live incident: the
-/// ENG-9548 browser screenshot never reached the model).
+/// ENG-9548 browser screenshot never reached the model). Anthropic
+/// requires EVERY `tool_result` block to precede any other content, so
+/// the message is two-pass: all results in tool-use order, then the
+/// attachments in result order.
 #[test]
 fn fan_in_tool_results_carry_documents_as_native_blocks() {
     let screenshot = agent_sdk_foundation::ToolResult::success("captured").with_documents(vec![
@@ -79,15 +82,32 @@ fn fan_in_tool_results_carry_documents_as_native_blocks() {
     assert!(
         matches!(&blocks[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_img")
     );
-    let ContentBlock::Image { source } = &blocks[1] else {
-        panic!("image attachment must follow its tool result block");
+    assert!(
+        matches!(&blocks[1], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_doc")
+    );
+    let ContentBlock::Image { source } = &blocks[2] else {
+        panic!("image attachment must follow the full tool-result run");
     };
     assert_eq!(source.media_type, "image/png");
     assert_eq!(source.data, "artifact://7");
-    assert!(
-        matches!(&blocks[2], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_doc")
-    );
     assert!(matches!(&blocks[3], ContentBlock::Document { .. }));
+    let last_result = blocks
+        .iter()
+        .rposition(|block| matches!(block, ContentBlock::ToolResult { .. }))
+        .expect("at least one tool result");
+    let first_attachment = blocks
+        .iter()
+        .position(|block| {
+            matches!(
+                block,
+                ContentBlock::Image { .. } | ContentBlock::Document { .. }
+            )
+        })
+        .expect("at least one attachment");
+    assert!(
+        last_result < first_attachment,
+        "no tool_result block may appear after any attachment"
+    );
 }
 use agent_sdk_providers::LlmProvider;
 use agent_sdk_providers::streaming::{StreamBox, StreamDelta, StreamErrorKind};
