@@ -6,9 +6,15 @@
 pub(crate) mod data;
 
 use crate::attachments::validate_request_attachments;
-use crate::provider::LlmProvider;
+use crate::provider::{
+    BoundedEmbeddingRowsSeed, BoundedEmbeddingVector, EmbeddingError, LlmProvider,
+    deserialize_bounded_embedding_json, read_embedding_response,
+    validate_bounded_embedding_vector_shape, validate_embedding_request,
+};
 use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind, reqwest_error_delta};
-use agent_sdk_foundation::llm::{ChatOutcome, ChatRequest, ChatResponse, ThinkingConfig};
+use agent_sdk_foundation::llm::{
+    ChatOutcome, ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, ThinkingConfig,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use data::{
@@ -375,6 +381,50 @@ impl LlmProvider for GeminiProvider {
         }))
     }
 
+    async fn embed(
+        &self,
+        request: &EmbeddingRequest,
+    ) -> std::result::Result<EmbeddingResponse, EmbeddingError> {
+        validate_embedding_request(request)?;
+        let model_id = gemini_embedding_model_id(&request.model)?;
+        let model_name = format!("models/{model_id}");
+        let requested_dimensions = request.dimensions;
+        let requests = request
+            .inputs
+            .iter()
+            .map(|input| ApiEmbedContentRequest {
+                model: &model_name,
+                content: ApiEmbeddingContent {
+                    parts: [ApiEmbeddingPart { text: input }],
+                },
+                embed_content_config: requested_dimensions.map(|dimensions| {
+                    ApiEmbedContentConfig {
+                        output_dimensionality: dimensions.get(),
+                    }
+                }),
+            })
+            .collect();
+        let api_request = ApiBatchEmbedContentsRequest { requests };
+
+        let builder = self
+            .client
+            .post(format!(
+                "{}/models/{model_id}:batchEmbedContents",
+                self.base_url
+            ))
+            .header("Content-Type", "application/json")
+            .timeout(std::time::Duration::from_secs(CHAT_READ_TIMEOUT_SECS));
+        let response = self
+            .apply_auth(builder)
+            .json(&api_request)
+            .send()
+            .await
+            .map_err(|_| EmbeddingError::Transport)?;
+        let bytes =
+            read_embedding_response(response, crate::retry_hints::google_retry_delay).await?;
+        decode_gemini_embedding_response(&bytes, request.inputs.len(), requested_dimensions)
+    }
+
     fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
         let served_route = self.route().to_owned();
         Box::pin(async_stream::stream! {
@@ -560,6 +610,162 @@ impl LlmProvider for GeminiProvider {
     }
 }
 
+fn gemini_embedding_model_id(model: &str) -> std::result::Result<&str, EmbeddingError> {
+    let model_id = model.strip_prefix("models/").unwrap_or(model);
+    if model_id.is_empty()
+        || model_id.chars().any(|character| {
+            character.is_ascii_control()
+                || character.is_ascii_whitespace()
+                || matches!(character, '/' | '?' | '#' | '\\' | '%')
+        })
+    {
+        return Err(EmbeddingError::InvalidRequest {
+            message: "model must be a single safe path segment".to_owned(),
+        });
+    }
+    Ok(model_id)
+}
+
+#[derive(serde::Serialize)]
+struct ApiBatchEmbedContentsRequest<'a> {
+    requests: Vec<ApiEmbedContentRequest<'a>>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiEmbedContentRequest<'a> {
+    model: &'a str,
+    content: ApiEmbeddingContent<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embed_content_config: Option<ApiEmbedContentConfig>,
+}
+
+#[derive(serde::Serialize)]
+struct ApiEmbeddingContent<'a> {
+    parts: [ApiEmbeddingPart<'a>; 1],
+}
+
+#[derive(serde::Serialize)]
+struct ApiEmbeddingPart<'a> {
+    text: &'a str,
+}
+
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiEmbedContentConfig {
+    output_dimensionality: u32,
+}
+
+struct ApiBatchEmbedContentsResponse {
+    embeddings: Vec<ApiContentEmbedding>,
+}
+
+struct ApiBatchEmbedContentsResponseSeed {
+    expected_count: usize,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(field_identifier, rename_all = "camelCase")]
+enum ApiBatchEmbedContentsResponseField {
+    Embeddings,
+    #[serde(other)]
+    Other,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for ApiBatchEmbedContentsResponseSeed {
+    type Value = ApiBatchEmbedContentsResponse;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ApiBatchEmbedContentsResponseVisitor {
+            expected_count: usize,
+        }
+
+        impl<'de> serde::de::Visitor<'de> for ApiBatchEmbedContentsResponseVisitor {
+            type Value = ApiBatchEmbedContentsResponse;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a Gemini batch embeddings response")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut embeddings = None;
+                while let Some(field) = map.next_key::<ApiBatchEmbedContentsResponseField>()? {
+                    match field {
+                        ApiBatchEmbedContentsResponseField::Embeddings => {
+                            if embeddings.is_some() {
+                                return Err(<A::Error as serde::de::Error>::duplicate_field(
+                                    "embeddings",
+                                ));
+                            }
+                            embeddings = Some(map.next_value_seed(BoundedEmbeddingRowsSeed::<
+                                ApiContentEmbedding,
+                            >::new(
+                                self.expected_count
+                            ))?);
+                        }
+                        ApiBatchEmbedContentsResponseField::Other => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                Ok(ApiBatchEmbedContentsResponse {
+                    embeddings: embeddings.ok_or_else(|| {
+                        <A::Error as serde::de::Error>::missing_field("embeddings")
+                    })?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(ApiBatchEmbedContentsResponseVisitor {
+            expected_count: self.expected_count,
+        })
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ApiContentEmbedding {
+    values: BoundedEmbeddingVector,
+}
+
+fn decode_gemini_embedding_response(
+    bytes: &[u8],
+    expected_count: usize,
+    requested_dimensions: Option<std::num::NonZeroU32>,
+) -> std::result::Result<EmbeddingResponse, EmbeddingError> {
+    let api_response = deserialize_bounded_embedding_json(
+        bytes,
+        ApiBatchEmbedContentsResponseSeed { expected_count },
+        "body is not valid batch embeddings JSON",
+    )?;
+    if api_response.embeddings.len() != expected_count {
+        return Err(EmbeddingError::InvalidResponse {
+            message: format!(
+                "response has {} vectors for {expected_count} inputs",
+                api_response.embeddings.len()
+            ),
+        });
+    }
+    let mut expected_dimension = None;
+    let mut vectors = Vec::with_capacity(expected_count);
+    for (index, embedding) in api_response.embeddings.into_iter().enumerate() {
+        expected_dimension = Some(validate_bounded_embedding_vector_shape(
+            index,
+            &embedding.values,
+            expected_dimension,
+            requested_dimensions,
+        )?);
+        vectors.push(embedding.values.into_inner());
+    }
+    Ok(EmbeddingResponse { vectors })
+}
+
 /// A raw Gemini model row, kept un-filtered so the `generateContent` filter can
 /// be applied only *after* every page has been collected (so server-side page
 /// truncation cannot hide a chat-capable model behind a page boundary).
@@ -637,6 +843,61 @@ fn finalize_gemini_models(rows: Vec<GeminiModelRow>) -> Vec<crate::provider::Mod
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedding_response_seed_stops_after_the_first_excess_row() {
+        let body = br#"{
+            "embeddings": [
+                {"values": [1.0]},
+                {"values": [2.0]},
+                {"values":
+            ]
+        }"#;
+        let mut deserializer = serde_json::Deserializer::from_slice(body);
+        let result = serde::de::DeserializeSeed::deserialize(
+            ApiBatchEmbedContentsResponseSeed { expected_count: 1 },
+            &mut deserializer,
+        );
+        let Err(error) = result else {
+            panic!("the first excess row must trip the bound");
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("embedding response exceeds the 1-row limit"),
+            "the parser must stop before polling the malformed third row: {error}"
+        );
+    }
+
+    #[test]
+    fn embedding_response_seed_keeps_recognized_duplicate_detection() {
+        let mut deserializer =
+            serde_json::Deserializer::from_slice(br#"{"embeddings":[],"embeddings":[]}"#);
+        let result = serde::de::DeserializeSeed::deserialize(
+            ApiBatchEmbedContentsResponseSeed { expected_count: 1 },
+            &mut deserializer,
+        );
+        let Err(error) = result else {
+            panic!("a duplicate recognized field must be rejected");
+        };
+        assert!(error.to_string().contains("duplicate field"));
+    }
+
+    #[test]
+    fn embedding_response_seed_ignores_unknown_fields_without_changing_the_wire_shape() {
+        let response = decode_gemini_embedding_response(
+            br#"{
+                "future": {"nested": ["value"]},
+                "embeddings": [{"values": [1.0, 2.0]}]
+            }"#,
+            1,
+            None,
+        )
+        .expect("unknown fields remain forward compatible");
+
+        assert_eq!(response.vectors, vec![vec![1.0, 2.0]]);
+    }
 
     const GEMINI_MODELS_FIXTURE: &str = r#"{
       "models": [

@@ -20,15 +20,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_sdk_foundation::llm::{
-    CacheConfig, ChatOutcome, ChatRequest, ChatResponse, ContentBlock, Effort, StopReason,
-    ThinkingConfig, ThinkingMode, ToolChoice, Usage,
+    CacheConfig, ChatOutcome, ChatRequest, ChatResponse, ContentBlock, Effort, EmbeddingRequest,
+    EmbeddingResponse, StopReason, ThinkingConfig, ThinkingMode, ToolChoice, Usage,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
-use crate::provider::LlmProvider;
+use crate::provider::{EmbeddingError, LlmProvider};
 use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind};
 
 /// Whether a [`RecordReplayProvider`] captures live traffic or serves a
@@ -162,6 +162,26 @@ impl LlmProvider for RecordReplayProvider {
                     bail!("recorded interaction for '{key}' is a stream, not a chat")
                 }
             },
+        }
+    }
+
+    /// Record mode forwards embeddings without persisting input text or vectors.
+    /// Replay mode returns a deterministic typed error because embedding
+    /// interactions are intentionally excluded from cassette data.
+    async fn embed(
+        &self,
+        request: &EmbeddingRequest,
+    ) -> std::result::Result<EmbeddingResponse, EmbeddingError> {
+        match self.mode {
+            RecordReplayMode::Record => match &self.inner {
+                Some(inner) => inner.embed(request).await,
+                None => Err(EmbeddingError::Unsupported {
+                    provider: self.provider(),
+                }),
+            },
+            RecordReplayMode::Replay => Err(EmbeddingError::Unsupported {
+                provider: self.provider(),
+            }),
         }
     }
 
@@ -701,6 +721,15 @@ mod tests {
             Ok(self.chat_outcome.clone())
         }
 
+        async fn embed(
+            &self,
+            _request: &EmbeddingRequest,
+        ) -> std::result::Result<EmbeddingResponse, EmbeddingError> {
+            Ok(EmbeddingResponse {
+                vectors: vec![vec![0.125, 0.25]],
+            })
+        }
+
         async fn list_models(&self) -> Result<Vec<crate::provider::ModelInfo>> {
             Ok(vec![crate::provider::ModelInfo {
                 id: "inner-discovered-model".to_owned(),
@@ -873,6 +902,43 @@ mod tests {
         // reports the operation as unsupported rather than panicking.
         let player = RecordReplayProvider::replay(&path)?;
         assert!(player.list_models().await.is_err());
+
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn embeddings_do_not_enter_cassettes() -> Result<()> {
+        let path = temp_cassette_path();
+        let inner = Arc::new(InnerProvider {
+            model: "inner-model",
+            chat_outcome: success_outcome("cassette seed"),
+            deltas: Vec::new(),
+            supports_historical_images: false,
+        });
+        let recorder = RecordReplayProvider::record(inner, &path);
+        let embedding_request = EmbeddingRequest::new(
+            "embedding-model",
+            vec!["sensitive embedding input".to_owned()],
+        );
+
+        let response = recorder.embed(&embedding_request).await?;
+        assert_eq!(response.vectors, vec![vec![0.125, 0.25]]);
+        assert!(!path.exists());
+
+        recorder.chat(request()).await?;
+        let cassette = std::fs::read_to_string(&path).context("read recorded cassette")?;
+        assert!(!cassette.contains("sensitive embedding input"));
+        assert!(!cassette.contains("0.125"));
+
+        let player = RecordReplayProvider::replay(&path)?;
+        let replayed = player.embed(&embedding_request).await;
+        assert!(matches!(
+            replayed,
+            Err(EmbeddingError::Unsupported {
+                provider: "record-replay"
+            })
+        ));
 
         let _ = std::fs::remove_file(&path);
         Ok(())

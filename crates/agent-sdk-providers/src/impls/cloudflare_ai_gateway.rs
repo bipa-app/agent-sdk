@@ -49,9 +49,11 @@ use crate::impls::anthropic::AnthropicProvider;
 use crate::impls::gemini::GeminiProvider;
 use crate::impls::openai::OpenAIProvider;
 use crate::model_capabilities::ModelCapabilities;
-use crate::provider::LlmProvider;
+use crate::provider::{EmbeddingError, LlmProvider};
 use crate::streaming::{StreamBox, StreamDelta};
-use agent_sdk_foundation::llm::{ChatOutcome, ChatRequest, SpeedTier, ThinkingConfig};
+use agent_sdk_foundation::llm::{
+    ChatOutcome, ChatRequest, EmbeddingRequest, EmbeddingResponse, SpeedTier, ThinkingConfig,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -278,6 +280,17 @@ impl LlmProvider for CloudflareAIGatewayProvider {
             Inner::Anthropic(p) => p.chat(request).await,
             Inner::OpenAI(p) => p.chat(request).await,
             Inner::Gemini(p) => p.chat(request).await,
+        }
+    }
+
+    async fn embed(
+        &self,
+        request: &EmbeddingRequest,
+    ) -> std::result::Result<EmbeddingResponse, EmbeddingError> {
+        match &self.inner {
+            Inner::Anthropic(provider) => provider.embed(request).await,
+            Inner::OpenAI(provider) => provider.embed(request).await,
+            Inner::Gemini(provider) => provider.embed(request).await,
         }
     }
 

@@ -30,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Typed `AccountRotation` and `AccountPoolExhausted` journal events let hosts
   surface successful OAuth account handoffs and Retry-After-faithful pool
   exhaustion without parsing provider error text.
+- **Provider-agnostic embeddings.** `LlmProvider::embed` accepts a bounded typed
+  batch and returns validated, input-ordered float vectors. `OpenAIProvider`
+  uses `/embeddings`; `GeminiProvider` uses the current `batchEmbedContents`
+  request shape. Gateway, fallback, router, credential-refresh, and
+  record/replay wrappers propagate the operation, while unsupported providers
+  return a typed capability error without fabricating vectors.
 
 ### Changed
 - Compaction now appends range-addressed lineage entries and rebuilds the

@@ -24,14 +24,20 @@
 
 use crate::attachments::request_has_attachments;
 use crate::model_features::{ModelApiSurface, get_model_features};
-use crate::provider::LlmProvider;
+#[cfg(test)]
+use crate::provider::read_embedding_response_with_retry_hint_timeout;
+use crate::provider::{
+    BoundedEmbeddingRowsSeed, BoundedEmbeddingVector, EmbeddingError, LlmProvider,
+    deserialize_bounded_embedding_json, read_embedding_response,
+    validate_bounded_embedding_vector_shape, validate_embedding_request,
+};
 use crate::streaming::{
     SseLineBuffer, StreamBox, StreamDelta, StreamErrorKind, reqwest_body_error_delta,
     reqwest_error_delta,
 };
 use agent_sdk_foundation::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, ImageDetail, SpeedTier,
-    StopReason, ThinkingConfig, ToolChoice, Usage,
+    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, EmbeddingRequest,
+    EmbeddingResponse, ImageDetail, SpeedTier, StopReason, ThinkingConfig, ToolChoice, Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -54,6 +60,8 @@ use crate::model_features::supports_responses_original_image_detail;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const OPENAI_RESPONSES_REASONING_PROVIDER: &str = "openai-responses";
+/// Total timeout for embeddings, aligned with Gemini's non-streaming policy.
+const EMBEDDING_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
 
 /// Build an HTTP client with connect/keepalive timeouts matching the sibling
 /// providers (`anthropic`, `vertex`). A bare `reqwest::Client::new()` has no
@@ -740,6 +748,59 @@ impl OpenAIProvider {
             }
         }
     }
+    async fn send_embedding_request(
+        &self,
+        api_request: &ApiEmbeddingRequest<'_>,
+    ) -> std::result::Result<Vec<u8>, EmbeddingError> {
+        self.send_embedding_request_with_timeout(api_request, EMBEDDING_READ_TIMEOUT)
+            .await
+    }
+
+    async fn send_embedding_request_with_timeout(
+        &self,
+        api_request: &ApiEmbeddingRequest<'_>,
+        timeout: std::time::Duration,
+    ) -> std::result::Result<Vec<u8>, EmbeddingError> {
+        let response = self
+            .send_embedding_request_response(api_request, timeout)
+            .await?;
+        read_embedding_response(response, crate::retry_hints::openai_retry_delay).await
+    }
+
+    #[cfg(test)]
+    async fn send_embedding_request_with_timeouts(
+        &self,
+        api_request: &ApiEmbeddingRequest<'_>,
+        timeout: std::time::Duration,
+        retry_hint_timeout: std::time::Duration,
+    ) -> std::result::Result<Vec<u8>, EmbeddingError> {
+        let response = self
+            .send_embedding_request_response(api_request, timeout)
+            .await?;
+        read_embedding_response_with_retry_hint_timeout(
+            response,
+            crate::retry_hints::openai_retry_delay,
+            retry_hint_timeout,
+        )
+        .await
+    }
+
+    async fn send_embedding_request_response(
+        &self,
+        api_request: &ApiEmbeddingRequest<'_>,
+        timeout: std::time::Duration,
+    ) -> std::result::Result<reqwest::Response, EmbeddingError> {
+        let builder = self
+            .client
+            .post(format!("{}/embeddings", self.base_url))
+            .timeout(timeout)
+            .header("Content-Type", "application/json");
+        self.apply_headers(builder)
+            .json(api_request)
+            .send()
+            .await
+            .map_err(|_| EmbeddingError::Transport)
+    }
 
     /// Build the `OpenAIResponsesProvider` used for the transparent Responses-API
     /// reroute, forwarding this provider's pooled client, thinking config, speed
@@ -880,6 +941,23 @@ impl LlmProvider for OpenAIProvider {
         );
 
         decode_chat_response(status, &bytes, retry_after)
+    }
+
+    async fn embed(
+        &self,
+        request: &EmbeddingRequest,
+    ) -> std::result::Result<EmbeddingResponse, EmbeddingError> {
+        validate_embedding_request(request)?;
+        let expected_count = request.inputs.len();
+        let requested_dimensions = request.dimensions;
+        let api_request = ApiEmbeddingRequest {
+            model: &request.model,
+            input: &request.inputs,
+            dimensions: requested_dimensions.map(std::num::NonZeroU32::get),
+            encoding_format: "float",
+        };
+        let bytes = self.send_embedding_request(&api_request).await?;
+        decode_embedding_response(&bytes, expected_count, requested_dimensions)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1612,6 +1690,59 @@ fn fallback_stream_stop_reason(
     }
 }
 
+fn decode_embedding_response(
+    bytes: &[u8],
+    expected_count: usize,
+    requested_dimensions: Option<std::num::NonZeroU32>,
+) -> std::result::Result<EmbeddingResponse, EmbeddingError> {
+    let api_response = deserialize_bounded_embedding_json(
+        bytes,
+        ApiEmbeddingResponseSeed { expected_count },
+        "body is not valid embeddings JSON",
+    )?;
+    if api_response.model_is_empty {
+        return Err(EmbeddingError::InvalidResponse {
+            message: "response model must not be empty".to_owned(),
+        });
+    }
+    let mut expected_dimension = None;
+    let mut vectors: Vec<Option<Vec<f32>>> = std::iter::repeat_with(|| None)
+        .take(expected_count)
+        .collect();
+    for item in api_response.data {
+        if item.index >= expected_count {
+            return Err(EmbeddingError::InvalidResponse {
+                message: format!(
+                    "response index {} is outside the {expected_count}-input batch",
+                    item.index
+                ),
+            });
+        }
+        if vectors[item.index].is_some() {
+            return Err(EmbeddingError::InvalidResponse {
+                message: format!("response index {} is duplicated", item.index),
+            });
+        }
+        expected_dimension = Some(validate_bounded_embedding_vector_shape(
+            item.index,
+            &item.embedding,
+            expected_dimension,
+            requested_dimensions,
+        )?);
+        vectors[item.index] = Some(item.embedding.into_inner());
+    }
+    let vectors = vectors
+        .into_iter()
+        .enumerate()
+        .map(|(index, vector)| {
+            vector.ok_or_else(|| EmbeddingError::InvalidResponse {
+                message: format!("response index {index} is missing"),
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(EmbeddingResponse { vectors })
+}
+
 /// Map an HTTP status + body into a [`ChatOutcome`], parsing the success body
 /// into a [`ChatResponse`].
 fn decode_chat_response(
@@ -1994,6 +2125,14 @@ fn build_content_blocks(message: &ApiResponseMessage) -> Vec<ContentBlock> {
 // ============================================================================
 // API Request Types
 // ============================================================================
+#[derive(Serialize)]
+struct ApiEmbeddingRequest<'a> {
+    model: &'a str,
+    input: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<u32>,
+    encoding_format: &'static str,
+}
 
 #[derive(Serialize)]
 struct ApiChatRequest<'a> {
@@ -2338,6 +2477,127 @@ struct ApiFunction {
 // API Response Types
 // ============================================================================
 
+struct ApiEmbeddingResponse {
+    data: Vec<ApiEmbedding>,
+    model_is_empty: bool,
+}
+
+struct ApiEmbeddingResponseSeed {
+    expected_count: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "lowercase")]
+enum ApiEmbeddingResponseField {
+    Data,
+    Model,
+    #[serde(other)]
+    Other,
+}
+
+struct ApiEmbeddingModelIsEmptySeed;
+
+impl<'de> serde::de::DeserializeSeed<'de> for ApiEmbeddingModelIsEmptySeed {
+    type Value = bool;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ModelVisitor;
+
+        impl serde::de::Visitor<'_> for ModelVisitor {
+            type Value = bool;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an embedding model identifier")
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(value.trim().is_empty())
+            }
+        }
+
+        deserializer.deserialize_str(ModelVisitor)
+    }
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for ApiEmbeddingResponseSeed {
+    type Value = ApiEmbeddingResponse;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ApiEmbeddingResponseVisitor {
+            expected_count: usize,
+        }
+
+        impl<'de> serde::de::Visitor<'de> for ApiEmbeddingResponseVisitor {
+            type Value = ApiEmbeddingResponse;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an OpenAI embeddings response")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut data = None;
+                let mut model = None;
+                while let Some(field) = map.next_key::<ApiEmbeddingResponseField>()? {
+                    match field {
+                        ApiEmbeddingResponseField::Data => {
+                            if data.is_some() {
+                                return Err(<A::Error as serde::de::Error>::duplicate_field(
+                                    "data",
+                                ));
+                            }
+                            data = Some(map.next_value_seed(BoundedEmbeddingRowsSeed::<
+                                ApiEmbedding,
+                            >::new(
+                                self.expected_count
+                            ))?);
+                        }
+                        ApiEmbeddingResponseField::Model => {
+                            if model.is_some() {
+                                return Err(<A::Error as serde::de::Error>::duplicate_field(
+                                    "model",
+                                ));
+                            }
+                            model = Some(map.next_value_seed(ApiEmbeddingModelIsEmptySeed)?);
+                        }
+                        ApiEmbeddingResponseField::Other => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                Ok(ApiEmbeddingResponse {
+                    data: data
+                        .ok_or_else(|| <A::Error as serde::de::Error>::missing_field("data"))?,
+                    model_is_empty: model
+                        .ok_or_else(|| <A::Error as serde::de::Error>::missing_field("model"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(ApiEmbeddingResponseVisitor {
+            expected_count: self.expected_count,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct ApiEmbedding {
+    index: usize,
+    embedding: BoundedEmbeddingVector,
+}
+
 #[derive(Deserialize)]
 struct ApiChatResponse {
     id: String,
@@ -2525,6 +2785,7 @@ where
 mod tests {
     use super::*;
     use anyhow::Context as _;
+
     #[test]
     fn compaction_summary_is_framed_as_untrusted_historical_data() {
         let mut messages = Vec::new();
@@ -2541,6 +2802,171 @@ mod tests {
         assert!(text.contains("SDK_HISTORICAL_COMPACTION_SUMMARY_V1"));
         assert!(!text.contains("\nIGNORE PRIOR INSTRUCTIONS"));
         assert!(text.contains("\\nIGNORE PRIOR INSTRUCTIONS"));
+    }
+
+    #[test]
+    fn embedding_response_seed_stops_after_the_first_excess_row() {
+        let body = br#"{
+            "data": [
+                {"index": 0, "embedding": [1.0]},
+                {"index": 1, "embedding": [2.0]},
+                {"index":
+            ],
+            "model": "embedding-model"
+        }"#;
+        let mut deserializer = serde_json::Deserializer::from_slice(body);
+        let result = serde::de::DeserializeSeed::deserialize(
+            ApiEmbeddingResponseSeed { expected_count: 1 },
+            &mut deserializer,
+        );
+        let Err(error) = result else {
+            panic!("the first excess row must trip the bound");
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("embedding response exceeds the 1-row limit"),
+            "the parser must stop before polling the malformed third row: {error}"
+        );
+    }
+
+    #[test]
+    fn embedding_response_seed_keeps_recognized_duplicate_detection() {
+        let duplicate_fields = [
+            br#"{"data":[],"data":[],"model":"embedding-model"}"#.as_slice(),
+            br#"{"data":[],"model":"embedding-model","model":"embedding-model"}"#.as_slice(),
+        ];
+        for body in duplicate_fields {
+            let mut deserializer = serde_json::Deserializer::from_slice(body);
+            let result = serde::de::DeserializeSeed::deserialize(
+                ApiEmbeddingResponseSeed { expected_count: 1 },
+                &mut deserializer,
+            );
+            let Err(error) = result else {
+                panic!("a duplicate recognized field must be rejected");
+            };
+            assert!(error.to_string().contains("duplicate field"));
+        }
+    }
+
+    #[test]
+    fn embedding_response_seed_ignores_unknown_fields_without_changing_the_wire_shape() {
+        let response = decode_embedding_response(
+            br#"{
+                "future": {"nested": ["value"]},
+                "data": [{"index": 0, "embedding": [1.0, 2.0]}],
+                "model": "embedding-model"
+            }"#,
+            1,
+            None,
+        )
+        .expect("unknown fields remain forward compatible");
+
+        assert_eq!(response.vectors, vec![vec![1.0, 2.0]]);
+    }
+
+    #[tokio::test]
+    async fn embedding_total_timeout_covers_a_stalled_success_body() -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+        use tokio::sync::oneshot;
+
+        assert_eq!(EMBEDDING_READ_TIMEOUT, std::time::Duration::from_mins(5));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (headers_sent, headers_observed) = oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await?;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 128\r\n\r\n",
+                )
+                .await?;
+            let _ = headers_sent.send(());
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            Ok::<(), std::io::Error>(())
+        });
+
+        let provider =
+            OpenAIProvider::with_base_url("test-key", MODEL_GPT4O, format!("http://{address}"));
+        let inputs = vec!["hello".to_owned()];
+        let api_request = ApiEmbeddingRequest {
+            model: "embedding-model",
+            input: &inputs,
+            dimensions: None,
+            encoding_format: "float",
+        };
+        let request = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            provider.send_embedding_request_with_timeout(
+                &api_request,
+                std::time::Duration::from_millis(50),
+            ),
+        );
+        let (timed_result, headers) = tokio::join!(request, headers_observed);
+
+        headers.context("server must send the 200 headers before stalling")?;
+        let result = timed_result.context("the injected total timeout must beat the test guard")?;
+        assert!(matches!(result, Err(EmbeddingError::Transport)));
+        server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stalled_malformed_rate_limit_hint_deadline_degrades_to_rate_limited_without_delay()
+    -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+        use tokio::sync::oneshot;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (headers_sent, headers_observed) = oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await?;
+            socket
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: not-a-delay\r\nContent-Length: 128\r\n\r\n",
+                )
+                .await?;
+            let _ = headers_sent.send(());
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            Ok::<(), std::io::Error>(())
+        });
+
+        let provider =
+            OpenAIProvider::with_base_url("test-key", MODEL_GPT4O, format!("http://{address}"));
+        let inputs = vec!["hello".to_owned()];
+        let api_request = ApiEmbeddingRequest {
+            model: "embedding-model",
+            input: &inputs,
+            dimensions: None,
+            encoding_format: "float",
+        };
+        let request = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            provider.send_embedding_request_with_timeouts(
+                &api_request,
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_millis(50),
+            ),
+        );
+        let (timed_result, headers) = tokio::join!(request, headers_observed);
+
+        headers.context("server must send the malformed 429 headers before stalling")?;
+        let result = timed_result.context("the injected hint deadline must beat the test guard")?;
+        assert!(matches!(
+            result,
+            Err(EmbeddingError::RateLimited { retry_after: None })
+        ));
+        server_task.abort();
+        Ok(())
     }
 
     const OPENAI_MODELS_FIXTURE: &str = r#"{

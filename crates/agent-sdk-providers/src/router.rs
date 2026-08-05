@@ -4,9 +4,11 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
 
-use crate::provider::LlmProvider;
+use crate::provider::{EmbeddingError, LlmProvider};
 use crate::streaming::StreamBox;
-use agent_sdk_foundation::llm::{ChatOutcome, ChatRequest, ChatResponse, Message, Role};
+use agent_sdk_foundation::llm::{
+    ChatOutcome, ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, Message, Role,
+};
 
 /// A capability/cost tier a request can be routed to.
 ///
@@ -196,6 +198,15 @@ where
 {
     async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
         self.route(request).await
+    }
+
+    /// Embeddings have no chat prompt to classify, so delegate to the router's
+    /// representative capable tier.
+    async fn embed(
+        &self,
+        request: &EmbeddingRequest,
+    ) -> std::result::Result<EmbeddingResponse, EmbeddingError> {
+        self.capable.embed(request).await
     }
 
     fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
