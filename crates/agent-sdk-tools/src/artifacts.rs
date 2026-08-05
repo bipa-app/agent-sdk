@@ -1644,11 +1644,19 @@ fn try_lock_inactive_artifact_store(dir: &Dir) -> Result<Option<std::fs::File>> 
     }
 }
 
-/// Next free ID: one past the highest `<id>.` file in `dir`.
+/// Next free ID: one past the highest `<id>.` file in `dir`, never below 1.
+///
+/// Artifact id 0 is wire-invalid by contract: `artifact://0` is rejected by
+/// request hydration and Snapcompact checkpoint detection because a proto3
+/// `u64` id of 0 is indistinguishable from unset. An empty store therefore
+/// starts allocating at 1 — otherwise the FIRST spilled attachment of every
+/// thread is permanently unhydratable (live ENG-9548 smoke).
 fn scan_next_id(dir: &Dir) -> Result<u64> {
     let max = list_artifacts(dir)?.into_iter().map(|(id, _)| id).max();
-    max.map_or(Ok(0), |max| {
-        max.checked_add(1).context("artifact ID space exhausted")
+    max.map_or(Ok(1), |max| {
+        max.checked_add(1)
+            .context("artifact ID space exhausted")
+            .map(|next| next.max(1))
     })
 }
 
@@ -2276,8 +2284,8 @@ mod tests {
         let (_dir, store) = temp_store();
         let first = store.save("bash", "one")?;
         let second = store.save("grep", "two")?;
-        assert_eq!(first.id, 0);
-        assert_eq!(second.id, 1);
+        assert_eq!(first.id, 1, "empty store starts at wire-valid id 1");
+        assert_eq!(second.id, 2);
         Ok(())
     }
 
@@ -2354,8 +2362,13 @@ mod tests {
     fn save_batch_preserves_legacy_zero_and_starts_with_positive_ids() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = ArtifactStore::new(dir.path().join("artifacts"));
-        let legacy = store.save("legacy", "legacy zero bytes")?;
-        assert_eq!(legacy.id, 0);
+        // Simulate a pre-cutover store that already holds legacy artifact 0.
+        std::fs::create_dir_all(store.dir())?;
+        std::fs::write(store.dir().join("0.legacy.log"), "legacy zero bytes")?;
+        let legacy = SavedArtifact {
+            id: 0,
+            path: store.dir().join("0.legacy.log"),
+        };
         let items: [(&str, &[u8]); 2] = [
             ("first", b"first batch bytes"),
             ("second", b"second batch bytes"),
@@ -2440,7 +2453,7 @@ mod tests {
         resolved.read_to_string(&mut content)?;
         assert_eq!(content, "content");
         let error = store.resolve(99).expect_err("missing ID must error");
-        assert!(error.to_string().contains("available IDs: 0"));
+        assert!(error.to_string().contains("available IDs: 1"));
         let empty = ArtifactStore::new(store.dir().join("nope"));
         let error = empty.resolve(0).expect_err("empty store must error");
         assert!(error.to_string().contains("no artifacts exist yet"));
@@ -2919,13 +2932,13 @@ mod tests {
         let thread = ThreadId::from_string("durable-watermark");
         let storage = ArtifactStorage::new(&root);
         let first = storage.for_thread(&thread)?.save("bash", "first")?;
-        assert_eq!(first.id, 0);
+        assert_eq!(first.id, 1);
         std::fs::remove_file(&first.path)?;
         drop(storage);
 
         let restarted = ArtifactStorage::new(&root);
         let second = restarted.for_thread(&thread)?.save("bash", "second")?;
-        assert_eq!(second.id, 1, "a deleted ID must remain permanently burned");
+        assert_eq!(second.id, 2, "a deleted ID must remain permanently burned");
         Ok(())
     }
 
@@ -3100,7 +3113,7 @@ mod tests {
         );
         let fresh = destination_store.save("bash", "destination bytes")?;
         assert_eq!(
-            fresh.id, 0,
+            fresh.id, 1,
             "failed copy must not seed the destination allocator watermark"
         );
         Ok(())

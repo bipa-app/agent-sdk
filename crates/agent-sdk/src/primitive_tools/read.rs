@@ -2015,7 +2015,7 @@ mod tests {
             .await?;
         assert!(!result.success);
         assert!(
-            result.output.contains("available IDs: 0"),
+            result.output.contains("available IDs: 1"),
             "{}",
             result.output
         );

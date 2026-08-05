@@ -276,8 +276,10 @@ mod tests {
     }
 
     fn prime_positive_artifact_ids(store: &ArtifactStore) -> Result<()> {
-        let reserved = save_bytes(store, "reserved", b"reserved artifact zero")?;
-        assert_eq!(reserved, 0, "fresh fixture must reserve artifact zero");
+        // The allocator now starts at the wire-valid id 1 on its own; keep
+        // the fixture as a regression tripwire for that contract.
+        let reserved = save_bytes(store, "reserved", b"first allocation probe")?;
+        assert_eq!(reserved, 1, "fresh store must start allocating at 1");
         Ok(())
     }
 

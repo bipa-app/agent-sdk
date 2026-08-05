@@ -2574,10 +2574,10 @@ mod artifact_budget_tests {
         assert!(
             tool_result
                 .output
-                .ends_with(&agent_sdk_tools::artifact_footer(0))
+                .ends_with(&agent_sdk_tools::artifact_footer(1))
         );
         let mut spilled = String::new();
-        std::io::Read::read_to_string(&mut store.resolve(0)?, &mut spilled)?;
+        std::io::Read::read_to_string(&mut store.resolve(1)?, &mut spilled)?;
         assert_eq!(spilled.as_bytes(), final_response.as_bytes());
         let data = tool_result
             .data
