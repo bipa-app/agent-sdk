@@ -51,11 +51,86 @@ fn request_has_artifact_sources(request: &llm::ChatRequest) -> bool {
     })
 }
 
+/// Older non-canonical attachments beyond the cumulative budget degrade to
+/// bounded text notes, newest kept. Without this, a session that accrued
+/// enough tool attachments (e.g. ~11 max-size browser screenshots) makes
+/// every subsequent provider request fail fatally until manual compaction.
+fn plan_budget_degrades(
+    request: &llm::ChatRequest,
+    artifact_store: Option<&ArtifactStore>,
+    max_hydrated_bytes: u64,
+) -> std::collections::HashSet<(usize, usize)> {
+    let Some(store) = artifact_store else {
+        return std::collections::HashSet::new();
+    };
+    // (message, block) of every non-canonical artifact attachment with its
+    // backing length, in request order. Canonical Snapcompact frames keep
+    // their own budget/degrade semantics and are charged first.
+    let mut canonical_bytes = 0_u64;
+    let mut candidates: Vec<(usize, usize, u64)> = Vec::new();
+    for (message_index, message) in request.messages.iter().enumerate() {
+        let canonical = llm::canonical_snapcompact_checkpoint(message);
+        let canonical_frame_range = canonical.as_ref().and_then(|meta| {
+            let frame_count = usize::try_from(meta.frame_count).ok()?;
+            Some(3..3usize.checked_add(frame_count)?)
+        });
+        let llm::Content::Blocks(blocks) = &message.content else {
+            continue;
+        };
+        for (block_index, block) in blocks.iter().enumerate() {
+            let (llm::ContentBlock::Image { source } | llm::ContentBlock::Document { source }) =
+                block
+            else {
+                continue;
+            };
+            if !source.data.starts_with(crate::ARTIFACT_URI_SCHEME) {
+                continue;
+            }
+            let Some(artifact_id) = exact_artifact_uri_id(&source.data) else {
+                continue;
+            };
+            let Ok(file) = store.resolve(artifact_id) else {
+                continue;
+            };
+            let Ok(metadata) = file.metadata() else {
+                continue;
+            };
+            if canonical_frame_range
+                .as_ref()
+                .is_some_and(|range| range.contains(&block_index))
+            {
+                canonical_bytes = canonical_bytes.saturating_add(metadata.len());
+            } else {
+                candidates.push((message_index, block_index, metadata.len()));
+            }
+        }
+    }
+    let mut remaining = max_hydrated_bytes.saturating_sub(canonical_bytes);
+    let mut degraded = std::collections::HashSet::new();
+    // Newest first: the freshest attachments are the ones the model is
+    // actually being asked about.
+    for (message_index, block_index, len) in candidates.into_iter().rev() {
+        if len > max_hydrated_bytes {
+            // A SINGLE attachment over the per-request limit keeps its
+            // fatal per-attachment rejection in `hydrate_source`; only the
+            // aggregate overflow degrades.
+            continue;
+        }
+        if len <= remaining {
+            remaining -= len;
+        } else {
+            degraded.insert((message_index, block_index));
+        }
+    }
+    degraded
+}
+
 fn hydrate_request(
     mut request: llm::ChatRequest,
     artifact_store: Option<&ArtifactStore>,
     max_hydrated_bytes: u64,
 ) -> Result<llm::ChatRequest> {
+    let budget_degrades = plan_budget_degrades(&request, artifact_store, max_hydrated_bytes);
     let mut hydrated_bytes = 0_u64;
     for (message_index, message) in request.messages.iter_mut().enumerate() {
         let canonical = llm::canonical_snapcompact_checkpoint(message);
@@ -81,6 +156,21 @@ fn hydrate_request(
             };
             if !source.data.starts_with(crate::ARTIFACT_URI_SCHEME) {
                 blocks.push(block);
+                continue;
+            }
+            if budget_degrades.contains(&(message_index, block_index)) {
+                // Older attachment past the cumulative provider budget:
+                // degrade to a bounded note instead of failing the whole
+                // request. The artifact stays readable via its URI.
+                let uri = source.data.clone();
+                let media_type = source.media_type.clone();
+                blocks.push(llm::ContentBlock::Text {
+                    text: format!(
+                        "[{media_type} attachment {uri} omitted from this request: \
+                         cumulative provider attachment budget exceeded; read it back \
+                         via {uri}]"
+                    ),
+                });
                 continue;
             }
 
@@ -585,6 +675,49 @@ mod tests {
             .await
             .expect_err("oversized artifact must fail");
         assert!(format!("{error:#}").contains("provider attachment limit"));
+        Ok(())
+    }
+
+    /// Cumulative attachments past the provider budget must not brick the
+    /// request (live ENG-9548 class: ~11 max-size browser screenshots made
+    /// every later turn fail until manual compaction). Older attachments
+    /// degrade to bounded notes; the NEWEST stay native.
+    #[test]
+    fn cumulative_budget_degrades_oldest_attachments_instead_of_failing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(ArtifactStore::new(dir.path()));
+        prime_positive_artifact_ids(&store)?;
+        let first = save_bytes(&store, "image", PNG)?;
+        let second = save_bytes(&store, "image", PNG)?;
+        let third = save_bytes(&store, "image", PNG)?;
+        let image = |id: u64| {
+            Message::user_with_content(vec![ContentBlock::Image {
+                source: ContentSource::new("image/png", format!("artifact://{id}")),
+            }])
+        };
+        let durable =
+            llm::ChatRequest::new("system", vec![image(first), image(second), image(third)]);
+        // Budget fits exactly two frames: the OLDEST degrades.
+        let budget = (PNG.len() as u64) * 2;
+        let hydrated = hydrate_request(durable, Some(store.as_ref()), budget)?;
+        let block_of = |message: &Message| match &message.content {
+            Content::Blocks(blocks) => blocks[0].clone(),
+            Content::Text(_) => panic!("expected block content"),
+        };
+        let ContentBlock::Text { text } = block_of(&hydrated.messages[0]) else {
+            panic!("oldest attachment must degrade to a text note");
+        };
+        assert!(text.contains(&format!("artifact://{first}")));
+        assert!(text.contains("budget"));
+        for (index, id) in [(1, second), (2, third)] {
+            let ContentBlock::Image { source } = block_of(&hydrated.messages[index]) else {
+                panic!("newest attachments must stay native images");
+            };
+            assert!(
+                !source.data.starts_with(crate::ARTIFACT_URI_SCHEME),
+                "attachment {id} must be hydrated to base64"
+            );
+        }
         Ok(())
     }
 }
