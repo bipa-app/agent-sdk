@@ -3393,6 +3393,19 @@ fn map_json_value(value: &serde_json::Value) -> RpcResult<ProtoValue> {
 }
 
 fn map_binary_attachment(source: &ContentSource) -> RpcResult<pb::BinaryAttachment> {
+    // Retention spills an oversized attachment's bytes to the artifact
+    // store and rewrites `data` to its `artifact://<id>` reference. A
+    // committed event carrying such a reference MUST NOT error the event
+    // stream: the error would replay identically on every reconnect and
+    // permanently brick the session (observed live, ENG-9548 smoke).
+    // Degrade to an empty payload — the tool result's artifact id remains
+    // on the wire for bounded read-back.
+    if source.data.starts_with(agent_sdk::ARTIFACT_URI_SCHEME) {
+        return Ok(pb::BinaryAttachment {
+            media_type: source.media_type.clone(),
+            data: Vec::new(),
+        });
+    }
     Ok(pb::BinaryAttachment {
         media_type: source.media_type.clone(),
         data: base64::engine::general_purpose::STANDARD
@@ -4317,6 +4330,36 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    /// A retention-spilled attachment (`data` = `artifact://<id>`) must
+    /// degrade to an empty wire payload, never error: a `Status::internal`
+    /// here replays identically on every reconnect and permanently bricks
+    /// the session's event stream (live incident, ENG-9548 smoke).
+    #[test]
+    fn artifact_backed_attachment_degrades_instead_of_bricking_the_stream() {
+        let spilled = agent_sdk_foundation::llm::ContentSource {
+            media_type: "image/png".to_owned(),
+            data: "artifact://42".to_owned(),
+            detail: None,
+        };
+        let mapped = map_binary_attachment(&spilled).expect("artifact reference must map");
+        assert_eq!(mapped.media_type, "image/png");
+        assert!(mapped.data.is_empty());
+
+        let inline = agent_sdk_foundation::llm::ContentSource {
+            media_type: "image/png".to_owned(),
+            data: base64::engine::general_purpose::STANDARD.encode(b"png-bytes"),
+            detail: None,
+        };
+        let mapped = map_binary_attachment(&inline).expect("inline base64 must map");
+        assert_eq!(mapped.data, b"png-bytes");
+
+        let malformed = agent_sdk_foundation::llm::ContentSource {
+            media_type: "image/png".to_owned(),
+            data: "not-base64:!".to_owned(),
+            detail: None,
+        };
+        assert!(map_binary_attachment(&malformed).is_err());
+    }
     use super::*;
     use crate::runtime::{
         AllowAllConfirmationPolicy, ExecutionRuntime, NoopToolExecutor, StaticProviderResolver,
