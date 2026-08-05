@@ -74,6 +74,9 @@ message TokenUsage {
 message BinaryAttachment {
   string media_type = 1;
   bytes data = 2;
+  // Response-only canonical `artifact://<positive numeric id>` source when
+  // the payload is stored out of line. `data` is empty when this is set.
+  optional string artifact_uri = 3;
 }
 
 message ToolResult {

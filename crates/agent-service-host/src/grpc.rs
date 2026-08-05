@@ -3392,18 +3392,39 @@ fn map_json_value(value: &serde_json::Value) -> RpcResult<ProtoValue> {
     Ok(ProtoValue { kind: Some(kind) })
 }
 
+fn canonical_artifact_uri(data: &str) -> Option<&str> {
+    let id = data.strip_prefix(agent_sdk::ARTIFACT_URI_SCHEME)?;
+    if id.is_empty()
+        || !id.bytes().all(|byte| byte.is_ascii_digit())
+        || (id.len() > 1 && id.starts_with('0'))
+    {
+        return None;
+    }
+    id.parse::<u64>()
+        .ok()
+        .filter(|artifact_id| *artifact_id > 0)?;
+    Some(data)
+}
+
 fn map_binary_attachment(source: &ContentSource) -> RpcResult<pb::BinaryAttachment> {
     // Retention spills an oversized attachment's bytes to the artifact
-    // store and rewrites `data` to its `artifact://<id>` reference. A
-    // committed event carrying such a reference MUST NOT error the event
-    // stream: the error would replay identically on every reconnect and
-    // permanently brick the session (observed live, ENG-9548 smoke).
-    // Degrade to an empty payload — the tool result's artifact id remains
-    // on the wire for bounded read-back.
+    // store and rewrites `data` to its canonical `artifact://<id>`
+    // reference. Preserve that durable source while keeping the byte payload
+    // empty so replay does not fail or duplicate the stored attachment.
+    if let Some(artifact_uri) = canonical_artifact_uri(&source.data) {
+        return Ok(pb::BinaryAttachment {
+            media_type: source.media_type.clone(),
+            data: Vec::new(),
+            artifact_uri: Some(artifact_uri.to_owned()),
+        });
+    }
+    // Legacy journals can contain malformed artifact-prefixed sources. Keep
+    // their replay byte-free and non-failing, but do not assert provenance.
     if source.data.starts_with(agent_sdk::ARTIFACT_URI_SCHEME) {
         return Ok(pb::BinaryAttachment {
             media_type: source.media_type.clone(),
             data: Vec::new(),
+            artifact_uri: None,
         });
     }
     Ok(pb::BinaryAttachment {
@@ -3413,6 +3434,7 @@ fn map_binary_attachment(source: &ContentSource) -> RpcResult<pb::BinaryAttachme
             .map_err(|error| {
                 Status::internal(format!("invalid base64 attachment payload: {error}"))
             })?,
+        artifact_uri: None,
     })
 }
 
@@ -3532,14 +3554,30 @@ fn map_submitted_input_item(item: &pb::UserInputItem) -> RpcResult<SubmittedInpu
         Some(pb::user_input_item::Item::Text(text)) => {
             Ok(SubmittedInputItem::Text { text: text.clone() })
         }
-        Some(pb::user_input_item::Item::Image(image)) => Ok(SubmittedInputItem::Image {
-            media_type: image.media_type.clone(),
-            data_base64: base64::engine::general_purpose::STANDARD.encode(&image.data),
-        }),
-        Some(pb::user_input_item::Item::Document(document)) => Ok(SubmittedInputItem::Document {
-            media_type: document.media_type.clone(),
-            data_base64: base64::engine::general_purpose::STANDARD.encode(&document.data),
-        }),
+        Some(pb::user_input_item::Item::Image(image)) => {
+            if image.artifact_uri.is_some() {
+                return Err(Status::invalid_argument(
+                    "BinaryAttachment.artifact_uri is response-only",
+                )
+                .into());
+            }
+            Ok(SubmittedInputItem::Image {
+                media_type: image.media_type.clone(),
+                data_base64: base64::engine::general_purpose::STANDARD.encode(&image.data),
+            })
+        }
+        Some(pb::user_input_item::Item::Document(document)) => {
+            if document.artifact_uri.is_some() {
+                return Err(Status::invalid_argument(
+                    "BinaryAttachment.artifact_uri is response-only",
+                )
+                .into());
+            }
+            Ok(SubmittedInputItem::Document {
+                media_type: document.media_type.clone(),
+                data_base64: base64::engine::general_purpose::STANDARD.encode(&document.data),
+            })
+        }
         None => Err(Status::invalid_argument("user input item is required").into()),
     }
 }
@@ -4330,35 +4368,104 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    /// A retention-spilled attachment (`data` = `artifact://<id>`) must
-    /// degrade to an empty wire payload, never error: a `Status::internal`
-    /// here replays identically on every reconnect and permanently bricks
-    /// the session's event stream (live incident, ENG-9548 smoke).
+    fn round_trip_attachment(
+        attachment: &pb::BinaryAttachment,
+    ) -> anyhow::Result<pb::BinaryAttachment> {
+        let encoded = prost::Message::encode_to_vec(attachment);
+        Ok(<pb::BinaryAttachment as prost::Message>::decode(
+            encoded.as_slice(),
+        )?)
+    }
+
     #[test]
-    fn artifact_backed_attachment_degrades_instead_of_bricking_the_stream() {
-        let spilled = agent_sdk_foundation::llm::ContentSource {
+    fn canonical_artifact_attachment_survives_proto_round_trip() -> anyhow::Result<()> {
+        let source = agent_sdk_foundation::llm::ContentSource {
             media_type: "image/png".to_owned(),
             data: "artifact://42".to_owned(),
             detail: None,
         };
-        let mapped = map_binary_attachment(&spilled).expect("artifact reference must map");
+
+        let mapped = map_binary_attachment(&source)?;
         assert_eq!(mapped.media_type, "image/png");
         assert!(mapped.data.is_empty());
+        assert_eq!(mapped.artifact_uri.as_deref(), Some("artifact://42"));
+        assert_eq!(round_trip_attachment(&mapped)?, mapped);
+        Ok(())
+    }
 
-        let inline = agent_sdk_foundation::llm::ContentSource {
+    #[test]
+    fn inline_attachment_bytes_survive_without_artifact_uri() -> anyhow::Result<()> {
+        let source = agent_sdk_foundation::llm::ContentSource {
             media_type: "image/png".to_owned(),
             data: base64::engine::general_purpose::STANDARD.encode(b"png-bytes"),
             detail: None,
         };
-        let mapped = map_binary_attachment(&inline).expect("inline base64 must map");
-        assert_eq!(mapped.data, b"png-bytes");
 
-        let malformed = agent_sdk_foundation::llm::ContentSource {
-            media_type: "image/png".to_owned(),
-            data: "not-base64:!".to_owned(),
-            detail: None,
+        let mapped = map_binary_attachment(&source)?;
+        assert_eq!(mapped.media_type, "image/png");
+        assert_eq!(mapped.data, b"png-bytes");
+        assert_eq!(mapped.artifact_uri, None);
+        assert_eq!(round_trip_attachment(&mapped)?, mapped);
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_artifact_lookalikes_are_not_promoted() -> anyhow::Result<()> {
+        for data in [
+            "artifact://",
+            "artifact://0",
+            "artifact://042",
+            "artifact://42#raw",
+            "artifact://18446744073709551616",
+        ] {
+            let source = agent_sdk_foundation::llm::ContentSource {
+                media_type: "image/png".to_owned(),
+                data: data.to_owned(),
+                detail: None,
+            };
+
+            let mapped = map_binary_attachment(&source)?;
+            assert!(mapped.data.is_empty(), "{data} must degrade byte-free");
+            assert_eq!(
+                mapped.artifact_uri, None,
+                "{data} must not gain artifact provenance"
+            );
+        }
+        Ok(())
+    }
+
+    fn assert_response_only_artifact_uri_rejected(
+        item: pb::user_input_item::Item,
+    ) -> anyhow::Result<()> {
+        let Err(error) = map_submitted_input_item(&pb::UserInputItem { item: Some(item) }) else {
+            anyhow::bail!("response-only artifact_uri must be rejected");
         };
-        assert!(map_binary_attachment(&malformed).is_err());
+        let status: Status = error.into();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("response-only"));
+        Ok(())
+    }
+
+    #[test]
+    fn submitted_image_rejects_response_only_artifact_uri() -> anyhow::Result<()> {
+        assert_response_only_artifact_uri_rejected(pb::user_input_item::Item::Image(
+            pb::BinaryAttachment {
+                media_type: "image/png".to_owned(),
+                data: Vec::new(),
+                artifact_uri: Some("artifact://42".to_owned()),
+            },
+        ))
+    }
+
+    #[test]
+    fn submitted_document_rejects_response_only_artifact_uri() -> anyhow::Result<()> {
+        assert_response_only_artifact_uri_rejected(pb::user_input_item::Item::Document(
+            pb::BinaryAttachment {
+                media_type: "application/pdf".to_owned(),
+                data: Vec::new(),
+                artifact_uri: Some("artifact://42".to_owned()),
+            },
+        ))
     }
     use super::*;
     use crate::runtime::{
