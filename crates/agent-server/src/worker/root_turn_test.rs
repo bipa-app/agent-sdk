@@ -6,11 +6,12 @@
 //! child-outcome aggregation and resume-from-children path.
 
 use super::root_turn::{
-    PartialCancelCommit, RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes, cancel_root_turn,
-    commit_partial_turn_on_cancel, derive_reattach_tool_use_id, drain_boundary_injections,
-    execute_root_turn, fail_root_turn, is_root_turn_cancelled, provider_valid_split,
-    resume_for_steering, resume_from_children, resume_from_question, resume_root_turn,
-    revert_steering_wake, settle_attempt_after_lost_ownership, terminal_reason_for_root_error,
+    PartialCancelCommit, RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes,
+    build_tool_results_message, cancel_root_turn, commit_partial_turn_on_cancel,
+    derive_reattach_tool_use_id, drain_boundary_injections, execute_root_turn, fail_root_turn,
+    is_root_turn_cancelled, provider_valid_split, resume_for_steering, resume_from_children,
+    resume_from_question, resume_root_turn, revert_steering_wake,
+    settle_attempt_after_lost_ownership, terminal_reason_for_root_error,
 };
 use crate::journal::checkpoint::CheckpointKind;
 use std::sync::Arc;
@@ -52,6 +53,42 @@ use agent_sdk_foundation::{
     AgentContinuation, AgentState, ContinuationEnvelope, QuestionAnswer, TerminalReason, ThreadId,
     TokenUsage,
 };
+
+/// The daemon fan-in must carry a tool result's native attachments into
+/// the same user message as its `ToolResult` block, exactly like the
+/// in-process loop's `append_tool_results` — dropping them silences
+/// every multimodal tool result on the daemon path (live incident: the
+/// ENG-9548 browser screenshot never reached the model).
+#[test]
+fn fan_in_tool_results_carry_documents_as_native_blocks() {
+    let screenshot = agent_sdk_foundation::ToolResult::success("captured").with_documents(vec![
+        agent_sdk_foundation::llm::ContentSource::new("image/png", "artifact://7"),
+    ]);
+    let report = agent_sdk_foundation::ToolResult::success("report").with_documents(vec![
+        agent_sdk_foundation::llm::ContentSource::new("application/pdf", "ZmFrZQ=="),
+    ]);
+    let message = build_tool_results_message(&[
+        ("call_img".to_owned(), screenshot),
+        ("call_doc".to_owned(), report),
+    ]);
+    assert_eq!(message.role, Role::User);
+    let agent_sdk_foundation::llm::Content::Blocks(blocks) = &message.content else {
+        panic!("fan-in tool results must be a block message");
+    };
+    assert_eq!(blocks.len(), 4);
+    assert!(
+        matches!(&blocks[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_img")
+    );
+    let ContentBlock::Image { source } = &blocks[1] else {
+        panic!("image attachment must follow its tool result block");
+    };
+    assert_eq!(source.media_type, "image/png");
+    assert_eq!(source.data, "artifact://7");
+    assert!(
+        matches!(&blocks[2], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_doc")
+    );
+    assert!(matches!(&blocks[3], ContentBlock::Document { .. }));
+}
 use agent_sdk_providers::LlmProvider;
 use agent_sdk_providers::streaming::{StreamBox, StreamDelta, StreamErrorKind};
 use agent_sdk_tools::stores::MessageStore;

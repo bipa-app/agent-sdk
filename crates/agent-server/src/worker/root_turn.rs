@@ -7333,17 +7333,33 @@ async fn buffer_resume_messages(
 }
 
 /// Build a user message containing tool-result blocks for each
-/// completed child task.
-fn build_tool_results_message(child_results: &[(String, ToolResult)]) -> llm::Message {
-    let blocks: Vec<llm::ContentBlock> = child_results
-        .iter()
-        .map(|(tool_use_id, result)| llm::ContentBlock::ToolResult {
+/// completed child task, followed by the result's native binary
+/// attachments (images/documents) exactly like the in-process loop's
+/// `append_tool_results` — dropping them here silences every
+/// multimodal tool result on the daemon path. Artifact-backed sources
+/// (`artifact://…` data) ride along untouched; the pre-call hydration
+/// seam restores their bytes for the provider request.
+pub(crate) fn build_tool_results_message(child_results: &[(String, ToolResult)]) -> llm::Message {
+    let mut blocks: Vec<llm::ContentBlock> = Vec::new();
+    for (tool_use_id, result) in child_results {
+        blocks.push(llm::ContentBlock::ToolResult {
             tool_use_id: tool_use_id.clone(),
             content: result.output.clone(),
             artifact: result.artifact.clone(),
             is_error: if result.success { None } else { Some(true) },
-        })
-        .collect();
+        });
+        for document in &result.documents {
+            if document.media_type.starts_with("image/") {
+                blocks.push(llm::ContentBlock::Image {
+                    source: document.clone(),
+                });
+            } else {
+                blocks.push(llm::ContentBlock::Document {
+                    source: document.clone(),
+                });
+            }
+        }
+    }
 
     llm::Message::user_with_content(blocks)
 }
