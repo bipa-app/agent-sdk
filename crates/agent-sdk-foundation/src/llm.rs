@@ -336,6 +336,8 @@ impl SpeedTier {
 
 /// Maximum number of inputs accepted by one provider-agnostic embedding request.
 pub const MAX_EMBEDDING_BATCH_SIZE: usize = 256;
+/// Maximum UTF-8 byte length of an embedding model identifier.
+pub const MAX_EMBEDDING_MODEL_BYTES: usize = 1024;
 
 /// Maximum UTF-8 byte length of one embedding input.
 pub const MAX_EMBEDDING_INPUT_BYTES: usize = 1024 * 1024;
@@ -350,7 +352,7 @@ pub const MAX_EMBEDDING_DIMENSIONS: u32 = 65_536;
 pub const MAX_EMBEDDING_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 /// A bounded batch of text inputs to embed with an explicit model.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EmbeddingRequest {
     /// Model identifier sent to the embeddings endpoint.
     pub model: String,
@@ -373,14 +375,14 @@ impl EmbeddingRequest {
 
     /// Request a specific non-zero output dimension.
     #[must_use]
-    pub fn with_dimensions(mut self, dimensions: std::num::NonZeroU32) -> Self {
+    pub const fn with_dimensions(mut self, dimensions: std::num::NonZeroU32) -> Self {
         self.dimensions = Some(dimensions);
         self
     }
 }
 
 /// Provider-independent embedding vectors in the same order as the request inputs.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EmbeddingResponse {
     /// Validated vectors reordered to match [`EmbeddingRequest::inputs`].
     pub vectors: Vec<Vec<f32>>,

@@ -14,9 +14,7 @@
 
 use std::sync::Arc;
 
-use agent_sdk_foundation::llm::{
-    ChatOutcome, ChatRequest, EmbeddingRequest, EmbeddingResponse,
-};
+use agent_sdk_foundation::llm::{ChatOutcome, ChatRequest, EmbeddingRequest, EmbeddingResponse};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -147,7 +145,7 @@ impl LlmProvider for FallbackProvider {
     /// does not apply to this independently typed operation.
     async fn embed(
         &self,
-        request: EmbeddingRequest,
+        request: &EmbeddingRequest,
     ) -> std::result::Result<EmbeddingResponse, EmbeddingError> {
         self.primary.embed(request).await
     }

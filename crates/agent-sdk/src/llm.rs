@@ -20,7 +20,10 @@ pub mod types {
 
 // Re-export everything at the llm:: level for backward compatibility
 pub use agent_sdk_foundation::llm::*;
-pub use agent_sdk_providers::provider::{EmbeddingError, LlmProvider, collect_stream};
+pub use agent_sdk_providers::provider::{
+    EmbeddingError, LlmProvider, collect_stream, validate_embedding_request,
+    validate_embedding_response,
+};
 pub use agent_sdk_providers::router::{ModelRouter, ModelTier, TaskComplexity};
 pub use agent_sdk_providers::streaming::{
     StreamAccumulator, StreamBox, StreamDelta, StreamErrorKind,

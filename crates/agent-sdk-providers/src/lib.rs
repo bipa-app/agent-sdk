@@ -76,7 +76,7 @@ pub mod structured;
 pub use fallback::FallbackProvider;
 pub use provider::{
     EmbeddingError, LlmProvider, ModelInfo, StructuredOutputSupport, collect_stream,
-    probe_http_reachability,
+    probe_http_reachability, validate_embedding_request, validate_embedding_response,
 };
 #[cfg(feature = "record-replay")]
 pub use record_replay::{RecordReplayMode, RecordReplayProvider};

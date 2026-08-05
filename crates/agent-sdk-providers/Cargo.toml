@@ -18,7 +18,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 agent-sdk-foundation = { workspace = true }
-tokio = { workspace = true, features = ["rt", "io-util"] }
+tokio = { workspace = true, features = ["rt", "io-util", "time"] }
 async-trait = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }

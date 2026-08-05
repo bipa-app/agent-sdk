@@ -285,7 +285,7 @@ impl LlmProvider for CloudflareAIGatewayProvider {
 
     async fn embed(
         &self,
-        request: EmbeddingRequest,
+        request: &EmbeddingRequest,
     ) -> std::result::Result<EmbeddingResponse, EmbeddingError> {
         match &self.inner {
             Inner::Anthropic(provider) => provider.embed(request).await,

@@ -170,7 +170,7 @@ impl LlmProvider for RecordReplayProvider {
     /// interactions are intentionally excluded from cassette data.
     async fn embed(
         &self,
-        request: EmbeddingRequest,
+        request: &EmbeddingRequest,
     ) -> std::result::Result<EmbeddingResponse, EmbeddingError> {
         match self.mode {
             RecordReplayMode::Record => match &self.inner {
@@ -723,7 +723,7 @@ mod tests {
 
         async fn embed(
             &self,
-            _request: EmbeddingRequest,
+            _request: &EmbeddingRequest,
         ) -> std::result::Result<EmbeddingResponse, EmbeddingError> {
             Ok(EmbeddingResponse {
                 vectors: vec![vec![0.125, 0.25]],
@@ -922,7 +922,7 @@ mod tests {
             vec!["sensitive embedding input".to_owned()],
         );
 
-        let response = recorder.embed(embedding_request.clone()).await?;
+        let response = recorder.embed(&embedding_request).await?;
         assert_eq!(response.vectors, vec![vec![0.125, 0.25]]);
         assert!(!path.exists());
 
@@ -932,7 +932,7 @@ mod tests {
         assert!(!cassette.contains("0.125"));
 
         let player = RecordReplayProvider::replay(&path)?;
-        let replayed = player.embed(embedding_request).await;
+        let replayed = player.embed(&embedding_request).await;
         assert!(matches!(
             replayed,
             Err(EmbeddingError::Unsupported {

@@ -678,8 +678,9 @@ macro_rules! tool {
 pub use llm::{
     ContentBlock, ContentSource, Effort, EmbeddingError, EmbeddingRequest, EmbeddingResponse,
     LlmProvider, MAX_EMBEDDING_BATCH_SIZE, MAX_EMBEDDING_DIMENSIONS, MAX_EMBEDDING_INPUT_BYTES,
-    MAX_EMBEDDING_RESPONSE_BYTES, MAX_EMBEDDING_TOTAL_INPUT_BYTES, ServedSpeed, SpeedTier,
-    ThinkingConfig, ThinkingMode,
+    MAX_EMBEDDING_MODEL_BYTES, MAX_EMBEDDING_RESPONSE_BYTES, MAX_EMBEDDING_TOTAL_INPUT_BYTES,
+    ServedSpeed, SpeedTier, ThinkingConfig, ThinkingMode, validate_embedding_request,
+    validate_embedding_response,
 };
 pub use model_capabilities::{
     ModelCapabilities, PricePoint, Pricing, SourceStatus, get_model_capabilities,

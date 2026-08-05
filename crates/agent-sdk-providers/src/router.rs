@@ -204,7 +204,7 @@ where
     /// representative capable tier.
     async fn embed(
         &self,
-        request: EmbeddingRequest,
+        request: &EmbeddingRequest,
     ) -> std::result::Result<EmbeddingResponse, EmbeddingError> {
         self.capable.embed(request).await
     }

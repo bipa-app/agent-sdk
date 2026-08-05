@@ -243,6 +243,27 @@ fn provider_trait_and_streaming() {
     fn _assert_chat(_req: ChatRequest, _res: ChatResponse, _out: ChatOutcome) {}
 }
 
+#[test]
+fn embedding_validators_are_available_to_external_custom_providers() {
+    use agent_sdk::llm::{
+        EmbeddingError, EmbeddingRequest, EmbeddingResponse, validate_embedding_request,
+        validate_embedding_response,
+    };
+    use agent_sdk::{
+        validate_embedding_request as validate_root_request,
+        validate_embedding_response as validate_root_response,
+    };
+
+    type RequestValidator = fn(&EmbeddingRequest) -> Result<(), EmbeddingError>;
+    type ResponseValidator =
+        fn(&EmbeddingRequest, &EmbeddingResponse) -> Result<(), EmbeddingError>;
+
+    fn assert_exports(_: RequestValidator, _: ResponseValidator) {}
+
+    assert_exports(validate_embedding_request, validate_embedding_response);
+    assert_exports(validate_root_request, validate_root_response);
+}
+
 // Each provider re-export is gated behind its cargo feature, so the
 // accessibility assertions are split per feature. Under `--all-features`
 // every branch compiles; the default build only exercises `anthropic`.

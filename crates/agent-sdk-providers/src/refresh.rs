@@ -184,17 +184,18 @@ where
 
     async fn embed(
         &self,
-        request: EmbeddingRequest,
+        request: &EmbeddingRequest,
     ) -> std::result::Result<EmbeddingResponse, EmbeddingError> {
-        let result = self.snapshot().await.embed(request.clone()).await;
-        if matches!(
-            &result,
-            Err(EmbeddingError::Api {
-                status: 401
-            })
-        ) {
+        let result = {
+            let provider = self.snapshot().await;
+            provider.embed(request).await
+        };
+        if matches!(&result, Err(EmbeddingError::Api { status: 401 })) {
             match self.run_refresh().await {
-                Ok(()) => return self.snapshot().await.embed(request).await,
+                Ok(()) => {
+                    let provider = self.snapshot().await;
+                    return provider.embed(request).await;
+                }
                 Err(_) => {
                     log::warn!("RefreshingProvider refresh after embedding 401 failed");
                 }
@@ -368,12 +369,20 @@ mod tests {
         Err(String),
     }
 
+    #[derive(Clone, Copy)]
+    enum MockEmbeddingResult {
+        Unauthorized,
+        Success,
+    }
+
     #[derive(Clone)]
     struct MockProvider {
         model: String,
         provider_name: &'static str,
         outcomes: Arc<StdMutex<VecDeque<ChatOutcome>>>,
         stream_batches: Arc<StdMutex<VecDeque<Vec<MockStreamItem>>>>,
+        embedding_results: Arc<StdMutex<VecDeque<MockEmbeddingResult>>>,
+        embedding_request_addresses: Arc<StdMutex<Vec<usize>>>,
         chat_calls: Arc<AtomicUsize>,
         stream_calls: Arc<AtomicUsize>,
     }
@@ -385,6 +394,8 @@ mod tests {
                 provider_name: "mock",
                 outcomes: Arc::new(StdMutex::new(VecDeque::new())),
                 stream_batches: Arc::new(StdMutex::new(VecDeque::new())),
+                embedding_results: Arc::new(StdMutex::new(VecDeque::new())),
+                embedding_request_addresses: Arc::new(StdMutex::new(Vec::new())),
                 chat_calls: Arc::new(AtomicUsize::new(0)),
                 stream_calls: Arc::new(AtomicUsize::new(0)),
             }
@@ -397,6 +408,24 @@ mod tests {
                 .context("outcomes lock poisoned")?
                 .push_back(outcome);
             Ok(())
+        }
+
+        fn queue_embedding(&self, result: MockEmbeddingResult) -> Result<()> {
+            self.embedding_results
+                .lock()
+                .ok()
+                .context("embedding_results lock poisoned")?
+                .push_back(result);
+            Ok(())
+        }
+
+        fn embedding_request_addresses(&self) -> Result<Vec<usize>> {
+            Ok(self
+                .embedding_request_addresses
+                .lock()
+                .ok()
+                .context("embedding_request_addresses lock poisoned")?
+                .clone())
         }
 
         fn queue_stream(&self, batch: Vec<MockStreamItem>) -> Result<()> {
@@ -427,6 +456,28 @@ mod tests {
                 .ok()
                 .context("outcomes lock poisoned")?;
             queue.pop_front().context("MockProvider: no queued outcome")
+        }
+
+        async fn embed(
+            &self,
+            request: &EmbeddingRequest,
+        ) -> std::result::Result<EmbeddingResponse, EmbeddingError> {
+            self.embedding_request_addresses
+                .lock()
+                .map_err(|_| EmbeddingError::Transport)?
+                .push(std::ptr::from_ref(request).addr());
+            let result = self
+                .embedding_results
+                .lock()
+                .map_err(|_| EmbeddingError::Transport)?
+                .pop_front()
+                .ok_or(EmbeddingError::Transport)?;
+            match result {
+                MockEmbeddingResult::Unauthorized => Err(EmbeddingError::Api { status: 401 }),
+                MockEmbeddingResult::Success => Ok(EmbeddingResponse {
+                    vectors: vec![vec![0.5]; request.inputs.len()],
+                }),
+            }
         }
 
         async fn list_models(&self) -> Result<Vec<crate::provider::ModelInfo>> {
@@ -636,6 +687,31 @@ mod tests {
         assert!(matches!(outcome, ChatOutcome::Success(_)));
         assert_eq!(refresh_count.load(Ordering::SeqCst), 1);
         assert_eq!(mock.chat_call_count(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn embedding_401_refresh_retries_the_same_borrowed_request() -> Result<()> {
+        let mock = MockProvider::new();
+        mock.queue_embedding(MockEmbeddingResult::Unauthorized)?;
+        mock.queue_embedding(MockEmbeddingResult::Success)?;
+
+        let refresh_count = Arc::new(AtomicUsize::new(0));
+        let wrapped = wrap_success(&mock, &refresh_count);
+        let request = EmbeddingRequest::new(
+            "embedding-model",
+            vec!["payload that must not be cloned".to_owned()],
+        );
+        let request_address = std::ptr::from_ref(&request).addr();
+
+        let response = wrapped.embed(&request).await?;
+
+        assert_eq!(response.vectors, vec![vec![0.5]]);
+        assert_eq!(refresh_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            mock.embedding_request_addresses()?,
+            vec![request_address, request_address]
+        );
         Ok(())
     }
 

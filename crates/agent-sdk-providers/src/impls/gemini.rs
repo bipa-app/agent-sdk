@@ -7,8 +7,9 @@ pub(crate) mod data;
 
 use crate::attachments::validate_request_attachments;
 use crate::provider::{
-    EmbeddingError, LlmProvider, read_bounded_embedding_body, validate_embedding_request,
-    validate_embedding_vector,
+    BoundedEmbeddingRowsSeed, BoundedEmbeddingVector, EmbeddingError, LlmProvider,
+    deserialize_bounded_embedding_json, read_embedding_response,
+    validate_bounded_embedding_vector_shape, validate_embedding_request,
 };
 use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind, reqwest_error_delta};
 use agent_sdk_foundation::llm::{
@@ -382,9 +383,9 @@ impl LlmProvider for GeminiProvider {
 
     async fn embed(
         &self,
-        request: EmbeddingRequest,
+        request: &EmbeddingRequest,
     ) -> std::result::Result<EmbeddingResponse, EmbeddingError> {
-        validate_embedding_request(&request)?;
+        validate_embedding_request(request)?;
         let model_id = gemini_embedding_model_id(&request.model)?;
         let model_name = format!("models/{model_id}");
         let requested_dimensions = request.dimensions;
@@ -419,28 +420,9 @@ impl LlmProvider for GeminiProvider {
             .send()
             .await
             .map_err(|_| EmbeddingError::Transport)?;
-        let status = response.status();
-        let retry_after = (status == StatusCode::TOO_MANY_REQUESTS)
-            .then(|| crate::http::retry_after_from_headers(response.headers()))
-            .flatten();
-        let bytes = read_bounded_embedding_body(response).await?;
-
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = retry_after.or_else(|| {
-                crate::retry_hints::google_retry_delay(&String::from_utf8_lossy(&bytes))
-            });
-            return Err(EmbeddingError::RateLimited { retry_after });
-        }
-        if !status.is_success() {
-            return Err(EmbeddingError::Api {
-                status: status.as_u16(),
-            });
-        }
-        decode_gemini_embedding_response(
-            &bytes,
-            request.inputs.len(),
-            requested_dimensions,
-        )
+        let bytes =
+            read_embedding_response(response, crate::retry_hints::google_retry_delay).await?;
+        decode_gemini_embedding_response(&bytes, request.inputs.len(), requested_dimensions)
     }
 
     fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
@@ -674,14 +656,82 @@ struct ApiEmbedContentConfig {
     output_dimensionality: u32,
 }
 
-#[derive(serde::Deserialize)]
 struct ApiBatchEmbedContentsResponse {
     embeddings: Vec<ApiContentEmbedding>,
 }
 
+struct ApiBatchEmbedContentsResponseSeed {
+    expected_count: usize,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(field_identifier, rename_all = "camelCase")]
+enum ApiBatchEmbedContentsResponseField {
+    Embeddings,
+    #[serde(other)]
+    Other,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for ApiBatchEmbedContentsResponseSeed {
+    type Value = ApiBatchEmbedContentsResponse;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ApiBatchEmbedContentsResponseVisitor {
+            expected_count: usize,
+        }
+
+        impl<'de> serde::de::Visitor<'de> for ApiBatchEmbedContentsResponseVisitor {
+            type Value = ApiBatchEmbedContentsResponse;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a Gemini batch embeddings response")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut embeddings = None;
+                while let Some(field) = map.next_key::<ApiBatchEmbedContentsResponseField>()? {
+                    match field {
+                        ApiBatchEmbedContentsResponseField::Embeddings => {
+                            if embeddings.is_some() {
+                                return Err(<A::Error as serde::de::Error>::duplicate_field(
+                                    "embeddings",
+                                ));
+                            }
+                            embeddings = Some(map.next_value_seed(BoundedEmbeddingRowsSeed::<
+                                ApiContentEmbedding,
+                            >::new(
+                                self.expected_count
+                            ))?);
+                        }
+                        ApiBatchEmbedContentsResponseField::Other => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                Ok(ApiBatchEmbedContentsResponse {
+                    embeddings: embeddings.ok_or_else(|| {
+                        <A::Error as serde::de::Error>::missing_field("embeddings")
+                    })?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(ApiBatchEmbedContentsResponseVisitor {
+            expected_count: self.expected_count,
+        })
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct ApiContentEmbedding {
-    values: Vec<f32>,
+    values: BoundedEmbeddingVector,
 }
 
 fn decode_gemini_embedding_response(
@@ -689,10 +739,11 @@ fn decode_gemini_embedding_response(
     expected_count: usize,
     requested_dimensions: Option<std::num::NonZeroU32>,
 ) -> std::result::Result<EmbeddingResponse, EmbeddingError> {
-    let api_response: ApiBatchEmbedContentsResponse =
-        serde_json::from_slice(bytes).map_err(|_| EmbeddingError::InvalidResponse {
-            message: "body is not valid batch embeddings JSON".to_owned(),
-        })?;
+    let api_response = deserialize_bounded_embedding_json(
+        bytes,
+        ApiBatchEmbedContentsResponseSeed { expected_count },
+        "body is not valid batch embeddings JSON",
+    )?;
     if api_response.embeddings.len() != expected_count {
         return Err(EmbeddingError::InvalidResponse {
             message: format!(
@@ -701,17 +752,16 @@ fn decode_gemini_embedding_response(
             ),
         });
     }
-
     let mut expected_dimension = None;
     let mut vectors = Vec::with_capacity(expected_count);
     for (index, embedding) in api_response.embeddings.into_iter().enumerate() {
-        expected_dimension = Some(validate_embedding_vector(
+        expected_dimension = Some(validate_bounded_embedding_vector_shape(
             index,
             &embedding.values,
             expected_dimension,
             requested_dimensions,
         )?);
-        vectors.push(embedding.values);
+        vectors.push(embedding.values.into_inner());
     }
     Ok(EmbeddingResponse { vectors })
 }
@@ -793,6 +843,61 @@ fn finalize_gemini_models(rows: Vec<GeminiModelRow>) -> Vec<crate::provider::Mod
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedding_response_seed_stops_after_the_first_excess_row() {
+        let body = br#"{
+            "embeddings": [
+                {"values": [1.0]},
+                {"values": [2.0]},
+                {"values":
+            ]
+        }"#;
+        let mut deserializer = serde_json::Deserializer::from_slice(body);
+        let result = serde::de::DeserializeSeed::deserialize(
+            ApiBatchEmbedContentsResponseSeed { expected_count: 1 },
+            &mut deserializer,
+        );
+        let Err(error) = result else {
+            panic!("the first excess row must trip the bound");
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("embedding response exceeds the 1-row limit"),
+            "the parser must stop before polling the malformed third row: {error}"
+        );
+    }
+
+    #[test]
+    fn embedding_response_seed_keeps_recognized_duplicate_detection() {
+        let mut deserializer =
+            serde_json::Deserializer::from_slice(br#"{"embeddings":[],"embeddings":[]}"#);
+        let result = serde::de::DeserializeSeed::deserialize(
+            ApiBatchEmbedContentsResponseSeed { expected_count: 1 },
+            &mut deserializer,
+        );
+        let Err(error) = result else {
+            panic!("a duplicate recognized field must be rejected");
+        };
+        assert!(error.to_string().contains("duplicate field"));
+    }
+
+    #[test]
+    fn embedding_response_seed_ignores_unknown_fields_without_changing_the_wire_shape() {
+        let response = decode_gemini_embedding_response(
+            br#"{
+                "future": {"nested": ["value"]},
+                "embeddings": [{"values": [1.0, 2.0]}]
+            }"#,
+            1,
+            None,
+        )
+        .expect("unknown fields remain forward compatible");
+
+        assert_eq!(response.vectors, vec![vec![1.0, 2.0]]);
+    }
 
     const GEMINI_MODELS_FIXTURE: &str = r#"{
       "models": [

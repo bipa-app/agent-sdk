@@ -3,17 +3,21 @@
 //! This module defines the [`LlmProvider`] trait that all LLM backends implement,
 //! as well as the [`collect_stream`] helper for consuming a streaming response.
 
+#[cfg(any(feature = "openai", feature = "gemini"))]
+use agent_sdk_foundation::llm::MAX_EMBEDDING_RESPONSE_BYTES;
 #[cfg(feature = "anthropic")]
 use agent_sdk_foundation::llm::ToolChoice;
 use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, EmbeddingRequest, EmbeddingResponse,
     MAX_EMBEDDING_BATCH_SIZE, MAX_EMBEDDING_DIMENSIONS, MAX_EMBEDDING_INPUT_BYTES,
-    MAX_EMBEDDING_RESPONSE_BYTES, MAX_EMBEDDING_TOTAL_INPUT_BYTES, SpeedTier, ThinkingConfig,
+    MAX_EMBEDDING_MODEL_BYTES, MAX_EMBEDDING_TOTAL_INPUT_BYTES, SpeedTier, ThinkingConfig,
     ThinkingMode, Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
+#[cfg(any(feature = "openai", feature = "gemini"))]
+use serde::de::{DeserializeSeed, Error as _, IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -89,9 +93,37 @@ pub enum EmbeddingError {
     InvalidResponse { message: String },
 }
 
-pub(crate) fn validate_embedding_request(
+#[cfg(any(feature = "openai", feature = "gemini"))]
+/// Maximum prefix of an embeddings 429 body inspected for a retry hint.
+pub(crate) const MAX_EMBEDDING_RETRY_HINT_SCAN_BYTES: usize = 64 * 1024;
+
+#[cfg(any(feature = "openai", feature = "gemini"))]
+/// Maximum time spent reading an optional 429 retry-hint body.
+const EMBEDDING_RETRY_HINT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[cfg(any(feature = "openai", feature = "gemini"))]
+/// Return the bounded, lossily decoded prefix eligible for retry-hint parsing.
+pub(crate) fn embedding_retry_hint_body_prefix(body: &[u8]) -> std::borrow::Cow<'_, str> {
+    String::from_utf8_lossy(&body[..body.len().min(MAX_EMBEDDING_RETRY_HINT_SCAN_BYTES)])
+}
+
+/// Validate the provider-independent safety bounds for an embedding request.
+///
+/// Provider implementations should call this before dispatching any network
+/// request.
+///
+/// # Errors
+///
+/// Returns [`EmbeddingError::InvalidRequest`] when any public request bound or
+/// required-field invariant is violated.
+pub fn validate_embedding_request(
     request: &EmbeddingRequest,
 ) -> std::result::Result<(), EmbeddingError> {
+    if request.model.len() > MAX_EMBEDDING_MODEL_BYTES {
+        return Err(EmbeddingError::InvalidRequest {
+            message: format!("model exceeds the {MAX_EMBEDDING_MODEL_BYTES}-byte limit"),
+        });
+    }
     if request.model.trim().is_empty() {
         return Err(EmbeddingError::InvalidRequest {
             message: "model must not be empty".to_owned(),
@@ -131,12 +163,11 @@ pub(crate) fn validate_embedding_request(
                 message: format!("an input exceeds the {MAX_EMBEDDING_INPUT_BYTES}-byte limit"),
             });
         }
-        total_input_bytes =
-            total_input_bytes
-                .checked_add(input.len())
-                .ok_or_else(|| EmbeddingError::InvalidRequest {
-                    message: "aggregate input length overflowed".to_owned(),
-                })?;
+        total_input_bytes = total_input_bytes.checked_add(input.len()).ok_or_else(|| {
+            EmbeddingError::InvalidRequest {
+                message: "aggregate input length overflowed".to_owned(),
+            }
+        })?;
         if total_input_bytes > MAX_EMBEDDING_TOTAL_INPUT_BYTES {
             return Err(EmbeddingError::InvalidRequest {
                 message: format!(
@@ -148,31 +179,107 @@ pub(crate) fn validate_embedding_request(
     Ok(())
 }
 
-pub(crate) fn validate_embedding_vector(
+/// Validate a provider-independent embedding response against its request.
+///
+/// This checks batch cardinality, non-zero and consistent vector dimensions,
+/// the public dimension bound, finite values, and any explicitly requested
+/// dimension. Provider implementations should call this before returning a
+/// successful response.
+///
+/// # Errors
+///
+/// Returns [`EmbeddingError::InvalidResponse`] when the response cardinality,
+/// dimensions, or values violate the provider-independent contract.
+pub fn validate_embedding_response(
+    request: &EmbeddingRequest,
+    response: &EmbeddingResponse,
+) -> std::result::Result<(), EmbeddingError> {
+    let expected_count = request.inputs.len();
+    if response.vectors.len() != expected_count {
+        return Err(EmbeddingError::InvalidResponse {
+            message: format!(
+                "response has {} vectors for {expected_count} inputs",
+                response.vectors.len()
+            ),
+        });
+    }
+
+    let mut expected_dimension = None;
+    for (index, vector) in response.vectors.iter().enumerate() {
+        let dimension =
+            u32::try_from(vector.len()).map_err(|_| EmbeddingError::InvalidResponse {
+                message: format!("response vector {index} dimension is too large"),
+            })?;
+        if dimension > MAX_EMBEDDING_DIMENSIONS {
+            return Err(EmbeddingError::InvalidResponse {
+                message: format!(
+                    "response vector {index} exceeds {MAX_EMBEDDING_DIMENSIONS} dimensions"
+                ),
+            });
+        }
+        if dimension == 0 {
+            return Err(EmbeddingError::InvalidResponse {
+                message: format!("response vector {index} has zero dimensions"),
+            });
+        }
+        if vector.iter().any(|value| !value.is_finite()) {
+            return Err(EmbeddingError::InvalidResponse {
+                message: format!("response vector {index} contains a non-finite value"),
+            });
+        }
+        if let Some(requested) = request.dimensions
+            && requested.get() != dimension
+        {
+            return Err(EmbeddingError::InvalidResponse {
+                message: format!(
+                    "response vector {index} has {dimension} dimensions, not the requested {}",
+                    requested.get()
+                ),
+            });
+        }
+        if let Some(expected) = expected_dimension
+            && expected != dimension
+        {
+            return Err(EmbeddingError::InvalidResponse {
+                message: format!(
+                    "response vector {index} has {dimension} dimensions, not {expected}"
+                ),
+            });
+        }
+        expected_dimension = Some(dimension);
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "openai", feature = "gemini"))]
+#[derive(Debug)]
+pub(crate) struct BoundedEmbeddingVector(Vec<f32>);
+
+#[cfg(any(feature = "openai", feature = "gemini"))]
+impl BoundedEmbeddingVector {
+    pub(crate) fn into_inner(self) -> Vec<f32> {
+        self.0
+    }
+}
+
+#[cfg(any(feature = "openai", feature = "gemini"))]
+/// Validate only response shape proven safe by [`BoundedEmbeddingVector`].
+///
+/// Deserialization into the proof-bearing type has already enforced the
+/// dimension bound and finite-value invariant, so built-ins must not rescan
+/// every float here.
+pub(crate) fn validate_bounded_embedding_vector_shape(
     index: usize,
-    vector: &[f32],
+    vector: &BoundedEmbeddingVector,
     expected_dimension: Option<u32>,
     requested_dimensions: Option<std::num::NonZeroU32>,
 ) -> std::result::Result<u32, EmbeddingError> {
-    if vector.iter().any(|value| !value.is_finite()) {
-        return Err(EmbeddingError::InvalidResponse {
-            message: format!("response vector {index} contains a non-finite value"),
-        });
-    }
-    let dimension =
-        u32::try_from(vector.len()).map_err(|_| EmbeddingError::InvalidResponse {
-            message: format!("response vector {index} dimension is too large"),
-        })?;
+    let dimension = u32::try_from(vector.0.len()).map_err(|_| EmbeddingError::InvalidResponse {
+        message: format!("response vector {index} dimension is too large"),
+    })?;
     if dimension == 0 {
         return Err(EmbeddingError::InvalidResponse {
             message: format!("response vector {index} has zero dimensions"),
-        });
-    }
-    if dimension > MAX_EMBEDDING_DIMENSIONS {
-        return Err(EmbeddingError::InvalidResponse {
-            message: format!(
-                "response vector {index} exceeds {MAX_EMBEDDING_DIMENSIONS} dimensions"
-            ),
         });
     }
     if let Some(requested) = requested_dimensions
@@ -189,37 +296,329 @@ pub(crate) fn validate_embedding_vector(
         && expected != dimension
     {
         return Err(EmbeddingError::InvalidResponse {
-            message: format!(
-                "response vector {index} has {dimension} dimensions, not {expected}"
-            ),
+            message: format!("response vector {index} has {dimension} dimensions, not {expected}"),
         });
     }
     Ok(dimension)
 }
 
+#[cfg(any(feature = "openai", feature = "gemini"))]
+fn collect_bounded_embedding_values<'de, A>(
+    sequence: &mut A,
+    maximum: usize,
+) -> std::result::Result<Vec<f32>, A::Error>
+where
+    A: SeqAccess<'de>,
+{
+    let capacity = sequence.size_hint().unwrap_or(0).min(maximum);
+    let mut values = Vec::with_capacity(capacity);
+    while values.len() < maximum {
+        let Some(value) = sequence.next_element::<f32>()? else {
+            return Ok(values);
+        };
+        if !value.is_finite() {
+            return Err(A::Error::custom(
+                "embedding vector contains a non-finite value",
+            ));
+        }
+        values.push(value);
+    }
+
+    if sequence.next_element::<IgnoredAny>()?.is_some() {
+        return Err(A::Error::custom(format_args!(
+            "embedding vector exceeds {maximum} dimensions"
+        )));
+    }
+    Ok(values)
+}
+
+#[cfg(any(feature = "openai", feature = "gemini"))]
+impl<'de> Deserialize<'de> for BoundedEmbeddingVector {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct EmbeddingVectorVisitor;
+
+        impl<'de> Visitor<'de> for EmbeddingVectorVisitor {
+            type Value = BoundedEmbeddingVector;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a bounded embedding vector")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let maximum = usize::try_from(MAX_EMBEDDING_DIMENSIONS).map_err(|_| {
+                    A::Error::custom("embedding dimension limit does not fit usize")
+                })?;
+                collect_bounded_embedding_values(&mut sequence, maximum).map(BoundedEmbeddingVector)
+            }
+        }
+
+        deserializer.deserialize_seq(EmbeddingVectorVisitor)
+    }
+}
+
+#[cfg(any(feature = "openai", feature = "gemini"))]
+pub(crate) struct BoundedEmbeddingRowsSeed<T> {
+    limit: usize,
+    marker: std::marker::PhantomData<fn() -> T>,
+}
+
+#[cfg(any(feature = "openai", feature = "gemini"))]
+impl<T> BoundedEmbeddingRowsSeed<T> {
+    pub(crate) fn new(expected_count: usize) -> Self {
+        Self {
+            limit: expected_count.min(MAX_EMBEDDING_BATCH_SIZE),
+            marker: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(any(feature = "openai", feature = "gemini"))]
+fn collect_bounded_embedding_rows<'de, A, T>(
+    sequence: &mut A,
+    limit: usize,
+) -> std::result::Result<Vec<T>, A::Error>
+where
+    A: SeqAccess<'de>,
+    T: Deserialize<'de>,
+{
+    let capacity = sequence.size_hint().unwrap_or(0).min(limit);
+    let mut rows = Vec::with_capacity(capacity);
+    while rows.len() < limit {
+        let Some(row) = sequence.next_element::<T>()? else {
+            return Ok(rows);
+        };
+        rows.push(row);
+    }
+
+    if sequence.next_element::<IgnoredAny>()?.is_some() {
+        return Err(A::Error::custom(format_args!(
+            "embedding response exceeds the {limit}-row limit"
+        )));
+    }
+    Ok(rows)
+}
+
+#[cfg(any(feature = "openai", feature = "gemini"))]
+impl<'de, T> DeserializeSeed<'de> for BoundedEmbeddingRowsSeed<T>
+where
+    T: Deserialize<'de>,
+{
+    type Value = Vec<T>;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct EmbeddingRowsVisitor<T> {
+            limit: usize,
+            marker: std::marker::PhantomData<fn() -> T>,
+        }
+
+        impl<'de, T> Visitor<'de> for EmbeddingRowsVisitor<T>
+        where
+            T: Deserialize<'de>,
+        {
+            type Value = Vec<T>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a bounded sequence of embedding rows")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                collect_bounded_embedding_rows(&mut sequence, self.limit)
+            }
+        }
+
+        deserializer.deserialize_seq(EmbeddingRowsVisitor {
+            limit: self.limit,
+            marker: self.marker,
+        })
+    }
+}
+
+#[cfg(any(feature = "openai", feature = "gemini"))]
+pub(crate) fn deserialize_bounded_embedding_json<'de, T, S>(
+    bytes: &'de [u8],
+    seed: S,
+    invalid_message: &'static str,
+) -> std::result::Result<T, EmbeddingError>
+where
+    S: DeserializeSeed<'de, Value = T>,
+{
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let value =
+        seed.deserialize(&mut deserializer)
+            .map_err(|_| EmbeddingError::InvalidResponse {
+                message: invalid_message.to_owned(),
+            })?;
+    deserializer
+        .end()
+        .map_err(|_| EmbeddingError::InvalidResponse {
+            message: invalid_message.to_owned(),
+        })?;
+    Ok(value)
+}
+
+#[cfg(any(feature = "openai", feature = "gemini"))]
+#[derive(Debug)]
+struct BoundedEmbeddingBody {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+#[cfg(any(feature = "openai", feature = "gemini"))]
+impl BoundedEmbeddingBody {
+    const fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
+
+    fn append_success_chunk(&mut self, chunk: &[u8]) -> std::result::Result<(), EmbeddingError> {
+        if chunk.len() > self.limit.saturating_sub(self.bytes.len()) {
+            return Err(EmbeddingError::ResponseTooLarge { limit: self.limit });
+        }
+        self.bytes.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    fn append_prefix_chunk(&mut self, chunk: &[u8]) -> bool {
+        let remaining = self.limit.saturating_sub(self.bytes.len());
+        self.bytes
+            .extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        self.bytes.len() == self.limit
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+#[cfg(any(feature = "openai", feature = "gemini"))]
+async fn collect_bounded_embedding_stream<S, B, E>(
+    stream: S,
+    body: &mut BoundedEmbeddingBody,
+) -> std::result::Result<(), EmbeddingError>
+where
+    S: futures::Stream<Item = std::result::Result<B, E>>,
+    B: AsRef<[u8]>,
+{
+    futures::pin_mut!(stream);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| EmbeddingError::Transport)?;
+        body.append_success_chunk(chunk.as_ref())?;
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "openai", feature = "gemini"))]
+async fn collect_embedding_stream_prefix<S, B, E>(
+    stream: S,
+    body: &mut BoundedEmbeddingBody,
+) -> std::result::Result<(), EmbeddingError>
+where
+    S: futures::Stream<Item = std::result::Result<B, E>>,
+    B: AsRef<[u8]>,
+{
+    futures::pin_mut!(stream);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| EmbeddingError::Transport)?;
+        if body.append_prefix_chunk(chunk.as_ref()) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "openai", feature = "gemini"))]
+async fn read_bounded_embedding_body_with_limit(
+    response: reqwest::Response,
+    limit: usize,
+) -> std::result::Result<Vec<u8>, EmbeddingError> {
+    if response
+        .content_length()
+        .is_some_and(|length| usize::try_from(length).map_or(true, |length| length > limit))
+    {
+        return Err(EmbeddingError::ResponseTooLarge { limit });
+    }
+
+    let mut body = BoundedEmbeddingBody::new(limit);
+    collect_bounded_embedding_stream(response.bytes_stream(), &mut body).await?;
+    Ok(body.into_inner())
+}
+
+#[cfg(any(feature = "openai", feature = "gemini"))]
 pub(crate) async fn read_bounded_embedding_body(
     response: reqwest::Response,
 ) -> std::result::Result<Vec<u8>, EmbeddingError> {
-    if response.content_length().is_some_and(|length| {
-        usize::try_from(length).map_or(true, |length| length > MAX_EMBEDDING_RESPONSE_BYTES)
-    }) {
-        return Err(EmbeddingError::ResponseTooLarge {
-            limit: MAX_EMBEDDING_RESPONSE_BYTES,
+    read_bounded_embedding_body_with_limit(response, MAX_EMBEDDING_RESPONSE_BYTES).await
+}
+
+#[cfg(any(feature = "openai", feature = "gemini"))]
+async fn read_embedding_retry_hint_prefix(
+    response: reqwest::Response,
+) -> std::result::Result<Vec<u8>, EmbeddingError> {
+    let mut body = BoundedEmbeddingBody::new(MAX_EMBEDDING_RETRY_HINT_SCAN_BYTES);
+    collect_embedding_stream_prefix(response.bytes_stream(), &mut body).await?;
+    Ok(body.into_inner())
+}
+
+#[cfg(any(feature = "openai", feature = "gemini"))]
+pub(crate) async fn read_embedding_response(
+    response: reqwest::Response,
+    retry_hint: fn(&str) -> Option<std::time::Duration>,
+) -> std::result::Result<Vec<u8>, EmbeddingError> {
+    read_embedding_response_with_retry_hint_timeout(
+        response,
+        retry_hint,
+        EMBEDDING_RETRY_HINT_READ_TIMEOUT,
+    )
+    .await
+}
+
+#[cfg(any(feature = "openai", feature = "gemini"))]
+pub(crate) async fn read_embedding_response_with_retry_hint_timeout(
+    response: reqwest::Response,
+    retry_hint: fn(&str) -> Option<std::time::Duration>,
+    retry_hint_timeout: std::time::Duration,
+) -> std::result::Result<Vec<u8>, EmbeddingError> {
+    let status = response.status();
+    if status.is_success() {
+        return read_bounded_embedding_body(response).await;
+    }
+    if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(EmbeddingError::Api {
+            status: status.as_u16(),
+        });
+    }
+    if let Some(retry_after) = crate::http::retry_after_from_headers(response.headers()) {
+        return Err(EmbeddingError::RateLimited {
+            retry_after: Some(retry_after),
         });
     }
 
-    let mut bytes = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| EmbeddingError::Transport)?;
-        if chunk.len() > MAX_EMBEDDING_RESPONSE_BYTES.saturating_sub(bytes.len()) {
-            return Err(EmbeddingError::ResponseTooLarge {
-                limit: MAX_EMBEDDING_RESPONSE_BYTES,
-            });
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(bytes)
+    let Ok(Ok(prefix)) = tokio::time::timeout(
+        retry_hint_timeout,
+        read_embedding_retry_hint_prefix(response),
+    )
+    .await
+    else {
+        return Err(EmbeddingError::RateLimited { retry_after: None });
+    };
+    let body = embedding_retry_hint_body_prefix(&prefix);
+    Err(EmbeddingError::RateLimited {
+        retry_after: retry_hint(&body),
+    })
 }
 
 #[async_trait]
@@ -232,6 +631,10 @@ pub trait LlmProvider: Send + Sync {
     /// Providers that do not support embeddings retain source compatibility via
     /// this default and return an actionable typed error.
     ///
+    /// Implementations must call [`validate_embedding_request`] before
+    /// dispatch and [`validate_embedding_response`] before returning success,
+    /// or enforce the exact same request and response contracts.
+    ///
     /// # Errors
     ///
     /// Returns [`EmbeddingError::Unsupported`] by default. Implementations
@@ -239,7 +642,7 @@ pub trait LlmProvider: Send + Sync {
     /// failures, safety-bound violations, and malformed responses.
     async fn embed(
         &self,
-        _request: EmbeddingRequest,
+        _request: &EmbeddingRequest,
     ) -> std::result::Result<EmbeddingResponse, EmbeddingError> {
         Err(EmbeddingError::Unsupported {
             provider: self.provider(),
@@ -768,6 +1171,198 @@ mod tests {
     use super::*;
     use anyhow::Result;
     use async_trait::async_trait;
+
+    #[test]
+    fn public_embedding_validators_cover_external_provider_contracts() {
+        let request = EmbeddingRequest::new(
+            "embedding-model",
+            vec!["first".to_owned(), "second".to_owned()],
+        )
+        .with_dimensions(std::num::NonZeroU32::new(2).expect("two is nonzero"));
+        assert!(validate_embedding_request(&request).is_ok());
+
+        let response = EmbeddingResponse {
+            vectors: vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+        };
+        assert!(validate_embedding_response(&request, &response).is_ok());
+
+        let invalid_responses = [
+            EmbeddingResponse {
+                vectors: vec![vec![1.0, 2.0]],
+            },
+            EmbeddingResponse {
+                vectors: vec![vec![1.0, 2.0], vec![3.0]],
+            },
+            EmbeddingResponse {
+                vectors: vec![vec![1.0, f32::NAN], vec![3.0, 4.0]],
+            },
+            EmbeddingResponse {
+                vectors: vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]],
+            },
+        ];
+        for response in invalid_responses {
+            assert!(matches!(
+                validate_embedding_response(&request, &response),
+                Err(EmbeddingError::InvalidResponse { .. })
+            ));
+        }
+
+        let over_limit = EmbeddingResponse {
+            vectors: vec![
+                vec![
+                    0.0;
+                    usize::try_from(MAX_EMBEDDING_DIMENSIONS).expect("dimension bound fits usize")
+                        + 1
+                ],
+                vec![1.0, 2.0],
+            ],
+        };
+        assert!(matches!(
+            validate_embedding_response(&request, &over_limit),
+            Err(EmbeddingError::InvalidResponse { .. })
+        ));
+
+        let invalid_request = EmbeddingRequest::new(" ", vec!["text".to_owned()]);
+        assert!(matches!(
+            validate_embedding_request(&invalid_request),
+            Err(EmbeddingError::InvalidRequest { .. })
+        ));
+    }
+
+    #[cfg(any(feature = "openai", feature = "gemini"))]
+    #[test]
+    fn bounded_rows_poll_only_the_first_excess_element() {
+        use serde::de::value::{Error, U8Deserializer};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingRows {
+            remaining: usize,
+            polls: Arc<AtomicUsize>,
+        }
+
+        impl<'de> SeqAccess<'de> for CountingRows {
+            type Error = Error;
+
+            fn next_element_seed<T>(
+                &mut self,
+                seed: T,
+            ) -> std::result::Result<Option<T::Value>, Self::Error>
+            where
+                T: DeserializeSeed<'de>,
+            {
+                self.polls.fetch_add(1, Ordering::SeqCst);
+                if self.remaining == 0 {
+                    return Ok(None);
+                }
+                self.remaining -= 1;
+                seed.deserialize(U8Deserializer::<Error>::new(0)).map(Some)
+            }
+        }
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut rows = CountingRows {
+            remaining: 4,
+            polls: Arc::clone(&polls),
+        };
+        let result: std::result::Result<Vec<u8>, _> = collect_bounded_embedding_rows(&mut rows, 2);
+
+        assert!(result.is_err());
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
+    }
+
+    #[cfg(any(feature = "openai", feature = "gemini"))]
+    #[test]
+    fn bounded_vector_polls_only_the_first_excess_value() {
+        use serde::de::value::{Error, F32Deserializer};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingValues {
+            remaining: usize,
+            polls: Arc<AtomicUsize>,
+        }
+
+        impl<'de> SeqAccess<'de> for CountingValues {
+            type Error = Error;
+
+            fn next_element_seed<T>(
+                &mut self,
+                seed: T,
+            ) -> std::result::Result<Option<T::Value>, Self::Error>
+            where
+                T: DeserializeSeed<'de>,
+            {
+                self.polls.fetch_add(1, Ordering::SeqCst);
+                if self.remaining == 0 {
+                    return Ok(None);
+                }
+                self.remaining -= 1;
+                seed.deserialize(F32Deserializer::<Error>::new(1.0))
+                    .map(Some)
+            }
+        }
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut values = CountingValues {
+            remaining: 4,
+            polls: Arc::clone(&polls),
+        };
+        let result = collect_bounded_embedding_values(&mut values, 2);
+
+        assert!(result.is_err());
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
+    }
+
+    #[cfg(any(feature = "openai", feature = "gemini"))]
+    #[tokio::test]
+    async fn bounded_success_stream_stops_at_first_excess_chunk_without_overretaining() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed_polls = Arc::clone(&polls);
+        let mut chunks = vec![vec![1_u8, 2, 3], vec![4_u8, 5], vec![6_u8]].into_iter();
+        let stream = futures::stream::poll_fn(move |_| {
+            observed_polls.fetch_add(1, Ordering::SeqCst);
+            std::task::Poll::Ready(chunks.next().map(Ok::<_, ()>))
+        });
+        let mut body = BoundedEmbeddingBody::new(4);
+
+        let result = collect_bounded_embedding_stream(stream, &mut body).await;
+
+        assert!(matches!(
+            result,
+            Err(EmbeddingError::ResponseTooLarge { limit: 4 })
+        ));
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+        assert_eq!(body.bytes, vec![1, 2, 3]);
+        assert!(body.bytes.len() <= body.limit);
+    }
+
+    #[cfg(any(feature = "openai", feature = "gemini"))]
+    #[tokio::test]
+    async fn retry_hint_prefix_stops_at_limit_without_overretaining() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed_polls = Arc::clone(&polls);
+        let mut chunks = vec![b"abc".to_vec(), b"def".to_vec(), b"ghi".to_vec()].into_iter();
+        let stream = futures::stream::poll_fn(move |_| {
+            observed_polls.fetch_add(1, Ordering::SeqCst);
+            std::task::Poll::Ready(chunks.next().map(Ok::<_, ()>))
+        });
+        let mut body = BoundedEmbeddingBody::new(4);
+
+        collect_embedding_stream_prefix(stream, &mut body)
+            .await
+            .expect("prefix collection succeeds");
+
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+        assert_eq!(body.bytes, b"abcd");
+        assert!(body.bytes.len() <= body.limit);
+    }
 
     struct Stub {
         provider: &'static str,
