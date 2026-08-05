@@ -411,13 +411,13 @@ async fn test_over_budget_tool_output_spills_to_artifact_store() -> anyhow::Resu
     assert!(
         result
             .output
-            .ends_with(&crate::artifacts::artifact_footer(0)),
+            .ends_with(&crate::artifacts::artifact_footer(1)),
         "journaled output must end with the recovery footer: {}",
         &result.output[result.output.len().saturating_sub(120)..]
     );
 
     // The spill file holds the full pre-truncation stream, byte-identical.
-    let mut artifact_file = store.resolve(0)?;
+    let mut artifact_file = store.resolve(1)?;
     let mut spilled = String::new();
     std::io::Read::read_to_string(&mut artifact_file, &mut spilled)?;
     assert_eq!(spilled, format!("Echo: {big_message}"));
@@ -10121,8 +10121,8 @@ async fn stalled_stream_retries_even_with_zero_transient_budget() -> anyhow::Res
 }
 
 fn provider_hydration_checkpoint(store: &crate::ArtifactStore) -> anyhow::Result<(Message, u64)> {
-    let mut reserved = &b"reserved artifact zero"[..];
-    assert_eq!(store.save_streamed("reserved", &mut reserved)?.id, 0);
+    let mut reserved = &b"first allocation probe"[..];
+    assert_eq!(store.save_streamed("reserved", &mut reserved)?.id, 1);
     let mut source = &b"snapcompact exact source"[..];
     let source_id = store.save_streamed("snapcompact-source", &mut source)?.id;
     let mut png = &b"\x89PNG\r\n\x1a\nprovider-hydration-frame"[..];

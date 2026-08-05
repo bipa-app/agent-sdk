@@ -925,7 +925,10 @@ mod tests {
             )
             .await?;
 
-        let spec = ChildSpawnSpec { max_attempts: 3 };
+        let spec = ChildSpawnSpec {
+            max_attempts: 3,
+            precompleted_result: None,
+        };
         let payload = SuspensionPayload {
             continuation: agent_sdk_foundation::ContinuationEnvelope::wrap(
                 agent_sdk_foundation::AgentContinuation {
@@ -1081,10 +1084,7 @@ mod tests {
                 &root.id,
                 &worker,
                 &lease,
-                vec![
-                    ChildSpawnSpec { max_attempts: 3 },
-                    ChildSpawnSpec { max_attempts: 3 },
-                ],
+                vec![ChildSpawnSpec::new(3), ChildSpawnSpec::new(3)],
                 suspension_payload(tid),
                 None,
                 Vec::new(),
@@ -1199,10 +1199,7 @@ mod tests {
                 &root.id,
                 &worker,
                 &lease,
-                vec![
-                    ChildSpawnSpec { max_attempts: 3 },
-                    ChildSpawnSpec { max_attempts: 3 },
-                ],
+                vec![ChildSpawnSpec::new(3), ChildSpawnSpec::new(3)],
                 suspension_payload(tid),
                 None,
                 Vec::new(),
@@ -1718,7 +1715,7 @@ mod tests {
                 &plain_id,
                 &worker,
                 &lease,
-                vec![ChildSpawnSpec { max_attempts: 3 }],
+                vec![ChildSpawnSpec::new(3)],
                 suspension_payload(tid),
                 None,
                 Vec::new(),
@@ -1789,10 +1786,7 @@ mod tests {
                 &parent_id,
                 &worker,
                 &lease,
-                vec![
-                    ChildSpawnSpec { max_attempts: 3 },
-                    ChildSpawnSpec { max_attempts: 3 },
-                ],
+                vec![ChildSpawnSpec::new(3), ChildSpawnSpec::new(3)],
                 suspension_payload(tid),
                 None,
                 Vec::new(),
@@ -2146,7 +2140,7 @@ mod tests {
                 &parent.id,
                 &pw,
                 &pl,
-                vec![ChildSpawnSpec { max_attempts: 1 }],
+                vec![ChildSpawnSpec::new(1)],
                 payload,
                 None,
                 Vec::new(),
@@ -2198,7 +2192,10 @@ mod tests {
             )
             .await?;
 
-        let spec = ChildSpawnSpec { max_attempts: 3 };
+        let spec = ChildSpawnSpec {
+            max_attempts: 3,
+            precompleted_result: None,
+        };
         let payload = SuspensionPayload {
             continuation: agent_sdk_foundation::ContinuationEnvelope::wrap(
                 agent_sdk_foundation::AgentContinuation {
@@ -2673,7 +2670,9 @@ mod tests {
         use agent_server::journal::event_repository::InMemoryEventRepository;
         use agent_server::journal::message_store::InMemoryMessageProjectionStore;
         use agent_server::journal::outbox::InMemoryOutboxStore;
-        use agent_server::journal::store::{CancellationMarkerSink, InMemoryAgentTaskStore};
+        use agent_server::journal::store::{
+            CancellationMarkerSink, InMemoryAgentTaskStore, InMemoryAtomicSpawnEventCommitter,
+        };
         use agent_server::journal::thread_store::InMemoryThreadStore;
         use agent_server::journal::turn_attempt_store::InMemoryTurnAttemptStore;
 
@@ -2687,12 +2686,18 @@ mod tests {
             std::sync::Arc::new(InMemoryEventRepository::new());
         let outbox: std::sync::Arc<InMemoryOutboxStore> =
             std::sync::Arc::new(InMemoryOutboxStore::new());
-        let task =
-            InMemoryAgentTaskStore::new().with_cancellation_markers(CancellationMarkerSink {
+        let task = InMemoryAgentTaskStore::new()
+            .with_cancellation_markers(CancellationMarkerSink {
                 event_repo: event.clone(),
                 outbox_store: outbox.clone(),
                 thread_store: thread.clone(),
-            });
+            })
+            .with_spawn_event_committer(std::sync::Arc::new(
+                InMemoryAtomicSpawnEventCommitter::new(
+                    event.as_ref().clone(),
+                    outbox.as_ref().clone(),
+                ),
+            ));
 
         InMemoryStores {
             task: std::sync::Arc::new(task),

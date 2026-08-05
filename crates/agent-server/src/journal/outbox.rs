@@ -381,8 +381,8 @@ pub const fn kind_payload_invariants_hold(
 // ─────────────────────────────────────────────────────────────────────
 
 #[derive(Default)]
-struct InMemoryOutboxStoreInner {
-    rows: HashMap<String, OutboxRow>,
+pub(crate) struct InMemoryOutboxStoreInner {
+    pub(crate) rows: HashMap<String, OutboxRow>,
 }
 
 /// In-memory reference implementation of [`OutboxStore`].
@@ -390,7 +390,7 @@ struct InMemoryOutboxStoreInner {
 /// Cloning shares the same underlying outbox state.
 #[derive(Clone, Default)]
 pub struct InMemoryOutboxStore {
-    inner: Arc<RwLock<InMemoryOutboxStoreInner>>,
+    pub(crate) inner: Arc<RwLock<InMemoryOutboxStoreInner>>,
 }
 
 impl InMemoryOutboxStore {

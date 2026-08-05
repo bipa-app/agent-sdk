@@ -51,6 +51,7 @@ fn sample_definition() -> AgentDefinition {
         thinking: ThinkingPolicy::Disabled,
         thinking_display: None,
         tools_fn: None,
+        tool_input_sanitizer: None,
         policy: RuntimePolicy::default(),
     }
 }

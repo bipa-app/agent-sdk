@@ -78,6 +78,7 @@ fn sample_definition() -> AgentDefinition {
         thinking: ThinkingPolicy::Disabled,
         thinking_display: None,
         tools_fn: None,
+        tool_input_sanitizer: None,
         policy: RuntimePolicy::server_default(),
     }
 }
@@ -248,6 +249,7 @@ async fn registry_resolves_per_thread_override() -> anyhow::Result<()> {
         max_tokens: 8192,
         tools: Vec::new(),
         tools_fn: None,
+        tool_input_sanitizer: None,
         thinking: ThinkingPolicy::Adaptive {
             effort: Some(Effort::Max),
         },

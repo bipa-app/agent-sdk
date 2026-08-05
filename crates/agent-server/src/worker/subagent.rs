@@ -1943,6 +1943,9 @@ pub struct SpawnedMixedBatch {
     /// One persisted [`TaskKind::ToolRuntime`] child per tool entry, in
     /// input order.
     pub tool_children: Vec<AgentTask>,
+    /// Full atomic boundary batch in durable sequence order: any caller
+    /// boundary events followed by the subagent `ToolCallStart` events.
+    pub committed_events: Vec<CommittedEvent>,
 }
 
 /// Inputs for [`spawn_mixed_children_invocations`].
@@ -1954,6 +1957,9 @@ pub struct MixedChildrenRequest {
     /// Boundary-injection rows this turn already delivered; completed
     /// with the spawn in one store write.
     pub delivered_injection_ids: Vec<AgentTaskId>,
+    /// Parent-thread boundary events committed atomically before any
+    /// precompleted child can make the parent runnable.
+    pub boundary_events: Vec<AgentEvent>,
     /// Durable subagent invocations to persist, in input order.
     pub subagents: Vec<SubagentBatchEntry>,
     /// Tool-runtime children to persist, in input order.
@@ -1972,9 +1978,18 @@ fn validate_mixed_request_slots(
     subagents: &[SubagentBatchEntry],
     tool_children: &[ToolChildSpawn],
     reattach: &[ReattachedChild],
+    boundary_events: &[AgentEvent],
 ) -> Result<()> {
     let subagent_slots: Vec<u32> = subagents.iter().map(|entry| entry.spawn_index).collect();
     let tool_slots: Vec<u32> = tool_children.iter().map(|tool| tool.spawn_index).collect();
+    if subagents.is_empty() && reattach.is_empty() && !boundary_events.is_empty() {
+        return validate_reattached_slot_coverage(
+            &[],
+            &tool_slots,
+            &[],
+            payload.continuation.payload.pending_tool_calls.len(),
+        );
+    }
     if reattach.is_empty() {
         validate_mixed_slot_coverage(
             &subagent_slots,
@@ -2031,8 +2046,10 @@ pub async fn spawn_mixed_children_invocations(
     deps: &SubagentInvocationDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<SpawnedMixedBatch> {
+    let boundary_event_count = request.boundary_events.len();
     let MixedChildrenRequest {
         delivered_injection_ids,
+        boundary_events,
         mut subagents,
         tool_children,
         reattach,
@@ -2045,7 +2062,13 @@ pub async fn spawn_mixed_children_invocations(
     // own validation runs inside its transaction, which rolls back only
     // the rows it wrote: a child-thread projection created out here
     // would survive a late rejection as an orphan.
-    validate_mixed_request_slots(&payload, &subagents, &tool_children, &reattach)?;
+    validate_mixed_request_slots(
+        &payload,
+        &subagents,
+        &tool_children,
+        &reattach,
+        &boundary_events,
+    )?;
     let pending_tools_by_entry = validate_batch_spawns(&payload, &subagents)?;
 
     let child_threads = materialize_batch_child_threads(&mut subagents, deps, now).await?;
@@ -2071,6 +2094,7 @@ pub async fn spawn_mixed_children_invocations(
             lease,
             MixedChildrenSpawn {
                 delivered_injection_ids,
+                boundary_events,
                 subagents: spawns,
                 tool_children,
                 reattach,
@@ -2083,13 +2107,26 @@ pub async fn spawn_mixed_children_invocations(
         .await
         .context("persist mixed batch children")?;
 
+    assemble_mixed_spawned_batch(
+        spawned,
+        child_threads,
+        pending_tools_by_entry.len(),
+        boundary_event_count,
+    )
+}
+
+pub(crate) fn assemble_mixed_spawned_batch(
+    spawned: SpawnedMixedChildren,
+    child_threads: Vec<Thread>,
+    pending_tool_count: usize,
+    boundary_event_count: usize,
+) -> Result<SpawnedMixedBatch> {
     let SpawnedMixedChildren {
-        committed_events,
+        mut committed_events,
         parent,
         subagents: prepared,
         tool_children,
     } = spawned;
-
     ensure!(
         prepared.len() == child_threads.len(),
         "spawn_mixed_children returned {} invocations for {} child threads",
@@ -2097,20 +2134,25 @@ pub async fn spawn_mixed_children_invocations(
         child_threads.len(),
     );
     ensure!(
-        prepared.len() == pending_tools_by_entry.len(),
-        "spawn_mixed_children returned {} invocations for {} pending tools",
+        prepared.len() == pending_tool_count,
+        "spawn_mixed_children returned {} invocations for {pending_tool_count} pending tools",
         prepared.len(),
-        pending_tools_by_entry.len(),
     );
-    let per_entry_events = distribute_committed_events(committed_events, prepared.len())?;
-
+    ensure!(
+        committed_events.len() >= boundary_event_count,
+        "spawn_mixed_children returned {} committed events for {boundary_event_count} boundary events",
+        committed_events.len(),
+    );
+    let all_committed_events = committed_events.clone();
+    let spawn_committed_events = committed_events.split_off(boundary_event_count);
+    let per_entry_events = distribute_committed_events(spawn_committed_events, prepared.len())?;
     let mut invocations = Vec::with_capacity(prepared.len());
     for (((invocation_task, child_root_task), child_thread), committed) in prepared
         .into_iter()
         .zip(child_threads)
         .zip(per_entry_events)
     {
-        let assembled = assemble_batch_invocation(
+        invocations.push(assemble_batch_invocation(
             BatchEntryAssembly {
                 parent_task: &parent,
                 invocation_task,
@@ -2118,14 +2160,13 @@ pub async fn spawn_mixed_children_invocations(
                 child_thread,
             },
             committed,
-        )?;
-        invocations.push(assembled);
+        )?);
     }
-
     Ok(SpawnedMixedBatch {
         parent_task: parent,
         invocations,
         tool_children,
+        committed_events: all_committed_events,
     })
 }
 
@@ -2533,10 +2574,10 @@ mod artifact_budget_tests {
         assert!(
             tool_result
                 .output
-                .ends_with(&agent_sdk_tools::artifact_footer(0))
+                .ends_with(&agent_sdk_tools::artifact_footer(1))
         );
         let mut spilled = String::new();
-        std::io::Read::read_to_string(&mut store.resolve(0)?, &mut spilled)?;
+        std::io::Read::read_to_string(&mut store.resolve(1)?, &mut spilled)?;
         assert_eq!(spilled.as_bytes(), final_response.as_bytes());
         let data = tool_result
             .data

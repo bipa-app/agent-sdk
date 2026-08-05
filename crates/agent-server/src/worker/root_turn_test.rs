@@ -6,11 +6,12 @@
 //! child-outcome aggregation and resume-from-children path.
 
 use super::root_turn::{
-    PartialCancelCommit, RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes, cancel_root_turn,
-    commit_partial_turn_on_cancel, derive_reattach_tool_use_id, drain_boundary_injections,
-    execute_root_turn, fail_root_turn, is_root_turn_cancelled, provider_valid_split,
-    resume_for_steering, resume_from_children, resume_from_question, resume_root_turn,
-    revert_steering_wake, settle_attempt_after_lost_ownership, terminal_reason_for_root_error,
+    PartialCancelCommit, RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes,
+    build_tool_results_message, cancel_root_turn, commit_partial_turn_on_cancel,
+    derive_reattach_tool_use_id, drain_boundary_injections, execute_root_turn, fail_root_turn,
+    is_root_turn_cancelled, provider_valid_split, resume_for_steering, resume_from_children,
+    resume_from_question, resume_root_turn, revert_steering_wake,
+    settle_attempt_after_lost_ownership, terminal_reason_for_root_error,
 };
 use crate::journal::checkpoint::CheckpointKind;
 use std::sync::Arc;
@@ -38,7 +39,10 @@ use crate::journal::turn_attempt::{
 };
 use crate::journal::turn_attempt_store::{InMemoryTurnAttemptStore, TurnAttemptStore};
 use crate::worker::bootstrap::WorkerBootstrapContext;
-use crate::worker::definition::{AgentDefinition, ChildJoinPolicy, RuntimePolicy, ThinkingPolicy};
+use crate::worker::definition::{
+    AgentDefinition, ChildJoinPolicy, RuntimePolicy, ThinkingPolicy, ToolInputPreflightContext,
+    ToolInputPreflightOutcome,
+};
 use agent_sdk::context::CompactionConfig;
 use agent_sdk_foundation::audit::AuditProvenance;
 use agent_sdk_foundation::events::AgentEvent;
@@ -49,6 +53,62 @@ use agent_sdk_foundation::{
     AgentContinuation, AgentState, ContinuationEnvelope, QuestionAnswer, TerminalReason, ThreadId,
     TokenUsage,
 };
+
+/// The daemon fan-in must carry a tool result's native attachments into
+/// the same user message as its `ToolResult` block, exactly like the
+/// in-process loop's `append_tool_results` — dropping them silences
+/// every multimodal tool result on the daemon path (live incident: the
+/// ENG-9548 browser screenshot never reached the model). Anthropic
+/// requires EVERY `tool_result` block to precede any other content, so
+/// the message is two-pass: all results in tool-use order, then the
+/// attachments in result order.
+#[test]
+fn fan_in_tool_results_carry_documents_as_native_blocks() {
+    let screenshot = agent_sdk_foundation::ToolResult::success("captured").with_documents(vec![
+        agent_sdk_foundation::llm::ContentSource::new("image/png", "artifact://7"),
+    ]);
+    let report = agent_sdk_foundation::ToolResult::success("report").with_documents(vec![
+        agent_sdk_foundation::llm::ContentSource::new("application/pdf", "ZmFrZQ=="),
+    ]);
+    let message = build_tool_results_message(&[
+        ("call_img".to_owned(), screenshot),
+        ("call_doc".to_owned(), report),
+    ]);
+    assert_eq!(message.role, Role::User);
+    let agent_sdk_foundation::llm::Content::Blocks(blocks) = &message.content else {
+        panic!("fan-in tool results must be a block message");
+    };
+    assert_eq!(blocks.len(), 4);
+    assert!(
+        matches!(&blocks[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_img")
+    );
+    assert!(
+        matches!(&blocks[1], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_doc")
+    );
+    let ContentBlock::Image { source } = &blocks[2] else {
+        panic!("image attachment must follow the full tool-result run");
+    };
+    assert_eq!(source.media_type, "image/png");
+    assert_eq!(source.data, "artifact://7");
+    assert!(matches!(&blocks[3], ContentBlock::Document { .. }));
+    let last_result = blocks
+        .iter()
+        .rposition(|block| matches!(block, ContentBlock::ToolResult { .. }))
+        .expect("at least one tool result");
+    let first_attachment = blocks
+        .iter()
+        .position(|block| {
+            matches!(
+                block,
+                ContentBlock::Image { .. } | ContentBlock::Document { .. }
+            )
+        })
+        .expect("at least one attachment");
+    assert!(
+        last_result < first_attachment,
+        "no tool_result block may appear after any attachment"
+    );
+}
 use agent_sdk_providers::LlmProvider;
 use agent_sdk_providers::streaming::{StreamBox, StreamDelta, StreamErrorKind};
 use agent_sdk_tools::stores::MessageStore;
@@ -205,6 +265,7 @@ fn sample_definition() -> AgentDefinition {
         thinking: ThinkingPolicy::default(),
         thinking_display: None,
         tools_fn: None,
+        tool_input_sanitizer: None,
         policy: RuntimePolicy::server_default(),
     }
 }
@@ -321,12 +382,18 @@ impl TestStores {
         let threads = InMemoryThreadStore::new();
         let events = InMemoryEventRepository::new();
         let outbox = InMemoryOutboxStore::new();
-        let tasks =
-            InMemoryAgentTaskStore::new().with_cancellation_markers(CancellationMarkerSink {
+        let tasks = InMemoryAgentTaskStore::new()
+            .with_cancellation_markers(CancellationMarkerSink {
                 event_repo: Arc::new(events.clone()),
                 outbox_store: Arc::new(outbox.clone()),
                 thread_store: Arc::new(threads.clone()),
-            });
+            })
+            .with_spawn_event_committer(Arc::new(
+                crate::journal::store::InMemoryAtomicSpawnEventCommitter::new(
+                    events.clone(),
+                    outbox.clone(),
+                ),
+            ));
         Self {
             tasks,
             threads,
@@ -370,6 +437,132 @@ impl TestStores {
             compaction_artifact_store: None,
             ..self.deps()
         }
+    }
+}
+struct DraftOrderingMessageStore {
+    inner: InMemoryMessageProjectionStore,
+    tasks: InMemoryAgentTaskStore,
+    parent_id: AgentTaskId,
+    fail_set_draft: bool,
+    observed_before_spawn: AtomicBool,
+    draft_completed: AtomicBool,
+}
+
+#[async_trait]
+impl MessageProjectionStore for DraftOrderingMessageStore {
+    async fn get_or_create(
+        &self,
+        thread_id: &ThreadId,
+        now: time::OffsetDateTime,
+    ) -> Result<crate::journal::message::MessageProjection> {
+        self.inner.get_or_create(thread_id, now).await
+    }
+
+    async fn get(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Result<Option<crate::journal::message::MessageProjection>> {
+        self.inner.get(thread_id).await
+    }
+
+    async fn get_history(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Result<Vec<agent_sdk_foundation::llm::Message>> {
+        self.inner.get_history(thread_id).await
+    }
+
+    async fn commit_messages(
+        &self,
+        thread_id: &ThreadId,
+        messages: Vec<agent_sdk_foundation::llm::Message>,
+        now: time::OffsetDateTime,
+    ) -> Result<crate::journal::message::MessageProjection> {
+        self.inner.commit_messages(thread_id, messages, now).await
+    }
+
+    async fn replace_history(
+        &self,
+        thread_id: &ThreadId,
+        messages: Vec<agent_sdk_foundation::llm::Message>,
+        now: time::OffsetDateTime,
+    ) -> Result<crate::journal::message::MessageProjection> {
+        self.inner.replace_history(thread_id, messages, now).await
+    }
+
+    async fn append_compaction(
+        &self,
+        thread_id: &ThreadId,
+        result_messages: Vec<agent_sdk_foundation::llm::Message>,
+        source_message_count: usize,
+        retained_message_count: usize,
+        now: time::OffsetDateTime,
+    ) -> Result<crate::journal::message::MessageProjection> {
+        self.inner
+            .append_compaction(
+                thread_id,
+                result_messages,
+                source_message_count,
+                retained_message_count,
+                now,
+            )
+            .await
+    }
+
+    async fn append_repair(
+        &self,
+        thread_id: &ThreadId,
+        repair_messages: Vec<agent_sdk_foundation::llm::Message>,
+        balanced_messages: Vec<agent_sdk_foundation::llm::Message>,
+        source_message_count: usize,
+        now: time::OffsetDateTime,
+    ) -> Result<crate::journal::message::MessageProjection> {
+        self.inner
+            .append_repair(
+                thread_id,
+                repair_messages,
+                balanced_messages,
+                source_message_count,
+                now,
+            )
+            .await
+    }
+
+    async fn set_draft(
+        &self,
+        thread_id: &ThreadId,
+        messages: Vec<agent_sdk_foundation::llm::Message>,
+        now: time::OffsetDateTime,
+    ) -> Result<crate::journal::message::MessageProjection> {
+        let parent = self
+            .tasks
+            .get(&self.parent_id)
+            .await?
+            .context("probe parent exists before required draft")?;
+        anyhow::ensure!(
+            parent.status == TaskStatus::Running,
+            "spawn entered before required draft: parent is {:?}",
+            parent.status,
+        );
+        anyhow::ensure!(
+            self.tasks.list_children(&self.parent_id).await?.is_empty(),
+            "spawn entered before required draft: child rows already exist",
+        );
+        self.observed_before_spawn.store(true, Ordering::SeqCst);
+        if self.fail_set_draft {
+            anyhow::bail!("injected required preflight draft failure");
+        }
+        let projection = self.inner.set_draft(thread_id, messages, now).await?;
+        self.draft_completed.store(true, Ordering::SeqCst);
+        Ok(projection)
+    }
+
+    async fn clear_draft(
+        &self,
+        thread_id: &ThreadId,
+        now: time::OffsetDateTime,
+    ) -> Result<Option<crate::journal::message::MessageProjection>> {
+        self.inner.clear_draft(thread_id, now).await
     }
 }
 
@@ -727,6 +920,412 @@ async fn terminal_stop_reason_with_tool_blocks_commits_without_child_dispatch() 
     Ok(())
 }
 
+/// Test sanitizer: rejects any `browser` call whose `url` input carries a
+/// query string, completing it with a typed `NO_BROWSER_HOST` result;
+/// allows everything else.
+fn reject_signed_url_preflight(
+    context: &ToolInputPreflightContext<'_>,
+    name: &str,
+    input: &mut serde_json::Value,
+) -> ToolInputPreflightOutcome {
+    assert_eq!(context.thread_id, &thread_a());
+    if name == "browser"
+        && input
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|url| url.contains('?'))
+    {
+        *input = serde_json::json!({"rejected": true});
+        return ToolInputPreflightOutcome::Complete(agent_sdk_foundation::ToolResult {
+            success: false,
+            output: "NO_BROWSER_HOST: no host owns this thread".to_owned(),
+            data: Some(serde_json::json!({"code": "NO_BROWSER_HOST"})),
+            documents: Vec::new(),
+            artifact: None,
+            duration_ms: None,
+        });
+    }
+    ToolInputPreflightOutcome::Allow
+}
+
+/// Assert the preflight boundary contract on a committed event batch: a
+/// failing typed `ToolCallEnd` for `call_id`, committed strictly after its
+/// `ToolCallStart`, and no confirmation round-trip.
+fn assert_preflight_boundary_events(
+    committed_events: &[CommittedEvent],
+    call_id: &str,
+) -> Result<()> {
+    assert!(committed_events.iter().any(|event| matches!(
+        &event.event,
+        AgentEvent::ToolCallEnd { id, result, .. }
+            if id == call_id
+                && !result.success
+                && result.data.as_ref().and_then(|data| data["code"].as_str())
+                    == Some("NO_BROWSER_HOST")
+    )));
+    let start_index = committed_events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.event,
+                AgentEvent::ToolCallStart { id, .. } if id == call_id
+            )
+        })
+        .context("preflight completion must commit ToolCallStart")?;
+    let end_index = committed_events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.event,
+                AgentEvent::ToolCallEnd { id, .. } if id == call_id
+            )
+        })
+        .context("preflight completion must commit ToolCallEnd")?;
+    assert!(
+        start_index < end_index,
+        "precompleted child must not publish ToolCallEnd before ToolCallStart"
+    );
+    assert!(
+        !committed_events
+            .iter()
+            .any(|event| matches!(&event.event, AgentEvent::ToolRequiresConfirmation { .. }))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn preflight_completion_is_typed_skips_confirmation_and_resumes_same_turn() -> Result<()> {
+    let stores = TestStores::new();
+    let provider = MockToolCallProvider::single(
+        "call_signed",
+        "browser",
+        serde_json::json!({"action": "open", "url": "https://example.com/?signed=secret"}),
+    );
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let mut bootstrap = sample_bootstrap_with_tools(task);
+    bootstrap.definition =
+        bootstrap
+            .definition
+            .with_tool_input_sanitizer(Arc::new(|context, name, input| {
+                Ok(reject_signed_url_preflight(context, name, input))
+            }));
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let deps = stores.deps();
+
+    let outcome = execute_root_turn(inputs, "open it", &provider, &deps, t_plus(5)).await?;
+    let RootTurnOutcome::Suspended {
+        parent_task,
+        child_tasks,
+        committed_events,
+    } = outcome
+    else {
+        panic!("preflight completion must suspend for same-turn resume")
+    };
+    assert_eq!(parent_task.status, TaskStatus::Pending);
+    assert!(matches!(parent_task.state, TaskState::ReadyToResume { .. }));
+    assert_eq!(child_tasks.len(), 1);
+    assert_eq!(child_tasks[0].status, TaskStatus::Completed);
+    let durable_result: agent_sdk_foundation::ToolResult = serde_json::from_value(
+        child_tasks[0]
+            .result_payload
+            .clone()
+            .context("preflight child result")?,
+    )?;
+    assert!(!durable_result.success);
+    assert_eq!(
+        durable_result
+            .data
+            .as_ref()
+            .and_then(|data| data["code"].as_str()),
+        Some("NO_BROWSER_HOST")
+    );
+    assert_preflight_boundary_events(&committed_events, "call_signed")?;
+
+    let projection = stores
+        .messages
+        .get(&thread_a())
+        .await?
+        .context("projection after preflight completion")?;
+    let draft = serde_json::to_string(&projection.draft_messages)?;
+    assert!(!draft.contains("signed=secret"));
+    assert!(draft.contains(r#""rejected":true"#));
+
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &task_id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            t_plus(10),
+        )
+        .await?
+        .context("re-acquire preflight-completed parent")?;
+    let acquired_parent = acquired.clone();
+    let resume_inputs = build_root_worker_inputs(
+        sample_bootstrap_with_tools(acquired),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(10),
+    )
+    .await?;
+    let resume_provider = MockTextProvider::new("Browser is unavailable.");
+    let resumed = resume_from_children(
+        resume_inputs,
+        &acquired_parent,
+        &resume_provider,
+        &stores.deps(),
+        t_plus(15),
+    )
+    .await?;
+    assert!(matches!(resumed, RootTurnOutcome::Completed { .. }));
+    let history = serde_json::to_string(&stores.messages.get_history(&thread_a()).await?)?;
+    assert!(!history.contains("signed=secret"));
+    assert!(history.contains("NO_BROWSER_HOST"));
+    Ok(())
+}
+#[tokio::test]
+async fn preflight_required_draft_completes_before_child_publication() -> Result<()> {
+    let stores = TestStores::new();
+    let provider = MockToolCallProvider::single(
+        "call_signed",
+        "browser",
+        serde_json::json!({"action": "open", "url": "https://example.com/?signed=secret"}),
+    );
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let mut bootstrap = sample_bootstrap_with_tools(task);
+    bootstrap.definition =
+        bootstrap
+            .definition
+            .with_tool_input_sanitizer(Arc::new(|context, name, input| {
+                Ok(reject_signed_url_preflight(context, name, input))
+            }));
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let probe = DraftOrderingMessageStore {
+        inner: stores.messages.clone(),
+        tasks: stores.tasks.clone(),
+        parent_id: task_id,
+        fail_set_draft: false,
+        observed_before_spawn: AtomicBool::new(false),
+        draft_completed: AtomicBool::new(false),
+    };
+    let mut deps = stores.deps();
+    deps.message_store = &probe;
+
+    let outcome = execute_root_turn(inputs, "open it", &provider, &deps, t_plus(5)).await?;
+    let RootTurnOutcome::Suspended {
+        parent_task,
+        child_tasks,
+        ..
+    } = outcome
+    else {
+        panic!("preflight completion must suspend")
+    };
+    assert!(probe.observed_before_spawn.load(Ordering::SeqCst));
+    assert!(probe.draft_completed.load(Ordering::SeqCst));
+    assert_eq!(parent_task.status, TaskStatus::Pending);
+    assert_eq!(child_tasks.len(), 1);
+    assert_eq!(child_tasks[0].status, TaskStatus::Completed);
+    assert!(
+        stores
+            .messages
+            .get(&thread_a())
+            .await?
+            .context("required draft projection")?
+            .has_draft(),
+        "required draft must be durable before the child can publish the parent",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn preflight_required_draft_failure_prevents_child_publication() -> Result<()> {
+    let stores = TestStores::new();
+    let provider = MockToolCallProvider::single(
+        "call_signed",
+        "browser",
+        serde_json::json!({"action": "open", "url": "https://example.com/?signed=secret"}),
+    );
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let mut bootstrap = sample_bootstrap_with_tools(task);
+    bootstrap.definition =
+        bootstrap
+            .definition
+            .with_tool_input_sanitizer(Arc::new(|context, name, input| {
+                Ok(reject_signed_url_preflight(context, name, input))
+            }));
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let probe = DraftOrderingMessageStore {
+        inner: stores.messages.clone(),
+        tasks: stores.tasks.clone(),
+        parent_id: task_id.clone(),
+        fail_set_draft: true,
+        observed_before_spawn: AtomicBool::new(false),
+        draft_completed: AtomicBool::new(false),
+    };
+    let mut deps = stores.deps();
+    deps.message_store = &probe;
+
+    let error = execute_root_turn(inputs, "open it", &provider, &deps, t_plus(5))
+        .await
+        .expect_err("required preflight draft failure must abort suspension");
+    assert!(
+        format!("{error:#}").contains("injected required preflight draft failure"),
+        "unexpected error: {error:#}",
+    );
+    assert!(probe.observed_before_spawn.load(Ordering::SeqCst));
+    assert!(!probe.draft_completed.load(Ordering::SeqCst));
+    let durable_parent = stores
+        .tasks
+        .get(&task_id)
+        .await?
+        .context("durable parent")?;
+    assert_eq!(durable_parent.status, TaskStatus::Running);
+    assert!(
+        stores.tasks.list_children(&task_id).await?.is_empty(),
+        "draft failure must not publish any child",
+    );
+    assert!(
+        stores
+            .messages
+            .get(&thread_a())
+            .await?
+            .is_none_or(|projection| !projection.has_draft()),
+        "failed required write must not leave a draft",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn preflight_completion_in_mixed_batch_commits_starts_before_end() -> Result<()> {
+    let stores = TestStores::new();
+    let provider = MockToolCallProvider::new(vec![
+        (
+            "call_browser".into(),
+            "browser".into(),
+            serde_json::json!({"action": "screenshot"}),
+        ),
+        (
+            "call_bash".into(),
+            "bash".into(),
+            serde_json::json!({"command": "pwd"}),
+        ),
+    ]);
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let complete_browser = |_: &ToolInputPreflightContext<'_>,
+                            name: &str,
+                            _: &mut serde_json::Value|
+     -> Result<ToolInputPreflightOutcome> {
+        if name == "browser" {
+            return Ok(ToolInputPreflightOutcome::Complete(
+                agent_sdk_foundation::ToolResult {
+                    success: false,
+                    output: "NO_BROWSER_HOST: no host owns this thread".to_owned(),
+                    data: Some(serde_json::json!({"code": "NO_BROWSER_HOST"})),
+                    documents: Vec::new(),
+                    artifact: None,
+                    duration_ms: None,
+                },
+            ));
+        }
+        Ok(ToolInputPreflightOutcome::Allow)
+    };
+    let mut bootstrap = sample_bootstrap_with_tools(task);
+    bootstrap.definition = bootstrap
+        .definition
+        .with_tool_input_sanitizer(Arc::new(complete_browser));
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let deps = stores.deps();
+
+    let outcome = execute_root_turn(inputs, "inspect it", &provider, &deps, t_plus(5)).await?;
+    let RootTurnOutcome::Suspended {
+        parent_task,
+        child_tasks,
+        committed_events,
+    } = outcome
+    else {
+        panic!("mixed preflight batch must suspend")
+    };
+    assert_eq!(parent_task.status, TaskStatus::WaitingOnChildren);
+    assert_eq!(child_tasks.len(), 2);
+    assert_eq!(child_tasks[0].status, TaskStatus::Completed);
+    assert!(!child_tasks[1].status.is_terminal());
+
+    let browser_start = committed_events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.event,
+                AgentEvent::ToolCallStart { id, .. } if id == "call_browser"
+            )
+        })
+        .context("browser ToolCallStart")?;
+    let bash_start = committed_events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.event,
+                AgentEvent::ToolCallStart { id, .. } if id == "call_bash"
+            )
+        })
+        .context("bash ToolCallStart")?;
+    let browser_end = committed_events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.event,
+                AgentEvent::ToolCallEnd { id, .. } if id == "call_browser"
+            )
+        })
+        .context("browser ToolCallEnd")?;
+    assert_eq!(
+        committed_events
+            .iter()
+            .filter(|event| matches!(
+                &event.event,
+                AgentEvent::ToolCallEnd { id, .. } if id == "call_browser"
+            ))
+            .count(),
+        1,
+        "preflight completion must be journaled exactly once"
+    );
+    assert!(browser_start < browser_end);
+    assert!(bash_start < browser_end);
+    Ok(())
+}
+
 #[tokio::test]
 async fn tool_suspension_end_to_end() -> Result<()> {
     let stores = TestStores::new();
@@ -895,6 +1494,74 @@ async fn duplicate_suspension_loser_bills_its_own_attempt_row() -> Result<()> {
     );
     assert_eq!(attempts[1].output_tokens, Some(60));
 
+    Ok(())
+}
+#[tokio::test]
+async fn duplicate_suspension_guard_rejects_precompleted_ready_parent() -> Result<()> {
+    let stores = TestStores::new();
+    let provider = MockToolCallProvider::single(
+        "call_precompleted",
+        "browser",
+        serde_json::json!({"url": "https://example.test/?signed=secret"}),
+    );
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let sanitizer = Arc::new(
+        |context: &ToolInputPreflightContext<'_>, name: &str, input: &mut serde_json::Value| {
+            Ok(reject_signed_url_preflight(context, name, input))
+        },
+    );
+    let mut winner_bootstrap = sample_bootstrap_with_tools(task.clone());
+    winner_bootstrap.definition = winner_bootstrap
+        .definition
+        .with_tool_input_sanitizer(sanitizer.clone());
+    let mut loser_bootstrap = sample_bootstrap_with_tools(task);
+    loser_bootstrap.definition = loser_bootstrap
+        .definition
+        .with_tool_input_sanitizer(sanitizer);
+    let inputs_winner = build_root_worker_inputs(
+        winner_bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let inputs_loser = build_root_worker_inputs(
+        loser_bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    let winner = execute_root_turn(
+        inputs_winner,
+        "Open the signed URL",
+        &provider,
+        &stores.deps(),
+        t_plus(5),
+    )
+    .await?;
+    let RootTurnOutcome::Suspended { parent_task, .. } = winner else {
+        bail!("precompleted winner must suspend for immediate resume")
+    };
+    assert_eq!(parent_task.status, TaskStatus::Pending);
+    assert!(matches!(parent_task.state, TaskState::ReadyToResume { .. }));
+
+    let error = execute_root_turn(
+        inputs_loser,
+        "Open the signed URL",
+        &provider,
+        &stores.deps(),
+        t_plus(6),
+    )
+    .await
+    .expect_err("the loser must recognize Pending/ReadyToResume as already transitioned");
+    assert!(
+        error.to_string().contains("duplicate suspension"),
+        "unexpected loser error: {error:#}",
+    );
     Ok(())
 }
 
@@ -4782,6 +5449,7 @@ async fn pending_tool_tier_uses_per_turn_tools_fn_not_static_list() -> Result<()
                 tier: agent_sdk_foundation::ToolTier::Confirm,
             }]
         })),
+        tool_input_sanitizer: None,
         policy: RuntimePolicy::server_default(),
     };
 
@@ -4943,6 +5611,51 @@ async fn selector_error_fails_the_turn() -> Result<()> {
         "expected the selector error to surface, got: {error:#}",
     );
 
+    Ok(())
+}
+#[tokio::test]
+async fn fully_precompleted_batch_bypasses_failing_spawn_selector() -> Result<()> {
+    let stores = TestStores::new();
+    let provider = MockToolCallProvider::single(
+        "call_precompleted",
+        "browser",
+        serde_json::json!({"url": "https://example.test/?signed=secret"}),
+    );
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let mut bootstrap = sample_bootstrap_with_tools(task);
+    bootstrap.definition =
+        bootstrap
+            .definition
+            .with_tool_input_sanitizer(Arc::new(|context, name, input| {
+                Ok(reject_signed_url_preflight(context, name, input))
+            }));
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let selector = FailingSpawnSelector;
+    let mut deps = stores.deps();
+    deps.subagent_spawn_selector = Some(&selector);
+
+    let outcome =
+        execute_root_turn(inputs, "Open the signed URL", &provider, &deps, t_plus(5)).await?;
+    let RootTurnOutcome::Suspended {
+        parent_task,
+        child_tasks,
+        committed_events,
+    } = outcome
+    else {
+        bail!("fully precompleted batch must suspend for immediate resume")
+    };
+    assert_eq!(parent_task.status, TaskStatus::Pending);
+    assert!(matches!(parent_task.state, TaskState::ReadyToResume { .. }));
+    assert_eq!(child_tasks.len(), 1);
+    assert_eq!(child_tasks[0].status, TaskStatus::Completed);
+    assert_preflight_boundary_events(&committed_events, "call_precompleted")?;
     Ok(())
 }
 
@@ -5988,7 +6701,7 @@ async fn resume_undispatched_wave(
         "truncated mid-thought",
         "stray_call",
         "bash",
-        serde_json::json!({"command": "never dispatched"}),
+        serde_json::json!({"authorization": "Bearer sk-undispatched-sensitive"}),
         stop_reason,
     );
     let outcome = if steering {
@@ -6127,6 +6840,21 @@ async fn assert_steering_repark_drops_undispatched_tool_use(stop_reason: StopRea
                 "pending must be the re-attach batch only ({stop_reason:?}): {pending:?}",
             );
             assert_eq!(pending[0].id, reattach_id);
+            assert!(
+                continuation
+                    .payload
+                    .response_content
+                    .iter()
+                    .all(|block| !matches!(block, ContentBlock::ToolUse { .. })),
+                "durable response_content must drop undispatched ToolUse blocks \
+                 ({stop_reason:?})",
+            );
+            let durable = serde_json::to_string(&continuation.payload)?;
+            assert!(
+                !durable.contains("sk-undispatched-sensitive"),
+                "durable continuation retained raw undispatched tool input \
+                 ({stop_reason:?}): {durable}",
+            );
         }
         other => panic!("expected WaitingOnChildren re-park, got {other:?}"),
     }

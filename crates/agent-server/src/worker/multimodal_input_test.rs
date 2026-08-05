@@ -122,6 +122,7 @@ fn sample_definition() -> AgentDefinition {
         thinking: ThinkingPolicy::default(),
         thinking_display: None,
         tools_fn: None,
+        tool_input_sanitizer: None,
         policy: RuntimePolicy::server_default(),
     }
 }
@@ -381,8 +382,8 @@ async fn text_only_string_input_still_works() -> Result<()> {
 fn snapcompact_checkpoint(
     store: &agent_sdk::ArtifactStore,
 ) -> Result<(agent_sdk_foundation::llm::Message, u64)> {
-    let mut reserved = &b"reserved artifact zero"[..];
-    assert_eq!(store.save_streamed("reserved", &mut reserved)?.id, 0);
+    let mut reserved = &b"first allocation probe"[..];
+    assert_eq!(store.save_streamed("reserved", &mut reserved)?.id, 1);
     let mut source = &b"daemon exact source"[..];
     let source_id = store.save_streamed("snapcompact-source", &mut source)?.id;
     let mut png = &b"\x89PNG\r\n\x1a\ndaemon-provider-frame"[..];

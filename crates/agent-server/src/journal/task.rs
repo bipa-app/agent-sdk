@@ -235,24 +235,62 @@ pub struct SuspensionPayload {
 /// `root_id`, and `depth + 1` the same way the Phase 2.1 constructor
 /// already does.
 ///
-/// The struct is deliberately narrow: the only per-child knob is
-/// [`ChildSpawnSpec::max_attempts`]. Tool-specific payload (name,
-/// input, tier, listen/execute staging, etc.) lives on the typed
-/// task-state a later phase's tool-runtime worker owns — it does not
-/// belong on the schema row.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `precompleted_result` is reserved for host-supplied input preflight on
+/// [`super::store::AgentTaskStore::spawn_mixed_children`], whose transaction
+/// persists both the terminal child and its boundary event. The pure
+/// `spawn_tool_children` primitive rejects specs carrying this field.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChildSpawnSpec {
     /// Per-child retry budget. Independent of the parent's budget
     /// because child retries do not count against the parent's
     /// attempt counter.
     pub max_attempts: u32,
+    /// Durable result for a mixed-batch child that must never enter the
+    /// runnable index.
+    pub precompleted_result: Option<serde_json::Value>,
 }
 
 impl ChildSpawnSpec {
     /// Construct a spec with the given retry budget.
     #[must_use]
     pub const fn new(max_attempts: u32) -> Self {
-        Self { max_attempts }
+        Self {
+            max_attempts,
+            precompleted_result: None,
+        }
+    }
+
+    /// Persist this child as terminal inside a mixed spawn transaction.
+    #[must_use]
+    pub fn with_precompleted_result(mut self, result: serde_json::Value) -> Self {
+        self.precompleted_result = Some(result);
+        self
+    }
+
+    /// Apply the terminal transition before the child row becomes visible.
+    ///
+    /// # Errors
+    /// Returns [`TaskSchemaError`] if the synthetic running transition or
+    /// the terminal completion is rejected (for example, an invalid status
+    /// transition on the supplied child).
+    pub fn apply_precompletion(
+        &self,
+        child: AgentTask,
+        parent_id: &AgentTaskId,
+        spawn_index: usize,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask, TaskSchemaError> {
+        let Some(result) = &self.precompleted_result else {
+            return Ok(child);
+        };
+        child
+            .mark_running(
+                WorkerId::from_string(format!("preflight-{parent_id}-{spawn_index}")),
+                LeaseId::from_string(format!("preflight-{parent_id}-{spawn_index}")),
+                now + time::Duration::seconds(30),
+                now,
+            )?
+            .complete_with_result(result.clone(), now)
     }
 }
 
@@ -1487,6 +1525,7 @@ impl AgentTask {
             suspended_messages: payload.suspended_messages,
             child_ids,
             child_join_policy: payload.child_join_policy,
+            precompleted_children_unpublished: false,
         };
         // ADR-0003 I3. Parking ENDS this row's heartbeat, so every activity
         // bump since the last tick would otherwise be discarded — and this is
@@ -1534,24 +1573,73 @@ impl AgentTask {
         self.recompute_pending_children(live_children, now)
     }
 
+    /// Hold parent fan-in until the precompleted child's boundary event is
+    /// durable. This closes the transaction/event publication window where a
+    /// live sibling can otherwise wake the parent too early.
+    ///
+    /// # Errors
+    /// Returns [`TaskSchemaError::InvalidTransition`] if the task is not in
+    /// [`TaskStatus::WaitingOnChildren`], or another [`TaskSchemaError`] if
+    /// the resulting row fails validation.
+    pub fn defer_precompleted_children_publication(mut self) -> Result<Self, TaskSchemaError> {
+        let TaskState::WaitingOnChildren {
+            precompleted_children_unpublished,
+            ..
+        } = &mut self.state
+        else {
+            return Err(TaskSchemaError::InvalidTransition {
+                from: self.status,
+                to: TaskStatus::WaitingOnChildren,
+            });
+        };
+        *precompleted_children_unpublished = true;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Release the precompleted-child publication barrier.
+    ///
+    /// # Errors
+    /// Returns [`TaskSchemaError::InvalidTransition`] if the task is not in
+    /// [`TaskStatus::WaitingOnChildren`], or another [`TaskSchemaError`] if
+    /// the resulting row fails validation.
+    pub fn publish_precompleted_children(mut self) -> Result<Self, TaskSchemaError> {
+        let TaskState::WaitingOnChildren {
+            precompleted_children_unpublished,
+            ..
+        } = &mut self.state
+        else {
+            return Err(TaskSchemaError::InvalidTransition {
+                from: self.status,
+                to: TaskStatus::WaitingOnChildren,
+            });
+        };
+        *precompleted_children_unpublished = false;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Whether fan-in is still fenced on publication of a precompleted
+    /// child's durable boundary event.
+    #[must_use]
+    pub const fn has_unpublished_precompleted_children(&self) -> bool {
+        matches!(
+            self.state,
+            TaskState::WaitingOnChildren {
+                precompleted_children_unpublished: true,
+                ..
+            }
+        )
+    }
+
     /// Authoritatively replace the parent's `pending_child_count` with
     /// `live_children` and, when the count hits zero, flip the row back
     /// to [`TaskStatus::Pending`] with [`TaskState::ReadyToResume`] so
     /// the continuation and suspended messages survive the transition
     /// and a worker can resume the turn from durable state.
     ///
-    /// This is the Phase 2.6 replacement for [`Self::child_resolved`]'s
-    /// saturating subtraction: the store passes the live child count
-    /// derived from the `by_parent` index so a double-complete or a
-    /// dropped-complete cannot silently drift the parent's counter.
-    ///
-    /// `live_children` is the number of children still in a
-    /// non-terminal state. When the caller passes zero the parent
-    /// resumes; when the caller passes a positive number the parent
-    /// stays in [`TaskStatus::WaitingOnChildren`] with its typed
-    /// [`TaskState::WaitingOnChildren`] payload intact so the eventual
-    /// resume transition still has the continuation it was paused
-    /// with.
+    /// The store passes the live child count derived from its child index,
+    /// avoiding counter drift from duplicate completion.
     ///
     /// # Errors
     /// - [`TaskSchemaError::InvalidTransition`] if the task is not in
@@ -1566,6 +1654,15 @@ impl AgentTask {
                 from: self.status,
                 to: TaskStatus::Pending,
             });
+        }
+        if matches!(
+            &self.state,
+            TaskState::WaitingOnChildren {
+                precompleted_children_unpublished: true,
+                ..
+            }
+        ) {
+            return Ok(self);
         }
         let should_resume = match self.state.child_join_policy() {
             ChildJoinPolicy::All => live_children == 0,
@@ -1585,6 +1682,7 @@ impl AgentTask {
                     suspended_messages,
                     child_ids,
                     child_join_policy,
+                    ..
                 } => TaskState::ReadyToResume {
                     continuation,
                     suspended_messages,
@@ -1644,6 +1742,7 @@ impl AgentTask {
             suspended_messages,
             child_ids,
             child_join_policy,
+            ..
         } = self.state
         else {
             return Err(TaskSchemaError::InvalidTransition {
@@ -1739,6 +1838,7 @@ impl AgentTask {
                 suspended_messages: payload.suspended_messages,
                 child_ids,
                 child_join_policy: payload.child_join_policy,
+                precompleted_children_unpublished: false,
             };
         }
         // ADR-0003 I3. A re-park drops the lease and ends the heartbeat on

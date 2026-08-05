@@ -16,8 +16,8 @@
 
 use std::sync::Arc;
 
-use agent_sdk_foundation::ToolRuntime;
 use agent_sdk_foundation::llm::{Effort, ThinkingDisplay, Tool};
+use agent_sdk_foundation::{ThreadId, ToolResult, ToolRuntime};
 use serde::{Deserialize, Serialize};
 
 // ─────────────────────────────────────────────────────────────────────
@@ -46,6 +46,31 @@ pub struct ToolFilterContext {
 /// filtering is desired. Invoked from the worker's turn-composition
 /// path immediately before the LLM request is built.
 pub type ToolsFn = Arc<dyn Fn(&ToolFilterContext) -> Vec<Tool> + Send + Sync>;
+
+/// Trusted caller context for a host-supplied tool-input preflight.
+pub struct ToolInputPreflightContext<'a> {
+    pub thread_id: &'a ThreadId,
+    pub caller_metadata: Option<&'a serde_json::Value>,
+}
+
+/// Host decision for one model-emitted tool call.
+pub enum ToolInputPreflightOutcome {
+    /// Continue through the ordinary confirmation and execution lifecycle.
+    Allow,
+    /// Complete the tool call with this typed result without confirmation or
+    /// executor dispatch. The hook must first replace sensitive input with a
+    /// persistence-safe representation.
+    Complete(ToolResult),
+}
+
+/// Host-supplied preflight for model tool input before durable suspension.
+pub type ToolInputSanitizer = dyn for<'a> Fn(
+        &ToolInputPreflightContext<'a>,
+        &str,
+        &mut serde_json::Value,
+    ) -> anyhow::Result<ToolInputPreflightOutcome>
+    + Send
+    + Sync;
 
 // ─────────────────────────────────────────────────────────────────────
 // Thinking policy
@@ -135,9 +160,9 @@ impl Default for RuntimePolicy {
 ///
 /// The struct is `Serialize + Deserialize` so it can be persisted as
 /// part of audit rows or checkpoint metadata. The optional
-/// [`tools_fn`](Self::tools_fn) is skipped by serde (closures are
-/// not serializable) — deserialized definitions use the static
-/// [`tools`](Self::tools) list.
+/// [`tools_fn`](Self::tools_fn) and
+/// [`tool_input_sanitizer`](Self::tool_input_sanitizer) closures are skipped
+/// by serde because closures are not serializable.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AgentDefinition {
     // ── Provider / model ─────────────────────────────────────────
@@ -173,6 +198,11 @@ pub struct AgentDefinition {
     /// fresh LLM request.
     #[serde(skip)]
     pub tools_fn: Option<ToolsFn>,
+    /// Optional host validator/sanitizer run on every model-emitted tool input
+    /// before the tool boundary is made durable. Deserialized definitions do
+    /// not retain this process-local hook.
+    #[serde(skip)]
+    pub tool_input_sanitizer: Option<Arc<ToolInputSanitizer>>,
     /// Extended thinking configuration.
     pub thinking: ThinkingPolicy,
     /// How thinking content is returned when [`thinking`](Self::thinking)
@@ -191,11 +221,9 @@ pub struct AgentDefinition {
 // Manual trait impls
 // ─────────────────────────────────────────────────────────────────────
 //
-// `tools_fn: Option<Arc<dyn Fn>>` rules out deriving `Debug`,
-// `PartialEq`, and `Eq`. We implement them manually, treating
-// `tools_fn` as presence-only (closure identity is not part of the
-// definition's semantic identity — two definitions are equal iff
-// their data fields match).
+// The process-local closures rule out deriving `Debug`, `PartialEq`, and `Eq`.
+// We implement them manually and exclude closure identity from the
+// definition's semantic identity.
 
 impl std::fmt::Debug for AgentDefinition {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -209,6 +237,13 @@ impl std::fmt::Debug for AgentDefinition {
                 "tools_fn",
                 &self.tools_fn.as_ref().map_or("None", |_| "Some(<closure>)"),
             )
+            .field(
+                "tool_input_sanitizer",
+                &self
+                    .tool_input_sanitizer
+                    .as_ref()
+                    .map_or("None", |_| "Some(<closure>)"),
+            )
             .field("thinking", &self.thinking)
             .field("thinking_display", &self.thinking_display)
             .field("policy", &self.policy)
@@ -218,8 +253,7 @@ impl std::fmt::Debug for AgentDefinition {
 
 impl PartialEq for AgentDefinition {
     fn eq(&self, other: &Self) -> bool {
-        // `tools_fn` is intentionally excluded from equality — closure
-        // identity is not part of the definition's semantic identity.
+        // Process-local closure identity is intentionally excluded.
         self.provider == other.provider
             && self.model == other.model
             && self.system_prompt == other.system_prompt
@@ -234,6 +268,19 @@ impl PartialEq for AgentDefinition {
 impl Eq for AgentDefinition {}
 
 impl AgentDefinition {
+    /// Install a host-specific validator/sanitizer that runs before
+    /// model-emitted tool inputs enter the durable continuation.
+    #[must_use]
+    pub fn with_tool_input_sanitizer(mut self, sanitizer: Arc<ToolInputSanitizer>) -> Self {
+        self.tool_input_sanitizer = Some(sanitizer);
+        self
+    }
+
+    #[must_use]
+    pub fn tool_input_sanitizer(&self) -> Option<&ToolInputSanitizer> {
+        self.tool_input_sanitizer.as_deref()
+    }
+
     /// Resolve the effective tool list for a turn.
     ///
     /// If a [`tools_fn`](Self::tools_fn) is set AND the task has
@@ -274,6 +321,7 @@ mod tests {
             max_tokens: 1024,
             tools,
             tools_fn: None,
+            tool_input_sanitizer: None,
             thinking: ThinkingPolicy::default(),
             thinking_display: None,
             policy: RuntimePolicy::default(),
@@ -335,19 +383,18 @@ mod tests {
     }
 
     #[test]
-    fn definition_serde_round_trips_without_tools_fn() {
-        // tools_fn is #[serde(skip)] — ensure the rest of the struct
-        // round-trips and the deserialized tools_fn is None.
+    fn definition_serde_round_trips_without_process_local_hooks() {
         let def = AgentDefinition {
             tools_fn: Some(Arc::new(|_| vec![tool("ghost")])),
+            tool_input_sanitizer: Some(Arc::new(|_, _, _| Ok(ToolInputPreflightOutcome::Allow))),
             ..definition_with_static_tools(vec![tool("persistent")])
         };
         let json = serde_json::to_string(&def).expect("serialize");
         let restored: AgentDefinition = serde_json::from_str(&json).expect("deserialize");
         assert!(restored.tools_fn.is_none());
+        assert!(restored.tool_input_sanitizer.is_none());
         assert_eq!(restored.tools.len(), 1);
         assert_eq!(restored.tools[0].name, "persistent");
-        // restored.resolve_tools falls back to the static list.
         let resolved = restored.resolve_tools(None);
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].name, "persistent");
@@ -397,10 +444,11 @@ mod tests {
     }
 
     #[test]
-    fn partial_eq_ignores_tools_fn() {
+    fn partial_eq_ignores_process_local_hooks() {
         let a = definition_with_static_tools(vec![tool("x")]);
         let b = AgentDefinition {
             tools_fn: Some(Arc::new(|_| Vec::new())),
+            tool_input_sanitizer: Some(Arc::new(|_, _, _| Ok(ToolInputPreflightOutcome::Allow))),
             ..definition_with_static_tools(vec![tool("x")])
         };
         assert_eq!(a, b);

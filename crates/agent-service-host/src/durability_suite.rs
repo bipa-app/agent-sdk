@@ -254,7 +254,7 @@ mod tests {
                 root_id,
                 &worker,
                 &lease,
-                vec![ChildSpawnSpec { max_attempts: 3 }],
+                vec![ChildSpawnSpec::new(3)],
                 suspension_payload(thread),
                 None,
                 Vec::new(),

@@ -36,6 +36,7 @@ use agent_server::journal::outbox::{InMemoryOutboxStore, OutboxStore};
 use agent_server::journal::retention::{InMemoryRetentionStore, RetentionStore};
 use agent_server::journal::store::{
     AgentTaskStore, CancellationMarkerSink, InMemoryAgentTaskStore,
+    InMemoryAtomicSpawnEventCommitter,
 };
 use agent_server::journal::task::AgentTaskId;
 use agent_server::journal::thread_store::{InMemoryThreadStore, ThreadStore};
@@ -554,12 +555,16 @@ impl StoreRegistry {
         let thread_store: Arc<InMemoryThreadStore> = Arc::new(InMemoryThreadStore::new());
         let event_repo: Arc<InMemoryEventRepository> = Arc::new(InMemoryEventRepository::new());
         let outbox_store: Arc<InMemoryOutboxStore> = Arc::new(InMemoryOutboxStore::new());
-        let task_store =
-            InMemoryAgentTaskStore::new().with_cancellation_markers(CancellationMarkerSink {
+        let task_store = InMemoryAgentTaskStore::new()
+            .with_cancellation_markers(CancellationMarkerSink {
                 event_repo: event_repo.clone(),
                 outbox_store: outbox_store.clone(),
                 thread_store: thread_store.clone(),
-            });
+            })
+            .with_spawn_event_committer(Arc::new(InMemoryAtomicSpawnEventCommitter::new(
+                event_repo.as_ref().clone(),
+                outbox_store.as_ref().clone(),
+            )));
         Self {
             task_store: Arc::new(task_store),
             thread_store,
@@ -833,6 +838,7 @@ mod tests {
             thinking: ThinkingPolicy::default(),
             thinking_display: None,
             tools_fn: None,
+            tool_input_sanitizer: None,
             policy: RuntimePolicy::server_default(),
         }
     }

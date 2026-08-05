@@ -160,14 +160,14 @@ pub trait EventRepository: Send + Sync {
 // ─────────────────────────────────────────────────────────────────────
 
 #[derive(Default)]
-struct InMemoryEventRepositoryInner {
+pub(crate) struct InMemoryEventRepositoryInner {
     /// Events keyed by `thread_id`, stored in append order (which is
     /// also sequence order).
-    events: HashMap<String, Vec<CommittedEvent>>,
+    pub(crate) events: HashMap<String, Vec<CommittedEvent>>,
 }
 
 impl InMemoryEventRepositoryInner {
-    fn next_sequence(&self, thread_id: &ThreadId) -> u64 {
+    pub(crate) fn next_sequence(&self, thread_id: &ThreadId) -> u64 {
         self.events
             .get(&thread_id.0)
             .and_then(|events| events.last())
@@ -184,7 +184,7 @@ impl InMemoryEventRepositoryInner {
 /// Cloning this type shares the same underlying event journal.
 #[derive(Clone, Default)]
 pub struct InMemoryEventRepository {
-    inner: Arc<RwLock<InMemoryEventRepositoryInner>>,
+    pub(crate) inner: Arc<RwLock<InMemoryEventRepositoryInner>>,
 }
 
 impl InMemoryEventRepository {
