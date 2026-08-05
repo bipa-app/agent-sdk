@@ -2670,7 +2670,9 @@ mod tests {
         use agent_server::journal::event_repository::InMemoryEventRepository;
         use agent_server::journal::message_store::InMemoryMessageProjectionStore;
         use agent_server::journal::outbox::InMemoryOutboxStore;
-        use agent_server::journal::store::{CancellationMarkerSink, InMemoryAgentTaskStore};
+        use agent_server::journal::store::{
+            CancellationMarkerSink, InMemoryAgentTaskStore, InMemoryAtomicSpawnEventCommitter,
+        };
         use agent_server::journal::thread_store::InMemoryThreadStore;
         use agent_server::journal::turn_attempt_store::InMemoryTurnAttemptStore;
 
@@ -2684,12 +2686,18 @@ mod tests {
             std::sync::Arc::new(InMemoryEventRepository::new());
         let outbox: std::sync::Arc<InMemoryOutboxStore> =
             std::sync::Arc::new(InMemoryOutboxStore::new());
-        let task =
-            InMemoryAgentTaskStore::new().with_cancellation_markers(CancellationMarkerSink {
+        let task = InMemoryAgentTaskStore::new()
+            .with_cancellation_markers(CancellationMarkerSink {
                 event_repo: event.clone(),
                 outbox_store: outbox.clone(),
                 thread_store: thread.clone(),
-            });
+            })
+            .with_spawn_event_committer(std::sync::Arc::new(
+                InMemoryAtomicSpawnEventCommitter::new(
+                    event.as_ref().clone(),
+                    outbox.as_ref().clone(),
+                ),
+            ));
 
         InMemoryStores {
             task: std::sync::Arc::new(task),

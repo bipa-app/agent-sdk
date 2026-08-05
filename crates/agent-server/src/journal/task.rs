@@ -235,17 +235,18 @@ pub struct SuspensionPayload {
 /// `root_id`, and `depth + 1` the same way the Phase 2.1 constructor
 /// already does.
 ///
-/// `max_attempts` controls the per-child retry budget.
-/// `precompleted_result` is used only for a host-supplied input preflight:
-/// the spawn transaction persists that child directly as terminal, so no
-/// worker can acquire the scrubbed call before its typed result is durable.
+/// `precompleted_result` is reserved for host-supplied input preflight on
+/// [`super::store::AgentTaskStore::spawn_mixed_children`], whose transaction
+/// persists both the terminal child and its boundary event. The pure
+/// `spawn_tool_children` primitive rejects specs carrying this field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChildSpawnSpec {
     /// Per-child retry budget. Independent of the parent's budget
     /// because child retries do not count against the parent's
     /// attempt counter.
     pub max_attempts: u32,
-    /// Durable result for a child that must never enter the runnable index.
+    /// Durable result for a mixed-batch child that must never enter the
+    /// runnable index.
     pub precompleted_result: Option<serde_json::Value>,
 }
 
@@ -259,7 +260,7 @@ impl ChildSpawnSpec {
         }
     }
 
-    /// Persist this child as terminal inside the spawn transaction.
+    /// Persist this child as terminal inside a mixed spawn transaction.
     #[must_use]
     pub fn with_precompleted_result(mut self, result: serde_json::Value) -> Self {
         self.precompleted_result = Some(result);
@@ -267,6 +268,11 @@ impl ChildSpawnSpec {
     }
 
     /// Apply the terminal transition before the child row becomes visible.
+    ///
+    /// # Errors
+    /// Returns [`TaskSchemaError`] if the synthetic running transition or
+    /// the terminal completion is rejected (for example, an invalid status
+    /// transition on the supplied child).
     pub fn apply_precompletion(
         &self,
         child: AgentTask,
@@ -1570,6 +1576,11 @@ impl AgentTask {
     /// Hold parent fan-in until the precompleted child's boundary event is
     /// durable. This closes the transaction/event publication window where a
     /// live sibling can otherwise wake the parent too early.
+    ///
+    /// # Errors
+    /// Returns [`TaskSchemaError::InvalidTransition`] if the task is not in
+    /// [`TaskStatus::WaitingOnChildren`], or another [`TaskSchemaError`] if
+    /// the resulting row fails validation.
     pub fn defer_precompleted_children_publication(mut self) -> Result<Self, TaskSchemaError> {
         let TaskState::WaitingOnChildren {
             precompleted_children_unpublished,
@@ -1587,6 +1598,11 @@ impl AgentTask {
     }
 
     /// Release the precompleted-child publication barrier.
+    ///
+    /// # Errors
+    /// Returns [`TaskSchemaError::InvalidTransition`] if the task is not in
+    /// [`TaskStatus::WaitingOnChildren`], or another [`TaskSchemaError`] if
+    /// the resulting row fails validation.
     pub fn publish_precompleted_children(mut self) -> Result<Self, TaskSchemaError> {
         let TaskState::WaitingOnChildren {
             precompleted_children_unpublished,
@@ -1606,7 +1622,7 @@ impl AgentTask {
     /// Whether fan-in is still fenced on publication of a precompleted
     /// child's durable boundary event.
     #[must_use]
-    pub fn has_unpublished_precompleted_children(&self) -> bool {
+    pub const fn has_unpublished_precompleted_children(&self) -> bool {
         matches!(
             self.state,
             TaskState::WaitingOnChildren {

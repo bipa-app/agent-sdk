@@ -144,13 +144,15 @@ impl InMemoryJournalStore {
         // The sink's Arc owns the outbox; the bundle itself does not
         // expose an OutboxStore surface, so no field is kept.
         let outbox = super::outbox::InMemoryOutboxStore::new();
-        let task = super::store::InMemoryAgentTaskStore::new().with_cancellation_markers(
-            super::store::CancellationMarkerSink {
+        let task = super::store::InMemoryAgentTaskStore::new()
+            .with_cancellation_markers(super::store::CancellationMarkerSink {
                 event_repo: std::sync::Arc::new(event.clone()),
-                outbox_store: std::sync::Arc::new(outbox),
+                outbox_store: std::sync::Arc::new(outbox.clone()),
                 thread_store: std::sync::Arc::new(thread.clone()),
-            },
-        );
+            })
+            .with_spawn_event_committer(std::sync::Arc::new(
+                super::store::InMemoryAtomicSpawnEventCommitter::new(event.clone(), outbox),
+            ));
         Self {
             task,
             thread,
@@ -1107,6 +1109,54 @@ fn mixed_batch_spawn(
     })
 }
 
+// ── pure tool spawn: precompleted specs require mixed transaction ────
+
+/// A precompleted child must carry its terminal boundary event in the same
+/// transaction. The pure tool-only primitive has no event input, so every
+/// backend must reject such a spec before transitioning the parent.
+async fn case_tool_spawn_rejects_precompleted_spec<S: JournalStore>(store: &S) -> Result<()> {
+    let thread = tid("conf-tool-precompleted-rejected");
+    let fixture = mixed_batch_fixture(store, &thread, 0).await?;
+    let rejected = AgentTaskStore::spawn_tool_children(
+        store,
+        &fixture.parent_id,
+        &fixture.worker,
+        &fixture.lease,
+        vec![
+            ChildSpawnSpec::new(1)
+                .with_precompleted_result(serde_json::json!({"secret": "must-not-persist"})),
+        ],
+        empty_suspension(&thread),
+        None,
+        Vec::new(),
+        t_plus(2),
+    )
+    .await;
+    let Err(error) = rejected else {
+        anyhow::bail!("spawn_tool_children must reject a precompleted spec");
+    };
+    ensure!(
+        format!("{error:#}")
+            .contains("precompleted_result at index 0 requires spawn_mixed_children"),
+        "unexpected precompleted-spec rejection: {error:#}",
+    );
+
+    let parent = AgentTaskStore::get(store, &fixture.parent_id)
+        .await?
+        .context("parent must survive rejected precompleted spawn")?;
+    ensure!(
+        parent.status == TaskStatus::Running,
+        "precompleted rejection must leave parent Running"
+    );
+    ensure!(
+        AgentTaskStore::list_children(store, &fixture.parent_id)
+            .await?
+            .is_empty(),
+        "precompleted rejection must persist no children"
+    );
+    Ok(())
+}
+
 // ── mixed batch: subagents + tools spawn atomically ──────────────────
 
 /// A decision vector mixing subagent spawns with ordinary tool calls
@@ -1221,7 +1271,7 @@ async fn case_mixed_batch_spawns_subagents_and_tools<S: JournalStore>(store: &S)
 }
 
 /// A preflight-completed tool is published in the same durable transaction
-/// as its ToolCallEnd boundary. Reloading the parent must therefore expose
+/// as its `ToolCallEnd` boundary. Reloading the parent must therefore expose
 /// only the post-publication count and never a reopenable barrier flag.
 async fn case_precompleted_boundary_is_published_before_spawn_returns<S: JournalStore>(
     store: &S,
@@ -1234,10 +1284,7 @@ async fn case_precompleted_boundary_is_published_before_spawn_returns<S: Journal
     spawn.tool_children[0].spec =
         ChildSpawnSpec::new(1).with_precompleted_result(serde_json::to_value(&preflight)?);
     spawn.boundary_events.push(AgentEvent::tool_call_end(
-        "conf-preflight-call",
-        "browser",
-        "Browser",
-        preflight,
+        "call_0", "tool_0", "Tool 0", preflight,
     ));
 
     let spawned = AgentTaskStore::spawn_mixed_children(
@@ -1268,6 +1315,51 @@ async fn case_precompleted_boundary_is_published_before_spawn_returns<S: Journal
             && reloaded.pending_child_count == spawned.parent.pending_child_count
             && !reloaded.has_unpublished_precompleted_children(),
         "reloaded parent must not expose an unpublished precompletion barrier"
+    );
+    Ok(())
+}
+/// Direct store callers cannot publish a terminal mixed child without the
+/// exact `ToolCallEnd` evidence required to make that result replayable.
+async fn case_precompleted_mixed_child_requires_matching_boundary<S: JournalStore>(
+    store: &S,
+) -> Result<()> {
+    let thread = tid("conf-precompleted-missing-boundary");
+    let fixture = mixed_batch_fixture(store, &thread, 1).await?;
+    let payload = suspension_with_pending_tools(&thread, 2);
+    let mut spawn = mixed_batch_spawn(&fixture, payload, &[0], &[1])?;
+    let preflight = agent_sdk_foundation::ToolResult::success("rejected before dispatch");
+    spawn.tool_children[0].spec =
+        ChildSpawnSpec::new(1).with_precompleted_result(serde_json::to_value(&preflight)?);
+
+    let error = AgentTaskStore::spawn_mixed_children(
+        store,
+        &fixture.parent_id,
+        &fixture.worker,
+        &fixture.lease,
+        spawn,
+        spawn_events(1),
+        t_plus(2),
+    )
+    .await
+    .expect_err("precompleted child without matching boundary must reject");
+    ensure!(
+        format!("{error:#}").contains(
+            "precompleted_result at index 1 requires exactly one matching ToolCallEnd boundary event; found 0"
+        ),
+        "unexpected missing-boundary error: {error:#}",
+    );
+    let parent = AgentTaskStore::get(store, &fixture.parent_id)
+        .await?
+        .context("parent survives rejected precompleted spawn")?;
+    ensure!(
+        parent.status == TaskStatus::Running,
+        "rejected precompleted spawn must leave parent Running",
+    );
+    ensure!(
+        AgentTaskStore::list_children(store, &fixture.parent_id)
+            .await?
+            .is_empty(),
+        "rejected precompleted spawn must not leave children",
     );
     Ok(())
 }
@@ -1704,6 +1796,8 @@ pub async fn run_journal_store_conformance<S: JournalStore + Clone + 'static>(
 
     case_before_plus_limit_pagination(store).await?;
     report.passed("before_plus_limit_pagination");
+    case_tool_spawn_rejects_precompleted_spec(store).await?;
+    report.passed("tool_spawn_rejects_precompleted_spec");
 
     case_mixed_batch_spawns_subagents_and_tools(store).await?;
     report.passed("mixed_batch_spawns_subagents_and_tools");
@@ -1712,6 +1806,8 @@ pub async fn run_journal_store_conformance<S: JournalStore + Clone + 'static>(
     report.passed("attached_tool_batch_accepts_empty_spawn_events");
     case_precompleted_boundary_is_published_before_spawn_returns(store).await?;
     report.passed("precompleted_boundary_is_published_before_spawn_returns");
+    case_precompleted_mixed_child_requires_matching_boundary(store).await?;
+    report.passed("precompleted_mixed_child_requires_matching_boundary");
 
     case_mixed_batch_child_ids_follow_slot_order(store).await?;
     report.passed("mixed_batch_child_ids_follow_slot_order");

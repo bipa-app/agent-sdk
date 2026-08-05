@@ -221,9 +221,11 @@ use tokio::sync::RwLock;
 
 use super::commit::DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS;
 use super::committed_event::CommittedEvent;
-use super::event_repository::EventRepository;
+use super::event_repository::{EventRepository, InMemoryEventRepository};
 use super::idempotency::{IdempotencyClaim, IdempotencyKind, IdempotencyRecord};
-use super::outbox::{NewOutboxRow, OutboxStatus, OutboxStore};
+use super::outbox::{
+    InMemoryOutboxStore, NewOutboxRow, OutboxRow, OutboxRowId, OutboxStatus, OutboxStore,
+};
 use super::outbox_message::{OutboxMessage, OutboxMessageKind, ThreadEventsAvailablePayload};
 use super::recovery::{
     FailureReason, RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
@@ -403,6 +405,78 @@ pub fn validate_mixed_children_spawn(spawn: &MixedChildrenSpawn) -> Result<()> {
         spawn.payload.continuation.payload.pending_tool_calls.len(),
     )
 }
+/// Require a one-to-one correspondence between precompleted mixed children
+/// and boundary `ToolCallEnd` events for the same pending call and result.
+///
+/// This keeps direct store callers from publishing an immediately runnable
+/// parent whose terminal result has missing, duplicate, mismatched, or
+/// unrelated journal evidence.
+///
+/// # Errors
+/// Returns an error unless each precompleted slot has exactly one matching
+/// event and the boundary contains no additional `ToolCallEnd`.
+pub fn validate_precompleted_boundary_events(spawn: &MixedChildrenSpawn) -> Result<()> {
+    let pending_calls = &spawn.payload.continuation.payload.pending_tool_calls;
+    for child in &spawn.tool_children {
+        let Some(expected_result) = child.spec.precompleted_result.as_ref() else {
+            continue;
+        };
+        let slot = usize::try_from(child.spawn_index)
+            .context("spawn rejected: spawn_index exceeds usize")?;
+        let pending = pending_calls
+            .get(slot)
+            .with_context(|| format!("spawn rejected: spawn_index {slot} out of bounds"))?;
+        let matching = spawn
+            .boundary_events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    AgentEvent::ToolCallEnd {
+                        id,
+                        name,
+                        display_name,
+                        result,
+                    } if id == &pending.id
+                        && name == &pending.name
+                        && display_name == &pending.display_name
+                        && serde_json::to_value(result).ok().as_ref() == Some(expected_result)
+                )
+            })
+            .count();
+        ensure!(
+            matching == 1,
+            "spawn rejected: precompleted_result at index {slot} requires exactly one matching ToolCallEnd boundary event; found {matching}"
+        );
+    }
+    let precompleted_count = spawn
+        .tool_children
+        .iter()
+        .filter(|child| child.spec.precompleted_result.is_some())
+        .count();
+    let tool_call_end_count = spawn
+        .boundary_events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::ToolCallEnd { .. }))
+        .count();
+    ensure!(
+        tool_call_end_count == precompleted_count,
+        "spawn rejected: {tool_call_end_count} ToolCallEnd boundary events for {precompleted_count} precompleted children"
+    );
+    Ok(())
+}
+
+/// Validate that every mixed-batch subagent has one boundary event.
+///
+/// # Errors
+/// Returns an error when the event and subagent counts differ.
+pub fn validate_subagent_event_count(event_count: usize, subagent_count: usize) -> Result<()> {
+    ensure!(
+        event_count == subagent_count,
+        "spawn rejected: {event_count} events for {subagent_count} subagent entries"
+    );
+    Ok(())
+}
 
 /// Validate exact pending-slot coverage when existing children are reattached.
 ///
@@ -532,6 +606,84 @@ pub fn mixed_child_ids_in_slot_order(
     }
     by_slot.sort_unstable_by_key(|(slot, _)| *slot);
     Ok(by_slot.into_iter().map(|(_, id)| id).collect())
+}
+
+/// Validate the specs accepted by the pure tool-only spawn primitive.
+///
+/// Precompleted children carry boundary events that must be committed with
+/// their terminal rows, which only [`AgentTaskStore::spawn_mixed_children`]
+/// can do. Reject them here before any backend opens a transaction or mutates
+/// an in-memory index.
+///
+/// # Errors
+/// - `spawn rejected: specs must be non-empty`
+/// - `spawn rejected: precompleted_result at index ... requires spawn_mixed_children`
+pub fn validate_tool_child_specs_for_pure_spawn(specs: &[ChildSpawnSpec]) -> Result<()> {
+    ensure!(!specs.is_empty(), "spawn rejected: specs must be non-empty");
+    if let Some(index) = specs
+        .iter()
+        .position(|spec| spec.precompleted_result.is_some())
+    {
+        return Err(anyhow!(
+            "spawn rejected: precompleted_result at index {index} requires spawn_mixed_children"
+        ));
+    }
+    Ok(())
+}
+
+/// Return whether a mixed batch contains any precompleted tool child.
+#[must_use]
+pub fn has_precompleted_tool_child(tool_children: &[ToolChildSpawn]) -> bool {
+    tool_children
+        .iter()
+        .any(|tool| tool.spec.precompleted_result.is_some())
+}
+
+/// Count the non-terminal invocation and tool children in a mixed batch.
+///
+/// # Errors
+/// Returns an error when the count exceeds the persisted `u32` field.
+pub fn live_mixed_child_count(
+    subagents: &[(AgentTask, AgentTask)],
+    tool_children: &[AgentTask],
+    reattached: &[AgentTask],
+) -> Result<u32> {
+    let live_children = subagents
+        .iter()
+        .map(|(invocation, _)| invocation)
+        .chain(tool_children)
+        .chain(reattached)
+        .filter(|child| !child.status.is_terminal())
+        .count();
+    u32::try_from(live_children).context("spawn rejected: live child count exceeds u32")
+}
+
+/// Publish a transaction-local mixed parent after every child row is prepared.
+///
+/// SQL backends may expose the final parent directly because parent and child
+/// rows become visible together at commit.
+///
+/// # Errors
+/// Returns an error when the parent cannot publish or recompute its child count.
+pub fn publish_transactional_mixed_parent(
+    waiting_parent: AgentTask,
+    has_precompleted: bool,
+    live_children: u32,
+    now: OffsetDateTime,
+) -> Result<AgentTask> {
+    if has_precompleted {
+        waiting_parent
+            .defer_precompleted_children_publication()
+            .context("spawn rejected: defer precompleted child publication")?
+            .publish_precompleted_children()
+            .context("spawn rejected: release precompleted child publication")?
+            .recompute_pending_children(live_children, now)
+            .context("spawn rejected: publish precompleted children")
+    } else {
+        waiting_parent
+            .recompute_pending_children(live_children, now)
+            .context("spawn rejected: recompute_pending_children transition failed")
+    }
 }
 
 /// Build one [`TaskKind::ToolRuntime`] child row for a mixed batch.
@@ -891,6 +1043,130 @@ pub struct CancellationMarkerSink {
     /// Thread projection consulted for the marker's `turn` /
     /// fallback `usage` payload.
     pub thread_store: Arc<dyn ThreadStore>,
+}
+
+/// One thread-scoped event batch staged as part of an in-memory mixed spawn.
+#[derive(Clone, Debug)]
+pub struct AtomicSpawnEventBatch {
+    pub thread_id: ThreadId,
+    pub events: Vec<AgentEvent>,
+}
+
+/// Atomic event/advisory half of the in-memory mixed-spawn transaction.
+///
+/// Implementations must perform every fallible validation before publishing
+/// any event or outbox row, then make all batches visible as one non-fallible
+/// commit. The task store holds its write lock across this call and publishes
+/// the already-staged task rows in the same critical section.
+#[async_trait]
+pub trait AtomicSpawnEventCommitter: Send + Sync {
+    async fn commit_spawn_events(
+        &self,
+        batches: Vec<AtomicSpawnEventBatch>,
+        now: OffsetDateTime,
+    ) -> Result<Vec<Vec<CommittedEvent>>>;
+}
+
+/// Concrete atomic committer for the composed in-memory journal backend.
+#[derive(Clone)]
+pub struct InMemoryAtomicSpawnEventCommitter {
+    events: InMemoryEventRepository,
+    outbox: InMemoryOutboxStore,
+}
+
+impl InMemoryAtomicSpawnEventCommitter {
+    #[must_use]
+    pub const fn new(events: InMemoryEventRepository, outbox: InMemoryOutboxStore) -> Self {
+        Self { events, outbox }
+    }
+}
+
+#[async_trait]
+impl AtomicSpawnEventCommitter for InMemoryAtomicSpawnEventCommitter {
+    async fn commit_spawn_events(
+        &self,
+        batches: Vec<AtomicSpawnEventBatch>,
+        now: OffsetDateTime,
+    ) -> Result<Vec<Vec<CommittedEvent>>> {
+        let mut event_inner = self.events.inner.write().await;
+        let mut next_by_thread: HashMap<String, u64> = HashMap::new();
+        let mut committed_batches = Vec::with_capacity(batches.len());
+        let mut advisory_rows = Vec::with_capacity(batches.len());
+
+        // Stage and validate everything first. Nothing below this loop can
+        // fail, so events and advisories become visible together.
+        for batch in batches {
+            ensure!(
+                !batch.events.is_empty(),
+                "atomic mixed spawn cannot commit an empty event batch"
+            );
+            let next = next_by_thread
+                .entry(batch.thread_id.0.clone())
+                .or_insert_with(|| event_inner.next_sequence(&batch.thread_id));
+            let mut committed = Vec::with_capacity(batch.events.len());
+            for event in batch.events {
+                committed.push(CommittedEvent {
+                    event_id: uuid::Uuid::now_v7(),
+                    thread_id: batch.thread_id.clone(),
+                    sequence: *next,
+                    timestamp: now,
+                    event,
+                });
+                *next = next
+                    .checked_add(1)
+                    .context("atomic mixed spawn event sequence overflow")?;
+            }
+            let last = committed
+                .last()
+                .context("atomic mixed spawn staged no committed event")?;
+            let payload_json = OutboxMessage::ThreadEventsAvailable(ThreadEventsAvailablePayload {
+                thread_id: last.thread_id.clone(),
+                last_sequence: last.sequence,
+            })
+            .to_payload_json()
+            .context("atomic mixed spawn serialise advisory payload")?;
+            advisory_rows.push(OutboxRow {
+                id: OutboxRowId::new(),
+                kind: OutboxMessageKind::ThreadEventsAvailable,
+                thread_id: last.thread_id.clone(),
+                event_id: Some(last.event_id),
+                sequence: Some(last.sequence),
+                status: OutboxStatus::Pending,
+                payload_json,
+                created_at: now,
+                next_attempt_at: now,
+                attempt_count: 0,
+                max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+                last_error: None,
+                claimed_by: None,
+                claimed_at: None,
+                delivered_at: None,
+            });
+            committed_batches.push(committed);
+        }
+
+        for committed in &committed_batches {
+            let thread_id = committed
+                .first()
+                .expect("validated non-empty atomic event batch")
+                .thread_id
+                .0
+                .clone();
+            event_inner
+                .events
+                .entry(thread_id)
+                .or_default()
+                .extend(committed.iter().cloned());
+        }
+        drop(event_inner);
+        {
+            let mut outbox_inner = self.outbox.inner.write().await;
+            for row in advisory_rows {
+                outbox_inner.rows.insert(row.id.0.clone(), row);
+            }
+        }
+        Ok(committed_batches)
+    }
 }
 
 /// Marker candidate captured while cancelling a blocking root, before
@@ -2008,6 +2284,9 @@ pub trait AgentTaskStore: Send + Sync {
     ///   children.
     /// - `spawn rejected: specs must be non-empty` — zero-child
     ///   spawn.
+    /// - `spawn rejected: precompleted_result at index ... requires
+    ///   spawn_mixed_children` — precompleted children need the mixed
+    ///   primitive's atomic row + boundary-event transaction.
     /// - Schema errors from [`AgentTask::new_child`],
     ///   [`AgentTask::wait_on_children`], or [`AgentTask::validate`].
     #[allow(clippy::too_many_arguments)]
@@ -2592,6 +2871,101 @@ pub struct InMemoryAgentTaskStore {
     /// composed in-memory backend wires it via
     /// [`Self::with_cancellation_markers`].
     marker_sink: Option<Arc<CancellationMarkerSink>>,
+    /// Atomic event/advisory committer used by mixed spawn. Kept separate
+    /// from cancellation markers because cancellation retains its own
+    /// idempotent retry protocol.
+    spawn_event_committer: Option<Arc<dyn AtomicSpawnEventCommitter>>,
+}
+
+/// Cancellation-safe rollback for the staged half of an in-memory mixed
+/// spawn.
+///
+/// [`InMemoryAgentTaskStore::spawn_mixed_children`] stages task rows under
+/// the store's write lock, then suspends on the atomic event commit. If
+/// that future is dropped at the await (worker abort, timeout, runtime
+/// shutdown), no `Err` arm runs — only destructors. While `armed`, this
+/// guard's `Drop` restores the staged rows and indexes before the wrapped
+/// lock guard is released, so abandoned task rows can never publish
+/// without their boundary events. [`Self::disarm`] keeps the rows once
+/// the commit has succeeded.
+struct MixedSpawnRollbackGuard<'a> {
+    inner: tokio::sync::RwLockWriteGuard<'a, Inner>,
+    rollback_rows: Vec<AgentTask>,
+    subagents: Vec<(AgentTask, AgentTask)>,
+    tool_rows: Vec<AgentTask>,
+    armed: bool,
+}
+
+impl<'a> MixedSpawnRollbackGuard<'a> {
+    /// Take ownership of the store's write lock for the whole staging
+    /// window, starting disarmed: until [`Self::arm`], dropping the guard
+    /// only releases the lock.
+    const fn begin(inner: tokio::sync::RwLockWriteGuard<'a, Inner>) -> Self {
+        Self {
+            inner,
+            rollback_rows: Vec::new(),
+            subagents: Vec::new(),
+            tool_rows: Vec::new(),
+            armed: false,
+        }
+    }
+
+    /// Rows are staged: from here on, dropping the guard rolls them back
+    /// before the wrapped lock guard releases.
+    fn arm(
+        &mut self,
+        rollback_rows: Vec<AgentTask>,
+        subagents: Vec<(AgentTask, AgentTask)>,
+        tool_rows: Vec<AgentTask>,
+    ) {
+        self.rollback_rows = rollback_rows;
+        self.subagents = subagents;
+        self.tool_rows = tool_rows;
+        self.armed = true;
+    }
+
+    /// The event half committed: keep the staged rows and hand the
+    /// prepared children back to the caller.
+    fn disarm(mut self) -> (Vec<(AgentTask, AgentTask)>, Vec<AgentTask>) {
+        self.armed = false;
+        (
+            std::mem::take(&mut self.subagents),
+            std::mem::take(&mut self.tool_rows),
+        )
+    }
+
+    /// Run the atomic event commit while armed, then disarm and assemble
+    /// the spawn result.
+    ///
+    /// Consumes the guard in the caller's tail expression so the staged
+    /// rows stay protected exactly across the commit await: a committer
+    /// error or a dropped future rolls the rows back in `Drop` before the
+    /// wrapped lock guard releases.
+    async fn commit_events(
+        self,
+        store: &InMemoryAgentTaskStore,
+        parent: AgentTask,
+        event_batches: Vec<AtomicSpawnEventBatch>,
+        now: OffsetDateTime,
+    ) -> Result<SpawnedMixedChildren> {
+        let committed_events = store.commit_atomic_spawn_events(event_batches, now).await?;
+        let (subagents, tool_rows) = self.disarm();
+        Ok(SpawnedMixedChildren {
+            committed_events,
+            parent,
+            subagents,
+            tool_children: tool_rows,
+        })
+    }
+}
+
+impl Drop for MixedSpawnRollbackGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.inner
+                .rollback_mixed_spawn(&self.rollback_rows, &self.subagents, &self.tool_rows);
+        }
+    }
 }
 
 impl InMemoryAgentTaskStore {
@@ -2607,6 +2981,15 @@ impl InMemoryAgentTaskStore {
     #[must_use]
     pub fn with_cancellation_markers(mut self, sink: CancellationMarkerSink) -> Self {
         self.marker_sink = Some(Arc::new(sink));
+        self
+    }
+    /// Wire the atomic event/advisory half of mixed-spawn persistence.
+    #[must_use]
+    pub fn with_spawn_event_committer(
+        mut self,
+        committer: Arc<dyn AtomicSpawnEventCommitter>,
+    ) -> Self {
+        self.spawn_event_committer = Some(committer);
         self
     }
 
@@ -2831,7 +3214,8 @@ impl InMemoryAgentTaskStore {
     /// Commit each new subagent's `SubagentProgress` start event on the
     /// parent journal and each new child thread's `ThreadCreated` event
     /// through the wired marker sink. Attached tool-only batches have
-    /// neither and commit no event batch. Bare stores commit rows only.
+    /// neither and commit no event batch. Bare stores may commit rows only
+    /// when no boundary event was supplied.
     async fn commit_spawn_started_events(
         &self,
         parent_thread: &ThreadId,
@@ -2841,6 +3225,10 @@ impl InMemoryAgentTaskStore {
         now: OffsetDateTime,
     ) -> Result<Vec<CommittedEvent>> {
         let Some(sink) = &self.marker_sink else {
+            ensure!(
+                boundary_events.is_empty(),
+                "spawn rejected: boundary events require an in-memory event sink"
+            );
             return Ok(Vec::new());
         };
         let mut started = Vec::with_capacity(boundary_events.len() + events.len());
@@ -2876,6 +3264,100 @@ impl InMemoryAgentTaskStore {
             Self::insert_marker_advisory(sink, &child_created, now).await?;
         }
         Ok(committed)
+    }
+    async fn guard_mixed_spawn_threads(
+        &self,
+        parent_id: &AgentTaskId,
+        subagents: &[SubagentInvocationSpawn],
+    ) -> Result<()> {
+        self.guard_task_thread(parent_id, super::thread::ThreadOperation::Spawn)
+            .await?;
+        for child_thread_id in subagents.iter().map(|spawn| &spawn.child_thread_id) {
+            self.require_thread_active(child_thread_id, super::thread::ThreadOperation::Spawn)
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn prepare_atomic_spawn_event_batches(
+        parent_thread: &ThreadId,
+        prepared: &[(AgentTask, AgentTask)],
+        mut boundary_events: Vec<AgentEvent>,
+        events: Vec<SubagentSpawnEvent>,
+    ) -> Result<Vec<AtomicSpawnEventBatch>> {
+        for (event, (invocation, child_root)) in events.into_iter().zip(prepared) {
+            boundary_events.push(started_event_from_invocation(
+                event, invocation, child_root,
+            )?);
+        }
+        let mut batches =
+            Vec::with_capacity(usize::from(!boundary_events.is_empty()) + prepared.len());
+        if !boundary_events.is_empty() {
+            batches.push(AtomicSpawnEventBatch {
+                thread_id: parent_thread.clone(),
+                events: boundary_events,
+            });
+        }
+        batches.extend(
+            prepared
+                .iter()
+                .map(|(_, child_root)| AtomicSpawnEventBatch {
+                    thread_id: child_root.thread_id.clone(),
+                    events: vec![AgentEvent::thread_created(
+                        child_root.thread_id.clone(),
+                        None,
+                        None,
+                    )],
+                }),
+        );
+        Ok(batches)
+    }
+
+    async fn commit_atomic_spawn_events(
+        &self,
+        batches: Vec<AtomicSpawnEventBatch>,
+        now: OffsetDateTime,
+    ) -> Result<Vec<CommittedEvent>> {
+        if batches.is_empty() {
+            return Ok(Vec::new());
+        }
+        let committer = self.spawn_event_committer.as_ref().context(
+            "spawn rejected: in-memory event batches require an atomic spawn event committer",
+        )?;
+        let expected = batches.clone();
+        let persisted_batches = committer.commit_spawn_events(batches, now).await?;
+        ensure!(
+            persisted_batches.len() == expected.len(),
+            "atomic spawn event committer returned {} batches for {} requested batches",
+            persisted_batches.len(),
+            expected.len(),
+        );
+        for (batch_index, (requested, persisted)) in
+            expected.iter().zip(&persisted_batches).enumerate()
+        {
+            ensure!(
+                persisted.len() == requested.events.len(),
+                "atomic spawn event committer returned {} events for requested batch {batch_index} with {} events",
+                persisted.len(),
+                requested.events.len(),
+            );
+            for (event_index, (requested_event, persisted_event)) in
+                requested.events.iter().zip(persisted).enumerate()
+            {
+                ensure!(
+                    persisted_event.thread_id == requested.thread_id,
+                    "atomic spawn event committer returned event {event_index} in batch {batch_index} for thread {} instead of {}",
+                    persisted_event.thread_id,
+                    requested.thread_id,
+                );
+                ensure!(
+                    serde_json::to_value(&persisted_event.event)?
+                        == serde_json::to_value(requested_event)?,
+                    "atomic spawn event committer returned mismatched event {event_index} in batch {batch_index}",
+                );
+            }
+        }
+        Ok(persisted_batches.into_iter().next().unwrap_or_default())
     }
 
     /// Write the `thread_events_available` advisory that wakes cross-host
@@ -3000,6 +3482,39 @@ impl Inner {
         // (runnable) and a `Running` row (leased) always carry
         // exactly one entry in the relevant index.
         self.register_runnable_lease_indexes(task);
+    }
+    /// Remove a row from every secondary index before deleting a staged
+    /// in-memory mutation. Used only by mixed-spawn rollback after an external
+    /// event sink fails.
+    fn remove_from_indexes(&mut self, task: &AgentTask) {
+        if let Some(ids) = self.by_thread.get_mut(&task.thread_id) {
+            ids.retain(|id| id != &task.id);
+            if ids.is_empty() {
+                self.by_thread.remove(&task.thread_id);
+            }
+        }
+        if let Some(parent_id) = &task.parent_id
+            && let Some(ids) = self.by_parent.get_mut(parent_id)
+        {
+            ids.retain(|id| id != &task.id);
+            if ids.is_empty() {
+                self.by_parent.remove(parent_id);
+            }
+        }
+        self.remove_from_status_index(task);
+        self.unregister_runnable_lease_indexes(task);
+        self.remove_active_root_if_match(task);
+        self.remove_queued_root_if_match(task);
+        if task.kind == TaskKind::Subagent
+            && let Some(invocation) = task.state.subagent_invocation()
+            && self
+                .invocation_by_child_root
+                .get(&invocation.child_root_task_id)
+                .is_some_and(|id| id == &task.id)
+        {
+            self.invocation_by_child_root
+                .remove(&invocation.child_root_task_id);
+        }
     }
 
     /// Add `task` to the `runnable_by_created_at` index if it is
@@ -3749,33 +4264,18 @@ impl Inner {
         }
         Ok(children)
     }
-}
 
-#[async_trait]
-impl AgentTaskStore for InMemoryAgentTaskStore {
-    async fn insert(&self, task: AgentTask) -> Result<()> {
-        task.validate()
-            .context("insert rejected: task failed schema validation")?;
-
-        let mut inner = self.inner.write().await;
-
-        if inner.by_id.contains_key(&task.id) {
-            return Err(anyhow!(
-                "insert rejected: task id {} already exists",
-                task.id
-            ));
-        }
-
-        // Cross-row invariants for non-root tasks: the parent must already
-        // exist in the store, and the child's `thread_id`, `root_id`, and
-        // `depth` must match the parent row. These are enforced here (and
-        // not by `AgentTask::validate`) because `validate` has no access to
-        // the parent. Bypassing these checks would let a mutated or
-        // deserialized child slip into the wrong `by_thread` / `by_parent`
-        // bucket and silently corrupt list queries and the active-root
-        // invariant.
+    /// Cross-row invariants for non-root tasks: the parent must already
+    /// exist in the store, and the child's `thread_id`, `root_id`, and
+    /// `depth` must match the parent row. These are enforced here (and
+    /// not by `AgentTask::validate`) because `validate` has no access to
+    /// the parent. Bypassing these checks would let a mutated or
+    /// deserialized child slip into the wrong `by_thread` / `by_parent`
+    /// bucket and silently corrupt list queries and the active-root
+    /// invariant.
+    fn check_insert_parent_invariants(&self, task: &AgentTask) -> Result<()> {
         if let Some(parent_id) = &task.parent_id {
-            let parent = inner.by_id.get(parent_id).ok_or_else(|| {
+            let parent = self.by_id.get(parent_id).ok_or_else(|| {
                 anyhow!("insert rejected: child task references unknown parent {parent_id}")
             })?;
             if parent.kind.is_leaf() {
@@ -3807,55 +4307,32 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                 ));
             }
         }
+        Ok(())
+    }
 
-        // Partial-unique: one *blocking* root per thread.
-        //
-        // `blocks_root_admission()` excludes [`TaskStatus::Queued`], so a
-        // fresh root turn may be inserted in [`TaskStatus::Queued`] even
-        // when another root already holds the slot — that is how
-        // [`AgentTaskStore::submit_root_turn`] persists queued
-        // submissions. A caller that bypasses `submit_root_turn` and
-        // tries to insert a *blocking* root while the slot is already
-        // held is rejected here.
+    /// Partial-unique: one *blocking* root per thread.
+    ///
+    /// `blocks_root_admission()` excludes [`TaskStatus::Queued`], so a
+    /// fresh root turn may be inserted in [`TaskStatus::Queued`] even
+    /// when another root already holds the slot — that is how
+    /// [`AgentTaskStore::submit_root_turn`] persists queued
+    /// submissions. A caller that bypasses `submit_root_turn` and
+    /// tries to insert a *blocking* root while the slot is already
+    /// held is rejected here.
+    fn check_insert_root_admission(&self, task: &AgentTask) -> Result<()> {
         if task.kind == TaskKind::RootTurn
             && task.status.blocks_root_admission()
-            && let Some(existing) = inner.active_root_by_thread.get(&task.thread_id)
+            && let Some(existing) = self.active_root_by_thread.get(&task.thread_id)
         {
             let thread_id = &task.thread_id;
             return Err(anyhow!(
                 "insert rejected: thread {thread_id} already has active root task {existing}"
             ));
         }
-
-        inner.add_to_indexes(&task);
-        inner.by_id.insert(task.id.clone(), task);
-        drop(inner);
         Ok(())
     }
 
-    async fn get(&self, id: &AgentTaskId) -> Result<Option<AgentTask>> {
-        let inner = self.inner.read().await;
-        let result = inner.by_id.get(id).cloned();
-        drop(inner);
-        Ok(result)
-    }
-
-    async fn update(&self, task: AgentTask) -> Result<()> {
-        task.validate()
-            .context("update rejected: task failed schema validation")?;
-
-        let mut inner = self.inner.write().await;
-
-        let old = inner.by_id.get(&task.id).cloned().ok_or_else(|| {
-            let id = &task.id;
-            anyhow!("update rejected: task {id} does not exist")
-        })?;
-
-        // Row invariants: `kind`, `parent_id`, `root_id`, `depth`, `thread_id`,
-        // `created_at`, and `max_attempts` are fixed at construction time and
-        // must never change across updates. Silently accepting a mutation here
-        // would corrupt the secondary indexes (`by_thread`, `by_parent`,
-        // `active_root_by_thread`) because those are keyed by the old values.
+    fn check_update_row_invariants(old: &AgentTask, task: &AgentTask) -> Result<()> {
         if old.kind != task.kind {
             let old_kind = old.kind;
             let new_kind = task.kind;
@@ -3901,14 +4378,13 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                 "update rejected: max_attempts is immutable (was {old_max}, got {new_max})"
             ));
         }
+        Ok(())
+    }
 
-        // Partial-unique check: if the new row is a blocking root, make
-        // sure no *other* row already holds the active-root slot on the
-        // same thread. Queued roots skip this check because they don't
-        // occupy the slot.
+    fn check_update_root_admission(&self, task: &AgentTask) -> Result<()> {
         if task.kind == TaskKind::RootTurn
             && task.status.blocks_root_admission()
-            && let Some(current) = inner.active_root_by_thread.get(&task.thread_id)
+            && let Some(current) = self.active_root_by_thread.get(&task.thread_id)
             && *current != task.id
         {
             let thread_id = &task.thread_id;
@@ -3916,6 +4392,121 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                 "update rejected: thread {thread_id} already has a different active root task {current}"
             ));
         }
+        Ok(())
+    }
+
+    fn mixed_spawn_rollback_rows(
+        &self,
+        old_parent: &AgentTask,
+        reattached: &[ReattachedChild],
+        delivered_injection_ids: &[AgentTaskId],
+    ) -> Vec<AgentTask> {
+        let mut ids = BTreeSet::from([old_parent.id.clone()]);
+        ids.extend(reattached.iter().map(|child| child.child_id.clone()));
+        ids.extend(delivered_injection_ids.iter().cloned());
+        ids.into_iter()
+            .filter_map(|id| self.by_id.get(&id).cloned())
+            .collect()
+    }
+
+    fn apply_mixed_spawn_rows(
+        &mut self,
+        parent_transition: (&AgentTask, &AgentTask),
+        subagents: &[(AgentTask, AgentTask)],
+        tool_children: &[AgentTask],
+        reattached: Vec<AgentTask>,
+        delivered_injection_ids: &[AgentTaskId],
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let (old_parent, new_parent) = parent_transition;
+        self.rebalance_after_row_change(old_parent, new_parent);
+        self.by_id.insert(new_parent.id.clone(), new_parent.clone());
+        for (invocation, child_root) in subagents {
+            for child in [invocation, child_root] {
+                self.add_to_indexes(child);
+                self.by_id.insert(child.id.clone(), child.clone());
+            }
+        }
+        for child in tool_children {
+            self.add_to_indexes(child);
+            self.by_id.insert(child.id.clone(), child.clone());
+        }
+        for child in reattached {
+            self.by_id.insert(child.id.clone(), child);
+        }
+        self.complete_injection_rows(delivered_injection_ids, now)
+    }
+
+    fn rollback_mixed_spawn(
+        &mut self,
+        original_rows: &[AgentTask],
+        subagents: &[(AgentTask, AgentTask)],
+        tool_children: &[AgentTask],
+    ) {
+        for task in subagents
+            .iter()
+            .flat_map(|(invocation, child_root)| [invocation, child_root])
+            .chain(tool_children)
+        {
+            if let Some(inserted) = self.by_id.remove(&task.id) {
+                self.remove_from_indexes(&inserted);
+            }
+        }
+        for original in original_rows {
+            if let Some(current) = self.by_id.get(&original.id).cloned() {
+                self.rebalance_after_row_change(&current, original);
+            } else {
+                self.add_to_indexes(original);
+            }
+            self.by_id.insert(original.id.clone(), original.clone());
+        }
+    }
+}
+
+#[async_trait]
+impl AgentTaskStore for InMemoryAgentTaskStore {
+    async fn insert(&self, task: AgentTask) -> Result<()> {
+        task.validate()
+            .context("insert rejected: task failed schema validation")?;
+
+        let mut inner = self.inner.write().await;
+
+        if inner.by_id.contains_key(&task.id) {
+            return Err(anyhow!(
+                "insert rejected: task id {} already exists",
+                task.id
+            ));
+        }
+
+        inner.check_insert_parent_invariants(&task)?;
+        inner.check_insert_root_admission(&task)?;
+
+        inner.add_to_indexes(&task);
+        inner.by_id.insert(task.id.clone(), task);
+        drop(inner);
+        Ok(())
+    }
+
+    async fn get(&self, id: &AgentTaskId) -> Result<Option<AgentTask>> {
+        let inner = self.inner.read().await;
+        let result = inner.by_id.get(id).cloned();
+        drop(inner);
+        Ok(result)
+    }
+
+    async fn update(&self, task: AgentTask) -> Result<()> {
+        task.validate()
+            .context("update rejected: task failed schema validation")?;
+
+        let mut inner = self.inner.write().await;
+
+        let old = inner.by_id.get(&task.id).cloned().ok_or_else(|| {
+            let id = &task.id;
+            anyhow!("update rejected: task {id} does not exist")
+        })?;
+
+        Inner::check_update_row_invariants(&old, &task)?;
+        inner.check_update_root_admission(&task)?;
 
         // Thread / parent indexes are append-only and keyed by `id`, so the
         // old entries stay in place and still point at the (now-updated)
@@ -4852,9 +5443,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         delivered_injection_ids: Vec<AgentTaskId>,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Vec<AgentTask>)> {
-        if specs.is_empty() {
-            return Err(anyhow!("spawn rejected: specs must be non-empty"));
-        }
+        validate_tool_child_specs_for_pure_spawn(&specs)?;
         self.guard_task_thread(parent_id, super::thread::ThreadOperation::Spawn)
             .await?;
 
@@ -4881,9 +5470,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             // `invoke_agent` span (not the inherited inbound client span)
             // so its `execute_tool` span nests under the turn.
             child.otel_traceparent.clone_from(&child_otel_traceparent);
-            child = spec
-                .apply_precompletion(child, &old_parent.id, idx, now)
-                .context("spawn rejected: precomplete child")?;
+
             if inner.by_id.contains_key(&child.id)
                 || children.iter().any(|existing| existing.id == child.id)
             {
@@ -5098,6 +5685,12 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         now: OffsetDateTime,
     ) -> Result<SpawnedMixedChildren> {
         validate_mixed_children_spawn(&spawn)?;
+        if self.marker_sink.is_none() && !spawn.boundary_events.is_empty() {
+            return Err(anyhow!(
+                "spawn rejected: boundary events require an in-memory event sink"
+            ));
+        }
+        validate_precompleted_boundary_events(&spawn)?;
         let MixedChildrenSpawn {
             delivered_injection_ids,
             boundary_events,
@@ -5107,34 +5700,17 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             payload,
             child_otel_traceparent,
         } = spawn;
-        if events.len() != subagents.len() {
-            return Err(anyhow!(
-                "spawn rejected: {} events for {} subagent entries",
-                events.len(),
-                subagents.len()
-            ));
-        }
-        let has_precompleted = tool_children
-            .iter()
-            .any(|tool| tool.spec.precompleted_result.is_some());
-
-        self.guard_task_thread(parent_id, super::thread::ThreadOperation::Spawn)
+        validate_subagent_event_count(events.len(), subagents.len())?;
+        self.guard_mixed_spawn_threads(parent_id, &subagents)
             .await?;
-        for child_thread_id in subagents.iter().map(|spawn| &spawn.child_thread_id) {
-            self.require_thread_active(child_thread_id, super::thread::ThreadOperation::Spawn)
-                .await?;
-        }
 
-        let mut inner = self.inner.write().await;
-
+        let mut guard = MixedSpawnRollbackGuard::begin(self.inner.write().await);
+        let inner = &mut *guard.inner;
         let old_parent = inner.validate_running_owned_non_leaf_parent(parent_id, worker, lease)?;
         inner.validate_batch_thread_uniqueness(&subagents)?;
-
-        // Materialize every row — invocation pairs and tool children —
-        // before touching a single index, so a schema error or an id
-        // collision anywhere in the batch leaves the store untouched.
-        let (prepared, _batch_child_ids) =
-            inner.build_batch_invocation_pairs(&old_parent, subagents, now)?;
+        let rollback_rows =
+            inner.mixed_spawn_rollback_rows(&old_parent, &reattach, &delivered_injection_ids);
+        let (prepared, _) = inner.build_batch_invocation_pairs(&old_parent, subagents, now)?;
         let tool_rows = inner.build_mixed_tool_children(
             &old_parent,
             &tool_children,
@@ -5145,86 +5721,53 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         let child_ids = mixed_child_ids_in_slot_order(&prepared, &tool_rows, &reattached_rows)?;
         let child_count =
             u32::try_from(child_ids.len()).context("spawn rejected: child count exceeds u32")?;
-        let live_children = prepared
-            .iter()
-            .map(|(invocation, _)| invocation)
-            .chain(tool_rows.iter())
-            .chain(reattached_rows.iter())
-            .filter(|child| !child.status.is_terminal())
-            .count();
-        let live_children =
-            u32::try_from(live_children).context("spawn rejected: live child count exceeds u32")?;
+        let live_children = live_mixed_child_count(&prepared, &tool_rows, &reattached_rows)?;
         let waiting_parent = old_parent
             .clone()
             .wait_on_children(child_count, payload, child_ids, now)
             .context("spawn rejected: wait_on_children transition failed")?;
-        let new_parent = if has_precompleted {
-            waiting_parent
-                .defer_precompleted_children_publication()
-                .context("spawn rejected: defer precompleted child publication")?
-        } else {
-            waiting_parent
-                .recompute_pending_children(live_children, now)
-                .context("spawn rejected: recompute_pending_children transition failed")?
-        };
-
-        // All validation passed — apply mutations.
-        inner.rebalance_after_row_change(&old_parent, &new_parent);
-        inner
-            .by_id
-            .insert(new_parent.id.clone(), new_parent.clone());
-        for (invocation, child_root) in &prepared {
-            inner.add_to_indexes(invocation);
-            inner
-                .by_id
-                .insert(invocation.id.clone(), invocation.clone());
-            inner.add_to_indexes(child_root);
-            inner
-                .by_id
-                .insert(child_root.id.clone(), child_root.clone());
-        }
-        for child in &tool_rows {
-            inner.add_to_indexes(child);
-            inner.by_id.insert(child.id.clone(), child.clone());
-        }
-        for child in reattached_rows {
-            inner.by_id.insert(child.id.clone(), child);
-        }
-
-        inner.complete_injection_rows(&delivered_injection_ids, now)?;
-
-        let committed = self
-            .commit_spawn_started_events(
-                &new_parent.thread_id,
+        let published_parent = publish_transactional_mixed_parent(
+            waiting_parent,
+            has_precompleted_tool_child(&tool_children),
+            live_children,
+            now,
+        )?;
+        let event_batches = if self.marker_sink.is_some() {
+            Self::prepare_atomic_spawn_event_batches(
+                &published_parent.thread_id,
                 &prepared,
                 boundary_events,
                 events,
-                now,
-            )
-            .await?;
-        // Keep the task-store write fence until boundary events are durable.
-        // Once the batch commit succeeds, release the precompletion barrier
-        // under the same lock before any child completion can interleave.
-        let published_parent = if has_precompleted {
-            let parent = new_parent
-                .clone()
-                .publish_precompleted_children()
-                .context("spawn rejected: release precompleted child publication")?
-                .recompute_pending_children(live_children, now)
-                .context("spawn rejected: publish precompleted children")?;
-            inner.rebalance_after_row_change(&new_parent, &parent);
-            inner.by_id.insert(parent.id.clone(), parent.clone());
-            parent
+            )?
         } else {
-            new_parent
+            Vec::new()
         };
-        drop(inner);
-        Ok(SpawnedMixedChildren {
-            committed_events: committed,
-            parent: published_parent,
-            subagents: prepared,
-            tool_children: tool_rows,
-        })
+        if !event_batches.is_empty() && self.spawn_event_committer.is_none() {
+            return Err(anyhow!(
+                "spawn rejected: in-memory event batches require an atomic spawn event committer"
+            ));
+        }
+
+        if let Err(error) = inner.apply_mixed_spawn_rows(
+            (&old_parent, &published_parent),
+            &prepared,
+            &tool_rows,
+            reattached_rows,
+            &delivered_injection_ids,
+            now,
+        ) {
+            inner.rollback_mixed_spawn(&rollback_rows, &prepared, &tool_rows);
+            return Err(error);
+        }
+        // Rows are staged under the write lock, but the event commit
+        // below suspends. Arm the drop guard so BOTH a committer error and
+        // a cancelled/aborted future at that await restore the staged
+        // rows before the lock guard is released — otherwise abandoned
+        // task rows would publish without their boundary events.
+        guard.arm(rollback_rows, prepared, tool_rows);
+        guard
+            .commit_events(self, published_parent, event_batches, now)
+            .await
     }
 
     async fn find_subagent_invocation_for_child_root(
@@ -10305,7 +10848,20 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn atomic_precompleted_event_publish_leaves_no_reopenable_barrier() -> Result<()> {
-        let store = InMemoryAgentTaskStore::new();
+        let events = crate::journal::event_repository::InMemoryEventRepository::new();
+        let threads = crate::journal::thread_store::InMemoryThreadStore::new();
+        let parent_thread = thread("t-precompleted-event-barrier");
+        threads.get_or_create(&parent_thread, t0()).await?;
+        let outbox = crate::journal::outbox::InMemoryOutboxStore::new();
+        let store = InMemoryAgentTaskStore::new()
+            .with_cancellation_markers(CancellationMarkerSink {
+                event_repo: Arc::new(events.clone()),
+                outbox_store: Arc::new(outbox.clone()),
+                thread_store: Arc::new(threads),
+            })
+            .with_spawn_event_committer(Arc::new(InMemoryAtomicSpawnEventCommitter::new(
+                events, outbox,
+            )));
         let (parent, worker, lease) =
             running_root_for_spawn(&store, "t-precompleted-event-barrier").await?;
         let parent_id = parent.id.clone();
@@ -10325,10 +10881,7 @@ mod tests {
             },
         );
         spawn.boundary_events.push(AgentEvent::tool_call_end(
-            "call-preflight",
-            "browser",
-            "Browser",
-            preflight,
+            "call_0", "tool_0", "Tool 0", preflight,
         ));
 
         let spawned = store
@@ -10365,6 +10918,161 @@ mod tests {
         assert_eq!(resumed.status, TaskStatus::Pending);
         assert_eq!(resumed.pending_child_count, 0);
 
+        Ok(())
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sinkless_mixed_spawn_rejects_boundary_events_without_mutation() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-sinkless-boundary").await?;
+        let mut spawn = mixed_spawn_for(
+            "t-sinkless-boundary",
+            vec![thread("t-sinkless-unused")],
+            &[1],
+        );
+        spawn.boundary_events.push(AgentEvent::tool_call_end(
+            "call-boundary",
+            "browser",
+            "Browser",
+            agent_sdk_foundation::ToolResult::success("precompleted"),
+        ));
+
+        let error = store
+            .spawn_mixed_children(&parent.id, &worker, &lease, spawn, Vec::new(), t_plus(2))
+            .await
+            .expect_err("a sink-less store must reject non-empty boundary events");
+        assert!(
+            format!("{error:#}").contains("boundary events require an in-memory event sink"),
+            "unexpected error: {error:#}",
+        );
+        let persisted = store.get(&parent.id).await?.context("parent survives")?;
+        assert_eq!(persisted.status, TaskStatus::Running);
+        assert!(!persisted.has_unpublished_precompleted_children());
+        assert!(store.list_children(&parent.id).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_mixed_boundary_commit_rolls_back_parent_and_children() -> Result<()> {
+        let events = crate::journal::event_repository::InMemoryEventRepository::new();
+        let threads = crate::journal::thread_store::InMemoryThreadStore::new();
+        let parent_thread = thread("t-boundary-rollback");
+        let child_thread = thread("t-boundary-rollback-child");
+        threads.get_or_create(&parent_thread, t0()).await?;
+        threads.get_or_create(&child_thread, t0()).await?;
+        let outbox = crate::journal::outbox::InMemoryOutboxStore::new();
+        let store = InMemoryAgentTaskStore::new()
+            .with_cancellation_markers(CancellationMarkerSink {
+                event_repo: Arc::new(events),
+                outbox_store: Arc::new(outbox),
+                thread_store: Arc::new(threads),
+            })
+            .with_spawn_event_committer(Arc::new(RefusingAtomicSpawnEventCommitter));
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-boundary-rollback").await?;
+        let mut spawn = mixed_spawn_for("t-boundary-rollback", vec![child_thread], &[1]);
+        let preflight = agent_sdk_foundation::ToolResult::success("precompleted");
+        spawn.tool_children[0].spec =
+            ChildSpawnSpec::new(1).with_precompleted_result(serde_json::to_value(&preflight)?);
+        spawn.boundary_events.push(AgentEvent::tool_call_end(
+            "call_1", "tool_1", "Tool 1", preflight,
+        ));
+
+        let error = store
+            .spawn_mixed_children(
+                &parent.id,
+                &worker,
+                &lease,
+                spawn,
+                test_spawn_events(1),
+                t_plus(2),
+            )
+            .await
+            .expect_err("injected boundary commit failure must reject the spawn");
+        assert!(
+            format!("{error:#}").contains("injected event-batch failure"),
+            "unexpected error: {error:#}",
+        );
+        let persisted = store.get(&parent.id).await?.context("parent survives")?;
+        assert_eq!(persisted.status, TaskStatus::Running);
+        assert!(!persisted.has_unpublished_precompleted_children());
+        assert_eq!(persisted.worker_id.as_ref(), Some(&worker));
+        assert_eq!(persisted.lease_id.as_ref(), Some(&lease));
+        assert!(store.list_children(&parent.id).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn aborted_mixed_spawn_rolls_back_staged_rows_before_lock_release() -> Result<()> {
+        // Cancellation safety: task rows are staged under the store's
+        // write lock, then the spawn future suspends on the atomic event
+        // commit. Aborting the future at that await must run the rollback
+        // guard — not just drop the lock — or the staged parent/children
+        // would publish without their boundary events.
+        let events = crate::journal::event_repository::InMemoryEventRepository::new();
+        let threads = crate::journal::thread_store::InMemoryThreadStore::new();
+        let parent_thread = thread("t-abort-rollback");
+        let child_thread = thread("t-abort-rollback-child");
+        threads.get_or_create(&parent_thread, t0()).await?;
+        threads.get_or_create(&child_thread, t0()).await?;
+        let outbox = crate::journal::outbox::InMemoryOutboxStore::new();
+        let store = InMemoryAgentTaskStore::new()
+            .with_cancellation_markers(CancellationMarkerSink {
+                event_repo: Arc::new(events.clone()),
+                outbox_store: Arc::new(outbox.clone()),
+                thread_store: Arc::new(threads),
+            })
+            .with_spawn_event_committer(Arc::new(InMemoryAtomicSpawnEventCommitter::new(
+                events.clone(),
+                outbox.clone(),
+            )));
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-abort-rollback").await?;
+        let spawn = mixed_spawn_for("t-abort-rollback", vec![child_thread], &[1]);
+
+        // Park the committer: holding the event journal's write lock
+        // suspends the spawn at its event-commit await AFTER the task
+        // rows are staged.
+        let event_gate = events.inner.write().await;
+
+        let spawn_store = store.clone();
+        let spawn_parent = parent.id.clone();
+        let spawn_worker = worker.clone();
+        let spawn_lease = lease.clone();
+        let spawn_task = tokio::spawn(async move {
+            spawn_store
+                .spawn_mixed_children(
+                    &spawn_parent,
+                    &spawn_worker,
+                    &spawn_lease,
+                    spawn,
+                    test_spawn_events(1),
+                    t_plus(2),
+                )
+                .await
+        });
+        // The spawn holds the task-store write lock from staging until
+        // the parked commit, so a failing `try_read` here means the rows
+        // are staged and the future is (or is about to be) parked on the
+        // event gate — the exact window the abort must land in.
+        while store.inner.try_read().is_ok() {
+            assert!(
+                !spawn_task.is_finished(),
+                "spawn must park on the event gate instead of completing"
+            );
+            tokio::task::yield_now().await;
+        }
+        spawn_task.abort();
+        let join_error = spawn_task
+            .await
+            .expect_err("aborted spawn must not complete");
+        assert!(join_error.is_cancelled(), "unexpected join outcome");
+        drop(event_gate);
+
+        let persisted = store.get(&parent.id).await?.context("parent survives")?;
+        assert_eq!(persisted.status, TaskStatus::Running);
+        assert!(!persisted.has_unpublished_precompleted_children());
+        assert_eq!(persisted.worker_id.as_ref(), Some(&worker));
+        assert_eq!(persisted.lease_id.as_ref(), Some(&lease));
+        assert!(store.list_children(&parent.id).await?.is_empty());
+        assert!(events.get_events(&parent_thread).await?.is_empty());
         Ok(())
     }
 
@@ -12556,6 +13264,19 @@ mod tests {
         Ok(())
     }
 
+    struct RefusingAtomicSpawnEventCommitter;
+
+    #[async_trait]
+    impl AtomicSpawnEventCommitter for RefusingAtomicSpawnEventCommitter {
+        async fn commit_spawn_events(
+            &self,
+            _batches: Vec<AtomicSpawnEventBatch>,
+            _now: OffsetDateTime,
+        ) -> Result<Vec<Vec<CommittedEvent>>> {
+            anyhow::bail!("injected event-batch failure")
+        }
+    }
+
     /// Journal that refuses to append the terminal marker, standing in
     /// for any sink failure (event store, outbox, thread projection).
     #[derive(Clone)]
@@ -12564,6 +13285,8 @@ mod tests {
         /// Refuse only this thread's marker, so a cascade can fail at its
         /// SECOND candidate; `None` refuses every marker.
         refuse_on: Option<ThreadId>,
+        /// Also reject batched commits while `refusing` is set.
+        refuse_batches: bool,
         /// Cleared to heal the sink for a retry.
         refusing: Arc<std::sync::atomic::AtomicBool>,
     }
@@ -12597,6 +13320,9 @@ mod tests {
             events: Vec<AgentEvent>,
             now: OffsetDateTime,
         ) -> Result<Vec<CommittedEvent>> {
+            if self.refuse_batches && self.refuses(thread_id) {
+                anyhow::bail!("injected event-batch failure");
+            }
             self.inner.commit_event_batch(thread_id, events, now).await
         }
         async fn next_sequence(&self, thread_id: &ThreadId) -> Result<u64> {
@@ -12657,6 +13383,7 @@ mod tests {
                     inner: events.clone(),
                     refuse_on: None,
                     refusing: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                    refuse_batches: false,
                 }),
                 outbox_store: Arc::new(crate::journal::outbox::InMemoryOutboxStore::new()),
                 thread_store: Arc::new(threads.clone()),
@@ -12762,6 +13489,7 @@ mod tests {
                     inner: events.clone(),
                     refuse_on: Some(child_thread.clone()),
                     refusing: Arc::clone(&refusing),
+                    refuse_batches: false,
                 }),
                 outbox_store: Arc::new(outbox.clone()),
                 thread_store: Arc::new(crate::journal::thread_store::InMemoryThreadStore::new()),
@@ -13001,6 +13729,7 @@ mod tests {
                     inner: events.clone(),
                     refuse_on: Some(child_thread.clone()),
                     refusing: Arc::clone(&refusing),
+                    refuse_batches: false,
                 }),
                 outbox_store: Arc::new(outbox.clone()),
                 thread_store: Arc::new(crate::journal::thread_store::InMemoryThreadStore::new()),

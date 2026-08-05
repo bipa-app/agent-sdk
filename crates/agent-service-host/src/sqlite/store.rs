@@ -65,8 +65,10 @@ use agent_server::journal::store::{
     QuestionPause, ReattachedChild, RequeueOutcome, SpawnedMixedChildren, SubagentBatchSpawn,
     SubagentInvocationSpawn, SubmitDisposition, SubmitRootTurnError, SubmitRootTurnOutcome,
     SubmitRootTurnParams, ToolChildSpawn, apply_question_answer, apply_question_pause,
-    mixed_child_ids_in_slot_order, new_mixed_tool_child, submitted_task_disposition,
-    validate_mixed_children_spawn,
+    has_precompleted_tool_child, live_mixed_child_count, mixed_child_ids_in_slot_order,
+    new_mixed_tool_child, publish_transactional_mixed_parent, submitted_task_disposition,
+    validate_mixed_children_spawn, validate_precompleted_boundary_events,
+    validate_subagent_event_count, validate_tool_child_specs_for_pure_spawn,
 };
 use agent_server::journal::subagent_spawn_transaction::{
     AtomicSubagentSpawnCommitter, SubagentSpawnCommit, SubagentSpawnEvent, SubagentSpawnOutcome,
@@ -3747,9 +3749,7 @@ impl AgentTaskStore for SqliteDurableStore {
         delivered_injection_ids: Vec<AgentTaskId>,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Vec<AgentTask>)> {
-        if specs.is_empty() {
-            return Err(anyhow!("spawn rejected: specs must be non-empty"));
-        }
+        validate_tool_child_specs_for_pure_spawn(&specs)?;
         let mut tx = self.begin().await?;
         let old_parent = Self::load_task_tx(&mut tx, parent_id)
             .await?
@@ -3766,9 +3766,7 @@ impl AgentTaskStore for SqliteDurableStore {
             child.spawn_index =
                 Some(u32::try_from(idx).context("spawn rejected: batch index exceeds u32::MAX")?);
             child.otel_traceparent.clone_from(&child_otel_traceparent);
-            child = spec
-                .apply_precompletion(child, &old_parent.id, idx, now)
-                .context("spawn rejected: precomplete child")?;
+
             let existing = Self::load_task_tx(&mut tx, &child.id).await?;
             if existing.is_some() || children.iter().any(|e: &AgentTask| e.id == child.id) {
                 return Err(anyhow!(
@@ -3971,6 +3969,7 @@ impl AgentTaskStore for SqliteDurableStore {
         now: OffsetDateTime,
     ) -> Result<SpawnedMixedChildren> {
         validate_mixed_children_spawn(&spawn)?;
+        validate_precompleted_boundary_events(&spawn)?;
         let MixedChildrenSpawn {
             delivered_injection_ids,
             boundary_events,
@@ -3980,16 +3979,8 @@ impl AgentTaskStore for SqliteDurableStore {
             payload,
             child_otel_traceparent,
         } = spawn;
-        if events.len() != subagents.len() {
-            return Err(anyhow!(
-                "spawn rejected: {} events for {} subagent entries",
-                events.len(),
-                subagents.len()
-            ));
-        }
-        let has_precompleted = tool_children
-            .iter()
-            .any(|tool| tool.spec.precompleted_result.is_some());
+        validate_subagent_event_count(events.len(), subagents.len())?;
+        let has_precompleted = has_precompleted_tool_child(&tool_children);
 
         // `BEGIN IMMEDIATE` serializes writers, so the parent CAS, the
         // per-entry child-thread checks, and every insert below land in
@@ -4022,32 +4013,17 @@ impl AgentTaskStore for SqliteDurableStore {
         let child_ids = mixed_child_ids_in_slot_order(&prepared, &tool_rows, &reattached_rows)?;
         let child_count =
             u32::try_from(child_ids.len()).context("spawn rejected: child count exceeds u32")?;
-        let live_children = prepared
-            .iter()
-            .map(|(invocation, _)| invocation)
-            .chain(tool_rows.iter())
-            .chain(reattached_rows.iter())
-            .filter(|child| !child.status.is_terminal())
-            .count();
-        let live_children =
-            u32::try_from(live_children).context("spawn rejected: live child count exceeds u32")?;
+        let live_children = live_mixed_child_count(&prepared, &tool_rows, &reattached_rows)?;
         let waiting_parent = old_parent
             .clone()
             .wait_on_children(child_count, payload, child_ids, now)
             .context("spawn rejected: wait_on_children transition failed")?;
-        let new_parent = if has_precompleted {
-            waiting_parent
-                .defer_precompleted_children_publication()
-                .context("spawn rejected: defer precompleted child publication")?
-                .publish_precompleted_children()
-                .context("spawn rejected: release precompleted child publication")?
-                .recompute_pending_children(live_children, now)
-                .context("spawn rejected: publish precompleted children")?
-        } else {
-            waiting_parent
-                .recompute_pending_children(live_children, now)
-                .context("spawn rejected: recompute_pending_children transition failed")?
-        };
+        let new_parent = publish_transactional_mixed_parent(
+            waiting_parent,
+            has_precompleted,
+            live_children,
+            now,
+        )?;
 
         Self::update_task_tx(&mut tx, &new_parent).await?;
         for (invocation, child_root) in &prepared {

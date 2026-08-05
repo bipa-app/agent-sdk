@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
 
 use crate::journal::event_repository::{EventRepository, InMemoryEventRepository};
@@ -99,6 +99,18 @@ impl EventRepository for FailingEventRepository {
         _cutoff: OffsetDateTime,
     ) -> Result<Option<u64>> {
         Ok(None)
+    }
+}
+struct ShortBatchAtomicSpawnCommitter;
+
+#[async_trait]
+impl crate::journal::store::AtomicSpawnEventCommitter for ShortBatchAtomicSpawnCommitter {
+    async fn commit_spawn_events(
+        &self,
+        _batches: Vec<crate::journal::store::AtomicSpawnEventBatch>,
+        _now: OffsetDateTime,
+    ) -> Result<Vec<Vec<crate::journal::CommittedEvent>>> {
+        Ok(Vec::new())
     }
 }
 
@@ -969,12 +981,18 @@ async fn spawn_batch_creates_n_invocations_under_one_parent() -> Result<()> {
     let thread_store = InMemoryThreadStore::new();
     let event_repo = InMemoryEventRepository::new();
     let outbox_store = crate::journal::outbox::InMemoryOutboxStore::new();
-    let task_store =
-        InMemoryAgentTaskStore::new().with_cancellation_markers(CancellationMarkerSink {
+    let task_store = InMemoryAgentTaskStore::new()
+        .with_cancellation_markers(CancellationMarkerSink {
             event_repo: std::sync::Arc::new(event_repo.clone()),
             outbox_store: std::sync::Arc::new(outbox_store.clone()),
             thread_store: std::sync::Arc::new(thread_store.clone()),
-        });
+        })
+        .with_spawn_event_committer(std::sync::Arc::new(
+            crate::journal::store::InMemoryAtomicSpawnEventCommitter::new(
+                event_repo.clone(),
+                outbox_store,
+            ),
+        ));
     let (parent, worker, lease) = running_parent_root(&task_store).await?;
     let tasks = vec!["explore A", "explore B", "explore C"];
     let payload = parent_suspension_payload_with_tools(&parent.thread_id, &tasks);
@@ -1591,12 +1609,18 @@ async fn spawn_mixed_creates_subagents_and_tool_children_under_one_parent() -> R
     let thread_store = InMemoryThreadStore::new();
     let event_repo = InMemoryEventRepository::new();
     let outbox_store = crate::journal::outbox::InMemoryOutboxStore::new();
-    let task_store =
-        InMemoryAgentTaskStore::new().with_cancellation_markers(CancellationMarkerSink {
+    let task_store = InMemoryAgentTaskStore::new()
+        .with_cancellation_markers(CancellationMarkerSink {
             event_repo: std::sync::Arc::new(event_repo.clone()),
             outbox_store: std::sync::Arc::new(outbox_store.clone()),
             thread_store: std::sync::Arc::new(thread_store.clone()),
-        });
+        })
+        .with_spawn_event_committer(std::sync::Arc::new(
+            crate::journal::store::InMemoryAtomicSpawnEventCommitter::new(
+                event_repo.clone(),
+                outbox_store,
+            ),
+        ));
     let (parent, worker, lease) = running_parent_root(&task_store).await?;
     let tasks = ["explore A", "explore B"];
     let payload = mixed_suspension_payload(&parent.thread_id, &tasks, &["todo_write"]);
@@ -1672,6 +1696,85 @@ async fn spawn_mixed_creates_subagents_and_tool_children_under_one_parent() -> R
         }
     }
 
+    Ok(())
+}
+#[tokio::test]
+async fn spawn_mixed_reports_short_committed_event_batch_without_panicking() -> Result<()> {
+    let thread_store = InMemoryThreadStore::new();
+    let event_repo = InMemoryEventRepository::new();
+    let outbox_store = crate::journal::outbox::InMemoryOutboxStore::new();
+    let task_store = InMemoryAgentTaskStore::new()
+        .with_cancellation_markers(CancellationMarkerSink {
+            event_repo: std::sync::Arc::new(event_repo.clone()),
+            outbox_store: std::sync::Arc::new(outbox_store),
+            thread_store: std::sync::Arc::new(thread_store.clone()),
+        })
+        .with_spawn_event_committer(std::sync::Arc::new(ShortBatchAtomicSpawnCommitter));
+    let (parent, worker, lease) = running_parent_root(&task_store).await?;
+    let tasks = ["explore A"];
+    let payload = mixed_suspension_payload(&parent.thread_id, &tasks, &["todo_write"]);
+
+    let error = spawn_mixed_children_invocations(
+        &parent.id,
+        &worker,
+        &lease,
+        MixedChildrenRequest {
+            delivered_injection_ids: Vec::new(),
+            boundary_events: vec![AgentEvent::text("boundary", "boundary")],
+            subagents: mixed_subagent_entries(&tasks)?,
+            tool_children: mixed_tool_children(tasks.len(), 2)?,
+            reattach: Vec::new(),
+            payload,
+            child_otel_traceparent: None,
+        },
+        &SubagentInvocationDeps {
+            task_store: &task_store,
+            thread_store: &thread_store,
+            event_repo: &event_repo,
+        },
+        t_plus(2),
+    )
+    .await
+    .expect_err("short committed-event batch must return an error");
+    assert!(
+        error_text(&error).contains("atomic spawn event committer returned 0 batches"),
+        "unexpected error: {error:#}",
+    );
+    let persisted = task_store
+        .get(&parent.id)
+        .await?
+        .context("parent survives a rejected spawn")?;
+    assert_eq!(persisted.status, TaskStatus::Running);
+    assert!(task_store.list_children(&parent.id).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn assemble_mixed_batch_rejects_short_committed_event_batch() -> Result<()> {
+    // A store that returns fewer committed events than the staged
+    // boundary events must surface an error instead of panicking in
+    // `split_off`.
+    let parent = AgentTask::new_root_turn(
+        agent_sdk_foundation::ThreadId::from_string("t-short-assemble"),
+        t0(),
+        3,
+    );
+    let error = super::subagent::assemble_mixed_spawned_batch(
+        crate::journal::store::SpawnedMixedChildren {
+            committed_events: Vec::new(),
+            parent,
+            subagents: Vec::new(),
+            tool_children: Vec::new(),
+        },
+        Vec::new(),
+        0,
+        1,
+    )
+    .expect_err("short committed-event batch must return an error");
+    assert!(
+        error_text(&error).contains("returned 0 committed events for 1 boundary events"),
+        "unexpected error: {error:#}",
+    );
     Ok(())
 }
 
