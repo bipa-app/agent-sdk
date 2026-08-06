@@ -238,13 +238,18 @@ pub struct InitializeParams {
 }
 
 /// Client capabilities.
+///
+/// Absent capabilities are OMITTED from the wire, never serialized as
+/// `null`: the MCP schema types each capability as an optional *object*,
+/// and strict servers (e.g. `@playwright/mcp`) reject an explicit `null`
+/// during the `initialize` handshake with JSON-RPC `-32603`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ClientCapabilities {
     /// Roots capability.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roots: Option<RootsCapability>,
     /// Sampling capability.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sampling: Option<SamplingCapability>,
 }
 
@@ -610,5 +615,38 @@ mod tests {
             McpContent::Text { text } => assert_eq!(text, "hi"),
             _ => panic!("expected text content"),
         }
+    }
+
+    /// Absent client capabilities must be omitted, not `null`: strict MCP
+    /// servers (e.g. `@playwright/mcp`) type each capability as an optional
+    /// object and reject `"roots": null` / `"sampling": null` during the
+    /// `initialize` handshake with JSON-RPC `-32603`.
+    #[test]
+    fn test_default_client_capabilities_serialize_to_empty_object() {
+        let serialized = serde_json::to_value(ClientCapabilities::default())
+            .expect("serialize client capabilities");
+        assert_eq!(serialized, serde_json::json!({}));
+
+        let params = InitializeParams {
+            protocol_version: PREFERRED_PROTOCOL_VERSION.to_string(),
+            capabilities: ClientCapabilities::default(),
+            client_info: ClientInfo {
+                name: "test".to_string(),
+                version: "0.0.0".to_string(),
+            },
+        };
+        let serialized = serde_json::to_value(params).expect("serialize initialize params");
+        assert_eq!(serialized["capabilities"], serde_json::json!({}));
+
+        // Present capabilities still serialize.
+        let with_roots = ClientCapabilities {
+            roots: Some(RootsCapability { list_changed: true }),
+            sampling: None,
+        };
+        let serialized = serde_json::to_value(with_roots).expect("serialize roots capability");
+        assert_eq!(
+            serialized,
+            serde_json::json!({"roots": {"listChanged": true}})
+        );
     }
 }
