@@ -2830,6 +2830,8 @@ async fn build_chat_request(
 const DUPLICATED_RESUME_REPAIR: &str =
     "[SDK_PROVIDER_HISTORY_REPAIR_V1]\nRemoved one exact duplicated suspended-message replay.";
 
+const IN_PLACE_SEQUENCE_REPAIR: &str = "[SDK_PROVIDER_HISTORY_REPAIR_V1]\nRepaired a compound tool_use/tool_result corruption in place (dangling uses answered with cancelled results, orphan results dropped, duplicated replay uses removed).";
+
 fn remove_duplicated_resume_replay(history: &[llm::Message]) -> Option<Vec<llm::Message>> {
     let invalid_index = llm::provider_tool_sequence_error_index(history)?;
     let second_start = invalid_index.checked_add(1)?;
@@ -2887,13 +2889,26 @@ async fn repair_provider_tool_history(
     }
 
     if let Some(index) = llm::provider_tool_sequence_error_index(&repaired) {
-        repaired = remove_duplicated_resume_replay(&repaired).with_context(|| {
-            format!(
-                "thread {thread_id}: invalid tool_use/tool_result sequence at message index {index} has no safe repair"
-            )
-        })?;
-        repair_evidence.push(llm::Message::user(DUPLICATED_RESUME_REPAIR));
-        log::warn!("thread {thread_id}: removing duplicated suspended-message replay");
+        if let Some(deduped) = remove_duplicated_resume_replay(&repaired) {
+            repaired = deduped;
+            repair_evidence.push(llm::Message::user(DUPLICATED_RESUME_REPAIR));
+            log::warn!("thread {thread_id}: removing duplicated suspended-message replay");
+        } else {
+            // Compound corruption (a cancelled confirmation's dangling
+            // tool_use interleaved with replay duplication, orphan
+            // results, cross-message duplicate ids) matches neither
+            // targeted arm. The general in-place pass repairs each
+            // violation the checker reports to a fixed point; refusing
+            // here bricks the thread for good (ENG-9651).
+            repaired =
+                llm::repair_tool_sequence_in_place(&repaired, llm::USER_CANCELLED_TOOL_RESULT);
+            repair_evidence.push(llm::Message::user(IN_PLACE_SEQUENCE_REPAIR));
+            log::warn!("thread {thread_id}: repairing the tool sequence in place (index {index})");
+        }
+        debug_assert!(
+            llm::is_provider_valid_tool_sequence(&repaired),
+            "thread {thread_id}: in-place repair must converge to a provider-valid sequence"
+        );
     }
 
     deps.message_store

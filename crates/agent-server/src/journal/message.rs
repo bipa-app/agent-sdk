@@ -77,6 +77,10 @@ pub enum MessageProjectionError {
         retained: usize,
         result_count: usize,
     },
+    #[error(
+        "compaction result breaks the provider tool_use/tool_result sequence at effective message index {index}; refusing to persist it"
+    )]
+    CompactionBreaksToolSequence { index: usize },
 }
 /// One append-only compaction boundary in a message projection.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -275,6 +279,23 @@ impl MessageProjection {
         let generated_summary = replacement_messages
             .first()
             .is_some_and(is_generated_compaction_summary);
+
+        // Hard storage invariant (ENG-9651): the effective view this entry
+        // selects must be a provider-valid tool sequence. An engine whose
+        // boundary cuts an assistant `tool_use` / user `tool_result` pair
+        // would otherwise persist a thread no provider accepts — invisible
+        // to the pre-call repair, which validates the raw staged history.
+        // Refuse before anything is recorded; the caller skips the
+        // compaction and the turn proceeds uncompacted.
+        let effective: Vec<llm::Message> = replacement_messages
+            .iter()
+            .cloned()
+            .chain(self.messages[compacted_end..].iter().cloned())
+            .collect();
+        if let Some(index) = llm::provider_tool_sequence_error_index(&effective) {
+            return Err(MessageProjectionError::CompactionBreaksToolSequence { index });
+        }
+
         self.compactions.push(CompactionEntry {
             compacted_start: prior_boundary,
             compacted_end,
@@ -1187,6 +1208,53 @@ mod tests {
                     llm::ContentBlock::CompactionSummary { .. }
                 ))
         ));
+        Ok(())
+    }
+
+    /// ENG-9651: a compaction whose retained tail starts with a dangling
+    /// `tool_result` (the boundary cut the use/result pair) is refused
+    /// before anything is recorded, and the projection is left untouched.
+    #[test]
+    fn compaction_that_cuts_a_tool_pair_is_refused() -> anyhow::Result<()> {
+        let p = MessageProjection::new(thread_id(), t0()).append_committed(
+            vec![
+                llm::Message::user("do it"),
+                llm::Message::assistant_with_tool_use(
+                    None,
+                    "call-1",
+                    "read",
+                    serde_json::json!({}),
+                ),
+                llm::Message::tool_result("call-1", "contents", false),
+            ],
+            t_plus(1),
+        )?;
+        let error = p
+            .append_compaction(vec![llm::Message::user("summary")], 3, 1, t_plus(2))
+            .expect_err("a pair-cutting compaction must be refused");
+        assert!(matches!(
+            error,
+            MessageProjectionError::CompactionBreaksToolSequence { .. }
+        ));
+
+        let kept_assistant =
+            llm::Message::assistant_with_tool_use(None, "call-1", "read", serde_json::json!({}));
+        let kept_result = llm::Message::tool_result("call-1", "contents", false);
+        let p = MessageProjection::new(thread_id(), t0()).append_committed(
+            vec![
+                llm::Message::user("do it"),
+                kept_assistant.clone(),
+                kept_result.clone(),
+            ],
+            t_plus(1),
+        )?;
+        let p = p.append_compaction(
+            vec![llm::Message::user("summary"), kept_assistant, kept_result],
+            3,
+            2,
+            t_plus(2),
+        )?;
+        assert_eq!(p.compactions.len(), 1, "the pair-preserving cut persists");
         Ok(())
     }
 
