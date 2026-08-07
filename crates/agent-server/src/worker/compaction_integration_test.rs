@@ -1194,69 +1194,28 @@ async fn completed_compaction_cancel_race_audits_usage_without_applying() -> Res
 }
 
 #[tokio::test]
-async fn no_progress_compaction_usage_stays_on_failed_attempt_only() -> Result<()> {
+async fn no_progress_compaction_is_skipped_and_the_turn_proceeds() -> Result<()> {
     let fixtures = Fixtures::new();
     seed_projection_history(&fixtures.messages, &thread_id(), 12, &"n".repeat(200)).await?;
     let cfg = CompactionConfig::default()
         .with_engine(CompactionEngine::Legacy)
         .with_threshold_tokens(10);
-    let failing = Arc::new(ScriptedProvider::new(vec![ok_response(
-        &"z".repeat(20_000),
-    )]));
-    let failing_provider: Arc<dyn LlmProvider> = failing.clone();
-    let deps = fixtures.deps_with_compaction(&cfg, &failing_provider);
+    // The summarizer returns an oversized summary, so the assembled view is
+    // no smaller than the source — a no-progress compaction. The doctrine
+    // (ENG-9651 follow-up): this must SKIP the compaction and let the turn
+    // proceed with the uncompacted history, never fail the turn.
+    // The first queued response feeds the compaction summarizer (oversized
+    // → no progress → skip); the second feeds the turn's own LLM call, which
+    // then completes against the uncompacted history.
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ok_response(&"z".repeat(20_000)),
+        ok_response("turn completed without compacting"),
+    ]));
+    let turn_provider: Arc<dyn LlmProvider> = provider.clone();
+    let deps = fixtures.deps_with_compaction(&cfg, &turn_provider);
 
     let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
-    let task_id = task.id.clone();
-    let first_inputs = build_root_worker_inputs(
-        sample_bootstrap(task.clone()),
-        &fixtures.threads,
-        &fixtures.checkpoints,
-        &fixtures.messages,
-        t0(),
-    )
-    .await?;
-    let failure = execute_root_turn(
-        first_inputs,
-        "trigger no progress",
-        failing_provider.as_ref(),
-        &deps,
-        t0() + Duration::seconds(1),
-    )
-    .await
-    .err()
-    .context("oversized summary should fail compaction")?;
-    assert!(
-        format!("{failure:#}").contains("Compaction made no progress"),
-        "unexpected compaction failure: {failure:#}",
-    );
-    assert_eq!(failing.calls(), 1);
-
-    let failed_attempts = fixtures.attempts.list_by_task(&task_id).await?;
-    assert_eq!(failed_attempts.len(), 1);
-    assert_eq!(
-        failed_attempts[0].outcome,
-        Some(TurnAttemptOutcome::ServerError),
-    );
-    assert_eq!(failed_attempts[0].input_tokens, Some(100));
-    assert_eq!(failed_attempts[0].output_tokens, Some(50));
-    assert_eq!(
-        fixtures
-            .messages
-            .get(&thread_id())
-            .await?
-            .context("projection after failed compaction")?
-            .compactions
-            .len(),
-        0,
-    );
-
-    let retry = Arc::new(ScriptedProvider::new(vec![ok_response("retry succeeded")]));
-    let retry_provider: Arc<dyn LlmProvider> = retry.clone();
-    let mut retry_deps = fixtures.deps_with_compaction(&cfg, &retry_provider);
-    retry_deps.compaction_config = None;
-    retry_deps.compaction_provider = None;
-    let retry_inputs = build_root_worker_inputs(
+    let inputs = build_root_worker_inputs(
         sample_bootstrap(task),
         &fixtures.threads,
         &fixtures.checkpoints,
@@ -1264,30 +1223,32 @@ async fn no_progress_compaction_usage_stays_on_failed_attempt_only() -> Result<(
         t0(),
     )
     .await?;
-    let retry_outcome = execute_root_turn(
-        retry_inputs,
+    let outcome = execute_root_turn(
+        inputs,
         "trigger no progress",
-        retry_provider.as_ref(),
-        &retry_deps,
-        t0() + Duration::seconds(2),
+        turn_provider.as_ref(),
+        &deps,
+        t0() + Duration::seconds(1),
     )
     .await?;
-    let RootTurnOutcome::Completed { commit, .. } = retry_outcome else {
-        panic!("retry should complete");
-    };
-    assert_eq!(
-        commit.thread.total_usage.input_tokens, 100,
-        "failed compaction usage belongs only to its attempt row",
-    );
-    assert_eq!(commit.thread.total_usage.output_tokens, 50);
 
-    let mut attempts = fixtures.attempts.list_by_task(&task_id).await?;
-    attempts.sort_by_key(|attempt| attempt.attempt_number);
-    assert_eq!(attempts.len(), 2);
-    assert_eq!(attempts[0].input_tokens, Some(100));
-    assert_eq!(attempts[0].output_tokens, Some(50));
-    assert_eq!(attempts[1].input_tokens, Some(100));
-    assert_eq!(attempts[1].output_tokens, Some(50));
+    // The turn COMPLETES — the no-progress compaction was skipped, not fatal.
+    let RootTurnOutcome::Completed { .. } = outcome else {
+        panic!("a no-progress compaction must not fail the turn: {outcome:?}");
+    };
+
+    // No compaction boundary was recorded.
+    assert_eq!(
+        fixtures
+            .messages
+            .get(&thread_id())
+            .await?
+            .context("projection after skipped compaction")?
+            .compactions
+            .len(),
+        0,
+        "a skipped compaction records no boundary",
+    );
     Ok(())
 }
 

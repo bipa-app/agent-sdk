@@ -416,6 +416,17 @@ fn is_tool_sequence_refusal(error: &anyhow::Error) -> bool {
         })
 }
 
+/// True when the compactor produced no token savings — the assembled view
+/// would be as large as the source. Benign: the turn proceeds with the
+/// uncompacted history. This can fire when the trigger's measured anchor
+/// overestimates the staged history (a resumed draft measured against a
+/// prior larger turn), so compaction runs on a history too small to shrink.
+fn is_no_progress(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<agent_sdk::context::NoProgressCompaction>()
+        .is_some()
+}
+
 /// fence inside that worker: no artifact batch is published after this arm
 /// wins, instead of the batch landing as an unreferenced orphan.
 async fn apply_compaction(
@@ -444,6 +455,14 @@ async fn apply_compaction(
         }
         Err(failure) => {
             deps.note_token_usage(&failure.llm_usage);
+            // A no-progress compaction is not an error: the assembled view
+            // would be as large as the source, so there is nothing useful
+            // to compact. Skip and let the provider call go out with the
+            // uncompacted history (matches the tool-sequence refusal).
+            if is_no_progress(&failure.error) {
+                log::info!("thread {thread_id}: compaction made no progress; skipping compaction");
+                return Ok(CompactionOutcome::not_run());
+            }
             return Err(CompactionFailure::from(failure)
                 .with_context("compactor.compact_history_with_usage failed"));
         }
@@ -593,5 +612,22 @@ mod tests {
         let (tokens, source) = trigger_tokens(None, 120_000);
         assert_eq!(tokens, 120_000);
         assert_eq!(source, "estimated_fallback");
+    }
+
+    #[test]
+    fn no_progress_compaction_is_classified_as_skippable() {
+        let no_progress = anyhow::Error::new(agent_sdk::context::NoProgressCompaction {
+            new_tokens: 20_066,
+            original_tokens: 20_052,
+        });
+        assert!(is_no_progress(&no_progress));
+
+        // A real error is not a no-progress skip.
+        let genuine = anyhow::anyhow!("provider stream failed");
+        assert!(!is_no_progress(&genuine));
+
+        // The marker survives anyhow context wrapping (downcast walks the chain).
+        let wrapped = no_progress.context("pre-call compaction");
+        assert!(is_no_progress(&wrapped));
     }
 }
