@@ -32,6 +32,7 @@
 //! dependency.
 
 pub mod migrations;
+pub mod repair_sweep;
 pub mod store;
 
 pub use store::SqliteDurableStore;
@@ -449,6 +450,7 @@ mod tests {
             "agent_sdk_execution_intents",
             "agent_sdk_tool_audit_events",
             "agent_sdk_idempotency",
+            "agent_sdk_applied_repairs",
         ]
         .into_iter()
         .map(String::from)
