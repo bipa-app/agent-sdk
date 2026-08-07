@@ -402,6 +402,20 @@ pub(crate) async fn compact_after_overflow(
 /// `spawn_blocking` worker it started keeps running detached. The callers
 /// wire the same [`RootTurnDeps::cancel`] token into the compactor via
 /// `with_cancellation`, so the already-tripped token doubles as a publish
+/// True when a failed `append_compaction` was refused for breaking the
+/// provider `tool_use`/`tool_result` sequence (ENG-9651) — the signal to skip
+/// the compaction rather than fail the turn.
+fn is_tool_sequence_refusal(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::journal::message::MessageProjectionError>()
+        .is_some_and(|projection_error| {
+            matches!(
+                projection_error,
+                crate::journal::message::MessageProjectionError::CompactionBreaksToolSequence { .. }
+            )
+        })
+}
+
 /// fence inside that worker: no artifact batch is published after this arm
 /// wins, instead of the batch landing as an unreferenced orphan.
 async fn apply_compaction(
@@ -448,7 +462,12 @@ async fn apply_compaction(
         });
     }
 
-    deps.message_store
+    // A boundary that would cut a tool_use/tool_result pair is refused by
+    // the storage layer (ENG-9651). That refusal must never fail the turn:
+    // the compaction is skipped and the provider call goes out with the
+    // uncompacted history.
+    let appended = deps
+        .message_store
         .append_compaction(
             thread_id,
             result.messages.clone(),
@@ -456,12 +475,19 @@ async fn apply_compaction(
             result.retained_count,
             now,
         )
-        .await
-        .context("append durable compaction entry")
-        .map_err(|error| CompactionFailure {
-            error,
+        .await;
+    if let Err(error) = appended {
+        if is_tool_sequence_refusal(&error) {
+            log::warn!(
+                "thread {thread_id}: compaction result broke the provider tool sequence; skipping compaction"
+            );
+            return Ok(CompactionOutcome::not_run());
+        }
+        return Err(CompactionFailure {
+            error: error.context("append durable compaction entry"),
             llm_usage: llm_usage.clone(),
-        })?;
+        });
+    }
 
     staged_messages
         .replace_history(thread_id, result.messages.clone())

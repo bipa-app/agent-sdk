@@ -1676,6 +1676,201 @@ pub fn balance_tool_results(messages: &[Message], cancel_text: &str) -> Vec<Mess
     out
 }
 
+/// Repair a `tool_use`/`tool_result` sequence in place.
+///
+/// Handles the compound corruptions the targeted passes (orphan backfill,
+/// duplicated-replay removal) cannot: duplicated `tool_use` ids, orphan
+/// `tool_result`s, and unanswered calls interleaved with later turns.
+/// Runs the provider-sequence checker to a fixed point — see
+/// `repair_violation_at` for the per-violation repairs. Each repair
+/// permanently eliminates its violation class at that index, so the loop
+/// converges; a defensive cap guards against a checker/repair disagreement
+/// oscillating forever.
+#[must_use]
+pub fn repair_tool_sequence_in_place(messages: &[Message], cancel_text: &str) -> Vec<Message> {
+    let mut out = messages.to_vec();
+    let max_iterations = messages.len().saturating_mul(2).saturating_add(16);
+    for _ in 0..max_iterations {
+        let Some(index) = provider_tool_sequence_error_index(&out) else {
+            return out;
+        };
+        repair_violation_at(&mut out, index, cancel_text);
+    }
+    out
+}
+
+fn repair_violation_at(messages: &mut Vec<Message>, index: usize, cancel_text: &str) {
+    let Some(message) = messages.get(index) else {
+        return;
+    };
+    let blocks = match &message.content {
+        Content::Text(_) => return,
+        Content::Blocks(blocks) => blocks,
+    };
+    let tool_use_ids: Vec<String> = blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+
+    if !tool_use_ids.is_empty() {
+        if message.role != Role::Assistant {
+            // A tool_use outside an assistant message can never be answered
+            // validly; drop those blocks.
+            if let Some(message) = messages.get_mut(index) {
+                strip_blocks(message, &tool_use_ids, BlockKind::Use);
+            }
+            return;
+        }
+        repair_use_message(messages, index, &tool_use_ids, cancel_text);
+        return;
+    }
+
+    // No tool_use at this index: the violation is a tool_result problem —
+    // orphan result (no preceding use), extra result, or wrong role.
+    let orphan_ids: Vec<String> = blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+            _ => None,
+        })
+        .collect();
+    if orphan_ids.is_empty() {
+        return;
+    }
+    if let Some(message) = messages.get_mut(index) {
+        strip_blocks(message, &orphan_ids, BlockKind::Result);
+    }
+}
+
+/// Repair an assistant message whose `tool_use`s fail the adjacency/pairing
+/// rule: answer every unanswered use (merged into the following user
+/// message when it carries results, else a fresh message right after), or,
+/// when the uses are already answered, drop replayed duplicates and the
+/// excess results that keep the counts unequal.
+fn repair_use_message(
+    messages: &mut Vec<Message>,
+    index: usize,
+    tool_use_ids: &[String],
+    cancel_text: &str,
+) {
+    let answered: std::collections::HashSet<String> = messages
+        .get(index + 1)
+        .map(|next| {
+            message_tool_result_ids(next)
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let missing: Vec<ContentBlock> = tool_use_ids
+        .iter()
+        .filter(|id| !answered.contains(*id))
+        .map(|id| ContentBlock::ToolResult {
+            tool_use_id: id.clone(),
+            content: cancel_text.to_owned(),
+            artifact: None,
+            is_error: Some(true),
+        })
+        .collect();
+    if !missing.is_empty() {
+        let next_has_results = messages
+            .get(index + 1)
+            .is_some_and(|next| !message_tool_result_ids(next).is_empty());
+        if next_has_results {
+            if let Some(next) = messages.get_mut(index + 1)
+                && let Content::Blocks(blocks) = &mut next.content
+            {
+                blocks.extend(missing);
+            }
+        } else {
+            messages.insert(index + 1, Message::user_with_content(missing));
+        }
+        return;
+    }
+
+    // All ids have results below but the checker still flags this index:
+    // either the results sit on a non-user message (insert a fresh user
+    // results message so the adjacency rule holds) or the id is duplicated
+    // (drop the later/replayed copies).
+    let next_is_user = messages
+        .get(index + 1)
+        .is_some_and(|next| next.role == Role::User);
+    if !next_is_user {
+        let synthetic: Vec<ContentBlock> = tool_use_ids
+            .iter()
+            .map(|id| ContentBlock::ToolResult {
+                tool_use_id: id.clone(),
+                content: cancel_text.to_owned(),
+                artifact: None,
+                is_error: Some(true),
+            })
+            .collect();
+        messages.insert(index + 1, Message::user_with_content(synthetic));
+        return;
+    }
+    let prior_use_ids: std::collections::HashSet<String> = messages[..index]
+        .iter()
+        .flat_map(message_tool_use_ids)
+        .map(str::to_owned)
+        .collect();
+    let surviving: Vec<String> = {
+        let mut seen = std::collections::HashSet::new();
+        tool_use_ids
+            .iter()
+            .filter(|id| !prior_use_ids.contains(*id) && seen.insert((*id).clone()))
+            .cloned()
+            .collect()
+    };
+    if let Some(next) = messages.get_mut(index + 1)
+        && let Content::Blocks(blocks) = &mut next.content
+    {
+        let mut emitted = std::collections::HashSet::new();
+        blocks.retain(|block| match block {
+            ContentBlock::ToolResult { tool_use_id, .. } => {
+                surviving.contains(tool_use_id) && emitted.insert(tool_use_id.clone())
+            }
+            _ => true,
+        });
+    }
+    if let Some(message) = messages.get_mut(index)
+        && let Content::Blocks(blocks) = &mut message.content
+    {
+        let mut kept = std::collections::HashSet::new();
+        blocks.retain(|block| match block {
+            ContentBlock::ToolUse { id, .. } => surviving.contains(id) && kept.insert(id.clone()),
+            _ => true,
+        });
+        if blocks.is_empty() {
+            message.content = Content::Text(String::new());
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BlockKind {
+    Use,
+    Result,
+}
+
+fn strip_blocks(message: &mut Message, ids: &[String], kind: BlockKind) {
+    if let Content::Blocks(blocks) = &mut message.content {
+        blocks.retain(|block| {
+            let id = match (kind, block) {
+                (BlockKind::Use, ContentBlock::ToolUse { id, .. }) => id,
+                (BlockKind::Result, ContentBlock::ToolResult { tool_use_id, .. }) => tool_use_id,
+                _ => return true,
+            };
+            !ids.contains(id)
+        });
+        if blocks.is_empty() {
+            message.content = Content::Text(String::new());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2737,5 +2932,74 @@ mod tests {
         ];
 
         assert_eq!(provider_tool_sequence_error_index(&messages), Some(0));
+    }
+
+    /// ENG-9651: the compound corruption the targeted passes cannot fix —
+    /// a cancelled confirmation's unanswered `tool_use` mid-history, a
+    /// duplicated suspended prefix, and an orphan result — repairs in place
+    /// to a provider-valid sequence.
+    #[test]
+    fn in_place_repairs_compound_corruption() {
+        let messages = vec![
+            Message::user("start"),
+            assistant_tool_uses(&["a"]),
+            Message::user("unrelated text"),
+            Message::user("start"),
+            assistant_tool_uses(&["a"]),
+            tool_results(&["a", "ghost"]),
+            Message::user("tail"),
+        ];
+
+        assert!(!is_provider_valid_tool_sequence(&messages));
+        let repaired = repair_tool_sequence_in_place(&messages, "cancelled");
+        assert!(
+            is_provider_valid_tool_sequence(&repaired),
+            "in-place repair must produce a provider-valid sequence"
+        );
+    }
+
+    #[test]
+    fn in_place_answers_a_dangling_use_between_turns() {
+        let messages = vec![
+            Message::user("do it"),
+            assistant_tool_uses(&["plan-apply-1"]),
+            Message::user("next prompt"),
+            Message::assistant("ok"),
+        ];
+        let repaired = repair_tool_sequence_in_place(&messages, "cancelled");
+        assert!(is_provider_valid_tool_sequence(&repaired));
+        let Content::Blocks(blocks) = &repaired[2].content else {
+            panic!("the synthetic results message carries content blocks");
+        };
+        assert!(
+            blocks
+                .iter()
+                .all(|block| matches!(block, ContentBlock::ToolResult { .. })),
+            "the synthetic results message carries only tool results"
+        );
+    }
+
+    #[test]
+    fn in_place_drops_orphan_results_and_duplicate_uses() {
+        let messages = vec![
+            assistant_tool_uses(&["x", "x"]),
+            tool_results(&["x", "x"]),
+            tool_results(&["y"]),
+            Message::assistant("done"),
+        ];
+        let repaired = repair_tool_sequence_in_place(&messages, "cancelled");
+        assert!(is_provider_valid_tool_sequence(&repaired));
+    }
+
+    #[test]
+    fn in_place_is_a_noop_on_valid_history() {
+        let messages = vec![
+            Message::user("q"),
+            assistant_tool_uses(&["x"]),
+            tool_results(&["x"]),
+            Message::assistant("done"),
+        ];
+        let repaired = repair_tool_sequence_in_place(&messages, "cancelled");
+        assert_eq!(repaired, messages);
     }
 }
