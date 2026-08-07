@@ -6,6 +6,8 @@
 //!   ENG9651_VERIFY_DB=/path/to/agent-runtime.sqlite3 \
 //!     cargo test -p agent-service-host --all-features --test `repair_sweep_live` -- --ignored --nocapture
 
+#![cfg(feature = "sqlite")]
+
 use anyhow::{Context, Result};
 
 use agent_sdk_foundation::llm;
