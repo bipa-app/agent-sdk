@@ -1452,7 +1452,6 @@ fn all_answered_tool_use_ids(messages: &[Message]) -> std::collections::HashSet<
 /// not match the preceding assistant call are rejected.
 #[must_use]
 pub fn provider_tool_sequence_error_index(messages: &[Message]) -> Option<usize> {
-    let mut seen_tool_uses = std::collections::HashSet::new();
     let mut seen_tool_results = std::collections::HashSet::new();
 
     for (index, message) in messages.iter().enumerate() {
@@ -1463,9 +1462,15 @@ pub fn provider_tool_sequence_error_index(messages: &[Message]) -> Option<usize>
         let mut tool_use_count = 0;
 
         for block in blocks {
-            if let ContentBlock::ToolUse { id, .. } = block {
+            if let ContentBlock::ToolUse { .. } = block {
                 tool_use_count += 1;
-                if message.role != Role::Assistant || !seen_tool_uses.insert(id.as_str()) {
+                // The provider contract rejects a tool_use on a non-assistant
+                // message. It does NOT reject a duplicated tool_use id (a
+                // suspended-turn replay legitimately re-emits one) — and a
+                // repair that "fixes" a duplicate by editing a signed
+                // thinking-bearing message violates the signature rule the
+                // provider DOES enforce (ENG-9651).
+                if message.role != Role::Assistant {
                     return Some(index);
                 }
             }
@@ -1849,6 +1854,25 @@ fn repair_use_message(
     }
 }
 
+/// True when the message carries signature-bound reasoning blocks
+/// (`thinking` / `redacted_thinking` / opaque provider reasoning). The
+/// provider rejects any in-place edit of such a message ("thinking blocks
+/// cannot be modified") — repairs may only remove the message wholesale or
+/// insert around it, never strip its blocks (ENG-9651).
+fn message_is_signature_bound(message: &Message) -> bool {
+    match &message.content {
+        Content::Text(_) => false,
+        Content::Blocks(blocks) => blocks.iter().any(|block| {
+            matches!(
+                block,
+                ContentBlock::Thinking { .. }
+                    | ContentBlock::RedactedThinking { .. }
+                    | ContentBlock::OpaqueReasoning { .. }
+            )
+        }),
+    }
+}
+
 #[derive(Clone, Copy)]
 enum BlockKind {
     Use,
@@ -1856,6 +1880,11 @@ enum BlockKind {
 }
 
 fn strip_blocks(message: &mut Message, ids: &[String], kind: BlockKind) {
+    if message_is_signature_bound(message) {
+        // Never edit a signed message in place; the violation it carries is
+        // resolved by insertion around it or wholesale removal elsewhere.
+        return;
+    }
     if let Content::Blocks(blocks) = &mut message.content {
         blocks.retain(|block| {
             let id = match (kind, block) {
@@ -2989,6 +3018,41 @@ mod tests {
         ];
         let repaired = repair_tool_sequence_in_place(&messages, "cancelled");
         assert!(is_provider_valid_tool_sequence(&repaired));
+    }
+
+    /// ENG-9651: a duplicated `tool_use` id inside a thinking-bearing
+    /// assistant message must survive repair byte-for-byte — the provider
+    /// rejects any in-place edit of a signed block, so repair works around
+    /// it (insertion), never through it.
+    #[test]
+    fn in_place_never_edits_a_signature_bound_message() {
+        let signed = Message::assistant_with_content(vec![
+            ContentBlock::Thinking {
+                thinking: "reasoning".to_string(),
+                signature: Some("sig-abc".to_string()),
+            },
+            ContentBlock::ToolUse {
+                id: "dup".to_string(),
+                name: "read".to_string(),
+                input: serde_json::json!({}),
+                thought_signature: None,
+            },
+        ]);
+        let messages = vec![
+            Message::user("q"),
+            signed.clone(),
+            Message::user("unanswered"),
+        ];
+        let repaired = repair_tool_sequence_in_place(&messages, "cancelled");
+        assert!(is_provider_valid_tool_sequence(&repaired));
+        let still_signed = repaired
+            .iter()
+            .find(|message| message.role == Role::Assistant)
+            .expect("the signed assistant message survives");
+        assert_eq!(
+            still_signed, &signed,
+            "the signed message is byte-identical after repair"
+        );
     }
 
     #[test]
