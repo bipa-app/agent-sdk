@@ -2874,7 +2874,10 @@ async fn repair_provider_tool_history(
         .context("read staged history for provider repair")?;
     let has_unanswered_tool_use = llm::has_unbalanced_tool_use(&history);
     if !has_unanswered_tool_use && llm::provider_tool_sequence_error_index(&history).is_none() {
-        return Ok(());
+        // The raw history is clean — but the provider call is built from
+        // the compaction-selected projection, which the raw check cannot
+        // see (ENG-9651). Validate that view before declaring no repair.
+        return repair_provider_projection(deps, staged_messages, thread_id, now).await;
     }
 
     let mut repaired = history.clone();
@@ -2926,6 +2929,62 @@ async fn repair_provider_tool_history(
         .await
         .context("replace staged buffer with provider-valid history")?;
 
+    // The staged repair rewrites the raw history; the compaction-selected
+    // projection the provider actually receives must be validated after
+    // that write, not before (ENG-9651).
+    repair_provider_projection(deps, staged_messages, thread_id, now).await
+}
+
+/// Validate the projection the provider actually sees and repair it in
+/// place when it is broken (ENG-9651).
+///
+/// The raw-history repair above cannot see corruption introduced by a
+/// compaction entry: the provider call is built from `context_history()`
+/// (the last entry's replacements + the retained raw tail), so a
+/// pair-cutting boundary bricks the thread while every staged-history
+/// check passes. When the effective view is invalid, repair it in place
+/// and persist the provider-valid view through the same atomic
+/// append-repair seam — reloading the thread then loads the repair, so the
+/// poison cannot return.
+async fn repair_provider_projection(
+    deps: &RootTurnDeps<'_>,
+    staged_messages: &crate::journal::staged::StagedMessageStore,
+    thread_id: &agent_sdk_foundation::ThreadId,
+    now: OffsetDateTime,
+) -> Result<()> {
+    let Some(projection) = deps
+        .message_store
+        .get(thread_id)
+        .await
+        .context("read projection for provider repair")?
+    else {
+        return Ok(());
+    };
+    let effective = projection.context_history();
+    if llm::is_provider_valid_tool_sequence(&effective) {
+        return Ok(());
+    }
+    let repaired = llm::repair_tool_sequence_in_place(&effective, llm::USER_CANCELLED_TOOL_RESULT);
+    debug_assert!(
+        llm::is_provider_valid_tool_sequence(&repaired),
+        "thread {thread_id}: projection repair must converge to a provider-valid sequence"
+    );
+    log::warn!("thread {thread_id}: repairing the compacted projection's tool sequence");
+    let source_message_count = effective.len() + projection.draft_messages.len();
+    deps.message_store
+        .append_repair(
+            thread_id,
+            vec![llm::Message::user(IN_PLACE_SEQUENCE_REPAIR)],
+            repaired.clone(),
+            source_message_count,
+            now,
+        )
+        .await
+        .context("persist provider-valid projection repair")?;
+    staged_messages
+        .replace_history(thread_id, repaired)
+        .await
+        .context("replace staged buffer with repaired projection")?;
     Ok(())
 }
 
