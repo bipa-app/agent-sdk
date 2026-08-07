@@ -660,10 +660,10 @@ async fn fail_root_turn_inner(
 /// [`AgentTaskStore::cancel_tree`] to atomically cancel the
 /// root task and any live descendant tasks (e.g. `tool_runtime` children
 /// spawned during suspension). `cancel_tree` clears each row's
-/// `TaskState` to `None`; the durable message-projection draft slot
-/// survives, so a re-seeded suffix (the dropped trailing
-/// `assistant + tool_use`) is closed by the next turn's
-/// `repair_provider_tool_history`.
+/// `TaskState` to `None`; a trailing unresulted `assistant + tool_use`
+/// is closed at the cancel commit itself (`commit_partial_turn_on_cancel`
+/// splits and closes it with cancelled results — nothing dangles past the
+/// cancel).
 ///
 /// The terminal [`AgentEvent::Cancelled`] marker is committed by
 /// [`AgentTaskStore::cancel_tree`] itself, atomically with the
@@ -1082,10 +1082,21 @@ pub(crate) async fn commit_partial_turn_on_cancel(
     } = params;
 
     let (prefix, suffix) = provider_valid_split(candidate);
-    if prefix.is_empty() {
-        // Nothing provider-valid to commit. Strict no-op: no attempt row,
+
+    // Split-and-close, not split-and-drop (ENG-9651): the suffix's dangling
+    // `tool_use` (the tool the user cancelled mid-flight, or one parked on
+    // a confirmation) is committed WITH its cancelled result, so the
+    // journal is balanced the moment the turn stops and nothing is left
+    // for a later pass to clean up. The closure only inserts a synthetic
+    // user message — signed thinking-bearing assistant messages are never
+    // edited.
+    let closed_suffix =
+        llm::repair_tool_sequence_in_place(&suffix, llm::USER_CANCELLED_TOOL_RESULT);
+    let committed = [prefix, closed_suffix].concat();
+    if committed.is_empty() {
+        // Nothing to commit. Strict no-op: no attempt row,
         // no thread mutation.
-        return Ok(suffix);
+        return Ok(Vec::new());
     }
 
     // Cheap pre-check; the in-transaction CAS below is the authority.
@@ -1152,7 +1163,7 @@ pub(crate) async fn commit_partial_turn_on_cancel(
                 thinking_budget_tokens: None,
                 thinking_effort: None,
             },
-            messages: prefix,
+            messages: committed,
             // Zero for the same reason: `turn_usage` advances the
             // thread's aggregate token totals, which never included
             // uncommitted turns — the measured usage stays on the
@@ -1203,7 +1214,9 @@ pub(crate) async fn commit_partial_turn_on_cancel(
         return Err(error.context("commit partial turn on cancel"));
     }
 
-    Ok(suffix)
+    // The suffix was committed closed — nothing is left dangling, so the
+    // caller's draft re-seed (`if !suffix.is_empty()`) skips naturally.
+    Ok(Vec::new())
 }
 
 /// Best snapshot of the agent state for a cancelled turn's checkpoint:
@@ -1376,12 +1389,9 @@ async fn best_effort_commit_parked_cancel(
         }
     };
 
-    // Re-seed the draft with the dropped trailing `assistant + tool_use`
-    // (the commit cleared the slot in-transaction). The next turn's
-    // `repair_provider_tool_history` closes it with
-    // `USER_CANCELLED_TOOL_RESULT` without duplicating the committed
-    // prefix. Best-effort — a crash here loses only that trailing
-    // message, strictly better than today.
+    // The cancel commit closes the dangling suffix in place (a cancelled
+    // tool_use gets its cancelled result committed with it), so it returns
+    // empty and this guard never fires. Kept as a defensive no-op.
     if !suffix.is_empty()
         && let Err(error) = deps
             .message_store
@@ -1768,22 +1778,14 @@ async fn execute_root_turn_inner(
     deps.event_notifier
         .notify(std::slice::from_ref(&start_committed));
 
-    // 2.4 Backfill any tool_use loop the prior turn left open.
-    //
-    //     A fresh root turn executes only after the previous root turn
-    //     on this thread is terminal (`promote_next_root` serialises one
-    //     root turn per thread), so nothing is legitimately awaiting a
-    //     tool result here. `recover_thread` preserves the raw suspension
-    //     draft verbatim, which may end in an assistant `tool_use` whose
-    //     `tool_result`s never landed — the user answered one question
-    //     and cancelled the rest, or the prior turn was cancelled. Those
-    //     unanswered `tool_use` blocks are abandoned and are closed
-    //     durably now (not patched into the outgoing request), so an
-    //     orphaned `tool_use` can never reach a provider and the thread
-    //     is balanced the moment it is next loaded.
-    repair_provider_tool_history(deps, &inputs.staged_stores.messages, thread_id, now)
-        .await
-        .context("pre-call provider tool history repair")?;
+    // 2.4 (removed) — the pre-call history repair pass was deleted: repair
+    //     in the turn path is monkey-patching at runtime, and it produced
+    //     its own bugs (a repair that edited a signed thinking-bearing
+    //     message was rejected by the provider). Invalid states are
+    //     prevented at the write seams — the cancel path closes started
+    //     tool calls, the compaction storage seam refuses pair-cutting
+    //     boundaries — and legacy-corrupted threads are repaired by an
+    //     offline migration, never by the turn path (ENG-9651).
 
     // 2.5 Pre-call auto-compaction.
     //
@@ -2825,167 +2827,6 @@ async fn build_chat_request(
         response_format: None,
         cache: None,
     })
-}
-
-const DUPLICATED_RESUME_REPAIR: &str =
-    "[SDK_PROVIDER_HISTORY_REPAIR_V1]\nRemoved one exact duplicated suspended-message replay.";
-
-const IN_PLACE_SEQUENCE_REPAIR: &str = "[SDK_PROVIDER_HISTORY_REPAIR_V1]\nRepaired a compound tool_use/tool_result corruption in place (dangling uses answered with cancelled results, orphan results dropped, duplicated replay uses removed).";
-
-fn remove_duplicated_resume_replay(history: &[llm::Message]) -> Option<Vec<llm::Message>> {
-    let invalid_index = llm::provider_tool_sequence_error_index(history)?;
-    let second_start = invalid_index.checked_add(1)?;
-
-    for width in 1..=second_start {
-        let second_end = second_start.checked_add(width)?;
-        if second_end > history.len() {
-            break;
-        }
-        let first_start = second_start - width;
-        if history[first_start..second_start] != history[second_start..second_end] {
-            continue;
-        }
-
-        let mut repaired = Vec::with_capacity(history.len() - width);
-        repaired.extend_from_slice(&history[..second_start]);
-        repaired.extend_from_slice(&history[second_end..]);
-        if llm::is_provider_valid_tool_sequence(&repaired) {
-            return Some(repaired);
-        }
-    }
-
-    None
-}
-
-/// Repair globally unanswered calls and the exact duplicated suspended-message
-/// replay written by pre-fix `AnsweredQuestion` resumes.
-///
-/// Raw repair evidence and the provider-valid effective projection are
-/// persisted atomically, so reloading the thread cannot restore the poison.
-async fn repair_provider_tool_history(
-    deps: &RootTurnDeps<'_>,
-    staged_messages: &crate::journal::staged::StagedMessageStore,
-    thread_id: &agent_sdk_foundation::ThreadId,
-    now: OffsetDateTime,
-) -> Result<()> {
-    let history = staged_messages
-        .get_history(thread_id)
-        .await
-        .context("read staged history for provider repair")?;
-    let has_unanswered_tool_use = llm::has_unbalanced_tool_use(&history);
-    if !has_unanswered_tool_use && llm::provider_tool_sequence_error_index(&history).is_none() {
-        // The raw history is clean — but the provider call is built from
-        // the compaction-selected projection, which the raw check cannot
-        // see (ENG-9651). Validate that view before declaring no repair.
-        return repair_provider_projection(deps, staged_messages, thread_id, now).await;
-    }
-
-    let mut repaired = history.clone();
-    let mut repair_evidence = Vec::new();
-    if has_unanswered_tool_use {
-        let repair_message =
-            llm::orphaned_tool_result_message(&repaired, llm::USER_CANCELLED_TOOL_RESULT)
-                .context("orphan backfill produced no synthetic repair message")?;
-        repaired = llm::balance_tool_results(&repaired, llm::USER_CANCELLED_TOOL_RESULT);
-        repair_evidence.push(repair_message);
-        log::warn!("thread {thread_id}: closing unanswered tool_use blocks with cancelled results");
-    }
-
-    if let Some(index) = llm::provider_tool_sequence_error_index(&repaired) {
-        if let Some(deduped) = remove_duplicated_resume_replay(&repaired) {
-            repaired = deduped;
-            repair_evidence.push(llm::Message::user(DUPLICATED_RESUME_REPAIR));
-            log::warn!("thread {thread_id}: removing duplicated suspended-message replay");
-        } else {
-            // Compound corruption (a cancelled confirmation's dangling
-            // tool_use interleaved with replay duplication, orphan
-            // results, cross-message duplicate ids) matches neither
-            // targeted arm. The general in-place pass repairs each
-            // violation the checker reports to a fixed point; refusing
-            // here bricks the thread for good (ENG-9651).
-            repaired =
-                llm::repair_tool_sequence_in_place(&repaired, llm::USER_CANCELLED_TOOL_RESULT);
-            repair_evidence.push(llm::Message::user(IN_PLACE_SEQUENCE_REPAIR));
-            log::warn!("thread {thread_id}: repairing the tool sequence in place (index {index})");
-        }
-        debug_assert!(
-            llm::is_provider_valid_tool_sequence(&repaired),
-            "thread {thread_id}: in-place repair must converge to a provider-valid sequence"
-        );
-    }
-
-    deps.message_store
-        .append_repair(
-            thread_id,
-            repair_evidence,
-            repaired.clone(),
-            history.len(),
-            now,
-        )
-        .await
-        .context("persist provider-valid append-only repair")?;
-    staged_messages
-        .replace_history(thread_id, repaired)
-        .await
-        .context("replace staged buffer with provider-valid history")?;
-
-    // The staged repair rewrites the raw history; the compaction-selected
-    // projection the provider actually receives must be validated after
-    // that write, not before (ENG-9651).
-    repair_provider_projection(deps, staged_messages, thread_id, now).await
-}
-
-/// Validate the projection the provider actually sees and repair it in
-/// place when it is broken (ENG-9651).
-///
-/// The raw-history repair above cannot see corruption introduced by a
-/// compaction entry: the provider call is built from `context_history()`
-/// (the last entry's replacements + the retained raw tail), so a
-/// pair-cutting boundary bricks the thread while every staged-history
-/// check passes. When the effective view is invalid, repair it in place
-/// and persist the provider-valid view through the same atomic
-/// append-repair seam — reloading the thread then loads the repair, so the
-/// poison cannot return.
-async fn repair_provider_projection(
-    deps: &RootTurnDeps<'_>,
-    staged_messages: &crate::journal::staged::StagedMessageStore,
-    thread_id: &agent_sdk_foundation::ThreadId,
-    now: OffsetDateTime,
-) -> Result<()> {
-    let Some(projection) = deps
-        .message_store
-        .get(thread_id)
-        .await
-        .context("read projection for provider repair")?
-    else {
-        return Ok(());
-    };
-    let effective = projection.context_history();
-    if llm::is_provider_valid_tool_sequence(&effective) {
-        return Ok(());
-    }
-    let repaired = llm::repair_tool_sequence_in_place(&effective, llm::USER_CANCELLED_TOOL_RESULT);
-    debug_assert!(
-        llm::is_provider_valid_tool_sequence(&repaired),
-        "thread {thread_id}: projection repair must converge to a provider-valid sequence"
-    );
-    log::warn!("thread {thread_id}: repairing the compacted projection's tool sequence");
-    let source_message_count = effective.len() + projection.draft_messages.len();
-    deps.message_store
-        .append_repair(
-            thread_id,
-            vec![llm::Message::user(IN_PLACE_SEQUENCE_REPAIR)],
-            repaired.clone(),
-            source_message_count,
-            now,
-        )
-        .await
-        .context("persist provider-valid projection repair")?;
-    staged_messages
-        .replace_history(thread_id, repaired)
-        .await
-        .context("replace staged buffer with repaired projection")?;
-    Ok(())
 }
 
 /// Maximum retries for a transient LLM stream `ServerError`.  After

@@ -101,11 +101,15 @@ const APPEND_ONLY_COMPACTIONS_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/sqlite/0020_append_only_compactions.sql"
 ));
+const APPLIED_REPAIRS_LEDGER_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/sqlite/0021_applied_repairs_ledger.sql"
+));
 
 /// `sqlx`-managed migration bundle for the `SQLite` durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/sqlite");
 
-const MIGRATIONS: [SqliteMigration; 19] = [
+const MIGRATIONS: [SqliteMigration; 20] = [
     SqliteMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -200,6 +204,11 @@ const MIGRATIONS: [SqliteMigration; 19] = [
         version: "0020",
         summary: "append-only compaction entries on message heads",
         sql: APPEND_ONLY_COMPACTIONS_SQL,
+    },
+    SqliteMigration {
+        version: "0021",
+        summary: "one-shot data-repair ledger for the startup history-repair sweep",
+        sql: APPLIED_REPAIRS_LEDGER_SQL,
     },
 ];
 

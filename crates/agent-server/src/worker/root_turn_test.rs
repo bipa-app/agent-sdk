@@ -3231,20 +3231,28 @@ async fn cancel_suspended_turn_cancels_children() -> Result<()> {
     }
 
     // The completed prefix of the cancelled turn is committed before the
-    // subtree is torn down. The suspension draft was
-    // `[user, assistant+tool_use]`; its largest provider-valid prefix is
-    // the bare user prompt, which commits as turn 1. The trailing
-    // (unresulted) assistant tool_use is dropped from the commit and
-    // re-seeded as the draft so the next turn's backfill can close it.
+    // subtree is torn down, and the cancelled tool call is committed WITH
+    // its cancelled result (ENG-9651): the suspension draft was
+    // `[user, assistant+tool_use]`; the commit is prefix + closed suffix —
+    // nothing is dropped, nothing dangles, and no draft is re-seeded for a
+    // later pass to repair.
     let thread = stores.threads.get(&thread_a()).await?.context("thread")?;
     assert_eq!(thread.committed_turns, 1);
 
     let committed = stores.messages.get_history(&thread_a()).await?;
-    assert_eq!(committed.len(), 1, "only the provider-valid prefix commits");
+    assert_eq!(
+        committed.len(),
+        3,
+        "user prompt + cancelled tool_use + its cancelled result all commit"
+    );
     assert_eq!(
         committed[0].role,
         agent_sdk_foundation::llm::Role::User,
         "the committed prefix is the user prompt",
+    );
+    assert!(
+        agent_sdk_foundation::llm::is_provider_valid_tool_sequence(&committed),
+        "the committed history is provider-valid on the spot",
     );
 
     // Exactly one checkpoint at turn 1.
@@ -3253,15 +3261,14 @@ async fn cancel_suspended_turn_cancels_children() -> Result<()> {
         1,
     );
 
-    // The dropped trailing assistant tool_use survives as the re-seeded
-    // draft.
+    // Nothing dangles: the cancelled tool call committed its cancelled
+    // result, so there is no re-seeded draft to close later.
     let projection = stores
         .messages
         .get(&thread_a())
         .await?
         .context("projection")?;
-    assert!(projection.has_draft());
-    assert_eq!(projection.draft_messages.len(), 1);
+    assert!(!projection.has_draft());
 
     Ok(())
 }
@@ -5715,48 +5722,21 @@ impl LlmProvider for CapturingProvider {
     }
 }
 
-/// Collect the `tool_use_id`s closed by a synthetic "User cancelled"
-/// error result across a message list.
-fn cancelled_result_ids(messages: &[agent_sdk_foundation::llm::Message]) -> Vec<&str> {
-    use agent_sdk_foundation::llm::{Content, USER_CANCELLED_TOOL_RESULT};
-    let mut ids = Vec::new();
-    for message in messages {
-        if let Content::Blocks(blocks) = &message.content {
-            for block in blocks {
-                if let ContentBlock::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error: Some(true),
-                    ..
-                } = block
-                    && content == USER_CANCELLED_TOOL_RESULT
-                {
-                    ids.push(tool_use_id.as_str());
-                }
-            }
-        }
-    }
-    ids
-}
-
-/// Regression for the exact screenshot 400: a prior turn asked several
-/// questions (an assistant `tool_use` turn was persisted to the
-/// suspension draft) and was then abandoned/cancelled, leaving the draft
-/// unanswered. When the user types a fresh follow-up, the next root turn
-/// must NOT ship that orphaned `tool_use` to the provider — the worker
-/// backfills "User cancelled" results durably before the request is built,
-/// so the conversation continues instead of failing the provider's
-/// `tool_use`/`tool_result` pairing check.
+/// A draft written by a pre-fix build (an abandoned/cancelled turn's
+/// unanswered tool calls) must fail the next turn fast and loud — the turn
+/// path never silently repairs legacy corruption; the offline migration
+/// owns that (ENG-9651).
 #[tokio::test]
-async fn fresh_turn_backfills_orphaned_tool_use_durably() -> Result<()> {
-    use agent_sdk_foundation::llm::{self, Message};
+async fn fresh_turn_fails_fast_on_legacy_orphaned_tool_use() -> Result<()> {
+    use agent_sdk_foundation::llm::Message;
 
     let stores = TestStores::new();
     let thread = thread_a();
 
-    // A prior turn's suspension left an assistant turn with four unanswered
-    // questions in the durable draft (committed_turns is still 0 — it never
-    // completed).
+    // A draft written by a pre-fix build: an assistant turn with four
+    // unanswered tool calls. The turn path must NOT silently repair it —
+    // legacy corruption is fixed by the offline migration, so the turn
+    // fails fast and loud instead (ENG-9651).
     let ask = |id: &str| ContentBlock::ToolUse {
         id: id.to_string(),
         name: "ask_user".to_string(),
@@ -5775,7 +5755,6 @@ async fn fresh_turn_backfills_orphaned_tool_use_durably() -> Result<()> {
         )
         .await?;
 
-    // A fresh root turn carrying the user's follow-up.
     let task = create_and_acquire_task(&stores.tasks, &thread).await?;
     let bootstrap = sample_bootstrap(task);
     let inputs = build_root_worker_inputs(
@@ -5788,53 +5767,21 @@ async fn fresh_turn_backfills_orphaned_tool_use_durably() -> Result<()> {
     .await?;
 
     let provider = CapturingProvider::new();
-    let outcome = execute_root_turn(
-        inputs,
-        "I only received one of the questions",
-        &provider,
-        &stores.deps(),
-        t_plus(5),
-    )
-    .await
-    .context("execute_root_turn")?;
-    assert!(matches!(outcome, RootTurnOutcome::Completed { .. }));
-
-    // The request actually handed to the provider is balanced — the four
-    // unanswered questions are closed with "User cancelled" results.
-    let request_messages = provider.captured()?;
+    let error = execute_root_turn(inputs, "follow-up", &provider, &stores.deps(), t_plus(5))
+        .await
+        .expect_err("a legacy-corrupted draft must fail fast, not be silently repaired");
     assert!(
-        !llm::has_unbalanced_tool_use(&request_messages),
-        "request handed to the provider must be balanced",
+        format!("{error:#}").contains("invalid tool_use/tool_result sequence"),
+        "the failure names the invariant: {error:#}",
     );
-    assert_eq!(
-        cancelled_result_ids(&request_messages),
-        vec!["q1", "q2", "q3", "q4"],
-        "every unanswered question is closed with a cancelled result",
-    );
-
-    // The repair is durable, not a transient patch: the projection draft is
-    // cleared and the committed history is balanced, so the next load is
-    // clean without re-synthesizing.
-    let durable = stores.messages.get_history(&thread).await?;
-    assert!(
-        !llm::has_unbalanced_tool_use(&durable),
-        "durable projection history must be balanced after the turn",
-    );
-    let projection = stores
-        .messages
-        .get(&thread)
-        .await?
-        .context("projection exists")?;
-    assert!(
-        !projection.has_draft(),
-        "the orphaned draft must be cleared, not left dangling",
-    );
-
+    // The turn died before the provider call — the invalid sequence never
+    // shipped. (No `provider.captured()` here: that helper itself errors
+    // when the provider was never called, which is the point.)
     Ok(())
 }
 
 #[tokio::test]
-async fn fresh_turn_repairs_duplicated_question_resume_durably() -> Result<()> {
+async fn fresh_turn_fails_fast_on_legacy_duplicated_resume() -> Result<()> {
     use agent_sdk_foundation::llm::{self, Message};
 
     let stores = TestStores::new();
@@ -5865,37 +5812,13 @@ async fn fresh_turn_repairs_duplicated_question_resume_durably() -> Result<()> {
     )
     .await?;
     let provider = CapturingProvider::new();
-    let outcome = execute_root_turn(
-        inputs,
-        "Continue after the answer",
-        &provider,
-        &stores.deps(),
-        t_plus(5),
-    )
-    .await?;
-    assert!(matches!(outcome, RootTurnOutcome::Completed { .. }));
-
-    let request_messages = provider.captured()?;
-    assert!(llm::is_provider_valid_tool_sequence(&request_messages));
-    assert_eq!(request_messages.len(), 4);
-    assert_eq!(
-        serde_json::to_value(&request_messages[..2])?,
-        serde_json::to_value(&suspended)?,
-        "the suspended prefix must survive exactly once",
+    let error = execute_root_turn(inputs, "Continue", &provider, &stores.deps(), t_plus(5))
+        .await
+        .expect_err("a legacy duplicated resume must fail fast, not be silently repaired");
+    assert!(
+        format!("{error:#}").contains("invalid tool_use/tool_result sequence"),
+        "the failure names the invariant: {error:#}",
     );
-    assert_eq!(
-        serde_json::to_value(&request_messages[2])?,
-        serde_json::to_value(answer)?,
-    );
-
-    let durable = stores.messages.get_history(&thread).await?;
-    assert!(llm::is_provider_valid_tool_sequence(&durable));
-    let projection = stores
-        .messages
-        .get(&thread)
-        .await?
-        .context("projection exists")?;
-    assert!(!projection.has_draft());
     Ok(())
 }
 
@@ -7483,7 +7406,7 @@ async fn partial_commit_empty_candidate_is_a_strict_no_op() -> Result<()> {
 }
 
 #[tokio::test]
-async fn partial_commit_unbalanced_candidate_commits_prefix_returns_suffix() -> Result<()> {
+async fn partial_commit_unbalanced_candidate_closes_and_commits_the_dangling_use() -> Result<()> {
     let stores = TestStores::new();
     stores.threads.get_or_create(&thread_a(), t0()).await?;
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
@@ -7510,12 +7433,23 @@ async fn partial_commit_unbalanced_candidate_commits_prefix_returns_suffix() -> 
     )
     .await?;
 
-    // The user prompt committed; the tool_use came back as suffix.
-    assert_eq!(suffix.len(), 1);
-    assert_eq!(suffix[0].role, Role::Assistant);
+    // Nothing comes back dangling (ENG-9651): the cancelled tool call
+    // committed with its cancelled result, so the suffix is empty and the
+    // committed history is provider-valid on the spot.
+    assert!(
+        suffix.is_empty(),
+        "a closed suffix commits; nothing dangles"
+    );
     let committed = stores.messages.get_history(&thread_a()).await?;
-    assert_eq!(committed.len(), 1);
-    assert_eq!(committed[0].role, Role::User);
+    assert_eq!(committed.len(), 3, "prompt + cancelled call + its result");
+    assert!(agent_sdk_foundation::llm::is_provider_valid_tool_sequence(
+        &committed
+    ));
+    assert_eq!(
+        committed[2].role,
+        Role::User,
+        "the cancelled result closes the pair"
+    );
     let thread = stores.threads.get(&thread_a()).await?.context("thread")?;
     assert_eq!(thread.committed_turns, 1);
     // Usage is not double-billed onto the thread aggregate.
@@ -7826,7 +7760,7 @@ fn has_tool_result_for(message: &agent_sdk_foundation::llm::Message, tool_use_id
 // ── Seam A: parked WaitingOnChildren cancel + next-turn backfill ─────
 
 #[tokio::test]
-async fn parked_cancel_commits_prefix_and_next_turn_backfill_closes_without_dup() -> Result<()> {
+async fn parked_cancel_commits_the_closed_suffix_and_needs_no_backfill() -> Result<()> {
     let stores = TestStores::new();
     let provider =
         MockToolCallProvider::single("call_a", "bash", serde_json::json!({"command": "ls"}));
@@ -7842,34 +7776,33 @@ async fn parked_cancel_commits_prefix_and_next_turn_backfill_closes_without_dup(
         t0(),
     )
     .await?;
-
-    // Suspend at a tool boundary → parent WaitingOnChildren, draft =
-    // [user, assistant+tool_use].
     let outcome = execute_root_turn(inputs, "run ls", &provider, &stores.deps(), t_plus(5)).await?;
     assert!(matches!(outcome, RootTurnOutcome::Suspended { .. }));
 
-    // Cancel the parked parent via cancel_root_turn (seam A).
     cancel_root_turn(&task_id, &stores.deps(), t_plus(6)).await?;
 
-    // The user prompt committed as turn 1; the trailing tool_use is the
-    // re-seeded draft.
-    let committed = stores.messages.get_history(&thread_a()).await?;
-    assert_eq!(committed.len(), 1);
-    assert_eq!(committed[0].role, Role::User);
+    // ENG-9651: the cancel committed the dangling tool call WITH its
+    // cancelled result — the journal is balanced the moment the turn stops,
+    // so there is nothing for a later pass to close and no draft to re-seed.
+    let history = stores.messages.get_history(&thread_a()).await?;
+    assert!(
+        agent_sdk_foundation::llm::is_provider_valid_tool_sequence(&history),
+        "the journal is provider-valid immediately after the cancel",
+    );
+    assert!(
+        !agent_sdk_foundation::llm::has_unbalanced_tool_use(&history),
+        "the cancelled tool call is closed, not dangling",
+    );
     let projection = stores
         .messages
         .get(&thread_a())
         .await?
         .context("projection")?;
-    assert_eq!(
-        projection.draft_messages.len(),
-        1,
-        "trailing tool_use re-seeded"
-    );
+    assert!(!projection.has_draft(), "no dangling draft to re-seed");
 
-    // Run a fresh next turn on a NEW task. The pre-call backfill must
-    // close the orphaned tool_use with a cancelled result WITHOUT
-    // duplicating the already-committed user prompt.
+    // The next turn proceeds with zero repair evidence: the committed
+    // history was already valid, so the provider request contains the
+    // cancelled result exactly once and nothing else synthetic.
     let next_task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let next_bootstrap = sample_bootstrap(next_task);
     let next_inputs = build_root_worker_inputs(
@@ -7893,15 +7826,14 @@ async fn parked_cancel_commits_prefix_and_next_turn_backfill_closes_without_dup(
 
     let final_history = stores.messages.get_history(&thread_a()).await?;
     assert!(
-        !agent_sdk_foundation::llm::has_unbalanced_tool_use(&final_history),
-        "the next turn balances the orphaned tool_use",
+        agent_sdk_foundation::llm::is_provider_valid_tool_sequence(&final_history),
+        "history stays provider-valid across the follow-up turn",
     );
-    // The cancelled prefix's user prompt appears exactly once (no dup).
     let run_ls_count = final_history
         .iter()
         .filter(|m| message_text(m).contains("run ls"))
         .count();
-    assert_eq!(run_ls_count, 1, "the committed prefix is not duplicated");
+    assert_eq!(run_ls_count, 1, "the committed prompt is not duplicated");
 
     Ok(())
 }

@@ -636,7 +636,7 @@ pub use execution_intent::{
     guarded_tool_execution,
 };
 pub use live_tail::{LiveTailConfig, LiveTailEvent, LiveTailHub, LiveTailReceiver, SubscriberId};
-pub use message::{MessageProjection, MessageProjectionError};
+pub use message::{CompactionEntry, MessageProjection, MessageProjectionError};
 pub use message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
 pub use outbox::{
     InMemoryOutboxStore, NewOutboxRow, OutboxRow, OutboxRowId, OutboxStatus, OutboxStore,
