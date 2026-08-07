@@ -141,7 +141,12 @@ pub(crate) fn validate_request_attachments(
 fn attachment_policy(provider: &str, model: &str) -> Option<AttachmentPolicy> {
     match provider {
         "anthropic" => Some(AttachmentPolicy::Anthropic),
-        "openai" | "openai-responses" => Some(AttachmentPolicy::OpenAI),
+        // The codex route is the OpenAI Responses API over ChatGPT OAuth —
+        // same models, same inline image/document handling. Capabilities and
+        // features already fold codex into "openai" (provider.rs); the
+        // attachment policy must too, or the codex provider's own
+        // validate_request_attachments call rejects images it can send.
+        "openai" | "openai-responses" | "openai-codex" => Some(AttachmentPolicy::OpenAI),
         "vertex" if model.starts_with("claude-") => Some(AttachmentPolicy::Anthropic),
         "gemini" | "vertex" => Some(AttachmentPolicy::Gemini),
         _ => None,
@@ -303,6 +308,22 @@ mod tests {
         }]);
 
         validate_request_attachments("anthropic", "claude-sonnet-4-6", &request)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_validate_codex_accepts_supported_image() -> anyhow::Result<()> {
+        // The codex route (OpenAI Responses over ChatGPT OAuth) must fold into
+        // the OpenAI attachment policy like capabilities/features do — its own
+        // validate_request_attachments call otherwise rejects images it can send.
+        let request = request_with_blocks(vec![ContentBlock::Image {
+            source: ContentSource::new(
+                "image/png",
+                base64::engine::general_purpose::STANDARD.encode(b"png"),
+            ),
+        }]);
+
+        validate_request_attachments("openai-codex", "gpt-5.6-sol", &request)?;
         Ok(())
     }
 
