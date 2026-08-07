@@ -1452,8 +1452,6 @@ fn all_answered_tool_use_ids(messages: &[Message]) -> std::collections::HashSet<
 /// not match the preceding assistant call are rejected.
 #[must_use]
 pub fn provider_tool_sequence_error_index(messages: &[Message]) -> Option<usize> {
-    let mut seen_tool_results = std::collections::HashSet::new();
-
     for (index, message) in messages.iter().enumerate() {
         let blocks = match &message.content {
             Content::Text(_) => &[][..],
@@ -1514,7 +1512,13 @@ pub fn provider_tool_sequence_error_index(messages: &[Message]) -> Option<usize>
             let ContentBlock::ToolResult { tool_use_id, .. } = block else {
                 continue;
             };
-            if message.role != Role::User || !seen_tool_results.insert(tool_use_id.as_str()) {
+            // The provider contract is purely local: a tool_result must
+            // immediately follow the assistant message carrying its
+            // tool_use. A replayed/resumed turn legitimately re-emits the
+            // same tool_use id with a fresh result, so there is no global
+            // "a result id may appear once" rule (ENG-9651 — the strict
+            // duplicate rejection bricked real resumed threads).
+            if message.role != Role::User {
                 return Some(index);
             }
             let Some(previous) = index
