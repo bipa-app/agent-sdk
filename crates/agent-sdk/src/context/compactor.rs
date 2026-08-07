@@ -28,6 +28,44 @@ use super::snapcompact::{
 };
 
 const COMPACTION_SYSTEM_PROMPT: &str = "You are a precise summarizer. Your task is to create concise but complete summaries of conversations, preserving all technical details needed to continue the work.";
+
+/// Sanitize an assembled compaction view so it is provider-valid for a
+/// thinking-capable model (ENG-9651 follow-up).
+///
+/// Anthropic's contract: `thinking`/`redacted_thinking` blocks may appear
+/// only in the *latest* assistant message, verbatim. Older assistant turns
+/// must have their reasoning blocks stripped — a signed thinking block in
+/// any earlier position is rejected ("thinking blocks cannot be modified").
+/// The retained tail keeps source messages byte-for-byte, so a
+/// thinking-heavy history would otherwise re-ship signed reasoning from
+/// non-final turns. We remove reasoning blocks from every assistant message
+/// except the last; a message left with no content at all (it was only
+/// thinking) is dropped, and any empty-content message is dropped, so the
+/// view never carries a contentless message that breaks role alternation.
+fn sanitize_compacted_view(messages: &mut Vec<Message>) {
+    // Last assistant index — the only message allowed to keep reasoning.
+    let last_assistant = messages.iter().rposition(|m| m.role == Role::Assistant);
+    for (index, message) in messages.iter_mut().enumerate() {
+        if message.role != Role::Assistant || Some(index) == last_assistant {
+            continue;
+        }
+        if let Content::Blocks(blocks) = &mut message.content {
+            blocks.retain(|block| {
+                !matches!(
+                    block,
+                    ContentBlock::Thinking { .. }
+                        | ContentBlock::RedactedThinking { .. }
+                        | ContentBlock::OpaqueReasoning { .. }
+                )
+            });
+        }
+    }
+    // Drop messages that are now (or always were) contentless.
+    messages.retain(|message| match &message.content {
+        Content::Text(text) => !text.trim().is_empty(),
+        Content::Blocks(blocks) => !blocks.is_empty(),
+    });
+}
 const COMPACTION_SUMMARY_PROMPT_PREFIX: &str = "Summarize this conversation concisely, preserving:\n- Key decisions and conclusions reached\n- Important file paths, code changes, and technical details\n- Current task context and what has been accomplished\n- Any pending items, errors encountered, or next steps\n\nBe specific about technical details (file names, function names, error messages) as these\nare critical for continuing the work.\n\nConversation:\n";
 const COMPACTION_SUMMARY_PROMPT_SUFFIX: &str =
     "Provide a concise summary (aim for 500-1000 words):";
@@ -274,6 +312,33 @@ pub struct FailedCompaction {
     /// when the failure preceded any LLM call).
     pub llm_usage: TokenUsage,
 }
+
+/// Marker for a compaction that produced no token savings.
+///
+/// The assembled view would be as large as (or larger than) the source.
+/// This is benign: the turn must proceed with the uncompacted history, not
+/// fail. The compaction worker recognizes this marker and skips the
+/// compaction instead of erroring the turn (ENG-9651 follow-up).
+#[derive(Debug, Clone, Copy)]
+pub struct NoProgressCompaction {
+    /// Estimated tokens of the assembled (would-be compacted) view.
+    pub new_tokens: usize,
+    /// Estimated tokens of the source history.
+    pub original_tokens: usize,
+}
+
+impl std::fmt::Display for NoProgressCompaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Compaction made no progress: effective occupancy would be \
+             {} tokens (original {})",
+            self.new_tokens, self.original_tokens
+        )
+    }
+}
+
+impl std::error::Error for NoProgressCompaction {}
 
 /// LLM-based context compactor.
 ///
@@ -2769,7 +2834,10 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
         // larger than the entire transcript.
         if messages.is_empty() {
             return Err(FailedCompaction {
-                error: anyhow::anyhow!("Compaction made no progress: history is empty"),
+                error: anyhow::Error::new(NoProgressCompaction {
+                    new_tokens: 0,
+                    original_tokens: 0,
+                }),
                 llm_usage: TokenUsage::default(),
             });
         }
@@ -2836,15 +2904,22 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
         // The tail is moved (not cloned) since `compact_history` owns it.
         new_messages.extend(to_keep);
 
+        // The retained tail keeps source messages byte-for-byte, which can
+        // re-ship signed thinking blocks from non-final assistant turns and
+        // contentless messages that break role alternation — both rejected
+        // by thinking-capable providers. Sanitize the assembled view so the
+        // persisted view is provider-valid (ENG-9651 follow-up).
+        sanitize_compacted_view(&mut new_messages);
+
         let new_count = new_messages.len();
         let new_tokens = self.estimate_tokens(&new_messages);
         if new_tokens >= original_tokens {
             self.remove_published_snapcompact_run(&published_ids);
             return Err(FailedCompaction {
-                error: anyhow::anyhow!(
-                    "Compaction made no progress: effective occupancy would be \
-                     {new_tokens} tokens (original {original_tokens})"
-                ),
+                error: anyhow::Error::new(NoProgressCompaction {
+                    new_tokens,
+                    original_tokens,
+                }),
                 llm_usage,
             });
         }
@@ -3087,6 +3162,93 @@ mod tests {
         provider_name: &'static str,
         model_name: &'static str,
         max_request_attachment_bytes: Option<u64>,
+    }
+
+    fn thinking_message(text: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: Content::Blocks(vec![
+                ContentBlock::Thinking {
+                    thinking: "reasoning".to_string(),
+                    signature: Some("sig".to_string()),
+                },
+                ContentBlock::Text {
+                    text: text.to_string(),
+                },
+            ]),
+        }
+    }
+
+    #[test]
+    fn sanitize_strips_reasoning_from_all_but_the_last_assistant() {
+        let mut messages = vec![
+            Message::user("u1"),
+            thinking_message("a1"),
+            Message::user("u2"),
+            thinking_message("a2"),
+            thinking_message("a3"), // consecutive assistant
+        ];
+        sanitize_compacted_view(&mut messages);
+
+        // The two EARLIER thinking-bearing assistant messages lose their
+        // thinking blocks but keep their text; only the LAST assistant keeps
+        // its reasoning verbatim.
+        let assistant_block_shapes: Vec<Vec<&str>> = messages
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .map(|m| match &m.content {
+                Content::Text(_) => vec!["text"],
+                Content::Blocks(blocks) => blocks
+                    .iter()
+                    .map(|b| match b {
+                        ContentBlock::Thinking { .. } => "thinking",
+                        ContentBlock::Text { .. } => "text",
+                        _ => "other",
+                    })
+                    .collect(),
+            })
+            .collect();
+        assert_eq!(
+            assistant_block_shapes,
+            vec![vec!["text"], vec!["text"], vec!["thinking", "text"]],
+            "only the final assistant retains its thinking block",
+        );
+    }
+
+    #[test]
+    fn sanitize_drops_messages_left_contentless() {
+        let only_thinking = Message {
+            role: Role::Assistant,
+            content: Content::Blocks(vec![ContentBlock::Thinking {
+                thinking: "reasoning".to_string(),
+                signature: Some("sig".to_string()),
+            }]),
+        };
+        let mut messages = vec![
+            Message::user("u1"),
+            only_thinking,
+            Message {
+                role: Role::User,
+                content: Content::Blocks(vec![]),
+            },
+            thinking_message("final"),
+        ];
+        sanitize_compacted_view(&mut messages);
+
+        // The thinking-only earlier assistant and the empty user message are
+        // both dropped; the final thinking-bearing assistant survives.
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(messages[1].role, Role::Assistant);
+        let Content::Blocks(blocks) = &messages[1].content else {
+            panic!("final message keeps its blocks");
+        };
+        assert!(
+            blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Thinking { .. })),
+            "the final assistant message keeps its thinking block",
+        );
     }
 
     impl MockProvider {
