@@ -87,10 +87,6 @@ FROM agent_sdk_message_heads h
         report.scanned += 1;
         let thread_key: String = row.get("thread_id");
         let already_repaired: i64 = row.get("already_repaired");
-        if already_repaired != 0 {
-            report.ledgered += 1;
-            continue;
-        }
         let thread_id = ThreadId::from_string(thread_key.clone());
 
         let history: Vec<llm::Message> =
@@ -109,8 +105,20 @@ FROM agent_sdk_message_heads h
         let mut sequence = history;
         sequence.extend(draft);
 
+        // Validate BEFORE consulting the ledger: a thread that re-corrupts
+        // after being repaired (e.g. a daemon kill mid-turn leaves a new
+        // dangling tool_use) must be repaired again, not skipped because a
+        // stale ledger row exists. The ledger's ON CONFLICT DO NOTHING makes
+        // the re-repair idempotent.
         if llm::is_provider_valid_tool_sequence(&sequence) {
             continue;
+        }
+        if already_repaired != 0 {
+            report.ledgered += 1;
+            tracing::warn!(
+                "startup repair sweep: thread {thread_key} re-corrupted after a prior repair; \
+                 re-repairing (a producer regressed or a kill left a dangling call)"
+            );
         }
 
         match repair_one_thread(pool, &thread_id, &sequence, now).await {
@@ -376,8 +384,47 @@ mod tests {
         let first = run_startup_repair_sweep(store.pool(), t0()).await?;
         assert_eq!(first.repaired, 1);
         let second = run_startup_repair_sweep(store.pool(), t0()).await?;
-        assert_eq!(second.repaired, 0, "second run repairs nothing (ledgered)");
-        assert_eq!(second.ledgered, 1);
+        assert_eq!(
+            second.repaired, 0,
+            "second run repairs nothing — the repaired thread is now valid"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sweep_re_repairs_a_thread_that_re_corrupts() -> Result<()> {
+        // A daemon kill mid-turn can leave a NEW dangling tool_use on a thread
+        // the sweep already repaired. The validity check runs before the
+        // ledger skip, so a re-corrupted thread is repaired again.
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+        let thread_id = seed_corrupted_thread(&store, "sweep-recorrupt").await?;
+
+        let first = run_startup_repair_sweep(store.pool(), t0()).await?;
+        assert_eq!(first.repaired, 1);
+
+        // Re-corrupt: drop a fresh dangling tool_use into the draft.
+        agent_server::journal::message_store::MessageProjectionStore::set_draft(
+            &store,
+            &thread_id,
+            vec![
+                llm::Message::user("again"),
+                llm::Message::assistant_with_tool_use(
+                    None,
+                    "call-recorrupt",
+                    "bash",
+                    serde_json::json!({"command": "ls"}),
+                ),
+            ],
+            t0(),
+        )
+        .await?;
+
+        let second = run_startup_repair_sweep(store.pool(), t0()).await?;
+        assert_eq!(
+            second.repaired, 1,
+            "a thread that re-corrupts after a prior repair must be repaired again"
+        );
+        assert_eq!(second.ledgered, 1, "the re-corruption is flagged");
         Ok(())
     }
 
