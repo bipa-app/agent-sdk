@@ -416,15 +416,19 @@ fn is_tool_sequence_refusal(error: &anyhow::Error) -> bool {
         })
 }
 
-/// True when the compactor produced no token savings — the assembled view
-/// would be as large as the source. Benign: the turn proceeds with the
-/// uncompacted history. This can fire when the trigger's measured anchor
-/// overestimates the staged history (a resumed draft measured against a
-/// prior larger turn), so compaction runs on a history too small to shrink.
+/// True when the compactor produced no usable result and the turn should
+/// proceed uncompacted rather than fail: either no token savings
+/// (`NoProgressCompaction`) or the summarizer returned no text
+/// (`SummarizationEmpty`, e.g. an adaptive-thinking model whose response
+/// carried only thinking blocks). Both are benign; the provider call goes
+/// out with the uncompacted history.
 fn is_no_progress(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<agent_sdk::context::NoProgressCompaction>()
         .is_some()
+        || error
+            .downcast_ref::<agent_sdk::context::SummarizationEmpty>()
+            .is_some()
 }
 
 /// fence inside that worker: no artifact batch is published after this arm

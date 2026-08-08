@@ -1252,6 +1252,81 @@ async fn no_progress_compaction_is_skipped_and_the_turn_proceeds() -> Result<()>
     Ok(())
 }
 
+/// A summarizer response carrying only a thinking block (no text) — what an
+/// adaptive-thinking model returns when its visible text is empty.
+fn thinking_only_response() -> ChatOutcome {
+    ChatOutcome::Success(ChatResponse {
+        id: "msg_mock_thinking".into(),
+        content: vec![agent_sdk::llm::ContentBlock::Thinking {
+            thinking: "reasoning with no visible answer".into(),
+            signature: None,
+        }],
+        model: "mock-model".into(),
+        stop_reason: Some(StopReason::EndTurn),
+        usage: Usage {
+            served_speed: None,
+            input_tokens: 100,
+            output_tokens: 50,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        },
+    })
+}
+
+#[tokio::test]
+async fn thinking_only_summarization_is_skipped_and_the_turn_proceeds() -> Result<()> {
+    let fixtures = Fixtures::new();
+    seed_projection_history(&fixtures.messages, &thread_id(), 12, &"n".repeat(200)).await?;
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::Legacy)
+        .with_threshold_tokens(10);
+    // The summarizer returns a thinking-only response (no text) — the
+    // adaptive-thinking failure mode. The doctrine: this must SKIP the
+    // compaction and let the turn proceed uncompacted, never fail it.
+    // First queued response feeds the summarizer (thinking-only → skip);
+    // the second feeds the turn's own call.
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        thinking_only_response(),
+        ok_response("turn completed without a summary"),
+    ]));
+    let turn_provider: Arc<dyn LlmProvider> = provider.clone();
+    let deps = fixtures.deps_with_compaction(&cfg, &turn_provider);
+
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &fixtures.threads,
+        &fixtures.checkpoints,
+        &fixtures.messages,
+        t0(),
+    )
+    .await?;
+    let outcome = execute_root_turn(
+        inputs,
+        "trigger thinking-only summarization",
+        turn_provider.as_ref(),
+        &deps,
+        t0() + Duration::seconds(1),
+    )
+    .await?;
+
+    let RootTurnOutcome::Completed { .. } = outcome else {
+        panic!("a thinking-only summarization must not fail the turn: {outcome:?}");
+    };
+    assert_eq!(
+        fixtures
+            .messages
+            .get(&thread_id())
+            .await?
+            .context("projection after skipped compaction")?
+            .compactions
+            .len(),
+        0,
+        "a skipped compaction records no boundary",
+    );
+    Ok(())
+}
+
 /// Finding #4: when compaction folds history into the committed
 /// projection, the in-flight draft must be cleared — otherwise a turn
 /// that later fails (so the commit path never clears the draft) leaves
