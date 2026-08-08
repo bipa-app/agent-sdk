@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.1](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.18.0...agent-sdk-providers-v0.18.1) - 2026-08-08
+
+### Added
+
+- *(providers)* add bounded embedding API ([#440](https://github.com/bipa-app/agent-sdk/pull/440))
+
+### Fixed
+
+- *(providers)* fold openai-codex into the OpenAI attachment policy ([#448](https://github.com/bipa-app/agent-sdk/pull/448))
+
 ## [0.18.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.17.0...agent-sdk-providers-v0.18.0) - 2026-08-04
 
 ### Added

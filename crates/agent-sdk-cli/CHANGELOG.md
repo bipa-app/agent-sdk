@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.1](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-cli-v0.18.0...agent-sdk-cli-v0.18.1) - 2026-08-08
+
+### Other
+
+- *(dev)* make local dev runtime-agnostic, drop the compose dependency ([#438](https://github.com/bipa-app/agent-sdk/pull/438))
+
 ## [0.18.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-cli-v0.17.0...agent-sdk-cli-v0.18.0) - 2026-08-04
 
 ### Added

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.1](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-foundation-v0.18.0...agent-sdk-foundation-v0.18.1) - 2026-08-08
+
+### Added
+
+- *(providers)* add bounded embedding API ([#440](https://github.com/bipa-app/agent-sdk/pull/440))
+
+### Fixed
+
+- *(worker)* close cancelled tool calls at the cancel seam; remove turn-path repair ([#446](https://github.com/bipa-app/agent-sdk/pull/446))
+- *(journal)* never persist or ship an invalid tool_use/tool_result sequence ([#445](https://github.com/bipa-app/agent-sdk/pull/445))
+
 ## [0.18.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-foundation-v0.17.0...agent-sdk-foundation-v0.18.0) - 2026-08-04
 
 ### Added
