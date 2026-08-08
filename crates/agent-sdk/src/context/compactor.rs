@@ -340,6 +340,23 @@ impl std::fmt::Display for NoProgressCompaction {
 
 impl std::error::Error for NoProgressCompaction {}
 
+/// Marker for a summarization LLM call that returned no usable text.
+///
+/// e.g. an adaptive-thinking model (fable-5) whose response carried only
+/// thinking blocks. Benign and recoverable: the compaction cannot proceed,
+/// so the worker must skip it (proceed uncompacted) rather than fail the
+/// turn (ENG-9651 follow-up).
+#[derive(Debug, Clone, Copy)]
+pub struct SummarizationEmpty;
+
+impl std::fmt::Display for SummarizationEmpty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "No text in summarization response")
+    }
+}
+
+impl std::error::Error for SummarizationEmpty {}
+
 /// LLM-based context compactor.
 ///
 /// Uses the LLM itself to summarize older messages into a compact form.
@@ -1242,7 +1259,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
         let output_limit = Self::summary_output_byte_limit(max_tokens);
         let Some(text) = response.first_text() else {
             return Err(SummarizationFailure {
-                error: anyhow::anyhow!("No text in summarization response"),
+                error: anyhow::Error::new(SummarizationEmpty),
                 usage,
             });
         };
