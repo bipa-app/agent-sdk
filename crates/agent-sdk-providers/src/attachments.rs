@@ -52,10 +52,21 @@ pub(crate) enum AttachmentKind {
 }
 
 // Only the OpenAI Chat Completions provider gates its multimodal routing on
-// this helper; under other feature sets it would be dead code.
+// these helpers; under other feature sets they would be dead code.
 #[cfg(feature = "openai")]
 pub(crate) fn request_has_attachments(request: &ChatRequest) -> bool {
     !collect_attachments(request).is_empty()
+}
+
+/// Whether the request carries any document (non-image) attachment. Chat
+/// Completions has a standard `image_url` content part but no portable
+/// document part, so the `OpenAI` chat provider serializes images and refuses
+/// documents.
+#[cfg(feature = "openai")]
+pub(crate) fn request_has_document_attachments(request: &ChatRequest) -> bool {
+    collect_attachments(request)
+        .iter()
+        .any(|attachment| attachment.kind == AttachmentKind::Document)
 }
 
 pub(crate) fn collect_attachments(request: &ChatRequest) -> Vec<AttachmentRef<'_>> {
