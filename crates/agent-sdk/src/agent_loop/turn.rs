@@ -1542,6 +1542,9 @@ where
         .collect()
 }
 
+// The large Err is deliberate: turn/run control flow rides Err on the
+// hot early-exit path, and boxing it would allocate on every exit.
+#[allow(clippy::result_large_err)]
 pub(super) async fn execute_pending_tool_calls_for_turn<Ctx, H>(
     ToolBatchExecutionParams {
         pending_tool_calls,
@@ -1824,6 +1827,9 @@ where
     Ok(())
 }
 
+// The large Err is deliberate: turn/run control flow rides Err on the
+// hot early-exit path, and boxing it would allocate on every exit.
+#[allow(clippy::result_large_err)]
 pub(super) async fn execute_turn_tool_phase<Ctx, H, M>(
     TurnToolPhaseParams {
         pending_tool_calls,
@@ -2353,6 +2359,9 @@ where
 
 /// Persist a strict-durability state checkpoint, mapping a save failure
 /// onto the hard `InternalTurnResult::Error` the turn must surface.
+// The large Err is deliberate: turn/run control flow rides Err on the
+// hot early-exit path, and boxing it would allocate on every exit.
+#[allow(clippy::result_large_err)]
 async fn save_strict_checkpoint<S>(
     state_store: &Arc<S>,
     state: &crate::types::AgentState,
@@ -2632,6 +2641,9 @@ where
 /// `Err` carries the `InternalTurnResult` the turn must return instead:
 /// a mid-turn budget stop, a cancellation during compaction (whose billed
 /// summarization usage is still folded), or a load error.
+// The large Err is deliberate: turn/run control flow rides Err on the
+// hot early-exit path, and boxing it would allocate on every exit.
+#[allow(clippy::result_large_err)]
 async fn load_turn_messages_accounted<P, H, M>(
     load_params: TurnMessageLoadParams<'_, P, H, M>,
     ctx: &mut TurnContext,
@@ -2869,6 +2881,9 @@ struct TurnLlmRequestParams<'a, P, H, M, S> {
 /// unrecoverable error (after attempting an emergency compaction for a
 /// prompt-too-long error), is mapped onto the `InternalTurnResult` the
 /// caller should return.
+// The large Err is deliberate: turn/run control flow rides Err on the
+// hot early-exit path, and boxing it would allocate on every exit.
+#[allow(clippy::result_large_err)]
 async fn request_turn_response<P, H, M, S>(
     TurnLlmRequestParams {
         ctx,
@@ -3049,6 +3064,9 @@ struct ResponseGuardrailParams<'a, H, M, S> {
 /// carries the `InternalTurnResult` the turn must return instead (block
 /// error, retry-cap error, strict-checkpoint failure, or the
 /// retry-with-feedback `Continue`).
+// The large Err is deliberate: turn/run control flow rides Err on the
+// hot early-exit path, and boxing it would allocate on every exit.
+#[allow(clippy::result_large_err)]
 async fn apply_response_guardrail<H, M, S>(
     ResponseGuardrailParams {
         ctx,

@@ -171,7 +171,7 @@ async fn latest_measured_anchor(
             if total == 0 {
                 continue;
             }
-            let tokens = usize::try_from(total).map_or(usize::MAX, |value| value);
+            let tokens = usize::try_from(total).unwrap_or(usize::MAX);
             if latest
                 .as_ref()
                 .is_none_or(|(latest_at, _)| closed_at > *latest_at)

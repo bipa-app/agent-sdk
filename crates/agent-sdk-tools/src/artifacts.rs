@@ -1476,8 +1476,8 @@ pub fn cap_inline_from_windows(
     let tail_start = ceil_char_boundary(tail, tail.len().saturating_sub(tail_budget));
     let kept_head = &head[..head_end];
     let kept_tail = &tail[tail_start..];
-    let retained = u64::try_from(kept_head.len().saturating_add(kept_tail.len()))
-        .map_or(u64::MAX, |bytes| bytes);
+    let retained =
+        u64::try_from(kept_head.len().saturating_add(kept_tail.len())).unwrap_or(u64::MAX);
     let elided = total_bytes.saturating_sub(retained);
     format!("{kept_head}\n[... {elided} bytes elided ...]\n{kept_tail}\n{footer}")
 }
