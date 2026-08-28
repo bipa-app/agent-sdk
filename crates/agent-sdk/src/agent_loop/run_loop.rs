@@ -816,6 +816,9 @@ async fn finish_turn_or_error(
         })
 }
 
+// The large Err is deliberate: turn/run control flow rides Err on the
+// hot early-exit path, and boxing it would allocate on every exit.
+#[allow(clippy::result_large_err)]
 async fn initialize_run_loop_state<M, S>(
     input: AgentInput,
     thread_id: &ThreadId,
@@ -899,6 +902,9 @@ where
     }
 }
 
+// The large Err is deliberate: turn/run control flow rides Err on the
+// hot early-exit path, and boxing it would allocate on every exit.
+#[allow(clippy::result_large_err)]
 async fn initialize_single_turn_state<M, S>(
     input: AgentInput,
     thread_id: &ThreadId,
@@ -1499,6 +1505,9 @@ where
 /// `initialize_from_input` can append it, leaving the history untouched so
 /// the caller can raise the budget / rephrase and resubmit without the
 /// rejected prompt poisoning future context.
+// The large Err is deliberate: turn/run control flow rides Err on the
+// hot early-exit path, and boxing it would allocate on every exit.
+#[allow(clippy::result_large_err)]
 async fn init_run_loop_with_entry_guard<Ctx, P, H, M, S>(
     params: GuardedInitParams<'_, Ctx, P, H, M, S>,
 ) -> Result<InitializedState, AgentRunState>
@@ -1531,6 +1540,9 @@ where
 }
 
 /// Single-turn-mode counterpart of [`init_run_loop_with_entry_guard`].
+// The large Err is deliberate: turn/run control flow rides Err on the
+// hot early-exit path, and boxing it would allocate on every exit.
+#[allow(clippy::result_large_err)]
 async fn init_single_turn_with_entry_guard<Ctx, P, H, M, S>(
     params: GuardedInitParams<'_, Ctx, P, H, M, S>,
     turn_options: &TurnOptions,
@@ -1748,6 +1760,9 @@ fn refusal_run_state(ctx: &TurnContext) -> AgentRunState {
     }
 }
 
+// The large Err is deliberate: turn/run control flow rides Err on the
+// hot early-exit path, and boxing it would allocate on every exit.
+#[allow(clippy::result_large_err)]
 async fn emit_persistent_turn_complete<H>(
     ctx: &TurnContext,
     event_store: &Arc<dyn EventStore>,
@@ -2019,6 +2034,9 @@ where
     }
 }
 
+// The large Err is deliberate: turn/run control flow rides Err on the
+// hot early-exit path, and boxing it would allocate on every exit.
+#[allow(clippy::result_large_err)]
 async fn finish_turn_or_run_state(
     event_store: &Arc<dyn EventStore>,
     thread_id: &ThreadId,

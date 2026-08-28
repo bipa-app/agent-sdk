@@ -170,6 +170,13 @@ unsafe_code = "forbid"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(docsrs)'] }
 
 [workspace.lints.clippy]
-all = "warn"
-pedantic = "warn"
-nursery = "warn"
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# `Tool` / `TypedTool` / `ListenExecuteTool` declare `execute` as
+# `-> impl Future + Send` precisely so consumers implement them with
+# `async fn`. This pedantic lint (new in rust 1.98) flags every mock,
+# example, and test impl whose body happens not to await, and the
+# "fix" — `fn … -> impl Future` + `std::future::ready(…)` — would make
+# the SDK's own examples teach a worse pattern than the intended API.
+unused_async_trait_impl = "allow"
