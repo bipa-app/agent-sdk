@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.1](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-v0.18.0...agent-sdk-v0.18.1) - 2026-09-04
+
+### Added
+
+- *(providers)* add bounded embedding API ([#440](https://github.com/bipa-app/agent-sdk/pull/440))
+- *(server)* durable tool-input preflight + atomic precompleted mixed-spawn (ENG-9548) ([#442](https://github.com/bipa-app/agent-sdk/pull/442))
+
+### Fixed
+
+- *(compaction)* skip a summarization that returns no usable text ([#450](https://github.com/bipa-app/agent-sdk/pull/450))
+- *(compaction)* skip no-progress compaction; sanitize thinking blocks from non-final turns ([#447](https://github.com/bipa-app/agent-sdk/pull/447))
+- *(mcp)* omit absent client capabilities from the initialize handshake ([#444](https://github.com/bipa-app/agent-sdk/pull/444))
+
+### Other
+
+- *(ci)* repair the rust 1.98 clippy and RustSec gate breakage on main ([#452](https://github.com/bipa-app/agent-sdk/pull/452))
+- *(dev)* make local dev runtime-agnostic, drop the compose dependency ([#438](https://github.com/bipa-app/agent-sdk/pull/438))
+
 ## [0.18.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-v0.17.0...agent-sdk-v0.18.0) - 2026-08-04
 
 ### Added
