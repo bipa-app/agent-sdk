@@ -14,7 +14,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 
 /// The ACP protocol version this server implements.
 ///
-/// This is "v2 as spoken by the buzz-acp harness at block/buzz `7e34bee`",
+/// This is "v2 as spoken by the buzz-acp harness at block/buzz `3e48f1b`",
 /// which requests `protocolVersion: 2` ahead of the upstream ACP RFD. The
 /// recorded fixtures in `tests/fixtures/` are the compatibility contract.
 pub const PROTOCOL_VERSION: u64 = 2;

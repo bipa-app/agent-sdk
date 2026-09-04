@@ -42,8 +42,8 @@
 //! ## Protocol version stance
 //!
 //! This server implements **"ACP v2 as spoken by buzz-acp at block/buzz
-//! `7e34bee`"** — the harness requests `protocolVersion: 2` ahead of the
-//! upstream ACP RFD, with hand-rolled wire shapes. The compatibility
+//! `v0.5.2` (`3e48f1b`)"** — the harness requests `protocolVersion: 2` ahead
+//! of the upstream ACP RFD, with hand-rolled wire shapes. The compatibility
 //! contract is the recorded fixture set in `tests/fixtures/`, captured
 //! verbatim from that revision's source.
 //!
