@@ -5463,11 +5463,24 @@ async fn spawn_suspended_tool_children(
     // Preflight-completed children can make the parent runnable as soon as
     // they are published. Their ToolCallEnd events were therefore committed
     // in the same boundary transaction as the children and ToolCallStart.
-    let suspension_committed = if preflight_calls.is_empty() {
-        deps.event_repo
-            .commit_event_batch(&inputs.bootstrap.thread_id, suspension_events, now)
-            .await
-            .context(commit_context)?
+    //
+    // Without preflight, the spawn transaction's own events (a subagent's
+    // `SubagentProgress` start) were committed BEFORE the suspension batch
+    // and must ride the outcome ahead of it: `publish_events` feeds the
+    // same-process live tail in vec order, and the tail drops any
+    // sequence at or below the last one it yielded. Returning only the
+    // suspension batch left the spawn event to the outbox advisory, which
+    // lands after the higher sequences — so live subscribers never saw
+    // the subagent open.
+    let committed = if preflight_calls.is_empty() {
+        let mut committed = atomic_committed;
+        committed.extend(
+            deps.event_repo
+                .commit_event_batch(&inputs.bootstrap.thread_id, suspension_events, now)
+                .await
+                .context(commit_context)?,
+        );
+        committed
     } else {
         atomic_committed
     };
@@ -5475,7 +5488,7 @@ async fn spawn_suspended_tool_children(
     let (parent_task, child_tasks) =
         complete_preflight_children(deps, parent_task, child_tasks, preflight_calls)?;
 
-    Ok((parent_task, child_tasks, suspension_committed))
+    Ok((parent_task, child_tasks, committed))
 }
 
 /// Suspend execution at the tool boundary.
@@ -6119,6 +6132,10 @@ async fn apply_batch_routing(
         ..
     } = application;
     let task_id = &inputs.bootstrap.task_id;
+    // Every arm returns the events its spawn transaction committed: the
+    // subagent `SubagentProgress` start snapshots must ride the outcome
+    // so `publish_events` feeds them to the live tail ahead of the
+    // suspension batch that follows them in sequence.
     let spawned = match routing {
         super::subagent_spawn_selector::BatchRouting::SingleSubagent { spawn_index, plan } => {
             let SuspendedBatch {
@@ -6139,7 +6156,7 @@ async fn apply_batch_routing(
             (
                 spawned.parent_task,
                 vec![spawned.invocation_task],
-                Vec::new(),
+                spawned.committed_events,
             )
         }
         super::subagent_spawn_selector::BatchRouting::MultiSubagent { plans } => {
@@ -6157,8 +6174,14 @@ async fn apply_batch_routing(
                 now,
             )
             .await?;
-            let invocation_tasks = invocation_tasks(batch.invocations);
-            (batch.parent_task, invocation_tasks, Vec::new())
+            let mut committed = Vec::new();
+            let mut invocation_tasks = Vec::with_capacity(batch.invocations.len());
+            for invocation in batch.invocations {
+                committed.extend(invocation.committed_events);
+                invocation_tasks.push(invocation.invocation_task);
+            }
+            committed.sort_by_key(|event| event.sequence);
+            (batch.parent_task, invocation_tasks, committed)
         }
         super::subagent_spawn_selector::BatchRouting::Mixed {
             plans,

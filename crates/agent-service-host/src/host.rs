@@ -6751,6 +6751,106 @@ mod tests {
             .with_context(|| format!("thread {thread_id} has no root turn"))
     }
 
+    /// A live subscriber opened before the turn must see EVERY parent
+    /// event, gap-free — including the subagent spawn snapshots that
+    /// the spawn transaction commits ahead of the suspension batch.
+    /// The same-process live tail drops any sequence at or below the
+    /// last one it yielded, so a spawn event published after the
+    /// higher suspension sequences (or only through the outbox
+    /// advisory) vanishes from every live consumer: the subagent row
+    /// never opens in the ACP/desktop feed.
+    #[tokio::test]
+    async fn live_subscriber_sees_subagent_spawn_snapshots_gap_free() -> Result<()> {
+        use agent_sdk_foundation::ThreadId;
+        use agent_server::journal::event_stream::StreamEvent;
+
+        let config = ServiceConfig {
+            worker: crate::config::WorkerConfig {
+                pool_size: 4,
+                heartbeat_interval_secs: 1,
+                acquisition_interval_secs: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let provider = Arc::new(SubagentScriptProvider::new());
+        let runtime = subagent_timeout_runtime(Arc::clone(&provider))?;
+        let host = ServiceHost::new(config, sample_registry(), runtime)?;
+        let stores = host.stores().clone();
+        let token = host.shutdown_token();
+
+        let parent_thread = ThreadId::from_string("t-subagent-live-tail");
+        // Subscribe BEFORE anything is committed: the whole turn must
+        // arrive through replay-then-live with no gap.
+        let mut live = agent_server::stream_events(
+            &parent_thread,
+            None,
+            stores.event_repo.as_ref(),
+            stores.retention_store.as_ref(),
+            &stores.event_notifier,
+        )
+        .await?;
+
+        let parent = AgentTask::new_root_turn_with_input(
+            parent_thread.clone(),
+            vec![SubmittedInputItem::Text {
+                text: "coordinate the helpers".into(),
+            }],
+            time::OffsetDateTime::now_utc(),
+            3,
+        );
+        stores.task_store.submit_root_turn(parent).await?;
+        let host_handle = tokio::spawn(async move { host.run().await });
+
+        let drain = async {
+            let mut seen = Vec::new();
+            loop {
+                match live.next().await {
+                    Some(StreamEvent::Event(event)) => {
+                        let done =
+                            matches!(event.event, agent_sdk_foundation::AgentEvent::Done { .. });
+                        seen.push(*event);
+                        if done {
+                            return Ok::<_, anyhow::Error>(seen);
+                        }
+                    }
+                    other => bail!("live stream broke before the parent's Done: {other:?}"),
+                }
+            }
+        };
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(30), drain)
+            .await
+            .context("parent turn did not finish on the live tail in time")??;
+
+        let sequences: Vec<u64> = seen.iter().map(|event| event.sequence).collect();
+        let expected: Vec<u64> = (0..sequences.len() as u64).collect();
+        assert_eq!(
+            sequences, expected,
+            "the live tail must deliver every committed parent event, in order, without gaps"
+        );
+        let spawn_snapshots = seen
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event,
+                    agent_sdk_foundation::AgentEvent::SubagentProgress {
+                        completed: false,
+                        current_turn: Some(0),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            spawn_snapshots, 2,
+            "both subagent spawn snapshots must reach the live subscriber"
+        );
+
+        token.cancel();
+        host_handle.await??;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn timed_out_subagent_child_fails_and_parent_resumes() -> Result<()> {
         use agent_sdk_foundation::ThreadId;
