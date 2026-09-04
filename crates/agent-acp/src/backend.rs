@@ -8,9 +8,11 @@
 //! ([`crate::run`]), so every backend implementation inherits the same
 //! correctness behavior.
 //!
-//! The loop maps text and thinking content, tool lifecycle, usage, keepalives,
-//! and terminal events. Subagent, plan, and permission mapping land in later
-//! slices.
+//! The loop maps text and thinking content, tool lifecycle, the subagent
+//! lifecycle, plan synthesis, usage, keepalives, terminal events, and
+//! confirmation parks (contract C-e): the backend names the parked child
+//! behind a tool call and applies a decision; correlation, retry, and
+//! answer routing live in the loop.
 
 use std::sync::Arc;
 
@@ -107,6 +109,36 @@ pub enum BackendTaskStatus {
     },
 }
 
+/// A tool-runtime child parked on a confirmation, paired with the tool
+/// call it will execute when approved (contract C-e / V3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AwaitingConfirmation {
+    /// The parked child task — what a decision targets.
+    pub child_task_id: String,
+    /// The tool call the child runs; matches `ToolRequiresConfirmation.id`.
+    pub tool_call_id: String,
+}
+
+/// The client's answer to a confirmation, as applied to the backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionDecision {
+    /// Run the tool. The backend's policy is re-checked at resume
+    /// regardless — approval never bypasses it.
+    Allow,
+    /// Do not run the tool; the turn continues with the rejection.
+    Reject,
+}
+
+/// What applying a decision did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecideOutcome {
+    /// The park was decided.
+    Decided,
+    /// No such park is pending any more — already decided, cancelled, or
+    /// swept. A stale answer is a successful no-op, never an error.
+    NonePending,
+}
+
 /// An agent runtime the ACP transport can drive.
 ///
 /// Object-safe: `Arc<dyn AcpBackend>` works. Thread identity is the
@@ -167,6 +199,60 @@ pub trait AcpBackend: Send + Sync + 'static {
         thread_id: &str,
         task_id: &str,
     ) -> Result<BackendTaskStatus, BackendError>;
+
+    /// Read the result text of a completed subagent invocation.
+    ///
+    /// Design §3.1 rule 4: result text never rides the event stream —
+    /// `SubagentResult` goes to the invocation task's result and the
+    /// parent's history only. The run loop calls this once per subagent
+    /// close so the terminal `tool_call_update` can carry the child's
+    /// final response (or its recorded error) instead of a bare
+    /// success/failure. `Ok(None)` means the backend has nothing to
+    /// offer; the loop then closes the row with the progress summary.
+    ///
+    /// # Errors
+    ///
+    /// A [`BackendError`] here is logged, never fatal — the row still
+    /// closes, with the summary as content.
+    async fn subagent_result(
+        &self,
+        thread_id: &str,
+        subagent_task_id: &str,
+    ) -> Result<Option<String>, BackendError>;
+
+    /// The children currently parked on a confirmation for this thread,
+    /// oldest first, each with the tool call it will run (contract C-e).
+    ///
+    /// The run loop calls this when a `ToolRequiresConfirmation` event
+    /// arrives, to name the child in the permission request's option ids.
+    /// The park may commit a beat after the event; the loop retries
+    /// briefly, so a momentarily incomplete list is not an error.
+    ///
+    /// # Errors
+    ///
+    /// A [`BackendError`] is logged and retried within the correlation
+    /// window, never fatal on its own.
+    async fn awaiting_confirmations(
+        &self,
+        thread_id: &str,
+    ) -> Result<Vec<AwaitingConfirmation>, BackendError>;
+
+    /// Apply the client's decision to ONE parked child, by id.
+    ///
+    /// Targets exactly `child_task_id`: with parallel parks, answers arrive
+    /// in any order and an oldest-first decide would eat a sibling's
+    /// confirmation.
+    ///
+    /// # Errors
+    ///
+    /// A [`BackendError`] is logged; the park stays for the turn's cancel
+    /// or the backend's orphan policy to resolve.
+    async fn decide_confirmation(
+        &self,
+        thread_id: &str,
+        child_task_id: &str,
+        decision: PermissionDecision,
+    ) -> Result<DecideOutcome, BackendError>;
 }
 
 /// Bridges an [`AcpBackend`] into the wire server's [`PromptHandler`] seam.

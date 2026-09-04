@@ -1,5 +1,5 @@
 //! Fixture-driven wire tests: the recorded buzz-acp exchanges from
-//! `tests/fixtures/` (block/buzz rev `7e34bee`) replayed against the server
+//! `tests/fixtures/` (block/buzz rev `3e48f1b`) replayed against the server
 //! over an in-memory duplex transport.
 
 use std::time::Duration;

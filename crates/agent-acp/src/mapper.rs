@@ -1,17 +1,46 @@
 //! Maps durable SDK events into ACP `session/update` payloads.
+//!
+//! Subagent lifecycle (design §3.1, host-path semantics only):
+//!
+//! 1. `ToolCallStart` opens the row; its id IS the later
+//!    `SubagentProgress.subagent_id`, so no correlation table exists.
+//! 2. No `ToolCallEnd` is ever emitted for a subagent invocation. The row
+//!    closes ONLY on `SubagentProgress { completed: true }`, with the
+//!    status taken from `success`. Progress ticks map to `in_progress`
+//!    updates carrying a turn/tool/token summary.
+//! 3. The in-process SDK loop emits the same variant per CHILD tool call;
+//!    this mapper is correct on the durable host path, where the variant
+//!    means the whole invocation.
+//! 4. Result text never rides the event stream. A close is handed to the
+//!    run loop as [`Mapped::SubagentClosed`] so it can read the
+//!    invocation's result from the backend before emitting the terminal
+//!    update; the tick summary is the fallback content.
+//!
+//! Plan synthesis: `todo_write` input is cached at `ToolCallStart` (it is
+//! unvalidated there) and turned into an ACP `plan` update only after the
+//! matching SUCCESSFUL `ToolCallEnd`. A failed `todo_write` releases the
+//! cache and surfaces no plan.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use agent_sdk_foundation::{AgentEvent, TokenUsage};
 use serde_json::{Value, json};
 
+use crate::backend::PermissionDecision;
 use crate::wire::StopReason;
 
 /// Outcome of mapping one committed event.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Mapped {
-    /// Emit a `session/update` payload.
-    Update(Value),
+    /// Emit these `session/update` payloads, in order. Never empty.
+    Update(Vec<Value>),
+    /// A subagent invocation closed; the run loop reads its result text
+    /// from the backend, then emits [`SubagentClosed::update`].
+    SubagentClosed(SubagentClosed),
+    /// A Confirm-tier tool parked (contract C-e); the run loop correlates
+    /// the tool call to its parked child, asks the client, and applies
+    /// the answer.
+    PermissionRequired(PermissionRequest),
     /// The turn is over with this stop reason.
     Terminal(StopReason),
     /// The turn failed; resolve the prompt as a JSON-RPC error.
@@ -20,11 +49,121 @@ pub enum Mapped {
     Ignore,
 }
 
-/// Per-prompt state needed to suppress consolidated content after deltas.
+/// A subagent invocation's terminal state, minus the result text that
+/// only the backend's task store holds (§3.1 rule 4).
+#[derive(Debug, PartialEq, Eq)]
+pub struct SubagentClosed {
+    /// The spawning tool call — the row this close resolves.
+    pub tool_call_id: String,
+    /// Durable invocation task to read the result from, when the event
+    /// carried one.
+    pub subagent_task_id: Option<String>,
+    /// Whether the invocation succeeded.
+    pub success: bool,
+    /// Turn/tool/token summary: the terminal content when no result text
+    /// is available.
+    pub summary: String,
+}
+
+impl SubagentClosed {
+    /// The terminal `tool_call_update`, with `result_text` as content when
+    /// the backend supplied it and the progress summary otherwise.
+    #[must_use]
+    pub fn update(&self, result_text: Option<&str>) -> Value {
+        tool_call_end(
+            &self.tool_call_id,
+            self.success,
+            result_text.unwrap_or(&self.summary),
+        )
+    }
+}
+
+/// A `ToolRequiresConfirmation` event, ready to become a
+/// `session/request_permission` once the run loop names the parked child.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PermissionRequest {
+    /// The parked tool call — the row the client decides.
+    pub tool_call_id: String,
+    /// Tool name (for the ACP kind).
+    pub name: String,
+    /// Human title of the call.
+    pub display_name: String,
+    /// The call's input, shown to the client as `rawInput`.
+    pub input: Value,
+}
+
+impl PermissionRequest {
+    /// The ACP tool-call object carried on the request.
+    #[must_use]
+    pub fn tool_call(&self) -> Value {
+        json!({
+            "toolCallId": self.tool_call_id,
+            "title": self.display_name,
+            "kind": tool_kind(&self.name),
+            "status": "pending",
+            "rawInput": self.input,
+        })
+    }
+}
+
+/// The permission options for a parked child. The child task id rides in
+/// the option ids (`allow:<child>` / `reject:<child>`), so the answer —
+/// which may arrive out of order among parallel parks — decides exactly
+/// this child. Kinds are what buzz-acp auto-selects (`allow_once`) and
+/// falls back to (`reject_once`).
+#[must_use]
+pub fn permission_options(child_task_id: &str) -> Value {
+    json!([
+        {
+            "optionId": option_id(PermissionDecision::Allow, child_task_id),
+            "name": "Allow",
+            "kind": "allow_once",
+        },
+        {
+            "optionId": option_id(PermissionDecision::Reject, child_task_id),
+            "name": "Reject",
+            "kind": "reject_once",
+        },
+    ])
+}
+
+fn option_id(decision: PermissionDecision, child_task_id: &str) -> String {
+    let prefix = match decision {
+        PermissionDecision::Allow => ALLOW_PREFIX,
+        PermissionDecision::Reject => REJECT_PREFIX,
+    };
+    format!("{prefix}{child_task_id}")
+}
+
+/// Decode an answered `optionId` back into the decision and the child it
+/// names. `None` for anything this mapper did not mint.
+#[must_use]
+pub fn parse_option_id(option_id: &str) -> Option<(PermissionDecision, &str)> {
+    if let Some(child) = option_id.strip_prefix(ALLOW_PREFIX) {
+        return (!child.is_empty()).then_some((PermissionDecision::Allow, child));
+    }
+    let child = option_id.strip_prefix(REJECT_PREFIX)?;
+    (!child.is_empty()).then_some((PermissionDecision::Reject, child))
+}
+
+const ALLOW_PREFIX: &str = "allow:";
+const REJECT_PREFIX: &str = "reject:";
+
+/// Per-prompt mapper state.
 #[derive(Debug, Default)]
 pub struct EventMapper {
+    /// Message ids whose text arrived as deltas; their consolidated
+    /// `Text` is suppressed.
     text_delta_seen: HashSet<String>,
+    /// Same for thinking.
     thinking_delta_seen: HashSet<String>,
+    /// `todo_write` inputs cached at `ToolCallStart`, keyed by tool call
+    /// id, released at the matching `ToolCallEnd`.
+    pending_todo_writes: HashMap<String, Value>,
+    /// Subagent ids already closed. A completion commit is retried until
+    /// it lands, so a second `completed: true` for the same id must not
+    /// re-close (or re-tick) the row.
+    closed_subagents: HashSet<String>,
 }
 
 impl EventMapper {
@@ -34,7 +173,7 @@ impl EventMapper {
                 message_id, delta, ..
             } => {
                 self.text_delta_seen.insert(message_id.clone());
-                Mapped::Update(text_chunk("agent_message_chunk", delta))
+                Mapped::Update(vec![text_chunk("agent_message_chunk", delta)])
             }
             AgentEvent::Text {
                 message_id, text, ..
@@ -48,7 +187,7 @@ impl EventMapper {
                 message_id, delta, ..
             } => {
                 self.thinking_delta_seen.insert(message_id.clone());
-                Mapped::Update(text_chunk("agent_thought_chunk", delta))
+                Mapped::Update(vec![text_chunk("agent_thought_chunk", delta)])
             }
             AgentEvent::Thinking {
                 message_id, text, ..
@@ -64,24 +203,144 @@ impl EventMapper {
                 display_name,
                 input,
                 ..
-            } => Mapped::Update(tool_call_start(id, name, display_name, input)),
+            } => {
+                if name == TODO_WRITE_TOOL {
+                    self.pending_todo_writes.insert(id.clone(), input.clone());
+                }
+                Mapped::Update(vec![tool_call_start(id, name, display_name, input)])
+            }
             AgentEvent::ToolProgress { id, message, .. } => {
-                Mapped::Update(tool_progress(id, message))
+                Mapped::Update(vec![tool_progress(id, message)])
             }
             AgentEvent::ToolCallEnd { id, result, .. } => {
-                Mapped::Update(tool_call_end(id, result.success, &result.output))
+                let mut updates = vec![tool_call_end(id, result.success, &result.output)];
+                let plan = self
+                    .pending_todo_writes
+                    .remove(id)
+                    .filter(|_| result.success)
+                    .and_then(|input| synthesize_plan(&input));
+                updates.extend(plan);
+                Mapped::Update(updates)
             }
+            AgentEvent::SubagentProgress { .. } => self.map_subagent_progress(event),
             AgentEvent::TurnComplete { turn, usage, .. } => {
-                Mapped::Update(usage_update(*turn, usage))
+                Mapped::Update(vec![usage_update(*turn, usage)])
             }
             AgentEvent::Done { .. } => Mapped::Terminal(StopReason::EndTurn),
             AgentEvent::Cancelled { .. } => Mapped::Terminal(StopReason::Cancelled),
             AgentEvent::Refusal { .. } => Mapped::Terminal(StopReason::Refusal),
             AgentEvent::BudgetExceeded { .. } => Mapped::Terminal(StopReason::MaxTokens),
             AgentEvent::Error { message, .. } => Mapped::Fail(message.clone()),
+            AgentEvent::ToolRequiresConfirmation {
+                id,
+                name,
+                display_name,
+                input,
+                ..
+            } => Mapped::PermissionRequired(PermissionRequest {
+                tool_call_id: id.clone(),
+                name: name.clone(),
+                display_name: display_name.clone(),
+                input: input.clone(),
+            }),
             _ => Mapped::Ignore,
         }
     }
+
+    /// §3.1 rules 2 and 4: ticks keep the row `in_progress`; only
+    /// `completed: true` closes it, once, as a directive for the loop.
+    fn map_subagent_progress(&mut self, event: &AgentEvent) -> Mapped {
+        let AgentEvent::SubagentProgress {
+            subagent_id,
+            subagent_name,
+            nickname,
+            subagent_task_id,
+            max_turns,
+            current_turn,
+            completed,
+            success,
+            tool_count,
+            total_tokens,
+            ..
+        } = event
+        else {
+            return Mapped::Ignore;
+        };
+        if self.closed_subagents.contains(subagent_id) {
+            return Mapped::Ignore;
+        }
+        let summary = subagent_summary(
+            subagent_name,
+            nickname.as_deref(),
+            *current_turn,
+            *max_turns,
+            *tool_count,
+            *total_tokens,
+        );
+        if !*completed {
+            return Mapped::Update(vec![tool_progress(subagent_id, &summary)]);
+        }
+        self.closed_subagents.insert(subagent_id.clone());
+        Mapped::SubagentClosed(SubagentClosed {
+            tool_call_id: subagent_id.clone(),
+            subagent_task_id: subagent_task_id.clone(),
+            success: *success,
+            summary,
+        })
+    }
+}
+
+/// The SDK's plan-tracking tool; its successful writes become ACP plans.
+const TODO_WRITE_TOOL: &str = "todo_write";
+
+/// ACP plan entries carry a priority; `todo_write` has no such notion, so
+/// every synthesized entry gets the neutral one.
+const PLAN_ENTRY_PRIORITY: &str = "medium";
+
+/// Build the ACP `plan` update from a validated `todo_write` input
+/// (`{ todos: [{ content, status, activeForm }] }`). Statuses are the
+/// same vocabulary on both sides (`pending`/`in_progress`/`completed`);
+/// `activeForm` has no ACP counterpart. `None` when the input has no
+/// `todos` array — the tool accepted it, so this is defensive, not
+/// expected.
+fn synthesize_plan(input: &Value) -> Option<Value> {
+    let todos = input.get("todos")?.as_array()?;
+    let entries: Vec<Value> = todos
+        .iter()
+        .filter_map(|todo| {
+            let content = todo.get("content")?.as_str()?;
+            let status = todo.get("status")?.as_str()?;
+            Some(json!({
+                "content": content,
+                "priority": PLAN_ENTRY_PRIORITY,
+                "status": status,
+            }))
+        })
+        .collect();
+    Some(json!({ "sessionUpdate": "plan", "entries": entries }))
+}
+
+/// One line of subagent progress for the activity feed, e.g.
+/// `Zara (explore) · turn 2/10 · 3 tools · 1234 tokens`.
+fn subagent_summary(
+    name: &str,
+    nickname: Option<&str>,
+    current_turn: Option<u32>,
+    max_turns: Option<u32>,
+    tool_count: u32,
+    total_tokens: u64,
+) -> String {
+    let label = nickname.map_or_else(
+        || name.to_owned(),
+        |nickname| format!("{nickname} ({name})"),
+    );
+    let turn = match (current_turn, max_turns) {
+        (Some(turn), Some(max)) => format!(" · turn {turn}/{max}"),
+        (Some(turn), None) => format!(" · turn {turn}"),
+        (None, _) => String::new(),
+    };
+    let tools = if tool_count == 1 { "tool" } else { "tools" };
+    format!("{label}{turn} · {tool_count} {tools} · {total_tokens} tokens")
 }
 
 fn map_consolidated(
@@ -93,7 +352,7 @@ fn map_consolidated(
     if delta_seen.contains(message_id) {
         Mapped::Ignore
     } else {
-        Mapped::Update(text_chunk(update_kind, text))
+        Mapped::Update(vec![text_chunk(update_kind, text)])
     }
 }
 
@@ -245,23 +504,60 @@ mod tests {
         }
     }
 
+    /// A durable-host `SubagentProgress` frame for subagent `id`.
+    fn subagent_progress(id: &str, completed: bool, success: bool, turn: u32) -> AgentEvent {
+        AgentEvent::SubagentProgress {
+            subagent_id: id.to_owned(),
+            subagent_name: "explore".to_owned(),
+            nickname: Some("Zara".to_owned()),
+            child_thread_id: Some(ThreadId::from_string("child".to_owned())),
+            child_root_task_id: Some("child-root".to_owned()),
+            subagent_task_id: Some("invocation-1".to_owned()),
+            max_turns: Some(10),
+            current_turn: Some(turn),
+            model: Some("model".to_owned()),
+            tool_name: "explore".to_owned(),
+            tool_context: "look around".to_owned(),
+            completed,
+            success,
+            tool_count: 3,
+            total_tokens: 1234,
+            input_tokens: 1000,
+            output_tokens: 234,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        }
+    }
+
+    fn tool_update(id: &str, status: &str, text: &str) -> Value {
+        json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": id,
+            "status": status,
+            "content": [{
+                "type": "content",
+                "content": { "type": "text", "text": text },
+            }],
+        })
+    }
+
     #[test]
     fn golden_text_delta_and_consolidated_dedupe() {
         let mut mapper = EventMapper::default();
         assert_eq!(
             mapper.map(&AgentEvent::text_delta("m1", "hel")),
-            Mapped::Update(json!({
+            Mapped::Update(vec![json!({
                 "sessionUpdate": "agent_message_chunk",
                 "content": { "type": "text", "text": "hel" },
-            }))
+            })])
         );
         assert_eq!(mapper.map(&AgentEvent::text("m1", "hello")), Mapped::Ignore);
         assert_eq!(
             mapper.map(&AgentEvent::text("m2", "whole")),
-            Mapped::Update(json!({
+            Mapped::Update(vec![json!({
                 "sessionUpdate": "agent_message_chunk",
                 "content": { "type": "text", "text": "whole" },
-            }))
+            })])
         );
     }
 
@@ -270,10 +566,10 @@ mod tests {
         let mut mapper = EventMapper::default();
         assert_eq!(
             mapper.map(&AgentEvent::thinking_delta("m1", "hmm")),
-            Mapped::Update(json!({
+            Mapped::Update(vec![json!({
                 "sessionUpdate": "agent_thought_chunk",
                 "content": { "type": "text", "text": "hmm" },
-            }))
+            })])
         );
         assert_eq!(
             mapper.map(&AgentEvent::thinking("m1", "hmm, yes")),
@@ -281,10 +577,10 @@ mod tests {
         );
         assert_eq!(
             mapper.map(&AgentEvent::thinking("m2", "whole thought")),
-            Mapped::Update(json!({
+            Mapped::Update(vec![json!({
                 "sessionUpdate": "agent_thought_chunk",
                 "content": { "type": "text", "text": "whole thought" },
-            }))
+            })])
         );
     }
 
@@ -300,14 +596,14 @@ mod tests {
         );
         assert_eq!(
             mapper.map(&event),
-            Mapped::Update(json!({
+            Mapped::Update(vec![json!({
                 "sessionUpdate": "tool_call",
                 "toolCallId": "tc-1",
                 "title": "Search files",
                 "kind": "search",
                 "status": "pending",
                 "rawInput": {"pattern": "needle"},
-            }))
+            })])
         );
     }
 
@@ -324,15 +620,7 @@ mod tests {
         );
         assert_eq!(
             mapper.map(&event),
-            Mapped::Update(json!({
-                "sessionUpdate": "tool_call_update",
-                "toolCallId": "tc-1",
-                "status": "in_progress",
-                "content": [{
-                    "type": "content",
-                    "content": { "type": "text", "text": "3 files checked" },
-                }],
-            }))
+            Mapped::Update(vec![tool_update("tc-1", "in_progress", "3 files checked")])
         );
     }
 
@@ -346,17 +634,231 @@ mod tests {
             let event = AgentEvent::tool_call_end("tc-1", "grep", "Search files", result);
             assert_eq!(
                 mapper.map(&event),
-                Mapped::Update(json!({
-                    "sessionUpdate": "tool_call_update",
-                    "toolCallId": "tc-1",
-                    "status": status,
-                    "content": [{
-                        "type": "content",
-                        "content": { "type": "text", "text": output },
-                    }],
-                }))
+                Mapped::Update(vec![tool_update("tc-1", status, output)])
             );
         }
+    }
+
+    /// §3.1 rules 1, 2 and 4: the spawning `ToolCallStart` opens the row
+    /// like any tool; ticks keep it `in_progress` with a summary; only
+    /// `completed: true` closes it — as a directive carrying the
+    /// invocation task id, so the run loop can fetch the result text.
+    #[test]
+    fn golden_subagent_lifecycle_opens_ticks_and_closes_only_on_completion() {
+        let mut mapper = EventMapper::default();
+        let start = AgentEvent::tool_call_start(
+            "sub-1",
+            "subagent_explore",
+            "explore",
+            json!({"task": "look around"}),
+            ToolTier::Observe,
+        );
+        assert_eq!(
+            mapper.map(&start),
+            Mapped::Update(vec![json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "sub-1",
+                "title": "explore",
+                "kind": "other",
+                "status": "pending",
+                "rawInput": {"task": "look around"},
+            })])
+        );
+        assert_eq!(
+            mapper.map(&subagent_progress("sub-1", false, false, 2)),
+            Mapped::Update(vec![tool_update(
+                "sub-1",
+                "in_progress",
+                "Zara (explore) · turn 2/10 · 3 tools · 1234 tokens",
+            )])
+        );
+        let closed = mapper.map(&subagent_progress("sub-1", true, true, 4));
+        let Mapped::SubagentClosed(closed) = closed else {
+            panic!("completion must be a SubagentClosed directive, got {closed:?}");
+        };
+        assert_eq!(closed.tool_call_id, "sub-1");
+        assert_eq!(closed.subagent_task_id.as_deref(), Some("invocation-1"));
+        assert!(closed.success);
+        assert_eq!(
+            closed.update(Some("The answer is 42.")),
+            tool_update("sub-1", "completed", "The answer is 42.")
+        );
+        assert_eq!(
+            closed.update(None),
+            tool_update(
+                "sub-1",
+                "completed",
+                "Zara (explore) · turn 4/10 · 3 tools · 1234 tokens",
+            )
+        );
+    }
+
+    #[test]
+    fn golden_subagent_failure_closes_failed_and_retried_completion_is_ignored() {
+        let mut mapper = EventMapper::default();
+        let Mapped::SubagentClosed(closed) =
+            mapper.map(&subagent_progress("sub-1", true, false, 1))
+        else {
+            panic!("completion must be a SubagentClosed directive");
+        };
+        assert!(!closed.success);
+        assert_eq!(closed.update(None)["status"], json!("failed"));
+        // A retried completion commit, or a tick that raced the close,
+        // must not reopen or re-close the row.
+        assert_eq!(
+            mapper.map(&subagent_progress("sub-1", true, false, 1)),
+            Mapped::Ignore
+        );
+        assert_eq!(
+            mapper.map(&subagent_progress("sub-1", false, false, 1)),
+            Mapped::Ignore
+        );
+    }
+
+    #[test]
+    fn subagent_summary_degrades_without_nickname_or_turn_bounds() {
+        assert_eq!(
+            subagent_summary("explore", None, Some(1), None, 1, 10),
+            "explore · turn 1 · 1 tool · 10 tokens"
+        );
+        assert_eq!(
+            subagent_summary("explore", None, None, Some(5), 0, 0),
+            "explore · 0 tools · 0 tokens"
+        );
+    }
+
+    /// Plan synthesis waits for the SUCCESSFUL `ToolCallEnd`: the tool
+    /// row closes first, then the plan follows in the same mapping.
+    #[test]
+    fn golden_successful_todo_write_synthesizes_a_plan_after_its_tool_row() {
+        let mut mapper = EventMapper::default();
+        let input = json!({"todos": [
+            {"content": "Read the ticket", "status": "completed", "activeForm": "Reading"},
+            {"content": "Write the fix", "status": "in_progress", "activeForm": "Writing"},
+            {"content": "Open the PR", "status": "pending", "activeForm": "Opening"},
+        ]});
+        let start = AgentEvent::tool_call_start(
+            "todo-1",
+            "todo_write",
+            "Update Tasks",
+            input,
+            ToolTier::Observe,
+        );
+        assert!(matches!(mapper.map(&start), Mapped::Update(_)));
+        let end = AgentEvent::tool_call_end(
+            "todo-1",
+            "todo_write",
+            "Update Tasks",
+            ToolResult::success("3 items"),
+        );
+        assert_eq!(
+            mapper.map(&end),
+            Mapped::Update(vec![
+                tool_update("todo-1", "completed", "3 items"),
+                json!({
+                    "sessionUpdate": "plan",
+                    "entries": [
+                        {"content": "Read the ticket", "priority": "medium", "status": "completed"},
+                        {"content": "Write the fix", "priority": "medium", "status": "in_progress"},
+                        {"content": "Open the PR", "priority": "medium", "status": "pending"},
+                    ],
+                }),
+            ])
+        );
+        // The cache is released: a second end for the same id is a plain
+        // tool update.
+        assert_eq!(
+            mapper.map(&end),
+            Mapped::Update(vec![tool_update("todo-1", "completed", "3 items")])
+        );
+    }
+
+    #[test]
+    fn failed_todo_write_surfaces_no_plan_and_releases_its_cache() {
+        let mut mapper = EventMapper::default();
+        let input = json!({"todos": [{"content": "x", "status": "pending", "activeForm": "y"}]});
+        let start = AgentEvent::tool_call_start(
+            "todo-1",
+            "todo_write",
+            "Update Tasks",
+            input,
+            ToolTier::Observe,
+        );
+        mapper.map(&start);
+        let failed = AgentEvent::tool_call_end(
+            "todo-1",
+            "todo_write",
+            "Update Tasks",
+            ToolResult::error("Invalid input for todo_write"),
+        );
+        assert_eq!(
+            mapper.map(&failed),
+            Mapped::Update(vec![tool_update(
+                "todo-1",
+                "failed",
+                "Invalid input for todo_write"
+            )])
+        );
+        let later_success = AgentEvent::tool_call_end(
+            "todo-1",
+            "todo_write",
+            "Update Tasks",
+            ToolResult::success("ok"),
+        );
+        assert_eq!(
+            mapper.map(&later_success),
+            Mapped::Update(vec![tool_update("todo-1", "completed", "ok")]),
+            "a released cache must not resurrect a plan from a stale input"
+        );
+    }
+
+    /// C-e: the confirmation event becomes a directive; the ACP request
+    /// carries the tool call and options whose ids name the parked child.
+    #[test]
+    fn golden_confirmation_maps_to_child_bound_permission_options() {
+        let mut mapper = EventMapper::default();
+        let event = AgentEvent::tool_requires_confirmation(
+            "tc-1",
+            "pg_query",
+            "Run query",
+            json!({"sql": "delete from x"}),
+            "mutation",
+        );
+        let Mapped::PermissionRequired(request) = mapper.map(&event) else {
+            panic!("confirmation must map to a permission directive");
+        };
+        assert_eq!(
+            request.tool_call(),
+            json!({
+                "toolCallId": "tc-1",
+                "title": "Run query",
+                "kind": "execute",
+                "status": "pending",
+                "rawInput": {"sql": "delete from x"},
+            })
+        );
+        assert_eq!(
+            permission_options("child-7"),
+            json!([
+                {"optionId": "allow:child-7", "name": "Allow", "kind": "allow_once"},
+                {"optionId": "reject:child-7", "name": "Reject", "kind": "reject_once"},
+            ])
+        );
+    }
+
+    #[test]
+    fn option_ids_round_trip_and_foreign_ids_are_rejected() {
+        assert_eq!(
+            parse_option_id("allow:child-7"),
+            Some((PermissionDecision::Allow, "child-7"))
+        );
+        assert_eq!(
+            parse_option_id("reject:child-7"),
+            Some((PermissionDecision::Reject, "child-7"))
+        );
+        assert_eq!(parse_option_id("allow:"), None);
+        assert_eq!(parse_option_id("allow"), None);
+        assert_eq!(parse_option_id("always:child-7"), None);
     }
 
     #[test]
@@ -370,14 +872,14 @@ mod tests {
         };
         assert_eq!(
             mapper.map(&AgentEvent::turn_complete(2, usage)),
-            Mapped::Update(json!({
+            Mapped::Update(vec![json!({
                 "sessionUpdate": "usage_update",
                 "turn": 2,
                 "inputTokens": 11,
                 "outputTokens": 7,
                 "cachedInputTokens": 3,
                 "cacheCreationInputTokens": 2,
-            }))
+            })])
         );
     }
 

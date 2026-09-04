@@ -9,15 +9,17 @@
 //! terminals carry `emitter_task_id`. Stale-predecessor traffic is played
 //! as `task-0`.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_acp::{
-    AcpBackend, AcpRunHandle, AcpServer, BackendError, BackendPromptHandler, BackendTaskStatus,
-    EventStream, NewSessionParams, RunEvent, RunStreamItem,
+    AcpBackend, AcpRunHandle, AcpServer, AwaitingConfirmation, BackendError, BackendPromptHandler,
+    BackendTaskStatus, DecideOutcome, EventStream, NewSessionParams, PermissionDecision, RunEvent,
+    RunStreamItem,
 };
-use agent_sdk_foundation::{AgentEvent, ThreadId, TokenUsage};
+use agent_sdk_foundation::{AgentEvent, ThreadId, TokenUsage, ToolTier};
 use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf};
@@ -67,6 +69,31 @@ fn cancelled_event(task: Option<&str>) -> AgentEvent {
     }
 }
 
+/// A durable-host `SubagentProgress` frame for the invocation `task`.
+fn subagent_progress(id: &str, task: &str, completed: bool, success: bool) -> AgentEvent {
+    AgentEvent::SubagentProgress {
+        subagent_id: id.to_owned(),
+        subagent_name: "explore".to_owned(),
+        nickname: None,
+        child_thread_id: Some(ThreadId::from_string("child".to_owned())),
+        child_root_task_id: Some("child-root".to_owned()),
+        subagent_task_id: Some(task.to_owned()),
+        max_turns: Some(10),
+        current_turn: Some(2),
+        model: None,
+        tool_name: "explore".to_owned(),
+        tool_context: "look around".to_owned(),
+        completed,
+        success,
+        tool_count: 1,
+        total_tokens: 50,
+        input_tokens: 40,
+        output_tokens: 10,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+    }
+}
+
 /// Scripted backend. `streams` is a queue of event scripts — each
 /// `open_events` call pops the next one (so lag-reopen gets the second
 /// script). The LAST script may stay open as a live channel (fed by
@@ -82,10 +109,24 @@ struct MockBackend {
     live_tx: Mutex<Option<mpsc::UnboundedSender<RunStreamItem>>>,
     opened_after: Mutex<Vec<Option<u64>>>,
     cancels: AtomicUsize,
+    /// What `subagent_result` answers, keyed by invocation task id:
+    /// `Ok(text)` serves it, `Err(message)` fails the read. Unknown ids
+    /// answer `Ok(None)`.
+    subagent_results: Mutex<HashMap<String, Result<String, String>>>,
+    subagent_result_reads: Mutex<Vec<String>>,
+    /// Parks served by `awaiting_confirmations`, oldest first.
+    awaiting: Mutex<Vec<AwaitingConfirmation>>,
+    /// How many `awaiting_confirmations` polls answer EMPTY before the
+    /// parks above become visible (a park committing after its event).
+    awaiting_hidden_polls: AtomicUsize,
+    awaiting_polls: AtomicUsize,
+    /// Every decision the loop applied, in arrival order.
+    decisions: Mutex<Vec<(String, PermissionDecision)>>,
+    decide_outcome: Mutex<DecideOutcome>,
 }
 
 impl MockBackend {
-    const fn new(first_event_sequence: u64, streams: Vec<Vec<RunStreamItem>>) -> Self {
+    fn new(first_event_sequence: u64, streams: Vec<Vec<RunStreamItem>>) -> Self {
         Self {
             first_event_sequence,
             streams: Mutex::new(streams),
@@ -95,7 +136,47 @@ impl MockBackend {
             live_tx: Mutex::new(None),
             opened_after: Mutex::new(Vec::new()),
             cancels: AtomicUsize::new(0),
+            subagent_results: Mutex::new(HashMap::new()),
+            subagent_result_reads: Mutex::new(Vec::new()),
+            awaiting: Mutex::new(Vec::new()),
+            awaiting_hidden_polls: AtomicUsize::new(0),
+            awaiting_polls: AtomicUsize::new(0),
+            decisions: Mutex::new(Vec::new()),
+            decide_outcome: Mutex::new(DecideOutcome::Decided),
         }
+    }
+
+    fn with_park(self, child_task_id: &str, tool_call_id: &str) -> Self {
+        self.awaiting
+            .lock()
+            .expect("lock")
+            .push(AwaitingConfirmation {
+                child_task_id: child_task_id.to_owned(),
+                tool_call_id: tool_call_id.to_owned(),
+            });
+        self
+    }
+
+    fn with_parks_hidden_for(self, polls: usize) -> Self {
+        self.awaiting_hidden_polls.store(polls, Ordering::SeqCst);
+        self
+    }
+
+    fn with_decide_outcome(self, outcome: DecideOutcome) -> Self {
+        *self.decide_outcome.lock().expect("lock") = outcome;
+        self
+    }
+
+    fn decisions(&self) -> Vec<(String, PermissionDecision)> {
+        self.decisions.lock().expect("lock").clone()
+    }
+
+    fn with_subagent_result(self, task: &str, result: Result<&str, &str>) -> Self {
+        self.subagent_results.lock().expect("lock").insert(
+            task.to_owned(),
+            result.map(str::to_owned).map_err(str::to_owned),
+        );
+        self
     }
 
     const fn hold_open(mut self) -> Self {
@@ -180,6 +261,51 @@ impl AcpBackend for MockBackend {
     ) -> Result<BackendTaskStatus, BackendError> {
         self.status_polls.fetch_add(1, Ordering::SeqCst);
         Ok(self.status.lock().expect("lock").clone())
+    }
+
+    async fn subagent_result(
+        &self,
+        _thread_id: &str,
+        subagent_task_id: &str,
+    ) -> Result<Option<String>, BackendError> {
+        self.subagent_result_reads
+            .lock()
+            .expect("lock")
+            .push(subagent_task_id.to_owned());
+        match self
+            .subagent_results
+            .lock()
+            .expect("lock")
+            .get(subagent_task_id)
+        {
+            Some(Ok(text)) => Ok(Some(text.clone())),
+            Some(Err(message)) => Err(BackendError::new(message.clone())),
+            None => Ok(None),
+        }
+    }
+
+    async fn awaiting_confirmations(
+        &self,
+        _thread_id: &str,
+    ) -> Result<Vec<AwaitingConfirmation>, BackendError> {
+        let poll = self.awaiting_polls.fetch_add(1, Ordering::SeqCst);
+        if poll < self.awaiting_hidden_polls.load(Ordering::SeqCst) {
+            return Ok(Vec::new());
+        }
+        Ok(self.awaiting.lock().expect("lock").clone())
+    }
+
+    async fn decide_confirmation(
+        &self,
+        _thread_id: &str,
+        child_task_id: &str,
+        decision: PermissionDecision,
+    ) -> Result<DecideOutcome, BackendError> {
+        self.decisions
+            .lock()
+            .expect("lock")
+            .push((child_task_id.to_owned(), decision));
+        Ok(*self.decide_outcome.lock().expect("lock"))
     }
 }
 
@@ -742,4 +868,318 @@ async fn active_streaming_for_ninety_seconds_emits_no_keepalive() {
             .all(|message| { message["params"]["update"]["sessionUpdate"] != json!("keepalive") })
     );
     assert_eq!(response["result"]["stopReason"], json!("end_turn"));
+}
+
+fn tool_updates(notifications: &[Value]) -> Vec<(String, String, String)> {
+    notifications
+        .iter()
+        .map(|n| &n["params"]["update"])
+        .filter(|u| u["sessionUpdate"] == json!("tool_call_update"))
+        .map(|u| {
+            (
+                u["toolCallId"].as_str().unwrap_or_default().to_owned(),
+                u["status"].as_str().unwrap_or_default().to_owned(),
+                u["content"][0]["content"]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        })
+        .collect()
+}
+
+fn subagent_script() -> Vec<RunStreamItem> {
+    vec![
+        ev(0, start_event(TASK)),
+        ev(
+            1,
+            AgentEvent::tool_call_start(
+                "sub-1",
+                "subagent_explore",
+                "explore",
+                json!({"task": "look around"}),
+                ToolTier::Observe,
+            ),
+        ),
+        ev(2, subagent_progress("sub-1", "inv-1", false, false)),
+        ev(3, subagent_progress("sub-1", "inv-1", true, true)),
+        ev(4, done_event(Some(TASK))),
+    ]
+}
+
+/// §3.1 rule 4 end to end: the closing `tool_call_update` carries the
+/// invocation's result text read from the backend, and the row closes
+/// exactly once — no `ToolCallEnd` exists for a subagent.
+#[tokio::test]
+async fn subagent_close_reads_result_text_from_backend() {
+    let backend = Arc::new(
+        MockBackend::new(0, vec![subagent_script()])
+            .with_subagent_result("inv-1", Ok("The answer is 42.")),
+    );
+    let mut client = Client::start(Arc::clone(&backend));
+    let (notifications, response) = client.handshake_and_prompt().await;
+
+    assert_eq!(
+        tool_updates(&notifications),
+        vec![
+            (
+                "sub-1".to_owned(),
+                "in_progress".to_owned(),
+                "explore · turn 2/10 · 1 tool · 50 tokens".to_owned(),
+            ),
+            (
+                "sub-1".to_owned(),
+                "completed".to_owned(),
+                "The answer is 42.".to_owned(),
+            ),
+        ]
+    );
+    assert_eq!(
+        *backend.subagent_result_reads.lock().expect("lock"),
+        vec!["inv-1".to_owned()],
+        "exactly one result read per subagent close"
+    );
+    assert_eq!(response["result"]["stopReason"], json!("end_turn"));
+}
+
+/// A failed result read never blocks the close: the row still resolves,
+/// with the progress summary as content.
+#[tokio::test]
+async fn subagent_close_survives_a_failed_result_read() {
+    let backend = Arc::new(
+        MockBackend::new(0, vec![subagent_script()])
+            .with_subagent_result("inv-1", Err("task store unreachable")),
+    );
+    let mut client = Client::start(Arc::clone(&backend));
+    let (notifications, response) = client.handshake_and_prompt().await;
+
+    let updates = tool_updates(&notifications);
+    assert_eq!(updates.len(), 2);
+    assert_eq!(
+        updates[1],
+        (
+            "sub-1".to_owned(),
+            "completed".to_owned(),
+            "explore · turn 2/10 · 1 tool · 50 tokens".to_owned(),
+        )
+    );
+    assert_eq!(response["result"]["stopReason"], json!("end_turn"));
+}
+
+/// A parked Confirm-tier call: the row opens like any tool, then the
+/// confirmation event names it.
+fn park_script(tool_call_ids: &[&str]) -> Vec<RunStreamItem> {
+    let mut script = vec![ev(0, start_event(TASK))];
+    let mut sequence = 1;
+    for id in tool_call_ids {
+        script.push(ev(
+            sequence,
+            AgentEvent::tool_call_start(
+                *id,
+                "pg_query",
+                "Run query",
+                json!({"sql": format!("delete from {id}")}),
+                ToolTier::Confirm,
+            ),
+        ));
+        sequence += 1;
+    }
+    for id in tool_call_ids {
+        script.push(ev(
+            sequence,
+            AgentEvent::tool_requires_confirmation(
+                *id,
+                "pg_query",
+                "Run query",
+                json!({"sql": format!("delete from {id}")}),
+                "mutation",
+            ),
+        ));
+        sequence += 1;
+    }
+    script
+}
+
+/// A `session/request_permission` as the client sees it.
+struct PermissionAsk {
+    id: Value,
+    tool_call_id: String,
+    allow: String,
+    reject: String,
+}
+
+impl Client {
+    async fn prompt(&mut self, session_id: &str) {
+        self.send(
+            json!({"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{
+                "sessionId": session_id, "prompt": [{"type":"text","text":"go"}],
+            }}),
+        )
+        .await;
+    }
+
+    /// Read until `count` permission requests have arrived, skipping
+    /// updates. Each carries its `optionId`s keyed by kind.
+    async fn permission_asks(&mut self, count: usize) -> Vec<PermissionAsk> {
+        let mut asks = Vec::new();
+        while asks.len() < count {
+            let msg = self.next_message().await;
+            if msg["method"] != json!("session/request_permission") {
+                continue;
+            }
+            let option = |kind: &str| -> String {
+                msg["params"]["options"]
+                    .as_array()
+                    .expect("options array")
+                    .iter()
+                    .find(|o| o["kind"] == json!(kind))
+                    .and_then(|o| o["optionId"].as_str())
+                    .unwrap_or_else(|| panic!("no {kind} option"))
+                    .to_owned()
+            };
+            asks.push(PermissionAsk {
+                id: msg["id"].clone(),
+                tool_call_id: msg["params"]["toolCall"]["toolCallId"]
+                    .as_str()
+                    .expect("toolCallId")
+                    .to_owned(),
+                allow: option("allow_once"),
+                reject: option("reject_once"),
+            });
+        }
+        asks
+    }
+
+    async fn answer(&mut self, ask: &PermissionAsk, option_id: &str) {
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "id": ask.id,
+            "result": { "outcome": { "outcome": "selected", "optionId": option_id } },
+        }))
+        .await;
+    }
+}
+
+async fn wait_for_decisions(backend: &MockBackend, count: usize) {
+    for _ in 0..200 {
+        if backend.decisions().len() >= count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("expected {count} decisions, got {:?}", backend.decisions());
+}
+
+/// C-e acceptance: two parallel parks answered in REVERSE order decide
+/// the right children — the child rides in the option ids, so no
+/// oldest-first lookup can eat a sibling's answer.
+#[tokio::test]
+async fn parallel_parks_answered_out_of_order_decide_the_right_children() {
+    let backend = Arc::new(
+        MockBackend::new(0, vec![park_script(&["tc-1", "tc-2"])])
+            .hold_open()
+            .with_park("child-1", "tc-1")
+            .with_park("child-2", "tc-2"),
+    );
+    let mut client = Client::start(Arc::clone(&backend));
+    let session_id = client.handshake().await;
+    client.prompt(&session_id).await;
+
+    let asks = client.permission_asks(2).await;
+    let (first, second) = (&asks[0], &asks[1]);
+    assert_eq!(first.tool_call_id, "tc-1");
+    assert_eq!(second.tool_call_id, "tc-2");
+    assert_eq!(second.allow, "allow:child-2");
+    assert_eq!(first.reject, "reject:child-1");
+
+    client.answer(second, &second.allow).await;
+    client.answer(first, &first.reject).await;
+    wait_for_decisions(&backend, 2).await;
+    assert_eq!(
+        backend.decisions(),
+        vec![
+            ("child-2".to_owned(), PermissionDecision::Allow),
+            ("child-1".to_owned(), PermissionDecision::Reject),
+        ]
+    );
+
+    assert!(backend.send_live(ev(10, done_event(Some(TASK)))));
+    let (_, response) = client.until_response(2).await;
+    assert_eq!(response["result"]["stopReason"], json!("end_turn"));
+}
+
+/// A stale answer — the park was already decided, cancelled, or swept —
+/// is a successful no-op: the turn is untouched.
+#[tokio::test]
+async fn stale_permission_answer_is_a_no_op() {
+    let backend = Arc::new(
+        MockBackend::new(0, vec![park_script(&["tc-1"])])
+            .hold_open()
+            .with_park("child-1", "tc-1")
+            .with_decide_outcome(DecideOutcome::NonePending),
+    );
+    let mut client = Client::start(Arc::clone(&backend));
+    let session_id = client.handshake().await;
+    client.prompt(&session_id).await;
+
+    let asks = client.permission_asks(1).await;
+    client.answer(&asks[0], &asks[0].allow).await;
+    wait_for_decisions(&backend, 1).await;
+
+    assert!(backend.send_live(ev(10, done_event(Some(TASK)))));
+    let (_, response) = client.until_response(2).await;
+    assert_eq!(response["result"]["stopReason"], json!("end_turn"));
+}
+
+/// The park may commit after its event: correlation retries inside the
+/// window and still names the right child.
+#[tokio::test]
+async fn permission_request_waits_for_a_park_that_commits_after_its_event() {
+    let backend = Arc::new(
+        MockBackend::new(0, vec![park_script(&["tc-1"])])
+            .hold_open()
+            .with_park("child-1", "tc-1")
+            .with_parks_hidden_for(3),
+    );
+    let mut client = Client::start(Arc::clone(&backend));
+    let session_id = client.handshake().await;
+    client.prompt(&session_id).await;
+
+    let asks = client.permission_asks(1).await;
+    assert_eq!(asks[0].allow, "allow:child-1");
+    assert!(backend.awaiting_polls.load(Ordering::SeqCst) >= 4);
+
+    assert!(backend.send_live(ev(10, done_event(Some(TASK)))));
+    let (_, response) = client.until_response(2).await;
+    assert_eq!(response["result"]["stopReason"], json!("end_turn"));
+}
+
+/// A client `cancelled` outcome decides nothing; the park is left to the
+/// turn's cancel (here: the harness cancels the turn right after).
+#[tokio::test]
+async fn cancelled_permission_outcome_decides_nothing() {
+    let backend = Arc::new(
+        MockBackend::new(0, vec![park_script(&["tc-1"])])
+            .hold_open()
+            .with_park("child-1", "tc-1"),
+    );
+    let mut client = Client::start(Arc::clone(&backend));
+    let session_id = client.handshake().await;
+    client.prompt(&session_id).await;
+
+    let asks = client.permission_asks(1).await;
+    client
+        .send(json!({
+            "jsonrpc": "2.0",
+            "id": asks[0].id,
+            "result": { "outcome": { "outcome": "cancelled" } },
+        }))
+        .await;
+    client
+        .send(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId": session_id}}))
+        .await;
+    let (_, response) = client.until_response(2).await;
+    assert_eq!(response["result"]["stopReason"], json!("cancelled"));
+    assert!(backend.decisions().is_empty(), "cancelled must not decide");
+    assert_eq!(backend.cancels.load(Ordering::SeqCst), 1);
 }
