@@ -9,6 +9,7 @@
 //! terminals carry `emitter_task_id`. Stale-predecessor traffic is played
 //! as `task-0`.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,7 +18,7 @@ use agent_acp::{
     AcpBackend, AcpRunHandle, AcpServer, BackendError, BackendPromptHandler, BackendTaskStatus,
     EventStream, NewSessionParams, RunEvent, RunStreamItem,
 };
-use agent_sdk_foundation::{AgentEvent, ThreadId, TokenUsage};
+use agent_sdk_foundation::{AgentEvent, ThreadId, TokenUsage, ToolTier};
 use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf};
@@ -67,6 +68,31 @@ fn cancelled_event(task: Option<&str>) -> AgentEvent {
     }
 }
 
+/// A durable-host `SubagentProgress` frame for the invocation `task`.
+fn subagent_progress(id: &str, task: &str, completed: bool, success: bool) -> AgentEvent {
+    AgentEvent::SubagentProgress {
+        subagent_id: id.to_owned(),
+        subagent_name: "explore".to_owned(),
+        nickname: None,
+        child_thread_id: Some(ThreadId::from_string("child".to_owned())),
+        child_root_task_id: Some("child-root".to_owned()),
+        subagent_task_id: Some(task.to_owned()),
+        max_turns: Some(10),
+        current_turn: Some(2),
+        model: None,
+        tool_name: "explore".to_owned(),
+        tool_context: "look around".to_owned(),
+        completed,
+        success,
+        tool_count: 1,
+        total_tokens: 50,
+        input_tokens: 40,
+        output_tokens: 10,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+    }
+}
+
 /// Scripted backend. `streams` is a queue of event scripts — each
 /// `open_events` call pops the next one (so lag-reopen gets the second
 /// script). The LAST script may stay open as a live channel (fed by
@@ -82,10 +108,15 @@ struct MockBackend {
     live_tx: Mutex<Option<mpsc::UnboundedSender<RunStreamItem>>>,
     opened_after: Mutex<Vec<Option<u64>>>,
     cancels: AtomicUsize,
+    /// What `subagent_result` answers, keyed by invocation task id:
+    /// `Ok(text)` serves it, `Err(message)` fails the read. Unknown ids
+    /// answer `Ok(None)`.
+    subagent_results: Mutex<HashMap<String, Result<String, String>>>,
+    subagent_result_reads: Mutex<Vec<String>>,
 }
 
 impl MockBackend {
-    const fn new(first_event_sequence: u64, streams: Vec<Vec<RunStreamItem>>) -> Self {
+    fn new(first_event_sequence: u64, streams: Vec<Vec<RunStreamItem>>) -> Self {
         Self {
             first_event_sequence,
             streams: Mutex::new(streams),
@@ -95,7 +126,17 @@ impl MockBackend {
             live_tx: Mutex::new(None),
             opened_after: Mutex::new(Vec::new()),
             cancels: AtomicUsize::new(0),
+            subagent_results: Mutex::new(HashMap::new()),
+            subagent_result_reads: Mutex::new(Vec::new()),
         }
+    }
+
+    fn with_subagent_result(self, task: &str, result: Result<&str, &str>) -> Self {
+        self.subagent_results.lock().expect("lock").insert(
+            task.to_owned(),
+            result.map(str::to_owned).map_err(str::to_owned),
+        );
+        self
     }
 
     const fn hold_open(mut self) -> Self {
@@ -180,6 +221,27 @@ impl AcpBackend for MockBackend {
     ) -> Result<BackendTaskStatus, BackendError> {
         self.status_polls.fetch_add(1, Ordering::SeqCst);
         Ok(self.status.lock().expect("lock").clone())
+    }
+
+    async fn subagent_result(
+        &self,
+        _thread_id: &str,
+        subagent_task_id: &str,
+    ) -> Result<Option<String>, BackendError> {
+        self.subagent_result_reads
+            .lock()
+            .expect("lock")
+            .push(subagent_task_id.to_owned());
+        match self
+            .subagent_results
+            .lock()
+            .expect("lock")
+            .get(subagent_task_id)
+        {
+            Some(Ok(text)) => Ok(Some(text.clone())),
+            Some(Err(message)) => Err(BackendError::new(message.clone())),
+            None => Ok(None),
+        }
     }
 }
 
@@ -740,6 +802,102 @@ async fn active_streaming_for_ninety_seconds_emits_no_keepalive() {
         notifications
             .iter()
             .all(|message| { message["params"]["update"]["sessionUpdate"] != json!("keepalive") })
+    );
+    assert_eq!(response["result"]["stopReason"], json!("end_turn"));
+}
+
+fn tool_updates(notifications: &[Value]) -> Vec<(String, String, String)> {
+    notifications
+        .iter()
+        .map(|n| &n["params"]["update"])
+        .filter(|u| u["sessionUpdate"] == json!("tool_call_update"))
+        .map(|u| {
+            (
+                u["toolCallId"].as_str().unwrap_or_default().to_owned(),
+                u["status"].as_str().unwrap_or_default().to_owned(),
+                u["content"][0]["content"]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        })
+        .collect()
+}
+
+fn subagent_script() -> Vec<RunStreamItem> {
+    vec![
+        ev(0, start_event(TASK)),
+        ev(
+            1,
+            AgentEvent::tool_call_start(
+                "sub-1",
+                "subagent_explore",
+                "explore",
+                json!({"task": "look around"}),
+                ToolTier::Observe,
+            ),
+        ),
+        ev(2, subagent_progress("sub-1", "inv-1", false, false)),
+        ev(3, subagent_progress("sub-1", "inv-1", true, true)),
+        ev(4, done_event(Some(TASK))),
+    ]
+}
+
+/// §3.1 rule 4 end to end: the closing `tool_call_update` carries the
+/// invocation's result text read from the backend, and the row closes
+/// exactly once — no `ToolCallEnd` exists for a subagent.
+#[tokio::test]
+async fn subagent_close_reads_result_text_from_backend() {
+    let backend = Arc::new(
+        MockBackend::new(0, vec![subagent_script()])
+            .with_subagent_result("inv-1", Ok("The answer is 42.")),
+    );
+    let mut client = Client::start(Arc::clone(&backend));
+    let (notifications, response) = client.handshake_and_prompt().await;
+
+    assert_eq!(
+        tool_updates(&notifications),
+        vec![
+            (
+                "sub-1".to_owned(),
+                "in_progress".to_owned(),
+                "explore · turn 2/10 · 1 tool · 50 tokens".to_owned(),
+            ),
+            (
+                "sub-1".to_owned(),
+                "completed".to_owned(),
+                "The answer is 42.".to_owned(),
+            ),
+        ]
+    );
+    assert_eq!(
+        *backend.subagent_result_reads.lock().expect("lock"),
+        vec!["inv-1".to_owned()],
+        "exactly one result read per subagent close"
+    );
+    assert_eq!(response["result"]["stopReason"], json!("end_turn"));
+}
+
+/// A failed result read never blocks the close: the row still resolves,
+/// with the progress summary as content.
+#[tokio::test]
+async fn subagent_close_survives_a_failed_result_read() {
+    let backend = Arc::new(
+        MockBackend::new(0, vec![subagent_script()])
+            .with_subagent_result("inv-1", Err("task store unreachable")),
+    );
+    let mut client = Client::start(Arc::clone(&backend));
+    let (notifications, response) = client.handshake_and_prompt().await;
+
+    let updates = tool_updates(&notifications);
+    assert_eq!(updates.len(), 2);
+    assert_eq!(
+        updates[1],
+        (
+            "sub-1".to_owned(),
+            "completed".to_owned(),
+            "explore · turn 2/10 · 1 tool · 50 tokens".to_owned(),
+        )
     );
     assert_eq!(response["result"]["stopReason"], json!("end_turn"));
 }

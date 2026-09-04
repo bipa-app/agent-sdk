@@ -54,8 +54,9 @@
 //!   is a `return`.
 //!
 //! Mapper scope: text/thinking deltas, consolidated-content dedupe, tool
-//! lifecycle, turn usage, keepalives, and terminals. Subagent, plan, and
-//! permission mapping land in later slices.
+//! lifecycle, the subagent lifecycle (with result text read from the
+//! backend at close), plan synthesis, turn usage, keepalives, and
+//! terminals. Permission mapping lands in the confirmations slice.
 
 use std::pin::Pin;
 use std::time::Duration;
@@ -66,7 +67,7 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::{AcpBackend, AcpRunHandle, BackendTaskStatus, RunStreamItem};
-use crate::mapper::{EventMapper, Mapped};
+use crate::mapper::{EventMapper, Mapped, SubagentClosed};
 use crate::server::{PromptError, UpdateSink};
 use crate::wire::StopReason;
 
@@ -146,6 +147,27 @@ async fn reconcile_unattributed<B: AcpBackend + ?Sized>(
     }
 }
 
+/// The child's result text for a closing subagent row (§3.1 rule 4).
+/// `None` — no invocation id on the event, nothing stored, or a failed
+/// read — leaves the row closing with its progress summary; the close
+/// itself never depends on this read.
+async fn subagent_result_text<B: AcpBackend + ?Sized>(
+    backend: &B,
+    handle: &AcpRunHandle,
+    closed: &SubagentClosed,
+) -> Option<String> {
+    let task_id = closed.subagent_task_id.as_deref()?;
+    match backend.subagent_result(&handle.thread_id, task_id).await {
+        Ok(text) => text,
+        Err(error) => {
+            log::warn!(
+                "acp: subagent {task_id} result read failed (closing with its summary): {error}"
+            );
+            None
+        }
+    }
+}
+
 async fn handle_event<B: AcpBackend + ?Sized>(
     backend: &B,
     handle: &AcpRunHandle,
@@ -174,14 +196,27 @@ async fn handle_event<B: AcpBackend + ?Sized>(
     }
 
     match mapper.map(event) {
-        Mapped::Update(update) => {
+        Mapped::Update(frames) => {
             if *phase == Phase::Streaming {
+                for frame in frames {
+                    updates
+                        .session_update(frame)
+                        .await
+                        .map_err(|error| PromptError::new(error.to_string()))?;
+                }
+                // Outbound frames reached the client — THAT is what
+                // postpones the keepalive, not reading a stream item.
+                reset_keepalive(keepalive);
+            }
+            Ok(None)
+        }
+        Mapped::SubagentClosed(closed) => {
+            if *phase == Phase::Streaming {
+                let result_text = subagent_result_text(backend, handle, &closed).await;
                 updates
-                    .session_update(update)
+                    .session_update(closed.update(result_text.as_deref()))
                     .await
                     .map_err(|error| PromptError::new(error.to_string()))?;
-                // An outbound frame reached the client — THAT is what
-                // postpones the keepalive, not reading a stream item.
                 reset_keepalive(keepalive);
             }
             Ok(None)

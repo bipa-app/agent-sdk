@@ -8,9 +8,9 @@
 //! ([`crate::run`]), so every backend implementation inherits the same
 //! correctness behavior.
 //!
-//! The loop maps text and thinking content, tool lifecycle, usage, keepalives,
-//! and terminal events. Subagent, plan, and permission mapping land in later
-//! slices.
+//! The loop maps text and thinking content, tool lifecycle, the subagent
+//! lifecycle, plan synthesis, usage, keepalives, and terminal events.
+//! Permission mapping lands in the confirmations slice.
 
 use std::sync::Arc;
 
@@ -167,6 +167,26 @@ pub trait AcpBackend: Send + Sync + 'static {
         thread_id: &str,
         task_id: &str,
     ) -> Result<BackendTaskStatus, BackendError>;
+
+    /// Read the result text of a completed subagent invocation.
+    ///
+    /// Design §3.1 rule 4: result text never rides the event stream —
+    /// `SubagentResult` goes to the invocation task's result and the
+    /// parent's history only. The run loop calls this once per subagent
+    /// close so the terminal `tool_call_update` can carry the child's
+    /// final response (or its recorded error) instead of a bare
+    /// success/failure. `Ok(None)` means the backend has nothing to
+    /// offer; the loop then closes the row with the progress summary.
+    ///
+    /// # Errors
+    ///
+    /// A [`BackendError`] here is logged, never fatal — the row still
+    /// closes, with the summary as content.
+    async fn subagent_result(
+        &self,
+        thread_id: &str,
+        subagent_task_id: &str,
+    ) -> Result<Option<String>, BackendError>;
 }
 
 /// Bridges an [`AcpBackend`] into the wire server's [`PromptHandler`] seam.
