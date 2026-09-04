@@ -32,9 +32,9 @@ pub mod error_codes {
 /// A single incoming line, classified.
 ///
 /// JSON-RPC 2.0 distinguishes requests (`id` + `method`), notifications
-/// (`method`, no `id`), and responses (`id`, no `method`). The server only
-/// initiates notifications in this milestone, so incoming responses are
-/// ignored by the dispatch loop — but they still classify cleanly here.
+/// (`method`, no `id`), and responses (`id`, no `method`). Responses answer
+/// the server's own client-directed requests (`session/request_permission`)
+/// and are routed back to their waiter by id.
 #[derive(Debug)]
 pub enum Incoming {
     /// A request that expects a response with the same `id`.
@@ -54,11 +54,16 @@ pub enum Incoming {
         /// Notification params (`Value::Null` when absent).
         params: Value,
     },
-    /// A response to a server-initiated request (none exist in this
-    /// milestone; classified so the dispatch loop can ignore it explicitly).
+    /// A response to a server-initiated request, routed to its waiter by
+    /// `id`. `result` and `error` are kept verbatim; exactly one of them is
+    /// set on a well-formed response.
     Response {
         /// The id of the request this responds to.
         id: Value,
+        /// The `result` member, when the request succeeded.
+        result: Option<Value>,
+        /// The `error` member, when the request failed.
+        error: Option<Value>,
     },
     /// An object with neither `method` nor `id` — not valid JSON-RPC.
     Malformed,
@@ -76,10 +81,12 @@ impl Incoming {
             .remove("method")
             .and_then(|m| m.as_str().map(str::to_owned));
         let params = map.remove("params").unwrap_or(Value::Null);
+        let result = map.remove("result");
+        let error = map.remove("error");
         match (id, method) {
             (Some(id), Some(method)) => Self::Request { id, method, params },
             (None, Some(method)) => Self::Notification { method, params },
-            (Some(id), None) => Self::Response { id },
+            (Some(id), None) => Self::Response { id, result, error },
             (None, None) => Self::Malformed,
         }
     }
@@ -122,6 +129,20 @@ pub fn notification(method: &str, params: Value) -> Value {
         "jsonrpc".to_owned(),
         Value::String(JSONRPC_VERSION.to_owned()),
     );
+    map.insert("method".to_owned(), Value::String(method.to_owned()));
+    map.insert("params".to_owned(), params);
+    Value::Object(map)
+}
+
+/// Build a server-initiated request envelope (e.g. `session/request_permission`).
+#[must_use]
+pub fn request(id: u64, method: &str, params: Value) -> Value {
+    let mut map = serde_json::Map::with_capacity(4);
+    map.insert(
+        "jsonrpc".to_owned(),
+        Value::String(JSONRPC_VERSION.to_owned()),
+    );
+    map.insert("id".to_owned(), Value::from(id));
     map.insert("method".to_owned(), Value::String(method.to_owned()));
     map.insert("params".to_owned(), params);
     Value::Object(map)
@@ -172,8 +193,22 @@ mod tests {
         let notif = Incoming::classify(json!({"method": "session/cancel"}));
         assert!(matches!(notif, Incoming::Notification { .. }));
 
-        let resp = Incoming::classify(json!({"id": 7, "result": {}}));
-        assert!(matches!(resp, Incoming::Response { .. }));
+        let Incoming::Response { id, result, error } =
+            Incoming::classify(json!({"id": 7, "result": {"ok": true}}))
+        else {
+            panic!("expected response");
+        };
+        assert_eq!(
+            (id, result, error),
+            (json!(7), Some(json!({"ok": true})), None)
+        );
+
+        let Incoming::Response { error, .. } =
+            Incoming::classify(json!({"id": 8, "error": {"code": -32603, "message": "x"}}))
+        else {
+            panic!("expected response");
+        };
+        assert_eq!(error.expect("error kept")["code"], json!(-32603));
 
         assert!(matches!(
             Incoming::classify(json!({"result": {}})),
@@ -195,6 +230,20 @@ mod tests {
         assert_eq!(id, json!("abc-1"));
         let resp = response(&id, json!({"ok": true}));
         assert_eq!(resp["id"], json!("abc-1"));
+    }
+
+    #[test]
+    fn request_envelope_carries_a_numeric_id() {
+        let req = request(3, "session/request_permission", json!({"sessionId": "s"}));
+        assert_eq!(
+            req,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "session/request_permission",
+                "params": {"sessionId": "s"},
+            })
+        );
     }
 
     #[test]

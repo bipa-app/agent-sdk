@@ -1,9 +1,12 @@
 //! The ACP stdio server: read loop, dispatch, and the prompt-handler seam.
 //!
 //! Transport shape: one JSON-RPC message per line on stdin/stdout. All
-//! outgoing traffic (responses AND `session/update` notifications) funnels
-//! through one writer channel, so a prompt's streamed updates are always
-//! written before its final response — ordering is structural, not timed.
+//! outgoing traffic (responses, `session/update` notifications, and the
+//! server's own `session/request_permission` requests) funnels through one
+//! writer channel, so a prompt's streamed updates are always written before
+//! its final response — ordering is structural, not timed. Answers to the
+//! server's requests come back on stdin and are routed to their waiter by
+//! id (the request registry behind [`UpdateSink::request_permission`]).
 //!
 //! Liveness matters to the harness: buzz-acp enforces an idle timeout keyed
 //! to stdout activity. Handlers are expected to stream updates through the
@@ -20,6 +23,7 @@ use tokio::task::JoinSet;
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 use tokio_util::sync::CancellationToken;
 
+use crate::client_requests::ClientRequests;
 use crate::session::{BeginPromptError, NewSessionParams, SessionStore};
 use crate::wire::{self, Incoming, PROTOCOL_VERSION, StopReason, error_codes};
 
@@ -53,11 +57,40 @@ impl Default for AgentInfo {
 #[error("update sink closed: the transport writer has shut down")]
 pub struct UpdateSinkClosed;
 
-/// Streaming outlet for `session/update` notifications during a prompt.
+/// Why a server-initiated request produced no usable answer.
+#[derive(Debug, thiserror::Error)]
+pub enum ClientRequestError {
+    /// The transport shut down before (or while) the client answered.
+    #[error("client request unanswered: the transport has shut down")]
+    Closed,
+    /// The client answered with a JSON-RPC error object.
+    #[error("client rejected the request: {0}")]
+    Rejected(Value),
+    /// The client answered, but not in the shape the method defines.
+    #[error("client answered with an unexpected shape: {0}")]
+    Malformed(String),
+}
+
+/// The client's answer to `session/request_permission`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionOutcome {
+    /// The client picked one of the offered options.
+    Selected {
+        /// The `optionId` of the chosen option, verbatim.
+        option_id: String,
+    },
+    /// The client cancelled the request (the turn is being cancelled, or
+    /// the client is shutting down); nothing was decided.
+    Cancelled,
+}
+
+/// Streaming outlet for `session/update` notifications during a prompt,
+/// and the sending side of the server's own requests to the client.
 #[derive(Clone)]
 pub struct UpdateSink {
     session_id: String,
     out: mpsc::Sender<Value>,
+    requests: Arc<ClientRequests>,
 }
 
 impl UpdateSink {
@@ -78,8 +111,8 @@ impl UpdateSink {
     /// Emit a raw `session/update` with an arbitrary `update` payload.
     ///
     /// The `sessionId` is injected by the sink; callers supply only the
-    /// `update` object. This is the escape hatch later milestones build the
-    /// full event mapping on.
+    /// `update` object. This is the escape hatch the event mapping is built
+    /// on.
     ///
     /// # Errors
     ///
@@ -91,6 +124,77 @@ impl UpdateSink {
         );
         self.out.send(msg).await.map_err(|_| UpdateSinkClosed)
     }
+
+    /// Ask the client to decide a tool call: send `session/request_permission`
+    /// and wait for its answer.
+    ///
+    /// `tool_call` is the ACP tool-call object being decided (at least
+    /// `toolCallId`); `options` is the array of `{ optionId, name, kind }`
+    /// choices. The `sessionId` is injected by the sink.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientRequestError::Closed`] when the transport shuts down before
+    /// the answer arrives; `Rejected` when the client returns a JSON-RPC
+    /// error; `Malformed` when the answer is not a permission outcome.
+    pub async fn request_permission(
+        &self,
+        tool_call: Value,
+        options: Value,
+    ) -> Result<PermissionOutcome, ClientRequestError> {
+        let (id, answer) = self.requests.register();
+        let msg = wire::request(
+            id,
+            "session/request_permission",
+            json!({
+                "sessionId": self.session_id,
+                "toolCall": tool_call,
+                "options": options,
+            }),
+        );
+        self.out
+            .send(msg)
+            .await
+            .map_err(|_| ClientRequestError::Closed)?;
+        let result = answer
+            .await
+            .map_err(|_| ClientRequestError::Closed)?
+            .map_err(ClientRequestError::Rejected)?;
+        parse_permission_outcome(&result)
+    }
+}
+
+/// The `result` of `session/request_permission`:
+/// `{ "outcome": { "outcome": "selected", "optionId": … } }` or
+/// `{ "outcome": { "outcome": "cancelled" } }`.
+fn parse_permission_outcome(result: &Value) -> Result<PermissionOutcome, ClientRequestError> {
+    let outcome = &result["outcome"];
+    match outcome["outcome"].as_str() {
+        Some("selected") => outcome["optionId"].as_str().map_or_else(
+            || {
+                Err(ClientRequestError::Malformed(
+                    "selected outcome without an optionId".to_owned(),
+                ))
+            },
+            |option_id| {
+                Ok(PermissionOutcome::Selected {
+                    option_id: option_id.to_owned(),
+                })
+            },
+        ),
+        Some("cancelled") => Ok(PermissionOutcome::Cancelled),
+        _ => Err(ClientRequestError::Malformed(format!(
+            "not a permission outcome: {result}"
+        ))),
+    }
+}
+
+/// What every dispatch on one transport shares: the writer, the sessions,
+/// and the server's own in-flight requests to the client.
+struct Connection {
+    out: mpsc::Sender<Value>,
+    store: Arc<SessionStore>,
+    requests: Arc<ClientRequests>,
 }
 
 /// Failure surfaced by a prompt handler, mapped to a JSON-RPC internal error
@@ -195,7 +299,11 @@ impl<H: PromptHandler> AcpServer<H> {
         let (out_tx, out_rx) = mpsc::channel::<Value>(256);
         let writer_task = tokio::spawn(write_loop(writer, out_rx));
 
-        let store = Arc::new(SessionStore::default());
+        let conn = Connection {
+            out: out_tx,
+            store: Arc::new(SessionStore::default()),
+            requests: Arc::new(ClientRequests::default()),
+        };
         let mut prompts: JoinSet<()> = JoinSet::new();
         let mut lines = FramedRead::new(reader, LinesCodec::new_with_max_length(MAX_LINE_BYTES));
 
@@ -214,14 +322,24 @@ impl<H: PromptHandler> AcpServer<H> {
             };
             match Incoming::classify(value) {
                 Incoming::Request { id, method, params } => {
-                    self.dispatch_request(&out_tx, &store, &mut prompts, id, &method, params)
+                    self.dispatch_request(&conn, &mut prompts, id, &method, params)
                         .await;
                 }
                 Incoming::Notification { method, params } => {
-                    dispatch_notification(&store, &method, &params);
+                    dispatch_notification(&conn.store, &method, &params);
                 }
-                Incoming::Response { id } => {
-                    log::debug!("acp: ignoring response to unknown request id {id}");
+                Incoming::Response { id, result, error } => {
+                    // A well-formed response carries exactly one member; an
+                    // `error` wins over a stray `result` so a failure is
+                    // never read as success.
+                    let answer = match (result, error) {
+                        (_, Some(error)) => Err(error),
+                        (Some(result), None) => Ok(result),
+                        (None, None) => Ok(Value::Null),
+                    };
+                    if !conn.requests.resolve(&id, answer) {
+                        log::debug!("acp: ignoring response to unknown request id {id}");
+                    }
                 }
                 Incoming::Malformed => {
                     log::warn!("acp: skipping malformed JSON-RPC line (no method, no id)");
@@ -229,28 +347,30 @@ impl<H: PromptHandler> AcpServer<H> {
             }
         }
 
-        // EOF: the client is gone. Cancel in-flight turns, give them a
-        // bounded window to resolve, then let the writer drain and stop.
-        store.cancel_all();
+        // EOF: the client is gone. Wake every waiter on a client request,
+        // cancel in-flight turns, give them a bounded window to resolve,
+        // then let the writer drain and stop.
+        conn.requests.fail_all();
+        conn.store.cancel_all();
         let drain = async { while prompts.join_next().await.is_some() {} };
         if tokio::time::timeout(SHUTDOWN_DRAIN, drain).await.is_err() {
             log::warn!("acp: in-flight prompts did not resolve within shutdown drain window");
             prompts.abort_all();
         }
-        drop(out_tx);
+        drop(conn);
         let _ = writer_task.await;
         Ok(())
     }
 
     async fn dispatch_request(
         &self,
-        out: &mpsc::Sender<Value>,
-        store: &Arc<SessionStore>,
+        conn: &Connection,
         prompts: &mut JoinSet<()>,
         id: Value,
         method: &str,
         params: Value,
     ) {
+        let out = &conn.out;
         match method {
             "initialize" => {
                 let result = json!({
@@ -265,12 +385,12 @@ impl<H: PromptHandler> AcpServer<H> {
                 send(out, wire::response(&id, result)).await;
             }
             "session/new" => {
-                let session_id = store.create(NewSessionParams::from_params(&params));
+                let session_id = conn.store.create(NewSessionParams::from_params(&params));
                 log::info!("acp: session created: {session_id}");
                 send(out, wire::response(&id, json!({ "sessionId": session_id }))).await;
             }
             "session/prompt" => {
-                self.dispatch_prompt(out, store, prompts, id, &params).await;
+                self.dispatch_prompt(conn, prompts, id, &params).await;
             }
             other => {
                 log::debug!("acp: method not found: {other}");
@@ -286,12 +406,12 @@ impl<H: PromptHandler> AcpServer<H> {
 
     async fn dispatch_prompt(
         &self,
-        out: &mpsc::Sender<Value>,
-        store: &Arc<SessionStore>,
+        conn: &Connection,
         prompts: &mut JoinSet<()>,
         id: Value,
         params: &Value,
     ) {
+        let out = &conn.out;
         let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else {
             send(
                 out,
@@ -307,7 +427,7 @@ impl<H: PromptHandler> AcpServer<H> {
         let session_id = session_id.to_owned();
         let blocks = text_blocks(params);
 
-        let (session, cancel) = match store.begin_prompt(&session_id) {
+        let (session, cancel) = match conn.store.begin_prompt(&session_id) {
             Ok(pair) => pair,
             Err(BeginPromptError::UnknownSession) => {
                 let msg = format!("unknown sessionId: {session_id}");
@@ -333,12 +453,14 @@ impl<H: PromptHandler> AcpServer<H> {
         };
 
         let handler = Arc::clone(&self.handler);
-        let store = Arc::clone(store);
+        let store = Arc::clone(&conn.store);
         let out = out.clone();
+        let requests = Arc::clone(&conn.requests);
         prompts.spawn(async move {
             let updates = UpdateSink {
                 session_id: session_id.clone(),
                 out: out.clone(),
+                requests,
             };
             let request = PromptRequest {
                 session_id: session_id.clone(),

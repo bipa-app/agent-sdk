@@ -26,6 +26,7 @@ use std::collections::{HashMap, HashSet};
 use agent_sdk_foundation::{AgentEvent, TokenUsage};
 use serde_json::{Value, json};
 
+use crate::backend::PermissionDecision;
 use crate::wire::StopReason;
 
 /// Outcome of mapping one committed event.
@@ -36,6 +37,10 @@ pub enum Mapped {
     /// A subagent invocation closed; the run loop reads its result text
     /// from the backend, then emits [`SubagentClosed::update`].
     SubagentClosed(SubagentClosed),
+    /// A Confirm-tier tool parked (contract C-e); the run loop correlates
+    /// the tool call to its parked child, asks the client, and applies
+    /// the answer.
+    PermissionRequired(PermissionRequest),
     /// The turn is over with this stop reason.
     Terminal(StopReason),
     /// The turn failed; resolve the prompt as a JSON-RPC error.
@@ -72,6 +77,77 @@ impl SubagentClosed {
         )
     }
 }
+
+/// A `ToolRequiresConfirmation` event, ready to become a
+/// `session/request_permission` once the run loop names the parked child.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PermissionRequest {
+    /// The parked tool call — the row the client decides.
+    pub tool_call_id: String,
+    /// Tool name (for the ACP kind).
+    pub name: String,
+    /// Human title of the call.
+    pub display_name: String,
+    /// The call's input, shown to the client as `rawInput`.
+    pub input: Value,
+}
+
+impl PermissionRequest {
+    /// The ACP tool-call object carried on the request.
+    #[must_use]
+    pub fn tool_call(&self) -> Value {
+        json!({
+            "toolCallId": self.tool_call_id,
+            "title": self.display_name,
+            "kind": tool_kind(&self.name),
+            "status": "pending",
+            "rawInput": self.input,
+        })
+    }
+}
+
+/// The permission options for a parked child. The child task id rides in
+/// the option ids (`allow:<child>` / `reject:<child>`), so the answer —
+/// which may arrive out of order among parallel parks — decides exactly
+/// this child. Kinds are what buzz-acp auto-selects (`allow_once`) and
+/// falls back to (`reject_once`).
+#[must_use]
+pub fn permission_options(child_task_id: &str) -> Value {
+    json!([
+        {
+            "optionId": option_id(PermissionDecision::Allow, child_task_id),
+            "name": "Allow",
+            "kind": "allow_once",
+        },
+        {
+            "optionId": option_id(PermissionDecision::Reject, child_task_id),
+            "name": "Reject",
+            "kind": "reject_once",
+        },
+    ])
+}
+
+fn option_id(decision: PermissionDecision, child_task_id: &str) -> String {
+    let prefix = match decision {
+        PermissionDecision::Allow => ALLOW_PREFIX,
+        PermissionDecision::Reject => REJECT_PREFIX,
+    };
+    format!("{prefix}{child_task_id}")
+}
+
+/// Decode an answered `optionId` back into the decision and the child it
+/// names. `None` for anything this mapper did not mint.
+#[must_use]
+pub fn parse_option_id(option_id: &str) -> Option<(PermissionDecision, &str)> {
+    if let Some(child) = option_id.strip_prefix(ALLOW_PREFIX) {
+        return (!child.is_empty()).then_some((PermissionDecision::Allow, child));
+    }
+    let child = option_id.strip_prefix(REJECT_PREFIX)?;
+    (!child.is_empty()).then_some((PermissionDecision::Reject, child))
+}
+
+const ALLOW_PREFIX: &str = "allow:";
+const REJECT_PREFIX: &str = "reject:";
 
 /// Per-prompt mapper state.
 #[derive(Debug, Default)]
@@ -146,41 +222,7 @@ impl EventMapper {
                 updates.extend(plan);
                 Mapped::Update(updates)
             }
-            AgentEvent::SubagentProgress {
-                subagent_id,
-                subagent_name,
-                nickname,
-                subagent_task_id,
-                max_turns,
-                current_turn,
-                completed,
-                success,
-                tool_count,
-                total_tokens,
-                ..
-            } => {
-                if self.closed_subagents.contains(subagent_id) {
-                    return Mapped::Ignore;
-                }
-                let summary = subagent_summary(
-                    subagent_name,
-                    nickname.as_deref(),
-                    *current_turn,
-                    *max_turns,
-                    *tool_count,
-                    *total_tokens,
-                );
-                if !*completed {
-                    return Mapped::Update(vec![tool_progress(subagent_id, &summary)]);
-                }
-                self.closed_subagents.insert(subagent_id.clone());
-                Mapped::SubagentClosed(SubagentClosed {
-                    tool_call_id: subagent_id.clone(),
-                    subagent_task_id: subagent_task_id.clone(),
-                    success: *success,
-                    summary,
-                })
-            }
+            AgentEvent::SubagentProgress { .. } => self.map_subagent_progress(event),
             AgentEvent::TurnComplete { turn, usage, .. } => {
                 Mapped::Update(vec![usage_update(*turn, usage)])
             }
@@ -189,8 +231,62 @@ impl EventMapper {
             AgentEvent::Refusal { .. } => Mapped::Terminal(StopReason::Refusal),
             AgentEvent::BudgetExceeded { .. } => Mapped::Terminal(StopReason::MaxTokens),
             AgentEvent::Error { message, .. } => Mapped::Fail(message.clone()),
+            AgentEvent::ToolRequiresConfirmation {
+                id,
+                name,
+                display_name,
+                input,
+                ..
+            } => Mapped::PermissionRequired(PermissionRequest {
+                tool_call_id: id.clone(),
+                name: name.clone(),
+                display_name: display_name.clone(),
+                input: input.clone(),
+            }),
             _ => Mapped::Ignore,
         }
+    }
+
+    /// §3.1 rules 2 and 4: ticks keep the row `in_progress`; only
+    /// `completed: true` closes it, once, as a directive for the loop.
+    fn map_subagent_progress(&mut self, event: &AgentEvent) -> Mapped {
+        let AgentEvent::SubagentProgress {
+            subagent_id,
+            subagent_name,
+            nickname,
+            subagent_task_id,
+            max_turns,
+            current_turn,
+            completed,
+            success,
+            tool_count,
+            total_tokens,
+            ..
+        } = event
+        else {
+            return Mapped::Ignore;
+        };
+        if self.closed_subagents.contains(subagent_id) {
+            return Mapped::Ignore;
+        }
+        let summary = subagent_summary(
+            subagent_name,
+            nickname.as_deref(),
+            *current_turn,
+            *max_turns,
+            *tool_count,
+            *total_tokens,
+        );
+        if !*completed {
+            return Mapped::Update(vec![tool_progress(subagent_id, &summary)]);
+        }
+        self.closed_subagents.insert(subagent_id.clone());
+        Mapped::SubagentClosed(SubagentClosed {
+            tool_call_id: subagent_id.clone(),
+            subagent_task_id: subagent_task_id.clone(),
+            success: *success,
+            summary,
+        })
     }
 }
 
@@ -714,6 +810,55 @@ mod tests {
             Mapped::Update(vec![tool_update("todo-1", "completed", "ok")]),
             "a released cache must not resurrect a plan from a stale input"
         );
+    }
+
+    /// C-e: the confirmation event becomes a directive; the ACP request
+    /// carries the tool call and options whose ids name the parked child.
+    #[test]
+    fn golden_confirmation_maps_to_child_bound_permission_options() {
+        let mut mapper = EventMapper::default();
+        let event = AgentEvent::tool_requires_confirmation(
+            "tc-1",
+            "pg_query",
+            "Run query",
+            json!({"sql": "delete from x"}),
+            "mutation",
+        );
+        let Mapped::PermissionRequired(request) = mapper.map(&event) else {
+            panic!("confirmation must map to a permission directive");
+        };
+        assert_eq!(
+            request.tool_call(),
+            json!({
+                "toolCallId": "tc-1",
+                "title": "Run query",
+                "kind": "execute",
+                "status": "pending",
+                "rawInput": {"sql": "delete from x"},
+            })
+        );
+        assert_eq!(
+            permission_options("child-7"),
+            json!([
+                {"optionId": "allow:child-7", "name": "Allow", "kind": "allow_once"},
+                {"optionId": "reject:child-7", "name": "Reject", "kind": "reject_once"},
+            ])
+        );
+    }
+
+    #[test]
+    fn option_ids_round_trip_and_foreign_ids_are_rejected() {
+        assert_eq!(
+            parse_option_id("allow:child-7"),
+            Some((PermissionDecision::Allow, "child-7"))
+        );
+        assert_eq!(
+            parse_option_id("reject:child-7"),
+            Some((PermissionDecision::Reject, "child-7"))
+        );
+        assert_eq!(parse_option_id("allow:"), None);
+        assert_eq!(parse_option_id("allow"), None);
+        assert_eq!(parse_option_id("always:child-7"), None);
     }
 
     #[test]

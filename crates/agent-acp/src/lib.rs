@@ -66,6 +66,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod backend;
+mod client_requests;
 mod mapper;
 pub mod run;
 pub mod server;
@@ -73,11 +74,12 @@ pub mod session;
 pub mod wire;
 
 pub use backend::{
-    AcpBackend, AcpRunHandle, BackendError, BackendPromptHandler, BackendTaskStatus, EventStream,
-    RunEvent, RunStreamItem,
+    AcpBackend, AcpRunHandle, AwaitingConfirmation, BackendError, BackendPromptHandler,
+    BackendTaskStatus, DecideOutcome, EventStream, PermissionDecision, RunEvent, RunStreamItem,
 };
 pub use server::{
-    AcpServer, AgentInfo, PromptError, PromptHandler, PromptRequest, UpdateSink, UpdateSinkClosed,
+    AcpServer, AgentInfo, ClientRequestError, PermissionOutcome, PromptError, PromptHandler,
+    PromptRequest, UpdateSink, UpdateSinkClosed,
 };
 pub use session::NewSessionParams;
 pub use wire::{PROTOCOL_VERSION, StopReason};

@@ -53,22 +53,38 @@
 //!   callback, or shared cell that could fire twice; every terminal path
 //!   is a `return`.
 //!
+//! - **Confirmations (contract C-e)** — a `ToolRequiresConfirmation`
+//!   event becomes a concurrent permission task: correlate the tool call
+//!   to its parked child (the park may commit a beat after the event, so
+//!   the lookup is retried inside a short window; the last resort is the
+//!   oldest park, with a WARN), send `session/request_permission` with the
+//!   child id in the option ids, and apply the answer to THAT child. N
+//!   parallel parks are N independent tasks, so out-of-order answers can
+//!   never cross. A stale answer (`NonePending`) and a client `cancelled`
+//!   outcome are no-ops; the stream keeps flowing throughout.
+//!
 //! Mapper scope: text/thinking deltas, consolidated-content dedupe, tool
 //! lifecycle, the subagent lifecycle (with result text read from the
-//! backend at close), plan synthesis, turn usage, keepalives, and
-//! terminals. Permission mapping lands in the confirmations slice.
+//! backend at close), plan synthesis, confirmations, turn usage,
+//! keepalives, and terminals.
 
+use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
 use agent_sdk_foundation::AgentEvent;
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use crate::backend::{AcpBackend, AcpRunHandle, BackendTaskStatus, RunStreamItem};
-use crate::mapper::{EventMapper, Mapped, SubagentClosed};
-use crate::server::{PromptError, UpdateSink};
+use crate::backend::{
+    AcpBackend, AcpRunHandle, AwaitingConfirmation, BackendTaskStatus, DecideOutcome, RunStreamItem,
+};
+use crate::mapper::{
+    EventMapper, Mapped, PermissionRequest, SubagentClosed, parse_option_id, permission_options,
+};
+use crate::server::{PermissionOutcome, PromptError, UpdateSink};
 use crate::wire::StopReason;
 
 /// How often the loop probes the backend for OUR task's durable status
@@ -93,6 +109,18 @@ const LAG_REOPEN_DELAY: Duration = Duration::from_millis(200);
 /// it back — a chatty-but-unmapped backend would otherwise starve stdout.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How long a `ToolRequiresConfirmation` waits for its park to become
+/// visible in the backend's awaiting list before falling back to the
+/// oldest park (contract C-e: "retry briefly, ≤2s").
+const CORRELATION_WINDOW: Duration = Duration::from_millis(2_000);
+
+/// Poll spacing inside the correlation window.
+const CORRELATION_POLL: Duration = Duration::from_millis(200);
+
+/// In-flight permission tasks for one prompt. They borrow the loop's
+/// backend, handle, and sink, and are dropped with the loop.
+type PermissionTasks<'a> = FuturesUnordered<Pin<Box<dyn Future<Output = ()> + Send + 'a>>>;
+
 /// The turn's completion machine (contract C-d). Resolution is not a
 /// state: resolving IS returning from [`run_prompt`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +132,13 @@ enum Phase {
     /// After OUR task's `Start`: content streams; terminals resolve per
     /// the attribution rules.
     Streaming,
+}
+
+/// Everything one prompt mutates while its events flow.
+struct TurnState<'a> {
+    phase: Phase,
+    mapper: EventMapper,
+    permissions: PermissionTasks<'a>,
 }
 
 /// Resolve the prompt from the task's durable STATUS (no journal event).
@@ -168,13 +203,112 @@ async fn subagent_result_text<B: AcpBackend + ?Sized>(
     }
 }
 
-async fn handle_event<B: AcpBackend + ?Sized>(
+/// Name the parked child behind `tool_call_id` (contract C-e). The park
+/// may commit a beat after its event, so the lookup is retried inside
+/// [`CORRELATION_WINDOW`]; past it, the oldest park is used with a WARN,
+/// and no park at all means nothing to ask (WARN, `None`).
+async fn correlate_park<B: AcpBackend + ?Sized>(
+    backend: &B,
+    handle: &AcpRunHandle,
+    tool_call_id: &str,
+) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + CORRELATION_WINDOW;
+    loop {
+        let parks = match backend.awaiting_confirmations(&handle.thread_id).await {
+            Ok(parks) => parks,
+            Err(error) => {
+                log::warn!("acp: awaiting-confirmation lookup failed (retrying): {error}");
+                Vec::new()
+            }
+        };
+        if let Some(park) = parks.iter().find(|park| park.tool_call_id == tool_call_id) {
+            return Some(park.child_task_id.clone());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return oldest_park_fallback(tool_call_id, &parks);
+        }
+        tokio::time::sleep(CORRELATION_POLL).await;
+    }
+}
+
+/// Past the correlation window: the oldest park, with a WARN, or nothing.
+fn oldest_park_fallback(tool_call_id: &str, parks: &[AwaitingConfirmation]) -> Option<String> {
+    let Some(oldest) = parks.first() else {
+        log::warn!(
+            "acp: tool call {tool_call_id} requires confirmation but no park is pending \
+             after the correlation window; not asking"
+        );
+        return None;
+    };
+    log::warn!(
+        "acp: no park names tool call {tool_call_id} after the correlation window; \
+         falling back to the oldest park {}",
+        oldest.child_task_id
+    );
+    Some(oldest.child_task_id.clone())
+}
+
+/// One park, end to end: correlate, ask the client, apply the answer.
+/// Nothing here fails the prompt — an unanswerable park is left for the
+/// turn's cancel or the backend's orphan policy, and the stream keeps
+/// flowing while this runs.
+async fn run_permission<B: AcpBackend + ?Sized>(
     backend: &B,
     handle: &AcpRunHandle,
     updates: &UpdateSink,
+    request: PermissionRequest,
+) {
+    let Some(child) = correlate_park(backend, handle, &request.tool_call_id).await else {
+        return;
+    };
+    let option_id = match updates
+        .request_permission(request.tool_call(), permission_options(&child))
+        .await
+    {
+        Ok(PermissionOutcome::Selected { option_id }) => option_id,
+        Ok(PermissionOutcome::Cancelled) => {
+            log::info!(
+                "acp: client cancelled the permission request for child {child}; leaving \
+                 the park to the turn's cancel or the orphan policy"
+            );
+            return;
+        }
+        Err(error) => {
+            log::warn!("acp: permission request for child {child} got no answer: {error}");
+            return;
+        }
+    };
+    let Some((decision, child_task_id)) = parse_option_id(&option_id) else {
+        log::warn!(
+            "acp: client answered with an optionId this transport did not mint: {option_id}"
+        );
+        return;
+    };
+    match backend
+        .decide_confirmation(&handle.thread_id, child_task_id, decision)
+        .await
+    {
+        Ok(DecideOutcome::Decided) => {
+            log::info!("acp: confirmation {decision:?} applied to child {child_task_id}");
+        }
+        Ok(DecideOutcome::NonePending) => {
+            log::info!(
+                "acp: confirmation answer for child {child_task_id} found no pending park \
+                 (already decided, cancelled, or swept) — no-op"
+            );
+        }
+        Err(error) => {
+            log::warn!("acp: applying the confirmation to child {child_task_id} failed: {error}");
+        }
+    }
+}
+
+async fn handle_event<'a, B: AcpBackend + ?Sized>(
+    backend: &'a B,
+    handle: &'a AcpRunHandle,
+    updates: &'a UpdateSink,
     keepalive: Pin<&mut tokio::time::Sleep>,
-    phase: &mut Phase,
-    mapper: &mut EventMapper,
+    turn: &mut TurnState<'a>,
     event: &AgentEvent,
 ) -> Result<Option<StopReason>, PromptError> {
     let is_ours = event.emitter_task_id() == Some(handle.task_id.as_str());
@@ -183,8 +317,8 @@ async fn handle_event<B: AcpBackend + ?Sized>(
         .is_some_and(|task_id| task_id != handle.task_id);
 
     if matches!(event, AgentEvent::Start { .. }) {
-        if is_ours && *phase == Phase::AwaitingStart {
-            *phase = Phase::Streaming;
+        if is_ours && turn.phase == Phase::AwaitingStart {
+            turn.phase = Phase::Streaming;
         }
         return Ok(None);
     }
@@ -195,9 +329,10 @@ async fn handle_event<B: AcpBackend + ?Sized>(
         return Ok(None);
     }
 
-    match mapper.map(event) {
+    let phase = turn.phase;
+    match turn.mapper.map(event) {
         Mapped::Update(frames) => {
-            if *phase == Phase::Streaming {
+            if phase == Phase::Streaming {
                 for frame in frames {
                     updates
                         .session_update(frame)
@@ -211,7 +346,7 @@ async fn handle_event<B: AcpBackend + ?Sized>(
             Ok(None)
         }
         Mapped::SubagentClosed(closed) => {
-            if *phase == Phase::Streaming {
+            if phase == Phase::Streaming {
                 let result_text = subagent_result_text(backend, handle, &closed).await;
                 updates
                     .session_update(closed.update(result_text.as_deref()))
@@ -221,11 +356,21 @@ async fn handle_event<B: AcpBackend + ?Sized>(
             }
             Ok(None)
         }
+        Mapped::PermissionRequired(request) => {
+            // A park before OUR Start is a predecessor's; the harness's
+            // request for it died with the previous session, and the
+            // backend's orphan policy owns it now.
+            if phase == Phase::Streaming {
+                turn.permissions
+                    .push(Box::pin(run_permission(backend, handle, updates, request)));
+            }
+            Ok(None)
+        }
         Mapped::Terminal(reason) => {
             if is_ours {
                 return Ok(Some(reason));
             }
-            if *phase == Phase::AwaitingStart {
+            if phase == Phase::AwaitingStart {
                 return Ok(None);
             }
             reconcile_unattributed(backend, handle).await
@@ -234,7 +379,7 @@ async fn handle_event<B: AcpBackend + ?Sized>(
             if is_ours {
                 return Err(PromptError::new(message));
             }
-            if *phase == Phase::AwaitingStart {
+            if phase == Phase::AwaitingStart {
                 return Ok(None);
             }
             reconcile_unattributed(backend, handle).await
@@ -269,10 +414,13 @@ pub(crate) async fn run_prompt<B: AcpBackend + ?Sized>(
         .map_err(|e| PromptError::new(e.message))?;
 
     let mut last_yielded: Option<u64> = None;
-    let mut mapper = EventMapper::default();
     let mut cancel_forwarded = false;
-    let mut phase = Phase::AwaitingStart;
     let mut terminal_status_streak: u32 = 0;
+    let mut turn = TurnState {
+        phase: Phase::AwaitingStart,
+        mapper: EventMapper::default(),
+        permissions: FuturesUnordered::new(),
+    };
 
     let mut stall = tokio::time::interval(STALL_POLL_INTERVAL);
     stall.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -334,8 +482,7 @@ pub(crate) async fn run_prompt<B: AcpBackend + ?Sized>(
                             handle,
                             updates,
                             keepalive.as_mut(),
-                            &mut phase,
-                            &mut mapper,
+                            &mut turn,
                             &event.event,
                         )
                         .await?
@@ -345,6 +492,9 @@ pub(crate) async fn run_prompt<B: AcpBackend + ?Sized>(
                     }
                 }
             }
+            // A finished permission task has already logged its outcome;
+            // the guard keeps an empty set from resolving instantly.
+            Some(()) = turn.permissions.next(), if !turn.permissions.is_empty() => {}
             () = &mut keepalive => {
                 emit_keepalive(updates).await?;
                 reset_keepalive(keepalive.as_mut());
