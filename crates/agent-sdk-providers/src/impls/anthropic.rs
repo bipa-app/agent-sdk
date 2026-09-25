@@ -45,6 +45,7 @@ pub const MODEL_SONNET_46: &str = "claude-sonnet-4-6";
 pub const MODEL_OPUS_46: &str = "claude-opus-4-6";
 pub const MODEL_OPUS_47: &str = "claude-opus-4-7";
 pub const MODEL_OPUS_48: &str = "claude-opus-4-8";
+pub const MODEL_OPUS_55: &str = "claude-opus-5-5";
 pub const MODEL_FABLE_5: &str = "claude-fable-5";
 
 /// Claude Code tool name mappings for OAuth mode.
@@ -461,6 +462,18 @@ impl AnthropicProvider {
         Self::new(api_key, MODEL_OPUS_48)
     }
 
+    /// Create a provider using Claude Opus 5.5.
+    ///
+    /// Note: Opus 5.5 is adaptive-only — adaptive thinking is always on and
+    /// the API defaults effort to `medium`. Passing a `ThinkingConfig` with
+    /// `ThinkingMode::Enabled { budget_tokens }` will return an
+    /// `InvalidRequest` — use `ThinkingConfig::adaptive()` or
+    /// `ThinkingConfig::adaptive_with_effort(_)` instead.
+    #[must_use]
+    pub fn opus_55(api_key: impl Into<String>) -> Self {
+        Self::new(api_key, MODEL_OPUS_55)
+    }
+
     /// Create a provider using Claude Fable 5.
     ///
     /// Note: Fable 5 is adaptive-only — the API applies adaptive thinking
@@ -498,7 +511,12 @@ impl AnthropicProvider {
     fn requires_adaptive_thinking(&self) -> bool {
         matches!(
             self.model.as_str(),
-            MODEL_SONNET_46 | MODEL_OPUS_46 | MODEL_OPUS_47 | MODEL_OPUS_48 | MODEL_FABLE_5
+            MODEL_SONNET_46
+                | MODEL_OPUS_46
+                | MODEL_OPUS_47
+                | MODEL_OPUS_48
+                | MODEL_OPUS_55
+                | MODEL_FABLE_5
         )
     }
 }
@@ -1227,6 +1245,26 @@ mod tests {
             opus_47
                 .validate_thinking_config(Some(&ThinkingConfig::adaptive_with_effort(
                     agent_sdk_foundation::llm::Effort::High
+                )))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_opus_55_rejects_budgeted_thinking_and_accepts_max_effort() {
+        let opus_55 = AnthropicProvider::opus_55("test-api-key".to_string());
+        assert_eq!(opus_55.model(), MODEL_OPUS_55);
+        let error = opus_55
+            .validate_thinking_config(Some(&ThinkingConfig::new(10_000)))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("ThinkingConfig::adaptive()"),
+            "expected migration hint, got: {error}"
+        );
+        assert!(
+            opus_55
+                .validate_thinking_config(Some(&ThinkingConfig::adaptive_with_effort(
+                    agent_sdk_foundation::llm::Effort::Max
                 )))
                 .is_ok()
         );

@@ -150,6 +150,18 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
     },
     ModelCapabilities {
         provider: "anthropic",
+        model_id: "claude-opus-5-5",
+        context_window: Some(1_000_000),
+        max_output_tokens: Some(128_000),
+        pricing: Some(Pricing::flat(4.0, 20.0).with_notes("Anthropic Opus 5.5 official pricing: $4 input / $20 output per 1M tokens.")),
+        supports_thinking: true,
+        supports_adaptive_thinking: true,
+        source_url: ANTHROPIC_MODELS_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("Opus 5.5 is adaptive-only: adaptive thinking is always on (`thinking.type: \"disabled\"` returns 400) and `ThinkingMode::Enabled { budget_tokens }` is rejected by the Anthropic API. The SDK fails fast in validate_thinking_config. Effort defaults to `medium` when unset; `max_tokens` caps thinking plus response text, so set it large at high effort."),
+    },
+    ModelCapabilities {
+        provider: "anthropic",
         model_id: "claude-opus-4-8",
         context_window: Some(1_000_000),
         max_output_tokens: Some(128_000),
@@ -807,6 +819,25 @@ mod tests {
         let output = pricing.output.context("output price missing")?;
         assert!((input.usd_per_million_tokens - 10.0).abs() < f64::EPSILON);
         assert!((output.usd_per_million_tokens - 50.0).abs() < f64::EPSILON);
+        Ok(())
+    }
+
+    #[test]
+    fn test_lookup_anthropic_opus_55() -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let caps =
+            get_model_capabilities("anthropic", "claude-opus-5-5").context("opus 5.5 missing")?;
+        assert_eq!(caps.context_window, Some(1_000_000));
+        assert_eq!(caps.max_output_tokens, Some(128_000));
+        assert!(caps.supports_thinking);
+        assert!(caps.supports_adaptive_thinking);
+        assert_eq!(caps.source_status, SourceStatus::Official);
+        let pricing = caps.pricing.context("pricing missing")?;
+        let input = pricing.input.context("input price missing")?;
+        let output = pricing.output.context("output price missing")?;
+        assert!((input.usd_per_million_tokens - 4.0).abs() < f64::EPSILON);
+        assert!((output.usd_per_million_tokens - 20.0).abs() < f64::EPSILON);
         Ok(())
     }
 
