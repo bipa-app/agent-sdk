@@ -40,12 +40,15 @@ use crate::streaming::{StreamBox, StreamDelta, UsageCarry};
 ///   reports usage before any content and then errors is therefore failed over
 ///   now where it previously surfaced the error — deliberate: nothing visible is
 ///   duplicated, because usage is invisible.
+/// * **Does not commit** — `KeepAlive`, a content-free liveness frame (an
+///   Anthropic `ping` while the model thinks silently). A provider that pings
+///   and then fails has shown the consumer nothing, so failing over is safe.
 /// * **Not classified here** — `Error`, which the caller's own arm handles.
 ///
 /// The per-variant behaviour is pinned by
 /// `only_metadata_deltas_leave_the_chain_uncommitted`.
 const fn commits_stream(delta: &StreamDelta) -> bool {
-    !matches!(delta, StreamDelta::Usage(_))
+    !matches!(delta, StreamDelta::Usage(_) | StreamDelta::KeepAlive)
 }
 
 /// An [`LlmProvider`] that fails over across an ordered list of backends.
@@ -577,6 +580,10 @@ mod tests {
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })));
+
+        // A keep-alive carries no content, so a provider that only pinged can
+        // still be failed over.
+        assert!(!commits_stream(&StreamDelta::KeepAlive));
     }
 
     #[tokio::test]
