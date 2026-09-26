@@ -20,6 +20,7 @@ use futures::StreamExt;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
+use super::openai_prompt_cache::bounded_prompt_cache_key;
 use super::openai_reasoning::{
     OpenAIAllowedToolsMode, OpenAIPromptCacheMode, OpenAIPromptCacheTtl, OpenAIReasoningConfig,
     OpenAIReasoningContext, OpenAIReasoningEffort, OpenAIReasoningMode, OpenAIReasoningSummary,
@@ -29,6 +30,7 @@ use super::openai_reasoning::{
 };
 use super::openai_schema::normalize_strict_schema;
 use crate::model_features::supports_responses_original_image_detail;
+use std::borrow::Cow;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const ENCRYPTED_REASONING_INCLUDE: &[&str] = &["reasoning.encrypted_content"];
@@ -427,7 +429,7 @@ impl LlmProvider for OpenAIResponsesProvider {
             prompt_cache_options,
             store,
             include: include_encrypted_reasoning.then_some(ENCRYPTED_REASONING_INCLUDE),
-            prompt_cache_key: request.session_id.as_deref(),
+            prompt_cache_key: request.session_id.as_deref().map(bounded_prompt_cache_key),
             safety_identifier: reasoning_config
                 .as_ref()
                 .and_then(OpenAIReasoningConfig::safety_identifier),
@@ -553,7 +555,10 @@ impl LlmProvider for OpenAIResponsesProvider {
                 store,
                 include: include_encrypted_reasoning
                     .then(|| ENCRYPTED_REASONING_INCLUDE.iter().map(|value| (*value).to_owned()).collect()),
-                prompt_cache_key: request.session_id.clone(),
+                prompt_cache_key: request
+                    .session_id
+                    .as_deref()
+                    .map(|session_id| bounded_prompt_cache_key(session_id).into_owned()),
                 safety_identifier: reasoning_config
                     .as_ref()
                     .and_then(OpenAIReasoningConfig::safety_identifier)
@@ -1588,7 +1593,7 @@ struct ApiResponsesRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     include: Option<&'a [&'a str]>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    prompt_cache_key: Option<&'a str>,
+    prompt_cache_key: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     safety_identifier: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2259,6 +2264,72 @@ mod tests {
             deltas.push(delta?);
         }
         Ok(deltas)
+    }
+
+    #[tokio::test]
+    async fn long_session_ids_are_bounded_as_prompt_cache_key_on_the_wire() -> anyhow::Result<()> {
+        use crate::impls::openai_prompt_cache::MAX_PROMPT_CACHE_KEY_LEN;
+
+        let session_id = "eval-bipa-premium-data-query-001-0b4e88a4-6f1c-4c55-9d2a-51c0e4a7f3b9";
+        let expected_key = bounded_prompt_cache_key(session_id);
+        assert!(expected_key.len() <= MAX_PROMPT_CACHE_KEY_LEN);
+
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/responses"))
+            .and(matchers::body_partial_json(
+                serde_json::json!({"stream": true}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: {\"type\":\"response.completed\",\"response\":{}}\n\n"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_123",
+                "model": MODEL_GPT6_SOL,
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                }],
+                "status": "completed",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+        let provider = OpenAIResponsesProvider::with_base_url(
+            "test-key".to_owned(),
+            MODEL_GPT6_SOL.to_owned(),
+            server.uri(),
+        );
+        let request = ChatRequest::new(String::new(), vec![Message::user("hello")])
+            .with_session_id(session_id);
+
+        let _ = provider.chat(request.clone()).await?;
+        let mut stream = std::pin::pin!(provider.chat_stream(request));
+        while let Some(delta) = stream.next().await {
+            delta?;
+        }
+
+        let received = server
+            .received_requests()
+            .await
+            .context("mock server did not record requests")?;
+        assert_eq!(
+            received.len(),
+            2,
+            "expected one chat and one chat_stream request"
+        );
+        for sent in &received {
+            let body: serde_json::Value = serde_json::from_slice(&sent.body)?;
+            assert_eq!(body["prompt_cache_key"], expected_key.as_ref());
+        }
+        Ok(())
     }
 
     #[test]

@@ -49,8 +49,10 @@ use reqwest::StatusCode;
 use serde::de::Error as _;
 use serde::ser::SerializeStruct as _;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
+use super::openai_prompt_cache::bounded_prompt_cache_key;
 use super::openai_reasoning::{
     OpenAIAllowedToolsMode, OpenAIApiSurface, OpenAIPromptCacheMode, OpenAIPromptCacheTtl,
     OpenAIReasoningConfig, OpenAIReasoningEffort, OpenAITextVerbosity, OpenAIToolChoice,
@@ -99,10 +101,10 @@ fn chat_store(base_url: &str, config: Option<&OpenAIReasoningConfig>) -> Option<
         .or_else(|| is_official_openai_base_url(base_url).then_some(false))
 }
 
-fn chat_prompt_cache_key<'a>(base_url: &str, session_id: Option<&'a str>) -> Option<&'a str> {
-    is_official_openai_base_url(base_url)
-        .then_some(session_id)
-        .flatten()
+fn chat_prompt_cache_key<'a>(base_url: &str, session_id: Option<&'a str>) -> Option<Cow<'a, str>> {
+    session_id
+        .filter(|_| is_official_openai_base_url(base_url))
+        .map(bounded_prompt_cache_key)
 }
 
 fn request_is_agentic(request: &ChatRequest) -> bool {
@@ -2207,7 +2209,7 @@ struct ApiChatRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     safety_identifier: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    prompt_cache_key: Option<&'a str>,
+    prompt_cache_key: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     service_tier: Option<&'static str>,
 }
@@ -2239,7 +2241,7 @@ struct ApiChatRequestStreaming<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     safety_identifier: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    prompt_cache_key: Option<&'a str>,
+    prompt_cache_key: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     service_tier: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5245,7 +5247,7 @@ mod tests {
         );
         assert_eq!(chat_store("https://gateway.example/v1", None), None);
         assert_eq!(
-            chat_prompt_cache_key(DEFAULT_BASE_URL, Some("thread-42")),
+            chat_prompt_cache_key(DEFAULT_BASE_URL, Some("thread-42")).as_deref(),
             Some("thread-42")
         );
         assert_eq!(
@@ -5363,6 +5365,52 @@ mod tests {
     }
 
     #[test]
+    fn long_session_id_is_bounded_as_chat_prompt_cache_key_on_the_wire() -> anyhow::Result<()> {
+        use crate::impls::openai_prompt_cache::MAX_PROMPT_CACHE_KEY_LEN;
+
+        let session_id = "eval-bipa-premium-data-query-001-0b4e88a4-6f1c-4c55-9d2a-51c0e4a7f3b9";
+        let messages = vec![ApiMessage {
+            role: ApiRole::User,
+            content: Some("Hello".to_owned()),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            prompt_cache_breakpoint: false,
+            images: Vec::new(),
+        }];
+        let request = ApiChatRequest {
+            model: MODEL_GPT6_SOL,
+            messages: &messages,
+            max_completion_tokens: Some(1024),
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            reasoning: None,
+            response_format: None,
+            verbosity: None,
+            prompt_cache_options: None,
+            store: None,
+            parallel_tool_calls: None,
+            safety_identifier: None,
+            prompt_cache_key: chat_prompt_cache_key(DEFAULT_BASE_URL, Some(session_id)),
+            service_tier: None,
+        };
+
+        let json = serde_json::to_value(request)?;
+        let key = json["prompt_cache_key"]
+            .as_str()
+            .context("prompt_cache_key missing from the Chat Completions body")?;
+        assert!(
+            key.len() <= MAX_PROMPT_CACHE_KEY_LEN,
+            "got {} chars",
+            key.len()
+        );
+        assert_eq!(key, bounded_prompt_cache_key(session_id));
+        assert_ne!(key, session_id);
+        Ok(())
+    }
+
+    #[test]
     fn test_request_serializes_openai_application_controls() -> anyhow::Result<()> {
         let messages = vec![ApiMessage {
             role: ApiRole::User,
@@ -5387,7 +5435,7 @@ mod tests {
             store: Some(true),
             parallel_tool_calls: Some(false),
             safety_identifier: Some("safety-user-42"),
-            prompt_cache_key: Some("thread-42"),
+            prompt_cache_key: Some(Cow::Borrowed("thread-42")),
             service_tier: None,
         };
 

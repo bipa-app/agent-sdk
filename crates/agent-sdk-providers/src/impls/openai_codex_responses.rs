@@ -34,6 +34,7 @@ use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+use super::openai_prompt_cache::bounded_prompt_cache_key;
 use crate::model_features::supports_responses_original_image_detail;
 
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
@@ -532,7 +533,10 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                 store: false,
                 text: Some(ApiTextSettings { verbosity: "medium", format: text_format }),
                 include: Some(vec!["reasoning.encrypted_content".to_string()]),
-                prompt_cache_key: request.session_id.clone(),
+                prompt_cache_key: request
+                    .session_id
+                    .as_deref()
+                    .map(|session_id| bounded_prompt_cache_key(session_id).into_owned()),
                 stream: true,
             };
 
@@ -5207,6 +5211,48 @@ mod tests {
         assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
         assert_eq!(response.usage.input_tokens, 265);
         assert_eq!(response.usage.output_tokens, 42);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn long_session_id_is_bounded_as_prompt_cache_key_on_the_wire() -> anyhow::Result<()> {
+        use crate::impls::openai_prompt_cache::MAX_PROMPT_CACHE_KEY_LEN;
+
+        let session_id = "eval-bipa-premium-data-query-001-0b4e88a4-6f1c-4c55-9d2a-51c0e4a7f3b9";
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/backend-api/codex/responses"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(HTTP_SSE_BODY),
+            )
+            .mount(&server)
+            .await;
+        let provider = OpenAICodexResponsesProvider::with_base_url(
+            oauth_token(),
+            MODEL_GPT53_CODEX.to_owned(),
+            format!("{}/backend-api", server.uri()),
+        )
+        .with_websockets_disabled(true);
+
+        let _ = provider.chat(streaming_request(session_id)).await?;
+
+        let received = server
+            .received_requests()
+            .await
+            .context("mock server did not record requests")?;
+        let sent = received.first().context("no Codex request recorded")?;
+        let body: serde_json::Value = serde_json::from_slice(&sent.body)?;
+        let key = body["prompt_cache_key"]
+            .as_str()
+            .context("prompt_cache_key missing from the Codex body")?;
+        assert!(
+            key.len() <= MAX_PROMPT_CACHE_KEY_LEN,
+            "got {} chars",
+            key.len()
+        );
+        assert_eq!(key, bounded_prompt_cache_key(session_id));
         Ok(())
     }
 
