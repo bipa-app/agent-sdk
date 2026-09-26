@@ -3460,7 +3460,10 @@ struct ApiWrappedWebsocketErrorEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::impls::openai::{MODEL_GPT56, MODEL_GPT56_LUNA, MODEL_GPT56_SOL, MODEL_GPT56_TERRA};
+    use crate::impls::openai::{
+        MODEL_GPT6_ASTRA, MODEL_GPT6_LUNA, MODEL_GPT6_SOL, MODEL_GPT56, MODEL_GPT56_LUNA,
+        MODEL_GPT56_SOL, MODEL_GPT56_TERRA,
+    };
     #[test]
     fn compaction_summary_is_framed_as_untrusted_historical_data() {
         let mut items = Vec::new();
@@ -3515,6 +3518,7 @@ mod tests {
             MODEL_GPT56_SOL,
             MODEL_GPT56_TERRA,
             MODEL_GPT56_LUNA,
+            MODEL_GPT6_ASTRA,
         ] {
             assert!(
                 OpenAICodexResponsesProvider::new("key".to_owned(), model.to_owned())
@@ -3523,7 +3527,12 @@ mod tests {
             );
         }
 
-        for model in [MODEL_GPT53_CODEX, "unknown-future-model"] {
+        for model in [
+            MODEL_GPT53_CODEX,
+            MODEL_GPT6_SOL,
+            MODEL_GPT6_LUNA,
+            "unknown-future-model",
+        ] {
             assert!(
                 !OpenAICodexResponsesProvider::new("key".to_owned(), model.to_owned())
                     .supports_historical_image_blocks(),
@@ -3535,7 +3544,12 @@ mod tests {
     #[test]
     fn codex_request_conversion_downgrades_original_for_older_and_unknown_models()
     -> anyhow::Result<()> {
-        for model in [MODEL_GPT53_CODEX, "unknown-future-model"] {
+        for model in [
+            MODEL_GPT53_CODEX,
+            MODEL_GPT6_SOL,
+            MODEL_GPT6_LUNA,
+            "unknown-future-model",
+        ] {
             let provider = OpenAICodexResponsesProvider::new("key".to_owned(), model.to_owned());
             let mut request = original_image_request();
             provider.downgrade_unsupported_original_image_detail(&mut request);

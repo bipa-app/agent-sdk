@@ -82,6 +82,7 @@ pub const MODEL_OPUS_48: &str = "claude-opus-4-8";
 pub const MODEL_OPUS_5: &str = "claude-opus-5";
 pub const MODEL_OPUS_55: &str = "claude-opus-5-5";
 pub const MODEL_FABLE_5: &str = "claude-fable-5";
+pub const MODEL_FABLE_51: &str = "claude-fable-5-1";
 
 /// Beta header that opts a request into interleaved (mid-loop) thinking.
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
@@ -599,6 +600,20 @@ impl AnthropicProvider {
         Self::new(api_key, MODEL_FABLE_5)
     }
 
+    /// Create a provider using Claude Fable 5.1.
+    ///
+    /// Note: Fable 5.1 is adaptive-only — adaptive thinking is always on, the
+    /// API defaults effort to `high`, and raw chain of thought is never
+    /// returned. Passing a `ThinkingConfig` with
+    /// `ThinkingMode::Enabled { budget_tokens }` will return an
+    /// `InvalidRequest` — use `ThinkingConfig::adaptive()` or
+    /// `ThinkingConfig::adaptive_with_effort(_)` instead. Unlike Fable 5, the
+    /// API rejects forced tool use (`ToolChoice::Tool`).
+    #[must_use]
+    pub fn fable_51(api_key: impl Into<String>) -> Self {
+        Self::new(api_key, MODEL_FABLE_51)
+    }
+
     /// Claude Sonnet 5 — like Opus 4.8, manual `budget_tokens` returns a
     /// 400; use `ThinkingConfig::adaptive()` or
     /// `ThinkingConfig::default_with_effort(_)` instead.
@@ -699,6 +714,7 @@ impl AnthropicProvider {
                 | MODEL_OPUS_5
                 | MODEL_OPUS_55
                 | MODEL_FABLE_5
+                | MODEL_FABLE_51
         )
     }
 }
@@ -1425,6 +1441,7 @@ mod tests {
             MODEL_OPUS_5,
             MODEL_OPUS_55,
             MODEL_FABLE_5,
+            MODEL_FABLE_51,
         ] {
             let provider = AnthropicProvider::new("test-key", model);
             let flag = crate::model_capabilities::get_model_capabilities("anthropic", model)
@@ -1780,6 +1797,31 @@ mod tests {
                 .is_ok(),
             "effort without adaptive must be accepted",
         );
+    }
+
+    #[test]
+    fn test_fable_51_rejects_budgeted_thinking_and_accepts_max_effort() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        let fable_51 = AnthropicProvider::fable_51("test-api-key".to_string());
+        assert_eq!(fable_51.model(), MODEL_FABLE_51);
+        assert_eq!(fable_51.provider(), "anthropic");
+        let error = fable_51
+            .validate_thinking_config(Some(&ThinkingConfig::new(10_000)))
+            .err()
+            .context("budget thinking must be rejected on Fable 5.1")?;
+        assert!(
+            error.to_string().contains("ThinkingConfig::adaptive()"),
+            "expected migration hint, got: {error}"
+        );
+        assert!(
+            fable_51
+                .validate_thinking_config(Some(&ThinkingConfig::adaptive_with_effort(
+                    agent_sdk_foundation::llm::Effort::Max
+                )))
+                .is_ok()
+        );
+        Ok(())
     }
 
     #[test]

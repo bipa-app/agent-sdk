@@ -12,7 +12,8 @@
 //! when:
 //!
 //! - the model only exists on the Responses surface (e.g. `gpt-5.3-codex`), or
-//! - GPT-5.6 is used against the official `OpenAI` API with automatic routing, or
+//! - GPT-5.6 or GPT-6 is used against the official `OpenAI` API with automatic
+//!   routing, or
 //! - the configured exact reasoning controls require the Responses API, or
 //! - the request carries attachments (images / documents), or
 //! - the request is *agentic* (has tools or tool-use/tool-result blocks) against
@@ -53,7 +54,7 @@ use std::collections::HashMap;
 use super::openai_reasoning::{
     OpenAIAllowedToolsMode, OpenAIApiSurface, OpenAIPromptCacheMode, OpenAIPromptCacheTtl,
     OpenAIReasoningConfig, OpenAIReasoningEffort, OpenAITextVerbosity, OpenAIToolChoice,
-    is_gpt56_model, legacy_reasoning_effort, served_speed_from_service_tier,
+    is_gpt56_or_later_model, legacy_reasoning_effort, served_speed_from_service_tier,
     service_tier_wire_value, validate_reasoning_config, validate_tool_choice,
 };
 use super::openai_responses::OpenAIResponsesProvider;
@@ -155,7 +156,7 @@ fn should_use_responses_api(
         !explicitly_requests_chat && request_has_openai_responses_history(request);
     let official_auto_route = is_official_openai_base_url(base_url)
         && !explicitly_requests_chat
-        && (is_gpt56_model(model) || request_is_agentic(request));
+        && (is_gpt56_or_later_model(model) || request_is_agentic(request));
 
     let attachment_route = !explicitly_requests_chat
         && request_has_attachments(request)
@@ -168,6 +169,11 @@ fn should_use_responses_api(
         || attachment_route
         || official_auto_route
 }
+
+// GPT-6 series
+pub const MODEL_GPT6_ASTRA: &str = "gpt-6-astra";
+pub const MODEL_GPT6_SOL: &str = "gpt-6-sol";
+pub const MODEL_GPT6_LUNA: &str = "gpt-6-luna";
 
 // GPT-5.6 series
 pub const MODEL_GPT56: &str = "gpt-5.6";
@@ -338,6 +344,27 @@ impl OpenAIProvider {
     #[must_use]
     pub fn minimax_m2_5(api_key: String) -> Self {
         Self::minimax(api_key, MODEL_MINIMAX_M2_5.to_owned())
+    }
+
+    /// Create a provider using GPT-6 Astra (highest capability).
+    ///
+    /// Astra rejects `none` reasoning effort, and its tool calls need the
+    /// Responses API, which the official base URL selects automatically.
+    #[must_use]
+    pub fn gpt6_astra(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT6_ASTRA.to_owned())
+    }
+
+    /// Create a provider using GPT-6 Sol (strong reasoning on demanding tasks).
+    #[must_use]
+    pub fn gpt6_sol(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT6_SOL.to_owned())
+    }
+
+    /// Create a provider using GPT-6 Luna (efficient, repeatable work at scale).
+    #[must_use]
+    pub fn gpt6_luna(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT6_LUNA.to_owned())
     }
 
     /// Create a provider using the GPT-5.6 alias, which routes to GPT-5.6 Sol.
@@ -643,7 +670,7 @@ impl OpenAIProvider {
         config: Option<&OpenAIReasoningConfig>,
     ) -> Result<ChatPromptCachePlan> {
         let exact_options = ApiPromptCacheOptions::from_config(config);
-        if !is_gpt56_model(&self.model) && request.cache.is_some() {
+        if !is_gpt56_or_later_model(&self.model) && request.cache.is_some() {
             return Ok(ChatPromptCachePlan {
                 options: exact_options,
                 explicit_breakpoints: 0,
@@ -658,7 +685,7 @@ impl OpenAIProvider {
 
         if let Some(ttl) = cache.ttl {
             anyhow::bail!(
-                "OpenAI GPT-5.6 prompt caching supports only a 30m TTL; shared cache TTL {} cannot be represented for model={}",
+                "OpenAI GPT-5.6 and later prompt caching supports only a 30m TTL; shared cache TTL {} cannot be represented for model={}",
                 ttl.as_wire_str(),
                 self.model
             );
@@ -3153,8 +3180,20 @@ mod tests {
     }
 
     #[test]
-    fn test_gpt56_factories_create_expected_providers() {
+    fn test_gpt6_and_gpt56_factories_create_expected_providers() {
         for (provider, expected_model) in [
+            (
+                OpenAIProvider::gpt6_astra("test-api-key".to_string()),
+                MODEL_GPT6_ASTRA,
+            ),
+            (
+                OpenAIProvider::gpt6_sol("test-api-key".to_string()),
+                MODEL_GPT6_SOL,
+            ),
+            (
+                OpenAIProvider::gpt6_luna("test-api-key".to_string()),
+                MODEL_GPT6_LUNA,
+            ),
             (
                 OpenAIProvider::gpt56("test-api-key".to_string()),
                 MODEL_GPT56,
@@ -3312,6 +3351,10 @@ mod tests {
 
     #[test]
     fn test_model_constants_have_expected_values() {
+        // GPT-6 series
+        assert_eq!(MODEL_GPT6_ASTRA, "gpt-6-astra");
+        assert_eq!(MODEL_GPT6_SOL, "gpt-6-sol");
+        assert_eq!(MODEL_GPT6_LUNA, "gpt-6-luna");
         // GPT-5.6 series
         assert_eq!(MODEL_GPT56, "gpt-5.6");
         assert_eq!(MODEL_GPT56_SOL, "gpt-5.6-sol");
@@ -4552,6 +4595,9 @@ mod tests {
         assert!(!requires_responses_api(MODEL_GPT56_SOL));
         assert!(!requires_responses_api(MODEL_GPT56_TERRA));
         assert!(!requires_responses_api(MODEL_GPT56_LUNA));
+        assert!(!requires_responses_api(MODEL_GPT6_ASTRA));
+        assert!(!requires_responses_api(MODEL_GPT6_SOL));
+        assert!(!requires_responses_api(MODEL_GPT6_LUNA));
     }
 
     #[test]
@@ -4582,6 +4628,9 @@ mod tests {
             MODEL_GPT56_SOL,
             MODEL_GPT56_TERRA,
             MODEL_GPT56_LUNA,
+            MODEL_GPT6_ASTRA,
+            MODEL_GPT6_SOL,
+            MODEL_GPT6_LUNA,
         ] {
             assert!(should_use_responses_api(
                 DEFAULT_BASE_URL,
@@ -4601,18 +4650,21 @@ mod tests {
     #[test]
     fn official_gpt56_auto_routes_but_custom_base_url_does_not() {
         let request = ChatRequest::new(String::new(), vec![]);
-        assert!(should_use_responses_api(
-            DEFAULT_BASE_URL,
+        for model in [
             MODEL_GPT56,
-            &request,
-            None,
-        ));
-        assert!(!should_use_responses_api(
-            "https://gateway.example/v1",
-            MODEL_GPT56,
-            &request,
-            None,
-        ));
+            MODEL_GPT6_ASTRA,
+            MODEL_GPT6_SOL,
+            MODEL_GPT6_LUNA,
+        ] {
+            assert!(
+                should_use_responses_api(DEFAULT_BASE_URL, model, &request, None),
+                "{model} should auto-route to Responses on the official base URL"
+            );
+            assert!(
+                !should_use_responses_api("https://gateway.example/v1", model, &request, None),
+                "{model} must stay on Chat Completions behind a custom base URL"
+            );
+        }
     }
 
     #[test]
@@ -5225,6 +5277,7 @@ mod tests {
             MODEL_GPT56_SOL,
             MODEL_GPT56_TERRA,
             MODEL_GPT56_LUNA,
+            MODEL_GPT6_ASTRA,
         ] {
             let native = OpenAIProvider::new("key", model);
             assert!(
@@ -5238,6 +5291,8 @@ mod tests {
             MODEL_GPT4O_MINI,
             MODEL_GPT53_CODEX,
             MODEL_GPT52_PRO,
+            MODEL_GPT6_SOL,
+            MODEL_GPT6_LUNA,
             "unknown-future-model",
         ] {
             let native = OpenAIProvider::new("key", model);

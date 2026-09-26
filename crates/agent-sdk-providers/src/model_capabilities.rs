@@ -224,6 +224,9 @@ const ANTHROPIC_MODELS_URL: &str =
     "https://docs.anthropic.com/en/docs/about-claude/models/all-models";
 const OPENAI_MODELS_URL: &str = "https://developers.openai.com/api/docs/models";
 const OPENAI_PRICING_URL: &str = "https://developers.openai.com/api/docs/pricing";
+const OPENAI_GPT6_ASTRA_URL: &str = "https://developers.openai.com/api/docs/models/gpt-6-astra";
+const OPENAI_GPT6_SOL_URL: &str = "https://developers.openai.com/api/docs/models/gpt-6-sol";
+const OPENAI_GPT6_LUNA_URL: &str = "https://developers.openai.com/api/docs/models/gpt-6-luna";
 const OPENAI_GPT56_SOL_URL: &str = "https://developers.openai.com/api/docs/models/gpt-5.6-sol";
 const OPENAI_GPT56_TERRA_URL: &str = "https://developers.openai.com/api/docs/models/gpt-5.6-terra";
 const OPENAI_GPT56_LUNA_URL: &str = "https://developers.openai.com/api/docs/models/gpt-5.6-luna";
@@ -249,6 +252,19 @@ const OPENROUTER_MINIMAX_M25_URL: &str = "https://openrouter.ai/minimax/minimax-
 
 const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
     // Anthropic
+    ModelCapabilities {
+        provider: "anthropic",
+        model_id: "claude-fable-5-1",
+        context_window: Some(1_000_000),
+        max_output_tokens: Some(128_000),
+        pricing: Some(Pricing::flat_with_cached(10.0, 50.0, 0.25).with_notes("Anthropic Fable 5.1 official pricing: $10 input / $50 output per 1M tokens. Cache reads cost $0.25/M (2.5% of base input, versus 10% on other Claude models). Cache writes cost $12.50/M (5m) or $20/M (1h).")),
+        supports_thinking: true,
+        supports_adaptive_thinking: true,
+        rejects_budget_thinking: true,
+        source_url: ANTHROPIC_MODELS_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("Fable 5.1 is adaptive-only: adaptive thinking is always on (`thinking.type: \"disabled\"` returns 400) and `ThinkingMode::Enabled { budget_tokens }` is rejected by the Anthropic API. The SDK fails fast in validate_thinking_config. Effort defaults to `high` when unset. Raw chain of thought is never returned — thinking blocks arrive empty (the SDK requests thinking display=omitted). Forced tool use (`tool_choice` `any` or `tool`) returns 400. Safety classifiers may decline a request with stop_reason=refusal on an HTTP 200."),
+    },
     ModelCapabilities {
         provider: "anthropic",
         model_id: "claude-fable-5",
@@ -432,6 +448,51 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         notes: None,
     },
     // OpenAI
+    ModelCapabilities {
+        provider: "openai",
+        model_id: "gpt-6-astra",
+        context_window: Some(1_050_000),
+        max_output_tokens: Some(128_000),
+        pricing: Some(Pricing::flat_with_cached(10.0, 50.0, 1.0).with_notes(
+            "Standard tier base rates. Cache writes cost $12.50/M input tokens. Requests with more than 272K input tokens cost 2x input and cache rates and 1.5x output for the full request.",
+        )),
+        supports_thinking: true,
+        supports_adaptive_thinking: true,
+        rejects_budget_thinking: false,
+        source_url: OPENAI_GPT6_ASTRA_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("Supports Chat Completions and Responses, 1.05M context, and 128K max output. Rejects `none` reasoning effort. Chat Completions does not support function calling; tool calls need the Responses API."),
+    },
+    ModelCapabilities {
+        provider: "openai",
+        model_id: "gpt-6-sol",
+        context_window: Some(1_050_000),
+        max_output_tokens: Some(128_000),
+        pricing: Some(Pricing::flat_with_cached(2.0, 10.0, 0.2).with_notes(
+            "Standard tier base rates. Cache writes cost $2.50/M input tokens. Requests with more than 272K input tokens cost 2x input and cache rates and 1.5x output for the full request.",
+        )),
+        supports_thinking: true,
+        supports_adaptive_thinking: true,
+        rejects_budget_thinking: false,
+        source_url: OPENAI_GPT6_SOL_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("Supports Chat Completions and Responses, 1.05M context, and 128K max output. Chat Completions supports function calling only with `reasoning_effort: none`; tools with reasoning need the Responses API."),
+    },
+    ModelCapabilities {
+        provider: "openai",
+        model_id: "gpt-6-luna",
+        context_window: Some(1_050_000),
+        max_output_tokens: Some(128_000),
+        pricing: Some(Pricing::flat_with_cached(0.1, 0.5, 0.01).with_notes(
+            "Standard tier base rates. Cache writes cost $0.125/M input tokens. Requests with more than 272K input tokens cost 2x input and cache rates and 1.5x output for the full request.",
+        )),
+        supports_thinking: true,
+        supports_adaptive_thinking: true,
+        rejects_budget_thinking: false,
+        source_url: OPENAI_GPT6_LUNA_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("Supports Chat Completions and Responses, 1.05M context, and 128K max output. Chat Completions supports function calling only with `reasoning_effort: none`; tools with reasoning need the Responses API."),
+    },
     ModelCapabilities {
         provider: "openai",
         model_id: "gpt-5.6",
@@ -1116,6 +1177,43 @@ mod tests {
     }
 
     #[test]
+    fn test_lookup_anthropic_fable_51() -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let caps = get_model_capabilities("anthropic", "claude-fable-5-1")
+            .context("claude-fable-5-1 capabilities missing")?;
+        assert_eq!(caps.context_window, Some(1_000_000));
+        assert_eq!(caps.max_output_tokens, Some(128_000));
+        assert!(caps.supports_thinking);
+        assert!(caps.supports_adaptive_thinking);
+        assert!(caps.rejects_budget_thinking);
+        assert_eq!(caps.source_status, SourceStatus::Official);
+        let pricing = caps.pricing.context("pricing missing")?;
+        assert_eq!(pricing.input, Some(PricePoint::new(10.0)));
+        assert_eq!(pricing.output, Some(PricePoint::new(50.0)));
+        assert_eq!(pricing.cached_input, Some(PricePoint::new(0.25)));
+        Ok(())
+    }
+
+    #[test]
+    fn fable_51_bills_cache_reads_at_a_quarter_of_the_usual_rate() -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let caps = get_model_capabilities("anthropic", "claude-fable-5-1")
+            .context("claude-fable-5-1 capabilities missing")?;
+        let usage = Usage {
+            served_speed: None,
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cached_input_tokens: 1_000_000,
+            cache_creation_input_tokens: 0,
+        };
+        let cost = caps.estimate_cost_usd(&usage).context("priced")?;
+        assert!((cost - 0.25).abs() < 1e-9, "unexpected cost: {cost}");
+        Ok(())
+    }
+
+    #[test]
     fn test_lookup_anthropic_opus_55() -> anyhow::Result<()> {
         use anyhow::Context;
 
@@ -1199,6 +1297,7 @@ mod tests {
     #[test]
     fn budget_rejecting_anthropic_models_carry_the_flag() {
         for model in [
+            "claude-fable-5-1",
             "claude-fable-5",
             "claude-opus-5",
             "claude-opus-4-8",
@@ -1235,6 +1334,9 @@ mod tests {
             ("anthropic", "claude-sonnet-4-5-20250929"),
             ("anthropic", "claude-haiku-4-5-20251001"),
             ("openai", "gpt-5.6-sol"),
+            ("openai", "gpt-6-astra"),
+            ("openai", "gpt-6-sol"),
+            ("openai", "gpt-6-luna"),
         ] {
             let caps = get_model_capabilities(provider, model).unwrap();
             assert!(
@@ -1280,10 +1382,13 @@ mod tests {
     }
 
     #[test]
-    fn test_lookup_openai_gpt56_family() -> anyhow::Result<()> {
+    fn test_lookup_openai_gpt56_and_gpt6_families() -> anyhow::Result<()> {
         use anyhow::Context as _;
 
         for (model_id, input, cached_input, output, cache_write_note) in [
+            ("gpt-6-astra", 10.0, 1.0, 50.0, "$12.50/M"),
+            ("gpt-6-sol", 2.0, 0.2, 10.0, "$2.50/M"),
+            ("gpt-6-luna", 0.1, 0.01, 0.5, "$0.125/M"),
             ("gpt-5.6", 5.0, 0.5, 30.0, "$6.25/M"),
             ("gpt-5.6-sol", 5.0, 0.5, 30.0, "$6.25/M"),
             ("gpt-5.6-terra", 2.5, 0.25, 15.0, "$3.125/M"),

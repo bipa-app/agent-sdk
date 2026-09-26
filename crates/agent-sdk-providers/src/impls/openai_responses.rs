@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use super::openai_reasoning::{
     OpenAIAllowedToolsMode, OpenAIPromptCacheMode, OpenAIPromptCacheTtl, OpenAIReasoningConfig,
     OpenAIReasoningContext, OpenAIReasoningEffort, OpenAIReasoningMode, OpenAIReasoningSummary,
-    OpenAITextVerbosity, OpenAIToolChoice, is_gpt56_model, legacy_reasoning_effort,
+    OpenAITextVerbosity, OpenAIToolChoice, is_gpt56_or_later_model, legacy_reasoning_effort,
     legacy_reasoning_summary, served_speed_from_service_tier, service_tier_wire_value,
     supports_reasoning_summary, validate_reasoning_config, validate_tool_choice,
 };
@@ -46,6 +46,11 @@ fn build_http_client() -> reqwest::Client {
         .build()
         .unwrap_or_default()
 }
+
+// GPT-6 series
+pub const MODEL_GPT6_ASTRA: &str = "gpt-6-astra";
+pub const MODEL_GPT6_SOL: &str = "gpt-6-sol";
+pub const MODEL_GPT6_LUNA: &str = "gpt-6-luna";
 
 // GPT-5.6 series
 pub const MODEL_GPT56: &str = "gpt-5.6";
@@ -157,6 +162,26 @@ impl OpenAIResponsesProvider {
         self.extra_headers
             .iter()
             .fold(builder, |b, (k, v)| b.header(k.as_str(), v.as_str()))
+    }
+
+    /// Create a provider using GPT-6 Astra (highest capability).
+    ///
+    /// Astra rejects `none` reasoning effort.
+    #[must_use]
+    pub fn gpt6_astra(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT6_ASTRA.to_owned())
+    }
+
+    /// Create a provider using GPT-6 Sol (strong reasoning on demanding tasks).
+    #[must_use]
+    pub fn gpt6_sol(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT6_SOL.to_owned())
+    }
+
+    /// Create a provider using GPT-6 Luna (efficient, repeatable work at scale).
+    #[must_use]
+    pub fn gpt6_luna(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT6_LUNA.to_owned())
     }
 
     /// Create a provider using the GPT-5.6 alias, which routes to GPT-5.6 Sol.
@@ -1723,7 +1748,7 @@ fn resolve_prompt_cache_plan(
     let exact_mode = config.and_then(OpenAIReasoningConfig::prompt_cache_mode);
     let exact_ttl = config.and_then(OpenAIReasoningConfig::prompt_cache_ttl);
 
-    if !is_gpt56_model(model) && request.cache.is_some() {
+    if !is_gpt56_or_later_model(model) && request.cache.is_some() {
         return Ok(PromptCachePlan {
             options: ApiPromptCacheOptions::new(exact_mode, exact_ttl),
             explicit_breakpoints: 0,
@@ -1739,7 +1764,7 @@ fn resolve_prompt_cache_plan(
 
     if let Some(ttl) = cache.ttl {
         anyhow::bail!(
-            "OpenAI GPT-5.6 prompt caching supports only ttl=30m; shared cache TTL {} cannot be mapped losslessly. Use OpenAIReasoningConfig::with_prompt_cache_ttl(OpenAIPromptCacheTtl::ThirtyMinutes)",
+            "OpenAI GPT-5.6 and later prompt caching supports only ttl=30m; shared cache TTL {} cannot be mapped losslessly. Use OpenAIReasoningConfig::with_prompt_cache_ttl(OpenAIPromptCacheTtl::ThirtyMinutes)",
             ttl.as_wire_str()
         );
     }
@@ -2238,6 +2263,9 @@ mod tests {
 
     #[test]
     fn test_model_constant() {
+        assert_eq!(MODEL_GPT6_ASTRA, "gpt-6-astra");
+        assert_eq!(MODEL_GPT6_SOL, "gpt-6-sol");
+        assert_eq!(MODEL_GPT6_LUNA, "gpt-6-luna");
         assert_eq!(MODEL_GPT56, "gpt-5.6");
         assert_eq!(MODEL_GPT56_SOL, "gpt-5.6-sol");
         assert_eq!(MODEL_GPT56_TERRA, "gpt-5.6-terra");
@@ -2247,8 +2275,20 @@ mod tests {
     }
 
     #[test]
-    fn test_gpt56_factories_create_expected_providers() {
+    fn test_gpt6_and_gpt56_factories_create_expected_providers() {
         for (provider, expected_model) in [
+            (
+                OpenAIResponsesProvider::gpt6_astra("test-key".to_string()),
+                MODEL_GPT6_ASTRA,
+            ),
+            (
+                OpenAIResponsesProvider::gpt6_sol("test-key".to_string()),
+                MODEL_GPT6_SOL,
+            ),
+            (
+                OpenAIResponsesProvider::gpt6_luna("test-key".to_string()),
+                MODEL_GPT6_LUNA,
+            ),
             (
                 OpenAIResponsesProvider::gpt56("test-key".to_string()),
                 MODEL_GPT56,
@@ -2892,6 +2932,10 @@ mod tests {
             .with_cache(CacheConfig::enabled().with_max_breakpoints(4));
         let generic_plan = resolve_prompt_cache_plan(MODEL_GPT56, &generic_request, Some(&exact))?;
         assert_eq!(generic_plan.explicit_breakpoints, 4);
+        for model in [MODEL_GPT6_ASTRA, MODEL_GPT6_SOL, MODEL_GPT6_LUNA] {
+            let plan = resolve_prompt_cache_plan(model, &generic_request, Some(&exact))?;
+            assert_eq!(plan.explicit_breakpoints, 4, "{model}");
+        }
 
         let incompatible = request.with_cache(CacheConfig::enabled().with_ttl(CacheTtl::OneHour));
         let error = resolve_prompt_cache_plan(MODEL_GPT56, &incompatible, Some(&exact))
@@ -3270,6 +3314,7 @@ mod tests {
             MODEL_GPT56_SOL,
             MODEL_GPT56_TERRA,
             MODEL_GPT56_LUNA,
+            MODEL_GPT6_ASTRA,
         ] {
             assert!(
                 OpenAIResponsesProvider::new("key".to_owned(), model.to_owned())
@@ -3278,7 +3323,13 @@ mod tests {
             );
         }
 
-        for model in ["gpt-4o", MODEL_GPT53_CODEX, "unknown-future-model"] {
+        for model in [
+            "gpt-4o",
+            MODEL_GPT53_CODEX,
+            MODEL_GPT6_SOL,
+            MODEL_GPT6_LUNA,
+            "unknown-future-model",
+        ] {
             assert!(
                 !OpenAIResponsesProvider::new("key".to_owned(), model.to_owned())
                     .supports_historical_image_blocks(),

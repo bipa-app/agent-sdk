@@ -378,7 +378,7 @@ impl OpenAIReasoningConfig {
     }
 }
 
-pub(crate) use crate::model_features::is_gpt56_model;
+pub(crate) use crate::model_features::is_gpt56_or_later_model;
 
 /// `service_tier` value selecting `OpenAI` priority processing.
 pub(crate) const SERVICE_TIER_PRIORITY: &str = "priority";
@@ -422,7 +422,19 @@ pub(crate) const fn service_tier_wire_value(speed: Option<SpeedTier>) -> Option<
 
 pub(crate) fn validate_reasoning_config(model: &str, config: &OpenAIReasoningConfig) -> Result<()> {
     if let Some(effort) = config.effort() {
-        let validation = if is_gpt56_model(model) {
+        let validation = if model == "gpt-6-astra" {
+            Some((
+                matches!(
+                    effort,
+                    OpenAIReasoningEffort::Low
+                        | OpenAIReasoningEffort::Medium
+                        | OpenAIReasoningEffort::High
+                        | OpenAIReasoningEffort::XHigh
+                        | OpenAIReasoningEffort::Max
+                ),
+                "low, medium, high, xhigh, and max",
+            ))
+        } else if is_gpt56_or_later_model(model) {
             Some((
                 matches!(
                     effort,
@@ -489,10 +501,10 @@ pub(crate) fn validate_reasoning_config(model: &str, config: &OpenAIReasoningCon
     }
 
     if (config.prompt_cache_mode().is_some() || config.prompt_cache_ttl().is_some())
-        && !is_gpt56_model(model)
+        && !is_gpt56_or_later_model(model)
     {
         bail!(
-            "exact prompt-cache mode and TTL controls are only supported for GPT-5.6 models; model={model}"
+            "exact prompt-cache mode and TTL controls are only supported for GPT-5.6 and later models; model={model}"
         );
     }
 
@@ -722,6 +734,47 @@ mod tests {
 
         let max = OpenAIReasoningConfig::new().with_effort(OpenAIReasoningEffort::Max);
         assert!(validate_reasoning_config("gpt-5.6", &max).is_ok());
+    }
+
+    #[test]
+    fn gpt6_effort_sets_match_the_model_pages() -> anyhow::Result<()> {
+        let none = OpenAIReasoningConfig::new().with_effort(OpenAIReasoningEffort::None);
+        let minimal = OpenAIReasoningConfig::new().with_effort(OpenAIReasoningEffort::Minimal);
+        let low = OpenAIReasoningConfig::new().with_effort(OpenAIReasoningEffort::Low);
+        let max = OpenAIReasoningConfig::new().with_effort(OpenAIReasoningEffort::Max);
+
+        for model in ["gpt-6-sol", "gpt-6-luna"] {
+            assert!(validate_reasoning_config(model, &none).is_ok(), "{model}");
+            assert!(validate_reasoning_config(model, &max).is_ok(), "{model}");
+            assert!(
+                validate_reasoning_config(model, &minimal).is_err(),
+                "{model}"
+            );
+        }
+
+        let astra_none = validate_reasoning_config("gpt-6-astra", &none)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("gpt-6-astra must reject none effort"))?;
+        assert!(
+            astra_none
+                .to_string()
+                .contains("low, medium, high, xhigh, and max"),
+            "got: {astra_none}"
+        );
+        assert!(validate_reasoning_config("gpt-6-astra", &minimal).is_err());
+        assert!(validate_reasoning_config("gpt-6-astra", &low).is_ok());
+        assert!(validate_reasoning_config("gpt-6-astra", &max).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn gpt6_accepts_exact_prompt_cache_controls() {
+        let cache = OpenAIReasoningConfig::new()
+            .with_prompt_cache_mode(OpenAIPromptCacheMode::Explicit)
+            .with_prompt_cache_ttl(OpenAIPromptCacheTtl::ThirtyMinutes);
+        for model in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+            assert!(validate_reasoning_config(model, &cache).is_ok(), "{model}");
+        }
     }
 
     #[test]
