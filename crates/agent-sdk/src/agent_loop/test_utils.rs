@@ -173,6 +173,9 @@ pub enum StreamScriptStep {
     /// Yield these frames, then never complete — simulates a half-open
     /// connection that stalls mid-stream so the inactivity timeout fires.
     FramesThenStall(Vec<StreamDelta>),
+    /// Yield each frame after waiting its delay, then end the stream — paces
+    /// frames against the inactivity timeout.
+    PacedFrames(Vec<(std::time::Duration, StreamDelta)>),
 }
 
 /// A streaming provider whose `chat_stream` returns a different scripted
@@ -250,6 +253,12 @@ impl crate::llm::LlmProvider for StreamScriptProvider {
             Some(StreamScriptStep::FramesThenStall(frames)) => Box::pin(
                 futures::stream::iter(frames.into_iter().map(Ok))
                     .chain(futures::stream::pending::<Result<StreamDelta>>()),
+            ),
+            Some(StreamScriptStep::PacedFrames(frames)) => Box::pin(
+                futures::stream::iter(frames).then(|(delay, delta)| async move {
+                    tokio::time::sleep(delay).await;
+                    Ok(delta)
+                }),
             ),
             None => Box::pin(futures::stream::iter(std::iter::once(Ok(
                 StreamDelta::Done {

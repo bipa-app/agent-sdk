@@ -10120,6 +10120,116 @@ async fn stalled_stream_retries_even_with_zero_transient_budget() -> anyhow::Res
     Ok(())
 }
 
+#[tokio::test(start_paused = true)]
+async fn keep_alives_hold_a_silent_stream_open_past_the_inactivity_timeout() -> anyhow::Result<()> {
+    // Anthropic pings while a model thinks with display=omitted and streams
+    // no content. Pings spaced under the inactivity timeout for five times its
+    // length must keep the stream open: no timeout, no retry, and nothing
+    // from the pings reaches the response or the event log.
+    use super::types::LLM_STREAM_INACTIVITY_TIMEOUT;
+
+    let gap = LLM_STREAM_INACTIVITY_TIMEOUT / 4;
+    let mut frames: Vec<_> = (0..20).map(|_| (gap, StreamDelta::KeepAlive)).collect();
+    assert!(gap * 20 >= LLM_STREAM_INACTIVITY_TIMEOUT * 5);
+    frames.push((
+        std::time::Duration::ZERO,
+        StreamDelta::TextDelta {
+            delta: "thought it through".to_string(),
+            block_index: 0,
+        },
+    ));
+    frames.push((
+        std::time::Duration::ZERO,
+        StreamDelta::Done {
+            stop_reason: Some(crate::llm::StopReason::EndTurn),
+            served_route: None,
+        },
+    ));
+    let provider = StreamScriptProvider::new(vec![StreamScriptStep::PacedFrames(frames)]);
+    let config = AgentConfig {
+        streaming: true,
+        retry: RetryConfig::no_retry(),
+        ..Default::default()
+    };
+    let agent = builder::<()>()
+        .provider(provider)
+        .config(config)
+        .event_store(new_event_store())
+        .build();
+
+    let (state, events) = run_recorded(
+        &agent,
+        ThreadId::new(),
+        AgentInput::Text("think hard".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "a pinging stream must complete, got {state:?}"
+    );
+    assert_eq!(
+        agent.provider.recorded_requests()?.len(),
+        1,
+        "keep-alives must stop the inactivity timeout from reopening the stream"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.event, AgentEvent::AutoRetryStart { .. })),
+        "no retry may start while keep-alives arrive"
+    );
+    let text_deltas: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match &e.event {
+            AgentEvent::TextDelta { delta, .. } => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text_deltas, vec!["thought it through"]);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn keep_alives_followed_by_silence_still_time_out() -> anyhow::Result<()> {
+    // Pings prove the connection was alive, not that it still is: once they
+    // stop, the inactivity timeout must still reopen the stream.
+    let provider = StreamScriptProvider::new(vec![StreamScriptStep::FramesThenStall(vec![
+        StreamDelta::KeepAlive,
+        StreamDelta::KeepAlive,
+    ])]);
+    let config = AgentConfig {
+        streaming: true,
+        retry: RetryConfig::no_retry(),
+        ..Default::default()
+    };
+    let agent = builder::<()>()
+        .provider(provider)
+        .config(config)
+        .event_store(new_event_store())
+        .build();
+
+    let state = agent
+        .run(
+            ThreadId::new(),
+            AgentInput::Text("go".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "the stalled stream must recover on a fresh one, got {state:?}"
+    );
+    assert_eq!(
+        agent.provider.recorded_requests()?.len(),
+        2,
+        "silence after keep-alives must still trip the inactivity timeout"
+    );
+    Ok(())
+}
+
 fn provider_hydration_checkpoint(store: &crate::ArtifactStore) -> anyhow::Result<(Message, u64)> {
     let mut reserved = &b"first allocation probe"[..];
     assert_eq!(store.save_streamed("reserved", &mut reserved)?.id, 1);

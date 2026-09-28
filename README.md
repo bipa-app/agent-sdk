@@ -618,11 +618,11 @@ let openai_agent = builder::<()>()
 
 Adaptive thinking is only supported for Anthropic `claude-sonnet-4-6`, `claude-sonnet-5`,
 `claude-opus-4-6`, `claude-opus-4-7`, `claude-opus-4-8`, `claude-opus-5`, `claude-opus-5-5`,
-and `claude-fable-5`. These models reject budget-based thinking
-(`ThinkingConfig::new(budget)`); on `claude-opus-5-5` and `claude-fable-5` adaptive
-thinking is always on, even when no thinking config is set. Note that `claude-fable-5`
-never returns raw chain of thought, so its `AgentEvent::Thinking` / `AgentEvent::ThinkingDelta`
-events carry empty thinking content.
+`claude-fable-5`, and `claude-fable-5-1`. These models reject budget-based thinking
+(`ThinkingConfig::new(budget)`); on `claude-opus-5-5`, `claude-fable-5`, and `claude-fable-5-1`
+adaptive thinking is always on, even when no thinking config is set. Note that `claude-fable-5`
+and `claude-fable-5-1` never return raw chain of thought, so their `AgentEvent::Thinking` /
+`AgentEvent::ThinkingDelta` events carry empty thinking content.
 When thinking is enabled, the agent emits `AgentEvent::Thinking` and `AgentEvent::ThinkingDelta`
 events with the model's reasoning output.
 
@@ -956,11 +956,12 @@ for envelope in event_store.get_events(&thread_id).await? {
 | Provider | Models | Usage |
 |----------|--------|-------|
 | Anthropic | Claude Sonnet, Opus, Haiku | `AnthropicProvider::sonnet(api_key)` |
-| OpenAI | GPT-5.6, GPT-5.4, GPT-5.3-Codex, GPT-4.1, o-series | `OpenAIProvider::gpt56(api_key)` |
+| OpenAI | GPT-6, GPT-5.6, GPT-5.4, GPT-5.3-Codex, GPT-4.1, o-series | `OpenAIProvider::gpt56(api_key)` |
 | Google | Gemini 3.x and 2.x families | `GeminiProvider::new(api_key, model)` |
 
-GPT-5.6 uses the Responses API automatically on the official OpenAI endpoint. Exact controls that
-do not fit the provider-neutral thinking config are available through `OpenAIReasoningConfig`:
+GPT-5.6 and GPT-6 use the Responses API automatically on the official OpenAI endpoint. Exact
+controls that do not fit the provider-neutral thinking config are available through
+`OpenAIReasoningConfig`:
 
 ```rust
 use agent_sdk_providers::{

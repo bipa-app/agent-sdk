@@ -20,15 +20,17 @@ use futures::StreamExt;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
+use super::openai_prompt_cache::bounded_prompt_cache_key;
 use super::openai_reasoning::{
     OpenAIAllowedToolsMode, OpenAIPromptCacheMode, OpenAIPromptCacheTtl, OpenAIReasoningConfig,
     OpenAIReasoningContext, OpenAIReasoningEffort, OpenAIReasoningMode, OpenAIReasoningSummary,
-    OpenAITextVerbosity, OpenAIToolChoice, is_gpt56_model, legacy_reasoning_effort,
+    OpenAITextVerbosity, OpenAIToolChoice, is_gpt56_or_later_model, legacy_reasoning_effort,
     legacy_reasoning_summary, served_speed_from_service_tier, service_tier_wire_value,
     supports_reasoning_summary, validate_reasoning_config, validate_tool_choice,
 };
 use super::openai_schema::normalize_strict_schema;
 use crate::model_features::supports_responses_original_image_detail;
+use std::borrow::Cow;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const ENCRYPTED_REASONING_INCLUDE: &[&str] = &["reasoning.encrypted_content"];
@@ -46,6 +48,11 @@ fn build_http_client() -> reqwest::Client {
         .build()
         .unwrap_or_default()
 }
+
+// GPT-6 series
+pub const MODEL_GPT6_ASTRA: &str = "gpt-6-astra";
+pub const MODEL_GPT6_SOL: &str = "gpt-6-sol";
+pub const MODEL_GPT6_LUNA: &str = "gpt-6-luna";
 
 // GPT-5.6 series
 pub const MODEL_GPT56: &str = "gpt-5.6";
@@ -157,6 +164,26 @@ impl OpenAIResponsesProvider {
         self.extra_headers
             .iter()
             .fold(builder, |b, (k, v)| b.header(k.as_str(), v.as_str()))
+    }
+
+    /// Create a provider using GPT-6 Astra (highest capability).
+    ///
+    /// Astra rejects `none` reasoning effort.
+    #[must_use]
+    pub fn gpt6_astra(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT6_ASTRA.to_owned())
+    }
+
+    /// Create a provider using GPT-6 Sol (strong reasoning on demanding tasks).
+    #[must_use]
+    pub fn gpt6_sol(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT6_SOL.to_owned())
+    }
+
+    /// Create a provider using GPT-6 Luna (efficient, repeatable work at scale).
+    #[must_use]
+    pub fn gpt6_luna(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT6_LUNA.to_owned())
     }
 
     /// Create a provider using the GPT-5.6 alias, which routes to GPT-5.6 Sol.
@@ -402,7 +429,7 @@ impl LlmProvider for OpenAIResponsesProvider {
             prompt_cache_options,
             store,
             include: include_encrypted_reasoning.then_some(ENCRYPTED_REASONING_INCLUDE),
-            prompt_cache_key: request.session_id.as_deref(),
+            prompt_cache_key: request.session_id.as_deref().map(bounded_prompt_cache_key),
             safety_identifier: reasoning_config
                 .as_ref()
                 .and_then(OpenAIReasoningConfig::safety_identifier),
@@ -528,7 +555,10 @@ impl LlmProvider for OpenAIResponsesProvider {
                 store,
                 include: include_encrypted_reasoning
                     .then(|| ENCRYPTED_REASONING_INCLUDE.iter().map(|value| (*value).to_owned()).collect()),
-                prompt_cache_key: request.session_id.clone(),
+                prompt_cache_key: request
+                    .session_id
+                    .as_deref()
+                    .map(|session_id| bounded_prompt_cache_key(session_id).into_owned()),
                 safety_identifier: reasoning_config
                     .as_ref()
                     .and_then(OpenAIReasoningConfig::safety_identifier)
@@ -1563,7 +1593,7 @@ struct ApiResponsesRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     include: Option<&'a [&'a str]>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    prompt_cache_key: Option<&'a str>,
+    prompt_cache_key: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     safety_identifier: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1723,7 +1753,7 @@ fn resolve_prompt_cache_plan(
     let exact_mode = config.and_then(OpenAIReasoningConfig::prompt_cache_mode);
     let exact_ttl = config.and_then(OpenAIReasoningConfig::prompt_cache_ttl);
 
-    if !is_gpt56_model(model) && request.cache.is_some() {
+    if !is_gpt56_or_later_model(model) && request.cache.is_some() {
         return Ok(PromptCachePlan {
             options: ApiPromptCacheOptions::new(exact_mode, exact_ttl),
             explicit_breakpoints: 0,
@@ -1739,7 +1769,7 @@ fn resolve_prompt_cache_plan(
 
     if let Some(ttl) = cache.ttl {
         anyhow::bail!(
-            "OpenAI GPT-5.6 prompt caching supports only ttl=30m; shared cache TTL {} cannot be mapped losslessly. Use OpenAIReasoningConfig::with_prompt_cache_ttl(OpenAIPromptCacheTtl::ThirtyMinutes)",
+            "OpenAI GPT-5.6 and later prompt caching supports only ttl=30m; shared cache TTL {} cannot be mapped losslessly. Use OpenAIReasoningConfig::with_prompt_cache_ttl(OpenAIPromptCacheTtl::ThirtyMinutes)",
             ttl.as_wire_str()
         );
     }
@@ -2236,8 +2266,77 @@ mod tests {
         Ok(deltas)
     }
 
+    #[tokio::test]
+    async fn long_session_ids_are_bounded_as_prompt_cache_key_on_the_wire() -> anyhow::Result<()> {
+        use crate::impls::openai_prompt_cache::MAX_PROMPT_CACHE_KEY_LEN;
+
+        let session_id = "eval-bipa-premium-data-query-001-0b4e88a4-6f1c-4c55-9d2a-51c0e4a7f3b9";
+        let expected_key = bounded_prompt_cache_key(session_id);
+        assert!(expected_key.len() <= MAX_PROMPT_CACHE_KEY_LEN);
+
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/responses"))
+            .and(matchers::body_partial_json(
+                serde_json::json!({"stream": true}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: {\"type\":\"response.completed\",\"response\":{}}\n\n"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_123",
+                "model": MODEL_GPT6_SOL,
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                }],
+                "status": "completed",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+        let provider = OpenAIResponsesProvider::with_base_url(
+            "test-key".to_owned(),
+            MODEL_GPT6_SOL.to_owned(),
+            server.uri(),
+        );
+        let request = ChatRequest::new(String::new(), vec![Message::user("hello")])
+            .with_session_id(session_id);
+
+        let _ = provider.chat(request.clone()).await?;
+        let mut stream = std::pin::pin!(provider.chat_stream(request));
+        while let Some(delta) = stream.next().await {
+            delta?;
+        }
+
+        let received = server
+            .received_requests()
+            .await
+            .context("mock server did not record requests")?;
+        assert_eq!(
+            received.len(),
+            2,
+            "expected one chat and one chat_stream request"
+        );
+        for sent in &received {
+            let body: serde_json::Value = serde_json::from_slice(&sent.body)?;
+            assert_eq!(body["prompt_cache_key"], expected_key.as_ref());
+        }
+        Ok(())
+    }
+
     #[test]
     fn test_model_constant() {
+        assert_eq!(MODEL_GPT6_ASTRA, "gpt-6-astra");
+        assert_eq!(MODEL_GPT6_SOL, "gpt-6-sol");
+        assert_eq!(MODEL_GPT6_LUNA, "gpt-6-luna");
         assert_eq!(MODEL_GPT56, "gpt-5.6");
         assert_eq!(MODEL_GPT56_SOL, "gpt-5.6-sol");
         assert_eq!(MODEL_GPT56_TERRA, "gpt-5.6-terra");
@@ -2247,8 +2346,20 @@ mod tests {
     }
 
     #[test]
-    fn test_gpt56_factories_create_expected_providers() {
+    fn test_gpt6_and_gpt56_factories_create_expected_providers() {
         for (provider, expected_model) in [
+            (
+                OpenAIResponsesProvider::gpt6_astra("test-key".to_string()),
+                MODEL_GPT6_ASTRA,
+            ),
+            (
+                OpenAIResponsesProvider::gpt6_sol("test-key".to_string()),
+                MODEL_GPT6_SOL,
+            ),
+            (
+                OpenAIResponsesProvider::gpt6_luna("test-key".to_string()),
+                MODEL_GPT6_LUNA,
+            ),
             (
                 OpenAIResponsesProvider::gpt56("test-key".to_string()),
                 MODEL_GPT56,
@@ -2892,6 +3003,10 @@ mod tests {
             .with_cache(CacheConfig::enabled().with_max_breakpoints(4));
         let generic_plan = resolve_prompt_cache_plan(MODEL_GPT56, &generic_request, Some(&exact))?;
         assert_eq!(generic_plan.explicit_breakpoints, 4);
+        for model in [MODEL_GPT6_ASTRA, MODEL_GPT6_SOL, MODEL_GPT6_LUNA] {
+            let plan = resolve_prompt_cache_plan(model, &generic_request, Some(&exact))?;
+            assert_eq!(plan.explicit_breakpoints, 4, "{model}");
+        }
 
         let incompatible = request.with_cache(CacheConfig::enabled().with_ttl(CacheTtl::OneHour));
         let error = resolve_prompt_cache_plan(MODEL_GPT56, &incompatible, Some(&exact))
@@ -3270,6 +3385,7 @@ mod tests {
             MODEL_GPT56_SOL,
             MODEL_GPT56_TERRA,
             MODEL_GPT56_LUNA,
+            MODEL_GPT6_ASTRA,
         ] {
             assert!(
                 OpenAIResponsesProvider::new("key".to_owned(), model.to_owned())
@@ -3278,7 +3394,13 @@ mod tests {
             );
         }
 
-        for model in ["gpt-4o", MODEL_GPT53_CODEX, "unknown-future-model"] {
+        for model in [
+            "gpt-4o",
+            MODEL_GPT53_CODEX,
+            MODEL_GPT6_SOL,
+            MODEL_GPT6_LUNA,
+            "unknown-future-model",
+        ] {
             assert!(
                 !OpenAIResponsesProvider::new("key".to_owned(), model.to_owned())
                     .supports_historical_image_blocks(),

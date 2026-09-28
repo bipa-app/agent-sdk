@@ -16,6 +16,8 @@ pub mod gemini;
 pub mod openai;
 #[cfg(feature = "openai-codex")]
 pub mod openai_codex_responses;
+#[cfg(any(feature = "openai", feature = "openai-codex"))]
+pub(crate) mod openai_prompt_cache;
 #[cfg(feature = "openai")]
 pub mod openai_reasoning;
 #[cfg(feature = "openai")]

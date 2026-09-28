@@ -68,7 +68,7 @@ pub enum ModelReasoningStateReplay {
     EncryptedContent,
 }
 
-/// Exact GPT-5.6 `prompt_cache_options.mode` value.
+/// Exact GPT-5.6-and-later `prompt_cache_options.mode` value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ModelPromptCacheMode {
@@ -76,7 +76,7 @@ pub enum ModelPromptCacheMode {
     Explicit,
 }
 
-/// Exact GPT-5.6 `prompt_cache_options.ttl` value.
+/// Exact GPT-5.6-and-later `prompt_cache_options.ttl` value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ModelPromptCacheTtl {
@@ -174,6 +174,13 @@ const GPT56_EFFORTS: &[ModelReasoningEffort] = &[
     ModelReasoningEffort::XHigh,
     ModelReasoningEffort::Max,
 ];
+const GPT6_ASTRA_EFFORTS: &[ModelReasoningEffort] = &[
+    ModelReasoningEffort::Low,
+    ModelReasoningEffort::Medium,
+    ModelReasoningEffort::High,
+    ModelReasoningEffort::XHigh,
+    ModelReasoningEffort::Max,
+];
 const GPT53_CODEX_EFFORTS: &[ModelReasoningEffort] = &[
     ModelReasoningEffort::Low,
     ModelReasoningEffort::Medium,
@@ -231,6 +238,14 @@ const GPT56_REASONING: ModelReasoningFeatures = ModelReasoningFeatures {
         values: REASONING_STATE_REPLAY,
         api_surfaces: RESPONSES,
     },
+};
+
+const GPT6_ASTRA_REASONING: ModelReasoningFeatures = ModelReasoningFeatures {
+    efforts: ModelFeatureSet {
+        values: GPT6_ASTRA_EFFORTS,
+        api_surfaces: CHAT_AND_RESPONSES,
+    },
+    ..GPT56_REASONING
 };
 
 const GPT53_CODEX_REASONING: ModelReasoningFeatures = ModelReasoningFeatures {
@@ -325,19 +340,26 @@ const RESPONSES_FUNCTION_TOOLS: ModelToolFeatures = ModelToolFeatures {
     parallel_function_calls: RESPONSES,
 };
 
+/// GPT-6 Sol and Luna accept function tools on Chat Completions only with
+/// `reasoning_effort: "none"`; tools with reasoning need the Responses API.
+const GPT6_FUNCTION_TOOLS: ModelToolFeatures = FUNCTION_TOOLS;
+
 const REASONING_URL: &str = "https://developers.openai.com/api/docs/guides/reasoning";
 const CACHE_URL: &str = "https://developers.openai.com/api/docs/guides/prompt-caching";
 const FUNCTION_CALLING_URL: &str = "https://developers.openai.com/api/docs/guides/function-calling";
-const GPT56_GUIDE_URL: &str = "https://developers.openai.com/api/docs/guides/latest-model";
+const LATEST_MODEL_GUIDE_URL: &str = "https://developers.openai.com/api/docs/guides/latest-model";
 const GPT56_SOL_URL: &str = "https://developers.openai.com/api/docs/models/gpt-5.6-sol";
 const GPT56_TERRA_URL: &str = "https://developers.openai.com/api/docs/models/gpt-5.6-terra";
 const GPT56_LUNA_URL: &str = "https://developers.openai.com/api/docs/models/gpt-5.6-luna";
+const GPT6_ASTRA_URL: &str = "https://developers.openai.com/api/docs/models/gpt-6-astra";
+const GPT6_SOL_URL: &str = "https://developers.openai.com/api/docs/models/gpt-6-sol";
+const GPT6_LUNA_URL: &str = "https://developers.openai.com/api/docs/models/gpt-6-luna";
 const GPT53_CODEX_URL: &str = "https://developers.openai.com/api/docs/models/gpt-5.3-codex";
 const GPT52_PRO_URL: &str = "https://developers.openai.com/api/docs/models/gpt-5.2-pro";
 
 const GPT56_SOURCES: &[&str] = &[
     GPT56_SOL_URL,
-    GPT56_GUIDE_URL,
+    LATEST_MODEL_GUIDE_URL,
     REASONING_URL,
     CACHE_URL,
     FUNCTION_CALLING_URL,
@@ -345,14 +367,35 @@ const GPT56_SOURCES: &[&str] = &[
 const GPT56_SOL_SOURCES: &[&str] = GPT56_SOURCES;
 const GPT56_TERRA_SOURCES: &[&str] = &[
     GPT56_TERRA_URL,
-    GPT56_GUIDE_URL,
+    LATEST_MODEL_GUIDE_URL,
     REASONING_URL,
     CACHE_URL,
     FUNCTION_CALLING_URL,
 ];
 const GPT56_LUNA_SOURCES: &[&str] = &[
     GPT56_LUNA_URL,
-    GPT56_GUIDE_URL,
+    LATEST_MODEL_GUIDE_URL,
+    REASONING_URL,
+    CACHE_URL,
+    FUNCTION_CALLING_URL,
+];
+const GPT6_ASTRA_SOURCES: &[&str] = &[
+    GPT6_ASTRA_URL,
+    LATEST_MODEL_GUIDE_URL,
+    REASONING_URL,
+    CACHE_URL,
+    FUNCTION_CALLING_URL,
+];
+const GPT6_SOL_SOURCES: &[&str] = &[
+    GPT6_SOL_URL,
+    LATEST_MODEL_GUIDE_URL,
+    REASONING_URL,
+    CACHE_URL,
+    FUNCTION_CALLING_URL,
+];
+const GPT6_LUNA_SOURCES: &[&str] = &[
+    GPT6_LUNA_URL,
+    LATEST_MODEL_GUIDE_URL,
     REASONING_URL,
     CACHE_URL,
     FUNCTION_CALLING_URL,
@@ -371,6 +414,45 @@ const GPT52_PRO_SOURCES: &[&str] = &[
 ];
 
 const MODEL_FEATURES: &[ModelFeatures] = &[
+    ModelFeatures {
+        model_id: "gpt-6-astra",
+        alias_of: None,
+        context_window: 1_050_000,
+        max_input_tokens: 922_000,
+        max_output_tokens: 128_000,
+        api_surfaces: ALL_SURFACES,
+        input_modalities: TEXT_AND_IMAGE,
+        reasoning: GPT6_ASTRA_REASONING,
+        prompt_cache: GPT56_CACHE,
+        tools: RESPONSES_FUNCTION_TOOLS,
+        source_urls: GPT6_ASTRA_SOURCES,
+    },
+    ModelFeatures {
+        model_id: "gpt-6-sol",
+        alias_of: None,
+        context_window: 1_050_000,
+        max_input_tokens: 922_000,
+        max_output_tokens: 128_000,
+        api_surfaces: ALL_SURFACES,
+        input_modalities: TEXT_AND_IMAGE,
+        reasoning: GPT56_REASONING,
+        prompt_cache: GPT56_CACHE,
+        tools: GPT6_FUNCTION_TOOLS,
+        source_urls: GPT6_SOL_SOURCES,
+    },
+    ModelFeatures {
+        model_id: "gpt-6-luna",
+        alias_of: None,
+        context_window: 1_050_000,
+        max_input_tokens: 922_000,
+        max_output_tokens: 128_000,
+        api_surfaces: ALL_SURFACES,
+        input_modalities: TEXT_AND_IMAGE,
+        reasoning: GPT56_REASONING,
+        prompt_cache: GPT56_CACHE,
+        tools: GPT6_FUNCTION_TOOLS,
+        source_urls: GPT6_LUNA_SOURCES,
+    },
     ModelFeatures {
         model_id: "gpt-5.6",
         alias_of: Some("gpt-5.6-sol"),
@@ -470,22 +552,32 @@ pub const fn supported_model_features() -> &'static [ModelFeatures] {
 /// Lives here (ungated module) because both the `openai` and `openai-codex`
 /// features classify these models without implying each other.
 #[cfg(any(feature = "openai", feature = "openai-codex"))]
-pub(crate) const fn is_gpt56_model(model: &str) -> bool {
+const fn is_gpt56_model(model: &str) -> bool {
     matches!(
         model.as_bytes(),
         b"gpt-5.6" | b"gpt-5.6-sol" | b"gpt-5.6-terra" | b"gpt-5.6-luna"
     )
 }
 
+/// True for every GPT-5.6 and GPT-6 family model ID: the models with `max`
+/// effort, exact `prompt_cache_options`, and Responses routing by default.
+#[cfg(feature = "openai")]
+pub(crate) const fn is_gpt56_or_later_model(model: &str) -> bool {
+    is_gpt56_model(model)
+        || matches!(
+            model.as_bytes(),
+            b"gpt-6-astra" | b"gpt-6-sol" | b"gpt-6-luna"
+        )
+}
+
 /// True when `model` accepts the Responses API's `detail: original` image
 /// rendering for historical transcript frames.
+///
+/// The vision guide lists GPT-6 Astra but not GPT-6 Sol or Luna, so those two
+/// keep the `high` downgrade until `OpenAI` documents `original` for them.
 #[cfg(any(feature = "openai", feature = "openai-codex"))]
 pub(crate) fn supports_responses_original_image_detail(model: &str) -> bool {
-    model == "gpt-5.4"
-        || (is_gpt56_model(model)
-            && get_model_features(model).is_some_and(|features| {
-                features.api_surfaces.contains(&ModelApiSurface::Responses)
-            }))
+    matches!(model, "gpt-5.4" | "gpt-6-astra") || is_gpt56_model(model)
 }
 
 #[cfg(test)]
@@ -496,6 +588,9 @@ mod tests {
     #[test]
     fn registry_contains_every_official_row() -> anyhow::Result<()> {
         for model_id in [
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
             "gpt-5.6",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
@@ -541,6 +636,39 @@ mod tests {
         assert_eq!(features.prompt_cache.max_write_breakpoints, Some(4));
         assert_eq!(features.tools.choices.values, TOOL_CHOICES);
         assert_eq!(features.tools.parallel_function_calls, CHAT_AND_RESPONSES);
+        Ok(())
+    }
+
+    #[test]
+    fn gpt6_sol_and_luna_keep_the_gpt56_reasoning_and_cache_surface() -> anyhow::Result<()> {
+        for model_id in ["gpt-6-sol", "gpt-6-luna"] {
+            let features = get_model_features(model_id)
+                .with_context(|| format!("missing {model_id} features"))?;
+
+            assert_eq!(features.alias_of, None);
+            assert_eq!(features.context_window, 1_050_000);
+            assert_eq!(features.max_input_tokens, 922_000);
+            assert_eq!(features.max_output_tokens, 128_000);
+            assert_eq!(features.api_surfaces, ALL_SURFACES);
+            assert_eq!(features.input_modalities, TEXT_AND_IMAGE);
+            assert_eq!(features.reasoning, GPT56_REASONING);
+            assert_eq!(features.prompt_cache, GPT56_CACHE);
+            assert_eq!(features.tools.choices.api_surfaces, CHAT_AND_RESPONSES);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gpt6_astra_rejects_none_effort_and_calls_tools_only_on_responses() -> anyhow::Result<()> {
+        let features = get_model_features("gpt-6-astra").context("missing gpt-6-astra features")?;
+
+        assert_eq!(features.api_surfaces, ALL_SURFACES);
+        assert_eq!(features.reasoning.efforts.values, GPT6_ASTRA_EFFORTS);
+        assert_eq!(features.reasoning.modes, GPT56_REASONING.modes);
+        assert_eq!(features.reasoning.contexts, GPT56_REASONING.contexts);
+        assert_eq!(features.prompt_cache, GPT56_CACHE);
+        assert_eq!(features.tools.choices.api_surfaces, RESPONSES);
+        assert_eq!(features.tools.parallel_function_calls, RESPONSES);
         Ok(())
     }
 

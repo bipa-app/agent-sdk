@@ -656,6 +656,56 @@ async fn mid_stream_stall_is_retried_then_succeeds() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(start_paused = true)]
+async fn keep_alives_hold_a_silent_stream_past_both_stall_budgets() -> Result<()> {
+    let stores = Stores::new();
+    // A model thinking with display=omitted streams only Anthropic pings.
+    // Every frame lands 100s after the last (inside the 120s inter-event
+    // budget), and the pings alone span 600s, past the 330s first-event
+    // budget too. The stream must stay open on one attempt, and the pings
+    // must leave nothing in the journal.
+    let mut deltas = vec![StreamDelta::KeepAlive; 6];
+    deltas.push(StreamDelta::TextDelta {
+        delta: "thought it through".into(),
+        block_index: 0,
+    });
+    deltas.push(StreamDelta::Done {
+        stop_reason: Some(StopReason::EndTurn),
+        served_route: None,
+    });
+    let provider = StreamingScriptedProvider::single(
+        TurnScript::from_deltas(deltas).with_delay(std::time::Duration::from_secs(100)),
+    );
+
+    let outcome = run_turn(&stores, &provider).await?;
+    let RootTurnOutcome::Completed { response_text, .. } = outcome else {
+        panic!("expected Completed while keep-alives arrive");
+    };
+    assert_eq!(response_text, "thought it through");
+
+    let attempts = stores
+        .attempts
+        .list_by_task(&acquire_existing_task_id(&stores).await?)
+        .await?;
+    assert_eq!(attempts.len(), 1, "keep-alives must prevent a stall retry");
+
+    let journal = stores.events.get_events(&thread_id()).await?;
+    assert_eq!(
+        event_kinds(&journal),
+        vec![
+            "UserInput",
+            "Start",
+            "TextDelta",
+            "Text",
+            "TurnComplete",
+            "Done",
+        ],
+    );
+    assert_contiguous(&journal);
+
+    Ok(())
+}
+
 /// The single root task's id (there is exactly one in these tests).
 async fn acquire_existing_task_id(stores: &Stores) -> Result<crate::journal::task::AgentTaskId> {
     let tasks = stores.tasks.list_by_thread(&thread_id()).await?;

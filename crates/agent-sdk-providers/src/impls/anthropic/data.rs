@@ -1022,6 +1022,10 @@ pub fn parse_sse_event(
             let (message, kind) = parse_stream_error_event(&data);
             Some(StreamDelta::Error { message, kind })
         }
+        // Anthropic pings periodically while the model works silently
+        // (thinking with display=omitted can stream no delta for minutes).
+        // Surfacing them lets consumers tell a busy stream from a dead one.
+        "ping" => Some(StreamDelta::KeepAlive),
         _ => None,
     }
 }
@@ -1223,6 +1227,28 @@ mod tests {
             ),
             other => panic!("expected a Usage delta, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ping_events_surface_as_keep_alives_without_touching_stream_state() {
+        let mut usage = SseUsageState::default();
+        let mut tool_ids = std::collections::HashMap::new();
+        let mut pending = Some(StopReason::EndTurn);
+
+        let delta = parse_sse_event(
+            "event: ping\ndata: {\"type\": \"ping\"}\n\n",
+            &mut usage,
+            &mut tool_ids,
+            &mut pending,
+        );
+
+        assert!(
+            matches!(delta, Some(StreamDelta::KeepAlive)),
+            "a ping must reach the consumer as liveness, got {delta:?}"
+        );
+        assert_eq!(pending, Some(StopReason::EndTurn));
+        assert!(tool_ids.is_empty());
+        assert_eq!(usage.to_usage().output_tokens, 0);
     }
 
     #[test]

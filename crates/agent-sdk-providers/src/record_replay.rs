@@ -201,7 +201,7 @@ impl LlmProvider for RecordReplayProvider {
                         match item {
                             Ok(delta) => {
                                 let terminal_error = matches!(delta, StreamDelta::Error { .. });
-                                captured.push(CassetteDelta::from_delta(&delta));
+                                captured.extend(CassetteDelta::from_delta(&delta));
                                 if terminal_error {
                                     // A caller stops reading at a terminal error and drops the
                                     // stream, so this generator is never resumed past the yield
@@ -433,8 +433,9 @@ enum CassetteDelta {
 }
 
 impl CassetteDelta {
-    fn from_delta(delta: &StreamDelta) -> Self {
-        match delta {
+    /// `None` for a keep-alive: it carries no content, so replay never needs it.
+    fn from_delta(delta: &StreamDelta) -> Option<Self> {
+        Some(match delta {
             StreamDelta::TextDelta { delta, block_index } => Self::TextDelta {
                 delta: delta.clone(),
                 block_index: *block_index,
@@ -493,7 +494,8 @@ impl CassetteDelta {
                 kind: CassetteErrorKind::from_kind(*kind),
                 retry_after_ms: kind.retry_after().map(millis_from_duration),
             },
-        }
+            StreamDelta::KeepAlive => return None,
+        })
     }
 
     fn into_delta(self) -> StreamDelta {
@@ -1066,7 +1068,12 @@ mod tests {
     }
 
     #[test]
-    fn cassette_delta_round_trips_opaque_reasoning_exactly() {
+    fn keep_alives_are_forwarded_but_never_recorded() {
+        assert!(CassetteDelta::from_delta(&StreamDelta::KeepAlive).is_none());
+    }
+
+    #[test]
+    fn cassette_delta_round_trips_opaque_reasoning_exactly() -> anyhow::Result<()> {
         let delta = StreamDelta::OpaqueReasoning {
             provider: "test-provider".to_owned(),
             data: serde_json::json!({
@@ -1077,7 +1084,9 @@ mod tests {
             block_index: 4,
         };
 
-        let replayed = CassetteDelta::from_delta(&delta).into_delta();
+        let replayed = CassetteDelta::from_delta(&delta)
+            .context("opaque reasoning must be recorded")?
+            .into_delta();
         assert!(matches!(
             replayed,
             StreamDelta::OpaqueReasoning {
@@ -1091,6 +1100,7 @@ mod tests {
                     "encrypted_content": "ciphertext"
                 })
         ));
+        Ok(())
     }
 
     #[tokio::test]

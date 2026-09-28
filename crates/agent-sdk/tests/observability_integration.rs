@@ -2273,6 +2273,70 @@ async fn llm_span_emits_stream_lifecycle_events() -> Result<()> {
 }
 
 #[tokio::test]
+async fn keep_alives_are_not_counted_as_stream_deltas() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (tp, exporter) = setup_tracer();
+
+    let provider = ScriptedStreamProvider::new(vec![
+        StreamDelta::KeepAlive,
+        StreamDelta::KeepAlive,
+        StreamDelta::TextDelta {
+            delta: "hi".to_string(),
+            block_index: 0,
+        },
+        StreamDelta::KeepAlive,
+        StreamDelta::Usage(Usage {
+            served_speed: None,
+            input_tokens: 1,
+            output_tokens: 1,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        }),
+        StreamDelta::Done {
+            stop_reason: Some(StopReason::EndTurn),
+            served_route: None,
+        },
+    ]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .config(streaming_config())
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+    let final_state = agent.run(
+        thread_id.clone(),
+        AgentInput::Text("Hi".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    wait_for_run(final_state).await?;
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+
+    let spans = get_spans(&exporter)?;
+    let root = root_span_for_thread(&spans, &thread_id)?;
+    let trace_spans = spans_in_trace(&spans, root.span_context.trace_id());
+    let llm = find_span_in_trace(&trace_spans, "chat test-model")?;
+    let completed = llm
+        .events
+        .iter()
+        .find(|event| event.name.as_ref() == "llm.stream.completed")
+        .context("missing llm.stream.completed event")?;
+    let delta_count = completed
+        .attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == attrs::SDK_LLM_STREAM_DELTA_COUNT)
+        .map(|kv| format!("{}", kv.value))
+        .context("missing delta_count attribute")?;
+    assert_eq!(
+        delta_count, "3",
+        "only the text, usage, and done frames count; the three keep-alives must not"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn llm_span_emits_dropped_event_when_stream_aborts() -> Result<()> {
     let _guard = acquire_test_lock().await;
     let (tp, exporter) = setup_tracer();

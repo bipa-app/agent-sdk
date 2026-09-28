@@ -955,6 +955,13 @@ where
             }
         };
 
+        // A keep-alive only proves the connection is alive, and receiving it
+        // already restarted the inactivity window. It carries nothing to
+        // count, time, accumulate, or emit.
+        if matches!(delta, StreamDelta::KeepAlive) {
+            continue;
+        }
+
         delta_count += 1;
         accumulator.apply(&delta);
 

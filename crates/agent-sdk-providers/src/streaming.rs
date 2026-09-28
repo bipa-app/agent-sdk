@@ -160,6 +160,13 @@ pub enum StreamDelta {
         block_index: usize,
     },
 
+    /// Provider keep-alive frame (Anthropic `ping`) with no content.
+    ///
+    /// Proves the connection is alive while the model works silently, e.g.
+    /// thinking with `display: "omitted"`. Consumers treat it as liveness
+    /// only: it carries nothing to accumulate, emit, count, or persist.
+    KeepAlive,
+
     /// Error during streaming.
     Error {
         /// Error message
@@ -592,7 +599,7 @@ impl StreamAccumulator {
                 self.stop_reason = *stop_reason;
                 self.served_route.clone_from(served_route);
             }
-            StreamDelta::Error { .. } => {}
+            StreamDelta::Error { .. } | StreamDelta::KeepAlive => {}
         }
     }
 

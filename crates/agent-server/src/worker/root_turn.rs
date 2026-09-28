@@ -4539,6 +4539,12 @@ async fn call_llm_once_inner(
                 .await);
             }
         };
+        // Liveness only: the frame already restarted the stall budget and
+        // bumped the activity beacon, and it carries nothing to accumulate,
+        // beacon as usage, or journal.
+        if matches!(delta, StreamDelta::KeepAlive) {
+            continue;
+        }
 
         accumulator.apply(&delta);
         if let Some(usage) = accumulator.usage() {
