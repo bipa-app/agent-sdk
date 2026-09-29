@@ -345,6 +345,19 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
     },
     ModelCapabilities {
         provider: "anthropic",
+        model_id: "claude-sonnet-5-5",
+        context_window: Some(1_000_000),
+        max_output_tokens: Some(128_000),
+        pricing: Some(Pricing::flat(2.0, 10.0).with_notes("Anthropic Sonnet 5.5 official pricing: $2 input / $10 output per 1M tokens; cache reads at 10% of input.")),
+        supports_thinking: true,
+        supports_adaptive_thinking: true,
+        rejects_budget_thinking: true,
+        source_url: ANTHROPIC_MODELS_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("Adaptive thinking (not always on; default effort `high`). `ThinkingMode::Enabled { budget_tokens }` is rejected by the Anthropic API; the SDK fails fast in validate_thinking_config."),
+    },
+    ModelCapabilities {
+        provider: "anthropic",
         model_id: "claude-sonnet-5",
         context_window: Some(1_000_000),
         max_output_tokens: Some(128_000),
@@ -1271,6 +1284,24 @@ mod tests {
     }
 
     #[test]
+    fn test_lookup_anthropic_sonnet_55() -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let caps = get_model_capabilities("anthropic", "claude-sonnet-5-5")
+            .context("sonnet 5.5 missing")?;
+        assert_eq!(caps.context_window, Some(1_000_000));
+        assert_eq!(caps.max_output_tokens, Some(128_000));
+        assert!(caps.supports_adaptive_thinking);
+        assert!(caps.rejects_budget_thinking);
+        let pricing = caps.pricing.context("pricing missing")?;
+        let input = pricing.input.context("input price missing")?;
+        let output = pricing.output.context("output price missing")?;
+        assert!((input.usd_per_million_tokens - 2.0).abs() < f64::EPSILON);
+        assert!((output.usd_per_million_tokens - 10.0).abs() < f64::EPSILON);
+        Ok(())
+    }
+
+    #[test]
     fn test_lookup_anthropic_sonnet_5() {
         let caps = get_model_capabilities("anthropic", "claude-sonnet-5").unwrap();
         assert_eq!(caps.context_window, Some(1_000_000));
@@ -1303,6 +1334,7 @@ mod tests {
             "claude-opus-4-8",
             "claude-opus-4-7",
             "claude-opus-4-6",
+            "claude-sonnet-5-5",
             "claude-sonnet-5",
             "claude-sonnet-4-6",
         ] {
