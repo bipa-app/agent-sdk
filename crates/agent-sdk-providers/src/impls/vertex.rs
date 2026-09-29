@@ -11,7 +11,7 @@
 use crate::attachments::validate_request_attachments;
 use crate::impls::anthropic::{
     MODEL_FABLE_5, MODEL_FABLE_51, MODEL_OPUS_5, MODEL_OPUS_46, MODEL_OPUS_47, MODEL_OPUS_48,
-    MODEL_OPUS_55, MODEL_SONNET_5, MODEL_SONNET_46, data as anthropic_data,
+    MODEL_OPUS_55, MODEL_SONNET_5, MODEL_SONNET_46, MODEL_SONNET_55, data as anthropic_data,
 };
 use crate::impls::gemini::data::{
     ApiContent, ApiFunctionCallingConfig, ApiGenerateContentRequest, ApiGenerateContentResponse,
@@ -167,6 +167,7 @@ impl VertexProvider {
             self.model.as_str(),
             MODEL_SONNET_46
                 | MODEL_SONNET_5
+                | MODEL_SONNET_55
                 | MODEL_OPUS_46
                 | MODEL_OPUS_47
                 | MODEL_OPUS_48
