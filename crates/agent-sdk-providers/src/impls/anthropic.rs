@@ -76,6 +76,7 @@ pub const MODEL_HAIKU_45: &str = "claude-haiku-4-5-20251001";
 pub const MODEL_SONNET_45: &str = "claude-sonnet-4-5-20250929";
 pub const MODEL_SONNET_46: &str = "claude-sonnet-4-6";
 pub const MODEL_SONNET_5: &str = "claude-sonnet-5";
+pub const MODEL_SONNET_55: &str = "claude-sonnet-5-5";
 pub const MODEL_OPUS_46: &str = "claude-opus-4-6";
 pub const MODEL_OPUS_47: &str = "claude-opus-4-7";
 pub const MODEL_OPUS_48: &str = "claude-opus-4-8";
@@ -622,6 +623,14 @@ impl AnthropicProvider {
         Self::new(api_key, MODEL_SONNET_5)
     }
 
+    /// Claude Sonnet 5.5 — adaptive thinking (not always on), default effort
+    /// `high`; manual `budget_tokens` returns a 400, so use
+    /// `ThinkingConfig::adaptive()` or `ThinkingConfig::adaptive_with_effort(_)`.
+    #[must_use]
+    pub fn sonnet_55(api_key: impl Into<String>) -> Self {
+        Self::new(api_key, MODEL_SONNET_55)
+    }
+
     /// Set the provider-owned thinking configuration for this model.
     #[must_use]
     pub const fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
@@ -708,6 +717,7 @@ impl AnthropicProvider {
             self.model.as_str(),
             MODEL_SONNET_46
                 | MODEL_SONNET_5
+                | MODEL_SONNET_55
                 | MODEL_OPUS_46
                 | MODEL_OPUS_47
                 | MODEL_OPUS_48
@@ -1435,6 +1445,7 @@ mod tests {
             MODEL_SONNET_45,
             MODEL_SONNET_46,
             MODEL_SONNET_5,
+            MODEL_SONNET_55,
             MODEL_OPUS_46,
             MODEL_OPUS_47,
             MODEL_OPUS_48,
@@ -1595,6 +1606,26 @@ mod tests {
                 )))
                 .is_ok(),
             "effort without adaptive must be accepted",
+        );
+    }
+
+    #[test]
+    fn test_sonnet_55_rejects_budgeted_thinking_and_accepts_adaptive_effort() {
+        let sonnet_55 = AnthropicProvider::sonnet_55("test-api-key".to_string());
+        assert_eq!(sonnet_55.model(), MODEL_SONNET_55);
+        let error = sonnet_55
+            .validate_thinking_config(Some(&ThinkingConfig::new(10_000)))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("ThinkingConfig::adaptive()"),
+            "expected migration hint, got: {error}"
+        );
+        assert!(
+            sonnet_55
+                .validate_thinking_config(Some(&ThinkingConfig::adaptive_with_effort(
+                    agent_sdk_foundation::llm::Effort::Max
+                )))
+                .is_ok()
         );
     }
 
