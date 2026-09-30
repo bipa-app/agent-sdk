@@ -70,7 +70,9 @@ windows-sys = { version = "0.61.2", default-features = false }
 # disabled. NOTE (coordination): Phase 13·B may also reference this entry for
 # typed tool-argument validation — keep the version/feature set in sync at
 # merge.
-jsonschema = { version = "0.49.9", default-features = false }
+# `idna` keeps `idn-hostname` / `idn-email` asserted wherever `format` is; since
+# 0.52 they are unknown (so accepted) without it. `url` already links `idna`.
+jsonschema = { version = "0.58.3", default-features = false, features = ["idna"] }
 serde_yaml_ng = { version = "0.10.0", default-features = false }
 anyhow = { version = "1.0.104", default-features = false, features = ["std"] }
 thiserror = { version = "2.0.21", default-features = false, features = ["std"] }
