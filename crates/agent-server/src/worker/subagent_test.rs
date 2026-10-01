@@ -350,7 +350,7 @@ fn prompt_is_trimmed_and_blank_prompt_resolves_to_empty_string() -> Result<()> {
         &constraints,
         &policy,
     )?;
-    assert!(blank.prompt.is_empty());
+    assert_eq!(blank.prompt, "");
 
     Ok(())
 }

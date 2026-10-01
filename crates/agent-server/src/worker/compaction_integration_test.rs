@@ -472,7 +472,10 @@ async fn assert_snapcompact_promoted_projection(
         &projection.messages[seeded_len - 1].content,
         Content::Text(text) if text.contains("assistant-5: old-transcript-body")
     ));
-    assert!(projection.draft_messages.is_empty());
+    assert_eq!(
+        projection.draft_messages,
+        [] as [agent_sdk_foundation::Message; 0]
+    );
     assert_eq!(projection.compactions.len(), 1);
     let entry = &projection.compactions[0];
     assert_eq!(entry.compacted_start, 0);

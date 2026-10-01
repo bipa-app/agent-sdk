@@ -574,7 +574,7 @@ mod tests {
         }
 
         let reminders = tracker.get_periodic_reminders(&config);
-        assert!(reminders.is_empty());
+        assert_eq!(reminders, [] as [String; 0]);
     }
 
     #[test]

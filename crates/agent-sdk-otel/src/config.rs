@@ -509,7 +509,7 @@ mod tests {
         assert_eq!(cfg.sampler, SamplerKind::ParentBasedTraceIdRatio);
         assert!((cfg.sample_ratio - 1.0).abs() < f64::EPSILON);
         assert!(cfg.otlp_endpoint.is_none());
-        assert!(cfg.otlp_headers.is_empty());
+        assert_eq!(cfg.otlp_headers, [] as [(String, String); 0]);
         assert!(!cfg.exporter_enabled());
         Ok(())
     }

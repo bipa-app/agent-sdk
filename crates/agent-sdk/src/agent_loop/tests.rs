@@ -2075,7 +2075,7 @@ async fn test_external_tool_runtime_returns_pending_tool_calls() -> anyhow::Resu
             assert_eq!(tool_calls[0].name, "echo");
             assert_eq!(tool_calls[0].id, "tool_1");
             // Continuation should reference the same thread
-            assert!(!continuation.payload.thread_id.to_string().is_empty());
+            assert_ne!(continuation.payload.thread_id.to_string(), "");
         }
         other => panic!("Expected PendingToolCalls, got {other:?}"),
     }

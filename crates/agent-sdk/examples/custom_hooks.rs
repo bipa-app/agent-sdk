@@ -123,19 +123,16 @@ impl AgentHooks for CustomHooks {
         // For Confirm tier tools, we could prompt the user
         // For this example, we'll auto-approve with logging
         match invocation.tier {
-            ToolTier::Observe => {
-                println!("[Hooks] ALLOWED: Observe tier tool");
-                ToolDecision::Allow
-            }
+            ToolTier::Observe => println!("[Hooks] ALLOWED: Observe tier tool"),
             ToolTier::Confirm => {
                 // In a real app, you might prompt the user here
                 println!(
                     "[Hooks] AUTO-APPROVED: Confirm tier tool (input: {})",
                     invocation.requested_input,
                 );
-                ToolDecision::Allow
             }
         }
+        ToolDecision::Allow
     }
 
     async fn post_tool_use(&self, tool_name: &str, result: &ToolResult) {

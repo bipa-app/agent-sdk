@@ -544,7 +544,7 @@ mod tests {
 
         // After drain, store is empty.
         let history = store.get_history(&thread_a()).await?;
-        assert!(history.is_empty());
+        assert_eq!(history, [] as [agent_sdk_foundation::Message; 0]);
 
         Ok(())
     }
@@ -655,7 +655,7 @@ mod tests {
         let store = StagedMessageStore::new(thread_a(), sample_messages());
         store.clear(&thread_a()).await?;
         let history = store.get_history(&thread_a()).await?;
-        assert!(history.is_empty());
+        assert_eq!(history, [] as [agent_sdk_foundation::Message; 0]);
         Ok(())
     }
 
@@ -758,7 +758,7 @@ mod tests {
 
         // Messages start empty.
         let msgs = staged.messages.get_history(&thread_a()).await?;
-        assert!(msgs.is_empty());
+        assert_eq!(msgs, [] as [agent_sdk_foundation::Message; 0]);
 
         // State is a fresh AgentState for the thread.
         let state = staged.state.load(&thread_a()).await?;
@@ -1038,7 +1038,10 @@ mod tests {
     #[tokio::test]
     async fn snapshot_appended_is_empty_before_any_append() -> Result<()> {
         let store = StagedMessageStore::new(thread_a(), sample_messages());
-        assert!(store.snapshot_appended_messages()?.is_empty());
+        assert_eq!(
+            store.snapshot_appended_messages()?,
+            [] as [agent_sdk_foundation::Message; 0]
+        );
         Ok(())
     }
 

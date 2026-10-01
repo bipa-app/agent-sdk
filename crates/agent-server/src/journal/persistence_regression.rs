@@ -239,7 +239,7 @@ mod tests {
         // Recovery: fresh thread with no committed state.
         let view = s.recover(&thread_id).await.context("recover")?;
         assert_eq!(view.thread.committed_turns, 0);
-        assert!(view.messages.is_empty());
+        assert_eq!(view.messages, [] as [agent_sdk_foundation::Message; 0]);
         assert_eq!(view.agent_state_snapshot, serde_json::Value::Null);
         assert!(view.latest_checkpoint.is_none());
         assert_eq!(view.next_turn_number, 1);
@@ -248,7 +248,7 @@ mod tests {
         let checkpoints = s.checkpoints.list_by_thread(&thread_id).await?;
         assert!(checkpoints.is_empty());
         let history = s.messages.get_history(&thread_id).await?;
-        assert!(history.is_empty());
+        assert_eq!(history, [] as [agent_sdk_foundation::Message; 0]);
         Ok(())
     }
 
@@ -749,7 +749,7 @@ mod tests {
 
         // Recovery follows the explicitly empty effective projection.
         let view = s.recover(&thread_id).await.context("recover")?;
-        assert!(view.messages.is_empty());
+        assert_eq!(view.messages, [] as [agent_sdk_foundation::Message; 0]);
         Ok(())
     }
 

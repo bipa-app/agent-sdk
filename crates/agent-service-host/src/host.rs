@@ -9054,11 +9054,19 @@ mod tests {
         /// Consume one injected failure from `remaining`, returning
         /// `true` while injections are left.
         fn take_injected_failure(remaining: &AtomicUsize) -> bool {
-            remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                    current.checked_sub(1)
-                })
-                .is_ok()
+            let mut current = remaining.load(Ordering::SeqCst);
+            while let Some(next) = current.checked_sub(1) {
+                match remaining.compare_exchange_weak(
+                    current,
+                    next,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => return true,
+                    Err(actual) => current = actual,
+                }
+            }
+            false
         }
     }
 
@@ -9639,7 +9647,10 @@ mod tests {
             Some(serde_json::json!({"raw": original})),
             "recovery envelope must preserve structured data exactly once"
         );
-        assert!(recovered.documents.is_empty());
+        assert_eq!(
+            recovered.documents,
+            [] as [agent_sdk_foundation::ContentSource; 0]
+        );
         Ok(())
     }
     async fn acquire_probe_tool_child(

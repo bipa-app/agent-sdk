@@ -943,7 +943,7 @@ mod tests {
 
         // Initially empty
         let history = store.get_history(&thread_id).await?;
-        assert!(history.is_empty());
+        assert_eq!(history, [] as [agent_sdk_foundation::Message; 0]);
 
         // Add messages
         store.append(&thread_id, Message::user("Hello")).await?;
@@ -962,7 +962,7 @@ mod tests {
         // Clear
         store.clear(&thread_id).await?;
         let history = store.get_history(&thread_id).await?;
-        assert!(history.is_empty());
+        assert_eq!(history, [] as [agent_sdk_foundation::Message; 0]);
 
         Ok(())
     }

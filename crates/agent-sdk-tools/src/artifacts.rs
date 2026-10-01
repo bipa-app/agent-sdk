@@ -2077,7 +2077,10 @@ mod tests {
         );
 
         assert!(result.data.is_none());
-        assert!(result.documents.is_empty());
+        assert_eq!(
+            result.documents,
+            [] as [agent_sdk_foundation::ContentSource; 0]
+        );
         assert_eq!(result.artifact, Some(ToolResultArtifact { id: saved.id }));
         assert!(result.output.ends_with(&artifact_footer(saved.id)));
         assert!(
@@ -2103,7 +2106,10 @@ mod tests {
         assert!(enforce_inline_budget(&mut result, None, "untrusted").is_none());
         assert!(!result.success);
         assert!(result.data.is_none());
-        assert!(result.documents.is_empty());
+        assert_eq!(
+            result.documents,
+            [] as [agent_sdk_foundation::ContentSource; 0]
+        );
         assert!(result.artifact.is_none());
         assert!(result.output.len() < 512);
         assert!(serde_json::to_vec(&result)?.len() < 1024);
@@ -2921,7 +2927,10 @@ mod tests {
             .sweep(policy, &snapshot, SystemTime::now())?;
         assert_eq!(second.files_removed, 1);
         let thread_dir = open_confined_dir(&root.join(key), false)?;
-        assert!(list_artifacts(&thread_dir)?.is_empty());
+        assert_eq!(
+            list_artifacts(&thread_dir)?,
+            [] as [(u64, std::ffi::OsString); 0]
+        );
         Ok(())
     }
 

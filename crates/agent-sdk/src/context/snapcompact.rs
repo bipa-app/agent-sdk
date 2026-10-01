@@ -1217,7 +1217,10 @@ mod tests {
                 frame_data_bytes_budget: 0,
             },
         )?;
-        assert!(no_frame_budget.frames.is_empty());
+        assert_eq!(
+            no_frame_budget.frames,
+            [] as [crate::context::snapcompact::SnapcompactFrame; 0]
+        );
         assert!(no_frame_budget.truncated_chars > 0);
         Ok(())
     }

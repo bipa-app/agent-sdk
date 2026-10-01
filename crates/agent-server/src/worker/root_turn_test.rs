@@ -680,7 +680,10 @@ async fn no_durable_writes_before_commit() -> Result<()> {
     // After build_root_worker_inputs, thread exists (get_or_create)
     // but message projection and checkpoints are empty — no turn data
     // has been committed yet.
-    assert!(stores.messages.get_history(&thread_a()).await?.is_empty());
+    assert_eq!(
+        stores.messages.get_history(&thread_a()).await?,
+        [] as [agent_sdk_foundation::Message; 0]
+    );
     assert!(
         stores
             .checkpoints
@@ -1396,7 +1399,10 @@ async fn tool_suspension_end_to_end() -> Result<()> {
         .await?
         .context("thread from recovery")?;
     assert_eq!(thread.committed_turns, 0);
-    assert!(stores.messages.get_history(&thread_a()).await?.is_empty());
+    assert_eq!(
+        stores.messages.get_history(&thread_a()).await?,
+        [] as [agent_sdk_foundation::Message; 0]
+    );
 
     // ── Turn attempt opened and closed with Success ────────────
     let attempts = stores.attempts.list_by_task(&task_id).await?;
@@ -2711,7 +2717,10 @@ async fn failed_root_turn_does_not_advance_projections() -> Result<()> {
     // No durable projection writes.
     let thread = stores.threads.get(&thread_a()).await?.context("thread")?;
     assert_eq!(thread.committed_turns, 0);
-    assert!(stores.messages.get_history(&thread_a()).await?.is_empty());
+    assert_eq!(
+        stores.messages.get_history(&thread_a()).await?,
+        [] as [agent_sdk_foundation::Message; 0]
+    );
     assert!(
         stores
             .checkpoints
@@ -3101,7 +3110,10 @@ async fn cancelled_root_turn_does_not_advance_projections() -> Result<()> {
     // No durable projection writes.
     let thread = stores.threads.get(&thread_a()).await?.context("thread")?;
     assert_eq!(thread.committed_turns, 0);
-    assert!(stores.messages.get_history(&thread_a()).await?.is_empty());
+    assert_eq!(
+        stores.messages.get_history(&thread_a()).await?,
+        [] as [agent_sdk_foundation::Message; 0]
+    );
     assert!(
         stores
             .checkpoints
@@ -7251,8 +7263,8 @@ fn assistant_thinking_tool_use(
 #[test]
 fn provider_valid_split_empty() {
     let (prefix, suffix) = provider_valid_split(Vec::new());
-    assert!(prefix.is_empty());
-    assert!(suffix.is_empty());
+    assert_eq!(prefix, [] as [agent_sdk_foundation::Message; 0]);
+    assert_eq!(suffix, [] as [agent_sdk_foundation::Message; 0]);
 }
 
 #[test]
@@ -7260,7 +7272,7 @@ fn provider_valid_split_user_only() {
     let (prefix, suffix) =
         provider_valid_split(vec![agent_sdk_foundation::llm::Message::user("hi")]);
     assert_eq!(prefix.len(), 1);
-    assert!(suffix.is_empty());
+    assert_eq!(suffix, [] as [agent_sdk_foundation::Message; 0]);
 }
 
 #[test]
@@ -7277,7 +7289,7 @@ fn provider_valid_split_balanced_round_commits_in_full() {
     ];
     let (prefix, suffix) = provider_valid_split(messages);
     assert_eq!(prefix.len(), 3, "a balanced round commits in full");
-    assert!(suffix.is_empty());
+    assert_eq!(suffix, [] as [agent_sdk_foundation::Message; 0]);
 }
 
 #[test]
@@ -7365,7 +7377,7 @@ fn provider_valid_split_preserves_thinking_verbatim() {
     ];
     let (prefix, suffix) = provider_valid_split(messages);
     assert_eq!(prefix.len(), 3);
-    assert!(suffix.is_empty());
+    assert_eq!(suffix, [] as [agent_sdk_foundation::Message; 0]);
     // The thinking block (and its signature) round-tripped unchanged.
     assert_eq!(
         serde_json::to_value(&prefix[1]).unwrap(),
@@ -7396,12 +7408,15 @@ async fn partial_commit_empty_candidate_is_a_strict_no_op() -> Result<()> {
     )
     .await?;
 
-    assert!(suffix.is_empty());
+    assert_eq!(suffix, [] as [agent_sdk_foundation::Message; 0]);
     // No attempt row, no thread mutation, no projection write.
     assert!(stores.attempts.list_by_task(&task.id).await?.is_empty());
     let thread = stores.threads.get(&thread_a()).await?.context("thread")?;
     assert_eq!(thread.committed_turns, 0);
-    assert!(stores.messages.get_history(&thread_a()).await?.is_empty());
+    assert_eq!(
+        stores.messages.get_history(&thread_a()).await?,
+        [] as [agent_sdk_foundation::Message; 0]
+    );
     Ok(())
 }
 
@@ -7627,7 +7642,10 @@ async fn lease_lost_mid_stream_does_not_partial_commit() -> Result<()> {
     // No partial commit: the task was never Cancelled.
     let thread = stores.threads.get(&thread_a()).await?.context("thread")?;
     assert_eq!(thread.committed_turns, 0);
-    assert!(stores.messages.get_history(&thread_a()).await?.is_empty());
+    assert_eq!(
+        stores.messages.get_history(&thread_a()).await?,
+        [] as [agent_sdk_foundation::Message; 0]
+    );
     let attempts = stores.attempts.list_by_task(&task_id).await?;
     assert!(
         !attempts.iter().any(|a| a.provider == "cancel-commit"),
@@ -8033,7 +8051,7 @@ async fn cancel_root_turn_commits_single_terminal_cancelled_event() -> Result<()
 
     // Idempotent retry: nothing transitioned, so no second marker.
     let second = cancel_root_turn(&task_id, &stores.deps(), t_plus(2)).await?;
-    assert!(second.is_empty());
+    assert_eq!(second, [] as [crate::journal::task::AgentTaskId; 0]);
     assert_eq!(cancelled_event_count(&stores.events, &thread_a()).await?, 1);
     Ok(())
 }

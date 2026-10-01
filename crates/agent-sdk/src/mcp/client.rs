@@ -792,7 +792,7 @@ mod tests {
 
     #[test]
     fn test_mcp_protocol_version() {
-        assert!(!MCP_PROTOCOL_VERSION.is_empty());
+        assert_ne!(MCP_PROTOCOL_VERSION, "");
     }
 
     #[test]

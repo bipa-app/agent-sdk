@@ -2873,7 +2873,7 @@ mod tests {
         assert_eq!(out.len(), 3);
         assert_balanced(&out);
         // Order: assistant tool_use, synthetic results, then the user prompt.
-        assert!(!message_tool_use_ids(&out[0]).is_empty());
+        assert_ne!(message_tool_use_ids(&out[0]), [] as [&str; 0]);
         assert!(!message_tool_result_ids(&out[1]).is_empty());
         assert_eq!(
             out[2].content.first_text(),

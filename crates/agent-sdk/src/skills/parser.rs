@@ -238,7 +238,7 @@ You are a helpful assistant.
         assert_eq!(skill.name, "test-skill");
         assert_eq!(skill.description, "A test skill");
         assert_eq!(skill.system_prompt, "You are a helpful assistant.");
-        assert!(skill.tools.is_empty());
+        assert_eq!(skill.tools, [] as [String; 0]);
         assert!(skill.allowed_tools.is_none());
         assert!(skill.denied_tools.is_none());
 
@@ -398,7 +398,7 @@ name: minimal
         let skill = parse_skill_file(content)?;
 
         assert_eq!(skill.name, "minimal");
-        assert!(skill.system_prompt.is_empty());
+        assert_eq!(skill.system_prompt, "");
 
         Ok(())
     }

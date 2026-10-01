@@ -4387,7 +4387,7 @@ mod tests {
 
         let mapped = map_binary_attachment(&source)?;
         assert_eq!(mapped.media_type, "image/png");
-        assert!(mapped.data.is_empty());
+        assert_eq!(mapped.data, [] as [u8; 0]);
         assert_eq!(mapped.artifact_uri.as_deref(), Some("artifact://42"));
         assert_eq!(round_trip_attachment(&mapped)?, mapped);
         Ok(())
@@ -6363,7 +6363,10 @@ mod tests {
             Some(json!({"raw": original})),
             "recovery envelope must preserve structured data exactly once"
         );
-        assert!(recovered.documents.is_empty());
+        assert_eq!(
+            recovered.documents,
+            [] as [agent_sdk_foundation::ContentSource; 0]
+        );
         Ok(())
     }
 
@@ -7927,7 +7930,10 @@ mod tests {
                 .into_inner()
                 .projection
                 .context("fork projection missing")?;
-            assert!(fork_messages.messages.is_empty());
+            assert_eq!(
+                fork_messages.messages,
+                [] as [agent_service_proto::agent::service::v1::ConversationMessage; 0]
+            );
             Ok(())
         }
         .await;

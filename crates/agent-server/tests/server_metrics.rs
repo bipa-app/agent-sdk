@@ -608,11 +608,13 @@ async fn duration_helpers_record_in_seconds_and_milliseconds() -> Result<()> {
     metrics.record_thread_events_watch_lag(elapsed.as_secs_f64() * 1_000.0);
     flush(&provider)?;
     let snapshots = collected(&exporter)?;
-    assert!(
-        !collect_histogram_attrs(&snapshots, "agent_server.tasks.execution.duration").is_empty()
+    assert_ne!(
+        collect_histogram_attrs(&snapshots, "agent_server.tasks.execution.duration"),
+        [] as [Vec<(String, String)>; 0]
     );
-    assert!(
-        !collect_histogram_attrs(&snapshots, "agent_server.thread_events_watch.lag_ms").is_empty()
+    assert_ne!(
+        collect_histogram_attrs(&snapshots, "agent_server.thread_events_watch.lag_ms"),
+        [] as [Vec<(String, String)>; 0]
     );
     Ok(())
 }

@@ -940,7 +940,10 @@ mod tests {
     #[test]
     fn noop_detector_finds_nothing() {
         let d = NoopDetector;
-        assert!(d.detect("sk-abc123 email a@b.co").is_empty());
+        assert_eq!(
+            d.detect("sk-abc123 email a@b.co"),
+            [] as [crate::privacy::PiiSpan; 0]
+        );
     }
 
     // ── SecretDetector ──────────────────────────────────────────
@@ -967,8 +970,11 @@ mod tests {
     #[test]
     fn secret_detector_ignores_non_secret_text() -> TestResult {
         let d = SecretDetector::baseline()?;
-        assert!(d.detect("just some ordinary prose").is_empty());
-        assert!(d.detect("sk-short").is_empty()); // Below min body length
+        assert_eq!(
+            d.detect("just some ordinary prose"),
+            [] as [crate::privacy::PiiSpan; 0]
+        );
+        assert_eq!(d.detect("sk-short"), [] as [crate::privacy::PiiSpan; 0]); // Below min body length
         Ok(())
     }
 
@@ -998,7 +1004,10 @@ mod tests {
     fn non_e164_phone_not_detected() -> TestResult {
         let d = EntityDetector::new(CategorySet::none().with(DetectCategory::Phone))?;
         // Missing leading '+' — not E.164.
-        assert!(d.detect("call 11987654321").is_empty());
+        assert_eq!(
+            d.detect("call 11987654321"),
+            [] as [crate::privacy::PiiSpan; 0]
+        );
         Ok(())
     }
 
@@ -1061,11 +1070,20 @@ mod tests {
     fn rejects_invalid_cpf() -> TestResult {
         let d = EntityDetector::new(CategorySet::none().with(DetectCategory::Cpf))?;
         // 11 digits but wrong check digits
-        assert!(d.detect("cpf 12345678900").is_empty());
+        assert_eq!(
+            d.detect("cpf 12345678900"),
+            [] as [crate::privacy::PiiSpan; 0]
+        );
         // All-same digits — rejected
-        assert!(d.detect("cpf 11111111111").is_empty());
+        assert_eq!(
+            d.detect("cpf 11111111111"),
+            [] as [crate::privacy::PiiSpan; 0]
+        );
         // Invalid formatted
-        assert!(d.detect("cpf 123.456.789-00").is_empty());
+        assert_eq!(
+            d.detect("cpf 123.456.789-00"),
+            [] as [crate::privacy::PiiSpan; 0]
+        );
         Ok(())
     }
 
@@ -1095,8 +1113,14 @@ mod tests {
     #[test]
     fn rejects_invalid_cnpj() -> TestResult {
         let d = EntityDetector::new(CategorySet::none().with(DetectCategory::Cnpj))?;
-        assert!(d.detect("cnpj 12345678000100").is_empty());
-        assert!(d.detect("cnpj 11111111111111").is_empty());
+        assert_eq!(
+            d.detect("cnpj 12345678000100"),
+            [] as [crate::privacy::PiiSpan; 0]
+        );
+        assert_eq!(
+            d.detect("cnpj 11111111111111"),
+            [] as [crate::privacy::PiiSpan; 0]
+        );
         Ok(())
     }
 
@@ -1128,7 +1152,10 @@ mod tests {
     #[test]
     fn rejects_out_of_range_ipv4_octets() -> TestResult {
         let d = EntityDetector::new(CategorySet::none().with(DetectCategory::Ipv4))?;
-        assert!(d.detect("999.999.999.999").is_empty());
+        assert_eq!(
+            d.detect("999.999.999.999"),
+            [] as [crate::privacy::PiiSpan; 0]
+        );
         Ok(())
     }
 
@@ -1149,7 +1176,10 @@ mod tests {
     #[test]
     fn disabled_categories_are_skipped() -> TestResult {
         let d = EntityDetector::new(CategorySet::none())?;
-        assert!(d.detect("a@b.co and 111.444.777-35").is_empty());
+        assert_eq!(
+            d.detect("a@b.co and 111.444.777-35"),
+            [] as [crate::privacy::PiiSpan; 0]
+        );
         Ok(())
     }
 
@@ -1368,7 +1398,10 @@ mod tests {
         // Sliding must not flag a coincidental interior Luhn-valid sub-window
         // in obviously-sequential filler that is not a PAN.
         let d = EntityDetector::new(CategorySet::none().with(DetectCategory::CreditCard))?;
-        assert!(d.detect("order 1234 5678 9012 3456 processed").is_empty());
+        assert_eq!(
+            d.detect("order 1234 5678 9012 3456 processed"),
+            [] as [crate::privacy::PiiSpan; 0]
+        );
         Ok(())
     }
 
@@ -1376,9 +1409,9 @@ mod tests {
     fn entity_detector_clean_string_via_prefilter() -> TestResult {
         // The RegexSet prefilter short-circuits a string with no PII.
         let d = EntityDetector::baseline()?;
-        assert!(
-            d.detect("a perfectly ordinary sentence with no pii")
-                .is_empty()
+        assert_eq!(
+            d.detect("a perfectly ordinary sentence with no pii"),
+            [] as [crate::privacy::PiiSpan; 0]
         );
         Ok(())
     }

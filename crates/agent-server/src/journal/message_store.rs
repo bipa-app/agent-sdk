@@ -416,7 +416,7 @@ mod tests {
         let store = InMemoryMessageProjectionStore::new();
         let p = store.get_or_create(&thread_a(), t0()).await.unwrap();
         assert_eq!(p.thread_id, thread_a());
-        assert!(p.messages.is_empty());
+        assert_eq!(p.messages, [] as [agent_sdk_foundation::Message; 0]);
         assert_eq!(p.version, 0);
     }
 
@@ -461,7 +461,7 @@ mod tests {
     async fn get_history_returns_empty_for_unknown_thread() {
         let store = InMemoryMessageProjectionStore::new();
         let history = store.get_history(&thread_a()).await.unwrap();
-        assert!(history.is_empty());
+        assert_eq!(history, [] as [agent_sdk_foundation::Message; 0]);
     }
 
     #[tokio::test]
