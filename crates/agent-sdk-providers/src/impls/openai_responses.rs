@@ -52,6 +52,7 @@ fn build_http_client() -> reqwest::Client {
 // GPT-6 series
 pub const MODEL_GPT6_ASTRA: &str = "gpt-6-astra";
 pub const MODEL_GPT6_SOL: &str = "gpt-6-sol";
+pub const MODEL_GPT61_SOL: &str = "gpt-6.1-sol";
 pub const MODEL_GPT6_LUNA: &str = "gpt-6-luna";
 
 // GPT-5.6 series
@@ -178,6 +179,14 @@ impl OpenAIResponsesProvider {
     #[must_use]
     pub fn gpt6_sol(api_key: String) -> Self {
         Self::new(api_key, MODEL_GPT6_SOL.to_owned())
+    }
+
+    /// Create a provider using GPT-6.1 Sol (near-Astra performance at a lower cost).
+    ///
+    /// Like Astra, GPT-6.1 Sol rejects `none` reasoning effort.
+    #[must_use]
+    pub fn gpt61_sol(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT61_SOL.to_owned())
     }
 
     /// Create a provider using GPT-6 Luna (efficient, repeatable work at scale).
@@ -2336,6 +2345,7 @@ mod tests {
     fn test_model_constant() {
         assert_eq!(MODEL_GPT6_ASTRA, "gpt-6-astra");
         assert_eq!(MODEL_GPT6_SOL, "gpt-6-sol");
+        assert_eq!(MODEL_GPT61_SOL, "gpt-6.1-sol");
         assert_eq!(MODEL_GPT6_LUNA, "gpt-6-luna");
         assert_eq!(MODEL_GPT56, "gpt-5.6");
         assert_eq!(MODEL_GPT56_SOL, "gpt-5.6-sol");
@@ -2355,6 +2365,10 @@ mod tests {
             (
                 OpenAIResponsesProvider::gpt6_sol("test-key".to_string()),
                 MODEL_GPT6_SOL,
+            ),
+            (
+                OpenAIResponsesProvider::gpt61_sol("test-key".to_string()),
+                MODEL_GPT61_SOL,
             ),
             (
                 OpenAIResponsesProvider::gpt6_luna("test-key".to_string()),
@@ -3003,7 +3017,12 @@ mod tests {
             .with_cache(CacheConfig::enabled().with_max_breakpoints(4));
         let generic_plan = resolve_prompt_cache_plan(MODEL_GPT56, &generic_request, Some(&exact))?;
         assert_eq!(generic_plan.explicit_breakpoints, 4);
-        for model in [MODEL_GPT6_ASTRA, MODEL_GPT6_SOL, MODEL_GPT6_LUNA] {
+        for model in [
+            MODEL_GPT6_ASTRA,
+            MODEL_GPT6_SOL,
+            MODEL_GPT61_SOL,
+            MODEL_GPT6_LUNA,
+        ] {
             let plan = resolve_prompt_cache_plan(model, &generic_request, Some(&exact))?;
             assert_eq!(plan.explicit_breakpoints, 4, "{model}");
         }
@@ -3398,6 +3417,7 @@ mod tests {
             "gpt-4o",
             MODEL_GPT53_CODEX,
             MODEL_GPT6_SOL,
+            MODEL_GPT61_SOL,
             MODEL_GPT6_LUNA,
             "unknown-future-model",
         ] {
