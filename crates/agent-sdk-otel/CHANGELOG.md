@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.1](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-otel-v0.18.0...agent-sdk-otel-v0.18.1) - 2026-10-01
+
+### Other
+
+- *(ci)* repair the rust 1.99 clippy and deprecation breakage on main ([#462](https://github.com/bipa-app/agent-sdk/pull/462))
+
 ## [0.18.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-otel-v0.17.0...agent-sdk-otel-v0.18.0) - 2026-08-04
 
 ### Added
