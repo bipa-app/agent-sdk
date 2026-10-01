@@ -301,7 +301,7 @@ mod tests {
         let (thinking, text, tool_uses) = extract_content(&response);
         assert!(thinking.is_none());
         assert_eq!(text, Some("Hello".to_string()));
-        assert!(tool_uses.is_empty());
+        assert_eq!(tool_uses, [] as [(String, String, serde_json::Value); 0]);
     }
 
     #[test]

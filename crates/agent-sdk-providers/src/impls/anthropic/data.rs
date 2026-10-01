@@ -997,13 +997,10 @@ pub fn parse_sse_event(
                     // Store the stop reason for emission in message_stop,
                     // ensuring Usage is emitted before Done.
                     *pending_stop_reason = event.delta.stop_reason.as_ref().map(map_stop_reason);
-                    None
                 }
-                Err(error) => {
-                    log_sse_parse_error(&event_type, &data, &error);
-                    None
-                }
+                Err(error) => log_sse_parse_error(&event_type, &data, &error),
             }
+            None
         }
         "message_stop" => {
             // Emit Usage — the caller is responsible for emitting Done
@@ -1683,7 +1680,7 @@ data: {"type":"message_stop"}"#;
         let event = take_next_sse_event(&mut buffer).unwrap();
 
         assert!(is_message_stop_event(&event));
-        assert!(buffer.is_empty());
+        assert_eq!(buffer, "");
     }
 
     #[test]

@@ -599,8 +599,8 @@ mod tests {
         // Errors default to Baseline too — stack traces often leak
         // user PII and we'd rather mask by default than ship raw.
         assert_eq!(policy.error_level, RedactionLevel::Baseline);
-        assert!(!policy.sensitive_key_patterns.is_empty());
-        assert!(!policy.sensitive_value_prefixes.is_empty());
+        assert_ne!(policy.sensitive_key_patterns, [] as [String; 0]);
+        assert_ne!(policy.sensitive_value_prefixes, [] as [String; 0]);
     }
 
     #[test]

@@ -523,7 +523,7 @@ mod tests {
     fn new_projection_is_empty_with_version_zero() {
         let p = MessageProjection::new(thread_id(), t0());
         assert_eq!(p.thread_id, thread_id());
-        assert!(p.messages.is_empty());
+        assert_eq!(p.messages, [] as [agent_sdk_foundation::Message; 0]);
         assert_eq!(p.version, 0);
         assert_eq!(p.message_count(), 0);
     }
@@ -686,7 +686,7 @@ mod tests {
     fn new_projection_has_no_draft() {
         let p = MessageProjection::new(thread_id(), t0());
         assert!(!p.has_draft());
-        assert!(p.draft_messages.is_empty());
+        assert_eq!(p.draft_messages, [] as [agent_sdk_foundation::Message; 0]);
     }
 
     #[test]
@@ -1336,7 +1336,7 @@ mod tests {
             3,
             "draft must move into the raw transcript"
         );
-        assert!(p.draft_messages.is_empty());
+        assert_eq!(p.draft_messages, [] as [agent_sdk_foundation::Message; 0]);
         assert_eq!(p.compactions.len(), 1);
         assert_eq!(p.compactions[0].source_message_count, 3);
         assert_eq!(

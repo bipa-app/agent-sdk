@@ -1457,7 +1457,7 @@ mod tests {
         let config = SubagentConfig::new("default");
 
         assert_eq!(config.name, "default");
-        assert!(config.system_prompt.is_empty());
+        assert_eq!(config.system_prompt, "");
         assert_eq!(config.max_turns, None);
         assert_eq!(config.timeout_ms, None);
     }

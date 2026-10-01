@@ -432,7 +432,7 @@ async fn postgres_pool_gauges_publish_active_and_idle_counts() -> Result<()> {
     let snapshots = collected(&exporter)?;
     let active_points = collect_u64_gauge(&snapshots, "db.pool.connections.active");
     let idle_points = collect_u64_gauge(&snapshots, "db.pool.connections.idle");
-    assert!(!active_points.is_empty());
-    assert!(!idle_points.is_empty());
+    assert_ne!(active_points, [] as [(Vec<(String, String)>, u64); 0]);
+    assert_ne!(idle_points, [] as [(Vec<(String, String)>, u64); 0]);
     Ok(())
 }

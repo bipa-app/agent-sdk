@@ -447,7 +447,7 @@ mod tests {
         };
         let ckpt = Checkpoint::new(params).context("new")?;
         ckpt.validate().context("validate")?;
-        assert!(ckpt.messages.is_empty());
+        assert_eq!(ckpt.messages, [] as [agent_sdk_foundation::Message; 0]);
         Ok(())
     }
 }

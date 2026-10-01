@@ -92,9 +92,15 @@ impl AtomicTokenUsage {
             (&self.cache_read, usage.cached_input_tokens),
             (&self.cache_creation, usage.cache_creation_input_tokens),
         ] {
-            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                Some(current.saturating_add(delta))
-            });
+            let mut current = counter.load(Ordering::Relaxed);
+            while let Err(actual) = counter.compare_exchange_weak(
+                current,
+                current.saturating_add(delta),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                current = actual;
+            }
         }
     }
 

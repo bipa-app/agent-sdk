@@ -564,6 +564,6 @@ mod tests {
             ]
         });
         assert_eq!(text_blocks(&params), vec!["first", "second"]);
-        assert!(text_blocks(&json!({})).is_empty());
+        assert_eq!(text_blocks(&json!({})), [] as [String; 0]);
     }
 }

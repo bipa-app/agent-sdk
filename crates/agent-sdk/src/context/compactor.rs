@@ -5796,7 +5796,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(!image_blocks.is_empty());
+        assert_ne!(
+            image_blocks,
+            [] as [&agent_sdk_foundation::ContentSource; 0]
+        );
         assert_eq!(image_blocks.len(), metadata.frame_count as usize);
         assert!(
             image_blocks

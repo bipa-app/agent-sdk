@@ -355,7 +355,10 @@ mod tests {
 
         // Recovery view is for a fresh thread.
         assert_eq!(inputs.recovery_view.next_turn_number, 1);
-        assert!(inputs.recovery_view.messages.is_empty());
+        assert_eq!(
+            inputs.recovery_view.messages,
+            [] as [agent_sdk_foundation::Message; 0]
+        );
 
         // Staged messages start empty.
         let msgs = inputs
@@ -363,7 +366,7 @@ mod tests {
             .messages
             .get_history(&thread_a())
             .await?;
-        assert!(msgs.is_empty());
+        assert_eq!(msgs, [] as [agent_sdk_foundation::Message; 0]);
 
         // Staged state is a fresh AgentState.
         let state = inputs
@@ -567,7 +570,7 @@ mod tests {
             .messages
             .get_history(&thread_a())
             .await?;
-        assert!(remaining.is_empty());
+        assert_eq!(remaining, [] as [agent_sdk_foundation::Message; 0]);
         let remaining_state = inputs.staged_stores.state.load(&thread_a()).await?;
         assert!(remaining_state.is_none());
 

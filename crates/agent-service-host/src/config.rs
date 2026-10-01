@@ -1262,10 +1262,16 @@ admission:
         assert!(!config.observability.enabled);
         assert!(config.observability.service_name.is_none());
         assert!(config.observability.otlp_endpoint.is_none());
-        assert!(config.observability.otlp_headers.is_empty());
+        assert_eq!(
+            config.observability.otlp_headers,
+            [] as [(String, String); 0]
+        );
         assert!(config.observability.sampler.is_none());
         assert!(config.observability.sample_ratio.is_none());
-        assert!(config.observability.propagated_baggage_keys.is_empty());
+        assert_eq!(
+            config.observability.propagated_baggage_keys,
+            [] as [String; 0]
+        );
         assert!(!config.observability.capture_payloads);
     }
 

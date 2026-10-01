@@ -906,7 +906,7 @@ mod tests {
             .context("missing event_repo surface")?;
         assert!(event_surface.persists_restart);
         assert_eq!(event_surface.backend, "postgres");
-        assert!(event_surface.note.is_empty());
+        assert_eq!(event_surface.note, "");
 
         let outbox_surface = stores
             .durability_report()

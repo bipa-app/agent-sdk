@@ -1525,7 +1525,7 @@ mod tests {
         let mut ids = std::collections::HashSet::new();
         for _ in 0..1000 {
             let id = uuid_simple();
-            assert!(!id.is_empty());
+            assert_ne!(id, "");
             assert!(ids.insert(id), "Duplicate ID generated");
         }
         assert_eq!(ids.len(), 1000);
@@ -1794,7 +1794,7 @@ mod tests {
         let line = "data: {not valid json";
         match parse_gemini_sse_line(line) {
             GeminiLineParse::ParseFailed { error, preview } => {
-                assert!(!error.is_empty());
+                assert_ne!(error, "");
                 assert!(preview.contains("not valid json"));
             }
             _ => panic!("expected ParseFailed"),

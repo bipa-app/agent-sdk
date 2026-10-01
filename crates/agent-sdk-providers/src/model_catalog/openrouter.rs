@@ -725,7 +725,10 @@ mod tests {
 
         let healthy = find(&entries, "openrouter", "vendor/healthy")?;
         assert!(healthy.pricing.is_some());
-        assert!(healthy.pricing_tiers.is_empty());
+        assert_eq!(
+            healthy.pricing_tiers,
+            [] as [crate::model_catalog::PricingTier; 0]
+        );
 
         // An override with no threshold cannot be located, and one with no
         // input/output rate cannot be billed: either way the base rates provably
@@ -733,7 +736,10 @@ mod tests {
         for model in ["vendor/no-threshold", "vendor/no-rates"] {
             let drifted = find(&entries, "openrouter", model)?;
             assert!(drifted.pricing.is_none(), "{model} must drop its pricing");
-            assert!(drifted.pricing_tiers.is_empty());
+            assert_eq!(
+                drifted.pricing_tiers,
+                [] as [crate::model_catalog::PricingTier; 0]
+            );
         }
         Ok(())
     }

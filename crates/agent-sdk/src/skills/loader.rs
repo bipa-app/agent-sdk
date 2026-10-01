@@ -290,7 +290,7 @@ Content"
         let loader = FileSkillLoader::new(dir.path());
 
         let skills = loader.list().await?;
-        assert!(skills.is_empty());
+        assert_eq!(skills, [] as [String; 0]);
 
         Ok(())
     }
@@ -299,7 +299,7 @@ Content"
     async fn test_file_loader_list_nonexistent_dir() -> Result<()> {
         let loader = FileSkillLoader::new("/nonexistent/path");
         let skills = loader.list().await?;
-        assert!(skills.is_empty());
+        assert_eq!(skills, [] as [String; 0]);
 
         Ok(())
     }

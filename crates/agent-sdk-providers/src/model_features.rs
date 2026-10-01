@@ -683,11 +683,11 @@ mod tests {
         assert_eq!(features.max_input_tokens, 272_000);
         assert_eq!(features.max_output_tokens, 128_000);
         assert_eq!(features.reasoning.efforts.api_surfaces, RESPONSES);
-        assert!(features.reasoning.modes.values.is_empty());
-        assert!(features.reasoning.contexts.values.is_empty());
-        assert!(features.reasoning.summaries.values.is_empty());
-        assert!(features.prompt_cache.modes.values.is_empty());
-        assert!(features.prompt_cache.explicit_breakpoints.is_empty());
+        assert_eq!(features.reasoning.modes.values, []);
+        assert_eq!(features.reasoning.contexts.values, []);
+        assert_eq!(features.reasoning.summaries.values, []);
+        assert_eq!(features.prompt_cache.modes.values, []);
+        assert_eq!(features.prompt_cache.explicit_breakpoints, []);
         assert_eq!(
             features.reasoning.state_replay.values,
             REASONING_STATE_REPLAY

@@ -1297,7 +1297,7 @@ mod tests {
     #[test]
     fn read_lines_offset_past_end_returns_empty() {
         let lines = read_lines("only", 5, 10, TOTAL_BYTE_BUDGET_FLOOR);
-        assert!(lines.is_empty());
+        assert_eq!(lines, [] as [String; 0]);
     }
 
     #[test]
@@ -1449,7 +1449,10 @@ mod tests {
             .await?;
 
         assert!(result.success);
-        assert!(result.documents.is_empty());
+        assert_eq!(
+            result.documents,
+            [] as [agent_sdk_foundation::ContentSource; 0]
+        );
         Ok(())
     }
 
@@ -1483,7 +1486,10 @@ mod tests {
         // Must fail before base64-encoding and never attach a document.
         assert!(!result.success);
         assert!(result.output.contains("attachment limit"));
-        assert!(result.documents.is_empty());
+        assert_eq!(
+            result.documents,
+            [] as [agent_sdk_foundation::ContentSource; 0]
+        );
         Ok(())
     }
 
@@ -1609,7 +1615,10 @@ mod tests {
             "{}",
             result.output
         );
-        assert!(result.documents.is_empty());
+        assert_eq!(
+            result.documents,
+            [] as [agent_sdk_foundation::ContentSource; 0]
+        );
         Ok(())
     }
 

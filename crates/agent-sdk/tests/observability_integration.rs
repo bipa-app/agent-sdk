@@ -3924,7 +3924,7 @@ async fn subagent_invoke_agent_links_to_parent_turn() -> Result<()> {
     assert_eq!(link.span_context.span_id(), parent_span_id);
     // `link_to_parent_turn` doesn't carry attributes — the relationship
     // is implicit in the linked SpanContext.
-    assert!(link.attributes.is_empty());
+    assert_eq!(link.attributes, [] as [opentelemetry::KeyValue; 0]);
 
     Ok(())
 }

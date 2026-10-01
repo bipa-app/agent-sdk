@@ -8928,7 +8928,10 @@ mod tests {
             .release_expired_leases(t_plus(25))
             .await
             .context("sweep idempotent")?;
-        assert!(released.is_empty());
+        assert_eq!(
+            released,
+            [] as [crate::journal::recovery::RecoveryRecord; 0]
+        );
         Ok(())
     }
 
@@ -8974,7 +8977,7 @@ mod tests {
             .release_expired_leases(t_plus(10))
             .await
             .context("third sweep")?;
-        assert!(third.is_empty());
+        assert_eq!(third, [] as [crate::journal::recovery::RecoveryRecord; 0]);
         Ok(())
     }
 
@@ -10590,7 +10593,7 @@ mod tests {
             .release_expired_leases(t_plus(20))
             .await
             .context("sweep 2")?;
-        assert!(swept.is_empty());
+        assert_eq!(swept, [] as [crate::journal::recovery::RecoveryRecord; 0]);
 
         // Scan: the row is terminal, so there is nothing to claim.
         let scan = store

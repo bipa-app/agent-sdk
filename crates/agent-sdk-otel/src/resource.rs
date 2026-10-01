@@ -99,7 +99,7 @@ mod tests {
         // Instance id is auto-generated when missing.
         let instance_id = lookup(&resource, "service.instance.id")
             .ok_or_else(|| anyhow::anyhow!("service.instance.id missing"))?;
-        assert!(!instance_id.is_empty());
+        assert_ne!(instance_id, "");
         // service.version is not set unless caller-supplied.
         assert!(
             lookup(&resource, "service.version").is_none(),

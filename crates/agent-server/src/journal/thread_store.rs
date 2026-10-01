@@ -776,7 +776,7 @@ mod tests {
     async fn list_returns_empty_for_empty_store() {
         let store = InMemoryThreadStore::new();
         let threads = store.list().await.unwrap();
-        assert!(threads.is_empty());
+        assert_eq!(threads, [] as [crate::journal::thread::Thread; 0]);
     }
 
     // ── aggregate ownership regression ────────────────────────────

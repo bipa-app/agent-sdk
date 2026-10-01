@@ -453,7 +453,7 @@ mod tests {
             .context("recover")?;
 
         assert_eq!(view.thread.committed_turns, 0);
-        assert!(view.messages.is_empty());
+        assert_eq!(view.messages, [] as [agent_sdk_foundation::Message; 0]);
         assert_eq!(view.agent_state_snapshot, serde_json::Value::Null);
         assert!(view.latest_checkpoint.is_none());
         assert_eq!(view.next_turn_number, 1);
@@ -496,7 +496,10 @@ mod tests {
             serde_json::to_value(&view.committed_messages)?,
             serde_json::to_value(&compacted)?,
         );
-        assert!(view.draft_messages.is_empty());
+        assert_eq!(
+            view.draft_messages,
+            [] as [agent_sdk_foundation::Message; 0]
+        );
         assert!(view.latest_checkpoint.is_none());
         Ok(())
     }

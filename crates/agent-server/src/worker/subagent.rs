@@ -2584,7 +2584,7 @@ mod artifact_budget_tests {
             .context("subagent result data must remain structured")?;
         let structured: SubagentResult =
             serde_json::from_value(data).context("decode structured subagent result")?;
-        assert!(structured.final_response.is_empty());
+        assert_eq!(structured.final_response, "");
         Ok(())
     }
 

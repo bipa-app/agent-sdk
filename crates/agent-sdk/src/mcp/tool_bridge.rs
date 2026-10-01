@@ -390,7 +390,7 @@ mod tests {
     fn test_format_mcp_content_empty() {
         let content: Vec<McpContent> = vec![];
         let output = format_mcp_content(&content);
-        assert!(output.is_empty());
+        assert_eq!(output, "");
     }
 
     #[test]
@@ -447,9 +447,15 @@ mod tests {
         let recovered: ToolResult = serde_json::from_slice(&std::fs::read(&saved.path)?)?;
         assert_eq!(recovered.output, output);
         assert_eq!(recovered.data, Some(data));
-        assert!(recovered.documents.is_empty());
+        assert_eq!(
+            recovered.documents,
+            [] as [agent_sdk_foundation::ContentSource; 0]
+        );
         assert!(result.data.is_none());
-        assert!(result.documents.is_empty());
+        assert_eq!(
+            result.documents,
+            [] as [agent_sdk_foundation::ContentSource; 0]
+        );
         assert!(result.output.ends_with(&crate::artifact_footer(saved.id)));
         assert!(
             serde_json::to_vec(&result)?.len() <= store.inline_budget() + 256,

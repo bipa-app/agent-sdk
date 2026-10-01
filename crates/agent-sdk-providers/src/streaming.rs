@@ -1085,7 +1085,7 @@ mod tests {
     fn test_accumulator_empty() {
         let acc = StreamAccumulator::new();
         let blocks = acc.into_content_blocks();
-        assert!(blocks.is_empty());
+        assert_eq!(blocks, [] as [agent_sdk_foundation::ContentBlock; 0]);
     }
 
     #[test]

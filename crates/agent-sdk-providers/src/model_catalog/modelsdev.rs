@@ -595,7 +595,10 @@ mod tests {
 
         let unknown = find(&entries, "openai", "unknown-tier-model")?;
         assert!(unknown.pricing.is_none());
-        assert!(unknown.pricing_tiers.is_empty());
+        assert_eq!(
+            unknown.pricing_tiers,
+            [] as [crate::model_catalog::PricingTier; 0]
+        );
         Ok(())
     }
 
@@ -651,7 +654,10 @@ mod tests {
         for model in ["drifted-tier-model", "bound-less-tier-model"] {
             let drifted = find(&entries, "openai", model)?;
             assert!(drifted.pricing.is_none(), "{model} must drop its pricing");
-            assert!(drifted.pricing_tiers.is_empty());
+            assert_eq!(
+                drifted.pricing_tiers,
+                [] as [crate::model_catalog::PricingTier; 0]
+            );
         }
         Ok(())
     }

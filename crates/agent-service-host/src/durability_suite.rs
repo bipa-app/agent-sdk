@@ -642,7 +642,10 @@ mod tests {
         assert_eq!(view.thread.committed_turns, 1);
         assert_eq!(view.next_turn_number, 2);
         assert_eq!(view.messages.len(), 2);
-        assert!(view.draft_messages.is_empty());
+        assert_eq!(
+            view.draft_messages,
+            [] as [agent_sdk_foundation::Message; 0]
+        );
 
         drop(store);
         Ok(())

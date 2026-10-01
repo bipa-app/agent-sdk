@@ -162,7 +162,7 @@ mod tests {
 
         let empty = NewSessionParams::from_params(&json!({}));
         assert!(empty.cwd.is_none());
-        assert!(empty.mcp_servers.is_empty());
+        assert_eq!(empty.mcp_servers, [] as [serde_json::Value; 0]);
         assert!(empty.system_prompt.is_none());
     }
 
