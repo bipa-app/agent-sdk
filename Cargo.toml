@@ -46,8 +46,8 @@ agent-server = { path = "crates/agent-server", version = "0.8.0" }
 agent-service-host = { path = "crates/agent-service-host", version = "0.8.0" }
 tokio = { version = "1.53.1", default-features = false, features = ["sync", "time"] }
 tokio-stream = { version = "0.1.19", default-features = false }
-async-trait = { version = "0.1.91", default-features = false }
-futures = { version = "0.3.33", default-features = false, features = ["std", "async-await"] }
+async-trait = { version = "0.1.92", default-features = false }
+futures = { version = "0.3.34", default-features = false, features = ["std", "async-await"] }
 prost = { version = "0.14.4", default-features = false, features = ["derive", "std"] }
 prost-types = { version = "0.14.4", default-features = false, features = ["std"] }
 # Featureless: tonic's default `transport` drags axum + the hyper server into
@@ -61,8 +61,8 @@ http = { version = "1.5.0", default-features = false, features = ["std"] }
 serde = { version = "1.0.229", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
 sha2 = { version = "0.11.0", default-features = false, features = ["alloc"] }
-cap-std = { version = "4.0.2", default-features = false }
-cap-fs-ext = { version = "4.0.2", default-features = false, features = ["std"] }
+cap-std = { version = "4.0.3", default-features = false }
+cap-fs-ext = { version = "4.0.3", default-features = false, features = ["std"] }
 windows-sys = { version = "0.61.2", default-features = false }
 # JSON Schema validation for structured / typed output (Phase 13). Default
 # features pull in HTTP/file `$ref` resolution (and a second reqwest);
@@ -70,32 +70,32 @@ windows-sys = { version = "0.61.2", default-features = false }
 # disabled. NOTE (coordination): Phase 13·B may also reference this entry for
 # typed tool-argument validation — keep the version/feature set in sync at
 # merge.
-jsonschema = { version = "0.49.3", default-features = false }
+jsonschema = { version = "0.49.9", default-features = false }
 serde_yaml_ng = { version = "0.10.0", default-features = false }
 anyhow = { version = "1.0.104", default-features = false, features = ["std"] }
-thiserror = { version = "2.0.19", default-features = false, features = ["std"] }
+thiserror = { version = "2.0.21", default-features = false, features = ["std"] }
 # No `perf`: short patterns, never over large haystacks.
 regex = { version = "1.13.1", default-features = false, features = ["std", "unicode-perl"] }
 glob = { version = "0.3.4", default-features = false }
-uuid = { version = "1.24.0", default-features = false, features = ["std", "v4", "v7", "serde"] }
+uuid = { version = "1.26.1", default-features = false, features = ["std", "v4", "v7", "serde"] }
 time = { version = "0.3.55", default-features = false, features = ["serde", "std", "formatting", "parsing"] }
 # No TLS backend: the `tls-native-tls` / `tls-rustls` features add one.
 # No `system-proxy`: it only reads OS-level settings; `HTTP_PROXY` still works.
-reqwest = { version = "0.13.4", default-features = false, features = ["gzip", "json", "query", "stream", "http2"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["gzip", "json", "query", "stream", "http2"] }
 # Both exist so error classification can `downcast_ref` into reqwest's chain;
 # each only matches while it resolves to the release reqwest links
 # (`tls_certificate_rejection_is_bounded_server_error` pins this).
 native-tls = { version = "0.2.18", default-features = false }
 # `prefer-post-quantum` is a rustls default that reqwest disables; naming it
 # here unifies it back on.
-rustls = { version = "0.23.43", default-features = false, features = ["std", "tls12", "logging", "aws_lc_rs", "prefer-post-quantum"] }
+rustls = { version = "0.23.45", default-features = false, features = ["std", "tls12", "logging", "aws_lc_rs", "prefer-post-quantum"] }
 async-stream = { version = "0.3.6", default-features = false }
 bytes = { version = "1.12.1", default-features = false, features = ["std"] }
-log = { version = "0.4.33", default-features = false, features = ["kv_std"] }
+log = { version = "0.4.34", default-features = false, features = ["kv_std"] }
 url = { version = "2.5.8", default-features = false, features = ["std"] }
 tokio-util = { version = "0.7.19", default-features = false }
 html2text = { version = "0.17.1", default-features = false }
-base64 = { version = "0.23.0", default-features = false, features = ["std"] }
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"] }
 opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "rt-tokio"] }
@@ -113,8 +113,8 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 # Held at 0.39: 0.40 wants libsqlite3-sys 0.38, sqlx-sqlite 0.9 caps it below
 # that, and both `links = "sqlite3"`. Bump when sqlx accepts 0.38.
 rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }
-lapin = { version = "4.10.0", default-features = false, features = ["tokio"] }
-clap = { version = "4.6.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions", "color"] }
+lapin = { version = "4.12.0", default-features = false, features = ["tokio"] }
+clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions", "color"] }
 png = { version = "0.18.1", default-features = false }
 
 # Proc-macro toolchain for the Phase 13·E ergonomics crate
@@ -122,7 +122,7 @@ png = { version = "0.18.1", default-features = false }
 # generics, where-clauses, and attribute exprs; `#[tool(...)]` attributes are
 # parsed by hand with `syn` (rather than a third-party attribute-derive crate
 # whose generated code trips the workspace's `-D warnings` clippy lints).
-syn = { version = "3.0.3", default-features = false, features = ["derive", "parsing", "printing", "proc-macro", "clone-impls", "full", "extra-traits"] }
+syn = { version = "3.0.6", default-features = false, features = ["derive", "parsing", "printing", "proc-macro", "clone-impls", "full", "extra-traits"] }
 quote = { version = "1.0.47", default-features = false, features = ["proc-macro"] }
 proc-macro2 = { version = "1.0.107", default-features = false, features = ["proc-macro"] }
 # Optional JSON-Schema derivation from a typed `Input` — the opt-in sugar over
@@ -149,7 +149,7 @@ loom = { version = "0.7.2", default-features = false }
 wiremock = { version = "0.6.5", default-features = false }
 # Compile-fail / UI tests for the proc-macros: asserts that a derive with a
 # missing required attribute fails to compile with a helpful diagnostic.
-trybuild = { version = "1.0.120", default-features = false }
+trybuild = { version = "1.0.121", default-features = false }
 
 # Crash-injection failpoints (tikv `fail-rs`). Kept out of the default
 # feature set on every crate so production builds never compile it in;
