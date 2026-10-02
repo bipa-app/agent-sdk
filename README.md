@@ -616,7 +616,7 @@ let openai_agent = builder::<()>()
     .build();
 ```
 
-Adaptive thinking is only supported for Anthropic `claude-sonnet-4-6`, `claude-sonnet-5`,
+Adaptive thinking is only supported for Anthropic `claude-sonnet-4-6`, `claude-sonnet-5`, `claude-sonnet-5-5`,
 `claude-opus-4-6`, `claude-opus-4-7`, `claude-opus-4-8`, `claude-opus-5`, `claude-opus-5-5`,
 `claude-fable-5`, and `claude-fable-5-1`. These models reject budget-based thinking
 (`ThinkingConfig::new(budget)`); on `claude-opus-5-5`, `claude-fable-5`, and `claude-fable-5-1`
