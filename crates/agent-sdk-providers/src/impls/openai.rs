@@ -175,6 +175,7 @@ fn should_use_responses_api(
 // GPT-6 series
 pub const MODEL_GPT6_ASTRA: &str = "gpt-6-astra";
 pub const MODEL_GPT6_SOL: &str = "gpt-6-sol";
+pub const MODEL_GPT61_SOL: &str = "gpt-6.1-sol";
 pub const MODEL_GPT6_LUNA: &str = "gpt-6-luna";
 
 // GPT-5.6 series
@@ -361,6 +362,16 @@ impl OpenAIProvider {
     #[must_use]
     pub fn gpt6_sol(api_key: String) -> Self {
         Self::new(api_key, MODEL_GPT6_SOL.to_owned())
+    }
+
+    /// Create a provider using GPT-6.1 Sol (near-Astra performance at a lower cost).
+    ///
+    /// Like Astra, GPT-6.1 Sol rejects `none` reasoning effort, and its tool
+    /// calls need the Responses API, which the official base URL selects
+    /// automatically.
+    #[must_use]
+    pub fn gpt61_sol(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT61_SOL.to_owned())
     }
 
     /// Create a provider using GPT-6 Luna (efficient, repeatable work at scale).
@@ -3193,6 +3204,10 @@ mod tests {
                 MODEL_GPT6_SOL,
             ),
             (
+                OpenAIProvider::gpt61_sol("test-api-key".to_string()),
+                MODEL_GPT61_SOL,
+            ),
+            (
                 OpenAIProvider::gpt6_luna("test-api-key".to_string()),
                 MODEL_GPT6_LUNA,
             ),
@@ -3356,6 +3371,7 @@ mod tests {
         // GPT-6 series
         assert_eq!(MODEL_GPT6_ASTRA, "gpt-6-astra");
         assert_eq!(MODEL_GPT6_SOL, "gpt-6-sol");
+        assert_eq!(MODEL_GPT61_SOL, "gpt-6.1-sol");
         assert_eq!(MODEL_GPT6_LUNA, "gpt-6-luna");
         // GPT-5.6 series
         assert_eq!(MODEL_GPT56, "gpt-5.6");
@@ -4599,6 +4615,7 @@ mod tests {
         assert!(!requires_responses_api(MODEL_GPT56_LUNA));
         assert!(!requires_responses_api(MODEL_GPT6_ASTRA));
         assert!(!requires_responses_api(MODEL_GPT6_SOL));
+        assert!(!requires_responses_api(MODEL_GPT61_SOL));
         assert!(!requires_responses_api(MODEL_GPT6_LUNA));
     }
 
@@ -4632,6 +4649,7 @@ mod tests {
             MODEL_GPT56_LUNA,
             MODEL_GPT6_ASTRA,
             MODEL_GPT6_SOL,
+            MODEL_GPT61_SOL,
             MODEL_GPT6_LUNA,
         ] {
             assert!(should_use_responses_api(
@@ -4656,6 +4674,7 @@ mod tests {
             MODEL_GPT56,
             MODEL_GPT6_ASTRA,
             MODEL_GPT6_SOL,
+            MODEL_GPT61_SOL,
             MODEL_GPT6_LUNA,
         ] {
             assert!(
@@ -5294,6 +5313,7 @@ mod tests {
             MODEL_GPT53_CODEX,
             MODEL_GPT52_PRO,
             MODEL_GPT6_SOL,
+            MODEL_GPT61_SOL,
             MODEL_GPT6_LUNA,
             "unknown-future-model",
         ] {

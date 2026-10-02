@@ -226,6 +226,7 @@ const OPENAI_MODELS_URL: &str = "https://developers.openai.com/api/docs/models";
 const OPENAI_PRICING_URL: &str = "https://developers.openai.com/api/docs/pricing";
 const OPENAI_GPT6_ASTRA_URL: &str = "https://developers.openai.com/api/docs/models/gpt-6-astra";
 const OPENAI_GPT6_SOL_URL: &str = "https://developers.openai.com/api/docs/models/gpt-6-sol";
+const OPENAI_GPT61_SOL_URL: &str = "https://developers.openai.com/api/docs/models/gpt-6.1-sol";
 const OPENAI_GPT6_LUNA_URL: &str = "https://developers.openai.com/api/docs/models/gpt-6-luna";
 const OPENAI_GPT56_SOL_URL: &str = "https://developers.openai.com/api/docs/models/gpt-5.6-sol";
 const OPENAI_GPT56_TERRA_URL: &str = "https://developers.openai.com/api/docs/models/gpt-5.6-terra";
@@ -477,6 +478,21 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         source_url: OPENAI_GPT6_SOL_URL,
         source_status: SourceStatus::Official,
         notes: Some("Supports Chat Completions and Responses, 1.05M context, and 128K max output. Chat Completions supports function calling only with `reasoning_effort: none`; tools with reasoning need the Responses API."),
+    },
+    ModelCapabilities {
+        provider: "openai",
+        model_id: "gpt-6.1-sol",
+        context_window: Some(1_050_000),
+        max_output_tokens: Some(128_000),
+        pricing: Some(Pricing::flat_with_cached(2.0, 10.0, 0.1).with_notes(
+            "Standard tier base rates. Cached input costs $0.10/M (5% of base input, versus 10% on other GPT-6 models). Cache writes cost $2.50/M input tokens. Requests with more than 272K input tokens cost 2x input and cache rates and 1.5x output for the full request.",
+        )),
+        supports_thinking: true,
+        supports_adaptive_thinking: true,
+        rejects_budget_thinking: false,
+        source_url: OPENAI_GPT61_SOL_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("Supports Chat Completions and Responses, 1.05M context, and 128K max output. Rejects `none` reasoning effort. Chat Completions does not support function calling; tool calls need the Responses API."),
     },
     ModelCapabilities {
         provider: "openai",
@@ -1336,6 +1352,7 @@ mod tests {
             ("openai", "gpt-5.6-sol"),
             ("openai", "gpt-6-astra"),
             ("openai", "gpt-6-sol"),
+            ("openai", "gpt-6.1-sol"),
             ("openai", "gpt-6-luna"),
         ] {
             let caps = get_model_capabilities(provider, model).unwrap();
@@ -1388,6 +1405,7 @@ mod tests {
         for (model_id, input, cached_input, output, cache_write_note) in [
             ("gpt-6-astra", 10.0, 1.0, 50.0, "$12.50/M"),
             ("gpt-6-sol", 2.0, 0.2, 10.0, "$2.50/M"),
+            ("gpt-6.1-sol", 2.0, 0.1, 10.0, "$2.50/M"),
             ("gpt-6-luna", 0.1, 0.01, 0.5, "$0.125/M"),
             ("gpt-5.6", 5.0, 0.5, 30.0, "$6.25/M"),
             ("gpt-5.6-sol", 5.0, 0.5, 30.0, "$6.25/M"),
@@ -1412,6 +1430,29 @@ mod tests {
             }));
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn gpt61_sol_bills_cached_input_at_half_the_gpt6_sol_rate() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        let usage = Usage {
+            served_speed: None,
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cached_input_tokens: 1_000_000,
+            cache_creation_input_tokens: 0,
+        };
+        for (model_id, expected) in [("gpt-6.1-sol", 0.1), ("gpt-6-sol", 0.2)] {
+            let caps = get_model_capabilities("openai", model_id)
+                .with_context(|| format!("{model_id} capabilities missing"))?;
+            let cost = caps.estimate_cost_usd(&usage).context("priced")?;
+            assert!(
+                (cost - expected).abs() < 1e-9,
+                "{model_id}: unexpected cost {cost}"
+            );
+        }
         Ok(())
     }
 

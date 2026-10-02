@@ -422,7 +422,7 @@ pub(crate) const fn service_tier_wire_value(speed: Option<SpeedTier>) -> Option<
 
 pub(crate) fn validate_reasoning_config(model: &str, config: &OpenAIReasoningConfig) -> Result<()> {
     if let Some(effort) = config.effort() {
-        let validation = if model == "gpt-6-astra" {
+        let validation = if matches!(model, "gpt-6-astra" | "gpt-6.1-sol") {
             Some((
                 matches!(
                     effort,
@@ -752,18 +752,23 @@ mod tests {
             );
         }
 
-        let astra_none = validate_reasoning_config("gpt-6-astra", &none)
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("gpt-6-astra must reject none effort"))?;
-        assert!(
-            astra_none
-                .to_string()
-                .contains("low, medium, high, xhigh, and max"),
-            "got: {astra_none}"
-        );
-        assert!(validate_reasoning_config("gpt-6-astra", &minimal).is_err());
-        assert!(validate_reasoning_config("gpt-6-astra", &low).is_ok());
-        assert!(validate_reasoning_config("gpt-6-astra", &max).is_ok());
+        for model in ["gpt-6-astra", "gpt-6.1-sol"] {
+            let rejected_none = validate_reasoning_config(model, &none)
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("{model} must reject none effort"))?;
+            assert!(
+                rejected_none
+                    .to_string()
+                    .contains("low, medium, high, xhigh, and max"),
+                "{model} got: {rejected_none}"
+            );
+            assert!(
+                validate_reasoning_config(model, &minimal).is_err(),
+                "{model}"
+            );
+            assert!(validate_reasoning_config(model, &low).is_ok(), "{model}");
+            assert!(validate_reasoning_config(model, &max).is_ok(), "{model}");
+        }
         Ok(())
     }
 
@@ -772,7 +777,7 @@ mod tests {
         let cache = OpenAIReasoningConfig::new()
             .with_prompt_cache_mode(OpenAIPromptCacheMode::Explicit)
             .with_prompt_cache_ttl(OpenAIPromptCacheTtl::ThirtyMinutes);
-        for model in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+        for model in ["gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"] {
             assert!(validate_reasoning_config(model, &cache).is_ok(), "{model}");
         }
     }

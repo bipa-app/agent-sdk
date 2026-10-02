@@ -956,11 +956,11 @@ for envelope in event_store.get_events(&thread_id).await? {
 | Provider | Models | Usage |
 |----------|--------|-------|
 | Anthropic | Claude Sonnet, Opus, Haiku | `AnthropicProvider::sonnet(api_key)` |
-| OpenAI | GPT-6, GPT-5.6, GPT-5.4, GPT-5.3-Codex, GPT-4.1, o-series | `OpenAIProvider::gpt56(api_key)` |
+| OpenAI | GPT-6.1 Sol, GPT-6, GPT-5.6, GPT-5.4, GPT-5.3-Codex, GPT-4.1, o-series | `OpenAIProvider::gpt56(api_key)` |
 | Google | Gemini 3.x and 2.x families | `GeminiProvider::new(api_key, model)` |
 
-GPT-5.6 and GPT-6 use the Responses API automatically on the official OpenAI endpoint. Exact
-controls that do not fit the provider-neutral thinking config are available through
+GPT-5.6, GPT-6, and GPT-6.1 Sol use the Responses API automatically on the official OpenAI
+endpoint. Exact controls that do not fit the provider-neutral thinking config are available through
 `OpenAIReasoningConfig`:
 
 ```rust
