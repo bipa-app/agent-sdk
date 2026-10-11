@@ -98,6 +98,14 @@ pub struct CompactionEntry {
     pub generated_summary: bool,
     /// Number of messages in the effective source view seen by the compactor.
     pub source_message_count: usize,
+    /// Raw messages this entry moved in from the in-flight draft:
+    /// `messages[draft_fold_start..draft_fold_start + draft_fold_len]`.
+    /// Rows written before these fields existed decode as an empty fold at
+    /// index 0.
+    #[serde(default)]
+    pub draft_fold_start: usize,
+    #[serde(default)]
+    pub draft_fold_len: usize,
     /// When this compaction entry was appended.
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -276,6 +284,8 @@ impl MessageProjection {
             });
         }
 
+        let draft_fold_start = self.messages.len();
+        let draft_fold_len = self.draft_messages.len();
         self.messages.append(&mut self.draft_messages);
         let visible_raw_count = self.messages.len().saturating_sub(prior_boundary);
         let retained_raw_count = retained_message_count.min(visible_raw_count);
@@ -311,6 +321,8 @@ impl MessageProjection {
             replacement_messages,
             generated_summary,
             source_message_count,
+            draft_fold_start,
+            draft_fold_len,
             created_at: now,
         });
         self.history_generation = self.history_generation.saturating_add(1);
@@ -356,6 +368,8 @@ impl MessageProjection {
             .compactions
             .last()
             .map_or(0, |entry| entry.compacted_end);
+        let draft_fold_start = self.messages.len();
+        let draft_fold_len = self.draft_messages.len();
         self.messages.append(&mut self.draft_messages);
         self.messages.append(&mut repair_messages);
         let generated_summary = balanced_messages.first().is_some_and(|message| {
@@ -370,6 +384,8 @@ impl MessageProjection {
             replacement_messages: balanced_messages,
             generated_summary,
             source_message_count,
+            draft_fold_start,
+            draft_fold_len,
             created_at: now,
         });
         self.history_generation = self.history_generation.saturating_add(1);
@@ -419,12 +435,43 @@ impl MessageProjection {
         history
     }
 
+    /// Leading `in_flight` messages that the raw transcript already holds
+    /// because a compaction folded them in from the draft since the last
+    /// commit.
+    ///
+    /// The folds since the last commit form one contiguous run at the end of
+    /// [`Self::messages`]. This returns the length of the longest fold-aligned
+    /// tail of that run that `in_flight` starts with verbatim, or 0. A resume
+    /// that compacted and then died is re-run from the same parked messages;
+    /// this is how the rerun recognizes what its predecessor already folded.
+    /// A run folded for another in-flight sequence cannot match, since its
+    /// tool-use ids never recur.
+    #[must_use]
+    pub fn folded_in_flight_prefix_len(&self, in_flight: &[llm::Message]) -> usize {
+        let mut fold_starts = Vec::new();
+        let mut run_start = self.messages.len();
+        for entry in self.compactions.iter().rev() {
+            if entry.draft_fold_start.saturating_add(entry.draft_fold_len) != run_start {
+                break;
+            }
+            if entry.draft_fold_len > 0 {
+                fold_starts.push(entry.draft_fold_start);
+            }
+            run_start = entry.draft_fold_start;
+        }
+        fold_starts
+            .iter()
+            .rev()
+            .filter_map(|start| self.messages.get(*start..))
+            .find(|folded| in_flight.starts_with(folded))
+            .map_or(0, <[llm::Message]>::len)
+    }
+
     /// Replace the in-flight draft messages.
     ///
-    /// Called at every tool-boundary suspension with the full
-    /// `suspended_messages` list captured at that point. The draft
-    /// is overwritten (not appended) because each suspension carries
-    /// the complete in-flight history through that boundary.
+    /// Called at every tool-boundary suspension with the turn's messages
+    /// that the raw transcript does not hold yet. The draft is overwritten
+    /// (not appended) because each suspension carries that whole suffix.
     ///
     /// An empty `messages` argument is allowed and produces the same
     /// observable state as [`Self::clear_draft`], but
@@ -1383,6 +1430,153 @@ mod tests {
             serde_json::to_value(p.context_history())?,
             serde_json::to_value(compacted)?,
         );
+        Ok(())
+    }
+
+    // ── folded in-flight messages ─────────────────────────────────
+
+    fn tool_round(id: &str) -> Vec<llm::Message> {
+        vec![
+            llm::Message {
+                role: llm::Role::Assistant,
+                content: llm::Content::Blocks(vec![llm::ContentBlock::ToolUse {
+                    id: id.to_owned(),
+                    name: "bash".to_owned(),
+                    input: serde_json::json!({ "command": "true" }),
+                    thought_signature: None,
+                }]),
+            },
+            llm::Message::user_with_content(vec![llm::ContentBlock::ToolResult {
+                tool_use_id: id.to_owned(),
+                content: "ok".to_owned(),
+                artifact: None,
+                is_error: None,
+            }]),
+        ]
+    }
+
+    fn summary() -> Vec<llm::Message> {
+        vec![llm::Message::user("[summary]")]
+    }
+
+    /// `[prompt, call_1 tool_use, call_1 tool_result]`, folded by one
+    /// compaction after two committed messages.
+    fn projection_with_folded_turn() -> anyhow::Result<(MessageProjection, Vec<llm::Message>)> {
+        let mut in_flight = vec![llm::Message::user("prompt")];
+        in_flight.extend(tool_round("call_1"));
+        let p = MessageProjection::new(thread_id(), t0())
+            .append_committed(
+                vec![
+                    llm::Message::user("earlier"),
+                    llm::Message::assistant("reply"),
+                ],
+                t_plus(1),
+            )?
+            .set_draft(in_flight.clone(), t_plus(2))
+            .append_compaction(summary(), 5, 0, t_plus(3))?;
+        Ok((p, in_flight))
+    }
+
+    #[test]
+    fn append_compaction_records_the_raw_range_it_folded_from_the_draft() -> anyhow::Result<()> {
+        let (p, in_flight) = projection_with_folded_turn()?;
+        let entry = p.compactions.last().context("compaction entry")?;
+        assert_eq!((entry.draft_fold_start, entry.draft_fold_len), (2, 3));
+        assert_eq!(p.messages[2..], in_flight[..]);
+
+        let repaired = p.set_draft(tool_round("call_2"), t_plus(4)).append_repair(
+            vec![llm::Message::user("repair evidence")],
+            summary(),
+            3,
+            t_plus(5),
+        )?;
+        let entry = repaired.compactions.last().context("repair entry")?;
+        assert_eq!((entry.draft_fold_start, entry.draft_fold_len), (5, 2));
+        Ok(())
+    }
+
+    #[test]
+    fn folded_in_flight_prefix_is_recognized_until_the_turn_commits() -> anyhow::Result<()> {
+        let (p, in_flight) = projection_with_folded_turn()?;
+        assert_eq!(p.folded_in_flight_prefix_len(&in_flight), 3);
+
+        let mut extended = in_flight.clone();
+        extended.push(llm::Message::user("injected after the fold"));
+        assert_eq!(
+            p.folded_in_flight_prefix_len(&extended),
+            3,
+            "only the folded prefix is already durable",
+        );
+        assert_eq!(
+            p.folded_in_flight_prefix_len(&in_flight[..2]),
+            0,
+            "a sequence that does not contain the whole fold is not that fold",
+        );
+        assert_eq!(
+            p.folded_in_flight_prefix_len(&in_flight[1..]),
+            0,
+            "a match must start at a fold boundary",
+        );
+        assert_eq!(p.folded_in_flight_prefix_len(&tool_round("call_9")), 0);
+
+        let committed = p.append_committed(vec![llm::Message::assistant("final")], t_plus(4))?;
+        assert_eq!(
+            committed.folded_in_flight_prefix_len(&in_flight),
+            0,
+            "a commit ends the in-flight run",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn folded_in_flight_runs_chain_across_compactions_of_one_turn() -> anyhow::Result<()> {
+        let (p, first) = projection_with_folded_turn()?;
+        let second = tool_round("call_2");
+        let p = p
+            .set_draft(second.clone(), t_plus(4))
+            .append_compaction(summary(), 3, 0, t_plus(5))?
+            .append_compaction(summary(), 1, 0, t_plus(6))?;
+
+        let mut whole_turn = first.clone();
+        whole_turn.extend(second.clone());
+        whole_turn.push(llm::Message::user("not folded"));
+        assert_eq!(p.folded_in_flight_prefix_len(&whole_turn), 5);
+
+        let mut since_second_fold = second;
+        since_second_fold.push(llm::Message::user("not folded"));
+        assert_eq!(p.folded_in_flight_prefix_len(&since_second_fold), 2);
+        assert_eq!(p.folded_in_flight_prefix_len(&first), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn folds_without_a_recorded_range_or_behind_a_repair_are_not_recognized() -> anyhow::Result<()>
+    {
+        let (p, in_flight) = projection_with_folded_turn()?;
+
+        let mut legacy = serde_json::to_value(&p)?;
+        for entry in legacy["compactions"]
+            .as_array_mut()
+            .context("compactions array")?
+        {
+            let fields = entry.as_object_mut().context("compaction entry object")?;
+            fields.remove("draft_fold_start");
+            fields.remove("draft_fold_len");
+        }
+        let legacy: MessageProjection = serde_json::from_value(legacy)?;
+        assert_eq!(
+            legacy.folded_in_flight_prefix_len(&in_flight),
+            0,
+            "rows written before the fold range existed carry no evidence",
+        );
+
+        let repaired = p.append_repair(
+            vec![llm::Message::user("repair evidence")],
+            summary(),
+            1,
+            t_plus(4),
+        )?;
+        assert_eq!(repaired.folded_in_flight_prefix_len(&in_flight), 0);
         Ok(())
     }
 

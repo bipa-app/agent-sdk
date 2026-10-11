@@ -161,10 +161,9 @@ pub trait MessageProjectionStore: Send + Sync {
     /// Replace the in-flight draft messages for `thread_id`.
     ///
     /// Called by the worker at every tool-boundary suspension with
-    /// the full `suspended_messages` list captured at that point.
+    /// the turn's messages that the raw transcript does not hold yet.
     /// The draft is overwritten (not appended) because each
-    /// suspension carries the complete in-flight history through
-    /// that boundary.
+    /// suspension carries that whole suffix.
     ///
     /// Behavior:
     /// 1. Loads or bootstraps the projection row for `thread_id`.
