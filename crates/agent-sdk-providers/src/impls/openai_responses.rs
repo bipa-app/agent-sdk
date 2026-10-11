@@ -20,7 +20,7 @@ use futures::StreamExt;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
-use super::openai_prompt_cache::bounded_prompt_cache_key;
+use super::openai::{is_official_openai_base_url, official_cache_key};
 use super::openai_reasoning::{
     OpenAIAllowedToolsMode, OpenAIPromptCacheMode, OpenAIPromptCacheTtl, OpenAIReasoningConfig,
     OpenAIReasoningContext, OpenAIReasoningEffort, OpenAIReasoningMode, OpenAIReasoningSummary,
@@ -439,7 +439,7 @@ impl LlmProvider for OpenAIResponsesProvider {
             prompt_cache_options,
             store,
             include: include_encrypted_reasoning.then_some(ENCRYPTED_REASONING_INCLUDE),
-            prompt_cache_key: request.session_id.as_deref().map(bounded_prompt_cache_key),
+            prompt_cache_key: official_cache_key(&self.base_url, request.session_id.as_deref()),
             safety_identifier: reasoning_config
                 .as_ref()
                 .and_then(OpenAIReasoningConfig::safety_identifier),
@@ -570,10 +570,8 @@ impl LlmProvider for OpenAIResponsesProvider {
                 store,
                 include: include_encrypted_reasoning
                     .then(|| ENCRYPTED_REASONING_INCLUDE.iter().map(|value| (*value).to_owned()).collect()),
-                prompt_cache_key: request
-                    .session_id
-                    .as_deref()
-                    .map(|session_id| bounded_prompt_cache_key(session_id).into_owned()),
+                prompt_cache_key: official_cache_key(&self.base_url, request.session_id.as_deref())
+                    .map(Cow::into_owned),
                 safety_identifier: reasoning_config
                     .as_ref()
                     .and_then(OpenAIReasoningConfig::safety_identifier)
@@ -961,7 +959,7 @@ impl LlmProvider for OpenAIResponsesProvider {
     }
 
     fn supports_historical_image_blocks(&self) -> bool {
-        super::openai::is_official_openai_base_url(&self.base_url)
+        is_official_openai_base_url(&self.base_url)
             && supports_responses_original_image_detail(&self.model)
     }
 
@@ -2232,6 +2230,7 @@ struct ApiStreamResponse {
 mod tests {
     use super::*;
     use crate::impls::openai::MODEL_GPT54;
+    use crate::impls::openai_prompt_cache::bounded_prompt_cache_key;
     use agent_sdk_foundation::llm::{CacheConfig, CacheTtl, Message, ThinkingDisplay};
 
     #[test]
@@ -2323,15 +2322,11 @@ mod tests {
         Ok(deltas)
     }
 
-    #[tokio::test]
-    async fn long_session_ids_are_bounded_as_prompt_cache_key_on_the_wire() -> anyhow::Result<()> {
-        use crate::impls::openai_prompt_cache::MAX_PROMPT_CACHE_KEY_LEN;
-
-        let session_id = "eval-bipa-premium-data-query-001-0b4e88a4-6f1c-4c55-9d2a-51c0e4a7f3b9";
-        let expected_key = bounded_prompt_cache_key(session_id);
-        assert!(expected_key.len() <= MAX_PROMPT_CACHE_KEY_LEN);
-
-        let server = MockServer::start().await;
+    async fn prompt_cache_keys_sent(
+        provider: &OpenAIResponsesProvider,
+        server: &MockServer,
+        session_id: &str,
+    ) -> anyhow::Result<Vec<Option<serde_json::Value>>> {
         Mock::given(matchers::method("POST"))
             .and(matchers::path("/responses"))
             .and(matchers::body_partial_json(
@@ -2342,7 +2337,7 @@ mod tests {
                     .insert_header("content-type", "text/event-stream")
                     .set_body_string("data: {\"type\":\"response.completed\",\"response\":{}}\n\n"),
             )
-            .mount(&server)
+            .mount(server)
             .await;
         Mock::given(matchers::method("POST"))
             .and(matchers::path("/responses"))
@@ -2357,17 +2352,16 @@ mod tests {
                 "status": "completed",
                 "usage": {"input_tokens": 1, "output_tokens": 1}
             })))
-            .mount(&server)
+            .mount(server)
             .await;
-        let provider = OpenAIResponsesProvider::with_base_url(
-            "test-key".to_owned(),
-            MODEL_GPT6_SOL.to_owned(),
-            server.uri(),
-        );
         let request = ChatRequest::new(String::new(), vec![Message::user("hello")])
             .with_session_id(session_id);
 
-        let _ = provider.chat(request.clone()).await?;
+        let outcome = provider.chat(request.clone()).await?;
+        assert!(
+            matches!(outcome, ChatOutcome::Success(_)),
+            "chat did not complete: {outcome:?}"
+        );
         let mut stream = std::pin::pin!(provider.chat_stream(request));
         while let Some(delta) = stream.next().await {
             delta?;
@@ -2382,10 +2376,53 @@ mod tests {
             2,
             "expected one chat and one chat_stream request"
         );
-        for sent in &received {
-            let body: serde_json::Value = serde_json::from_slice(&sent.body)?;
-            assert_eq!(body["prompt_cache_key"], expected_key.as_ref());
-        }
+        received
+            .iter()
+            .map(|sent| {
+                let body: serde_json::Value = serde_json::from_slice(&sent.body)?;
+                Ok(body.get("prompt_cache_key").cloned())
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn long_session_ids_are_bounded_as_prompt_cache_key_on_the_wire() -> anyhow::Result<()> {
+        use crate::impls::openai_prompt_cache::MAX_PROMPT_CACHE_KEY_LEN;
+
+        let session_id = "eval-bipa-premium-data-query-001-0b4e88a4-6f1c-4c55-9d2a-51c0e4a7f3b9";
+        let expected_key = bounded_prompt_cache_key(session_id);
+        assert!(expected_key.len() <= MAX_PROMPT_CACHE_KEY_LEN);
+
+        let server = MockServer::start().await;
+        let official_host = "api.openai.com";
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .resolve(official_host, *server.address())
+            .build()?;
+        let provider = OpenAIResponsesProvider::with_base_url(
+            "test-key".to_owned(),
+            MODEL_GPT6_SOL.to_owned(),
+            format!("http://{official_host}:{}", server.address().port()),
+        )
+        .with_client(client);
+
+        let sent = prompt_cache_keys_sent(&provider, &server, session_id).await?;
+        let expected = Some(serde_json::Value::from(expected_key.as_ref()));
+        assert_eq!(sent, vec![expected.clone(), expected]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn custom_base_urls_receive_no_prompt_cache_key() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        let provider = OpenAIResponsesProvider::with_base_url(
+            "test-key".to_owned(),
+            MODEL_GPT6_SOL.to_owned(),
+            server.uri(),
+        );
+
+        let sent = prompt_cache_keys_sent(&provider, &server, "thread-42").await?;
+        assert_eq!(sent, vec![None, None]);
         Ok(())
     }
 

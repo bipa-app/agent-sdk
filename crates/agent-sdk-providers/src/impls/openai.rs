@@ -102,7 +102,10 @@ fn chat_store(base_url: &str, config: Option<&OpenAIReasoningConfig>) -> Option<
         .or_else(|| is_official_openai_base_url(base_url).then_some(false))
 }
 
-fn chat_prompt_cache_key<'a>(base_url: &str, session_id: Option<&'a str>) -> Option<Cow<'a, str>> {
+pub(super) fn official_cache_key<'a>(
+    base_url: &str,
+    session_id: Option<&'a str>,
+) -> Option<Cow<'a, str>> {
     session_id
         .filter(|_| is_official_openai_base_url(base_url))
         .map(bounded_prompt_cache_key)
@@ -939,7 +942,7 @@ impl LlmProvider for OpenAIProvider {
         let safety_identifier = reasoning_config
             .as_ref()
             .and_then(OpenAIReasoningConfig::safety_identifier);
-        let prompt_cache_key = chat_prompt_cache_key(&self.base_url, request.session_id.as_deref());
+        let prompt_cache_key = official_cache_key(&self.base_url, request.session_id.as_deref());
         let max_tokens = self.effective_max_tokens(&request);
         // Take `tools` out before `messages` pins a borrow of `request`
         // (the built messages hold references to its image sources).
@@ -1132,7 +1135,7 @@ impl LlmProvider for OpenAIProvider {
                 .as_ref()
                 .and_then(OpenAIReasoningConfig::safety_identifier);
             let prompt_cache_key =
-                chat_prompt_cache_key(&self.base_url, request.session_id.as_deref());
+                official_cache_key(&self.base_url, request.session_id.as_deref());
             let max_tokens = self.effective_max_tokens(&request);
             // Take `tools` out before `messages` pins a borrow of `request`
             // (the built messages hold references to its image sources).
@@ -5383,11 +5386,11 @@ mod tests {
         );
         assert_eq!(chat_store("https://gateway.example/v1", None), None);
         assert_eq!(
-            chat_prompt_cache_key(DEFAULT_BASE_URL, Some("thread-42")).as_deref(),
+            official_cache_key(DEFAULT_BASE_URL, Some("thread-42")).as_deref(),
             Some("thread-42")
         );
         assert_eq!(
-            chat_prompt_cache_key("https://gateway.example/v1", Some("thread-42")),
+            official_cache_key("https://gateway.example/v1", Some("thread-42")),
             None
         );
     }
@@ -5529,7 +5532,7 @@ mod tests {
             store: None,
             parallel_tool_calls: None,
             safety_identifier: None,
-            prompt_cache_key: chat_prompt_cache_key(DEFAULT_BASE_URL, Some(session_id)),
+            prompt_cache_key: official_cache_key(DEFAULT_BASE_URL, Some(session_id)),
             service_tier: None,
         };
 
