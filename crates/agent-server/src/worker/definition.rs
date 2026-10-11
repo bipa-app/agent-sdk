@@ -240,20 +240,22 @@ pub struct AgentDefinition {
     /// it again. Returned non-blank text is wrapped in `<system-reminder>`
     /// tags and merged into the request's last user message as its final
     /// text block, after any `tool_result` blocks; when the request ends on
-    /// an assistant turn it is sent as a new user message instead. Anthropic
-    /// cache breakpoints stay ahead of it (see
-    /// [`ChatRequest::request_only_tail_blocks`](agent_sdk_foundation::llm::ChatRequest::request_only_tail_blocks)).
+    /// an assistant turn or a compaction record it is sent as a new user
+    /// message instead. Anthropic and Vertex Claude cache breakpoints stay
+    /// ahead of it (see
+    /// [`ChatRequest::request_only_reminders`](agent_sdk_foundation::llm::ChatRequest::request_only_reminders)).
     /// The text is request-only: it is never written to staged history, the
     /// journal, message projections, checkpoints, or transcripts. Hosts with
     /// async state should capture an `Arc` to a snapshot they keep current
     /// elsewhere.
     ///
-    /// On Anthropic models older than Claude Opus 4.5, a user message that
-    /// carries any block besides `tool_result` starts a new turn, and the API
-    /// strips the thinking blocks of earlier assistant turns. Context returned
-    /// for a [`ProviderRequestKind::Continuation`] request therefore drops the
-    /// in-progress turn's thinking on those models; hosts should return `None`
-    /// there and keep per-tool-round reminders to newer models.
+    /// Claude Sonnet 4.5, Claude Haiku 4.5, and earlier Claude models treat a
+    /// user message carrying any block besides `tool_result` as a new turn and
+    /// strip the thinking blocks of earlier assistant turns, so context
+    /// returned for a [`ProviderRequestKind::Continuation`] request drops the
+    /// in-progress turn's thinking on them; hosts should return `None` there
+    /// for those models. Claude Opus 4.5 and later, Sonnet 4.6 and later, and
+    /// Haiku 5.5 keep earlier thinking blocks.
     #[serde(skip)]
     pub request_context_fn: Option<RequestContextFn>,
     /// Extended thinking configuration.
