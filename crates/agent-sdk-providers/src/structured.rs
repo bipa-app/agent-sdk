@@ -877,6 +877,7 @@ mod tests {
             tool_choice: None,
             response_format: Some(ResponseFormat::new("person", person_schema())),
             cache: None,
+            request_only_tail_blocks: 0,
         }
     }
 

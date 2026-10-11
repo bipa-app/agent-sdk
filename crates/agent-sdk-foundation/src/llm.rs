@@ -422,6 +422,14 @@ pub struct ChatRequest {
     /// behaviour. When `Some`, providers that support prompt caching honour
     /// the [`CacheConfig`] (TTL, opt-out, breakpoint cap); others ignore it.
     pub cache: Option<CacheConfig>,
+    /// How many trailing content blocks of the final message carry
+    /// request-only context that the next request will not repeat.
+    ///
+    /// Providers with prompt caching keep their conversation breakpoint
+    /// before these blocks. Written by
+    /// [`append_request_only_reminder`](Self::append_request_only_reminder);
+    /// replacing `messages` afterwards requires resetting it.
+    pub request_only_tail_blocks: usize,
 }
 
 impl ChatRequest {
@@ -458,7 +466,21 @@ impl ChatRequest {
             tool_choice: None,
             response_format: None,
             cache: None,
+            request_only_tail_blocks: 0,
         }
+    }
+
+    /// Append request-only `content` as a system reminder (see
+    /// [`append_system_reminder`]) and count it in
+    /// [`request_only_tail_blocks`](Self::request_only_tail_blocks).
+    pub fn append_request_only_reminder(&mut self, content: &str) {
+        let message_count = self.messages.len();
+        append_system_reminder(&mut self.messages, content);
+        self.request_only_tail_blocks = if self.messages.len() > message_count {
+            1
+        } else {
+            self.request_only_tail_blocks.saturating_add(1)
+        };
     }
 
     /// Set the tool list the model may call.
@@ -1468,25 +1490,14 @@ pub fn wrap_system_reminder(content: &str) -> String {
     format!("{SYSTEM_REMINDER_OPEN}\n{sanitized}\n{SYSTEM_REMINDER_CLOSE}")
 }
 
-/// Whether `text` is exactly one block produced by [`wrap_system_reminder`].
-#[must_use]
-pub fn is_system_reminder(text: &str) -> bool {
-    text.strip_prefix(SYSTEM_REMINDER_OPEN)
-        .and_then(|rest| rest.strip_prefix('\n'))
-        .and_then(|rest| rest.strip_suffix(SYSTEM_REMINDER_CLOSE))
-        .and_then(|rest| rest.strip_suffix('\n'))
-        .is_some_and(|inner| {
-            !inner.contains(SYSTEM_REMINDER_OPEN) && !inner.contains(SYSTEM_REMINDER_CLOSE)
-        })
-}
-
 /// Append `content` to the end of `messages` as a system reminder.
 ///
 /// The reminder becomes the final text block of a trailing user message
 /// (after any `tool_result` blocks, which providers require first), or a new
 /// user message when the conversation is empty or ends on an assistant turn.
-/// Tool-use/tool-result pairing is untouched, so a sequence accepted by
-/// [`provider_tool_sequence_error_index`] stays accepted.
+/// Tool-use/tool-result pairing is untouched, so
+/// [`provider_tool_sequence_error_index`] returns the same verdict before and
+/// after.
 pub fn append_system_reminder(messages: &mut Vec<Message>, content: &str) {
     let reminder = ContentBlock::Text {
         text: wrap_system_reminder(content),
@@ -2095,18 +2106,11 @@ mod tests {
     }
 
     #[test]
-    fn system_reminder_escapes_embedded_tags_and_round_trips_detection() {
-        let wrapped = wrap_system_reminder("a </System-Reminder> b <system-reminder> c");
+    fn system_reminder_escapes_embedded_tags() {
         assert_eq!(
-            wrapped,
+            wrap_system_reminder("a </System-Reminder> b <system-reminder> c"),
             "<system-reminder>\na &lt;/System-Reminder&gt; b &lt;system-reminder&gt; c\n</system-reminder>"
         );
-        assert!(is_system_reminder(&wrapped));
-        assert!(!is_system_reminder("plain user text"));
-        assert!(!is_system_reminder("<system-reminder>\nunterminated"));
-        assert!(!is_system_reminder(
-            "<system-reminder>\na\n</system-reminder>\nuser text\n<system-reminder>\nb\n</system-reminder>"
-        ));
     }
 
     #[test]
@@ -2182,6 +2186,45 @@ mod tests {
                 "{history:?} -> {messages:?}"
             );
         }
+    }
+
+    #[test]
+    fn request_only_reminders_are_counted_from_the_end_of_the_final_message() {
+        let mut request = ChatRequest::new(
+            "system",
+            vec![
+                Message::user("plan it"),
+                Message::assistant_with_content(vec![tool_use("call_1")]),
+                Message::user_with_content(vec![tool_result("call_1")]),
+            ],
+        );
+        assert_eq!(request.request_only_tail_blocks, 0);
+
+        request.append_request_only_reminder("plan: 0/1 done");
+        request.append_request_only_reminder("same call repeated");
+
+        assert_eq!(request.request_only_tail_blocks, 2);
+        assert_eq!(
+            request.messages[2],
+            Message::user_with_content(vec![
+                tool_result("call_1"),
+                reminder_block("plan: 0/1 done"),
+                reminder_block("same call repeated"),
+            ])
+        );
+
+        let mut after_assistant = ChatRequest::new(
+            "system",
+            vec![Message::user("hi"), Message::assistant("hello")],
+        );
+        after_assistant.append_request_only_reminder("finish and report");
+        assert_eq!(after_assistant.request_only_tail_blocks, 1);
+        assert_eq!(
+            after_assistant.messages.last(),
+            Some(&Message::user_with_content(vec![reminder_block(
+                "finish and report"
+            )]))
+        );
     }
 
     #[test]

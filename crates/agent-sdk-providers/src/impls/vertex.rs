@@ -186,6 +186,7 @@ impl VertexProvider {
         let mut messages = anthropic_data::build_api_messages(request);
         anthropic_data::apply_cache_control_to_last_user_message(
             &mut messages,
+            request.request_only_tail_blocks,
             vertex_cache_control(),
         );
         messages
@@ -1305,6 +1306,24 @@ mod tests {
         assert_eq!(MODEL_GEMINI_3_PRO, "gemini-3.0-pro");
     }
 
+    #[test]
+    fn claude_cached_messages_keep_the_breakpoint_off_request_only_context() -> anyhow::Result<()> {
+        let mut request = ChatRequest::new(
+            "system",
+            vec![agent_sdk_foundation::llm::Message::user("hello")],
+        );
+        request.append_request_only_reminder("plan: 0/1 done");
+
+        let wire = serde_json::to_value(VertexProvider::build_cached_vertex_claude_messages(
+            &request,
+        ))?;
+
+        assert_eq!(wire[0]["content"][0]["text"], "hello");
+        assert_eq!(wire[0]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert!(wire[0]["content"][1].get("cache_control").is_none());
+        Ok(())
+    }
+
     fn request_with_max_tokens(max_tokens: u32, explicit: bool) -> ChatRequest {
         ChatRequest {
             system: String::new(),
@@ -1318,6 +1337,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             cache: None,
+            request_only_tail_blocks: 0,
         }
     }
 

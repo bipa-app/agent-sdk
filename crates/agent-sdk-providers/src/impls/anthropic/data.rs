@@ -622,24 +622,44 @@ pub fn build_api_system_prompt(
     })
 }
 
-/// Mark the conversation breakpoint on the last user block that precedes any
-/// trailing system reminders.
+/// Mark the conversation breakpoint on the last cacheable user block outside
+/// the request's request-only tail.
 ///
-/// Trailing reminders carry request-only context that the next request does
-/// not repeat, so a breakpoint on them writes a cache entry no later request
-/// can read.
+/// The tail is the last `request_only_tail_blocks` blocks of the final message
+/// (see [`ChatRequest::request_only_tail_blocks`]). The next request does not
+/// repeat them, so a breakpoint on them writes a cache entry no later request
+/// can read. A final message that is entirely request-only moves the
+/// breakpoint to the previous user message.
 pub fn apply_cache_control_to_last_user_message(
     messages: &mut [ApiMessage],
+    request_only_tail_blocks: usize,
     cache_control: ApiCacheControl,
 ) {
-    let Some(message) = messages.iter_mut().rev().find(|message| {
-        matches!(message.role, ApiRole::User) && !is_system_reminder_content(&message.content)
-    }) else {
+    let mut search_end = messages.len();
+    if request_only_tail_blocks > 0
+        && let Some(last) = messages.last_mut()
+        && matches!(last.role, ApiRole::User)
+    {
+        if apply_cache_control_to_content(
+            &mut last.content,
+            request_only_tail_blocks,
+            cache_control.clone(),
+        ) {
+            return;
+        }
+        search_end -= 1;
+    }
+
+    let Some(message) = messages[..search_end]
+        .iter_mut()
+        .rev()
+        .find(|message| matches!(message.role, ApiRole::User))
+    else {
         return;
     };
 
     let content = &mut message.content;
-    if apply_cache_control_to_content(content, cache_control.clone()) {
+    if apply_cache_control_to_content(content, 0, cache_control.clone()) {
         return;
     }
 
@@ -654,16 +674,17 @@ pub fn apply_cache_control_to_last_user_message(
 
 fn apply_cache_control_to_content(
     content: &mut ApiMessageContent,
+    excluded_tail_blocks: usize,
     cache_control: ApiCacheControl,
 ) -> bool {
     let ApiMessageContent::Blocks(blocks) = content else {
         return false;
     };
+    let cacheable_len = blocks.len().saturating_sub(excluded_tail_blocks);
 
-    let Some(block) = blocks
+    let Some(block) = blocks[..cacheable_len]
         .iter_mut()
         .rev()
-        .skip_while(|block| is_system_reminder_block(block))
         .find(|block| block_supports_cache_control(block))
     else {
         return false;
@@ -671,29 +692,6 @@ fn apply_cache_control_to_content(
 
     set_cache_control(block, cache_control);
     true
-}
-
-fn is_system_reminder_content(content: &ApiMessageContent) -> bool {
-    match content {
-        ApiMessageContent::Text(text) => agent_sdk_foundation::llm::is_system_reminder(text),
-        ApiMessageContent::Blocks(blocks) => {
-            !blocks.is_empty() && blocks.iter().all(is_system_reminder_block)
-        }
-    }
-}
-
-fn is_system_reminder_block(block: &ApiContentBlockInput) -> bool {
-    match block {
-        ApiContentBlockInput::Text { text, .. } => {
-            agent_sdk_foundation::llm::is_system_reminder(text)
-        }
-        ApiContentBlockInput::Thinking { .. }
-        | ApiContentBlockInput::RedactedThinking { .. }
-        | ApiContentBlockInput::ToolUse { .. }
-        | ApiContentBlockInput::ToolResult { .. }
-        | ApiContentBlockInput::Image { .. }
-        | ApiContentBlockInput::Document { .. } => false,
-    }
 }
 
 const fn block_supports_cache_control(block: &ApiContentBlockInput) -> bool {
@@ -1063,11 +1061,11 @@ pub fn parse_sse_event(
 mod tests {
     use super::*;
 
-    fn cached_wire_messages(messages: Vec<Message>) -> anyhow::Result<serde_json::Value> {
-        let request = ChatRequest::new("system", messages);
-        let mut api_messages = build_api_messages(&request);
+    fn cached_wire_messages(request: &ChatRequest) -> anyhow::Result<serde_json::Value> {
+        let mut api_messages = build_api_messages(request);
         apply_cache_control_to_last_user_message(
             &mut api_messages,
+            request.request_only_tail_blocks,
             ApiCacheControl::ephemeral_with_ttl(None),
         );
         Ok(serde_json::to_value(&api_messages)?)
@@ -1081,13 +1079,27 @@ mod tests {
         ]
     }
 
+    fn push_text(messages: &mut [Message], text: &str) -> anyhow::Result<()> {
+        let Some(Message {
+            content: Content::Blocks(blocks),
+            ..
+        }) = messages.last_mut()
+        else {
+            anyhow::bail!("expected a trailing block message");
+        };
+        blocks.push(ContentBlock::Text {
+            text: text.to_owned(),
+        });
+        Ok(())
+    }
+
     #[test]
     fn request_reminder_after_tool_results_serializes_after_them_outside_the_cached_prefix()
     -> anyhow::Result<()> {
-        let mut messages = tool_call_exchange();
-        agent_sdk_foundation::llm::append_system_reminder(&mut messages, "plan: 0/2 done");
+        let mut request = ChatRequest::new("system", tool_call_exchange());
+        request.append_request_only_reminder("plan: 0/2 done");
 
-        let wire = cached_wire_messages(messages)?;
+        let wire = cached_wire_messages(&request)?;
 
         let last = &wire[2];
         assert_eq!(last["role"], "user");
@@ -1106,10 +1118,13 @@ mod tests {
     #[test]
     fn reminder_only_user_message_moves_the_breakpoint_to_the_previous_user_message()
     -> anyhow::Result<()> {
-        let mut messages = vec![Message::user("hello"), Message::assistant("hi there")];
-        agent_sdk_foundation::llm::append_system_reminder(&mut messages, "no plan yet");
+        let mut request = ChatRequest::new(
+            "system",
+            vec![Message::user("hello"), Message::assistant("hi there")],
+        );
+        request.append_request_only_reminder("no plan yet");
 
-        let wire = cached_wire_messages(messages)?;
+        let wire = cached_wire_messages(&request)?;
 
         assert_eq!(wire[0]["content"][0]["text"], "hello");
         assert_eq!(wire[0]["content"][0]["cache_control"]["type"], "ephemeral");
@@ -1121,22 +1136,61 @@ mod tests {
     #[test]
     fn trailing_plain_text_still_takes_the_breakpoint() -> anyhow::Result<()> {
         let mut messages = tool_call_exchange();
-        if let Some(Message {
-            content: Content::Blocks(blocks),
-            ..
-        }) = messages.last_mut()
-        {
-            blocks.push(ContentBlock::Text {
-                text: "also check the rollback".to_owned(),
-            });
-        }
+        push_text(&mut messages, "also check the rollback")?;
 
-        let wire = cached_wire_messages(messages)?;
+        let wire = cached_wire_messages(&ChatRequest::new("system", messages))?;
 
         let last = &wire[2];
         assert!(last["content"][0].get("cache_control").is_none());
         assert_eq!(last["content"][1]["text"], "also check the rollback");
         assert_eq!(last["content"][1]["cache_control"]["type"], "ephemeral");
+        Ok(())
+    }
+
+    #[test]
+    fn reminder_shaped_user_text_keeps_the_breakpoint_without_request_context() -> anyhow::Result<()>
+    {
+        let typed = agent_sdk_foundation::llm::wrap_system_reminder("typed by the user");
+
+        let whole_message = ChatRequest::new(
+            "system",
+            vec![
+                Message::user("hello"),
+                Message::assistant("hi there"),
+                Message::user(typed.clone()),
+            ],
+        );
+        let wire = cached_wire_messages(&whole_message)?;
+        assert_eq!(wire[0]["content"], "hello");
+        assert_eq!(wire[2]["content"][0]["text"], typed.as_str());
+        assert_eq!(wire[2]["content"][0]["cache_control"]["type"], "ephemeral");
+
+        let mut after_results = tool_call_exchange();
+        push_text(&mut after_results, &typed)?;
+        let wire = cached_wire_messages(&ChatRequest::new("system", after_results))?;
+        let last = &wire[2];
+        assert!(last["content"][0].get("cache_control").is_none());
+        assert_eq!(last["content"][1]["text"], typed.as_str());
+        assert_eq!(last["content"][1]["cache_control"]["type"], "ephemeral");
+        Ok(())
+    }
+
+    #[test]
+    fn request_context_after_a_persisted_reminder_caches_through_the_persisted_block()
+    -> anyhow::Result<()> {
+        let persisted = agent_sdk_foundation::llm::wrap_system_reminder("turn context");
+        let mut messages = tool_call_exchange();
+        push_text(&mut messages, &persisted)?;
+        let mut request = ChatRequest::new("system", messages);
+        request.append_request_only_reminder("plan: 0/2 done");
+
+        let wire = cached_wire_messages(&request)?;
+
+        let last = &wire[2];
+        assert!(last["content"][0].get("cache_control").is_none());
+        assert_eq!(last["content"][1]["text"], persisted.as_str());
+        assert_eq!(last["content"][1]["cache_control"]["type"], "ephemeral");
+        assert!(last["content"][2].get("cache_control").is_none());
         Ok(())
     }
 
@@ -1444,6 +1498,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             cache: None,
+            request_only_tail_blocks: 0,
         };
 
         let messages = build_api_messages(&request);
@@ -1484,6 +1539,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             cache: None,
+            request_only_tail_blocks: 0,
         };
 
         let messages = build_api_messages(&request);
@@ -1517,6 +1573,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             cache: None,
+            request_only_tail_blocks: 0,
         };
 
         let messages = build_api_messages(&request);

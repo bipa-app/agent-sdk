@@ -3746,6 +3746,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             cache: None,
+            request_only_tail_blocks: 0,
         };
 
         let api_messages = build_api_messages(&request);
@@ -3773,6 +3774,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             cache: None,
+            request_only_tail_blocks: 0,
         };
 
         let api_messages = build_api_messages(&request);
@@ -3793,6 +3795,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             cache: None,
+            request_only_tail_blocks: 0,
         }
     }
 
@@ -4720,6 +4723,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             cache: None,
+            request_only_tail_blocks: 0,
         };
 
         for model in [

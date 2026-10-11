@@ -1519,13 +1519,10 @@ async fn prompt_too_long_triggers_emergency_compaction_and_retry() -> Result<()>
     Ok(())
 }
 
-/// The request rebuilt after emergency compaction carries the definition's
-/// request-only context again, while the summarization call and the compacted
-/// projection never see it.
-#[tokio::test]
-async fn prompt_too_long_retry_reapplies_request_context() -> Result<()> {
-    const MARKER: &str = "REQUEST-ONLY-OVERFLOW-91c2";
-    let fixtures = Fixtures::new();
+async fn overflow_then_recover(
+    fixtures: &Fixtures,
+    request_context_fn: crate::worker::definition::RequestContextFn,
+) -> Result<Vec<ChatRequest>> {
     seed_projection_history(&fixtures.messages, &thread_id(), 12, &"y".repeat(200)).await?;
     let cfg = CompactionConfig::default()
         .with_engine(CompactionEngine::PruneFirst)
@@ -1540,7 +1537,7 @@ async fn prompt_too_long_retry_reapplies_request_context() -> Result<()> {
 
     let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
     let mut bootstrap = sample_bootstrap(task);
-    bootstrap.definition.request_context_fn = Some(Arc::new(|_| Some(MARKER.to_owned())));
+    bootstrap.definition.request_context_fn = Some(request_context_fn);
     let inputs = build_root_worker_inputs(
         bootstrap,
         &fixtures.threads,
@@ -1560,23 +1557,37 @@ async fn prompt_too_long_retry_reapplies_request_context() -> Result<()> {
     let RootTurnOutcome::Completed { .. } = outcome else {
         anyhow::bail!("expected Completed turn after emergency compaction");
     };
+    scripted.captured_requests()
+}
 
-    let requests = scripted.captured_requests()?;
+fn ends_with_request_context(request: &ChatRequest, marker: &str) -> bool {
+    matches!(
+        request.messages.last().map(|message| &message.content),
+        Some(Content::Blocks(blocks)) if matches!(
+            blocks.last(),
+            Some(ContentBlock::Text { text })
+                if text == &format!("<system-reminder>\n{marker}\n</system-reminder>")
+        )
+    )
+}
+
+/// The request rebuilt after emergency compaction carries the definition's
+/// request-only context again, while the summarization call and the compacted
+/// projection never see it.
+#[tokio::test]
+async fn prompt_too_long_retry_reapplies_request_context() -> Result<()> {
+    const MARKER: &str = "REQUEST-ONLY-OVERFLOW-91c2";
+    let fixtures = Fixtures::new();
+    let requests = overflow_then_recover(&fixtures, Arc::new(|_| Some(MARKER.to_owned()))).await?;
+
     let [rejected, summarization, retry] = requests.as_slice() else {
         anyhow::bail!("expected rejection, summarization, and retry requests");
     };
-    let ends_with_context = |request: &ChatRequest| {
-        matches!(
-            request.messages.last().map(|message| &message.content),
-            Some(Content::Blocks(blocks)) if matches!(
-                blocks.last(),
-                Some(ContentBlock::Text { text })
-                    if text == &format!("<system-reminder>\n{MARKER}\n</system-reminder>")
-            )
-        )
-    };
-    assert!(ends_with_context(rejected));
-    assert!(ends_with_context(retry));
+    assert!(ends_with_request_context(rejected, MARKER));
+    assert!(ends_with_request_context(retry, MARKER));
+    assert_eq!(rejected.request_only_tail_blocks, 1);
+    assert_eq!(retry.request_only_tail_blocks, 1);
+    assert_eq!(summarization.request_only_tail_blocks, 0);
     assert!(retry.messages.len() < rejected.messages.len());
     assert!(!format!("{:?}", summarization.messages).contains(MARKER));
 
@@ -1584,6 +1595,33 @@ async fn prompt_too_long_retry_reapplies_request_context() -> Result<()> {
     assert!(!format!("{projection:?}").contains(MARKER));
     let events = fixtures.events.get_events(&thread_id()).await?;
     assert!(!format!("{events:?}").contains(MARKER));
+    Ok(())
+}
+
+/// The rebuild re-asks the hook, so context it stops returning leaves the
+/// retry with no request-only tail rather than the rejected request's count.
+#[tokio::test]
+async fn prompt_too_long_retry_clears_request_context_the_hook_withdraws() -> Result<()> {
+    const MARKER: &str = "REQUEST-ONLY-WITHDRAWN-4d81";
+    let fixtures = Fixtures::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let hook_calls = Arc::clone(&calls);
+    let requests = overflow_then_recover(
+        &fixtures,
+        Arc::new(move |_| {
+            (hook_calls.fetch_add(1, Ordering::SeqCst) == 0).then(|| MARKER.to_owned())
+        }),
+    )
+    .await?;
+
+    let [rejected, _summarization, retry] = requests.as_slice() else {
+        anyhow::bail!("expected rejection, summarization, and retry requests");
+    };
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(ends_with_request_context(rejected, MARKER));
+    assert_eq!(rejected.request_only_tail_blocks, 1);
+    assert!(!format!("{:?}", retry.messages).contains(MARKER));
+    assert_eq!(retry.request_only_tail_blocks, 0);
     Ok(())
 }
 

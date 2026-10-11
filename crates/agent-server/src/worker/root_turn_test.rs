@@ -11622,33 +11622,29 @@ fn request_only_reminder(kind: &str) -> ContentBlock {
     }
 }
 
-fn without_system_reminders(
-    messages: &[agent_sdk_foundation::llm::Message],
-) -> Vec<agent_sdk_foundation::llm::Message> {
-    messages
-        .iter()
-        .map(|message| match &message.content {
-            agent_sdk_foundation::llm::Content::Blocks(blocks) => {
-                agent_sdk_foundation::llm::Message {
-                    role: message.role,
-                    content: agent_sdk_foundation::llm::Content::Blocks(
-                        blocks
-                            .iter()
-                            .filter(|block| {
-                                !matches!(
-                                    block,
-                                    ContentBlock::Text { text }
-                                        if agent_sdk_foundation::llm::is_system_reminder(text)
-                                )
-                            })
-                            .cloned()
-                            .collect(),
-                    ),
-                }
-            }
-            agent_sdk_foundation::llm::Content::Text(_) => message.clone(),
-        })
-        .collect()
+fn without_request_only_context(
+    request: &ChatRequest,
+) -> Result<Vec<agent_sdk_foundation::llm::Message>> {
+    let mut messages = request.messages.clone();
+    if request.request_only_tail_blocks == 0 {
+        return Ok(messages);
+    }
+    let Some(agent_sdk_foundation::llm::Message {
+        content: agent_sdk_foundation::llm::Content::Blocks(blocks),
+        ..
+    }) = messages.last_mut()
+    else {
+        bail!("request-only context must end a block message");
+    };
+    let kept = blocks
+        .len()
+        .checked_sub(request.request_only_tail_blocks)
+        .context("request-only tail longer than the final message")?;
+    blocks.truncate(kept);
+    if blocks.is_empty() {
+        messages.pop();
+    }
+    Ok(messages)
 }
 
 async fn root_inputs_with_definition(
@@ -11790,8 +11786,10 @@ async fn request_context_reaches_each_provider_request_but_no_durable_store() ->
     else {
         bail!("expected the tool call to suspend the turn");
     };
+    let first_request = first.single_request()?;
+    assert_eq!(first_request.request_only_tail_blocks, 1);
     assert_eq!(
-        first.single_request()?.messages.last(),
+        first_request.messages.last(),
         Some(&agent_sdk_foundation::llm::Message::user_with_content(
             vec![
                 ContentBlock::Text {
@@ -11837,6 +11835,7 @@ async fn request_context_reaches_each_provider_request_but_no_durable_store() ->
         bail!("expected the resumed turn to complete");
     };
     let second_request = second.single_request()?;
+    assert_eq!(second_request.request_only_tail_blocks, 1);
     assert_eq!(
         second_request.messages.last(),
         Some(&agent_sdk_foundation::llm::Message::user_with_content(
@@ -11858,10 +11857,8 @@ async fn request_context_reaches_each_provider_request_but_no_durable_store() ->
     // Committed history is exactly the dispatched conversation minus the
     // request-only context, followed by the final answer.
     let history = stores.messages.get_history(&thread_a()).await?;
-    assert_eq!(history.len(), second_request.messages.len() + 1);
-    assert_eq!(
-        history[..second_request.messages.len()],
-        without_system_reminders(&second_request.messages)[..],
-    );
+    let dispatched = without_request_only_context(&second_request)?;
+    assert_eq!(history.len(), dispatched.len() + 1);
+    assert_eq!(history[..dispatched.len()], dispatched[..]);
     assert_no_durable_store_carries(&stores, &parent_task, &commit, REQUEST_ONLY_MARKER).await
 }
