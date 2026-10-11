@@ -7274,6 +7274,7 @@ impl LlmProvider for RequestLogProvider {
             model: "mock-model".into(),
             stop_reason: Some(StopReason::EndTurn),
             usage: Usage {
+                request_input_tokens: None,
                 served_speed: None,
                 input_tokens: 70,
                 output_tokens: 20,
