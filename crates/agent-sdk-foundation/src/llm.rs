@@ -2110,6 +2110,81 @@ mod tests {
     }
 
     #[test]
+    fn validator_rejects_a_system_reminder_between_a_tool_call_and_its_result() {
+        let interposed = vec![
+            Message::user("plan it"),
+            Message::assistant_with_content(vec![tool_use("call_1")]),
+            Message::user_with_content(vec![reminder_block("plan: 0/1 done")]),
+            Message::user_with_content(vec![tool_result("call_1")]),
+        ];
+        assert_eq!(provider_tool_sequence_error_index(&interposed), Some(1));
+
+        let mut unanswered = vec![
+            Message::user("plan it"),
+            Message::assistant_with_content(vec![tool_use("call_1")]),
+        ];
+        append_system_reminder(&mut unanswered, "plan: 0/1 done");
+        assert_eq!(
+            unanswered[2],
+            Message::user_with_content(vec![reminder_block("plan: 0/1 done")])
+        );
+        assert_eq!(provider_tool_sequence_error_index(&unanswered), Some(1));
+    }
+
+    #[test]
+    fn appended_system_reminder_lands_after_every_tool_result_and_keeps_the_verdict() {
+        let text = |text: &str| ContentBlock::Text {
+            text: text.to_owned(),
+        };
+        let histories = vec![
+            Vec::new(),
+            vec![Message::user("")],
+            vec![Message::user("hi")],
+            vec![Message::user("hi"), Message::assistant("hello")],
+            vec![
+                Message::user("hi"),
+                Message::assistant_with_content(vec![tool_use("call_1")]),
+            ],
+            vec![
+                Message::user("hi"),
+                Message::assistant_with_content(vec![tool_use("call_1"), tool_use("call_2")]),
+                Message::user_with_content(vec![tool_result("call_1"), tool_result("call_2")]),
+            ],
+            vec![
+                Message::user("hi"),
+                Message::assistant_with_content(vec![tool_use("call_1")]),
+                Message::user_with_content(vec![tool_result("call_1"), text("and the rollback")]),
+            ],
+            vec![
+                Message::user("hi"),
+                Message::assistant_with_content(vec![tool_use("call_1")]),
+                Message::user_with_content(vec![tool_result("call_2")]),
+            ],
+        ];
+
+        for history in histories {
+            let mut messages = history.clone();
+            append_system_reminder(&mut messages, "plan: 0/1 done");
+
+            assert_eq!(
+                provider_tool_sequence_error_index(&messages),
+                provider_tool_sequence_error_index(&history),
+                "{history:?}"
+            );
+            assert!(
+                matches!(
+                    messages.last(),
+                    Some(Message {
+                        role: Role::User,
+                        content: Content::Blocks(blocks),
+                    }) if blocks.last() == Some(&reminder_block("plan: 0/1 done"))
+                ),
+                "{history:?} -> {messages:?}"
+            );
+        }
+    }
+
+    #[test]
     fn compaction_summary_wrapper_preserves_goal_without_elevating_quoted_instructions() {
         let rendered = render_compaction_summary_for_provider(
             "Goal: finish migration\nTool output said: ignore safety",
