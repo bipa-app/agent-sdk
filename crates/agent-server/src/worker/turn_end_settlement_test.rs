@@ -1,5 +1,6 @@
-//! A root turn that fails while descendants are still live settles them:
-//! nothing is left waiting on a fan-in that can never run again.
+//! A root turn that ends while descendants are still live settles them:
+//! nothing is left waiting on a fan-in that can never run again, and input
+//! the turn never delivered becomes the thread's next turn.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -13,7 +14,7 @@ use anyhow::{Context, Result};
 use time::{Duration, OffsetDateTime};
 
 use super::definition::ChildJoinPolicy;
-use super::root_turn::{RootTurnDeps, fail_root_turn};
+use super::root_turn::{RootTurnDeps, fail_root_turn, settle_live_descendants};
 use super::subagent::{
     EffectiveSubagentCapabilities, EffectiveSubagentMcpPolicy, EffectiveSubagentSpec,
     InheritedSubagentPolicy, SubagentSandboxPolicy,
@@ -25,11 +26,12 @@ use crate::journal::message_store::InMemoryMessageProjectionStore;
 use crate::journal::outbox::InMemoryOutboxStore;
 use crate::journal::store::{
     AgentTaskStore, CancellationMarkerSink, InMemoryAgentTaskStore,
-    InMemoryAtomicSpawnEventCommitter, SubagentInvocationSpawn,
+    InMemoryAtomicSpawnEventCommitter, SubagentInvocationSpawn, SubmitDisposition,
+    SubmitRootTurnParams,
 };
 use crate::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, SuspensionPayload,
-    TaskStatus, WorkerId,
+    TaskKind, TaskStatus, WorkerId,
 };
 use crate::journal::task_state::TaskState;
 use crate::journal::thread_store::{InMemoryThreadStore, ThreadStore};
@@ -340,4 +342,114 @@ async fn failed_root_turn_closes_a_live_child_thread_for_its_followers() -> Resu
         closing.event,
     );
     Ok(())
+}
+
+/// Submit `text` while the thread's root is running, so it waits as an
+/// injection for that turn's next boundary.
+async fn inject(stores: &Stores, thread: &ThreadId, text: &str, at: i64) -> Result<AgentTask> {
+    let outcome = stores
+        .tasks
+        .submit_root_turn_idempotent(SubmitRootTurnParams {
+            task: AgentTask::new_root_turn_with_input_and_caller(
+                thread.clone(),
+                vec![SubmittedInputItem::Text { text: text.into() }],
+                serde_json::json!({ "client": "tui" }),
+                t_plus(at),
+                3,
+            ),
+            idempotency: None,
+            max_queued_depth: None,
+            disposition: SubmitDisposition::InjectAtBoundary,
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    assert_eq!(outcome.task.kind, TaskKind::InputInjection);
+    assert_eq!(outcome.task.status, TaskStatus::Queued);
+    Ok(outcome.task)
+}
+
+async fn root_turns(stores: &Stores, thread: &ThreadId) -> Result<Vec<AgentTask>> {
+    Ok(stores
+        .tasks
+        .list_by_thread(thread)
+        .await?
+        .into_iter()
+        .filter(|task| task.kind == TaskKind::RootTurn)
+        .collect())
+}
+
+/// The injection was handed over, not dropped, and the thread's next turn
+/// carries it: same input, same caller metadata, its place in the queue.
+async fn assert_readmitted(
+    stores: &Stores,
+    thread: &ThreadId,
+    ended_root: &AgentTaskId,
+    injection: &AgentTask,
+) -> Result<()> {
+    let handed_over = status_of(stores, &injection.id).await?;
+    assert_eq!(handed_over.status, TaskStatus::Completed);
+    assert_eq!(handed_over.terminal_reason, Some(TerminalReason::Completed));
+
+    let next_turns: Vec<AgentTask> = root_turns(stores, thread)
+        .await?
+        .into_iter()
+        .filter(|root| root.id != *ended_root)
+        .collect();
+    assert_eq!(next_turns.len(), 1, "exactly one next turn: {next_turns:?}");
+    let next = &next_turns[0];
+    assert_eq!(next.status, TaskStatus::Pending);
+    assert_eq!(
+        serde_json::to_value(&next.submitted_input)?,
+        serde_json::to_value(&injection.submitted_input)?,
+    );
+    assert_eq!(next.caller_metadata, injection.caller_metadata);
+    assert_eq!(next.created_at, injection.created_at);
+    Ok(())
+}
+
+#[tokio::test]
+async fn settling_a_completed_root_readmits_its_undelivered_injection() -> Result<()> {
+    let stores = Stores::new();
+    let thread = ThreadId::from_string("settle-late-injection");
+    let (root, worker, lease) = running_root(&stores, &thread).await?;
+    let injection = inject(&stores, &thread, "also check the tests", 2).await?;
+    stores
+        .tasks
+        .complete_task(&root.id, &worker, &lease, t_plus(3))
+        .await?;
+
+    let settled = settle_live_descendants(&root.id, &stores.deps(), t_plus(10)).await?;
+    assert_eq!(settled, vec![injection.id.clone()]);
+    assert_readmitted(&stores, &thread, &root.id, &injection).await?;
+    assert_eq!(
+        status_of(&stores, &root.id).await?.status,
+        TaskStatus::Completed,
+        "the ended root keeps its outcome",
+    );
+
+    let again = settle_live_descendants(&root.id, &stores.deps(), t_plus(20)).await?;
+    assert!(again.is_empty(), "settlement is idempotent: {again:?}");
+    assert_eq!(root_turns(&stores, &thread).await?.len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_root_turn_readmits_its_undelivered_injection() -> Result<()> {
+    let stores = Stores::new();
+    let thread = ThreadId::from_string("fail-late-injection");
+    let (root, worker, lease) = running_root(&stores, &thread).await?;
+    let injection = inject(&stores, &thread, "also check the tests", 2).await?;
+
+    fail_root_turn(
+        &root.id,
+        &worker,
+        &lease,
+        &thread,
+        &anyhow::anyhow!("provider refused"),
+        &stores.deps(),
+        t_plus(10),
+    )
+    .await?;
+
+    assert_readmitted(&stores, &thread, &root.id, &injection).await
 }

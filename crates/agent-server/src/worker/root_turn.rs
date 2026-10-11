@@ -73,7 +73,10 @@ use crate::journal::event_notifier::EventNotifier;
 use crate::journal::event_repository::EventRepository;
 use crate::journal::execution_context::RootWorkerInputs;
 use crate::journal::message_store::MessageProjectionStore;
-use crate::journal::store::{AgentTaskStore, QuestionPause, ReattachedChild};
+use crate::journal::store::{
+    AgentTaskStore, QuestionPause, ReattachedChild, SubmitDisposition, SubmitRootIdempotency,
+    SubmitRootTurnError, SubmitRootTurnParams,
+};
 use crate::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskKind, TaskStatus,
     WorkerId,
@@ -678,20 +681,24 @@ async fn fail_root_turn_inner(
     Ok(failed_task)
 }
 
-/// Cancel every descendant still live under the terminal root `task_id`.
+/// Settle every descendant still live under the terminal root `task_id`.
 ///
 /// A terminal root's fan-in never runs again, so a descendant left live —
-/// running, never started, parked on a confirmation nobody will answer, or
-/// an injected input no boundary will deliver — only strands whatever waits
-/// on it. A root that is not terminal is left alone: settling never
-/// cancels live work.
+/// running, never started, or parked on a confirmation nobody will answer —
+/// only strands whatever waits on it, and is cancelled. Input submitted into
+/// the turn that no boundary delivered is not the turn's work but the
+/// user's: unless the user stopped the turn, it becomes the thread's next
+/// turn (see [`readmit_undelivered_injections`]). A root that is not
+/// terminal is left alone: settling never cancels live work.
 ///
 /// Child-thread roots reached through a live subagent invocation are
 /// cancelled with their closing marker, which is forwarded here to the
 /// threads' live followers. Returns the ids that transitioned; idempotent.
 ///
 /// # Errors
-/// Returns an error if the root cannot be read or the cascade is rejected.
+/// Returns an error if the root cannot be read, an injection cannot be
+/// re-admitted, or the cascade is rejected; nothing is cancelled before
+/// every injection is re-admitted, so a retry loses no input.
 pub async fn settle_live_descendants(
     task_id: &AgentTaskId,
     deps: &RootTurnDeps<'_>,
@@ -702,9 +709,10 @@ pub async fn settle_live_descendants(
         .get(task_id)
         .await
         .context("read root before settling its descendants")?;
-    if !root.is_some_and(|root| root.status.is_terminal()) {
+    let Some(root) = root.filter(|root| root.status.is_terminal()) else {
         return Ok(Vec::new());
-    }
+    };
+    let mut settled = readmit_undelivered_injections(&root, deps, now).await?;
     let outcome = deps
         .task_store
         .cancel_tree(task_id, now)
@@ -713,7 +721,113 @@ pub async fn settle_live_descendants(
     if !outcome.markers.is_empty() {
         deps.event_notifier.notify(&outcome.markers);
     }
-    Ok(outcome.transitioned)
+    settled.extend(outcome.transitioned);
+    Ok(settled)
+}
+
+/// Re-admit the input injections the ended `root` never delivered as the
+/// next turns of its thread, and complete them as handed over.
+///
+/// The input is what it would have been had it arrived a moment later,
+/// once nothing was running: the thread's next turn. It keeps its
+/// submission time, so it queues ahead of input submitted after it. A user
+/// stop discards it with the rest of the tree, and so does a thread being
+/// purged. Admission is keyed on the injection, so a retry after a crash
+/// between the two steps replays it instead of admitting it twice.
+async fn readmit_undelivered_injections(
+    root: &AgentTask,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<Vec<AgentTaskId>> {
+    match root.status {
+        TaskStatus::Completed | TaskStatus::Failed => {}
+        TaskStatus::Cancelled
+        | TaskStatus::Queued
+        | TaskStatus::Pending
+        | TaskStatus::Running
+        | TaskStatus::WaitingOnChildren
+        | TaskStatus::AwaitingConfirmation
+        | TaskStatus::AwaitingQuestion => return Ok(Vec::new()),
+    }
+    let undelivered = deps
+        .task_store
+        .list_children(&root.id)
+        .await
+        .context("list a terminal root's undelivered injections")?
+        .into_iter()
+        .filter(|child| {
+            child.kind == TaskKind::InputInjection && child.status == TaskStatus::Queued
+        });
+
+    let mut readmitted = Vec::new();
+    for injection in undelivered {
+        match deps
+            .task_store
+            .submit_root_turn_idempotent(next_turn_from_injection(&injection))
+            .await
+        {
+            Ok(outcome) => log::info!(
+                "re-admitted input {} that turn {} never delivered as turn {}",
+                injection.id,
+                root.id,
+                outcome.task.id,
+            ),
+            Err(SubmitRootTurnError::ThreadStateConflict(conflict)) => {
+                log::info!("dropping undelivered input {}: {conflict}", injection.id);
+                continue;
+            }
+            Err(SubmitRootTurnError::IdempotencyConflict) => {
+                log::warn!(
+                    "dropping undelivered input {}: its re-admission key is taken",
+                    injection.id,
+                );
+                continue;
+            }
+            Err(
+                error @ (SubmitRootTurnError::QueueDepthExceeded { .. }
+                | SubmitRootTurnError::Other(_)),
+            ) => {
+                return Err(anyhow::anyhow!("{error}"))
+                    .with_context(|| format!("re-admit undelivered input {}", injection.id));
+            }
+        }
+        if deps
+            .task_store
+            .complete_input_injection(&injection.id, now)
+            .await
+            .with_context(|| format!("hand over re-admitted input {}", injection.id))?
+            .is_some()
+        {
+            readmitted.push(injection.id);
+        }
+    }
+    Ok(readmitted)
+}
+
+fn next_turn_from_injection(injection: &AgentTask) -> SubmitRootTurnParams {
+    let mut task = AgentTask::new_root_turn_with_optional_caller(
+        injection.thread_id.clone(),
+        injection.submitted_input.clone(),
+        injection.caller_metadata.clone(),
+        injection.created_at,
+        injection.max_attempts,
+    );
+    task.otel_traceparent
+        .clone_from(&injection.otel_traceparent);
+    let result_json = serde_json::json!({
+        "thread_id": injection.thread_id.0,
+        "task_id": task.id.as_str(),
+    });
+    SubmitRootTurnParams {
+        task,
+        idempotency: Some(SubmitRootIdempotency {
+            request_id: format!("readmit:{}", injection.id),
+            fingerprint: injection.id.as_str().as_bytes().to_vec(),
+            result_json,
+        }),
+        max_queued_depth: None,
+        disposition: SubmitDisposition::NextTurn,
+    }
 }
 
 /// Cancel a root turn and its entire subtree.
