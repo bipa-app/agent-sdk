@@ -8386,6 +8386,81 @@ async fn steering_fan_in_carries_result_and_late_result_attachments_in_order() -
     Ok(())
 }
 
+/// An interim answer serialized with its keys in another order (a build
+/// whose JSON maps preserve insertion order) is still closed on cancel.
+#[tokio::test]
+async fn cancel_closes_an_interim_answer_serialized_in_another_key_order() -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
+        &stores,
+        vec![bash_call("call_0"), bash_call("call_1")],
+        ChildJoinPolicy::Any,
+    ))
+    .await?;
+    complete_child_at(
+        &stores,
+        &children[0],
+        &ok_result("done-0"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+    let provider = RequestLogProvider::new("The second call is still running.");
+    run_child_resume(&stores, &parent.id, &provider, t_plus(10), t_plus(12)).await?;
+    let parked = stores.tasks.get(&parent.id).await?.context("parked")?;
+    let pending = parked
+        .state
+        .continuation()
+        .context("parked continuation")?
+        .payload
+        .pending_tool_calls
+        .clone();
+
+    let mut candidate = parked.state.suspended_messages().to_vec();
+    for message in &mut candidate {
+        let agent_sdk_foundation::llm::Content::Blocks(blocks) = &mut message.content else {
+            continue;
+        };
+        for block in blocks {
+            if let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } = block
+                && tool_use_id == "call_1"
+            {
+                let interim: serde_json::Map<String, serde_json::Value> =
+                    serde_json::from_str(content)?;
+                let reversed = interim
+                    .iter()
+                    .rev()
+                    .map(|(key, value)| Ok(format!("{}:{value}", serde_json::to_string(key)?)))
+                    .collect::<Result<Vec<_>>>()?;
+                let reordered = format!("{{{}}}", reversed.join(","));
+                assert_ne!(&reordered, content, "the keys must actually move");
+                *content = reordered;
+            }
+        }
+    }
+
+    commit_partial_turn_on_cancel(
+        PartialCancelCommit {
+            thread_id: &thread_a(),
+            task_id: &parent.id,
+            candidate,
+            expected_turn: 1,
+            agent_state_snapshot: serde_json::Value::Null,
+            pending_tool_calls: &pending,
+        },
+        &stores.deps(),
+        t_plus(20),
+    )
+    .await?;
+    let committed = stores.messages.get_history(&thread_a()).await?;
+    assert_running_call_closed(&committed, "call_1", "cancelled");
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Commit the completed prefix of a cancelled turn (partial commit)
 // ─────────────────────────────────────────────────────────────────────

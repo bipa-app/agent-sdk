@@ -8260,18 +8260,28 @@ pub async fn resume_from_question(
 /// real result arrives at a later fan-in as a late result (see
 /// [`llm::late_tool_result`]).
 fn steering_interim_tool_result() -> ToolResult {
-    let payload = serde_json::json!({
-        "status": "running",
-        "note": "This call is still executing. Do not call it again: it keeps running, and its final result will be delivered automatically in a later message as a late_tool_result for this tool_use_id.",
-    });
     ToolResult {
         success: true,
-        output: payload.to_string(),
+        output: steering_interim_payload().to_string(),
         artifact: None,
         data: None,
         documents: Vec::new(),
         duration_ms: None,
     }
+}
+
+fn steering_interim_payload() -> serde_json::Value {
+    serde_json::json!({
+        "status": "running",
+        "note": "This call is still executing. Do not call it again: it keeps running, and its final result will be delivered automatically in a later message as a late_tool_result for this tool_use_id.",
+    })
+}
+
+/// Whether `content` is the interim payload, compared as JSON so a build
+/// that serializes object keys in another order still recognizes it.
+fn is_interim_payload(content: &str, interim: &serde_json::Value, interim_len: usize) -> bool {
+    content.len() == interim_len
+        && serde_json::from_str::<serde_json::Value>(content).is_ok_and(|value| value == *interim)
 }
 
 /// A child still running at early-resume time. It stays bound to its
@@ -8502,7 +8512,8 @@ fn close_undelivered_interim_calls(
     pending: &[PendingToolCallInfo],
     because: UndeliveredBecause,
 ) -> bool {
-    let interim = steering_interim_tool_result().output;
+    let interim = steering_interim_payload();
+    let interim_len = interim.to_string().len();
     let mut interim_answered = BTreeSet::new();
     let mut late_delivered = BTreeSet::new();
     let blocks = messages
@@ -8517,7 +8528,7 @@ fn close_undelivered_interim_calls(
             content,
             ..
         } = block
-            && *content == interim
+            && is_interim_payload(content, &interim, interim_len)
         {
             interim_answered.insert(tool_use_id.clone());
         } else if let llm::ContentBlock::Text { text } = block
