@@ -7159,7 +7159,9 @@ pub(crate) async fn drain_boundary_injections(
 ///   (including tool-use blocks) captured at the original suspension
 ///   point, also from the [`TaskState::ReadyToResume`] payload.
 /// - `child_results`: completed tool results, one per pending tool
-///   call, keyed by tool-call ID.
+///   call, keyed by tool-call ID. A call the parked history already
+///   answered (an early resume's interim result) gets its result as a
+///   late result, never a second `tool_result`.
 ///
 /// # Execution flow
 ///
@@ -7191,16 +7193,49 @@ pub async fn resume_root_turn(
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<RootTurnOutcome> {
+    let fan_in = fan_in_for_child_results(&continuation, &suspended_messages, child_results)?;
     Box::pin(resume_root_turn_with_fan_in(
         inputs,
         continuation,
         suspended_messages,
-        build_tool_results_message(&child_results),
+        fan_in,
         provider,
         deps,
         now,
     ))
     .await
+}
+
+fn fan_in_for_child_results(
+    continuation: &AgentContinuation,
+    suspended_messages: &[llm::Message],
+    child_results: Vec<(String, ToolResult)>,
+) -> Result<llm::Message> {
+    let answered = answered_tool_use_ids(suspended_messages);
+    let mut tool_results = Vec::with_capacity(child_results.len());
+    let mut late_results = Vec::new();
+    for (tool_use_id, result) in child_results {
+        if answered.contains(tool_use_id.as_str()) {
+            let call = continuation
+                .pending_tool_calls
+                .iter()
+                .find(|call| call.id == tool_use_id)
+                .cloned()
+                .with_context(|| format!("answered call {tool_use_id} is not pending"))?;
+            late_results.push(LateToolResult {
+                call,
+                status: finished_status(&result),
+                result,
+            });
+        } else {
+            tool_results.push((tool_use_id, result));
+        }
+    }
+    Ok(llm::Message::user_with_content(fan_in_blocks(
+        &tool_results,
+        &late_results,
+        &[],
+    )))
 }
 
 /// [`resume_root_turn`] with a prebuilt fan-in user message, which may
@@ -7637,9 +7672,8 @@ async fn buffer_resume_messages(
     Ok(())
 }
 
-/// Build a user message containing tool-result blocks for each
-/// completed child task, followed by the results' native binary
-/// attachments (images/documents).
+/// Tool-result blocks for each completed child task, followed by the
+/// results' native binary attachments (images/documents).
 ///
 /// Two passes, matching the in-process loop's `append_tool_results`:
 /// Anthropic requires EVERY `tool_result` block to precede any other
@@ -7649,11 +7683,7 @@ async fn buffer_resume_messages(
 /// Artifact-backed sources (`artifact://…` data) ride along untouched;
 /// the pre-call hydration seam restores their bytes for the provider
 /// request.
-pub(crate) fn build_tool_results_message(child_results: &[(String, ToolResult)]) -> llm::Message {
-    llm::Message::user_with_content(tool_result_blocks(child_results))
-}
-
-fn tool_result_blocks(child_results: &[(String, ToolResult)]) -> Vec<llm::ContentBlock> {
+pub(crate) fn tool_result_blocks(child_results: &[(String, ToolResult)]) -> Vec<llm::ContentBlock> {
     let mut blocks: Vec<llm::ContentBlock> = Vec::new();
     for (tool_use_id, result) in child_results {
         blocks.push(llm::ContentBlock::ToolResult {
@@ -8194,22 +8224,15 @@ struct LateToolResult {
     result: ToolResult,
 }
 
-impl LateToolResult {
-    fn finished(call: PendingToolCallInfo, child_status: TaskStatus, result: ToolResult) -> Self {
-        let status = if child_status == TaskStatus::Cancelled {
-            LateToolResultStatus::Cancelled
-        } else if result.success {
-            LateToolResultStatus::Success
-        } else {
-            LateToolResultStatus::Error
-        };
-        Self {
-            call,
-            status,
-            result,
-        }
+const fn finished_status(result: &ToolResult) -> LateToolResultStatus {
+    if result.success {
+        LateToolResultStatus::Success
+    } else {
+        LateToolResultStatus::Error
     }
+}
 
+impl LateToolResult {
     fn render(&self) -> String {
         llm::late_tool_result::render(&self.call, self.status, &self.result.output)
     }
@@ -8307,7 +8330,16 @@ async fn build_steering_interim(
         if child.status.is_terminal() {
             let result = extract_child_tool_result(child)?;
             if already_answered {
-                late_results.push(LateToolResult::finished(call.clone(), child.status, result));
+                let status = if child.status == TaskStatus::Cancelled {
+                    LateToolResultStatus::Cancelled
+                } else {
+                    finished_status(&result)
+                };
+                late_results.push(LateToolResult {
+                    call: call.clone(),
+                    status,
+                    result,
+                });
             } else {
                 tool_results.push((call.id.clone(), result));
             }
@@ -8337,19 +8369,28 @@ fn build_fan_in_message(
     interim: &SteeringInterim,
     steering: &[llm::ContentBlock],
 ) -> Result<llm::Message> {
-    let mut blocks = tool_result_blocks(&interim.tool_results);
-    for late in &interim.late_results {
+    let blocks = fan_in_blocks(&interim.tool_results, &interim.late_results, steering);
+    ensure!(
+        !blocks.is_empty(),
+        "child fan-in has nothing to deliver: every parked call is already answered and still running",
+    );
+    Ok(llm::Message::user_with_content(blocks))
+}
+
+fn fan_in_blocks(
+    tool_results: &[(String, ToolResult)],
+    late_results: &[LateToolResult],
+    steering: &[llm::ContentBlock],
+) -> Vec<llm::ContentBlock> {
+    let mut blocks = tool_result_blocks(tool_results);
+    for late in late_results {
         blocks.push(llm::ContentBlock::Text {
             text: late.render(),
         });
         blocks.extend(tool_result_attachments(&late.result));
     }
     blocks.extend(steering.iter().cloned());
-    ensure!(
-        !blocks.is_empty(),
-        "child fan-in has nothing to deliver: every parked call is already answered and still running",
-    );
-    Ok(llm::Message::user_with_content(blocks))
+    blocks
 }
 
 /// Why a call answered with the interim payload never got its result.

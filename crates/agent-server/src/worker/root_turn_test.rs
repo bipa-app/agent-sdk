@@ -6,12 +6,11 @@
 //! child-outcome aggregation and resume-from-children path.
 
 use super::root_turn::{
-    PartialCancelCommit, RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes,
-    build_tool_results_message, cancel_root_turn, commit_partial_turn_on_cancel,
-    drain_boundary_injections, execute_root_turn, fail_root_turn, is_root_turn_cancelled,
-    provider_valid_split, resume_for_steering, resume_from_children, resume_from_question,
-    resume_root_turn, revert_steering_wake, settle_attempt_after_lost_ownership,
-    terminal_reason_for_root_error,
+    PartialCancelCommit, RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes, cancel_root_turn,
+    commit_partial_turn_on_cancel, drain_boundary_injections, execute_root_turn, fail_root_turn,
+    is_root_turn_cancelled, provider_valid_split, resume_for_steering, resume_from_children,
+    resume_from_question, resume_root_turn, revert_steering_wake,
+    settle_attempt_after_lost_ownership, terminal_reason_for_root_error, tool_result_blocks,
 };
 use crate::journal::checkpoint::CheckpointKind;
 use std::sync::Arc;
@@ -70,14 +69,10 @@ fn fan_in_tool_results_carry_documents_as_native_blocks() {
     let report = agent_sdk_foundation::ToolResult::success("report").with_documents(vec![
         agent_sdk_foundation::llm::ContentSource::new("application/pdf", "ZmFrZQ=="),
     ]);
-    let message = build_tool_results_message(&[
+    let blocks = tool_result_blocks(&[
         ("call_img".to_owned(), screenshot),
         ("call_doc".to_owned(), report),
     ]);
-    assert_eq!(message.role, Role::User);
-    let agent_sdk_foundation::llm::Content::Blocks(blocks) = &message.content else {
-        panic!("fan-in tool results must be a block message");
-    };
     assert_eq!(blocks.len(), 4);
     assert!(
         matches!(&blocks[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_img")
@@ -8049,6 +8044,90 @@ async fn cancelling_after_a_delivered_late_result_does_not_close_the_call_again(
         "the delivered result is the only one: {late:?}"
     );
     assert!(late[0].contains("status=\"success\""), "{}", late[0]);
+    Ok(())
+}
+
+/// The public aggregate + resume pair, driven by hand after an early
+/// resume, delivers the answered call's result as a late result.
+#[tokio::test]
+async fn aggregate_then_resume_after_an_early_resume_answers_each_call_once() -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
+        &stores,
+        vec![bash_call("call_0"), bash_call("call_1")],
+        ChildJoinPolicy::Any,
+    ))
+    .await?;
+    complete_child_at(
+        &stores,
+        &children[0],
+        &ok_result("done-0"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+    let early = RequestLogProvider::new("The second call is still running.");
+    run_child_resume(&stores, &parent.id, &early, t_plus(10), t_plus(12)).await?;
+    complete_child_at(
+        &stores,
+        &children[1],
+        &ok_result("done-1"),
+        t_plus(20),
+        t_plus(21),
+    )
+    .await?;
+
+    let ready = stores
+        .tasks
+        .get(&parent.id)
+        .await?
+        .context("ready parent")?;
+    let continuation = ready
+        .state
+        .continuation()
+        .context("ready continuation")?
+        .payload
+        .clone();
+    let suspended = ready.state.suspended_messages().to_vec();
+    let aggregated = aggregate_child_outcomes(&ready, &continuation, &stores.tasks).await?;
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent.id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            t_plus(30),
+        )
+        .await?
+        .context("acquire ready parent")?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap_with_tools(acquired),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(30),
+    )
+    .await?;
+    let provider = RequestLogProvider::new("All finished.");
+    let outcome = Box::pin(resume_root_turn(
+        inputs,
+        continuation,
+        suspended,
+        aggregated,
+        &provider,
+        &stores.deps(),
+        t_plus(32),
+    ))
+    .await?;
+    assert!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+
+    let request = provider.requests()?.pop().context("resume request")?;
+    assert_each_request_presents_calls_once(std::slice::from_ref(&request), &["call_0", "call_1"]);
+    assert_eq!(count_tool_results(&request, "call_1"), 1);
+    let late = late_results_for(&request, "call_1");
+    assert_eq!(late.len(), 1);
+    assert!(late[0].contains("done-1"), "{}", late[0]);
     Ok(())
 }
 
