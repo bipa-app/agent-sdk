@@ -120,11 +120,15 @@ const MESSAGE_HEAD_HISTORY_GENERATION_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/postgres/0022_message_head_history_generation.sql"
 ));
+const VALIDATE_MESSAGE_HEAD_HISTORY_GENERATION_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/postgres/0023_validate_message_head_history_generation.sql"
+));
 
 /// `sqlx`-managed migration bundle for the Postgres durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/postgres");
 
-const MIGRATIONS: [PostgresMigration; 20] = [
+const MIGRATIONS: [PostgresMigration; 21] = [
     PostgresMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -225,6 +229,11 @@ const MIGRATIONS: [PostgresMigration; 20] = [
         summary: "monotonic history rewrite lineage on message heads",
         sql: MESSAGE_HEAD_HISTORY_GENERATION_SQL,
     },
+    PostgresMigration {
+        version: "0023",
+        summary: "validate the history rewrite lineage check outside the column migration",
+        sql: VALIDATE_MESSAGE_HEAD_HISTORY_GENERATION_SQL,
+    },
 ];
 
 /// Version of the migration this PR introduces: the typed terminal
@@ -258,6 +267,11 @@ pub(crate) const PURGE_SEED_MIGRATION_VERSION: i64 = 19;
 /// `history_generation` rewrite-lineage column on message heads.
 #[cfg(test)]
 pub(crate) const HISTORY_GENERATION_MIGRATION_VERSION: i64 = 22;
+
+/// Version of the migration that validates the `history_generation` check
+/// outside the column migration's ACCESS EXCLUSIVE lock.
+#[cfg(test)]
+pub(crate) const HISTORY_GENERATION_VALIDATION_MIGRATION_VERSION: i64 = 23;
 
 /// The reviewable executable migration bundle for the current durable core.
 #[must_use]
@@ -343,7 +357,86 @@ pub const fn checkpoint_kind_migration() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{DURABLE_CORE_MIGRATOR, TURN_ATTEMPT_EVIDENCE_SQL, durable_core_migrations};
+    use anyhow::{Context, Result, ensure};
+    use sqlx::Connection;
+    use sqlx::postgres::PgConnection;
+
+    use super::{
+        DURABLE_CORE_MIGRATOR, PostgresMigration, TURN_ATTEMPT_EVIDENCE_SQL,
+        durable_core_migrations,
+    };
+
+    async fn history_generation_check_is_validated(conn: &mut PgConnection) -> Result<bool> {
+        let (validated,): (bool,) = sqlx::query_as(
+            "SELECT convalidated FROM pg_constraint
+             WHERE conname = 'agent_sdk_message_heads_history_generation_check'
+               AND conrelid = 'agent_sdk_message_heads'::regclass",
+        )
+        .fetch_one(conn)
+        .await
+        .context("read the history_generation check")?;
+        Ok(validated)
+    }
+
+    async fn assert_history_generation_check_validates_separately(
+        conn: &mut PgConnection,
+    ) -> Result<()> {
+        let (through_column, later): (Vec<&PostgresMigration>, Vec<&PostgresMigration>) =
+            durable_core_migrations()
+                .iter()
+                .partition(|migration| migration.version <= "0022");
+        for migration in through_column {
+            sqlx::raw_sql(migration.sql)
+                .execute(&mut *conn)
+                .await
+                .with_context(|| format!("apply migration {}", migration.version))?;
+        }
+        ensure!(
+            !history_generation_check_is_validated(conn).await?,
+            "0022 must add the check NOT VALID: validating it there scans every \
+             message head under the ACCESS EXCLUSIVE lock its ADD COLUMN holds \
+             until commit",
+        );
+        for migration in later {
+            sqlx::raw_sql(migration.sql)
+                .execute(&mut *conn)
+                .await
+                .with_context(|| format!("apply migration {}", migration.version))?;
+        }
+        ensure!(
+            history_generation_check_is_validated(conn).await?,
+            "a later migration must validate the history_generation check",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn history_generation_check_is_validated_outside_the_column_migration() -> Result<()> {
+        let Ok(database_url) =
+            std::env::var("TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))
+        else {
+            return Ok(());
+        };
+        let schema = format!("history_generation_{}", uuid::Uuid::new_v4().simple());
+        let mut conn = PgConnection::connect(&database_url)
+            .await
+            .context("connect postgres for the migration test")?;
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&mut conn)
+            .await
+            .with_context(|| format!("create test schema {schema}"))?;
+        sqlx::query(sqlx::AssertSqlSafe(format!("SET search_path TO {schema}")))
+            .execute(&mut conn)
+            .await
+            .context("scope the connection to the test schema")?;
+
+        let outcome = assert_history_generation_check_validates_separately(&mut conn).await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&mut conn)
+            .await
+            .with_context(|| format!("drop test schema {schema}"))?;
+        outcome
+    }
 
     /// Guard against the finding-#20 regression: the reviewable
     /// [`durable_core_migrations`] array silently omitted 0006/0007/0010,
