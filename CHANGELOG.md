@@ -171,9 +171,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tool children still run keeps each running call under its original id:
   the call is answered once with an interim `tool_result`, and its final
   outcome arrives once as a `<late_tool_result>` text block. If the turn is
-  cancelled or fails first, the call is closed with a `cancelled` / `failed`
-  late result so a retry may re-issue it. Compaction and fork retain the
-  artifact a late result's spilled output points at.
+  cancelled or fails first, each such call is closed exactly once with its
+  child's real state: its result if it finished, `cancelled` if it was
+  cancelled, or `still_running` if it outlives a failed turn, so the model
+  checks its effects before re-issuing it. This holds even when compaction
+  already folded the interim result into history. Compaction and fork retain
+  the artifact a late result's spilled output points at.
 
   **Rollback:** do not roll the server back to a build without late results
   while any early-resumed parent is parked. Those rows keep already-answered

@@ -30,11 +30,11 @@ pub enum LateToolResultStatus {
     /// The call finished with an error.
     Error,
     /// The call, or the turn waiting on it, was cancelled before its result
-    /// was delivered. It may be issued again.
+    /// was delivered.
     Cancelled,
-    /// The turn waiting on the call failed before its result was delivered.
-    /// It may be issued again.
-    Failed,
+    /// The call outlived the turn waiting on it, so its result will never be
+    /// delivered, though it may still take effect.
+    StillRunning,
 }
 
 impl LateToolResultStatus {
@@ -43,7 +43,7 @@ impl LateToolResultStatus {
             Self::Success => "success",
             Self::Error => "error",
             Self::Cancelled => "cancelled",
-            Self::Failed => "failed",
+            Self::StillRunning => "still_running",
         }
     }
 
@@ -58,10 +58,10 @@ impl LateToolResultStatus {
                  cancelled before its result was delivered; no result will follow. It may have \
                  partly run: check its effects, then call it again if you still need it."
             ),
-            Self::Failed => format!(
-                "The turn stopped on an error before the earlier `{name}` call {id}, previously \
-                 reported as still running, delivered its result; no result will follow. It may \
-                 still have run: check its effects, then call it again if you still need it."
+            Self::StillRunning => format!(
+                "The earlier `{name}` call {id} was still running when this turn stopped, so its \
+                 result will never be delivered. It may still complete and take effect: verify \
+                 its effects before calling it again."
             ),
         }
     }
@@ -261,11 +261,11 @@ mod tests {
     fn statuses_that_end_without_a_result_invite_a_checked_retry() {
         for status in [
             LateToolResultStatus::Cancelled,
-            LateToolResultStatus::Failed,
+            LateToolResultStatus::StillRunning,
         ] {
             let text = render(&call("call_1", "bash"), status, "never delivered");
             assert!(text.contains(&format!("status=\"{}\"", status.label())));
-            assert!(text.contains("no result will follow"), "{text}");
+            assert!(text.contains("its effects"), "{text}");
             assert!(!text.contains("do not call it again"), "{text}");
         }
         let done = render(&call("call_1", "bash"), LateToolResultStatus::Error, "boom");

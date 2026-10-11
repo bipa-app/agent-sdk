@@ -8,8 +8,8 @@
 use super::root_turn::{
     PartialCancelCommit, RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes, cancel_root_turn,
     commit_partial_turn_on_cancel, drain_boundary_injections, execute_root_turn, fail_root_turn,
-    is_root_turn_cancelled, provider_valid_split, resume_for_steering, resume_from_children,
-    resume_from_question, resume_root_turn, revert_steering_wake,
+    is_interim_payload, is_root_turn_cancelled, provider_valid_split, resume_for_steering,
+    resume_from_children, resume_from_question, resume_root_turn, revert_steering_wake,
     settle_attempt_after_lost_ownership, terminal_reason_for_root_error, tool_result_blocks,
 };
 use crate::journal::checkpoint::CheckpointKind;
@@ -7970,10 +7970,10 @@ async fn a_failed_early_resumed_parent_closes_its_running_call() -> Result<()> {
     let delivered = late_results_for(&view.messages, "call_1");
     assert_eq!(delivered.len(), 1);
     assert!(delivered[0].contains("done-1"), "{}", delivered[0]);
-    assert_running_call_closed(&view.messages, "call_2", "failed");
+    assert_running_call_closed(&view.messages, "call_2", "still_running");
 
     let request = follow_up_request(&stores, "Try the third command again.", t_plus(30)).await?;
-    assert_running_call_closed(&request, "call_2", "failed");
+    assert_running_call_closed(&request, "call_2", "still_running");
     assert_eq!(late_results_for(&request, "call_1").len(), 1);
     Ok(())
 }
@@ -8386,10 +8386,10 @@ async fn steering_fan_in_carries_result_and_late_result_attachments_in_order() -
     Ok(())
 }
 
-/// An interim answer serialized with its keys in another order (a build
-/// whose JSON maps preserve insertion order) is still closed on cancel.
+/// The interim payload serialized with its keys in another order (a build
+/// whose JSON maps preserve insertion order) is still recognized.
 #[tokio::test]
-async fn cancel_closes_an_interim_answer_serialized_in_another_key_order() -> Result<()> {
+async fn interim_payload_is_recognized_in_any_key_order() -> Result<()> {
     let stores = TestStores::new();
     let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
         &stores,
@@ -8408,56 +8408,495 @@ async fn cancel_closes_an_interim_answer_serialized_in_another_key_order() -> Re
     let provider = RequestLogProvider::new("The second call is still running.");
     run_child_resume(&stores, &parent.id, &provider, t_plus(10), t_plus(12)).await?;
     let parked = stores.tasks.get(&parent.id).await?.context("parked")?;
-    let pending = parked
+    let interim = find_tool_result(parked.state.suspended_messages(), "call_1")
+        .context("interim answer for call_1")?;
+
+    let fields: serde_json::Map<String, serde_json::Value> = serde_json::from_str(interim)?;
+    let reversed = fields
+        .iter()
+        .rev()
+        .map(|(key, value)| Ok(format!("{}:{value}", serde_json::to_string(key)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let reordered = format!("{{{}}}", reversed.join(","));
+
+    assert_ne!(reordered, interim, "the keys must actually move");
+    assert!(is_interim_payload(interim));
+    assert!(is_interim_payload(&reordered));
+    assert!(!is_interim_payload(r#"{"status":"running"}"#));
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Invariant: a turn that ends leaves no interim-only call open
+// ─────────────────────────────────────────────────────────────────────
+
+/// How the early-resumed turn ends.
+#[derive(Clone, Copy, Debug)]
+enum TurnExit {
+    /// `cancel_root_turn` while the parent is parked.
+    CancelParked,
+    /// `cancel_root_turn` during a steering wake's LLM call.
+    CancelMidSteering,
+    /// The child wake's LLM call fails and the root is failed.
+    FailMidResume,
+    /// The public `aggregate_child_outcomes` + `resume_root_turn` pair.
+    AggregateResume,
+}
+
+/// `call_1`'s child when the turn ends. `AggregateResume` needs every child
+/// terminal, so there `Live` means the child was cancelled instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SurvivorAtExit {
+    Live,
+    Finished,
+}
+
+/// Provider whose single call optionally finishes a still-running child
+/// and then fails the call.
+struct FinishThenFailProvider {
+    stores: TestStores,
+    finish: Option<AgentTask>,
+}
+
+#[async_trait]
+impl LlmProvider for FinishThenFailProvider {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        if let Some(child) = &self.finish {
+            complete_child_at(
+                &self.stores,
+                child,
+                &ok_result("done-1"),
+                t_plus(40),
+                t_plus(41),
+            )
+            .await?;
+        }
+        Ok(ChatOutcome::InvalidRequest("schema rejected".into()))
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
+/// Streaming provider that optionally finishes a still-running child mid
+/// call, then runs the full `cancel_root_turn` and trips the worker token.
+struct FinishThenCancelProvider {
+    cancel: CancellationToken,
+    stores: TestStores,
+    task_id: AgentTaskId,
+    finish: Option<AgentTask>,
+}
+
+#[async_trait]
+impl LlmProvider for FinishThenCancelProvider {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        anyhow::bail!("FinishThenCancelProvider drives only the streaming path")
+    }
+
+    fn chat_stream(&self, _request: ChatRequest) -> StreamBox<'_> {
+        Box::pin(async_stream::stream! {
+            yield Ok(StreamDelta::TextDelta {
+                delta: "partial ".to_owned(),
+                block_index: 0,
+            });
+            if let Some(child) = &self.finish {
+                let _ = complete_child_at(
+                    &self.stores,
+                    child,
+                    &ok_result("done-1"),
+                    t_plus(40),
+                    t_plus(41),
+                )
+                .await;
+            }
+            let _ = cancel_root_turn(&self.task_id, &self.stores.deps(), t_plus(42)).await;
+            self.cancel.cancel();
+            yield Ok(StreamDelta::TextDelta {
+                delta: "answer".to_owned(),
+                block_index: 0,
+            });
+        })
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
+/// Park three Any-policy calls behind a prompt long enough to compact,
+/// finish `call_0`, and early-resume so `call_1` and `call_2` hold only
+/// the interim answer.
+async fn park_early_resumed_batch(
+    stores: &TestStores,
+    deps: &RootTurnDeps<'_>,
+) -> Result<(AgentTask, Vec<AgentTask>)> {
+    let provider = MockToolCallProvider::new(vec![
+        bash_call("call_0"),
+        bash_call("call_1"),
+        bash_call("call_2"),
+    ]);
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let mut bootstrap = sample_bootstrap_with_tools(task);
+    bootstrap.definition.policy.child_join_policy = ChildJoinPolicy::Any;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let prompt = "Run the three build steps and report back. ".repeat(400);
+    let outcome = execute_root_turn(inputs, prompt, &provider, &stores.deps(), t_plus(5)).await?;
+    let RootTurnOutcome::Suspended {
+        parent_task: parent,
+        child_tasks: children,
+        ..
+    } = outcome
+    else {
+        bail!("the batch must park");
+    };
+    complete_child_at(
+        stores,
+        &children[0],
+        &ok_result("done-0"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+    let acquired = acquire_parent(stores, &parent.id, t_plus(10)).await?;
+    let inputs = resume_inputs(stores, &acquired, t_plus(10)).await?;
+    let early = RequestLogProvider::new("Two calls are still running.");
+    let outcome = Box::pin(resume_from_children(
+        inputs,
+        &acquired,
+        &early,
+        deps,
+        t_plus(12),
+    ))
+    .await?;
+    assert!(matches!(outcome, RootTurnOutcome::Suspended { .. }));
+    Ok((parent, children))
+}
+
+async fn acquire_parent(
+    stores: &TestStores,
+    parent_id: &AgentTaskId,
+    at: time::OffsetDateTime,
+) -> Result<AgentTask> {
+    stores
+        .tasks
+        .try_acquire_task(
+            parent_id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            at,
+        )
+        .await?
+        .context("acquire parent")
+}
+
+async fn resume_inputs(
+    stores: &TestStores,
+    acquired: &AgentTask,
+    at: time::OffsetDateTime,
+) -> Result<crate::journal::execution_context::RootWorkerInputs> {
+    build_root_worker_inputs(
+        sample_bootstrap_with_tools(acquired.clone()),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        at,
+    )
+    .await
+}
+
+/// End the early-resumed turn through `exit` and return the next provider
+/// request the thread produces.
+async fn end_early_resumed_turn(
+    stores: &TestStores,
+    deps: &RootTurnDeps<'_>,
+    exit: TurnExit,
+    survivor: SurvivorAtExit,
+) -> Result<Vec<agent_sdk_foundation::llm::Message>> {
+    let (parent, children) = Box::pin(park_early_resumed_batch(stores, deps)).await?;
+    let finish = (survivor == SurvivorAtExit::Finished).then(|| children[1].clone());
+    match exit {
+        TurnExit::CancelParked => {
+            if let Some(child) = &finish {
+                complete_child_at(stores, child, &ok_result("done-1"), t_plus(20), t_plus(21))
+                    .await?;
+            }
+            cancel_root_turn(&parent.id, deps, t_plus(30)).await?;
+        }
+        TurnExit::CancelMidSteering => {
+            Box::pin(cancel_mid_steering(stores, deps, &parent, finish)).await?;
+        }
+        TurnExit::FailMidResume => {
+            complete_child_at(
+                stores,
+                &children[2],
+                &ok_result("done-2"),
+                t_plus(20),
+                t_plus(21),
+            )
+            .await?;
+            Box::pin(fail_mid_resume(stores, deps, &parent, finish)).await?;
+        }
+        TurnExit::AggregateResume => {
+            return Box::pin(aggregate_and_resume(
+                stores, deps, &parent, &children, finish,
+            ))
+            .await;
+        }
+    }
+    follow_up_request(stores, "What happened to the build steps?", t_plus(50)).await
+}
+
+async fn cancel_mid_steering(
+    stores: &TestStores,
+    deps: &RootTurnDeps<'_>,
+    parent: &AgentTask,
+    finish: Option<AgentTask>,
+) -> Result<()> {
+    stores
+        .tasks
+        .enqueue_steering_resume(
+            &parent.id,
+            vec![ContentBlock::Text {
+                text: "how is it going?".into(),
+            }],
+            t_plus(20),
+        )
+        .await?
+        .context("woken")?;
+    let acquired = acquire_parent(stores, &parent.id, t_plus(21)).await?;
+    let inputs = resume_inputs(stores, &acquired, t_plus(21)).await?;
+    let cancel = CancellationToken::new();
+    let provider = FinishThenCancelProvider {
+        cancel: cancel.clone(),
+        stores: stores.clone(),
+        task_id: parent.id.clone(),
+        finish,
+    };
+    let cancellable = RootTurnDeps {
+        cancel: Some(&cancel),
+        ..*deps
+    };
+    let result = Box::pin(resume_for_steering(
+        inputs,
+        &acquired,
+        &provider,
+        &cancellable,
+        t_plus(22),
+    ))
+    .await;
+    let error = result
+        .err()
+        .context("the steering call must be cancelled")?;
+    anyhow::ensure!(is_root_turn_cancelled(&error), "{error:#}");
+    Ok(())
+}
+
+async fn fail_mid_resume(
+    stores: &TestStores,
+    deps: &RootTurnDeps<'_>,
+    parent: &AgentTask,
+    finish: Option<AgentTask>,
+) -> Result<()> {
+    let acquired = acquire_parent(stores, &parent.id, t_plus(22)).await?;
+    let inputs = resume_inputs(stores, &acquired, t_plus(22)).await?;
+    let provider = FinishThenFailProvider {
+        stores: stores.clone(),
+        finish,
+    };
+    let error = Box::pin(resume_from_children(
+        inputs,
+        &acquired,
+        &provider,
+        deps,
+        t_plus(23),
+    ))
+    .await
+    .err()
+    .context("the child wake must fail")?;
+    fail_root_turn(
+        &parent.id,
+        &WorkerId::from_string("worker_test"),
+        &LeaseId::from_string("lease_test"),
+        &thread_a(),
+        &error,
+        &stores.deps(),
+        t_plus(25),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn aggregate_and_resume(
+    stores: &TestStores,
+    deps: &RootTurnDeps<'_>,
+    parent: &AgentTask,
+    children: &[AgentTask],
+    finish: Option<AgentTask>,
+) -> Result<Vec<agent_sdk_foundation::llm::Message>> {
+    if let Some(child) = &finish {
+        complete_child_at(stores, child, &ok_result("done-1"), t_plus(20), t_plus(21)).await?;
+    } else {
+        stores
+            .tasks
+            .cancel_tree(&children[1].id, t_plus(21))
+            .await?;
+    }
+    complete_child_at(
+        stores,
+        &children[2],
+        &ok_result("done-2"),
+        t_plus(22),
+        t_plus(23),
+    )
+    .await?;
+    let acquired = acquire_parent(stores, &parent.id, t_plus(24)).await?;
+    let continuation = acquired
         .state
         .continuation()
-        .context("parked continuation")?
+        .context("ready continuation")?
         .payload
-        .pending_tool_calls
         .clone();
+    let suspended = acquired.state.suspended_messages().to_vec();
+    let aggregated = aggregate_child_outcomes(&acquired, &continuation, &stores.tasks).await?;
+    let inputs = resume_inputs(stores, &acquired, t_plus(24)).await?;
+    let provider = RequestLogProvider::new("All finished.");
+    Box::pin(resume_root_turn(
+        inputs,
+        continuation,
+        suspended,
+        aggregated,
+        &provider,
+        deps,
+        t_plus(26),
+    ))
+    .await?;
+    provider.requests()?.pop().context("resume request")
+}
 
-    let mut candidate = parked.state.suspended_messages().to_vec();
-    for message in &mut candidate {
-        let agent_sdk_foundation::llm::Content::Blocks(blocks) = &mut message.content else {
-            continue;
-        };
-        for block in blocks {
-            if let ContentBlock::ToolResult {
-                tool_use_id,
-                content,
-                ..
-            } = block
-                && tool_use_id == "call_1"
-            {
-                let interim: serde_json::Map<String, serde_json::Value> =
-                    serde_json::from_str(content)?;
-                let reversed = interim
-                    .iter()
-                    .rev()
-                    .map(|(key, value)| Ok(format!("{}:{value}", serde_json::to_string(key)?)))
-                    .collect::<Result<Vec<_>>>()?;
-                let reordered = format!("{{{}}}", reversed.join(","));
-                assert_ne!(&reordered, content, "the keys must actually move");
-                *content = reordered;
+/// The status each interim-answered call must be closed with.
+fn expected_closures(
+    exit: TurnExit,
+    survivor: SurvivorAtExit,
+) -> [(&'static str, &'static str); 2] {
+    let call_1 = match (exit, survivor) {
+        (_, SurvivorAtExit::Finished) => "success",
+        (TurnExit::FailMidResume, SurvivorAtExit::Live) => "still_running",
+        (
+            TurnExit::CancelParked | TurnExit::CancelMidSteering | TurnExit::AggregateResume,
+            SurvivorAtExit::Live,
+        ) => "cancelled",
+    };
+    let call_2 = match exit {
+        TurnExit::CancelParked | TurnExit::CancelMidSteering => "cancelled",
+        TurnExit::FailMidResume | TurnExit::AggregateResume => "success",
+    };
+    [("call_1", call_1), ("call_2", call_2)]
+}
+
+/// Violations of the closing invariant in `request`: every call answered
+/// with the interim payload has exactly one late result, and each expected
+/// call is closed once, with the status matching its child.
+fn interim_closure_violations(
+    request: &[agent_sdk_foundation::llm::Message],
+    expected: &[(&str, &str)],
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    if let Some(index) = agent_sdk_foundation::llm::provider_tool_sequence_error_index(request) {
+        violations.push(format!("provider-invalid at message {index}"));
+    }
+    let interim_answered = request.iter().flat_map(|message| match &message.content {
+        agent_sdk_foundation::llm::Content::Blocks(blocks) => blocks.as_slice(),
+        agent_sdk_foundation::llm::Content::Text(_) => &[],
+    });
+    for block in interim_answered {
+        if let ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } = block
+            && is_interim_payload(content)
+            && late_results_for(request, tool_use_id).len() != 1
+        {
+            violations.push(format!(
+                "interim-only {tool_use_id} is not closed exactly once"
+            ));
+        }
+    }
+    for (call_id, status) in expected {
+        let late = late_results_for(request, call_id);
+        let label = format!("status=\"{status}\"");
+        if late.len() != 1 || !late[0].contains(&label) {
+            violations.push(format!(
+                "{call_id} must be closed once as {status}: {late:?}"
+            ));
+        }
+    }
+    if !late_results_for(request, "call_0").is_empty() {
+        violations.push("call_0 already had its real result".to_owned());
+    }
+    violations
+}
+
+#[tokio::test]
+async fn every_turn_exit_closes_interim_only_calls_once_with_their_real_state() -> Result<()> {
+    let config = CompactionConfig::default()
+        .with_threshold_tokens(1)
+        .with_min_messages(2)
+        .with_retain_recent(2);
+    let compactor: Arc<dyn LlmProvider> = Arc::new(MockTextProvider::new("[summary]"));
+    let mut failures = Vec::new();
+    for exit in [
+        TurnExit::CancelParked,
+        TurnExit::CancelMidSteering,
+        TurnExit::FailMidResume,
+        TurnExit::AggregateResume,
+    ] {
+        for compaction in [false, true] {
+            for survivor in [SurvivorAtExit::Live, SurvivorAtExit::Finished] {
+                let cell = format!("{exit:?} compaction={compaction} survivor={survivor:?}");
+                let stores = TestStores::new();
+                let deps = if compaction {
+                    stores.deps_with_compaction(&config, &compactor)
+                } else {
+                    stores.deps()
+                };
+                let request = Box::pin(end_early_resumed_turn(&stores, &deps, exit, survivor))
+                    .await
+                    .with_context(|| cell.clone())?;
+                let compactions = stores
+                    .messages
+                    .get(&thread_a())
+                    .await?
+                    .map_or(0, |projection| projection.compactions.len());
+                if (compactions > 0) != compaction {
+                    failures.push(format!("{cell}: compactions={compactions}"));
+                }
+                failures.extend(
+                    interim_closure_violations(&request, &expected_closures(exit, survivor))
+                        .into_iter()
+                        .map(|violation| format!("{cell}: {violation}")),
+                );
             }
         }
     }
-
-    commit_partial_turn_on_cancel(
-        PartialCancelCommit {
-            thread_id: &thread_a(),
-            task_id: &parent.id,
-            candidate,
-            expected_turn: 1,
-            agent_state_snapshot: serde_json::Value::Null,
-            pending_tool_calls: &pending,
-        },
-        &stores.deps(),
-        t_plus(20),
-    )
-    .await?;
-    let committed = stores.messages.get_history(&thread_a()).await?;
-    assert_running_call_closed(&committed, "call_1", "cancelled");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
     Ok(())
 }
 
@@ -8650,7 +9089,7 @@ async fn partial_commit_empty_candidate_is_a_strict_no_op() -> Result<()> {
             candidate: Vec::new(),
             expected_turn: 1,
             agent_state_snapshot: serde_json::Value::Null,
-            pending_tool_calls: &[],
+            closing: Vec::new(),
         },
         &stores.deps(),
         t_plus(1),
@@ -8691,7 +9130,7 @@ async fn partial_commit_unbalanced_candidate_closes_and_commits_the_dangling_use
             candidate,
             expected_turn: 1,
             agent_state_snapshot: serde_json::Value::Null,
-            pending_tool_calls: &[],
+            closing: Vec::new(),
         },
         &stores.deps(),
         t_plus(1),
@@ -9590,7 +10029,7 @@ async fn failed_salvage_commit_closes_its_synthetic_attempt() -> Result<()> {
             candidate: vec![agent_sdk_foundation::llm::Message::user("salvage me")],
             expected_turn: 1,
             agent_state_snapshot: serde_json::json!({}),
-            pending_tool_calls: &[],
+            closing: Vec::new(),
         },
         &deps,
         t_plus(1),

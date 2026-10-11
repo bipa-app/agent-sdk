@@ -634,8 +634,9 @@ async fn fail_root_turn_inner(
         error,
         reason,
     } = params;
-    // Read before the fail transition clears the parked continuation.
-    let closed_draft = draft_closing_undelivered_calls(task_id, thread_id, deps).await;
+    // Before the transition: it clears the parked batch, and no successor
+    // root can be admitted to race this draft write while the root is live.
+    close_interim_calls_in_draft(task_id, thread_id, deps, now).await;
     let error_msg = format!("{error:#}");
     let (failed_task, _parent) = deps
         .task_store
@@ -649,14 +650,6 @@ async fn fail_root_turn_inner(
         )
         .await
         .context("fail root task")?;
-    if let Some(draft) = closed_draft
-        && let Err(close_error) = deps.message_store.set_draft(thread_id, draft, now).await
-    {
-        log::warn!(
-            "fail: closing undelivered calls in the draft failed on thread {thread_id}: \
-             {close_error:#}"
-        );
-    }
 
     // Best-effort: the task is durably Failed; event commit failure
     // must not override that outcome. Consistent with
@@ -681,30 +674,32 @@ async fn fail_root_turn_inner(
     Ok(failed_task)
 }
 
-/// The thread's draft with every call an early resume answered only with
-/// the interim payload closed as failed, or `None` when nothing needs
-/// closing. A failed turn's draft folds into the next turn's history, where
-/// an unclosed interim result keeps promising a result that never comes.
-async fn draft_closing_undelivered_calls(
+/// Append the failing turn's closing late results to the draft the next
+/// turn folds into its history (see [`closing_late_results`]).
+async fn close_interim_calls_in_draft(
     task_id: &AgentTaskId,
     thread_id: &agent_sdk_foundation::ThreadId,
     deps: &RootTurnDeps<'_>,
-) -> Option<Vec<llm::Message>> {
-    let task = deps.task_store.get(task_id).await.ok().flatten()?;
-    let continuation = task.state.continuation()?;
-    let mut draft = deps
-        .message_store
-        .get(thread_id)
-        .await
-        .ok()
-        .flatten()?
-        .draft_messages;
-    close_undelivered_interim_calls(
-        &mut draft,
-        &continuation.payload.pending_tool_calls,
-        UndeliveredBecause::TurnFailed,
-    )
-    .then_some(draft)
+    now: OffsetDateTime,
+) {
+    let Ok(Some(task)) = deps.task_store.get(task_id).await else {
+        return;
+    };
+    if task.state.continuation().is_none() {
+        return;
+    }
+    let Ok(projection) = deps.message_store.get(thread_id).await else {
+        return;
+    };
+    let mut draft = projection.map(|p| p.draft_messages).unwrap_or_default();
+    let closing = closing_late_results(&task, &draft, TurnEnd::Failed, deps).await;
+    if closing.is_empty() {
+        return;
+    }
+    append_to_trailing_user_message(&mut draft, closing);
+    if let Err(error) = deps.message_store.set_draft(thread_id, draft, now).await {
+        log::warn!("fail: closing interim-only calls failed on thread {thread_id}: {error:#}");
+    }
 }
 
 /// Cancel a root turn and its entire subtree.
@@ -1124,10 +1119,10 @@ pub(crate) struct PartialCancelCommit<'a> {
     pub(crate) expected_turn: u32,
     /// Agent-state snapshot for the checkpoint written at `expected_turn`.
     pub(crate) agent_state_snapshot: serde_json::Value,
-    /// The parked batch's pending calls. Any the candidate answered only
-    /// with the interim "still running" payload is committed closed as
-    /// cancelled.
-    pub(crate) pending_tool_calls: &'a [PendingToolCallInfo],
+    /// Late results closing the parked batch's interim-only calls (see
+    /// [`closing_late_results`]). Committed even when `candidate` is empty:
+    /// compaction may already have folded the interim answers into history.
+    pub(crate) closing: Vec<llm::ContentBlock>,
 }
 
 /// Durably commit the largest provider-valid prefix of a cancelled
@@ -1155,7 +1150,7 @@ pub(crate) async fn commit_partial_turn_on_cancel(
         candidate,
         expected_turn,
         agent_state_snapshot,
-        pending_tool_calls,
+        closing,
     } = params;
 
     let (prefix, suffix) = provider_valid_split(candidate);
@@ -1170,11 +1165,9 @@ pub(crate) async fn commit_partial_turn_on_cancel(
     let closed_suffix =
         llm::repair_tool_sequence_in_place(&suffix, llm::USER_CANCELLED_TOOL_RESULT);
     let mut committed = [prefix, closed_suffix].concat();
-    close_undelivered_interim_calls(
-        &mut committed,
-        pending_tool_calls,
-        UndeliveredBecause::TurnCancelled,
-    );
+    if !closing.is_empty() {
+        append_to_trailing_user_message(&mut committed, closing);
+    }
     if committed.is_empty() {
         // Nothing to commit. Strict no-op: no attempt row,
         // no thread mutation.
@@ -1329,15 +1322,15 @@ fn staged_or_recovery_snapshot(inputs: &RootWorkerInputs) -> serde_json::Value {
 async fn commit_cancelled_partial_turn(
     inputs: &RootWorkerInputs,
     candidate: Vec<llm::Message>,
-    pending_tool_calls: &[PendingToolCallInfo],
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
 ) {
     let task_id = &inputs.bootstrap.task_id;
     let thread_id = &inputs.bootstrap.thread_id;
 
-    match deps.task_store.get(task_id).await {
-        Ok(Some(task)) if matches!(task.status, TaskStatus::Cancelled | TaskStatus::Failed) => {}
+    let end = match deps.task_store.get(task_id).await {
+        Ok(Some(task)) if task.status == TaskStatus::Cancelled => TurnEnd::Cancelled,
+        Ok(Some(task)) if task.status == TaskStatus::Failed => TurnEnd::Failed,
         // Not terminal (lease-lost requeue), missing, or unreadable:
         // do not partial-commit — a re-run will own turn N.
         Ok(_) => return,
@@ -1345,8 +1338,10 @@ async fn commit_cancelled_partial_turn(
             log::warn!("cancel-commit: re-read task {task_id} failed: {error:#}");
             return;
         }
-    }
+    };
 
+    // The bootstrap row is the parked batch this worker resumed.
+    let closing = closing_late_results(&inputs.bootstrap.task, &candidate, end, deps).await;
     let agent_state_snapshot = staged_or_recovery_snapshot(inputs);
     let suffix = match commit_partial_turn_on_cancel(
         PartialCancelCommit {
@@ -1355,7 +1350,7 @@ async fn commit_cancelled_partial_turn(
             candidate,
             expected_turn: inputs.recovery_view.next_turn_number,
             agent_state_snapshot,
-            pending_tool_calls,
+            closing,
         },
         deps,
         now,
@@ -1383,12 +1378,10 @@ async fn commit_cancelled_partial_turn(
 /// staged `[suspended…, fan-in]` delta — balanced by construction, so it
 /// commits in full and the interrupted response is dropped. The delta
 /// becomes committed history instead of a draft that dies at the next
-/// commit, with every call still answered only by the interim payload
-/// closed as cancelled.
+/// commit.
 async fn salvage_cancelled_resume(
     inputs: &RootWorkerInputs,
     error: &anyhow::Error,
-    pending_tool_calls: &[PendingToolCallInfo],
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
 ) {
@@ -1400,7 +1393,7 @@ async fn salvage_cancelled_resume(
         .messages
         .snapshot_appended_messages()
         .unwrap_or_default();
-    commit_cancelled_partial_turn(inputs, candidate, pending_tool_calls, deps, now).await;
+    commit_cancelled_partial_turn(inputs, candidate, deps, now).await;
 }
 
 /// Seam A: commit the completed prefix of a **parked** cancelled turn.
@@ -1474,6 +1467,7 @@ async fn best_effort_commit_parked_cancel(
         }
     };
 
+    let closing = closing_late_results(task, &candidate, TurnEnd::Cancelled, deps).await;
     let suffix = match commit_partial_turn_on_cancel(
         PartialCancelCommit {
             thread_id: &task.thread_id,
@@ -1481,7 +1475,7 @@ async fn best_effort_commit_parked_cancel(
             candidate,
             expected_turn,
             agent_state_snapshot,
-            pending_tool_calls: &continuation.payload.pending_tool_calls,
+            closing,
         },
         deps,
         now,
@@ -1982,7 +1976,7 @@ async fn execute_root_turn_inner(
                         inputs.bootstrap.thread_id,
                     ),
                 }
-                commit_cancelled_partial_turn(&inputs, candidate, &[], deps, now).await;
+                commit_cancelled_partial_turn(&inputs, candidate, deps, now).await;
             }
             return Err(error);
         }
@@ -7193,7 +7187,14 @@ pub async fn resume_root_turn(
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<RootTurnOutcome> {
-    let fan_in = fan_in_for_child_results(&continuation, &suspended_messages, child_results)?;
+    let fan_in = fan_in_for_child_results(
+        &continuation,
+        &suspended_messages,
+        child_results,
+        inputs.bootstrap.task.state.child_ids(),
+        deps.task_store,
+    )
+    .await?;
     Box::pin(resume_root_turn_with_fan_in(
         inputs,
         continuation,
@@ -7206,25 +7207,35 @@ pub async fn resume_root_turn(
     .await
 }
 
-fn fan_in_for_child_results(
+async fn fan_in_for_child_results(
     continuation: &AgentContinuation,
     suspended_messages: &[llm::Message],
     child_results: Vec<(String, ToolResult)>,
+    child_ids: &[AgentTaskId],
+    task_store: &dyn AgentTaskStore,
 ) -> Result<llm::Message> {
     let answered = answered_tool_use_ids(suspended_messages);
+    let children = if child_results
+        .iter()
+        .any(|(tool_use_id, _)| answered.contains(tool_use_id.as_str()))
+    {
+        children_by_spawn_index(child_ids, task_store).await?
+    } else {
+        BTreeMap::new()
+    };
     let mut tool_results = Vec::with_capacity(child_results.len());
     let mut late_results = Vec::new();
     for (tool_use_id, result) in child_results {
         if answered.contains(tool_use_id.as_str()) {
-            let call = continuation
+            let (index, call) = continuation
                 .pending_tool_calls
                 .iter()
-                .find(|call| call.id == tool_use_id)
-                .cloned()
+                .enumerate()
+                .find(|(_, call)| call.id == tool_use_id)
                 .with_context(|| format!("answered call {tool_use_id} is not pending"))?;
             late_results.push(LateToolResult {
-                call,
-                status: finished_status(&result),
+                call: call.clone(),
+                status: late_status(children.get(&index).map(|child| child.status), &result),
                 result,
             });
         } else {
@@ -7313,8 +7324,7 @@ async fn resume_root_turn_with_fan_in(
     } = match streamed {
         Ok(streamed) => streamed,
         Err(error) => {
-            salvage_cancelled_resume(&inputs, &error, &continuation.pending_tool_calls, deps, now)
-                .await;
+            salvage_cancelled_resume(&inputs, &error, deps, now).await;
             return Err(error);
         }
     };
@@ -8277,10 +8287,18 @@ fn steering_interim_payload() -> serde_json::Value {
     })
 }
 
+static INTERIM_PAYLOAD: std::sync::LazyLock<(serde_json::Value, usize)> =
+    std::sync::LazyLock::new(|| {
+        let payload = steering_interim_payload();
+        let len = payload.to_string().len();
+        (payload, len)
+    });
+
 /// Whether `content` is the interim payload, compared as JSON so a build
 /// that serializes object keys in another order still recognizes it.
-fn is_interim_payload(content: &str, interim: &serde_json::Value, interim_len: usize) -> bool {
-    content.len() == interim_len
+pub(crate) fn is_interim_payload(content: &str) -> bool {
+    let (interim, len) = &*INTERIM_PAYLOAD;
+    content.len() == *len
         && serde_json::from_str::<serde_json::Value>(content).is_ok_and(|value| value == *interim)
 }
 
@@ -8304,8 +8322,10 @@ struct LateToolResult {
     result: ToolResult,
 }
 
-const fn finished_status(result: &ToolResult) -> LateToolResultStatus {
-    if result.success {
+fn late_status(child_status: Option<TaskStatus>, result: &ToolResult) -> LateToolResultStatus {
+    if child_status == Some(TaskStatus::Cancelled) {
+        LateToolResultStatus::Cancelled
+    } else if result.success {
         LateToolResultStatus::Success
     } else {
         LateToolResultStatus::Error
@@ -8370,6 +8390,28 @@ fn answered_tool_use_ids(messages: &[llm::Message]) -> BTreeSet<&str> {
         .collect()
 }
 
+/// The parked batch's children keyed by the pending-call index each one
+/// resolves (its `spawn_index`).
+async fn children_by_spawn_index(
+    child_ids: &[AgentTaskId],
+    task_store: &dyn AgentTaskStore,
+) -> Result<BTreeMap<usize, AgentTask>> {
+    let mut by_index = BTreeMap::new();
+    for child_id in child_ids {
+        let child = task_store
+            .get(child_id)
+            .await
+            .with_context(|| format!("read batch child {child_id}"))?
+            .with_context(|| format!("batch child {child_id} does not exist"))?;
+        let spawn_index = child
+            .spawn_index
+            .context("batch child missing spawn_index")?;
+        let index = usize::try_from(spawn_index).context("spawn_index exceeds usize")?;
+        by_index.insert(index, child);
+    }
+    Ok(by_index)
+}
+
 /// Build the fan-in: read every parked child and classify each pending
 /// call. A call is answered exactly once on the wire: an unanswered call
 /// gets its real or interim `tool_result`; an already-answered call that
@@ -8383,21 +8425,7 @@ async fn build_steering_interim(
 ) -> Result<SteeringInterim> {
     let pending = &continuation.pending_tool_calls;
     let answered = answered_tool_use_ids(suspended_messages);
-
-    // Map spawn_index → child from the parked batch.
-    let mut by_index: BTreeMap<usize, AgentTask> = BTreeMap::new();
-    for child_id in child_ids {
-        let child = task_store
-            .get(child_id)
-            .await
-            .with_context(|| format!("read steering child {child_id}"))?
-            .with_context(|| format!("steering child {child_id} does not exist"))?;
-        let spawn_index = child
-            .spawn_index
-            .context("steering child missing spawn_index")?;
-        let idx = usize::try_from(spawn_index).context("spawn_index exceeds usize")?;
-        by_index.insert(idx, child);
-    }
+    let by_index = children_by_spawn_index(child_ids, task_store).await?;
 
     let mut tool_results = Vec::with_capacity(pending.len());
     let mut late_results = Vec::new();
@@ -8410,14 +8438,9 @@ async fn build_steering_interim(
         if child.status.is_terminal() {
             let result = extract_child_tool_result(child)?;
             if already_answered {
-                let status = if child.status == TaskStatus::Cancelled {
-                    LateToolResultStatus::Cancelled
-                } else {
-                    finished_status(&result)
-                };
                 late_results.push(LateToolResult {
                     call: call.clone(),
-                    status,
+                    status: late_status(Some(child.status), &result),
                     result,
                 });
             } else {
@@ -8473,82 +8496,147 @@ fn fan_in_blocks(
     blocks
 }
 
-/// Why a call answered with the interim payload never got its result.
+/// How the turn holding a parked batch ended.
 #[derive(Clone, Copy)]
-enum UndeliveredBecause {
-    TurnCancelled,
-    TurnFailed,
+enum TurnEnd {
+    /// `cancel_tree` cancels the batch's live children with the turn.
+    Cancelled,
+    /// Failing the turn leaves its live children running.
+    Failed,
 }
 
-impl UndeliveredBecause {
-    const fn status(self) -> LateToolResultStatus {
-        match self {
-            Self::TurnCancelled => LateToolResultStatus::Cancelled,
-            Self::TurnFailed => LateToolResultStatus::Failed,
-        }
-    }
-
-    const fn output(self) -> &'static str {
-        match self {
-            Self::TurnCancelled => {
-                "The turn was cancelled before this call's result was delivered."
-            }
-            Self::TurnFailed => "The turn failed before this call's result was delivered.",
-        }
-    }
-}
-
-/// Close every pending call `messages` answered only with the interim
-/// payload and never followed with a late result. Left open, the interim
-/// result keeps telling the model the call still runs and must not be
-/// re-issued, though its result can no longer arrive. The closing blocks
-/// merge into a trailing user message (a repair's synthetic results or the
-/// fan-in) so roles keep alternating. Returns whether anything was closed.
+/// Late results closing every interim-only call of `task`'s parked batch.
 ///
-/// Only the current interim payload is recognized: an interim written by a
-/// build before late results existed is not closed here.
-fn close_undelivered_interim_calls(
-    messages: &mut Vec<llm::Message>,
-    pending: &[PendingToolCallInfo],
-    because: UndeliveredBecause,
-) -> bool {
-    let interim = steering_interim_payload();
-    let interim_len = interim.to_string().len();
+/// Invariant: when a root turn ends, every pending call its transcript
+/// answered only with the interim payload, and never with a late result,
+/// gets exactly one closing late result stating the child's real state —
+/// its own result once it finished, `cancelled` when it was or is being
+/// cancelled with the turn, `still_running` when it outlives a failed turn.
+/// Every turn-ending writer (parked cancel, in-flight cancel, failure)
+/// takes its closing blocks from here.
+///
+/// Interim answers are read from the raw transcript — the projection's
+/// messages, which compaction folds the draft into but never rewrites, the
+/// batch's suspended messages, and `tail` — so compaction cannot hide one.
+/// A late result counts as delivered only in the projection's messages or
+/// `tail`, which outlive the caller's write; a cancel commit clears the
+/// draft.
+async fn closing_late_results(
+    task: &AgentTask,
+    tail: &[llm::Message],
+    end: TurnEnd,
+    deps: &RootTurnDeps<'_>,
+) -> Vec<llm::ContentBlock> {
+    let Some(continuation) = task.state.continuation() else {
+        return Vec::new();
+    };
+    let committed = match deps.message_store.get(&task.thread_id).await {
+        Ok(projection) => projection.map(|p| p.messages).unwrap_or_default(),
+        Err(error) => {
+            log::warn!(
+                "closing late results: read projection failed on thread {}: {error:#}",
+                task.thread_id,
+            );
+            Vec::new()
+        }
+    };
     let mut interim_answered = BTreeSet::new();
     let mut late_delivered = BTreeSet::new();
-    let blocks = messages
-        .iter()
-        .filter_map(|message| match &message.content {
-            llm::Content::Blocks(blocks) => Some(blocks),
-            llm::Content::Text(_) => None,
-        });
-    for block in blocks.flatten() {
-        if let llm::ContentBlock::ToolResult {
-            tool_use_id,
-            content,
-            ..
-        } = block
-            && is_interim_payload(content, &interim, interim_len)
-        {
-            interim_answered.insert(tool_use_id.clone());
-        } else if let llm::ContentBlock::Text { text } = block
+    for block in committed.iter().chain(tail).flat_map(message_blocks) {
+        if let llm::ContentBlock::Text { text } = block
             && let Some(id) = llm::late_tool_result::tool_use_id(text)
         {
             late_delivered.insert(id);
         }
     }
-    let closing: Vec<llm::ContentBlock> = pending
+    let transcript = committed
         .iter()
-        .filter(|call| interim_answered.contains(&call.id) && !late_delivered.contains(&call.id))
-        .map(|call| llm::ContentBlock::Text {
-            text: llm::late_tool_result::render(call, because.status(), because.output()),
+        .chain(tail)
+        .chain(task.state.suspended_messages());
+    for block in transcript.flat_map(message_blocks) {
+        if let llm::ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } = block
+            && is_interim_payload(content)
+        {
+            interim_answered.insert(tool_use_id.clone());
+        }
+    }
+    let open: Vec<(usize, &PendingToolCallInfo)> = continuation
+        .payload
+        .pending_tool_calls
+        .iter()
+        .enumerate()
+        .filter(|(_, call)| {
+            interim_answered.contains(&call.id) && !late_delivered.contains(&call.id)
         })
         .collect();
-    if closing.is_empty() {
-        return false;
+    if open.is_empty() {
+        return Vec::new();
     }
-    append_to_trailing_user_message(messages, closing);
-    true
+    let children = children_by_spawn_index(task.state.child_ids(), deps.task_store)
+        .await
+        .unwrap_or_else(|error| {
+            log::warn!("closing late results: read batch children failed: {error:#}");
+            BTreeMap::new()
+        });
+    let late: Vec<LateToolResult> = open
+        .into_iter()
+        .map(|(index, call)| closing_late_result(call.clone(), children.get(&index), end))
+        .collect();
+    fan_in_blocks(&[], &late, &[])
+}
+
+fn closing_late_result(
+    call: PendingToolCallInfo,
+    child: Option<&AgentTask>,
+    end: TurnEnd,
+) -> LateToolResult {
+    let finished = child
+        .filter(|child| child.status.is_terminal())
+        .and_then(|child| {
+            extract_child_tool_result(child)
+                .ok()
+                .map(|result| (child.status, result))
+        });
+    let (status, output) = match (finished, end) {
+        (Some((child_status, result)), _) => {
+            return LateToolResult {
+                call,
+                status: late_status(Some(child_status), &result),
+                result,
+            };
+        }
+        (None, TurnEnd::Cancelled) => (
+            LateToolResultStatus::Cancelled,
+            "The turn was cancelled before this call finished.",
+        ),
+        (None, TurnEnd::Failed) => (
+            LateToolResultStatus::StillRunning,
+            "The turn failed while this call was still running.",
+        ),
+    };
+    LateToolResult {
+        call,
+        status,
+        result: ToolResult {
+            success: false,
+            output: output.to_owned(),
+            artifact: None,
+            data: None,
+            documents: Vec::new(),
+            duration_ms: None,
+        },
+    }
+}
+
+fn message_blocks(message: &llm::Message) -> &[llm::ContentBlock] {
+    match &message.content {
+        llm::Content::Blocks(blocks) => blocks,
+        llm::Content::Text(_) => &[],
+    }
 }
 
 fn append_to_trailing_user_message(
@@ -8796,8 +8884,7 @@ async fn run_steering_exchange(
     } = match streamed {
         Ok(streamed) => streamed,
         Err(error) => {
-            salvage_cancelled_resume(&inputs, &error, &continuation.pending_tool_calls, deps, now)
-                .await;
+            salvage_cancelled_resume(&inputs, &error, deps, now).await;
             return Err(error);
         }
     };
