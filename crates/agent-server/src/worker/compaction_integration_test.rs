@@ -1196,7 +1196,7 @@ async fn completed_compaction_cancel_race_audits_usage_without_applying() -> Res
     .err()
     .context("cancellation race should stop the turn")?;
     assert!(
-        super::root_turn::is_root_turn_cancelled(&error),
+        super::root_turn::root_turn_cancelled_at(&error).is_some(),
         "completed-response cancellation must retain the typed cancel marker: {error:#}",
     );
     assert_eq!(scripted.calls(), 1);

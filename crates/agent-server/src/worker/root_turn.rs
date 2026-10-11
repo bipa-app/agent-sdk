@@ -1139,9 +1139,14 @@ async fn best_effort_close_attempts(
 /// failure so it can commit the completed prefix before the task goes
 /// terminal. Callers detect it via
 /// `error.chain().any(|c| c.is::<RootTurnCancelledMarker>())` — see
-/// [`is_root_turn_cancelled`].
+/// [`root_turn_cancelled_at`].
+///
+/// Carries the instant the cancel was observed, so every record of it — the
+/// closed attempt and the salvaged turn — is dated to that one moment.
 #[derive(Debug)]
-pub(crate) struct RootTurnCancelledMarker;
+pub(crate) struct RootTurnCancelledMarker {
+    pub(crate) cancelled_at: OffsetDateTime,
+}
 
 impl std::fmt::Display for RootTurnCancelledMarker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1151,13 +1156,14 @@ impl std::fmt::Display for RootTurnCancelledMarker {
 
 impl std::error::Error for RootTurnCancelledMarker {}
 
-/// True when `error` carries a [`RootTurnCancelledMarker`] anywhere in
-/// its cause chain — i.e. the turn bailed because it was cancelled
-/// mid-stream rather than for any other reason.
-pub(crate) fn is_root_turn_cancelled(error: &anyhow::Error) -> bool {
+/// The instant the cancel was observed, when `error` carries a
+/// [`RootTurnCancelledMarker`] anywhere in its cause chain — i.e. the turn
+/// bailed because it was cancelled rather than for any other reason.
+pub(crate) fn root_turn_cancelled_at(error: &anyhow::Error) -> Option<OffsetDateTime> {
     error
         .chain()
-        .any(|cause| cause.downcast_ref::<RootTurnCancelledMarker>().is_some())
+        .find_map(|cause| cause.downcast_ref::<RootTurnCancelledMarker>())
+        .map(|marker| marker.cancelled_at)
 }
 
 /// Typed cause attached to every root-turn failure a provider stream
@@ -1440,15 +1446,16 @@ fn staged_or_recovery_snapshot(inputs: &RootWorkerInputs) -> serde_json::Value {
 /// logged and swallowed — a partial-commit failure must never mask
 /// the cancellation the caller is about to surface.
 ///
-/// Stamped with the cancel's own instant, not the turn's start: a stream
-/// that hung for hours before the stop would otherwise date the cancel
-/// to the moment the turn began.
+/// Stamped with `cancelled_at`, the instant the cancel was observed, not
+/// the turn's start: a stream that hung for hours before the stop would
+/// otherwise date the cancel to the moment the turn began.
 async fn commit_cancelled_partial_turn(
     inputs: &RootWorkerInputs,
     candidate: Vec<llm::Message>,
     deps: &RootTurnDeps<'_>,
+    cancelled_at: OffsetDateTime,
 ) {
-    let now = OffsetDateTime::now_utc();
+    let now = cancelled_at;
     let task_id = &inputs.bootstrap.task_id;
     let thread_id = &inputs.bootstrap.thread_id;
 
@@ -1504,15 +1511,15 @@ async fn salvage_cancelled_resume(
     error: &anyhow::Error,
     deps: &RootTurnDeps<'_>,
 ) {
-    if !is_root_turn_cancelled(error) {
+    let Some(cancelled_at) = root_turn_cancelled_at(error) else {
         return;
-    }
+    };
     let candidate = inputs
         .staged_stores
         .messages
         .snapshot_appended_messages()
         .unwrap_or_default();
-    commit_cancelled_partial_turn(inputs, candidate, deps).await;
+    commit_cancelled_partial_turn(inputs, candidate, deps, cancelled_at).await;
 }
 
 /// Seam A: commit the completed prefix of a **parked** cancelled turn.
@@ -2093,7 +2100,7 @@ async fn execute_root_turn_inner(
             // error unchanged. The candidate is the user prompt (`Some`
             // on non-resume turns) plus any staged post-seed delta, so
             // the agent at least remembers what was asked.
-            if is_root_turn_cancelled(&error) {
+            if let Some(cancelled_at) = root_turn_cancelled_at(&error) {
                 let mut candidate: Vec<llm::Message> =
                     user_input.clone().into_message().into_iter().collect();
                 match inputs.staged_stores.messages.snapshot_appended_messages() {
@@ -2104,7 +2111,7 @@ async fn execute_root_turn_inner(
                         inputs.bootstrap.thread_id,
                     ),
                 }
-                commit_cancelled_partial_turn(&inputs, candidate, deps).await;
+                commit_cancelled_partial_turn(&inputs, candidate, deps, cancelled_at).await;
             }
             return Err(error);
         }
@@ -3111,8 +3118,10 @@ async fn prepare_pre_call_compaction(
     )
     .await?;
     if deps.is_cancelled() {
-        return Err(anyhow::Error::new(RootTurnCancelledMarker)
-            .context("root turn cancelled after completed pre-call compaction"));
+        return Err(anyhow::Error::new(RootTurnCancelledMarker {
+            cancelled_at: OffsetDateTime::now_utc(),
+        })
+        .context("root turn cancelled after completed pre-call compaction"));
     }
     Ok(PreCallCompaction {
         abandoned_usage: token_usage_as_llm_usage(&outcome.llm_usage),
@@ -3437,7 +3446,10 @@ enum StreamAttemptError {
     /// [`RootTurnDeps::cancel`] token.  The turn attempt was already
     /// closed with `Cancelled`; the retry wrapper bails immediately,
     /// skipping both retry/backoff and the commit path.
-    Cancelled { message: String },
+    Cancelled {
+        message: String,
+        cancelled_at: OffsetDateTime,
+    },
 }
 
 impl StreamAttemptError {
@@ -3621,16 +3633,17 @@ async fn ensure_retry_not_cancelled(
     // path owns this row once the task is terminal, so close it here — with
     // the evidence of the call it was about to make, so a turn cancelled
     // mid-retry-storm still names the route it was hammering.
+    let cancelled_at = OffsetDateTime::now_utc();
     close_attempt_with(
         attempt,
         TurnAttemptOutcome::Cancelled,
         &ZERO_ATTEMPT_USAGE,
         Some(evidence),
         deps.attempt_store,
-        OffsetDateTime::now_utc(),
+        cancelled_at,
     )
     .await;
-    Err(anyhow::Error::new(RootTurnCancelledMarker)
+    Err(anyhow::Error::new(RootTurnCancelledMarker { cancelled_at })
         .context("root turn cancelled before LLM attempt"))
 }
 
@@ -3833,13 +3846,18 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
                 }
                 return Err(root_stream_failure(kind, message));
             }
-            Err(StreamAttemptError::Cancelled { message }) => {
+            Err(StreamAttemptError::Cancelled {
+                message,
+                cancelled_at,
+            }) => {
                 // The turn was cancelled mid-stream — the attempt is
                 // already closed `Cancelled`. Bail immediately with the
                 // cancel marker so the caller that still owns the staged
                 // buffer commits the completed prefix (seam B); skip both
                 // retry/backoff and the normal commit path.
-                return Err(anyhow::Error::new(RootTurnCancelledMarker).context(message));
+                return Err(
+                    anyhow::Error::new(RootTurnCancelledMarker { cancelled_at }).context(message)
+                );
             }
         }
     }
@@ -3882,16 +3900,17 @@ async fn race_wait_against_cancel<T>(
     tokio::select! {
         biased;
         () = cancel.cancelled() => {
+            let cancelled_at = OffsetDateTime::now_utc();
             close_attempt_with(
                 current_attempt,
                 TurnAttemptOutcome::Cancelled,
                 &ZERO_ATTEMPT_USAGE,
                 Some(evidence),
                 deps.attempt_store,
-                OffsetDateTime::now_utc(),
+                cancelled_at,
             )
             .await;
-            Err(anyhow::Error::new(RootTurnCancelledMarker).context(cancel_context))
+            Err(anyhow::Error::new(RootTurnCancelledMarker { cancelled_at }).context(cancel_context))
         }
         value = wait => Ok(value),
     }
@@ -4255,8 +4274,10 @@ async fn try_recover_with_compaction(
         )
         .await?;
         if deps.is_cancelled() {
-            return Err(anyhow::Error::new(RootTurnCancelledMarker)
-                .context("root turn cancelled after completed overflow compaction"));
+            return Err(anyhow::Error::new(RootTurnCancelledMarker {
+                cancelled_at: OffsetDateTime::now_utc(),
+            })
+            .context("root turn cancelled after completed overflow compaction"));
         }
     }
 
@@ -4544,17 +4565,19 @@ async fn call_llm_once(
         }
     };
     if deps.is_cancelled() {
+        let cancelled_at = OffsetDateTime::now_utc();
         close_attempt_with(
             attempt,
             TurnAttemptOutcome::Cancelled,
             &ZERO_ATTEMPT_USAGE,
             Some(evidence),
             deps.attempt_store,
-            OffsetDateTime::now_utc(),
+            cancelled_at,
         )
         .await;
         return Err(StreamAttemptError::Cancelled {
             message: "root turn cancelled during provider request hydration".to_owned(),
+            cancelled_at,
         });
     }
     // Publish the pending occupancy snapshot BEFORE the provider sees
@@ -4649,7 +4672,7 @@ async fn call_llm_once_instrumented(
                 | StreamAttemptError::Fatal { message, kind } => {
                     (kind.wire_label(), message.as_str())
                 }
-                StreamAttemptError::Cancelled { message } => ("cancelled", message.as_str()),
+                StreamAttemptError::Cancelled { message, .. } => ("cancelled", message.as_str()),
             };
             loop_instrument::finish_chat_span_error(
                 &mut span,
@@ -4817,21 +4840,23 @@ async fn finish_failed_stream_attempt(
 
 /// Close an attempt whose root turn was cancelled mid-stream via the
 /// [`RootTurnDeps::cancel`] token and build the matching non-retryable
-/// error (see [`StreamAttemptError::Cancelled`]). Closed at the cancel's
-/// instant for the same reason as [`commit_cancelled_partial_turn`].
+/// error (see [`StreamAttemptError::Cancelled`]). Closed at `cancelled_at`
+/// for the same reason as [`commit_cancelled_partial_turn`].
 async fn close_cancelled_attempt(
     ctx: StreamAttemptCtx<'_, '_>,
     usage: &llm::Usage,
+    cancelled_at: OffsetDateTime,
 ) -> StreamAttemptError {
     flush_and_close(CloseStreamAttemptParams {
         ctx,
         outcome: TurnAttemptOutcome::Cancelled,
         usage,
-        now: OffsetDateTime::now_utc(),
+        now: cancelled_at,
     })
     .await;
     StreamAttemptError::Cancelled {
         message: "root turn cancelled mid-stream".to_owned(),
+        cancelled_at,
     }
 }
 
@@ -4898,7 +4923,8 @@ async fn poll_stream_item(
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
-                    return Err(close_cancelled_attempt(ctx, &usage).await);
+                    let cancelled_at = OffsetDateTime::now_utc();
+                    return Err(close_cancelled_attempt(ctx, &usage, cancelled_at).await);
                 }
                 polled = tokio::time::timeout(stall_budget, stream.next()) => polled,
             }

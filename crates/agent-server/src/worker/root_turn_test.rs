@@ -8,9 +8,9 @@
 use super::root_turn::{
     FanInAnswer, PartialCancelCommit, RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes,
     cancel_root_turn, commit_partial_turn_on_cancel, drain_boundary_injections, execute_root_turn,
-    fail_root_turn, fan_in_blocks, interim_answer, is_root_turn_cancelled, provider_valid_split,
-    resume_for_steering, resume_from_children, resume_from_question, resume_root_turn,
-    revert_steering_wake, settle_attempt_after_lost_ownership, terminal_reason_for_root_error,
+    fail_root_turn, fan_in_blocks, interim_answer, provider_valid_split, resume_for_steering,
+    resume_from_children, resume_from_question, resume_root_turn, revert_steering_wake,
+    root_turn_cancelled_at, settle_attempt_after_lost_ownership, terminal_reason_for_root_error,
 };
 use crate::journal::checkpoint::CheckpointKind;
 use std::sync::Arc;
@@ -4992,7 +4992,7 @@ async fn connectivity_wait_stops_promptly_on_cancel() -> Result<()> {
     let Err(error) = result else {
         bail!("cancelled connectivity wait unexpectedly completed")
     };
-    assert!(is_root_turn_cancelled(&error));
+    assert!(root_turn_cancelled_at(&error).is_some());
 
     let attempts = stores.attempts.list_by_task(&task_id).await?;
     assert_eq!(attempts.len(), 1);
@@ -5060,7 +5060,7 @@ async fn connectivity_wait_registry_tracks_the_park_and_cancel_clears_it() -> Re
     let Err(error) = result else {
         bail!("cancelled connectivity wait unexpectedly completed")
     };
-    assert!(is_root_turn_cancelled(&error));
+    assert!(root_turn_cancelled_at(&error).is_some());
     assert!(
         !registry.is_waiting(&thread_a()),
         "the guard must retract the entry when cancellation unwinds the wait"
@@ -7923,7 +7923,7 @@ async fn cancelling_an_early_resume_mid_call_closes_its_running_call() -> Result
 
     let result = resume_from_children(inputs, &acquired, &provider, &deps, t_plus(11)).await;
     let error = result.err().context("a cancelled early resume must fail")?;
-    assert!(is_root_turn_cancelled(&error), "{error:#}");
+    assert!(root_turn_cancelled_at(&error).is_some(), "{error:#}");
 
     let committed = stores.messages.get_history(&thread_a()).await?;
     assert_eq!(find_tool_result(&committed, "call_0"), Some("done-0"));
@@ -9007,7 +9007,7 @@ async fn cancel_mid_steering(
     let error = result
         .err()
         .context("the steering call must be cancelled")?;
-    anyhow::ensure!(is_root_turn_cancelled(&error), "{error:#}");
+    anyhow::ensure!(root_turn_cancelled_at(&error).is_some(), "{error:#}");
     Ok(())
 }
 
@@ -9442,7 +9442,7 @@ async fn cancelling_a_compacted_early_resume_mid_call_closes_its_running_call() 
     .await
     .err()
     .context("the early resume must be cancelled")?;
-    anyhow::ensure!(is_root_turn_cancelled(&error), "{error:#}");
+    anyhow::ensure!(root_turn_cancelled_at(&error).is_some(), "{error:#}");
 
     let projection = stores
         .messages
@@ -10513,6 +10513,7 @@ async fn fresh_turn_mid_stream_cancel_commits_user_prompt() -> Result<()> {
     let mut deps = stores.deps();
     deps.cancel = Some(&cancel);
 
+    let before_cancel = time::OffsetDateTime::now_utc();
     let result = execute_root_turn(
         inputs,
         "What is the capital of France?",
@@ -10521,6 +10522,7 @@ async fn fresh_turn_mid_stream_cancel_commits_user_prompt() -> Result<()> {
         t_plus(5),
     )
     .await;
+    let after_cancel = time::OffsetDateTime::now_utc();
     let error = result.err().context("cancelled turn must return Err")?;
     assert!(
         format!("{error:#}").to_lowercase().contains("cancel"),
@@ -10556,24 +10558,22 @@ async fn fresh_turn_mid_stream_cancel_commits_user_prompt() -> Result<()> {
     assert!(synthetic.is_closed());
     assert_eq!(synthetic.outcome, Some(TurnAttemptOutcome::Cancelled));
 
-    // Both records carry the moment of the cancel, not the turn's start
-    // (`t_plus(5)`): a turn that hung for hours before the user stopped it
-    // must not read as cancelled the instant it began.
-    assert!(
-        synthetic.opened_at > t_plus(5),
-        "the salvage is stamped at the cancel, got {}",
-        synthetic.opened_at,
-    );
+    // Both records carry the one instant the cancel was observed, not the
+    // turn's start (`t_plus(5)`): a turn that hung for hours before the user
+    // stopped it must not read as cancelled the instant it began.
     let streamed = attempts
         .iter()
         .find(|a| a.provider != "cancel-commit")
         .context("the cancelled provider attempt")?;
     assert_eq!(streamed.outcome, Some(TurnAttemptOutcome::Cancelled));
+    let cancelled_at = streamed
+        .closed_at
+        .context("the cancelled attempt is closed")?;
+    assert_eq!(synthetic.opened_at, cancelled_at);
+    assert_eq!(synthetic.closed_at, Some(cancelled_at));
     assert!(
-        streamed.closed_at > Some(streamed.opened_at),
-        "the cancelled attempt closes when the cancel lands, got {:?} for an attempt opened at {}",
-        streamed.closed_at,
-        streamed.opened_at,
+        (before_cancel..=after_cancel).contains(&cancelled_at),
+        "the cancel is dated when it landed: {cancelled_at} outside {before_cancel}..={after_cancel}",
     );
 
     // The next turn's recovered context contains the committed prompt.
