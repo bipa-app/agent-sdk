@@ -1281,12 +1281,16 @@ fn staged_or_recovery_snapshot(inputs: &RootWorkerInputs) -> serde_json::Value {
 /// untouched so the new lease holder owns turn `N`. Every error is
 /// logged and swallowed — a partial-commit failure must never mask
 /// the cancellation the caller is about to surface.
+///
+/// Stamped with the cancel's own instant, not the turn's start: a stream
+/// that hung for hours before the stop would otherwise date the cancel
+/// to the moment the turn began.
 async fn commit_cancelled_partial_turn(
     inputs: &RootWorkerInputs,
     candidate: Vec<llm::Message>,
     deps: &RootTurnDeps<'_>,
-    now: OffsetDateTime,
 ) {
+    let now = OffsetDateTime::now_utc();
     let task_id = &inputs.bootstrap.task_id;
     let thread_id = &inputs.bootstrap.thread_id;
 
@@ -1341,7 +1345,6 @@ async fn salvage_cancelled_resume(
     inputs: &RootWorkerInputs,
     error: &anyhow::Error,
     deps: &RootTurnDeps<'_>,
-    now: OffsetDateTime,
 ) {
     if !is_root_turn_cancelled(error) {
         return;
@@ -1351,7 +1354,7 @@ async fn salvage_cancelled_resume(
         .messages
         .snapshot_appended_messages()
         .unwrap_or_default();
-    commit_cancelled_partial_turn(inputs, candidate, deps, now).await;
+    commit_cancelled_partial_turn(inputs, candidate, deps).await;
 }
 
 /// Seam A: commit the completed prefix of a **parked** cancelled turn.
@@ -1943,7 +1946,7 @@ async fn execute_root_turn_inner(
                         inputs.bootstrap.thread_id,
                     ),
                 }
-                commit_cancelled_partial_turn(&inputs, candidate, deps, now).await;
+                commit_cancelled_partial_turn(&inputs, candidate, deps).await;
             }
             return Err(error);
         }
@@ -4656,17 +4659,17 @@ async fn finish_failed_stream_attempt(
 
 /// Close an attempt whose root turn was cancelled mid-stream via the
 /// [`RootTurnDeps::cancel`] token and build the matching non-retryable
-/// error (see [`StreamAttemptError::Cancelled`]).
+/// error (see [`StreamAttemptError::Cancelled`]). Closed at the cancel's
+/// instant for the same reason as [`commit_cancelled_partial_turn`].
 async fn close_cancelled_attempt(
     ctx: StreamAttemptCtx<'_, '_>,
     usage: &llm::Usage,
-    now: OffsetDateTime,
 ) -> StreamAttemptError {
     flush_and_close(CloseStreamAttemptParams {
         ctx,
         outcome: TurnAttemptOutcome::Cancelled,
         usage,
-        now,
+        now: OffsetDateTime::now_utc(),
     })
     .await;
     StreamAttemptError::Cancelled {
@@ -4737,7 +4740,7 @@ async fn poll_stream_item(
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
-                    return Err(close_cancelled_attempt(ctx, &usage, now).await);
+                    return Err(close_cancelled_attempt(ctx, &usage).await);
                 }
                 polled = tokio::time::timeout(stall_budget, stream.next()) => polled,
             }
@@ -7396,7 +7399,7 @@ async fn resume_root_turn_with_fan_in(
     } = match streamed {
         Ok(streamed) => streamed,
         Err(error) => {
-            salvage_cancelled_resume(&inputs, &error, deps, now).await;
+            salvage_cancelled_resume(&inputs, &error, deps).await;
             return Err(error);
         }
     };
@@ -9186,7 +9189,7 @@ async fn run_steering_exchange(
     } = match streamed {
         Ok(streamed) => streamed,
         Err(error) => {
-            salvage_cancelled_resume(&inputs, &error, deps, now).await;
+            salvage_cancelled_resume(&inputs, &error, deps).await;
             return Err(error);
         }
     };
