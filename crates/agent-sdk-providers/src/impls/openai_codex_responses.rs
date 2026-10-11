@@ -3466,7 +3466,7 @@ mod tests {
     use super::*;
     use crate::impls::openai::{
         MODEL_GPT6_ASTRA, MODEL_GPT6_LUNA, MODEL_GPT6_SOL, MODEL_GPT56, MODEL_GPT56_LUNA,
-        MODEL_GPT56_SOL, MODEL_GPT56_TERRA,
+        MODEL_GPT56_SOL, MODEL_GPT56_TERRA, MODEL_GPT61_SOL,
     };
     #[test]
     fn compaction_summary_is_framed_as_untrusted_historical_data() {
@@ -3534,6 +3534,7 @@ mod tests {
         for model in [
             MODEL_GPT53_CODEX,
             MODEL_GPT6_SOL,
+            MODEL_GPT61_SOL,
             MODEL_GPT6_LUNA,
             "unknown-future-model",
         ] {
@@ -3551,6 +3552,7 @@ mod tests {
         for model in [
             MODEL_GPT53_CODEX,
             MODEL_GPT6_SOL,
+            MODEL_GPT61_SOL,
             MODEL_GPT6_LUNA,
             "unknown-future-model",
         ] {
