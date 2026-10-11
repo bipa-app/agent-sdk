@@ -3617,26 +3617,34 @@ ORDER BY created_at, id
                     .context("rollback vanished runnable head")?;
                 continue;
             };
-            if !old.status.can_be_leased() {
-                if old.status == TaskStatus::Running {
-                    // Lost the claim race to another worker between the
-                    // head scan and the FOR UPDATE load — rescan.
+            match old.status {
+                TaskStatus::Pending => {}
+                // The head scan takes no lock, so another worker may claim,
+                // fail closed, or cancel the head (and its claimer move it
+                // on) before this FOR UPDATE load. The scan only returns
+                // pending rows, so rescanning moves past the lost head.
+                TaskStatus::Running
+                | TaskStatus::WaitingOnChildren
+                | TaskStatus::AwaitingConfirmation
+                | TaskStatus::AwaitingQuestion
+                | TaskStatus::Completed
+                | TaskStatus::Failed
+                | TaskStatus::Cancelled => {
                     tx.rollback()
                         .await
                         .context("rollback raced runnable head")?;
                     continue;
                 }
-                // Anything else in the pending scan is index corruption,
-                // not a race — same hard error the sqlite and in-memory
-                // backends raise.
-                let status = old.status;
-                tx.rollback()
-                    .await
-                    .context("rollback corrupt runnable head")?;
-                return Err(anyhow!(
-                    "acquire_next_runnable: runnable index held non-pending row {} in status {status:?}",
-                    old.id
-                ));
+                TaskStatus::Queued => {
+                    let status = old.status;
+                    tx.rollback()
+                        .await
+                        .context("rollback corrupt runnable head")?;
+                    return Err(anyhow!(
+                        "acquire_next_runnable: runnable index held non-pending row {} in status {status:?}",
+                        old.id
+                    ));
+                }
             }
 
             match classify_recovery(&old, RecoveryContext::AcquisitionAttempt) {
@@ -7913,6 +7921,41 @@ INSERT INTO agent_sdk_turn_attempts (
         Ok(())
     }
 
+    /// Submit a root on `thread` whose only attempt was claimed and
+    /// released, leaving it `Pending` with a spent retry budget.
+    async fn submit_exhausted_root(
+        store: &PostgresDurableStore,
+        thread: &str,
+        secs: i64,
+    ) -> Result<AgentTaskId> {
+        let root = AgentTask::new_root_turn(thread_id(thread), t_plus(secs), 1);
+        let id = root.id.clone();
+        store
+            .submit_root_turn(root)
+            .await
+            .context("submit exhausted root")?;
+        let claimed = store
+            .try_acquire_task(
+                &id,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(secs + 50),
+                t_plus(secs + 1),
+            )
+            .await
+            .context("acquire exhausted root")?
+            .context("exhausted root claimed")?;
+        store
+            .update(
+                claimed
+                    .release_lease(t_plus(secs + 2))
+                    .context("release exhausted root")?,
+            )
+            .await
+            .context("persist released exhausted root")?;
+        Ok(id)
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn acquire_next_runnable_commits_fail_closed_heads_before_returning_none() -> Result<()> {
         let Some((store, _schema_guard)) = test_store().await? else {
@@ -7922,36 +7965,7 @@ INSERT INTO agent_sdk_turn_attempts (
         let mut ids = Vec::new();
         for (idx, name) in ["a", "b", "c"].iter().enumerate() {
             let secs = i64::try_from(idx).context("enumerate fits i64")? * 10;
-            let root = AgentTask::new_root_turn(
-                thread_id(&format!("t-pg-exhaust-{name}")),
-                t_plus(secs),
-                1,
-            );
-            let id = root.id.clone();
-            store
-                .submit_root_turn(root)
-                .await
-                .context("submit exhausted root")?;
-            let claimed = store
-                .try_acquire_task(
-                    &id,
-                    WorkerId::from_string(format!("w-{name}")),
-                    LeaseId::from_string(format!("l-{name}")),
-                    t_plus(secs + 50),
-                    t_plus(secs + 1),
-                )
-                .await
-                .context("acquire exhausted root")?
-                .context("exhausted root claimed")?;
-            store
-                .update(
-                    claimed
-                        .release_lease(t_plus(secs + 2))
-                        .context("release exhausted root")?,
-                )
-                .await
-                .context("persist released exhausted root")?;
-            ids.push(id);
+            ids.push(submit_exhausted_root(&store, &format!("t-pg-exhaust-{name}"), secs).await?);
         }
 
         let result = store
@@ -7986,6 +8000,85 @@ INSERT INTO agent_sdk_turn_attempts (
             );
         }
 
+        Ok(())
+    }
+
+    /// Workers racing over the same exhausted heads lose the fail-close
+    /// to whichever commits first; the losers must rescan and come back
+    /// empty, never surface the row they lost as an acquisition error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_acquirers_over_exhausted_heads_never_error() -> Result<()> {
+        const ROUNDS: i64 = 5;
+        const HEADS: i64 = 4;
+        const ACQUIRERS: usize = 8;
+        let Some((store, _schema_guard)) = test_store().await? else {
+            return Ok(());
+        };
+
+        let mut failures = Vec::new();
+        for round in 0..ROUNDS {
+            let mut heads = Vec::new();
+            for head in 0..HEADS {
+                let thread = format!("t-pg-race-{round}-{head}");
+                let secs = (round * HEADS + head) * 10;
+                heads.push((
+                    thread_id(&thread),
+                    submit_exhausted_root(&store, &thread, secs).await?,
+                ));
+            }
+
+            let start = std::sync::Arc::new(tokio::sync::Barrier::new(ACQUIRERS));
+            let mut acquirers = Vec::with_capacity(ACQUIRERS);
+            for _ in 0..ACQUIRERS {
+                let store = store.clone();
+                let start = std::sync::Arc::clone(&start);
+                acquirers.push(tokio::spawn(async move {
+                    start.wait().await;
+                    store
+                        .acquire_next_runnable(
+                            WorkerId::new(),
+                            LeaseId::new(),
+                            t_plus(10_000),
+                            t_plus(9_000),
+                        )
+                        .await
+                }));
+            }
+            for acquirer in acquirers {
+                match acquirer.await.context("join acquirer")? {
+                    Ok(None) => {}
+                    Ok(Some(claimed)) => {
+                        failures.push(format!("round {round}: claimed exhausted {}", claimed.id));
+                    }
+                    Err(error) => failures.push(format!("round {round}: {error:#}")),
+                }
+            }
+
+            for (thread, id) in &heads {
+                let row = AgentTaskStore::get(&store, id)
+                    .await?
+                    .context("head row exists")?;
+                assert_eq!(row.status, TaskStatus::Failed, "round {round}: {id}");
+                let terminal_errors = EventRepository::get_events(&store, thread)
+                    .await?
+                    .iter()
+                    .filter(|committed| {
+                        matches!(
+                            committed.event,
+                            AgentEvent::Error {
+                                recoverable: false,
+                                ..
+                            }
+                        )
+                    })
+                    .count();
+                assert_eq!(terminal_errors, 1, "round {round}: {id}");
+            }
+        }
+        anyhow::ensure!(
+            failures.is_empty(),
+            "acquirers racing over exhausted heads failed: {failures:#?}"
+        );
         Ok(())
     }
 
