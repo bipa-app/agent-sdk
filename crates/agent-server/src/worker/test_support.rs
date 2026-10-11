@@ -50,6 +50,23 @@ const DEFAULT_USAGE: Usage = Usage {
     cache_creation_input_tokens: 0,
 };
 
+#[derive(Clone)]
+enum DeltaDelays {
+    None,
+    Uniform(Duration),
+    PerDelta(Vec<Duration>),
+}
+
+impl DeltaDelays {
+    fn before(&self, index: usize) -> Option<Duration> {
+        match self {
+            Self::None => None,
+            Self::Uniform(delay) => Some(*delay),
+            Self::PerDelta(delays) => delays.get(index).copied(),
+        }
+    }
+}
+
 /// One scripted LLM call: the ordered deltas to stream, an optional
 /// per-delta delay, and an optional mid-stream fault.
 ///
@@ -59,8 +76,8 @@ const DEFAULT_USAGE: Usage = Usage {
 pub struct TurnScript {
     deltas: Vec<StreamDelta>,
     /// Wall-clock (virtual, under `tokio::test(start_paused)`) delay
-    /// applied *before* each delta is yielded.  `None` = no delay.
-    per_delta_delay: Option<Duration>,
+    /// applied *before* each delta is yielded.
+    delays: DeltaDelays,
     /// When set, the stream yields this many deltas, then yields a
     /// terminal [`StreamDelta::Error`] of the given kind and stops —
     /// the remaining scripted deltas are dropped.  Models a provider
@@ -74,7 +91,18 @@ impl TurnScript {
     pub fn from_deltas(deltas: Vec<StreamDelta>) -> Self {
         Self {
             deltas,
-            per_delta_delay: None,
+            delays: DeltaDelays::None,
+            fail_after: None,
+        }
+    }
+
+    /// Hand-crafted deltas, each yielded after its own delay.
+    #[must_use]
+    pub fn from_timed_deltas(timed: Vec<(Duration, StreamDelta)>) -> Self {
+        let (delays, deltas) = timed.into_iter().unzip();
+        Self {
+            deltas,
+            delays: DeltaDelays::PerDelta(delays),
             fail_after: None,
         }
     }
@@ -241,8 +269,8 @@ impl TurnScript {
     /// `#[tokio::test(start_paused = true)]` this advances virtual time
     /// deterministically without real sleeps.
     #[must_use]
-    pub const fn with_delay(mut self, delay: Duration) -> Self {
-        self.per_delta_delay = Some(delay);
+    pub fn with_delay(mut self, delay: Duration) -> Self {
+        self.delays = DeltaDelays::Uniform(delay);
         self
     }
 
@@ -345,7 +373,7 @@ impl LlmProvider for StreamingScriptedProvider {
         Box::pin(async_stream::stream! {
             let TurnScript {
                 deltas,
-                per_delta_delay,
+                delays,
                 fail_after,
             } = script;
 
@@ -362,7 +390,7 @@ impl LlmProvider for StreamingScriptedProvider {
                     return;
                 }
 
-                if let Some(delay) = per_delta_delay {
+                if let Some(delay) = delays.before(index) {
                     tokio::time::sleep(delay).await;
                 }
                 yield Ok(delta);
