@@ -497,7 +497,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         model_id: "gpt-6.1-sol",
         context_window: Some(1_050_000),
         max_output_tokens: Some(128_000),
-        pricing: Some(Pricing::flat_with_cached(2.0, 10.0, 0.1).with_notes(
+        pricing: Some(Pricing::flat_with_cached(2.0, 10.0, 0.1).with_cache_write(2.5).with_notes(
             "Standard tier base rates. Cached input costs $0.10/M (5% of base input, versus 10% on other GPT-6 models). Cache writes cost $2.50/M input tokens. Requests with more than 272K input tokens cost 2x input and cache rates and 1.5x output for the full request.",
         )),
         supports_thinking: true,
@@ -1379,7 +1379,9 @@ mod tests {
     }
 
     #[test]
-    fn budget_capable_models_do_not_carry_the_flag() {
+    fn budget_capable_models_do_not_carry_the_flag() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
         for (provider, model) in [
             ("anthropic", "claude-sonnet-4-5-20250929"),
             ("anthropic", "claude-haiku-4-5-20251001"),
@@ -1389,12 +1391,14 @@ mod tests {
             ("openai", "gpt-6.1-sol"),
             ("openai", "gpt-6-luna"),
         ] {
-            let caps = get_model_capabilities(provider, model).unwrap();
+            let caps = get_model_capabilities(provider, model)
+                .with_context(|| format!("{provider}/{model} capabilities missing"))?;
             assert!(
                 !caps.rejects_budget_thinking,
                 "{provider}/{model} accepts budget-style thinking config"
             );
         }
+        Ok(())
     }
 
     #[test]
@@ -1487,6 +1491,11 @@ mod tests {
                 "{model_id}: unexpected cost {cost}"
             );
         }
+        let sol_61 = get_model_capabilities("openai", "gpt-6.1-sol")
+            .context("gpt-6.1-sol capabilities missing")?
+            .pricing
+            .context("gpt-6.1-sol pricing missing")?;
+        assert_eq!(sol_61.cache_write, Some(PricePoint::new(2.5)));
         Ok(())
     }
 
