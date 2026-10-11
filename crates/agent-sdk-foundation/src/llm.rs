@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 // ── Thinking ──────────────────────────────────────────────────────────
 
 /// The mode of extended thinking.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum ThinkingMode {
     /// Explicitly enabled with a token budget.
     Enabled { budget_tokens: u32 },
@@ -52,7 +52,7 @@ pub enum Effort {
 ///
 /// When enabled, the model will show its reasoning process before
 /// generating the final response.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ThinkingConfig {
     /// Which thinking mode to use.
     pub mode: ThinkingMode,
@@ -136,7 +136,7 @@ impl Default for ThinkingConfig {
 // ── Request / Response ────────────────────────────────────────────────
 
 /// Controls whether the model must use a tool.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum ToolChoice {
     /// Let the model decide whether to use tools (default when `None`).
     Auto,
@@ -201,7 +201,7 @@ impl ResponseFormat {
 /// Only the values the Anthropic Messages API accepts are modelled, so the
 /// enum maps losslessly onto the wire `ttl` string. Providers without an
 /// equivalent control ignore it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum CacheTtl {
     /// Five-minute ephemeral cache (the provider default).
     FiveMinutes,
@@ -233,7 +233,7 @@ impl CacheTtl {
 ///   conversation tail). `None` leaves the provider's default count.
 ///
 /// Providers without a prompt-cache control ignore every field gracefully.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CacheConfig {
     /// Whether prompt caching is enabled for this request.
     pub enabled: bool,
@@ -1291,7 +1291,10 @@ impl ServedSpeed {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
-    /// Total input tokens reported by the provider.
+    /// Billable input tokens summed over every physical request this usage
+    /// covers; failover and refresh wrappers fold abandoned attempts in.
+    /// Context occupancy reads
+    /// [`request_input_tokens`](Self::request_input_tokens) instead.
     pub input_tokens: u32,
     pub output_tokens: u32,
     /// Portion of `input_tokens` billed at a cached-input rate, when reported.
@@ -1312,6 +1315,15 @@ pub struct Usage {
     /// every provider and model that has no premium tier to begin with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub served_speed: Option<ServedSpeed>,
+    /// Total prompt-side tokens of the latest single physical request,
+    /// cache reads and writes included. Raw provider adapters stamp it;
+    /// wrappers carry the current attempt's value and never sum it.
+    ///
+    /// `None` means that request's size is unknown (synthetic usage, a
+    /// provider that does not report it, or a failover survivor that sent
+    /// no usage frame). Never substitute the aggregate `input_tokens`.
+    #[serde(default)]
+    pub request_input_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone)]

@@ -55,6 +55,7 @@ impl TestProvider {
                 output_tokens: 20,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         })
     }
@@ -76,6 +77,7 @@ impl TestProvider {
                 output_tokens: 25,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         })
     }
@@ -688,6 +690,7 @@ async fn llm_span_emits_cached_token_attributes() -> Result<()> {
             output_tokens: 50,
             cached_input_tokens: 20,
             cache_creation_input_tokens: 10,
+            request_input_tokens: None,
         },
     )]);
     let agent = builder::<()>()
@@ -743,6 +746,7 @@ async fn root_span_emits_aggregated_cached_token_attributes() -> Result<()> {
             output_tokens: 50,
             cached_input_tokens: 20,
             cache_creation_input_tokens: 10,
+            request_input_tokens: None,
         },
     )]);
     let agent = builder::<()>()
@@ -796,6 +800,7 @@ async fn turn_span_emits_cached_token_attributes() -> Result<()> {
             output_tokens: 50,
             cached_input_tokens: 20,
             cache_creation_input_tokens: 10,
+            request_input_tokens: None,
         },
     )]);
     let agent = builder::<()>()
@@ -2225,6 +2230,7 @@ async fn llm_span_emits_stream_lifecycle_events() -> Result<()> {
             output_tokens: 2,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         }),
         StreamDelta::Done {
             stop_reason: Some(StopReason::EndTurn),
@@ -2291,6 +2297,7 @@ async fn keep_alives_are_not_counted_as_stream_deltas() -> Result<()> {
             output_tokens: 1,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         }),
         StreamDelta::Done {
             stop_reason: Some(StopReason::EndTurn),
@@ -2485,6 +2492,7 @@ async fn root_span_emits_context_window_exceeded_event() -> Result<()> {
             output_tokens: 0,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         },
     })]);
     let agent = builder::<()>()
@@ -3035,6 +3043,7 @@ mod metrics {
                 output_tokens: 3,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             }),
             StreamDelta::Done {
                 stop_reason: Some(StopReason::EndTurn),
@@ -3281,6 +3290,7 @@ mod metrics {
                         output_tokens: 0,
                         cached_input_tokens: 0,
                         cache_creation_input_tokens: 0,
+                        request_input_tokens: None,
                     },
                 }))
             } else {
@@ -3321,6 +3331,7 @@ mod metrics {
                     output_tokens: 10,
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
+                    request_input_tokens: None,
                 },
             },
         )]));
@@ -3611,6 +3622,9 @@ mod metrics {
                 retained_count: messages.len(),
                 messages,
                 llm_usage: TokenUsage::default(),
+                published_artifacts: agent_sdk::context::PublishedArtifacts::default(),
+                response_model: None,
+                served_route: None,
             })
         }
     }
@@ -3736,6 +3750,7 @@ impl LlmProvider for CloneableTestProvider {
                     output_tokens: 0,
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
+                    request_input_tokens: None,
                 },
             }))
         } else {
@@ -3874,6 +3889,7 @@ async fn subagent_invoke_agent_links_to_parent_turn() -> Result<()> {
                 output_tokens: 10,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         },
     )]));

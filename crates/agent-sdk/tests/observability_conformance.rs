@@ -547,6 +547,7 @@ async fn test_metrics_emitted_b3() -> Result<()> {
                 output_tokens: 10,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }),
     ]));

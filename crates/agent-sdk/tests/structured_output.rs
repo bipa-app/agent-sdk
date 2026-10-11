@@ -122,6 +122,7 @@ fn ok(content: Vec<ContentBlock>) -> ChatOutcome {
             output_tokens: 1,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         },
     })
 }

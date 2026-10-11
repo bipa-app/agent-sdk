@@ -226,7 +226,13 @@ impl RetryConfig {
     }
 }
 
-/// Token usage statistics
+/// Token usage statistics.
+///
+/// `input_tokens` is the total prompt-side count, summed over every physical
+/// request folded into this reading (failover and refresh attempts
+/// included); `cached_input_tokens` and `cache_creation_input_tokens` are
+/// subsets of it, not additions. None of these fields measures the context
+/// occupancy of a single request, and summing them double-counts.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: u32,

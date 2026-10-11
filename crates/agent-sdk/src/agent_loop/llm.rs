@@ -620,7 +620,7 @@ impl StreamingRetryState {
     /// new streak, i.e. when the caller must emit the streak's
     /// `AutoRetryStart`.
     const fn record_connectivity_failure(&mut self, usage: &Usage) -> bool {
-        add_usage(&mut self.abandoned_usage, usage);
+        self.fold_failed_attempt(usage);
         self.total = self.total.saturating_add(1);
         self.reachable_connectivity_deaths = self.reachable_connectivity_deaths.saturating_add(1);
         self.had_connectivity = true;
@@ -630,11 +630,24 @@ impl StreamingRetryState {
     }
 
     const fn record_transient_failure(&mut self, usage: &Usage, max_retries: u32) -> bool {
-        add_usage(&mut self.abandoned_usage, usage);
+        self.fold_failed_attempt(usage);
         self.transient = self.transient.saturating_add(1);
         self.total = self.total.saturating_add(1);
         self.in_connectivity_streak = false;
         self.transient <= max_retries
+    }
+
+    /// Fold a dead attempt into the abandoned bucket; the bucket's
+    /// `request_input_tokens` becomes that attempt's own, `None` included.
+    const fn fold_failed_attempt(&mut self, usage: &Usage) {
+        add_usage(&mut self.abandoned_usage, usage);
+        self.abandoned_usage.request_input_tokens = usage.request_input_tokens;
+    }
+
+    /// Fold abandoned billing into the surviving response, keeping the
+    /// survivor's `request_input_tokens`.
+    const fn fold_abandoned_into(&self, survivor: &mut Usage) {
+        add_usage(survivor, &self.abandoned_usage);
     }
 }
 
@@ -792,7 +805,7 @@ where
         match result {
             Ok(mut response) => {
                 finish_retry_events(event_ctx, retry.last_emitted).await;
-                add_usage(&mut response.usage, &retry.abandoned_usage);
+                retry.fold_abandoned_into(&mut response.usage);
                 return (LlmOutcome::Response(response), retry.total);
             }
             Err(StreamError::Connectivity { message, usage }) => {
@@ -850,7 +863,7 @@ where
                 return (fatal_stream_outcome(&message), retry.total);
             }
             Err(StreamError::Cancelled(usage)) => {
-                add_usage(&mut retry.abandoned_usage, &usage);
+                retry.fold_failed_attempt(&usage);
                 return (LlmOutcome::Cancelled(retry.abandoned_usage), retry.total);
             }
         }
@@ -1087,6 +1100,7 @@ const ZERO_USAGE: Usage = Usage {
     output_tokens: 0,
     cached_input_tokens: 0,
     cache_creation_input_tokens: 0,
+    request_input_tokens: None,
 };
 
 /// Usage the stream has reported so far, or zero when it reported none yet.
@@ -1098,7 +1112,8 @@ fn accumulated_usage(accumulator: &StreamAccumulator) -> Usage {
 ///
 /// The served tier folds rather than being overwritten, so a total that mixes
 /// an expedited call with a downgraded one reports `Mixed` instead of silently
-/// taking whichever call happened to land last.
+/// taking whichever call happened to land last. `request_input_tokens` is
+/// left to the direction-aware `StreamingRetryState` folds.
 const fn add_usage(total: &mut Usage, delta: &Usage) {
     total.served_speed = ServedSpeed::merge(total.served_speed, delta.served_speed);
     total.input_tokens = total.input_tokens.saturating_add(delta.input_tokens);
@@ -1346,4 +1361,75 @@ async fn send_auto_retry_end_event<H>(
         },
     )
     .await;
+}
+
+#[cfg(test)]
+mod retry_usage_tests {
+    use super::*;
+
+    fn usage(input: u32, output: u32, stamp: Option<u32>) -> Usage {
+        Usage {
+            served_speed: None,
+            input_tokens: input,
+            output_tokens: output,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            request_input_tokens: stamp,
+        }
+    }
+
+    #[test]
+    fn failure_accumulation_carries_the_latest_failed_request_stamp() {
+        let mut retry = StreamingRetryState::new();
+        retry.record_transient_failure(&usage(100, 50, Some(100)), 5);
+        retry.record_connectivity_failure(&usage(10, 5, Some(10)));
+
+        assert_eq!(retry.abandoned_usage.input_tokens, 110);
+        assert_eq!(retry.abandoned_usage.output_tokens, 55);
+        assert_eq!(
+            retry.abandoned_usage.request_input_tokens,
+            Some(10),
+            "the bucket must stamp the LATEST failed physical request, \
+             not the first and never the sum"
+        );
+        retry.record_transient_failure(&usage(3, 1, None), 5);
+        assert_eq!(retry.abandoned_usage.input_tokens, 113);
+        assert_eq!(retry.abandoned_usage.request_input_tokens, None);
+    }
+
+    #[test]
+    fn failures_then_success_keep_the_survivors_stamp() {
+        let mut retry = StreamingRetryState::new();
+        retry.record_transient_failure(&usage(100, 50, Some(100)), 5);
+        retry.record_connectivity_failure(&usage(10, 5, Some(10)));
+        let mut survivor = usage(7, 3, Some(7));
+        retry.fold_abandoned_into(&mut survivor);
+        assert_eq!(survivor.input_tokens, 117);
+        assert_eq!(survivor.output_tokens, 58);
+        assert_eq!(
+            survivor.request_input_tokens,
+            Some(7),
+            "the surviving response's stamp names the one physical request \
+             that produced it; abandoned billing must not overwrite it"
+        );
+        let mut unknown_survivor = usage(7, 3, None);
+        retry.fold_abandoned_into(&mut unknown_survivor);
+        assert_eq!(unknown_survivor.input_tokens, 117);
+        assert_eq!(unknown_survivor.request_input_tokens, None);
+    }
+
+    #[test]
+    fn failures_then_cancellation_report_the_cancelled_attempts_stamp() {
+        let mut retry = StreamingRetryState::new();
+        retry.record_transient_failure(&usage(100, 50, Some(100)), 5);
+        retry.fold_failed_attempt(&usage(10, 5, Some(10)));
+        assert_eq!(retry.abandoned_usage.input_tokens, 110);
+        assert_eq!(retry.abandoned_usage.output_tokens, 55);
+        assert_eq!(
+            retry.abandoned_usage.request_input_tokens,
+            Some(10),
+            "a cancelled turn's usage must stamp the cancelled attempt's own \
+             physical request"
+        );
+    }
 }

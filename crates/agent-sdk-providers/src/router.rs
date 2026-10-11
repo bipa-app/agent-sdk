@@ -251,6 +251,10 @@ where
         self.capable.route()
     }
 
+    fn has_stable_request_route(&self) -> bool {
+        false
+    }
+
     /// Pre-dispatch image pricing and limits come from the representative
     /// capable tier, but classification may select a heterogeneous fast or
     /// advanced tier. Dynamic model routing therefore never opts in.
@@ -392,6 +396,7 @@ mod tests {
                     output_tokens: 1,
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
+                    request_input_tokens: None,
                 },
             }))
         }
@@ -424,6 +429,27 @@ mod tests {
         );
 
         assert!(!router.supports_historical_image_blocks());
+    }
+
+    #[test]
+    fn dynamic_model_routing_reports_an_unstable_request_route() {
+        let tier = |name: &'static str| StaticProvider {
+            name,
+            reply: "MODERATE",
+            supports_historical_images: false,
+        };
+        let router = ModelRouter::new(
+            tier("classifier"),
+            tier("fast"),
+            tier("capable"),
+            tier("advanced"),
+        );
+        assert!(
+            !router.has_stable_request_route(),
+            "per-request classification may pick any tier; measured occupancy \
+             must never anchor on the representative capable identity",
+        );
+        assert!(tier("leaf").has_stable_request_route());
     }
 
     /// A request classified `SIMPLE` streams from the `fast` tier, and the

@@ -480,6 +480,7 @@ impl ApiUsageMetadata {
             output_tokens: self.candidates,
             cached_input_tokens: self.cached_content,
             cache_creation_input_tokens: 0,
+            request_input_tokens: Some(self.prompt),
         }
     }
 }
@@ -1263,6 +1264,11 @@ mod tests {
 
         assert_eq!(usage.input_tokens, 120);
         assert_eq!(usage.output_tokens, 30);
+        assert_eq!(
+            usage.request_input_tokens,
+            Some(120),
+            "one physical request: request occupancy equals its total input"
+        );
         assert_eq!(usage.cached_input_tokens, 40);
         assert_eq!(usage.cache_creation_input_tokens, 0);
     }

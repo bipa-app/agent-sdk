@@ -34,6 +34,7 @@ tokio-util = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
@@ -63,12 +64,13 @@ otel = ["dep:opentelemetry", "agent-sdk/otel"]
 failpoints = ["dep:fail", "fail/failpoints"]
 
 [dev-dependencies]
-# The turn-attempt evidence tests assert on REAL provider instances (an
-# `OpenAIProvider` pointed at a gateway URL vs the native one), because the
-# route discrimination they pin is exactly what a test double would fake by
-# construction. The workspace pins `default-features = false`, so the `openai`
-# feature has to be requested here rather than inherited.
-agent-sdk-providers = { workspace = true, features = ["openai"] }
+# The turn-attempt evidence and model-aware compaction threshold tests assert
+# on REAL provider instances (gateway URLs vs native endpoints, each provider's
+# capability lookup), because the route discrimination they pin is exactly
+# what a test double would fake by construction. The workspace pins
+# `default-features = false`, so provider features are requested here rather
+# than inherited.
+agent-sdk-providers = { workspace = true, features = ["anthropic", "gemini", "openai", "openai-codex"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "test-util"] }
 async-stream = { workspace = true }
 # The compaction/multimodal integration tests decode artifact-backed frame

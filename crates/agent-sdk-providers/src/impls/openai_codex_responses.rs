@@ -454,6 +454,7 @@ impl OpenAICodexResponsesProvider {
                     output_tokens: 0,
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
+                    request_input_tokens: None,
                 },
                 |usage| usage_from_api_usage(&usage),
             ),
@@ -2350,6 +2351,7 @@ fn usage_from_api_usage(usage: &ApiUsage) -> Usage {
             .input_tokens_details
             .as_ref()
             .map_or(0, |details| details.cache_write_tokens),
+        request_input_tokens: Some(usage.input_tokens),
     }
 }
 
@@ -4890,6 +4892,11 @@ mod tests {
         let usage = usage_from_api_usage(&usage);
         assert_eq!(usage.cached_input_tokens, 1024);
         assert_eq!(usage.cache_creation_input_tokens, 512);
+        assert_eq!(
+            usage.request_input_tokens,
+            Some(2048),
+            "one physical request: request occupancy equals its total input"
+        );
         Ok(())
     }
 

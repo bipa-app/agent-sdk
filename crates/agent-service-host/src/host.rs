@@ -3895,6 +3895,7 @@ mod tests {
                     output_tokens: 5,
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
+                    request_input_tokens: None,
                 },
             }))
         }
@@ -4073,6 +4074,7 @@ mod tests {
                     output_tokens: 1,
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
+                    request_input_tokens: None,
                 },
             }))
         }
@@ -6080,6 +6082,7 @@ mod tests {
                 output_tokens: 5,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }
     }
@@ -6105,6 +6108,7 @@ mod tests {
                 output_tokens: 6,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }
     }
@@ -6434,6 +6438,7 @@ mod tests {
         output_tokens: 50,
         cached_input_tokens: 0,
         cache_creation_input_tokens: 0,
+        request_input_tokens: None,
     };
 
     /// Its second usage frame — a RESTATED running total, which is what
@@ -6447,6 +6452,7 @@ mod tests {
         output_tokens: 70,
         cached_input_tokens: 0,
         cache_creation_input_tokens: 0,
+        request_input_tokens: None,
     };
 
     /// Scripted provider for the timeout tests, routed on request
@@ -6539,6 +6545,7 @@ mod tests {
                             output_tokens: 4,
                             cached_input_tokens: 0,
                             cache_creation_input_tokens: 0,
+                            request_input_tokens: None,
                         },
                     })),
                     HangChildBehavior::SlowThenText => {
@@ -6581,6 +6588,7 @@ mod tests {
                     output_tokens: 6,
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
+                    request_input_tokens: None,
                 },
             }))
         }

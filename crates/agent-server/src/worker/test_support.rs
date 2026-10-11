@@ -48,6 +48,7 @@ const DEFAULT_USAGE: Usage = Usage {
     output_tokens: 50,
     cached_input_tokens: 0,
     cache_creation_input_tokens: 0,
+    request_input_tokens: None,
 };
 
 /// One scripted LLM call: the ordered deltas to stream, an optional

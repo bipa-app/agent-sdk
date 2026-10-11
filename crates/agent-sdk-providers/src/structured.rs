@@ -508,6 +508,7 @@ fn build_streamed_response(mut accumulator: StreamAccumulator, model: String) ->
         output_tokens: 0,
         cached_input_tokens: 0,
         cache_creation_input_tokens: 0,
+        request_input_tokens: None,
     });
     let stop_reason = accumulator.take_stop_reason();
     ChatResponse {
@@ -908,6 +909,7 @@ mod tests {
                 output_tokens: 1,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         })
     }

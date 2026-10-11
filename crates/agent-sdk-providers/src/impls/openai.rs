@@ -1659,6 +1659,7 @@ fn process_sse_data(data: &str) -> Vec<SseProcessResult> {
                 .prompt_tokens_details
                 .as_ref()
                 .map_or(0, |details| details.cache_write_tokens),
+            request_input_tokens: Some(u.prompt_tokens),
         }));
     }
 
@@ -1867,6 +1868,7 @@ fn decode_chat_response(
                 .prompt_tokens_details
                 .as_ref()
                 .map_or(0, |details| details.cache_write_tokens),
+            request_input_tokens: Some(api_response.usage.prompt_tokens),
         },
     }))
 }
@@ -4512,6 +4514,7 @@ mod tests {
                 cached_input_tokens: 10,
                 cache_creation_input_tokens: 6,
                 served_speed: None,
+                request_input_tokens: Some(42),
             })]
         ));
     }

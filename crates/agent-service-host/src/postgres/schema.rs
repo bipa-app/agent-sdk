@@ -395,6 +395,12 @@ const AGENT_SDK_MESSAGE_HEAD_COLUMNS: &[ColumnContract] = &[
         notes: "Current SDK-visible history, created/advanced by `commit_messages` and rewritten by `replace_history` during compaction.",
     },
     ColumnContract {
+        name: "history_generation",
+        sql_type: "BIGINT",
+        nullable: false,
+        notes: "Monotonic count of history rewrite boundaries (`replace_history`, `append_compaction`, `append_repair`); never advanced by append-only commits and never reset by lineage clears. Rows written by pre-0022 builds decode as generation 0.",
+    },
+    ColumnContract {
         name: "version",
         sql_type: "BIGINT",
         nullable: false,
@@ -426,6 +432,10 @@ const AGENT_SDK_MESSAGE_HEAD_CONSTRAINTS: &[ConstraintContract] = &[
     ConstraintContract {
         name: "agent_sdk_message_heads_version_check",
         invariant: "Projection version is non-negative.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_message_heads_history_generation_check",
+        invariant: "History rewrite generation is non-negative.",
     },
 ];
 

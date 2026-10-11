@@ -245,6 +245,8 @@ const OPENROUTER_KIMI_K26_URL: &str = "https://openrouter.ai/moonshotai/kimi-k2.
 const OPENROUTER_KIMI_K25_URL: &str = "https://openrouter.ai/moonshotai/kimi-k2.5";
 const KIMI_K25_AA_URL: &str = "https://artificialanalysis.ai/models/kimi-k2-5";
 const OPENROUTER_KIMI_K2_THINKING_URL: &str = "https://openrouter.ai/moonshotai/kimi-k2-thinking";
+const OPENROUTER_KIMI_K3_URL: &str = "https://openrouter.ai/moonshotai/kimi-k3";
+const FIREWORKS_KIMI_K3_URL: &str = "https://fireworks.ai/models/fireworks/kimi-k3";
 const OPENROUTER_DEEPSEEK_V4_PRO_URL: &str = "https://openrouter.ai/deepseek/deepseek-v4-pro";
 const OPENROUTER_DEEPSEEK_V4_FLASH_URL: &str = "https://openrouter.ai/deepseek/deepseek-v4-flash";
 const DEEPSEEK_PRICING_URL: &str = "https://api-docs.deepseek.com/quick_start/pricing";
@@ -1056,6 +1058,32 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
     },
     ModelCapabilities {
         provider: "openai",
+        model_id: "moonshotai/kimi-k3",
+        context_window: Some(1_048_576),
+        max_output_tokens: None,
+        pricing: None,
+        supports_thinking: true,
+        supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
+        source_url: OPENROUTER_KIMI_K3_URL,
+        source_status: SourceStatus::Derived,
+        notes: Some("Exact OpenRouter slug; Baseten serves the same weights as moonshotai/Kimi-K3, which the case-insensitive lookup folds here. Reasoning model with a 1,048,576-token window (OpenRouter model metadata; Baseten documents a 1M window). No single output ceiling exists across routes: OpenRouter endpoints cap completions between 65,535 and 943,718 tokens (Baseten 262,144), so max_output_tokens stays None rather than reserving most of the window; callers size output through their own max_tokens. Pricing is None because the static `openai` key cannot tell the gateway base URLs apart and their rates differ; dynamic route catalogs remain the pricing authority."),
+    },
+    ModelCapabilities {
+        provider: "openai",
+        model_id: "accounts/fireworks/models/kimi-k3",
+        context_window: Some(1_048_576),
+        max_output_tokens: None,
+        pricing: None,
+        supports_thinking: true,
+        supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
+        source_url: FIREWORKS_KIMI_K3_URL,
+        source_status: SourceStatus::Derived,
+        notes: Some("Fireworks model path for Kimi K3. Fireworks documents a 1,048,576-token window and no fixed output cap (max_tokens is lowered to fit the window). Thinking metadata mirrors the moonshotai/kimi-k3 row; pricing is None for the same reason."),
+    },
+    ModelCapabilities {
+        provider: "openai",
         model_id: "deepseek/deepseek-v4-pro",
         context_window: Some(1_048_576),
         max_output_tokens: Some(384_000),
@@ -1168,6 +1196,7 @@ mod tests {
         let pricing = Pricing::flat(0.7, 2.8).with_reasoning(8.4);
         let usage = Usage {
             served_speed: None,
+            request_input_tokens: None,
             input_tokens: 1_000_000,
             output_tokens: 1_000_000,
             cached_input_tokens: 0,
@@ -1188,6 +1217,7 @@ mod tests {
         let pricing = Pricing::flat(1.0, 8.0).with_reasoning(3.0);
         let usage = Usage {
             served_speed: None,
+            request_input_tokens: None,
             input_tokens: 0,
             output_tokens: 1_000_000,
             cached_input_tokens: 0,
@@ -1245,6 +1275,7 @@ mod tests {
             .context("claude-fable-5-1 capabilities missing")?;
         let usage = Usage {
             served_speed: None,
+            request_input_tokens: None,
             input_tokens: 1_000_000,
             output_tokens: 0,
             cached_input_tokens: 1_000_000,
@@ -1305,6 +1336,7 @@ mod tests {
             get_model_capabilities("anthropic", "claude-haiku-5-5").context("haiku 5.5 missing")?;
         let usage = Usage {
             served_speed: None,
+            request_input_tokens: None,
             input_tokens: 3_000_000,
             output_tokens: 1_000_000,
             cached_input_tokens: 1_000_000,
@@ -1527,6 +1559,7 @@ mod tests {
 
         let usage = Usage {
             served_speed: None,
+            request_input_tokens: None,
             input_tokens: 1_000_000,
             output_tokens: 0,
             cached_input_tokens: 1_000_000,
@@ -1612,6 +1645,30 @@ mod tests {
     }
 
     #[test]
+    fn test_lookup_kimi_k3_routes() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        let k3 = get_model_capabilities("openai", "moonshotai/kimi-k3")
+            .context("missing capabilities for moonshotai/kimi-k3")?;
+        assert!(k3.supports_thinking);
+        assert_eq!(k3.context_window, Some(1_048_576));
+        assert_eq!(k3.max_output_tokens, None);
+        assert!(k3.pricing.is_none());
+
+        let fireworks = get_model_capabilities("openai", "accounts/fireworks/models/kimi-k3")
+            .context("missing capabilities for accounts/fireworks/models/kimi-k3")?;
+        assert_eq!(fireworks.context_window, Some(1_048_576));
+        assert_eq!(fireworks.max_output_tokens, None);
+        assert!(fireworks.pricing.is_none());
+        assert!(fireworks.supports_thinking);
+
+        let baseten = get_model_capabilities("openai", "moonshotai/Kimi-K3")
+            .context("missing capabilities for moonshotai/Kimi-K3")?;
+        assert_eq!(baseten.model_id, "moonshotai/kimi-k3");
+        Ok(())
+    }
+
+    #[test]
     fn test_lookup_all_open_models_resolve() {
         // Every model_id below is exactly how the consumer looks them up
         // (provider == "openai" for all open routes).
@@ -1668,6 +1725,7 @@ mod tests {
                 output_tokens: 1_000,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             })
             .unwrap();
         assert!((cost - 0.0075).abs() < f64::EPSILON);
@@ -1683,6 +1741,7 @@ mod tests {
                 output_tokens: 1_000,
                 cached_input_tokens: 1_000,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             })
             .unwrap();
         assert!((cost - 0.01775).abs() < f64::EPSILON);

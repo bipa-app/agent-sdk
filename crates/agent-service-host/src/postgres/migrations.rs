@@ -116,11 +116,15 @@ const APPEND_ONLY_COMPACTIONS_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/postgres/0020_append_only_compactions.sql"
 ));
+const MESSAGE_HEAD_HISTORY_GENERATION_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/postgres/0022_message_head_history_generation.sql"
+));
 
 /// `sqlx`-managed migration bundle for the Postgres durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/postgres");
 
-const MIGRATIONS: [PostgresMigration; 19] = [
+const MIGRATIONS: [PostgresMigration; 20] = [
     PostgresMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -216,6 +220,11 @@ const MIGRATIONS: [PostgresMigration; 19] = [
         summary: "append-only compaction entries on message heads",
         sql: APPEND_ONLY_COMPACTIONS_SQL,
     },
+    PostgresMigration {
+        version: "0022",
+        summary: "monotonic history rewrite lineage on message heads",
+        sql: MESSAGE_HEAD_HISTORY_GENERATION_SQL,
+    },
 ];
 
 /// Version of the migration this PR introduces: the typed terminal
@@ -244,6 +253,11 @@ pub(crate) const AWAITING_QUESTION_MIGRATION_VERSION: i64 = 18;
 /// Version of the migration this PR introduces: the fence-time purge seed.
 #[cfg(test)]
 pub(crate) const PURGE_SEED_MIGRATION_VERSION: i64 = 19;
+
+/// Version of the migration this PR introduces: the monotonic
+/// `history_generation` rewrite-lineage column on message heads.
+#[cfg(test)]
+pub(crate) const HISTORY_GENERATION_MIGRATION_VERSION: i64 = 22;
 
 /// The reviewable executable migration bundle for the current durable core.
 #[must_use]

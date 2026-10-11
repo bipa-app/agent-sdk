@@ -486,6 +486,7 @@ mod tests {
             output_tokens: 1_000,
             cached_input_tokens: 1_000,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         };
         let cost = registry
             .estimate_cost_usd("openai", "gpt-5.2", &usage)
@@ -508,6 +509,7 @@ mod tests {
             output_tokens: 1_000_000,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         };
 
         // `gpt-4o` is in the static table and in neither dynamic layer.
@@ -565,6 +567,7 @@ mod tests {
             output_tokens: 1_000_000,
             cached_input_tokens: 300_000,
             cache_creation_input_tokens: 500_000,
+            request_input_tokens: None,
         };
         let cost = registry
             .estimate_cost_usd("anthropic", "claude-haiku-4-5", &usage)
@@ -597,6 +600,7 @@ mod tests {
             output_tokens: 0,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 500_000,
+            request_input_tokens: None,
         };
         // Every input token at $1/M, cache-write included: $1.00.
         let cost = registry
@@ -637,6 +641,7 @@ mod tests {
             output_tokens: 100_000,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         };
         let short_cost = registry
             .estimate_cost_usd("openai", "gpt-5.4", &short)
@@ -654,6 +659,7 @@ mod tests {
             output_tokens: 100_000,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         };
         let long_cost = registry
             .estimate_cost_usd("openai", "gpt-5.4", &long)
@@ -677,6 +683,7 @@ mod tests {
             output_tokens: 0,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         };
         let base_cost = registry
             .estimate_cost_usd("openai", "gpt-5.4", &just_below)
@@ -693,6 +700,7 @@ mod tests {
             output_tokens: 0,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         };
         let tier_cost = registry
             .estimate_cost_usd("openai", "gpt-5.4", &at_threshold)
@@ -720,6 +728,7 @@ mod tests {
             output_tokens: 0,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         };
 
         let base = registry
@@ -793,6 +802,7 @@ mod tests {
             output_tokens: 1_000,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         };
         assert!(
             registry
@@ -808,6 +818,7 @@ mod tests {
             output_tokens: 0,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         };
         let cost = registry
             .estimate_cost_usd("openai", "gpt-4o", &input_only)

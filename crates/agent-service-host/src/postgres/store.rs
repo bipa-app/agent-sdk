@@ -460,10 +460,11 @@ INSERT INTO agent_sdk_message_heads (
     history_json,
     draft_messages_json,
     compactions_json,
+    history_generation,
     version,
     created_at,
     updated_at
-) VALUES ($1, $2, NULL, NULL, $3, $4, $5)
+) VALUES ($1, $2, NULL, NULL, $3, $4, $5, $6)
 ON CONFLICT (thread_id) DO NOTHING
 ",
         )
@@ -472,6 +473,7 @@ ON CONFLICT (thread_id) DO NOTHING
             &Vec::<llm::Message>::new(),
             "empty message history",
         )?)
+        .bind(0_i64)
         .bind(0_i64)
         .bind(now)
         .bind(now)
@@ -486,6 +488,7 @@ SELECT
     history_json,
     draft_messages_json,
     compactions_json,
+    history_generation,
     version,
     created_at,
     updated_at
@@ -512,6 +515,7 @@ SELECT
     history_json,
     draft_messages_json,
     compactions_json,
+    history_generation,
     version,
     created_at,
     updated_at
@@ -557,14 +561,16 @@ INSERT INTO agent_sdk_message_heads (
     history_json,
     draft_messages_json,
     compactions_json,
+    history_generation,
     version,
     created_at,
     updated_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7)
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 ON CONFLICT (thread_id) DO UPDATE SET
     history_json = EXCLUDED.history_json,
     draft_messages_json = EXCLUDED.draft_messages_json,
     compactions_json = EXCLUDED.compactions_json,
+    history_generation = EXCLUDED.history_generation,
     version = EXCLUDED.version,
     created_at = EXCLUDED.created_at,
     updated_at = EXCLUDED.updated_at
@@ -574,6 +580,10 @@ ON CONFLICT (thread_id) DO UPDATE SET
         .bind(json_to_value(&projection.messages, "message head history")?)
         .bind(draft_messages_json)
         .bind(compactions_json)
+        .bind(i64_from_u64(
+            projection.history_generation,
+            "message head history generation",
+        )?)
         .bind(i64_from_u64(projection.version, "message head version")?)
         .bind(projection.created_at)
         .bind(projection.updated_at)
@@ -6852,6 +6862,7 @@ struct MessageHeadRecord {
     /// cleared atomically by the completed-turn transaction.
     draft_messages_json: Option<serde_json::Value>,
     compactions_json: Option<serde_json::Value>,
+    history_generation: i64,
     version: i64,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
@@ -6879,6 +6890,10 @@ impl TryFrom<MessageHeadRecord> for MessageProjection {
             messages,
             draft_messages,
             compactions,
+            history_generation: u64_from_i64(
+                record.history_generation,
+                "message head history generation",
+            )?,
             version: u64_from_i64(record.version, "message head version")?,
             created_at: record.created_at,
             updated_at: record.updated_at,

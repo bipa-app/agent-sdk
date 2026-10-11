@@ -94,6 +94,7 @@ fn tool_use_response(id: &str, name: &str, input: Value) -> ChatOutcome {
             output_tokens: 5,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         },
     })
 }
@@ -112,6 +113,7 @@ fn text_response(text: &str) -> ChatOutcome {
             output_tokens: 5,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         },
     })
 }

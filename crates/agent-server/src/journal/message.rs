@@ -134,6 +134,13 @@ pub struct MessageProjection {
     /// [`Self::messages`]; the latest entry selects the effective LLM view.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compactions: Vec<CompactionEntry>,
+    /// Count of history rewrites: [`Self::replace_history`],
+    /// [`Self::append_compaction`], and [`Self::append_repair`] advance it;
+    /// append-only commits never do. Unlike `compactions.len()` it survives
+    /// `replace_history` clearing the compaction lineage. Rows written before
+    /// the field existed decode as 0.
+    #[serde(default)]
+    pub history_generation: u64,
     /// Monotonically increasing version, bumped on every mutation.
     pub version: u64,
     /// When this projection row was first created.
@@ -182,6 +189,7 @@ impl MessageProjection {
             messages: Vec::new(),
             draft_messages: Vec::new(),
             compactions: Vec::new(),
+            history_generation: 0,
             version: 0,
             created_at: now,
             updated_at: now,
@@ -220,6 +228,7 @@ impl MessageProjection {
         self.messages = messages;
         self.draft_messages = Vec::new();
         self.compactions = Vec::new();
+        self.history_generation = self.history_generation.saturating_add(1);
         self.version += 1;
         self.updated_at = now;
         self
@@ -304,6 +313,7 @@ impl MessageProjection {
             source_message_count,
             created_at: now,
         });
+        self.history_generation = self.history_generation.saturating_add(1);
         self.version += 1;
         self.updated_at = now;
         Ok(self)
@@ -362,6 +372,7 @@ impl MessageProjection {
             source_message_count,
             created_at: now,
         });
+        self.history_generation = self.history_generation.saturating_add(1);
         self.version += 1;
         self.updated_at = now;
         Ok(self)
@@ -644,6 +655,35 @@ mod tests {
         assert_eq!(p.version, 1);
         let p = p.replace_history(vec![llm::Message::user("newer")], t_plus(2));
         assert_eq!(p.version, 2);
+    }
+
+    #[test]
+    fn history_generation_counts_rewrite_boundaries_only() -> anyhow::Result<()> {
+        let p = MessageProjection::new(thread_id(), t0());
+        assert_eq!(p.history_generation, 0);
+
+        let p = p.append_committed(vec![llm::Message::user("a")], t_plus(1))?;
+        assert_eq!(
+            p.history_generation, 0,
+            "append-only commits are not rewrites"
+        );
+
+        let p = p.append_compaction(vec![llm::Message::user("summary")], 1, 0, t_plus(2))?;
+        assert_eq!(p.history_generation, 1);
+        assert_eq!(p.compactions.len(), 1);
+
+        let p = p.replace_history(vec![llm::Message::user("rewritten")], t_plus(3));
+        assert_eq!(p.compactions.len(), 0);
+        assert_eq!(p.history_generation, 2);
+
+        let repaired = p.append_repair(
+            vec![llm::Message::user("evidence")],
+            vec![llm::Message::user("balanced")],
+            1,
+            t_plus(4),
+        )?;
+        assert_eq!(repaired.history_generation, 3);
+        Ok(())
     }
 
     // ── version monotonicity ──────────────────────────────────────

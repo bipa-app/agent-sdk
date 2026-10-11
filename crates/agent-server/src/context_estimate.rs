@@ -411,6 +411,7 @@ mod tests {
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
             served_speed: None,
+            request_input_tokens: None,
         }
     }
 

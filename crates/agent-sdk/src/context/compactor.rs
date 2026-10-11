@@ -266,10 +266,7 @@ pub trait ContextCompactor: Send + Sync {
     ) -> Result<CompactionResult, FailedCompaction> {
         self.compact_history(messages)
             .await
-            .map_err(|error| FailedCompaction {
-                error,
-                llm_usage: TokenUsage::default(),
-            })
+            .map_err(FailedCompaction::unbilled)
     }
 }
 
@@ -295,6 +292,39 @@ pub struct CompactionResult {
     /// cumulative usage — otherwise summarization tokens would be invisible
     /// to `UsageLimits` budgets and under-reported on `Done`.
     pub llm_usage: TokenUsage,
+    /// Artifacts this run published. A result from
+    /// [`ContextCompactor::compact_history_with_usage`] reclaims them when
+    /// dropped without [`PublishedArtifacts::commit`]; commit right after the
+    /// durable compaction append succeeds, never before.
+    pub published_artifacts: PublishedArtifacts,
+    /// Model the summarization response reported; `None` when no
+    /// summarization call ran.
+    pub response_model: Option<String>,
+    /// The summarizer provider's [`LlmProvider::route`]; `None` exactly when
+    /// [`Self::response_model`] is `None`.
+    pub served_route: Option<String>,
+}
+
+impl CompactionResult {
+    fn local(
+        messages: Vec<Message>,
+        original_count: usize,
+        original_tokens: usize,
+        new_tokens: usize,
+    ) -> Self {
+        Self {
+            original_count,
+            new_count: messages.len(),
+            retained_count: messages.len(),
+            messages,
+            original_tokens,
+            new_tokens,
+            llm_usage: TokenUsage::default(),
+            published_artifacts: PublishedArtifacts::default(),
+            response_model: None,
+            served_route: None,
+        }
+    }
 }
 
 /// A failed compaction attempt, carrying the provider-billed usage of any
@@ -303,7 +333,8 @@ pub struct CompactionResult {
 /// Surfaced by [`ContextCompactor::compact_history_with_usage`] so the agent
 /// loop can fold billed-but-wasted summarization spend into the run's
 /// cumulative usage even when the history is left uncompacted (guardrail
-/// block, truncation-retry error, `replace_history` failure).
+/// block, truncation-retry error, `replace_history` failure). Artifacts the
+/// attempt published are already reclaimed.
 #[derive(Debug)]
 pub struct FailedCompaction {
     /// Why the compaction attempt failed.
@@ -311,6 +342,106 @@ pub struct FailedCompaction {
     /// Usage billed by summarization calls made before the failure (zero
     /// when the failure preceded any LLM call).
     pub llm_usage: TokenUsage,
+    /// Model the summarization response reported; `None` when the failure
+    /// preceded any response.
+    pub response_model: Option<String>,
+    /// `None` exactly when [`Self::response_model`] is `None`.
+    pub served_route: Option<String>,
+}
+
+impl FailedCompaction {
+    fn unbilled(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            llm_usage: TokenUsage::default(),
+            response_model: None,
+            served_route: None,
+        }
+    }
+}
+
+/// Rollback token for artifacts a Snapcompact run published.
+///
+/// Clones share one token; when the last clone drops uncommitted, the
+/// artifacts are deleted (best effort).
+#[derive(Clone, Default)]
+pub struct PublishedArtifacts {
+    inner: Option<Arc<PublishedArtifactsInner>>,
+}
+
+struct PublishedArtifactsInner {
+    store: Arc<ArtifactStore>,
+    ids: Vec<u64>,
+    committed: std::sync::atomic::AtomicBool,
+}
+
+impl PublishedArtifacts {
+    fn new(store: Arc<ArtifactStore>, ids: Vec<u64>) -> Self {
+        if ids.is_empty() {
+            return Self::default();
+        }
+        Self {
+            inner: Some(Arc::new(PublishedArtifactsInner {
+                store,
+                ids,
+                committed: std::sync::atomic::AtomicBool::new(false),
+            })),
+        }
+    }
+
+    /// Artifact IDs in publication order.
+    #[must_use]
+    pub fn ids(&self) -> &[u64] {
+        self.inner
+            .as_ref()
+            .map_or(&[], |inner| inner.ids.as_slice())
+    }
+
+    /// Mark the artifacts durably referenced; irreversible and shared across
+    /// clones.
+    pub fn commit(&self) {
+        if let Some(inner) = &self.inner {
+            inner
+                .committed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+impl std::fmt::Debug for PublishedArtifacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PublishedArtifacts")
+            .field("ids", &self.ids())
+            .field(
+                "committed",
+                &self
+                    .inner
+                    .as_ref()
+                    .map(|inner| inner.committed.load(std::sync::atomic::Ordering::Acquire)),
+            )
+            .finish()
+    }
+}
+
+impl Drop for PublishedArtifactsInner {
+    fn drop(&mut self) {
+        if !*self.committed.get_mut() {
+            remove_published_artifact_ids(&self.store, &self.ids);
+        }
+    }
+}
+
+/// Best-effort deletion of artifacts published by a Snapcompact run that
+/// was cancelled or rejected before anything durable referenced them.
+fn remove_published_artifact_ids(store: &ArtifactStore, ids: &[u64]) {
+    for id in ids {
+        if let Err(error) = store
+            .remove_saved(*id)
+            .with_context(|| format!("removing orphaned Snapcompact artifact {id}"))
+        {
+            log::warn!("{error:#}");
+        }
+    }
 }
 
 /// Marker for a compaction that produced no token savings.
@@ -1207,6 +1338,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
                             "Summarization request blocked by guardrail: {reason}"
                         ),
                         usage: TokenUsage::default(),
+                        response_model: None,
                     });
                 }
                 _ => {}
@@ -1228,6 +1360,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
                             "Summarization response blocked by guardrail: {reason}"
                         ),
                         usage: usage.clone(),
+                        response_model: Some(response.model.clone()),
                     });
                 }
                 ResponseDecision::RetryWithFeedback(reason) => {
@@ -1237,6 +1370,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
                              (RetryWithFeedback is not retried during compaction): {reason}"
                         ),
                         usage: usage.clone(),
+                        response_model: Some(response.model.clone()),
                     });
                 }
                 _ => {}
@@ -1261,6 +1395,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
             return Err(SummarizationFailure {
                 error: anyhow::Error::new(SummarizationEmpty),
                 usage,
+                response_model: Some(response.model.clone()),
             });
         };
         if text.len() > output_limit {
@@ -1271,6 +1406,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
                     text.len()
                 ),
                 usage,
+                response_model: Some(response.model.clone()),
             });
         }
         self.apply_summarization_response_guardrail(&response, &usage)
@@ -1279,6 +1415,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
             text: text.to_string(),
             truncated: response.stop_reason == Some(StopReason::MaxTokens),
             usage,
+            response_model: response.model.clone(),
         })
     }
 
@@ -1316,6 +1453,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
             .map_err(|error| SummarizationFailure {
                 error,
                 usage: TokenUsage::default(),
+                response_model: None,
             })?;
 
         match outcome {
@@ -1326,18 +1464,22 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
             ChatOutcome::RateLimited(_) => Err(SummarizationFailure {
                 error: anyhow::anyhow!("Rate limited during summarization"),
                 usage: TokenUsage::default(),
+                response_model: None,
             }),
             ChatOutcome::InvalidRequest(msg) => Err(SummarizationFailure {
                 error: anyhow::anyhow!("Invalid request during summarization: {msg}"),
                 usage: TokenUsage::default(),
+                response_model: None,
             }),
             ChatOutcome::ServerError(msg) => Err(SummarizationFailure {
                 error: anyhow::anyhow!("Server error during summarization: {msg}"),
                 usage: TokenUsage::default(),
+                response_model: None,
             }),
             _ => Err(SummarizationFailure {
                 error: anyhow::anyhow!("Unrecognized provider outcome during summarization"),
                 usage: TokenUsage::default(),
+                response_model: None,
             }),
         }
     }
@@ -1353,14 +1495,16 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
         &self,
         messages: &[Message],
     ) -> Result<(String, TokenUsage), SummarizationFailure> {
-        self.summarize_with_usage_and_prior(messages, None).await
+        self.summarize_with_usage_and_prior(messages, None)
+            .await
+            .map(|(text, usage, _model)| (text, usage))
     }
 
     async fn summarize_with_usage_and_prior(
         &self,
         messages: &[Message],
         snapcompact_prior_source: Option<&str>,
-    ) -> Result<(String, TokenUsage), SummarizationFailure> {
+    ) -> Result<(String, TokenUsage, Option<String>), SummarizationFailure> {
         // forward) from fresh messages (which still need summarizing). Prior
         // summaries used to be filtered out and silently dropped, destroying
         // all context from before the previous compaction.
@@ -1384,11 +1528,16 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
         // only as an opaque recovery URI.
         if fresh.is_empty() && snapcompact_prior_source.is_none() {
             if prior_summaries.is_empty() {
-                return Ok((COMPACT_EMPTY_SUMMARY.to_string(), TokenUsage::default()));
+                return Ok((
+                    COMPACT_EMPTY_SUMMARY.to_string(),
+                    TokenUsage::default(),
+                    None,
+                ));
             }
             return Ok((
                 Self::bounded_prior_summaries(&prior_summaries).join("\n\n"),
                 TokenUsage::default(),
+                None,
             ));
         }
 
@@ -1400,6 +1549,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
         let first = self.run_summarization(prompt.clone(), budget).await?;
         let mut summary = first.text;
         let mut total_usage = first.usage;
+        let mut last_model = first.response_model;
 
         if first.truncated {
             log::warn!(
@@ -1415,11 +1565,15 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
                     // The first (truncated) call was still billed: carry its
                     // usage on the failure so the caller can account it.
                     failure.usage.add(&total_usage);
+                    if failure.response_model.is_none() {
+                        failure.response_model = Some(last_model.clone());
+                    }
                     return Err(failure);
                 }
             };
             total_usage.add(&retry.usage);
             summary = retry.text;
+            last_model = retry.response_model;
             if retry.truncated {
                 log::warn!(
                     "compaction summary still truncated after retry; appending a \
@@ -1429,7 +1583,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
             }
         }
 
-        Ok((summary, total_usage))
+        Ok((summary, total_usage, Some(last_model)))
     }
 }
 
@@ -1438,6 +1592,7 @@ struct SummarizationCall {
     text: String,
     truncated: bool,
     usage: TokenUsage,
+    response_model: String,
 }
 
 /// A failed summarization round-trip, carrying whatever usage was billed
@@ -1446,6 +1601,15 @@ struct SummarizationCall {
 struct SummarizationFailure {
     error: anyhow::Error,
     usage: TokenUsage,
+    response_model: Option<String>,
+}
+
+struct BuiltSummary {
+    message: Message,
+    llm_usage: TokenUsage,
+    published: PublishedArtifacts,
+    response_model: Option<String>,
+    served_route: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1908,7 +2072,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
             // landing while the batch fsyncs/links still publishes. Catch it
             // here, right after the saved IDs are captured, so the batch
             // never outlives the cancelled run.
-            Self::remove_published_snapcompact_ids(store, &published_ids);
+            remove_published_artifact_ids(store, &published_ids);
             return Ok(None);
         }
 
@@ -2081,19 +2245,6 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
         cancel.is_some_and(CancellationToken::is_cancelled)
     }
 
-    /// Best-effort deletion of artifacts published by a Snapcompact run that
-    /// was cancelled or rejected before anything durable referenced them.
-    fn remove_published_snapcompact_ids(store: &ArtifactStore, ids: &[u64]) {
-        for id in ids {
-            if let Err(error) = store
-                .remove_saved(*id)
-                .with_context(|| format!("removing orphaned Snapcompact artifact {id}"))
-            {
-                log::warn!("{error:#}");
-            }
-        }
-    }
-
     /// Reclaim every artifact this run published once a fence observes
     /// cancellation, returning the artifact set with those IDs removed.
     fn reclaim_cancelled_snapcompact_run(
@@ -2101,7 +2252,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
         mut artifact_ids: std::collections::BTreeSet<u64>,
         published_ids: &mut Vec<u64>,
     ) -> std::collections::BTreeSet<u64> {
-        Self::remove_published_snapcompact_ids(store, published_ids);
+        remove_published_artifact_ids(store, published_ids);
         for id in published_ids.drain(..) {
             artifact_ids.remove(&id);
         }
@@ -2506,7 +2657,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
         retained: SnapcompactRetainedBudget,
         retained_artifact_ids: Vec<u64>,
         artifact_ids: &mut std::collections::BTreeSet<u64>,
-    ) -> Result<(Option<Message>, Option<String>, Vec<u64>)> {
+    ) -> Result<(Option<Message>, Option<String>, PublishedArtifacts)> {
         let store = self
             .artifact_store
             .as_ref()
@@ -2550,13 +2701,24 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
             family,
             cancel: self.cancellation.clone(),
         };
-        let outcome = tokio::task::spawn_blocking(move || {
-            Self::try_snapcompact_blocking(&store, &messages, carried_artifact_ids, &params)
+        let (outcome, published) = tokio::task::spawn_blocking(move || {
+            Self::try_snapcompact_blocking(&store, &messages, carried_artifact_ids, &params).map(
+                |mut outcome| {
+                    // Created inside the blocking task so a caller that drops
+                    // the compaction future mid-`await` still reclaims the
+                    // batch.
+                    let published = PublishedArtifacts::new(
+                        Arc::clone(&store),
+                        std::mem::take(&mut outcome.published_ids),
+                    );
+                    (outcome, published)
+                },
+            )
         })
         .await
         .context("joining Snapcompact preparation task")??;
         *artifact_ids = outcome.artifact_ids;
-        Ok((outcome.message, outcome.prior_source, outcome.published_ids))
+        Ok((outcome.message, outcome.prior_source, published))
     }
 
     fn try_snapcompact_blocking(
@@ -2642,7 +2804,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
                 Ok(outcome)
             }
             Err(error) => {
-                Self::remove_published_snapcompact_ids(store, &published_ids);
+                remove_published_artifact_ids(store, &published_ids);
                 Err(error)
             }
         }
@@ -2827,13 +2989,8 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
         {
             let new_count = messages.len();
             return Ok(CompactionResult {
-                messages,
-                original_count,
-                new_count,
-                original_tokens,
-                new_tokens: pruned_tokens,
                 retained_count: new_count.saturating_sub(pruned_index.saturating_add(1)),
-                llm_usage: TokenUsage::default(),
+                ..CompactionResult::local(messages, original_count, original_tokens, pruned_tokens)
             });
         }
 
@@ -2850,13 +3007,12 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
         // user/assistant pair can be replaced when the configured tail is
         // larger than the entire transcript.
         if messages.is_empty() {
-            return Err(FailedCompaction {
-                error: anyhow::Error::new(NoProgressCompaction {
+            return Err(FailedCompaction::unbilled(anyhow::Error::new(
+                NoProgressCompaction {
                     new_tokens: 0,
                     original_tokens: 0,
-                }),
-                llm_usage: TokenUsage::default(),
-            });
+                },
+            )));
         }
         let effective_retain_recent = self
             .config
@@ -2877,9 +3033,10 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
         let to_summarize = messages;
         let artifact_ids = self
             .summarized_artifact_ids(&to_summarize)
-            .map_err(|error| FailedCompaction {
-                error: error.context("collecting summarized artifact references"),
-                llm_usage: TokenUsage::default(),
+            .map_err(|error| {
+                FailedCompaction::unbilled(
+                    error.context("collecting summarized artifact references"),
+                )
             })?;
         let retained = SnapcompactRetainedBudget {
             original_tokens,
@@ -2888,7 +3045,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
             retained_attachment_bytes: Self::retained_inline_attachment_bytes(&to_keep),
         };
         let retained_artifact_ids = Self::retained_attachment_artifact_ids(&to_keep);
-        let (summary_message, llm_usage, published_ids) = self
+        let summary = self
             .build_summary_message(&to_summarize, retained, retained_artifact_ids, artifact_ids)
             .await?;
 
@@ -2902,7 +3059,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
         let mut new_messages = Vec::with_capacity(2 + to_keep.len());
 
         // Persist the generated summary as structured compaction metadata.
-        new_messages.push(summary_message);
+        new_messages.push(summary.message);
 
         // Add acknowledgment from assistant only when some recent tail remains.
         // If compaction drops the entire retained tail due to the token cap, ending
@@ -2931,13 +3088,15 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
         let new_count = new_messages.len();
         let new_tokens = self.estimate_tokens(&new_messages);
         if new_tokens >= original_tokens {
-            self.remove_published_snapcompact_run(&published_ids);
+            drop(summary.published);
             return Err(FailedCompaction {
                 error: anyhow::Error::new(NoProgressCompaction {
                     new_tokens,
                     original_tokens,
                 }),
-                llm_usage,
+                llm_usage: summary.llm_usage,
+                response_model: summary.response_model,
+                served_route: summary.served_route,
             });
         }
 
@@ -2948,7 +3107,10 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
             original_tokens,
             new_tokens,
             retained_count,
-            llm_usage,
+            llm_usage: summary.llm_usage,
+            response_model: summary.response_model,
+            served_route: summary.served_route,
+            published_artifacts: summary.published,
         })
     }
 
@@ -3034,17 +3196,6 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
         Ok(total)
     }
 
-    /// Best-effort reclamation of a rejected run's published artifacts via
-    /// the configured store.
-    fn remove_published_snapcompact_run(&self, published_ids: &[u64]) {
-        if published_ids.is_empty() {
-            return;
-        }
-        if let Some(store) = &self.artifact_store {
-            Self::remove_published_snapcompact_ids(store, published_ids);
-        }
-    }
-
     /// Produces the replacement summary message: Snapcompact when the engine
     /// is enabled and succeeds, otherwise the LLM prose summary annotated
     /// with archived-artifact recovery URIs.
@@ -3054,9 +3205,9 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
         retained: SnapcompactRetainedBudget,
         retained_artifact_ids: Vec<u64>,
         mut artifact_ids: std::collections::BTreeSet<u64>,
-    ) -> Result<(Message, TokenUsage, Vec<u64>), FailedCompaction> {
+    ) -> Result<BuiltSummary, FailedCompaction> {
         let pre_snapcompact_artifact_ids = artifact_ids.clone();
-        let (snapcompact_message, prior_source_for_fallback, published_ids) =
+        let (snapcompact_message, prior_source_for_fallback, published) =
             if self.config.uses_snapcompact_engine() {
                 self.try_snapcompact(
                     to_summarize,
@@ -3065,29 +3216,38 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
                     &mut artifact_ids,
                 )
                 .await
-                .map_err(|error| FailedCompaction {
-                    error,
-                    llm_usage: TokenUsage::default(),
-                })?
+                .map_err(FailedCompaction::unbilled)?
             } else {
-                (None, None, Vec::new())
+                (None, None, PublishedArtifacts::default())
             };
         if let Some(message) = snapcompact_message {
-            return Ok((message, TokenUsage::default(), published_ids));
+            return Ok(BuiltSummary {
+                message,
+                llm_usage: TokenUsage::default(),
+                published,
+                response_model: None,
+                served_route: None,
+            });
         }
         let summarized = self
             .summarize_with_usage_and_prior(to_summarize, prior_source_for_fallback.as_deref())
             .await;
-        let (mut summary, usage) = match summarized {
+        let (mut summary, usage, response_model) = match summarized {
             Ok(summarized) => summarized,
             Err(failure) => {
                 // The attachments published for this run gain a durable
                 // reference only through the summary message; a failed
                 // summarization leaves them orphaned, so reclaim them.
-                self.remove_published_snapcompact_run(&published_ids);
+                drop(published);
+                let served_route = failure
+                    .response_model
+                    .is_some()
+                    .then(|| self.provider.route().to_owned());
                 return Err(FailedCompaction {
                     error: failure.error,
                     llm_usage: failure.usage,
+                    response_model: failure.response_model,
+                    served_route,
                 });
             }
         };
@@ -3108,14 +3268,19 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
                  Re-read these artifacts rather than guessing attachment contents."
             );
         }
-        Ok((
-            Message::compaction_summary_with_artifact_ids(
+        let served_route = response_model
+            .is_some()
+            .then(|| self.provider.route().to_owned());
+        Ok(BuiltSummary {
+            message: Message::compaction_summary_with_artifact_ids(
                 summary,
                 artifact_ids.into_iter().collect(),
             ),
-            usage,
-            published_ids,
-        ))
+            llm_usage: usage,
+            published,
+            response_model,
+            served_route,
+        })
     }
 }
 
@@ -3149,10 +3314,15 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> ContextCompactor for LlmContextComp
         estimated_tokens > self.config.threshold_tokens
     }
 
+    /// The returned [`CompactionResult::published_artifacts`] are already
+    /// committed: callers of this method own the result's artifacts outright.
     async fn compact_history(&self, messages: Vec<Message>) -> Result<CompactionResult> {
-        self.compact_history_inner(messages)
+        let result = self
+            .compact_history_inner(messages)
             .await
-            .map_err(|failure| failure.error)
+            .map_err(|failure| failure.error)?;
+        result.published_artifacts.commit();
+        Ok(result)
     }
 
     async fn compact_history_with_usage(
@@ -3364,6 +3534,7 @@ mod tests {
                     output_tokens: 50,
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
+                    request_input_tokens: None,
                 },
             }))
         }
@@ -6245,6 +6416,156 @@ mod tests {
             0,
             "attachments published before the failed summarization must be reclaimed"
         );
+        Ok(())
+    }
+
+    fn published_attachment_messages() -> Vec<Message> {
+        vec![
+            Message::user_with_content(vec![
+                ContentBlock::Text {
+                    text: format!("rollback-token-marker\n{}", "x".repeat(90_000)),
+                },
+                ContentBlock::Image {
+                    source: ContentSource::new(
+                        "image/png",
+                        base64::engine::general_purpose::STANDARD.encode(SNAPCOMPACT_TEST_PNG),
+                    ),
+                },
+            ]),
+            Message::assistant("done"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn successful_result_dropped_uncommitted_reclaims_published_artifacts() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Arc::new(ArtifactStore::new(temp.path()));
+        let provider = Arc::new(MockProvider::new("fallback summary"));
+        let compactor = LlmContextCompactor::new(provider, snapcompact_test_config())
+            .with_artifact_store(Arc::clone(&store));
+
+        let result = compactor
+            .compact_history_with_usage(published_attachment_messages())
+            .await
+            .map_err(|failure| failure.error)?;
+
+        assert!(
+            !result.published_artifacts.ids().is_empty(),
+            "the successful result must carry the published attachment IDs"
+        );
+        assert!(
+            published_artifact_count(&store)? > 0,
+            "the attachment batch must exist while the result is live"
+        );
+
+        drop(result);
+
+        assert_eq!(
+            published_artifact_count(&store)?,
+            0,
+            "dropping the result without commit must reclaim every published artifact"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn committed_result_retains_published_artifacts_on_drop() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Arc::new(ArtifactStore::new(temp.path()));
+        let provider = Arc::new(MockProvider::new("fallback summary"));
+        let compactor = LlmContextCompactor::new(provider, snapcompact_test_config())
+            .with_artifact_store(Arc::clone(&store));
+
+        let result = compactor
+            .compact_history_with_usage(published_attachment_messages())
+            .await
+            .map_err(|failure| failure.error)?;
+        let published_ids: Vec<u64> = result.published_artifacts.ids().to_vec();
+        assert_ne!(published_ids.len(), 0);
+
+        result.published_artifacts.commit();
+        drop(result);
+
+        for id in published_ids {
+            assert_eq!(
+                read_artifact_bytes(&store, id)?,
+                SNAPCOMPACT_TEST_PNG,
+                "committed artifacts must survive the result drop byte-for-byte"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compact_history_results_keep_published_artifacts_when_dropped() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Arc::new(ArtifactStore::new(temp.path()));
+        let provider = Arc::new(MockProvider::new("fallback summary"));
+        let compactor = LlmContextCompactor::new(provider, snapcompact_test_config())
+            .with_artifact_store(Arc::clone(&store));
+
+        let result = compactor
+            .compact_history(published_attachment_messages())
+            .await?;
+        let published_ids: Vec<u64> = result.published_artifacts.ids().to_vec();
+        assert_ne!(published_ids.len(), 0);
+        drop(result);
+
+        for id in published_ids {
+            assert_eq!(read_artifact_bytes(&store, id)?, SNAPCOMPACT_TEST_PNG);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn summarizer_identity_rides_the_compaction_result() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Arc::new(ArtifactStore::new(temp.path()));
+        let provider = Arc::new(
+            MockProvider::new("fallback summary").with_route("summarizer-route", "route-model"),
+        );
+        let compactor = LlmContextCompactor::new(provider, snapcompact_test_config())
+            .with_artifact_store(Arc::clone(&store));
+
+        let result = compactor
+            .compact_history_with_usage(published_attachment_messages())
+            .await
+            .map_err(|failure| failure.error)?;
+
+        assert_eq!(result.response_model.as_deref(), Some("mock"));
+        assert_eq!(result.served_route.as_deref(), Some("summarizer-route"));
+        result.published_artifacts.commit();
+
+        let prune_provider = Arc::new(MockProvider::new("unused"));
+        let prune_config = CompactionConfig::default()
+            .with_engine(crate::context::CompactionEngine::PruneFirst)
+            .with_threshold_tokens(100_000)
+            .with_min_messages(1);
+        let prune_compactor = LlmContextCompactor::new(prune_provider, prune_config);
+        let tool_heavy = vec![
+            Message::user("start"),
+            Message::assistant_with_content(vec![ContentBlock::ToolUse {
+                id: "read_old".into(),
+                name: "read".into(),
+                input: serde_json::json!({"path": "src/lib.rs"}),
+                thought_signature: None,
+            }]),
+            Message::tool_result("read_old", "y".repeat(400_000), false),
+            Message::assistant_with_content(vec![ContentBlock::ToolUse {
+                id: "read_new".into(),
+                name: "read".into(),
+                input: serde_json::json!({"path": "src/lib.rs"}),
+                thought_signature: None,
+            }]),
+            Message::tool_result("read_new", "fresh contents", false),
+            Message::assistant("done"),
+        ];
+        let pruned = prune_compactor
+            .compact_history_with_usage(tool_heavy)
+            .await
+            .map_err(|failure| failure.error)?;
+        assert_eq!(pruned.response_model, None);
+        assert_eq!(pruned.served_route, None);
         Ok(())
     }
 

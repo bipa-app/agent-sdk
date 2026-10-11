@@ -685,6 +685,18 @@ pub trait LlmProvider: Send + Sync {
         true
     }
 
+    /// Whether every request is served by the route [`provider()`](Self::provider),
+    /// [`model()`](Self::model), and [`capabilities()`](Self::capabilities)
+    /// describe.
+    ///
+    /// Dynamic dispatchers (failover chains, per-request routers) must
+    /// return `false`; transparent single-provider wrappers delegate.
+    /// Consumers that compare token counts or capabilities across requests
+    /// rely on this.
+    fn has_stable_request_route(&self) -> bool {
+        true
+    }
+
     /// Streaming chat completion.
     ///
     /// Returns a stream of [`StreamDelta`] events. The default implementation
@@ -1089,6 +1101,7 @@ pub async fn collect_stream(mut stream: StreamBox<'_>, model: String) -> Result<
         output_tokens: 0,
         cached_input_tokens: 0,
         cache_creation_input_tokens: 0,
+        request_input_tokens: None,
     });
     let stop_reason = accumulator.take_stop_reason();
     let content = accumulator.into_content_blocks();

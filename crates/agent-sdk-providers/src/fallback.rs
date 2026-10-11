@@ -197,6 +197,11 @@ impl LlmProvider for FallbackProvider {
                                 }
                                 other => other,
                             };
+                            if matches!(delta, StreamDelta::Done { .. })
+                                && let Some(reset) = usage_carry.terminal_usage()
+                            {
+                                yield Ok(StreamDelta::Usage(reset));
+                            }
                             yield Ok(delta);
                         }
                         Err(error) => {
@@ -253,6 +258,10 @@ impl LlmProvider for FallbackProvider {
     /// failed-over call still attributes to the backend that answered.
     fn route(&self) -> &str {
         self.primary.route()
+    }
+
+    fn has_stable_request_route(&self) -> bool {
+        false
     }
 
     /// Pre-dispatch image pricing and limits come from the representative
@@ -398,6 +407,7 @@ mod tests {
                 output_tokens: 1,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: Some(1),
             },
         })
     }
@@ -415,6 +425,19 @@ mod tests {
         let mixed = FallbackProvider::new(ScriptedProvider::image_capable("primary"))
             .with_fallback(ScriptedProvider::chat_only("secondary", Vec::new()));
         assert!(!mixed.supports_historical_image_blocks());
+    }
+
+    #[test]
+    fn dynamic_fallback_reports_an_unstable_request_route() {
+        let chain = FallbackProvider::new(ScriptedProvider::chat_only("primary", Vec::new()))
+            .with_fallback(ScriptedProvider::chat_only("secondary", Vec::new()));
+        assert!(
+            !chain.has_stable_request_route(),
+            "any request may fail over mid-chain; consumers must not anchor \
+             measured occupancy on the configured primary identity",
+        );
+        // The leaf providers themselves stay stable.
+        assert!(ScriptedProvider::chat_only("leaf", Vec::new()).has_stable_request_route());
     }
 
     #[test]
@@ -579,6 +602,7 @@ mod tests {
             output_tokens: 1,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: Some(1),
         })));
 
         // A keep-alive carries no content, so a provider that only pinged can
@@ -602,6 +626,7 @@ mod tests {
                     output_tokens: 50,
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
+                    request_input_tokens: Some(100),
                 })),
                 Ok(StreamDelta::Error {
                     message: "rate limited".to_owned(),
@@ -622,6 +647,7 @@ mod tests {
                     output_tokens: 5,
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
+                    request_input_tokens: Some(10),
                 })),
                 Ok(StreamDelta::Done {
                     stop_reason: Some(StopReason::EndTurn),
@@ -662,6 +688,61 @@ mod tests {
             .context("the failover must still report usage")?;
         assert_eq!(usage.input_tokens, 110);
         assert_eq!(usage.output_tokens, 55);
+        assert_eq!(usage.request_input_tokens, Some(10));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failover_survivor_without_usage_resets_the_request_stamp() -> Result<()> {
+        let primary = ScriptedProvider::streaming(
+            "primary",
+            vec![
+                Ok(StreamDelta::Usage(Usage {
+                    served_speed: None,
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    request_input_tokens: Some(100),
+                })),
+                Ok(StreamDelta::Error {
+                    message: "rate limited".to_owned(),
+                    kind: StreamErrorKind::RateLimited(None),
+                }),
+            ],
+        );
+        let secondary = ScriptedProvider::streaming(
+            "secondary",
+            vec![
+                Ok(StreamDelta::TextDelta {
+                    delta: "hello".to_owned(),
+                    block_index: 0,
+                }),
+                Ok(StreamDelta::Done {
+                    stop_reason: Some(StopReason::EndTurn),
+                    served_route: None,
+                }),
+            ],
+        );
+        let fb = FallbackProvider::new(primary.clone()).with_fallback(secondary.clone());
+
+        let mut accumulator = crate::streaming::StreamAccumulator::new();
+        let mut stream = fb.chat_stream(request());
+        while let Some(item) = stream.next().await {
+            accumulator.apply(&item?);
+        }
+        drop(stream);
+
+        let usage = accumulator
+            .usage()
+            .context("the reset frame must reach the accumulator")?;
+        assert_eq!(usage.input_tokens, 100, "abandoned billing must survive");
+        assert_eq!(usage.output_tokens, 50);
+        assert_eq!(
+            usage.request_input_tokens, None,
+            "the survivor never reported usage: its occupancy is unknown and \
+             must not inherit the abandoned request's stamp"
+        );
         Ok(())
     }
 
