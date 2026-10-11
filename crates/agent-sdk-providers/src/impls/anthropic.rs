@@ -2337,6 +2337,164 @@ mod tests {
     }
 
     // ===================
+    // Thinking and effort on the newest models
+    // ===================
+
+    const NEWEST_ADAPTIVE_ONLY_MODELS: [&str; 3] = [MODEL_OPUS_55, MODEL_FABLE_51, MODEL_HAIKU_55];
+
+    async fn chat_wire_body(
+        model: &str,
+        token: &str,
+        thinking: Option<ThinkingConfig>,
+        request: ChatRequest,
+    ) -> anyhow::Result<serde_json::Value> {
+        let server = wiremock::MockServer::start().await;
+        mount_messages_stub(&server).await;
+        let provider = AnthropicProvider::new(token, model).with_base_url(server.uri());
+        let provider = match thinking {
+            Some(thinking) => provider.with_thinking(thinking),
+            None => provider,
+        };
+        let _ = provider.chat(request).await;
+        let recorded = single_recorded_request(&server).await?;
+        Ok(serde_json::from_slice(&recorded.body)?)
+    }
+
+    #[tokio::test]
+    async fn newest_models_send_adaptive_thinking_at_every_effort_level() -> anyhow::Result<()> {
+        use agent_sdk_foundation::llm::Effort;
+
+        for model in NEWEST_ADAPTIVE_ONLY_MODELS {
+            for token in ["sk-ant-api-test-not-a-secret", OAUTH_TEST_TOKEN] {
+                for (effort, wire) in [
+                    (Effort::Low, "low"),
+                    (Effort::Medium, "medium"),
+                    (Effort::High, "high"),
+                    (Effort::XHigh, "xhigh"),
+                    (Effort::Max, "max"),
+                ] {
+                    let body = chat_wire_body(
+                        model,
+                        token,
+                        Some(ThinkingConfig::adaptive_with_effort(effort)),
+                        request_with_tools(vec![tool("read")]),
+                    )
+                    .await?;
+                    assert_eq!(
+                        body["thinking"],
+                        serde_json::json!({"type": "adaptive", "display": "omitted"}),
+                        "model={model} effort={wire}"
+                    );
+                    assert_eq!(
+                        body["output_config"],
+                        serde_json::json!({"effort": wire}),
+                        "model={model}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn newest_models_send_bare_effort_without_a_thinking_object() -> anyhow::Result<()> {
+        for model in NEWEST_ADAPTIVE_ONLY_MODELS {
+            let body = chat_wire_body(
+                model,
+                OAUTH_TEST_TOKEN,
+                Some(ThinkingConfig::default_with_effort(
+                    agent_sdk_foundation::llm::Effort::Medium,
+                )),
+                request_with_tools(vec![tool("read")]),
+            )
+            .await?;
+            assert!(body.get("thinking").is_none(), "model={model} body={body}");
+            assert_eq!(body["output_config"]["effort"], "medium", "model={model}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn newest_models_omit_thinking_instead_of_disabling_it() -> anyhow::Result<()> {
+        for model in NEWEST_ADAPTIVE_ONLY_MODELS {
+            let unconfigured =
+                chat_wire_body(model, OAUTH_TEST_TOKEN, None, request_with_tools(vec![])).await?;
+
+            let mut forced = request_with_tools(vec![tool("respond")]);
+            forced.tool_choice = Some(agent_sdk_foundation::llm::ToolChoice::Tool(
+                "respond".to_owned(),
+            ));
+            let forced = chat_wire_body(
+                model,
+                OAUTH_TEST_TOKEN,
+                Some(ThinkingConfig::adaptive_with_effort(
+                    agent_sdk_foundation::llm::Effort::High,
+                )),
+                forced,
+            )
+            .await?;
+
+            for body in [unconfigured, forced] {
+                assert!(body.get("thinking").is_none(), "model={model} body={body}");
+                assert!(
+                    body.get("output_config").is_none(),
+                    "model={model} body={body}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn newest_models_refuse_budget_thinking_before_the_wire() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        for model in NEWEST_ADAPTIVE_ONLY_MODELS {
+            for streaming in [false, true] {
+                let server = wiremock::MockServer::start().await;
+                mount_messages_stub(&server).await;
+                let provider =
+                    AnthropicProvider::new(OAUTH_TEST_TOKEN, model).with_base_url(server.uri());
+                let mut request = request_with_tools(vec![tool("read")]);
+                request.thinking = Some(ThinkingConfig::new(10_000));
+
+                let message = if streaming {
+                    match provider.chat_stream(request).next().await {
+                        Some(Ok(StreamDelta::Error {
+                            message,
+                            kind: StreamErrorKind::InvalidRequest,
+                        })) => message,
+                        other => anyhow::bail!(
+                            "model={model}: expected an InvalidRequest delta, got {other:?}"
+                        ),
+                    }
+                } else {
+                    match provider.chat(request).await? {
+                        ChatOutcome::InvalidRequest(message) => message,
+                        other => {
+                            anyhow::bail!("model={model}: expected InvalidRequest, got {other:?}")
+                        }
+                    }
+                };
+
+                assert!(
+                    message.contains("budget_tokens thinking is rejected"),
+                    "model={model} streaming={streaming}: {message}"
+                );
+                let received = server
+                    .received_requests()
+                    .await
+                    .context("request recording is disabled")?;
+                assert!(
+                    received.is_empty(),
+                    "model={model} streaming={streaming}: budget thinking reached the wire"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    // ===================
     // Fast mode (speed: "fast")
     // ===================
 
