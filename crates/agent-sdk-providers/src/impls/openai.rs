@@ -60,7 +60,7 @@ use super::openai_reasoning::{
     service_tier_wire_value, validate_reasoning_config, validate_tool_choice,
 };
 use super::openai_responses::OpenAIResponsesProvider;
-use super::openai_schema::normalize_strict_schema;
+use super::openai_schema::{normalize_strict_schema, normalized_strict_schema};
 use crate::model_features::supports_responses_original_image_detail;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -667,10 +667,9 @@ impl OpenAIProvider {
         let Some(response_format) = response_format.filter(|format| format.strict) else {
             return Ok(());
         };
-        let mut schema = response_format.schema.clone();
-        if !normalize_strict_schema(&mut schema) {
+        if let Err(reason) = normalized_strict_schema(&response_format.schema) {
             anyhow::bail!(
-                "OpenAI strict structured output `{}` contains a free-form object schema",
+                "OpenAI strict structured output `{}` contains a {reason} schema",
                 response_format.name
             );
         }
@@ -3996,6 +3995,30 @@ mod tests {
         assert_eq!(api_tool.function.description, "A test tool");
         assert_eq!(api_tool.function.strict, Some(true));
         assert_eq!(api_tool.function.parameters["additionalProperties"], false);
+    }
+
+    #[test]
+    fn untyped_tool_property_disables_strict_mode() {
+        let input_schema = serde_json::json!({
+            "type": "object",
+            "required": ["action"],
+            "properties": {
+                "action": {"type": "string", "enum": ["set", "unset"]},
+                "value": {"description": "JSON value to store."}
+            },
+            "additionalProperties": false
+        });
+        let tool = agent_sdk_foundation::llm::Tool {
+            name: "bip_config".to_owned(),
+            description: "Configure".to_owned(),
+            input_schema: input_schema.clone(),
+            display_name: "Configure".to_owned(),
+            tier: agent_sdk_foundation::ToolTier::Confirm,
+        };
+
+        let api_tool = convert_tool(tool, true);
+        assert_eq!(api_tool.function.strict, None);
+        assert_eq!(api_tool.function.parameters, input_schema);
     }
 
     #[test]

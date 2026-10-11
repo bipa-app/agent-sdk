@@ -35,6 +35,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use super::openai_prompt_cache::bounded_prompt_cache_key;
+use super::openai_schema::normalize_strict_schema;
 use crate::model_features::supports_responses_original_image_detail;
 
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
@@ -2057,182 +2058,22 @@ fn flush_message_parts(
     }));
 }
 
-/// Recursively fix a JSON schema for `OpenAI` strict mode.
-///
-/// Adds `additionalProperties: false`, marks every property required, and — to
-/// keep previously-optional properties from being forced to fabricated values —
-/// wraps optional properties in `anyOf: [..., {"type": "null"}]`. This mirrors
-/// the sibling `openai_responses` provider so a tool schema behaves identically
-/// across both providers.
-fn fix_schema_for_strict_mode(schema: &mut serde_json::Value) {
-    let Some(obj) = schema.as_object_mut() else {
-        return;
-    };
-
-    // Check if this is an object type schema
-    let is_object_type = obj
-        .get("type")
-        .is_some_and(|t| t.as_str() == Some("object"));
-
-    if is_object_type {
-        // Add additionalProperties: false
-        obj.insert(
-            "additionalProperties".to_owned(),
-            serde_json::Value::Bool(false),
-        );
-
-        // Ensure properties and required exist (strict mode needs them even if empty)
-        obj.entry("properties".to_owned())
-            .or_insert_with(|| serde_json::json!({}));
-        obj.entry("required".to_owned())
-            .or_insert_with(|| serde_json::json!([]));
-
-        // Collect the set of originally required keys
-        let originally_required: std::collections::HashSet<String> = obj
-            .get("required")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Wrap previously-optional properties in anyOf with null
-        if let Some(serde_json::Value::Object(props)) = obj.get_mut("properties") {
-            for (key, prop_schema) in props.iter_mut() {
-                if !originally_required.contains(key) {
-                    make_nullable(prop_schema);
-                }
-            }
-        }
-
-        // Ensure all properties are marked as required
-        if let Some(serde_json::Value::Object(props)) = obj.get("properties") {
-            let all_keys: Vec<serde_json::Value> = props
-                .keys()
-                .map(|k| serde_json::Value::String(k.clone()))
-                .collect();
-            obj.insert("required".to_owned(), serde_json::Value::Array(all_keys));
-        }
-    }
-
-    // Recursively process nested schemas
-    if let Some(props) = obj.get_mut("properties")
-        && let Some(props_obj) = props.as_object_mut()
-    {
-        for prop_schema in props_obj.values_mut() {
-            fix_schema_for_strict_mode(prop_schema);
-        }
-    }
-
-    // Process array items
-    if let Some(items) = obj.get_mut("items") {
-        fix_schema_for_strict_mode(items);
-    }
-
-    // Process anyOf/oneOf/allOf
-    for key in ["anyOf", "oneOf", "allOf"] {
-        if let Some(arr) = obj.get_mut(key)
-            && let Some(arr_items) = arr.as_array_mut()
-        {
-            for item in arr_items {
-                fix_schema_for_strict_mode(item);
-            }
-        }
-    }
-}
-
-/// Wrap a schema in `anyOf: [{original}, {"type": "null"}]` so the property
-/// accepts its original type OR null. Appends the null variant when an `anyOf`
-/// already exists.
-fn make_nullable(schema: &mut serde_json::Value) {
-    if let Some(any_of) = schema
-        .as_object_mut()
-        .and_then(|o| o.get_mut("anyOf"))
-        .and_then(|v| v.as_array_mut())
-    {
-        let has_null = any_of
-            .iter()
-            .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("null"));
-        if !has_null {
-            any_of.push(serde_json::json!({"type": "null"}));
-        }
-        return;
-    }
-
-    let original = schema.clone();
-    *schema = serde_json::json!({
-        "anyOf": [original, {"type": "null"}]
-    });
-}
-
-/// Check whether a JSON schema contains any object-typed schema without a
-/// `properties` map (a free-form object). These are incompatible with
-/// `OpenAI` strict mode and must disable it.
-fn has_freeform_object(schema: &serde_json::Value) -> bool {
-    let Some(obj) = schema.as_object() else {
-        return false;
-    };
-
-    let is_object = obj
-        .get("type")
-        .is_some_and(|t| t.as_str() == Some("object"));
-
-    if is_object && !obj.contains_key("properties") {
-        return true;
-    }
-
-    if let Some(serde_json::Value::Object(props)) = obj.get("properties") {
-        for prop in props.values() {
-            if has_freeform_object(prop) {
-                return true;
-            }
-        }
-    }
-
-    if let Some(items) = obj.get("items")
-        && has_freeform_object(items)
-    {
-        return true;
-    }
-
-    for key in ["anyOf", "oneOf", "allOf"] {
-        if let Some(arr) = obj.get(key).and_then(|v| v.as_array()) {
-            for item in arr {
-                if has_freeform_object(item) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
-}
-
 fn convert_tool(tool: agent_sdk_foundation::llm::Tool) -> ApiTool {
-    // Strict mode requires additionalProperties: false on all objects and every
-    // property in required, which is incompatible with free-form object schemas
-    // (objects with no defined properties). Detect and skip strict for those —
-    // matching the sibling openai_responses provider.
-    let mut schema = tool.input_schema;
-    let use_strict = if has_freeform_object(&schema) {
+    let mut parameters = tool.input_schema;
+    let strict = normalize_strict_schema(&mut parameters).then_some(true);
+    if strict.is_none() {
         log::debug!(
-            "Tool '{}' has free-form object schema — disabling strict mode",
+            "Tool '{}' schema is not strict-compatible — disabling strict mode",
             tool.name
         );
-        None
-    } else {
-        fix_schema_for_strict_mode(&mut schema);
-        Some(true)
-    };
+    }
 
     ApiTool {
         r#type: "function".to_owned(),
         name: tool.name,
         description: Some(tool.description),
-        parameters: Some(schema),
-        strict: use_strict,
+        parameters: Some(parameters),
+        strict,
     }
 }
 
@@ -5030,6 +4871,32 @@ mod tests {
 
         let api_tool = convert_tool(tool);
         assert_eq!(api_tool.strict, None);
+    }
+
+    #[test]
+    fn untyped_tool_property_disables_strict_mode() {
+        let input_schema = serde_json::json!({
+            "type": "object",
+            "required": ["action", "scope"],
+            "properties": {
+                "action": {"type": "string", "enum": ["set", "unset", "validate"]},
+                "scope": {"type": "string", "enum": ["global", "project"]},
+                "key": {"type": "string", "description": "JSON Pointer."},
+                "value": {"description": "JSON value to store."}
+            },
+            "additionalProperties": false
+        });
+        let tool = agent_sdk_foundation::llm::Tool {
+            name: "bip_config".to_owned(),
+            description: "Configure".to_owned(),
+            input_schema: input_schema.clone(),
+            display_name: "Configure".to_owned(),
+            tier: agent_sdk_foundation::ToolTier::Confirm,
+        };
+
+        let api_tool = convert_tool(tool);
+        assert_eq!(api_tool.strict, None);
+        assert_eq!(api_tool.parameters, Some(input_schema));
     }
 
     #[test]
