@@ -56,8 +56,8 @@ const MAX_WEBSOCKET_SESSIONS: usize = 512;
 const OPENAI_CODEX_DISABLE_WEBSOCKETS_ENV: &str = "OPENAI_CODEX_DISABLE_WEBSOCKETS";
 
 /// Interpret a raw environment-variable value as a boolean. Absent or
-/// unrecognized values are treated as `false` so the default (WebSocket-first)
-/// behavior is preserved. Split out from the env read so the truthiness logic is
+/// unrecognized values are treated as `false`, leaving the configured
+/// [`CodexTransport`] in charge. Split out from the env read so the truthiness logic is
 /// unit-testable without mutating the process environment (`std::env::set_var`
 /// is `unsafe`, which `#![forbid(unsafe_code)]` rejects even in tests).
 fn parse_disable_websockets_value(value: Option<&str>) -> bool {
@@ -122,6 +122,21 @@ pub enum ReasoningEffort {
     Max,
 }
 
+/// Wire transport for Codex turns.
+///
+/// Prompt-cache affinity (`prompt_cache_key` and the `session_id` header) is
+/// derived from [`ChatRequest::session_id`] on both transports.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CodexTransport {
+    /// One HTTP SSE request per turn.
+    #[default]
+    HttpSse,
+    /// A persistent WebSocket per [`ChatRequest::session_id`] that sends
+    /// incremental input and falls back to HTTP SSE when the socket cannot
+    /// complete the turn. Requests without a session id use HTTP SSE.
+    WebSocket,
+}
+
 /// `OpenAI` Codex / `ChatGPT` subscription provider.
 ///
 /// This provider uses the `ChatGPT` Codex backend (`/backend-api/codex/responses`)
@@ -135,8 +150,9 @@ pub struct OpenAICodexResponsesProvider {
     thinking: Option<ThinkingConfig>,
     account_id: Option<String>,
     websocket_sessions: Arc<Mutex<HashMap<String, Arc<Mutex<WebsocketSessionState>>>>>,
-    /// Hard opt-out: when set, the WebSocket transport is never attempted and
-    /// every turn goes straight to HTTP. Sourced from
+    transport: CodexTransport,
+    /// Hard opt-out that overrides [`CodexTransport::WebSocket`]: every turn
+    /// goes straight to HTTP. Sourced from
     /// [`with_websockets_disabled`](Self::with_websockets_disabled) or the
     /// [`OPENAI_CODEX_DISABLE_WEBSOCKETS_ENV`] environment variable.
     websockets_disabled: bool,
@@ -187,6 +203,7 @@ impl OpenAICodexResponsesProvider {
             thinking: None,
             account_id: None,
             websocket_sessions: Arc::new(Mutex::new(HashMap::new())),
+            transport: CodexTransport::default(),
             websockets_disabled: websockets_disabled_from_env(),
             websockets_unhealthy: Arc::new(AtomicBool::new(false)),
         }
@@ -203,6 +220,7 @@ impl OpenAICodexResponsesProvider {
             thinking: None,
             account_id: None,
             websocket_sessions: Arc::new(Mutex::new(HashMap::new())),
+            transport: CodexTransport::default(),
             websockets_disabled: websockets_disabled_from_env(),
             websockets_unhealthy: Arc::new(AtomicBool::new(false)),
         }
@@ -246,10 +264,18 @@ impl OpenAICodexResponsesProvider {
         self.with_thinking(ThinkingConfig::default().with_effort(map_reasoning_effort(effort)))
     }
 
-    /// Force the HTTP transport, skipping the WebSocket path entirely.
+    /// Select the wire transport. Defaults to [`CodexTransport::HttpSse`].
+    #[must_use]
+    pub const fn with_transport(mut self, transport: CodexTransport) -> Self {
+        self.transport = transport;
+        self
+    }
+
+    /// Force the HTTP transport even when [`CodexTransport::WebSocket`] is
+    /// selected.
     ///
     /// In a WebSocket-hostile environment (a corporate proxy / firewall that
-    /// black-holes the `wss` upgrade) the WebSocket-first transport stalls for
+    /// black-holes the `wss` upgrade) the WebSocket transport stalls for
     /// up to the connect + warmup timeout budget on every fresh session before
     /// falling back to HTTP. An operator who knows their network cannot do
     /// `wss` can set this to skip the penalty entirely. The
@@ -261,11 +287,16 @@ impl OpenAICodexResponsesProvider {
         self
     }
 
-    /// Whether the WebSocket transport should be skipped for this turn: either
-    /// it was hard-disabled (builder / env) or a prior session in this process
-    /// already proved the environment cannot complete the `wss` transport.
+    /// Whether the WebSocket transport should be skipped for this turn: it was
+    /// not selected, it was hard-disabled (builder / env), or a prior session
+    /// in this process already proved the environment cannot complete `wss`.
     fn skip_websocket(&self) -> bool {
-        self.websockets_disabled || self.websockets_unhealthy.load(Ordering::Relaxed)
+        match self.transport {
+            CodexTransport::HttpSse => true,
+            CodexTransport::WebSocket => {
+                self.websockets_disabled || self.websockets_unhealthy.load(Ordering::Relaxed)
+            }
+        }
     }
 
     /// The `ChatGPT`-backend Codex Responses contract does not accept
@@ -549,11 +580,11 @@ impl LlmProvider for OpenAICodexResponsesProvider {
 
             let mut sse_turn_state: Option<String> = None;
 
-            // Skip the WebSocket transport entirely when it is hard-disabled
-            // (builder / env) or a prior session already proved this environment
-            // cannot complete the `wss` transport. The turn falls through to the
-            // HTTP request path below without paying any WebSocket connect /
-            // warmup timeout penalty.
+            // Skip the WebSocket transport entirely when it was not selected, is
+            // hard-disabled (builder / env), or a prior session already proved
+            // this environment cannot complete the `wss` transport. The turn
+            // falls through to the HTTP request path below without paying any
+            // WebSocket connect / warmup timeout penalty.
             if let Some(session_id) = request.session_id.as_deref().filter(|_| !self.skip_websocket()) {
                 let session = self.websocket_session(session_id).await;
                 let mut websocket_session = session.lock().await;
@@ -5437,6 +5468,7 @@ mod tests {
             MODEL_GPT53_CODEX.to_string(),
             base_url,
         )
+        .with_transport(CodexTransport::WebSocket)
         .with_websockets_disabled(true);
 
         assert!(drain_ok(&provider, streaming_request("session-a")).await);
@@ -5751,6 +5783,7 @@ mod tests {
             MODEL_GPT53_CODEX.to_string(),
             base_url,
         )
+        .with_transport(CodexTransport::WebSocket)
         .with_websockets_disabled(disabled);
 
         assert!(drain_ok(&provider, streaming_request("session-env")).await);
@@ -5793,7 +5826,8 @@ mod tests {
             oauth_token(),
             MODEL_GPT53_CODEX.to_string(),
             base_url,
-        );
+        )
+        .with_transport(CodexTransport::WebSocket);
 
         // Simulate a prior session having latched the provider-level transport
         // signal after a connectivity failure.
@@ -5873,7 +5907,8 @@ mod tests {
             oauth_token(),
             MODEL_GPT53_CODEX.to_string(),
             base_url,
-        );
+        )
+        .with_transport(CodexTransport::WebSocket);
 
         // The websocket warmup hits a wrapped 401, disables the session's
         // websocket, and falls back to HTTP — which completes cleanly.
@@ -5892,5 +5927,107 @@ mod tests {
         assert!(session.lock().await.websocket_disabled);
 
         assert!(http_requests.load(Ordering::Relaxed) >= 1);
+    }
+
+    #[tokio::test]
+    async fn session_requests_carry_cache_affinity_over_http_by_default() -> anyhow::Result<()> {
+        let thread_a = "0b4e88a4-6f1c-4c55-9d2a-51c0e4a7f3b9";
+        let thread_b = "5d0f7a3e-2c41-4f8e-9a6b-3e1d7c9b2a40";
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/backend-api/codex/responses"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(HTTP_SSE_BODY),
+            )
+            .mount(&server)
+            .await;
+        let provider = OpenAICodexResponsesProvider::with_base_url(
+            oauth_token(),
+            MODEL_GPT53_CODEX.to_owned(),
+            format!("{}/backend-api", server.uri()),
+        );
+
+        for session_id in [thread_a, thread_a, thread_b] {
+            anyhow::ensure!(
+                drain_ok(&provider, streaming_request(session_id)).await,
+                "the turn for {session_id} did not complete cleanly"
+            );
+        }
+
+        let received = server
+            .received_requests()
+            .await
+            .context("mock server did not record requests")?;
+        let mut affinity = Vec::new();
+        for sent in &received {
+            anyhow::ensure!(
+                sent.method == wiremock::http::Method::POST,
+                "only HTTP SSE POSTs may reach the backend by default, got {} {}",
+                sent.method,
+                sent.url
+            );
+            let body: serde_json::Value = serde_json::from_slice(&sent.body)?;
+            let header = |name: &str| {
+                sent.headers
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToOwned::to_owned)
+            };
+            affinity.push((
+                body["prompt_cache_key"].as_str().map(ToOwned::to_owned),
+                header("session_id"),
+                header("x-client-request-id"),
+            ));
+        }
+        let expected = |id: &str| {
+            (
+                Some(id.to_owned()),
+                Some(id.to_owned()),
+                Some(id.to_owned()),
+            )
+        };
+        assert_eq!(
+            affinity,
+            vec![expected(thread_a), expected(thread_a), expected(thread_b)]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn websocket_transport_is_an_explicit_opt_in() {
+        let (base_url, ws_attempts, http_requests) = spawn_http_only_server().await;
+        let default_provider = OpenAICodexResponsesProvider::with_base_url(
+            oauth_token(),
+            MODEL_GPT53_CODEX.to_string(),
+            base_url.clone(),
+        );
+
+        assert!(drain_ok(&default_provider, streaming_request("default-session")).await);
+        assert_eq!(
+            ws_attempts.load(Ordering::Relaxed),
+            0,
+            "a session id alone must not open a websocket",
+        );
+        assert_eq!(http_requests.load(Ordering::Relaxed), 1);
+
+        let opted_in = OpenAICodexResponsesProvider::with_base_url(
+            oauth_token(),
+            MODEL_GPT53_CODEX.to_string(),
+            base_url,
+        )
+        .with_transport(CodexTransport::WebSocket);
+
+        assert!(drain_ok(&opted_in, streaming_request("opted-in-session")).await);
+        assert!(
+            ws_attempts.load(Ordering::Relaxed) >= 1,
+            "the websocket opt-in must attempt the upgrade",
+        );
+        assert_eq!(
+            http_requests.load(Ordering::Relaxed),
+            2,
+            "the refused upgrade falls back to HTTP SSE",
+        );
     }
 }

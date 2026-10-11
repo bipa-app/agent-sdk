@@ -11,7 +11,7 @@
 //! | Anthropic (Messages API) | [`impls::anthropic`] | SSE streaming |
 //! | OpenAI (Chat Completions) | [`impls::openai`] | SSE streaming |
 //! | OpenAI (Responses API) | [`impls::openai_responses`] | SSE streaming |
-//! | OpenAI Codex / ChatGPT | [`impls::openai_codex_responses`] | WebSocket |
+//! | OpenAI Codex / ChatGPT | [`impls::openai_codex_responses`] | SSE streaming (WebSocket opt-in) |
 //! | Google Gemini | [`impls::gemini`] | SSE streaming |
 //! | Google Vertex AI | [`impls::vertex`] | SSE streaming |
 //! | Cloudflare AI Gateway | [`impls::cloudflare_ai_gateway`] | Proxy wrapper |
