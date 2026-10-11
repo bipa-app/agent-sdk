@@ -115,9 +115,10 @@ pub struct CompactionConfig {
     /// [`model_context_window_tokens`](Self::model_context_window_tokens),
     /// else the serving model's registered context window. The reserve is
     /// [`model_context_reserve_tokens`](Self::model_context_reserve_tokens),
-    /// else the model's registered `max_output_tokens`, else
-    /// [`DEFAULT_MODEL_CONTEXT_RESERVE_TOKENS`], and never less than the
-    /// `max_tokens` the call requests. Without a known window (unknown model,
+    /// else the model's registered `max_output_tokens` bounded the way the
+    /// worker bounds requests (a quarter of the registered window, at least
+    /// 32,000), else [`DEFAULT_MODEL_CONTEXT_RESERVE_TOKENS`], and never less
+    /// than the `max_tokens` the call requests. Without a known window (unknown model,
     /// or a provider whose route is not stable per request),
     /// `threshold_tokens` applies unchanged.
     /// Default: false

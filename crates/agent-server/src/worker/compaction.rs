@@ -334,11 +334,63 @@ fn saturating_usize(tokens: u32) -> usize {
     usize::try_from(tokens).unwrap_or(usize::MAX)
 }
 
+/// A response may claim at most this fraction of the serving window, so at
+/// least three quarters stay available to the prompt and history.
+const OUTPUT_WINDOW_SHARE_DIVISOR: u32 = 4;
+
+/// Floor of the window share, so small-window models keep the output budget
+/// the Anthropic and Vertex providers default to when a caller sets none.
+const MIN_OUTPUT_WINDOW_SHARE_TOKENS: u32 = 32_000;
+
+/// Capabilities of the model that will serve the next request. A dynamic
+/// dispatcher (failover chain, per-request router) may serve the call from a
+/// route its representative capabilities do not describe, so it contributes
+/// none.
+pub(crate) fn serving_capabilities(
+    provider: &dyn LlmProvider,
+) -> Option<&'static ModelCapabilities> {
+    if provider.has_stable_request_route() {
+        provider.capabilities()
+    } else {
+        None
+    }
+}
+
+/// `max_tokens` to request from the serving model for a host-requested
+/// output budget.
+///
+/// The request is capped at the model's registered `max_output_tokens`
+/// (above it the provider rejects the call) and at a quarter of its context
+/// window, floored at [`MIN_OUTPUT_WINDOW_SHARE_TOKENS`], because every
+/// output token reserved is an input token the compaction trigger must give
+/// up. The window share yields when it would not exceed an enabled thinking
+/// budget, which Anthropic requires `max_tokens` to exceed. Unknown models
+/// keep the request unchanged.
+pub(crate) fn serving_max_tokens(
+    requested: u32,
+    capabilities: Option<&ModelCapabilities>,
+    thinking_budget: Option<u32>,
+) -> u32 {
+    let model_max = capabilities
+        .and_then(|caps| caps.max_output_tokens)
+        .filter(|tokens| *tokens > 0);
+    let window_share = capabilities
+        .and_then(|caps| caps.context_window)
+        .filter(|window| *window > 0)
+        .map(|window| (window / OUTPUT_WINDOW_SHARE_DIVISOR).max(MIN_OUTPUT_WINDOW_SHARE_TOKENS))
+        .filter(|share| thinking_budget.is_none_or(|budget| *share > budget));
+    [model_max, window_share]
+        .into_iter()
+        .flatten()
+        .fold(requested, u32::min)
+}
+
 /// Trigger threshold for one call; see
-/// [`CompactionConfig::model_aware_threshold`]. A zero
-/// `requested_max_tokens` floors the reserve at the row's
-/// `max_output_tokens` instead. A reserve that consumes the whole window
-/// leaves `threshold_tokens` unchanged.
+/// [`CompactionConfig::model_aware_threshold`]. The row's
+/// `max_output_tokens` reserves only what [`serving_max_tokens`] would
+/// request of it, and a zero `requested_max_tokens` floors the reserve at
+/// that amount instead. A reserve that consumes the whole window leaves
+/// `threshold_tokens` unchanged.
 fn effective_threshold_tokens(
     cfg: &CompactionConfig,
     capabilities: Option<&ModelCapabilities>,
@@ -359,7 +411,7 @@ fn effective_threshold_tokens(
     };
     let row_max_output = capabilities
         .and_then(|caps| caps.max_output_tokens)
-        .map(saturating_usize);
+        .map(|tokens| saturating_usize(serving_max_tokens(tokens, capabilities, None)));
     let requested_output = Some(requested_max_tokens)
         .filter(|tokens| *tokens > 0)
         .map(saturating_usize)
@@ -379,20 +431,18 @@ fn effective_threshold_tokens(
         )
 }
 
-/// Threshold for a call served by `main_provider`. A dynamic dispatcher
-/// (failover chain, per-request router) may serve the call from a route its
-/// representative capabilities do not describe, so it contributes none.
+/// Threshold for a call served by `main_provider`; see
+/// [`serving_capabilities`].
 fn serving_threshold_tokens(
     cfg: &CompactionConfig,
     main_provider: &dyn LlmProvider,
     requested_max_tokens: u32,
 ) -> (usize, &'static str) {
-    let capabilities = if main_provider.has_stable_request_route() {
-        main_provider.capabilities()
-    } else {
-        None
-    };
-    effective_threshold_tokens(cfg, capabilities, requested_max_tokens)
+    effective_threshold_tokens(
+        cfg,
+        serving_capabilities(main_provider),
+        requested_max_tokens,
+    )
 }
 
 /// The compactor's own budgets (prune-only acceptance, Snapcompact frame
@@ -1290,6 +1340,178 @@ mod tests {
         assert_eq!(
             serving_threshold_tokens(&cfg, &bare, 4_096),
             (cfg.threshold_tokens, "fixed_unknown_model"),
+        );
+    }
+
+    const ROOT_REQUESTED_MAX_TOKENS: u32 = 128_000;
+
+    fn openrouter(model: &str) -> agent_sdk_providers::OpenAIProvider {
+        agent_sdk_providers::OpenAIProvider::with_base_url(
+            "key",
+            model,
+            "https://openrouter.ai/api/v1",
+        )
+    }
+
+    /// The dispatched `max_tokens` and the threshold the pre-call trigger
+    /// derives from that same request.
+    fn worker_budget(
+        cfg: &CompactionConfig,
+        provider: &dyn LlmProvider,
+        requested: u32,
+    ) -> (u32, (usize, &'static str)) {
+        let max_tokens = serving_max_tokens(requested, serving_capabilities(provider), None);
+        (
+            max_tokens,
+            serving_threshold_tokens(cfg, provider, max_tokens),
+        )
+    }
+
+    #[test]
+    fn inherited_root_output_budget_is_sized_to_the_serving_model() {
+        use agent_sdk_providers::{AnthropicProvider, OpenAICodexResponsesProvider};
+
+        let cfg = CompactionConfig::default()
+            .with_model_aware_threshold(true)
+            .with_threshold_tokens(80_000);
+        let routes: Vec<(&str, Box<dyn LlmProvider>, u32, usize)> = vec![
+            (
+                "claude-fable-5-1",
+                Box::new(AnthropicProvider::new("key", "claude-fable-5-1")),
+                128_000,
+                1_000_000 - 128_000,
+            ),
+            (
+                "claude-opus-5-5",
+                Box::new(AnthropicProvider::new("key", "claude-opus-5-5")),
+                128_000,
+                1_000_000 - 128_000,
+            ),
+            (
+                "gpt-6.1-sol",
+                Box::new(OpenAICodexResponsesProvider::new(
+                    "key".into(),
+                    "gpt-6.1-sol".into(),
+                )),
+                128_000,
+                1_050_000 - 128_000,
+            ),
+            (
+                "z-ai/glm-5.1",
+                Box::new(openrouter("z-ai/glm-5.1")),
+                202_752 / 4,
+                202_752 - 202_752 / 4,
+            ),
+            (
+                "moonshotai/kimi-k3",
+                Box::new(openrouter("moonshotai/kimi-k3")),
+                128_000,
+                1_048_576 - 128_000,
+            ),
+        ];
+        for (model, provider, expected_max_tokens, expected_threshold) in routes {
+            assert_eq!(
+                worker_budget(&cfg, provider.as_ref(), ROOT_REQUESTED_MAX_TOKENS),
+                (expected_max_tokens, (expected_threshold, "model_aware")),
+                "{model}",
+            );
+        }
+        let unknown = RouteStub {
+            provider: "mock",
+            model: "mock-model",
+            stable: true,
+        };
+        assert_eq!(
+            worker_budget(&cfg, &unknown, ROOT_REQUESTED_MAX_TOKENS),
+            (128_000, (80_000, "fixed_unknown_model")),
+        );
+    }
+
+    #[test]
+    fn registered_output_cap_reserve_is_sized_like_the_request() {
+        let cfg = CompactionConfig::default().with_model_aware_threshold(true);
+        let glm = registered("openai", "z-ai/glm-5.1");
+        assert_eq!(
+            effective_threshold_tokens(&cfg, glm, 32_000),
+            (202_752 - 202_752 / 4, "model_aware"),
+        );
+        assert_eq!(
+            effective_threshold_tokens(&cfg, glm, 0),
+            (202_752 - 202_752 / 4, "model_aware"),
+        );
+    }
+
+    #[test]
+    fn requests_above_the_model_max_output_are_clamped_to_it() {
+        assert_eq!(
+            serving_max_tokens(200_000, registered("anthropic", "claude-fable-5-1"), None),
+            128_000,
+        );
+        assert_eq!(
+            serving_max_tokens(128_000, registered("gemini", "gemini-2.0-flash"), None),
+            8_192,
+        );
+        assert_eq!(
+            serving_max_tokens(
+                200_000,
+                registered("anthropic", "claude-fable-5-1"),
+                Some(150_000)
+            ),
+            128_000,
+        );
+    }
+
+    #[test]
+    fn unknown_models_keep_the_requested_output_budget() {
+        assert_eq!(serving_max_tokens(128_000, None, None), 128_000);
+        assert_eq!(
+            serving_max_tokens(128_000, registered("mock", "mock-model"), None),
+            128_000,
+        );
+    }
+
+    #[test]
+    fn window_share_bounds_output_only_where_it_binds() -> anyhow::Result<()> {
+        let kimi = registered("openai", "moonshotai/kimi-k3").context("kimi k3 row")?;
+        assert_eq!(kimi.max_output_tokens, None);
+        assert_eq!(serving_max_tokens(128_000, Some(kimi), None), 128_000);
+        assert_eq!(serving_max_tokens(400_000, Some(kimi), None), 1_048_576 / 4);
+
+        let small_window = ModelCapabilities {
+            context_window: Some(100_000),
+            ..*kimi
+        };
+        assert_eq!(
+            serving_max_tokens(128_000, Some(&small_window), None),
+            32_000
+        );
+        assert_eq!(
+            serving_max_tokens(16_000, Some(&small_window), None),
+            16_000
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn window_share_never_starves_an_enabled_thinking_budget() {
+        let sonnet = registered("anthropic", "claude-sonnet-4-5-20250929");
+        assert_eq!(serving_max_tokens(64_000, sonnet, None), 50_000);
+        assert_eq!(serving_max_tokens(64_000, sonnet, Some(10_000)), 50_000);
+        assert_eq!(serving_max_tokens(64_000, sonnet, Some(55_000)), 64_000);
+        assert_eq!(serving_max_tokens(128_000, sonnet, Some(55_000)), 64_000);
+    }
+
+    #[test]
+    fn unstable_routes_trust_no_output_cap() {
+        let router = RouteStub {
+            provider: "openai",
+            model: "z-ai/glm-5.1",
+            stable: false,
+        };
+        assert!(serving_capabilities(&router).is_none());
+        assert_eq!(
+            serving_max_tokens(128_000, serving_capabilities(&router), None),
+            128_000,
         );
     }
 

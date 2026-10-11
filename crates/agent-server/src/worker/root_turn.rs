@@ -1757,6 +1757,7 @@ async fn run_boundary_injection_call(
     .context("open boundary-injection attempt")?;
     let chat_request = build_chat_request(
         definition,
+        provider,
         &inputs.staged_stores.messages,
         thread_id,
         &resume_input,
@@ -2032,6 +2033,7 @@ async fn execute_root_turn_inner(
     //    turn close reuse the same IDs.
     let chat_request = build_chat_request(
         definition,
+        provider,
         &inputs.staged_stores.messages,
         thread_id,
         &user_input,
@@ -3023,6 +3025,7 @@ async fn prepare_pre_call_compaction(
         agent_sdk::context::TokenEstimator::estimate_pending_user_message(user_input.blocks());
     let expected_request = build_request_envelope(
         definition,
+        provider,
         thread_id,
         inputs.bootstrap.task.caller_metadata.as_ref(),
     );
@@ -3177,11 +3180,24 @@ async fn assemble_provider_request_messages(
 /// request-only reminders. Shared by [`build_chat_request`] and the pre-call
 /// compaction trigger so the expected envelope fingerprint cannot drift from
 /// the dispatched request.
+///
+/// `max_tokens` is the definition's budget sized to the model `provider`
+/// serves; see [`super::compaction::serving_max_tokens`].
 fn build_request_envelope(
     definition: &AgentDefinition,
+    provider: &dyn LlmProvider,
     thread_id: &agent_sdk_foundation::ThreadId,
     caller_metadata: Option<&serde_json::Value>,
 ) -> ChatRequest {
+    let thinking_budget = match &definition.thinking {
+        ThinkingPolicy::Enabled { budget_tokens } => Some(*budget_tokens),
+        ThinkingPolicy::Disabled | ThinkingPolicy::Adaptive { .. } => None,
+    };
+    let max_tokens = super::compaction::serving_max_tokens(
+        definition.max_tokens,
+        super::compaction::serving_capabilities(provider),
+        thinking_budget,
+    );
     let thinking = match &definition.thinking {
         ThinkingPolicy::Disabled => None,
         ThinkingPolicy::Enabled { budget_tokens } => Some(llm::ThinkingConfig::new(*budget_tokens)),
@@ -3211,7 +3227,7 @@ fn build_request_envelope(
         } else {
             Some(resolved_tools)
         },
-        max_tokens: definition.max_tokens,
+        max_tokens,
         max_tokens_explicit: true,
         session_id: Some(thread_id.to_string()),
         cached_content: None,
@@ -3225,12 +3241,27 @@ fn build_request_envelope(
 
 async fn build_chat_request(
     definition: &AgentDefinition,
+    provider: &dyn LlmProvider,
     staged_messages: &crate::journal::staged::StagedMessageStore,
     thread_id: &agent_sdk_foundation::ThreadId,
     user_input: &super::user_input::UserInput,
     caller_metadata: Option<&serde_json::Value>,
 ) -> Result<ChatRequest> {
-    let mut request = build_request_envelope(definition, thread_id, caller_metadata);
+    let mut request = build_request_envelope(definition, provider, thread_id, caller_metadata);
+    if request.max_tokens < definition.max_tokens {
+        let capabilities = super::compaction::serving_capabilities(provider);
+        log::info!(
+            "thread {thread_id}: max_tokens {} sized to {} for provider={} route={} model={} \
+             (max_output_tokens={:?}, context_window={:?})",
+            definition.max_tokens,
+            request.max_tokens,
+            provider.provider(),
+            provider.route(),
+            provider.model(),
+            capabilities.and_then(|caps| caps.max_output_tokens),
+            capabilities.and_then(|caps| caps.context_window),
+        );
+    }
     assemble_provider_request_messages(
         &mut request,
         definition,
@@ -7732,6 +7763,7 @@ async fn stage_resume_call(
     //    `build_chat_request` rather than a near-duplicate helper.)
     let chat_request = build_chat_request(
         definition,
+        provider,
         &inputs.staged_stores.messages,
         thread_id,
         &resume_input,
@@ -9524,6 +9556,7 @@ async fn stage_and_call_steering_llm(
 
     let chat_request = build_chat_request(
         definition,
+        provider,
         &inputs.staged_stores.messages,
         thread_id,
         &resume_input,
@@ -9872,6 +9905,10 @@ mod tests {
         }
     }
 
+    fn uncapped_provider() -> OpenAIProvider {
+        OpenAIProvider::new("key", "mock-model")
+    }
+
     fn tool_round_history() -> Vec<llm::Message> {
         vec![
             llm::Message::user("plan the migration"),
@@ -9899,6 +9936,7 @@ mod tests {
 
         let request = build_chat_request(
             &definition,
+            &uncapped_provider(),
             &staged,
             &thread_id,
             &super::super::user_input::UserInput::resume(),
@@ -9926,6 +9964,7 @@ mod tests {
 
         let fresh = build_chat_request(
             &definition,
+            &uncapped_provider(),
             &staged,
             &thread_id,
             &super::super::user_input::UserInput::text("next step"),
@@ -9976,9 +10015,15 @@ mod tests {
         );
         let input = super::super::user_input::UserInput::text("next step");
 
-        let baseline =
-            build_chat_request(&context_definition(None), &staged, &thread_id, &input, None)
-                .await?;
+        let baseline = build_chat_request(
+            &context_definition(None),
+            &uncapped_provider(),
+            &staged,
+            &thread_id,
+            &input,
+            None,
+        )
+        .await?;
         let mut expected = tool_round_history();
         expected.push(llm::Message::user_with_content(vec![
             llm::ContentBlock::Text {
@@ -9993,6 +10038,7 @@ mod tests {
         for hook in [none_hook, blank_hook] {
             let request = build_chat_request(
                 &context_definition(Some(hook)),
+                &uncapped_provider(),
                 &staged,
                 &thread_id,
                 &input,
@@ -10002,6 +10048,79 @@ mod tests {
             assert_eq!(format!("{request:?}"), format!("{baseline:?}"));
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn trigger_and_dispatch_share_the_serving_output_budget() -> Result<()> {
+        let thread_id = agent_sdk_foundation::ThreadId::from_string("thread_output_budget");
+        let staged = crate::journal::staged::StagedMessageStore::new(
+            thread_id.clone(),
+            tool_round_history(),
+        );
+        let input = super::super::user_input::UserInput::text("next step");
+        let definition = AgentDefinition {
+            max_tokens: 128_000,
+            ..context_definition(None)
+        };
+        let glm =
+            OpenAIProvider::with_base_url("key", "z-ai/glm-5.1", "https://openrouter.ai/api/v1");
+
+        let trigger_envelope = build_request_envelope(&definition, &glm, &thread_id, None);
+        let dispatched =
+            build_chat_request(&definition, &glm, &staged, &thread_id, &input, None).await?;
+
+        assert_eq!(trigger_envelope.max_tokens, 202_752 / 4);
+        assert!(trigger_envelope.max_tokens_explicit);
+        assert_eq!(dispatched.max_tokens, trigger_envelope.max_tokens);
+        assert_eq!(
+            super::super::compaction::request_envelope_fingerprint(
+                glm.provider(),
+                glm.model(),
+                &trigger_envelope,
+            )?,
+            super::super::compaction::request_envelope_fingerprint(
+                glm.provider(),
+                glm.model(),
+                &dispatched,
+            )?,
+        );
+
+        let fable = agent_sdk_providers::AnthropicProvider::new("key", "claude-fable-5-1");
+        assert_eq!(
+            build_request_envelope(&definition, &fable, &thread_id, None).max_tokens,
+            128_000,
+        );
+        assert_eq!(
+            build_request_envelope(&definition, &uncapped_provider(), &thread_id, None).max_tokens,
+            128_000,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn envelope_window_share_yields_to_an_enabled_thinking_budget() {
+        let thread_id = agent_sdk_foundation::ThreadId::from_string("thread_output_budget");
+        let sonnet =
+            agent_sdk_providers::AnthropicProvider::new("key", "claude-sonnet-4-5-20250929");
+        let budgeted = AgentDefinition {
+            max_tokens: 64_000,
+            thinking: ThinkingPolicy::Enabled {
+                budget_tokens: 55_000,
+            },
+            ..context_definition(None)
+        };
+        assert_eq!(
+            build_request_envelope(&budgeted, &sonnet, &thread_id, None).max_tokens,
+            64_000,
+        );
+        let unbudgeted = AgentDefinition {
+            thinking: ThinkingPolicy::Disabled,
+            ..budgeted
+        };
+        assert_eq!(
+            build_request_envelope(&unbudgeted, &sonnet, &thread_id, None).max_tokens,
+            50_000,
+        );
     }
 
     fn identity_continuation(
