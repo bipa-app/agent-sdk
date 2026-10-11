@@ -27,7 +27,11 @@ use reqwest::StatusCode;
 
 const API_BASE_URL: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
-const CLAUDE_CODE_VERSION: &str = "2.1.75";
+/// Claude Code release whose OAuth request shape this provider reproduces.
+///
+/// Over OAuth the API rejects models newer than the reported client version
+/// (Opus 5.5 needs 2.1.280 or later), so this tracks Claude Code releases.
+pub const CLAUDE_CODE_VERSION: &str = "2.1.296";
 const DEFAULT_SAFE_MAX_OUTPUT_TOKENS: u32 = 32_000;
 /// Max page size the Anthropic `GET /v1/models` endpoint accepts.
 const MODELS_PAGE_LIMIT: u32 = 1000;
@@ -86,8 +90,12 @@ pub const MODEL_OPUS_55: &str = "claude-opus-5-5";
 pub const MODEL_FABLE_5: &str = "claude-fable-5";
 pub const MODEL_FABLE_51: &str = "claude-fable-5-1";
 
+const CLAUDE_CODE_BETA: &str = "claude-code-20250219";
+const OAUTH_BETA: &str = "oauth-2025-04-20";
 /// Beta header that opts a request into interleaved (mid-loop) thinking.
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+const EFFORT_BETA: &str = "effort-2025-11-24";
+const CLAUDE_CODE_SESSION_ID_HEADER: &str = "X-Claude-Code-Session-Id";
 /// Beta header required alongside `speed: "fast"`. Fast mode is a research
 /// preview, so the API rejects the field without it.
 const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
@@ -175,6 +183,13 @@ pub fn is_oauth_token(api_key: &str) -> bool {
     api_key.starts_with("sk-ant-oat")
 }
 
+/// The `user-agent` Claude Code [`CLAUDE_CODE_VERSION`] sends from an
+/// interactive terminal session.
+#[must_use]
+pub fn claude_code_user_agent() -> String {
+    format!("claude-cli/{CLAUDE_CODE_VERSION} (external, cli)")
+}
+
 /// One page of the Anthropic `GET /v1/models` response: the model rows plus the
 /// cursor fields used to follow pagination.
 struct AnthropicModelsPage {
@@ -248,7 +263,8 @@ enum AuthMode {
     /// Standard API key authentication (x-api-key header).
     ApiKey,
     /// OAuth token authentication (Bearer header + Claude Code identity).
-    OAuth,
+    /// `session_id` is sent as `X-Claude-Code-Session-Id`.
+    OAuth { session_id: String },
 }
 
 /// Anthropic LLM provider using the Messages API.
@@ -283,7 +299,9 @@ impl AnthropicProvider {
         let api_key = api_key.into();
         let model = model.into();
         let auth_mode = if is_oauth_token(&api_key) {
-            AuthMode::OAuth
+            AuthMode::OAuth {
+                session_id: uuid::Uuid::new_v4().to_string(),
+            }
         } else {
             AuthMode::ApiKey
         };
@@ -326,19 +344,24 @@ impl AnthropicProvider {
     /// Returns whether this provider is using OAuth authentication.
     #[must_use]
     pub const fn is_oauth(&self) -> bool {
-        matches!(self.auth_mode, AuthMode::OAuth)
+        matches!(self.auth_mode, AuthMode::OAuth { .. })
     }
 
     /// Applies authentication headers to a request builder.
     ///
     /// When `api_key` is empty the provider-specific credential header is
     /// skipped — useful for BYOK gateways where auth is handled externally
-    /// via `extra_headers`.
-    fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    /// via `extra_headers`. `effort_on_wire` reports whether the request body
+    /// carries `output_config.effort`.
+    fn apply_auth(
+        &self,
+        builder: reqwest::RequestBuilder,
+        effort_on_wire: bool,
+    ) -> reqwest::RequestBuilder {
         let builder = if self.api_key.is_empty() {
             builder.header("anthropic-version", API_VERSION)
         } else {
-            match self.auth_mode {
+            match &self.auth_mode {
                 AuthMode::ApiKey => {
                     let builder = builder
                         .header("x-api-key", &self.api_key)
@@ -346,10 +369,9 @@ impl AnthropicProvider {
                     // Budget-thinking models (e.g. Sonnet 4.5, Haiku 4.5) only
                     // emit interleaved (mid-loop) thinking blocks when this beta
                     // is set. Adaptive-thinking models (4.6+) interleave
-                    // server-side and ignore the header, so gate on the same
-                    // predicate as the OAuth arm to keep the cached request
-                    // prefix minimal and stable. Do NOT add other OAuth-identity
-                    // betas here — API-key auth is not Claude Code.
+                    // server-side and ignore the header, so it is left off to
+                    // keep the request minimal and stable. Do NOT add
+                    // OAuth-identity betas here — API-key auth is not Claude Code.
                     let mut beta_features = Vec::new();
                     if !self.is_adaptive_thinking_model() {
                         beta_features.push(INTERLEAVED_THINKING_BETA);
@@ -363,31 +385,32 @@ impl AnthropicProvider {
                         builder.header("anthropic-beta", beta_features.join(","))
                     }
                 }
-                AuthMode::OAuth => {
-                    // Build beta features list matching Claude Code's behaviour.
-                    // Adaptive-thinking models (4.6) have interleaved thinking
-                    // built-in; for older reasoning models we need the explicit beta.
-                    let mut beta_features = vec![
-                        "claude-code-20250219",
-                        "oauth-2025-04-20",
-                        "fine-grained-tool-streaming-2025-05-14",
-                    ];
-                    if !self.is_adaptive_thinking_model() {
-                        beta_features.push(INTERLEAVED_THINKING_BETA);
-                    }
-                    beta_features.extend(self.fast_mode_beta());
-                    builder
-                        .header("Authorization", format!("Bearer {}", self.api_key))
-                        .header("anthropic-version", API_VERSION)
-                        .header("anthropic-beta", beta_features.join(","))
-                        .header("user-agent", format!("claude-cli/{CLAUDE_CODE_VERSION}"))
-                        .header("x-app", "cli")
-                }
+                AuthMode::OAuth { session_id } => builder
+                    .header("Authorization", format!("Bearer {}", self.api_key))
+                    .header("anthropic-version", API_VERSION)
+                    .header("anthropic-beta", self.oauth_betas(effort_on_wire).join(","))
+                    .header("user-agent", claude_code_user_agent())
+                    .header("x-app", "cli")
+                    .header(CLAUDE_CODE_SESSION_ID_HEADER, session_id),
             }
         };
         self.extra_headers
             .iter()
             .fold(builder, |b, (k, v)| b.header(k.as_str(), v.as_str()))
+    }
+
+    /// The betas Claude Code sends on an agentic first-party request, minus
+    /// those that switch on features this provider does not implement.
+    fn oauth_betas(&self, effort_on_wire: bool) -> Vec<&'static str> {
+        let mut betas = vec![CLAUDE_CODE_BETA, OAUTH_BETA];
+        if !self.model.contains("claude-3-") {
+            betas.push(INTERLEAVED_THINKING_BETA);
+        }
+        if effort_on_wire {
+            betas.push(EFFORT_BETA);
+        }
+        betas.extend(self.fast_mode_beta());
+        betas
     }
 
     const OAUTH_IDENTITY: &'static str =
@@ -405,7 +428,7 @@ impl AnthropicProvider {
     ) -> Option<data::ApiSystemPrompt<'a>> {
         match self.auth_mode {
             AuthMode::ApiKey => data::build_api_system_prompt(system, cache_control),
-            AuthMode::OAuth => {
+            AuthMode::OAuth { .. } => {
                 let mut blocks = vec![data::ApiSystemBlock {
                     block_type: "text",
                     text: Self::OAUTH_IDENTITY,
@@ -841,7 +864,7 @@ impl LlmProvider for AnthropicProvider {
             .timeout(CHAT_REQUEST_TIMEOUT)
             .header("Content-Type", "application/json");
         let response = self
-            .apply_auth(builder)
+            .apply_auth(builder, api_request.output_config.is_some())
             .json(&api_request)
             .send()
             .await
@@ -1050,7 +1073,10 @@ impl LlmProvider for AnthropicProvider {
                     // retry layer classifies it as a retryable transport error and
                     // re-sends on a fresh connection.
                     let headers_timeout = self.stream_headers_timeout;
-                    let send = self.apply_auth(builder).json(&api_request).send();
+                    let send = self
+                        .apply_auth(builder, api_request.output_config.is_some())
+                        .json(&api_request)
+                        .send();
                     let response = match tokio::time::timeout(headers_timeout, send).await {
                         Ok(Ok(r)) => r,
                         Ok(Err(error)) => {
@@ -1346,7 +1372,7 @@ impl LlmProvider for AnthropicProvider {
                 .get(format!("{}/v1/models", self.base_url))
                 .header("Content-Type", "application/json")
                 .query(&query);
-            let builder = self.apply_auth(builder);
+            let builder = self.apply_auth(builder, false);
             let body =
                 crate::impls::model_listing::fetch_model_list_body(builder, "Anthropic").await?;
             let page = parse_models_page(&body)?;
@@ -2049,7 +2075,7 @@ mod tests {
 
     fn apply_auth_beta_header(provider: &AnthropicProvider) -> anyhow::Result<Option<String>> {
         let builder = reqwest::Client::new().post("http://localhost/v1/messages");
-        let request = provider.apply_auth(builder).build()?;
+        let request = provider.apply_auth(builder, false).build()?;
         Ok(request
             .headers()
             .get("anthropic-beta")
@@ -2093,6 +2119,219 @@ mod tests {
                 "expected no beta header for adaptive model {}",
                 provider.model()
             );
+        }
+        Ok(())
+    }
+
+    // ===================
+    // Claude Code OAuth identity
+    // ===================
+
+    const OAUTH_TEST_TOKEN: &str = "sk-ant-oat-test-not-a-secret";
+
+    fn auth_headers(
+        provider: &AnthropicProvider,
+        effort_on_wire: bool,
+    ) -> anyhow::Result<reqwest::header::HeaderMap> {
+        let builder = reqwest::Client::new().post("http://localhost/v1/messages");
+        Ok(provider
+            .apply_auth(builder, effort_on_wire)
+            .build()?
+            .headers()
+            .clone())
+    }
+
+    fn header_str<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> Option<&'a str> {
+        headers.get(name).and_then(|value| value.to_str().ok())
+    }
+
+    #[test]
+    fn claude_code_version_clears_the_newest_model_gates() -> anyhow::Result<()> {
+        // Over OAuth the API rejects Opus 5.5 below Claude Code 2.1.280 and
+        // Fable 5.1 below 2.1.251.
+        let version = CLAUDE_CODE_VERSION
+            .split('.')
+            .map(str::parse)
+            .collect::<Result<Vec<u32>, _>>()?;
+        assert!(
+            version.as_slice() >= [2, 1, 280].as_slice(),
+            "{CLAUDE_CODE_VERSION} is too old for Opus 5.5 over OAuth"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oauth_sends_the_current_claude_code_identity_headers() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        let provider = AnthropicProvider::new(OAUTH_TEST_TOKEN, MODEL_OPUS_55);
+        let headers = auth_headers(&provider, false)?;
+
+        assert_eq!(
+            header_str(&headers, "user-agent"),
+            Some(format!("claude-cli/{CLAUDE_CODE_VERSION} (external, cli)").as_str())
+        );
+        assert_eq!(header_str(&headers, "x-app"), Some("cli"));
+        assert_eq!(
+            header_str(&headers, "authorization"),
+            Some(format!("Bearer {OAUTH_TEST_TOKEN}").as_str())
+        );
+        assert_eq!(header_str(&headers, "anthropic-version"), Some(API_VERSION));
+        assert!(headers.get("x-api-key").is_none());
+        let session_id = header_str(&headers, CLAUDE_CODE_SESSION_ID_HEADER)
+            .context("OAuth requests must carry a Claude Code session id")?;
+        uuid::Uuid::parse_str(session_id)?;
+        Ok(())
+    }
+
+    #[test]
+    fn oauth_session_id_is_stable_per_provider_and_unique_across_providers() -> anyhow::Result<()> {
+        let provider = AnthropicProvider::new(OAUTH_TEST_TOKEN, MODEL_OPUS_55);
+        let cloned = provider.clone();
+        let first = auth_headers(&provider, false)?;
+        let clone = auth_headers(&cloned, true)?;
+        let other = auth_headers(
+            &AnthropicProvider::new(OAUTH_TEST_TOKEN, MODEL_OPUS_55),
+            false,
+        )?;
+
+        let first = header_str(&first, CLAUDE_CODE_SESSION_ID_HEADER);
+        assert!(first.is_some());
+        assert_eq!(first, header_str(&clone, CLAUDE_CODE_SESSION_ID_HEADER));
+        assert_ne!(first, header_str(&other, CLAUDE_CODE_SESSION_ID_HEADER));
+        Ok(())
+    }
+
+    #[test]
+    fn oauth_betas_match_claude_code_per_model_family() -> anyhow::Result<()> {
+        const CURRENT: &str =
+            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14";
+        let with_effort = format!("{CURRENT},effort-2025-11-24");
+        for (model, effort_on_wire, expected) in [
+            (MODEL_OPUS_55, false, CURRENT),
+            (MODEL_FABLE_51, false, CURRENT),
+            (MODEL_HAIKU_55, false, CURRENT),
+            (MODEL_OPUS_5, false, CURRENT),
+            (MODEL_SONNET_45, false, CURRENT),
+            (MODEL_OPUS_55, true, with_effort.as_str()),
+            (MODEL_FABLE_51, true, with_effort.as_str()),
+            (MODEL_HAIKU_55, true, with_effort.as_str()),
+            (
+                MODEL_HAIKU_35,
+                false,
+                "claude-code-20250219,oauth-2025-04-20",
+            ),
+        ] {
+            let provider = AnthropicProvider::new(OAUTH_TEST_TOKEN, model);
+            let headers = auth_headers(&provider, effort_on_wire)?;
+            assert_eq!(
+                header_str(&headers, "anthropic-beta"),
+                Some(expected),
+                "model={model} effort_on_wire={effort_on_wire}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn api_key_auth_carries_no_claude_code_identity() -> anyhow::Result<()> {
+        let provider = AnthropicProvider::opus_55("test-key-not-a-secret");
+        let headers = auth_headers(&provider, true)?;
+
+        assert_eq!(
+            header_str(&headers, "x-api-key"),
+            Some("test-key-not-a-secret")
+        );
+        for name in [
+            "authorization",
+            "user-agent",
+            "x-app",
+            "anthropic-beta",
+            CLAUDE_CODE_SESSION_ID_HEADER,
+        ] {
+            assert!(
+                headers.get(name).is_none(),
+                "API-key auth must not send {name}"
+            );
+        }
+        Ok(())
+    }
+
+    async fn mount_messages_stub(server: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(server)
+            .await;
+    }
+
+    async fn single_recorded_request(
+        server: &wiremock::MockServer,
+    ) -> anyhow::Result<wiremock::Request> {
+        use anyhow::Context as _;
+
+        let mut received = server
+            .received_requests()
+            .await
+            .context("request recording is disabled")?;
+        anyhow::ensure!(
+            received.len() == 1,
+            "expected exactly one request, got {}",
+            received.len()
+        );
+        received.pop().context("no request recorded")
+    }
+
+    #[tokio::test]
+    async fn oauth_requests_declare_effort_only_when_it_is_on_the_wire() -> anyhow::Result<()> {
+        use agent_sdk_foundation::llm::Effort;
+        use anyhow::Context as _;
+
+        for streaming in [false, true] {
+            for (thinking, expected_effort) in [
+                (
+                    ThinkingConfig::adaptive_with_effort(Effort::High),
+                    Some("high"),
+                ),
+                (ThinkingConfig::adaptive(), None),
+            ] {
+                let server = wiremock::MockServer::start().await;
+                mount_messages_stub(&server).await;
+                let provider = AnthropicProvider::new(OAUTH_TEST_TOKEN, MODEL_OPUS_55)
+                    .with_thinking(thinking)
+                    .with_base_url(server.uri());
+                let request = request_with_tools(vec![tool("read")]);
+                if streaming {
+                    let _ = provider.chat_stream(request).collect::<Vec<_>>().await;
+                } else {
+                    let _ = provider.chat(request).await;
+                }
+
+                let recorded = single_recorded_request(&server).await?;
+                let betas = recorded
+                    .headers
+                    .get("anthropic-beta")
+                    .and_then(|value| value.to_str().ok())
+                    .context("OAuth requests always declare betas")?;
+                let body: serde_json::Value = serde_json::from_slice(&recorded.body)?;
+                assert_eq!(
+                    betas.split(',').any(|beta| beta == EFFORT_BETA),
+                    expected_effort.is_some(),
+                    "streaming={streaming} betas={betas}"
+                );
+                assert_eq!(
+                    body["output_config"]["effort"].as_str(),
+                    expected_effort,
+                    "streaming={streaming} body={body}"
+                );
+                assert_eq!(
+                    body["system"][0]["text"],
+                    "You are Claude Code, Anthropic's official CLI for Claude."
+                );
+            }
         }
         Ok(())
     }
