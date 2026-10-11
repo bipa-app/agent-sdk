@@ -36,18 +36,7 @@ const fn default_compaction_engine() -> CompactionEngine {
     CompactionEngine::Legacy
 }
 
-/// Compaction implementation selected by the host.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompactionEngine {
-    /// Summarize the selected prefix without pruning and use estimated triggers.
-    #[default]
-    Legacy,
-    /// Prune recoverable tool output first and let the host use measured triggers.
-    PruneFirst,
-    /// Deterministic local transcript rendering with an exact source archive.
-    Snapcompact,
-}
+pub use agent_sdk_foundation::events::CompactionEngine;
 
 /// Configuration for context compaction.
 ///

@@ -50,7 +50,7 @@ use agent_sdk::context::{
     FailedCompaction, LlmContextCompactor,
 };
 use agent_sdk_foundation::TokenUsage;
-use agent_sdk_foundation::events::AgentEvent;
+use agent_sdk_foundation::events::{AgentEvent, CompactionTrigger};
 use agent_sdk_foundation::llm::ChatRequest;
 use agent_sdk_providers::{LlmProvider, ModelCapabilities};
 use agent_sdk_tools::stores::MessageStore;
@@ -562,9 +562,17 @@ pub(crate) async fn run_planned_compaction(
     now: OffsetDateTime,
 ) -> CompactionResult<CompactionOutcome> {
     let PlannedCompaction { compactor, history } = planned;
-    apply_compaction(deps, staged_messages, &compactor, history, thread_id, now)
-        .await
-        .map_err(|failure| failure.with_context("pre-call compaction"))
+    apply_compaction(
+        deps,
+        staged_messages,
+        &compactor,
+        history,
+        thread_id,
+        now,
+        CompactionTrigger::Threshold,
+    )
+    .await
+    .map_err(|failure| failure.with_context("pre-call compaction"))
 }
 
 #[cfg(test)]
@@ -660,9 +668,17 @@ pub(crate) async fn compact_after_overflow(
         history.len(),
         cfg.engine,
     );
-    apply_compaction(deps, staged_messages, &compactor, history, thread_id, now)
-        .await
-        .map_err(|failure| failure.with_context("overflow recovery compaction"))
+    apply_compaction(
+        deps,
+        staged_messages,
+        &compactor,
+        history,
+        thread_id,
+        now,
+        CompactionTrigger::Overflow,
+    )
+    .await
+    .map_err(|failure| failure.with_context("overflow recovery compaction"))
 }
 
 /// True when a failed `append_compaction` was refused for breaking the
@@ -710,6 +726,7 @@ async fn apply_compaction(
     history: Vec<agent_sdk_foundation::llm::Message>,
     thread_id: &agent_sdk_foundation::ThreadId,
     now: OffsetDateTime,
+    trigger: CompactionTrigger,
 ) -> CompactionResult<CompactionOutcome> {
     let compact = compactor.compact_history_with_usage(history);
     let completed = if let Some(cancel) = deps.cancel {
@@ -797,6 +814,8 @@ async fn apply_compaction(
         result.new_count,
         result.original_tokens,
         result.new_tokens,
+        trigger,
+        deps.compaction_config.map(|cfg| cfg.engine),
     );
     let committed = deps
         .event_repo
