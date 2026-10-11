@@ -1159,7 +1159,8 @@ mod tests {
             .with_model_aware_threshold(true)
             .with_threshold_tokens(80_000);
         let gpt_threshold = 1_050_000 - 128_000;
-        let kimi_threshold = 1_048_576 - DEFAULT_MODEL_CONTEXT_RESERVE_TOKENS.max(32_000);
+        let kimi_threshold = 1_048_576 - 65_535;
+        let fireworks_kimi_threshold = 1_048_576 - DEFAULT_MODEL_CONTEXT_RESERVE_TOKENS.max(32_000);
         let routes: Vec<(&str, Box<dyn LlmProvider>, usize)> = vec![
             (
                 "anthropic",
@@ -1214,7 +1215,7 @@ mod tests {
                     "accounts/fireworks/models/kimi-k3",
                     "https://api.fireworks.ai/inference/v1",
                 )),
-                kimi_threshold,
+                fireworks_kimi_threshold,
             ),
         ];
         for (route, provider, expected) in routes {
@@ -1327,10 +1328,7 @@ mod tests {
         };
         assert_eq!(
             serving_threshold_tokens(&cfg, &gateway, 4_096),
-            (
-                1_048_576 - DEFAULT_MODEL_CONTEXT_RESERVE_TOKENS,
-                "model_aware"
-            ),
+            (1_048_576 - 65_535, "model_aware"),
         );
         let bare = RouteStub {
             provider: "test-gateway",
@@ -1405,6 +1403,16 @@ mod tests {
             (
                 "moonshotai/kimi-k3",
                 Box::new(openrouter("moonshotai/kimi-k3")),
+                65_535,
+                1_048_576 - 65_535,
+            ),
+            (
+                "accounts/fireworks/models/kimi-k3",
+                Box::new(agent_sdk_providers::OpenAIProvider::with_base_url(
+                    "key",
+                    "accounts/fireworks/models/kimi-k3",
+                    "https://api.fireworks.ai/inference/v1",
+                )),
                 128_000,
                 1_048_576 - 128_000,
             ),
@@ -1472,7 +1480,8 @@ mod tests {
 
     #[test]
     fn window_share_bounds_output_only_where_it_binds() -> anyhow::Result<()> {
-        let kimi = registered("openai", "moonshotai/kimi-k3").context("kimi k3 row")?;
+        let kimi = registered("openai", "accounts/fireworks/models/kimi-k3")
+            .context("fireworks kimi k3 row")?;
         assert_eq!(kimi.max_output_tokens, None);
         assert_eq!(serving_max_tokens(128_000, Some(kimi), None), 128_000);
         assert_eq!(serving_max_tokens(400_000, Some(kimi), None), 1_048_576 / 4);
