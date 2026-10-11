@@ -105,6 +105,7 @@ async fn worker_publishes_estimate_at_dispatch_and_anchors_on_settle() -> Result
         thinking_display: None,
         tools_fn: None,
         tool_input_sanitizer: None,
+        request_context_fn: None,
         policy: RuntimePolicy::default(),
     };
     let bootstrap = WorkerBootstrapContext {
