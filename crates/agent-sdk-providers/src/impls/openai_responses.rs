@@ -28,7 +28,7 @@ use super::openai_reasoning::{
     legacy_reasoning_summary, served_speed_from_service_tier, service_tier_wire_value,
     supports_reasoning_summary, validate_reasoning_config, validate_tool_choice,
 };
-use super::openai_schema::normalize_strict_schema;
+use super::openai_schema::{normalize_strict_schema, normalized_strict_schema};
 use crate::model_features::supports_responses_original_image_detail;
 use std::borrow::Cow;
 
@@ -1177,28 +1177,23 @@ fn apply_explicit_cache_breakpoints(items: &mut [ApiInputItem], max_breakpoints:
 }
 
 fn convert_tool(tool: agent_sdk_foundation::llm::Tool) -> ApiTool {
-    let mut schema = tool.input_schema;
-
-    // Strict mode requires additionalProperties: false on all objects and
-    // every property in required. This is incompatible with free-form object
-    // schemas (objects with no defined properties). Detect and skip strict
-    // for those tools.
-    let use_strict = if normalize_strict_schema(&mut schema) {
-        Some(true)
-    } else {
-        log::debug!(
-            "Tool '{}' has free-form object schema — disabling strict mode",
-            tool.name
-        );
-        None
+    let (parameters, strict) = match normalized_strict_schema(&tool.input_schema) {
+        Ok(normalized) => (normalized, Some(true)),
+        Err(reason) => {
+            log::debug!(
+                "Tool '{}' schema is not strict-compatible ({reason}) — disabling strict mode",
+                tool.name
+            );
+            (tool.input_schema, None)
+        }
     };
 
     ApiTool {
         r#type: "function".to_owned(),
         name: tool.name,
         description: Some(tool.description),
-        parameters: Some(schema),
-        strict: use_strict,
+        parameters: Some(parameters),
+        strict,
     }
 }
 
@@ -1207,10 +1202,9 @@ fn validate_response_format(response_format: Option<&ResponseFormat>) -> Result<
         return Ok(());
     };
 
-    let mut schema = response_format.schema.clone();
-    if !normalize_strict_schema(&mut schema) {
+    if let Err(reason) = normalized_strict_schema(&response_format.schema) {
         anyhow::bail!(
-            "OpenAI strict structured output `{}` contains a free-form object schema",
+            "OpenAI strict structured output `{}` contains a {reason} schema",
             response_format.name
         );
     }
@@ -3098,6 +3092,44 @@ mod tests {
     #[test]
     fn strict_response_format_rejects_free_form_objects() {
         let format = ResponseFormat::new("freeform", serde_json::json!({"type": "object"}));
+        assert!(validate_response_format(Some(&format)).is_err());
+    }
+
+    #[test]
+    fn untyped_tool_property_disables_strict_mode() {
+        let input_schema = serde_json::json!({
+            "type": "object",
+            "required": ["action"],
+            "properties": {
+                "action": {"type": "string", "enum": ["set", "unset"]},
+                "value": {"description": "JSON value to store."}
+            },
+            "additionalProperties": false
+        });
+        let tool = agent_sdk_foundation::llm::Tool {
+            name: "bip_config".to_owned(),
+            description: "Configure".to_owned(),
+            input_schema: input_schema.clone(),
+            display_name: "Configure".to_owned(),
+            tier: agent_sdk_foundation::ToolTier::Confirm,
+        };
+
+        let api_tool = convert_tool(tool);
+        assert_eq!(api_tool.strict, None);
+        assert_eq!(api_tool.parameters, Some(input_schema));
+    }
+
+    #[test]
+    fn strict_response_format_rejects_untyped_values() {
+        let format = ResponseFormat::new(
+            "untyped",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"value": {}},
+                "required": ["value"],
+                "additionalProperties": false
+            }),
+        );
         assert!(validate_response_format(Some(&format)).is_err());
     }
 
