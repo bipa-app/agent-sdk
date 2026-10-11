@@ -73,6 +73,7 @@ pub const MODEL_SONNET_4: &str = "claude-sonnet-4-20250514";
 pub const MODEL_OPUS_4: &str = "claude-opus-4-20250514";
 
 pub const MODEL_HAIKU_45: &str = "claude-haiku-4-5-20251001";
+pub const MODEL_HAIKU_55: &str = "claude-haiku-5-5";
 pub const MODEL_SONNET_45: &str = "claude-sonnet-4-5-20250929";
 pub const MODEL_SONNET_46: &str = "claude-sonnet-4-6";
 pub const MODEL_SONNET_5: &str = "claude-sonnet-5";
@@ -503,6 +504,19 @@ impl AnthropicProvider {
         Self::new(api_key, MODEL_HAIKU_45)
     }
 
+    /// Create a provider using Claude Haiku 5.5.
+    ///
+    /// Note: Haiku 5.5 is adaptive-only and the API defaults effort to
+    /// `medium`. Passing a `ThinkingConfig` with
+    /// `ThinkingMode::Enabled { budget_tokens }` will return an
+    /// `InvalidRequest` — use `ThinkingConfig::adaptive()`,
+    /// `ThinkingConfig::adaptive_with_effort(_)`, or
+    /// `ThinkingConfig::default_with_effort(_)` instead.
+    #[must_use]
+    pub fn haiku_55(api_key: impl Into<String>) -> Self {
+        Self::new(api_key, MODEL_HAIKU_55)
+    }
+
     /// Create a provider using Claude Sonnet 4.6.
     #[must_use]
     pub fn sonnet(api_key: impl Into<String>) -> Self {
@@ -716,7 +730,8 @@ impl AnthropicProvider {
     fn is_adaptive_thinking_model(&self) -> bool {
         matches!(
             self.model.as_str(),
-            MODEL_SONNET_46
+            MODEL_HAIKU_55
+                | MODEL_SONNET_46
                 | MODEL_SONNET_5
                 | MODEL_SONNET_55
                 | MODEL_OPUS_46
@@ -1443,6 +1458,7 @@ mod tests {
             MODEL_SONNET_4,
             MODEL_OPUS_4,
             MODEL_HAIKU_45,
+            MODEL_HAIKU_55,
             MODEL_SONNET_45,
             MODEL_SONNET_46,
             MODEL_SONNET_5,
@@ -1653,6 +1669,30 @@ mod tests {
                 )))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn test_haiku_55_rejects_budgeted_thinking_and_accepts_effort() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        let haiku_55 = AnthropicProvider::haiku_55("test-api-key");
+        assert_eq!(haiku_55.model(), MODEL_HAIKU_55);
+        assert_eq!(haiku_55.provider(), "anthropic");
+        let error = haiku_55
+            .validate_thinking_config(Some(&ThinkingConfig::new(10_000)))
+            .err()
+            .context("budget thinking must be rejected on Haiku 5.5")?;
+        assert!(
+            error.to_string().contains("ThinkingConfig::adaptive()"),
+            "expected migration hint, got: {error}"
+        );
+        haiku_55.validate_thinking_config(Some(&ThinkingConfig::adaptive_with_effort(
+            agent_sdk_foundation::llm::Effort::XHigh,
+        )))?;
+        haiku_55.validate_thinking_config(Some(&ThinkingConfig::default_with_effort(
+            agent_sdk_foundation::llm::Effort::Max,
+        )))?;
+        Ok(())
     }
 
     #[test]

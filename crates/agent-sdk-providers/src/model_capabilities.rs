@@ -398,6 +398,19 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
     },
     ModelCapabilities {
         provider: "anthropic",
+        model_id: "claude-haiku-5-5",
+        context_window: Some(1_000_000),
+        max_output_tokens: Some(128_000),
+        pricing: Some(Pricing::flat_with_cached(0.1, 0.5, 0.01).with_cache_write(0.125).with_notes("Anthropic Haiku 5.5 official pricing for prompts up to 100K tokens: $0.10 input / $0.50 output per 1M tokens, cache reads $0.01/M (10% of input), cache writes $0.125/M (5m) or $0.20/M (1h). Prompts above 100K tokens bill the whole request at $0.50 input / $2.50 output, cache reads $0.05/M, cache writes $0.625/M (5m) or $1/M (1h); this table carries only the base tier.")),
+        supports_thinking: true,
+        supports_adaptive_thinking: true,
+        rejects_budget_thinking: true,
+        source_url: ANTHROPIC_MODELS_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("Haiku 5.5 is adaptive-only: `ThinkingMode::Enabled { budget_tokens }` is rejected by the Anthropic API and the SDK fails fast in validate_thinking_config. Effort defaults to `medium` when unset; `xhigh` and `max` are accepted. Claude Code's model catalog marks it as rejecting `thinking.type: \"disabled\"`, which the SDK never sends."),
+    },
+    ModelCapabilities {
+        provider: "anthropic",
         model_id: "claude-haiku-4-5-20251001",
         context_window: Some(200_000),
         max_output_tokens: Some(64_000),
@@ -1263,6 +1276,46 @@ mod tests {
     }
 
     #[test]
+    fn test_lookup_anthropic_haiku_55() -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let caps =
+            get_model_capabilities("anthropic", "claude-haiku-5-5").context("haiku 5.5 missing")?;
+        assert_eq!(caps.context_window, Some(1_000_000));
+        assert_eq!(caps.max_output_tokens, Some(128_000));
+        assert!(caps.supports_thinking);
+        assert!(caps.supports_adaptive_thinking);
+        assert!(caps.rejects_budget_thinking);
+        assert_eq!(caps.source_status, SourceStatus::Official);
+        let pricing = caps.pricing.context("pricing missing")?;
+        assert_eq!(pricing.input, Some(PricePoint::new(0.1)));
+        assert_eq!(pricing.output, Some(PricePoint::new(0.5)));
+        assert_eq!(pricing.cached_input, Some(PricePoint::new(0.01)));
+        assert_eq!(pricing.cache_write, Some(PricePoint::new(0.125)));
+        Ok(())
+    }
+
+    #[test]
+    fn haiku_55_prices_each_input_band_at_its_own_rate() -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let caps =
+            get_model_capabilities("anthropic", "claude-haiku-5-5").context("haiku 5.5 missing")?;
+        let usage = Usage {
+            served_speed: None,
+            input_tokens: 3_000_000,
+            output_tokens: 1_000_000,
+            cached_input_tokens: 1_000_000,
+            cache_creation_input_tokens: 1_000_000,
+        };
+        // 1M plain @ $0.10 + 1M cache read @ $0.01 + 1M cache write @ $0.125
+        // + 1M output @ $0.50.
+        let cost = caps.estimate_cost_usd(&usage).context("priced")?;
+        assert!((cost - 0.735).abs() < 1e-9, "unexpected cost: {cost}");
+        Ok(())
+    }
+
+    #[test]
     fn test_lookup_anthropic_opus_5() -> anyhow::Result<()> {
         use anyhow::Context;
 
@@ -1346,6 +1399,7 @@ mod tests {
     #[test]
     fn budget_rejecting_anthropic_models_carry_the_flag() {
         for model in [
+            "claude-haiku-5-5",
             "claude-fable-5-1",
             "claude-fable-5",
             "claude-opus-5",
