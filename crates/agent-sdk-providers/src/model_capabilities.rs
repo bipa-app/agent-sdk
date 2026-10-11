@@ -284,7 +284,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         model_id: "claude-opus-5-5",
         context_window: Some(1_000_000),
         max_output_tokens: Some(128_000),
-        pricing: Some(Pricing::flat(4.0, 20.0).with_notes("Anthropic Opus 5.5 official pricing: $4 input / $20 output per 1M tokens.")),
+        pricing: Some(Pricing::flat_with_cached(4.0, 20.0, 0.2).with_cache_write(5.0).with_notes("Anthropic Opus 5.5 official pricing: $4 input / $20 output per 1M tokens. Cache reads cost $0.20/M (5% of base input); cache writes cost $5/M (5m) or $8/M (1h).")),
         supports_thinking: true,
         supports_adaptive_thinking: true,
         rejects_budget_thinking: true,
@@ -1272,6 +1272,8 @@ mod tests {
         let output = pricing.output.context("output price missing")?;
         assert!((input.usd_per_million_tokens - 4.0).abs() < f64::EPSILON);
         assert!((output.usd_per_million_tokens - 20.0).abs() < f64::EPSILON);
+        assert_eq!(pricing.cached_input, Some(PricePoint::new(0.2)));
+        assert_eq!(pricing.cache_write, Some(PricePoint::new(5.0)));
         Ok(())
     }
 
