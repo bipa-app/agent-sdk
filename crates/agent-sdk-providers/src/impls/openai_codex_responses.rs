@@ -2713,8 +2713,8 @@ impl Drop for AbandonedStreamLog {
 /// Why the consumer most likely dropped a stream before its terminal event.
 ///
 /// The stream cannot see the consumer's reason. The SDK's stall budgets wait
-/// at least two minutes without a yield, and keep-alives count as yields, so a
-/// drop after less than [`StreamDropCause::STALL_MIN_SILENCE`] was a cancel.
+/// at least [`StreamDropCause::STALL_MIN_SILENCE`] without a yield, and
+/// keep-alives count as yields, so a drop after less silence was a cancel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StreamDropCause {
     Cancelled,
@@ -2722,7 +2722,9 @@ enum StreamDropCause {
 }
 
 impl StreamDropCause {
-    const STALL_MIN_SILENCE: Duration = Duration::from_mins(1);
+    /// The shortest stall budget: the root-turn inter-event budget and the
+    /// agent loop's inactivity timeout.
+    const STALL_MIN_SILENCE: Duration = Duration::from_mins(2);
 
     fn after_silence(silence: Duration) -> Self {
         if silence >= Self::STALL_MIN_SILENCE {
@@ -5515,8 +5517,8 @@ mod tests {
     fn dropping_an_active_stream_is_a_cancel_and_a_silent_one_a_stall() {
         for (silent_secs, cause, level) in [
             (0, StreamDropCause::Cancelled, log::Level::Debug),
-            (59, StreamDropCause::Cancelled, log::Level::Debug),
-            (60, StreamDropCause::Stalled, log::Level::Warn),
+            (60, StreamDropCause::Cancelled, log::Level::Debug),
+            (119, StreamDropCause::Cancelled, log::Level::Debug),
             (120, StreamDropCause::Stalled, log::Level::Warn),
             (330, StreamDropCause::Stalled, log::Level::Warn),
         ] {
