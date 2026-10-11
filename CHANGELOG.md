@@ -42,8 +42,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`get_execution(&thread_id, tool_call_id)`), and `InMemoryExecutionStore`
   and `SqliteStore` key executions by thread and tool-call id. Providers only
   keep tool-call ids unique within one conversation, so a thread that reused an
-  id could read another thread's cached result. `SqliteStore` migrates existing
-  files to schema version 3 on open.
+  id could read another thread's cached result. Custom stores must key
+  executions by thread as well.
+- `SqliteStore` schema version 3: opening an older file rebuilds its
+  tool-execution table with a `(thread_id, tool_call_id)` key, taking each
+  row's thread from its payload, in one transaction that also stamps the
+  version. A row with invalid JSON or no string `thread_id` fails the open and
+  is named by its `tool_call_id`; the file is left unchanged.
+- OpenAI strict mode: a tool schema strict mode cannot express is now sent
+  without `strict` on Chat Completions, Responses and Codex instead of being
+  rejected with a 400. That covers untyped or annotation-only subschemas
+  (`true`, `{}`, `{"description": ...}`) and free-form objects, including
+  no-argument tools declared as `{"type": "object", "properties": {}}`. A
+  strict response format with such a schema fails locally with the reason.
 - Compaction now appends range-addressed lineage entries and rebuilds the
   effective LLM view without deleting committed transcript messages.
 - Auto-compaction prunes artifact-backed and superseded read outputs before
@@ -78,6 +89,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PayloadRedactor`.
 
 ### Fixed
+
+- **Repeating tool-call ids from OpenAI-compatible gateways** - On routes
+  other than `api.openai.com`, the Chat Completions and Responses providers
+  replace tool-call ids that only count calls (`bash:0`, `functions.read:3`,
+  `call_0`, `0`, or any id shorter than eight characters) and ids that are
+  missing or repeat the request history, before streaming or returning them.
+  A `<name>:` stem is kept for Kimi's chat template, and every minted id is at
+  most 40 characters. `api.openai.com` ids are replaced only when missing or
+  repeated.
+
+- **Tool-argument streaming counts as liveness** - The Codex, Responses and
+  Chat Completions providers yield `StreamDelta::KeepAlive` while a model
+  streams tool-call arguments, and Codex also yields one for SSE comments and
+  WebSocket ping/pong. The durable root-turn worker does not treat a
+  keep-alive as the stream's first event: before the first event each
+  keep-alive restarts the 330s first-event budget, after it the 120s
+  inter-event budget.
 
 - **Workspace compatibility for cached token usage fields** - Updated server and host token usage fixtures, stores, and turn accounting so the new cached-input and cache-creation fields compile across all targets and continue accumulating real provider-reported values.
 
