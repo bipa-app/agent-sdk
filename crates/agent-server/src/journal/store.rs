@@ -3359,12 +3359,32 @@ impl InMemoryAgentTaskStore {
         Ok(persisted_batches.into_iter().next().unwrap_or_default())
     }
 
-    /// Journal the terminal event that closes `task`'s turn when it fails
-    /// closed for `reason` (see [`FailureReason::terminal_event`]).
+    /// Phase 2.5 fail-closed transition under the caller's store write
+    /// lock: build the `Failed` row, journal its terminal event, then
+    /// publish the row.
     ///
-    /// Callers commit it under the store write lock, before applying the
-    /// transition, so it precedes anything a promoted successor emits. A
-    /// bare store without a sink emits nothing.
+    /// The row is validated before the event commits, so a rejected
+    /// transition leaves no event without its failed row; the event
+    /// commits before the row so it precedes anything a promoted
+    /// successor emits.
+    async fn fail_closed_locked(
+        &self,
+        inner: &mut Inner,
+        old: &AgentTask,
+        reason: FailureReason,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let failed = old
+            .clone()
+            .fail_with_reason(reason, now)
+            .context("fail_closed_locked: fail_with_reason transition failed")?;
+        self.commit_fail_closed_event(old, reason, now).await?;
+        inner.publish_failed_row(old, &failed, now)
+    }
+
+    /// Journal the terminal event that closes `task`'s turn when it fails
+    /// closed for `reason` (see [`FailureReason::terminal_event`]). A bare
+    /// store without a sink emits nothing.
     async fn commit_fail_closed_event(
         &self,
         task: &AgentTask,
@@ -3628,7 +3648,7 @@ impl Inner {
     ///
     /// This is the lock-held core shared by
     /// [`AgentTaskStore::promote_next_queued_root`] and the in-store
-    /// terminal-transition paths ([`Self::fail_row_closed`],
+    /// terminal-transition paths ([`Self::publish_failed_row`],
     /// [`Self::cancel_row_in_place`], and the root-turn branch of
     /// [`Self::propagate_terminal_child_transition`]). Promoting inside
     /// the same locked scope as the root's terminal transition is what
@@ -3731,29 +3751,23 @@ impl Inner {
         }
     }
 
-    /// Phase 2.5 fail-closed transition under the store write lock.
+    /// Publish the fail-closed `failed` row that replaces `old`.
     ///
-    /// Runs [`AgentTask::fail_with_reason`] on a clone of `old`,
-    /// rebalances every secondary index onto the new `Failed` row,
-    /// and overwrites the primary key entry. All three steps happen
-    /// atomically under whatever write lock the caller already
-    /// holds on `Inner` — `try_acquire_task`,
-    /// `acquire_next_runnable`, and `release_expired_leases` all
-    /// invoke this helper from inside their existing write-locked
-    /// scope so the row is never observed in an intermediate state.
-    fn fail_row_closed(
+    /// Rebalances every secondary index onto the new row, overwrites
+    /// the primary key entry, and wakes the parent, all under whatever
+    /// write lock the caller already holds on `Inner` (see
+    /// [`InMemoryAgentTaskStore::fail_closed_locked`]) so the row is
+    /// never observed in an intermediate state.
+    fn publish_failed_row(
         &mut self,
         old: &AgentTask,
-        reason: FailureReason,
+        failed: &AgentTask,
         now: OffsetDateTime,
     ) -> Result<()> {
-        let failed = old
-            .clone()
-            .fail_with_reason(reason, now)
-            .context("fail_row_closed: fail_with_reason transition failed")?;
-        self.rebalance_after_row_change(old, &failed);
+        self.rebalance_after_row_change(old, failed);
         self.by_id.insert(failed.id.clone(), failed.clone());
-        let _ = self.propagate_terminal_child_transition(&failed, now, "fail_row_closed", false)?;
+        let _ =
+            self.propagate_terminal_child_transition(failed, now, "publish_failed_row", false)?;
         Ok(())
     }
 
@@ -4015,7 +4029,7 @@ impl Inner {
             // Promote the next queued FIFO head in the SAME locked scope
             // as the terminal transition so a queued root can never be
             // stranded by a store-side terminal transition — recovery
-            // fail-close (`fail_row_closed`) or `cancel_tree`
+            // fail-close (`publish_failed_row`) or `cancel_tree`
             // (`cancel_row_in_place`) — not only the host's post-commit
             // promotion path. Promotion is idempotent, so the host's
             // later `promote_next_queued_root` becomes a no-op.
@@ -4889,8 +4903,8 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         match classify_recovery(&old, RecoveryContext::AcquisitionAttempt) {
             RecoveryAction::NoAction => {}
             RecoveryAction::FailClosed(reason) => {
-                self.commit_fail_closed_event(&old, reason, now).await?;
-                inner.fail_row_closed(&old, reason, now)?;
+                self.fail_closed_locked(&mut inner, &old, reason, now)
+                    .await?;
                 return Ok(None);
             }
             RecoveryAction::Requeue => {
@@ -4985,8 +4999,8 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                     // whole worker pool. The fail-closed transition
                     // removes the row from the runnable index, so
                     // the next loop iteration picks up a fresh head.
-                    self.commit_fail_closed_event(&old, reason, now).await?;
-                    inner.fail_row_closed(&old, reason, now)?;
+                    self.fail_closed_locked(&mut inner, &old, reason, now)
+                        .await?;
                 }
                 RecoveryAction::Requeue => {
                     return Err(anyhow!(
@@ -5080,8 +5094,8 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                     RecoveryRecord::requeued(id)
                 }
                 RecoveryAction::FailClosed(reason) => {
-                    self.commit_fail_closed_event(&old, reason, now).await?;
-                    inner.fail_row_closed(&old, reason, now)?;
+                    self.fail_closed_locked(&mut inner, &old, reason, now)
+                        .await?;
                     RecoveryRecord::failed_closed(id, reason)
                 }
                 RecoveryAction::NoAction => {
@@ -10093,6 +10107,78 @@ mod tests {
                 "expected Failed for {id}, got {:?}",
                 row.status
             );
+        }
+        Ok(())
+    }
+
+    /// A fail-close whose `Failed` row does not validate must leave no
+    /// terminal event behind: the event and the row land together or
+    /// not at all, as on the SQL backends.
+    #[tokio::test]
+    async fn rejected_fail_close_journals_no_terminal_event() -> Result<()> {
+        let threads = Arc::new(crate::journal::thread_store::InMemoryThreadStore::new());
+        let events = Arc::new(crate::journal::event_repository::InMemoryEventRepository::new());
+        let store =
+            InMemoryAgentTaskStore::new().with_cancellation_markers(CancellationMarkerSink {
+                event_repo: events.clone(),
+                outbox_store: Arc::new(crate::journal::outbox::InMemoryOutboxStore::new()),
+                thread_store: threads.clone(),
+            });
+        let pending_thread = thread("t-unfailable-pending");
+        let running_thread = thread("t-unfailable-running");
+        let _ = threads.get_or_create(&pending_thread, t0()).await?;
+        let _ = threads.get_or_create(&running_thread, t0()).await?;
+
+        let pending = AgentTask::new_root_turn(pending_thread.clone(), t0(), 1);
+        let pending_id = pending.id.clone();
+        let _ = store.submit_root_turn(pending).await?;
+        let running = AgentTask::new_root_turn(running_thread.clone(), t_plus(1), 1);
+        let running_id = running.id.clone();
+        let _ = store.submit_root_turn(running).await?;
+        store
+            .try_acquire_task(
+                &running_id,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(10),
+                t_plus(2),
+            )
+            .await?
+            .context("claim running root")?;
+        // An attempt counter past its budget still classifies as
+        // exhausted, but the `Failed` row built from it is invalid.
+        {
+            let mut inner = store.inner.write().await;
+            for id in [&pending_id, &running_id] {
+                inner.by_id.get_mut(id).context("seeded row")?.attempt = 2;
+            }
+        }
+
+        let acquired = store
+            .try_acquire_task(
+                &pending_id,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(60),
+                t_plus(3),
+            )
+            .await;
+        assert!(acquired.is_err(), "targeted acquire: {acquired:?}");
+        let scanned = store
+            .acquire_next_runnable(WorkerId::new(), LeaseId::new(), t_plus(60), t_plus(3))
+            .await;
+        assert!(scanned.is_err(), "scan: {scanned:?}");
+        let swept = store.release_expired_leases(t_plus(11)).await;
+        assert!(swept.is_err(), "sweep: {swept:?}");
+
+        for (thread_id, id, status) in [
+            (&pending_thread, &pending_id, TaskStatus::Pending),
+            (&running_thread, &running_id, TaskStatus::Running),
+        ] {
+            let journaled = events.get_events(thread_id).await?;
+            assert!(journaled.is_empty(), "{id} journaled {journaled:?}");
+            let row = store.get(id).await?.context("row exists")?;
+            assert_eq!(row.status, status, "{id}");
         }
         Ok(())
     }
