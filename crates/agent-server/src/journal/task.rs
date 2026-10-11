@@ -417,7 +417,15 @@ impl TaskStatus {
     /// transition again.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+        match self {
+            Self::Completed | Self::Failed | Self::Cancelled => true,
+            Self::Queued
+            | Self::Pending
+            | Self::Running
+            | Self::WaitingOnChildren
+            | Self::AwaitingConfirmation
+            | Self::AwaitingQuestion => false,
+        }
     }
 
     /// `true` if this row is still in the active lifecycle (any non-terminal

@@ -2492,6 +2492,18 @@ pub trait AgentTaskStore: Send + Sync {
     /// Returns an error only for store-level read failures.
     async fn list_parked_subagent_invocations(&self) -> Result<Vec<AgentTask>>;
 
+    /// The ids of every terminal root that still owns a live (non-terminal)
+    /// descendant, each once, in id order.
+    ///
+    /// The candidate feed for the host's orphan settlement, which runs on
+    /// every sweep tick: it is driven from the live rows and returns ids
+    /// only, so its cost tracks the live work rather than the retained
+    /// terminal history, and no row payload is decoded.
+    ///
+    /// # Errors
+    /// Returns an error only for store-level read failures.
+    async fn list_terminal_roots_with_live_descendants(&self) -> Result<Vec<AgentTaskId>>;
+
     /// Transition a running child to [`TaskStatus::Completed`] and,
     /// under the same write lock, recompute the parent's
     /// `pending_child_count` from the live-children index so the
@@ -5856,6 +5868,27 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         // deterministic `(created_at, id)` order.
         result.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
         Ok(result)
+    }
+
+    async fn list_terminal_roots_with_live_descendants(&self) -> Result<Vec<AgentTaskId>> {
+        let inner = self.inner.read().await;
+        let roots: BTreeSet<AgentTaskId> = inner
+            .by_status
+            .iter()
+            .filter(|(status, _)| !status.is_terminal())
+            .flat_map(|(_, ids)| ids)
+            .filter_map(|id| inner.by_id.get(id))
+            .filter(|task| task.parent_id.is_some())
+            .filter(|task| {
+                inner
+                    .by_id
+                    .get(&task.root_id)
+                    .is_some_and(|root| root.status.is_terminal())
+            })
+            .map(|task| task.root_id.clone())
+            .collect();
+        drop(inner);
+        Ok(roots.into_iter().collect())
     }
 
     async fn complete_task(

@@ -4611,6 +4611,27 @@ ORDER BY created_at, id
         records.into_iter().map(TryInto::try_into).collect()
     }
 
+    async fn list_terminal_roots_with_live_descendants(&self) -> Result<Vec<AgentTaskId>> {
+        let roots = sqlx::query_scalar!(
+            r"
+SELECT DISTINCT descendant.root_id
+FROM agent_sdk_tasks AS descendant
+JOIN agent_sdk_tasks AS root ON root.id = descendant.root_id
+WHERE descendant.status IN (
+        'queued', 'pending', 'running', 'waiting_on_children',
+        'awaiting_confirmation', 'awaiting_question'
+    )
+  AND descendant.parent_id IS NOT NULL
+  AND root.status IN ('completed', 'failed', 'cancelled')
+ORDER BY descendant.root_id
+",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("list terminal roots with live descendants")?;
+        Ok(roots.into_iter().map(AgentTaskId::from_string).collect())
+    }
+
     async fn complete_task(
         &self,
         child_id: &AgentTaskId,

@@ -7,9 +7,10 @@ use anyhow::{Context, Result};
 use agent_sdk_foundation::TerminalReason;
 use agent_server::journal::event_repository::EventRepository;
 use agent_server::journal::recovery::{FailureReason, RecoveryAction};
-use agent_server::journal::store::AgentTaskStore;
+use agent_server::journal::store::{AgentTaskStore, SubmitDisposition, SubmitRootTurnParams};
 use agent_server::journal::task::{
-    AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, TaskStatus, WorkerId,
+    AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, TaskKind, TaskStatus,
+    WorkerId,
 };
 use agent_server::journal::task_state::TaskState;
 use agent_server::journal::thread_store::ThreadStore;
@@ -530,6 +531,213 @@ pub(super) async fn test_approved_confirmation_pickup_keeps_the_paused_attempt(
     Ok(())
 }
 
+/// A live row a root can still own after it ended.
+#[derive(Clone, Copy, Debug)]
+enum LiveDescendant {
+    Tool(LiveChild),
+    UndeliveredInjection,
+    ParkedSubagentInvocation,
+}
+
+const TASK_STATUSES: [TaskStatus; 9] = [
+    TaskStatus::Queued,
+    TaskStatus::Pending,
+    TaskStatus::Running,
+    TaskStatus::WaitingOnChildren,
+    TaskStatus::AwaitingConfirmation,
+    TaskStatus::AwaitingQuestion,
+    TaskStatus::Completed,
+    TaskStatus::Failed,
+    TaskStatus::Cancelled,
+];
+
+/// The descendant that holds `status` while live, so every live status a
+/// descendant can be in is proven to be found.
+const fn live_descendant_in(status: TaskStatus) -> Option<LiveDescendant> {
+    match status {
+        TaskStatus::Queued => Some(LiveDescendant::UndeliveredInjection),
+        TaskStatus::Pending => Some(LiveDescendant::Tool(LiveChild::Pending)),
+        TaskStatus::Running => Some(LiveDescendant::Tool(LiveChild::RunningLiveLease)),
+        TaskStatus::WaitingOnChildren => Some(LiveDescendant::ParkedSubagentInvocation),
+        TaskStatus::AwaitingConfirmation => {
+            Some(LiveDescendant::Tool(LiveChild::AwaitingConfirmation))
+        }
+        // Only a root turn parks on a question.
+        TaskStatus::AwaitingQuestion
+        | TaskStatus::Completed
+        | TaskStatus::Failed
+        | TaskStatus::Cancelled => None,
+    }
+}
+
+async fn running_root(
+    task_store: &dyn AgentTaskStore,
+    tid: &str,
+    at: i64,
+) -> Result<(AgentTask, WorkerId, LeaseId)> {
+    let root = AgentTask::new_root_turn(thread_id(tid), t_plus(at), 3);
+    task_store.submit_root_turn(root.clone()).await?;
+    let worker = WorkerId::new();
+    let lease = LeaseId::new();
+    let running = task_store
+        .try_acquire_task(
+            &root.id,
+            worker.clone(),
+            lease.clone(),
+            t_plus(at + 10_000),
+            t_plus(at + 1),
+        )
+        .await?
+        .context("root must acquire")?;
+    Ok((running, worker, lease))
+}
+
+/// Submit `text` while `tid`'s root is running, so it waits as an
+/// injection for that turn's next boundary.
+async fn inject(
+    task_store: &dyn AgentTaskStore,
+    tid: &str,
+    text: &str,
+    at: i64,
+) -> Result<AgentTask> {
+    let outcome = task_store
+        .submit_root_turn_idempotent(SubmitRootTurnParams {
+            task: AgentTask::new_root_turn_with_input(
+                thread_id(tid),
+                vec![SubmittedInputItem::Text { text: text.into() }],
+                t_plus(at),
+                3,
+            ),
+            idempotency: None,
+            max_queued_depth: None,
+            disposition: SubmitDisposition::InjectAtBoundary,
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    assert_eq!(outcome.task.kind, TaskKind::InputInjection);
+    assert_eq!(outcome.task.status, TaskStatus::Queued);
+    Ok(outcome.task)
+}
+
+/// A root that ended while `descendant` was still live under it.
+async fn end_root_over(
+    task_store: &dyn AgentTaskStore,
+    thread_store: &dyn ThreadStore,
+    tid: &str,
+    descendant: LiveDescendant,
+    at: i64,
+) -> Result<AgentTaskId> {
+    match descendant {
+        LiveDescendant::Tool(state) => {
+            let parked = park_root_on_tool_children(task_store, tid, 2, 3, at).await?;
+            for child in &parked.children {
+                drive_child(task_store, tid, &child.id, state, at + 5).await?;
+            }
+            let (worker, lease) = resume_root_early(task_store, &parked.root.id, at + 10).await?;
+            task_store
+                .fail_task_with_reason(
+                    &parked.root.id,
+                    &worker,
+                    &lease,
+                    "steering resume failed".to_owned(),
+                    TerminalReason::InternalError,
+                    t_plus(at + 20),
+                )
+                .await?;
+            Ok(parked.root.id)
+        }
+        LiveDescendant::UndeliveredInjection => {
+            let (root, worker, lease) = running_root(task_store, tid, at).await?;
+            inject(task_store, tid, "one more thing", at + 5).await?;
+            task_store
+                .complete_task(&root.id, &worker, &lease, t_plus(at + 10))
+                .await?;
+            Ok(root.id)
+        }
+        LiveDescendant::ParkedSubagentInvocation => {
+            let (parent, _invocation, _child_root) =
+                spawn_subagent_fixture(task_store, thread_store, tid).await?;
+            let (worker, lease) = resume_root_early(task_store, &parent.id, at).await?;
+            task_store
+                .fail_task_with_reason(
+                    &parent.id,
+                    &worker,
+                    &lease,
+                    "steering resume failed".to_owned(),
+                    TerminalReason::InternalError,
+                    t_plus(at + 10),
+                )
+                .await?;
+            Ok(parent.id)
+        }
+    }
+}
+
+/// The orphan listing names exactly the ended roots that still own a live
+/// descendant, whichever live status that descendant holds, once each, in id
+/// order. A live tree, an ended root whose children all finished, and a
+/// childless ended root are not listed, and a settled root drops out.
+pub(super) async fn test_list_terminal_roots_with_live_descendants(
+    task_store: &dyn AgentTaskStore,
+    thread_store: &dyn ThreadStore,
+) -> Result<()> {
+    let mut orphaned = Vec::new();
+    for (index, status) in TASK_STATUSES.into_iter().enumerate() {
+        let Some(descendant) = live_descendant_in(status) else {
+            continue;
+        };
+        let at = 5_000 + i64::try_from(index)? * 100;
+        let tid = format!("orphan-listing-{index}");
+        orphaned.push(end_root_over(task_store, thread_store, &tid, descendant, at).await?);
+    }
+
+    park_root_on_tool_children(task_store, "orphan-listing-live", 2, 3, 6_000).await?;
+
+    let finished =
+        park_root_on_tool_children(task_store, "orphan-listing-done", 1, 3, 6_100).await?;
+    complete_child(task_store, &finished.children[0].id, 6_105).await?;
+    let worker = WorkerId::new();
+    let lease = LeaseId::new();
+    task_store
+        .try_acquire_task(
+            &finished.root.id,
+            worker.clone(),
+            lease.clone(),
+            t_plus(16_110),
+            t_plus(6_110),
+        )
+        .await?
+        .context("woken root must acquire")?;
+    task_store
+        .complete_task(&finished.root.id, &worker, &lease, t_plus(6_115))
+        .await?;
+
+    let (childless, worker, lease) = running_root(task_store, "orphan-listing-bare", 6_200).await?;
+    task_store
+        .complete_task(&childless.id, &worker, &lease, t_plus(6_205))
+        .await?;
+
+    orphaned.sort();
+    assert_eq!(
+        task_store
+            .list_terminal_roots_with_live_descendants()
+            .await?,
+        orphaned,
+    );
+
+    for root in &orphaned {
+        task_store.cancel_tree(root, t_plus(7_000)).await?;
+    }
+    assert!(
+        task_store
+            .list_terminal_roots_with_live_descendants()
+            .await?
+            .is_empty(),
+        "a settled root is no longer listed",
+    );
+    Ok(())
+}
+
 // ── Backend runners ──────────────────────────────────────────────────
 
 mod in_memory {
@@ -576,6 +784,13 @@ mod in_memory {
         let s = fresh_in_memory_stores();
         super::test_approved_confirmation_pickup_keeps_the_paused_attempt(s.task.as_ref()).await
     }
+
+    #[tokio::test]
+    async fn settlement_in_memory_lists_terminal_roots_with_live_descendants() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        super::test_list_terminal_roots_with_live_descendants(s.task.as_ref(), s.thread.as_ref())
+            .await
+    }
 }
 
 #[cfg(feature = "sqlite")]
@@ -616,6 +831,12 @@ mod sqlite {
     async fn settlement_sqlite_approved_confirmation_keeps_the_paused_attempt() -> Result<()> {
         let store = store().await?;
         super::test_approved_confirmation_pickup_keeps_the_paused_attempt(&store).await
+    }
+
+    #[tokio::test]
+    async fn settlement_sqlite_lists_terminal_roots_with_live_descendants() -> Result<()> {
+        let store = store().await?;
+        super::test_list_terminal_roots_with_live_descendants(&store, &store).await
     }
 }
 
@@ -663,5 +884,13 @@ mod postgres {
             return Ok(());
         };
         super::test_approved_confirmation_pickup_keeps_the_paused_attempt(&store).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_lists_terminal_roots_with_live_descendants() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        super::test_list_terminal_roots_with_live_descendants(&store, &store).await
     }
 }

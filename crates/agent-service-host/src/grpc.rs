@@ -6720,6 +6720,9 @@ mod tests {
         async fn list_parked_subagent_invocations(&self) -> Result<Vec<AgentTask>> {
             self.inner.list_parked_subagent_invocations().await
         }
+        async fn list_terminal_roots_with_live_descendants(&self) -> Result<Vec<AgentTaskId>> {
+            self.inner.list_terminal_roots_with_live_descendants().await
+        }
         async fn complete_task(
             &self,
             task_id: &AgentTaskId,

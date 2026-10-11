@@ -849,26 +849,17 @@ async fn lease_sweep_loop(
 /// is terminal, because the linkage lives on the invocation's paused state.
 ///
 /// # Errors
-/// Returns an error if the live rows cannot be listed. Per-root failures
-/// are logged and retried on the next pass.
+/// Returns an error if the orphaned roots cannot be listed. Per-root
+/// failures are logged and retried on the next pass.
 async fn settle_orphaned_descendants(
     stores: &StoreRegistry,
     now: time::OffsetDateTime,
 ) -> Result<usize> {
-    let mut roots = std::collections::BTreeSet::new();
-    for status in live_task_statuses() {
-        let tasks = stores
-            .task_store
-            .list_by_status(status)
-            .await
-            .with_context(|| format!("list {status:?} tasks for orphan settlement"))?;
-        roots.extend(
-            tasks
-                .into_iter()
-                .filter(|task| task.parent_id.is_some())
-                .map(|task| task.root_id),
-        );
-    }
+    let roots = stores
+        .task_store
+        .list_terminal_roots_with_live_descendants()
+        .await
+        .context("list terminal roots with live descendants")?;
 
     let deps = stores.root_turn_deps();
     let mut settled = 0usize;
@@ -897,23 +888,6 @@ async fn settle_orphaned_descendants(
         }
     }
     Ok(settled)
-}
-
-/// Every status a task can hold while it still owes work.
-fn live_task_statuses() -> impl Iterator<Item = TaskStatus> {
-    [
-        TaskStatus::Queued,
-        TaskStatus::Pending,
-        TaskStatus::Running,
-        TaskStatus::WaitingOnChildren,
-        TaskStatus::AwaitingConfirmation,
-        TaskStatus::AwaitingQuestion,
-        TaskStatus::Completed,
-        TaskStatus::Failed,
-        TaskStatus::Cancelled,
-    ]
-    .into_iter()
-    .filter(|status| !status.is_terminal())
 }
 
 /// Rounds of [`AgentTaskStore::release_expired_leases`] one sweep tick
@@ -9695,6 +9669,9 @@ mod tests {
         }
         async fn list_parked_subagent_invocations(&self) -> Result<Vec<AgentTask>> {
             self.inner.list_parked_subagent_invocations().await
+        }
+        async fn list_terminal_roots_with_live_descendants(&self) -> Result<Vec<AgentTaskId>> {
+            self.inner.list_terminal_roots_with_live_descendants().await
         }
         async fn complete_task(
             &self,
