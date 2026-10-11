@@ -685,14 +685,26 @@ pub trait LlmProvider: Send + Sync {
         true
     }
 
-    /// Whether every request is served by the route [`provider()`](Self::provider),
-    /// [`model()`](Self::model), and [`capabilities()`](Self::capabilities)
+    /// Whether every request this instance dispatches is served by the one
+    /// backend that [`provider()`](Self::provider), [`model()`](Self::model),
+    /// [`route()`](Self::route), and [`capabilities()`](Self::capabilities)
     /// describe.
     ///
-    /// Dynamic dispatchers (failover chains, per-request routers) must
-    /// return `false`; transparent single-provider wrappers delegate.
-    /// Consumers that compare token counts or capabilities across requests
-    /// rely on this.
+    /// Stable means a measurement taken on one request describes the next:
+    /// the durable runtime sizes its per-model compaction threshold from
+    /// `capabilities()` and trusts the previous request's measured prompt
+    /// tokens as the occupancy of the next one only on a stable route.
+    ///
+    /// The `true` default is correct only for a leaf bound to one endpoint
+    /// and model. **Override it to return `false`** in any implementation
+    /// that can pick among several backends, per request or over time
+    /// (failover chains, classifier routers, load balancers, replay), even
+    /// when it reports a representative `provider()` / `model()`: keeping
+    /// the default silently lets consumers compare one backend's
+    /// measurements with another's. A wrapper around exactly one inner
+    /// provider delegates to it. Without a stable route, consumers trust a
+    /// measurement only when the stream's
+    /// [`StreamDelta::Done`] `served_route` equals `route()`.
     fn has_stable_request_route(&self) -> bool {
         true
     }
