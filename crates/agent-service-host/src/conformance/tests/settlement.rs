@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 
 use agent_sdk_foundation::TerminalReason;
 use agent_server::journal::event_repository::EventRepository;
+use agent_server::journal::recovery::{FailureReason, RecoveryAction};
 use agent_server::journal::store::AgentTaskStore;
 use agent_server::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, TaskStatus, WorkerId,
@@ -463,6 +464,72 @@ pub(super) async fn test_cancel_tree_settles_child_thread_of_terminal_root(
     Ok(())
 }
 
+/// Approving a confirmation continues the attempt that paused: the pickup
+/// re-enters that attempt instead of charging a new one, so a child whose
+/// paused execution used its whole budget can still run once approved.
+/// The budget still bounds a pickup that keeps crashing.
+pub(super) async fn test_approved_confirmation_pickup_keeps_the_paused_attempt(
+    task_store: &dyn AgentTaskStore,
+) -> Result<()> {
+    for max_attempts in [1_u32, 3] {
+        let tid = format!("settle-approve-{max_attempts}");
+        let at = 3_000 + i64::from(max_attempts) * 100;
+        let parked = park_root_on_tool_children(task_store, &tid, 1, max_attempts, at).await?;
+        let child_id = parked.children[0].id.clone();
+        drive_child(
+            task_store,
+            &tid,
+            &child_id,
+            LiveChild::AwaitingConfirmation,
+            at + 5,
+        )
+        .await?;
+        assert_eq!(fetch(task_store, &child_id).await?.attempt, 1);
+
+        let (approved, _prepared) = task_store
+            .resume_from_confirmation(&child_id, t_plus(at + 10))
+            .await?;
+        assert_eq!(approved.status, TaskStatus::Pending);
+
+        let picked_up = task_store
+            .try_acquire_task(
+                &child_id,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(at + 12),
+                t_plus(at + 11),
+            )
+            .await?
+            .with_context(|| {
+                format!("max_attempts={max_attempts}: the approved child must be acquirable")
+            })?;
+        assert_eq!(picked_up.status, TaskStatus::Running);
+        assert_eq!(
+            picked_up.attempt, 1,
+            "max_attempts={max_attempts}: the pickup continues the paused attempt",
+        );
+
+        if max_attempts == 1 {
+            let records = task_store.release_expired_leases(t_plus(at + 13)).await?;
+            let record = records
+                .iter()
+                .find(|record| record.id == child_id)
+                .context("the crashed pickup's lease must be reclaimed")?;
+            assert!(
+                matches!(
+                    record.action,
+                    RecoveryAction::FailClosed(FailureReason::LeaseExpiredBudgetExhausted)
+                ),
+                "a crashed pickup is still bounded by the budget, got {:?}",
+                record.action,
+            );
+            let parent = fetch(task_store, &parked.root.id).await?;
+            assert_eq!(parent.status, TaskStatus::Pending, "the parent fans in");
+        }
+    }
+    Ok(())
+}
+
 // ── Backend runners ──────────────────────────────────────────────────
 
 mod in_memory {
@@ -504,6 +571,11 @@ mod in_memory {
         .await
     }
 
+    #[tokio::test]
+    async fn settlement_in_memory_approved_confirmation_keeps_the_paused_attempt() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        super::test_approved_confirmation_pickup_keeps_the_paused_attempt(s.task.as_ref()).await
+    }
 }
 
 #[cfg(feature = "sqlite")]
@@ -540,6 +612,11 @@ mod sqlite {
         super::test_cancel_tree_settles_child_thread_of_terminal_root(&store, &store, &store).await
     }
 
+    #[tokio::test]
+    async fn settlement_sqlite_approved_confirmation_keeps_the_paused_attempt() -> Result<()> {
+        let store = store().await?;
+        super::test_approved_confirmation_pickup_keeps_the_paused_attempt(&store).await
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -580,4 +657,11 @@ mod postgres {
         super::test_cancel_tree_settles_child_thread_of_terminal_root(&store, &store, &store).await
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_approved_confirmation_keeps_the_paused_attempt() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        super::test_approved_confirmation_pickup_keeps_the_paused_attempt(&store).await
+    }
 }
