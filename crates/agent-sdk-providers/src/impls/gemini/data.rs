@@ -1378,6 +1378,45 @@ mod tests {
     // ===================
 
     #[test]
+    fn trailing_reminder_follows_function_response_in_the_same_user_content() -> anyhow::Result<()>
+    {
+        let mut messages = vec![
+            agent_sdk_foundation::llm::Message::user("plan the migration"),
+            agent_sdk_foundation::llm::Message::assistant_with_tool_use(
+                None,
+                "call_1",
+                "todo",
+                serde_json::json!({}),
+            ),
+            agent_sdk_foundation::llm::Message::tool_result("call_1", "plan saved", false),
+        ];
+        agent_sdk_foundation::llm::append_system_reminder(&mut messages, "plan: 0/2 done");
+
+        let contents = build_api_contents(&messages);
+
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[1].role.as_deref(), Some("model"));
+        assert!(matches!(
+            contents[1].parts.as_slice(),
+            [ApiPart::FunctionCall { .. }]
+        ));
+        assert_eq!(contents[2].role.as_deref(), Some("user"));
+        let [
+            ApiPart::FunctionResponse { function_response },
+            ApiPart::Text { text, .. },
+        ] = contents[2].parts.as_slice()
+        else {
+            anyhow::bail!("expected functionResponse then text parts");
+        };
+        assert_eq!(function_response.name, "todo");
+        assert_eq!(
+            text,
+            "<system-reminder>\nplan: 0/2 done\n</system-reminder>"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_build_api_contents_simple() {
         let messages = vec![agent_sdk_foundation::llm::Message::user("Hello")];
 

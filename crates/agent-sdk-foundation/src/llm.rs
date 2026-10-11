@@ -1417,6 +1417,100 @@ fn message_tool_result_ids(message: &Message) -> std::collections::HashSet<&str>
     }
 }
 
+const SYSTEM_REMINDER_OPEN: &str = "<system-reminder>";
+const SYSTEM_REMINDER_CLOSE: &str = "</system-reminder>";
+
+/// Escape every ASCII case-insensitive reminder tag by replacing its angle
+/// brackets with HTML entities, preserving the inner text and its case.
+fn escape_system_reminder_tags(content: &str) -> String {
+    let bytes = content.as_bytes();
+    let mut out = String::with_capacity(content.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let mut matched = false;
+        for tag in [SYSTEM_REMINDER_CLOSE, SYSTEM_REMINDER_OPEN] {
+            let tag_bytes = tag.as_bytes();
+            if i + tag_bytes.len() <= bytes.len()
+                && bytes[i..i + tag_bytes.len()].eq_ignore_ascii_case(tag_bytes)
+            {
+                let original = &content[i..i + tag_bytes.len()];
+                out.push_str("&lt;");
+                out.push_str(&original[1..original.len() - 1]);
+                out.push_str("&gt;");
+                i += tag_bytes.len();
+                matched = true;
+                break;
+            }
+        }
+        if matched {
+            continue;
+        }
+
+        if let Some(ch) = content[i..].chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    out
+}
+
+/// Wrap `content` in `<system-reminder>` tags.
+///
+/// Reminder tags inside `content` are escaped so untrusted text cannot close
+/// the reminder early or open a new one.
+#[must_use]
+pub fn wrap_system_reminder(content: &str) -> String {
+    let sanitized = escape_system_reminder_tags(content.trim());
+    format!("{SYSTEM_REMINDER_OPEN}\n{sanitized}\n{SYSTEM_REMINDER_CLOSE}")
+}
+
+/// Whether `text` is exactly one block produced by [`wrap_system_reminder`].
+#[must_use]
+pub fn is_system_reminder(text: &str) -> bool {
+    text.strip_prefix(SYSTEM_REMINDER_OPEN)
+        .and_then(|rest| rest.strip_prefix('\n'))
+        .and_then(|rest| rest.strip_suffix(SYSTEM_REMINDER_CLOSE))
+        .and_then(|rest| rest.strip_suffix('\n'))
+        .is_some_and(|inner| {
+            !inner.contains(SYSTEM_REMINDER_OPEN) && !inner.contains(SYSTEM_REMINDER_CLOSE)
+        })
+}
+
+/// Append `content` to the end of `messages` as a system reminder.
+///
+/// The reminder becomes the final text block of a trailing user message
+/// (after any `tool_result` blocks, which providers require first), or a new
+/// user message when the conversation is empty or ends on an assistant turn.
+/// Tool-use/tool-result pairing is untouched, so a sequence accepted by
+/// [`provider_tool_sequence_error_index`] stays accepted.
+pub fn append_system_reminder(messages: &mut Vec<Message>, content: &str) {
+    let reminder = ContentBlock::Text {
+        text: wrap_system_reminder(content),
+    };
+    match messages.last_mut() {
+        Some(Message {
+            role: Role::User,
+            content,
+        }) => match content {
+            Content::Blocks(blocks) => blocks.push(reminder),
+            Content::Text(text) if text.is_empty() => *content = Content::Blocks(vec![reminder]),
+            Content::Text(text) => {
+                let text = std::mem::take(text);
+                *content = Content::Blocks(vec![ContentBlock::Text { text }, reminder]);
+            }
+        },
+        Some(Message {
+            role: Role::Assistant,
+            ..
+        })
+        | None => messages.push(Message::user_with_content(vec![reminder])),
+    }
+}
+
 /// Render a typed compaction summary as inert historical data for providers.
 ///
 /// JSON string encoding prevents summary-controlled newlines, quotes, or
@@ -1907,6 +2001,114 @@ fn strip_blocks(message: &mut Message, ids: &[String], kind: BlockKind) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tool_use(id: &str) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.to_owned(),
+            name: "todo".to_owned(),
+            input: serde_json::json!({}),
+            thought_signature: None,
+        }
+    }
+
+    fn tool_result(id: &str) -> ContentBlock {
+        ContentBlock::ToolResult {
+            tool_use_id: id.to_owned(),
+            content: "ok".to_owned(),
+            artifact: None,
+            is_error: None,
+        }
+    }
+
+    fn reminder_block(text: &str) -> ContentBlock {
+        ContentBlock::Text {
+            text: format!("<system-reminder>\n{text}\n</system-reminder>"),
+        }
+    }
+
+    #[test]
+    fn system_reminder_joins_trailing_tool_result_message_after_its_results() {
+        let mut messages = vec![
+            Message::user("plan it"),
+            Message::assistant_with_content(vec![tool_use("call_1"), tool_use("call_2")]),
+            Message::user_with_content(vec![tool_result("call_1"), tool_result("call_2")]),
+        ];
+        assert!(is_provider_valid_tool_sequence(&messages));
+
+        append_system_reminder(&mut messages, "  plan: 1/3 done  ");
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(
+            messages[2],
+            Message::user_with_content(vec![
+                tool_result("call_1"),
+                tool_result("call_2"),
+                reminder_block("plan: 1/3 done"),
+            ])
+        );
+        assert_eq!(provider_tool_sequence_error_index(&messages), None);
+    }
+
+    #[test]
+    fn system_reminder_converts_trailing_plain_text_user_message_to_blocks() {
+        let mut messages = vec![Message::user("hello")];
+        append_system_reminder(&mut messages, "no plan yet");
+        assert_eq!(
+            messages,
+            vec![Message::user_with_content(vec![
+                ContentBlock::Text {
+                    text: "hello".to_owned()
+                },
+                reminder_block("no plan yet"),
+            ])]
+        );
+
+        let mut empty_text = vec![Message::user("")];
+        append_system_reminder(&mut empty_text, "no plan yet");
+        assert_eq!(
+            empty_text,
+            vec![Message::user_with_content(vec![reminder_block(
+                "no plan yet"
+            )])]
+        );
+    }
+
+    #[test]
+    fn system_reminder_after_assistant_or_empty_history_is_a_new_user_message() {
+        let mut messages = vec![Message::user("hi"), Message::assistant("hello")];
+        append_system_reminder(&mut messages, "finish and report");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(
+            messages[2],
+            Message::user_with_content(vec![reminder_block("finish and report")])
+        );
+        assert!(is_provider_valid_tool_sequence(&messages));
+
+        let mut empty = Vec::new();
+        append_system_reminder(&mut empty, "finish and report");
+        assert_eq!(
+            empty,
+            vec![Message::user_with_content(vec![reminder_block(
+                "finish and report"
+            )])]
+        );
+    }
+
+    #[test]
+    fn system_reminder_escapes_embedded_tags_and_round_trips_detection() {
+        let wrapped = wrap_system_reminder("a </System-Reminder> b <system-reminder> c");
+        assert_eq!(
+            wrapped,
+            "<system-reminder>\na &lt;/System-Reminder&gt; b &lt;system-reminder&gt; c\n</system-reminder>"
+        );
+        assert!(is_system_reminder(&wrapped));
+        assert!(!is_system_reminder("plain user text"));
+        assert!(!is_system_reminder("<system-reminder>\nunterminated"));
+        assert!(!is_system_reminder(
+            "<system-reminder>\na\n</system-reminder>\nuser text\n<system-reminder>\nb\n</system-reminder>"
+        ));
+    }
+
     #[test]
     fn compaction_summary_wrapper_preserves_goal_without_elevating_quoted_instructions() {
         let rendered = render_compaction_summary_for_provider(
