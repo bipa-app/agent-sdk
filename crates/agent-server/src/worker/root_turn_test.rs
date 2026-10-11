@@ -2134,7 +2134,37 @@ async fn resume_with_compaction_fixture(
     };
     assert_eq!(compactor_impl.calls(), 1);
     assert_eq!(resume_provider.calls(), 1);
+    assert_resume_row_opens_after_compaction(stores, &parent.id).await?;
     Ok((commit, expected_source_count))
+}
+
+async fn assert_resume_row_opens_after_compaction(
+    stores: &TestStores,
+    task_id: &AgentTaskId,
+) -> Result<()> {
+    let mut attempts = stores.attempts.list_by_task(task_id).await?;
+    attempts.sort_by_key(|attempt| attempt.attempt_number);
+    let [.., compaction_row, resume_row] = attempts.as_slice() else {
+        bail!("expected the compaction and resume rows, got {attempts:?}");
+    };
+    assert_eq!(
+        compaction_row
+            .response_blob
+            .as_ref()
+            .and_then(|blob| blob.get("operation"))
+            .and_then(serde_json::Value::as_str),
+        Some("context_compaction"),
+    );
+    let compaction_closed_at = compaction_row
+        .closed_at
+        .context("the compaction row closes before the resume call")?;
+    assert!(
+        resume_row.opened_at >= compaction_closed_at,
+        "the resume row opened at {} but the summarizer row it follows closed at \
+         {compaction_closed_at}",
+        resume_row.opened_at,
+    );
+    Ok(())
 }
 
 #[tokio::test]

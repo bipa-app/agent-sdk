@@ -2664,6 +2664,22 @@ async fn fresh_user_prompt_counts_toward_the_proactive_trigger() -> Result<()> {
     assert_single_user_input_before_start(&fixtures).await
 }
 
+fn assert_main_opens_after_compaction(
+    compaction: &crate::journal::turn_attempt::TurnAttempt,
+    main: &crate::journal::turn_attempt::TurnAttempt,
+) -> Result<()> {
+    let compaction_closed_at = compaction
+        .closed_at
+        .context("the compaction row closes before the main call")?;
+    assert!(
+        main.opened_at >= compaction_closed_at,
+        "the main row opened at {} but the summarizer row it follows closed at \
+         {compaction_closed_at}; its duration would include the summarizer call",
+        main.opened_at,
+    );
+    Ok(())
+}
+
 async fn assert_compaction_row_precedes_main_row(
     fixtures: &Fixtures,
     task_id: &crate::journal::task::AgentTaskId,
@@ -2681,6 +2697,7 @@ async fn assert_compaction_row_precedes_main_row(
     );
     assert_eq!(attempts[1].input_tokens, Some(100));
     assert_eq!(attempts[1].output_tokens, Some(50));
+    assert_main_opens_after_compaction(&attempts[1], &attempts[2])?;
     let final_history_len = fixtures
         .messages
         .get(&thread_id())
@@ -2961,6 +2978,7 @@ async fn compaction_and_main_spend_bill_on_distinct_truthful_rows() -> Result<()
     assert_eq!(compaction_row.output_tokens, Some(50));
 
     let main_row = &attempts[1];
+    assert_main_opens_after_compaction(compaction_row, main_row)?;
     assert_eq!(main_row.provider, "mock");
     assert_eq!(main_row.requested_model, "mock-model");
     assert_eq!(main_row.input_tokens, Some(100));

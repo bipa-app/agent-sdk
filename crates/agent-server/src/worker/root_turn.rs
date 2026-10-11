@@ -1808,7 +1808,7 @@ async fn execute_root_turn_inner(
     //     so the durable projection can be safely rewritten without
     //     duplicating the user prompt at commit time. No-op when
     //     `deps.compaction_config` is `None`.
-    let abandoned_usage = prepare_pre_call_compaction(PreCallCompactionParams {
+    let pre_call = prepare_pre_call_compaction(PreCallCompactionParams {
         inputs: &inputs,
         definition,
         provider,
@@ -1825,7 +1825,7 @@ async fn execute_root_turn_inner(
         definition,
         &audit_prompt,
         deps.attempt_store,
-        now,
+        pre_call.main_attempt_opened_at,
         root_otel_ids.clone(),
     )
     .await
@@ -1858,7 +1858,7 @@ async fn execute_root_turn_inner(
         provider,
         chat_request,
         initial_attempt: attempt,
-        initial_abandoned_usage: abandoned_usage,
+        initial_abandoned_usage: pre_call.abandoned_usage,
         deps,
         thread_id,
         now,
@@ -2807,13 +2807,20 @@ struct PreCallCompactionParams<'a> {
     error_context: &'static str,
 }
 
+struct PreCallCompaction {
+    /// Summarizer usage to fold into the turn's abandoned-spend accumulator.
+    abandoned_usage: llm::Usage,
+    /// The turn's `now` when no summarizer ran; otherwise the close time of
+    /// its row, so the main row never precedes it or times its call.
+    main_attempt_opened_at: OffsetDateTime,
+}
+
 /// Run the pre-call compaction check before the main attempt opens. A
 /// compaction that runs bills its summarizer on its own
 /// `<context-compaction>` attempt, opened before the summarizer call.
-///
-/// Returns the summarizer usage to fold into the turn's abandoned-spend
-/// accumulator (zero when compaction did not run).
-async fn prepare_pre_call_compaction(params: PreCallCompactionParams<'_>) -> Result<llm::Usage> {
+async fn prepare_pre_call_compaction(
+    params: PreCallCompactionParams<'_>,
+) -> Result<PreCallCompaction> {
     let PreCallCompactionParams {
         inputs,
         definition,
@@ -2839,7 +2846,10 @@ async fn prepare_pre_call_compaction(params: PreCallCompactionParams<'_>) -> Res
     .await
     .map_err(|error| error.context(error_context))?;
     let Some(planned) = planned else {
-        return Ok(ZERO_ATTEMPT_USAGE);
+        return Ok(PreCallCompaction {
+            abandoned_usage: ZERO_ATTEMPT_USAGE,
+            main_attempt_opened_at: now,
+        });
     };
 
     let compaction_attempt = open_compaction_attempt(inputs, deps, OffsetDateTime::now_utc())
@@ -2871,30 +2881,38 @@ async fn prepare_pre_call_compaction(params: PreCallCompactionParams<'_>) -> Res
     };
 
     if !outcome.completed {
+        let closed_at = OffsetDateTime::now_utc();
         close_compaction_attempt(
             &compaction_attempt,
             TurnAttemptOutcome::Cancelled,
             (&outcome).into(),
             deps,
-            OffsetDateTime::now_utc(),
+            closed_at,
         )
         .await?;
-        return Ok(ZERO_ATTEMPT_USAGE);
+        return Ok(PreCallCompaction {
+            abandoned_usage: ZERO_ATTEMPT_USAGE,
+            main_attempt_opened_at: closed_at,
+        });
     }
 
+    let closed_at = OffsetDateTime::now_utc();
     close_compaction_attempt(
         &compaction_attempt,
         TurnAttemptOutcome::Success,
         (&outcome).into(),
         deps,
-        OffsetDateTime::now_utc(),
+        closed_at,
     )
     .await?;
     if deps.is_cancelled() {
         return Err(anyhow::Error::new(RootTurnCancelledMarker)
             .context("root turn cancelled after completed pre-call compaction"));
     }
-    Ok(token_usage_as_llm_usage(&outcome.llm_usage))
+    Ok(PreCallCompaction {
+        abandoned_usage: token_usage_as_llm_usage(&outcome.llm_usage),
+        main_attempt_opened_at: closed_at,
+    })
 }
 
 /// Load the root `invoke_agent` span's `(trace_id, span_id)` for a turn
@@ -7163,7 +7181,7 @@ pub async fn resume_root_turn(
     // 4. Pre-call auto-compaction. This must run after the resumed draft is
     //    staged and persisted: the projection transition validates and folds
     //    the complete effective source, including completed tool results.
-    let abandoned_usage = prepare_pre_call_compaction(PreCallCompactionParams {
+    let pre_call = prepare_pre_call_compaction(PreCallCompactionParams {
         inputs: &inputs,
         definition,
         provider,
@@ -7180,7 +7198,7 @@ pub async fn resume_root_turn(
         definition,
         &resume_audit,
         deps.attempt_store,
-        now,
+        pre_call.main_attempt_opened_at,
         None,
     )
     .await
@@ -7216,7 +7234,7 @@ pub async fn resume_root_turn(
         provider,
         chat_request,
         initial_attempt: attempt,
-        initial_abandoned_usage: abandoned_usage,
+        initial_abandoned_usage: pre_call.abandoned_usage,
         deps,
         thread_id,
         now,
@@ -8563,7 +8581,7 @@ async fn stage_and_call_steering_llm(
     .await
     .context("persist exact steering compaction source")?;
 
-    let abandoned_usage = prepare_pre_call_compaction(PreCallCompactionParams {
+    let pre_call = prepare_pre_call_compaction(PreCallCompactionParams {
         inputs,
         definition,
         provider,
@@ -8580,7 +8598,7 @@ async fn stage_and_call_steering_llm(
         definition,
         &resume_audit,
         deps.attempt_store,
-        now,
+        pre_call.main_attempt_opened_at,
         None,
     )
     .await
@@ -8604,7 +8622,7 @@ async fn stage_and_call_steering_llm(
         provider,
         chat_request,
         initial_attempt: attempt,
-        initial_abandoned_usage: abandoned_usage,
+        initial_abandoned_usage: pre_call.abandoned_usage,
         deps,
         thread_id,
         now,
