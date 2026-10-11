@@ -43,7 +43,7 @@
 //!
 //! | Context          | Status / kind                                     | Budget    | Prepared op | Action                                                   |
 //! |------------------|---------------------------------------------------|-----------|-------------|----------------------------------------------------------|
-//! | Acquisition      | `Pending`, `ReadyToResume`                        | any       | n/a         | [`RecoveryAction::NoAction`]                             |
+//! | Acquisition      | `Pending`, `ReadyToResume` / `AnsweredQuestion`   | any       | n/a         | [`RecoveryAction::NoAction`]                             |
 //! | Acquisition      | `Pending`, budget ok                              | ok        | n/a         | [`RecoveryAction::NoAction`]                             |
 //! | Acquisition      | `Pending`, budget exhausted                       | exhausted | n/a         | [`RecoveryAction::FailClosed`] `RetryBudgetExhausted`    |
 //! | `ExpiredLease`   | `Running`, budget ok                              | ok        | n/a         | [`RecoveryAction::Requeue`]                              |
@@ -54,12 +54,16 @@
 //! | Any              | `Queued`                                          | any       | n/a         | [`RecoveryAction::NoAction`]                             |
 //! | Any              | `Completed` / `Failed` / `Cancelled`              | any       | n/a         | [`RecoveryAction::NoAction`]                             |
 //!
-//! `ReadyToResume` rows pick up the budget check on the expiry path
-//! because [`super::task::AgentTask::release_lease`] bumps `attempt`
-//! when the row's state is `ReadyToResume`. The first legitimate
-//! resume — driven by `recompute_pending_children` rather than the
-//! sweep — does not pass through `release_lease`, so it is not
+//! Rows that [resume an in-flight turn](super::TaskState::resumes_in_flight_turn)
+//! pick up the budget check on the expiry path because
+//! [`super::task::AgentTask::release_lease`] bumps `attempt` for them.
+//! A legitimate wake — a child fan-in, a steering note, an answered
+//! question — does not pass through `release_lease`, so it is not
 //! penalised by this bump.
+//!
+//! Every fail-closed root turn also journals the terminal `Error` event
+//! [`FailureReason::terminal_event`] builds, in the same store write as
+//! the transition, so followers of the thread see the turn end.
 //!
 //! The table is locked by the
 //! `classify_recovery_matrix_is_exhaustive` test in this module so
@@ -95,10 +99,10 @@
 //! [`TaskKind`]: super::TaskKind
 //! [`TaskStatus`]: super::TaskStatus
 
+use agent_sdk_foundation::events::{AgentEvent, TerminalReason};
 use serde::{Deserialize, Serialize};
 
 use super::task::{AgentTask, AgentTaskId, TaskKind, TaskStatus};
-use super::task_state::TaskState;
 
 /// Canonical fail-closed reasons written on Phase 2.5 recovery
 /// transitions.
@@ -163,6 +167,46 @@ impl FailureReason {
         format!(
             "{prefix}: task {id} ({kind} {status:?}) exhausted recovery budget (attempt={attempt}, max={max})"
         )
+    }
+
+    /// The typed terminal reason a row failed closed for this reason carries.
+    #[must_use]
+    pub const fn terminal_reason(self) -> TerminalReason {
+        match self {
+            Self::RetryBudgetExhausted | Self::LeaseExpiredBudgetExhausted => {
+                TerminalReason::Budget
+            }
+            Self::UnsafePreparedOperationRecovery => TerminalReason::InternalError,
+        }
+    }
+
+    /// What the user reads when a turn fails closed for this reason. The
+    /// diagnostic detail stays in [`Self::error_message`] on the row.
+    const fn user_message(self) -> &'static str {
+        match self {
+            Self::RetryBudgetExhausted | Self::LeaseExpiredBudgetExhausted => {
+                "This turn stopped after repeated failures and can't continue automatically. \
+                 Send a new message to retry."
+            }
+            Self::UnsafePreparedOperationRecovery => {
+                "This turn stopped because an interrupted tool call can't be resumed safely. \
+                 Send a new message to retry."
+            }
+        }
+    }
+
+    /// The terminal `Error` event that closes `task`'s turn on its thread
+    /// when `task` fails closed for this reason.
+    ///
+    /// `None` for rows below a thread's root turn: their failure wakes a
+    /// parent that is still running the turn, so closing the thread's
+    /// stream there would be wrong.
+    #[must_use]
+    pub fn terminal_event(self, task: &AgentTask) -> Option<AgentEvent> {
+        (task.kind == TaskKind::RootTurn && task.is_root()).then(|| {
+            AgentEvent::terminal_error(self.user_message(), self.terminal_reason())
+                .with_emitter_task_id(task.id.as_str())
+        })
     }
 }
 
@@ -297,11 +341,11 @@ pub fn classify_recovery(task: &AgentTask, context: RecoveryContext) -> Recovery
         // NoAction — the acquisition path will see `None` via the
         // existing CAS check regardless.
         //
-        // `ReadyToResume` is a continuation after child completion,
-        // not a retry — the task's attempt counter was not incremented
-        // for the resume, so budget-exhaustion does not apply.
+        // A row that resumes an in-flight turn is a continuation, not a
+        // retry: its acquisition charges nothing, so budget exhaustion
+        // does not apply here (the expiry path still enforces it).
         (RecoveryContext::AcquisitionAttempt, TaskStatus::Pending) => {
-            if matches!(task.state, TaskState::ReadyToResume { .. }) {
+            if task.state.resumes_in_flight_turn() {
                 RecoveryAction::NoAction
             } else if task.is_budget_exhausted() {
                 RecoveryAction::FailClosed(FailureReason::RetryBudgetExhausted)
@@ -316,9 +360,9 @@ pub fn classify_recovery(task: &AgentTask, context: RecoveryContext) -> Recovery
         // from `Running` transitions. Anything else is a bookkeeping bug
         // and the store surfaces it as an error, not a recovery decision.
         //
-        // `ReadyToResume` rows are subject to the same budget check as
-        // any other Running row. `release_lease` bumps `attempt` when
-        // the row carries a `ReadyToResume` state, so a poisoned resume
+        // Resuming rows are subject to the same budget check as any
+        // other Running row. `release_lease` bumps `attempt` when the
+        // row resumes an in-flight turn, so a poisoned resume
         // (LLM error, idempotency violation, or a worker crash that
         // does not break the row's invariants) eventually exhausts the
         // budget and gets a deterministic fail-closed transition
@@ -543,6 +587,54 @@ mod tests {
         assert!(message.contains(task.id.as_str()), "missing id: {message}");
         assert!(message.contains("attempt=3"), "missing attempt: {message}");
         assert!(message.contains("max=3"), "missing max: {message}");
+    }
+
+    /// The terminal event is what a user reads when the turn dies, so it
+    /// says what happened and what to do; the diagnostic wire format
+    /// stays on the failed row's `last_error`.
+    #[test]
+    fn terminal_event_speaks_to_the_user_and_last_error_keeps_the_detail() -> Result<()> {
+        let mut task = fresh_root(3);
+        task.attempt = 3;
+        for reason in [
+            FailureReason::RetryBudgetExhausted,
+            FailureReason::LeaseExpiredBudgetExhausted,
+            FailureReason::UnsafePreparedOperationRecovery,
+        ] {
+            let event = reason
+                .terminal_event(&task)
+                .context("a root turn closes its thread's turn")?;
+            let AgentEvent::Error { message, .. } = &event else {
+                anyhow::bail!("{reason:?}: expected a terminal error, got {event:?}");
+            };
+            assert!(
+                !message.contains(reason.error_prefix()) && !message.contains(task.id.as_str()),
+                "{reason:?} leaked internal detail to the user: {message}"
+            );
+            assert!(
+                message.ends_with("Send a new message to retry."),
+                "{reason:?}: {message}"
+            );
+        }
+        let event = FailureReason::RetryBudgetExhausted
+            .terminal_event(&task)
+            .context("a root turn closes its thread's turn")?;
+        let AgentEvent::Error { message, .. } = &event else {
+            anyhow::bail!("expected a terminal error, got {event:?}");
+        };
+        assert_eq!(
+            message,
+            "This turn stopped after repeated failures and can't continue automatically. \
+             Send a new message to retry."
+        );
+
+        let failed = task.fail_with_reason(FailureReason::RetryBudgetExhausted, t_plus(1))?;
+        let last_error = failed.last_error.as_deref().context("failed row")?;
+        assert!(
+            last_error.starts_with("retry_budget_exhausted:") && last_error.contains("max=3"),
+            "unexpected last_error: {last_error}"
+        );
+        Ok(())
     }
 
     #[test]

@@ -55,7 +55,7 @@ use agent_server::journal::outbox_message::{
     OutboxMessage, OutboxMessageKind, TaskWakeupPayload, ThreadEventsAvailablePayload,
 };
 use agent_server::journal::recovery::{
-    RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
+    FailureReason, RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
 };
 use agent_server::journal::relay::{
     TASK_WAKEUP_OUTBOX_MAX_ATTEMPTS, TaskWakeupEmitter, TaskWakeupTrigger,
@@ -1731,6 +1731,105 @@ WHERE parent_id = $1
             })?;
         Self::update_task_tx(tx, &new_parent).await?;
         Ok(())
+    }
+
+    /// Fail `old` closed for `reason` inside the caller's transaction:
+    /// the terminal transition, the terminal event that closes a root's
+    /// turn (see [`FailureReason::terminal_event`]), and the parent /
+    /// successor wake-up land together.
+    ///
+    /// Journaling that event locks `old`'s thread row, so for a root the
+    /// caller must already hold the thread lock taken before the task
+    /// lock (thread → task); otherwise use
+    /// [`Self::fail_closed_root_thread_first`].
+    async fn fail_closed_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        old: &AgentTask,
+        reason: FailureReason,
+        now: OffsetDateTime,
+        error_prefix: &str,
+    ) -> Result<()> {
+        let failed = old
+            .clone()
+            .fail_with_reason(reason, now)
+            .with_context(|| format!("{error_prefix}: fail-closed transition failed"))?;
+        Self::update_task_tx(tx, &failed).await?;
+        if let Some(event) = reason.terminal_event(old) {
+            let start_seq = Self::next_event_sequence_tx(tx, &old.thread_id).await?;
+            let committed =
+                Self::insert_events_tx(tx, &old.thread_id, vec![event], start_seq, now).await?;
+            Self::insert_thread_events_outbox_row_tx(
+                tx,
+                &committed,
+                DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+                now,
+            )
+            .await?;
+        }
+        Self::propagate_terminal_to_parent_tx(tx, &failed, now, error_prefix).await
+    }
+
+    /// Fail a root closed in its own transaction that locks the thread
+    /// before the task, for callers that classified the row under a task
+    /// lock taken first. The row is re-validated under the new locks and
+    /// left alone when it no longer classifies as fail-closed in
+    /// `context` (another worker claimed it, a heartbeat extended its
+    /// lease, ...).
+    ///
+    /// Returns the reason when this call failed the row.
+    async fn fail_closed_root_thread_first(
+        &self,
+        id: &AgentTaskId,
+        context: RecoveryContext,
+        now: OffsetDateTime,
+        error_prefix: &str,
+    ) -> Result<Option<FailureReason>> {
+        let mut tx = self.begin().await?;
+        let Some(screened) = Self::load_task_tx(&mut tx, id, false).await? else {
+            tx.rollback()
+                .await
+                .context("rollback vanished fail-close")?;
+            return Ok(None);
+        };
+        Self::bootstrap_thread_row_tx(&mut tx, &screened.thread_id, now).await?;
+        let thread = Self::lock_thread_tx(&mut tx, &screened.thread_id)
+            .await?
+            .with_context(|| format!("thread {} missing after bootstrap", screened.thread_id))?;
+        let Some(old) = Self::load_task_tx(&mut tx, id, true).await? else {
+            tx.rollback()
+                .await
+                .context("rollback vanished fail-close")?;
+            return Ok(None);
+        };
+        let still_eligible = match context {
+            RecoveryContext::AcquisitionAttempt => {
+                old.status.can_be_leased() && !thread.status.is_purge_fenced()
+            }
+            RecoveryContext::ExpiredLease => {
+                old.status == TaskStatus::Running
+                    && old.lease_expires_at.is_some_and(|expiry| expiry <= now)
+            }
+        };
+        let action = if still_eligible {
+            classify_recovery(&old, context)
+        } else {
+            RecoveryAction::NoAction
+        };
+        match action {
+            RecoveryAction::FailClosed(reason) => {
+                Self::fail_closed_tx(&mut tx, &old, reason, now, error_prefix).await?;
+                tx.commit()
+                    .await
+                    .with_context(|| format!("commit {error_prefix} fail-close"))?;
+                Ok(Some(reason))
+            }
+            RecoveryAction::NoAction | RecoveryAction::Requeue => {
+                tx.rollback()
+                    .await
+                    .with_context(|| format!("rollback {error_prefix} fail-close"))?;
+                Ok(None)
+            }
+        }
     }
 
     async fn apply_task_terminal_transition_tx(
@@ -3475,13 +3574,9 @@ ORDER BY created_at, id
         match classify_recovery(&old, RecoveryContext::AcquisitionAttempt) {
             RecoveryAction::NoAction => {}
             RecoveryAction::FailClosed(reason) => {
-                let failed = old
-                    .clone()
-                    .fail_with_reason(reason, now)
-                    .context("try_acquire_task: fail-closed transition failed")?;
-                Self::update_task_tx(&mut tx, &failed).await?;
-                Self::propagate_terminal_to_parent_tx(&mut tx, &failed, now, "try_acquire_task")
-                    .await?;
+                // `require_active_thread_tx` above already holds the thread
+                // lock, so the terminal event keeps thread → task order.
+                Self::fail_closed_tx(&mut tx, &old, reason, now, "try_acquire_task").await?;
                 tx.commit().await.context("commit fail-closed acquire")?;
                 return Ok(None);
             }
@@ -3522,26 +3617,34 @@ ORDER BY created_at, id
                     .context("rollback vanished runnable head")?;
                 continue;
             };
-            if !old.status.can_be_leased() {
-                if old.status == TaskStatus::Running {
-                    // Lost the claim race to another worker between the
-                    // head scan and the FOR UPDATE load — rescan.
+            match old.status {
+                TaskStatus::Pending => {}
+                // The head scan takes no lock, so another worker may claim,
+                // fail closed, or cancel the head (and its claimer move it
+                // on) before this FOR UPDATE load. The scan only returns
+                // pending rows, so rescanning moves past the lost head.
+                TaskStatus::Running
+                | TaskStatus::WaitingOnChildren
+                | TaskStatus::AwaitingConfirmation
+                | TaskStatus::AwaitingQuestion
+                | TaskStatus::Completed
+                | TaskStatus::Failed
+                | TaskStatus::Cancelled => {
                     tx.rollback()
                         .await
                         .context("rollback raced runnable head")?;
                     continue;
                 }
-                // Anything else in the pending scan is index corruption,
-                // not a race — same hard error the sqlite and in-memory
-                // backends raise.
-                let status = old.status;
-                tx.rollback()
-                    .await
-                    .context("rollback corrupt runnable head")?;
-                return Err(anyhow!(
-                    "acquire_next_runnable: runnable index held non-pending row {} in status {status:?}",
-                    old.id
-                ));
+                TaskStatus::Queued => {
+                    let status = old.status;
+                    tx.rollback()
+                        .await
+                        .context("rollback corrupt runnable head")?;
+                    return Err(anyhow!(
+                        "acquire_next_runnable: runnable index held non-pending row {} in status {status:?}",
+                        old.id
+                    ));
+                }
             }
 
             match classify_recovery(&old, RecoveryContext::AcquisitionAttempt) {
@@ -3556,19 +3659,21 @@ ORDER BY created_at, id
                     tx.commit().await.context("commit acquire_next_runnable")?;
                     return Ok(Some(claimed));
                 }
-                RecoveryAction::FailClosed(reason) => {
-                    let failed = old
-                        .clone()
-                        .fail_with_reason(reason, now)
-                        .context("acquire_next_runnable: fail-closed transition failed")?;
-                    Self::update_task_tx(&mut tx, &failed).await?;
-                    Self::propagate_terminal_to_parent_tx(
-                        &mut tx,
-                        &failed,
+                RecoveryAction::FailClosed(reason) if reason.terminal_event(&old).is_some() => {
+                    tx.rollback()
+                        .await
+                        .context("rollback before thread-first fail-close")?;
+                    self.fail_closed_root_thread_first(
+                        &old.id,
+                        RecoveryContext::AcquisitionAttempt,
                         now,
                         "acquire_next_runnable",
                     )
                     .await?;
+                }
+                RecoveryAction::FailClosed(reason) => {
+                    Self::fail_closed_tx(&mut tx, &old, reason, now, "acquire_next_runnable")
+                        .await?;
                     tx.commit()
                         .await
                         .context("commit fail-closed runnable head")?;
@@ -3723,6 +3828,7 @@ FOR UPDATE SKIP LOCKED
         .context("load expired leases")?;
 
         let mut released = Vec::with_capacity(expired.len());
+        let mut exhausted_roots = Vec::new();
         for record in expired {
             let old = AgentTask::try_from(record)?;
             if old.status != TaskStatus::Running {
@@ -3741,19 +3847,13 @@ FOR UPDATE SKIP LOCKED
                     Self::update_task_tx(&mut tx, &released_row).await?;
                     RecoveryRecord::requeued(old.id.clone())
                 }
+                RecoveryAction::FailClosed(reason) if reason.terminal_event(&old).is_some() => {
+                    exhausted_roots.push(old.id);
+                    continue;
+                }
                 RecoveryAction::FailClosed(reason) => {
-                    let failed = old
-                        .clone()
-                        .fail_with_reason(reason, now)
-                        .context("release_expired_leases: fail-closed transition failed")?;
-                    Self::update_task_tx(&mut tx, &failed).await?;
-                    Self::propagate_terminal_to_parent_tx(
-                        &mut tx,
-                        &failed,
-                        now,
-                        "release_expired_leases",
-                    )
-                    .await?;
+                    Self::fail_closed_tx(&mut tx, &old, reason, now, "release_expired_leases")
+                        .await?;
                     RecoveryRecord::failed_closed(old.id.clone(), reason)
                 }
                 RecoveryAction::NoAction => {
@@ -3767,6 +3867,22 @@ FOR UPDATE SKIP LOCKED
         }
 
         tx.commit().await.context("commit release_expired_leases")?;
+
+        // The batch locked these roots before their threads; journaling
+        // their terminal events needs thread → task order.
+        for id in exhausted_roots {
+            if let Some(reason) = self
+                .fail_closed_root_thread_first(
+                    &id,
+                    RecoveryContext::ExpiredLease,
+                    now,
+                    "release_expired_leases",
+                )
+                .await?
+            {
+                released.push(RecoveryRecord::failed_closed(id, reason));
+            }
+        }
         Ok(released)
     }
 
@@ -4796,13 +4912,10 @@ ORDER BY created_at, id
                 "approve rejected: task {id} is not awaiting confirmation (status {status:?})"
             ));
         }
-        let (resumed, prepared_operation) = old
+        let (claimed, prepared_operation) = old
             .clone()
-            .resume_from_confirmation(now)
-            .context("approve rejected: resume_from_confirmation transition failed")?;
-        let claimed = resumed
-            .mark_running(worker, lease, expires_at, now)
-            .context("approve rejected: mark_running transition failed")?;
+            .approve_confirmation(worker, lease, expires_at, now)
+            .context("approve rejected: approve_confirmation transition failed")?;
         Self::update_task_tx(&mut tx, &claimed).await?;
         tx.commit()
             .await
@@ -7808,6 +7921,41 @@ INSERT INTO agent_sdk_turn_attempts (
         Ok(())
     }
 
+    /// Submit a root on `thread` whose only attempt was claimed and
+    /// released, leaving it `Pending` with a spent retry budget.
+    async fn submit_exhausted_root(
+        store: &PostgresDurableStore,
+        thread: &str,
+        secs: i64,
+    ) -> Result<AgentTaskId> {
+        let root = AgentTask::new_root_turn(thread_id(thread), t_plus(secs), 1);
+        let id = root.id.clone();
+        store
+            .submit_root_turn(root)
+            .await
+            .context("submit exhausted root")?;
+        let claimed = store
+            .try_acquire_task(
+                &id,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(secs + 50),
+                t_plus(secs + 1),
+            )
+            .await
+            .context("acquire exhausted root")?
+            .context("exhausted root claimed")?;
+        store
+            .update(
+                claimed
+                    .release_lease(t_plus(secs + 2))
+                    .context("release exhausted root")?,
+            )
+            .await
+            .context("persist released exhausted root")?;
+        Ok(id)
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn acquire_next_runnable_commits_fail_closed_heads_before_returning_none() -> Result<()> {
         let Some((store, _schema_guard)) = test_store().await? else {
@@ -7817,36 +7965,7 @@ INSERT INTO agent_sdk_turn_attempts (
         let mut ids = Vec::new();
         for (idx, name) in ["a", "b", "c"].iter().enumerate() {
             let secs = i64::try_from(idx).context("enumerate fits i64")? * 10;
-            let root = AgentTask::new_root_turn(
-                thread_id(&format!("t-pg-exhaust-{name}")),
-                t_plus(secs),
-                1,
-            );
-            let id = root.id.clone();
-            store
-                .submit_root_turn(root)
-                .await
-                .context("submit exhausted root")?;
-            let claimed = store
-                .try_acquire_task(
-                    &id,
-                    WorkerId::from_string(format!("w-{name}")),
-                    LeaseId::from_string(format!("l-{name}")),
-                    t_plus(secs + 50),
-                    t_plus(secs + 1),
-                )
-                .await
-                .context("acquire exhausted root")?
-                .context("exhausted root claimed")?;
-            store
-                .update(
-                    claimed
-                        .release_lease(t_plus(secs + 2))
-                        .context("release exhausted root")?,
-                )
-                .await
-                .context("persist released exhausted root")?;
-            ids.push(id);
+            ids.push(submit_exhausted_root(&store, &format!("t-pg-exhaust-{name}"), secs).await?);
         }
 
         let result = store
@@ -7881,6 +8000,85 @@ INSERT INTO agent_sdk_turn_attempts (
             );
         }
 
+        Ok(())
+    }
+
+    /// Workers racing over the same exhausted heads lose the fail-close
+    /// to whichever commits first; the losers must rescan and come back
+    /// empty, never surface the row they lost as an acquisition error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_acquirers_over_exhausted_heads_never_error() -> Result<()> {
+        const ROUNDS: i64 = 5;
+        const HEADS: i64 = 4;
+        const ACQUIRERS: usize = 8;
+        let Some((store, _schema_guard)) = test_store().await? else {
+            return Ok(());
+        };
+
+        let mut failures = Vec::new();
+        for round in 0..ROUNDS {
+            let mut heads = Vec::new();
+            for head in 0..HEADS {
+                let thread = format!("t-pg-race-{round}-{head}");
+                let secs = (round * HEADS + head) * 10;
+                heads.push((
+                    thread_id(&thread),
+                    submit_exhausted_root(&store, &thread, secs).await?,
+                ));
+            }
+
+            let start = std::sync::Arc::new(tokio::sync::Barrier::new(ACQUIRERS));
+            let mut acquirers = Vec::with_capacity(ACQUIRERS);
+            for _ in 0..ACQUIRERS {
+                let store = store.clone();
+                let start = std::sync::Arc::clone(&start);
+                acquirers.push(tokio::spawn(async move {
+                    start.wait().await;
+                    store
+                        .acquire_next_runnable(
+                            WorkerId::new(),
+                            LeaseId::new(),
+                            t_plus(10_000),
+                            t_plus(9_000),
+                        )
+                        .await
+                }));
+            }
+            for acquirer in acquirers {
+                match acquirer.await.context("join acquirer")? {
+                    Ok(None) => {}
+                    Ok(Some(claimed)) => {
+                        failures.push(format!("round {round}: claimed exhausted {}", claimed.id));
+                    }
+                    Err(error) => failures.push(format!("round {round}: {error:#}")),
+                }
+            }
+
+            for (thread, id) in &heads {
+                let row = AgentTaskStore::get(&store, id)
+                    .await?
+                    .context("head row exists")?;
+                assert_eq!(row.status, TaskStatus::Failed, "round {round}: {id}");
+                let terminal_errors = EventRepository::get_events(&store, thread)
+                    .await?
+                    .iter()
+                    .filter(|committed| {
+                        matches!(
+                            committed.event,
+                            AgentEvent::Error {
+                                recoverable: false,
+                                ..
+                            }
+                        )
+                    })
+                    .count();
+                assert_eq!(terminal_errors, 1, "round {round}: {id}");
+            }
+        }
+        anyhow::ensure!(
+            failures.is_empty(),
+            "acquirers racing over exhausted heads failed: {failures:#?}"
+        );
         Ok(())
     }
 

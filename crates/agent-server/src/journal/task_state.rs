@@ -395,6 +395,28 @@ impl TaskState {
         }
     }
 
+    /// Whether acquiring a runnable row in this state continues the turn
+    /// that parked it rather than starting a new attempt.
+    ///
+    /// Such an acquisition is free: one turn may park and wake any number
+    /// of times (child fan-ins, steering notes, answered questions), and
+    /// charging each wake would fail a healthy turn once it woke
+    /// `max_attempts` times. The retry budget still bounds a resume that
+    /// keeps crashing, because every lease the sweep reclaims from such a
+    /// row charges one attempt instead
+    /// ([`super::AgentTask::release_lease`]).
+    #[must_use]
+    pub const fn resumes_in_flight_turn(&self) -> bool {
+        match self {
+            Self::ReadyToResume { .. } | Self::AnsweredQuestion { .. } => true,
+            Self::None
+            | Self::WaitingOnChildren { .. }
+            | Self::AwaitingConfirmation { .. }
+            | Self::AwaitingQuestion { .. }
+            | Self::SubagentInvocation { .. } => false,
+        }
+    }
+
     /// Borrow the [`ContinuationEnvelope`] embedded in a paused state,
     /// if any. Returns `None` for [`TaskState::None`] and
     /// [`TaskState::SubagentInvocation`].
