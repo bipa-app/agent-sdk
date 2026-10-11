@@ -7240,7 +7240,6 @@ fn fan_in_for_child_results(
 
 /// [`resume_root_turn`] with a prebuilt fan-in user message, which may
 /// also carry late results of calls an earlier early resume answered.
-#[allow(clippy::too_many_lines)]
 async fn resume_root_turn_with_fan_in(
     inputs: RootWorkerInputs,
     continuation: AgentContinuation,
@@ -7250,129 +7249,46 @@ async fn resume_root_turn_with_fan_in(
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<RootTurnOutcome> {
-    let definition = inputs.definition();
     let thread_id = &inputs.bootstrap.thread_id;
-    let injected = drain_boundary_injections(deps, &inputs.bootstrap.task_id, thread_id, &[], now)
-        .await
-        .context("drain boundary injections")?;
-
-    // 1. The audit prompt is the canonical resume sentinel exported as
-    //    `super::user_input::RESUME_AUDIT_PROMPT` so the worker and
-    //    the resume path share a single source of truth for what
-    //    "this attempt is a resume" looks like in the audit row.
-    let resume_input = super::user_input::UserInput::resume();
-    let resume_audit = resume_input.audit_summary();
-
-    // Load the turn's root `invoke_agent` span context (created on the
-    // fresh turn; ids persisted on the first attempt) so the resumed LLM
-    // call's `chat` span joins the same trace. Applied via `with_context`
-    // on the call future below — never a held `ContextGuard`, which would
-    // make this future `!Send`.
-    #[cfg(feature = "otel")]
-    let resume_root_cx = load_root_span_ids(deps.attempt_store, &inputs.bootstrap.task_id)
-        .await
-        .and_then(|(trace, span)| {
-            agent_sdk::observability::loop_instrument::remote_parent_context(&trace, &span)
-        });
-
-    // 2. Buffer the suspended messages (user prompt + assistant with tool
-    //    calls), completed tool results, and boundary injections on top of the
-    //    committed-only resume seed.
-    buffer_resume_messages(
-        &inputs.staged_stores.messages,
-        &inputs.staged_stores.state,
-        thread_id,
-        &continuation,
-        &suspended_messages,
-        &fan_in,
-    )
-    .await
-    .context("buffer resume messages")?;
-    for message in &injected.messages {
-        inputs
-            .staged_stores
-            .messages
-            .append(thread_id, message.clone())
-            .await
-            .context("append boundary injection")?;
-    }
-
-    // 3. Refresh the projection draft before either proactive or reactive
-    //    compaction can run. The staged source is now exactly
-    //    `[effective committed head] + [persisted resumed draft]`, so
-    //    `append_compaction` can atomically fold and clear that same draft
-    //    without making a paid provider call only to reject the result on a
-    //    source-count mismatch.
-    let mut resumed_draft = build_resumed_draft_messages(&suspended_messages, &fan_in);
-    resumed_draft.extend(injected.messages.clone());
-    persist_resume_draft_for_compaction(
-        deps,
-        thread_id,
-        &inputs.bootstrap.task_id,
-        resumed_draft.clone(),
-        now,
-        "refresh draft with completed child results before resume LLM call",
-    )
-    .await
-    .context("persist exact resume compaction source")?;
-
-    // 4. Pre-call auto-compaction. This must run after the resumed draft is
-    //    staged and persisted: the projection transition validates and folds
-    //    the complete effective source, including completed tool results.
-    let pre_call = prepare_pre_call_compaction(PreCallCompactionParams {
-        inputs: &inputs,
-        definition,
+    let StagedResumeCall {
+        resume_input,
+        resume_audit,
+        attempt,
+        abandoned_usage,
+        chat_request,
+        resumed_draft,
+        injected,
+        #[cfg(feature = "otel")]
+        resume_root_cx,
+    } = stage_resume_call(
+        &inputs,
+        ResumeFanIn {
+            continuation: &continuation,
+            suspended_messages: &suspended_messages,
+            fan_in: &fan_in,
+        },
         provider,
-        user_input: &resume_input,
         deps,
-        thread_id,
         now,
-        error_context: "pre-call auto-compaction (resume path)",
-    })
+    )
     .await?;
 
-    let attempt = open_attempt(
-        &inputs,
-        definition,
-        &resume_audit,
-        deps.attempt_store,
-        pre_call.main_attempt_opened_at,
-        None,
-    )
-    .await
-    .context("open resume turn attempt")?;
-
-    // 5. Build the chat request from staged history. `resume_input` is
-    //    a resume sentinel whose `into_message()` returns `None`, so
-    //    `build_chat_request` appends no extra user prompt — everything
-    //    is already buffered. (This is why the resume path shares
-    //    `build_chat_request` rather than a near-duplicate helper.)
-    let chat_request = build_chat_request(
-        definition,
-        &inputs.staged_stores.messages,
-        thread_id,
-        &resume_input,
-        inputs.bootstrap.task.caller_metadata.as_ref(),
-    )
-    .await
-    .context("build resume chat request")?;
-
-    // 4. Stream the LLM call.  The resumed turn doesn't get a fresh
-    //    `Start` event — the original turn's Start is already in the
-    //    journal and replay treats the resume as a continuation of
-    //    that turn.  `call_llm` allocates per-block message/thinking
-    //    IDs lazily during streaming so the per-delta TextDelta /
-    //    ThinkingDelta events match the consolidated `Text` /
-    //    `Thinking` events committed at turn close.
+    // Stream the LLM call.  The resumed turn doesn't get a fresh
+    // `Start` event — the original turn's Start is already in the
+    // journal and replay treats the resume as a continuation of
+    // that turn.  `call_llm` allocates per-block message/thinking
+    // IDs lazily during streaming so the per-delta TextDelta /
+    // ThinkingDelta events match the consolidated `Text` /
+    // `Thinking` events committed at turn close.
     let llm_call = call_llm_with_retry(LlmRetryParams {
         inputs: &inputs,
-        definition,
+        definition: inputs.definition(),
         user_input: &resume_input,
         attempt_audit_prompt: &resume_audit,
         provider,
         chat_request,
         initial_attempt: attempt,
-        initial_abandoned_usage: pre_call.abandoned_usage,
+        initial_abandoned_usage: abandoned_usage,
         deps,
         thread_id,
         now,
@@ -7403,8 +7319,14 @@ async fn resume_root_turn_with_fan_in(
         }
     };
     let commit_now = OffsetDateTime::now_utc();
+    let close = ResumeCloseContext {
+        content_ids: &content_ids,
+        success_usage: &success_usage,
+        evidence: &evidence,
+        delivered_injections: &injected.delivered,
+    };
 
-    // 5. Branch: authorized tool handoff → re-suspend; otherwise commit.
+    // Branch: authorized tool handoff → re-suspend; otherwise commit.
     if response_requests_tool_dispatch(&response) {
         return suspend_resumed_turn(
             inputs,
@@ -7414,12 +7336,7 @@ async fn resume_root_turn_with_fan_in(
             },
             response,
             attempt,
-            ResumeCloseContext {
-                content_ids: &content_ids,
-                success_usage: &success_usage,
-                evidence: &evidence,
-                delivered_injections: &injected.delivered,
-            },
+            close,
             deps,
             commit_now,
         )
@@ -7431,16 +7348,169 @@ async fn resume_root_turn_with_fan_in(
         &continuation,
         &response,
         &attempt,
-        ResumeCloseContext {
-            content_ids: &content_ids,
-            success_usage: &success_usage,
-            evidence: &evidence,
-            delivered_injections: &injected.delivered,
-        },
+        close,
         deps,
         commit_now,
     )
     .await
+}
+
+/// The parked batch a resume fans in: its continuation, the messages
+/// captured at suspension, and the fan-in user message answering them.
+struct ResumeFanIn<'a> {
+    continuation: &'a AgentContinuation,
+    suspended_messages: &'a [llm::Message],
+    fan_in: &'a llm::Message,
+}
+
+/// Everything [`stage_resume_call`] prepares for the resume LLM call.
+struct StagedResumeCall {
+    resume_input: super::user_input::UserInput,
+    resume_audit: String,
+    attempt: TurnAttempt,
+    /// Summarizer usage to fold into the turn's abandoned-spend accumulator.
+    abandoned_usage: llm::Usage,
+    chat_request: ChatRequest,
+    /// `[suspended…, fan-in, injections…]`, the replay prefix a
+    /// re-suspension carries forward.
+    resumed_draft: Vec<llm::Message>,
+    injected: DrainedInjections,
+    #[cfg(feature = "otel")]
+    resume_root_cx: Option<opentelemetry::Context>,
+}
+
+/// Open the resume attempt, stage and persist the resumed transcript, run
+/// pre-call compaction, and build the chat request.
+async fn stage_resume_call(
+    inputs: &RootWorkerInputs,
+    batch: ResumeFanIn<'_>,
+    provider: &dyn LlmProvider,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<StagedResumeCall> {
+    let ResumeFanIn {
+        continuation,
+        suspended_messages,
+        fan_in,
+    } = batch;
+    let definition = inputs.definition();
+    let thread_id = &inputs.bootstrap.thread_id;
+    let injected = drain_boundary_injections(deps, &inputs.bootstrap.task_id, thread_id, &[], now)
+        .await
+        .context("drain boundary injections")?;
+
+    // 1. The audit prompt is the canonical resume sentinel exported as
+    //    `super::user_input::RESUME_AUDIT_PROMPT` so the worker and
+    //    the resume path share a single source of truth for what
+    //    "this attempt is a resume" looks like in the audit row.
+    let resume_input = super::user_input::UserInput::resume();
+    let resume_audit = resume_input.audit_summary();
+
+    // Load the turn's root `invoke_agent` span context (created on the
+    // fresh turn; ids persisted on the first attempt) so the resumed LLM
+    // call's `chat` span joins the same trace. Applied via `with_context`
+    // on the call future — never a held `ContextGuard`, which would make
+    // the caller's future `!Send`.
+    #[cfg(feature = "otel")]
+    let resume_root_cx = load_root_span_ids(deps.attempt_store, &inputs.bootstrap.task_id)
+        .await
+        .and_then(|(trace, span)| {
+            agent_sdk::observability::loop_instrument::remote_parent_context(&trace, &span)
+        });
+
+    // 2. Buffer the suspended messages (user prompt + assistant with tool
+    //    calls), completed tool results, and boundary injections on top of the
+    //    committed-only resume seed.
+    buffer_resume_messages(
+        &inputs.staged_stores.messages,
+        &inputs.staged_stores.state,
+        thread_id,
+        continuation,
+        suspended_messages,
+        fan_in,
+    )
+    .await
+    .context("buffer resume messages")?;
+    for message in &injected.messages {
+        inputs
+            .staged_stores
+            .messages
+            .append(thread_id, message.clone())
+            .await
+            .context("append boundary injection")?;
+    }
+
+    // 3. Refresh the projection draft before either proactive or reactive
+    //    compaction can run. The staged source is now exactly
+    //    `[effective committed head] + [persisted resumed draft]`, so
+    //    `append_compaction` can atomically fold and clear that same draft
+    //    without making a paid provider call only to reject the result on a
+    //    source-count mismatch.
+    let mut resumed_draft = build_resumed_draft_messages(suspended_messages, fan_in);
+    resumed_draft.extend(injected.messages.clone());
+    persist_resume_draft_for_compaction(
+        deps,
+        thread_id,
+        &inputs.bootstrap.task_id,
+        resumed_draft.clone(),
+        now,
+        "refresh draft with completed child results before resume LLM call",
+    )
+    .await
+    .context("persist exact resume compaction source")?;
+
+    // 4. Pre-call auto-compaction. This must run after the resumed draft is
+    //    staged and persisted: the projection transition validates and folds
+    //    the complete effective source, including completed tool results.
+    let pre_call = prepare_pre_call_compaction(PreCallCompactionParams {
+        inputs,
+        definition,
+        provider,
+        user_input: &resume_input,
+        deps,
+        thread_id,
+        now,
+        error_context: "pre-call auto-compaction (resume path)",
+    })
+    .await?;
+
+    let attempt = open_attempt(
+        inputs,
+        definition,
+        &resume_audit,
+        deps.attempt_store,
+        pre_call.main_attempt_opened_at,
+        None,
+    )
+    .await
+    .context("open resume turn attempt")?;
+
+    // 5. Build the chat request from staged history. `resume_input` is
+    //    a resume sentinel whose `into_message()` returns `None`, so
+    //    `build_chat_request` appends no extra user prompt — everything
+    //    is already buffered. (This is why the resume path shares
+    //    `build_chat_request` rather than a near-duplicate helper.)
+    let chat_request = build_chat_request(
+        definition,
+        &inputs.staged_stores.messages,
+        thread_id,
+        &resume_input,
+        inputs.bootstrap.task.caller_metadata.as_ref(),
+    )
+    .await
+    .context("build resume chat request")?;
+
+    Ok(StagedResumeCall {
+        resume_input,
+        resume_audit,
+        attempt,
+        abandoned_usage: pre_call.abandoned_usage,
+        chat_request,
+        resumed_draft,
+        injected,
+        #[cfg(feature = "otel")]
+        resume_root_cx,
+    })
 }
 
 /// Buffer the final assistant message and update the staged agent state

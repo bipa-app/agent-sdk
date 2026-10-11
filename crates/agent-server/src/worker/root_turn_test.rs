@@ -7305,6 +7305,7 @@ impl LlmProvider for RequestLogProvider {
                 output_tokens: 20,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }
@@ -8128,6 +8129,260 @@ async fn aggregate_then_resume_after_an_early_resume_answers_each_call_once() ->
     let late = late_results_for(&request, "call_1");
     assert_eq!(late.len(), 1);
     assert!(late[0].contains("done-1"), "{}", late[0]);
+    Ok(())
+}
+
+/// Re-park `parent` the way the previous build did after a steering wake:
+/// the running `call_1` re-issued under `derived_id`, whose synthetic
+/// `tool_use` ends the history unanswered.
+async fn repark_as_previous_build(
+    stores: &TestStores,
+    parent: &AgentTask,
+    survivor: &AgentTask,
+    derived_id: &str,
+) -> Result<()> {
+    stores
+        .tasks
+        .enqueue_steering_resume(
+            &parent.id,
+            vec![ContentBlock::Text {
+                text: "status?".into(),
+            }],
+            t_plus(10),
+        )
+        .await?
+        .context("woken")?;
+    let worker = WorkerId::from_string("worker_test");
+    let lease = LeaseId::from_string("lease_test");
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent.id,
+            worker.clone(),
+            lease.clone(),
+            t_plus(900),
+            t_plus(11),
+        )
+        .await?
+        .context("acquire woken parent")?;
+
+    let mut continuation = acquired
+        .state
+        .continuation()
+        .context("parked continuation")?
+        .payload
+        .clone();
+    let mut reissued = continuation
+        .pending_tool_calls
+        .get(1)
+        .cloned()
+        .context("call_1 pending")?;
+    reissued.id = derived_id.to_owned();
+    continuation.pending_tool_calls = vec![reissued];
+    let mut suspended_messages = acquired.state.suspended_messages().to_vec();
+    suspended_messages.push(agent_sdk_foundation::llm::Message::user_with_content(vec![
+        ContentBlock::ToolResult {
+            tool_use_id: "call_0".into(),
+            content: "done-0".into(),
+            artifact: None,
+            is_error: None,
+        },
+        ContentBlock::ToolResult {
+            tool_use_id: "call_1".into(),
+            content: r#"{"note":"child is still executing; its final result will follow at the next fan-in","status":"running"}"#.into(),
+            artifact: None,
+            is_error: None,
+        },
+        ContentBlock::Text {
+            text: "status?".into(),
+        },
+    ]));
+    suspended_messages.push(agent_sdk_foundation::llm::Message {
+        role: Role::Assistant,
+        content: agent_sdk_foundation::llm::Content::Blocks(vec![
+            ContentBlock::Text {
+                text: "One call is still running.".into(),
+            },
+            ContentBlock::ToolUse {
+                id: derived_id.into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command": "call_1"}),
+                thought_signature: None,
+            },
+        ]),
+    });
+    stores
+        .tasks
+        .repark_after_steering(
+            &parent.id,
+            &worker,
+            &lease,
+            SuspensionPayload {
+                continuation: ContinuationEnvelope::wrap(continuation),
+                suspended_messages,
+                child_join_policy: ChildJoinPolicy::All,
+            },
+            vec![survivor.id.clone()],
+            t_plus(12),
+        )
+        .await?;
+    Ok(())
+}
+
+/// A row the previous build re-parked must still pair the derived id of
+/// its re-issued call with a normal `tool_result` on resume.
+#[tokio::test]
+async fn legacy_reissued_call_still_pairs_its_derived_id_on_resume() -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running(
+        &stores,
+        vec![bash_call("call_0"), bash_call("call_1")],
+    ))
+    .await?;
+    complete_child_at(
+        &stores,
+        &children[0],
+        &ok_result("done-0"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+    let derived_id = "5f0c1f8e-legacy-reattach-of-call_1";
+    repark_as_previous_build(&stores, &parent, &children[1], derived_id).await?;
+
+    complete_child_at(
+        &stores,
+        &children[1],
+        &ok_result("done-1"),
+        t_plus(20),
+        t_plus(21),
+    )
+    .await?;
+    let provider = RequestLogProvider::new("All finished.");
+    let outcome = run_child_resume(&stores, &parent.id, &provider, t_plus(30), t_plus(32)).await?;
+    assert!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+
+    let request = provider.requests()?.pop().context("resume request")?;
+    assert_eq!(
+        agent_sdk_foundation::llm::provider_tool_sequence_error_index(&request),
+        None,
+    );
+    assert_eq!(find_tool_result(&request, derived_id), Some("done-1"));
+    assert_eq!(late_results_for(&request, derived_id), Vec::<&str>::new());
+    assert_eq!(late_results_for(&request, "call_1"), Vec::<&str>::new());
+    Ok(())
+}
+
+/// Run one steering wake on the parked parent and return the steering
+/// user message the provider saw.
+async fn steering_wake_message(
+    stores: &TestStores,
+    parent_id: &AgentTaskId,
+    note: &str,
+    at: time::OffsetDateTime,
+) -> Result<agent_sdk_foundation::llm::Message> {
+    stores
+        .tasks
+        .enqueue_steering_resume(
+            parent_id,
+            vec![ContentBlock::Text { text: note.into() }],
+            at,
+        )
+        .await?
+        .context("woken")?;
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            parent_id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            at,
+        )
+        .await?
+        .context("acquire woken parent")?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap_with_tools(acquired.clone()),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        at,
+    )
+    .await?;
+    let provider = RequestLogProvider::new("Still working.");
+    let outcome = resume_for_steering(inputs, &acquired, &provider, &stores.deps(), at).await?;
+    assert!(matches!(outcome, RootTurnOutcome::Suspended { .. }));
+    provider
+        .requests()?
+        .pop()
+        .context("steering request")?
+        .pop()
+        .context("steering message")
+}
+
+fn block_kinds(message: &agent_sdk_foundation::llm::Message) -> Vec<String> {
+    let agent_sdk_foundation::llm::Content::Blocks(blocks) = &message.content else {
+        return vec!["text".to_owned()];
+    };
+    blocks
+        .iter()
+        .map(|block| match block {
+            ContentBlock::ToolResult { tool_use_id, .. } => format!("tool_result:{tool_use_id}"),
+            ContentBlock::Text { text } => {
+                agent_sdk_foundation::llm::late_tool_result::tool_use_id(text)
+                    .map_or_else(|| format!("text:{text}"), |id| format!("late:{id}"))
+            }
+            ContentBlock::Image { .. } => "image".to_owned(),
+            ContentBlock::Document { .. } => "document".to_owned(),
+            other => format!("{other:?}"),
+        })
+        .collect()
+}
+
+/// On the steering path a finished call's attachments follow the whole
+/// `tool_result` run, and a late result's attachments follow its own text,
+/// all ahead of the steering note.
+#[tokio::test]
+async fn steering_fan_in_carries_result_and_late_result_attachments_in_order() -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running(
+        &stores,
+        vec![
+            bash_call("call_0"),
+            bash_call("call_1"),
+            bash_call("call_2"),
+        ],
+    ))
+    .await?;
+    let screenshot =
+        ok_result("captured").with_documents(vec![agent_sdk_foundation::llm::ContentSource::new(
+            "image/png",
+            "iVBORw0KGgo=",
+        )]);
+    complete_child_at(&stores, &children[0], &screenshot, t_plus(8), t_plus(9)).await?;
+    let first = steering_wake_message(&stores, &parent.id, "how is it going?", t_plus(10)).await?;
+    assert_eq!(
+        block_kinds(&first),
+        [
+            "tool_result:call_0",
+            "tool_result:call_1",
+            "tool_result:call_2",
+            "image",
+            "text:how is it going?",
+        ],
+    );
+
+    let report =
+        ok_result("report").with_documents(vec![agent_sdk_foundation::llm::ContentSource::new(
+            "application/pdf",
+            "ZmFrZQ==",
+        )]);
+    complete_child_at(&stores, &children[1], &report, t_plus(20), t_plus(21)).await?;
+    let second = steering_wake_message(&stores, &parent.id, "and now?", t_plus(22)).await?;
+    assert_eq!(
+        block_kinds(&second),
+        ["late:call_1", "document", "text:and now?"],
+    );
     Ok(())
 }
 
