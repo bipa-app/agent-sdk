@@ -1365,10 +1365,20 @@ async fn best_effort_commit_parked_cancel(
     };
 
     // Prefer the durable draft (richer); fall back to the parked
-    // suspended_messages. Read BEFORE `cancel_tree` clears the state.
+    // suspended_messages. Read BEFORE `cancel_tree` clears the state. Either
+    // may start with messages a compaction already folded into the
+    // transcript; committing those again would duplicate them.
     let candidate = match deps.message_store.get(&task.thread_id).await {
-        Ok(Some(projection)) if !projection.draft_messages.is_empty() => projection.draft_messages,
-        Ok(_) => task.state.suspended_messages().to_vec(),
+        Ok(Some(projection)) => {
+            let candidate = if projection.draft_messages.is_empty() {
+                task.state.suspended_messages().to_vec()
+            } else {
+                projection.draft_messages.clone()
+            };
+            let folded = projection.folded_in_flight_prefix_len(&candidate);
+            candidate.into_iter().skip(folded).collect()
+        }
+        Ok(None) => task.state.suspended_messages().to_vec(),
         Err(error) => {
             log::warn!(
                 "cancel-commit: read draft failed on thread {}: {error:#}",
@@ -6912,14 +6922,51 @@ fn extract_pending_tool_calls(
 // Resume from completed child tool results (Phase 4.5)
 // ─────────────────────────────────────────────────────────────────────
 
-/// The prior turn's continuation plus the replay-history prefix
-/// (original user prompt + original assistant + the tool-results /
-/// steering-interim user message) threaded into a re-suspension's
-/// `suspended_messages`. Bundled so [`suspend_resumed_turn`] stays
-/// within the argument-count budget.
-struct ResumeSuspension<'a> {
-    continuation: &'a AgentContinuation,
-    history_prefix: Vec<llm::Message>,
+/// The running turn's messages that the durable projection does not hold
+/// yet: everything staged after the committed seed.
+///
+/// A compaction during this resume folds the persisted draft into the raw
+/// transcript and re-points the staged seed past it, so only messages staged
+/// after that fold remain. A re-suspension must carry exactly this suffix:
+/// parking anything the projection already holds makes the next resume
+/// re-stage it and the next compaction fold it a second time.
+fn unfolded_turn_messages(inputs: &RootWorkerInputs) -> Result<Vec<llm::Message>> {
+    inputs
+        .staged_stores
+        .messages
+        .snapshot_appended_messages()
+        .context("snapshot the turn's unfolded staged messages")
+}
+
+/// Drop the leading `in_flight` messages a compaction already folded into the
+/// durable transcript.
+///
+/// A resume that compacted and then died (provider weather, lease loss, a
+/// lost turn slot) is re-run from the same parked messages, while the fold
+/// it made is durable; restaging them would duplicate them in the next
+/// request and the next fold.
+async fn without_folded_prefix(
+    deps: &RootTurnDeps<'_>,
+    thread_id: &agent_sdk_foundation::ThreadId,
+    mut in_flight: Vec<llm::Message>,
+) -> Result<Vec<llm::Message>> {
+    let folded = deps
+        .message_store
+        .get(thread_id)
+        .await
+        .context("read projection for already-folded in-flight messages")?
+        .map_or(0, |projection| {
+            projection.folded_in_flight_prefix_len(&in_flight)
+        });
+    if folded > 0 {
+        log::warn!(
+            "thread {thread_id}: an earlier compaction already folded {folded} of {} in-flight \
+             messages into the transcript; staging only the rest",
+            in_flight.len(),
+        );
+        in_flight.drain(..folded);
+    }
+    Ok(in_flight)
 }
 
 /// Input-injection rows taken into an in-flight turn at one boundary.
@@ -7013,9 +7060,10 @@ pub(crate) async fn drain_boundary_injections(
 /// - `continuation`: the [`AgentContinuation`] extracted from the
 ///   parent's [`TaskState::ReadyToResume`] payload before the worker
 ///   acquired the task.
-/// - `suspended_messages`: the user prompt and full assistant response
-///   (including tool-use blocks) captured at the original suspension
-///   point, also from the [`TaskState::ReadyToResume`] payload.
+/// - `suspended_messages`: the turn's messages the durable projection did
+///   not hold at the previous suspension (initially the user prompt and
+///   the assistant tool-use response), also from the
+///   [`TaskState::ReadyToResume`] payload.
 /// - `child_results`: completed tool results, one per pending tool
 ///   call, keyed by tool-call ID.
 ///
@@ -7098,27 +7146,20 @@ async fn resume_root_turn_with_fan_in(
             agent_sdk::observability::loop_instrument::remote_parent_context(&trace, &span)
         });
 
-    // 2. Buffer the suspended messages (user prompt + assistant with tool
-    //    calls), completed tool results, and boundary injections on top of the
-    //    committed-only resume seed.
+    // 2. Buffer the suspended messages, completed tool results, and boundary
+    //    injections on top of the committed-only resume seed, minus whatever
+    //    an earlier compaction of this turn already folded into it.
+    let mut resumed = build_resumed_draft_messages(&suspended_messages, &fan_in);
+    resumed.extend(injected.messages.iter().cloned());
+    let resumed_draft = without_folded_prefix(deps, thread_id, resumed).await?;
     buffer_resume_messages(
-        &inputs.staged_stores.messages,
-        &inputs.staged_stores.state,
+        &inputs.staged_stores,
         thread_id,
         &continuation,
-        &suspended_messages,
-        &fan_in,
+        &resumed_draft,
     )
     .await
     .context("buffer resume messages")?;
-    for message in &injected.messages {
-        inputs
-            .staged_stores
-            .messages
-            .append(thread_id, message.clone())
-            .await
-            .context("append boundary injection")?;
-    }
 
     // 3. Refresh the projection draft before either proactive or reactive
     //    compaction can run. The staged source is now exactly
@@ -7126,13 +7167,11 @@ async fn resume_root_turn_with_fan_in(
     //    `append_compaction` can atomically fold and clear that same draft
     //    without making a paid provider call only to reject the result on a
     //    source-count mismatch.
-    let mut resumed_draft = build_resumed_draft_messages(&suspended_messages, &fan_in);
-    resumed_draft.extend(injected.messages.clone());
     persist_resume_draft_for_compaction(
         deps,
         thread_id,
         &inputs.bootstrap.task_id,
-        resumed_draft.clone(),
+        resumed_draft,
         now,
         "refresh draft with completed child results before resume LLM call",
     )
@@ -7243,10 +7282,7 @@ async fn resume_root_turn_with_fan_in(
     if response_requests_tool_dispatch(&response) {
         return suspend_resumed_turn(
             inputs,
-            ResumeSuspension {
-                continuation: &continuation,
-                history_prefix: resumed_draft,
-            },
+            &continuation,
             response,
             attempt,
             ResumeCloseContext {
@@ -7470,36 +7506,29 @@ async fn commit_resumed_turn(
     })
 }
 
-/// Buffer the suspended messages, tool results, and agent state into
-/// staged stores for the resume LLM call.
+/// Buffer the resumed in-flight messages and the continuation's agent state
+/// into the staged stores for the resume LLM call.
 ///
 /// After this function, the staged message store contains:
-/// `[checkpoint messages] + [user prompt] + [assistant with tool calls] + [tool results]`
+/// `[effective committed head] + [resumed in-flight messages]`
 async fn buffer_resume_messages(
-    staged_messages: &crate::journal::staged::StagedMessageStore,
-    staged_state: &crate::journal::staged::StagedStateStore,
+    staged: &crate::journal::staged::StagedStores,
     thread_id: &agent_sdk_foundation::ThreadId,
     continuation: &AgentContinuation,
-    suspended_messages: &[llm::Message],
-    fan_in: &llm::Message,
+    resumed: &[llm::Message],
 ) -> Result<()> {
-    // Append the suspended messages (user prompt + assistant response
-    // with tool-use blocks) captured at the original suspension point.
-    for msg in suspended_messages {
-        staged_messages
-            .append(thread_id, msg.clone())
+    for message in resumed {
+        staged
+            .messages
+            .append(thread_id, message.clone())
             .await
-            .context("append suspended message")?;
+            .context("append resumed in-flight message")?;
     }
-
-    staged_messages
-        .append(thread_id, fan_in.clone())
-        .await
-        .context("append tool results message")?;
 
     // Seed the agent state from the continuation's snapshot so the
     // staged state store reflects the state at the suspension point.
-    staged_state
+    staged
+        .state
         .save(&continuation.state)
         .await
         .context("save continuation agent state")?;
@@ -7564,13 +7593,12 @@ fn build_resumed_draft_messages(
 }
 
 /// Re-suspend a resumed turn when the LLM responds with more tool
-/// calls. Buffers the full conversation (original suspended messages +
-/// tool results + new assistant response) into the new suspension's
-/// `suspended_messages` so a subsequent resume can reconstruct the
-/// complete history.
+/// calls. The new suspension parks [`unfolded_turn_messages`] plus the new
+/// assistant response, so a subsequent resume reconstructs the turn from
+/// the projection's effective view without restaging anything it holds.
 async fn suspend_resumed_turn(
     inputs: RootWorkerInputs,
-    prior: ResumeSuspension<'_>,
+    prior: &AgentContinuation,
     mut response: llm::ChatResponse,
     attempt: TurnAttempt,
     close: ResumeCloseContext<'_>,
@@ -7590,7 +7618,7 @@ async fn suspend_resumed_turn(
 
     // Validate before closing this attempt: malformed provider identities must
     // not leave a successful attempt row without matching durable suspension.
-    let new_continuation = build_resume_continuation(&inputs, prior.continuation, &response)
+    let new_continuation = build_resume_continuation(&inputs, prior, &response)
         .context("build resume continuation")?;
     validate_pending_tool_call_identities_for_turn(&new_continuation, &inputs, deps).await?;
 
@@ -7606,16 +7634,10 @@ async fn suspend_resumed_turn(
     )
     .await?;
 
-    // Build suspended messages that capture the FULL conversation
-    // through this point: the caller-supplied replay-history prefix
-    // (original user prompt + original assistant + the tool-results /
-    // steering-interim user message) followed by the new assistant
-    // response. Threading the prefix through — rather than rebuilding it
-    // from `child_results` here — lets the steering all-terminal path
-    // preserve its interim-results-plus-note user message in the replay
-    // history instead of dropping the directive.
-    let mut new_suspended = prior.history_prefix;
-    // New assistant response (with new tool-use blocks).
+    // The staged suffix already holds whatever user message closed the
+    // previous tool batch (tool results, or the steering interim plus its
+    // note), so the steering all-terminal path keeps its directive.
+    let mut new_suspended = unfolded_turn_messages(&inputs)?;
     new_suspended.push(build_full_assistant_message(&response));
 
     // One child task per new tool call, inheriting the configured retry budget.
@@ -8476,14 +8498,9 @@ async fn run_steering_exchange(
         // user message (interim results + note) is threaded into the
         // replay history so the directive survives for the next resume.
         if response_requests_tool_dispatch(&response) {
-            let mut history_prefix = suspended_messages;
-            history_prefix.push(steering_message);
             return suspend_resumed_turn(
                 inputs,
-                ResumeSuspension {
-                    continuation: &continuation,
-                    history_prefix,
-                },
+                &continuation,
                 response,
                 attempt,
                 ResumeCloseContext {
@@ -8525,9 +8542,7 @@ async fn run_steering_exchange(
         deps,
         SteeringRepark {
             continuation,
-            suspended_messages,
             child_join_policy,
-            steering_message,
             surviving: interim.surviving,
             response,
             content_ids,
@@ -8571,21 +8586,19 @@ async fn stage_and_call_steering_llm(
         });
 
     // Buffer suspended messages + the interim-results-and-steering user
-    // message on top of the committed-only seed.
-    for msg in suspended_messages {
+    // message on top of the committed-only seed, minus whatever an earlier
+    // compaction of this turn already folded into it.
+    let mut resumed = suspended_messages.to_vec();
+    resumed.push(steering_message.clone());
+    let draft = without_folded_prefix(deps, thread_id, resumed).await?;
+    for message in &draft {
         inputs
             .staged_stores
             .messages
-            .append(thread_id, msg.clone())
+            .append(thread_id, message.clone())
             .await
-            .context("append suspended message (steering)")?;
+            .context("append steering resume message")?;
     }
-    inputs
-        .staged_stores
-        .messages
-        .append(thread_id, steering_message.clone())
-        .await
-        .context("append steering interim + note message")?;
     inputs
         .staged_stores
         .state
@@ -8595,8 +8608,6 @@ async fn stage_and_call_steering_llm(
 
     // Persist the complete steering draft before compaction so the provider
     // source and the atomically folded projection source are identical.
-    let mut draft = suspended_messages.to_vec();
-    draft.push(steering_message.clone());
     persist_resume_draft_for_compaction(
         deps,
         thread_id,
@@ -8673,9 +8684,7 @@ async fn stage_and_call_steering_llm(
 /// budget.
 struct SteeringRepark {
     continuation: AgentContinuation,
-    suspended_messages: Vec<llm::Message>,
     child_join_policy: ChildJoinPolicy,
-    steering_message: llm::Message,
     surviving: Vec<SurvivingChild>,
     response: llm::ChatResponse,
     content_ids: ContentIds,
@@ -8779,9 +8788,7 @@ async fn prepare_steering_repark(
 ) -> Result<PreparedSteeringRepark> {
     let SteeringRepark {
         continuation: prior,
-        suspended_messages,
         child_join_policy,
-        steering_message,
         surviving,
         mut response,
         content_ids,
@@ -8849,9 +8856,7 @@ async fn prepare_steering_repark(
     attach_precompleted_results(&mut specs, &preflight_completions)?;
 
     let assistant_message = build_steering_assistant_message(&response, routing.is_some());
-    let mut suspended = Vec::with_capacity(suspended_messages.len() + 2);
-    suspended.extend(suspended_messages);
-    suspended.push(steering_message);
+    let mut suspended = unfolded_turn_messages(inputs)?;
     suspended.push(assistant_message);
     let payload = SuspensionPayload {
         continuation,
