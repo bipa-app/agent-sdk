@@ -180,9 +180,23 @@ impl FailureReason {
         }
     }
 
+    /// What the user reads when a turn fails closed for this reason. The
+    /// diagnostic detail stays in [`Self::error_message`] on the row.
+    const fn user_message(self) -> &'static str {
+        match self {
+            Self::RetryBudgetExhausted | Self::LeaseExpiredBudgetExhausted => {
+                "This turn stopped after repeated failures and can't continue automatically. \
+                 Send a new message to retry."
+            }
+            Self::UnsafePreparedOperationRecovery => {
+                "This turn stopped because an interrupted tool call can't be resumed safely. \
+                 Send a new message to retry."
+            }
+        }
+    }
+
     /// The terminal `Error` event that closes `task`'s turn on its thread
-    /// when `task` fails closed for this reason, built from the row as it
-    /// was before the transition.
+    /// when `task` fails closed for this reason.
     ///
     /// `None` for rows below a thread's root turn: their failure wakes a
     /// parent that is still running the turn, so closing the thread's
@@ -190,7 +204,7 @@ impl FailureReason {
     #[must_use]
     pub fn terminal_event(self, task: &AgentTask) -> Option<AgentEvent> {
         (task.kind == TaskKind::RootTurn && task.is_root()).then(|| {
-            AgentEvent::terminal_error(self.error_message(task), self.terminal_reason())
+            AgentEvent::terminal_error(self.user_message(), self.terminal_reason())
                 .with_emitter_task_id(task.id.as_str())
         })
     }
@@ -573,6 +587,54 @@ mod tests {
         assert!(message.contains(task.id.as_str()), "missing id: {message}");
         assert!(message.contains("attempt=3"), "missing attempt: {message}");
         assert!(message.contains("max=3"), "missing max: {message}");
+    }
+
+    /// The terminal event is what a user reads when the turn dies, so it
+    /// says what happened and what to do; the diagnostic wire format
+    /// stays on the failed row's `last_error`.
+    #[test]
+    fn terminal_event_speaks_to_the_user_and_last_error_keeps_the_detail() -> Result<()> {
+        let mut task = fresh_root(3);
+        task.attempt = 3;
+        for reason in [
+            FailureReason::RetryBudgetExhausted,
+            FailureReason::LeaseExpiredBudgetExhausted,
+            FailureReason::UnsafePreparedOperationRecovery,
+        ] {
+            let event = reason
+                .terminal_event(&task)
+                .context("a root turn closes its thread's turn")?;
+            let AgentEvent::Error { message, .. } = &event else {
+                anyhow::bail!("{reason:?}: expected a terminal error, got {event:?}");
+            };
+            assert!(
+                !message.contains(reason.error_prefix()) && !message.contains(task.id.as_str()),
+                "{reason:?} leaked internal detail to the user: {message}"
+            );
+            assert!(
+                message.ends_with("Send a new message to retry."),
+                "{reason:?}: {message}"
+            );
+        }
+        let event = FailureReason::RetryBudgetExhausted
+            .terminal_event(&task)
+            .context("a root turn closes its thread's turn")?;
+        let AgentEvent::Error { message, .. } = &event else {
+            anyhow::bail!("expected a terminal error, got {event:?}");
+        };
+        assert_eq!(
+            message,
+            "This turn stopped after repeated failures and can't continue automatically. \
+             Send a new message to retry."
+        );
+
+        let failed = task.fail_with_reason(FailureReason::RetryBudgetExhausted, t_plus(1))?;
+        let last_error = failed.last_error.as_deref().context("failed row")?;
+        assert!(
+            last_error.starts_with("retry_budget_exhausted:") && last_error.contains("max=3"),
+            "unexpected last_error: {last_error}"
+        );
+        Ok(())
     }
 
     #[test]
