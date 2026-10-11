@@ -1378,7 +1378,8 @@ impl AgentTask {
     ///
     /// The caller supplies the worker ID, a freshly-minted lease token, and
     /// the absolute expiry timestamp. Increments `attempt` (Phase 2.5 uses
-    /// this as the retry counter).
+    /// this as the retry counter) unless the row
+    /// [resumes an in-flight turn](TaskState::resumes_in_flight_turn).
     ///
     /// # Errors
     /// Returns [`TaskSchemaError::InvalidTransition`] from non-`Pending`
@@ -1397,12 +1398,7 @@ impl AgentTask {
                 to: TaskStatus::Running,
             });
         }
-        // ReadyToResume is a continuation of an in-flight turn (child
-        // fan-in or early steering resume — both share the variant),
-        // not a new attempt — don't consume the retry budget on
-        // acquisition. Budget is charged on lease-release instead (see
-        // `release_lease`), which caps a poisoned resume.
-        if !matches!(self.state, TaskState::ReadyToResume { .. }) {
+        if !self.state.resumes_in_flight_turn() {
             let next_attempt = self.attempt.saturating_add(1);
             if next_attempt > self.max_attempts {
                 return Err(TaskSchemaError::AttemptExceedsMax {
@@ -1412,6 +1408,18 @@ impl AgentTask {
             }
             self.attempt = next_attempt;
         }
+        self.take_lease(worker, lease, expires_at, now);
+        self.validate()?;
+        Ok(self)
+    }
+
+    fn take_lease(
+        &mut self,
+        worker: WorkerId,
+        lease: LeaseId,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) {
         self.status = TaskStatus::Running;
         self.worker_id = Some(worker);
         self.lease_id = Some(lease);
@@ -1431,8 +1439,6 @@ impl AgentTask {
         // floor by the parked sweep.
         self.advance_last_activity_at(now);
         self.updated_at = now;
-        self.validate()?;
-        Ok(self)
     }
 
     /// Release the lease on a running task and send it back to
@@ -1450,16 +1456,14 @@ impl AgentTask {
     /// gets a fresh stamp from `mark_running` when a worker actually picks
     /// it up again.
     ///
-    /// When the task is in [`TaskState::ReadyToResume`] (an ordinary
-    /// child fan-in or an early steering resume — both share the
-    /// variant), `attempt` is incremented (capped at `max_attempts`) to
-    /// bound retries on the resume path. Without this bump, a poisoned
-    /// resume that keeps crashing would loop forever because
-    /// `mark_running` deliberately does not consume budget on
-    /// `ReadyToResume`. The cap matters for the legitimate first
-    /// resume: if the original attempt already burned the only budget
-    /// slot, the recovery matrix sees the already-exhausted row and
-    /// fails it closed instead of reaching `mark_running`.
+    /// When the task [resumes an in-flight turn](TaskState::resumes_in_flight_turn)
+    /// (a child fan-in, a steering resume, or an answered question),
+    /// `attempt` is incremented (capped at `max_attempts`) to bound
+    /// retries on the resume path. Without this bump, a poisoned resume
+    /// that keeps crashing would loop forever because `mark_running`
+    /// deliberately does not consume budget on those states. The cap
+    /// keeps the row valid; the next expiry of an exhausted resume fails
+    /// it closed.
     ///
     /// # Errors
     /// Returns [`TaskSchemaError::InvalidTransition`] if the task is not in
@@ -1471,7 +1475,7 @@ impl AgentTask {
                 to: TaskStatus::Pending,
             });
         }
-        if matches!(self.state, TaskState::ReadyToResume { .. }) {
+        if self.state.resumes_in_flight_turn() {
             self.attempt = self.attempt.saturating_add(1).min(self.max_attempts);
         }
         self.status = TaskStatus::Pending;

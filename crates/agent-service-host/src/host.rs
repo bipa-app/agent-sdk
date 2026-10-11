@@ -4253,6 +4253,185 @@ mod tests {
         Ok(())
     }
 
+    /// Asks `questions` single `ask_user` questions in a row, then
+    /// answers. Every resumed request must carry the answer to the
+    /// question before it, so the turn provably resumed through each
+    /// persisted answer.
+    struct SerialQuestionProvider {
+        questions: usize,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for SerialQuestionProvider {
+        async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(previous) = call.checked_sub(1) {
+                let expected_id = format!("ask-{previous}");
+                let expected_answer = format!("User answered: answer {previous}");
+                let answered = request.messages.iter().any(|message| {
+                    matches!(
+                        &message.content,
+                        agent_sdk_foundation::llm::Content::Blocks(blocks)
+                            if blocks.iter().any(|block| matches!(
+                                block,
+                                ContentBlock::ToolResult { tool_use_id, content, .. }
+                                    if *tool_use_id == expected_id && *content == expected_answer
+                            ))
+                    )
+                });
+                anyhow::ensure!(answered, "call {call} did not carry answer {previous}");
+            }
+            let (content, stop_reason) = if call < self.questions {
+                (
+                    vec![ContentBlock::ToolUse {
+                        id: format!("ask-{call}"),
+                        name: "ask_user".into(),
+                        input: serde_json::json!({ "question": format!("Question {call}?") }),
+                        thought_signature: None,
+                    }],
+                    StopReason::ToolUse,
+                )
+            } else {
+                (
+                    vec![ContentBlock::Text {
+                        text: "all answered".into(),
+                    }],
+                    StopReason::EndTurn,
+                )
+            };
+            Ok(ChatOutcome::Success(ChatResponse {
+                id: format!("msg_serial_question_{call}"),
+                content,
+                model: "mock-model".into(),
+                stop_reason: Some(stop_reason),
+                usage: Usage {
+                    served_speed: None,
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                },
+            }))
+        }
+
+        fn model(&self) -> &'static str {
+            "mock-model"
+        }
+
+        fn provider(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    /// One turn that asks more questions than its retry budget must
+    /// still resume after every answer and complete — through the real
+    /// acquisition scan and dispatch a worker uses.
+    async fn answer_questions_until_the_turn_completes(questions: usize) -> Result<()> {
+        use agent_sdk_foundation::{QuestionAnswer, ToolTier};
+        use agent_server::journal::task::{LeaseId, TaskStatus, WorkerId};
+
+        let definition = AgentDefinition {
+            tools: vec![agent_sdk_foundation::llm::Tool {
+                name: "ask_user".into(),
+                description: "Ask the user a question".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                display_name: "Ask User".into(),
+                tier: ToolTier::Observe,
+            }],
+            ..sample_definition()
+        };
+        let resolver = Arc::new(StaticProviderResolver::new());
+        resolver.set_fallback(Arc::new(SerialQuestionProvider {
+            questions,
+            calls: AtomicUsize::new(0),
+        }))?;
+        let runtime = Arc::new(ExecutionRuntime::new(
+            resolver,
+            Arc::new(NoopToolExecutor),
+            Arc::new(AllowAllConfirmationPolicy),
+        ));
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            Arc::new(InMemoryAgentDefinitionRegistry::new(definition)),
+            Arc::clone(&runtime),
+        )?;
+        let stores = host.stores().clone();
+        let now = time::OffsetDateTime::now_utc();
+        let thread = agent_sdk_foundation::ThreadId::from_string("t-serial-questions");
+        stores.thread_store.get_or_create(&thread, now).await?;
+        stores.message_store.get_or_create(&thread, now).await?;
+        let root = AgentTask::new_root_turn_with_input(
+            thread,
+            vec![SubmittedInputItem::Text {
+                text: "ask me everything".into(),
+            }],
+            now,
+            AgentTask::DEFAULT_ROOT_MAX_ATTEMPTS,
+        );
+        let id = root.id.clone();
+        stores.task_store.submit_root_turn(root).await?;
+
+        let cancel = CancellationToken::new();
+        for round in 0..=questions {
+            let Some(acquired) = stores
+                .task_store
+                .acquire_next_runnable(
+                    WorkerId::new(),
+                    LeaseId::new(),
+                    now + time::Duration::seconds(600),
+                    now,
+                )
+                .await?
+            else {
+                let row = stores.task_store.get(&id).await?.context("root row")?;
+                anyhow::bail!(
+                    "round {round}: the answered turn was not acquirable \
+                     (status {:?}, last_error {:?})",
+                    row.status,
+                    row.last_error,
+                );
+            };
+            execute_acquired_task(
+                acquired,
+                &stores,
+                Arc::clone(&runtime),
+                &cancel,
+                &ActivityBeacon::new(),
+            )
+            .await?;
+            let row = stores.task_store.get(&id).await?.context("root row")?;
+            if round == questions {
+                assert_eq!(row.status, TaskStatus::Completed);
+                return Ok(());
+            }
+            assert_eq!(row.status, TaskStatus::AwaitingQuestion, "round {round}");
+            stores
+                .task_store
+                .answer_question(
+                    &id,
+                    &format!("receipt-{round}"),
+                    vec![QuestionAnswer {
+                        tool_call_id: format!("ask-{round}"),
+                        answer: format!("answer {round}"),
+                    }],
+                    now,
+                )
+                .await?;
+        }
+        anyhow::bail!("the turn never completed")
+    }
+
+    #[tokio::test]
+    async fn turn_completes_after_three_answered_questions() -> Result<()> {
+        answer_questions_until_the_turn_completes(3).await
+    }
+
+    #[tokio::test]
+    async fn turn_completes_after_five_answered_questions() -> Result<()> {
+        answer_questions_until_the_turn_completes(5).await
+    }
+
     /// A completed-turn slot collision the shift refused must REQUEUE
     /// the promoted root instead of failing it terminally — the
     /// cancellation contract promises follow-up work completes, and
