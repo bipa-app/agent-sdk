@@ -1930,6 +1930,31 @@ impl AgentTask {
         Ok((self, prepared_operation))
     }
 
+    /// Approve a paused confirmation and lease the row to the approving
+    /// worker in one step, without passing through a runnable `Pending`.
+    ///
+    /// The approval continues the attempt that paused on the
+    /// confirmation, so it does not charge the retry budget: a child
+    /// whose pre-pause execution spent its last attempt stays
+    /// approvable. A crash after approval is still bounded — the swept
+    /// row's next acquisition is an ordinary charged attempt.
+    ///
+    /// # Errors
+    /// Returns [`TaskSchemaError::InvalidTransition`] if the task is not in
+    /// [`TaskStatus::AwaitingConfirmation`].
+    pub fn approve_confirmation(
+        self,
+        worker: WorkerId,
+        lease: LeaseId,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<(Self, Option<ListenExecutionContext>), TaskSchemaError> {
+        let (mut approved, prepared_operation) = self.resume_from_confirmation(now)?;
+        approved.take_lease(worker, lease, expires_at, now);
+        approved.validate()?;
+        Ok((approved, prepared_operation))
+    }
+
     /// Pause a running root turn on a durable user question.
     ///
     /// # Errors

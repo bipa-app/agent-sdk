@@ -1484,7 +1484,7 @@ pub fn apply_question_answer(
 /// | [`complete_task`](Self::complete_task) | `Running` → `Completed` + parent recompute | `(worker, lease)` CAS |
 /// | [`fail_task`](Self::fail_task) | `Running` → `Failed` + parent recompute | `(worker, lease)` CAS |
 /// | [`resume_from_confirmation`](Self::resume_from_confirmation) | `AwaitingConfirmation` → `Pending` | status CAS |
-/// | [`approve_confirmation_and_acquire`](Self::approve_confirmation_and_acquire) | `AwaitingConfirmation` → `Running` | status CAS, retry budget |
+/// | [`approve_confirmation_and_acquire`](Self::approve_confirmation_and_acquire) | `AwaitingConfirmation` → `Running` | status CAS |
 /// | [`reject_confirmation`](Self::reject_confirmation) | `AwaitingConfirmation` → `Failed` + parent recompute | status CAS |
 /// | [`cancel_tree`](Self::cancel_tree) | subtree → `Cancelled` | existence check |
 /// | [`release_expired_leases`](Self::release_expired_leases) | `Running` → `Pending` / `Failed` | lease-expiry CAS, recovery matrix |
@@ -2730,9 +2730,9 @@ pub trait AgentTaskStore: Send + Sync {
     ///    [`TaskStatus::AwaitingConfirmation`].
     /// 2. Extracts the prepared listen/execute operation from the
     ///    typed confirmation payload.
-    /// 3. Flips the row back to [`TaskStatus::Pending`] and immediately
-    ///    claims it as [`TaskStatus::Running`] under the supplied
-    ///    `(worker, lease)` ownership token.
+    /// 3. Claims it as [`TaskStatus::Running`] under the supplied
+    ///    `(worker, lease)` ownership token without charging the retry
+    ///    budget (see [`AgentTask::approve_confirmation`]).
     /// 4. Persists the claimed row under the same write lock so no
     ///    concurrent scan can observe an intermediate `Pending` row.
     ///
@@ -2744,8 +2744,7 @@ pub trait AgentTaskStore: Send + Sync {
     /// - `task does not exist` — if no row with `id` is stored.
     /// - `approve rejected: not awaiting confirmation` — if the row is
     ///   in any status other than [`TaskStatus::AwaitingConfirmation`].
-    /// - Schema errors from [`AgentTask::resume_from_confirmation`] or
-    ///   [`AgentTask::mark_running`].
+    /// - Schema errors from [`AgentTask::approve_confirmation`].
     async fn approve_confirmation_and_acquire(
         &self,
         id: &AgentTaskId,
@@ -6095,13 +6094,10 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             ));
         }
 
-        let (resumed, prepared_operation) = old
+        let (claimed, prepared_operation) = old
             .clone()
-            .resume_from_confirmation(now)
-            .context("approve rejected: resume_from_confirmation transition failed")?;
-        let claimed = resumed
-            .mark_running(worker, lease, expires_at, now)
-            .context("approve rejected: mark_running transition failed")?;
+            .approve_confirmation(worker, lease, expires_at, now)
+            .context("approve rejected: approve_confirmation transition failed")?;
         inner.rebalance_after_row_change(&old, &claimed);
         inner.by_id.insert(claimed.id.clone(), claimed.clone());
         drop(inner);

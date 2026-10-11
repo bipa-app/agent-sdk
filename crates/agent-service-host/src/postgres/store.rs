@@ -4914,13 +4914,10 @@ ORDER BY created_at, id
                 "approve rejected: task {id} is not awaiting confirmation (status {status:?})"
             ));
         }
-        let (resumed, prepared_operation) = old
+        let (claimed, prepared_operation) = old
             .clone()
-            .resume_from_confirmation(now)
-            .context("approve rejected: resume_from_confirmation transition failed")?;
-        let claimed = resumed
-            .mark_running(worker, lease, expires_at, now)
-            .context("approve rejected: mark_running transition failed")?;
+            .approve_confirmation(worker, lease, expires_at, now)
+            .context("approve rejected: approve_confirmation transition failed")?;
         Self::update_task_tx(&mut tx, &claimed).await?;
         tx.commit()
             .await
