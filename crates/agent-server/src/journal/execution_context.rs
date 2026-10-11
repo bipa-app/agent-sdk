@@ -219,6 +219,7 @@ mod tests {
             thinking_display: None,
             tools_fn: None,
             tool_input_sanitizer: None,
+            request_context_fn: None,
             policy: RuntimePolicy::server_default(),
         }
     }
@@ -622,6 +623,7 @@ mod tests {
             tools: Vec::new(),
             tools_fn: None,
             tool_input_sanitizer: None,
+            request_context_fn: None,
             thinking: ThinkingPolicy::Enabled {
                 budget_tokens: 1000,
             },

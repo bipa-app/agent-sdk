@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use agent_sdk_foundation::llm::{Effort, ThinkingDisplay, Tool};
+use agent_sdk_foundation::llm::{Effort, Message, ThinkingDisplay, Tool};
 use agent_sdk_foundation::{ThreadId, ToolResult, ToolRuntime};
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +46,34 @@ pub struct ToolFilterContext {
 /// filtering is desired. Invoked from the worker's turn-composition
 /// path immediately before the LLM request is built.
 pub type ToolsFn = Arc<dyn Fn(&ToolFilterContext) -> Vec<Tool> + Send + Sync>;
+
+// ─────────────────────────────────────────────────────────────────────
+// Per-request context
+// ─────────────────────────────────────────────────────────────────────
+
+/// What a provider request is answering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderRequestKind {
+    /// The last message is the user input submitted for this turn.
+    FreshInput,
+    /// The request continues a turn from staged history: tool or child
+    /// results, an answered question, or input delivered mid-turn.
+    Continuation,
+}
+
+/// Input handed to [`AgentDefinition::request_context_fn`] for one provider
+/// request.
+pub struct RequestContextInput<'a> {
+    pub thread_id: &'a ThreadId,
+    /// The request's messages as assembled from staged history plus the user
+    /// input, before any request context is appended.
+    pub messages: &'a [Message],
+    pub kind: ProviderRequestKind,
+    pub caller_metadata: Option<&'a serde_json::Value>,
+}
+
+/// Host hook returning request-only context for one provider request.
+pub type RequestContextFn = Arc<dyn Fn(&RequestContextInput<'_>) -> Option<String> + Send + Sync>;
 
 /// Trusted caller context for a host-supplied tool-input preflight.
 pub struct ToolInputPreflightContext<'a> {
@@ -160,8 +188,9 @@ impl Default for RuntimePolicy {
 ///
 /// The struct is `Serialize + Deserialize` so it can be persisted as
 /// part of audit rows or checkpoint metadata. The optional
-/// [`tools_fn`](Self::tools_fn) and
-/// [`tool_input_sanitizer`](Self::tool_input_sanitizer) closures are skipped
+/// [`tools_fn`](Self::tools_fn),
+/// [`tool_input_sanitizer`](Self::tool_input_sanitizer), and
+/// [`request_context_fn`](Self::request_context_fn) closures are skipped
 /// by serde because closures are not serializable.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AgentDefinition {
@@ -203,6 +232,19 @@ pub struct AgentDefinition {
     /// not retain this process-local hook.
     #[serde(skip)]
     pub tool_input_sanitizer: Option<Arc<ToolInputSanitizer>>,
+    /// Optional per-request context hook.
+    ///
+    /// Invoked synchronously each time root provider messages are assembled:
+    /// the initial request of every call and the rebuild after emergency
+    /// compaction. Transport retries resend the same request without calling
+    /// it again. Returned non-blank text is wrapped
+    /// in `<system-reminder>` tags and appended after the request's last
+    /// message, behind the cached prompt prefix. The text is request-only:
+    /// it is never written to staged history, the journal, message
+    /// projections, checkpoints, or transcripts. Hosts with async state
+    /// should capture an `Arc` to a snapshot they keep current elsewhere.
+    #[serde(skip)]
+    pub request_context_fn: Option<RequestContextFn>,
     /// Extended thinking configuration.
     pub thinking: ThinkingPolicy,
     /// How thinking content is returned when [`thinking`](Self::thinking)
@@ -241,6 +283,13 @@ impl std::fmt::Debug for AgentDefinition {
                 "tool_input_sanitizer",
                 &self
                     .tool_input_sanitizer
+                    .as_ref()
+                    .map_or("None", |_| "Some(<closure>)"),
+            )
+            .field(
+                "request_context_fn",
+                &self
+                    .request_context_fn
                     .as_ref()
                     .map_or("None", |_| "Some(<closure>)"),
             )
@@ -296,6 +345,16 @@ impl AgentDefinition {
             _ => self.tools.clone(),
         }
     }
+
+    /// Run [`request_context_fn`](Self::request_context_fn), discarding
+    /// blank output.
+    #[must_use]
+    pub fn resolve_request_context(&self, input: &RequestContextInput<'_>) -> Option<String> {
+        self.request_context_fn
+            .as_ref()
+            .and_then(|hook| hook(input))
+            .filter(|text| !text.trim().is_empty())
+    }
 }
 
 #[cfg(test)]
@@ -322,6 +381,7 @@ mod tests {
             tools,
             tools_fn: None,
             tool_input_sanitizer: None,
+            request_context_fn: None,
             thinking: ThinkingPolicy::default(),
             thinking_display: None,
             policy: RuntimePolicy::default(),
@@ -387,12 +447,14 @@ mod tests {
         let def = AgentDefinition {
             tools_fn: Some(Arc::new(|_| vec![tool("ghost")])),
             tool_input_sanitizer: Some(Arc::new(|_, _, _| Ok(ToolInputPreflightOutcome::Allow))),
+            request_context_fn: Some(Arc::new(|_| Some("ghost".to_owned()))),
             ..definition_with_static_tools(vec![tool("persistent")])
         };
         let json = serde_json::to_string(&def).expect("serialize");
         let restored: AgentDefinition = serde_json::from_str(&json).expect("deserialize");
         assert!(restored.tools_fn.is_none());
         assert!(restored.tool_input_sanitizer.is_none());
+        assert!(restored.request_context_fn.is_none());
         assert_eq!(restored.tools.len(), 1);
         assert_eq!(restored.tools[0].name, "persistent");
         let resolved = restored.resolve_tools(None);
@@ -449,8 +511,50 @@ mod tests {
         let b = AgentDefinition {
             tools_fn: Some(Arc::new(|_| Vec::new())),
             tool_input_sanitizer: Some(Arc::new(|_, _, _| Ok(ToolInputPreflightOutcome::Allow))),
+            request_context_fn: Some(Arc::new(|_| None)),
             ..definition_with_static_tools(vec![tool("x")])
         };
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn resolve_request_context_passes_input_and_drops_blank_output() {
+        let thread_id = ThreadId::from_string("t-request-context");
+        let messages = vec![Message::user("hi")];
+        let metadata = serde_json::json!({ "role": "admin" });
+        let input = RequestContextInput {
+            thread_id: &thread_id,
+            messages: &messages,
+            kind: ProviderRequestKind::FreshInput,
+            caller_metadata: Some(&metadata),
+        };
+
+        assert_eq!(
+            definition_with_static_tools(Vec::new()).resolve_request_context(&input),
+            None
+        );
+
+        let echo = AgentDefinition {
+            request_context_fn: Some(Arc::new(|input| {
+                Some(format!(
+                    "{} {:?} {} {}",
+                    input.thread_id,
+                    input.kind,
+                    input.messages.len(),
+                    input.caller_metadata.is_some(),
+                ))
+            })),
+            ..definition_with_static_tools(Vec::new())
+        };
+        assert_eq!(
+            echo.resolve_request_context(&input).as_deref(),
+            Some("t-request-context FreshInput 1 true")
+        );
+
+        let blank = AgentDefinition {
+            request_context_fn: Some(Arc::new(|_| Some(" \n\t".to_owned()))),
+            ..definition_with_static_tools(Vec::new())
+        };
+        assert_eq!(blank.resolve_request_context(&input), None);
     }
 }

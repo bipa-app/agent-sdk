@@ -137,8 +137,9 @@ pub use activity::{ActivityBeacon, ActivityTrackingEventRepo};
 pub use bootstrap::{WorkerBootstrapContext, resolve_bootstrap_context};
 pub use connectivity::{ConnectivityWait, ConnectivityWaitGuard, ConnectivityWaitRegistry};
 pub use definition::{
-    AgentDefinition, ChildJoinPolicy, RuntimePolicy, ThinkingPolicy, ToolInputPreflightContext,
-    ToolInputPreflightOutcome, ToolInputSanitizer,
+    AgentDefinition, ChildJoinPolicy, ProviderRequestKind, RequestContextFn, RequestContextInput,
+    RuntimePolicy, ThinkingPolicy, ToolInputPreflightContext, ToolInputPreflightOutcome,
+    ToolInputSanitizer,
 };
 pub use registry::{AgentDefinitionRegistry, InMemoryAgentDefinitionRegistry};
 pub use root_turn::{

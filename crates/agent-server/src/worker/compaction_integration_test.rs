@@ -286,6 +286,7 @@ fn sample_definition() -> AgentDefinition {
         thinking_display: None,
         tools_fn: None,
         tool_input_sanitizer: None,
+        request_context_fn: None,
         policy: RuntimePolicy::server_default(),
     }
 }
@@ -1515,6 +1516,74 @@ async fn prompt_too_long_triggers_emergency_compaction_and_retry() -> Result<()>
         "no Error event should be emitted when emergency compaction succeeds",
     );
 
+    Ok(())
+}
+
+/// The request rebuilt after emergency compaction carries the definition's
+/// request-only context again, while the summarization call and the compacted
+/// projection never see it.
+#[tokio::test]
+async fn prompt_too_long_retry_reapplies_request_context() -> Result<()> {
+    const MARKER: &str = "REQUEST-ONLY-OVERFLOW-91c2";
+    let fixtures = Fixtures::new();
+    seed_projection_history(&fixtures.messages, &thread_id(), 12, &"y".repeat(200)).await?;
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::PruneFirst)
+        .with_threshold_tokens(usize::MAX);
+    let scripted = Arc::new(ScriptedProvider::new(vec![
+        ChatOutcome::InvalidRequest("prompt is too long: 1010596 tokens > 1000000 maximum".into()),
+        ok_response("[emergency summary]"),
+        ok_response("Hello after recovery"),
+    ]));
+    let provider: Arc<dyn LlmProvider> = scripted.clone();
+    let deps = fixtures.deps_with_compaction(&cfg, &provider);
+
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    let mut bootstrap = sample_bootstrap(task);
+    bootstrap.definition.request_context_fn = Some(Arc::new(|_| Some(MARKER.to_owned())));
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &fixtures.threads,
+        &fixtures.checkpoints,
+        &fixtures.messages,
+        t0(),
+    )
+    .await?;
+    let outcome = execute_root_turn(
+        inputs,
+        "Tell me a joke",
+        provider.as_ref(),
+        &deps,
+        t0() + Duration::seconds(1),
+    )
+    .await?;
+    let RootTurnOutcome::Completed { .. } = outcome else {
+        anyhow::bail!("expected Completed turn after emergency compaction");
+    };
+
+    let requests = scripted.captured_requests()?;
+    let [rejected, summarization, retry] = requests.as_slice() else {
+        anyhow::bail!("expected rejection, summarization, and retry requests");
+    };
+    let ends_with_context = |request: &ChatRequest| {
+        matches!(
+            request.messages.last().map(|message| &message.content),
+            Some(Content::Blocks(blocks)) if matches!(
+                blocks.last(),
+                Some(ContentBlock::Text { text })
+                    if text == &format!("<system-reminder>\n{MARKER}\n</system-reminder>")
+            )
+        )
+    };
+    assert!(ends_with_context(rejected));
+    assert!(ends_with_context(retry));
+    assert!(retry.messages.len() < rejected.messages.len());
+    assert!(!format!("{:?}", summarization.messages).contains(MARKER));
+
+    let projection = fixtures.messages.get(&thread_id()).await?;
+    assert!(!format!("{projection:?}").contains(MARKER));
+    let events = fixtures.events.get_events(&thread_id()).await?;
+    assert!(!format!("{events:?}").contains(MARKER));
     Ok(())
 }
 
