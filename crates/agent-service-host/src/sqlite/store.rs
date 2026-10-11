@@ -4411,8 +4411,8 @@ impl AgentTaskStore for SqliteDurableStore {
         }
         let (resumed, prepared_operation) = old
             .clone()
-            .resume_from_confirmation(now)
-            .context("resume rejected: resume_from_confirmation transition failed")?;
+            .approve_confirmation_for_pickup(now)
+            .context("resume rejected: approve_confirmation_for_pickup transition failed")?;
         Self::update_task_tx(&mut tx, &resumed).await?;
         tx.commit()
             .await

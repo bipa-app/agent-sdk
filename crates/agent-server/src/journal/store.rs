@@ -2710,6 +2710,9 @@ pub trait AgentTaskStore: Send + Sync {
     /// lock so there is no window for a concurrent rejection to
     /// invalidate the snapshot.
     ///
+    /// The resumed row's pickup continues the attempt that paused rather
+    /// than spending a new one (see [`AgentTask::approve_confirmation_for_pickup`]).
+    ///
     /// # Errors
     /// - `task does not exist` — if no row with `id` is stored.
     /// - `resume rejected: not awaiting confirmation` — if the row is
@@ -6078,8 +6081,8 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
 
         let (resumed, prepared_operation) = old
             .clone()
-            .resume_from_confirmation(now)
-            .context("resume rejected: resume_from_confirmation transition failed")?;
+            .approve_confirmation_for_pickup(now)
+            .context("resume rejected: approve_confirmation_for_pickup transition failed")?;
         inner.rebalance_after_row_change(&old, &resumed);
         inner.by_id.insert(resumed.id.clone(), resumed.clone());
         drop(inner);

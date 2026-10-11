@@ -1955,6 +1955,27 @@ impl AgentTask {
         Ok((approved, prepared_operation))
     }
 
+    /// Approve a paused confirmation back to [`TaskStatus::Pending`] for a
+    /// later acquisition.
+    ///
+    /// The approval continues the attempt that paused, so the attempt that
+    /// pause was charged is refunded: the pickup re-enters it instead of
+    /// spending a new one. A pickup that keeps crashing stays bounded:
+    /// every acquisition after a reclaimed lease is charged as usual.
+    ///
+    /// # Errors
+    /// Returns [`TaskSchemaError::InvalidTransition`] if the task is not in
+    /// [`TaskStatus::AwaitingConfirmation`].
+    pub fn approve_confirmation_for_pickup(
+        self,
+        now: OffsetDateTime,
+    ) -> Result<(Self, Option<ListenExecutionContext>), TaskSchemaError> {
+        let (mut approved, prepared_operation) = self.resume_from_confirmation(now)?;
+        approved.attempt = approved.attempt.saturating_sub(1);
+        approved.validate()?;
+        Ok((approved, prepared_operation))
+    }
+
     /// Pause a running root turn on a durable user question.
     ///
     /// # Errors

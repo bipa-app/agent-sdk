@@ -1193,3 +1193,44 @@ async fn reject_confirmation_rejects_pending_task() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn approved_confirmation_pickup_continues_the_paused_attempt() -> Result<()> {
+    let stores = TestStores::new();
+    let (_parent, children) = suspend_root_with_tools(
+        &stores,
+        vec![(
+            "call_1".into(),
+            "transfer".into(),
+            serde_json::json!({"amount": 1}),
+        )],
+    )
+    .await?;
+
+    let child = acquire_child(&stores.tasks, &children[0].id).await?;
+    assert_eq!(child.attempt, 1);
+    let bootstrap = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
+    pause_tool_for_confirmation(&bootstrap, &stores.tasks, &stores.events, t_plus(15)).await?;
+    apply_confirmation_decision(
+        &children[0].id,
+        ConfirmationDecision::Approved,
+        &stores.tasks,
+        &stores.events,
+        t_plus(20),
+    )
+    .await?;
+
+    let picked_up = acquire_child_with(
+        &stores.tasks,
+        &children[0].id,
+        resume_worker(),
+        resume_lease(),
+        t_plus(25),
+    )
+    .await?;
+    assert_eq!(
+        picked_up.attempt, 1,
+        "the approval continues the attempt that paused instead of spending a retry",
+    );
+    Ok(())
+}
