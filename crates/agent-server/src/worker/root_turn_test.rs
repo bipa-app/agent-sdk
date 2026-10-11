@@ -8,10 +8,10 @@
 use super::root_turn::{
     PartialCancelCommit, RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes,
     build_tool_results_message, cancel_root_turn, commit_partial_turn_on_cancel,
-    derive_reattach_tool_use_id, drain_boundary_injections, execute_root_turn, fail_root_turn,
-    is_root_turn_cancelled, provider_valid_split, resume_for_steering, resume_from_children,
-    resume_from_question, resume_root_turn, revert_steering_wake,
-    settle_attempt_after_lost_ownership, terminal_reason_for_root_error,
+    drain_boundary_injections, execute_root_turn, fail_root_turn, is_root_turn_cancelled,
+    provider_valid_split, resume_for_steering, resume_from_children, resume_from_question,
+    resume_root_turn, revert_steering_wake, settle_attempt_after_lost_ownership,
+    terminal_reason_for_root_error,
 };
 use crate::journal::checkpoint::CheckpointKind;
 use std::sync::Arc;
@@ -6114,8 +6114,8 @@ async fn steering_wake_answers_and_reparks_with_wire_contract() -> Result<()> {
     assert!(interim.contains("running"), "interim payload: {interim}");
     assert!(messages_contain_text(&msgs, "how is it going?"));
 
-    // Re-park: no new children, parent waits on the survivor under a
-    // fresh binding, the finished child is dropped from tracking.
+    // Re-park: no new children, parent waits on the survivor under its
+    // original call, the finished child is dropped from tracking.
     let RootTurnOutcome::Suspended {
         parent_task,
         child_tasks,
@@ -6127,7 +6127,6 @@ async fn steering_wake_answers_and_reparks_with_wire_contract() -> Result<()> {
     assert!(child_tasks.is_empty(), "re-attach must spawn nothing");
     assert_eq!(parent_task.status, TaskStatus::WaitingOnChildren);
     assert_eq!(parent_task.pending_child_count, 1);
-    let reattach_id = derive_reattach_tool_use_id("call_1");
     match &parent_task.state {
         TaskState::WaitingOnChildren {
             continuation,
@@ -6137,7 +6136,7 @@ async fn steering_wake_answers_and_reparks_with_wire_contract() -> Result<()> {
             assert_eq!(child_ids.as_slice(), std::slice::from_ref(&children[1].id));
             let pending = &continuation.payload.pending_tool_calls;
             assert_eq!(pending.len(), 1);
-            assert_eq!(pending[0].id, reattach_id);
+            assert_eq!(pending[0].id, "call_1");
             assert_eq!(pending[0].name, "bash");
         }
         other => panic!("expected WaitingOnChildren re-park, got {other:?}"),
@@ -6146,19 +6145,27 @@ async fn steering_wake_answers_and_reparks_with_wire_contract() -> Result<()> {
     let child1 = stores.tasks.get(&children[1].id).await?.context("child1")?;
     assert_eq!(child1.spawn_index, Some(0));
 
-    // Survivor finishes → the real result reaches the coordinator under
-    // the fresh binding (nothing lost, nothing duplicated).
-    assert_survivor_fanin_delivers(&stores, &parent, &children[1], &reattach_id).await
+    // Survivor finishes → the real result reaches the coordinator once,
+    // as a late result for the original call (nothing lost or duplicated).
+    assert_survivor_fanin_delivers(&stores, &parent, &children[1], "call_1").await
+}
+
+/// The late result delivered for `id`, one entry per delivery.
+fn late_results_for<'a>(
+    messages: &'a [agent_sdk_foundation::llm::Message],
+    id: &str,
+) -> Vec<&'a str> {
+    text_blocks_containing(messages, &format!("<late_tool_result tool_use_id=\"{id}\""))
 }
 
 /// Complete the still-running survivor, drive the ordinary fan-in, and
-/// assert the coordinator's final LLM history resolves the re-issued
-/// binding with the survivor's REAL result.
+/// assert the coordinator's final LLM history carries the survivor's
+/// REAL result exactly once, without a second `tool_result` for its call.
 async fn assert_survivor_fanin_delivers(
     stores: &TestStores,
     parent: &AgentTask,
     survivor: &AgentTask,
-    reattach_id: &str,
+    call_id: &str,
 ) -> Result<()> {
     complete_child_at(
         stores,
@@ -6195,11 +6202,15 @@ async fn assert_survivor_fanin_delivers(
     let provider = SteeringCaptureProvider::new("All finished.");
     let outcome =
         resume_from_children(inputs, &final_acq, &provider, &stores.deps(), t_plus(65)).await?;
+    let captured = provider.captured();
+    let late = late_results_for(&captured, call_id);
     assert_eq!(
-        find_tool_result(&provider.captured(), reattach_id),
-        Some("done-1"),
-        "final fan-in must resolve the re-issued binding with the real result",
+        late.len(),
+        1,
+        "final fan-in must deliver the real result once"
     );
+    assert!(late[0].contains("done-1"), "late result: {}", late[0]);
+    assert_eq!(count_tool_results(&captured, call_id), 1);
     assert!(matches!(outcome, RootTurnOutcome::Completed { .. }));
     Ok(())
 }
@@ -6324,10 +6335,10 @@ async fn wait_any_resumes_each_wave_without_redelivering_settled_results() -> Re
         1,
         "the first settled result is retained in history, not delivered again",
     );
-    assert_eq!(
-        find_tool_result(&captured, &derive_reattach_tool_use_id("call_1")),
-        Some("done-1"),
-    );
+    let late = late_results_for(&captured, "call_1");
+    assert_eq!(late.len(), 1);
+    assert!(late[0].contains("done-1"), "late result: {}", late[0]);
+    assert_eq!(count_tool_results(&captured, "call_1"), 1);
     assert_eq!(second_repark.pending_child_count, 1);
     Ok(())
 }
@@ -6508,18 +6519,15 @@ async fn steering_wake_restart_between_wake_and_repark_resumes_cleanly() -> Resu
     let outcome =
         resume_for_steering(inputs, &reacquired, &provider, &stores.deps(), t_plus(215)).await?;
 
-    // Re-park is deterministic: the survivor re-attaches under the same
-    // derived id a first run would have produced.
+    // Re-park is deterministic: the survivor stays bound to its original
+    // call, exactly as a first run would have left it.
     let RootTurnOutcome::Suspended { parent_task, .. } = outcome else {
         panic!("expected Suspended re-park after restart");
     };
     assert_eq!(parent_task.status, TaskStatus::WaitingOnChildren);
     match &parent_task.state {
         TaskState::WaitingOnChildren { continuation, .. } => {
-            assert_eq!(
-                continuation.payload.pending_tool_calls[0].id,
-                derive_reattach_tool_use_id("call_0"),
-            );
+            assert_eq!(continuation.payload.pending_tool_calls[0].id, "call_0");
         }
         other => panic!("expected WaitingOnChildren, got {other:?}"),
     }
@@ -6676,7 +6684,7 @@ async fn assert_final_fanin_has_no_stray(
     stores: &TestStores,
     parent_id: &AgentTaskId,
     survivor: &AgentTask,
-    reattach_id: &str,
+    call_id: &str,
     stop_reason: StopReason,
 ) -> Result<()> {
     complete_child_at(
@@ -6720,7 +6728,9 @@ async fn assert_final_fanin_has_no_stray(
         "next wake must complete ({stop_reason:?})",
     );
     let msgs = final_provider.captured();
-    assert_eq!(find_tool_result(&msgs, reattach_id), Some("done-1"));
+    let late = late_results_for(&msgs, call_id);
+    assert_eq!(late.len(), 1, "({stop_reason:?})");
+    assert!(late[0].contains("done-1"), "late result: {}", late[0]);
     assert!(
         !messages_contain_tool_use_id(&msgs, "stray_call"),
         "undispatched tool_use must not be replayed ({stop_reason:?})",
@@ -6770,7 +6780,6 @@ async fn assert_steering_repark_drops_undispatched_tool_use(stop_reason: StopRea
     ))
     .await?;
     assert_eq!(parent_task.pending_child_count, 1);
-    let reattach_id = derive_reattach_tool_use_id("call_1");
     match &parent_task.state {
         TaskState::WaitingOnChildren {
             continuation,
@@ -6784,7 +6793,7 @@ async fn assert_steering_repark_drops_undispatched_tool_use(stop_reason: StopRea
                 1,
                 "pending must be the re-attach batch only ({stop_reason:?}): {pending:?}",
             );
-            assert_eq!(pending[0].id, reattach_id);
+            assert_eq!(pending[0].id, "call_1");
             assert!(
                 continuation
                     .payload
@@ -6820,7 +6829,7 @@ async fn assert_steering_repark_drops_undispatched_tool_use(stop_reason: StopRea
         &stores,
         &parent.id,
         &children[1],
-        &reattach_id,
+        "call_1",
         stop_reason,
     ))
     .await
@@ -6883,8 +6892,8 @@ async fn wait_any_partial_resume_drops_undispatched_tool_use_and_next_wave_succe
                 2,
                 "pending must be the re-attach batch only: {pending:?}",
             );
-            assert_eq!(pending[0].id, derive_reattach_tool_use_id("call_1"));
-            assert_eq!(pending[1].id, derive_reattach_tool_use_id("call_2"));
+            assert_eq!(pending[0].id, "call_1");
+            assert_eq!(pending[1].id, "call_2");
         }
         other => panic!("expected WaitingOnChildren re-park, got {other:?}"),
     }
@@ -6912,10 +6921,9 @@ async fn wait_any_partial_resume_drops_undispatched_tool_use_and_next_wave_succe
     .await?;
     let (second_repark, captured) =
         resume_wait_any_wave(&stores, &parent.id, t_plus(22), t_plus(25), "Second wave.").await?;
-    assert_eq!(
-        find_tool_result(&captured, &derive_reattach_tool_use_id("call_1")),
-        Some("done-1"),
-    );
+    let late = late_results_for(&captured, "call_1");
+    assert_eq!(late.len(), 1);
+    assert!(late[0].contains("done-1"), "late result: {}", late[0]);
     assert!(
         !messages_contain_tool_use_id(&captured, "stray_call"),
         "undispatched tool_use must not be replayed",
@@ -7220,6 +7228,509 @@ async fn steering_wake_failure_reverts_to_parked_state_without_stranding_childre
     );
     assert!(matches!(outcome, RootTurnOutcome::Completed { .. }));
 
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Early resume: a still-running call is never re-presented as new
+// ─────────────────────────────────────────────────────────────────────
+
+/// Records every provider request of a turn, across resumes, so a test
+/// can audit the whole request sequence an early-resumed turn produces.
+struct RequestLogProvider {
+    response_text: String,
+    requests: std::sync::Mutex<Vec<Vec<agent_sdk_foundation::llm::Message>>>,
+}
+
+impl RequestLogProvider {
+    fn new(text: &str) -> Self {
+        Self {
+            response_text: text.to_owned(),
+            requests: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn requests(&self) -> Result<Vec<Vec<agent_sdk_foundation::llm::Message>>> {
+        Ok(self
+            .requests
+            .lock()
+            .map_err(|_| anyhow::anyhow!("request log poisoned"))?
+            .clone())
+    }
+}
+
+#[async_trait]
+impl LlmProvider for RequestLogProvider {
+    async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
+        self.requests
+            .lock()
+            .map_err(|_| anyhow::anyhow!("request log poisoned"))?
+            .push(request.messages);
+        Ok(ChatOutcome::Success(ChatResponse {
+            id: "msg_early_resume".into(),
+            content: vec![ContentBlock::Text {
+                text: self.response_text.clone(),
+            }],
+            model: "mock-model".into(),
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage {
+                served_speed: None,
+                input_tokens: 70,
+                output_tokens: 20,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+        }))
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
+fn tool_use_ids(messages: &[agent_sdk_foundation::llm::Message]) -> Vec<String> {
+    messages
+        .iter()
+        .filter_map(|message| match &message.content {
+            agent_sdk_foundation::llm::Content::Blocks(blocks) => Some(blocks),
+            agent_sdk_foundation::llm::Content::Text(_) => None,
+        })
+        .flatten()
+        .filter_map(|block| {
+            if let ContentBlock::ToolUse { id, .. } = block {
+                Some(id.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn text_blocks_containing<'a>(
+    messages: &'a [agent_sdk_foundation::llm::Message],
+    needle: &str,
+) -> Vec<&'a str> {
+    messages
+        .iter()
+        .filter_map(|message| match &message.content {
+            agent_sdk_foundation::llm::Content::Blocks(blocks) => Some(blocks),
+            agent_sdk_foundation::llm::Content::Text(_) => None,
+        })
+        .flatten()
+        .filter_map(|block| {
+            if let ContentBlock::Text { text } = block
+                && text.contains(needle)
+            {
+                Some(text.as_str())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Every request must satisfy the provider pairing contract, and every
+/// call must appear as exactly one `tool_use` under its original id.
+fn assert_each_request_presents_calls_once(
+    requests: &[Vec<agent_sdk_foundation::llm::Message>],
+    expected_ids: &[&str],
+) {
+    for (index, request) in requests.iter().enumerate() {
+        assert_eq!(
+            agent_sdk_foundation::llm::provider_tool_sequence_error_index(request),
+            None,
+            "request {index} violates tool_use/tool_result pairing",
+        );
+        assert_eq!(
+            tool_use_ids(request),
+            expected_ids,
+            "request {index} must present each call once, under its original id",
+        );
+    }
+}
+
+/// Acquire the ready parent and run whichever resume its durable state
+/// asks for (early when children are still running, final otherwise).
+async fn run_child_resume(
+    stores: &TestStores,
+    parent_id: &AgentTaskId,
+    provider: &dyn LlmProvider,
+    acquire_at: time::OffsetDateTime,
+    resume_at: time::OffsetDateTime,
+) -> Result<RootTurnOutcome> {
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            parent_id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            acquire_at,
+        )
+        .await?
+        .context("acquire ready parent")?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap_with_tools(acquired.clone()),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        acquire_at,
+    )
+    .await?;
+    resume_from_children(inputs, &acquired, provider, &stores.deps(), resume_at).await
+}
+
+/// Acquire a still-running survivor the way a tool worker would and
+/// return the tool call it resolves from the re-parked parent.
+async fn acquire_survivor_binding(
+    stores: &TestStores,
+    survivor: &AgentTask,
+    worker: &WorkerId,
+    lease: &LeaseId,
+    acquire_at: time::OffsetDateTime,
+) -> Result<agent_sdk_foundation::PendingToolCallInfo> {
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &survivor.id,
+            worker.clone(),
+            lease.clone(),
+            t_plus(900),
+            acquire_at,
+        )
+        .await?
+        .context("acquire survivor")?;
+    let bootstrap = crate::worker::tool_task::resolve_tool_bootstrap(
+        acquired,
+        &stores.tasks,
+        crate::worker::activity::ActivityBeacon::default(),
+    )
+    .await?;
+    Ok(bootstrap.tool_call)
+}
+
+/// The early resume re-parked without spawning, keeping the running call
+/// bound to its original id and adding no `tool_use` to the history.
+fn assert_reparked_on_original_call(
+    outcome: RootTurnOutcome,
+    survivor: &AgentTask,
+    history_ids: &[&str],
+) -> Result<()> {
+    let RootTurnOutcome::Suspended {
+        parent_task,
+        child_tasks,
+        ..
+    } = outcome
+    else {
+        bail!("an early resume with a running child must re-park");
+    };
+    assert!(child_tasks.is_empty(), "the running call must not re-spawn");
+    let TaskState::WaitingOnChildren {
+        continuation,
+        suspended_messages,
+        child_ids,
+        ..
+    } = &parent_task.state
+    else {
+        bail!("expected WaitingOnChildren re-park");
+    };
+    let pending_ids: Vec<&str> = continuation
+        .payload
+        .pending_tool_calls
+        .iter()
+        .map(|call| call.id.as_str())
+        .collect();
+    assert_eq!(
+        pending_ids,
+        ["call_1"],
+        "the running call keeps its original id"
+    );
+    assert_eq!(child_ids.as_slice(), std::slice::from_ref(&survivor.id));
+    assert_eq!(
+        tool_use_ids(suspended_messages),
+        history_ids,
+        "the re-park must not append a synthetic tool_use for the running call",
+    );
+    Ok(())
+}
+
+/// Regression for duplicated side effects after an early resume: the
+/// re-park appended a synthetic copy of the running call (under a fresh
+/// id) to the model's own newest message, so the model saw itself
+/// re-issuing running calls and kept doing so.
+#[tokio::test]
+async fn early_resume_never_re_presents_a_running_call_as_a_new_tool_use() -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
+        &stores,
+        vec![bash_call("call_0"), bash_call("call_1")],
+        ChildJoinPolicy::Any,
+    ))
+    .await?;
+    complete_child_at(
+        &stores,
+        &children[0],
+        &ok_result("done-0"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+
+    let provider = RequestLogProvider::new("The second call is still running.");
+    let outcome = run_child_resume(&stores, &parent.id, &provider, t_plus(10), t_plus(15)).await?;
+    assert_reparked_on_original_call(outcome, &children[1], &["call_0", "call_1"])?;
+
+    let worker = WorkerId::from_string("tool_w");
+    let lease = LeaseId::from_string("tool_l");
+    let binding =
+        acquire_survivor_binding(&stores, &children[1], &worker, &lease, t_plus(20)).await?;
+    assert_eq!(
+        binding.id, "call_1",
+        "the survivor must execute and report under the call the model issued",
+    );
+    stores
+        .tasks
+        .complete_task_with_result(
+            &children[1].id,
+            &worker,
+            &lease,
+            serde_json::to_value(ok_result("done-1"))?,
+            t_plus(30),
+        )
+        .await?;
+
+    let final_outcome =
+        run_child_resume(&stores, &parent.id, &provider, t_plus(40), t_plus(45)).await?;
+    assert!(matches!(final_outcome, RootTurnOutcome::Completed { .. }));
+
+    let requests = provider.requests()?;
+    assert_eq!(requests.len(), 2);
+    assert_each_request_presents_calls_once(&requests, &["call_0", "call_1"]);
+    let final_request = &requests[1];
+    assert_eq!(
+        count_tool_results(final_request, "call_1"),
+        1,
+        "only the interim placeholder pairs with the original tool_use",
+    );
+    let late = text_blocks_containing(final_request, "done-1");
+    assert_eq!(late.len(), 1, "the late result is delivered exactly once");
+    assert!(
+        late[0].contains("call_1"),
+        "the late result names the call it belongs to: {}",
+        late[0],
+    );
+    assert_eq!(
+        stores.tasks.list_children(&parent.id).await?.len(),
+        2,
+        "no call was ever executed a second time",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn repeated_early_resumes_never_multiply_tool_uses_or_ids() -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
+        &stores,
+        vec![
+            bash_call("call_0"),
+            bash_call("call_1"),
+            bash_call("call_2"),
+        ],
+        ChildJoinPolicy::Any,
+    ))
+    .await?;
+    let provider = RequestLogProvider::new("Noted.");
+
+    complete_child_at(
+        &stores,
+        &children[0],
+        &ok_result("done-0"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+    let first = run_child_resume(&stores, &parent.id, &provider, t_plus(10), t_plus(12)).await?;
+    assert!(matches!(first, RootTurnOutcome::Suspended { .. }));
+
+    complete_child_at(
+        &stores,
+        &children[1],
+        &ok_result("done-1"),
+        t_plus(20),
+        t_plus(21),
+    )
+    .await?;
+    let second = run_child_resume(&stores, &parent.id, &provider, t_plus(22), t_plus(24)).await?;
+    let RootTurnOutcome::Suspended { parent_task, .. } = second else {
+        bail!("the second early resume must re-park on the last survivor");
+    };
+    let pending_ids: Vec<String> = parent_task
+        .state
+        .continuation()
+        .context("re-parked continuation")?
+        .payload
+        .pending_tool_calls
+        .iter()
+        .map(|call| call.id.clone())
+        .collect();
+    assert_eq!(pending_ids, ["call_2"], "ids are stable across re-parks");
+
+    complete_child_at(
+        &stores,
+        &children[2],
+        &ok_result("done-2"),
+        t_plus(30),
+        t_plus(31),
+    )
+    .await?;
+    let last = run_child_resume(&stores, &parent.id, &provider, t_plus(32), t_plus(34)).await?;
+    assert!(matches!(last, RootTurnOutcome::Completed { .. }));
+
+    let requests = provider.requests()?;
+    assert_eq!(requests.len(), 3);
+    assert_each_request_presents_calls_once(&requests, &["call_0", "call_1", "call_2"]);
+    let final_request = &requests[2];
+    for id in ["call_0", "call_1", "call_2"] {
+        assert_eq!(count_tool_results(final_request, id), 1, "{id}");
+    }
+    assert_eq!(text_blocks_containing(final_request, "done-1").len(), 1);
+    assert_eq!(text_blocks_containing(final_request, "done-2").len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn running_call_that_later_fails_is_reported_once_as_a_late_error() -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
+        &stores,
+        vec![bash_call("call_0"), bash_call("call_1")],
+        ChildJoinPolicy::Any,
+    ))
+    .await?;
+    complete_child_at(
+        &stores,
+        &children[0],
+        &ok_result("done-0"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+    let provider = RequestLogProvider::new("Waiting.");
+    run_child_resume(&stores, &parent.id, &provider, t_plus(10), t_plus(12)).await?;
+
+    let worker = WorkerId::from_string("tool_w");
+    let lease = LeaseId::from_string("tool_l");
+    acquire_survivor_binding(&stores, &children[1], &worker, &lease, t_plus(20)).await?;
+    stores
+        .tasks
+        .fail_task(
+            &children[1].id,
+            &worker,
+            &lease,
+            "exit status 2: boom".to_owned(),
+            t_plus(21),
+        )
+        .await?;
+
+    let outcome = run_child_resume(&stores, &parent.id, &provider, t_plus(30), t_plus(32)).await?;
+    assert!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+    let requests = provider.requests()?;
+    assert_each_request_presents_calls_once(&requests, &["call_0", "call_1"]);
+    let final_request = requests.last().context("final request")?;
+    assert_eq!(count_tool_results(final_request, "call_1"), 1);
+    let late = text_blocks_containing(final_request, "boom");
+    assert_eq!(late.len(), 1, "the failure is delivered exactly once");
+    assert!(
+        late[0].contains("status=\"error\""),
+        "a failed late result is labeled as an error: {}",
+        late[0],
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn early_resume_follow_up_wave_pairs_new_calls_and_delivers_late_result_once() -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
+        &stores,
+        vec![bash_call("call_0"), bash_call("call_1")],
+        ChildJoinPolicy::Any,
+    ))
+    .await?;
+    complete_child_at(
+        &stores,
+        &children[0],
+        &ok_result("done-0"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+
+    let redirect = SteeringRedirectProvider::new(
+        "Checking the logs while the second call runs.",
+        "followup_call",
+        "bash",
+        serde_json::json!({"command": "tail app.log"}),
+    );
+    let outcome = run_child_resume(&stores, &parent.id, &redirect, t_plus(10), t_plus(12)).await?;
+    let RootTurnOutcome::Suspended {
+        parent_task,
+        child_tasks,
+        ..
+    } = outcome
+    else {
+        bail!("a follow-up wave must re-park");
+    };
+    let [followup] = child_tasks.as_slice() else {
+        bail!("only the new call spawns a child: {child_tasks:?}");
+    };
+    let pending_ids: Vec<String> = parent_task
+        .state
+        .continuation()
+        .context("re-parked continuation")?
+        .payload
+        .pending_tool_calls
+        .iter()
+        .map(|call| call.id.clone())
+        .collect();
+    assert_eq!(pending_ids, ["followup_call", "call_1"]);
+
+    complete_child_at(
+        &stores,
+        &children[1],
+        &ok_result("done-1"),
+        t_plus(20),
+        t_plus(21),
+    )
+    .await?;
+    complete_child_at(
+        &stores,
+        followup,
+        &ok_result("log-tail"),
+        t_plus(22),
+        t_plus(23),
+    )
+    .await?;
+
+    let provider = RequestLogProvider::new("All done.");
+    let last = run_child_resume(&stores, &parent.id, &provider, t_plus(30), t_plus(32)).await?;
+    assert!(matches!(last, RootTurnOutcome::Completed { .. }));
+    let requests = provider.requests()?;
+    assert_each_request_presents_calls_once(&requests, &["call_0", "call_1", "followup_call"]);
+    let final_request = requests.last().context("final request")?;
+    assert_eq!(
+        find_tool_result(final_request, "followup_call"),
+        Some("log-tail")
+    );
+    assert_eq!(count_tool_results(final_request, "call_1"), 1);
+    let late = late_results_for(final_request, "call_1");
+    assert_eq!(late.len(), 1);
+    assert!(late[0].contains("done-1"), "late result: {}", late[0]);
     Ok(())
 }
 
@@ -9656,7 +10167,7 @@ async fn partial_resume_atomically_reattaches_survivor_and_spawns_mixed_batch() 
             assert_eq!(pending.len(), 3);
             assert_eq!(pending[0].id, "call_sub");
             assert_eq!(pending[1].id, "call_bash");
-            assert_eq!(pending[2].id, derive_reattach_tool_use_id("old_1"));
+            assert_eq!(pending[2].id, "old_1");
         }
         other => panic!("expected atomic mixed re-park, got {other:?}"),
     }
