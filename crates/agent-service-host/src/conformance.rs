@@ -4804,4 +4804,6 @@ mod tests {
         assert_eq!(parent_after.status, TaskStatus::Running);
         Ok(())
     }
+
+    mod settlement;
 }

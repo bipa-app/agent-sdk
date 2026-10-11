@@ -659,6 +659,12 @@ async fn fail_root_turn_inner(
         .commit_event(thread_id, error_event, now)
         .await;
 
+    // Best-effort for the same reason; the host's orphan sweep settles
+    // whatever this misses.
+    if let Err(error) = settle_live_descendants(task_id, deps, now).await {
+        log::warn!("settle descendants of failed root {task_id}: {error:#}");
+    }
+
     // Finalize the root `invoke_agent` span with the error outcome and
     // its full duration (no-op if a prior process owns the live span).
     #[cfg(feature = "otel")]
@@ -670,6 +676,44 @@ async fn fail_root_turn_inner(
     );
 
     Ok(failed_task)
+}
+
+/// Cancel every descendant still live under the terminal root `task_id`.
+///
+/// A terminal root's fan-in never runs again, so a descendant left live —
+/// running, never started, parked on a confirmation nobody will answer, or
+/// an injected input no boundary will deliver — only strands whatever waits
+/// on it. A root that is not terminal is left alone: settling never
+/// cancels live work.
+///
+/// Child-thread roots reached through a live subagent invocation are
+/// cancelled with their closing marker, which is forwarded here to the
+/// threads' live followers. Returns the ids that transitioned; idempotent.
+///
+/// # Errors
+/// Returns an error if the root cannot be read or the cascade is rejected.
+pub async fn settle_live_descendants(
+    task_id: &AgentTaskId,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<Vec<AgentTaskId>> {
+    let root = deps
+        .task_store
+        .get(task_id)
+        .await
+        .context("read root before settling its descendants")?;
+    if !root.is_some_and(|root| root.status.is_terminal()) {
+        return Ok(Vec::new());
+    }
+    let outcome = deps
+        .task_store
+        .cancel_tree(task_id, now)
+        .await
+        .context("cancel live descendants of a terminal root")?;
+    if !outcome.markers.is_empty() {
+        deps.event_notifier.notify(&outcome.markers);
+    }
+    Ok(outcome.transitioned)
 }
 
 /// Cancel a root turn and its entire subtree.
