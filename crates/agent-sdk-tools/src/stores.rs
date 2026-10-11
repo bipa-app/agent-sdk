@@ -251,13 +251,21 @@ pub trait EventStore: Send + Sync {
 /// 1. Record execution intent BEFORE calling the tool (`record_execution`)
 /// 2. Update with result AFTER completion (`update_execution`)
 /// 3. On retry, check if execution exists and return cached result
+///
+/// Executions are keyed by thread and `tool_call_id`: a provider only keeps
+/// its tool-call ids unique within one conversation, so another thread may
+/// reuse an id and must never see this thread's cached result.
 #[async_trait]
 pub trait ToolExecutionStore: Send + Sync {
-    /// Get an execution by `tool_call_id`.
+    /// Get the execution of `tool_call_id` in `thread_id`.
     ///
     /// # Errors
     /// Returns an error if the execution cannot be retrieved.
-    async fn get_execution(&self, tool_call_id: &str) -> Result<Option<ToolExecution>>;
+    async fn get_execution(
+        &self,
+        thread_id: &ThreadId,
+        tool_call_id: &str,
+    ) -> Result<Option<ToolExecution>>;
 
     /// Record a new execution (write-ahead, before calling tool).
     ///
@@ -838,10 +846,15 @@ where
 /// For production, implement a custom store backed by a database.
 #[derive(Default)]
 pub struct InMemoryExecutionStore {
-    /// Executions indexed by `tool_call_id`
-    executions: RwLock<HashMap<String, ToolExecution>>,
-    /// Index from `operation_id` to `tool_call_id` for async tool lookup
-    operation_index: RwLock<HashMap<String, String>>,
+    executions: RwLock<HashMap<ExecutionKey, ToolExecution>>,
+    /// Index from `operation_id` to the execution's key for async tool lookup
+    operation_index: RwLock<HashMap<String, ExecutionKey>>,
+}
+
+type ExecutionKey = (ThreadId, String);
+
+fn execution_key(execution: &ToolExecution) -> ExecutionKey {
+    (execution.thread_id.clone(), execution.tool_call_id.clone())
 }
 
 impl InMemoryExecutionStore {
@@ -853,13 +866,19 @@ impl InMemoryExecutionStore {
 
 #[async_trait]
 impl ToolExecutionStore for InMemoryExecutionStore {
-    async fn get_execution(&self, tool_call_id: &str) -> Result<Option<ToolExecution>> {
+    async fn get_execution(
+        &self,
+        thread_id: &ThreadId,
+        tool_call_id: &str,
+    ) -> Result<Option<ToolExecution>> {
         let executions = self.executions.read().ok().context("lock poisoned")?;
-        Ok(executions.get(tool_call_id).cloned())
+        Ok(executions
+            .get(&(thread_id.clone(), tool_call_id.to_owned()))
+            .cloned())
     }
 
     async fn record_execution(&self, execution: ToolExecution) -> Result<()> {
-        let tool_call_id = execution.tool_call_id.clone();
+        let key = execution_key(&execution);
         let operation_id = execution.operation_id.clone();
 
         // Hold the executions write lock for the whole insert. Readers acquire
@@ -873,15 +892,15 @@ impl ToolExecutionStore for InMemoryExecutionStore {
                 .write()
                 .ok()
                 .context("lock poisoned")?
-                .insert(op_id, tool_call_id.clone());
+                .insert(op_id, key.clone());
         }
-        executions.insert(tool_call_id, execution);
+        executions.insert(key, execution);
         drop(executions);
         Ok(())
     }
 
     async fn update_execution(&self, execution: ToolExecution) -> Result<()> {
-        let tool_call_id = execution.tool_call_id.clone();
+        let key = execution_key(&execution);
         let new_operation_id = execution.operation_id.clone();
 
         // Hold the executions write lock across the whole update so a concurrent
@@ -892,7 +911,7 @@ impl ToolExecutionStore for InMemoryExecutionStore {
         // Drop a superseded operation_id index entry when the id changes, so a
         // stale id stops resolving instead of pointing forever at this call.
         let stale_op_id = executions
-            .get(&tool_call_id)
+            .get(&key)
             .and_then(|prev| prev.operation_id.clone())
             .filter(|prev| Some(prev) != new_operation_id.as_ref());
         if stale_op_id.is_some() || new_operation_id.is_some() {
@@ -901,10 +920,10 @@ impl ToolExecutionStore for InMemoryExecutionStore {
                 op_index.remove(&stale);
             }
             if let Some(op_id) = new_operation_id {
-                op_index.insert(op_id, tool_call_id.clone());
+                op_index.insert(op_id, key.clone());
             }
         }
-        executions.insert(tool_call_id, execution);
+        executions.insert(key, execution);
         drop(executions);
         Ok(())
     }
@@ -918,14 +937,14 @@ impl ToolExecutionStore for InMemoryExecutionStore {
         // neither deadlock against nor observe a partial write from a concurrent
         // record/update.
         let executions = self.executions.read().ok().context("lock poisoned")?;
-        let tool_call_id = {
+        let key = {
             let op_index = self.operation_index.read().ok().context("lock poisoned")?;
             op_index.get(operation_id).cloned()
         };
-        let Some(tool_call_id) = tool_call_id else {
+        let Some(key) = key else {
             return Ok(None);
         };
-        Ok(executions.get(&tool_call_id).cloned())
+        Ok(executions.get(&key).cloned())
     }
 }
 
@@ -1254,7 +1273,7 @@ mod tests {
         let thread_id = ThreadId::new();
 
         // Initially none
-        let execution = store.get_execution("tool_call_123").await?;
+        let execution = store.get_execution(&thread_id, "tool_call_123").await?;
         assert!(execution.is_none());
 
         // Record execution
@@ -1269,7 +1288,7 @@ mod tests {
         store.record_execution(execution).await?;
 
         // Retrieve execution
-        let loaded = store.get_execution("tool_call_123").await?;
+        let loaded = store.get_execution(&thread_id, "tool_call_123").await?;
         assert!(loaded.is_some());
         let loaded = loaded.expect("execution should exist");
         assert_eq!(loaded.tool_call_id, "tool_call_123");
@@ -1300,12 +1319,50 @@ mod tests {
         store.update_execution(execution).await?;
 
         // Verify it's completed
-        let loaded = store.get_execution("tool_call_456").await?;
+        let loaded = store.get_execution(&thread_id, "tool_call_456").await?;
         let loaded = loaded.expect("execution should exist");
         assert!(loaded.is_completed());
         assert!(loaded.result.is_some());
         assert!(loaded.result.as_ref().is_some_and(|r| r.success));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executions_with_the_same_tool_call_id_stay_apart_per_thread() -> Result<()> {
+        let store = InMemoryExecutionStore::new();
+        let first = ThreadId::new();
+        let second = ThreadId::new();
+        for (thread_id, output) in [(&first, "first thread"), (&second, "second thread")] {
+            let mut execution = ToolExecution::new_in_flight(
+                "call_0",
+                thread_id.clone(),
+                "my_tool",
+                "My Tool",
+                serde_json::json!({}),
+                time::OffsetDateTime::now_utc(),
+            );
+            execution.complete(ToolResult::success(output));
+            store.record_execution(execution).await?;
+        }
+
+        for (thread_id, output) in [(&first, "first thread"), (&second, "second thread")] {
+            let loaded = store
+                .get_execution(thread_id, "call_0")
+                .await?
+                .context("execution recorded for this thread")?;
+            assert_eq!(loaded.thread_id, *thread_id);
+            assert_eq!(
+                loaded.result.map(|result| result.output),
+                Some(output.to_owned())
+            );
+        }
+        assert!(
+            store
+                .get_execution(&ThreadId::new(), "call_0")
+                .await?
+                .is_none()
+        );
         Ok(())
     }
 

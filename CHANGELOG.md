@@ -38,6 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   return a typed capability error without fabricating vectors.
 
 ### Changed
+- **Breaking:** `ToolExecutionStore::get_execution` now takes the thread id
+  (`get_execution(&thread_id, tool_call_id)`), and `InMemoryExecutionStore`
+  and `SqliteStore` key executions by thread and tool-call id. Providers only
+  keep tool-call ids unique within one conversation, so a thread that reused an
+  id could read another thread's cached result. `SqliteStore` migrates existing
+  files to schema version 3 on open.
 - Compaction now appends range-addressed lineage entries and rebuilds the
   effective LLM view without deleting committed transcript messages.
 - Auto-compaction prunes artifact-backed and superseded read outputs before

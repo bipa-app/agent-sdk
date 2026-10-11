@@ -4101,8 +4101,12 @@ async fn test_audit_external_append_failure_does_not_mark_execution_store() -> a
 
     // The execution store must NOT have been marked completed, so a
     // retry is re-evaluated as fresh.
-    let exec =
-        <dyn crate::stores::ToolExecutionStore>::get_execution(&*execution_store, "tool_1").await?;
+    let exec = <dyn crate::stores::ToolExecutionStore>::get_execution(
+        &*execution_store,
+        &thread_id,
+        "tool_1",
+    )
+    .await?;
     assert!(
         !exec.is_some_and(|e| e.is_completed()),
         "Execution store must not mark tool_1 as completed before append succeeds"

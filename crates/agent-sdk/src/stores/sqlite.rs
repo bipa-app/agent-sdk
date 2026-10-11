@@ -71,7 +71,7 @@ const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// On-disk format version stamped into `PRAGMA user_version`. Bump when the
 /// table layout changes and add a migration path in [`SqliteStore::open`].
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Schema applied on open. `CREATE TABLE IF NOT EXISTS` makes opening an
 /// existing database a no-op, which is exactly the resume path.
@@ -116,9 +116,11 @@ CREATE INDEX IF NOT EXISTS idx_agent_events_thread_turn
     ON agent_events (thread_id, turn, id);
 
 CREATE TABLE IF NOT EXISTS agent_tool_executions (
-    tool_call_id TEXT PRIMARY KEY,
+    thread_id    TEXT NOT NULL,
+    tool_call_id TEXT NOT NULL,
     operation_id TEXT,
-    payload      TEXT NOT NULL
+    payload      TEXT NOT NULL,
+    PRIMARY KEY (thread_id, tool_call_id)
 );
 CREATE INDEX IF NOT EXISTS idx_agent_tool_executions_operation
     ON agent_tool_executions (operation_id);
@@ -154,7 +156,7 @@ impl SqliteStore {
     /// SDK understands.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let conn = Connection::open(path)
+        let mut conn = Connection::open(path)
             .with_context(|| format!("failed to open sqlite database at {}", path.display()))?;
         // `busy_timeout` first: it makes every subsequent lock-taking
         // statement — including the WAL conversion below, the very first one
@@ -168,10 +170,10 @@ impl SqliteStore {
         conn.pragma_update(None, "journal_mode", "WAL")
             .context("failed to enable WAL journal mode")?;
         // Validate the on-disk format version BEFORE touching the schema: a
-        // file stamped by a newer SDK must fail safely here, not have v1 DDL
-        // re-applied over (or v1 queries run against) a format this binary
-        // does not understand. 0 means "fresh or pre-versioning", which is
-        // the v1 layout this store initializes below.
+        // file stamped by a newer SDK must fail safely here, not have older
+        // DDL re-applied over (or older queries run against) a format this
+        // binary does not understand. 0 means "fresh or pre-versioning"; an
+        // older layout is migrated below before the schema is applied.
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .context("failed to read sqlite user_version")?;
@@ -183,6 +185,7 @@ impl SqliteStore {
                 path.display()
             );
         }
+        scope_tool_executions_by_thread(&mut conn)?;
         conn.execute_batch(SCHEMA)
             .context("failed to initialize sqlite store schema")?;
         if version < SCHEMA_VERSION {
@@ -220,25 +223,67 @@ impl SqliteStore {
 
     /// Shared upsert for [`ToolExecutionStore::record_execution`] and
     /// [`ToolExecutionStore::update_execution`]: both write the full record,
-    /// keyed by `tool_call_id`, refreshing the `operation_id` index column.
+    /// keyed by thread and `tool_call_id`, refreshing the `operation_id` index
+    /// column.
     async fn upsert_execution(&self, execution: ToolExecution) -> Result<()> {
+        let thread = execution.thread_id.0.clone();
         let tool_call_id = execution.tool_call_id.clone();
         let operation_id = execution.operation_id.clone();
         let payload =
             serde_json::to_string(&execution).context("failed to encode tool execution")?;
         self.with_conn(move |conn| {
             conn.execute(
-                "INSERT INTO agent_tool_executions (tool_call_id, operation_id, payload)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(tool_call_id)
+                "INSERT INTO agent_tool_executions (thread_id, tool_call_id, operation_id, payload)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(thread_id, tool_call_id)
                  DO UPDATE SET operation_id = excluded.operation_id, payload = excluded.payload",
-                params![tool_call_id, operation_id, payload],
+                params![thread, tool_call_id, operation_id, payload],
             )
             .context("failed to upsert tool execution")?;
             Ok(())
         })
         .await
     }
+}
+
+/// Rebuild a tool-execution table keyed only by `tool_call_id` (schema
+/// version 2 and earlier) into the thread-scoped layout, taking each row's
+/// thread from its payload. Rows keep their insertion order, which the
+/// `operation_id` lookup uses as its tiebreak.
+fn scope_tool_executions_by_thread(conn: &mut Connection) -> Result<()> {
+    let columns = conn
+        .prepare("SELECT name FROM pragma_table_info('agent_tool_executions')")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .context("failed to inspect the tool execution table")?;
+    if columns.is_empty() || columns.iter().any(|column| column == "thread_id") {
+        return Ok(());
+    }
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("failed to begin tool execution migration")?;
+    tx.execute_batch(
+        "CREATE TABLE agent_tool_executions_by_thread (
+             thread_id    TEXT NOT NULL,
+             tool_call_id TEXT NOT NULL,
+             operation_id TEXT,
+             payload      TEXT NOT NULL,
+             PRIMARY KEY (thread_id, tool_call_id)
+         );
+         INSERT INTO agent_tool_executions_by_thread
+             (thread_id, tool_call_id, operation_id, payload)
+         SELECT json_extract(payload, '$.thread_id'), tool_call_id, operation_id, payload
+         FROM agent_tool_executions
+         ORDER BY rowid;
+         DROP TABLE agent_tool_executions;
+         ALTER TABLE agent_tool_executions_by_thread RENAME TO agent_tool_executions;",
+    )
+    .context("failed to scope tool executions by thread")?;
+    tx.commit()
+        .context("failed to commit tool execution migration")
 }
 
 #[async_trait]
@@ -871,13 +916,19 @@ impl EventStore for SqliteStore {
 
 #[async_trait]
 impl ToolExecutionStore for SqliteStore {
-    async fn get_execution(&self, tool_call_id: &str) -> Result<Option<ToolExecution>> {
+    async fn get_execution(
+        &self,
+        thread_id: &ThreadId,
+        tool_call_id: &str,
+    ) -> Result<Option<ToolExecution>> {
+        let thread = thread_id.0.clone();
         let id = tool_call_id.to_owned();
         self.with_conn(move |conn| {
             let payload: Option<String> = conn
                 .query_row(
-                    "SELECT payload FROM agent_tool_executions WHERE tool_call_id = ?1",
-                    params![id],
+                    "SELECT payload FROM agent_tool_executions
+                     WHERE thread_id = ?1 AND tool_call_id = ?2",
+                    params![thread, id],
                     |row| row.get(0),
                 )
                 .optional()
@@ -1005,7 +1056,7 @@ mod tests {
         assert!(turn.finished, "finish barrier must survive reopen");
 
         let execution = store
-            .get_execution("call_1")
+            .get_execution(&thread_id, "call_1")
             .await?
             .context("execution present")?;
         assert_eq!(execution.tool_name, "my_tool");
@@ -1188,7 +1239,7 @@ mod tests {
 
         let mut execution = ToolExecution::new_in_flight(
             "call_op",
-            thread_id,
+            thread_id.clone(),
             "async_tool",
             "Async Tool",
             serde_json::json!({}),
@@ -1225,16 +1276,135 @@ mod tests {
 
         // Completing the execution survives and is observable.
         let mut completed = store
-            .get_execution("call_op")
+            .get_execution(&thread_id, "call_op")
             .await?
             .context("execution present")?;
         completed.complete(ToolResult::success("done"));
         store.update_execution(completed).await?;
         let reloaded = store
-            .get_execution("call_op")
+            .get_execution(&thread_id, "call_op")
             .await?
             .context("execution present")?;
         assert!(reloaded.is_completed());
+        Ok(())
+    }
+
+    fn completed_execution(
+        thread_id: &ThreadId,
+        tool_call_id: &str,
+        output: &str,
+    ) -> ToolExecution {
+        let mut execution = ToolExecution::new_in_flight(
+            tool_call_id,
+            thread_id.clone(),
+            "tool",
+            "Tool",
+            serde_json::json!({}),
+            time::OffsetDateTime::now_utc(),
+        );
+        execution.complete(ToolResult::success(output));
+        execution
+    }
+
+    async fn cached_output(
+        store: &SqliteStore,
+        thread_id: &ThreadId,
+        tool_call_id: &str,
+    ) -> Result<Option<String>> {
+        Ok(store
+            .get_execution(thread_id, tool_call_id)
+            .await?
+            .and_then(|execution| execution.result)
+            .map(|result| result.output))
+    }
+
+    /// A provider keeps tool-call ids unique only within one conversation, so
+    /// another thread reusing an id must neither read nor overwrite this
+    /// thread's cached result.
+    #[tokio::test]
+    async fn executions_with_the_same_tool_call_id_stay_apart_per_thread() -> Result<()> {
+        let dir = tempdir()?;
+        let store = SqliteStore::open(dir.path().join("agent.db"))?;
+        let first = ThreadId::new();
+        let second = ThreadId::new();
+
+        store
+            .record_execution(completed_execution(&first, "call_0", "first thread"))
+            .await?;
+        store
+            .record_execution(completed_execution(&second, "call_0", "second thread"))
+            .await?;
+
+        assert_eq!(
+            cached_output(&store, &first, "call_0").await?.as_deref(),
+            Some("first thread")
+        );
+        assert_eq!(
+            cached_output(&store, &second, "call_0").await?.as_deref(),
+            Some("second thread")
+        );
+        assert_eq!(
+            cached_output(&store, &ThreadId::new(), "call_0").await?,
+            None
+        );
+        Ok(())
+    }
+
+    /// A file written before executions were keyed by thread is migrated on
+    /// open: its rows stay readable under their own thread only.
+    #[tokio::test]
+    async fn migrates_tool_executions_keyed_only_by_tool_call_id() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("agent.db");
+        let owner = ThreadId::new();
+        let other = ThreadId::new();
+        {
+            let conn = Connection::open(&path)?;
+            conn.execute_batch(
+                "CREATE TABLE agent_tool_executions (
+                     tool_call_id TEXT PRIMARY KEY,
+                     operation_id TEXT,
+                     payload      TEXT NOT NULL
+                 );
+                 CREATE INDEX idx_agent_tool_executions_operation
+                     ON agent_tool_executions (operation_id);",
+            )?;
+            let mut legacy = completed_execution(&owner, "call_0", "owner");
+            legacy.set_operation_id("op_legacy");
+            conn.execute(
+                "INSERT INTO agent_tool_executions (tool_call_id, operation_id, payload)
+                 VALUES (?1, ?2, ?3)",
+                params!["call_0", "op_legacy", serde_json::to_string(&legacy)?],
+            )?;
+            conn.pragma_update(None, "user_version", 2)?;
+        }
+
+        let store = SqliteStore::open(&path)?;
+
+        assert_eq!(
+            cached_output(&store, &owner, "call_0").await?.as_deref(),
+            Some("owner")
+        );
+        assert_eq!(cached_output(&store, &other, "call_0").await?, None);
+        assert_eq!(
+            store
+                .get_execution_by_operation_id("op_legacy")
+                .await?
+                .context("operation id survives the migration")?
+                .thread_id,
+            owner
+        );
+        store
+            .record_execution(completed_execution(&other, "call_0", "other"))
+            .await?;
+        assert_eq!(
+            cached_output(&store, &owner, "call_0").await?.as_deref(),
+            Some("owner")
+        );
+        drop(store);
+        let version: i64 =
+            Connection::open(&path)?.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        assert_eq!(version, SCHEMA_VERSION);
         Ok(())
     }
 }
