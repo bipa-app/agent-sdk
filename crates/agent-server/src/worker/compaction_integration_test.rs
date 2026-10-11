@@ -364,6 +364,26 @@ impl Fixtures {
             connectivity_waits: None,
         }
     }
+
+    fn deps_without_compaction(&self) -> RootTurnDeps<'_> {
+        RootTurnDeps {
+            task_store: &self.tasks,
+            thread_store: &self.threads,
+            message_store: &self.messages,
+            attempt_store: &self.attempts,
+            checkpoint_store: &self.checkpoints,
+            event_repo: &self.events,
+            event_notifier: &self.event_notifier,
+            subagent_spawn_selector: None,
+            compaction_config: None,
+            compaction_provider: None,
+            compaction_artifact_store: None,
+            cancel: None,
+            wakeup: None,
+            activity: None,
+            connectivity_waits: None,
+        }
+    }
 }
 
 async fn create_and_acquire_root_task(
@@ -2713,43 +2733,19 @@ async fn assert_single_user_input_before_start(fixtures: &Fixtures) -> Result<()
     Ok(())
 }
 
-#[tokio::test]
-async fn user_input_event_is_not_duplicated_on_task_retry() -> Result<()> {
-    let fixtures = Fixtures::new();
-    seed_projection_history(&fixtures.messages, &thread_id(), 2, "abc").await?;
-
-    let provider = ScriptedProvider::new(vec![ok_response("done")]);
-    let deps = RootTurnDeps {
-        task_store: &fixtures.tasks,
-        thread_store: &fixtures.threads,
-        message_store: &fixtures.messages,
-        attempt_store: &fixtures.attempts,
-        checkpoint_store: &fixtures.checkpoints,
-        event_repo: &fixtures.events,
-        event_notifier: &fixtures.event_notifier,
-        subagent_spawn_selector: None,
-        compaction_config: None,
-        compaction_provider: None,
-        compaction_artifact_store: None,
-        cancel: None,
-        wakeup: None,
-        activity: None,
-        connectivity_waits: None,
-    };
-
-    let first = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
-    let task_id = first.id.clone();
-    let prior = AgentEvent::user_input(
+fn ping_user_input() -> AgentEvent {
+    AgentEvent::user_input(
         thread_id(),
         vec![ContentBlock::Text {
             text: "ping".into(),
         }],
     )
-    .with_emitter_task_id(task_id.as_str());
-    fixtures
-        .events
-        .commit_event(&thread_id(), prior, t0())
-        .await?;
+}
+
+async fn reacquire_after_lease_expiry(
+    fixtures: &Fixtures,
+    task_id: &crate::journal::task::AgentTaskId,
+) -> Result<AgentTask> {
     fixtures
         .tasks
         .release_expired_leases(t0() + Duration::seconds(301))
@@ -2757,7 +2753,7 @@ async fn user_input_event_is_not_duplicated_on_task_retry() -> Result<()> {
     let retried = fixtures
         .tasks
         .try_acquire_task(
-            &task_id,
+            task_id,
             WorkerId::from_string("worker_compaction"),
             LeaseId::from_string("lease_compaction"),
             t0() + Duration::seconds(900),
@@ -2766,9 +2762,14 @@ async fn user_input_event_is_not_duplicated_on_task_retry() -> Result<()> {
         .await?
         .context("expired task should be re-acquirable")?;
     assert_eq!(retried.attempt, 2);
+    Ok(retried)
+}
 
+async fn run_ping_turn(fixtures: &Fixtures, task: AgentTask) -> Result<()> {
+    let provider = ScriptedProvider::new(vec![ok_response("done")]);
+    let deps = fixtures.deps_without_compaction();
     let inputs = build_root_worker_inputs(
-        sample_bootstrap(retried),
+        sample_bootstrap(task),
         &fixtures.threads,
         &fixtures.checkpoints,
         &fixtures.messages,
@@ -2783,17 +2784,120 @@ async fn user_input_event_is_not_duplicated_on_task_retry() -> Result<()> {
         t0() + Duration::seconds(303),
     )
     .await?;
+    Ok(())
+}
 
-    let user_inputs = fixtures
+async fn committed_user_input_emitters(fixtures: &Fixtures) -> Result<Vec<Option<String>>> {
+    Ok(fixtures
         .events
         .get_events(&thread_id())
         .await?
         .iter()
         .filter(|committed| matches!(committed.event, AgentEvent::UserInput { .. }))
-        .count();
+        .map(|committed| committed.event.emitter_task_id().map(str::to_owned))
+        .collect())
+}
+
+#[tokio::test]
+async fn user_input_event_is_not_duplicated_on_task_retry() -> Result<()> {
+    let fixtures = Fixtures::new();
+    seed_projection_history(&fixtures.messages, &thread_id(), 2, "abc").await?;
+
+    fixtures
+        .events
+        .commit_event(
+            &thread_id(),
+            ping_user_input().with_emitter_task_id("task_earlier_turn"),
+            t0() - Duration::seconds(60),
+        )
+        .await?;
+    let first = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    let task_id = first.id.clone();
+    fixtures
+        .events
+        .commit_event(
+            &thread_id(),
+            ping_user_input().with_emitter_task_id(task_id.as_str()),
+            t0(),
+        )
+        .await?;
+    let retried = reacquire_after_lease_expiry(&fixtures, &task_id).await?;
+    run_ping_turn(&fixtures, retried).await?;
+
     assert_eq!(
-        user_inputs, 1,
+        committed_user_input_emitters(&fixtures).await?,
+        vec![
+            Some("task_earlier_turn".to_owned()),
+            Some(task_id.as_str().to_owned()),
+        ],
         "retry must not duplicate the UserInput event"
+    );
+    Ok(())
+}
+
+/// Builds before the emitter stamp opened the attempt row first and then
+/// committed an unstamped `UserInput`; a task in flight across the upgrade
+/// is re-acquired by the new build after its lease expires.
+#[tokio::test]
+async fn user_input_committed_by_a_pre_upgrade_build_is_not_duplicated() -> Result<()> {
+    use crate::journal::turn_attempt::OpenAttemptParams;
+    use agent_sdk_foundation::audit::AuditProvenance;
+
+    let fixtures = Fixtures::new();
+    seed_projection_history(&fixtures.messages, &thread_id(), 2, "abc").await?;
+
+    let first = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    let task_id = first.id.clone();
+    fixtures
+        .attempts
+        .open_attempt(OpenAttemptParams {
+            task_id: task_id.clone(),
+            attempt_number: 1,
+            provenance: AuditProvenance::new("mock", "mock-model"),
+            request_blob: serde_json::json!({ "user_prompt": "ping" }),
+            now: t0() + Duration::seconds(1),
+            otel_trace_id: None,
+            otel_span_id: None,
+        })
+        .await?;
+    fixtures
+        .events
+        .commit_event(&thread_id(), ping_user_input(), t0() + Duration::seconds(1))
+        .await?;
+
+    let retried = reacquire_after_lease_expiry(&fixtures, &task_id).await?;
+    run_ping_turn(&fixtures, retried).await?;
+
+    assert_eq!(
+        committed_user_input_emitters(&fixtures).await?,
+        vec![None],
+        "the pre-upgrade unstamped prompt is this task's; re-acquiring must not \
+         commit it a second time",
+    );
+    Ok(())
+}
+
+/// Without an attempt row for this task, an unstamped `UserInput` cannot be
+/// its own: pre-upgrade builds always opened the attempt row first.
+#[tokio::test]
+async fn unstamped_user_input_of_another_task_does_not_suppress_the_prompt() -> Result<()> {
+    let fixtures = Fixtures::new();
+    seed_projection_history(&fixtures.messages, &thread_id(), 2, "abc").await?;
+
+    let first = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    let task_id = first.id.clone();
+    fixtures
+        .events
+        .commit_event(&thread_id(), ping_user_input(), t0() + Duration::seconds(1))
+        .await?;
+
+    let retried = reacquire_after_lease_expiry(&fixtures, &task_id).await?;
+    run_ping_turn(&fixtures, retried).await?;
+
+    assert_eq!(
+        committed_user_input_emitters(&fixtures).await?,
+        vec![None, Some(task_id.as_str().to_owned())],
+        "a foreign legacy prompt must not stand in for this task's own",
     );
     Ok(())
 }

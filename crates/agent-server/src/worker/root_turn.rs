@@ -2634,8 +2634,13 @@ async fn open_attempt(
         .context("open_attempt via store")
 }
 
-/// The `UserInput` event commits before any attempt row exists, so only a
-/// re-acquired task (`attempt > 1`) can find its own earlier commit.
+/// Only a re-acquired task (`attempt > 1`) can find its own earlier commit.
+///
+/// Any attempt row of the task proves the commit: this build commits the
+/// `UserInput` before opening an attempt row, and builds that predate the
+/// emitter stamp opened attempt 1 first and then committed the event
+/// unstamped. Without an attempt row only this task's stamped event counts;
+/// an unstamped one then belongs to another task.
 async fn user_input_already_committed(
     deps: &RootTurnDeps<'_>,
     thread_id: &agent_sdk_foundation::ThreadId,
@@ -2644,17 +2649,42 @@ async fn user_input_already_committed(
     if task.attempt <= 1 {
         return Ok(false);
     }
-    let task_id = task.id.as_str();
-    Ok(deps
-        .event_repo
-        .get_events(thread_id)
+    let has_attempt_row = !deps
+        .attempt_store
+        .list_by_task(&task.id)
         .await
-        .context("load events for the user-input gate")?
-        .iter()
-        .any(|committed| {
-            matches!(committed.event, AgentEvent::UserInput { .. })
-                && committed.event.emitter_task_id() == Some(task_id)
-        }))
+        .context("list attempts for the user-input gate")?
+        .is_empty();
+    if has_attempt_row {
+        return Ok(true);
+    }
+    let Some(first_sequence) = deps
+        .event_repo
+        .min_sequence_at_or_after(thread_id, task.created_at)
+        .await
+        .context("locate the first event since the task was created")?
+    else {
+        return Ok(false);
+    };
+    let events = match first_sequence.checked_sub(1) {
+        Some(after_sequence) => {
+            let next_sequence = deps
+                .event_repo
+                .next_sequence(thread_id)
+                .await
+                .context("read the journal high-water mark for the user-input gate")?;
+            deps.event_repo
+                .get_events_in_range(thread_id, after_sequence, next_sequence.saturating_sub(1))
+                .await
+        }
+        None => deps.event_repo.get_events(thread_id).await,
+    }
+    .context("load events for the user-input gate")?;
+    let task_id = task.id.as_str();
+    Ok(events.iter().any(|committed| {
+        matches!(committed.event, AgentEvent::UserInput { .. })
+            && committed.event.emitter_task_id() == Some(task_id)
+    }))
 }
 
 /// Open the audit row for a summarizer call. Provenance names the
