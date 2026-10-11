@@ -48,7 +48,10 @@ mod tests {
     use crate::fail;
     use agent_sdk_foundation::audit::AuditProvenance;
     use agent_sdk_foundation::events::AgentEvent;
-    use agent_sdk_foundation::{TerminalReason, ThreadId, TokenUsage};
+    use agent_sdk_foundation::{
+        PendingToolCallInfo, QuestionAnswer, QuestionPayload, TerminalReason, ThreadId, TokenUsage,
+        ToolTier,
+    };
     use agent_server::journal::checkpoint::CheckpointKind;
     use agent_server::journal::checkpoint_store::CheckpointStore;
     use agent_server::journal::commit::{CompletedTurnCommit, commit_completed_turn};
@@ -64,7 +67,7 @@ mod tests {
     use agent_server::journal::outbox::OutboxStore;
     use agent_server::journal::outbox_message::OutboxMessageKind;
     use agent_server::journal::recovery::{FailureReason, RecoveryAction};
-    use agent_server::journal::store::{AgentTaskStore, SubagentInvocationSpawn};
+    use agent_server::journal::store::{AgentTaskStore, QuestionPause, SubagentInvocationSpawn};
     #[cfg(feature = "sqlite")]
     use agent_server::journal::subagent_spawn_transaction::{
         AtomicSubagentSpawnCommitter, SubagentSpawnCommit, SubagentSpawnEvent,
@@ -2176,6 +2179,33 @@ mod tests {
         Ok(())
     }
 
+    fn question_pause(name: &str, round: u32) -> QuestionPause {
+        let call_id = format!("ask-{round}");
+        let input = serde_json::json!({ "question": format!("Question {round}?") });
+        let mut payload = suspension_payload(name);
+        payload.continuation.payload.pending_tool_calls = vec![PendingToolCallInfo {
+            id: call_id.clone(),
+            name: "ask_user".into(),
+            display_name: "Ask User".into(),
+            tier: ToolTier::Observe,
+            input: input.clone(),
+            effective_input: input,
+            listen_context: None,
+        }];
+        QuestionPause {
+            delivered_injection_ids: Vec::new(),
+            payload,
+            questions: vec![QuestionPayload {
+                tool_call_id: call_id,
+                question: format!("Question {round}?"),
+                header: None,
+                options: Vec::new(),
+                multi_select: false,
+            }],
+            events: Vec::new(),
+        }
+    }
+
     /// Acquire `task_id`, or fail with the row's terminal error so a
     /// fail-closed acquisition reads as the reason it happened.
     async fn acquire_or_explain(
@@ -2208,6 +2238,87 @@ mod tests {
         )
     }
 
+    /// Park `task_id` on question `round` under the given lease and answer it.
+    async fn ask_and_answer(
+        task_store: &dyn AgentTaskStore,
+        name: &str,
+        task_id: &AgentTaskId,
+        (worker, lease): (&WorkerId, &LeaseId),
+        round: u32,
+        secs: i64,
+    ) -> Result<()> {
+        task_store
+            .pause_on_question(
+                task_id,
+                worker,
+                lease,
+                question_pause(name, round),
+                t_plus(secs),
+            )
+            .await?;
+        task_store
+            .answer_question(
+                task_id,
+                &format!("receipt-{round}"),
+                vec![QuestionAnswer {
+                    tool_call_id: format!("ask-{round}"),
+                    answer: format!("answer {round}"),
+                }],
+                t_plus(secs + 1),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// An answered `ask_user` batch resumes the turn that asked it, so a
+    /// root must stay acquirable after every answer no matter how many
+    /// questions one turn asks — more than its whole retry budget here.
+    async fn test_answered_questions_do_not_consume_retry_budget(
+        task_store: &dyn AgentTaskStore,
+        questions: u32,
+    ) -> Result<()> {
+        let name = format!("conformance-questions-{questions}");
+        let root = AgentTask::new_root_turn(
+            thread_id(&name),
+            t_plus(0),
+            AgentTask::DEFAULT_ROOT_MAX_ATTEMPTS,
+        );
+        let _ = task_store.submit_root_turn(root.clone()).await?;
+        for round in 0..questions {
+            let secs = i64::from(round) * 10 + 1;
+            let worker = WorkerId::new();
+            let lease = LeaseId::new();
+            let label = format!("acquire before question {round}");
+            acquire_or_explain(task_store, &root.id, &worker, &lease, secs, &label).await?;
+            ask_and_answer(
+                task_store,
+                &name,
+                &root.id,
+                (&worker, &lease),
+                round,
+                secs + 1,
+            )
+            .await?;
+        }
+
+        let resumed = acquire_or_explain(
+            task_store,
+            &root.id,
+            &WorkerId::new(),
+            &LeaseId::new(),
+            i64::from(questions) * 10 + 1,
+            "acquire after the last answer",
+        )
+        .await?;
+        assert_eq!(resumed.status, TaskStatus::Running);
+        assert!(matches!(resumed.state, TaskState::AnsweredQuestion { .. }));
+        assert_eq!(
+            resumed.attempt, 1,
+            "only the turn's first execution is an attempt; answered resumes are continuations",
+        );
+        Ok(())
+    }
+
     fn terminal_budget_errors(events: &[CommittedEvent], task_id: &AgentTaskId) -> usize {
         events
             .iter()
@@ -2238,6 +2349,58 @@ mod tests {
                 )
             })
             .count()
+    }
+
+    /// The free answered resume must not make a crash-looping resume
+    /// immortal: every lease the sweep reclaims still charges one
+    /// attempt, so the row fails closed — visibly — once the budget is
+    /// spent.
+    async fn test_answered_question_crash_loop_fails_closed(
+        task_store: &dyn AgentTaskStore,
+        event_repo: &dyn EventRepository,
+    ) -> Result<()> {
+        let name = "conformance-question-crash-loop";
+        let root = AgentTask::new_root_turn(
+            thread_id(name),
+            t_plus(0),
+            AgentTask::DEFAULT_ROOT_MAX_ATTEMPTS,
+        );
+        let _ = task_store.submit_root_turn(root.clone()).await?;
+        let worker = WorkerId::new();
+        let lease = LeaseId::new();
+        acquire_or_explain(task_store, &root.id, &worker, &lease, 1, "first acquire").await?;
+        ask_and_answer(task_store, name, &root.id, (&worker, &lease), 0, 2).await?;
+
+        let mut actions = Vec::new();
+        for crash in 0..AgentTask::DEFAULT_ROOT_MAX_ATTEMPTS {
+            let secs = 100 + i64::from(crash) * 10;
+            task_store
+                .try_acquire_task(
+                    &root.id,
+                    WorkerId::new(),
+                    LeaseId::new(),
+                    t_plus(secs + 5),
+                    t_plus(secs),
+                )
+                .await?
+                .with_context(|| format!("acquire for crash {crash}"))?;
+            let records = task_store.release_expired_leases(t_plus(secs + 6)).await?;
+            anyhow::ensure!(records.len() == 1, "one expired lease per crash");
+            actions.push(records[0].action);
+        }
+        assert_eq!(
+            actions,
+            vec![
+                RecoveryAction::Requeue,
+                RecoveryAction::Requeue,
+                RecoveryAction::FailClosed(FailureReason::LeaseExpiredBudgetExhausted),
+            ],
+        );
+        let row = task_store.get(&root.id).await?.context("row exists")?;
+        assert_eq!(row.status, TaskStatus::Failed);
+        let events = event_repo.get_events(&thread_id(name)).await?;
+        assert_eq!(terminal_budget_errors(&events, &root.id), 1);
+        Ok(())
     }
 
     /// Release `task_id`'s only attempt back to `Pending` so the next
@@ -2717,6 +2880,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_three_answered_questions_keep_budget() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_answered_questions_do_not_consume_retry_budget(s.task.as_ref(), 3).await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_five_answered_questions_keep_budget() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_answered_questions_do_not_consume_retry_budget(s.task.as_ref(), 5).await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_answered_question_crash_loop_fails_closed() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_answered_question_crash_loop_fails_closed(s.task.as_ref(), s.event.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_retry_exhaustion_emits_terminal_error() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_retry_exhaustion_emits_terminal_error(s.task.as_ref(), s.event.as_ref()).await
@@ -3036,6 +3217,27 @@ mod tests {
     async fn conformance_sqlite_retry_exhaustion() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_retry_exhaustion(&store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_three_answered_questions_keep_budget() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_answered_questions_do_not_consume_retry_budget(&store, 3).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_five_answered_questions_keep_budget() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_answered_questions_do_not_consume_retry_budget(&store, 5).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_answered_question_crash_loop_fails_closed() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_answered_question_crash_loop_fails_closed(&store, &store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -3579,6 +3781,33 @@ mod tests {
             return Ok(());
         };
         test_retry_exhaustion(&store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_three_answered_questions_keep_budget() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_answered_questions_do_not_consume_retry_budget(&store, 3).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_five_answered_questions_keep_budget() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_answered_questions_do_not_consume_retry_budget(&store, 5).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_answered_question_crash_loop_fails_closed() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_answered_question_crash_loop_fails_closed(&store, &store).await
     }
 
     #[cfg(feature = "postgres")]

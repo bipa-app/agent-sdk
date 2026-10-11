@@ -43,7 +43,7 @@
 //!
 //! | Context          | Status / kind                                     | Budget    | Prepared op | Action                                                   |
 //! |------------------|---------------------------------------------------|-----------|-------------|----------------------------------------------------------|
-//! | Acquisition      | `Pending`, `ReadyToResume`                        | any       | n/a         | [`RecoveryAction::NoAction`]                             |
+//! | Acquisition      | `Pending`, `ReadyToResume` / `AnsweredQuestion`   | any       | n/a         | [`RecoveryAction::NoAction`]                             |
 //! | Acquisition      | `Pending`, budget ok                              | ok        | n/a         | [`RecoveryAction::NoAction`]                             |
 //! | Acquisition      | `Pending`, budget exhausted                       | exhausted | n/a         | [`RecoveryAction::FailClosed`] `RetryBudgetExhausted`    |
 //! | `ExpiredLease`   | `Running`, budget ok                              | ok        | n/a         | [`RecoveryAction::Requeue`]                              |
@@ -54,11 +54,11 @@
 //! | Any              | `Queued`                                          | any       | n/a         | [`RecoveryAction::NoAction`]                             |
 //! | Any              | `Completed` / `Failed` / `Cancelled`              | any       | n/a         | [`RecoveryAction::NoAction`]                             |
 //!
-//! `ReadyToResume` rows pick up the budget check on the expiry path
-//! because [`super::task::AgentTask::release_lease`] bumps `attempt`
-//! when the row's state is `ReadyToResume`. The first legitimate
-//! resume — driven by `recompute_pending_children` rather than the
-//! sweep — does not pass through `release_lease`, so it is not
+//! Rows that [resume an in-flight turn](super::TaskState::resumes_in_flight_turn)
+//! pick up the budget check on the expiry path because
+//! [`super::task::AgentTask::release_lease`] bumps `attempt` for them.
+//! A legitimate wake — a child fan-in, a steering note, an answered
+//! question — does not pass through `release_lease`, so it is not
 //! penalised by this bump.
 //!
 //! Every fail-closed root turn also journals the terminal `Error` event
@@ -103,7 +103,6 @@ use agent_sdk_foundation::events::{AgentEvent, TerminalReason};
 use serde::{Deserialize, Serialize};
 
 use super::task::{AgentTask, AgentTaskId, TaskKind, TaskStatus};
-use super::task_state::TaskState;
 
 /// Canonical fail-closed reasons written on Phase 2.5 recovery
 /// transitions.
@@ -328,11 +327,11 @@ pub fn classify_recovery(task: &AgentTask, context: RecoveryContext) -> Recovery
         // NoAction — the acquisition path will see `None` via the
         // existing CAS check regardless.
         //
-        // `ReadyToResume` is a continuation after child completion,
-        // not a retry — the task's attempt counter was not incremented
-        // for the resume, so budget-exhaustion does not apply.
+        // A row that resumes an in-flight turn is a continuation, not a
+        // retry: its acquisition charges nothing, so budget exhaustion
+        // does not apply here (the expiry path still enforces it).
         (RecoveryContext::AcquisitionAttempt, TaskStatus::Pending) => {
-            if matches!(task.state, TaskState::ReadyToResume { .. }) {
+            if task.state.resumes_in_flight_turn() {
                 RecoveryAction::NoAction
             } else if task.is_budget_exhausted() {
                 RecoveryAction::FailClosed(FailureReason::RetryBudgetExhausted)
@@ -347,9 +346,9 @@ pub fn classify_recovery(task: &AgentTask, context: RecoveryContext) -> Recovery
         // from `Running` transitions. Anything else is a bookkeeping bug
         // and the store surfaces it as an error, not a recovery decision.
         //
-        // `ReadyToResume` rows are subject to the same budget check as
-        // any other Running row. `release_lease` bumps `attempt` when
-        // the row carries a `ReadyToResume` state, so a poisoned resume
+        // Resuming rows are subject to the same budget check as any
+        // other Running row. `release_lease` bumps `attempt` when the
+        // row resumes an in-flight turn, so a poisoned resume
         // (LLM error, idempotency violation, or a worker crash that
         // does not break the row's invariants) eventually exhausts the
         // budget and gets a deterministic fail-closed transition
