@@ -223,17 +223,19 @@ impl SqliteDurableStore {
         store.migrate().await?;
         // Offline data repair (ENG-9651): run the one-shot, ledgered
         // history-repair sweep after the schema migrations (the ledger
-        // table must exist) and before any worker acquires a task.
+        // table must exist). Every open runs it, possibly while another
+        // process is serving turns, so it defers threads with live tasks.
         let report =
             super::repair_sweep::run_startup_repair_sweep(&store.pool, OffsetDateTime::now_utc())
                 .await
                 .context("startup history-repair sweep")?;
         if report.repaired > 0 || report.unrepairable > 0 {
             tracing::warn!(
-                "startup history-repair sweep: scanned={}, ledgered={}, repaired={}, unrepairable={}",
+                "startup history-repair sweep: scanned={}, ledgered={}, repaired={}, deferred={}, unrepairable={}",
                 report.scanned,
                 report.ledgered,
                 report.repaired,
+                report.deferred,
                 report.unrepairable
             );
         }
