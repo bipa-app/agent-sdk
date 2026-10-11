@@ -55,6 +55,7 @@ async fn sweep_repairs_every_invalid_thread_in_a_real_database() -> Result<()> {
     .fetch_all(store.pool())
     .await?;
     let mut invalid_after = 0usize;
+    let mut deferred = 0usize;
     let mut still_dangling = Vec::new();
     for (tid, history, draft, compactions) in &heads_after {
         let raw: Vec<llm::Message> = serde_json::from_str(history)?;
@@ -89,11 +90,24 @@ async fn sweep_repairs_every_invalid_thread_in_a_real_database() -> Result<()> {
         if let Some(d) = draft {
             view.extend(serde_json::from_str::<Vec<llm::Message>>(d)?);
         }
-        if !llm::is_provider_valid_tool_sequence(&view) {
+        if llm::is_provider_valid_tool_sequence(&view) {
+            continue;
+        }
+        let live_tasks: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM agent_sdk_tasks \
+             WHERE thread_id = ?1 AND status NOT IN ('completed', 'failed', 'cancelled')",
+        )
+        .bind(tid)
+        .fetch_one(store.pool())
+        .await?;
+        if live_tasks > 0 {
+            deferred += 1;
+        } else {
             invalid_after += 1;
             still_dangling.push(tid.clone());
         }
     }
+    println!("deferred (a live turn owns the pending calls): {deferred}");
     println!("invalid after sweep (provider view): {invalid_after}");
 
     let ledgered: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_sdk_applied_repairs")
@@ -107,7 +121,8 @@ async fn sweep_repairs_every_invalid_thread_in_a_real_database() -> Result<()> {
     );
     assert_eq!(
         invalid_after, 0,
-        "every thread must be provider-valid after the sweep; still invalid: {still_dangling:?}"
+        "every thread without a live turn must be provider-valid after the sweep; \
+         still invalid: {still_dangling:?}"
     );
     assert!(
         ledgered > 0,
