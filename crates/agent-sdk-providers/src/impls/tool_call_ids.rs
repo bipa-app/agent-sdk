@@ -5,17 +5,71 @@
 //! models such as Kimi return the id the model wrote itself: `<name>:<index>`,
 //! `<name>_<index>` or `functions.<name>:<index>`, where the index restarts
 //! whenever the model loses count, for example after compaction shrinks the
-//! visible history. Those ids repeat across turns, so they are replaced here,
-//! before anything is streamed or persisted.
+//! visible history. Other gateways number calls with generic ids such as
+//! `call_0` or `0`. Those ids repeat across turns, so on any route other than
+//! `api.openai.com` they are replaced here, before anything is streamed or
+//! persisted.
 
 use std::collections::HashSet;
 
 use agent_sdk_foundation::llm::{ChatOutcome, Content, ContentBlock, Message};
 
+/// `OpenAI` Chat Completions rejects a tool-call id longer than this.
+const MAX_TOOL_CALL_ID_LEN: usize = 40;
+/// Length of `u64::MAX` written in base 36.
+const MAX_BASE36_U64_LEN: usize = 13;
+/// Provider ids shorter than this carry too little entropy to stay unique.
+const MIN_OPAQUE_ID_LEN: usize = 8;
+/// A trailing number this long or shorter counts a call rather than naming it.
+const MAX_INDEX_DIGITS: usize = 9;
+/// Generic words gateways put in front of a call index, compared lowercase.
+const INDEX_PREFIXES: &[&str] = &[
+    "call",
+    "calls",
+    "fc",
+    "func",
+    "function",
+    "functions",
+    "id",
+    "tc",
+    "tool",
+    "tool_call",
+    "tool-call",
+    "toolcall",
+    "tool_use",
+    "tooluse",
+];
+
+/// Who wrote the tool-call ids a route returns.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolCallIdOrigin {
+    /// `api.openai.com`, whose ids are opaque and unique: only an empty or
+    /// repeated id is replaced.
+    FirstParty,
+    /// Any other `OpenAI`-compatible endpoint: ids that only number the call
+    /// are replaced as well.
+    #[default]
+    Gateway,
+}
+
+impl ToolCallIdOrigin {
+    pub fn of_base_url(base_url: &str) -> Self {
+        if super::openai::is_official_openai_base_url(base_url) {
+            Self::FirstParty
+        } else {
+            Self::Gateway
+        }
+    }
+}
+
 /// Give every tool use in a successful decoded response its durable id.
-pub fn with_unique_tool_ids(history: &[Message], mut outcome: ChatOutcome) -> ChatOutcome {
+pub fn with_unique_tool_ids(
+    history: &[Message],
+    origin: ToolCallIdOrigin,
+    mut outcome: ChatOutcome,
+) -> ChatOutcome {
     if let ChatOutcome::Success(response) = &mut outcome {
-        ToolCallIdAssigner::for_history(history).assign_blocks(&mut response.content);
+        ToolCallIdAssigner::for_history(history, origin).assign_blocks(&mut response.content);
     }
     outcome
 }
@@ -28,11 +82,12 @@ pub fn with_unique_tool_ids(history: &[Message], mut outcome: ChatOutcome) -> Ch
 #[derive(Debug, Default)]
 pub struct ToolCallIdAssigner {
     taken: HashSet<String>,
+    origin: ToolCallIdOrigin,
 }
 
 impl ToolCallIdAssigner {
     /// Start from every tool-use and tool-result id already in the history.
-    pub fn for_history(messages: &[Message]) -> Self {
+    pub fn for_history(messages: &[Message], origin: ToolCallIdOrigin) -> Self {
         let mut taken = HashSet::new();
         for message in messages {
             let Content::Blocks(blocks) = &message.content else {
@@ -46,34 +101,34 @@ impl ToolCallIdAssigner {
                 }
             }
         }
-        Self { taken }
+        Self { taken, origin }
     }
 
     /// Return the id to store for one provider tool call.
     ///
-    /// The provider's id is kept when it is present, not yet used, and not
-    /// positional. A positional id keeps its `<name>:` stem and gets a random
-    /// index: Kimi's chat template shows the model a past call by its id
-    /// alone, so the stem is how it still sees which function ran.
+    /// The provider's id is kept when it is present, not yet used, and opaque.
+    /// A `<name>:<index>` id keeps its `<name>:` stem and gets a random index:
+    /// Kimi's chat template shows the model a past call by its id alone, so the
+    /// stem is how it still sees which function ran.
     pub fn assign(&mut self, provider_id: &str, tool_name: &str) -> String {
-        let stem = positional_stem(provider_id, tool_name);
-        let id = if stem.is_none() && !provider_id.is_empty() && !self.taken.contains(provider_id) {
-            provider_id.to_owned()
-        } else {
-            let minted = loop {
-                let candidate = stem.map_or_else(
-                    || format!("call_{}", uuid::Uuid::new_v4().simple()),
-                    |stem| format!("{stem}{}", uuid::Uuid::new_v4().as_u64_pair().0),
-                );
-                if !self.taken.contains(&candidate) {
-                    break candidate;
-                }
-            };
-            log::debug!(
-                "Replaced provider tool-call id provider_id={provider_id:?} tool={tool_name} id={minted}"
-            );
-            minted
+        let shape = match self.origin {
+            ToolCallIdOrigin::FirstParty => ProviderIdShape::Opaque,
+            ToolCallIdOrigin::Gateway => ProviderIdShape::of(provider_id, tool_name),
         };
+        let id = match shape {
+            ProviderIdShape::Opaque
+                if !provider_id.is_empty() && !self.taken.contains(provider_id) =>
+            {
+                provider_id.to_owned()
+            }
+            ProviderIdShape::Opaque | ProviderIdShape::Counter => self.mint(None),
+            ProviderIdShape::NamedIndex(stem) => self.mint(Some(stem)),
+        };
+        if id != provider_id {
+            log::debug!(
+                "Replaced provider tool-call id provider_id={provider_id:?} tool={tool_name} id={id}"
+            );
+        }
         self.taken.insert(id.clone());
         id
     }
@@ -86,18 +141,81 @@ impl ToolCallIdAssigner {
             }
         }
     }
+
+    fn mint(&self, stem: Option<&str>) -> String {
+        loop {
+            let candidate = fresh_id(stem);
+            if !self.taken.contains(&candidate) {
+                return candidate;
+            }
+        }
+    }
 }
 
-/// The `<name>:` / `<name>_` / `functions.<name>:` stem of an id that only
-/// numbers the call, or `None` when the id is not derived from the name.
-fn positional_stem<'a>(id: &'a str, tool_name: &str) -> Option<&'a str> {
-    let stem = id.trim_end_matches(|c: char| c.is_ascii_digit());
-    if stem.len() == id.len() {
-        return None;
+enum ProviderIdShape<'a> {
+    /// Unique by construction.
+    Opaque,
+    /// `<name>:<n>`, `<name>_<n>` or `functions.<name>:<n>`, with its stem.
+    NamedIndex(&'a str),
+    /// Empty, short, all digits, or a generic word and a small index.
+    Counter,
+}
+
+impl<'a> ProviderIdShape<'a> {
+    fn of(id: &'a str, tool_name: &str) -> Self {
+        if id.is_empty() {
+            return Self::Counter;
+        }
+        let stem = id.trim_end_matches(|c: char| c.is_ascii_digit());
+        let index_digits = id.len() - stem.len();
+        if index_digits > 0
+            && let Some(prefix) = stem.strip_suffix([':', '_'])
+            && prefix.strip_prefix("functions.").unwrap_or(prefix) == tool_name
+        {
+            return Self::NamedIndex(stem);
+        }
+        if id.len() < MIN_OPAQUE_ID_LEN {
+            return Self::Counter;
+        }
+        let prefix = stem
+            .strip_suffix([':', '_', '-', '.'])
+            .unwrap_or(stem)
+            .to_ascii_lowercase();
+        let counts_calls = prefix.is_empty()
+            || prefix.starts_with("functions.")
+            || INDEX_PREFIXES.contains(&prefix.as_str());
+        if index_digits > 0 && index_digits <= MAX_INDEX_DIGITS && counts_calls {
+            Self::Counter
+        } else {
+            Self::Opaque
+        }
     }
-    let prefix = stem.strip_suffix(':').or_else(|| stem.strip_suffix('_'))?;
-    let name = prefix.strip_prefix("functions.").unwrap_or(prefix);
-    (name == tool_name).then_some(stem)
+}
+
+fn fresh_id(stem: Option<&str>) -> String {
+    let random = uuid::Uuid::new_v4();
+    match stem {
+        Some(stem) if stem.len() + MAX_BASE36_U64_LEN <= MAX_TOOL_CALL_ID_LEN => {
+            format!("{stem}{}", base36(random.as_u64_pair().0))
+        }
+        Some(_) | None => format!("call_{}", random.simple()),
+    }
+}
+
+fn base36(mut value: u64) -> String {
+    let mut digits = Vec::with_capacity(MAX_BASE36_U64_LEN);
+    loop {
+        digits.extend(
+            u32::try_from(value % 36)
+                .ok()
+                .and_then(|d| char::from_digit(d, 36)),
+        );
+        value /= 36;
+        if value == 0 {
+            break;
+        }
+    }
+    digits.iter().rev().collect()
 }
 
 #[cfg(test)]
@@ -120,19 +238,35 @@ mod tests {
         messages
     }
 
+    fn gateway(history: &[Message]) -> ToolCallIdAssigner {
+        ToolCallIdAssigner::for_history(history, ToolCallIdOrigin::Gateway)
+    }
+
     fn assert_reminted_with_stem(minted: &str, original: &str, stem: &str) {
         assert_ne!(minted, original);
         let index = minted.strip_prefix(stem).unwrap_or_default();
         assert!(
-            !index.is_empty() && index.chars().all(|c| c.is_ascii_digit()),
-            "{minted} should keep the {stem} stem with a numeric index"
+            !index.is_empty()
+                && index
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase()),
+            "{minted} should keep the {stem} stem with a base-36 index"
         );
+        assert!(minted.len() <= MAX_TOOL_CALL_ID_LEN, "{minted} is too long");
+    }
+
+    fn assert_fresh_call_id(minted: &str, original: &str) {
+        assert_ne!(minted, original);
+        assert!(
+            minted.starts_with("call_") && minted.len() > "call_".len(),
+            "{minted} should be a fresh call_ id"
+        );
+        assert!(minted.len() <= MAX_TOOL_CALL_ID_LEN, "{minted} is too long");
     }
 
     #[test]
     fn positional_id_that_repeats_history_is_replaced() {
-        let mut ids =
-            ToolCallIdAssigner::for_history(&history(&[("bash:0", "bash"), ("bash:1", "bash")]));
+        let mut ids = gateway(&history(&[("bash:0", "bash"), ("bash:1", "bash")]));
 
         let first = ids.assign("bash:0", "bash");
         let second = ids.assign("bash:1", "bash");
@@ -152,6 +286,11 @@ mod tests {
             ("read:25", "read", "read:"),
             ("functions.read:3", "read", "functions.read:"),
             ("link_fetch:1", "link_fetch", "link_fetch:"),
+            (
+                "functions.link_fetch:1",
+                "link_fetch",
+                "functions.link_fetch:",
+            ),
         ] {
             let minted = ids.assign(provider_id, name);
             assert_reminted_with_stem(&minted, provider_id, stem);
@@ -159,22 +298,61 @@ mod tests {
     }
 
     #[test]
+    fn counter_ids_get_fresh_call_ids_even_without_a_visible_collision() {
+        let mut ids = ToolCallIdAssigner::default();
+
+        for (provider_id, name) in [
+            ("0", "read"),
+            ("17", "read"),
+            ("call_0", "read"),
+            ("call_123", "read_file"),
+            ("toolcall-42", "read"),
+            ("tool_1", "bash"),
+            ("tool_call_12", "bash"),
+            ("Tool_Call:2", "bash"),
+            ("fc_3", "bash"),
+            ("functions.read:3", "bash"),
+            ("x1", "bash"),
+            ("abc", "bash"),
+        ] {
+            let minted = ids.assign(provider_id, name);
+            assert_fresh_call_id(&minted, provider_id);
+        }
+    }
+
+    #[test]
     fn opaque_unique_ids_pass_through() {
-        let mut ids = ToolCallIdAssigner::for_history(&history(&[("call_history", "read")]));
+        let mut ids = gateway(&history(&[("call_history", "read")]));
 
         for (provider_id, name) in [
             ("call_a31qKPFi7qB2YK3WxyXVjTuC", "read"),
-            ("call_123", "read_file"),
+            ("call_a31qKPFi7qB2YK3WxyXVj123", "read"),
+            ("call_8473629104857362", "read"),
             ("toolu_01ABC", "bash"),
-            ("read_v2", "read_v2"),
+            ("lookup_v2", "lookup_v2"),
+            ("D681PevKs", "bash"),
         ] {
             assert_eq!(ids.assign(provider_id, name), provider_id);
         }
     }
 
     #[test]
+    fn first_party_ids_are_replaced_only_when_missing_or_repeated() {
+        let mut ids = ToolCallIdAssigner::for_history(
+            &history(&[("call_history", "read")]),
+            ToolCallIdOrigin::FirstParty,
+        );
+
+        assert_eq!(ids.assign("call_0", "read"), "call_0");
+        assert_eq!(ids.assign("bash:0", "bash"), "bash:0");
+        assert_fresh_call_id(&ids.assign("", "read"), "");
+        assert_fresh_call_id(&ids.assign("call_0", "read"), "call_0");
+        assert_fresh_call_id(&ids.assign("call_history", "read"), "call_history");
+    }
+
+    #[test]
     fn missing_and_duplicate_ids_get_fresh_unique_ids() {
-        let mut ids = ToolCallIdAssigner::for_history(&history(&[("call_history", "read")]));
+        let mut ids = gateway(&history(&[("call_history", "read")]));
 
         let empty = ids.assign("", "read");
         let first = ids.assign("call_same", "read");
@@ -183,7 +361,7 @@ mod tests {
 
         assert_eq!(first, "call_same");
         for minted in [&empty, &duplicate, &historical] {
-            assert!(minted.starts_with("call_") && minted.len() > "call_".len());
+            assert_fresh_call_id(minted, "call_same");
         }
         let all: HashSet<&String> = [&empty, &first, &duplicate, &historical]
             .into_iter()
@@ -198,6 +376,29 @@ mod tests {
         let minted: HashSet<String> = (0..2_000).map(|_| ids.assign("bash:0", "bash")).collect();
         assert_eq!(minted.len(), 2_000);
         assert!(!minted.contains("bash:0"));
+    }
+
+    #[test]
+    fn minted_ids_fit_the_chat_completions_length_limit() {
+        let long_name = "x".repeat(64);
+        let long_positional = format!("functions.{long_name}:0");
+        let mut ids = ToolCallIdAssigner::default();
+
+        for _ in 0..200 {
+            for (provider_id, name) in [
+                ("functions.link_fetch:0", "link_fetch"),
+                ("call_0", "read"),
+                ("", "read"),
+                (long_positional.as_str(), long_name.as_str()),
+            ] {
+                let minted = ids.assign(provider_id, name);
+                assert!(minted.len() <= MAX_TOOL_CALL_ID_LEN, "{minted} is too long");
+            }
+        }
+        assert_eq!(base36(u64::MAX).len(), MAX_BASE36_U64_LEN);
+        assert_eq!(base36(0), "0");
+        assert_eq!(base36(35), "z");
+        assert_eq!(base36(36), "10");
     }
 
     #[test]

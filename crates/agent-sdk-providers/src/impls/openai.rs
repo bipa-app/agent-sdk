@@ -61,7 +61,7 @@ use super::openai_reasoning::{
 };
 use super::openai_responses::OpenAIResponsesProvider;
 use super::openai_schema::{normalize_strict_schema, normalized_strict_schema};
-use super::tool_call_ids::{ToolCallIdAssigner, with_unique_tool_ids};
+use super::tool_call_ids::{ToolCallIdAssigner, ToolCallIdOrigin, with_unique_tool_ids};
 use crate::model_features::supports_responses_original_image_detail;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -92,7 +92,7 @@ fn requires_responses_api(model: &str) -> bool {
         })
 }
 
-fn is_official_openai_base_url(base_url: &str) -> bool {
+pub(super) fn is_official_openai_base_url(base_url: &str) -> bool {
     url::Url::parse(base_url).is_ok_and(|url| url.host_str() == Some("api.openai.com"))
 }
 
@@ -987,8 +987,9 @@ impl LlmProvider for OpenAIProvider {
             bytes.len()
         );
 
+        let id_origin = ToolCallIdOrigin::of_base_url(&self.base_url);
         decode_chat_response(status, &bytes, retry_after)
-            .map(|outcome| with_unique_tool_ids(&request.messages, outcome))
+            .map(|outcome| with_unique_tool_ids(&request.messages, id_origin, outcome))
     }
 
     async fn embed(
@@ -1211,7 +1212,10 @@ impl LlmProvider for OpenAIProvider {
 
             // Track tool call state across deltas
             let mut tool_calls: HashMap<usize, ToolCallAccumulator> = HashMap::new();
-            let mut tool_call_ids = ToolCallIdAssigner::for_history(&request.messages);
+            let mut tool_call_ids = ToolCallIdAssigner::for_history(
+                &request.messages,
+                ToolCallIdOrigin::of_base_url(&self.base_url),
+            );
             let mut usage: Option<Usage> = None;
             // The stop reason from `finish_reason`. With stream_options.include_usage
             // (official OpenAI) the usage arrives in a SEPARATE trailing chunk

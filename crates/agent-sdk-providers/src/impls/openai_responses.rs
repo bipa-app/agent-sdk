@@ -29,7 +29,7 @@ use super::openai_reasoning::{
     supports_reasoning_summary, validate_reasoning_config, validate_tool_choice,
 };
 use super::openai_schema::{normalize_strict_schema, normalized_strict_schema};
-use super::tool_call_ids::{ToolCallIdAssigner, with_unique_tool_ids};
+use super::tool_call_ids::{ToolCallIdAssigner, ToolCallIdOrigin, with_unique_tool_ids};
 use crate::model_features::supports_responses_original_image_detail;
 use std::borrow::Cow;
 
@@ -469,6 +469,7 @@ impl LlmProvider for OpenAIResponsesProvider {
 
         Ok(with_unique_tool_ids(
             &request.messages,
+            ToolCallIdOrigin::of_base_url(&self.base_url),
             build_responses_outcome(api_response),
         ))
     }
@@ -622,7 +623,10 @@ impl LlmProvider for OpenAIResponsesProvider {
             let mut stream = response.bytes_stream();
             let mut tool_calls: std::collections::HashMap<String, ToolCallAccumulator> =
                 std::collections::HashMap::new();
-            let mut tool_call_ids = ToolCallIdAssigner::for_history(&request.messages);
+            let mut tool_call_ids = ToolCallIdAssigner::for_history(
+                &request.messages,
+                ToolCallIdOrigin::of_base_url(&self.base_url),
+            );
             let mut message_state_markers: std::collections::HashMap<usize, serde_json::Value> =
                 std::collections::HashMap::new();
             let mut streamed_summary_blocks: std::collections::HashSet<usize> =
@@ -954,7 +958,7 @@ impl LlmProvider for OpenAIResponsesProvider {
     }
 
     fn supports_historical_image_blocks(&self) -> bool {
-        url::Url::parse(&self.base_url).is_ok_and(|url| url.host_str() == Some("api.openai.com"))
+        super::openai::is_official_openai_base_url(&self.base_url)
             && supports_responses_original_image_detail(&self.model)
     }
 
