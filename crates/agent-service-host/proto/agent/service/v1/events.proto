@@ -333,11 +333,31 @@ message RefusalEvent {
   optional string text = 2;
 }
 
+// What started a context compaction. UNSPECIFIED on events journaled before
+// the trigger was recorded.
+enum CompactionTrigger {
+  COMPACTION_TRIGGER_UNSPECIFIED = 0;
+  COMPACTION_TRIGGER_THRESHOLD = 1;
+  COMPACTION_TRIGGER_OVERFLOW = 2;
+  COMPACTION_TRIGGER_USER_REQUESTED = 3;
+}
+
+// Engine the host configured for a compaction. UNSPECIFIED for custom
+// compactors and events journaled before the engine was recorded.
+enum CompactionEngine {
+  COMPACTION_ENGINE_UNSPECIFIED = 0;
+  COMPACTION_ENGINE_LEGACY = 1;
+  COMPACTION_ENGINE_PRUNE_FIRST = 2;
+  COMPACTION_ENGINE_SNAPCOMPACT = 3;
+}
+
 message ContextCompactedEvent {
   uint64 original_count = 1;
   uint64 new_count = 2;
   uint64 original_tokens = 3;
   uint64 new_tokens = 4;
+  CompactionTrigger trigger = 5;
+  CompactionEngine engine = 6;
 }
 
 message SubagentProgressEvent {

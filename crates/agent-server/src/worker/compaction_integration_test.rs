@@ -30,7 +30,7 @@ use std::time::Duration as StdDuration;
 
 use agent_sdk::context::{CompactionConfig, CompactionEngine};
 use agent_sdk_foundation::ThreadId;
-use agent_sdk_foundation::events::AgentEvent;
+use agent_sdk_foundation::events::{AgentEvent, CompactionTrigger};
 use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Message, StopReason, Usage,
 };
@@ -878,9 +878,14 @@ async fn assert_precall_compacted_projection(
 async fn assert_precall_compaction_events(fixtures: &Fixtures) -> Result<()> {
     let events = fixtures.events.get_events(&thread_id()).await?;
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e.event, AgentEvent::ContextCompacted { .. })),
+        events.iter().any(|e| matches!(
+            e.event,
+            AgentEvent::ContextCompacted {
+                trigger: Some(CompactionTrigger::Threshold),
+                engine: Some(CompactionEngine::PruneFirst),
+                ..
+            }
+        )),
         "expected ContextCompacted event, got events: {:?}",
         events
             .iter()
@@ -1519,10 +1524,15 @@ async fn prompt_too_long_triggers_emergency_compaction_and_retry() -> Result<()>
     // Compaction event committed.
     let events = fixtures.events.get_events(&thread_id()).await?;
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e.event, AgentEvent::ContextCompacted { .. })),
-        "expected ContextCompacted event after emergency compaction",
+        events.iter().any(|e| matches!(
+            e.event,
+            AgentEvent::ContextCompacted {
+                trigger: Some(CompactionTrigger::Overflow),
+                engine: Some(CompactionEngine::PruneFirst),
+                ..
+            }
+        )),
+        "expected an overflow ContextCompacted event after emergency compaction",
     );
 
     // The retry succeeded so a `Done` event landed; an `Error` would

@@ -8455,6 +8455,54 @@ async fn test_compaction_usage_counts_toward_budget() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn threshold_compaction_event_records_trigger_and_configured_engine() -> anyhow::Result<()> {
+    let message_store = Arc::new(InMemoryStore::new());
+    let thread_id = ThreadId::new();
+    seed_compactable_history(&message_store, &thread_id).await?;
+
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![
+            MockProvider::text_response("compact summary"),
+            MockProvider::text_response("done"),
+        ]))
+        .hooks(AllowAllHooks)
+        .with_compaction(
+            tiny_compaction_config().with_engine(crate::context::CompactionEngine::PruneFirst),
+        )
+        .message_store(Arc::clone(&message_store))
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let (_, events) = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    let compacted: Vec<&AgentEvent> = events
+        .iter()
+        .map(|envelope| &envelope.event)
+        .filter(|event| matches!(event, AgentEvent::ContextCompacted { .. }))
+        .collect();
+    assert_eq!(compacted.len(), 1, "{compacted:?}");
+    assert!(
+        matches!(
+            compacted[0],
+            AgentEvent::ContextCompacted {
+                trigger: Some(crate::events::CompactionTrigger::Threshold),
+                engine: Some(crate::context::CompactionEngine::PruneFirst),
+                ..
+            }
+        ),
+        "{compacted:?}"
+    );
+    Ok(())
+}
+
 /// Priced provider on a different catalog entry than [`PricedProvider`]:
 /// anthropic / claude-fable-5 ($10/M input, $50/M output), fixed usage
 /// 2000 in / 1000 out = $0.07 per call.
