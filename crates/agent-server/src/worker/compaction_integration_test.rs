@@ -2571,6 +2571,11 @@ async fn success_close_stamps_the_measured_request_facts() -> Result<()> {
         Some(0),
         "close must stamp the staged source's history generation",
     );
+    assert_eq!(
+        blob.get("served_route").and_then(serde_json::Value::as_str),
+        Some("mock"),
+        "close must stamp the route the stream confirmed served the request",
+    );
     assert!(
         attempts[0]
             .request_blob
@@ -3128,8 +3133,134 @@ async fn unstable_route_uses_fixed_threshold_and_full_estimate() -> Result<()> {
     assert_eq!(
         unstable.inner.calls(),
         1,
-        "fixed threshold + full estimate must fire; honoring the 1M \
-         representative window or the 90k anchor would have skipped",
+        "the fixed threshold must fire; honoring the 1M representative window \
+         would have skipped, and the seeded anchor never confirmed its serving route",
+    );
+    Ok(())
+}
+
+/// Summarizer calls made by one pre-call check through a primary → secondary
+/// failover chain whose only measured anchor was served by
+/// `anchor_served_route`.
+async fn failover_chain_summarizer_calls(anchor_served_route: &str) -> Result<usize> {
+    use crate::journal::staged::StagedMessageStore;
+
+    let fixtures = Fixtures::new();
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    seed_attempt_row(
+        &fixtures,
+        &task.id,
+        1,
+        serde_json::json!({
+            "model": "mock-model",
+            "request_input_tokens": 1_000,
+            "request_message_count": 24,
+            "request_fingerprint": sample_envelope_fingerprint()?,
+            "history_generation": 0,
+            "served_route": anchor_served_route,
+        }),
+        2_000,
+        t0() + Duration::seconds(5),
+    )
+    .await?;
+
+    let mut history = Vec::with_capacity(24);
+    for index in 0..12 {
+        history.push(Message::user(format!("u-{index}: {}", "x".repeat(30_000))));
+        history.push(Message::assistant(format!(
+            "a-{index}: {}",
+            "y".repeat(30_000)
+        )));
+    }
+    fixtures
+        .messages
+        .commit_messages(&thread_id(), history.clone(), t0() + Duration::seconds(6))
+        .await?;
+
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::PruneFirst)
+        .with_threshold_tokens(50_000);
+    let summarizer = Arc::new(ScriptedProvider::new(vec![ok_response(
+        "[summary] failover chain",
+    )]));
+    let compaction_provider: Arc<dyn LlmProvider> = summarizer.clone();
+    let chain =
+        agent_sdk_providers::FallbackProvider::new(Arc::new(ScriptedProvider::new(Vec::new())))
+            .with_fallback(Arc::new(ScriptedProvider::with_identity(
+                "openai",
+                "gpt-secondary",
+            )));
+    let deps = fixtures.deps_with_compaction(&cfg, &compaction_provider);
+    let staged = StagedMessageStore::new(thread_id(), history);
+
+    super::compaction::maybe_compact_staged_history(
+        &deps,
+        &chain,
+        &staged,
+        &thread_id(),
+        0,
+        &sample_envelope(),
+        t0() + Duration::seconds(20),
+    )
+    .await?;
+    Ok(summarizer.calls())
+}
+
+#[tokio::test]
+async fn failover_chain_anchors_on_the_route_that_served() -> Result<()> {
+    assert_eq!(
+        failover_chain_summarizer_calls("mock").await?,
+        0,
+        "the primary served the anchored request and is dispatched first again: \
+         its measured 1k occupancy must win over the ~180k full-history estimate",
+    );
+    assert_eq!(
+        failover_chain_summarizer_calls("openai").await?,
+        1,
+        "the anchored request failed over to the secondary, which measured another \
+         backend; the trigger must fall back to the full estimate",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn failover_close_stamps_the_route_that_served() -> Result<()> {
+    let fixtures = Fixtures::new();
+    seed_projection_history(&fixtures.messages, &thread_id(), 2, "abc").await?;
+
+    let chain = agent_sdk_providers::FallbackProvider::new(Arc::new(ScriptedProvider::new(vec![
+        ChatOutcome::ServerError("primary unavailable".to_owned()),
+    ])))
+    .with_fallback(Arc::new(ScriptedProvider::with_identity(
+        "openai",
+        "gpt-secondary",
+    )));
+    let deps = fixtures.deps_without_compaction();
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    let task_id = task.id.clone();
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &fixtures.threads,
+        &fixtures.checkpoints,
+        &fixtures.messages,
+        t0(),
+    )
+    .await?;
+    execute_root_turn(inputs, "ping", &chain, &deps, t0() + Duration::seconds(1)).await?;
+
+    let attempts = fixtures.attempts.list_by_task(&task_id).await?;
+    let [attempt] = attempts.as_slice() else {
+        anyhow::bail!("expected one main attempt, got {attempts:?}");
+    };
+    assert_eq!(
+        attempt
+            .response_blob
+            .as_ref()
+            .and_then(|blob| blob.get("served_route"))
+            .and_then(serde_json::Value::as_str),
+        Some("openai"),
+        "the close must stamp the route the stream's Done named, not the \
+         chain's representative primary",
     );
     Ok(())
 }

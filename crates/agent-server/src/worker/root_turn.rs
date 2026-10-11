@@ -361,6 +361,9 @@ struct AttemptEvidence {
     /// anchors the measured compaction trigger.
     request_fingerprint: Option<String>,
     staged_history_generation: Option<u64>,
+    /// The route the stream's `Done` named; `None` when the provider did not
+    /// stamp one and `route_provider` is only the pre-dispatch identity.
+    served_route: Option<String>,
 }
 
 impl AttemptEvidence {
@@ -401,6 +404,7 @@ impl AttemptEvidence {
             request_message_count: request.messages.len(),
             request_fingerprint,
             staged_history_generation: None,
+            served_route: None,
         }
     }
 
@@ -4883,6 +4887,7 @@ fn evidence_with_served_route(
     let mut evidence = evidence.clone();
     if let Some(route) = accumulator.served_route() {
         route.clone_into(&mut evidence.route_provider);
+        evidence.served_route = Some(route.to_owned());
     }
     evidence
 }
@@ -5311,6 +5316,9 @@ fn build_close_params(
     }
     if let Some(generation) = evidence.staged_history_generation {
         response_blob["history_generation"] = serde_json::Value::from(generation);
+    }
+    if let Some(route) = &evidence.served_route {
+        response_blob["served_route"] = serde_json::Value::from(route.clone());
     }
 
     CloseAttemptParams {

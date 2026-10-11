@@ -199,6 +199,10 @@ struct AnchorRequirements<'a> {
     current_history_generation: u64,
     history_len: usize,
     expected_request_fingerprint: &'a str,
+    /// `Some` for a provider without a stable request route: only a request
+    /// whose stream confirmed this route served it measured the backend the
+    /// next call dispatches to first.
+    required_served_route: Option<&'a str>,
 }
 
 /// `request_blob.user_prompt` of internal context-compaction attempts.
@@ -244,6 +248,11 @@ fn attempt_measured_anchor(
         .get("request_fingerprint")
         .and_then(serde_json::Value::as_str)
         != Some(requirements.expected_request_fingerprint)
+    {
+        return None;
+    }
+    if let Some(required_route) = requirements.required_served_route
+        && blob.get("served_route").and_then(serde_json::Value::as_str) != Some(required_route)
     {
         return None;
     }
@@ -424,8 +433,10 @@ pub(crate) struct PlannedCompaction {
 ///
 /// Trigger occupancy is the latest eligible measured anchor plus the
 /// estimated staged suffix it did not cover; the full history is estimated
-/// only when no anchor exists. `expected_request` is the message-less
-/// envelope of the request about to be sent.
+/// only when no anchor exists. A provider without a stable request route
+/// anchors only on requests its own representative route served.
+/// `expected_request` is the message-less envelope of the request about to
+/// be sent.
 pub(crate) async fn plan_pre_call_compaction(
     deps: &RootTurnDeps<'_>,
     main_provider: &dyn LlmProvider,
@@ -467,19 +478,15 @@ pub(crate) async fn plan_pre_call_compaction(
     );
     let (trigger_tokens, trigger_source) =
         if cfg.uses_prune_first_engine() || cfg.uses_snapcompact_engine() {
-            let measured = if main_provider.has_stable_request_route() {
-                measured_occupancy(
-                    deps,
-                    main_provider,
-                    &compactor,
-                    &history,
-                    thread_id,
-                    expected_request,
-                )
-                .await?
-            } else {
-                None
-            };
+            let measured = measured_occupancy(
+                deps,
+                main_provider,
+                &compactor,
+                &history,
+                thread_id,
+                expected_request,
+            )
+            .await?;
             trigger_tokens(measured, || compactor.estimate_tokens(&history))
         } else {
             (compactor.estimate_tokens(&history), "legacy_estimated")
@@ -534,6 +541,8 @@ async fn measured_occupancy(
         current_history_generation,
         history_len: history.len(),
         expected_request_fingerprint: &fingerprint,
+        required_served_route: (!main_provider.has_stable_request_route())
+            .then(|| main_provider.route()),
     };
     Ok(latest_measured_anchor(deps, thread_id, &requirements)
         .await?
@@ -1343,7 +1352,37 @@ mod tests {
             current_history_generation: 1,
             history_len: 24,
             expected_request_fingerprint: fingerprint,
+            required_served_route: None,
         }
+    }
+
+    #[test]
+    fn unstable_route_anchors_only_on_a_confirmed_serving_route() -> anyhow::Result<()> {
+        let fingerprint = mock_fingerprint()?;
+        let unstable = AnchorRequirements {
+            required_served_route: Some("primary"),
+            ..requirements(&fingerprint)
+        };
+        let served_by_primary = stamped_attempt(
+            anchor_time()?,
+            &serde_json::json!({ "served_route": "primary" }),
+        )?;
+        assert!(attempt_measured_anchor(&served_by_primary, &unstable).is_some());
+        let failed_over = stamped_attempt(
+            anchor_time()?,
+            &serde_json::json!({ "served_route": "secondary" }),
+        )?;
+        assert!(attempt_measured_anchor(&failed_over, &unstable).is_none());
+        let unconfirmed = stamped_attempt(anchor_time()?, &serde_json::json!({}))?;
+        assert!(
+            attempt_measured_anchor(&unconfirmed, &unstable).is_none(),
+            "a row without a stream-confirmed route cannot prove which backend it measured",
+        );
+        assert!(
+            attempt_measured_anchor(&unconfirmed, &requirements(&fingerprint)).is_some(),
+            "a stable route needs no serving confirmation",
+        );
+        Ok(())
     }
 
     #[test]
@@ -1445,8 +1484,7 @@ mod tests {
         let attempt = stamped_attempt(anchor_time()?, &serde_json::json!({}))?;
         let stale = AnchorRequirements {
             current_history_generation: 2,
-            history_len: 24,
-            expected_request_fingerprint: &fingerprint,
+            ..requirements(&fingerprint)
         };
         assert!(attempt_measured_anchor(&attempt, &stale).is_none());
         let unstamped = stamped_attempt(
@@ -1501,9 +1539,8 @@ mod tests {
             &serde_json::json!({ "request_message_count": 25 }),
         )?;
         let small_history = AnchorRequirements {
-            current_history_generation: 1,
             history_len: 24,
-            expected_request_fingerprint: &fingerprint,
+            ..requirements(&fingerprint)
         };
         assert!(attempt_measured_anchor(&oversized, &small_history).is_none());
 
