@@ -14,7 +14,9 @@ use agent_server::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskStatus, WorkerId,
 };
 
-use crate::config::{ServiceConfig, StorageBackend, StorageConfig, WorkerConfig};
+use crate::config::{ServiceConfig, WorkerConfig};
+#[cfg(feature = "sqlite")]
+use crate::config::{StorageBackend, StorageConfig};
 use crate::host::{ServiceHost, settle_orphaned_descendants};
 use crate::stores::StoreRegistry;
 
