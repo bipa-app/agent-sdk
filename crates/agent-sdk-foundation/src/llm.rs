@@ -8,6 +8,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+pub mod late_tool_result;
+
 // ── Thinking ──────────────────────────────────────────────────────────
 
 /// The mode of extended thinking.

@@ -7765,6 +7765,293 @@ async fn early_resume_follow_up_wave_pairs_new_calls_and_delivers_late_result_on
     Ok(())
 }
 
+/// Run a fresh follow-up turn on the thread and return the provider
+/// request it sent.
+async fn follow_up_request(
+    stores: &TestStores,
+    prompt: &str,
+    at: time::OffsetDateTime,
+) -> Result<Vec<agent_sdk_foundation::llm::Message>> {
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        at,
+    )
+    .await?;
+    let provider = RequestLogProvider::new("Understood.");
+    let outcome = execute_root_turn(inputs, prompt, &provider, &stores.deps(), at).await?;
+    assert!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+    provider
+        .requests()?
+        .pop()
+        .context("the follow-up turn must call the provider")
+}
+
+/// The history closes the running call exactly once, with `status`, and
+/// still satisfies the provider pairing contract.
+fn assert_running_call_closed(
+    messages: &[agent_sdk_foundation::llm::Message],
+    call_id: &str,
+    status: &str,
+) {
+    assert_eq!(
+        agent_sdk_foundation::llm::provider_tool_sequence_error_index(messages),
+        None,
+        "the history must stay provider-valid",
+    );
+    let closed = late_results_for(messages, call_id);
+    assert_eq!(closed.len(), 1, "the running call is closed exactly once");
+    assert!(
+        closed[0].contains(&format!("status=\"{status}\"")),
+        "closed as {status}: {}",
+        closed[0],
+    );
+    assert!(
+        !closed[0].contains("do not call it again"),
+        "a closed call may be issued again: {}",
+        closed[0],
+    );
+}
+
+#[tokio::test]
+async fn cancelling_an_early_resumed_parent_closes_its_running_call() -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
+        &stores,
+        vec![bash_call("call_0"), bash_call("call_1")],
+        ChildJoinPolicy::Any,
+    ))
+    .await?;
+    complete_child_at(
+        &stores,
+        &children[0],
+        &ok_result("done-0"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+    let provider = RequestLogProvider::new("The second call is still running.");
+    let outcome = run_child_resume(&stores, &parent.id, &provider, t_plus(10), t_plus(15)).await?;
+    assert_reparked_on_original_call(outcome, &children[1], &["call_0", "call_1"])?;
+
+    cancel_root_turn(&parent.id, &stores.deps(), t_plus(20)).await?;
+    let survivor = stores
+        .tasks
+        .get(&children[1].id)
+        .await?
+        .context("survivor")?;
+    assert_eq!(survivor.status, TaskStatus::Cancelled);
+
+    let committed = stores.messages.get_history(&thread_a()).await?;
+    assert_running_call_closed(&committed, "call_1", "cancelled");
+    assert_eq!(count_tool_results(&committed, "call_1"), 1);
+
+    let request = follow_up_request(&stores, "Run the second command again.", t_plus(30)).await?;
+    assert_running_call_closed(&request, "call_1", "cancelled");
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelling_an_early_resume_mid_call_closes_its_running_call() -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
+        &stores,
+        vec![bash_call("call_0"), bash_call("call_1")],
+        ChildJoinPolicy::Any,
+    ))
+    .await?;
+    complete_child_at(
+        &stores,
+        &children[0],
+        &ok_result("done-0"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent.id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            t_plus(10),
+        )
+        .await?
+        .context("acquire ready parent")?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap_with_tools(acquired.clone()),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(10),
+    )
+    .await?;
+    let cancel = CancellationToken::new();
+    let provider = MidStreamCancelRootTurnProvider {
+        cancel: cancel.clone(),
+        stores: stores.clone(),
+        task_id: parent.id.clone(),
+        cancel_at: t_plus(12),
+    };
+    let mut deps = stores.deps();
+    deps.cancel = Some(&cancel);
+
+    let result = resume_from_children(inputs, &acquired, &provider, &deps, t_plus(11)).await;
+    let error = result.err().context("a cancelled early resume must fail")?;
+    assert!(is_root_turn_cancelled(&error), "{error:#}");
+
+    let committed = stores.messages.get_history(&thread_a()).await?;
+    assert_eq!(find_tool_result(&committed, "call_0"), Some("done-0"));
+    assert_running_call_closed(&committed, "call_1", "cancelled");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_early_resumed_parent_closes_its_running_call() -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
+        &stores,
+        vec![
+            bash_call("call_0"),
+            bash_call("call_1"),
+            bash_call("call_2"),
+        ],
+        ChildJoinPolicy::Any,
+    ))
+    .await?;
+    complete_child_at(
+        &stores,
+        &children[0],
+        &ok_result("done-0"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+    let provider = RequestLogProvider::new("Two calls are still running.");
+    run_child_resume(&stores, &parent.id, &provider, t_plus(10), t_plus(12)).await?;
+    complete_child_at(
+        &stores,
+        &children[1],
+        &ok_result("done-1"),
+        t_plus(20),
+        t_plus(21),
+    )
+    .await?;
+
+    let error = run_child_resume(
+        &stores,
+        &parent.id,
+        &InvalidRequestProvider,
+        t_plus(22),
+        t_plus(24),
+    )
+    .await
+    .err()
+    .context("the second early resume must fail")?;
+    fail_root_turn(
+        &parent.id,
+        &WorkerId::from_string("worker_test"),
+        &LeaseId::from_string("lease_test"),
+        &thread_a(),
+        &error,
+        &stores.deps(),
+        t_plus(25),
+    )
+    .await?;
+
+    let view = crate::journal::thread_recover::recover_thread(
+        &thread_a(),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(26),
+    )
+    .await?;
+    let delivered = late_results_for(&view.messages, "call_1");
+    assert_eq!(delivered.len(), 1);
+    assert!(delivered[0].contains("done-1"), "{}", delivered[0]);
+    assert_running_call_closed(&view.messages, "call_2", "failed");
+
+    let request = follow_up_request(&stores, "Try the third command again.", t_plus(30)).await?;
+    assert_running_call_closed(&request, "call_2", "failed");
+    assert_eq!(late_results_for(&request, "call_1").len(), 1);
+    Ok(())
+}
+
+/// A requeued resume leaves a draft whose fan-in already delivered the
+/// running call's late result; cancelling then must not also close it.
+#[tokio::test]
+async fn cancelling_after_a_delivered_late_result_does_not_close_the_call_again() -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
+        &stores,
+        vec![bash_call("call_0"), bash_call("call_1")],
+        ChildJoinPolicy::Any,
+    ))
+    .await?;
+    complete_child_at(
+        &stores,
+        &children[0],
+        &ok_result("done-0"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+    let provider = RequestLogProvider::new("The second call is still running.");
+    run_child_resume(&stores, &parent.id, &provider, t_plus(10), t_plus(12)).await?;
+    complete_child_at(
+        &stores,
+        &children[1],
+        &ok_result("done-1"),
+        t_plus(20),
+        t_plus(21),
+    )
+    .await?;
+    run_child_resume(
+        &stores,
+        &parent.id,
+        &InvalidRequestProvider,
+        t_plus(22),
+        t_plus(24),
+    )
+    .await
+    .err()
+    .context("the final resume must fail")?;
+    let requeued = stores
+        .tasks
+        .requeue_owned_task(
+            &parent.id,
+            &WorkerId::from_string("worker_test"),
+            &LeaseId::from_string("lease_test"),
+            None,
+            t_plus(25),
+        )
+        .await?;
+    assert!(matches!(
+        requeued,
+        crate::journal::store::RequeueOutcome::Requeued(_)
+    ));
+
+    cancel_root_turn(&parent.id, &stores.deps(), t_plus(30)).await?;
+    let committed = stores.messages.get_history(&thread_a()).await?;
+    assert_eq!(
+        agent_sdk_foundation::llm::provider_tool_sequence_error_index(&committed),
+        None,
+    );
+    let late = late_results_for(&committed, "call_1");
+    assert_eq!(
+        late.len(),
+        1,
+        "the delivered result is the only one: {late:?}"
+    );
+    assert!(late[0].contains("status=\"success\""), "{}", late[0]);
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Commit the completed prefix of a cancelled turn (partial commit)
 // ─────────────────────────────────────────────────────────────────────
@@ -7954,6 +8241,7 @@ async fn partial_commit_empty_candidate_is_a_strict_no_op() -> Result<()> {
             candidate: Vec::new(),
             expected_turn: 1,
             agent_state_snapshot: serde_json::Value::Null,
+            pending_tool_calls: &[],
         },
         &stores.deps(),
         t_plus(1),
@@ -7994,6 +8282,7 @@ async fn partial_commit_unbalanced_candidate_closes_and_commits_the_dangling_use
             candidate,
             expected_turn: 1,
             agent_state_snapshot: serde_json::Value::Null,
+            pending_tool_calls: &[],
         },
         &stores.deps(),
         t_plus(1),
@@ -8892,6 +9181,7 @@ async fn failed_salvage_commit_closes_its_synthetic_attempt() -> Result<()> {
             candidate: vec![agent_sdk_foundation::llm::Message::user("salvage me")],
             expected_turn: 1,
             agent_state_snapshot: serde_json::json!({}),
+            pending_tool_calls: &[],
         },
         &deps,
         t_plus(1),

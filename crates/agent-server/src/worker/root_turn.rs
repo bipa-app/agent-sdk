@@ -38,6 +38,7 @@
 use agent_sdk_foundation::ThreadId;
 use agent_sdk_foundation::audit::AuditProvenance;
 use agent_sdk_foundation::events::AgentEvent;
+use agent_sdk_foundation::llm::late_tool_result::LateToolResultStatus;
 use agent_sdk_foundation::llm::{self, ChatRequest};
 use agent_sdk_foundation::{
     AgentContinuation, AgentState, ContinuationEnvelope, PendingToolCallInfo, QuestionOption,
@@ -633,6 +634,8 @@ async fn fail_root_turn_inner(
         error,
         reason,
     } = params;
+    // Read before the fail transition clears the parked continuation.
+    let closed_draft = draft_closing_undelivered_calls(task_id, thread_id, deps).await;
     let error_msg = format!("{error:#}");
     let (failed_task, _parent) = deps
         .task_store
@@ -646,6 +649,14 @@ async fn fail_root_turn_inner(
         )
         .await
         .context("fail root task")?;
+    if let Some(draft) = closed_draft
+        && let Err(close_error) = deps.message_store.set_draft(thread_id, draft, now).await
+    {
+        log::warn!(
+            "fail: closing undelivered calls in the draft failed on thread {thread_id}: \
+             {close_error:#}"
+        );
+    }
 
     // Best-effort: the task is durably Failed; event commit failure
     // must not override that outcome. Consistent with
@@ -668,6 +679,32 @@ async fn fail_root_turn_inner(
     );
 
     Ok(failed_task)
+}
+
+/// The thread's draft with every call an early resume answered only with
+/// the interim payload closed as failed, or `None` when nothing needs
+/// closing. A failed turn's draft folds into the next turn's history, where
+/// an unclosed interim result keeps promising a result that never comes.
+async fn draft_closing_undelivered_calls(
+    task_id: &AgentTaskId,
+    thread_id: &agent_sdk_foundation::ThreadId,
+    deps: &RootTurnDeps<'_>,
+) -> Option<Vec<llm::Message>> {
+    let task = deps.task_store.get(task_id).await.ok().flatten()?;
+    let continuation = task.state.continuation()?;
+    let mut draft = deps
+        .message_store
+        .get(thread_id)
+        .await
+        .ok()
+        .flatten()?
+        .draft_messages;
+    close_undelivered_interim_calls(
+        &mut draft,
+        &continuation.payload.pending_tool_calls,
+        UndeliveredBecause::TurnFailed,
+    )
+    .then_some(draft)
 }
 
 /// Cancel a root turn and its entire subtree.
@@ -1087,6 +1124,10 @@ pub(crate) struct PartialCancelCommit<'a> {
     pub(crate) expected_turn: u32,
     /// Agent-state snapshot for the checkpoint written at `expected_turn`.
     pub(crate) agent_state_snapshot: serde_json::Value,
+    /// The parked batch's pending calls. Any the candidate answered only
+    /// with the interim "still running" payload is committed closed as
+    /// cancelled.
+    pub(crate) pending_tool_calls: &'a [PendingToolCallInfo],
 }
 
 /// Durably commit the largest provider-valid prefix of a cancelled
@@ -1114,6 +1155,7 @@ pub(crate) async fn commit_partial_turn_on_cancel(
         candidate,
         expected_turn,
         agent_state_snapshot,
+        pending_tool_calls,
     } = params;
 
     let (prefix, suffix) = provider_valid_split(candidate);
@@ -1127,7 +1169,12 @@ pub(crate) async fn commit_partial_turn_on_cancel(
     // edited.
     let closed_suffix =
         llm::repair_tool_sequence_in_place(&suffix, llm::USER_CANCELLED_TOOL_RESULT);
-    let committed = [prefix, closed_suffix].concat();
+    let mut committed = [prefix, closed_suffix].concat();
+    close_undelivered_interim_calls(
+        &mut committed,
+        pending_tool_calls,
+        UndeliveredBecause::TurnCancelled,
+    );
     if committed.is_empty() {
         // Nothing to commit. Strict no-op: no attempt row,
         // no thread mutation.
@@ -1282,6 +1329,7 @@ fn staged_or_recovery_snapshot(inputs: &RootWorkerInputs) -> serde_json::Value {
 async fn commit_cancelled_partial_turn(
     inputs: &RootWorkerInputs,
     candidate: Vec<llm::Message>,
+    pending_tool_calls: &[PendingToolCallInfo],
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
 ) {
@@ -1307,6 +1355,7 @@ async fn commit_cancelled_partial_turn(
             candidate,
             expected_turn: inputs.recovery_view.next_turn_number,
             agent_state_snapshot,
+            pending_tool_calls,
         },
         deps,
         now,
@@ -1328,6 +1377,30 @@ async fn commit_cancelled_partial_turn(
     {
         log::warn!("cancel-commit: re-seed draft failed on thread {thread_id}: {error:#}");
     }
+}
+
+/// Seam B for a resume or steering round: on cancellation, commit the
+/// staged `[suspended…, fan-in]` delta — balanced by construction, so it
+/// commits in full and the interrupted response is dropped. The delta
+/// becomes committed history instead of a draft that dies at the next
+/// commit, with every call still answered only by the interim payload
+/// closed as cancelled.
+async fn salvage_cancelled_resume(
+    inputs: &RootWorkerInputs,
+    error: &anyhow::Error,
+    pending_tool_calls: &[PendingToolCallInfo],
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) {
+    if !is_root_turn_cancelled(error) {
+        return;
+    }
+    let candidate = inputs
+        .staged_stores
+        .messages
+        .snapshot_appended_messages()
+        .unwrap_or_default();
+    commit_cancelled_partial_turn(inputs, candidate, pending_tool_calls, deps, now).await;
 }
 
 /// Seam A: commit the completed prefix of a **parked** cancelled turn.
@@ -1408,6 +1481,7 @@ async fn best_effort_commit_parked_cancel(
             candidate,
             expected_turn,
             agent_state_snapshot,
+            pending_tool_calls: &continuation.payload.pending_tool_calls,
         },
         deps,
         now,
@@ -1908,7 +1982,7 @@ async fn execute_root_turn_inner(
                         inputs.bootstrap.thread_id,
                     ),
                 }
-                commit_cancelled_partial_turn(&inputs, candidate, deps, now).await;
+                commit_cancelled_partial_turn(&inputs, candidate, &[], deps, now).await;
             }
             return Err(error);
         }
@@ -7288,20 +7362,8 @@ async fn resume_root_turn_with_fan_in(
     } = match streamed {
         Ok(streamed) => streamed,
         Err(error) => {
-            // Seam B (resume): the staged post-seed delta is
-            // `[suspended…, tool_results]` — balanced by construction, so
-            // it commits in full and the interrupted resume response is
-            // dropped. This also permanently fixes the balanced-draft
-            // drop: the delta becomes committed history instead of a
-            // draft that dies at the next commit.
-            if is_root_turn_cancelled(&error) {
-                let candidate = inputs
-                    .staged_stores
-                    .messages
-                    .snapshot_appended_messages()
-                    .unwrap_or_default();
-                commit_cancelled_partial_turn(&inputs, candidate, deps, now).await;
-            }
+            salvage_cancelled_resume(&inputs, &error, &continuation.pending_tool_calls, deps, now)
+                .await;
             return Err(error);
         }
     };
@@ -8096,7 +8158,7 @@ pub async fn resume_from_question(
 /// when an early resume fans in. Honest — never a fabricated child
 /// result — and explicit that the call must not be issued again: its
 /// real result arrives at a later fan-in as a late result (see
-/// [`render_late_tool_result`]).
+/// [`llm::late_tool_result`]).
 fn steering_interim_tool_result() -> ToolResult {
     let payload = serde_json::json!({
         "status": "running",
@@ -8128,8 +8190,29 @@ struct SurvivingChild {
 /// resume already delivered.
 struct LateToolResult {
     call: PendingToolCallInfo,
-    cancelled: bool,
+    status: LateToolResultStatus,
     result: ToolResult,
+}
+
+impl LateToolResult {
+    fn finished(call: PendingToolCallInfo, child_status: TaskStatus, result: ToolResult) -> Self {
+        let status = if child_status == TaskStatus::Cancelled {
+            LateToolResultStatus::Cancelled
+        } else if result.success {
+            LateToolResultStatus::Success
+        } else {
+            LateToolResultStatus::Error
+        };
+        Self {
+            call,
+            status,
+            result,
+        }
+    }
+
+    fn render(&self) -> String {
+        llm::late_tool_result::render(&self.call, self.status, &self.result.output)
+    }
 }
 
 /// Bundle of everything the steering LLM round + re-park consumes,
@@ -8224,11 +8307,7 @@ async fn build_steering_interim(
         if child.status.is_terminal() {
             let result = extract_child_tool_result(child)?;
             if already_answered {
-                late_results.push(LateToolResult {
-                    call: call.clone(),
-                    cancelled: child.status == TaskStatus::Cancelled,
-                    result,
-                });
+                late_results.push(LateToolResult::finished(call.clone(), child.status, result));
             } else {
                 tool_results.push((call.id.clone(), result));
             }
@@ -8250,42 +8329,6 @@ async fn build_steering_interim(
     })
 }
 
-const LATE_RESULT_INPUT_PREVIEW_CHARS: usize = 300;
-
-fn input_preview(input: &serde_json::Value) -> String {
-    let rendered = input.to_string();
-    match rendered.char_indices().nth(LATE_RESULT_INPUT_PREVIEW_CHARS) {
-        Some((cut, _)) => format!("{}…", &rendered[..cut]),
-        None => rendered,
-    }
-}
-
-/// Render a late result as self-describing text: it names the call by
-/// id, tool, and input so it stays unambiguous even after compaction has
-/// folded away the original `tool_use`.
-fn render_late_tool_result(late: &LateToolResult) -> String {
-    let status = if late.cancelled {
-        "cancelled"
-    } else if late.result.success {
-        "success"
-    } else {
-        "error"
-    };
-    let id = &late.call.id;
-    let name = &late.call.name;
-    format!(
-        "<late_tool_result tool_use_id=\"{id}\" name=\"{name}\" status=\"{status}\">\n\
-         Final result of the earlier `{name}` call {id}, previously reported as still running. \
-         It ran once and has now finished; do not call it again.\n\
-         input: {input}\n\
-         output:\n\
-         {output}\n\
-         </late_tool_result>",
-        input = input_preview(&late.call.input),
-        output = late.result.output,
-    )
-}
-
 /// Build the one fan-in user message: native `tool_result` blocks lead
 /// (the provider requires them first), then their attachments, then each
 /// late result with its attachments, then any steering content. Exactly
@@ -8297,7 +8340,7 @@ fn build_fan_in_message(
     let mut blocks = tool_result_blocks(&interim.tool_results);
     for late in &interim.late_results {
         blocks.push(llm::ContentBlock::Text {
-            text: render_late_tool_result(late),
+            text: late.render(),
         });
         blocks.extend(tool_result_attachments(&late.result));
     }
@@ -8307,6 +8350,105 @@ fn build_fan_in_message(
         "child fan-in has nothing to deliver: every parked call is already answered and still running",
     );
     Ok(llm::Message::user_with_content(blocks))
+}
+
+/// Why a call answered with the interim payload never got its result.
+#[derive(Clone, Copy)]
+enum UndeliveredBecause {
+    TurnCancelled,
+    TurnFailed,
+}
+
+impl UndeliveredBecause {
+    const fn status(self) -> LateToolResultStatus {
+        match self {
+            Self::TurnCancelled => LateToolResultStatus::Cancelled,
+            Self::TurnFailed => LateToolResultStatus::Failed,
+        }
+    }
+
+    const fn output(self) -> &'static str {
+        match self {
+            Self::TurnCancelled => {
+                "The turn was cancelled before this call's result was delivered."
+            }
+            Self::TurnFailed => "The turn failed before this call's result was delivered.",
+        }
+    }
+}
+
+/// Close every pending call `messages` answered only with the interim
+/// payload and never followed with a late result. Left open, the interim
+/// result keeps telling the model the call still runs and must not be
+/// re-issued, though its result can no longer arrive. The closing blocks
+/// merge into a trailing user message (a repair's synthetic results or the
+/// fan-in) so roles keep alternating. Returns whether anything was closed.
+///
+/// Only the current interim payload is recognized: an interim written by a
+/// build before late results existed is not closed here.
+fn close_undelivered_interim_calls(
+    messages: &mut Vec<llm::Message>,
+    pending: &[PendingToolCallInfo],
+    because: UndeliveredBecause,
+) -> bool {
+    let interim = steering_interim_tool_result().output;
+    let mut interim_answered = BTreeSet::new();
+    let mut late_delivered = BTreeSet::new();
+    let blocks = messages
+        .iter()
+        .filter_map(|message| match &message.content {
+            llm::Content::Blocks(blocks) => Some(blocks),
+            llm::Content::Text(_) => None,
+        });
+    for block in blocks.flatten() {
+        if let llm::ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } = block
+            && *content == interim
+        {
+            interim_answered.insert(tool_use_id.clone());
+        } else if let llm::ContentBlock::Text { text } = block
+            && let Some(id) = llm::late_tool_result::tool_use_id(text)
+        {
+            late_delivered.insert(id);
+        }
+    }
+    let closing: Vec<llm::ContentBlock> = pending
+        .iter()
+        .filter(|call| interim_answered.contains(&call.id) && !late_delivered.contains(&call.id))
+        .map(|call| llm::ContentBlock::Text {
+            text: llm::late_tool_result::render(call, because.status(), because.output()),
+        })
+        .collect();
+    if closing.is_empty() {
+        return false;
+    }
+    append_to_trailing_user_message(messages, closing);
+    true
+}
+
+fn append_to_trailing_user_message(
+    messages: &mut Vec<llm::Message>,
+    blocks: Vec<llm::ContentBlock>,
+) {
+    if let Some(last) = messages.last_mut()
+        && last.role == llm::Role::User
+    {
+        match &mut last.content {
+            llm::Content::Blocks(existing) => existing.extend(blocks),
+            llm::Content::Text(text) => {
+                let mut merged = vec![llm::ContentBlock::Text {
+                    text: std::mem::take(text),
+                }];
+                merged.extend(blocks);
+                last.content = llm::Content::Blocks(merged);
+            }
+        }
+    } else {
+        messages.push(llm::Message::user_with_content(blocks));
+    }
 }
 
 /// The survivors' pending tool calls, unchanged and in pending order. A
@@ -8513,13 +8655,7 @@ async fn run_steering_exchange(
     // Stage the interim fan-in + steering note and run one bounded LLM
     // round.
     let steering_message = build_fan_in_message(&interim, &steering)?;
-    let StreamedTurn {
-        response,
-        content_ids,
-        attempt,
-        success_usage,
-        evidence,
-    } = stage_and_call_steering_llm(
+    let streamed = stage_and_call_steering_llm(
         &inputs,
         deps,
         provider,
@@ -8528,7 +8664,21 @@ async fn run_steering_exchange(
         &continuation.state,
         now,
     )
-    .await?;
+    .await;
+    let StreamedTurn {
+        response,
+        content_ids,
+        attempt,
+        success_usage,
+        evidence,
+    } = match streamed {
+        Ok(streamed) => streamed,
+        Err(error) => {
+            salvage_cancelled_resume(&inputs, &error, &continuation.pending_tool_calls, deps, now)
+                .await;
+            return Err(error);
+        }
+    };
     let commit_now = OffsetDateTime::now_utc();
 
     // Every child already finished: the interim message carried all
