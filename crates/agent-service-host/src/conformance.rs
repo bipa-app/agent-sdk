@@ -2533,6 +2533,68 @@ mod tests {
         Ok(())
     }
 
+    /// Approving a confirmation resumes the parked tool call; it is not
+    /// a retry, so it must not spend the child's retry budget — a child
+    /// whose budget the pre-pause execution already used stays
+    /// approvable.
+    async fn test_confirmation_approval_does_not_consume_retry_budget(
+        task_store: &dyn AgentTaskStore,
+    ) -> Result<()> {
+        let name = "conformance-confirmation-budget";
+        let parent = AgentTask::new_root_turn(thread_id(name), t_plus(1), 3);
+        let _ = task_store.submit_root_turn(parent.clone()).await?;
+        let worker = WorkerId::new();
+        let lease = LeaseId::new();
+        acquire_or_explain(task_store, &parent.id, &worker, &lease, 2, "acquire parent").await?;
+        let (_parent, children) = task_store
+            .spawn_tool_children(
+                &parent.id,
+                &worker,
+                &lease,
+                vec![ChildSpawnSpec::new(1)],
+                suspension_payload(name),
+                None,
+                Vec::new(),
+                t_plus(3),
+            )
+            .await?;
+        let child = children.first().context("one child")?;
+        let child_worker = WorkerId::new();
+        let child_lease = LeaseId::new();
+        acquire_or_explain(
+            task_store,
+            &child.id,
+            &child_worker,
+            &child_lease,
+            4,
+            "acquire child",
+        )
+        .await?;
+        task_store
+            .pause_on_confirmation(
+                &child.id,
+                &child_worker,
+                &child_lease,
+                suspension_payload(name).continuation,
+                None,
+                t_plus(5),
+            )
+            .await?;
+
+        let (approved, _prepared) = task_store
+            .approve_confirmation_and_acquire(
+                &child.id,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(600),
+                t_plus(6),
+            )
+            .await?;
+        assert_eq!(approved.status, TaskStatus::Running);
+        assert_eq!(approved.attempt, 1);
+        Ok(())
+    }
+
     /// Clear wipes every task — including parent/child chains guarded
     /// by ON DELETE RESTRICT self-referential FKs on `SQLite`.
     async fn test_clear_with_parent_child(task_store: &dyn AgentTaskStore) -> Result<()> {
@@ -2910,6 +2972,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_confirmation_approval_keeps_budget() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_confirmation_approval_does_not_consume_retry_budget(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_clear_parent_child() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_clear_with_parent_child(s.task.as_ref()).await
@@ -3252,6 +3320,13 @@ mod tests {
     async fn conformance_sqlite_fail_closed_tool_child_emits_no_terminal_error() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_fail_closed_tool_child_emits_no_terminal_error(&store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_confirmation_approval_keeps_budget() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_confirmation_approval_does_not_consume_retry_budget(&store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -3826,6 +3901,15 @@ mod tests {
             return Ok(());
         };
         test_fail_closed_tool_child_emits_no_terminal_error(&store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_confirmation_approval_keeps_budget() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_confirmation_approval_does_not_consume_retry_budget(&store).await
     }
 
     #[cfg(feature = "postgres")]
