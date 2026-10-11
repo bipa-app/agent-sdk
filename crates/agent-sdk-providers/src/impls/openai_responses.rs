@@ -29,6 +29,7 @@ use super::openai_reasoning::{
     supports_reasoning_summary, validate_reasoning_config, validate_tool_choice,
 };
 use super::openai_schema::{normalize_strict_schema, normalized_strict_schema};
+use super::tool_call_ids::{ToolCallIdAssigner, with_unique_tool_ids};
 use crate::model_features::supports_responses_original_image_detail;
 use std::borrow::Cow;
 
@@ -466,7 +467,10 @@ impl LlmProvider for OpenAIResponsesProvider {
         let api_response: ApiResponse = serde_json::from_slice(&bytes)
             .map_err(|e| anyhow::anyhow!("failed to parse response: {e}"))?;
 
-        Ok(build_responses_outcome(api_response))
+        Ok(with_unique_tool_ids(
+            &request.messages,
+            build_responses_outcome(api_response),
+        ))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -618,6 +622,7 @@ impl LlmProvider for OpenAIResponsesProvider {
             let mut stream = response.bytes_stream();
             let mut tool_calls: std::collections::HashMap<String, ToolCallAccumulator> =
                 std::collections::HashMap::new();
+            let mut tool_call_ids = ToolCallIdAssigner::for_history(&request.messages);
             let mut message_state_markers: std::collections::HashMap<usize, serde_json::Value> =
                 std::collections::HashMap::new();
             let mut streamed_summary_blocks: std::collections::HashSet<usize> =
@@ -839,7 +844,9 @@ impl LlmProvider for OpenAIResponsesProvider {
                                     StopReason::EndTurn
                                 };
                                 if stop_reason == StopReason::ToolUse {
-                                    for delta in flush_responses_tool_calls(&tool_calls) {
+                                    for delta in
+                                        flush_responses_tool_calls(&tool_calls, &mut tool_call_ids)
+                                    {
                                         yield Ok(delta);
                                     }
                                 }
@@ -1549,20 +1556,22 @@ fn incomplete_stop_reason(reason: &str) -> StopReason {
 /// unique index per call makes the final content-block order deterministic.
 fn flush_responses_tool_calls(
     tool_calls: &std::collections::HashMap<String, ToolCallAccumulator>,
+    tool_call_ids: &mut ToolCallIdAssigner,
 ) -> Vec<StreamDelta> {
     let mut accs: Vec<&ToolCallAccumulator> = tool_calls.values().collect();
     accs.sort_by_key(|acc| (acc.block_index, acc.order));
 
     let mut deltas = Vec::with_capacity(accs.len() * 2);
     for acc in accs {
+        let id = tool_call_ids.assign(&acc.id, &acc.name);
         deltas.push(StreamDelta::ToolUseStart {
-            id: acc.id.clone(),
+            id: id.clone(),
             name: acc.name.clone(),
             block_index: acc.block_index,
             thought_signature: None,
         });
         deltas.push(StreamDelta::ToolInputDelta {
-            id: acc.id.clone(),
+            id,
             delta: acc.arguments.clone(),
             block_index: acc.block_index,
         });
@@ -2774,7 +2783,7 @@ mod tests {
             },
         );
 
-        let deltas = flush_responses_tool_calls(&tool_calls);
+        let deltas = flush_responses_tool_calls(&tool_calls, &mut ToolCallIdAssigner::default());
         let starts: Vec<(String, usize)> = deltas
             .iter()
             .filter_map(|d| match d {
@@ -3523,6 +3532,112 @@ mod tests {
         let json = serde_json::to_value(build_api_input(&request, 0))?;
         assert_eq!(json[0]["content"][0]["type"], "input_image");
         assert_eq!(json[0]["content"][0]["detail"], "original");
+        Ok(())
+    }
+
+    fn positional_tool_id_history() -> Vec<Message> {
+        vec![
+            Message::user("inspect the repository"),
+            Message::assistant_with_content(vec![ContentBlock::ToolUse {
+                id: "bash:0".to_owned(),
+                name: "bash".to_owned(),
+                input: serde_json::json!({"command": "pwd"}),
+                thought_signature: None,
+            }]),
+            Message::tool_result("bash:0", "/repo", false),
+        ]
+    }
+
+    fn assert_fresh_positional_ids(blocks: Vec<ContentBlock>) {
+        let ids: Vec<String> = blocks
+            .into_iter()
+            .filter_map(|block| {
+                if let ContentBlock::ToolUse { id, .. } = block {
+                    Some(id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert!(
+            ids.iter()
+                .all(|id| id != "bash:0" && id.starts_with("bash:")),
+            "{ids:?}"
+        );
+        assert_ne!(ids[0], ids[1]);
+    }
+
+    #[tokio::test]
+    async fn streamed_positional_tool_ids_never_repeat_history() -> anyhow::Result<()> {
+        let body = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"bash:0\",\"name\":\"bash\"}}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_1\",\"delta\":\"{}\"}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_2\",\"call_id\":\"bash:0\",\"name\":\"bash\"}}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"item_id\":\"fc_2\",\"delta\":\"{}\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        let provider = OpenAIResponsesProvider::with_base_url(
+            "test-key".to_owned(),
+            "moonshotai/kimi-k3".to_owned(),
+            server.uri(),
+        );
+        let mut stream = std::pin::pin!(provider.chat_stream(ChatRequest::new(
+            String::new(),
+            positional_tool_id_history()
+        )));
+        let mut accumulator = crate::streaming::StreamAccumulator::new();
+        while let Some(delta) = stream.next().await {
+            accumulator.apply(&delta?);
+        }
+
+        assert_fresh_positional_ids(accumulator.into_content_blocks());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn positional_tool_ids_never_repeat_history() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_kimi",
+                "model": "moonshotai/kimi-k3",
+                "status": "completed",
+                "output": [
+                    {"type": "function_call", "call_id": "bash:0", "name": "bash", "arguments": "{}"},
+                    {"type": "function_call", "call_id": "bash:0", "name": "bash", "arguments": "{}"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let provider = OpenAIResponsesProvider::with_base_url(
+            "test-key".to_owned(),
+            "moonshotai/kimi-k3".to_owned(),
+            server.uri(),
+        );
+
+        let ChatOutcome::Success(response) = provider
+            .chat(ChatRequest::new(
+                String::new(),
+                positional_tool_id_history(),
+            ))
+            .await?
+        else {
+            anyhow::bail!("tool-call response did not decode as a success");
+        };
+
+        assert_fresh_positional_ids(response.content);
         Ok(())
     }
 }
