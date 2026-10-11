@@ -12412,3 +12412,94 @@ async fn request_context_reaches_each_provider_request_but_no_durable_store() ->
     );
     assert_no_durable_store_carries(&stores, &parent_task, &commit, REQUEST_ONLY_MARKER).await
 }
+
+struct SessionIdCapturingProvider {
+    session_ids: std::sync::Mutex<Vec<Option<String>>>,
+}
+
+impl SessionIdCapturingProvider {
+    fn new() -> Self {
+        Self {
+            session_ids: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn session_ids(&self) -> Result<Vec<Option<String>>> {
+        Ok(self
+            .session_ids
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session id capture lock poisoned"))?
+            .clone())
+    }
+}
+
+#[async_trait]
+impl LlmProvider for SessionIdCapturingProvider {
+    async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
+        self.session_ids
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session id capture lock poisoned"))?
+            .push(request.session_id);
+        Ok(ChatOutcome::Success(ChatResponse {
+            id: "msg_session_01".into(),
+            content: vec![ContentBlock::Text { text: "ok".into() }],
+            model: "mock-model".into(),
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage {
+                request_input_tokens: None,
+                served_speed: None,
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+        }))
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
+/// Providers derive prompt-cache affinity (`prompt_cache_key`, Codex
+/// `session_id` header) from `ChatRequest::session_id`, so the daemon must
+/// send the same key on every turn of a thread and a different one per thread.
+#[tokio::test]
+async fn daemon_requests_carry_a_stable_per_thread_session_id() -> Result<()> {
+    let stores = TestStores::new();
+    let provider = SessionIdCapturingProvider::new();
+    let thread_b = ThreadId::from_string("t-root-turn-b");
+
+    for (thread, prompt, at) in [
+        (thread_a(), "first", 5),
+        (thread_a(), "second", 10),
+        (thread_b.clone(), "other thread", 15),
+    ] {
+        let task = create_and_acquire_task(&stores.tasks, &thread).await?;
+        let inputs = build_root_worker_inputs(
+            sample_bootstrap(task),
+            &stores.threads,
+            &stores.checkpoints,
+            &stores.messages,
+            t_plus(at - 1),
+        )
+        .await?;
+        let outcome =
+            execute_root_turn(inputs, prompt, &provider, &stores.deps(), t_plus(at)).await?;
+        assert!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+    }
+
+    assert_eq!(
+        provider.session_ids()?,
+        vec![
+            Some(thread_a().to_string()),
+            Some(thread_a().to_string()),
+            Some(thread_b.to_string()),
+        ],
+    );
+    Ok(())
+}

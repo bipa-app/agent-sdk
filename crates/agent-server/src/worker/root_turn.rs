@@ -2854,8 +2854,11 @@ async fn prepare_pre_call_compaction(params: PreCallCompactionParams<'_>) -> Res
     } = params;
     let pending_input_tokens =
         agent_sdk::context::TokenEstimator::estimate_pending_user_message(user_input.blocks());
-    let expected_request =
-        build_request_envelope(definition, inputs.bootstrap.task.caller_metadata.as_ref());
+    let expected_request = build_request_envelope(
+        definition,
+        thread_id,
+        inputs.bootstrap.task.caller_metadata.as_ref(),
+    );
     let planned = super::compaction::plan_pre_call_compaction(
         deps,
         provider,
@@ -2993,6 +2996,7 @@ async fn assemble_provider_request_messages(
 /// expected envelope fingerprint cannot drift from the dispatched request.
 fn build_request_envelope(
     definition: &AgentDefinition,
+    thread_id: &agent_sdk_foundation::ThreadId,
     caller_metadata: Option<&serde_json::Value>,
 ) -> ChatRequest {
     let thinking = match &definition.thinking {
@@ -3026,9 +3030,7 @@ fn build_request_envelope(
         },
         max_tokens: definition.max_tokens,
         max_tokens_explicit: true,
-        // Not yet wired — session/cache affinity requires provider-side
-        // state that the server doesn't manage in Phase 4.3.
-        session_id: None,
+        session_id: Some(thread_id.to_string()),
         cached_content: None,
         thinking,
         tool_choice: None,
@@ -3044,7 +3046,7 @@ async fn build_chat_request(
     user_input: &super::user_input::UserInput,
     caller_metadata: Option<&serde_json::Value>,
 ) -> Result<ChatRequest> {
-    let mut request = build_request_envelope(definition, caller_metadata);
+    let mut request = build_request_envelope(definition, thread_id, caller_metadata);
     request.messages = assemble_provider_request_messages(
         definition,
         staged_messages,

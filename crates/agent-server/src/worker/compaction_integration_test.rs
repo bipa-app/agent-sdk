@@ -1797,7 +1797,7 @@ fn sample_envelope() -> ChatRequest {
         tools: None,
         max_tokens: definition.max_tokens,
         max_tokens_explicit: true,
-        session_id: None,
+        session_id: Some(thread_id().to_string()),
         cached_content: None,
         thinking: None,
         tool_choice: None,
