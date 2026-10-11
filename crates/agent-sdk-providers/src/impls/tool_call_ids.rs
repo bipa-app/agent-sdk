@@ -16,8 +16,9 @@ use agent_sdk_foundation::llm::{ChatOutcome, Content, ContentBlock, Message};
 
 /// `OpenAI` Chat Completions rejects a tool-call id longer than this.
 const MAX_TOOL_CALL_ID_LEN: usize = 40;
-/// Length of `u64::MAX` written in base 36.
-const MAX_BASE36_U64_LEN: usize = 13;
+/// Kimi's tool-call parsers only accept a decimal index after the stem.
+const MINTED_INDEX_DIGITS: usize = 12;
+const MINTED_INDEX_MODULUS: u64 = 10_u64.pow(12);
 /// Provider ids shorter than this carry too little entropy to stay unique.
 const MIN_OPAQUE_ID_LEN: usize = 8;
 /// A trailing number this long or shorter counts a call rather than naming it.
@@ -195,27 +196,15 @@ impl<'a> ProviderIdShape<'a> {
 fn fresh_id(stem: Option<&str>) -> String {
     let random = uuid::Uuid::new_v4();
     match stem {
-        Some(stem) if stem.len() + MAX_BASE36_U64_LEN <= MAX_TOOL_CALL_ID_LEN => {
-            format!("{stem}{}", base36(random.as_u64_pair().0))
+        Some(stem) if stem.len() + MINTED_INDEX_DIGITS <= MAX_TOOL_CALL_ID_LEN => {
+            format!(
+                "{stem}{:0width$}",
+                random.as_u64_pair().0 % MINTED_INDEX_MODULUS,
+                width = MINTED_INDEX_DIGITS
+            )
         }
         Some(_) | None => format!("call_{}", random.simple()),
     }
-}
-
-fn base36(mut value: u64) -> String {
-    let mut digits = Vec::with_capacity(MAX_BASE36_U64_LEN);
-    loop {
-        digits.extend(
-            u32::try_from(value % 36)
-                .ok()
-                .and_then(|d| char::from_digit(d, 36)),
-        );
-        value /= 36;
-        if value == 0 {
-            break;
-        }
-    }
-    digits.iter().rev().collect()
 }
 
 #[cfg(test)]
@@ -246,11 +235,8 @@ mod tests {
         assert_ne!(minted, original);
         let index = minted.strip_prefix(stem).unwrap_or_default();
         assert!(
-            !index.is_empty()
-                && index
-                    .chars()
-                    .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase()),
-            "{minted} should keep the {stem} stem with a base-36 index"
+            !index.is_empty() && index.chars().all(|c| c.is_ascii_digit()),
+            "{minted} should keep the {stem} stem with a decimal index"
         );
         assert!(minted.len() <= MAX_TOOL_CALL_ID_LEN, "{minted} is too long");
     }
@@ -395,10 +381,6 @@ mod tests {
                 assert!(minted.len() <= MAX_TOOL_CALL_ID_LEN, "{minted} is too long");
             }
         }
-        assert_eq!(base36(u64::MAX).len(), MAX_BASE36_U64_LEN);
-        assert_eq!(base36(0), "0");
-        assert_eq!(base36(35), "z");
-        assert_eq!(base36(36), "10");
     }
 
     #[test]

@@ -49,6 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   row's thread from its payload, in one transaction that also stamps the
   version. A row with invalid JSON or no string `thread_id` fails the open and
   is named by its `tool_call_id`; the file is left unchanged.
+  The upgrade is one-way: an older SDK refuses to open a v3 file, and an
+  older process that still has the file open fails every tool-execution
+  insert, so stop older processes first and do not roll back across it.
 - OpenAI strict mode: a tool schema strict mode cannot express is now sent
   without `strict` on Chat Completions, Responses and Codex instead of being
   rejected with a 400. That covers untyped or annotation-only subschemas
