@@ -1679,6 +1679,20 @@ async fn prompt_too_long_retry_clears_request_context_the_hook_withdraws() -> Re
     Ok(())
 }
 
+#[tokio::test]
+async fn prompt_too_long_retry_keeps_the_thread_session_id() -> Result<()> {
+    let fixtures = Fixtures::new();
+    let requests = overflow_then_recover(&fixtures, Arc::new(|_| None)).await?;
+
+    let [rejected, _summarization, retry] = requests.as_slice() else {
+        anyhow::bail!("expected rejection, summarization, and retry requests");
+    };
+    let expected = Some(thread_id().to_string());
+    assert_eq!(rejected.session_id, expected);
+    assert_eq!(retry.session_id, expected);
+    Ok(())
+}
+
 /// `OpenAI` Responses regression: a seeded history whose older turns carry
 /// `OpaqueReasoning` blocks (encrypted provider scratchpad) must still
 /// recover when the provider rejects the turn with the Responses-API
@@ -1855,7 +1869,7 @@ fn sample_envelope() -> ChatRequest {
         tools: None,
         max_tokens: definition.max_tokens,
         max_tokens_explicit: true,
-        session_id: None,
+        session_id: Some(thread_id().to_string()),
         cached_content: None,
         thinking: None,
         tool_choice: None,
