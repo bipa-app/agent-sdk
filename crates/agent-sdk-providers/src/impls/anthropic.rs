@@ -2346,7 +2346,12 @@ mod tests {
     // Thinking and effort on the newest models
     // ===================
 
-    const NEWEST_ADAPTIVE_ONLY_MODELS: [&str; 3] = [MODEL_OPUS_55, MODEL_FABLE_51, MODEL_HAIKU_55];
+    const NEWEST_ADAPTIVE_ONLY_MODELS: [&str; 4] = [
+        MODEL_OPUS_55,
+        MODEL_FABLE_51,
+        MODEL_SONNET_55,
+        MODEL_HAIKU_55,
+    ];
 
     async fn chat_wire_body(
         model: &str,
