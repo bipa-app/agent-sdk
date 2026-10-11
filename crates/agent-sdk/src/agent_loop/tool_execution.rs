@@ -244,7 +244,9 @@ where
     Ctx: Send + Sync + Clone + 'static,
     H: AgentHooks,
 {
-    if let Some(cached_result) = try_get_cached_result(ctx.execution_store, &pending.id).await {
+    if let Some(cached_result) =
+        try_get_cached_result(ctx.execution_store, ctx.thread_id, &pending.id).await
+    {
         // Cached result from a prior in-flight attempt — audit before returning.
         emit_audit(
             ctx.audit_sink,
@@ -1595,7 +1597,8 @@ where
         return finish_confirmed_tool(awaiting_tool, ctx, result).await;
     }
 
-    if let Some(cached_result) = try_get_cached_result(ctx.execution_store, &awaiting_tool.id).await
+    if let Some(cached_result) =
+        try_get_cached_result(ctx.execution_store, ctx.thread_id, &awaiting_tool.id).await
     {
         // Cached idempotent replay on the confirmed-resume path.
         emit_audit(

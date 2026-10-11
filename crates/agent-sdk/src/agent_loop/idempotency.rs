@@ -54,10 +54,11 @@ where
 /// or still in-flight.
 pub(super) async fn try_get_cached_result(
     execution_store: Option<&Arc<dyn ToolExecutionStore>>,
+    thread_id: &ThreadId,
     tool_call_id: &str,
 ) -> Option<ToolResult> {
     let store = execution_store?;
-    let execution = store.get_execution(tool_call_id).await.ok()??;
+    let execution = store.get_execution(thread_id, tool_call_id).await.ok()??;
 
     match execution.status {
         ExecutionStatus::Completed => execution.result,

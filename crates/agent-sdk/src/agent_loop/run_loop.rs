@@ -293,7 +293,7 @@ async fn initialize_from_tool_results<M: MessageStore>(
     for (tool_call_id, result) in tool_results {
         let already_completed = match execution_store {
             Some(store) => store
-                .get_execution(&tool_call_id)
+                .get_execution(thread_id, &tool_call_id)
                 .await
                 .ok()
                 .flatten()

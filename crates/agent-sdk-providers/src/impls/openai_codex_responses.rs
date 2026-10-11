@@ -35,6 +35,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use super::openai_prompt_cache::bounded_prompt_cache_key;
+use super::openai_schema::normalize_strict_schema;
 use crate::model_features::supports_responses_original_image_detail;
 
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
@@ -492,7 +493,9 @@ impl LlmProvider for OpenAICodexResponsesProvider {
     fn chat_stream(&self, mut request: ChatRequest) -> StreamBox<'_> {
         self.downgrade_unsupported_original_image_detail(&mut request);
         let served_route = self.route().to_owned();
-        Box::pin(async_stream::stream! {
+        let trace = StreamTraceRecorder::new(&self.model);
+        let abandoned = AbandonedStreamLog(trace.clone());
+        let stream = async_stream::stream! {
             let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
                 Ok(thinking) => thinking,
                 Err(error) => {
@@ -990,6 +993,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                             continue;
                         }
 
+                        trace.transport("websocket");
                         let mut usage: Option<Usage> = None;
                         let mut tool_calls: HashMap<String, ToolCallAccumulator> = HashMap::new();
                         let mut response_id: Option<String> = None;
@@ -1046,6 +1050,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                     continue 'websocket_attempts;
                                 }
                             };
+                            trace.frame();
 
                             match message {
                                 WebSocketMessage::Text(text) => {
@@ -1085,6 +1090,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                             return;
                                         }
                                     };
+                                    trace.event(&event.r#type);
                                     match event.r#type.as_str() {
                                             "response.output_text.delta" => {
                                                 if let Some(delta) = event.delta {
@@ -1147,6 +1153,9 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                             block_index,
                                                         });
                                                     acc.arguments.push_str(&delta);
+                                                    // Tool calls are only emitted at completion, so a long
+                                                    // argument stream would otherwise look stalled.
+                                                    yield Ok(StreamDelta::KeepAlive);
                                                 }
                                             }
                                             "response.output_item.done" => {
@@ -1319,6 +1328,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                 return;
                                             }
                                         };
+                                        trace.event(&event.r#type);
                                             match event.r#type.as_str() {
                                                 "response.output_text.delta" => {
                                                     if let Some(delta) = event.delta {
@@ -1384,6 +1394,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                                 block_index,
                                                             });
                                                         acc.arguments.push_str(&delta);
+                                                        yield Ok(StreamDelta::KeepAlive);
                                                     }
                                                 }
                                                 "response.output_item.done" => {
@@ -1535,8 +1546,14 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                         }
                                         continue 'websocket_attempts;
                                     }
+                                    trace.heartbeat();
+                                    yield Ok(StreamDelta::KeepAlive);
                                 }
-                                WebSocketMessage::Pong(_) | WebSocketMessage::Frame(_) => {}
+                                WebSocketMessage::Pong(_) => {
+                                    trace.heartbeat();
+                                    yield Ok(StreamDelta::KeepAlive);
+                                }
+                                WebSocketMessage::Frame(_) => {}
                                 WebSocketMessage::Close(_) => {
                                     if emitted_output {
                                         end_websocket_turn(&mut websocket_session);
@@ -1630,6 +1647,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                 }
             }
 
+            trace.transport("sse");
             let mut sse = SseLineBuffer::new();
             let mut stream = response.bytes_stream();
             let mut usage: Option<Usage> = None;
@@ -1652,6 +1670,12 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                 while let Some(line) = sse.next_line() {
                     let line = line.trim();
                     if line.is_empty() {
+                        continue;
+                    }
+                    trace.frame();
+                    if line.starts_with(':') {
+                        trace.heartbeat();
+                        yield Ok(StreamDelta::KeepAlive);
                         continue;
                     }
 
@@ -1702,6 +1726,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                             return;
                         }
                     };
+                    trace.event(&event.r#type);
                     match event.r#type.as_str() {
                             "response.output_text.delta" => {
                                 if let Some(delta) = event.delta {
@@ -1756,6 +1781,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                         }
                                     });
                                     acc.arguments.push_str(&delta);
+                                    yield Ok(StreamDelta::KeepAlive);
                                 }
                             }
                             "response.output_item.done" => {
@@ -1848,7 +1874,8 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                 stop_reason: Some(stop_reason),
                 served_route: Some(served_route.clone()),
             });
-        })
+        };
+        Box::pin(stream.inspect(move |item| abandoned.observe(item)))
     }
 
     async fn probe_connectivity(&self) -> bool {
@@ -2057,182 +2084,22 @@ fn flush_message_parts(
     }));
 }
 
-/// Recursively fix a JSON schema for `OpenAI` strict mode.
-///
-/// Adds `additionalProperties: false`, marks every property required, and — to
-/// keep previously-optional properties from being forced to fabricated values —
-/// wraps optional properties in `anyOf: [..., {"type": "null"}]`. This mirrors
-/// the sibling `openai_responses` provider so a tool schema behaves identically
-/// across both providers.
-fn fix_schema_for_strict_mode(schema: &mut serde_json::Value) {
-    let Some(obj) = schema.as_object_mut() else {
-        return;
-    };
-
-    // Check if this is an object type schema
-    let is_object_type = obj
-        .get("type")
-        .is_some_and(|t| t.as_str() == Some("object"));
-
-    if is_object_type {
-        // Add additionalProperties: false
-        obj.insert(
-            "additionalProperties".to_owned(),
-            serde_json::Value::Bool(false),
-        );
-
-        // Ensure properties and required exist (strict mode needs them even if empty)
-        obj.entry("properties".to_owned())
-            .or_insert_with(|| serde_json::json!({}));
-        obj.entry("required".to_owned())
-            .or_insert_with(|| serde_json::json!([]));
-
-        // Collect the set of originally required keys
-        let originally_required: std::collections::HashSet<String> = obj
-            .get("required")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Wrap previously-optional properties in anyOf with null
-        if let Some(serde_json::Value::Object(props)) = obj.get_mut("properties") {
-            for (key, prop_schema) in props.iter_mut() {
-                if !originally_required.contains(key) {
-                    make_nullable(prop_schema);
-                }
-            }
-        }
-
-        // Ensure all properties are marked as required
-        if let Some(serde_json::Value::Object(props)) = obj.get("properties") {
-            let all_keys: Vec<serde_json::Value> = props
-                .keys()
-                .map(|k| serde_json::Value::String(k.clone()))
-                .collect();
-            obj.insert("required".to_owned(), serde_json::Value::Array(all_keys));
-        }
-    }
-
-    // Recursively process nested schemas
-    if let Some(props) = obj.get_mut("properties")
-        && let Some(props_obj) = props.as_object_mut()
-    {
-        for prop_schema in props_obj.values_mut() {
-            fix_schema_for_strict_mode(prop_schema);
-        }
-    }
-
-    // Process array items
-    if let Some(items) = obj.get_mut("items") {
-        fix_schema_for_strict_mode(items);
-    }
-
-    // Process anyOf/oneOf/allOf
-    for key in ["anyOf", "oneOf", "allOf"] {
-        if let Some(arr) = obj.get_mut(key)
-            && let Some(arr_items) = arr.as_array_mut()
-        {
-            for item in arr_items {
-                fix_schema_for_strict_mode(item);
-            }
-        }
-    }
-}
-
-/// Wrap a schema in `anyOf: [{original}, {"type": "null"}]` so the property
-/// accepts its original type OR null. Appends the null variant when an `anyOf`
-/// already exists.
-fn make_nullable(schema: &mut serde_json::Value) {
-    if let Some(any_of) = schema
-        .as_object_mut()
-        .and_then(|o| o.get_mut("anyOf"))
-        .and_then(|v| v.as_array_mut())
-    {
-        let has_null = any_of
-            .iter()
-            .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("null"));
-        if !has_null {
-            any_of.push(serde_json::json!({"type": "null"}));
-        }
-        return;
-    }
-
-    let original = schema.clone();
-    *schema = serde_json::json!({
-        "anyOf": [original, {"type": "null"}]
-    });
-}
-
-/// Check whether a JSON schema contains any object-typed schema without a
-/// `properties` map (a free-form object). These are incompatible with
-/// `OpenAI` strict mode and must disable it.
-fn has_freeform_object(schema: &serde_json::Value) -> bool {
-    let Some(obj) = schema.as_object() else {
-        return false;
-    };
-
-    let is_object = obj
-        .get("type")
-        .is_some_and(|t| t.as_str() == Some("object"));
-
-    if is_object && !obj.contains_key("properties") {
-        return true;
-    }
-
-    if let Some(serde_json::Value::Object(props)) = obj.get("properties") {
-        for prop in props.values() {
-            if has_freeform_object(prop) {
-                return true;
-            }
-        }
-    }
-
-    if let Some(items) = obj.get("items")
-        && has_freeform_object(items)
-    {
-        return true;
-    }
-
-    for key in ["anyOf", "oneOf", "allOf"] {
-        if let Some(arr) = obj.get(key).and_then(|v| v.as_array()) {
-            for item in arr {
-                if has_freeform_object(item) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
-}
-
 fn convert_tool(tool: agent_sdk_foundation::llm::Tool) -> ApiTool {
-    // Strict mode requires additionalProperties: false on all objects and every
-    // property in required, which is incompatible with free-form object schemas
-    // (objects with no defined properties). Detect and skip strict for those —
-    // matching the sibling openai_responses provider.
-    let mut schema = tool.input_schema;
-    let use_strict = if has_freeform_object(&schema) {
+    let mut parameters = tool.input_schema;
+    let strict = normalize_strict_schema(&mut parameters).then_some(true);
+    if strict.is_none() {
         log::debug!(
-            "Tool '{}' has free-form object schema — disabling strict mode",
+            "Tool '{}' schema is not strict-compatible — disabling strict mode",
             tool.name
         );
-        None
-    } else {
-        fix_schema_for_strict_mode(&mut schema);
-        Some(true)
-    };
+    }
 
     ApiTool {
         r#type: "function".to_owned(),
         name: tool.name,
         description: Some(tool.description),
-        parameters: Some(schema),
-        strict: use_strict,
+        parameters: Some(parameters),
+        strict,
     }
 }
 
@@ -2723,6 +2590,163 @@ fn end_websocket_turn(session: &mut WebsocketSessionState) {
     session.last_response_id = None;
     session.last_response_items.clear();
     session.in_flight = false;
+}
+
+/// What one streaming turn received from the backend.
+///
+/// Logged when the consumer drops the stream before a terminal event, which
+/// is what its stall watchdog does. The counts separate a backend that kept
+/// sending frames the adapter does not surface, one that only sent transport
+/// heartbeats, and one that went silent.
+#[derive(Debug)]
+struct StreamTrace {
+    model: String,
+    opened_at: Instant,
+    transport: Option<&'static str>,
+    frames: u64,
+    heartbeats: u64,
+    last_frame_at: Option<Instant>,
+    last_event: Option<String>,
+    yielded: u64,
+    last_yield_at: Option<Instant>,
+    terminal: bool,
+}
+
+#[derive(Clone)]
+struct StreamTraceRecorder(Arc<std::sync::Mutex<StreamTrace>>);
+
+impl StreamTraceRecorder {
+    fn new(model: &str) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(StreamTrace {
+            model: model.to_owned(),
+            opened_at: Instant::now(),
+            transport: None,
+            frames: 0,
+            heartbeats: 0,
+            last_frame_at: None,
+            last_event: None,
+            yielded: 0,
+            last_yield_at: None,
+            terminal: false,
+        })))
+    }
+
+    fn update(&self, record: impl FnOnce(&mut StreamTrace)) {
+        if let Ok(mut trace) = self.0.lock() {
+            record(&mut trace);
+        }
+    }
+
+    fn transport(&self, transport: &'static str) {
+        self.update(|trace| trace.transport = Some(transport));
+    }
+
+    fn frame(&self) {
+        self.update(|trace| {
+            trace.frames = trace.frames.saturating_add(1);
+            trace.last_frame_at = Some(Instant::now());
+        });
+    }
+
+    fn heartbeat(&self) {
+        self.update(|trace| trace.heartbeats = trace.heartbeats.saturating_add(1));
+    }
+
+    fn event(&self, event_type: &str) {
+        self.update(|trace| {
+            if trace.last_event.as_deref() != Some(event_type) {
+                trace.last_event = Some(event_type.to_owned());
+            }
+        });
+    }
+}
+
+/// Owned by the stream handed to the consumer, so it is dropped with it.
+struct AbandonedStreamLog(StreamTraceRecorder);
+
+impl AbandonedStreamLog {
+    fn observe(&self, item: &Result<StreamDelta>) {
+        let terminal = matches!(
+            item,
+            Ok(StreamDelta::Done { .. } | StreamDelta::Error { .. }) | Err(_)
+        );
+        self.0.update(|trace| {
+            if terminal {
+                trace.terminal = true;
+            } else {
+                trace.yielded = trace.yielded.saturating_add(1);
+                trace.last_yield_at = Some(Instant::now());
+            }
+        });
+    }
+}
+
+impl Drop for AbandonedStreamLog {
+    fn drop(&mut self) {
+        let Ok(trace) = self.0.0.lock() else {
+            return;
+        };
+        if trace.terminal {
+            return;
+        }
+        let secs_since = |at: Option<Instant>| at.map(|at| at.elapsed().as_secs());
+        let cause = StreamDropCause::after_silence(
+            trace.last_yield_at.unwrap_or(trace.opened_at).elapsed(),
+        );
+        log::log!(
+            cause.level(),
+            cause = cause.as_str(),
+            model = trace.model.as_str(),
+            transport = trace.transport,
+            open_secs = trace.opened_at.elapsed().as_secs(),
+            frames = trace.frames,
+            heartbeats = trace.heartbeats,
+            yielded = trace.yielded,
+            secs_since_frame = secs_since(trace.last_frame_at),
+            secs_since_yield = secs_since(trace.last_yield_at),
+            last_event = trace.last_event.as_deref();
+            "OpenAI Codex stream dropped before a terminal event"
+        );
+    }
+}
+
+/// Why the consumer most likely dropped a stream before its terminal event.
+///
+/// The stream cannot see the consumer's reason. The SDK's stall budgets wait
+/// at least [`StreamDropCause::STALL_MIN_SILENCE`] without a yield, and
+/// keep-alives count as yields, so a drop after less silence was a cancel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamDropCause {
+    Cancelled,
+    Stalled,
+}
+
+impl StreamDropCause {
+    /// The shortest stall budget: the root-turn inter-event budget and the
+    /// agent loop's inactivity timeout.
+    const STALL_MIN_SILENCE: Duration = Duration::from_mins(2);
+
+    fn after_silence(silence: Duration) -> Self {
+        if silence >= Self::STALL_MIN_SILENCE {
+            Self::Stalled
+        } else {
+            Self::Cancelled
+        }
+    }
+
+    const fn level(self) -> log::Level {
+        match self {
+            Self::Cancelled => log::Level::Debug,
+            Self::Stalled => log::Level::Warn,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::Stalled => "stalled",
+        }
+    }
 }
 
 /// Bound the websocket-session map by evicting idle (not in-flight) sessions,
@@ -5000,6 +5024,32 @@ mod tests {
     }
 
     #[test]
+    fn untyped_tool_property_disables_strict_mode() {
+        let input_schema = serde_json::json!({
+            "type": "object",
+            "required": ["action", "scope"],
+            "properties": {
+                "action": {"type": "string", "enum": ["set", "unset", "validate"]},
+                "scope": {"type": "string", "enum": ["global", "project"]},
+                "key": {"type": "string", "description": "JSON Pointer."},
+                "value": {"description": "JSON value to store."}
+            },
+            "additionalProperties": false
+        });
+        let tool = agent_sdk_foundation::llm::Tool {
+            name: "bip_config".to_owned(),
+            description: "Configure".to_owned(),
+            input_schema: input_schema.clone(),
+            display_name: "Configure".to_owned(),
+            tier: agent_sdk_foundation::ToolTier::Confirm,
+        };
+
+        let api_tool = convert_tool(tool);
+        assert_eq!(api_tool.strict, None);
+        assert_eq!(api_tool.parameters, Some(input_schema));
+    }
+
+    #[test]
     fn test_emit_accumulated_tool_calls_assigns_distinct_ordered_indices() {
         let mut tool_calls = HashMap::new();
         tool_calls.insert(
@@ -5452,6 +5502,113 @@ mod tests {
             delta,
             StreamDelta::ToolInputDelta { id, delta, .. }
                 if id == "call_1" && delta == r#"{"path":"src/lib.rs"}"#
+        )));
+        assert!(matches!(
+            deltas.last(),
+            Some(StreamDelta::Done {
+                stop_reason: Some(StopReason::ToolUse),
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn dropping_an_active_stream_is_a_cancel_and_a_silent_one_a_stall() {
+        for (silent_secs, cause, level) in [
+            (0, StreamDropCause::Cancelled, log::Level::Debug),
+            (60, StreamDropCause::Cancelled, log::Level::Debug),
+            (119, StreamDropCause::Cancelled, log::Level::Debug),
+            (120, StreamDropCause::Stalled, log::Level::Warn),
+            (330, StreamDropCause::Stalled, log::Level::Warn),
+        ] {
+            let actual = StreamDropCause::after_silence(Duration::from_secs(silent_secs));
+            assert_eq!(actual, cause, "silent_secs={silent_secs}");
+            assert_eq!(actual.level(), level, "silent_secs={silent_secs}");
+        }
+    }
+
+    #[test]
+    fn stream_trace_treats_only_done_and_errors_as_terminal() -> anyhow::Result<()> {
+        let recorder = StreamTraceRecorder::new(MODEL_GPT53_CODEX);
+        let abandoned = AbandonedStreamLog(recorder.clone());
+        recorder.transport("sse");
+        recorder.frame();
+        recorder.heartbeat();
+        recorder.event("response.function_call_arguments.delta");
+        abandoned.observe(&Ok(StreamDelta::KeepAlive));
+        {
+            let trace = recorder.0.lock().ok().context("trace lock poisoned")?;
+            assert!(!trace.terminal);
+            assert_eq!((trace.frames, trace.heartbeats, trace.yielded), (1, 1, 1));
+            assert_eq!(
+                trace.last_event.as_deref(),
+                Some("response.function_call_arguments.delta")
+            );
+        }
+
+        for terminal in [
+            Ok(StreamDelta::Done {
+                stop_reason: Some(StopReason::EndTurn),
+                served_route: None,
+            }),
+            Ok(StreamDelta::Error {
+                message: "boom".to_owned(),
+                kind: StreamErrorKind::ServerError,
+            }),
+            Err(anyhow::anyhow!("transport")),
+        ] {
+            let recorder = StreamTraceRecorder::new(MODEL_GPT53_CODEX);
+            AbandonedStreamLog(recorder.clone()).observe(&terminal);
+            assert!(
+                recorder
+                    .0
+                    .lock()
+                    .ok()
+                    .context("trace lock poisoned")?
+                    .terminal
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_tool_argument_progress_and_comments_are_liveness() -> anyhow::Result<()> {
+        let sse_body = concat!(
+            ": keep-alive\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"call_id\":\"call_1\",\"name\":\"write\",\"delta\":\"{\\\"path\\\":\"}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"call_id\":\"call_1\",\"name\":\"write\",\"delta\":\"\\\"a.rs\\\",\"}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"call_id\":\"call_1\",\"name\":\"write\",\"delta\":\"\\\"content\\\":\\\"x\\\"}\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (base_url, _, _) = spawn_http_only_server_with_body(sse_body).await;
+        let provider = OpenAICodexResponsesProvider::with_base_url(
+            oauth_token(),
+            MODEL_GPT53_CODEX.to_owned(),
+            base_url,
+        )
+        .with_websockets_disabled(true);
+        let mut stream =
+            std::pin::pin!(provider.chat_stream(streaming_request("tool-argument-liveness")));
+        let mut deltas = Vec::new();
+        while let Some(delta) = stream.next().await {
+            deltas.push(delta?);
+        }
+
+        let first_tool_delta = deltas
+            .iter()
+            .position(|delta| matches!(delta, StreamDelta::ToolUseStart { .. }))
+            .context("tool call was not emitted")?;
+        let keep_alives = deltas[..first_tool_delta]
+            .iter()
+            .filter(|delta| matches!(delta, StreamDelta::KeepAlive))
+            .count();
+        assert_eq!(keep_alives, 4, "{deltas:?}");
+        assert!(deltas.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::ToolInputDelta { id, delta, .. }
+                if id == "call_1" && delta == r#"{"path":"a.rs","content":"x"}"#
         )));
         assert!(matches!(
             deltas.last(),

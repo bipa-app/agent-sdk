@@ -706,6 +706,82 @@ async fn keep_alives_hold_a_silent_stream_past_both_stall_budgets() -> Result<()
     Ok(())
 }
 
+fn secs(secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(secs)
+}
+
+fn answer_after(silence: std::time::Duration, keep_alive: bool) -> TurnScript {
+    let mut timed = Vec::new();
+    if keep_alive {
+        timed.push((secs(10), StreamDelta::KeepAlive));
+    }
+    timed.push((
+        silence,
+        StreamDelta::TextDelta {
+            delta: "slow answer".into(),
+            block_index: 0,
+        },
+    ));
+    timed.push((
+        secs(0),
+        StreamDelta::Done {
+            stop_reason: Some(StopReason::EndTurn),
+            served_route: None,
+        },
+    ));
+    TurnScript::from_timed_deltas(timed)
+}
+
+async fn completed_text_and_attempts(
+    stores: &Stores,
+    provider: &StreamingScriptedProvider,
+) -> Result<(String, usize)> {
+    let RootTurnOutcome::Completed { response_text, .. } = run_turn(stores, provider).await? else {
+        anyhow::bail!("expected the turn to complete");
+    };
+    let attempts = stores
+        .attempts
+        .list_by_task(&acquire_existing_task_id(stores).await?)
+        .await?;
+    Ok((response_text, attempts.len()))
+}
+
+// A Codex SSE stream can send one `:` comment as it connects and then reason
+// silently for minutes. That keep-alive is not the first event: the stream
+// keeps its 330s first-event budget instead of dropping to the 120s
+// inter-event budget.
+#[tokio::test(start_paused = true)]
+async fn keep_alive_before_the_first_event_keeps_the_first_event_budget() -> Result<()> {
+    let stores = Stores::new();
+    let provider = StreamingScriptedProvider::single(answer_after(secs(200), true));
+
+    let (text, attempts) = completed_text_and_attempts(&stores, &provider).await?;
+
+    assert_eq!(text, "slow answer");
+    assert_eq!(
+        attempts, 1,
+        "a keep-alive must not shorten the first-event budget"
+    );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn first_event_budget_still_stalls_a_stream_silent_for_340s() -> Result<()> {
+    for keep_alive in [false, true] {
+        let stores = Stores::new();
+        let provider = StreamingScriptedProvider::new(vec![
+            answer_after(secs(340), keep_alive),
+            TurnScript::text("recovered answer"),
+        ]);
+
+        let (text, attempts) = completed_text_and_attempts(&stores, &provider).await?;
+
+        assert_eq!(text, "recovered answer", "keep_alive={keep_alive}");
+        assert_eq!(attempts, 2, "keep_alive={keep_alive}");
+    }
+    Ok(())
+}
+
 /// The single root task's id (there is exactly one in these tests).
 async fn acquire_existing_task_id(stores: &Stores) -> Result<crate::journal::task::AgentTaskId> {
     let tasks = stores.tasks.list_by_thread(&thread_id()).await?;

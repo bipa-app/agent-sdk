@@ -2943,7 +2943,7 @@ const STREAM_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(330);
 /// Maximum silence BETWEEN stream events before the attempt is treated
 /// as stalled (same recovery path as [`STREAM_FIRST_EVENT_TIMEOUT`]).
 ///
-/// Once a stream has yielded anything, healthy gaps are bounded by
+/// Once a stream has yielded its first event, healthy gaps are bounded by
 /// token cadence plus provider keep-alives; two minutes of mid-stream
 /// silence means the connection died. Kept at or above every
 /// provider-level inter-event guard (60–120s) so those get first
@@ -2951,9 +2951,15 @@ const STREAM_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(330);
 const STREAM_INTER_EVENT_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// The stall budget for the next stream poll: the (longer) first-event
-/// budget until the stream yields anything, the inter-event budget after.
-const fn stream_stall_budget(received_first_item: bool) -> Duration {
-    if received_first_item {
+/// budget until the stream yields an event other than
+/// [`StreamDelta::KeepAlive`], the inter-event budget after.
+///
+/// A keep-alive is not a first event: Codex can send one SSE comment as it
+/// connects and then reason silently for longer than the inter-event budget.
+/// Before the first event each keep-alive restarts the first-event budget;
+/// after it, each restarts the inter-event budget.
+const fn stream_stall_budget(received_first_event: bool) -> Duration {
+    if received_first_event {
         STREAM_INTER_EVENT_TIMEOUT
     } else {
         STREAM_FIRST_EVENT_TIMEOUT
@@ -4251,7 +4257,7 @@ struct CloseStreamAttemptParams<'a, 'deps> {
 /// [`call_llm_once_inner`] readable.
 struct StalledAttemptParams<'a, 'deps> {
     ctx: StreamAttemptCtx<'a, 'deps>,
-    received_first_item: bool,
+    received_first_event: bool,
     stall_budget: Duration,
     /// Usage the stalled attempt streamed before going silent.
     usage: llm::Usage,
@@ -4267,12 +4273,12 @@ struct StalledAttemptParams<'a, 'deps> {
 async fn close_stalled_attempt(params: StalledAttemptParams<'_, '_>) -> StreamAttemptError {
     let StalledAttemptParams {
         ctx,
-        received_first_item,
+        received_first_event,
         stall_budget,
         usage,
         now,
     } = params;
-    let stage = if received_first_item {
+    let stage = if received_first_event {
         "mid-stream"
     } else {
         "before its first event"
@@ -4407,7 +4413,7 @@ async fn close_truncated_stream(
 /// closed row.
 struct StreamPollParams<'a, 'deps> {
     ctx: StreamAttemptCtx<'a, 'deps>,
-    received_first_item: bool,
+    received_first_event: bool,
     usage: llm::Usage,
     now: OffsetDateTime,
 }
@@ -4425,11 +4431,11 @@ async fn poll_stream_item(
 ) -> Result<Option<Result<StreamDelta>>, StreamAttemptError> {
     let StreamPollParams {
         ctx,
-        received_first_item,
+        received_first_event,
         usage,
         now,
     } = params;
-    let stall_budget = stream_stall_budget(received_first_item);
+    let stall_budget = stream_stall_budget(received_first_event);
     let polled = match ctx.deps.cancel {
         Some(cancel) => {
             tokio::select! {
@@ -4446,7 +4452,7 @@ async fn poll_stream_item(
         Ok(next) => Ok(next),
         Err(_elapsed) => Err(close_stalled_attempt(StalledAttemptParams {
             ctx,
-            received_first_item,
+            received_first_event,
             stall_budget,
             usage,
             now,
@@ -4483,9 +4489,9 @@ async fn call_llm_once_inner(
     // its partial transcript in the journal.
     let mut pending_deltas: Vec<AgentEvent> = Vec::new();
     let mut last_flush = std::time::Instant::now();
-    // Latched on the first yielded item; selects which stall budget the
-    // next poll runs under (first-event vs inter-event).
-    let mut received_first_item = false;
+    // Latched on the first yielded item that is not a keep-alive; selects
+    // which stall budget the next poll runs under (see `stream_stall_budget`).
+    let mut received_first_event = false;
 
     loop {
         let Some(result) = poll_stream_item(
@@ -4498,7 +4504,7 @@ async fn call_llm_once_inner(
                     attempt,
                     evidence,
                 },
-                received_first_item,
+                received_first_event,
                 usage: attempt_usage(&accumulator),
                 now,
             },
@@ -4507,7 +4513,6 @@ async fn call_llm_once_inner(
         else {
             break;
         };
-        received_first_item = true;
         // Refresh point (a), before the Ok/Err split and the text/thinking
         // filter: any frame is evidence the provider is yielding.
         deps.note_frame_activity();
@@ -4545,6 +4550,7 @@ async fn call_llm_once_inner(
         if matches!(delta, StreamDelta::KeepAlive) {
             continue;
         }
+        received_first_event = true;
 
         accumulator.apply(&delta);
         if let Some(usage) = accumulator.usage() {

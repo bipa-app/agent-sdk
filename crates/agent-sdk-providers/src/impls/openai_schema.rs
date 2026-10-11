@@ -13,6 +13,11 @@ pub enum StrictSchemaError {
     /// An object uses regular expressions to describe otherwise unknown
     /// property names.
     PatternProperties,
+    /// A schema leaves the value's type open (`true`, `false`, `{}`, or only
+    /// annotations such as `description`). Strict mode requires a `type` on
+    /// every subschema, and an open value may be an object with arbitrary
+    /// keys, which no closed strict schema can express.
+    UntypedSchema,
 }
 
 impl fmt::Display for StrictSchemaError {
@@ -23,6 +28,7 @@ impl fmt::Display for StrictSchemaError {
                 formatter.write_str("typed additionalProperties mapping")
             }
             Self::PatternProperties => formatter.write_str("patternProperties mapping"),
+            Self::UntypedSchema => formatter.write_str("type-less value"),
         }
     }
 }
@@ -62,9 +68,18 @@ pub fn normalize_strict_schema(schema: &mut serde_json::Value) -> bool {
 }
 
 fn validate_strict_compatibility(schema: &serde_json::Value) -> Result<(), StrictSchemaError> {
-    let Some(object) = schema.as_object() else {
-        return Ok(());
+    let object = match schema {
+        serde_json::Value::Object(object) => object,
+        serde_json::Value::Bool(_) => return Err(StrictSchemaError::UntypedSchema),
+        serde_json::Value::Null
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_)
+        | serde_json::Value::Array(_) => return Ok(()),
     };
+
+    if !declares_value_shape(object) {
+        return Err(StrictSchemaError::UntypedSchema);
+    }
 
     let has_properties = object
         .get("properties")
@@ -141,6 +156,7 @@ fn normalize_schema_node(schema: &mut serde_json::Value) {
     };
 
     let is_object = is_object_schema(object);
+    insert_inferred_type(object, is_object);
 
     if is_object {
         object.insert(
@@ -222,6 +238,40 @@ fn normalize_schema_or_array(value: &mut serde_json::Value) {
     }
 }
 
+/// Keywords that state which JSON values a subschema accepts.
+const VALUE_SHAPE_KEYWORDS: [&str; 7] =
+    ["type", "anyOf", "oneOf", "allOf", "$ref", "enum", "const"];
+
+fn declares_value_shape(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+    VALUE_SHAPE_KEYWORDS
+        .iter()
+        .any(|keyword| object.contains_key(*keyword))
+        || is_object_schema(object)
+        || object.contains_key("items")
+}
+
+/// Write the `type` that structural keywords imply, because strict mode
+/// rejects any subschema without a `type` key.
+fn insert_inferred_type(object: &mut serde_json::Map<String, serde_json::Value>, is_object: bool) {
+    if VALUE_SHAPE_KEYWORDS
+        .iter()
+        .any(|keyword| object.contains_key(*keyword))
+    {
+        return;
+    }
+    let inferred = if is_object {
+        "object"
+    } else if object.contains_key("items") {
+        "array"
+    } else {
+        return;
+    };
+    object.insert(
+        "type".to_owned(),
+        serde_json::Value::String(inferred.to_owned()),
+    );
+}
+
 fn is_object_type(value: &serde_json::Value) -> bool {
     value.as_str() == Some("object")
         || value
@@ -282,6 +332,244 @@ fn accepts_null(schema: &serde_json::Value) -> bool {
 mod tests {
     use super::*;
     use anyhow::Context as _;
+
+    const STRICT_TYPE_KEYWORDS: [&str; 5] = ["type", "anyOf", "$ref", "enum", "const"];
+
+    /// Assert the documented strict-mode subset: the root is a non-`anyOf`
+    /// object, every subschema declares a type (or an `anyOf`/`$ref`/`enum`/
+    /// `const`), every object is closed with all properties required, and
+    /// every array constrains its items.
+    fn assert_strict_conformant(schema: &serde_json::Value) -> anyhow::Result<()> {
+        anyhow::ensure!(schema.get("anyOf").is_none(), "root must not be anyOf");
+        anyhow::ensure!(schema["type"] == "object", "root must be an object");
+        assert_node_conformant(schema, "#")
+    }
+
+    fn assert_node_conformant(schema: &serde_json::Value, path: &str) -> anyhow::Result<()> {
+        let object = schema
+            .as_object()
+            .with_context(|| format!("{path}: schema must be an object, got {schema}"))?;
+        anyhow::ensure!(
+            STRICT_TYPE_KEYWORDS
+                .iter()
+                .any(|keyword| object.contains_key(*keyword)),
+            "{path}: schema must have a 'type' key: {schema}"
+        );
+
+        let types: Vec<&str> = match object.get("type") {
+            Some(serde_json::Value::String(kind)) => vec![kind.as_str()],
+            Some(serde_json::Value::Array(kinds)) => {
+                kinds.iter().filter_map(serde_json::Value::as_str).collect()
+            }
+            Some(_) | None => Vec::new(),
+        };
+
+        if types.contains(&"object") {
+            anyhow::ensure!(
+                object.get("additionalProperties") == Some(&serde_json::Value::Bool(false)),
+                "{path}: object must set additionalProperties: false"
+            );
+            let properties = object
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .with_context(|| format!("{path}: object must declare properties"))?;
+            let required = object
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .with_context(|| format!("{path}: object must declare required"))?;
+            for (name, property) in properties {
+                anyhow::ensure!(
+                    required.contains(&serde_json::Value::String(name.clone())),
+                    "{path}: property {name} must be required"
+                );
+                assert_node_conformant(property, &format!("{path}/properties/{name}"))?;
+            }
+        }
+
+        if types.contains(&"array") {
+            let items = object
+                .get("items")
+                .with_context(|| format!("{path}: array must declare items"))?;
+            assert_node_conformant(items, &format!("{path}/items"))?;
+        }
+
+        if let Some(variants) = object.get("anyOf").and_then(serde_json::Value::as_array) {
+            for (index, variant) in variants.iter().enumerate() {
+                assert_node_conformant(variant, &format!("{path}/anyOf/{index}"))?;
+            }
+        }
+
+        for keyword in ["$defs", "definitions"] {
+            if let Some(definitions) = object.get(keyword).and_then(serde_json::Value::as_object) {
+                for (name, definition) in definitions {
+                    assert_node_conformant(definition, &format!("{path}/{keyword}/{name}"))?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// `value` is optional and accepts any JSON value, so it has no `type`.
+    fn untyped_value_tool_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "required": ["action"],
+            "properties": {
+                "action": {"type": "string", "enum": ["set", "unset"]},
+                "value": {"description": "JSON value to store."}
+            },
+            "additionalProperties": false
+        })
+    }
+
+    #[test]
+    fn untyped_property_is_rejected_without_mutation() {
+        let mut schema = untyped_value_tool_schema();
+        let original = schema.clone();
+
+        assert_eq!(
+            normalized_strict_schema(&schema),
+            Err(StrictSchemaError::UntypedSchema)
+        );
+        assert!(!normalize_strict_schema(&mut schema));
+        assert_eq!(schema, original);
+    }
+
+    #[test]
+    fn open_value_schemas_are_rejected_wherever_they_appear() {
+        for schema in [
+            serde_json::json!({}),
+            serde_json::json!(true),
+            serde_json::json!({"description": "anything"}),
+            serde_json::json!({
+                "type": "object",
+                "properties": {"value": true},
+                "required": ["value"]
+            }),
+            serde_json::json!({
+                "type": "object",
+                "properties": {"value": {}},
+                "required": ["value"]
+            }),
+            serde_json::json!({
+                "type": "object",
+                "properties": {"never": false},
+                "required": ["never"]
+            }),
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "values": {"type": "array", "items": {}}
+                },
+                "required": ["values"]
+            }),
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "rows": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {"cell": {"description": "any cell"}},
+                            "required": ["cell"]
+                        }
+                    }
+                },
+                "required": ["rows"]
+            }),
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "value": {"anyOf": [{"type": "string"}, {"description": "other"}]}
+                },
+                "required": ["value"]
+            }),
+            serde_json::json!({
+                "type": "object",
+                "properties": {"value": {"$ref": "#/$defs/any"}},
+                "required": ["value"],
+                "$defs": {"any": {}}
+            }),
+        ] {
+            assert_eq!(
+                normalized_strict_schema(&schema),
+                Err(StrictSchemaError::UntypedSchema),
+                "{schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn objects_missing_additional_properties_are_closed() -> anyhow::Result<()> {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "nested": {
+                    "type": "object",
+                    "properties": {"count": {"type": "integer"}},
+                    "required": ["count"]
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"label": {"type": "string"}}
+                    }
+                }
+            },
+            "required": ["name"]
+        });
+
+        let normalized = normalized_strict_schema(&schema)?;
+        assert_eq!(normalized["additionalProperties"], false);
+        assert_eq!(
+            normalized["properties"]["nested"]["anyOf"][0]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            normalized["properties"]["tags"]["anyOf"][0]["items"]["additionalProperties"],
+            false
+        );
+        assert_strict_conformant(&normalized)
+    }
+
+    #[test]
+    fn missing_object_and_array_types_are_inferred() -> anyhow::Result<()> {
+        let schema = serde_json::json!({
+            "properties": {
+                "labels": {"items": {"type": "string"}},
+                "meta": {
+                    "properties": {"key": {"type": "string"}},
+                    "required": ["key"]
+                }
+            },
+            "required": ["labels", "meta"]
+        });
+
+        let normalized = normalized_strict_schema(&schema)?;
+        assert_eq!(normalized["type"], "object");
+        assert_eq!(normalized["properties"]["labels"]["type"], "array");
+        assert_eq!(normalized["properties"]["meta"]["type"], "object");
+        assert_strict_conformant(&normalized)
+    }
+
+    #[test]
+    fn typed_tool_schema_stays_strict_and_conformant() -> anyhow::Result<()> {
+        let mut schema = untyped_value_tool_schema();
+        schema["properties"]["value"] = serde_json::json!({
+            "type": ["string", "number", "boolean"],
+            "description": "JSON scalar to store."
+        });
+
+        let normalized = normalized_strict_schema(&schema)?;
+        assert_eq!(
+            normalized["properties"]["value"]["anyOf"][1]["type"],
+            "null"
+        );
+        assert_strict_conformant(&normalized)
+    }
 
     #[test]
     fn normalizes_nested_optional_objects_and_definitions() {
