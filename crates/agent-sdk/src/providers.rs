@@ -25,7 +25,7 @@ pub mod openai {
 }
 #[cfg(feature = "openai-codex")]
 pub mod openai_codex_responses {
-    //! `OpenAI` Codex / `ChatGPT` WebSocket provider.
+    //! `OpenAI` Codex / `ChatGPT` subscription provider.
     pub use agent_sdk_providers::impls::openai_codex_responses::*;
 }
 #[cfg(feature = "openai")]
