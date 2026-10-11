@@ -1411,7 +1411,8 @@ fn apply_tool_call_update(
 /// Immediate + terminal deltas produced by feeding one SSE `data:` line to the
 /// Chat Completions streaming state.
 struct SseLineOutcome {
-    /// Deltas to yield immediately (text / thinking).
+    /// Deltas to yield immediately (text / thinking, and a keep-alive per
+    /// tool-call chunk).
     immediate: Vec<StreamDelta>,
     /// When `Some`, the stream finished ([DONE] received): yield these terminal
     /// deltas (tool calls + usage + Done) and stop.
@@ -1459,7 +1460,12 @@ fn step_completion_stream(
                 id,
                 name,
                 arguments,
-            } => apply_tool_call_update(tool_calls, index, id, name, arguments),
+            } => {
+                apply_tool_call_update(tool_calls, index, id, name, arguments);
+                // Tool calls are only emitted at `[DONE]`, so a long argument
+                // stream is otherwise indistinguishable from a stalled one.
+                immediate.push(StreamDelta::KeepAlive);
+            }
             SseProcessResult::Usage(u) => *usage = Some(u),
             SseProcessResult::Done(sr) => {
                 if !matches!(stop_reason, Some(StopReason::Refusal)) {
@@ -5962,6 +5968,27 @@ mod tests {
             }]
         ));
         Ok(())
+    }
+
+    #[test]
+    fn tool_call_chunks_are_stream_liveness() {
+        let mut tool_calls = HashMap::new();
+        let mut usage = None;
+        let mut stop_reason = None;
+
+        let outcome = step_completion_stream(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":"}}]}}]}"#,
+            &mut tool_calls,
+            &mut ToolCallIdAssigner::default(),
+            &mut usage,
+            &mut stop_reason,
+        );
+
+        assert!(matches!(
+            outcome.immediate.as_slice(),
+            [StreamDelta::KeepAlive]
+        ));
+        assert!(outcome.terminal.is_none());
     }
 
     #[test]

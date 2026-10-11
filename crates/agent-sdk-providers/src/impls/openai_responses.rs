@@ -796,6 +796,9 @@ impl LlmProvider for OpenAIResponsesProvider {
                                             }
                                         });
                                     acc.arguments.push_str(&delta);
+                                    // Tool calls are only emitted at completion, so a
+                                    // long argument stream would otherwise look stalled.
+                                    yield Ok(StreamDelta::KeepAlive);
                                 }
                             }
                             // ── Reasoning (thinking) deltas ─────────────
@@ -3532,6 +3535,32 @@ mod tests {
         let json = serde_json::to_value(build_api_input(&request, 0))?;
         assert_eq!(json[0]["content"][0]["type"], "input_image");
         assert_eq!(json[0]["content"][0]["detail"], "original");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tool_argument_progress_is_stream_liveness() -> anyhow::Result<()> {
+        let body = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"write\"}}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_1\",\"delta\":\"{\\\"path\\\":\"}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_1\",\"delta\":\"\\\"a.rs\\\"}\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+        );
+        let deltas = stream_deltas(body).await?;
+
+        let first_tool_delta = deltas
+            .iter()
+            .position(|delta| matches!(delta, StreamDelta::ToolUseStart { .. }))
+            .context("tool call was not emitted")?;
+        let keep_alives = deltas[..first_tool_delta]
+            .iter()
+            .filter(|delta| matches!(delta, StreamDelta::KeepAlive))
+            .count();
+        assert_eq!(keep_alives, 2, "{deltas:?}");
+        assert!(deltas.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::ToolInputDelta { delta, .. } if delta == r#"{"path":"a.rs"}"#
+        )));
         Ok(())
     }
 

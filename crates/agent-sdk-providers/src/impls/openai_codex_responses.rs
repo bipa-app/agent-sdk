@@ -493,7 +493,9 @@ impl LlmProvider for OpenAICodexResponsesProvider {
     fn chat_stream(&self, mut request: ChatRequest) -> StreamBox<'_> {
         self.downgrade_unsupported_original_image_detail(&mut request);
         let served_route = self.route().to_owned();
-        Box::pin(async_stream::stream! {
+        let trace = StreamTraceRecorder::new(&self.model);
+        let abandoned = AbandonedStreamLog(trace.clone());
+        let stream = async_stream::stream! {
             let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
                 Ok(thinking) => thinking,
                 Err(error) => {
@@ -991,6 +993,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                             continue;
                         }
 
+                        trace.transport("websocket");
                         let mut usage: Option<Usage> = None;
                         let mut tool_calls: HashMap<String, ToolCallAccumulator> = HashMap::new();
                         let mut response_id: Option<String> = None;
@@ -1047,6 +1050,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                     continue 'websocket_attempts;
                                 }
                             };
+                            trace.frame();
 
                             match message {
                                 WebSocketMessage::Text(text) => {
@@ -1086,6 +1090,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                             return;
                                         }
                                     };
+                                    trace.event(&event.r#type);
                                     match event.r#type.as_str() {
                                             "response.output_text.delta" => {
                                                 if let Some(delta) = event.delta {
@@ -1148,6 +1153,9 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                             block_index,
                                                         });
                                                     acc.arguments.push_str(&delta);
+                                                    // Tool calls are only emitted at completion, so a long
+                                                    // argument stream would otherwise look stalled.
+                                                    yield Ok(StreamDelta::KeepAlive);
                                                 }
                                             }
                                             "response.output_item.done" => {
@@ -1320,6 +1328,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                 return;
                                             }
                                         };
+                                        trace.event(&event.r#type);
                                             match event.r#type.as_str() {
                                                 "response.output_text.delta" => {
                                                     if let Some(delta) = event.delta {
@@ -1385,6 +1394,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                                 block_index,
                                                             });
                                                         acc.arguments.push_str(&delta);
+                                                        yield Ok(StreamDelta::KeepAlive);
                                                     }
                                                 }
                                                 "response.output_item.done" => {
@@ -1536,8 +1546,14 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                         }
                                         continue 'websocket_attempts;
                                     }
+                                    trace.heartbeat();
+                                    yield Ok(StreamDelta::KeepAlive);
                                 }
-                                WebSocketMessage::Pong(_) | WebSocketMessage::Frame(_) => {}
+                                WebSocketMessage::Pong(_) => {
+                                    trace.heartbeat();
+                                    yield Ok(StreamDelta::KeepAlive);
+                                }
+                                WebSocketMessage::Frame(_) => {}
                                 WebSocketMessage::Close(_) => {
                                     if emitted_output {
                                         end_websocket_turn(&mut websocket_session);
@@ -1631,6 +1647,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                 }
             }
 
+            trace.transport("sse");
             let mut sse = SseLineBuffer::new();
             let mut stream = response.bytes_stream();
             let mut usage: Option<Usage> = None;
@@ -1653,6 +1670,12 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                 while let Some(line) = sse.next_line() {
                     let line = line.trim();
                     if line.is_empty() {
+                        continue;
+                    }
+                    trace.frame();
+                    if line.starts_with(':') {
+                        trace.heartbeat();
+                        yield Ok(StreamDelta::KeepAlive);
                         continue;
                     }
 
@@ -1703,6 +1726,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                             return;
                         }
                     };
+                    trace.event(&event.r#type);
                     match event.r#type.as_str() {
                             "response.output_text.delta" => {
                                 if let Some(delta) = event.delta {
@@ -1757,6 +1781,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                         }
                                     });
                                     acc.arguments.push_str(&delta);
+                                    yield Ok(StreamDelta::KeepAlive);
                                 }
                             }
                             "response.output_item.done" => {
@@ -1849,7 +1874,8 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                 stop_reason: Some(stop_reason),
                 served_route: Some(served_route.clone()),
             });
-        })
+        };
+        Box::pin(stream.inspect(move |item| abandoned.observe(item)))
     }
 
     async fn probe_connectivity(&self) -> bool {
@@ -2564,6 +2590,119 @@ fn end_websocket_turn(session: &mut WebsocketSessionState) {
     session.last_response_id = None;
     session.last_response_items.clear();
     session.in_flight = false;
+}
+
+/// What one streaming turn received from the backend.
+///
+/// Logged when the consumer drops the stream before a terminal event, which
+/// is what its stall watchdog does. The counts separate a backend that kept
+/// sending frames the adapter does not surface, one that only sent transport
+/// heartbeats, and one that went silent.
+#[derive(Debug)]
+struct StreamTrace {
+    model: String,
+    opened_at: Instant,
+    transport: Option<&'static str>,
+    frames: u64,
+    heartbeats: u64,
+    last_frame_at: Option<Instant>,
+    last_event: Option<String>,
+    yielded: u64,
+    last_yield_at: Option<Instant>,
+    terminal: bool,
+}
+
+#[derive(Clone)]
+struct StreamTraceRecorder(Arc<std::sync::Mutex<StreamTrace>>);
+
+impl StreamTraceRecorder {
+    fn new(model: &str) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(StreamTrace {
+            model: model.to_owned(),
+            opened_at: Instant::now(),
+            transport: None,
+            frames: 0,
+            heartbeats: 0,
+            last_frame_at: None,
+            last_event: None,
+            yielded: 0,
+            last_yield_at: None,
+            terminal: false,
+        })))
+    }
+
+    fn update(&self, record: impl FnOnce(&mut StreamTrace)) {
+        if let Ok(mut trace) = self.0.lock() {
+            record(&mut trace);
+        }
+    }
+
+    fn transport(&self, transport: &'static str) {
+        self.update(|trace| trace.transport = Some(transport));
+    }
+
+    fn frame(&self) {
+        self.update(|trace| {
+            trace.frames = trace.frames.saturating_add(1);
+            trace.last_frame_at = Some(Instant::now());
+        });
+    }
+
+    fn heartbeat(&self) {
+        self.update(|trace| trace.heartbeats = trace.heartbeats.saturating_add(1));
+    }
+
+    fn event(&self, event_type: &str) {
+        self.update(|trace| {
+            if trace.last_event.as_deref() != Some(event_type) {
+                trace.last_event = Some(event_type.to_owned());
+            }
+        });
+    }
+}
+
+/// Owned by the stream handed to the consumer, so it is dropped with it.
+struct AbandonedStreamLog(StreamTraceRecorder);
+
+impl AbandonedStreamLog {
+    fn observe(&self, item: &Result<StreamDelta>) {
+        let terminal = matches!(
+            item,
+            Ok(StreamDelta::Done { .. } | StreamDelta::Error { .. }) | Err(_)
+        );
+        self.0.update(|trace| {
+            if terminal {
+                trace.terminal = true;
+            } else {
+                trace.yielded = trace.yielded.saturating_add(1);
+                trace.last_yield_at = Some(Instant::now());
+            }
+        });
+    }
+}
+
+impl Drop for AbandonedStreamLog {
+    fn drop(&mut self) {
+        let Ok(trace) = self.0.0.lock() else {
+            return;
+        };
+        if trace.terminal {
+            return;
+        }
+        let secs_since = |at: Option<Instant>| at.map(|at| at.elapsed().as_secs());
+        log::warn!(
+            model = trace.model.as_str(),
+            transport = trace.transport,
+            open_secs = trace.opened_at.elapsed().as_secs(),
+            frames = trace.frames,
+            heartbeats = trace.heartbeats,
+            yielded = trace.yielded,
+            secs_since_frame = secs_since(trace.last_frame_at),
+            secs_since_yield = secs_since(trace.last_yield_at),
+            last_event = trace.last_event.as_deref();
+            "OpenAI Codex stream dropped before a terminal event (consumer stall timeout or cancellation)"
+        );
+    }
 }
 
 /// Bound the websocket-session map by evicting idle (not in-flight) sessions,
@@ -5352,6 +5491,98 @@ mod tests {
             delta,
             StreamDelta::ToolInputDelta { id, delta, .. }
                 if id == "call_1" && delta == r#"{"path":"src/lib.rs"}"#
+        )));
+        assert!(matches!(
+            deltas.last(),
+            Some(StreamDelta::Done {
+                stop_reason: Some(StopReason::ToolUse),
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn stream_trace_treats_only_done_and_errors_as_terminal() -> anyhow::Result<()> {
+        let recorder = StreamTraceRecorder::new(MODEL_GPT53_CODEX);
+        let abandoned = AbandonedStreamLog(recorder.clone());
+        recorder.transport("sse");
+        recorder.frame();
+        recorder.heartbeat();
+        recorder.event("response.function_call_arguments.delta");
+        abandoned.observe(&Ok(StreamDelta::KeepAlive));
+        {
+            let trace = recorder.0.lock().ok().context("trace lock poisoned")?;
+            assert!(!trace.terminal);
+            assert_eq!((trace.frames, trace.heartbeats, trace.yielded), (1, 1, 1));
+            assert_eq!(
+                trace.last_event.as_deref(),
+                Some("response.function_call_arguments.delta")
+            );
+        }
+
+        for terminal in [
+            Ok(StreamDelta::Done {
+                stop_reason: Some(StopReason::EndTurn),
+                served_route: None,
+            }),
+            Ok(StreamDelta::Error {
+                message: "boom".to_owned(),
+                kind: StreamErrorKind::ServerError,
+            }),
+            Err(anyhow::anyhow!("transport")),
+        ] {
+            let recorder = StreamTraceRecorder::new(MODEL_GPT53_CODEX);
+            AbandonedStreamLog(recorder.clone()).observe(&terminal);
+            assert!(
+                recorder
+                    .0
+                    .lock()
+                    .ok()
+                    .context("trace lock poisoned")?
+                    .terminal
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_tool_argument_progress_and_comments_are_liveness() -> anyhow::Result<()> {
+        let sse_body = concat!(
+            ": keep-alive\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"call_id\":\"call_1\",\"name\":\"write\",\"delta\":\"{\\\"path\\\":\"}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"call_id\":\"call_1\",\"name\":\"write\",\"delta\":\"\\\"a.rs\\\",\"}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"call_id\":\"call_1\",\"name\":\"write\",\"delta\":\"\\\"content\\\":\\\"x\\\"}\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (base_url, _, _) = spawn_http_only_server_with_body(sse_body).await;
+        let provider = OpenAICodexResponsesProvider::with_base_url(
+            oauth_token(),
+            MODEL_GPT53_CODEX.to_owned(),
+            base_url,
+        )
+        .with_websockets_disabled(true);
+        let mut stream =
+            std::pin::pin!(provider.chat_stream(streaming_request("tool-argument-liveness")));
+        let mut deltas = Vec::new();
+        while let Some(delta) = stream.next().await {
+            deltas.push(delta?);
+        }
+
+        let first_tool_delta = deltas
+            .iter()
+            .position(|delta| matches!(delta, StreamDelta::ToolUseStart { .. }))
+            .context("tool call was not emitted")?;
+        let keep_alives = deltas[..first_tool_delta]
+            .iter()
+            .filter(|delta| matches!(delta, StreamDelta::KeepAlive))
+            .count();
+        assert_eq!(keep_alives, 4, "{deltas:?}");
+        assert!(deltas.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::ToolInputDelta { id, delta, .. }
+                if id == "call_1" && delta == r#"{"path":"a.rs","content":"x"}"#
         )));
         assert!(matches!(
             deltas.last(),
