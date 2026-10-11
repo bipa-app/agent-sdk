@@ -61,6 +61,10 @@
 //! sweep — does not pass through `release_lease`, so it is not
 //! penalised by this bump.
 //!
+//! Every fail-closed root turn also journals the terminal `Error` event
+//! [`FailureReason::terminal_event`] builds, in the same store write as
+//! the transition, so followers of the thread see the turn end.
+//!
 //! The table is locked by the
 //! `classify_recovery_matrix_is_exhaustive` test in this module so
 //! any future status / kind addition forces an explicit
@@ -95,6 +99,7 @@
 //! [`TaskKind`]: super::TaskKind
 //! [`TaskStatus`]: super::TaskStatus
 
+use agent_sdk_foundation::events::{AgentEvent, TerminalReason};
 use serde::{Deserialize, Serialize};
 
 use super::task::{AgentTask, AgentTaskId, TaskKind, TaskStatus};
@@ -163,6 +168,32 @@ impl FailureReason {
         format!(
             "{prefix}: task {id} ({kind} {status:?}) exhausted recovery budget (attempt={attempt}, max={max})"
         )
+    }
+
+    /// The typed terminal reason a row failed closed for this reason carries.
+    #[must_use]
+    pub const fn terminal_reason(self) -> TerminalReason {
+        match self {
+            Self::RetryBudgetExhausted | Self::LeaseExpiredBudgetExhausted => {
+                TerminalReason::Budget
+            }
+            Self::UnsafePreparedOperationRecovery => TerminalReason::InternalError,
+        }
+    }
+
+    /// The terminal `Error` event that closes `task`'s turn on its thread
+    /// when `task` fails closed for this reason, built from the row as it
+    /// was before the transition.
+    ///
+    /// `None` for rows below a thread's root turn: their failure wakes a
+    /// parent that is still running the turn, so closing the thread's
+    /// stream there would be wrong.
+    #[must_use]
+    pub fn terminal_event(self, task: &AgentTask) -> Option<AgentEvent> {
+        (task.kind == TaskKind::RootTurn && task.is_root()).then(|| {
+            AgentEvent::terminal_error(self.error_message(task), self.terminal_reason())
+                .with_emitter_task_id(task.id.as_str())
+        })
     }
 }
 
