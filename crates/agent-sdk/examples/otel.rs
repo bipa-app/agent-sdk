@@ -49,6 +49,7 @@ impl LlmProvider for DemoProvider {
                 output_tokens: 12,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }

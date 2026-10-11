@@ -157,6 +157,7 @@ impl LlmProvider for MockTextProvider {
                 output_tokens: 50,
                 cached_input_tokens: 10,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }
@@ -226,6 +227,7 @@ impl LlmProvider for MockToolCallProvider {
                 output_tokens: 60,
                 cached_input_tokens: 15,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }
@@ -4598,6 +4600,7 @@ impl LlmProvider for FlakyProvider {
                 output_tokens: 50,
                 cached_input_tokens: 10,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }
@@ -4682,6 +4685,7 @@ impl LlmProvider for OfflineThenSuccessProvider {
                 output_tokens: 3,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             }));
             yield Ok(StreamDelta::Done {
                 stop_reason: Some(StopReason::EndTurn),
@@ -5284,6 +5288,7 @@ impl LlmProvider for ScriptedProvider {
                     output_tokens: 50,
                     cached_input_tokens: 10,
                     cache_creation_input_tokens: 0,
+                    request_input_tokens: None,
                 },
             })),
         }
@@ -5723,6 +5728,7 @@ impl LlmProvider for CapturingProvider {
                 output_tokens: 5,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }
@@ -5885,6 +5891,7 @@ impl LlmProvider for SteeringCaptureProvider {
                 output_tokens: 30,
                 cached_input_tokens: 5,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }
@@ -6578,6 +6585,7 @@ impl LlmProvider for SteeringRedirectProvider {
                 output_tokens: 40,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }
@@ -10373,6 +10381,7 @@ impl LlmProvider for BoundaryFailProvider {
                 output_tokens: 50,
                 cached_input_tokens: 10,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }
@@ -10416,6 +10425,7 @@ impl LlmProvider for SecondWaveProvider<'_> {
                 output_tokens: 50,
                 cached_input_tokens: 10,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }
@@ -10457,6 +10467,7 @@ impl LlmProvider for TextThenToolProvider<'_> {
                     output_tokens: 5,
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
+                    request_input_tokens: None,
                 },
             }));
         }
@@ -10476,6 +10487,7 @@ impl LlmProvider for TextThenToolProvider<'_> {
                 output_tokens: 5,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }
@@ -11402,6 +11414,7 @@ impl LlmProvider for RoutedBackend {
                 output_tokens: 5,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }
@@ -11490,6 +11503,7 @@ impl LlmProvider for RoutelessStreamProvider {
                 output_tokens: 5,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             }));
             yield Ok(StreamDelta::Done {
                 stop_reason: Some(StopReason::EndTurn),
@@ -11612,6 +11626,7 @@ fn scripted_response(content: Vec<ContentBlock>, stop_reason: StopReason) -> Cha
             output_tokens: 20,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: Some(100),
         },
     }
 }

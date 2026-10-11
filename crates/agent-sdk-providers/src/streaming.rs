@@ -414,6 +414,9 @@ pub fn reqwest_body_error_delta(context: &str, error: &reqwest::Error) -> Stream
 pub type StreamBox<'a> = Pin<Box<dyn Stream<Item = anyhow::Result<StreamDelta>> + Send + 'a>>;
 
 /// Sum two usage readings, saturating so token counters never wrap.
+///
+/// `request_input_tokens` is carried from `usage` verbatim, never summed and
+/// never re-derived from the aggregate counters.
 fn add_usage(carried: Option<&Usage>, usage: &Usage) -> Usage {
     let Some(carried) = carried else {
         return usage.clone();
@@ -428,6 +431,7 @@ fn add_usage(carried: Option<&Usage>, usage: &Usage) -> Usage {
         cache_creation_input_tokens: carried
             .cache_creation_input_tokens
             .saturating_add(usage.cache_creation_input_tokens),
+        request_input_tokens: usage.request_input_tokens,
     }
 }
 
@@ -444,6 +448,11 @@ fn add_usage(carried: Option<&Usage>, usage: &Usage) -> Usage {
 /// stream to retry, it calls [`abandon`](Self::abandon) to fold that stream's
 /// usage into the carry. The final delta the consumer sees — the only one the
 /// accumulator keeps — is therefore the true total across every attempt.
+///
+/// `request_input_tokens` is never summed: each rewritten delta carries the
+/// current attempt's own value, and a wrapper whose replacement stream
+/// reported no usage emits [`terminal_usage`](Self::terminal_usage) before
+/// the successful `Done`.
 #[derive(Default)]
 pub(crate) struct UsageCarry {
     /// Usage billed by abandoned attempts.
@@ -474,6 +483,20 @@ impl UsageCarry {
         if let Some(current) = self.current.take() {
             self.carried = Some(add_usage(self.carried.as_ref(), &current));
         }
+    }
+
+    /// Usage frame owed before a successful `Done` when abandoned attempts
+    /// billed tokens but the surviving stream reported no usage: the
+    /// consumer's last-wins accumulator would otherwise keep an abandoned
+    /// request's `request_input_tokens`.
+    pub(crate) fn terminal_usage(&self) -> Option<Usage> {
+        if self.current.is_some() {
+            return None;
+        }
+        let carried = self.carried.as_ref()?;
+        let mut usage = carried.clone();
+        usage.request_input_tokens = None;
+        Some(usage)
     }
 }
 
@@ -768,6 +791,78 @@ mod tests {
     }
 
     #[test]
+    fn usage_carry_sums_billing_but_carries_the_current_request_stamp() {
+        let mut carry = UsageCarry::new();
+        let first = carry.running_total(Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            request_input_tokens: Some(100),
+            ..Usage::default()
+        });
+        assert_eq!(first.input_tokens, 100);
+        assert_eq!(first.request_input_tokens, Some(100));
+        carry.abandon();
+
+        let second = carry.running_total(Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            request_input_tokens: Some(10),
+            ..Usage::default()
+        });
+        assert_eq!(second.input_tokens, 110, "billing must aggregate");
+        assert_eq!(second.output_tokens, 55);
+        assert_eq!(
+            second.request_input_tokens,
+            Some(10),
+            "the stamp must name the current physical request, never the sum"
+        );
+        assert!(carry.terminal_usage().is_none());
+    }
+
+    #[test]
+    fn usage_carry_never_rederives_a_missing_stamp_from_the_aggregate() {
+        let mut carry = UsageCarry::new();
+        carry.running_total(Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            request_input_tokens: Some(100),
+            ..Usage::default()
+        });
+        carry.abandon();
+
+        let total = carry.running_total(Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            request_input_tokens: None,
+            ..Usage::default()
+        });
+        assert_eq!(total.input_tokens, 110);
+        assert_eq!(total.request_input_tokens, None);
+    }
+
+    #[test]
+    fn usage_carry_owes_a_reset_frame_when_the_survivor_reported_no_usage() -> anyhow::Result<()> {
+        let mut carry = UsageCarry::new();
+        assert!(carry.terminal_usage().is_none());
+
+        carry.running_total(Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            request_input_tokens: Some(100),
+            ..Usage::default()
+        });
+        carry.abandon();
+
+        let reset = carry
+            .terminal_usage()
+            .ok_or_else(|| anyhow::anyhow!("a reset frame is owed when carried billing exists"))?;
+        assert_eq!(reset.input_tokens, 100);
+        assert_eq!(reset.output_tokens, 50);
+        assert_eq!(reset.request_input_tokens, None);
+        Ok(())
+    }
+
+    #[test]
     fn test_accumulator_text_deltas() {
         let mut acc = StreamAccumulator::new();
 
@@ -964,6 +1059,7 @@ mod tests {
             output_tokens: 50,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         }));
         acc.apply(&StreamDelta::Done {
             stop_reason: Some(StopReason::ToolUse),

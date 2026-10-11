@@ -18,6 +18,13 @@ pub const DEFAULT_MAX_RETAINED_TAIL_TOKENS: usize = 20_000;
 /// and retried.
 pub const DEFAULT_SUMMARY_MAX_TOKENS: usize = 4_096;
 
+/// Fallback reserve for the model-aware compaction threshold.
+///
+/// Used when neither an explicit reserve nor the model's registered
+/// `max_output_tokens` is known; the reserve never drops below the
+/// `max_tokens` a call requests.
+pub const DEFAULT_MODEL_CONTEXT_RESERVE_TOKENS: usize = 16_384;
+
 const fn default_max_retained_tail_tokens() -> usize {
     DEFAULT_MAX_RETAINED_TAIL_TOKENS
 }
@@ -109,6 +116,37 @@ pub struct CompactionConfig {
     /// Existing hosts therefore retain legacy behavior by default.
     #[serde(default = "default_compaction_engine")]
     pub engine: CompactionEngine,
+
+    /// Derive the trigger threshold per call from the serving model instead
+    /// of treating [`threshold_tokens`](Self::threshold_tokens) as
+    /// authoritative. Honored by the daemon root-turn path
+    /// (`agent-server`); the in-process agent loop ignores it.
+    ///
+    /// The threshold is `window - reserve`. The window is
+    /// [`model_context_window_tokens`](Self::model_context_window_tokens),
+    /// else the serving model's registered context window. The reserve is
+    /// [`model_context_reserve_tokens`](Self::model_context_reserve_tokens),
+    /// else the model's registered `max_output_tokens`, else
+    /// [`DEFAULT_MODEL_CONTEXT_RESERVE_TOKENS`], and never less than the
+    /// `max_tokens` the call requests. Without a known window (unknown model,
+    /// or a provider whose route is not stable per request),
+    /// `threshold_tokens` applies unchanged.
+    /// Default: false
+    #[serde(default)]
+    pub model_aware_threshold: bool,
+
+    /// Reserve override for
+    /// [`model_aware_threshold`](Self::model_aware_threshold); still raised
+    /// to the call's requested `max_tokens` when smaller.
+    /// Default: `None`
+    #[serde(default)]
+    pub model_context_reserve_tokens: Option<usize>,
+
+    /// Context-window override for
+    /// [`model_aware_threshold`](Self::model_aware_threshold).
+    /// Default: `None`
+    #[serde(default)]
+    pub model_context_window_tokens: Option<usize>,
 }
 
 impl Default for CompactionConfig {
@@ -121,6 +159,9 @@ impl Default for CompactionConfig {
             max_retained_tail_tokens: DEFAULT_MAX_RETAINED_TAIL_TOKENS,
             summary_max_tokens: DEFAULT_SUMMARY_MAX_TOKENS,
             engine: CompactionEngine::Legacy,
+            model_aware_threshold: false,
+            model_context_reserve_tokens: None,
+            model_context_window_tokens: None,
         }
     }
 }
@@ -184,6 +225,27 @@ impl CompactionConfig {
         self
     }
 
+    /// See [`model_aware_threshold`](Self::model_aware_threshold).
+    #[must_use]
+    pub const fn with_model_aware_threshold(mut self, enabled: bool) -> Self {
+        self.model_aware_threshold = enabled;
+        self
+    }
+
+    /// See [`model_context_reserve_tokens`](Self::model_context_reserve_tokens).
+    #[must_use]
+    pub const fn with_model_context_reserve_tokens(mut self, tokens: usize) -> Self {
+        self.model_context_reserve_tokens = Some(tokens);
+        self
+    }
+
+    /// See [`model_context_window_tokens`](Self::model_context_window_tokens).
+    #[must_use]
+    pub const fn with_model_context_window_tokens(mut self, tokens: usize) -> Self {
+        self.model_context_window_tokens = Some(tokens);
+        self
+    }
+
     /// Whether prune-first compaction and measured host triggers are enabled.
     #[must_use]
     pub const fn uses_prune_first_engine(&self) -> bool {
@@ -214,6 +276,9 @@ mod tests {
         );
         assert_eq!(config.summary_max_tokens, DEFAULT_SUMMARY_MAX_TOKENS);
         assert_eq!(config.engine, CompactionEngine::Legacy);
+        assert!(!config.model_aware_threshold);
+        assert_eq!(config.model_context_reserve_tokens, None);
+        assert_eq!(config.model_context_window_tokens, None);
     }
 
     #[test]
@@ -225,7 +290,10 @@ mod tests {
             .with_auto_compact(false)
             .with_max_retained_tail_tokens(40_000)
             .with_summary_max_tokens(8_000)
-            .with_engine(CompactionEngine::PruneFirst);
+            .with_engine(CompactionEngine::PruneFirst)
+            .with_model_aware_threshold(true)
+            .with_model_context_reserve_tokens(32_000)
+            .with_model_context_window_tokens(200_000);
 
         assert_eq!(config.threshold_tokens, 50_000);
         assert_eq!(config.retain_recent, 5);
@@ -234,6 +302,9 @@ mod tests {
         assert_eq!(config.max_retained_tail_tokens, 40_000);
         assert_eq!(config.summary_max_tokens, 8_000);
         assert_eq!(config.engine, CompactionEngine::PruneFirst);
+        assert!(config.model_aware_threshold);
+        assert_eq!(config.model_context_reserve_tokens, Some(32_000));
+        assert_eq!(config.model_context_window_tokens, Some(200_000));
     }
 
     #[test]
@@ -257,7 +328,24 @@ mod tests {
         );
         assert_eq!(config.summary_max_tokens, DEFAULT_SUMMARY_MAX_TOKENS);
         assert_eq!(config.engine, CompactionEngine::Legacy);
+        assert!(!config.model_aware_threshold);
+        assert_eq!(config.model_context_reserve_tokens, None);
+        assert_eq!(config.model_context_window_tokens, None);
 
+        Ok(())
+    }
+
+    #[test]
+    fn model_aware_fields_serde_round_trip() -> anyhow::Result<()> {
+        let config = CompactionConfig::default()
+            .with_model_aware_threshold(true)
+            .with_model_context_reserve_tokens(24_000)
+            .with_model_context_window_tokens(1_048_576);
+        let json = serde_json::to_string(&config)?;
+        let restored: CompactionConfig = serde_json::from_str(&json)?;
+        assert!(restored.model_aware_threshold);
+        assert_eq!(restored.model_context_reserve_tokens, Some(24_000));
+        assert_eq!(restored.model_context_window_tokens, Some(1_048_576));
         Ok(())
     }
 

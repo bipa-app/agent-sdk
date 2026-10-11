@@ -953,6 +953,7 @@ impl LlmProvider for AnthropicProvider {
                 output_tokens: api_response.usage.output,
                 cached_input_tokens: api_response.usage.cached_input_tokens(),
                 cache_creation_input_tokens: api_response.usage.cache_creation_input_tokens(),
+                request_input_tokens: Some(api_response.usage.total_input_tokens()),
             },
         }))
     }

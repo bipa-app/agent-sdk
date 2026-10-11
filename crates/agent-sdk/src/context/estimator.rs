@@ -54,6 +54,20 @@ impl TokenEstimator {
         Self::estimate_message_for_snapcompact_route(message, None)
     }
 
+    /// Estimate a not-yet-staged user message from its blocks. An empty
+    /// block list estimates zero: it appends no message.
+    #[must_use]
+    pub fn estimate_pending_user_message(blocks: &[ContentBlock]) -> usize {
+        if blocks.is_empty() {
+            return 0;
+        }
+        blocks
+            .iter()
+            .map(Self::estimate_block)
+            .sum::<usize>()
+            .saturating_add(Self::MESSAGE_OVERHEAD)
+    }
+
     /// Estimate one message, repricing canonical Snapcompact frames for the
     /// current provider route. Metadata on any non-canonical message is ignored.
     #[must_use]

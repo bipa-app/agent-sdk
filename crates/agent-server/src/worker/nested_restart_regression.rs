@@ -154,6 +154,7 @@ impl LlmProvider for MockTextProvider {
                 output_tokens: 20,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }
@@ -216,6 +217,7 @@ impl LlmProvider for MockToolThenText {
                     output_tokens: 40,
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
+                    request_input_tokens: None,
                 },
             }))
         } else {
@@ -232,6 +234,7 @@ impl LlmProvider for MockToolThenText {
                     output_tokens: 25,
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
+                    request_input_tokens: None,
                 },
             }))
         }

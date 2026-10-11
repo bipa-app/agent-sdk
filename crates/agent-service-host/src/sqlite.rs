@@ -46,9 +46,10 @@ mod tests {
 
     use super::migrations::{
         AWAITING_QUESTION_MIGRATION_VERSION, DURABLE_CORE_MIGRATOR,
-        INPUT_INJECTION_KIND_MIGRATION_VERSION, PURGE_SEED_MIGRATION_VERSION,
-        TASK_TERMINAL_REASON_MIGRATION_VERSION, THREAD_PURGE_LIFECYCLE_MIGRATION_VERSION,
-        durable_core_migrations, outbox_message_kind_migration,
+        HISTORY_GENERATION_MIGRATION_VERSION, INPUT_INJECTION_KIND_MIGRATION_VERSION,
+        PURGE_SEED_MIGRATION_VERSION, TASK_TERMINAL_REASON_MIGRATION_VERSION,
+        THREAD_PURGE_LIFECYCLE_MIGRATION_VERSION, durable_core_migrations,
+        outbox_message_kind_migration,
     };
 
     #[test]
@@ -132,6 +133,11 @@ mod tests {
             "bundle is missing this PR's migration \
              {PURGE_SEED_MIGRATION_VERSION}, got {versions:?}",
         );
+        ensure!(
+            versions.contains(&HISTORY_GENERATION_MIGRATION_VERSION),
+            "bundle is missing this PR's migration \
+             {HISTORY_GENERATION_MIGRATION_VERSION}, got {versions:?}",
+        );
         Ok(())
     }
 
@@ -182,6 +188,7 @@ mod tests {
             "agent_sdk_tasks_waiting_state_check",
             "agent_sdk_threads_status_check",
             "agent_sdk_message_heads_version_check",
+            "agent_sdk_message_heads_history_generation_check",
             "agent_sdk_committed_events_sequence_check",
             "agent_sdk_outbox_status_check",
             "agent_sdk_retention_cursors_floor_check",

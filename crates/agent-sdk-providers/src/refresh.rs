@@ -261,6 +261,9 @@ where
                                 }
                                 other => other,
                             };
+                            if done && let Some(reset) = usage_carry.terminal_usage() {
+                                yield Ok(StreamDelta::Usage(reset));
+                            }
                             yield Ok(delta);
                             if done {
                                 return;
@@ -347,6 +350,10 @@ where
 
     fn structured_output_support(&self) -> StructuredOutputSupport {
         self.template.structured_output_support()
+    }
+
+    fn has_stable_request_route(&self) -> bool {
+        self.template.has_stable_request_route()
     }
 }
 
@@ -555,6 +562,7 @@ mod tests {
                 output_tokens: 1,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: Some(1),
             },
         }
     }
@@ -841,6 +849,7 @@ mod tests {
                 output_tokens: o,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: Some(i),
             }))
         };
         mock_a.queue_stream(vec![
@@ -886,6 +895,12 @@ mod tests {
             .context("the stacked stream must report usage")?;
         assert_eq!(total.input_tokens, 130, "100 + 10 + 20, each counted once");
         assert_eq!(total.output_tokens, 65, "50 + 5 + 10, each counted once");
+        assert_eq!(
+            total.request_input_tokens,
+            Some(20),
+            "the stamp must survive both wrapper layers as the LAST physical \
+             request's own reading, never a sum"
+        );
         assert_eq!(refresh_count.load(Ordering::SeqCst), 1);
         Ok(())
     }
@@ -904,6 +919,7 @@ mod tests {
                 output_tokens: 50,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: Some(100),
             })),
             MockStreamItem::Ok(StreamDelta::Error {
                 message: "status=401 Unauthorized".into(),
@@ -921,6 +937,7 @@ mod tests {
                 output_tokens: 5,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: Some(10),
             })),
             MockStreamItem::Ok(StreamDelta::Done {
                 stop_reason: Some(StopReason::EndTurn),
@@ -941,6 +958,57 @@ mod tests {
             .context("the refreshed stream must still report usage")?;
         assert_eq!(usage.input_tokens, 110, "100 abandoned + 10 retried");
         assert_eq!(usage.output_tokens, 55, "50 abandoned + 5 retried");
+        assert_eq!(usage.request_input_tokens, Some(10));
+        assert_eq!(refresh_count.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_survivor_without_usage_resets_the_request_stamp() -> Result<()> {
+        let mock = MockProvider::new();
+        mock.queue_stream(vec![
+            MockStreamItem::Ok(StreamDelta::Usage(Usage {
+                served_speed: None,
+                input_tokens: 100,
+                output_tokens: 50,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                request_input_tokens: Some(100),
+            })),
+            MockStreamItem::Ok(StreamDelta::Error {
+                message: "status=401 Unauthorized".into(),
+                kind: StreamErrorKind::InvalidRequest,
+            }),
+        ])?;
+        mock.queue_stream(vec![
+            MockStreamItem::Ok(StreamDelta::TextDelta {
+                delta: "retried".into(),
+                block_index: 0,
+            }),
+            MockStreamItem::Ok(StreamDelta::Done {
+                stop_reason: Some(StopReason::EndTurn),
+                served_route: None,
+            }),
+        ])?;
+
+        let refresh_count = Arc::new(AtomicUsize::new(0));
+        let wrapped = wrap_success(&mock, &refresh_count);
+
+        let deltas = drain(wrapped.chat_stream(empty_request())).await;
+        let mut accumulator = crate::streaming::StreamAccumulator::new();
+        for delta in deltas.iter().flatten() {
+            accumulator.apply(delta);
+        }
+        let usage = accumulator
+            .usage()
+            .context("the reset frame must reach the accumulator")?;
+        assert_eq!(usage.input_tokens, 100, "abandoned billing must survive");
+        assert_eq!(usage.output_tokens, 50);
+        assert_eq!(
+            usage.request_input_tokens, None,
+            "the survivor never reported usage: its occupancy is unknown and \
+             must not inherit the abandoned request's stamp"
+        );
         assert_eq!(refresh_count.load(Ordering::SeqCst), 1);
         Ok(())
     }

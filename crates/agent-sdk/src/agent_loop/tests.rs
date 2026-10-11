@@ -2142,6 +2142,7 @@ async fn terminal_stop_reason_ignores_tool_blocks_before_execution_and_persisten
             output_tokens: 20,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         },
     })]);
 
@@ -4747,6 +4748,9 @@ impl ContextCompactor for ShrinkCompactor {
             new_tokens: 10,
             retained_count: 0,
             llm_usage: crate::types::TokenUsage::default(),
+            published_artifacts: crate::context::PublishedArtifacts::default(),
+            response_model: None,
+            served_route: None,
         })
     }
 }
@@ -5441,6 +5445,7 @@ async fn streaming_retry_bills_the_failed_attempts_usage() -> anyhow::Result<()>
             output_tokens: output,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         })
     };
     let provider = StreamScriptProvider::new(vec![
@@ -5548,6 +5553,7 @@ async fn failover_after_usage_bills_both_providers() -> anyhow::Result<()> {
             output_tokens: output,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         })
     };
     let primary = std::sync::Arc::new(StreamScriptProvider::new(vec![StreamScriptStep::Frames(
@@ -5632,6 +5638,7 @@ async fn cancelled_stream_bills_the_usage_it_already_streamed() -> anyhow::Resul
             output_tokens: 10,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         }),
     ])]);
     let config = AgentConfig {
@@ -5911,6 +5918,7 @@ impl crate::llm::LlmProvider for PricedProvider {
                 output_tokens: 1_000,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }
@@ -6908,6 +6916,7 @@ fn refusal_response() -> ChatOutcome {
             output_tokens: 20,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         },
     })
 }
@@ -8471,6 +8480,7 @@ impl crate::llm::LlmProvider for FablePricedProvider {
                 output_tokens: 1_000,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }

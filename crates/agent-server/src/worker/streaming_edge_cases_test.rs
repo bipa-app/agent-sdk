@@ -257,6 +257,7 @@ async fn interleaved_text_and_tool_deltas_suspend_with_balanced_history() -> Res
             output_tokens: 20,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         }),
         StreamDelta::Done {
             stop_reason: Some(StopReason::ToolUse),
@@ -818,6 +819,7 @@ async fn stream_ends_without_done_is_retried_then_completes() -> Result<()> {
                 output_tokens: 4,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             }),
             // no StreamDelta::Done
         ]),

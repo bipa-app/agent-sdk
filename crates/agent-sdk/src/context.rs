@@ -39,7 +39,7 @@ mod snapcompact;
 
 pub use compactor::{
     CompactionPurpose, CompactionResult, ContextCompactor, FailedCompaction, LlmContextCompactor,
-    NoProgressCompaction, SnapcompactResourceLimit, SummarizationEmpty,
+    NoProgressCompaction, PublishedArtifacts, SnapcompactResourceLimit, SummarizationEmpty,
 };
-pub use config::{CompactionConfig, CompactionEngine};
+pub use config::{CompactionConfig, CompactionEngine, DEFAULT_MODEL_CONTEXT_RESERVE_TOKENS};
 pub use estimator::TokenEstimator;

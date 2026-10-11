@@ -529,6 +529,7 @@ where
         retained_count: result.retained_count,
         llm_usage: result.llm_usage,
     };
+    let published_artifacts = result.published_artifacts;
 
     #[cfg(feature = "otel")]
     record_compaction_result(&mut compaction_span, &stored_result, trigger);
@@ -553,6 +554,8 @@ where
             llm_usage: stored_result.llm_usage,
         };
     }
+
+    published_artifacts.commit();
 
     #[cfg(feature = "otel")]
     finish_compaction_span_success(&mut compaction_span);

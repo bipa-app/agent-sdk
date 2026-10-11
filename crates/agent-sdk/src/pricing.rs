@@ -199,6 +199,7 @@ mod tests {
             output_tokens: 1_000_000,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         };
 
         let estimator: &dyn CostEstimator = &registry;

@@ -1473,6 +1473,7 @@ fn map_usage(usage: Option<ApiUsage>, service_tier: Option<&str>) -> Usage {
             output_tokens: 0,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         },
         |u| Usage {
             served_speed,
@@ -1486,6 +1487,7 @@ fn map_usage(usage: Option<ApiUsage>, service_tier: Option<&str>) -> Usage {
                 .input_tokens_details
                 .as_ref()
                 .map_or(0, |details| details.cache_write_tokens),
+            request_input_tokens: Some(u.input_tokens),
         },
     )
 }
@@ -2640,6 +2642,11 @@ mod tests {
         assert_eq!(usage.output_tokens, 7);
         assert_eq!(usage.cached_input_tokens, 10);
         assert_eq!(usage.cache_creation_input_tokens, 6);
+        assert_eq!(
+            usage.request_input_tokens,
+            Some(42),
+            "one physical request: request occupancy equals its total input"
+        );
         Ok(())
     }
 

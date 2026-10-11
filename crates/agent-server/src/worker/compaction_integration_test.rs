@@ -75,6 +75,8 @@ struct ScriptedProvider {
     call_count: AtomicUsize,
     supports_historical_images: bool,
     requests: Mutex<Vec<ChatRequest>>,
+    provider_name: &'static str,
+    model_name: &'static str,
 }
 
 impl ScriptedProvider {
@@ -84,6 +86,16 @@ impl ScriptedProvider {
             call_count: AtomicUsize::new(0),
             supports_historical_images: false,
             requests: Mutex::new(Vec::new()),
+            provider_name: "mock",
+            model_name: "mock-model",
+        }
+    }
+
+    fn with_identity(provider_name: &'static str, model_name: &'static str) -> Self {
+        Self {
+            provider_name,
+            model_name,
+            ..Self::new(vec![ok_response("[summary]")])
         }
     }
 
@@ -144,12 +156,12 @@ impl LlmProvider for ScriptedProvider {
         Ok(responses.remove(0))
     }
 
-    fn model(&self) -> &'static str {
-        "mock-model"
+    fn model(&self) -> &str {
+        self.model_name
     }
 
     fn provider(&self) -> &'static str {
-        "mock"
+        self.provider_name
     }
 
     fn supports_historical_image_blocks(&self) -> bool {
@@ -241,6 +253,7 @@ fn ok_response(text: &str) -> ChatOutcome {
             output_tokens: 50,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: Some(100),
         },
     })
 }
@@ -259,6 +272,7 @@ fn zero_usage_response(text: &str) -> ChatOutcome {
             output_tokens: 0,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         },
     })
 }
@@ -595,8 +609,11 @@ async fn assert_no_immediate_snapcompact_retrigger(
     let staged = crate::journal::staged::StagedMessageStore::new(thread_id(), effective);
     let immediate = super::compaction::maybe_compact_staged_history(
         deps,
+        scripted,
         &staged,
         &thread_id(),
+        0,
+        &sample_envelope(),
         t0() + Duration::seconds(2),
     )
     .await?;
@@ -988,11 +1005,15 @@ async fn cancellation_during_summarization_leaves_compaction_state_unchanged() -
         let cancel = CancellationToken::new();
         let mut deps = fixtures.deps_with_compaction(&cfg, &provider);
         deps.cancel = Some(&cancel);
+        let envelope = sample_envelope();
 
         let compaction = super::compaction::maybe_compact_staged_history(
             &deps,
+            provider.as_ref(),
             &staged,
             &id,
+            0,
+            &envelope,
             t0() + Duration::seconds(1),
         );
         tokio::pin!(compaction);
@@ -1022,6 +1043,8 @@ async fn cancellation_during_summarization_leaves_compaction_state_unchanged() -
 
         let compaction = super::compaction::compact_after_overflow(
             &deps,
+            provider.as_ref(),
+            sample_definition().max_tokens,
             &staged,
             &id,
             t0() + Duration::seconds(2),
@@ -1273,6 +1296,7 @@ fn thinking_only_response() -> ChatOutcome {
             output_tokens: 50,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         },
     })
 }
@@ -1793,12 +1817,37 @@ async fn prompt_too_long_without_config_still_goes_fatal() -> Result<()> {
     Ok(())
 }
 
-async fn close_success_attempt(
+fn sample_envelope() -> ChatRequest {
+    let definition = sample_definition();
+    ChatRequest {
+        system: definition.system_prompt,
+        messages: Vec::new(),
+        tools: None,
+        max_tokens: definition.max_tokens,
+        max_tokens_explicit: true,
+        session_id: None,
+        cached_content: None,
+        thinking: None,
+        tool_choice: None,
+        response_format: None,
+        cache: None,
+        request_only_reminders: Vec::new(),
+    }
+}
+
+fn sample_envelope_fingerprint() -> Result<String> {
+    super::compaction::request_envelope_fingerprint("mock", "mock-model", &sample_envelope())
+}
+
+/// Aggregate billing columns are set larger than any stamped
+/// `request_input_tokens` so a leak of the aggregate into the trigger fails.
+async fn seed_attempt_row(
     fixtures: &Fixtures,
     task_id: &crate::journal::task::AgentTaskId,
-    request_blob: serde_json::Value,
-    input_tokens: u32,
-    closed_at: OffsetDateTime,
+    attempt_number: u32,
+    response_blob: serde_json::Value,
+    aggregate_input_tokens: u32,
+    opened_at: OffsetDateTime,
 ) -> Result<()> {
     use crate::journal::turn_attempt::{CloseAttemptParams, OpenAttemptParams, TurnAttemptOutcome};
     use crate::journal::turn_attempt_store::TurnAttemptStore;
@@ -1808,10 +1857,10 @@ async fn close_success_attempt(
         .attempts
         .open_attempt(OpenAttemptParams {
             task_id: task_id.clone(),
-            attempt_number: 1,
+            attempt_number,
             provenance: AuditProvenance::new("mock", "mock-model"),
-            request_blob,
-            now: closed_at - Duration::seconds(1),
+            request_blob: serde_json::json!({ "user_prompt": "seeded" }),
+            now: opened_at,
             otel_trace_id: None,
             otel_span_id: None,
         })
@@ -1821,12 +1870,12 @@ async fn close_success_attempt(
         .close_attempt(
             &attempt.id,
             CloseAttemptParams {
-                response_blob: serde_json::json!({}),
+                response_blob,
                 response_id: None,
                 response_model: None,
                 stop_reason: Some(StopReason::EndTurn),
                 outcome: TurnAttemptOutcome::Success,
-                input_tokens,
+                input_tokens: aggregate_input_tokens,
                 output_tokens: 10,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
@@ -1835,10 +1884,43 @@ async fn close_success_attempt(
                 thinking_budget_tokens: None,
                 thinking_effort: None,
             },
-            closed_at,
+            opened_at + Duration::seconds(1),
         )
         .await?;
     Ok(())
+}
+
+async fn seed_anchor_attempt(
+    fixtures: &Fixtures,
+    task_id: &crate::journal::task::AgentTaskId,
+    attempt_number: u32,
+    request_input_tokens: u64,
+    request_message_count: u64,
+    history_generation: u64,
+    opened_at: OffsetDateTime,
+) -> Result<()> {
+    let blob = serde_json::json!({
+        "model": "mock-model",
+        "request_input_tokens": request_input_tokens,
+        "request_message_count": request_message_count,
+        "request_fingerprint": sample_envelope_fingerprint()?,
+        "history_generation": history_generation,
+    });
+    let aggregate = u32::try_from(
+        request_input_tokens
+            .saturating_mul(2)
+            .min(u64::from(u32::MAX)),
+    )
+    .unwrap_or(u32::MAX);
+    seed_attempt_row(
+        fixtures,
+        task_id,
+        attempt_number,
+        blob,
+        aggregate,
+        opened_at,
+    )
+    .await
 }
 
 #[tokio::test]
@@ -1847,11 +1929,13 @@ async fn legacy_engine_flag_off_uses_estimated_trigger_and_generic_prompt() -> R
 
     let fixtures = Fixtures::new();
     let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
-    close_success_attempt(
+    seed_anchor_attempt(
         &fixtures,
         &task.id,
-        serde_json::json!({ "messages": vec!["covered"; 24] }),
+        1,
         100,
+        24,
+        0,
         t0() + Duration::seconds(5),
     )
     .await?;
@@ -1882,8 +1966,11 @@ async fn legacy_engine_flag_off_uses_estimated_trigger_and_generic_prompt() -> R
 
     super::compaction::maybe_compact_staged_history(
         &deps,
+        provider.as_ref(),
         &staged,
         &thread_id(),
+        0,
+        &sample_envelope(),
         t0() + Duration::seconds(20),
     )
     .await?;
@@ -1911,11 +1998,13 @@ async fn snapcompact_measured_trigger_wins_over_large_estimate() -> Result<()> {
 
     let fixtures = Fixtures::new();
     let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
-    close_success_attempt(
+    seed_anchor_attempt(
         &fixtures,
         &task.id,
-        serde_json::json!({ "messages": vec!["covered"; 24] }),
+        1,
         100,
+        24,
+        0,
         t0() + Duration::seconds(5),
     )
     .await?;
@@ -1951,8 +2040,11 @@ async fn snapcompact_measured_trigger_wins_over_large_estimate() -> Result<()> {
 
     let outcome = super::compaction::maybe_compact_staged_history(
         &deps,
+        provider.as_ref(),
         &staged,
         &thread_id(),
+        0,
+        &sample_envelope(),
         t0() + Duration::seconds(20),
     )
     .await?;
@@ -1974,11 +2066,6 @@ async fn snapcompact_measured_trigger_wins_over_large_estimate() -> Result<()> {
     Ok(())
 }
 
-/// A billed Success attempt that PREDATES the latest durable compaction
-/// boundary must not re-trigger compaction: after a prune-only compaction the
-/// message count is unchanged, so without the fence the stale 90k reading
-/// would fire a fresh (billed) summarization on an already-under-threshold
-/// history after a failure, cancel, or daemon restart.
 #[tokio::test]
 async fn stale_measured_usage_before_compaction_does_not_retrigger() -> Result<()> {
     use crate::journal::staged::StagedMessageStore;
@@ -1987,11 +2074,13 @@ async fn stale_measured_usage_before_compaction_does_not_retrigger() -> Result<(
     let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
 
     // Billed Success at t+5, long before the compaction boundary at t+10.
-    close_success_attempt(
+    seed_anchor_attempt(
         &fixtures,
         &task.id,
-        serde_json::json!({ "messages": [] }),
+        1,
         90_000,
+        24,
+        0,
         t0() + Duration::seconds(5),
     )
     .await?;
@@ -2026,8 +2115,11 @@ async fn stale_measured_usage_before_compaction_does_not_retrigger() -> Result<(
 
     super::compaction::maybe_compact_staged_history(
         &deps,
+        provider.as_ref(),
         &staged,
         &thread_id(),
+        0,
+        &sample_envelope(),
         t0() + Duration::seconds(20),
     )
     .await?;
@@ -2059,11 +2151,13 @@ async fn history_appended_after_measured_attempt_triggers_proactively() -> Resul
 
     // Billed Success covering only the first 2 staged messages, well under
     // the threshold.
-    close_success_attempt(
+    seed_anchor_attempt(
         &fixtures,
         &task.id,
-        serde_json::json!({ "messages": ["u-0", "a-0"] }),
+        1,
         1_000,
+        2,
+        0,
         t0() + Duration::seconds(5),
     )
     .await?;
@@ -2092,8 +2186,11 @@ async fn history_appended_after_measured_attempt_triggers_proactively() -> Resul
 
     super::compaction::maybe_compact_staged_history(
         &deps,
+        provider.as_ref(),
         &staged,
         &thread_id(),
+        0,
+        &sample_envelope(),
         t0() + Duration::seconds(20),
     )
     .await?;
@@ -2109,6 +2206,944 @@ async fn history_appended_after_measured_attempt_triggers_proactively() -> Resul
         .await?
         .context("projection")?;
     assert_eq!(projection.compactions.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cache_and_output_usage_fields_cannot_inflate_the_measured_trigger() -> Result<()> {
+    use crate::journal::staged::StagedMessageStore;
+
+    let fixtures = Fixtures::new();
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    seed_attempt_row(
+        &fixtures,
+        &task.id,
+        1,
+        serde_json::json!({
+            "model": "mock-model",
+            "request_input_tokens": 500_000,
+            "request_message_count": 24,
+            "request_fingerprint": sample_envelope_fingerprint()?,
+            "history_generation": 0,
+        }),
+        1_000_000,
+        t0() + Duration::seconds(5),
+    )
+    .await?;
+
+    let mut history = Vec::with_capacity(24);
+    for index in 0..12 {
+        history.push(Message::user(format!("u-{index}")));
+        history.push(Message::assistant(format!("a-{index}")));
+    }
+    fixtures
+        .messages
+        .commit_messages(&thread_id(), history.clone(), t0() + Duration::seconds(6))
+        .await?;
+
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::PruneFirst)
+        .with_threshold_tokens(600_000);
+    let scripted = Arc::new(ScriptedProvider::new(Vec::new()));
+    let provider: Arc<dyn LlmProvider> = scripted.clone();
+    let deps = fixtures.deps_with_compaction(&cfg, &provider);
+    let staged = StagedMessageStore::new(thread_id(), history);
+
+    let outcome = super::compaction::maybe_compact_staged_history(
+        &deps,
+        provider.as_ref(),
+        &staged,
+        &thread_id(),
+        0,
+        &sample_envelope(),
+        t0() + Duration::seconds(20),
+    )
+    .await?;
+
+    assert!(
+        !outcome.completed && !outcome.applied,
+        "500k measured input must not cross a 600k threshold; summing output \
+         and cache subsets would have read 1.1M and fired",
+    );
+    assert_eq!(scripted.calls(), 0);
+    assert!(
+        fixtures
+            .messages
+            .get(&thread_id())
+            .await?
+            .context("projection after inflated-usage check")?
+            .compactions
+            .is_empty(),
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn later_compaction_audit_attempt_is_ignored_for_the_anchor() -> Result<()> {
+    use crate::journal::staged::StagedMessageStore;
+
+    let fixtures = Fixtures::new();
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    seed_anchor_attempt(
+        &fixtures,
+        &task.id,
+        1,
+        90_000,
+        24,
+        0,
+        t0() + Duration::seconds(5),
+    )
+    .await?;
+    seed_attempt_row(
+        &fixtures,
+        &task.id,
+        2,
+        serde_json::json!({
+            "operation": "context_compaction",
+            "applied": false,
+            "request_input_tokens": 1_000,
+            "request_message_count": 24,
+            "request_fingerprint": sample_envelope_fingerprint()?,
+            "history_generation": 0,
+        }),
+        1_000,
+        t0() + Duration::seconds(10),
+    )
+    .await?;
+
+    let mut history = Vec::with_capacity(24);
+    for index in 0..12 {
+        history.push(Message::user(format!("u-{index}")));
+        history.push(Message::assistant(format!("a-{index}")));
+    }
+    fixtures
+        .messages
+        .commit_messages(&thread_id(), history.clone(), t0() + Duration::seconds(6))
+        .await?;
+
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::PruneFirst)
+        .with_threshold_tokens(50_000);
+    let scripted = Arc::new(ScriptedProvider::new(vec![ok_response(
+        "[summary] anchored on the main attempt",
+    )]));
+    let provider: Arc<dyn LlmProvider> = scripted.clone();
+    let deps = fixtures.deps_with_compaction(&cfg, &provider);
+    let staged = StagedMessageStore::new(thread_id(), history);
+
+    super::compaction::maybe_compact_staged_history(
+        &deps,
+        provider.as_ref(),
+        &staged,
+        &thread_id(),
+        0,
+        &sample_envelope(),
+        t0() + Duration::seconds(20),
+    )
+    .await?;
+
+    assert_eq!(
+        scripted.calls(),
+        1,
+        "the 90k main attempt must anchor the trigger; the later audit \
+         attempt's 1k summarizer usage must be ignored",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn single_response_appended_after_measured_attempt_adds_estimator_delta() -> Result<()> {
+    use crate::journal::staged::StagedMessageStore;
+
+    let fixtures = Fixtures::new();
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    seed_anchor_attempt(
+        &fixtures,
+        &task.id,
+        1,
+        40_000,
+        24,
+        0,
+        t0() + Duration::seconds(5),
+    )
+    .await?;
+
+    let mut history = Vec::with_capacity(25);
+    for index in 0..12 {
+        history.push(Message::user(format!("u-{index}")));
+        history.push(Message::assistant(format!("a-{index}")));
+    }
+    history.push(Message::assistant(format!(
+        "post-measure-response: {}",
+        "z".repeat(80_000)
+    )));
+    fixtures
+        .messages
+        .commit_messages(&thread_id(), history.clone(), t0() + Duration::seconds(6))
+        .await?;
+
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::PruneFirst)
+        .with_threshold_tokens(50_000);
+    let scripted = Arc::new(ScriptedProvider::new(vec![ok_response(
+        "[summary] appended response folded",
+    )]));
+    let provider: Arc<dyn LlmProvider> = scripted.clone();
+    let deps = fixtures.deps_with_compaction(&cfg, &provider);
+    let staged = StagedMessageStore::new(thread_id(), history);
+
+    super::compaction::maybe_compact_staged_history(
+        &deps,
+        provider.as_ref(),
+        &staged,
+        &thread_id(),
+        0,
+        &sample_envelope(),
+        t0() + Duration::seconds(20),
+    )
+    .await?;
+
+    assert_eq!(
+        scripted.calls(),
+        1,
+        "the uncovered response's estimator delta must lift 40k over the \
+         50k threshold",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn appended_suffix_counts_exactly_once() -> Result<()> {
+    use crate::journal::staged::StagedMessageStore;
+
+    let fixtures = Fixtures::new();
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    seed_anchor_attempt(
+        &fixtures,
+        &task.id,
+        1,
+        40_000,
+        24,
+        0,
+        t0() + Duration::seconds(5),
+    )
+    .await?;
+
+    let mut history = Vec::with_capacity(25);
+    for index in 0..12 {
+        history.push(Message::user(format!("u-{index}")));
+        history.push(Message::assistant(format!("a-{index}")));
+    }
+    history.push(Message::assistant("z".repeat(80_000)));
+    fixtures
+        .messages
+        .commit_messages(&thread_id(), history.clone(), t0() + Duration::seconds(6))
+        .await?;
+
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::PruneFirst)
+        .with_threshold_tokens(70_000);
+    let scripted = Arc::new(ScriptedProvider::new(Vec::new()));
+    let provider: Arc<dyn LlmProvider> = scripted.clone();
+    let deps = fixtures.deps_with_compaction(&cfg, &provider);
+    let staged = StagedMessageStore::new(thread_id(), history);
+
+    let outcome = super::compaction::maybe_compact_staged_history(
+        &deps,
+        provider.as_ref(),
+        &staged,
+        &thread_id(),
+        0,
+        &sample_envelope(),
+        t0() + Duration::seconds(20),
+    )
+    .await?;
+
+    assert!(
+        !outcome.completed,
+        "40k anchored + ~20k suffix stays under 70k; counting the suffix twice would fire",
+    );
+    assert_eq!(scripted.calls(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn success_close_stamps_the_measured_request_facts() -> Result<()> {
+    let fixtures = Fixtures::new();
+    seed_projection_history(&fixtures.messages, &thread_id(), 2, "abc").await?;
+
+    let provider = ScriptedProvider::new(vec![ok_response("done")]);
+    let deps = RootTurnDeps {
+        task_store: &fixtures.tasks,
+        thread_store: &fixtures.threads,
+        message_store: &fixtures.messages,
+        attempt_store: &fixtures.attempts,
+        checkpoint_store: &fixtures.checkpoints,
+        event_repo: &fixtures.events,
+        event_notifier: &fixtures.event_notifier,
+        subagent_spawn_selector: None,
+        compaction_config: None,
+        compaction_provider: None,
+        compaction_artifact_store: None,
+        cancel: None,
+        wakeup: None,
+        activity: None,
+        connectivity_waits: None,
+    };
+
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    let task_id = task.id.clone();
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &fixtures.threads,
+        &fixtures.checkpoints,
+        &fixtures.messages,
+        t0(),
+    )
+    .await?;
+
+    execute_root_turn(
+        inputs,
+        "ping",
+        &provider,
+        &deps,
+        t0() + Duration::seconds(1),
+    )
+    .await?;
+
+    let attempts = fixtures.attempts.list_by_task(&task_id).await?;
+    assert_eq!(attempts.len(), 1);
+    let blob = attempts[0]
+        .response_blob
+        .as_ref()
+        .context("closed attempt has a response blob")?;
+    assert_eq!(
+        blob.get("request_message_count")
+            .and_then(serde_json::Value::as_u64),
+        Some(5),
+        "close must stamp staged history (4) + fresh user message (1)",
+    );
+    assert_eq!(
+        blob.get("request_input_tokens")
+            .and_then(serde_json::Value::as_u64),
+        Some(100),
+        "close must stamp the provider's physical request total",
+    );
+    assert_eq!(
+        blob.get("request_fingerprint")
+            .and_then(serde_json::Value::as_str),
+        Some(sample_envelope_fingerprint()?.as_str()),
+        "close must stamp the dispatched envelope's fingerprint",
+    );
+    assert_eq!(
+        blob.get("history_generation")
+            .and_then(serde_json::Value::as_u64),
+        Some(0),
+        "close must stamp the staged source's history generation",
+    );
+    assert!(
+        attempts[0]
+            .request_blob
+            .get("request_message_count")
+            .is_none(),
+        "no scalar may annotate the request blob at open time",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fresh_user_prompt_counts_toward_the_proactive_trigger() -> Result<()> {
+    let fixtures = Fixtures::new();
+    // Near-empty bodies would make compaction a no-progress skip.
+    seed_projection_history(&fixtures.messages, &thread_id(), 12, &"q".repeat(200)).await?;
+
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    let task_id = task.id.clone();
+    seed_anchor_attempt(
+        &fixtures,
+        &task_id,
+        1,
+        79_000,
+        24,
+        0,
+        t0() - Duration::seconds(5),
+    )
+    .await?;
+
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::PruneFirst)
+        .with_threshold_tokens(80_000);
+    let scripted = Arc::new(ScriptedProvider::new(vec![
+        ok_response("[summary] prompt counted"),
+        ok_response("main reply"),
+    ]));
+    let provider: Arc<dyn LlmProvider> = scripted.clone();
+    let deps = fixtures.deps_with_compaction(&cfg, &provider);
+
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &fixtures.threads,
+        &fixtures.checkpoints,
+        &fixtures.messages,
+        t0(),
+    )
+    .await?;
+
+    // ~5k estimated tokens: 79k anchored + 5k pending crosses 80k.
+    let prompt = "p".repeat(20_000);
+    execute_root_turn(
+        inputs,
+        &prompt,
+        provider.as_ref(),
+        &deps,
+        t0() + Duration::seconds(1),
+    )
+    .await?;
+
+    assert_eq!(
+        scripted.calls(),
+        2,
+        "summarizer + main call — the prompt's estimate must fire the trigger proactively",
+    );
+    let requests = scripted.captured_requests()?;
+    assert!(
+        !requests[0].messages.iter().any(|message| {
+            matches!(&message.content, Content::Text(text) if text.contains("ppppp"))
+                || matches!(
+                    &message.content,
+                    Content::Blocks(blocks) if blocks.iter().any(|block| matches!(
+                        block,
+                        ContentBlock::Text { text } if text.contains("ppppp")
+                    ))
+                )
+        }),
+        "the fresh prompt must never be folded into the compaction summary source",
+    );
+    assert_eq!(
+        fixtures
+            .messages
+            .get(&thread_id())
+            .await?
+            .context("projection")?
+            .compactions
+            .len(),
+        1,
+    );
+
+    assert_compaction_row_precedes_main_row(&fixtures, &task_id).await?;
+    assert_single_user_input_before_start(&fixtures).await
+}
+
+async fn assert_compaction_row_precedes_main_row(
+    fixtures: &Fixtures,
+    task_id: &crate::journal::task::AgentTaskId,
+) -> Result<()> {
+    let mut attempts = fixtures.attempts.list_by_task(task_id).await?;
+    attempts.sort_by_key(|attempt| attempt.attempt_number);
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(
+        attempts[1]
+            .response_blob
+            .as_ref()
+            .and_then(|blob| blob.get("operation"))
+            .and_then(serde_json::Value::as_str),
+        Some("context_compaction"),
+    );
+    assert_eq!(attempts[1].input_tokens, Some(100));
+    assert_eq!(attempts[1].output_tokens, Some(50));
+    let final_history_len = fixtures
+        .messages
+        .get(&thread_id())
+        .await?
+        .context("projection after turn")?
+        .context_history()
+        .len();
+    let main_blob = attempts[2]
+        .response_blob
+        .as_ref()
+        .context("main attempt response blob")?;
+    assert_eq!(
+        main_blob
+            .get("request_message_count")
+            .and_then(serde_json::Value::as_u64),
+        u64::try_from(final_history_len - 1).ok(),
+        "post-compaction main request: rewritten staged history + fresh prompt",
+    );
+    assert_eq!(
+        main_blob
+            .get("history_generation")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "the main dispatch is stamped with the POST-compaction lineage",
+    );
+
+    Ok(())
+}
+
+async fn assert_single_user_input_before_start(fixtures: &Fixtures) -> Result<()> {
+    let events = fixtures.events.get_events(&thread_id()).await?;
+    let user_inputs: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, committed)| matches!(committed.event, AgentEvent::UserInput { .. }))
+        .map(|(index, _)| index)
+        .collect();
+    let starts: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, committed)| matches!(committed.event, AgentEvent::Start { .. }))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(user_inputs.len(), 1, "exactly one UserInput event");
+    assert_eq!(starts.len(), 1, "exactly one Start event");
+    assert!(
+        user_inputs[0] < starts[0],
+        "UserInput precedes Start in the journal",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_input_event_is_not_duplicated_on_task_retry() -> Result<()> {
+    let fixtures = Fixtures::new();
+    seed_projection_history(&fixtures.messages, &thread_id(), 2, "abc").await?;
+
+    let provider = ScriptedProvider::new(vec![ok_response("done")]);
+    let deps = RootTurnDeps {
+        task_store: &fixtures.tasks,
+        thread_store: &fixtures.threads,
+        message_store: &fixtures.messages,
+        attempt_store: &fixtures.attempts,
+        checkpoint_store: &fixtures.checkpoints,
+        event_repo: &fixtures.events,
+        event_notifier: &fixtures.event_notifier,
+        subagent_spawn_selector: None,
+        compaction_config: None,
+        compaction_provider: None,
+        compaction_artifact_store: None,
+        cancel: None,
+        wakeup: None,
+        activity: None,
+        connectivity_waits: None,
+    };
+
+    let first = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    let task_id = first.id.clone();
+    let prior = AgentEvent::user_input(
+        thread_id(),
+        vec![ContentBlock::Text {
+            text: "ping".into(),
+        }],
+    )
+    .with_emitter_task_id(task_id.as_str());
+    fixtures
+        .events
+        .commit_event(&thread_id(), prior, t0())
+        .await?;
+    fixtures
+        .tasks
+        .release_expired_leases(t0() + Duration::seconds(301))
+        .await?;
+    let retried = fixtures
+        .tasks
+        .try_acquire_task(
+            &task_id,
+            WorkerId::from_string("worker_compaction"),
+            LeaseId::from_string("lease_compaction"),
+            t0() + Duration::seconds(900),
+            t0() + Duration::seconds(302),
+        )
+        .await?
+        .context("expired task should be re-acquirable")?;
+    assert_eq!(retried.attempt, 2);
+
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(retried),
+        &fixtures.threads,
+        &fixtures.checkpoints,
+        &fixtures.messages,
+        t0() + Duration::seconds(302),
+    )
+    .await?;
+    execute_root_turn(
+        inputs,
+        "ping",
+        &provider,
+        &deps,
+        t0() + Duration::seconds(303),
+    )
+    .await?;
+
+    let user_inputs = fixtures
+        .events
+        .get_events(&thread_id())
+        .await?
+        .iter()
+        .filter(|committed| matches!(committed.event, AgentEvent::UserInput { .. }))
+        .count();
+    assert_eq!(
+        user_inputs, 1,
+        "retry must not duplicate the UserInput event"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn compaction_and_main_spend_bill_on_distinct_truthful_rows() -> Result<()> {
+    let fixtures = Fixtures::new();
+    seed_projection_history(&fixtures.messages, &thread_id(), 12, &"q".repeat(200)).await?;
+
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::Legacy)
+        .with_threshold_tokens(10);
+    let summarizer = Arc::new(ScriptedProvider::with_identity("openai", "gpt-summarizer"));
+    let compaction_provider: Arc<dyn LlmProvider> = summarizer.clone();
+    let main_scripted = Arc::new(ScriptedProvider::new(vec![ok_response("main response")]));
+    let main_provider: Arc<dyn LlmProvider> = main_scripted.clone();
+    let mut deps = fixtures.deps_with_compaction(&cfg, &main_provider);
+    deps.compaction_provider = Some(&compaction_provider);
+
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    let task_id = task.id.clone();
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &fixtures.threads,
+        &fixtures.checkpoints,
+        &fixtures.messages,
+        t0(),
+    )
+    .await?;
+
+    execute_root_turn(
+        inputs,
+        "main request",
+        main_provider.as_ref(),
+        &deps,
+        t0() + Duration::seconds(1),
+    )
+    .await?;
+
+    let mut attempts = fixtures.attempts.list_by_task(&task_id).await?;
+    attempts.sort_by_key(|attempt| attempt.attempt_number);
+    assert_eq!(attempts.len(), 2, "compaction row + main row");
+
+    let compaction_row = &attempts[0];
+    assert_eq!(
+        compaction_row
+            .response_blob
+            .as_ref()
+            .and_then(|blob| blob.get("operation"))
+            .and_then(serde_json::Value::as_str),
+        Some("context_compaction"),
+    );
+    assert_eq!(compaction_row.provider, "openai");
+    assert_eq!(compaction_row.requested_model, "gpt-summarizer");
+    assert_eq!(
+        compaction_row.response_model.as_deref(),
+        Some("mock-model"),
+        "summarizer ChatResponse model rides the compaction close",
+    );
+    assert_eq!(compaction_row.input_tokens, Some(100));
+    assert_eq!(compaction_row.output_tokens, Some(50));
+
+    let main_row = &attempts[1];
+    assert_eq!(main_row.provider, "mock");
+    assert_eq!(main_row.requested_model, "mock-model");
+    assert_eq!(main_row.input_tokens, Some(100));
+    assert_eq!(main_row.output_tokens, Some(50));
+
+    let total_input: u32 = attempts.iter().filter_map(|a| a.input_tokens).sum();
+    let total_output: u32 = attempts.iter().filter_map(|a| a.output_tokens).sum();
+    assert_eq!((total_input, total_output), (200, 100));
+    Ok(())
+}
+
+#[tokio::test]
+async fn compactor_budgets_follow_the_model_aware_threshold() -> Result<()> {
+    use crate::journal::staged::StagedMessageStore;
+
+    let read = |id: &str| Message {
+        role: agent_sdk_foundation::llm::Role::Assistant,
+        content: Content::Blocks(vec![ContentBlock::ToolUse {
+            id: id.into(),
+            name: "read".into(),
+            input: serde_json::json!({ "path": "src/lib.rs" }),
+            thought_signature: None,
+        }]),
+    };
+    let history = vec![
+        Message::user("start"),
+        read("read_old"),
+        Message::tool_result("read_old", "y".repeat(800_000), false),
+        read("read_new"),
+        Message::tool_result("read_new", "x".repeat(40_000), false),
+        Message::assistant("done"),
+    ];
+    let fixtures = Fixtures::new();
+    fixtures
+        .messages
+        .commit_messages(&thread_id(), history.clone(), t0())
+        .await?;
+
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::PruneFirst)
+        .with_threshold_tokens(1_000)
+        .with_min_messages(1)
+        .with_model_aware_threshold(true)
+        .with_model_context_window_tokens(200_000);
+    let scripted = Arc::new(ScriptedProvider::new(vec![ok_response(
+        "[summary] must not be needed",
+    )]));
+    let provider: Arc<dyn LlmProvider> = scripted.clone();
+    let deps = fixtures.deps_with_compaction(&cfg, &provider);
+    let staged = StagedMessageStore::new(thread_id(), history);
+
+    let outcome = super::compaction::maybe_compact_staged_history(
+        &deps,
+        provider.as_ref(),
+        &staged,
+        &thread_id(),
+        0,
+        &sample_envelope(),
+        t0() + Duration::seconds(1),
+    )
+    .await?;
+
+    assert!(outcome.applied, "{outcome:?}");
+    assert_eq!(
+        scripted.calls(),
+        0,
+        "the pruned view fits the model-aware threshold, so no summary is needed",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn unstable_route_uses_fixed_threshold_and_full_estimate() -> Result<()> {
+    use crate::journal::staged::StagedMessageStore;
+
+    struct UnstableRouteProvider {
+        inner: ScriptedProvider,
+    }
+
+    #[async_trait]
+    impl LlmProvider for UnstableRouteProvider {
+        async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
+            self.inner.chat(request).await
+        }
+
+        fn model(&self) -> &'static str {
+            "claude-fable-5"
+        }
+
+        fn provider(&self) -> &'static str {
+            "anthropic"
+        }
+
+        fn has_stable_request_route(&self) -> bool {
+            false
+        }
+    }
+
+    let fixtures = Fixtures::new();
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    seed_anchor_attempt(
+        &fixtures,
+        &task.id,
+        1,
+        90_000,
+        24,
+        0,
+        t0() + Duration::seconds(5),
+    )
+    .await?;
+
+    let mut history = Vec::with_capacity(24);
+    for index in 0..12 {
+        history.push(Message::user(format!("u-{index}: {}", "x".repeat(30_000))));
+        history.push(Message::assistant(format!(
+            "a-{index}: {}",
+            "y".repeat(30_000)
+        )));
+    }
+    fixtures
+        .messages
+        .commit_messages(&thread_id(), history.clone(), t0() + Duration::seconds(6))
+        .await?;
+
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::PruneFirst)
+        .with_model_aware_threshold(true)
+        .with_threshold_tokens(50_000);
+    let unstable = Arc::new(UnstableRouteProvider {
+        inner: ScriptedProvider::new(vec![ok_response("[summary] unstable route")]),
+    });
+    let provider: Arc<dyn LlmProvider> = unstable.clone();
+    let deps = fixtures.deps_with_compaction(&cfg, &provider);
+    let staged = StagedMessageStore::new(thread_id(), history);
+
+    super::compaction::maybe_compact_staged_history(
+        &deps,
+        provider.as_ref(),
+        &staged,
+        &thread_id(),
+        0,
+        &sample_envelope(),
+        t0() + Duration::seconds(20),
+    )
+    .await?;
+
+    assert_eq!(
+        unstable.inner.calls(),
+        1,
+        "fixed threshold + full estimate must fire; honoring the 1M \
+         representative window or the 90k anchor would have skipped",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn post_compaction_main_attempt_anchors_the_next_turn() -> Result<()> {
+    use crate::journal::staged::StagedMessageStore;
+
+    let fixtures = Fixtures::new();
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+
+    let mut history = Vec::with_capacity(24);
+    for index in 0..12 {
+        history.push(Message::user(format!("u-{index}")));
+        history.push(Message::assistant(format!("a-{index}")));
+    }
+    fixtures
+        .messages
+        .commit_messages(&thread_id(), history.clone(), t0())
+        .await?;
+    fixtures
+        .messages
+        .append_compaction(
+            &thread_id(),
+            history.clone(),
+            history.len(),
+            0,
+            t0() + Duration::seconds(10),
+        )
+        .await?;
+
+    seed_anchor_attempt(
+        &fixtures,
+        &task.id,
+        1,
+        500_000,
+        24,
+        0,
+        t0() + Duration::seconds(5),
+    )
+    .await?;
+    seed_anchor_attempt(
+        &fixtures,
+        &task.id,
+        2,
+        9_000,
+        24,
+        1,
+        t0() + Duration::seconds(10),
+    )
+    .await?;
+
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::PruneFirst)
+        .with_threshold_tokens(50_000);
+    let scripted = Arc::new(ScriptedProvider::new(Vec::new()));
+    let provider: Arc<dyn LlmProvider> = scripted.clone();
+    let deps = fixtures.deps_with_compaction(&cfg, &provider);
+    let staged = StagedMessageStore::new(thread_id(), history);
+
+    super::compaction::maybe_compact_staged_history(
+        &deps,
+        provider.as_ref(),
+        &staged,
+        &thread_id(),
+        0,
+        &sample_envelope(),
+        t0() + Duration::seconds(20),
+    )
+    .await?;
+
+    assert_eq!(
+        scripted.calls(),
+        0,
+        "the generation-1 attempt (9k) must anchor — rejecting it (or \
+         anchoring the stale 500k generation-0 row) re-triggers a billed \
+         summarization on an already-compacted history",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn anchor_selection_is_causal_by_covered_prefix() -> Result<()> {
+    use crate::journal::staged::StagedMessageStore;
+
+    let fixtures = Fixtures::new();
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+
+    seed_anchor_attempt(
+        &fixtures,
+        &task.id,
+        1,
+        1_000,
+        2,
+        0,
+        t0() + Duration::seconds(15),
+    )
+    .await?;
+    seed_anchor_attempt(
+        &fixtures,
+        &task.id,
+        2,
+        90_000,
+        24,
+        0,
+        t0() + Duration::seconds(5),
+    )
+    .await?;
+
+    let mut history = Vec::with_capacity(24);
+    for index in 0..12 {
+        history.push(Message::user(format!("u-{index}")));
+        history.push(Message::assistant(format!("a-{index}")));
+    }
+    fixtures
+        .messages
+        .commit_messages(&thread_id(), history.clone(), t0() + Duration::seconds(6))
+        .await?;
+
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::PruneFirst)
+        .with_threshold_tokens(50_000);
+    let scripted = Arc::new(ScriptedProvider::new(vec![ok_response(
+        "[summary] causal anchor",
+    )]));
+    let provider: Arc<dyn LlmProvider> = scripted.clone();
+    let deps = fixtures.deps_with_compaction(&cfg, &provider);
+    let staged = StagedMessageStore::new(thread_id(), history);
+
+    super::compaction::maybe_compact_staged_history(
+        &deps,
+        provider.as_ref(),
+        &staged,
+        &thread_id(),
+        0,
+        &sample_envelope(),
+        t0() + Duration::seconds(20),
+    )
+    .await?;
+
+    assert_eq!(
+        scripted.calls(),
+        1,
+        "the count-24/90k attempt is the causal latest and must anchor; \
+         picking the later-opened count-2/1k row would silently skip",
+    );
     Ok(())
 }
 
@@ -2129,4 +3164,353 @@ fn event_kind(event: &AgentEvent) -> &'static str {
         AgentEvent::AutoRetryEnd { .. } => "auto_retry_end",
         _ => "other",
     }
+}
+
+const RECLAIM_TEST_PNG: &[u8] = b"\x89PNG\r\n\x1a\nreclaim-regression-bytes";
+
+fn published_artifact_count(store: &agent_sdk::ArtifactStore) -> Result<usize> {
+    let mut count = 0;
+    for entry in std::fs::read_dir(store.dir())? {
+        let file_name = entry?.file_name();
+        let file_name = file_name.to_string_lossy();
+        if file_name.ends_with(".log")
+            && file_name.as_bytes().first().is_some_and(u8::is_ascii_digit)
+        {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Snapcompact publishes exactly one attachment artifact for this history;
+/// the fixture providers lack historical-image support, so the summary
+/// comes from the LLM.
+fn attachment_bearing_history(marker: &str) -> Vec<Message> {
+    use base64::Engine as _;
+
+    let mut history = vec![Message::user_with_content(vec![
+        ContentBlock::Text {
+            text: format!("{marker}\n{}", "x".repeat(120_000)),
+        },
+        ContentBlock::Image {
+            source: agent_sdk_foundation::llm::ContentSource::new(
+                "image/png",
+                base64::engine::general_purpose::STANDARD.encode(RECLAIM_TEST_PNG),
+            ),
+        },
+    ])];
+    for index in 0..3 {
+        history.push(Message::assistant(format!("{marker}-assistant-{index}")));
+        history.push(Message::user(format!("{marker}-user-{index}")));
+    }
+    history.push(Message::assistant(format!("{marker}-final")));
+    history
+}
+
+fn reclaim_test_config() -> CompactionConfig {
+    CompactionConfig::default()
+        .with_engine(CompactionEngine::Snapcompact)
+        .with_threshold_tokens(10_000)
+        .with_min_messages(1)
+        .with_retain_recent(2)
+}
+
+/// Cancels from inside the summarization call, i.e. after the attachment
+/// batch was published.
+struct CancelAfterPublishProvider {
+    cancel: CancellationToken,
+    artifact_dir: std::path::PathBuf,
+    artifacts_at_call: AtomicUsize,
+    call_count: AtomicUsize,
+}
+
+impl CancelAfterPublishProvider {
+    fn new(cancel: CancellationToken, artifact_dir: std::path::PathBuf) -> Self {
+        Self {
+            cancel,
+            artifact_dir,
+            artifacts_at_call: AtomicUsize::new(0),
+            call_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn count_artifacts(&self) -> usize {
+        std::fs::read_dir(&self.artifact_dir).map_or(0, |entries| {
+            entries
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| {
+                    let file_name = entry.file_name();
+                    let file_name = file_name.to_string_lossy();
+                    file_name.ends_with(".log")
+                        && file_name.as_bytes().first().is_some_and(u8::is_ascii_digit)
+                })
+                .count()
+        })
+    }
+
+    fn calls(&self) -> usize {
+        self.call_count.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl LlmProvider for CancelAfterPublishProvider {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        self.call_count.fetch_add(1, Ordering::SeqCst);
+        self.artifacts_at_call
+            .store(self.count_artifacts(), Ordering::SeqCst);
+        self.cancel.cancel();
+        Ok(ok_response("[summary after publish, before apply]"))
+    }
+
+    fn model(&self) -> &'static str {
+        "cancel-after-publish-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "cancel-after-publish"
+    }
+}
+
+#[tokio::test]
+async fn cancellation_after_compactor_return_reclaims_published_artifacts() -> Result<()> {
+    use crate::journal::staged::StagedMessageStore;
+
+    let fixtures = Fixtures::new();
+    let history = attachment_bearing_history("cancel-reclaim");
+    fixtures
+        .messages
+        .commit_messages(&thread_id(), history.clone(), t0())
+        .await?;
+
+    let cfg = reclaim_test_config();
+    let artifact_dir = tempfile::tempdir()?;
+    let artifact_store = Arc::new(agent_sdk::ArtifactStore::new(artifact_dir.path()));
+    let cancel = CancellationToken::new();
+    let scripted = Arc::new(CancelAfterPublishProvider::new(
+        cancel.clone(),
+        artifact_store.dir().to_path_buf(),
+    ));
+    let provider: Arc<dyn LlmProvider> = scripted.clone();
+    let mut deps = fixtures.deps_with_compaction(&cfg, &provider);
+    deps.compaction_artifact_store = Some(&artifact_store);
+    deps.cancel = Some(&cancel);
+    let staged = StagedMessageStore::new(thread_id(), history);
+
+    let outcome = super::compaction::maybe_compact_staged_history(
+        &deps,
+        provider.as_ref(),
+        &staged,
+        &thread_id(),
+        0,
+        &sample_envelope(),
+        t0() + Duration::seconds(20),
+    )
+    .await?;
+
+    assert!(
+        !outcome.applied,
+        "a cancelled-after-return compaction must not apply"
+    );
+    assert_eq!(scripted.calls(), 1, "the summarizer must have been called");
+    assert!(
+        scripted.artifacts_at_call.load(Ordering::SeqCst) > 0,
+        "the attachment batch must have been published before the cancellation",
+    );
+    assert_eq!(
+        published_artifact_count(&artifact_store)?,
+        0,
+        "cancellation after the compactor returned must reclaim the published batch",
+    );
+    let projection = fixtures
+        .messages
+        .get(&thread_id())
+        .await?
+        .context("projection after cancelled compaction")?;
+    assert!(
+        projection.compactions.is_empty(),
+        "no durable compaction entry may exist"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn tool_sequence_refusal_reclaims_published_artifacts() -> Result<()> {
+    use crate::journal::staged::StagedMessageStore;
+
+    let fixtures = Fixtures::new();
+    let staged_history = attachment_bearing_history("refusal-reclaim");
+
+    // Same message count, but the retained boundary cuts a
+    // tool_use/tool_result pair, so `append_compaction` refuses.
+    let mut projection_history = staged_history.clone();
+    projection_history[5] = Message {
+        role: agent_sdk_foundation::llm::Role::Assistant,
+        content: Content::Blocks(vec![ContentBlock::ToolUse {
+            id: "call_cut".into(),
+            name: "bash".into(),
+            input: serde_json::json!({"command": "ls"}),
+            thought_signature: None,
+        }]),
+    };
+    projection_history[6] = Message {
+        role: agent_sdk_foundation::llm::Role::User,
+        content: Content::Blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "call_cut".into(),
+            content: "ok".into(),
+            artifact: None,
+            is_error: None,
+        }]),
+    };
+    fixtures
+        .messages
+        .commit_messages(&thread_id(), projection_history, t0())
+        .await?;
+
+    let cfg = reclaim_test_config();
+    let artifact_dir = tempfile::tempdir()?;
+    let artifact_store = Arc::new(agent_sdk::ArtifactStore::new(artifact_dir.path()));
+    let scripted = Arc::new(ScriptedProvider::new(vec![ok_response(
+        "[refused summary]",
+    )]));
+    let provider: Arc<dyn LlmProvider> = scripted.clone();
+    let mut deps = fixtures.deps_with_compaction(&cfg, &provider);
+    deps.compaction_artifact_store = Some(&artifact_store);
+    let staged = StagedMessageStore::new(thread_id(), staged_history);
+
+    let outcome = super::compaction::maybe_compact_staged_history(
+        &deps,
+        provider.as_ref(),
+        &staged,
+        &thread_id(),
+        0,
+        &sample_envelope(),
+        t0() + Duration::seconds(20),
+    )
+    .await?;
+
+    assert!(
+        !outcome.applied,
+        "a refused compaction must be skipped, not applied"
+    );
+    assert_eq!(scripted.calls(), 1, "the summarizer must have been called");
+    assert_eq!(
+        published_artifact_count(&artifact_store)?,
+        0,
+        "a tool-sequence refusal must reclaim the published batch",
+    );
+    let projection = fixtures
+        .messages
+        .get(&thread_id())
+        .await?
+        .context("projection after refused compaction")?;
+    assert!(
+        projection.compactions.is_empty(),
+        "the refused append must leave no compaction entry"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn append_failure_reclaims_published_artifacts() -> Result<()> {
+    use crate::journal::staged::StagedMessageStore;
+
+    let fixtures = Fixtures::new();
+    let staged_history = attachment_bearing_history("append-failure-reclaim");
+
+    // Fewer durable messages than staged: `CompactionSourceMismatch`.
+    fixtures
+        .messages
+        .commit_messages(
+            &thread_id(),
+            vec![Message::user("short"), Message::assistant("projection")],
+            t0(),
+        )
+        .await?;
+
+    let cfg = reclaim_test_config();
+    let artifact_dir = tempfile::tempdir()?;
+    let artifact_store = Arc::new(agent_sdk::ArtifactStore::new(artifact_dir.path()));
+    let scripted = Arc::new(ScriptedProvider::new(vec![ok_response(
+        "[appendless summary]",
+    )]));
+    let provider: Arc<dyn LlmProvider> = scripted.clone();
+    let mut deps = fixtures.deps_with_compaction(&cfg, &provider);
+    deps.compaction_artifact_store = Some(&artifact_store);
+    let staged = StagedMessageStore::new(thread_id(), staged_history);
+
+    let error = super::compaction::maybe_compact_staged_history(
+        &deps,
+        provider.as_ref(),
+        &staged,
+        &thread_id(),
+        0,
+        &sample_envelope(),
+        t0() + Duration::seconds(20),
+    )
+    .await
+    .err()
+    .context("a failed durable append must fail the compaction")?;
+    assert!(
+        format!("{error:?}").contains("append durable compaction entry"),
+        "unexpected failure shape: {error:?}",
+    );
+    assert_eq!(scripted.calls(), 1, "the summarizer must have been called");
+    assert_eq!(
+        published_artifact_count(&artifact_store)?,
+        0,
+        "an append failure must reclaim the published batch",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn applied_compaction_retains_published_artifacts() -> Result<()> {
+    use crate::journal::staged::StagedMessageStore;
+
+    let fixtures = Fixtures::new();
+    let history = attachment_bearing_history("retain-on-apply");
+    fixtures
+        .messages
+        .commit_messages(&thread_id(), history.clone(), t0())
+        .await?;
+
+    let cfg = reclaim_test_config();
+    let artifact_dir = tempfile::tempdir()?;
+    let artifact_store = Arc::new(agent_sdk::ArtifactStore::new(artifact_dir.path()));
+    let scripted = Arc::new(ScriptedProvider::new(vec![ok_response(
+        "[applied summary]",
+    )]));
+    let provider: Arc<dyn LlmProvider> = scripted.clone();
+    let mut deps = fixtures.deps_with_compaction(&cfg, &provider);
+    deps.compaction_artifact_store = Some(&artifact_store);
+    let staged = StagedMessageStore::new(thread_id(), history);
+
+    let outcome = super::compaction::maybe_compact_staged_history(
+        &deps,
+        provider.as_ref(),
+        &staged,
+        &thread_id(),
+        0,
+        &sample_envelope(),
+        t0() + Duration::seconds(20),
+    )
+    .await?;
+
+    assert!(outcome.applied, "the healthy compaction must apply");
+    assert!(
+        published_artifact_count(&artifact_store)? > 0,
+        "the applied compaction's published artifacts must be retained",
+    );
+    let projection = fixtures
+        .messages
+        .get(&thread_id())
+        .await?
+        .context("projection after applied compaction")?;
+    assert_eq!(
+        projection.compactions.len(),
+        1,
+        "exactly one durable compaction entry must exist"
+    );
+    Ok(())
 }

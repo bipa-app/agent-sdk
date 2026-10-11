@@ -337,6 +337,14 @@ impl LlmProvider for CloudflareAIGatewayProvider {
         }
     }
 
+    fn has_stable_request_route(&self) -> bool {
+        match &self.inner {
+            Inner::Anthropic(p) => p.has_stable_request_route(),
+            Inner::OpenAI(p) => p.has_stable_request_route(),
+            Inner::Gemini(p) => p.has_stable_request_route(),
+        }
+    }
+
     /// The wrapper reports `cloudflare-ai-gateway` as its provider identity,
     /// while its static inner route may use Anthropic, Gemini, or `OpenAI` image
     /// accounting. Until the trait exposes that accounting profile, the gateway

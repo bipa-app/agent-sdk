@@ -500,7 +500,7 @@ ON CONFLICT (thread_id) DO UPDATE SET
     ) -> Result<MessageProjection> {
         let record = sqlx::query_as::<_, MessageHeadRecord>(
             r"
-SELECT thread_id, history_json, draft_messages_json, compactions_json, version, created_at, updated_at
+SELECT thread_id, history_json, draft_messages_json, compactions_json, history_generation, version, created_at, updated_at
 FROM agent_sdk_message_heads
 WHERE thread_id = ?1
 ",
@@ -520,6 +520,10 @@ WHERE thread_id = ?1
             // Matches the Postgres lock_message_head_tx behaviour.
             let thread_id_key = thread_key(thread_id);
             let history_json = json_to_value(&fresh.messages, "message head bootstrap history")?;
+            let history_generation = i64_from_u64(
+                fresh.history_generation,
+                "message head bootstrap history generation",
+            )?;
             let version = i64_from_u64(fresh.version, "message head bootstrap version")?;
             // Bootstrap the row with `draft_messages_json = NULL` —
             // a fresh thread has no in-flight turn. The full upsert
@@ -527,13 +531,14 @@ WHERE thread_id = ?1
             // draft once a suspension boundary fires.
             sqlx::query(
                 r"
-INSERT INTO agent_sdk_message_heads (thread_id, history_json, draft_messages_json, compactions_json, version, created_at, updated_at)
-VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?5)
+INSERT INTO agent_sdk_message_heads (thread_id, history_json, draft_messages_json, compactions_json, history_generation, version, created_at, updated_at)
+VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?5, ?6)
 ON CONFLICT (thread_id) DO NOTHING
 ",
             )
             .bind(thread_id_key)
             .bind(history_json)
+            .bind(history_generation)
             .bind(version)
             .bind(fresh.created_at)
             .bind(fresh.updated_at)
@@ -550,7 +555,7 @@ ON CONFLICT (thread_id) DO NOTHING
     ) -> Result<Option<MessageProjection>> {
         let record = sqlx::query_as::<_, MessageHeadRecord>(
             r"
-SELECT thread_id, history_json, draft_messages_json, compactions_json, version, created_at, updated_at
+SELECT thread_id, history_json, draft_messages_json, compactions_json, history_generation, version, created_at, updated_at
 FROM agent_sdk_message_heads
 WHERE thread_id = ?1
 ",
@@ -587,15 +592,20 @@ WHERE thread_id = ?1
                 "message head compactions",
             )?)
         };
+        let history_generation = i64_from_u64(
+            projection.history_generation,
+            "message head history generation",
+        )?;
         let version = i64_from_u64(projection.version, "message head version")?;
         sqlx::query(
             r"
-INSERT INTO agent_sdk_message_heads (thread_id, history_json, draft_messages_json, compactions_json, version, created_at, updated_at)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+INSERT INTO agent_sdk_message_heads (thread_id, history_json, draft_messages_json, compactions_json, history_generation, version, created_at, updated_at)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
 ON CONFLICT (thread_id) DO UPDATE SET
     history_json = excluded.history_json,
     draft_messages_json = excluded.draft_messages_json,
     compactions_json = excluded.compactions_json,
+    history_generation = excluded.history_generation,
     version = excluded.version,
     updated_at = excluded.updated_at
 ",
@@ -604,6 +614,7 @@ ON CONFLICT (thread_id) DO UPDATE SET
         .bind(history_json)
         .bind(draft_messages_json)
         .bind(compactions_json)
+        .bind(history_generation)
         .bind(version)
         .bind(projection.created_at)
         .bind(projection.updated_at)
@@ -5936,6 +5947,7 @@ struct MessageHeadRecord {
     /// cleared atomically by `commit_completed_turn_atomic_inner`.
     draft_messages_json: Option<serde_json::Value>,
     compactions_json: Option<serde_json::Value>,
+    history_generation: i64,
     version: i64,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
@@ -5961,6 +5973,10 @@ impl TryFrom<MessageHeadRecord> for MessageProjection {
             messages,
             draft_messages,
             compactions,
+            history_generation: u64_from_i64(
+                r.history_generation,
+                "message head history generation",
+            )?,
             version: u64_from_i64(r.version, "message head version")?,
             created_at: r.created_at,
             updated_at: r.updated_at,

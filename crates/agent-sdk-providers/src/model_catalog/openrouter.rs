@@ -445,6 +445,7 @@ mod tests {
             output_tokens: 1_000,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         };
         assert_eq!(
             registry.estimate_cost_usd("openrouter", "openrouter/auto", &usage),
@@ -552,6 +553,7 @@ mod tests {
             output_tokens: 100_000,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         };
         let short_cost = registry
             .estimate_cost_usd("openrouter", "google/gemini-2.5-pro", &short)
@@ -571,6 +573,7 @@ mod tests {
                 output_tokens: 100_000,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             };
             let cost = registry
                 .estimate_cost_usd("openrouter", "google/gemini-2.5-pro", &long)
@@ -589,6 +592,7 @@ mod tests {
             output_tokens: 0,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         };
         let under_cost = registry
             .estimate_cost_usd("openrouter", "google/gemini-2.5-pro", &just_under)
@@ -619,6 +623,7 @@ mod tests {
             output_tokens: 0,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         };
         let base = registry
             .estimate_dynamic_base_cost_usd("openrouter", "google/gemini-2.5-pro", &aggregate)
@@ -664,6 +669,7 @@ mod tests {
             output_tokens: 0,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         };
 
         // Below 100K: base $1/M.
