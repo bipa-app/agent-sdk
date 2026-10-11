@@ -3891,11 +3891,11 @@ mod tests {
                 stop_reason: Some(StopReason::EndTurn),
                 usage: Usage {
                     served_speed: None,
+                    request_input_tokens: None,
                     input_tokens: 10,
                     output_tokens: 5,
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
-                    request_input_tokens: None,
                 },
             }))
         }
@@ -4070,11 +4070,11 @@ mod tests {
                 stop_reason: Some(StopReason::EndTurn),
                 usage: Usage {
                     served_speed: None,
+                    request_input_tokens: None,
                     input_tokens: 1,
                     output_tokens: 1,
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
-                    request_input_tokens: None,
                 },
             }))
         }
@@ -4307,6 +4307,7 @@ mod tests {
                 stop_reason: Some(stop_reason),
                 usage: Usage {
                     served_speed: None,
+                    request_input_tokens: None,
                     input_tokens: 1,
                     output_tokens: 1,
                     cached_input_tokens: 0,
@@ -6257,11 +6258,11 @@ mod tests {
             stop_reason: Some(StopReason::EndTurn),
             usage: Usage {
                 served_speed: None,
+                request_input_tokens: None,
                 input_tokens: 10,
                 output_tokens: 5,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
-                request_input_tokens: None,
             },
         }
     }
@@ -6283,11 +6284,11 @@ mod tests {
             stop_reason: Some(StopReason::ToolUse),
             usage: Usage {
                 served_speed: None,
+                request_input_tokens: None,
                 input_tokens: 12,
                 output_tokens: 6,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
-                request_input_tokens: None,
             },
         }
     }
@@ -6720,11 +6721,11 @@ mod tests {
                         stop_reason: Some(StopReason::ToolUse),
                         usage: Usage {
                             served_speed: None,
+                            request_input_tokens: None,
                             input_tokens: 8,
                             output_tokens: 4,
                             cached_input_tokens: 0,
                             cache_creation_input_tokens: 0,
-                            request_input_tokens: None,
                         },
                     })),
                     HangChildBehavior::SlowThenText => {
@@ -6763,11 +6764,11 @@ mod tests {
                 stop_reason: Some(StopReason::ToolUse),
                 usage: Usage {
                     served_speed: None,
+                    request_input_tokens: None,
                     input_tokens: 12,
                     output_tokens: 6,
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
-                    request_input_tokens: None,
                 },
             }))
         }
