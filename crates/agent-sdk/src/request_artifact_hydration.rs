@@ -495,6 +495,39 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn request_only_context_keeps_a_corrupt_checkpoint_frame_omittable() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(ArtifactStore::new(dir.path()));
+        prime_positive_artifact_ids(&store)?;
+        let source_id = save_bytes(&store, "snapcompact-source", b"source")?;
+        let frame_id = save_bytes(&store, "snapcompact-frame", b"not an image")?;
+        let mut durable = request(canonical_frame_message(source_id, frame_id));
+        durable.append_request_only_reminder("plan: 0/1 done");
+
+        let hydrated = hydrate_request_artifact_sources(&durable, Some(store)).await?;
+
+        let [checkpoint, reminder] = hydrated.messages.as_slice() else {
+            anyhow::bail!("expected the checkpoint and a separate reminder message");
+        };
+        let Content::Blocks(blocks) = &checkpoint.content else {
+            anyhow::bail!("hydrated checkpoint must use blocks");
+        };
+        assert_eq!(blocks.len(), 4);
+        assert!(blocks.iter().all(|block| !matches!(
+            block,
+            ContentBlock::Image { .. } | ContentBlock::Document { .. }
+        )));
+        assert_eq!(
+            reminder,
+            &Message::user_with_content(vec![ContentBlock::Text {
+                text: llm::wrap_system_reminder("plan: 0/1 done"),
+            }])
+        );
+        assert_eq!(hydrated.request_only_tail_blocks(), 1);
+        Ok(())
+    }
+
     fn pin_frame_manifest(message: &mut Message, frame_id: u64, frame_bytes: &[u8]) {
         let Content::Blocks(blocks) = &mut message.content else {
             panic!("checkpoint must use blocks");

@@ -479,7 +479,7 @@ impl AnthropicProvider {
         if let Some(cache_control) = cache_control {
             data::apply_cache_control_to_last_user_message(
                 &mut messages,
-                request.request_only_tail_blocks,
+                request.request_only_tail_blocks(),
                 cache_control,
             );
         }
@@ -2032,7 +2032,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             cache: None,
-            request_only_tail_blocks: 0,
+            request_only_reminders: Vec::new(),
         }
     }
 

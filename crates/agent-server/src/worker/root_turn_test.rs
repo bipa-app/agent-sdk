@@ -11626,7 +11626,7 @@ fn without_request_only_context(
     request: &ChatRequest,
 ) -> Result<Vec<agent_sdk_foundation::llm::Message>> {
     let mut messages = request.messages.clone();
-    if request.request_only_tail_blocks == 0 {
+    if request.request_only_tail_blocks() == 0 {
         return Ok(messages);
     }
     let Some(agent_sdk_foundation::llm::Message {
@@ -11638,7 +11638,7 @@ fn without_request_only_context(
     };
     let kept = blocks
         .len()
-        .checked_sub(request.request_only_tail_blocks)
+        .checked_sub(request.request_only_tail_blocks())
         .context("request-only tail longer than the final message")?;
     blocks.truncate(kept);
     if blocks.is_empty() {
@@ -11787,7 +11787,7 @@ async fn request_context_reaches_each_provider_request_but_no_durable_store() ->
         bail!("expected the tool call to suspend the turn");
     };
     let first_request = first.single_request()?;
-    assert_eq!(first_request.request_only_tail_blocks, 1);
+    assert_eq!(first_request.request_only_tail_blocks(), 1);
     assert_eq!(
         first_request.messages.last(),
         Some(&agent_sdk_foundation::llm::Message::user_with_content(
@@ -11835,7 +11835,7 @@ async fn request_context_reaches_each_provider_request_but_no_durable_store() ->
         bail!("expected the resumed turn to complete");
     };
     let second_request = second.single_request()?;
-    assert_eq!(second_request.request_only_tail_blocks, 1);
+    assert_eq!(second_request.request_only_tail_blocks(), 1);
     assert_eq!(
         second_request.messages.last(),
         Some(&agent_sdk_foundation::llm::Message::user_with_content(

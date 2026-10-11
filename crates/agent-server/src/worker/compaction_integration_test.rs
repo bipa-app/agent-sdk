@@ -1585,9 +1585,9 @@ async fn prompt_too_long_retry_reapplies_request_context() -> Result<()> {
     };
     assert!(ends_with_request_context(rejected, MARKER));
     assert!(ends_with_request_context(retry, MARKER));
-    assert_eq!(rejected.request_only_tail_blocks, 1);
-    assert_eq!(retry.request_only_tail_blocks, 1);
-    assert_eq!(summarization.request_only_tail_blocks, 0);
+    assert_eq!(rejected.request_only_tail_blocks(), 1);
+    assert_eq!(retry.request_only_tail_blocks(), 1);
+    assert_eq!(summarization.request_only_tail_blocks(), 0);
     assert!(retry.messages.len() < rejected.messages.len());
     assert!(!format!("{:?}", summarization.messages).contains(MARKER));
 
@@ -1619,9 +1619,9 @@ async fn prompt_too_long_retry_clears_request_context_the_hook_withdraws() -> Re
     };
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert!(ends_with_request_context(rejected, MARKER));
-    assert_eq!(rejected.request_only_tail_blocks, 1);
+    assert_eq!(rejected.request_only_tail_blocks(), 1);
     assert!(!format!("{:?}", retry.messages).contains(MARKER));
-    assert_eq!(retry.request_only_tail_blocks, 0);
+    assert_eq!(retry.request_only_tail_blocks(), 0);
     Ok(())
 }
 

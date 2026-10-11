@@ -2753,7 +2753,7 @@ async fn load_root_span_ids(
 }
 
 /// Assemble and validate the messages for every root provider call, replacing
-/// `request.messages` and its request-only tail count.
+/// `request.messages` and its request-only reminders.
 ///
 /// Fresh inputs append their typed text/media blocks; resume inputs append
 /// nothing because staged history already carries the suspended exchange. Both
@@ -2787,7 +2787,7 @@ async fn assemble_provider_request_messages(
             caller_metadata,
         });
     request.messages = messages;
-    request.request_only_tail_blocks = 0;
+    request.request_only_reminders.clear();
     if let Some(text) = request_context {
         request.append_request_only_reminder(&text);
     }
@@ -2845,7 +2845,7 @@ async fn build_chat_request(
         tool_choice: None,
         response_format: None,
         cache: None,
-        request_only_tail_blocks: 0,
+        request_only_reminders: Vec::new(),
     };
     assemble_provider_request_messages(
         &mut request,
@@ -8780,7 +8780,7 @@ mod tests {
             },
         ]);
         assert_eq!(request.messages, expected);
-        assert_eq!(request.request_only_tail_blocks, 1);
+        assert_eq!(request.request_only_tail_blocks(), 1);
         assert!(llm::is_provider_valid_tool_sequence(&request.messages));
         assert_eq!(staged.get_history(&thread_id).await?, tool_round_history());
 
@@ -8804,7 +8804,7 @@ mod tests {
                 },
             ]))
         );
-        assert_eq!(fresh.request_only_tail_blocks, 1);
+        assert_eq!(fresh.request_only_tail_blocks(), 1);
         assert_eq!(staged.get_history(&thread_id).await?, tool_round_history());
 
         let seen = seen
@@ -8846,7 +8846,7 @@ mod tests {
             },
         ]));
         assert_eq!(baseline.messages, expected);
-        assert_eq!(baseline.request_only_tail_blocks, 0);
+        assert_eq!(baseline.request_only_tail_blocks(), 0);
 
         let none_hook: RequestContextFn = std::sync::Arc::new(|_| None);
         let blank_hook: RequestContextFn = std::sync::Arc::new(|_| Some("  \n".to_owned()));

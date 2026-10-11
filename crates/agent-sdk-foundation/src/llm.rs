@@ -422,14 +422,19 @@ pub struct ChatRequest {
     /// behaviour. When `Some`, providers that support prompt caching honour
     /// the [`CacheConfig`] (TTL, opt-out, breakpoint cap); others ignore it.
     pub cache: Option<CacheConfig>,
-    /// How many trailing content blocks of the final message carry
-    /// request-only context that the next request will not repeat.
+    /// Wrapped reminder texts that
+    /// [`append_request_only_reminder`](Self::append_request_only_reminder)
+    /// appended as request-only context, in order: text the next request
+    /// will not repeat.
     ///
-    /// Providers with prompt caching keep their conversation breakpoint
-    /// before these blocks. Written by
-    /// [`append_request_only_reminder`](Self::append_request_only_reminder);
-    /// replacing `messages` afterwards requires resetting it.
-    pub request_only_tail_blocks: usize,
+    /// They count only while they are still the trailing text blocks of the
+    /// final user message (see
+    /// [`request_only_tail_blocks`](Self::request_only_tail_blocks)), so a
+    /// writer that appends messages after them or replaces `messages` voids
+    /// the marker instead of misplacing it. The Anthropic and Vertex Claude
+    /// adapters keep their conversation cache breakpoint ahead of these
+    /// blocks; `OpenAI` explicit cache breakpoints do not consult them.
+    pub request_only_reminders: Vec<String>,
 }
 
 impl ChatRequest {
@@ -466,21 +471,48 @@ impl ChatRequest {
             tool_choice: None,
             response_format: None,
             cache: None,
-            request_only_tail_blocks: 0,
+            request_only_reminders: Vec::new(),
         }
     }
 
     /// Append request-only `content` as a system reminder (see
-    /// [`append_system_reminder`]) and count it in
-    /// [`request_only_tail_blocks`](Self::request_only_tail_blocks).
+    /// [`append_system_reminder`]) and record it in
+    /// [`request_only_reminders`](Self::request_only_reminders).
     pub fn append_request_only_reminder(&mut self, content: &str) {
-        let message_count = self.messages.len();
-        append_system_reminder(&mut self.messages, content);
-        self.request_only_tail_blocks = if self.messages.len() > message_count {
-            1
-        } else {
-            self.request_only_tail_blocks.saturating_add(1)
+        if self.request_only_tail_blocks() != self.request_only_reminders.len() {
+            self.request_only_reminders.clear();
+        }
+        let text = wrap_system_reminder(content);
+        if push_system_reminder_block(&mut self.messages, text.clone()) {
+            self.request_only_reminders.clear();
+        }
+        self.request_only_reminders.push(text);
+    }
+
+    /// How many trailing blocks of the final message are request-only: the
+    /// recorded [`request_only_reminders`](Self::request_only_reminders) when
+    /// the final user message still ends with exactly them, otherwise zero.
+    #[must_use]
+    pub fn request_only_tail_blocks(&self) -> usize {
+        let count = self.request_only_reminders.len();
+        let Some(Message {
+            role: Role::User,
+            content: Content::Blocks(blocks),
+        }) = self.messages.last()
+        else {
+            return 0;
         };
+        let Some(tail) = blocks
+            .len()
+            .checked_sub(count)
+            .and_then(|start| blocks.get(start..))
+        else {
+            return 0;
+        };
+        let intact = tail.iter().zip(&self.request_only_reminders).all(
+            |(block, reminder)| matches!(block, ContentBlock::Text { text } if text == reminder),
+        );
+        if intact { count } else { 0 }
     }
 
     /// Set the tool list the model may call.
@@ -1494,32 +1526,54 @@ pub fn wrap_system_reminder(content: &str) -> String {
 ///
 /// The reminder becomes the final text block of a trailing user message
 /// (after any `tool_result` blocks, which providers require first), or a new
-/// user message when the conversation is empty or ends on an assistant turn.
-/// Tool-use/tool-result pairing is untouched, so
-/// [`provider_tool_sequence_error_index`] returns the same verdict before and
-/// after.
+/// user message when the conversation is empty, ends on an assistant turn, or
+/// ends on a compaction record, whose exact block layout (a Snapcompact
+/// checkpoint's frame slots) must stay intact. Tool-use/tool-result pairing is
+/// untouched, so [`provider_tool_sequence_error_index`] returns the same
+/// verdict before and after.
 pub fn append_system_reminder(messages: &mut Vec<Message>, content: &str) {
-    let reminder = ContentBlock::Text {
-        text: wrap_system_reminder(content),
-    };
+    push_system_reminder_block(messages, wrap_system_reminder(content));
+}
+
+/// Returns whether the reminder started a new user message.
+fn push_system_reminder_block(messages: &mut Vec<Message>, text: String) -> bool {
+    let reminder = ContentBlock::Text { text };
     match messages.last_mut() {
         Some(Message {
             role: Role::User,
             content,
-        }) => match content {
-            Content::Blocks(blocks) => blocks.push(reminder),
-            Content::Text(text) if text.is_empty() => *content = Content::Blocks(vec![reminder]),
-            Content::Text(text) => {
-                let text = std::mem::take(text);
-                *content = Content::Blocks(vec![ContentBlock::Text { text }, reminder]);
+        }) if !carries_compaction_summary(content) => {
+            match content {
+                Content::Blocks(blocks) => blocks.push(reminder),
+                Content::Text(text) if text.is_empty() => {
+                    *content = Content::Blocks(vec![reminder]);
+                }
+                Content::Text(text) => {
+                    let text = std::mem::take(text);
+                    *content = Content::Blocks(vec![ContentBlock::Text { text }, reminder]);
+                }
             }
-        },
+            false
+        }
         Some(Message {
-            role: Role::Assistant,
+            role: Role::User | Role::Assistant,
             ..
         })
-        | None => messages.push(Message::user_with_content(vec![reminder])),
+        | None => {
+            messages.push(Message::user_with_content(vec![reminder]));
+            true
+        }
     }
+}
+
+fn carries_compaction_summary(content: &Content) -> bool {
+    matches!(
+        content,
+        Content::Blocks(blocks)
+            if blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::CompactionSummary { .. }))
+    )
 }
 
 /// Render a typed compaction summary as inert historical data for providers.
@@ -2164,6 +2218,7 @@ mod tests {
                 Message::assistant_with_content(vec![tool_use("call_1")]),
                 Message::user_with_content(vec![tool_result("call_2")]),
             ],
+            vec![canonical_snapcompact_message(2)],
         ];
 
         for history in histories {
@@ -2198,12 +2253,12 @@ mod tests {
                 Message::user_with_content(vec![tool_result("call_1")]),
             ],
         );
-        assert_eq!(request.request_only_tail_blocks, 0);
+        assert_eq!(request.request_only_tail_blocks(), 0);
 
         request.append_request_only_reminder("plan: 0/1 done");
         request.append_request_only_reminder("same call repeated");
 
-        assert_eq!(request.request_only_tail_blocks, 2);
+        assert_eq!(request.request_only_tail_blocks(), 2);
         assert_eq!(
             request.messages[2],
             Message::user_with_content(vec![
@@ -2218,13 +2273,59 @@ mod tests {
             vec![Message::user("hi"), Message::assistant("hello")],
         );
         after_assistant.append_request_only_reminder("finish and report");
-        assert_eq!(after_assistant.request_only_tail_blocks, 1);
+        assert_eq!(after_assistant.request_only_tail_blocks(), 1);
         assert_eq!(
             after_assistant.messages.last(),
             Some(&Message::user_with_content(vec![reminder_block(
                 "finish and report"
             )]))
         );
+    }
+
+    #[test]
+    fn system_reminder_after_a_compaction_record_is_a_separate_user_message() {
+        let records = [
+            canonical_snapcompact_message(2),
+            canonical_snapcompact_message(0),
+            Message::compaction_summary("earlier work"),
+        ];
+        for record in records {
+            let mut request = ChatRequest::new("system", vec![record.clone()]);
+            request.append_request_only_reminder("plan: 0/1 done");
+
+            assert_eq!(
+                request.messages,
+                vec![
+                    record,
+                    Message::user_with_content(vec![reminder_block("plan: 0/1 done")]),
+                ]
+            );
+            assert_eq!(request.request_only_tail_blocks(), 1);
+        }
+        let mut checkpoint = vec![canonical_snapcompact_message(2)];
+        append_system_reminder(&mut checkpoint, "plan: 0/1 done");
+        assert!(canonical_snapcompact_checkpoint(&checkpoint[0]).is_some());
+    }
+
+    #[test]
+    fn request_only_tail_is_void_once_other_messages_follow_or_replace_it() {
+        let mut request = ChatRequest::new("system", vec![Message::user("describe a person")]);
+        request.append_request_only_reminder("plan: 0/1 done");
+        assert_eq!(request.request_only_tail_blocks(), 1);
+
+        request
+            .messages
+            .push(Message::assistant_with_content(vec![tool_use("call_1")]));
+        request
+            .messages
+            .push(Message::user_with_content(vec![tool_result("call_1")]));
+        assert_eq!(request.request_only_tail_blocks(), 0);
+
+        request.append_request_only_reminder("plan: 1/1 done");
+        assert_eq!(request.request_only_tail_blocks(), 1);
+
+        request.messages = vec![Message::user("rebuilt history")];
+        assert_eq!(request.request_only_tail_blocks(), 0);
     }
 
     #[test]

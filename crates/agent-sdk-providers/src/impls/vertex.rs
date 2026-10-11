@@ -186,7 +186,7 @@ impl VertexProvider {
         let mut messages = anthropic_data::build_api_messages(request);
         anthropic_data::apply_cache_control_to_last_user_message(
             &mut messages,
-            request.request_only_tail_blocks,
+            request.request_only_tail_blocks(),
             vertex_cache_control(),
         );
         messages
@@ -1337,7 +1337,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             cache: None,
-            request_only_tail_blocks: 0,
+            request_only_reminders: Vec::new(),
         }
     }
 

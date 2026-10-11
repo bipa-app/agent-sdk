@@ -877,7 +877,7 @@ mod tests {
             tool_choice: None,
             response_format: Some(ResponseFormat::new("person", person_schema())),
             cache: None,
-            request_only_tail_blocks: 0,
+            request_only_reminders: Vec::new(),
         }
     }
 
@@ -1111,6 +1111,49 @@ mod tests {
             seen[1].messages.len() > seen[0].messages.len()
         };
         assert!(grew);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn correction_retry_drops_the_request_only_tail() -> Result<()> {
+        let scripts = [
+            (
+                "openai",
+                StructuredOutputSupport::Native,
+                vec![
+                    success(text_block(r#"{"name": "Ada", "age": "old"}"#)),
+                    success(text_block(r#"{"name": "Ada", "age": 36}"#)),
+                ],
+            ),
+            (
+                "anthropic",
+                StructuredOutputSupport::ToolForcing,
+                vec![
+                    success(respond_tool_block(serde_json::json!({"name": "Ada"}))),
+                    success(respond_tool_block(
+                        serde_json::json!({"name": "Ada", "age": 36}),
+                    )),
+                ],
+            ),
+        ];
+        for (provider_name, support, outcomes) in scripts {
+            let provider = ScriptedProvider::new(provider_name, support, outcomes);
+            let mut request = request_with_format();
+            request.append_request_only_reminder("answer as JSON");
+
+            run_structured(&provider, request, StructuredConfig { max_retries: 2 }).await?;
+
+            let seen = provider
+                .seen_requests
+                .lock()
+                .map_err(|_| anyhow::anyhow!("seen_requests lock poisoned"))?
+                .clone();
+            let [first, correction] = seen.as_slice() else {
+                anyhow::bail!("{provider_name}: expected one attempt and one correction retry");
+            };
+            assert_eq!(first.request_only_tail_blocks(), 1, "{provider_name}");
+            assert_eq!(correction.request_only_tail_blocks(), 0, "{provider_name}");
+        }
         Ok(())
     }
 

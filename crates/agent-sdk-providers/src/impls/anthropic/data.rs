@@ -1065,7 +1065,7 @@ mod tests {
         let mut api_messages = build_api_messages(request);
         apply_cache_control_to_last_user_message(
             &mut api_messages,
-            request.request_only_tail_blocks,
+            request.request_only_tail_blocks(),
             ApiCacheControl::ephemeral_with_ttl(None),
         );
         Ok(serde_json::to_value(&api_messages)?)
@@ -1130,6 +1130,28 @@ mod tests {
         assert_eq!(wire[0]["content"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(wire[2]["role"], "user");
         assert!(wire[2]["content"][0].get("cache_control").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn request_context_after_a_compaction_record_is_its_own_uncached_user_message()
+    -> anyhow::Result<()> {
+        let mut request = ChatRequest::new("system", vec![Message::compaction_summary("earlier")]);
+        request.append_request_only_reminder("plan: 0/2 done");
+
+        let wire = cached_wire_messages(&request)?;
+
+        let [record, reminder] = wire.as_array().map(Vec::as_slice).unwrap_or_default() else {
+            anyhow::bail!("expected the record and a separate reminder message: {wire}");
+        };
+        assert_eq!(record["role"], "user");
+        assert_eq!(record["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(reminder["role"], "user");
+        assert_eq!(
+            reminder["content"][0]["text"],
+            "<system-reminder>\nplan: 0/2 done\n</system-reminder>"
+        );
+        assert!(reminder["content"][0].get("cache_control").is_none());
         Ok(())
     }
 
@@ -1498,7 +1520,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             cache: None,
-            request_only_tail_blocks: 0,
+            request_only_reminders: Vec::new(),
         };
 
         let messages = build_api_messages(&request);
@@ -1539,7 +1561,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             cache: None,
-            request_only_tail_blocks: 0,
+            request_only_reminders: Vec::new(),
         };
 
         let messages = build_api_messages(&request);
@@ -1573,7 +1595,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             cache: None,
-            request_only_tail_blocks: 0,
+            request_only_reminders: Vec::new(),
         };
 
         let messages = build_api_messages(&request);

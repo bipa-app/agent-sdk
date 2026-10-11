@@ -3746,7 +3746,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             cache: None,
-            request_only_tail_blocks: 0,
+            request_only_reminders: Vec::new(),
         };
 
         let api_messages = build_api_messages(&request);
@@ -3774,7 +3774,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             cache: None,
-            request_only_tail_blocks: 0,
+            request_only_reminders: Vec::new(),
         };
 
         let api_messages = build_api_messages(&request);
@@ -3795,8 +3795,32 @@ mod tests {
             tool_choice: None,
             response_format: None,
             cache: None,
-            request_only_tail_blocks: 0,
+            request_only_reminders: Vec::new(),
         }
+    }
+
+    #[test]
+    fn test_build_api_messages_sends_request_context_after_a_compaction_record() {
+        let mut request = request_with_messages(vec![
+            agent_sdk_foundation::llm::Message::compaction_summary("earlier work"),
+        ]);
+        request.append_request_only_reminder("plan: 0/2 done");
+
+        let api_messages = build_api_messages(&request);
+
+        assert_eq!(api_messages.len(), 2);
+        assert_eq!(api_messages[0].role, ApiRole::User);
+        assert!(
+            api_messages[0]
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("earlier work"))
+        );
+        assert_eq!(api_messages[1].role, ApiRole::User);
+        assert_eq!(
+            api_messages[1].content.as_deref(),
+            Some("<system-reminder>\nplan: 0/2 done\n</system-reminder>")
+        );
     }
 
     #[test]
@@ -4723,7 +4747,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             cache: None,
-            request_only_tail_blocks: 0,
+            request_only_reminders: Vec::new(),
         };
 
         for model in [
