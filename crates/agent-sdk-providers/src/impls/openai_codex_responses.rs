@@ -2690,7 +2690,12 @@ impl Drop for AbandonedStreamLog {
             return;
         }
         let secs_since = |at: Option<Instant>| at.map(|at| at.elapsed().as_secs());
-        log::warn!(
+        let cause = StreamDropCause::after_silence(
+            trace.last_yield_at.unwrap_or(trace.opened_at).elapsed(),
+        );
+        log::log!(
+            cause.level(),
+            cause = cause.as_str(),
             model = trace.model.as_str(),
             transport = trace.transport,
             open_secs = trace.opened_at.elapsed().as_secs(),
@@ -2700,8 +2705,45 @@ impl Drop for AbandonedStreamLog {
             secs_since_frame = secs_since(trace.last_frame_at),
             secs_since_yield = secs_since(trace.last_yield_at),
             last_event = trace.last_event.as_deref();
-            "OpenAI Codex stream dropped before a terminal event (consumer stall timeout or cancellation)"
+            "OpenAI Codex stream dropped before a terminal event"
         );
+    }
+}
+
+/// Why the consumer most likely dropped a stream before its terminal event.
+///
+/// The stream cannot see the consumer's reason. The SDK's stall budgets wait
+/// at least two minutes without a yield, and keep-alives count as yields, so a
+/// drop after less than [`StreamDropCause::STALL_MIN_SILENCE`] was a cancel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamDropCause {
+    Cancelled,
+    Stalled,
+}
+
+impl StreamDropCause {
+    const STALL_MIN_SILENCE: Duration = Duration::from_mins(1);
+
+    fn after_silence(silence: Duration) -> Self {
+        if silence >= Self::STALL_MIN_SILENCE {
+            Self::Stalled
+        } else {
+            Self::Cancelled
+        }
+    }
+
+    const fn level(self) -> log::Level {
+        match self {
+            Self::Cancelled => log::Level::Debug,
+            Self::Stalled => log::Level::Warn,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::Stalled => "stalled",
+        }
     }
 }
 
@@ -5467,6 +5509,21 @@ mod tests {
             })
         ));
         Ok(())
+    }
+
+    #[test]
+    fn dropping_an_active_stream_is_a_cancel_and_a_silent_one_a_stall() {
+        for (silent_secs, cause, level) in [
+            (0, StreamDropCause::Cancelled, log::Level::Debug),
+            (59, StreamDropCause::Cancelled, log::Level::Debug),
+            (60, StreamDropCause::Stalled, log::Level::Warn),
+            (120, StreamDropCause::Stalled, log::Level::Warn),
+            (330, StreamDropCause::Stalled, log::Level::Warn),
+        ] {
+            let actual = StreamDropCause::after_silence(Duration::from_secs(silent_secs));
+            assert_eq!(actual, cause, "silent_secs={silent_secs}");
+            assert_eq!(actual.level(), level, "silent_secs={silent_secs}");
+        }
     }
 
     #[test]
