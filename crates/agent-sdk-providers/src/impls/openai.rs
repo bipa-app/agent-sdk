@@ -61,6 +61,7 @@ use super::openai_reasoning::{
 };
 use super::openai_responses::OpenAIResponsesProvider;
 use super::openai_schema::{normalize_strict_schema, normalized_strict_schema};
+use super::tool_call_ids::{ToolCallIdAssigner, with_unique_tool_ids};
 use crate::model_features::supports_responses_original_image_detail;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -987,6 +988,7 @@ impl LlmProvider for OpenAIProvider {
         );
 
         decode_chat_response(status, &bytes, retry_after)
+            .map(|outcome| with_unique_tool_ids(&request.messages, outcome))
     }
 
     async fn embed(
@@ -1209,6 +1211,7 @@ impl LlmProvider for OpenAIProvider {
 
             // Track tool call state across deltas
             let mut tool_calls: HashMap<usize, ToolCallAccumulator> = HashMap::new();
+            let mut tool_call_ids = ToolCallIdAssigner::for_history(&request.messages);
             let mut usage: Option<Usage> = None;
             // The stop reason from `finish_reason`. With stream_options.include_usage
             // (official OpenAI) the usage arrives in a SEPARATE trailing chunk
@@ -1241,6 +1244,7 @@ impl LlmProvider for OpenAIProvider {
                     let outcome = step_completion_stream(
                         data,
                         &mut tool_calls,
+                        &mut tool_call_ids,
                         &mut usage,
                         &mut stop_reason,
                     );
@@ -1424,6 +1428,7 @@ struct SseLineOutcome {
 fn step_completion_stream(
     data: &str,
     tool_calls: &mut HashMap<usize, ToolCallAccumulator>,
+    tool_call_ids: &mut ToolCallIdAssigner,
     usage: &mut Option<Usage>,
     stop_reason: &mut Option<StopReason>,
 ) -> SseLineOutcome {
@@ -1479,7 +1484,7 @@ fn step_completion_stream(
             }
             SseProcessResult::Sentinel => {
                 let sr = stop_reason.unwrap_or_else(|| fallback_stream_stop_reason(tool_calls));
-                let terminal = build_stream_end_deltas(tool_calls, usage.take(), sr);
+                let terminal = build_stream_end_deltas(tool_calls, tool_call_ids, usage.take(), sr);
                 return SseLineOutcome {
                     immediate,
                     terminal: Some(terminal),
@@ -1496,25 +1501,29 @@ fn step_completion_stream(
 /// Helper to emit tool call deltas and done event.
 fn build_stream_end_deltas(
     tool_calls: &std::collections::HashMap<usize, ToolCallAccumulator>,
+    tool_call_ids: &mut ToolCallIdAssigner,
     usage: Option<Usage>,
     stop_reason: StopReason,
 ) -> Vec<StreamDelta> {
     let mut deltas = Vec::new();
 
     if matches!(stop_reason, StopReason::ToolUse) {
-        // `idx` comes from the wire `tool_calls[].index`; use saturating_add so
-        // a hostile `usize::MAX` index cannot overflow-panic in debug builds.
-        // StreamAccumulator sorts by index so order stays stable.
-        for (idx, tool) in tool_calls {
+        // Wire order decides which of two duplicate ids is kept.
+        let mut ordered: Vec<_> = tool_calls.iter().collect();
+        ordered.sort_by_key(|(idx, _)| **idx);
+        for (idx, tool) in ordered {
+            // `idx` comes from the wire `tool_calls[].index`; use saturating_add so
+            // a hostile `usize::MAX` index cannot overflow-panic in debug builds.
             let block_index = idx.saturating_add(1);
+            let id = tool_call_ids.assign(&tool.id, &tool.name);
             deltas.push(StreamDelta::ToolUseStart {
-                id: tool.id.clone(),
+                id: id.clone(),
                 name: tool.name.clone(),
                 block_index,
                 thought_signature: None,
             });
             deltas.push(StreamDelta::ToolInputDelta {
-                id: tool.id.clone(),
+                id,
                 delta: tool.arguments.clone(),
                 block_index,
             });
@@ -4356,6 +4365,7 @@ mod tests {
         let outcome = step_completion_stream(
             r#"{"choices":[{"delta":{},"finish_reason":"error","index":0}],"usage":{"prompt_tokens":140,"completion_tokens":20},"error":{"code":429,"message":"Rate limited. Please try again in 12s."}}"#,
             &mut tool_calls,
+            &mut ToolCallIdAssigner::default(),
             &mut stream_usage,
             &mut stop_reason,
         );
@@ -4584,6 +4594,7 @@ mod tests {
         let chunk = step_completion_stream(
             r#"{"choices":[{"delta":{"refusal":"Cannot comply."},"finish_reason":"stop"}]}"#,
             &mut tool_calls,
+            &mut ToolCallIdAssigner::default(),
             &mut usage,
             &mut stop_reason,
         );
@@ -4594,9 +4605,15 @@ mod tests {
         ));
         assert_eq!(stop_reason, Some(StopReason::Refusal));
 
-        let done = step_completion_stream("[DONE]", &mut tool_calls, &mut usage, &mut stop_reason)
-            .terminal
-            .context("[DONE] did not finalize refusal stream")?;
+        let done = step_completion_stream(
+            "[DONE]",
+            &mut tool_calls,
+            &mut ToolCallIdAssigner::default(),
+            &mut usage,
+            &mut stop_reason,
+        )
+        .terminal
+        .context("[DONE] did not finalize refusal stream")?;
         assert!(done.iter().any(|delta| matches!(
             delta,
             StreamDelta::Done {
@@ -5844,6 +5861,7 @@ mod tests {
         let o1 = step_completion_stream(
             r#"{"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}"#,
             &mut tool_calls,
+            &mut ToolCallIdAssigner::default(),
             &mut usage,
             &mut stop_reason,
         );
@@ -5854,13 +5872,20 @@ mod tests {
         let o2 = step_completion_stream(
             r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
             &mut tool_calls,
+            &mut ToolCallIdAssigner::default(),
             &mut usage,
             &mut stop_reason,
         );
         assert!(o2.terminal.is_none());
 
         // Chunk 3: [DONE] sentinel finalizes and must carry the trailing usage.
-        let o3 = step_completion_stream("[DONE]", &mut tool_calls, &mut usage, &mut stop_reason);
+        let o3 = step_completion_stream(
+            "[DONE]",
+            &mut tool_calls,
+            &mut ToolCallIdAssigner::default(),
+            &mut usage,
+            &mut stop_reason,
+        );
         let terminal = o3.terminal.expect("[DONE] finalizes the stream");
         assert!(terminal.iter().any(|d| matches!(
             d,
@@ -5887,6 +5912,7 @@ mod tests {
         let outcome = step_completion_stream(
             "{not valid json",
             &mut tool_calls,
+            &mut ToolCallIdAssigner::default(),
             &mut usage,
             &mut stop_reason,
         );
@@ -5918,13 +5944,23 @@ mod tests {
             },
         )]);
 
-        let truncated = build_stream_end_deltas(&tool_calls, None, StopReason::MaxTokens);
+        let truncated = build_stream_end_deltas(
+            &tool_calls,
+            &mut ToolCallIdAssigner::default(),
+            None,
+            StopReason::MaxTokens,
+        );
         assert!(!truncated.iter().any(|delta| matches!(
             delta,
             StreamDelta::ToolUseStart { .. } | StreamDelta::ToolInputDelta { .. }
         )));
 
-        let tool_terminal = build_stream_end_deltas(&tool_calls, None, StopReason::ToolUse);
+        let tool_terminal = build_stream_end_deltas(
+            &tool_calls,
+            &mut ToolCallIdAssigner::default(),
+            None,
+            StopReason::ToolUse,
+        );
         assert!(
             tool_terminal
                 .iter()
@@ -6105,6 +6141,130 @@ mod tests {
         };
         assert_eq!(usage.input_tokens, 140);
         assert_eq!(usage.output_tokens, 20);
+        Ok(())
+    }
+
+    fn positional_tool_id_history() -> Vec<agent_sdk_foundation::llm::Message> {
+        use agent_sdk_foundation::llm::Message;
+        vec![
+            Message::user("inspect the repository"),
+            Message::assistant_with_content(vec![ContentBlock::ToolUse {
+                id: "bash:0".to_owned(),
+                name: "bash".to_owned(),
+                input: serde_json::json!({"command": "pwd"}),
+                thought_signature: None,
+            }]),
+            Message::tool_result("bash:0", "/repo", false),
+        ]
+    }
+
+    fn tool_uses(blocks: Vec<ContentBlock>) -> Vec<(String, serde_json::Value)> {
+        blocks
+            .into_iter()
+            .filter_map(|block| {
+                if let ContentBlock::ToolUse { id, input, .. } = block {
+                    Some((id, input))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn assert_fresh_positional_ids(uses: &[(String, serde_json::Value)]) {
+        assert_eq!(uses.len(), 2);
+        assert!(
+            uses.iter()
+                .all(|(id, _)| id != "bash:0" && id.starts_with("bash:")),
+            "{uses:?}"
+        );
+        assert_ne!(uses[0].0, uses[1].0);
+        assert_eq!(uses[0].1, serde_json::json!({"command": "ls"}));
+    }
+
+    #[tokio::test]
+    async fn streamed_positional_tool_ids_never_repeat_history() -> anyhow::Result<()> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let body = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"bash:0\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"bash:0\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let provider =
+            OpenAIProvider::with_base_url("test-key", "moonshotai/kimi-k3", server.uri());
+        let request = ChatRequest::new(String::new(), positional_tool_id_history());
+        let deltas = provider
+            .chat_stream(request)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut accumulator = crate::streaming::StreamAccumulator::new();
+        for delta in &deltas {
+            accumulator.apply(delta);
+        }
+        assert_fresh_positional_ids(&tool_uses(accumulator.into_content_blocks()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn positional_tool_ids_never_repeat_history() -> anyhow::Result<()> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let body = serde_json::json!({
+            "id": "chatcmpl-kimi",
+            "model": "moonshotai/kimi-k3",
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [
+                        {
+                            "id": "bash:0",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": "{\"command\":\"ls\"}"}
+                        },
+                        {
+                            "id": "bash:0",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": "{}"}
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        });
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let provider =
+            OpenAIProvider::with_base_url("test-key", "moonshotai/kimi-k3", server.uri());
+        let request = ChatRequest::new(String::new(), positional_tool_id_history());
+        let ChatOutcome::Success(response) = provider.chat(request).await? else {
+            anyhow::bail!("tool-call response did not decode as a success");
+        };
+
+        assert_fresh_positional_ids(&tool_uses(response.content));
         Ok(())
     }
 }
