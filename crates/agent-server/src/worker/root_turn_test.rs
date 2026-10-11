@@ -8110,6 +8110,26 @@ async fn fresh_turn_mid_stream_cancel_commits_user_prompt() -> Result<()> {
     assert!(synthetic.is_closed());
     assert_eq!(synthetic.outcome, Some(TurnAttemptOutcome::Cancelled));
 
+    // Both records carry the moment of the cancel, not the turn's start
+    // (`t_plus(5)`): a turn that hung for hours before the user stopped it
+    // must not read as cancelled the instant it began.
+    assert!(
+        synthetic.opened_at > t_plus(5),
+        "the salvage is stamped at the cancel, got {}",
+        synthetic.opened_at,
+    );
+    let streamed = attempts
+        .iter()
+        .find(|a| a.provider != "cancel-commit")
+        .context("the cancelled provider attempt")?;
+    assert_eq!(streamed.outcome, Some(TurnAttemptOutcome::Cancelled));
+    assert!(
+        streamed.closed_at > Some(streamed.opened_at),
+        "the cancelled attempt closes when the cancel lands, got {:?} for an attempt opened at {}",
+        streamed.closed_at,
+        streamed.opened_at,
+    );
+
     // The next turn's recovered context contains the committed prompt.
     let view = crate::journal::thread_recover::recover_thread(
         &thread_a(),
