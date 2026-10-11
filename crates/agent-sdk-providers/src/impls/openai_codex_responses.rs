@@ -13,7 +13,7 @@ use crate::streaming::{
 #[cfg(test)]
 use agent_sdk_foundation::llm::ChatResponse;
 use agent_sdk_foundation::llm::{
-    ChatOutcome, ChatRequest, Content, ContentBlock, Effort, ImageDetail, ResponseFormat,
+    ChatOutcome, ChatRequest, Content, ContentBlock, Effort, ImageDetail, ResponseFormat, Role,
     SpeedTier, StopReason, ThinkingConfig, ThinkingDisplay, ThinkingMode, ToolChoice, Usage,
 };
 use anyhow::{Context, Result};
@@ -189,6 +189,38 @@ struct WebsocketSessionState {
     in_flight: bool,
     /// Last time this session was touched, for LRU eviction of the bounded map.
     last_used: Option<Instant>,
+}
+
+impl WebsocketSessionState {
+    /// The `x-codex-turn-state` sticky-routing token belongs to one user turn:
+    /// Codex replays it on that turn's tool-result follow-ups and retries and
+    /// must not carry it into the next turn.
+    fn begin_request(&mut self, request: &ChatRequest) {
+        self.last_used = Some(Instant::now());
+        if !continues_user_turn(request) {
+            self.turn_state = None;
+        }
+    }
+
+    fn record_turn_state(&mut self, turn_state: String) {
+        self.last_used = Some(Instant::now());
+        self.turn_state.get_or_insert(turn_state);
+    }
+}
+
+fn continues_user_turn(request: &ChatRequest) -> bool {
+    request
+        .messages
+        .last()
+        .is_some_and(|message| match message.role {
+            Role::User => match &message.content {
+                Content::Blocks(blocks) => blocks
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolResult { .. })),
+                Content::Text(_) => false,
+            },
+            Role::Assistant => false,
+        })
 }
 
 impl OpenAICodexResponsesProvider {
@@ -408,6 +440,19 @@ impl OpenAICodexResponsesProvider {
             .clone()
     }
 
+    async fn http_turn_state(&self, request: &ChatRequest) -> Option<String> {
+        let session_id = request.session_id.as_deref()?;
+        let session = self
+            .websocket_sessions
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()?;
+        let mut state = session.lock().await;
+        state.begin_request(request);
+        state.turn_state.clone()
+    }
+
     async fn connect_websocket(
         &self,
         session_id: Option<&str>,
@@ -578,7 +623,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
 
             log::debug!("OpenAI Codex streaming request model={} max_tokens={}", self.model, request.max_tokens);
 
-            let mut sse_turn_state: Option<String> = None;
+            let sse_turn_state: Option<String>;
 
             // Skip the WebSocket transport entirely when it was not selected, is
             // hard-disabled (builder / env), or a prior session already proved
@@ -614,7 +659,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                     websocket_session.last_response_items.clear();
                 }
                 websocket_session.in_flight = true;
-                websocket_session.last_used = Some(Instant::now());
+                websocket_session.begin_request(&request);
 
                 if !websocket_session.websocket_disabled {
                     'websocket_attempts: for attempt in 0..2 {
@@ -1616,6 +1661,8 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                 websocket_session.in_flight = false;
                 sse_turn_state = websocket_session.turn_state.clone();
                 drop(websocket_session);
+            } else {
+                sse_turn_state = self.http_turn_state(&request).await;
             }
 
             let headers = match self.build_headers(
@@ -1677,8 +1724,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                     .map(ToOwned::to_owned);
                 if let Some(turn_state) = turn_state {
                     let session = self.websocket_session(session_id).await;
-                    let mut websocket_session = session.lock().await;
-                    websocket_session.turn_state = Some(turn_state);
+                    session.lock().await.record_turn_state(turn_state);
                 }
             }
 
@@ -5382,6 +5428,92 @@ mod tests {
             key.len()
         );
         assert_eq!(key, bounded_prompt_cache_key(session_id));
+        Ok(())
+    }
+
+    fn tool_followup_request(session_id: &str) -> ChatRequest {
+        ChatRequest::new(
+            "You are helpful.",
+            vec![
+                Message::user("hello"),
+                Message::assistant_with_tool_use(None, "call_1", "read", serde_json::json!({})),
+                Message::tool_result("call_1", "contents", false),
+            ],
+        )
+        .with_max_tokens(1024)
+        .with_session_id(session_id)
+    }
+
+    fn next_user_turn_request(session_id: &str) -> ChatRequest {
+        let mut request = tool_followup_request(session_id);
+        request.messages.push(Message::assistant("done"));
+        request.messages.push(Message::user("and now?"));
+        request
+    }
+
+    #[tokio::test]
+    async fn http_turn_state_is_replayed_within_a_turn_and_reset_for_the_next() -> anyhow::Result<()>
+    {
+        let server = wiremock::MockServer::start().await;
+        let sse_with_turn_state = |turn_state: &str| {
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .insert_header(OPENAI_CODEX_TURN_STATE_HEADER, turn_state)
+                .set_body_string(HTTP_SSE_BODY)
+        };
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/backend-api/codex/responses"))
+            .and(wiremock::matchers::header_exists(
+                OPENAI_CODEX_TURN_STATE_HEADER,
+            ))
+            .respond_with(sse_with_turn_state("sticky-rotated"))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/backend-api/codex/responses"))
+            .respond_with(sse_with_turn_state("sticky-abc"))
+            .mount(&server)
+            .await;
+        let provider = OpenAICodexResponsesProvider::with_base_url(
+            oauth_token(),
+            MODEL_GPT53_CODEX.to_owned(),
+            format!("{}/backend-api", server.uri()),
+        );
+
+        for request in [
+            streaming_request("thread-a"),
+            tool_followup_request("thread-a"),
+            tool_followup_request("thread-a"),
+            tool_followup_request("thread-b"),
+            next_user_turn_request("thread-a"),
+        ] {
+            let outcome = provider.chat(request).await?;
+            assert!(
+                matches!(outcome, ChatOutcome::Success(_)),
+                "turn did not complete: {outcome:?}"
+            );
+        }
+
+        let received = server
+            .received_requests()
+            .await
+            .context("mock server did not record requests")?;
+        let sent_turn_states: Vec<Option<&str>> = received
+            .iter()
+            .map(|request| {
+                request
+                    .headers
+                    .get(OPENAI_CODEX_TURN_STATE_HEADER)
+                    .and_then(|value| value.to_str().ok())
+            })
+            .collect();
+        assert_eq!(
+            sent_turn_states,
+            vec![None, Some("sticky-abc"), Some("sticky-abc"), None, None,],
+            "thread-a's tool follow-ups replay the turn's first token, thread-b never \
+             sees it, and thread-a's next user turn starts without it"
+        );
         Ok(())
     }
 
