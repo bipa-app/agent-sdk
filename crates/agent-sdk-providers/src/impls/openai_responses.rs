@@ -2228,6 +2228,39 @@ mod tests {
     use super::*;
     use crate::impls::openai::MODEL_GPT54;
     use agent_sdk_foundation::llm::{CacheConfig, CacheTtl, Message, ThinkingDisplay};
+
+    #[test]
+    fn trailing_reminder_follows_function_call_output_as_a_user_message() -> anyhow::Result<()> {
+        let mut messages = vec![
+            agent_sdk_foundation::llm::Message::user("plan the migration"),
+            agent_sdk_foundation::llm::Message::assistant_with_tool_use(
+                None,
+                "call_1",
+                "todo",
+                serde_json::json!({}),
+            ),
+            agent_sdk_foundation::llm::Message::tool_result("call_1", "plan saved", false),
+        ];
+        agent_sdk_foundation::llm::append_system_reminder(&mut messages, "plan: 0/2 done");
+
+        let request = ChatRequest::new(String::new(), messages);
+        let json = serde_json::to_value(build_api_input(&request, 0))?;
+        let Some(items) = json.as_array() else {
+            anyhow::bail!("input must serialize as an array: {json}");
+        };
+
+        assert_eq!(items.len(), 4, "{json}");
+        assert_eq!(items[1]["type"], "function_call");
+        assert_eq!(items[2]["type"], "function_call_output");
+        assert_eq!(items[2]["call_id"], "call_1");
+        assert_eq!(items[3]["role"], "user");
+        assert_eq!(items[3]["content"][0]["type"], "input_text");
+        assert_eq!(
+            items[3]["content"][0]["text"],
+            "<system-reminder>\nplan: 0/2 done\n</system-reminder>"
+        );
+        Ok(())
+    }
     #[test]
     fn compaction_summary_is_framed_as_untrusted_historical_data() {
         let mut items = Vec::new();
