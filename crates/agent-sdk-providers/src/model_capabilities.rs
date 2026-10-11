@@ -1060,14 +1060,14 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         provider: "openai",
         model_id: "moonshotai/kimi-k3",
         context_window: Some(1_048_576),
-        max_output_tokens: None,
+        max_output_tokens: Some(65_535),
         pricing: None,
         supports_thinking: true,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
         source_url: OPENROUTER_KIMI_K3_URL,
         source_status: SourceStatus::Derived,
-        notes: Some("Exact OpenRouter slug; Baseten serves the same weights as moonshotai/Kimi-K3, which the case-insensitive lookup folds here. Reasoning model with a 1,048,576-token window (OpenRouter model metadata; Baseten documents a 1M window). No single output ceiling exists across routes: OpenRouter endpoints cap completions between 65,535 and 943,718 tokens (Baseten 262,144), so max_output_tokens stays None rather than reserving most of the window; callers size output through their own max_tokens. Pricing is None because the static `openai` key cannot tell the gateway base URLs apart and their rates differ; dynamic route catalogs remain the pricing authority."),
+        notes: Some("Exact OpenRouter slug; Baseten serves the same weights as moonshotai/Kimi-K3, which the case-insensitive lookup folds here. Reasoning model with a 1,048,576-token window (OpenRouter model metadata; Baseten documents a 1M window). OpenRouter endpoints cap completions between 65,535 and 943,718 tokens (Baseten 262,144) and route requests to any of them, so max_output_tokens is the lowest of those caps: a larger request can be rejected by whichever endpoint serves it. Pricing is None because the static `openai` key cannot tell the gateway base URLs apart and their rates differ; dynamic route catalogs remain the pricing authority."),
     },
     ModelCapabilities {
         provider: "openai",
@@ -1654,7 +1654,7 @@ mod tests {
             .context("missing capabilities for moonshotai/kimi-k3")?;
         assert!(k3.supports_thinking);
         assert_eq!(k3.context_window, Some(1_048_576));
-        assert_eq!(k3.max_output_tokens, None);
+        assert_eq!(k3.max_output_tokens, Some(65_535));
         assert!(k3.pricing.is_none());
 
         let fireworks = get_model_capabilities("openai", "accounts/fireworks/models/kimi-k3")
@@ -1667,6 +1667,7 @@ mod tests {
         let baseten = get_model_capabilities("openai", "moonshotai/Kimi-K3")
             .context("missing capabilities for moonshotai/Kimi-K3")?;
         assert_eq!(baseten.model_id, "moonshotai/kimi-k3");
+        assert_eq!(baseten.max_output_tokens, Some(65_535));
         Ok(())
     }
 
