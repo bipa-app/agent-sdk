@@ -3360,6 +3360,29 @@ impl InMemoryAgentTaskStore {
         Ok(persisted_batches.into_iter().next().unwrap_or_default())
     }
 
+    /// Journal the terminal event that closes `task`'s turn when it fails
+    /// closed for `reason` (see [`FailureReason::terminal_event`]).
+    ///
+    /// Callers commit it under the store write lock, before applying the
+    /// transition, so it precedes anything a promoted successor emits. A
+    /// bare store without a sink emits nothing.
+    async fn commit_fail_closed_event(
+        &self,
+        task: &AgentTask,
+        reason: FailureReason,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let (Some(sink), Some(event)) = (&self.marker_sink, reason.terminal_event(task)) else {
+            return Ok(());
+        };
+        let committed = sink
+            .event_repo
+            .commit_event(&task.thread_id, event, now)
+            .await
+            .with_context(|| format!("commit fail-closed terminal event for {}", task.id))?;
+        Self::insert_marker_advisory(sink, &committed, now).await
+    }
+
     /// Write the `thread_events_available` advisory that wakes cross-host
     /// followers of a journaled marker.
     async fn insert_marker_advisory(
@@ -4867,6 +4890,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         match classify_recovery(&old, RecoveryContext::AcquisitionAttempt) {
             RecoveryAction::NoAction => {}
             RecoveryAction::FailClosed(reason) => {
+                self.commit_fail_closed_event(&old, reason, now).await?;
                 inner.fail_row_closed(&old, reason, now)?;
                 return Ok(None);
             }
@@ -4962,6 +4986,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                     // whole worker pool. The fail-closed transition
                     // removes the row from the runnable index, so
                     // the next loop iteration picks up a fresh head.
+                    self.commit_fail_closed_event(&old, reason, now).await?;
                     inner.fail_row_closed(&old, reason, now)?;
                 }
                 RecoveryAction::Requeue => {
@@ -5056,6 +5081,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                     RecoveryRecord::requeued(id)
                 }
                 RecoveryAction::FailClosed(reason) => {
+                    self.commit_fail_closed_event(&old, reason, now).await?;
                     inner.fail_row_closed(&old, reason, now)?;
                     RecoveryRecord::failed_closed(id, reason)
                 }

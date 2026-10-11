@@ -54,7 +54,7 @@ use agent_server::journal::outbox_message::{
     OutboxMessage, OutboxMessageKind, TaskWakeupPayload, ThreadEventsAvailablePayload,
 };
 use agent_server::journal::recovery::{
-    RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
+    FailureReason, RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
 };
 use agent_server::journal::relay::{
     TASK_WAKEUP_OUTBOX_MAX_ATTEMPTS, TaskWakeupEmitter, TaskWakeupTrigger,
@@ -1535,6 +1535,37 @@ LIMIT 1
             })?;
         Self::update_task_tx(tx, &new_parent).await?;
         Ok(())
+    }
+
+    /// Fail `old` closed for `reason` inside the caller's transaction:
+    /// the terminal transition, the terminal event that closes a root's
+    /// turn (see [`FailureReason::terminal_event`]), and the parent /
+    /// successor wake-up land together.
+    async fn fail_closed_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        old: &AgentTask,
+        reason: FailureReason,
+        now: OffsetDateTime,
+        error_prefix: &str,
+    ) -> Result<()> {
+        let failed = old
+            .clone()
+            .fail_with_reason(reason, now)
+            .with_context(|| format!("{error_prefix}: fail-closed transition failed"))?;
+        Self::update_task_tx(tx, &failed).await?;
+        if let Some(event) = reason.terminal_event(old) {
+            let start_seq = Self::next_event_sequence_tx(tx, &old.thread_id).await?;
+            let committed =
+                Self::insert_events_tx(tx, &old.thread_id, vec![event], start_seq, now).await?;
+            Self::insert_thread_events_outbox_row_tx(
+                tx,
+                &committed,
+                DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+                now,
+            )
+            .await?;
+        }
+        Self::propagate_terminal_to_parent_tx(tx, &failed, now, error_prefix).await
     }
 
     /// Phase 7.6: find a `Subagent` invocation task that is
@@ -3218,13 +3249,7 @@ impl AgentTaskStore for SqliteDurableStore {
         match classify_recovery(&old, RecoveryContext::AcquisitionAttempt) {
             RecoveryAction::NoAction => {}
             RecoveryAction::FailClosed(reason) => {
-                let failed = old
-                    .clone()
-                    .fail_with_reason(reason, now)
-                    .context("try_acquire_task: fail-closed transition failed")?;
-                Self::update_task_tx(&mut tx, &failed).await?;
-                Self::propagate_terminal_to_parent_tx(&mut tx, &failed, now, "try_acquire_task")
-                    .await?;
+                Self::fail_closed_tx(&mut tx, &old, reason, now, "try_acquire_task").await?;
                 tx.commit().await.context("commit fail-closed acquire")?;
                 return Ok(None);
             }
@@ -3294,18 +3319,8 @@ impl AgentTaskStore for SqliteDurableStore {
                     return Ok(Some(claimed));
                 }
                 RecoveryAction::FailClosed(reason) => {
-                    let failed = old
-                        .clone()
-                        .fail_with_reason(reason, now)
-                        .context("acquire_next_runnable: fail-closed transition failed")?;
-                    Self::update_task_tx(&mut tx, &failed).await?;
-                    Self::propagate_terminal_to_parent_tx(
-                        &mut tx,
-                        &failed,
-                        now,
-                        "acquire_next_runnable",
-                    )
-                    .await?;
+                    Self::fail_closed_tx(&mut tx, &old, reason, now, "acquire_next_runnable")
+                        .await?;
                     tx.commit()
                         .await
                         .context("commit fail-closed runnable head")?;
@@ -3445,18 +3460,8 @@ impl AgentTaskStore for SqliteDurableStore {
                     RecoveryRecord::requeued(old.id.clone())
                 }
                 RecoveryAction::FailClosed(reason) => {
-                    let failed = old
-                        .clone()
-                        .fail_with_reason(reason, now)
-                        .context("release_expired_leases: fail-closed transition failed")?;
-                    Self::update_task_tx(&mut tx, &failed).await?;
-                    Self::propagate_terminal_to_parent_tx(
-                        &mut tx,
-                        &failed,
-                        now,
-                        "release_expired_leases",
-                    )
-                    .await?;
+                    Self::fail_closed_tx(&mut tx, &old, reason, now, "release_expired_leases")
+                        .await?;
                     RecoveryRecord::failed_closed(old.id.clone(), reason)
                 }
                 RecoveryAction::NoAction => {

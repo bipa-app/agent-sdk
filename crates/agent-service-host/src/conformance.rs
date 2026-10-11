@@ -52,6 +52,7 @@ mod tests {
     use agent_server::journal::checkpoint::CheckpointKind;
     use agent_server::journal::checkpoint_store::CheckpointStore;
     use agent_server::journal::commit::{CompletedTurnCommit, commit_completed_turn};
+    use agent_server::journal::committed_event::CommittedEvent;
     use agent_server::journal::event_repository::EventRepository;
     use agent_server::journal::execution_intent::{
         ExecutionIntent, ExecutionIntentStore, IntentStatus, OperationId, ToolEffectClass,
@@ -62,7 +63,7 @@ mod tests {
     use agent_server::journal::message_store::MessageProjectionStore;
     use agent_server::journal::outbox::OutboxStore;
     use agent_server::journal::outbox_message::OutboxMessageKind;
-    use agent_server::journal::recovery::RecoveryAction;
+    use agent_server::journal::recovery::{FailureReason, RecoveryAction};
     use agent_server::journal::store::{AgentTaskStore, SubagentInvocationSpawn};
     #[cfg(feature = "sqlite")]
     use agent_server::journal::subagent_spawn_transaction::{
@@ -2175,6 +2176,200 @@ mod tests {
         Ok(())
     }
 
+    /// Acquire `task_id`, or fail with the row's terminal error so a
+    /// fail-closed acquisition reads as the reason it happened.
+    async fn acquire_or_explain(
+        task_store: &dyn AgentTaskStore,
+        task_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        secs: i64,
+        label: &str,
+    ) -> Result<AgentTask> {
+        if let Some(acquired) = task_store
+            .try_acquire_task(
+                task_id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(secs + 600),
+                t_plus(secs),
+            )
+            .await?
+        {
+            return Ok(acquired);
+        }
+        let row = task_store.get(task_id).await?.context("row exists")?;
+        anyhow::bail!(
+            "{label}: task was not acquirable (status {:?}, attempt {}/{}, last_error {:?})",
+            row.status,
+            row.attempt,
+            row.max_attempts,
+            row.last_error,
+        )
+    }
+
+    fn terminal_budget_errors(events: &[CommittedEvent], task_id: &AgentTaskId) -> usize {
+        events
+            .iter()
+            .filter(|committed| {
+                matches!(
+                    &committed.event,
+                    AgentEvent::Error {
+                        recoverable: false,
+                        reason: Some(TerminalReason::Budget),
+                        emitter_task_id: Some(emitter),
+                        ..
+                    } if emitter == task_id.as_str()
+                )
+            })
+            .count()
+    }
+
+    fn terminal_errors(events: &[CommittedEvent]) -> usize {
+        events
+            .iter()
+            .filter(|committed| {
+                matches!(
+                    committed.event,
+                    AgentEvent::Error {
+                        recoverable: false,
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
+    /// Release `task_id`'s only attempt back to `Pending` so the next
+    /// acquisition sees an exhausted budget.
+    async fn requeue_with_spent_budget(
+        task_store: &dyn AgentTaskStore,
+        task_id: &AgentTaskId,
+        secs: i64,
+    ) -> Result<()> {
+        let claimed = task_store
+            .try_acquire_task(
+                task_id,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(secs + 50),
+                t_plus(secs),
+            )
+            .await?
+            .context("claim the only attempt")?;
+        let released = claimed.release_lease(t_plus(secs + 1))?;
+        task_store.update(released).await
+    }
+
+    /// Every budget fail-close of a thread's root turn journals a
+    /// terminal `Error` event, so a frontend following the thread
+    /// renders the failure instead of a turn that silently stopped.
+    async fn test_retry_exhaustion_emits_terminal_error(
+        task_store: &dyn AgentTaskStore,
+        event_repo: &dyn EventRepository,
+    ) -> Result<()> {
+        let swept =
+            AgentTask::new_root_turn(thread_id("conformance-exhausted-sweep"), t_plus(1), 1);
+        let _ = task_store.submit_root_turn(swept.clone()).await?;
+        task_store
+            .try_acquire_task(
+                &swept.id,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(5),
+                t_plus(2),
+            )
+            .await?
+            .context("claim swept root")?;
+        let records = task_store.release_expired_leases(t_plus(6)).await?;
+        assert_eq!(
+            records.first().map(|record| record.action),
+            Some(RecoveryAction::FailClosed(
+                FailureReason::LeaseExpiredBudgetExhausted
+            )),
+        );
+        let events = event_repo.get_events(&swept.thread_id).await?;
+        assert_eq!(terminal_budget_errors(&events, &swept.id), 1);
+
+        let targeted =
+            AgentTask::new_root_turn(thread_id("conformance-exhausted-targeted"), t_plus(10), 1);
+        let _ = task_store.submit_root_turn(targeted.clone()).await?;
+        requeue_with_spent_budget(task_store, &targeted.id, 11).await?;
+        let acquired = task_store
+            .try_acquire_task(
+                &targeted.id,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(70),
+                t_plus(20),
+            )
+            .await?;
+        assert!(acquired.is_none(), "an exhausted root must fail closed");
+        let events = event_repo.get_events(&targeted.thread_id).await?;
+        assert_eq!(terminal_budget_errors(&events, &targeted.id), 1);
+
+        let scanned =
+            AgentTask::new_root_turn(thread_id("conformance-exhausted-scanned"), t_plus(30), 1);
+        let _ = task_store.submit_root_turn(scanned.clone()).await?;
+        requeue_with_spent_budget(task_store, &scanned.id, 31).await?;
+        let acquired = task_store
+            .acquire_next_runnable(WorkerId::new(), LeaseId::new(), t_plus(90), t_plus(40))
+            .await?;
+        assert!(acquired.is_none(), "the only runnable row is exhausted");
+        let row = task_store.get(&scanned.id).await?.context("row exists")?;
+        assert_eq!(row.status, TaskStatus::Failed);
+        let events = event_repo.get_events(&scanned.thread_id).await?;
+        assert_eq!(terminal_budget_errors(&events, &scanned.id), 1);
+        Ok(())
+    }
+
+    /// A fail-closed tool child is not the turn's end — its parent wakes
+    /// and resumes — so it must not journal a terminal thread error.
+    async fn test_fail_closed_tool_child_emits_no_terminal_error(
+        task_store: &dyn AgentTaskStore,
+        event_repo: &dyn EventRepository,
+    ) -> Result<()> {
+        let name = "conformance-child-no-terminal";
+        let parent = AgentTask::new_root_turn(thread_id(name), t_plus(1), 3);
+        let _ = task_store.submit_root_turn(parent.clone()).await?;
+        let worker = WorkerId::new();
+        let lease = LeaseId::new();
+        acquire_or_explain(task_store, &parent.id, &worker, &lease, 2, "acquire parent").await?;
+        let (_parent, children) = task_store
+            .spawn_tool_children(
+                &parent.id,
+                &worker,
+                &lease,
+                vec![ChildSpawnSpec::new(1)],
+                suspension_payload(name),
+                None,
+                Vec::new(),
+                t_plus(3),
+            )
+            .await?;
+        let child = children.first().context("one child")?;
+        task_store
+            .try_acquire_task(
+                &child.id,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(10),
+                t_plus(4),
+            )
+            .await?
+            .context("claim child")?;
+        let records = task_store.release_expired_leases(t_plus(11)).await?;
+        assert_eq!(
+            records.first().map(|record| record.action),
+            Some(RecoveryAction::FailClosed(
+                FailureReason::LeaseExpiredBudgetExhausted
+            )),
+        );
+        let events = event_repo.get_events(&thread_id(name)).await?;
+        assert_eq!(terminal_errors(&events), 0);
+        Ok(())
+    }
+
     /// Clear wipes every task — including parent/child chains guarded
     /// by ON DELETE RESTRICT self-referential FKs on `SQLite`.
     async fn test_clear_with_parent_child(task_store: &dyn AgentTaskStore) -> Result<()> {
@@ -2522,6 +2717,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_retry_exhaustion_emits_terminal_error() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_retry_exhaustion_emits_terminal_error(s.task.as_ref(), s.event.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_fail_closed_tool_child_emits_no_terminal_error() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_fail_closed_tool_child_emits_no_terminal_error(s.task.as_ref(), s.event.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_clear_parent_child() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_clear_with_parent_child(s.task.as_ref()).await
@@ -2829,6 +3036,20 @@ mod tests {
     async fn conformance_sqlite_retry_exhaustion() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_retry_exhaustion(&store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_retry_exhaustion_emits_terminal_error() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_retry_exhaustion_emits_terminal_error(&store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_fail_closed_tool_child_emits_no_terminal_error() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_fail_closed_tool_child_emits_no_terminal_error(&store, &store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -3358,6 +3579,24 @@ mod tests {
             return Ok(());
         };
         test_retry_exhaustion(&store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_retry_exhaustion_emits_terminal_error() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_retry_exhaustion_emits_terminal_error(&store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_fail_closed_tool_child_emits_no_terminal_error() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_fail_closed_tool_child_emits_no_terminal_error(&store, &store).await
     }
 
     #[cfg(feature = "postgres")]

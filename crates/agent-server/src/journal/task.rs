@@ -2147,13 +2147,7 @@ impl AgentTask {
         now: OffsetDateTime,
     ) -> Result<Self, TaskSchemaError> {
         let error = reason.error_message(&self);
-        let terminal_reason = match reason {
-            FailureReason::RetryBudgetExhausted | FailureReason::LeaseExpiredBudgetExhausted => {
-                TerminalReason::Budget
-            }
-            FailureReason::UnsafePreparedOperationRecovery => TerminalReason::InternalError,
-        };
-        self.fail_with_terminal_reason(error, terminal_reason, now)
+        self.fail_with_terminal_reason(error, reason.terminal_reason(), now)
     }
 
     /// Mark the task [`TaskStatus::Cancelled`].

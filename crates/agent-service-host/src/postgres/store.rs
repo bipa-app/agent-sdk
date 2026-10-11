@@ -55,7 +55,7 @@ use agent_server::journal::outbox_message::{
     OutboxMessage, OutboxMessageKind, TaskWakeupPayload, ThreadEventsAvailablePayload,
 };
 use agent_server::journal::recovery::{
-    RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
+    FailureReason, RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
 };
 use agent_server::journal::relay::{
     TASK_WAKEUP_OUTBOX_MAX_ATTEMPTS, TaskWakeupEmitter, TaskWakeupTrigger,
@@ -1741,6 +1741,105 @@ WHERE parent_id = $1
             })?;
         Self::update_task_tx(tx, &new_parent).await?;
         Ok(())
+    }
+
+    /// Fail `old` closed for `reason` inside the caller's transaction:
+    /// the terminal transition, the terminal event that closes a root's
+    /// turn (see [`FailureReason::terminal_event`]), and the parent /
+    /// successor wake-up land together.
+    ///
+    /// Journaling that event locks `old`'s thread row, so for a root the
+    /// caller must already hold the thread lock taken before the task
+    /// lock (thread → task); otherwise use
+    /// [`Self::fail_closed_root_thread_first`].
+    async fn fail_closed_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        old: &AgentTask,
+        reason: FailureReason,
+        now: OffsetDateTime,
+        error_prefix: &str,
+    ) -> Result<()> {
+        let failed = old
+            .clone()
+            .fail_with_reason(reason, now)
+            .with_context(|| format!("{error_prefix}: fail-closed transition failed"))?;
+        Self::update_task_tx(tx, &failed).await?;
+        if let Some(event) = reason.terminal_event(old) {
+            let start_seq = Self::next_event_sequence_tx(tx, &old.thread_id).await?;
+            let committed =
+                Self::insert_events_tx(tx, &old.thread_id, vec![event], start_seq, now).await?;
+            Self::insert_thread_events_outbox_row_tx(
+                tx,
+                &committed,
+                DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+                now,
+            )
+            .await?;
+        }
+        Self::propagate_terminal_to_parent_tx(tx, &failed, now, error_prefix).await
+    }
+
+    /// Fail a root closed in its own transaction that locks the thread
+    /// before the task, for callers that classified the row under a task
+    /// lock taken first. The row is re-validated under the new locks and
+    /// left alone when it no longer classifies as fail-closed in
+    /// `context` (another worker claimed it, a heartbeat extended its
+    /// lease, ...).
+    ///
+    /// Returns the reason when this call failed the row.
+    async fn fail_closed_root_thread_first(
+        &self,
+        id: &AgentTaskId,
+        context: RecoveryContext,
+        now: OffsetDateTime,
+        error_prefix: &str,
+    ) -> Result<Option<FailureReason>> {
+        let mut tx = self.begin().await?;
+        let Some(screened) = Self::load_task_tx(&mut tx, id, false).await? else {
+            tx.rollback()
+                .await
+                .context("rollback vanished fail-close")?;
+            return Ok(None);
+        };
+        Self::bootstrap_thread_row_tx(&mut tx, &screened.thread_id, now).await?;
+        let thread = Self::lock_thread_tx(&mut tx, &screened.thread_id)
+            .await?
+            .with_context(|| format!("thread {} missing after bootstrap", screened.thread_id))?;
+        let Some(old) = Self::load_task_tx(&mut tx, id, true).await? else {
+            tx.rollback()
+                .await
+                .context("rollback vanished fail-close")?;
+            return Ok(None);
+        };
+        let still_eligible = match context {
+            RecoveryContext::AcquisitionAttempt => {
+                old.status.can_be_leased() && !thread.status.is_purge_fenced()
+            }
+            RecoveryContext::ExpiredLease => {
+                old.status == TaskStatus::Running
+                    && old.lease_expires_at.is_some_and(|expiry| expiry <= now)
+            }
+        };
+        let action = if still_eligible {
+            classify_recovery(&old, context)
+        } else {
+            RecoveryAction::NoAction
+        };
+        match action {
+            RecoveryAction::FailClosed(reason) => {
+                Self::fail_closed_tx(&mut tx, &old, reason, now, error_prefix).await?;
+                tx.commit()
+                    .await
+                    .with_context(|| format!("commit {error_prefix} fail-close"))?;
+                Ok(Some(reason))
+            }
+            RecoveryAction::NoAction | RecoveryAction::Requeue => {
+                tx.rollback()
+                    .await
+                    .with_context(|| format!("rollback {error_prefix} fail-close"))?;
+                Ok(None)
+            }
+        }
     }
 
     async fn apply_task_terminal_transition_tx(
@@ -3485,13 +3584,9 @@ ORDER BY created_at, id
         match classify_recovery(&old, RecoveryContext::AcquisitionAttempt) {
             RecoveryAction::NoAction => {}
             RecoveryAction::FailClosed(reason) => {
-                let failed = old
-                    .clone()
-                    .fail_with_reason(reason, now)
-                    .context("try_acquire_task: fail-closed transition failed")?;
-                Self::update_task_tx(&mut tx, &failed).await?;
-                Self::propagate_terminal_to_parent_tx(&mut tx, &failed, now, "try_acquire_task")
-                    .await?;
+                // `require_active_thread_tx` above already holds the thread
+                // lock, so the terminal event keeps thread → task order.
+                Self::fail_closed_tx(&mut tx, &old, reason, now, "try_acquire_task").await?;
                 tx.commit().await.context("commit fail-closed acquire")?;
                 return Ok(None);
             }
@@ -3566,19 +3661,21 @@ ORDER BY created_at, id
                     tx.commit().await.context("commit acquire_next_runnable")?;
                     return Ok(Some(claimed));
                 }
-                RecoveryAction::FailClosed(reason) => {
-                    let failed = old
-                        .clone()
-                        .fail_with_reason(reason, now)
-                        .context("acquire_next_runnable: fail-closed transition failed")?;
-                    Self::update_task_tx(&mut tx, &failed).await?;
-                    Self::propagate_terminal_to_parent_tx(
-                        &mut tx,
-                        &failed,
+                RecoveryAction::FailClosed(reason) if reason.terminal_event(&old).is_some() => {
+                    tx.rollback()
+                        .await
+                        .context("rollback before thread-first fail-close")?;
+                    self.fail_closed_root_thread_first(
+                        &old.id,
+                        RecoveryContext::AcquisitionAttempt,
                         now,
                         "acquire_next_runnable",
                     )
                     .await?;
+                }
+                RecoveryAction::FailClosed(reason) => {
+                    Self::fail_closed_tx(&mut tx, &old, reason, now, "acquire_next_runnable")
+                        .await?;
                     tx.commit()
                         .await
                         .context("commit fail-closed runnable head")?;
@@ -3733,6 +3830,7 @@ FOR UPDATE SKIP LOCKED
         .context("load expired leases")?;
 
         let mut released = Vec::with_capacity(expired.len());
+        let mut exhausted_roots = Vec::new();
         for record in expired {
             let old = AgentTask::try_from(record)?;
             if old.status != TaskStatus::Running {
@@ -3751,19 +3849,13 @@ FOR UPDATE SKIP LOCKED
                     Self::update_task_tx(&mut tx, &released_row).await?;
                     RecoveryRecord::requeued(old.id.clone())
                 }
+                RecoveryAction::FailClosed(reason) if reason.terminal_event(&old).is_some() => {
+                    exhausted_roots.push(old.id);
+                    continue;
+                }
                 RecoveryAction::FailClosed(reason) => {
-                    let failed = old
-                        .clone()
-                        .fail_with_reason(reason, now)
-                        .context("release_expired_leases: fail-closed transition failed")?;
-                    Self::update_task_tx(&mut tx, &failed).await?;
-                    Self::propagate_terminal_to_parent_tx(
-                        &mut tx,
-                        &failed,
-                        now,
-                        "release_expired_leases",
-                    )
-                    .await?;
+                    Self::fail_closed_tx(&mut tx, &old, reason, now, "release_expired_leases")
+                        .await?;
                     RecoveryRecord::failed_closed(old.id.clone(), reason)
                 }
                 RecoveryAction::NoAction => {
@@ -3777,6 +3869,22 @@ FOR UPDATE SKIP LOCKED
         }
 
         tx.commit().await.context("commit release_expired_leases")?;
+
+        // The batch locked these roots before their threads; journaling
+        // their terminal events needs thread → task order.
+        for id in exhausted_roots {
+            if let Some(reason) = self
+                .fail_closed_root_thread_first(
+                    &id,
+                    RecoveryContext::ExpiredLease,
+                    now,
+                    "release_expired_leases",
+                )
+                .await?
+            {
+                released.push(RecoveryRecord::failed_closed(id, reason));
+            }
+        }
         Ok(released)
     }
 
