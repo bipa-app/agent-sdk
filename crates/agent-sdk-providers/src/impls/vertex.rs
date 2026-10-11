@@ -1258,6 +1258,25 @@ mod tests {
     }
 
     #[test]
+    fn test_vertex_claude_sonnet_55_rejects_budgeted_thinking() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        let provider = VertexProvider::new(
+            "token".to_string(),
+            "project".to_string(),
+            "global".to_string(),
+            MODEL_SONNET_55.to_string(),
+        );
+
+        let error = provider
+            .validate_thinking_config(Some(&ThinkingConfig::new(10_000)))
+            .err()
+            .context("budget thinking must be rejected on Vertex Sonnet 5.5")?;
+        assert!(error.to_string().contains("ThinkingConfig::adaptive()"));
+        Ok(())
+    }
+
+    #[test]
     fn test_model_constants() {
         assert_eq!(MODEL_GEMINI_3_FLASH, "gemini-3-flash-preview");
         assert_eq!(MODEL_GEMINI_31_PRO, "gemini-3.1-pro-preview");

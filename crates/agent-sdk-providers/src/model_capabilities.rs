@@ -348,7 +348,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         model_id: "claude-sonnet-5-5",
         context_window: Some(1_000_000),
         max_output_tokens: Some(128_000),
-        pricing: Some(Pricing::flat_with_cached(2.0, 10.0, 0.1).with_cache_write(2.5).with_notes("Anthropic Sonnet 5.5 official pricing: $2 input / $10 output per 1M tokens. Cache reads cost $0.10/M (5% of base input, cut from $0.20 on 2026-10-07); cache writes cost $2.50/M (5m) or $4/M (1h).")),
+        pricing: Some(Pricing::flat_with_cached(2.0, 10.0, 0.1).with_cache_write(2.5).with_notes("Anthropic Sonnet 5.5 official pricing: $2 input / $10 output per 1M tokens. Cache reads cost $0.10/M (5% of base input); cache writes cost $2.50/M (5m) or $4/M (1h).")),
         supports_thinking: true,
         supports_adaptive_thinking: true,
         rejects_budget_thinking: true,

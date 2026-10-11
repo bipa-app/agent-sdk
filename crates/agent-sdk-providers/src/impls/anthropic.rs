@@ -625,7 +625,8 @@ impl AnthropicProvider {
 
     /// Claude Sonnet 5.5 — adaptive thinking (not always on), default effort
     /// `high`; manual `budget_tokens` returns a 400, so use
-    /// `ThinkingConfig::adaptive()` or `ThinkingConfig::adaptive_with_effort(_)`.
+    /// `ThinkingConfig::adaptive()`, `ThinkingConfig::adaptive_with_effort(_)`,
+    /// or `ThinkingConfig::default_with_effort(_)`.
     #[must_use]
     pub fn sonnet_55(api_key: impl Into<String>) -> Self {
         Self::new(api_key, MODEL_SONNET_55)
@@ -1610,12 +1611,16 @@ mod tests {
     }
 
     #[test]
-    fn test_sonnet_55_rejects_budgeted_thinking_and_accepts_adaptive_effort() {
+    fn test_sonnet_55_rejects_budgeted_thinking_and_accepts_adaptive_effort() -> anyhow::Result<()>
+    {
+        use anyhow::Context as _;
+
         let sonnet_55 = AnthropicProvider::sonnet_55("test-api-key".to_string());
         assert_eq!(sonnet_55.model(), MODEL_SONNET_55);
         let error = sonnet_55
             .validate_thinking_config(Some(&ThinkingConfig::new(10_000)))
-            .unwrap_err();
+            .err()
+            .context("budget thinking must be rejected on Sonnet 5.5")?;
         assert!(
             error.to_string().contains("ThinkingConfig::adaptive()"),
             "expected migration hint, got: {error}"
@@ -1627,6 +1632,7 @@ mod tests {
                 )))
                 .is_ok()
         );
+        Ok(())
     }
 
     #[test]
