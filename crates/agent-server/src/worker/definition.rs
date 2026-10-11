@@ -237,12 +237,23 @@ pub struct AgentDefinition {
     /// Invoked synchronously each time root provider messages are assembled:
     /// the initial request of every call and the rebuild after emergency
     /// compaction. Transport retries resend the same request without calling
-    /// it again. Returned non-blank text is wrapped
-    /// in `<system-reminder>` tags and appended after the request's last
-    /// message, behind the cached prompt prefix. The text is request-only:
-    /// it is never written to staged history, the journal, message
-    /// projections, checkpoints, or transcripts. Hosts with async state
-    /// should capture an `Arc` to a snapshot they keep current elsewhere.
+    /// it again. Returned non-blank text is wrapped in `<system-reminder>`
+    /// tags and merged into the request's last user message as its final
+    /// text block, after any `tool_result` blocks; when the request ends on
+    /// an assistant turn it is sent as a new user message instead. Anthropic
+    /// cache breakpoints stay ahead of it (see
+    /// [`ChatRequest::request_only_tail_blocks`](agent_sdk_foundation::llm::ChatRequest::request_only_tail_blocks)).
+    /// The text is request-only: it is never written to staged history, the
+    /// journal, message projections, checkpoints, or transcripts. Hosts with
+    /// async state should capture an `Arc` to a snapshot they keep current
+    /// elsewhere.
+    ///
+    /// On Anthropic models older than Claude Opus 4.5, a user message that
+    /// carries any block besides `tool_result` starts a new turn, and the API
+    /// strips the thinking blocks of earlier assistant turns. Context returned
+    /// for a [`ProviderRequestKind::Continuation`] request therefore drops the
+    /// in-progress turn's thinking on those models; hosts should return `None`
+    /// there and keep per-tool-round reminders to newer models.
     #[serde(skip)]
     pub request_context_fn: Option<RequestContextFn>,
     /// Extended thinking configuration.
