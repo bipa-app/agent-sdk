@@ -3412,20 +3412,33 @@ async fn anchor_selection_is_causal_by_covered_prefix() -> Result<()> {
 
 fn event_kind(event: &AgentEvent) -> &'static str {
     match event {
+        AgentEvent::ThreadCreated { .. } => "thread_created",
         AgentEvent::Start { .. } => "start",
-        AgentEvent::Text { .. } => "text",
-        AgentEvent::TextDelta { .. } => "text_delta",
+        AgentEvent::UserInput { .. } => "user_input",
         AgentEvent::Thinking { .. } => "thinking",
         AgentEvent::ThinkingDelta { .. } => "thinking_delta",
+        AgentEvent::TextDelta { .. } => "text_delta",
+        AgentEvent::Text { .. } => "text",
         AgentEvent::ToolCallStart { .. } => "tool_call_start",
         AgentEvent::ToolCallEnd { .. } => "tool_call_end",
+        AgentEvent::ToolProgress { .. } => "tool_progress",
+        AgentEvent::ToolRequiresConfirmation { .. } => "tool_requires_confirmation",
+        AgentEvent::QuestionAsked { .. } => "question_asked",
         AgentEvent::TurnComplete { .. } => "turn_complete",
         AgentEvent::Done { .. } => "done",
+        AgentEvent::BudgetExceeded { .. } => "budget_exceeded",
         AgentEvent::Error { .. } => "error",
-        AgentEvent::ContextCompacted { .. } => "context_compacted",
         AgentEvent::AutoRetryStart { .. } => "auto_retry_start",
         AgentEvent::AutoRetryEnd { .. } => "auto_retry_end",
-        _ => "other",
+        AgentEvent::AccountRotation { .. } => "account_rotation",
+        AgentEvent::AccountPoolExhausted { .. } => "account_pool_exhausted",
+        AgentEvent::Refusal { .. } => "refusal",
+        AgentEvent::Cancelled { .. } => "cancelled",
+        AgentEvent::ContextCompacted { .. } => "context_compacted",
+        AgentEvent::SubagentProgress { .. } => "subagent_progress",
+        // `AgentEvent` is `#[non_exhaustive]` in another crate, so a catch-all
+        // is mandatory; only a variant added after this list lands here.
+        _ => "unlisted_variant",
     }
 }
 
