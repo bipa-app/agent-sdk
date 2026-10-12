@@ -4532,7 +4532,7 @@ impl AgentTaskStore for SqliteDurableStore {
         }
         let failed = old
             .clone()
-            .fail_with_terminal_reason(error, TerminalReason::ConfirmationRejected, now)
+            .reject_confirmation(error, now)
             .context("reject_confirmation: fail transition failed")?;
         Self::update_task_tx(&mut tx, &failed).await?;
 

@@ -549,6 +549,8 @@ pub enum TaskSchemaError {
     AttemptExceedsMax { attempt: u32, max: u32 },
     #[error("Queued is only valid for root_turn tasks")]
     QueuedOnlyForRootTurns,
+    #[error("only a tool_runtime task's confirmation can be rejected (got {kind:?})")]
+    ConfirmationRejectedOnlyForToolRuntime { kind: TaskKind },
     #[error("invalid transition: {from:?} -> {to:?}")]
     InvalidTransition { from: TaskStatus, to: TaskStatus },
     #[error("heartbeat worker_id does not match the task's current lease")]
@@ -2176,6 +2178,37 @@ impl AgentTask {
     /// already in a terminal state.
     pub fn fail(self, error: String, now: OffsetDateTime) -> Result<Self, TaskSchemaError> {
         self.fail_with_terminal_reason(error, TerminalReason::InternalError, now)
+    }
+
+    /// Fail a tool child whose confirmation the user rejected.
+    ///
+    /// Only a tool child parks on a confirmation, and failing it this way
+    /// leaves its parent to fan in. A root or invocation ending here would
+    /// skip the settlement a root's own terminal transitions carry, so any
+    /// other kind is refused.
+    ///
+    /// # Errors
+    /// Returns [`TaskSchemaError::ConfirmationRejectedOnlyForToolRuntime`]
+    /// for any kind but [`TaskKind::ToolRuntime`], and
+    /// [`TaskSchemaError::InvalidTransition`] unless the task is awaiting
+    /// confirmation.
+    pub fn reject_confirmation(
+        self,
+        error: String,
+        now: OffsetDateTime,
+    ) -> Result<Self, TaskSchemaError> {
+        if self.kind != TaskKind::ToolRuntime {
+            return Err(TaskSchemaError::ConfirmationRejectedOnlyForToolRuntime {
+                kind: self.kind,
+            });
+        }
+        if self.status != TaskStatus::AwaitingConfirmation {
+            return Err(TaskSchemaError::InvalidTransition {
+                from: self.status,
+                to: TaskStatus::Failed,
+            });
+        }
+        self.fail_with_terminal_reason(error, TerminalReason::ConfirmationRejected, now)
     }
 
     /// Mark the task [`TaskStatus::Failed`] with an explicit typed reason.

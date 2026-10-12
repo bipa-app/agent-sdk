@@ -6378,7 +6378,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
 
         let failed = old
             .clone()
-            .fail_with_terminal_reason(error, TerminalReason::ConfirmationRejected, now)
+            .reject_confirmation(error, now)
             .context("reject_confirmation: fail transition failed")?;
         inner.rebalance_after_row_change(&old, &failed);
         inner.by_id.insert(failed.id.clone(), failed.clone());

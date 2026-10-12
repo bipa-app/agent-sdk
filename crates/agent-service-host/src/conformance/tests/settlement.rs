@@ -1014,6 +1014,39 @@ pub(super) async fn test_root_end_on_a_purging_thread_discards_undelivered_input
     Ok(())
 }
 
+/// Rejecting a confirmation fails a tool child and lets its parent fan in.
+/// A root paused on a confirmation is refused: failing it there would end
+/// the root without the settlement its own terminal transitions carry.
+pub(super) async fn test_reject_confirmation_refuses_a_root(
+    task_store: &dyn AgentTaskStore,
+) -> Result<()> {
+    let tid = "settle-reject-root";
+    let (root, worker, lease) = running_root(task_store, tid, 10_000).await?;
+    task_store
+        .pause_on_confirmation(
+            &root.id,
+            &worker,
+            &lease,
+            suspension_payload(tid).continuation,
+            None,
+            t_plus(10_002),
+        )
+        .await?;
+
+    let refused = task_store
+        .reject_confirmation(&root.id, "denied".to_owned(), t_plus(10_003))
+        .await;
+    assert!(
+        refused.is_err(),
+        "a root's confirmation must not be rejected: {refused:?}"
+    );
+    assert_eq!(
+        fetch(task_store, &root.id).await?.status,
+        TaskStatus::AwaitingConfirmation,
+    );
+    Ok(())
+}
+
 // ── Backend runners ──────────────────────────────────────────────────
 
 mod in_memory {
@@ -1085,6 +1118,12 @@ mod in_memory {
     }
 
     #[tokio::test]
+    async fn settlement_in_memory_reject_confirmation_refuses_a_root() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        super::test_reject_confirmation_refuses_a_root(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn settlement_in_memory_root_end_on_a_purging_thread_discards_input() -> Result<()> {
         let s = fresh_in_memory_stores();
         super::test_root_end_on_a_purging_thread_discards_undelivered_input(
@@ -1151,6 +1190,12 @@ mod sqlite {
     async fn settlement_sqlite_child_thread_root_end_discards_input() -> Result<()> {
         let store = store().await?;
         super::test_child_thread_root_end_discards_undelivered_input(&store, &store).await
+    }
+
+    #[tokio::test]
+    async fn settlement_sqlite_reject_confirmation_refuses_a_root() -> Result<()> {
+        let store = store().await?;
+        super::test_reject_confirmation_refuses_a_root(&store).await
     }
 
     #[tokio::test]
@@ -1892,6 +1937,14 @@ WHERE id = $1
             return Ok(());
         };
         super::test_child_thread_root_end_discards_undelivered_input(&store, &store).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_reject_confirmation_refuses_a_root() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        super::test_reject_confirmation_refuses_a_root(&store).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
