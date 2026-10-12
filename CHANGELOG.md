@@ -36,6 +36,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request shape. Gateway, fallback, router, credential-refresh, and
   record/replay wrappers propagate the operation, while unsupported providers
   return a typed capability error without fabricating vectors.
+- **Confirmation decision guard.** `GrpcTransport::with_confirmation_decision_guard`
+  registers a `ConfirmationDecisionGuard` (`agent_service_host::confirmation_guard`)
+  that sees each `DecideConfirmation` before anything applies: the parked task,
+  the call it awaits (`awaited_call`), the decision and the request's
+  `automatic` flag. A refusal leaves the task parked and fails with
+  `FAILED_PRECONDITION`; it runs before the idempotency claim, so a retry is
+  refused the same way.
+- **`DecideConfirmationRequest.automatic`** (`agent.service.v1`, field 5) marks
+  a decision no person made. An unset field encodes nothing, so stored
+  idempotency fingerprints are unchanged, but Rust struct literals of
+  `DecideConfirmationRequest` must add the field when they bump.
 
 ### Changed
 - **Breaking: a batch's mutating calls run alone and in model order.** A
@@ -199,6 +210,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PayloadRedactor`.
 
 ### Fixed
+
+- A task parked on one call of a multi-call batch now names its own call in
+  `ListThreadTasks`, `GetTask` and the `DecideConfirmation` response. Every
+  sibling used to name the batch's first call, because the snapshot read the
+  shared continuation's `awaiting_index`, so a person could be shown one tool
+  while approving another.
 
 - **Repeating tool-call ids from OpenAI-compatible gateways** - On routes
   other than `api.openai.com`, the Chat Completions and Responses providers

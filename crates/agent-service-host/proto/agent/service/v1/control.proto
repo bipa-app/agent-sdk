@@ -236,6 +236,11 @@ message DecideConfirmationRequest {
   string thread_id = 2;
   string task_id = 3;
   ConfirmationDecision decision = 4;
+
+  // True when no person made this decision (a standing or automatic
+  // approval). A host's ConfirmationDecisionGuard may refuse it; the field
+  // changes nothing on a host without one.
+  bool automatic = 5;
 }
 
 message DecideConfirmationResponse {
