@@ -11454,12 +11454,18 @@ mod tests {
             anyhow::bail!("two children must be spawned");
         };
         let key = |task: &AgentTask| (task.created_at, task.id.clone());
-        {
-            let inner = store.inner.read().await;
-            assert!(inner.runnable_by_created_at.contains(&key(first)));
-            assert!(!inner.runnable_by_created_at.contains(&key(held)));
-            assert!(inner.held_by_created_at.contains(&key(held)));
-        }
+        let inner = store.inner.read().await;
+        let indexed = (
+            inner.runnable_by_created_at.contains(&key(first)),
+            inner.runnable_by_created_at.contains(&key(held)),
+            inner.held_by_created_at.contains(&key(held)),
+        );
+        drop(inner);
+        assert_eq!(
+            indexed,
+            (true, false, true),
+            "(first in FIFO, held in FIFO, held in held index)"
+        );
 
         let claimed = store
             .try_acquire_task(
@@ -11492,8 +11498,12 @@ mod tests {
             .context("the released child must be reached")?;
         assert_eq!(leased.id, held.id);
         let inner = store.inner.read().await;
-        assert!(!inner.held_by_created_at.contains(&key(held)));
-        assert!(!inner.runnable_by_created_at.contains(&key(held)));
+        let indexed = (
+            inner.held_by_created_at.contains(&key(held)),
+            inner.runnable_by_created_at.contains(&key(held)),
+        );
+        drop(inner);
+        assert_eq!(indexed, (false, false), "a leased row leaves both indexes");
         Ok(())
     }
 

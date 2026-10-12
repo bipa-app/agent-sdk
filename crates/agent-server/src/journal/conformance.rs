@@ -301,6 +301,9 @@ mod in_memory_bundle {
                 .acquire_next_runnable(worker, lease, lease_expires_at, now)
                 .await
         }
+        async fn ready_held_children(&self, parent_id: &AgentTaskId) -> Result<Vec<AgentTaskId>> {
+            self.task.ready_held_children(parent_id).await
+        }
         async fn heartbeat_task(
             &self,
             task_id: &AgentTaskId,
