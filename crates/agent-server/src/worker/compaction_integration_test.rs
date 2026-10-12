@@ -2924,6 +2924,38 @@ async fn unstamped_user_input_of_another_task_does_not_suppress_the_prompt() -> 
     Ok(())
 }
 
+/// Multi-host: the committing worker's clock lags the admitting host's, so
+/// the task's own prompt carries a timestamp before `created_at`, and the
+/// worker crashed before opening any attempt row.
+#[tokio::test]
+async fn own_user_input_committed_before_created_at_is_not_duplicated() -> Result<()> {
+    let fixtures = Fixtures::new();
+    seed_projection_history(&fixtures.messages, &thread_id(), 2, "abc").await?;
+
+    let first = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    let task_id = first.id.clone();
+    assert_eq!(first.created_at, t0());
+    fixtures
+        .events
+        .commit_event(
+            &thread_id(),
+            ping_user_input().with_emitter_task_id(task_id.as_str()),
+            t0() - Duration::seconds(2),
+        )
+        .await?;
+
+    let retried = reacquire_after_lease_expiry(&fixtures, &task_id).await?;
+    run_ping_turn(&fixtures, retried).await?;
+
+    assert_eq!(
+        committed_user_input_emitters(&fixtures).await?,
+        vec![Some(task_id.as_str().to_owned())],
+        "a worker clock behind the admitting host's must not hide the task's \
+         own prompt from the re-acquire gate",
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn compaction_and_main_spend_bill_on_distinct_truthful_rows() -> Result<()> {
     let fixtures = Fixtures::new();

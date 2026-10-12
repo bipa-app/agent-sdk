@@ -2645,6 +2645,11 @@ async fn open_attempt(
 /// emitter stamp opened attempt 1 first and then committed the event
 /// unstamped. Without an attempt row only this task's stamped event counts;
 /// an unstamped one then belongs to another task.
+///
+/// The journal is matched by emitter alone, with no time bound: the event
+/// carries the committing worker's clock and `created_at` the admitting
+/// host's, so a bound would skip the event whenever the worker lags. Only a
+/// re-acquired task without any attempt row reads the whole thread.
 async fn user_input_already_committed(
     deps: &RootTurnDeps<'_>,
     thread_id: &agent_sdk_foundation::ThreadId,
@@ -2662,30 +2667,13 @@ async fn user_input_already_committed(
     if has_attempt_row {
         return Ok(true);
     }
-    let Some(first_sequence) = deps
+    let events = deps
         .event_repo
-        .min_sequence_at_or_after(thread_id, task.created_at)
+        .get_events(thread_id)
         .await
-        .context("locate the first event since the task was created")?
-    else {
-        return Ok(false);
-    };
-    let events = match first_sequence.checked_sub(1) {
-        Some(after_sequence) => {
-            let next_sequence = deps
-                .event_repo
-                .next_sequence(thread_id)
-                .await
-                .context("read the journal high-water mark for the user-input gate")?;
-            deps.event_repo
-                .get_events_in_range(thread_id, after_sequence, next_sequence.saturating_sub(1))
-                .await
-        }
-        None => deps.event_repo.get_events(thread_id).await,
-    }
-    .context("load events for the user-input gate")?;
+        .context("load events for the user-input gate")?;
     let task_id = task.id.as_str();
-    Ok(events.iter().any(|committed| {
+    Ok(events.iter().rev().any(|committed| {
         matches!(committed.event, AgentEvent::UserInput { .. })
             && committed.event.emitter_task_id() == Some(task_id)
     }))
