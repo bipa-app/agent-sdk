@@ -100,7 +100,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is opt-in via `with_transport(CodexTransport::WebSocket)`. Both transports
   derive prompt-cache affinity (`prompt_cache_key`, `session_id`) from
   `ChatRequest::session_id` and replay the `x-codex-turn-state` sticky-routing
-  token only within one user turn.
+  token on a turn's tool-result follow-ups, never into the next turn. A retry
+  of a turn's opening request, or a plain user message appended mid-turn,
+  starts without it.
 - `OpenAIResponsesProvider` sends `prompt_cache_key` only to the official
   `api.openai.com` base URL, matching the Chat Completions provider.
 - The durable worker sends the thread id as `ChatRequest::session_id` on

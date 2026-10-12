@@ -192,9 +192,12 @@ struct WebsocketSessionState {
 }
 
 impl WebsocketSessionState {
-    /// The `x-codex-turn-state` sticky-routing token belongs to one user turn:
-    /// Codex replays it on that turn's tool-result follow-ups and retries and
-    /// must not carry it into the next turn.
+    /// The `x-codex-turn-state` sticky-routing token belongs to one user turn
+    /// and must not be carried into the next. Only the caller knows where a
+    /// turn starts, so the token is replayed only on requests whose last
+    /// message carries tool results: a turn's tool-result follow-ups and their
+    /// retries. Every other request starts without it, including a retry of a
+    /// turn's opening request and a plain user message appended mid-turn.
     fn begin_request(&mut self, request: &ChatRequest) {
         self.last_used = Some(Instant::now());
         if !continues_user_turn(request) {
@@ -5451,9 +5454,9 @@ mod tests {
         request
     }
 
-    #[tokio::test]
-    async fn http_turn_state_is_replayed_within_a_turn_and_reset_for_the_next() -> anyhow::Result<()>
-    {
+    async fn http_turn_states_sent(
+        requests: Vec<ChatRequest>,
+    ) -> anyhow::Result<Vec<Option<String>>> {
         let server = wiremock::MockServer::start().await;
         let sse_with_turn_state = |turn_state: &str| {
             wiremock::ResponseTemplate::new(200)
@@ -5481,15 +5484,9 @@ mod tests {
             format!("{}/backend-api", server.uri()),
         );
 
-        for request in [
-            streaming_request("thread-a"),
-            tool_followup_request("thread-a"),
-            tool_followup_request("thread-a"),
-            tool_followup_request("thread-b"),
-            next_user_turn_request("thread-a"),
-        ] {
+        for request in requests {
             let outcome = provider.chat(request).await?;
-            assert!(
+            anyhow::ensure!(
                 matches!(outcome, ChatOutcome::Success(_)),
                 "turn did not complete: {outcome:?}"
             );
@@ -5499,20 +5496,62 @@ mod tests {
             .received_requests()
             .await
             .context("mock server did not record requests")?;
-        let sent_turn_states: Vec<Option<&str>> = received
+        Ok(received
             .iter()
             .map(|request| {
                 request
                     .headers
                     .get(OPENAI_CODEX_TURN_STATE_HEADER)
                     .and_then(|value| value.to_str().ok())
+                    .map(ToOwned::to_owned)
             })
-            .collect();
+            .collect())
+    }
+
+    #[tokio::test]
+    async fn http_turn_state_is_replayed_within_a_turn_and_reset_for_the_next() -> anyhow::Result<()>
+    {
+        let sticky = Some("sticky-abc".to_owned());
         assert_eq!(
-            sent_turn_states,
-            vec![None, Some("sticky-abc"), Some("sticky-abc"), None, None,],
+            http_turn_states_sent(vec![
+                streaming_request("thread-a"),
+                tool_followup_request("thread-a"),
+                tool_followup_request("thread-a"),
+                tool_followup_request("thread-b"),
+                next_user_turn_request("thread-a"),
+            ])
+            .await?,
+            vec![None, sticky.clone(), sticky, None, None],
             "thread-a's tool follow-ups replay the turn's first token, thread-b never \
              sees it, and thread-a's next user turn starts without it"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_turn_state_is_not_replayed_when_the_request_ends_in_plain_user_text()
+    -> anyhow::Result<()> {
+        assert_eq!(
+            http_turn_states_sent(vec![
+                streaming_request("thread-retry"),
+                streaming_request("thread-retry"),
+            ])
+            .await?,
+            vec![None, None],
+            "a retried opening request looks like a new turn, so it starts without the token"
+        );
+
+        let mut reminder = tool_followup_request("thread-reminder");
+        reminder.messages.push(Message::user("Two turns left."));
+        assert_eq!(
+            http_turn_states_sent(vec![
+                streaming_request("thread-reminder"),
+                tool_followup_request("thread-reminder"),
+                reminder,
+            ])
+            .await?,
+            vec![None, Some("sticky-abc".to_owned()), None],
+            "a plain user message after tool results looks like a new turn's prompt"
         );
         Ok(())
     }
