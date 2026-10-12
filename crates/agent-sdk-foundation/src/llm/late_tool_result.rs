@@ -38,6 +38,16 @@ pub enum LateToolResultStatus {
 }
 
 impl LateToolResultStatus {
+    fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "success" => Some(Self::Success),
+            "error" => Some(Self::Error),
+            "cancelled" => Some(Self::Cancelled),
+            "still_running" => Some(Self::StillRunning),
+            _ => None,
+        }
+    }
+
     const fn label(self) -> &'static str {
         match self {
             Self::Success => "success",
@@ -84,10 +94,10 @@ pub fn render(call: &PendingToolCallInfo, status: LateToolResultStatus, output: 
 }
 
 /// The `tool_use_id` a late result block names, or `None` when `text` is
-/// not a late result block.
+/// not exactly a block [`render`] produced.
 #[must_use]
 pub fn tool_use_id(text: &str) -> Option<String> {
-    attribute(header(text)?, "tool_use_id").map(unescape_attribute)
+    canonical(text).map(|block| block.tool_use_id)
 }
 
 /// The output a late result block carries, exactly as rendered.
@@ -97,9 +107,41 @@ pub fn tool_use_id(text: &str) -> Option<String> {
 /// verified against its durable artifact.
 #[must_use]
 pub fn output(text: &str) -> Option<&str> {
-    let after_header = text.get(OPEN_TAG.len() + header(text)?.len()..)?;
-    let (_, body) = after_header.split_once(OUTPUT_MARKER)?;
-    body.strip_suffix(CLOSE_TAG)
+    canonical(text).map(|block| block.output)
+}
+
+struct Canonical<'a> {
+    tool_use_id: String,
+    output: &'a str,
+}
+
+/// Parse `text` only when it is laid out exactly as [`render`] writes it:
+/// the escaped header, the summary for its status, one input line, the
+/// output, and the closing tag. Text that merely starts with the tag — a
+/// quoted header, a question about one — is not a late result.
+fn canonical(text: &str) -> Option<Canonical<'_>> {
+    let attributes = header(text)?;
+    let tool_use_id = unescape_attribute(attribute(attributes, "tool_use_id")?);
+    let name = unescape_attribute(attribute(attributes, "name")?);
+    let label = attribute(attributes, "status")?;
+    let status = LateToolResultStatus::from_label(label)?;
+    let id = escape_attribute(&tool_use_id);
+    let name = escape_attribute(&name);
+    let lead = format!(
+        "{OPEN_TAG}tool_use_id=\"{id}\" name=\"{name}\" status=\"{label}\">\n{summary}\ninput: ",
+        summary = status.summary(&name, &id),
+    );
+    let (input, rest) = text
+        .strip_prefix(lead.as_str())?
+        .split_once(OUTPUT_MARKER)?;
+    if input.contains('\n') {
+        return None;
+    }
+    let output = rest.strip_suffix(CLOSE_TAG)?;
+    Some(Canonical {
+        tool_use_id,
+        output,
+    })
 }
 
 fn header(text: &str) -> Option<&str> {
@@ -280,6 +322,26 @@ mod tests {
         assert!(!running.contains("its effects"), "{running}");
         let done = render(&call("call_1", "bash"), LateToolResultStatus::Error, "boom");
         assert!(done.contains("do not call it again"));
+    }
+
+    #[test]
+    fn only_the_exact_rendering_is_a_late_result() {
+        let rendered = render(
+            &call("call_1", "bash"),
+            LateToolResultStatus::Success,
+            "done",
+        );
+        assert_eq!(tool_use_id(&rendered).as_deref(), Some("call_1"));
+
+        let header_only = "<late_tool_result tool_use_id=\"call_1\" name=\"bash\" \
+                           status=\"success\">\nwhat does this result mean?";
+        let reworded = rendered.replace("do not call it again", "call it again");
+        let unknown_status = rendered.replace("status=\"success\"", "status=\"done\"");
+        let truncated = rendered.trim_end_matches("</late_tool_result>").to_owned();
+        for echo in [header_only, &reworded, &unknown_status, &truncated] {
+            assert_eq!(tool_use_id(echo), None, "{echo}");
+            assert_eq!(output(echo), None, "{echo}");
+        }
     }
 
     #[test]

@@ -75,7 +75,8 @@ use crate::journal::execution_context::RootWorkerInputs;
 use crate::journal::message_store::MessageProjectionStore;
 use crate::journal::store::{AgentTaskStore, QuestionPause, ReattachedChild};
 use crate::journal::task::{
-    AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskStatus, WorkerId,
+    AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskKind, TaskStatus,
+    WorkerId,
 };
 use crate::journal::task_state::TaskState;
 use crate::journal::task_wakeup::WakeupSignal;
@@ -1966,9 +1967,16 @@ async fn execute_root_turn_inner(
     // Capture a post-LLM timestamp so the turn attempt's duration_ms
     // reflects actual wall-clock latency instead of always being 0.
     let commit_now = OffsetDateTime::now_utc();
-    // A suspension carries only `staged_prefix`, not the staged draft, so
-    // the closures must lead there too.
-    let staged_prefix = closing.into_iter().chain(staged_prefix).collect();
+    let suspends = response_requests_tool_dispatch(&response);
+    let staged_prefix = if suspends {
+        closures_for_suspension(closing, thread_id, deps)
+            .await?
+            .into_iter()
+            .chain(staged_prefix)
+            .collect()
+    } else {
+        staged_prefix
+    };
     let close_ctx = TurnCloseContext {
         content_ids,
         user_input_committed,
@@ -1985,7 +1993,7 @@ async fn execute_root_turn_inner(
     // Start was committed in step 2 (before streaming).  The branches
     // commit only the consolidated content events, `TurnComplete`, and
     // `Done` — atomically, with the message-projection write.
-    if response_requests_tool_dispatch(&response) {
+    if suspends {
         return Box::pin(suspend_at_tool_boundary(
             inputs,
             &close_input,
@@ -8231,11 +8239,15 @@ pub async fn resume_from_question(
 /// result — and explicit that the call must not be issued again: its
 /// real result arrives at a later fan-in as a late result (see
 /// [`llm::late_tool_result`]).
-fn steering_interim_tool_result(child_id: &AgentTaskId) -> ToolResult {
+pub(crate) fn steering_interim_tool_result(
+    tool_use_id: &str,
+    child_id: &AgentTaskId,
+) -> ToolResult {
     let payload = serde_json::json!({
         "kind": INTERIM_KIND,
         "status": "running",
         "child_task_id": child_id.as_str(),
+        "binding": interim_binding(tool_use_id, child_id),
         "note": INTERIM_NOTE,
     });
     ToolResult {
@@ -8251,44 +8263,39 @@ fn steering_interim_tool_result(child_id: &AgentTaskId) -> ToolResult {
 const INTERIM_KIND: &str = "interim_tool_result";
 const INTERIM_NOTE: &str = "This call is still executing. Do not call it again: it keeps running, and its final result will be delivered automatically in a later message as a late_tool_result for this tool_use_id.";
 
-/// The note of the interim payload written before it carried a `kind` and
-/// the child's id. Rows parked by that build still hold it, so it stays
-/// frozen even if [`INTERIM_NOTE`] changes.
-const UNMARKED_INTERIM_NOTE: &str = "This call is still executing. Do not call it again: it keeps running, and its final result will be delivered automatically in a later message as a late_tool_result for this tool_use_id.";
+const INTERIM_BINDING_NAMESPACE: Uuid = Uuid::from_u128(0x5c1e_7a0d_3f84_4b62_9e1a_c4d7_0b38_f215);
 
-static UNMARKED_INTERIM: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(|| {
-    serde_json::json!({
-        "status": "running",
-        "note": UNMARKED_INTERIM_NOTE,
-    })
-});
+/// Server-derived token binding an interim answer to the call it answers
+/// and the child running that call, so a tool whose output imitates the
+/// interim payload is not taken for one.
+fn interim_binding(tool_use_id: &str, child_id: &AgentTaskId) -> String {
+    let name = format!("{}\n{tool_use_id}", child_id.as_str());
+    Uuid::new_v5(&INTERIM_BINDING_NAMESPACE, name.as_bytes()).to_string()
+}
 
 /// An interim `tool_result` found in a transcript.
 pub(crate) struct InterimAnswer {
-    /// The child running the call; `None` for an unmarked interim.
-    pub(crate) child_task_id: Option<AgentTaskId>,
+    /// The child running the call.
+    pub(crate) child_task_id: AgentTaskId,
 }
 
-/// Recognize `content` as an interim answer by its `kind` discriminator,
-/// or as the unmarked payload (compared as JSON, so key order does not
-/// matter).
-pub(crate) fn interim_answer(content: &str) -> Option<InterimAnswer> {
-    if !content.starts_with('{')
-        || !(content.contains(INTERIM_KIND) || content.contains(UNMARKED_INTERIM_NOTE))
-    {
+/// Recognize `content`, the `tool_result` for `tool_use_id`, as an interim
+/// answer: it carries the `kind` discriminator and the binding derived for
+/// this call and the child it names. Whether that child really ran an
+/// earlier root turn's call on this thread is checked against the store
+/// (see [`undelivered_call_closures`]).
+pub(crate) fn interim_answer(tool_use_id: &str, content: &str) -> Option<InterimAnswer> {
+    if !content.starts_with('{') || !content.contains(INTERIM_KIND) {
         return None;
     }
     let value: serde_json::Value = serde_json::from_str(content).ok()?;
-    if value.get("kind").and_then(serde_json::Value::as_str) == Some(INTERIM_KIND) {
-        let child_task_id = value
-            .get("child_task_id")
-            .and_then(serde_json::Value::as_str)
-            .map(AgentTaskId::from_string);
-        return Some(InterimAnswer { child_task_id });
+    let field = |key: &str| value.get(key).and_then(serde_json::Value::as_str);
+    if field("kind") != Some(INTERIM_KIND) {
+        return None;
     }
-    (value == *UNMARKED_INTERIM).then_some(InterimAnswer {
-        child_task_id: None,
-    })
+    let child_task_id = AgentTaskId::from_string(field("child_task_id")?);
+    (field("binding") == Some(interim_binding(tool_use_id, &child_task_id).as_str()))
+        .then_some(InterimAnswer { child_task_id })
 }
 
 /// A child still running at early-resume time. It stays bound to its
@@ -8437,7 +8444,10 @@ async fn build_steering_interim(
             }
         } else {
             if !already_answered {
-                tool_results.push((call.id.clone(), steering_interim_tool_result(&child.id)));
+                tool_results.push((
+                    call.id.clone(),
+                    steering_interim_tool_result(&call.id, &child.id),
+                ));
             }
             surviving.push(SurvivingChild {
                 child_id: child.id.clone(),
@@ -8497,72 +8507,41 @@ fn fan_in_blocks(
 /// the thread has ended, so an interim-only call it finds can no longer be
 /// answered by its own turn.
 ///
-/// Interim answers are read from the raw history plus the draft: compaction
-/// folds the draft into the raw history but never rewrites it, so a
-/// compacted turn still closes its calls. A late result in the raw history
-/// closes its call for good. One still only in the draft — a failed turn's
-/// fan-in, or a closure an earlier attempt of this turn persisted — is
-/// `carried` rather than rendered again: the draft is already staged, but a
-/// suspension would drop it.
+/// The scan rules are in [`scan_transcript`]. An interim must also name a
+/// tool or subagent child this server spawned: a child of an ended root
+/// turn on this thread is closed with its own state, one on another thread
+/// (the transcript was forked) is closed `still_running` without reading
+/// its result, and an unknown child is not an interim at all.
 async fn undelivered_call_closures(
     thread_id: &agent_sdk_foundation::ThreadId,
     raw: &[llm::Message],
     draft: &[llm::Message],
     task_store: &dyn AgentTaskStore,
 ) -> UndeliveredCallClosures {
-    let mut interim: Vec<(String, Option<AgentTaskId>)> = Vec::new();
-    let mut seen = BTreeSet::new();
-    for block in raw.iter().chain(draft).flat_map(message_blocks) {
-        if let llm::ContentBlock::ToolResult {
-            tool_use_id,
-            content,
-            ..
-        } = block
-            && let Some(answer) = interim_answer(content)
-            && seen.insert(tool_use_id.clone())
-        {
-            interim.push((tool_use_id.clone(), answer.child_task_id));
-        }
-    }
-    let late_result_id = |block: &llm::ContentBlock| match block {
-        llm::ContentBlock::Text { text } => llm::late_tool_result::tool_use_id(text),
-        _ => None,
+    let scan = scan_transcript(raw, draft);
+    let mut closures = UndeliveredCallClosures {
+        carried: scan
+            .carried
+            .iter()
+            .map(|(_, block)| (*block).clone())
+            .collect(),
+        new: Vec::new(),
     };
-    let committed: BTreeSet<String> = raw
-        .iter()
-        .flat_map(message_blocks)
-        .filter_map(late_result_id)
-        .collect();
-    interim.retain(|(id, _)| !committed.contains(id));
-    let mut closures = UndeliveredCallClosures::default();
-    if interim.is_empty() {
-        return closures;
-    }
-
-    let mut carried_ids = BTreeSet::new();
-    for block in draft.iter().flat_map(message_blocks) {
-        if let Some(id) = late_result_id(block)
-            && interim.iter().any(|(open, _)| *open == id)
-            && carried_ids.insert(id)
-        {
-            closures.carried.push(block.clone());
+    let mut late = Vec::new();
+    for (id, child_id) in scan.open {
+        if scan.carried.iter().any(|(carried, _)| *carried == id) {
+            continue;
         }
-    }
-    interim.retain(|(id, _)| !carried_ids.contains(id));
-
-    let mut calls: BTreeMap<&str, (&str, &serde_json::Value)> = BTreeMap::new();
-    for block in raw.iter().chain(draft).flat_map(message_blocks) {
-        if let llm::ContentBlock::ToolUse {
-            id, name, input, ..
-        } = block
-            && interim.iter().any(|(open, _)| open == id)
-        {
-            calls.entry(id.as_str()).or_insert((name.as_str(), input));
-        }
-    }
-    let mut late = Vec::with_capacity(interim.len());
-    for (id, child_task_id) in interim {
-        let (name, input) = calls
+        let child = match interim_child(thread_id, &child_id, task_store).await {
+            Ok(Some(child)) => child,
+            Ok(None) => continue,
+            Err(error) => {
+                log::warn!("closing late results: check child {child_id} failed: {error:#}");
+                continue;
+            }
+        };
+        let (name, input) = scan
+            .calls
             .get(id.as_str())
             .map_or(("unknown", &serde_json::Value::Null), |(name, input)| {
                 (*name, *input)
@@ -8576,23 +8555,143 @@ async fn undelivered_call_closures(
             effective_input: serde_json::Value::Null,
             listen_context: None,
         };
-        let child = match child_task_id {
-            Some(child_id) => task_store
-                .get(&child_id)
-                .await
-                .ok()
-                .flatten()
-                .filter(|child| child.thread_id == *thread_id && child.parent_id.is_some()),
-            None => None,
-        };
-        late.push(late_result_after_turn_ended(call, child.as_ref()));
+        late.push(late_result_after_turn_ended(call, child));
     }
     closures.new = fan_in_blocks(&[], &late, &[]);
     closures
 }
 
+/// What the child an interim names tells the closure.
+enum InterimChild {
+    /// A child of an ended root turn on this thread: report its state.
+    OnThisThread(Box<AgentTask>),
+    /// A child on another thread, as in a forked transcript: its result is
+    /// not this thread's to deliver.
+    Elsewhere,
+}
+
+/// Resolve the child an interim names, or `None` when this server never
+/// spawned it as a call of an earlier root turn.
+async fn interim_child(
+    thread_id: &agent_sdk_foundation::ThreadId,
+    child_id: &AgentTaskId,
+    task_store: &dyn AgentTaskStore,
+) -> Result<Option<InterimChild>> {
+    let Some(child) = task_store.get(child_id).await? else {
+        return Ok(None);
+    };
+    let spawned_for_a_call = match child.kind {
+        TaskKind::ToolRuntime | TaskKind::Subagent => true,
+        TaskKind::RootTurn | TaskKind::InputInjection => false,
+    };
+    let Some(parent_id) = child.parent_id.as_ref().filter(|_| spawned_for_a_call) else {
+        return Ok(None);
+    };
+    if child.thread_id != *thread_id {
+        return Ok(Some(InterimChild::Elsewhere));
+    }
+    let Some(parent) = task_store.get(parent_id).await? else {
+        return Ok(None);
+    };
+    let parent_turn_ended = parent.kind == TaskKind::RootTurn
+        && parent.thread_id == *thread_id
+        && parent.status.is_terminal();
+    Ok(parent_turn_ended.then(|| InterimChild::OnThisThread(Box::new(child))))
+}
+
+/// What a scan of the thread's transcript finds for the starting turn.
+struct TranscriptScan<'a> {
+    /// Interim-answered calls with no late result in the raw history, in
+    /// transcript order, with the child each one names.
+    open: Vec<(String, AgentTaskId)>,
+    /// Late results for open calls that sit only in the draft — a failed
+    /// turn's fan-in, or a closure an earlier attempt of this turn
+    /// persisted. The draft is already staged, but a suspension drops it.
+    carried: Vec<(String, &'a llm::ContentBlock)>,
+    /// Calls closed by a late result in the raw history.
+    delivered: BTreeSet<String>,
+    /// Each open call's tool name and input, from its `tool_use`.
+    calls: BTreeMap<&'a str, (&'a str, &'a serde_json::Value)>,
+}
+
+/// Scan the raw history and then the draft. Compaction folds the draft
+/// into the raw history but never rewrites it, so a compacted turn still
+/// shows every interim answer.
+///
+/// Only server-written blocks count: an interim is a user-message
+/// `tool_result` carrying the binding for its own call (see
+/// [`interim_answer`]), and each child may answer one call. A late result
+/// is a user-message text block laid out exactly as the server renders
+/// it, for a call already answered with an interim earlier in the
+/// transcript. A model reply or a user prompt that quotes either one
+/// therefore never opens or closes a call.
+fn scan_transcript<'a>(raw: &'a [llm::Message], draft: &'a [llm::Message]) -> TranscriptScan<'a> {
+    let mut interim_calls = BTreeSet::new();
+    let mut claimed_children = BTreeSet::new();
+    let mut open = Vec::new();
+    let mut carried: Vec<(String, &llm::ContentBlock)> = Vec::new();
+    let mut delivered = BTreeSet::new();
+    let messages = raw
+        .iter()
+        .map(|message| (true, message))
+        .chain(draft.iter().map(|message| (false, message)));
+    for (in_raw, message) in messages {
+        if message.role != llm::Role::User {
+            continue;
+        }
+        for block in message_blocks(message) {
+            match block {
+                llm::ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => {
+                    if !interim_calls.contains(tool_use_id)
+                        && let Some(answer) = interim_answer(tool_use_id, content)
+                        && claimed_children.insert(answer.child_task_id.clone())
+                    {
+                        interim_calls.insert(tool_use_id.clone());
+                        open.push((tool_use_id.clone(), answer.child_task_id));
+                    }
+                }
+                llm::ContentBlock::Text { text } => {
+                    if let Some(id) = llm::late_tool_result::tool_use_id(text)
+                        && interim_calls.contains(&id)
+                        && !delivered.contains(&id)
+                    {
+                        if in_raw {
+                            delivered.insert(id);
+                        } else if !carried.iter().any(|(carried, _)| *carried == id) {
+                            carried.push((id, block));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    open.retain(|(id, _)| !delivered.contains(id));
+    carried.retain(|(id, _)| !delivered.contains(id));
+
+    let mut calls = BTreeMap::new();
+    for block in raw.iter().chain(draft).flat_map(message_blocks) {
+        if let llm::ContentBlock::ToolUse {
+            id, name, input, ..
+        } = block
+            && open.iter().any(|(open, _)| open == id)
+        {
+            calls.entry(id.as_str()).or_insert((name.as_str(), input));
+        }
+    }
+    TranscriptScan {
+        open,
+        carried,
+        delivered,
+        calls,
+    }
+}
+
 /// What [`undelivered_call_closures`] found for the starting turn.
-#[derive(Default)]
 struct UndeliveredCallClosures {
     /// Late results already in the draft for calls the committed history
     /// leaves open.
@@ -8601,10 +8700,7 @@ struct UndeliveredCallClosures {
     new: Vec<llm::ContentBlock>,
 }
 
-fn late_result_after_turn_ended(
-    call: PendingToolCallInfo,
-    child: Option<&AgentTask>,
-) -> LateToolResult {
+fn late_result_after_turn_ended(call: PendingToolCallInfo, child: InterimChild) -> LateToolResult {
     let undelivered = |status, output: String| LateToolResult {
         call: call.clone(),
         status,
@@ -8618,18 +8714,20 @@ fn late_result_after_turn_ended(
         },
     };
     match child {
-        Some(child) if child.status.is_terminal() => match extract_child_tool_result(child) {
-            Ok(result) => LateToolResult {
-                status: late_status(Some(child.status), &result),
-                call,
-                result,
-            },
-            Err(error) => undelivered(
-                LateToolResultStatus::Error,
-                format!("The call finished, but its result could not be read: {error:#}"),
-            ),
-        },
-        Some(_) | None => undelivered(
+        InterimChild::OnThisThread(child) if child.status.is_terminal() => {
+            match extract_child_tool_result(&child) {
+                Ok(result) => LateToolResult {
+                    status: late_status(Some(child.status), &result),
+                    call,
+                    result,
+                },
+                Err(error) => undelivered(
+                    LateToolResultStatus::Error,
+                    format!("The call finished, but its result could not be read: {error:#}"),
+                ),
+            }
+        }
+        InterimChild::OnThisThread(_) | InterimChild::Elsewhere => undelivered(
             LateToolResultStatus::StillRunning,
             "The turn waiting on this call ended before its result arrived.".to_owned(),
         ),
@@ -8679,6 +8777,40 @@ async fn close_undelivered_calls(
             .context("stage closing late results")?;
     }
     carried.extend(new);
+    Ok((!carried.is_empty()).then(|| llm::Message::user_with_content(carried)))
+}
+
+/// The turn's closures that a suspension must carry: a suspension keeps
+/// only its `suspended_messages`, not the staged draft. Decided now, against
+/// the raw history as it stands at suspension: a closure that compaction
+/// already folded into it is durable there, and carrying it too would
+/// deliver it twice.
+async fn closures_for_suspension(
+    closing: Option<llm::Message>,
+    thread_id: &agent_sdk_foundation::ThreadId,
+    deps: &RootTurnDeps<'_>,
+) -> Result<Option<llm::Message>> {
+    let Some(closing) = closing else {
+        return Ok(None);
+    };
+    let raw = deps
+        .message_store
+        .get(thread_id)
+        .await
+        .context("read raw history before carrying closures")?
+        .map(|projection| projection.messages)
+        .unwrap_or_default();
+    let delivered = scan_transcript(&raw, &[]).delivered;
+    let carried: Vec<llm::ContentBlock> = message_blocks(&closing)
+        .iter()
+        .filter(|block| match block {
+            llm::ContentBlock::Text { text } => {
+                llm::late_tool_result::tool_use_id(text).is_none_or(|id| !delivered.contains(&id))
+            }
+            _ => true,
+        })
+        .cloned()
+        .collect();
     Ok((!carried.is_empty()).then(|| llm::Message::user_with_content(carried)))
 }
 
