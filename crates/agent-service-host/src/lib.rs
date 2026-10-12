@@ -67,6 +67,7 @@
 pub mod broker;
 pub mod collector_event_store;
 pub mod config;
+pub mod confirmation_guard;
 pub mod grpc;
 pub mod health;
 pub mod host;

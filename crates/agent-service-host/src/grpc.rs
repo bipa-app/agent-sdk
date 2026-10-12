@@ -53,6 +53,9 @@ use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
 use crate::config::{AdmissionConfig, ServiceConfig};
+use crate::confirmation_guard::{
+    ConfirmationDecisionGuard, ConfirmationDecisionRequest, awaited_call,
+};
 use crate::health::HealthSurface;
 use crate::host::ServiceHost;
 use crate::proto::agent::service::v1 as pb;
@@ -144,6 +147,7 @@ struct GrpcShared {
     /// activity for a probed subtree.
     heartbeat_interval: std::time::Duration,
     admission: AdmissionConfig,
+    confirmation_guard: Option<Arc<dyn ConfirmationDecisionGuard>>,
 }
 
 impl GrpcShared {
@@ -164,6 +168,7 @@ impl GrpcShared {
             lease_duration,
             heartbeat_interval,
             admission,
+            confirmation_guard: None,
         }
     }
 
@@ -317,16 +322,13 @@ impl GrpcShared {
                 continuation,
                 prepared_operation,
             } => {
-                let pending_tool = continuation
-                    .payload
-                    .pending_tool_calls
-                    .get(continuation.payload.awaiting_index)
-                    .ok_or_else(|| {
-                        Status::internal(format!(
-                            "task {} awaiting confirmation without pending tool at index {}",
-                            task.id, continuation.payload.awaiting_index
-                        ))
-                    })?;
+                let pending_tool = awaited_call(task).ok_or_else(|| {
+                    Status::internal(format!(
+                        "task {} awaiting confirmation names no pending tool (spawn index {:?}, \
+                         awaiting index {})",
+                        task.id, task.spawn_index, continuation.payload.awaiting_index
+                    ))
+                })?;
                 let description = self
                     .resolve_tool_description(task, &pending_tool.name)
                     .await;
@@ -1254,6 +1256,52 @@ impl GrpcControlService {
         Ok((task, parent_task))
     }
 
+    /// Run the host's [`ConfirmationDecisionGuard`] on a decision for a task
+    /// that is still parked. It runs before the idempotency claim, so a
+    /// refusal reserves nothing and a retry gets the same refusal. A task
+    /// that is missing, foreign, or no longer parked is left to the claim
+    /// (a replay) and to [`Self::run_confirmation_decision`] (the errors).
+    async fn check_confirmation_guard(
+        &self,
+        request: &pb::DecideConfirmationRequest,
+        thread_id: &ThreadId,
+        task_id: &AgentTaskId,
+    ) -> RpcResult<()> {
+        let Some(guard) = &self.shared.confirmation_guard else {
+            return Ok(());
+        };
+        let Some(task) = self
+            .shared
+            .stores
+            .task_store
+            .get(task_id)
+            .await
+            .map_err(internal_status("loading confirmation task"))?
+        else {
+            return Ok(());
+        };
+        if task.thread_id != *thread_id
+            || !matches!(task.state, TaskState::AwaitingConfirmation { .. })
+        {
+            return Ok(());
+        }
+        let decision = map_confirmation_decision(
+            request
+                .decision
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("confirmation decision is required"))?,
+        )?;
+        guard
+            .check(&ConfirmationDecisionRequest::new(
+                thread_id,
+                &task,
+                &decision,
+                request.automatic,
+            ))
+            .map_err(Status::failed_precondition)?;
+        Ok(())
+    }
+
     async fn run_confirmation_decision(
         &self,
         request: &pb::DecideConfirmationRequest,
@@ -1892,6 +1940,8 @@ impl AgentControlService for GrpcControlService {
         let thread_id = parse_thread_id(&request.thread_id)?;
         let task_id = parse_task_id(&request.task_id)?;
         let fingerprint = decide_confirmation_fingerprint(&request);
+        self.check_confirmation_guard(&request, &thread_id, &task_id)
+            .await?;
 
         // Durable idempotency replay (Phase 10 · E): a retried decision
         // — even across a restart — applies the decision exactly once.
@@ -2670,6 +2720,18 @@ impl GrpcTransport {
                 admission,
             )),
         }
+    }
+
+    /// Check every `DecideConfirmation` with `guard` before it applies; a
+    /// refused decision changes nothing and fails with
+    /// `FAILED_PRECONDITION`.
+    #[must_use]
+    pub fn with_confirmation_decision_guard(
+        mut self,
+        guard: Arc<dyn ConfirmationDecisionGuard>,
+    ) -> Self {
+        Arc::make_mut(&mut self.shared).confirmation_guard = Some(guard);
+        self
     }
 
     /// # Errors
@@ -6387,6 +6449,7 @@ mod tests {
                         pb::ApprovedConfirmation {},
                     )),
                 }),
+                automatic: false,
             })
             .await
             .context("decide_confirmation rpc")?
@@ -8708,6 +8771,345 @@ mod tests {
         }
     }
 
+    fn approval_request(
+        request_id: &str,
+        thread_id: &str,
+        task_id: &str,
+        automatic: bool,
+    ) -> pb::DecideConfirmationRequest {
+        pb::DecideConfirmationRequest {
+            request_id: request_id.into(),
+            thread_id: thread_id.into(),
+            task_id: task_id.into(),
+            decision: Some(pb::ConfirmationDecision {
+                decision: Some(pb::confirmation_decision::Decision::Approved(
+                    pb::ApprovedConfirmation {},
+                )),
+            }),
+            automatic,
+        }
+    }
+
+    /// Refuses an automatic approval, naming the call the task awaits.
+    struct RefuseAutomaticApproval;
+
+    impl ConfirmationDecisionGuard for RefuseAutomaticApproval {
+        fn check(&self, request: &ConfirmationDecisionRequest<'_>) -> Result<(), String> {
+            let name = request.awaited_call.map_or("", |call| call.name.as_str());
+            if request.automatic && matches!(request.decision, ConfirmationDecision::Approved) {
+                return Err(format!("{name} needs a person"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Start a host and a transport with [`RefuseAutomaticApproval`]
+    /// registered, the way `LocalDaemon` assembles them.
+    async fn start_guarded_daemon(
+        registry: Arc<dyn AgentDefinitionRegistry>,
+        runtime: Arc<ExecutionRuntime>,
+    ) -> Result<(
+        String,
+        CancellationToken,
+        JoinHandle<Result<()>>,
+        JoinHandle<Result<()>>,
+    )> {
+        let config = ServiceConfig::default();
+        let stores = StoreRegistry::from_config(&config.storage, registry)?;
+        stores.initialize().await?;
+        let host = ServiceHost::with_stores(config.clone(), stores.clone(), Arc::clone(&runtime))?;
+        let health = Arc::clone(host.health());
+        let shutdown = host.shutdown_token();
+        let grpc = GrpcTransport::with_admission(
+            stores,
+            runtime,
+            health,
+            shutdown.clone(),
+            config.worker.lease_duration(),
+            config.worker.heartbeat_interval(),
+            config.admission.clone(),
+        )
+        .with_confirmation_decision_guard(Arc::new(RefuseAutomaticApproval));
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let host_task = tokio::spawn(async move { host.run().await });
+        let grpc_task = tokio::spawn(async move { grpc.serve_listener(listener).await });
+        Ok((endpoint, shutdown, grpc_task, host_task))
+    }
+
+    /// The `FAILED_PRECONDITION` a refused decision returns, naming
+    /// `tool_name` in its reason.
+    fn expect_refusal(
+        outcome: std::result::Result<tonic::Response<pb::DecideConfirmationResponse>, Status>,
+        tool_name: &str,
+    ) -> Result<Status> {
+        let status = match outcome {
+            Ok(response) => bail!("the guard let the decision apply: {response:?}"),
+            Err(status) => status,
+        };
+        ensure!(
+            status.code() == tonic::Code::FailedPrecondition,
+            "a refusal is FAILED_PRECONDITION, got {status}",
+        );
+        ensure!(
+            status
+                .message()
+                .contains(&format!("{tool_name} needs a person")),
+            "the refusal names {tool_name}: {status}",
+        );
+        Ok(status)
+    }
+
+    /// The call a parked snapshot names, as `(tool_call_id, tool_name)`.
+    fn named_call(task: &pb::TaskSnapshot) -> Option<(String, String)> {
+        match task.state_detail.as_ref() {
+            Some(pb::task_snapshot::StateDetail::AwaitingConfirmation(state)) => state
+                .confirmation
+                .as_ref()
+                .map(|c| (c.tool_call_id.clone(), c.tool_name.clone())),
+            _ => None,
+        }
+    }
+
+    /// `ListThreadTasks`, `GetTask` and the guard all name the same call for
+    /// the parked `task`; returns that call.
+    async fn check_sibling_names_its_own_call(
+        control: &mut ControlClient,
+        thread_id: &str,
+        task: &pb::TaskSnapshot,
+    ) -> Result<(String, String)> {
+        let listed = named_call(task).context("listed snapshot names a call")?;
+        let fetched = control
+            .get_task(pb::GetTaskRequest {
+                task_id: task.task_id.clone(),
+            })
+            .await?
+            .into_inner()
+            .task
+            .context("GetTask returns the task")?;
+        assert_eq!(named_call(&fetched), Some(listed.clone()), "GetTask agrees");
+
+        let automatic = approval_request(
+            &format!("batch-auto-{}", task.task_id),
+            thread_id,
+            &task.task_id,
+            true,
+        );
+        let refused = expect_refusal(
+            control.decide_confirmation(automatic.clone()).await,
+            &listed.1,
+        )?;
+        let retried = expect_refusal(control.decide_confirmation(automatic).await, &listed.1)?;
+        ensure!(
+            retried.message() == refused.message(),
+            "a refused retry returns the same refusal, not a reserved key: {retried}",
+        );
+
+        control
+            .decide_confirmation(approval_request(
+                &format!("batch-person-{}", task.task_id),
+                thread_id,
+                &task.task_id,
+                false,
+            ))
+            .await?;
+        Ok(listed)
+    }
+
+    /// Every surface that names a parked call names the task's OWN call.
+    /// The server parks one child per call of a batch, and all of them share
+    /// the batch continuation, whose `awaiting_index` is 0: reading that
+    /// slot named the batch's first call for every sibling, so a person
+    /// shown `alpha` approved `transfer`.
+    #[tokio::test]
+    async fn each_parked_sibling_names_its_own_call() -> Result<()> {
+        check_batch_names_each_parked_call(&[
+            ("alpha", ToolTier::Confirm),
+            ("transfer", ToolTier::Confirm),
+        ])
+        .await
+    }
+
+    /// The same with an Observe call between the two parked ones, so a
+    /// parked call's slot differs from both the first call and its index
+    /// among the parked tasks.
+    #[tokio::test]
+    async fn parked_siblings_around_an_observe_call_name_their_own_calls() -> Result<()> {
+        check_batch_names_each_parked_call(&[
+            ("alpha", ToolTier::Confirm),
+            ("beta", ToolTier::Observe),
+            ("transfer", ToolTier::Confirm),
+        ])
+        .await
+    }
+
+    /// Run one batch of `calls` against a guarded daemon and check each
+    /// parked call with [`check_sibling_names_its_own_call`].
+    async fn check_batch_names_each_parked_call(calls: &[(&str, ToolTier)]) -> Result<()> {
+        let tools = calls
+            .iter()
+            .map(|(name, tier)| Tool {
+                name: (*name).into(),
+                description: format!("{name} the account"),
+                input_schema: json!({"type": "object"}),
+                display_name: (*name).into(),
+                tier: *tier,
+                concurrency: agent_sdk_foundation::ToolConcurrency::ReadOnly,
+            })
+            .collect();
+        let registry: Arc<dyn AgentDefinitionRegistry> =
+            Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(tools)));
+        let batch = ChatResponse {
+            content: calls
+                .iter()
+                .map(|(name, _)| ContentBlock::ToolUse {
+                    id: format!("call_{name}"),
+                    name: (*name).into(),
+                    input: json!({}),
+                    thought_signature: None,
+                })
+                .collect(),
+            ..tool_use_response("resp_batch_1", "unused", "unused", json!({}))
+        };
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(vec![
+                batch,
+                text_response("resp_batch_2", "done"),
+            ])),
+            Arc::new(ProgressToolExecutor {
+                result: ToolResult::success("ok"),
+                emit_progress: false,
+                artifact_store_seen: None,
+            }),
+        )?;
+        let mut expected: Vec<(String, String)> = calls
+            .iter()
+            .filter(|(_, tier)| *tier == ToolTier::Confirm)
+            .map(|(name, _)| (format!("call_{name}"), (*name).to_owned()))
+            .collect();
+        expected.sort();
+        let (endpoint, shutdown, grpc_task, host_task) =
+            start_guarded_daemon(registry, runtime).await?;
+
+        let result = async {
+            let (mut control, _events) = connect_clients(&endpoint).await?;
+            let thread_id = create_thread(&mut control, "batch-create").await?;
+            submit_text_work(&mut control, "batch-submit", &thread_id, "go").await?;
+            let parked_count = expected.len();
+            let parked = wait_for(|| {
+                let mut control = control.clone();
+                let thread_id = thread_id.clone();
+                async move {
+                    let tasks = list_thread_tasks(&mut control, &thread_id, "batch").await?;
+                    let parked: Vec<_> = tasks
+                        .into_iter()
+                        .filter(|task| task.status == pb::TaskStatus::AwaitingConfirmation as i32)
+                        .collect();
+                    Ok((parked.len() == parked_count).then_some(parked))
+                }
+            })
+            .await?;
+
+            let mut seen = Vec::new();
+            for task in &parked {
+                seen.push(check_sibling_names_its_own_call(&mut control, &thread_id, task).await?);
+            }
+            seen.sort();
+            ensure!(
+                seen == expected,
+                "each sibling names its own call: {seen:?}"
+            );
+            Ok(())
+        }
+        .await;
+        shutdown.cancel();
+        grpc_task.await??;
+        host_task.await??;
+        result
+    }
+
+    /// A host's [`ConfirmationDecisionGuard`] sees each decision before it
+    /// applies: a refused one leaves the task parked and fails with
+    /// `FAILED_PRECONDITION`, and an allowed one applies as before.
+    #[tokio::test]
+    async fn a_confirmation_decision_guard_refuses_before_anything_applies() -> Result<()> {
+        let transfer_tool = Tool {
+            name: "transfer".into(),
+            description: "Transfer funds".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "amount": { "type": "number" } },
+                "required": ["amount"]
+            }),
+            display_name: "Transfer".into(),
+            tier: ToolTier::Confirm,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+        };
+        let registry: Arc<dyn AgentDefinitionRegistry> =
+            Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(vec![
+                transfer_tool,
+            ])));
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(vec![
+                tool_use_response(
+                    "resp_guard_1",
+                    "tool_call_guard",
+                    "transfer",
+                    json!({"amount": 3}),
+                ),
+                text_response("resp_guard_2", "transfer complete"),
+            ])),
+            Arc::new(ProgressToolExecutor {
+                result: ToolResult::success("sent"),
+                emit_progress: false,
+                artifact_store_seen: None,
+            }),
+        )?;
+        let (endpoint, shutdown, grpc_task, host_task) =
+            start_guarded_daemon(registry, runtime).await?;
+
+        let result = async {
+            let (mut control, _events) = connect_clients(&endpoint).await?;
+            let thread_id = create_thread(&mut control, "guard-create").await?;
+            submit_text_work(&mut control, "guard-submit", &thread_id, "transfer 3").await?;
+            let awaiting = wait_for_awaiting_confirmation(&control, &thread_id).await?;
+            let approve = |request_id: &str, automatic: bool| {
+                approval_request(request_id, &thread_id, &awaiting.task_id, automatic)
+            };
+
+            expect_refusal(
+                control
+                    .decide_confirmation(approve("guard-automatic", true))
+                    .await,
+                "transfer",
+            )?;
+            expect_refusal(
+                control
+                    .decide_confirmation(approve("guard-automatic", true))
+                    .await,
+                "transfer",
+            )
+            .context("a retry of the refused request keeps the refusal reason")?;
+            let tasks = list_thread_tasks(&mut control, &thread_id, "after refusal").await?;
+            assert!(
+                tasks.iter().any(|task| task.task_id == awaiting.task_id
+                    && task.status == pb::TaskStatus::AwaitingConfirmation as i32),
+                "the refused task stays parked: {tasks:?}",
+            );
+
+            control
+                .decide_confirmation(approve("guard-person", false))
+                .await
+                .context("a person's approval applies")?;
+            wait_for_completed_tasks(&control, &thread_id).await
+        }
+        .await;
+        shutdown.cancel();
+        grpc_task.await??;
+        host_task.await??;
+        result
+    }
+
     /// Issue #299 round 4 (item 1): an APPROVED Confirm-tier tool runs
     /// on a detached drive under the server shutdown token; before
     /// this fix, cancelling its task row (`CancelTask`, the subagent
@@ -8761,16 +9163,12 @@ mod tests {
 
             let awaiting = wait_for_awaiting_confirmation(&control, &thread_id).await?;
             control
-                .decide_confirmation(pb::DecideConfirmationRequest {
-                    request_id: "drive-cancel-approve".into(),
-                    thread_id: thread_id.clone(),
-                    task_id: awaiting.task_id.clone(),
-                    decision: Some(pb::ConfirmationDecision {
-                        decision: Some(pb::confirmation_decision::Decision::Approved(
-                            pb::ApprovedConfirmation {},
-                        )),
-                    }),
-                })
+                .decide_confirmation(approval_request(
+                    "drive-cancel-approve",
+                    &thread_id,
+                    &awaiting.task_id,
+                    false,
+                ))
                 .await
                 .context("decide_confirmation rpc")?;
 
