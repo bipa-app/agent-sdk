@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 
 use agent_sdk_foundation::TerminalReason;
 use agent_server::journal::event_repository::EventRepository;
-use agent_server::journal::recovery::{FailureReason, RecoveryAction};
+use agent_server::journal::recovery::{FailureReason, RecoveryAction, RecoveryRecord};
 use agent_server::journal::store::{AgentTaskStore, SubmitDisposition, SubmitRootTurnParams};
 use agent_server::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, TaskKind, TaskStatus,
@@ -1167,6 +1167,132 @@ pub(super) async fn test_cancel_descendants_closes_child_threads(
     Ok(())
 }
 
+/// Wake `root` early whenever it is parked and lease it with a lease that
+/// lapses at once, until the sweep fails it closed; return that record.
+async fn fail_closed_by_lease_expiry(
+    task_store: &dyn AgentTaskStore,
+    root: &AgentTaskId,
+    mut at: i64,
+) -> Result<RecoveryRecord> {
+    for _ in 0..10 {
+        if fetch(task_store, root).await?.status == TaskStatus::WaitingOnChildren {
+            let note = vec![agent_sdk_foundation::llm::ContentBlock::Text {
+                text: "status?".into(),
+            }];
+            task_store
+                .enqueue_steering_resume(root, note, t_plus(at))
+                .await?
+                .context("parked root must wake")?;
+        }
+        task_store
+            .try_acquire_task(
+                root,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(at + 2),
+                t_plus(at + 1),
+            )
+            .await?
+            .context("woken root must acquire")?;
+        let records = task_store.release_expired_leases(t_plus(at + 3)).await?;
+        if let Some(record) = records
+            .into_iter()
+            .find(|record| record.id == *root && record.action.is_fail_closed())
+        {
+            return Ok(record);
+        }
+        at += 10;
+    }
+    anyhow::bail!("{root} was never failed closed")
+}
+
+/// A root failed closed when its last lease lapses settles its live
+/// children in that same step, before the turn queued behind it is
+/// promoted, and reports what it settled.
+pub(super) async fn test_fail_close_settles_children_before_the_successor(
+    task_store: &dyn AgentTaskStore,
+) -> Result<()> {
+    let tid = "settle-fail-close";
+    let parked = park_root_on_tool_children(task_store, tid, 2, 3, 12_000).await?;
+    let children: Vec<AgentTaskId> = parked.children.iter().map(|c| c.id.clone()).collect();
+    drive_child(
+        task_store,
+        tid,
+        &children[0],
+        LiveChild::RunningLiveLease,
+        12_005,
+    )
+    .await?;
+    let successor = AgentTask::new_root_turn(thread_id(tid), t_plus(12_006), 3);
+    let successor = task_store.submit_root_turn(successor).await?;
+    assert_eq!(successor.status, TaskStatus::Queued);
+
+    let record = fail_closed_by_lease_expiry(task_store, &parked.root.id, 12_010).await?;
+
+    for child in &children {
+        assert_settled(
+            &fetch(task_store, child).await?,
+            &TerminalReason::ParentCancelled,
+            child.as_str(),
+        );
+    }
+    let mut settled = record.settled.transitioned.clone();
+    settled.sort();
+    let mut expected = children.clone();
+    expected.sort();
+    assert_eq!(settled, expected, "the record names every child it settled");
+    assert_eq!(
+        fetch(task_store, &parked.root.id).await?.status,
+        TaskStatus::Failed
+    );
+    assert_eq!(
+        fetch(task_store, &successor.id).await?.status,
+        TaskStatus::Pending,
+        "the successor is promoted",
+    );
+    assert!(
+        !task_store
+            .list_terminal_roots_with_live_descendants()
+            .await?
+            .contains(&parked.root.id),
+        "nothing is left for the orphan sweep",
+    );
+    Ok(())
+}
+
+/// The same fail-close crosses into a subagent's child thread and reports
+/// the closing marker it committed there.
+pub(super) async fn test_fail_close_closes_child_threads(
+    task_store: &dyn AgentTaskStore,
+    thread_store: &dyn ThreadStore,
+) -> Result<()> {
+    let (parent, invocation, child_root) =
+        spawn_subagent_fixture(task_store, thread_store, "settle-fail-close-subagent").await?;
+    task_store
+        .try_acquire_task(
+            &child_root.id,
+            WorkerId::new(),
+            LeaseId::new(),
+            t_plus(100_000),
+            t_plus(3),
+        )
+        .await?
+        .context("child root must acquire")?;
+
+    let record = fail_closed_by_lease_expiry(task_store, &parent.id, 13_000).await?;
+
+    for (task, label) in [(&invocation, "invocation"), (&child_root, "child root")] {
+        assert_settled(
+            &fetch(task_store, &task.id).await?,
+            &TerminalReason::ParentCancelled,
+            label,
+        );
+    }
+    assert_eq!(record.settled.markers.len(), 1, "{:?}", record.settled);
+    assert_eq!(record.settled.markers[0].thread_id, child_root.thread_id);
+    Ok(())
+}
+
 // ── Backend runners ──────────────────────────────────────────────────
 
 mod in_memory {
@@ -1255,6 +1381,18 @@ mod in_memory {
     }
 
     #[tokio::test]
+    async fn settlement_in_memory_fail_close_settles_children_first() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        super::test_fail_close_settles_children_before_the_successor(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn settlement_in_memory_fail_close_closes_child_threads() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        super::test_fail_close_closes_child_threads(s.task.as_ref(), s.thread.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn settlement_in_memory_reject_confirmation_refuses_a_root() -> Result<()> {
         let s = fresh_in_memory_stores();
         super::test_reject_confirmation_refuses_a_root(s.task.as_ref()).await
@@ -1339,6 +1477,18 @@ mod sqlite {
     async fn settlement_sqlite_cancel_descendants_closes_child_threads() -> Result<()> {
         let store = store().await?;
         super::test_cancel_descendants_closes_child_threads(&store, &store, &store).await
+    }
+
+    #[tokio::test]
+    async fn settlement_sqlite_fail_close_settles_children_first() -> Result<()> {
+        let store = store().await?;
+        super::test_fail_close_settles_children_before_the_successor(&store).await
+    }
+
+    #[tokio::test]
+    async fn settlement_sqlite_fail_close_closes_child_threads() -> Result<()> {
+        let store = store().await?;
+        super::test_fail_close_closes_child_threads(&store, &store).await
     }
 
     #[tokio::test]
@@ -2249,6 +2399,22 @@ WHERE id = $1
             return Ok(());
         };
         super::test_cancel_descendants_closes_child_threads(&store, &store, &store).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_fail_close_settles_children_first() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        super::test_fail_close_settles_children_before_the_successor(&store).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_fail_close_closes_child_threads() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        super::test_fail_close_closes_child_threads(&store, &store).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -8605,9 +8605,8 @@ enum TurnExit {
     FailMidResume,
     /// The public `aggregate_child_outcomes` + `resume_root_turn` pair.
     AggregateResume,
-    /// The child wake's lease expires until the sweep fails the row closed.
-    /// Nothing settles its live children here (the host's orphan sweep
-    /// would), so a call still running is reported as such.
+    /// The child wake's lease expires until the sweep fails the row closed,
+    /// which settles its live children in the same step.
     FailClosedByLeaseExpiry,
     /// A steering wake's LLM call fails and the wake is reverted; the
     /// children's fan-in then commits the turn.
@@ -9089,6 +9088,49 @@ async fn expire_wake_until_failed_closed(
     bail!("the wake was never failed closed")
 }
 
+/// A woken root's lease keeps expiring until the sweep fails it closed,
+/// which promotes the turn queued behind it. That fail-close settles the
+/// root's still-running child before the promotion, so the promoted turn
+/// is told the call was cancelled.
+#[tokio::test]
+async fn a_root_failed_closed_by_the_sweep_settles_its_children_before_its_successor() -> Result<()>
+{
+    let stores = TestStores::new();
+    let deps = stores.deps();
+    let (parent, children) = Box::pin(park_early_resumed_batch(&stores, &deps)).await?;
+    complete_child_at(
+        &stores,
+        &children[2],
+        &ok_result("done-2"),
+        t_plus(20),
+        t_plus(21),
+    )
+    .await?;
+    let successor = stores
+        .tasks
+        .submit_root_turn(AgentTask::new_root_turn(thread_a(), t_plus(22), 3))
+        .await?;
+    assert_eq!(successor.status, TaskStatus::Queued);
+
+    expire_wake_until_failed_closed(&stores, &parent.id).await?;
+
+    let settled = stores.tasks.get(&children[1].id).await?.context("child")?;
+    assert_eq!(settled.status, TaskStatus::Cancelled);
+    assert_eq!(
+        settled.terminal_reason,
+        Some(TerminalReason::ParentCancelled)
+    );
+    let request = next_turn_request(
+        &stores,
+        &successor.id,
+        "What happened to the build steps?",
+        t_plus(300),
+    )
+    .await?;
+    assert_running_call_closed(&request, "call_1", "cancelled");
+    Ok(())
+}
+
 async fn cancel_mid_steering(
     stores: &TestStores,
     deps: &RootTurnDeps<'_>,
@@ -9304,12 +9346,12 @@ fn expected_closures(
         (_, SurvivorAtExit::Finished) | (TurnExit::RevertFailedSteering, SurvivorAtExit::Live) => {
             "success"
         }
-        (TurnExit::FailClosedByLeaseExpiry, SurvivorAtExit::Live) => "still_running",
         (
             TurnExit::CancelParked
             | TurnExit::CancelMidSteering
             | TurnExit::FailMidResume
-            | TurnExit::AggregateResume,
+            | TurnExit::AggregateResume
+            | TurnExit::FailClosedByLeaseExpiry,
             SurvivorAtExit::Live,
         ) => "cancelled",
     };

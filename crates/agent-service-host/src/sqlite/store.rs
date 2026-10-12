@@ -308,7 +308,18 @@ impl SqliteDurableStore {
                 "cancel rejected: task {root_id} is not running under this worker and lease"
             ));
         }
+        let outcome = Self::cancel_scoped_tx(&mut tx, root_id, scope, now).await?;
+        tx.commit().await.context("commit cancel_tree")?;
+        Ok(outcome)
+    }
 
+    /// The body of `cancel_scoped`, inside the caller's transaction.
+    async fn cancel_scoped_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        root_id: &AgentTaskId,
+        scope: CancelScope,
+        now: OffsetDateTime,
+    ) -> Result<CancelTreeOutcome> {
         // Collect the given task + descendants (mirror in-memory
         // `collect_subtree`: children-BFS, root-first, following
         // SubagentInvocation linkage across threads). A mid-tree id
@@ -330,14 +341,14 @@ impl SqliteDurableStore {
         // transitions (pinned by the
         // `conformance_sqlite_concurrent_cancels_single_marker` race
         // test).
-        let all_tasks = Self::collect_subtree_tx(&mut tx, root_id).await?;
+        let all_tasks = Self::collect_subtree_tx(tx, root_id).await?;
         let candidate_threads: std::collections::HashSet<ThreadId> = all_tasks
             .iter()
             .map(|task| task.thread_id.clone())
             .collect();
         let mut fenced_threads = std::collections::HashSet::new();
         for thread_id in candidate_threads {
-            if Self::get_thread_tx(&mut tx, &thread_id)
+            if Self::get_thread_tx(tx, &thread_id)
                 .await?
                 .is_some_and(|thread| thread.status.is_purge_fenced())
             {
@@ -371,7 +382,7 @@ impl SqliteDurableStore {
                     .continuation()
                     .map(|continuation| continuation.payload.total_usage.clone());
                 let committed = Self::insert_cancelled_marker_tx(
-                    &mut tx,
+                    tx,
                     &thread_id,
                     &row.id,
                     continuation_usage,
@@ -384,7 +395,7 @@ impl SqliteDurableStore {
             let cancelled = row
                 .cancel_with_reason(reason, now)
                 .context("cancel_tree: cancel transition failed")?;
-            Self::update_task_tx(&mut tx, &cancelled).await?;
+            Self::update_task_tx(tx, &cancelled).await?;
             if is_root_turn_root {
                 cancelled_root_ids.push(cancelled.id.clone());
                 cancelled_root_threads.push(thread_id);
@@ -398,7 +409,7 @@ impl SqliteDurableStore {
         // The woken invocation transitions to Pending (not Cancelled),
         // so it must NOT be added to the transitioned vec.
         for cancelled_child_root in &cancelled_root_ids {
-            Self::resume_linked_subagent_invocation_tx(&mut tx, cancelled_child_root, now).await?;
+            Self::resume_linked_subagent_invocation_tx(tx, cancelled_child_root, now).await?;
         }
 
         // Each cancelled root frees its thread's active-root slot; promote
@@ -407,7 +418,7 @@ impl SqliteDurableStore {
         // queued successors.
         for thread_id in &cancelled_root_threads {
             if !fenced_threads.contains(thread_id) {
-                Self::promote_next_queued_root_tx(&mut tx, thread_id, now).await?;
+                Self::promote_next_queued_root_tx(tx, thread_id, now).await?;
             }
         }
 
@@ -421,14 +432,12 @@ impl SqliteDurableStore {
         // (every deeper row's parent lies inside the subtree and is
         // itself cancelled), so one propagation suffices.
         if transitioned.first().is_some_and(|id| id == root_id)
-            && let Some(cancelled_top) = Self::load_task_tx(&mut tx, root_id).await?
+            && let Some(cancelled_top) = Self::load_task_tx(tx, root_id).await?
             && cancelled_top.parent_id.is_some()
         {
-            Self::propagate_terminal_to_parent_tx(&mut tx, &cancelled_top, now, "cancel_tree")
-                .await?;
+            Self::propagate_terminal_to_parent_tx(tx, &cancelled_top, now, "cancel_tree").await?;
         }
 
-        tx.commit().await.context("commit cancel_tree")?;
         Ok(CancelTreeOutcome {
             transitioned,
             markers,
@@ -1708,7 +1717,12 @@ LIMIT 1
         reason: FailureReason,
         now: OffsetDateTime,
         error_prefix: &str,
-    ) -> Result<()> {
+    ) -> Result<CancelTreeOutcome> {
+        let settled = if old.kind == TaskKind::RootTurn && old.is_root() {
+            Self::cancel_scoped_tx(tx, &old.id, CancelScope::Descendants, now).await?
+        } else {
+            CancelTreeOutcome::default()
+        };
         let failed = old
             .clone()
             .fail_with_reason(reason, now)
@@ -1726,7 +1740,8 @@ LIMIT 1
             )
             .await?;
         }
-        Self::propagate_terminal_to_parent_tx(tx, &failed, now, error_prefix).await
+        Self::propagate_terminal_to_parent_tx(tx, &failed, now, error_prefix).await?;
+        Ok(settled)
     }
 
     /// Settle the input injections `root` never delivered, inside the
@@ -3464,7 +3479,8 @@ impl AgentTaskStore for SqliteDurableStore {
         match classify_recovery(&old, RecoveryContext::AcquisitionAttempt) {
             RecoveryAction::NoAction => {}
             RecoveryAction::FailClosed(reason) => {
-                Self::fail_closed_tx(&mut tx, &old, reason, now, "try_acquire_task").await?;
+                let _settled =
+                    Self::fail_closed_tx(&mut tx, &old, reason, now, "try_acquire_task").await?;
                 tx.commit().await.context("commit fail-closed acquire")?;
                 return Ok(None);
             }
@@ -3534,8 +3550,9 @@ impl AgentTaskStore for SqliteDurableStore {
                     return Ok(Some(claimed));
                 }
                 RecoveryAction::FailClosed(reason) => {
-                    Self::fail_closed_tx(&mut tx, &old, reason, now, "acquire_next_runnable")
-                        .await?;
+                    let _settled =
+                        Self::fail_closed_tx(&mut tx, &old, reason, now, "acquire_next_runnable")
+                            .await?;
                     tx.commit()
                         .await
                         .context("commit fail-closed runnable head")?;
@@ -3657,7 +3674,13 @@ impl AgentTaskStore for SqliteDurableStore {
 
         let mut released = Vec::with_capacity(expired.len());
         for record in expired {
-            let old = AgentTask::try_from(record)?;
+            let Some(old) = Self::load_task_tx(&mut tx, &AgentTask::try_from(record)?.id).await?
+            else {
+                continue;
+            };
+            if old.status.is_terminal() {
+                continue;
+            }
             if old.status != TaskStatus::Running {
                 let status = old.status;
                 return Err(anyhow!(
@@ -3675,9 +3698,10 @@ impl AgentTaskStore for SqliteDurableStore {
                     RecoveryRecord::requeued(old.id.clone())
                 }
                 RecoveryAction::FailClosed(reason) => {
-                    Self::fail_closed_tx(&mut tx, &old, reason, now, "release_expired_leases")
-                        .await?;
-                    RecoveryRecord::failed_closed(old.id.clone(), reason)
+                    let settled =
+                        Self::fail_closed_tx(&mut tx, &old, reason, now, "release_expired_leases")
+                            .await?;
+                    RecoveryRecord::failed_closed(old.id.clone(), reason).with_settled(settled)
                 }
                 RecoveryAction::NoAction => {
                     return Err(anyhow!(

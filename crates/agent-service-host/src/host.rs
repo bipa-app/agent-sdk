@@ -890,6 +890,21 @@ async fn settle_orphaned_descendants(
     Ok(settled)
 }
 
+/// Wake same-process followers of the child threads a settlement closed,
+/// and trip the approved-confirmation drives of the tasks it cancelled,
+/// which would otherwise notice only at their next heartbeat rejection.
+fn forward_settlement(
+    stores: &StoreRegistry,
+    settled: &agent_server::journal::store::CancelTreeOutcome,
+) {
+    if !settled.markers.is_empty() {
+        stores.event_notifier.notify(&settled.markers);
+    }
+    for id in &settled.transitioned {
+        stores.confirm_drive_cancels.cancel(id);
+    }
+}
+
 /// Rounds of [`AgentTaskStore::release_expired_leases`] one sweep tick
 /// may run while draining a backlog — a guard against a pathological
 /// store that keeps reporting full batches (the remainder defers to
@@ -919,6 +934,9 @@ async fn drain_expired_leases(stores: &StoreRegistry, now: time::OffsetDateTime)
             .release_expired_leases(now)
             .await
             .context("release expired leases")?;
+        for record in &records {
+            forward_settlement(stores, &record.settled);
+        }
         total = total.saturating_add(records.len());
         if records.len() < agent_server::journal::store::LEASE_RELEASE_BATCH {
             return Ok(total);

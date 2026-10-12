@@ -24,7 +24,7 @@ use crate::config::{ServiceConfig, WorkerConfig};
 #[cfg(feature = "sqlite")]
 use crate::config::{StorageBackend, StorageConfig};
 use crate::host::{
-    AttemptClosePolicy, OwnedRootTask, ServiceHost, fail_root_task_if_owned,
+    AttemptClosePolicy, OwnedRootTask, ServiceHost, drain_expired_leases, fail_root_task_if_owned,
     settle_orphaned_descendants,
 };
 use crate::stores::StoreRegistry;
@@ -341,14 +341,17 @@ async fn host_startup_settles_orphans_left_by_a_previous_process() -> Result<()>
 
 /// A root parked on one subagent whose child-thread root is itself parked on
 /// a tool child awaiting an approved confirmation's drive, then woken early
-/// and leased: the failing root's only direct child is the invocation.
+/// and leased until `root_lease_expires_at`: the failing root's only direct
+/// child is the invocation.
 async fn running_root_over_a_child_thread_drive(
     stores: &StoreRegistry,
     thread: &ThreadId,
+    max_attempts: u32,
+    root_lease_expires_at: OffsetDateTime,
 ) -> Result<(AgentTaskId, AgentTaskId, WorkerId, LeaseId)> {
     let now = OffsetDateTime::now_utc();
     let horizon = now + time::Duration::hours(1);
-    let root = AgentTask::new_root_turn(thread.clone(), now, 3);
+    let root = AgentTask::new_root_turn(thread.clone(), now, max_attempts);
     stores.task_store.submit_root_turn(root.clone()).await?;
     let worker = WorkerId::new();
     let lease = LeaseId::new();
@@ -434,7 +437,7 @@ async fn running_root_over_a_child_thread_drive(
         )
         .await?;
 
-    let (worker, lease) = resume_early(stores, &root.id, horizon).await?;
+    let (worker, lease) = resume_early(stores, &root.id, root_lease_expires_at).await?;
     Ok((root.id, tools[0].id.clone(), worker, lease))
 }
 
@@ -469,8 +472,9 @@ async fn fail_owned_root(
 async fn failing_a_root_trips_the_drives_it_cancelled_on_a_child_thread() -> Result<()> {
     let stores = StoreRegistry::in_memory(super::sample_registry());
     let thread = ThreadId::from_string("t-deep-drive");
+    let horizon = OffsetDateTime::now_utc() + time::Duration::hours(1);
     let (root, tool, worker, lease) =
-        running_root_over_a_child_thread_drive(&stores, &thread).await?;
+        running_root_over_a_child_thread_drive(&stores, &thread, 3, horizon).await?;
     let drive = CancellationToken::new();
     let _drive_registration = stores
         .confirm_drive_cancels
@@ -528,5 +532,44 @@ async fn failing_a_root_trips_no_drive_its_settlement_did_not_cancel() -> Result
     settle_orphaned_descendants(&stores, OffsetDateTime::now_utc()).await?;
     assert_children_settled(&stores, &tree).await?;
     assert!(drive.is_cancelled(), "the sweep's settlement trips it");
+    Ok(())
+}
+
+/// The lease sweep forwards what its fail-close settled: it trips the
+/// drives of the tasks it cancelled and wakes the followers of the child
+/// threads it closed.
+#[tokio::test]
+async fn the_lease_sweep_forwards_what_its_fail_close_settled() -> Result<()> {
+    let stores = StoreRegistry::in_memory(super::sample_registry());
+    let thread = ThreadId::from_string("t-swept-drive");
+    let expired = OffsetDateTime::now_utc() - time::Duration::seconds(1);
+    let (root, tool, _worker, _lease) =
+        running_root_over_a_child_thread_drive(&stores, &thread, 1, expired).await?;
+    let drive = CancellationToken::new();
+    let _drive_registration = stores
+        .confirm_drive_cancels
+        .register(tool.clone(), drive.clone());
+    let child_thread = task(&stores, &tool).await?.thread_id;
+    let mut follower = stores.event_notifier.subscribe(&child_thread);
+
+    drain_expired_leases(&stores, OffsetDateTime::now_utc()).await?;
+
+    assert_eq!(task(&stores, &root).await?.status, TaskStatus::Failed);
+    let cancelled = task(&stores, &tool).await?;
+    assert_eq!(cancelled.status, TaskStatus::Cancelled);
+    assert!(
+        drive.is_cancelled(),
+        "the drive of a task the sweep cancelled must be tripped",
+    );
+    let marker = tokio::time::timeout(std::time::Duration::from_secs(5), follower.recv()).await??;
+    assert_eq!(marker.thread_id, child_thread);
+    assert!(
+        matches!(
+            marker.event,
+            agent_sdk_foundation::AgentEvent::Cancelled { .. }
+        ),
+        "{:?}",
+        marker.event,
+    );
     Ok(())
 }

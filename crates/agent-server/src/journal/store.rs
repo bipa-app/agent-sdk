@@ -1938,7 +1938,10 @@ pub trait AgentTaskStore: Send + Sync {
     ///   [`super::recovery::classify_recovery`] before returning, so
     ///   the caller sees the same `None` it would see for any other
     ///   non-runnable row and the worker pool is never poisoned by a
-    ///   row that will never make progress.
+    ///   row that will never make progress. A root turn failed closed
+    ///   here settles its live descendants in the same transition, as
+    ///   in [`AgentTaskStore::release_expired_leases`], but they are
+    ///   not reported back.
     /// - Returns `Err` only on true store-level failures: validation
     ///   errors or downstream write errors.
     ///
@@ -2081,11 +2084,16 @@ pub trait AgentTaskStore: Send + Sync {
     ///   (`UnsafePreparedOperationRecovery`) both take this path,
     ///   so the journal never enters an endless requeue loop and
     ///   never risks double-executing an in-flight external
-    ///   operation.
+    ///   operation. A root turn's fail-close cancels its live
+    ///   descendants with [`TerminalReason::ParentCancelled`] in the
+    ///   same transition, before its thread's next queued turn is
+    ///   promoted, and reports them in [`RecoveryRecord::settled`].
     ///
     /// Returns one [`RecoveryRecord`] per swept row in expiry order
     /// so callers can log and react per-outcome without a second
-    /// round trip to `get()`.
+    /// round trip to `get()`. A row a root's fail-close settles in the
+    /// same call is listed in that root's record, and has a record of its
+    /// own only if the store reached it first.
     ///
     /// Each call reclaims at most [`LEASE_RELEASE_BATCH`] rows (in
     /// expiry order) so a mass worker outage cannot turn one sweep
@@ -3191,7 +3199,21 @@ impl InMemoryAgentTaskStore {
                 "cancel rejected: task {root_id} is not running under this worker and lease"
             ));
         }
+        let outcome = self
+            .cancel_scoped_locked(&mut inner, root_id, scope, now)
+            .await?;
+        drop(inner);
+        Ok(outcome)
+    }
 
+    /// The body of [`Self::cancel_scoped`], under the caller's write lock.
+    async fn cancel_scoped_locked(
+        &self,
+        inner: &mut Inner,
+        root_id: &AgentTaskId,
+        scope: CancelScope,
+        now: OffsetDateTime,
+    ) -> Result<CancelTreeOutcome> {
         // Snapshot the subtree ids under the write lock and then
         // walk them in BFS order. The cancel transition is pure and
         // does not mutate `by_parent`, so the snapshot stays
@@ -3245,7 +3267,7 @@ impl InMemoryAgentTaskStore {
         }
 
         let cancel_ids: Vec<AgentTaskId> = to_cancel.iter().map(|(id, _)| id.clone()).collect();
-        let fenced_threads = self.fenced_threads_for_cancel(&inner, &cancel_ids).await?;
+        let fenced_threads = self.fenced_threads_for_cancel(inner, &cancel_ids).await?;
 
         // The whole marker set is journaled BEFORE any row flips, while
         // STILL holding the task-store write lock.
@@ -3287,7 +3309,6 @@ impl InMemoryAgentTaskStore {
         // are durable nothing can interrupt the flips they describe.
         let transitioned = inner.cancel_rows(to_cancel, &fenced_threads, now)?;
 
-        drop(inner);
         Ok(CancelTreeOutcome {
             transitioned,
             markers,
@@ -3709,14 +3730,21 @@ impl InMemoryAgentTaskStore {
         old: &AgentTask,
         reason: FailureReason,
         now: OffsetDateTime,
-    ) -> Result<()> {
+    ) -> Result<CancelTreeOutcome> {
         let failed = old
             .clone()
             .fail_with_reason(reason, now)
             .context("fail_closed_locked: fail_with_reason transition failed")?;
+        let settled = if old.kind == TaskKind::RootTurn && old.is_root() {
+            self.cancel_scoped_locked(inner, &old.id, CancelScope::Descendants, now)
+                .await?
+        } else {
+            CancelTreeOutcome::default()
+        };
         let thread = self.thread_admission_locked(inner, &old.id).await?;
         self.commit_fail_closed_event(old, reason, now).await?;
-        inner.publish_failed_row(old, &failed, thread, now)
+        inner.publish_failed_row(old, &failed, thread, now)?;
+        Ok(settled)
     }
 
     /// Journal the terminal event that closes `task`'s turn when it fails
@@ -5310,7 +5338,8 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         match classify_recovery(&old, RecoveryContext::AcquisitionAttempt) {
             RecoveryAction::NoAction => {}
             RecoveryAction::FailClosed(reason) => {
-                self.fail_closed_locked(&mut inner, &old, reason, now)
+                let _settled = self
+                    .fail_closed_locked(&mut inner, &old, reason, now)
                     .await?;
                 return Ok(None);
             }
@@ -5406,7 +5435,8 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                     // whole worker pool. The fail-closed transition
                     // removes the row from the runnable index, so
                     // the next loop iteration picks up a fresh head.
-                    self.fail_closed_locked(&mut inner, &old, reason, now)
+                    let _settled = self
+                        .fail_closed_locked(&mut inner, &old, reason, now)
                         .await?;
                 }
                 RecoveryAction::Requeue => {
@@ -5475,6 +5505,9 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             let old = inner.by_id.get(&id).cloned().ok_or_else(|| {
                 anyhow!("release_expired_leases: leased index held missing row {id}")
             })?;
+            if old.status.is_terminal() {
+                continue;
+            }
             // Defense in depth: only `Running` rows belong in the
             // expiry index. A non-Running row here is an internal
             // bookkeeping bug.
@@ -5501,9 +5534,10 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                     RecoveryRecord::requeued(id)
                 }
                 RecoveryAction::FailClosed(reason) => {
-                    self.fail_closed_locked(&mut inner, &old, reason, now)
+                    let settled = self
+                        .fail_closed_locked(&mut inner, &old, reason, now)
                         .await?;
-                    RecoveryRecord::failed_closed(id, reason)
+                    RecoveryRecord::failed_closed(id, reason).with_settled(settled)
                 }
                 RecoveryAction::NoAction => {
                     // The expiry sweep should only ever classify

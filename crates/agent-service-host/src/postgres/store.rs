@@ -451,7 +451,21 @@ FOR UPDATE
                 "cancel_tree rejected: task {root_id} does not exist"
             ));
         };
+        let (outcome, _top) = Self::cancel_scoped_tx(&mut tx, root_id, scope, owner, now).await?;
+        tx.commit().await.context("commit cancel_tree")?;
+        Ok(outcome)
+    }
 
+    /// The body of `cancel_scoped`, inside the caller's transaction. Also
+    /// returns `root_id`'s row as read under its lock, before any
+    /// transition.
+    async fn cancel_scoped_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        root_id: &AgentTaskId,
+        scope: CancelScope,
+        owner: Option<(&WorkerId, &LeaseId)>,
+        now: OffsetDateTime,
+    ) -> Result<(CancelTreeOutcome, Option<AgentTask>)> {
         // Collect the given task + descendants (mirror in-memory
         // `collect_subtree`: children-BFS, root-first, following
         // SubagentInvocation linkage across threads). A mid-tree id
@@ -488,7 +502,7 @@ FOR UPDATE
         // new thread (a subagent spawned meanwhile) locks it and walks
         // once more.
         let (all_tasks, fenced_threads) =
-            Self::walk_tree_under_thread_locks_tx(&mut tx, root_id, now).await?;
+            Self::walk_tree_under_thread_locks_tx(tx, root_id, now).await?;
 
         // Phase 2 — CAS cancel transitions, taking the row locks in the
         // store's task-row order (see `PostgresDurableStore`): deepest
@@ -496,6 +510,7 @@ FOR UPDATE
         // it settled concurrently — the transition, the returned
         // `transitioned` slice, and the marker gating below all derive
         // from the locked re-read, never from the snapshot.
+        let mut top = None;
         let mut cancel_order: Vec<&AgentTask> = all_tasks.iter().collect();
         cancel_order.sort_by(|a, b| task_lock_order(a).cmp(&task_lock_order(b)));
 
@@ -514,16 +529,18 @@ FOR UPDATE
             (ThreadId, Option<TokenUsage>, TerminalReason),
         > = std::collections::BTreeMap::new();
         for row in cancel_order {
-            let Some(current) = Self::load_task_tx(&mut tx, &row.id, true).await? else {
+            let Some(current) = Self::load_task_tx(tx, &row.id, true).await? else {
                 continue;
             };
-            if current.id == *root_id
-                && let Some((worker, lease)) = owner
-                && !is_owned_by(&current, worker, lease)
-            {
-                return Err(anyhow!(
-                    "cancel rejected: task {root_id} is not running under this worker and lease"
-                ));
+            if current.id == *root_id {
+                if let Some((worker, lease)) = owner
+                    && !is_owned_by(&current, worker, lease)
+                {
+                    return Err(anyhow!(
+                        "cancel rejected: task {root_id} is not running under this worker and lease"
+                    ));
+                }
+                top = Some(current.clone());
             }
             let Some(reason) = cancel_reason(scope, root_id, &current) else {
                 continue;
@@ -546,7 +563,7 @@ FOR UPDATE
             let cancelled = current
                 .cancel_with_reason(reason, now)
                 .context("cancel_tree: cancel transition failed")?;
-            Self::update_task_tx(&mut tx, &cancelled).await?;
+            Self::update_task_tx(tx, &cancelled).await?;
             cancelled_ids.insert(cancelled.id.clone());
             if is_root_turn_root {
                 cancelled_root_ids.push(cancelled.id.clone());
@@ -571,7 +588,7 @@ FOR UPDATE
         // nothing. The thread rows were locked in phase 1, so the
         // sequence allocation here re-locks held rows (no new lock
         // edges). Emitted in BFS order.
-        let markers = commit_cancel_markers_tx(&mut tx, &all_tasks, marker_candidates, now).await?;
+        let markers = commit_cancel_markers_tx(tx, &all_tasks, marker_candidates, now).await?;
 
         // Phase 7.6: wake linked SubagentInvocation tasks that were
         // WaitingOnChildren on a now-cancelled child root. This
@@ -579,7 +596,7 @@ FOR UPDATE
         // The woken invocation transitions to Pending (not Cancelled),
         // so it must NOT be added to the transitioned vec.
         for cancelled_child_root in &cancelled_root_ids {
-            Self::resume_linked_subagent_invocation_tx(&mut tx, cancelled_child_root, now).await?;
+            Self::resume_linked_subagent_invocation_tx(tx, cancelled_child_root, now).await?;
         }
 
         // Each cancelled root frees its thread's active-root slot; promote
@@ -588,7 +605,7 @@ FOR UPDATE
         // queued successors.
         for thread_id in &cancelled_root_threads {
             if !fenced_threads.contains(thread_id) {
-                Self::promote_next_queued_root_tx(&mut tx, thread_id, now).await?;
+                Self::promote_next_queued_root_tx(tx, thread_id, now).await?;
             }
         }
 
@@ -605,24 +622,20 @@ FOR UPDATE
         // child-then-parent lock order the deepest-first cancel loop
         // establishes.
         if transitioned.first().is_some_and(|id| id == root_id)
-            && let Some(cancelled_top) = Self::load_task_tx(&mut tx, root_id, false).await?
+            && let Some(cancelled_top) = Self::load_task_tx(tx, root_id, false).await?
             && cancelled_top.parent_id.is_some()
         {
-            Self::propagate_terminal_to_parent_tx(
-                &mut tx,
-                &cancelled_top,
-                None,
-                now,
-                "cancel_tree",
-            )
-            .await?;
+            Self::propagate_terminal_to_parent_tx(tx, &cancelled_top, None, now, "cancel_tree")
+                .await?;
         }
 
-        tx.commit().await.context("commit cancel_tree")?;
-        Ok(CancelTreeOutcome {
-            transitioned,
-            markers,
-        })
+        Ok((
+            CancelTreeOutcome {
+                transitioned,
+                markers,
+            },
+            top,
+        ))
     }
 
     /// The thread's active root, locked: an injection's parentage is
@@ -2130,21 +2143,24 @@ WHERE parent_id = $1
         Self::fail_closed_with_thread_tx(tx, old, reason, None, now, error_prefix).await
     }
 
-    /// Fail a root closed in its own transaction that locks the thread
-    /// before the task, for callers that classified the row under a task
-    /// lock taken first. The row is re-validated under the new locks and
-    /// left alone when it no longer classifies as fail-closed in
+    /// Fail a root closed in its own transaction, in the store's lock
+    /// order: its tree's threads first, then its live descendants, which
+    /// are cancelled before it fails, then the root itself. The root's
+    /// successor is promoted only after nothing under it is left live.
+    /// The row is re-validated under its lock and left alone, with every
+    /// cancel rolled back, when it no longer classifies as fail-closed in
     /// `context` (another worker claimed it, a heartbeat extended its
     /// lease, ...).
     ///
-    /// Returns the reason when this call failed the row.
+    /// Returns the reason and what was settled when this call failed the
+    /// row.
     async fn fail_closed_root_thread_first(
         &self,
         id: &AgentTaskId,
         context: RecoveryContext,
         now: OffsetDateTime,
         error_prefix: &str,
-    ) -> Result<Option<FailureReason>> {
+    ) -> Result<Option<(FailureReason, CancelTreeOutcome)>> {
         let mut tx = self.begin().await?;
         let Some(screened) = Self::load_task_tx(&mut tx, id, false).await? else {
             tx.rollback()
@@ -2153,17 +2169,23 @@ WHERE parent_id = $1
             return Ok(None);
         };
         Self::bootstrap_thread_row_tx(&mut tx, &screened.thread_id, now).await?;
-        let Some(LockedForTransition {
-            task: old,
-            root_thread,
-        }) = Self::lock_for_transition_tx(&mut tx, id).await?
-        else {
+        let (settled, locked) =
+            Self::cancel_scoped_tx(&mut tx, id, CancelScope::Descendants, None, now).await?;
+        let Some(old) = locked else {
             tx.rollback()
                 .await
                 .context("rollback vanished fail-close")?;
             return Ok(None);
         };
-        let thread = root_thread.with_context(|| format!("{error_prefix}: {id} is not a root"))?;
+        anyhow::ensure!(
+            old.kind == TaskKind::RootTurn && old.is_root(),
+            "{error_prefix}: {id} is not a root"
+        );
+        let thread = HeldThreadLock(
+            Self::lock_thread_tx(&mut tx, &old.thread_id)
+                .await?
+                .with_context(|| format!("thread {} missing after bootstrap", old.thread_id))?,
+        );
         let still_eligible = match context {
             RecoveryContext::AcquisitionAttempt => {
                 old.status.can_be_leased() && !thread.0.status.is_purge_fenced()
@@ -2192,7 +2214,7 @@ WHERE parent_id = $1
                 tx.commit()
                     .await
                     .with_context(|| format!("commit {error_prefix} fail-close"))?;
-                Ok(Some(reason))
+                Ok(Some((reason, settled)))
             }
             RecoveryAction::NoAction | RecoveryAction::Requeue => {
                 tx.rollback()
@@ -4058,9 +4080,8 @@ ORDER BY created_at, id
             tx.rollback().await.context("rollback missing acquire")?;
             return Ok(None);
         };
-        let thread =
-            Self::require_active_thread_tx(&mut tx, &screened.thread_id, ThreadOperation::Acquire)
-                .await?;
+        Self::require_active_thread_tx(&mut tx, &screened.thread_id, ThreadOperation::Acquire)
+            .await?;
         let Some(old) = Self::load_task_tx(&mut tx, id, true).await? else {
             tx.rollback().await.context("rollback vanished acquire")?;
             return Ok(None);
@@ -4073,18 +4094,21 @@ ORDER BY created_at, id
         }
         match classify_recovery(&old, RecoveryContext::AcquisitionAttempt) {
             RecoveryAction::NoAction => {}
-            RecoveryAction::FailClosed(reason) => {
-                // `require_active_thread_tx` above already holds the thread
-                // lock, so the terminal event keeps thread → task order.
-                Self::fail_closed_with_thread_tx(
-                    &mut tx,
-                    &old,
-                    reason,
-                    Some(&thread),
+            RecoveryAction::FailClosed(_) if old.kind == TaskKind::RootTurn && old.is_root() => {
+                tx.rollback()
+                    .await
+                    .context("rollback before thread-first fail-close")?;
+                self.fail_closed_root_thread_first(
+                    id,
+                    RecoveryContext::AcquisitionAttempt,
                     now,
                     "try_acquire_task",
                 )
                 .await?;
+                return Ok(None);
+            }
+            RecoveryAction::FailClosed(reason) => {
+                Self::fail_closed_tx(&mut tx, &old, reason, now, "try_acquire_task").await?;
                 tx.commit().await.context("commit fail-closed acquire")?;
                 return Ok(None);
             }
@@ -4167,7 +4191,9 @@ ORDER BY created_at, id
                     tx.commit().await.context("commit acquire_next_runnable")?;
                     return Ok(Some(claimed));
                 }
-                RecoveryAction::FailClosed(reason) if reason.terminal_event(&old).is_some() => {
+                RecoveryAction::FailClosed(_)
+                    if old.kind == TaskKind::RootTurn && old.is_root() =>
+                {
                     tx.rollback()
                         .await
                         .context("rollback before thread-first fail-close")?;
@@ -4355,7 +4381,9 @@ FOR UPDATE SKIP LOCKED
                     Self::update_task_tx(&mut tx, &released_row).await?;
                     RecoveryRecord::requeued(old.id.clone())
                 }
-                RecoveryAction::FailClosed(reason) if reason.terminal_event(&old).is_some() => {
+                RecoveryAction::FailClosed(_)
+                    if old.kind == TaskKind::RootTurn && old.is_root() =>
+                {
                     exhausted_roots.push(old.id);
                     continue;
                 }
@@ -4379,7 +4407,7 @@ FOR UPDATE SKIP LOCKED
         // The batch locked these roots before their threads; journaling
         // their terminal events needs thread → task order.
         for id in exhausted_roots {
-            if let Some(reason) = self
+            if let Some((reason, settled)) = self
                 .fail_closed_root_thread_first(
                     &id,
                     RecoveryContext::ExpiredLease,
@@ -4388,7 +4416,7 @@ FOR UPDATE SKIP LOCKED
                 )
                 .await?
             {
-                released.push(RecoveryRecord::failed_closed(id, reason));
+                released.push(RecoveryRecord::failed_closed(id, reason).with_settled(settled));
             }
         }
         Ok(released)
