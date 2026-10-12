@@ -128,11 +128,15 @@ const SUBAGENT_CHILD_ROOT_LINK_INDEX_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/postgres/0024_subagent_child_root_link_index.sql"
 ));
+const DROP_PARKED_SUBAGENT_CHILD_ROOT_INDEX_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/postgres/0025_drop_parked_subagent_child_root_index.sql"
+));
 
 /// `sqlx`-managed migration bundle for the Postgres durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/postgres");
 
-const MIGRATIONS: [PostgresMigration; 22] = [
+const MIGRATIONS: [PostgresMigration; 23] = [
     PostgresMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -242,6 +246,11 @@ const MIGRATIONS: [PostgresMigration; 22] = [
         version: "0024",
         summary: "index every subagent invocation's child-root link, whatever its status",
         sql: SUBAGENT_CHILD_ROOT_LINK_INDEX_SQL,
+    },
+    PostgresMigration {
+        version: "0025",
+        summary: "drop the parked-invocation child-root index 0024 supersedes",
+        sql: DROP_PARKED_SUBAGENT_CHILD_ROOT_INDEX_SQL,
     },
 ];
 
@@ -483,6 +492,47 @@ mod tests {
             reviewable, executable,
             "reviewable migration versions must match the executable migrator's, in order",
         );
+    }
+
+    /// Index work on the task table runs CONCURRENTLY, outside a
+    /// transaction, so task writes continue while it runs. Each migration
+    /// holds that one statement (a multi-statement script would run as one
+    /// implicit transaction), and none accepts an existing index: a failed
+    /// concurrent build leaves an INVALID one, which must fail the retry.
+    #[test]
+    fn task_index_migrations_run_concurrently_outside_a_transaction() {
+        for version in ["0024", "0025"] {
+            let executable = DURABLE_CORE_MIGRATOR
+                .migrations
+                .iter()
+                .find(|migration| format!("{:04}", migration.version) == version)
+                .unwrap_or_else(|| panic!("migration {version} must be in the bundle"));
+            assert!(executable.no_tx, "{version} must run outside a transaction");
+            let reviewable = durable_core_migrations()
+                .iter()
+                .find(|migration| migration.version == version)
+                .unwrap_or_else(|| panic!("migration {version} must be reviewable"));
+            let body = reviewable
+                .sql
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("--"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let statements: Vec<&str> = body
+                .split(';')
+                .map(str::trim)
+                .filter(|statement| !statement.is_empty())
+                .collect();
+            assert_eq!(statements.len(), 1, "{version}: {statements:?}");
+            assert!(
+                statements[0].contains("CONCURRENTLY"),
+                "{version}: {statements:?}"
+            );
+            assert!(
+                !statements[0].contains("IF NOT EXISTS"),
+                "{version}: {statements:?}"
+            );
+        }
     }
 
     #[test]
