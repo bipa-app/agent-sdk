@@ -62,6 +62,7 @@ impl MockProvider {
                 output_tokens: 20,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         })
     }
@@ -87,6 +88,7 @@ impl MockProvider {
                 output_tokens: 20,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         })
     }
@@ -106,6 +108,7 @@ impl MockProvider {
                 output_tokens: 0,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         })
     }
@@ -132,6 +135,7 @@ impl MockProvider {
                 output_tokens: 20,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         })
     }
@@ -264,6 +268,7 @@ impl crate::llm::LlmProvider for StreamScriptProvider {
                 StreamDelta::Done {
                     stop_reason: Some(StopReason::EndTurn),
                     served_route: None,
+                    served_model: None,
                 },
             )))),
         }

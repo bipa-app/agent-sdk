@@ -178,6 +178,7 @@ const fn replay_usage() -> Usage {
         output_tokens: 100,
         cached_input_tokens: 0,
         cache_creation_input_tokens: 0,
+        request_input_tokens: None,
     }
 }
 
@@ -196,7 +197,7 @@ fn thinking_text_stream(thinking: String, signature: String, text: String) -> St
             yield Ok(StreamDelta::TextDelta { delta: text, block_index: 1 });
         }
         yield Ok(StreamDelta::Usage(replay_usage()));
-        yield Ok(StreamDelta::Done { stop_reason: Some(StopReason::EndTurn), served_route: None });
+        yield Ok(StreamDelta::Done { stop_reason: Some(StopReason::EndTurn), served_route: None , served_model: None});
     })
 }
 
@@ -275,6 +276,7 @@ impl LlmProvider for ThinkingToolCallProvider {
                     output_tokens: 25,
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
+                    request_input_tokens: None,
                 },
             }));
         }
@@ -341,7 +343,7 @@ impl LlmProvider for ThinkingToolCallProvider {
                 });
             }
             yield Ok(StreamDelta::Usage(replay_usage()));
-            yield Ok(StreamDelta::Done { stop_reason: Some(StopReason::ToolUse), served_route: None });
+            yield Ok(StreamDelta::Done { stop_reason: Some(StopReason::ToolUse), served_route: None , served_model: None});
         })
     }
 

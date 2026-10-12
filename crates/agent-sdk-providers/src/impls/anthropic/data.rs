@@ -913,6 +913,7 @@ impl SseUsageState {
             cached_input_tokens: self.cached_input_tokens,
             cache_creation_input_tokens: self.cache_creation_input_tokens,
             served_speed: self.served_speed,
+            request_input_tokens: Some(self.input_tokens),
         }
     }
 }
@@ -1853,6 +1854,7 @@ data: {"type":"message_stop"}"#;
                 cached_input_tokens: 20,
                 cache_creation_input_tokens: 10,
                 served_speed: None,
+                request_input_tokens: Some(180),
             }))
         ));
     }

@@ -143,6 +143,10 @@ pub struct ThreadRecoveryView {
     ///
     /// Equal to `thread.committed_turns + 1` (1 for a fresh thread).
     pub next_turn_number: u32,
+
+    /// The projection's [`history_generation`](super::message::MessageProjection::history_generation)
+    /// at recovery time; zero when no projection row exists.
+    pub history_generation: u64,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -208,17 +212,19 @@ pub async fn recover_thread(
     //    attempt — therefore does not replay the context that overflowed.
     //    The checkpoint remains load-bearing for agent state and the
     //    turn-number consistency guard.
-    let (has_projection, committed_messages, draft_messages) = match message_store
-        .get(thread_id)
-        .await
-        .context("recover: load message projection")?
-    {
-        Some(projection) => {
-            let context_history = projection.context_history();
-            (true, context_history, projection.draft_messages)
-        }
-        None => (false, Vec::new(), Vec::new()),
-    };
+    let (has_projection, history_generation, committed_messages, draft_messages) =
+        match message_store
+            .get(thread_id)
+            .await
+            .context("recover: load message projection")?
+        {
+            Some(projection) => {
+                let generation = projection.history_generation;
+                let context_history = projection.context_history();
+                (true, generation, context_history, projection.draft_messages)
+            }
+            None => (false, 0, Vec::new(), Vec::new()),
+        };
 
     // 4. Fresh thread — no checkpoints to load. A projection can still carry
     //    effective history here: pre-call compaction may have atomically folded
@@ -234,6 +240,7 @@ pub async fn recover_thread(
             messages,
             agent_state_snapshot: serde_json::Value::Null,
             latest_checkpoint: None,
+            history_generation,
             committed_messages,
             draft_messages,
             next_turn_number: 1,
@@ -283,6 +290,7 @@ pub async fn recover_thread(
         messages,
         agent_state_snapshot: checkpoint.agent_state_snapshot.clone(),
         latest_checkpoint: Some(checkpoint),
+        history_generation,
         committed_messages: committed_head,
         draft_messages,
         next_turn_number: next_turn,

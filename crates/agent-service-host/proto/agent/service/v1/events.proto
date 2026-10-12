@@ -66,13 +66,16 @@ message StartEvent {
   optional string emitter_task_id = 3;
 }
 
-// The user prompt that opens a turn. Committed by the worker on
-// the first attempt of each root-turn task, immediately before
-// the matching `StartEvent`. Carries the admitted prompt as a
-// list of conversation content blocks (text, image, document)
-// so replay clients can render the user message without
-// re-deriving it from the projection's user-role messages —
-// the projection mixes prompts with tool-result responses and
+// The user prompt that opens a turn, or input injected into a
+// running turn. A turn's prompt is committed once per root-turn
+// task, immediately before that task's first `StartEvent`; a
+// re-acquired task never commits it again. Injected input is
+// committed when the running turn drains it at a tool boundary,
+// so it follows that turn's `StartEvent`. Carries the admitted
+// input as a list of conversation content blocks (text, image,
+// document) so replay clients can render the user message without
+// re-deriving it from the projection's user-role messages — the
+// projection mixes prompts with tool-result responses and
 // compaction summaries, none of which carry a sequence number.
 message UserInputEvent {
   string thread_id = 1;
@@ -80,7 +83,12 @@ message UserInputEvent {
   // the common `ConversationContentBlock` shape so wire types
   // stay consistent with the projection snapshot.
   repeated ConversationContentBlock content = 2;
-  // Durable input-injection task that admitted this boundary input.
+  // Durable task that admitted this input: the root-turn task for
+  // a turn's prompt, the input-injection task for injected input.
+  // Unset on events journaled before prompts were stamped. Its
+  // presence does not mark an injection: injected input names a
+  // different task than the turn's `StartEvent.emitter_task_id`,
+  // a prompt names the same.
   optional string emitter_task_id = 3;
 }
 
@@ -333,11 +341,31 @@ message RefusalEvent {
   optional string text = 2;
 }
 
+// What started a context compaction. UNSPECIFIED on events journaled before
+// the trigger was recorded.
+enum CompactionTrigger {
+  COMPACTION_TRIGGER_UNSPECIFIED = 0;
+  COMPACTION_TRIGGER_THRESHOLD = 1;
+  COMPACTION_TRIGGER_OVERFLOW = 2;
+  COMPACTION_TRIGGER_USER_REQUESTED = 3;
+}
+
+// Engine the host configured for a compaction. UNSPECIFIED for custom
+// compactors and events journaled before the engine was recorded.
+enum CompactionEngine {
+  COMPACTION_ENGINE_UNSPECIFIED = 0;
+  COMPACTION_ENGINE_LEGACY = 1;
+  COMPACTION_ENGINE_PRUNE_FIRST = 2;
+  COMPACTION_ENGINE_SNAPCOMPACT = 3;
+}
+
 message ContextCompactedEvent {
   uint64 original_count = 1;
   uint64 new_count = 2;
   uint64 original_tokens = 3;
   uint64 new_tokens = 4;
+  CompactionTrigger trigger = 5;
+  CompactionEngine engine = 6;
 }
 
 message SubagentProgressEvent {

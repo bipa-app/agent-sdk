@@ -220,7 +220,7 @@ async fn repair_one_thread(
 
     let record = sqlx::query(
         r"
-SELECT history_json, draft_messages_json, compactions_json, version, created_at, updated_at
+SELECT history_json, draft_messages_json, compactions_json, history_generation, version, created_at, updated_at
 FROM agent_sdk_message_heads
 WHERE thread_id = ?1
 ",
@@ -248,6 +248,7 @@ WHERE thread_id = ?1
         .transpose()
         .context("re-decode compactions")?
         .unwrap_or_default();
+    let history_generation: i64 = record.get("history_generation");
     let version: i64 = record.get("version");
     let created_at: OffsetDateTime = record.get("created_at");
     let updated_at: OffsetDateTime = record.get("updated_at");
@@ -266,6 +267,8 @@ WHERE thread_id = ?1
         messages: history,
         draft_messages: draft,
         compactions,
+        history_generation: u64::try_from(history_generation)
+            .context("projection history generation overflow")?,
         version: u64::try_from(version).context("projection version overflow")?,
         created_at,
         updated_at,
@@ -345,16 +348,19 @@ async fn persist_projection_tx(
     } else {
         Some(serde_json::to_string(&projection.compactions).context("serialize compactions")?)
     };
+    let history_generation =
+        i64::try_from(projection.history_generation).context("history generation overflow")?;
     let version = i64::try_from(projection.version).context("version overflow")?;
     sqlx::query(
         r"
 INSERT INTO agent_sdk_message_heads
-    (thread_id, history_json, draft_messages_json, compactions_json, version, created_at, updated_at)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+    (thread_id, history_json, draft_messages_json, compactions_json, history_generation, version, created_at, updated_at)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
 ON CONFLICT (thread_id) DO UPDATE SET
     history_json = excluded.history_json,
     draft_messages_json = excluded.draft_messages_json,
     compactions_json = excluded.compactions_json,
+    history_generation = excluded.history_generation,
     version = excluded.version,
     updated_at = excluded.updated_at
 ",
@@ -363,6 +369,7 @@ ON CONFLICT (thread_id) DO UPDATE SET
     .bind(history_json)
     .bind(draft_json)
     .bind(compactions_json)
+    .bind(history_generation)
     .bind(version)
     .bind(projection.created_at)
     .bind(projection.updated_at)

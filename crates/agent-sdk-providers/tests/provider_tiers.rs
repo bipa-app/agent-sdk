@@ -110,6 +110,7 @@ fn tier_a_text_deltas_accumulate_in_block_order() {
         StreamDelta::Done {
             stop_reason: Some(StopReason::EndTurn),
             served_route: None,
+            served_model: None,
         },
     ] {
         acc.apply(&delta);
@@ -143,6 +144,7 @@ fn tier_a_tool_use_json_round_trips_through_streamed_fragments() {
     acc.apply(&StreamDelta::Done {
         stop_reason: Some(StopReason::ToolUse),
         served_route: None,
+        served_model: None,
     });
 
     let blocks = acc.into_content_blocks();

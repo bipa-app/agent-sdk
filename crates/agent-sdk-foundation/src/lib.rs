@@ -23,7 +23,8 @@ pub mod types;
 
 pub use audit::{AuditProvenance, ToolAuditOutcome, ToolAuditRecord, ToolAuditRecordParams};
 pub use events::{
-    AccountRotationReason, AgentEvent, AgentEventEnvelope, SequenceCounter, TerminalReason,
+    AccountRotationReason, AgentEvent, AgentEventEnvelope, CompactionEngine, CompactionTrigger,
+    SequenceCounter, TerminalReason,
 };
 pub use llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, ContentSource, Effort, Message,

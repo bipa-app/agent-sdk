@@ -128,6 +128,12 @@ pub enum StreamDelta {
         /// `None` from providers that predate the field — consumers fall back
         /// to the dispatch handle's `route()`.
         served_route: Option<String>,
+        /// The [`LlmProvider::model`](crate::provider::LlmProvider::model) of
+        /// the provider that actually served this stream, stamped and
+        /// forwarded alongside `served_route`. One route can serve several
+        /// models, so only the pair names what measured the request. `None`
+        /// from providers that predate the field.
+        served_model: Option<String>,
     },
 
     /// A signature delta for a thinking block.
@@ -414,6 +420,9 @@ pub fn reqwest_body_error_delta(context: &str, error: &reqwest::Error) -> Stream
 pub type StreamBox<'a> = Pin<Box<dyn Stream<Item = anyhow::Result<StreamDelta>> + Send + 'a>>;
 
 /// Sum two usage readings, saturating so token counters never wrap.
+///
+/// `request_input_tokens` is carried from `usage` verbatim, never summed and
+/// never re-derived from the aggregate counters.
 fn add_usage(carried: Option<&Usage>, usage: &Usage) -> Usage {
     let Some(carried) = carried else {
         return usage.clone();
@@ -428,6 +437,7 @@ fn add_usage(carried: Option<&Usage>, usage: &Usage) -> Usage {
         cache_creation_input_tokens: carried
             .cache_creation_input_tokens
             .saturating_add(usage.cache_creation_input_tokens),
+        request_input_tokens: usage.request_input_tokens,
     }
 }
 
@@ -444,6 +454,11 @@ fn add_usage(carried: Option<&Usage>, usage: &Usage) -> Usage {
 /// stream to retry, it calls [`abandon`](Self::abandon) to fold that stream's
 /// usage into the carry. The final delta the consumer sees — the only one the
 /// accumulator keeps — is therefore the true total across every attempt.
+///
+/// `request_input_tokens` is never summed: each rewritten delta carries the
+/// current attempt's own value, and a wrapper whose replacement stream
+/// reported no usage emits [`terminal_usage`](Self::terminal_usage) before
+/// the successful `Done`.
 #[derive(Default)]
 pub(crate) struct UsageCarry {
     /// Usage billed by abandoned attempts.
@@ -475,6 +490,20 @@ impl UsageCarry {
             self.carried = Some(add_usage(self.carried.as_ref(), &current));
         }
     }
+
+    /// Usage frame owed before a successful `Done` when abandoned attempts
+    /// billed tokens but the surviving stream reported no usage: the
+    /// consumer's last-wins accumulator would otherwise keep an abandoned
+    /// request's `request_input_tokens`.
+    pub(crate) fn terminal_usage(&self) -> Option<Usage> {
+        if self.current.is_some() {
+            return None;
+        }
+        let carried = self.carried.as_ref()?;
+        let mut usage = carried.clone();
+        usage.request_input_tokens = None;
+        Some(usage)
+    }
 }
 
 /// Helper to accumulate streamed content into a final response.
@@ -501,6 +530,8 @@ pub struct StreamAccumulator {
     stop_reason: Option<StopReason>,
     /// Serving route reported by the stream's `Done` marker
     served_route: Option<String>,
+    /// Serving model reported by the stream's `Done` marker
+    served_model: Option<String>,
 }
 
 /// Accumulator for a single tool use during streaming.
@@ -595,9 +626,11 @@ impl StreamAccumulator {
             StreamDelta::Done {
                 stop_reason,
                 served_route,
+                served_model,
             } => {
                 self.stop_reason = *stop_reason;
                 self.served_route.clone_from(served_route);
+                self.served_model.clone_from(served_model);
             }
             StreamDelta::Error { .. } | StreamDelta::KeepAlive => {}
         }
@@ -619,6 +652,12 @@ impl StreamAccumulator {
     #[must_use]
     pub fn served_route(&self) -> Option<&str> {
         self.served_route.as_deref()
+    }
+
+    /// The serving model the stream's `Done` marker reported, if any.
+    #[must_use]
+    pub fn served_model(&self) -> Option<&str> {
+        self.served_model.as_deref()
     }
 
     /// Convert accumulated content to `ContentBlock`s.
@@ -765,6 +804,78 @@ mod tests {
             total.served_speed,
             Some(ServedSpeed::Uniform(SpeedTier::Fast))
         );
+    }
+
+    #[test]
+    fn usage_carry_sums_billing_but_carries_the_current_request_stamp() {
+        let mut carry = UsageCarry::new();
+        let first = carry.running_total(Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            request_input_tokens: Some(100),
+            ..Usage::default()
+        });
+        assert_eq!(first.input_tokens, 100);
+        assert_eq!(first.request_input_tokens, Some(100));
+        carry.abandon();
+
+        let second = carry.running_total(Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            request_input_tokens: Some(10),
+            ..Usage::default()
+        });
+        assert_eq!(second.input_tokens, 110, "billing must aggregate");
+        assert_eq!(second.output_tokens, 55);
+        assert_eq!(
+            second.request_input_tokens,
+            Some(10),
+            "the stamp must name the current physical request, never the sum"
+        );
+        assert!(carry.terminal_usage().is_none());
+    }
+
+    #[test]
+    fn usage_carry_never_rederives_a_missing_stamp_from_the_aggregate() {
+        let mut carry = UsageCarry::new();
+        carry.running_total(Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            request_input_tokens: Some(100),
+            ..Usage::default()
+        });
+        carry.abandon();
+
+        let total = carry.running_total(Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            request_input_tokens: None,
+            ..Usage::default()
+        });
+        assert_eq!(total.input_tokens, 110);
+        assert_eq!(total.request_input_tokens, None);
+    }
+
+    #[test]
+    fn usage_carry_owes_a_reset_frame_when_the_survivor_reported_no_usage() -> anyhow::Result<()> {
+        let mut carry = UsageCarry::new();
+        assert!(carry.terminal_usage().is_none());
+
+        carry.running_total(Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            request_input_tokens: Some(100),
+            ..Usage::default()
+        });
+        carry.abandon();
+
+        let reset = carry
+            .terminal_usage()
+            .ok_or_else(|| anyhow::anyhow!("a reset frame is owed when carried billing exists"))?;
+        assert_eq!(reset.input_tokens, 100);
+        assert_eq!(reset.output_tokens, 50);
+        assert_eq!(reset.request_input_tokens, None);
+        Ok(())
     }
 
     #[test]
@@ -964,10 +1075,12 @@ mod tests {
             output_tokens: 50,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         }));
         acc.apply(&StreamDelta::Done {
             stop_reason: Some(StopReason::ToolUse),
             served_route: None,
+            served_model: None,
         });
 
         assert!(acc.usage().is_some());
@@ -981,21 +1094,26 @@ mod tests {
     }
 
     #[test]
-    fn accumulator_captures_the_done_markers_served_route() {
+    fn accumulator_captures_the_done_markers_served_identity() {
         let mut acc = StreamAccumulator::new();
         assert_eq!(acc.served_route(), None);
+        assert_eq!(acc.served_model(), None);
         acc.apply(&StreamDelta::Done {
             stop_reason: Some(StopReason::EndTurn),
             served_route: Some("openrouter".to_owned()),
+            served_model: Some("moonshotai/kimi-k3".to_owned()),
         });
         assert_eq!(acc.served_route(), Some("openrouter"));
+        assert_eq!(acc.served_model(), Some("moonshotai/kimi-k3"));
 
         let mut without = StreamAccumulator::new();
         without.apply(&StreamDelta::Done {
             stop_reason: Some(StopReason::EndTurn),
             served_route: None,
+            served_model: None,
         });
         assert_eq!(without.served_route(), None);
+        assert_eq!(without.served_model(), None);
     }
 
     #[test]

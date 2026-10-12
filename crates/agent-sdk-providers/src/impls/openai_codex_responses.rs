@@ -454,6 +454,7 @@ impl OpenAICodexResponsesProvider {
                     output_tokens: 0,
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
+                    request_input_tokens: None,
                 },
                 |usage| usage_from_api_usage(&usage),
             ),
@@ -493,6 +494,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
     fn chat_stream(&self, mut request: ChatRequest) -> StreamBox<'_> {
         self.downgrade_unsupported_original_image_detail(&mut request);
         let served_route = self.route().to_owned();
+        let served_model = self.model().to_owned();
         let trace = StreamTraceRecorder::new(&self.model);
         let abandoned = AbandonedStreamLog(trace.clone());
         let stream = async_stream::stream! {
@@ -1249,6 +1251,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                 yield Ok(StreamDelta::Done {
                                                     stop_reason,
                                                     served_route: Some(served_route.clone()),
+                                                    served_model: Some(served_model.clone()),
                                                 });
                                                 return;
                                             }
@@ -1499,6 +1502,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                     yield Ok(StreamDelta::Done {
                                                         stop_reason,
                                                         served_route: Some(served_route.clone()),
+                                                        served_model: Some(served_model.clone()),
                                                     });
                                                     return;
                                                 }
@@ -1710,6 +1714,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                         yield Ok(StreamDelta::Done {
                             stop_reason: Some(stop_reason),
                             served_route: Some(served_route.clone()),
+                            served_model: Some(served_model.clone()),
                         });
                         return;
                     }
@@ -1873,6 +1878,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
             yield Ok(StreamDelta::Done {
                 stop_reason: Some(stop_reason),
                 served_route: Some(served_route.clone()),
+                served_model: Some(served_model.clone()),
             });
         };
         Box::pin(stream.inspect(move |item| abandoned.observe(item)))
@@ -2350,6 +2356,7 @@ fn usage_from_api_usage(usage: &ApiUsage) -> Usage {
             .input_tokens_details
             .as_ref()
             .map_or(0, |details| details.cache_write_tokens),
+        request_input_tokens: Some(usage.input_tokens),
     }
 }
 
@@ -4935,6 +4942,11 @@ mod tests {
         let usage = usage_from_api_usage(&usage);
         assert_eq!(usage.cached_input_tokens, 1024);
         assert_eq!(usage.cache_creation_input_tokens, 512);
+        assert_eq!(
+            usage.request_input_tokens,
+            Some(2048),
+            "one physical request: request occupancy equals its total input"
+        );
         Ok(())
     }
 
@@ -5585,6 +5597,7 @@ mod tests {
             Ok(StreamDelta::Done {
                 stop_reason: Some(StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             }),
             Ok(StreamDelta::Error {
                 message: "boom".to_owned(),

@@ -93,6 +93,42 @@ pub enum TerminalReason {
     Unknown,
 }
 
+/// What started a context compaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionTrigger {
+    /// The pre-call occupancy check crossed the threshold.
+    Threshold,
+    /// The provider rejected a request for exceeding its context window.
+    Overflow,
+    /// A user or host explicitly asked for compaction.
+    UserRequested,
+}
+
+/// Compaction implementation selected by the host.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionEngine {
+    /// Summarize the selected prefix without pruning and use estimated triggers.
+    #[default]
+    Legacy,
+    /// Prune recoverable tool output first and let the host use measured triggers.
+    PruneFirst,
+    /// Deterministic local transcript rendering with an exact source archive.
+    Snapcompact,
+}
+
+/// Decodes an optional event field, mapping values this build does not know
+/// to `None` so journal rows from newer producers stay readable.
+fn known_or_none<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+}
+
 /// Why a daemon changed the OAuth account serving a provider request.
 ///
 /// The unknown sink keeps durable journal rows readable when a newer producer
@@ -139,17 +175,19 @@ pub enum AgentEvent {
         emitter_task_id: Option<String>,
     },
 
-    /// The user prompt that opens a turn.
+    /// The user prompt that opens a turn, or input injected into a
+    /// running turn.
     ///
-    /// Committed by the worker on the **first attempt** of each
-    /// root-turn task, immediately before the matching
-    /// [`AgentEvent::Start`]. Carries the task's admitted
-    /// `submitted_input` lifted into the LLM-content shape
-    /// (`Vec<ContentBlock>` — text, image, document) so consumers
-    /// can render the prompt without reaching into the projection
-    /// or the task store. Retries of the same turn do not re-emit
-    /// the event; downstream readers can pair `UserInput` 1:1
-    /// with the *first* `Start { turn: N }` per turn.
+    /// A turn's prompt is committed **once per root-turn task**,
+    /// immediately before that task's first [`AgentEvent::Start`]; a
+    /// re-acquired task never commits it again, so readers can pair
+    /// each prompt 1:1 with the *first* `Start { turn: N }` per turn.
+    /// Input injected into a running turn is committed when the turn
+    /// drains it at a tool boundary, so it follows that turn's `Start`.
+    /// Carries the admitted `submitted_input` lifted into the
+    /// LLM-content shape (`Vec<ContentBlock>` — text, image, document)
+    /// so consumers can render it without reaching into the projection
+    /// or the task store.
     ///
     /// This is the durable, sequence-numbered admission event the
     /// projection never carried — `MessageProjection::messages`
@@ -167,8 +205,12 @@ pub enum AgentEvent {
         /// `ContentBlock` type lets the field round-trip through
         /// the same wire shapes the projection uses.
         content: Vec<ContentBlock>,
-        /// Durable task that admitted this input. Present for boundary
-        /// injections; absent on ordinary root prompts and legacy rows.
+        /// Durable task that admitted this input: the root-turn task for
+        /// a turn's prompt, the input-injection task for injected input.
+        /// Absent on rows journaled before prompts were stamped and on
+        /// runs without a durable task. Its presence does not mark an
+        /// injection: injected input names a different task than the
+        /// `emitter_task_id` of the turn's `Start`, a prompt names the same.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         emitter_task_id: Option<String>,
     },
@@ -463,6 +505,21 @@ pub enum AgentEvent {
         original_tokens: usize,
         /// Estimated tokens after compaction
         new_tokens: usize,
+        /// `None` on events journaled before the trigger was recorded.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "known_or_none"
+        )]
+        trigger: Option<CompactionTrigger>,
+        /// Engine the host configured; `None` for custom compactors and
+        /// events journaled before the engine was recorded.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "known_or_none"
+        )]
+        engine: Option<CompactionEngine>,
     },
 
     /// Progress update from a running subagent
@@ -882,12 +939,16 @@ impl AgentEvent {
         new_count: usize,
         original_tokens: usize,
         new_tokens: usize,
+        trigger: CompactionTrigger,
+        engine: Option<CompactionEngine>,
     ) -> Self {
         Self::ContextCompacted {
             original_count,
             new_count,
             original_tokens,
             new_tokens,
+            trigger: Some(trigger),
+            engine,
         }
     }
 }
@@ -1410,6 +1471,82 @@ mod tests {
     }
 
     #[test]
+    fn context_compacted_rows_without_trigger_or_engine_still_deserialize() -> serde_json::Result<()>
+    {
+        let legacy: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "context_compacted",
+            "original_count": 10,
+            "new_count": 4,
+            "original_tokens": 1_000,
+            "new_tokens": 400,
+        }))?;
+        assert!(
+            matches!(
+                legacy,
+                AgentEvent::ContextCompacted {
+                    original_count: 10,
+                    new_tokens: 400,
+                    trigger: None,
+                    engine: None,
+                    ..
+                }
+            ),
+            "{legacy:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn context_compacted_records_trigger_and_engine_and_tolerates_unknown_values()
+    -> serde_json::Result<()> {
+        let event = AgentEvent::context_compacted(
+            10,
+            4,
+            1_000,
+            400,
+            CompactionTrigger::UserRequested,
+            Some(CompactionEngine::Snapcompact),
+        );
+        let encoded = serde_json::to_value(&event)?;
+        assert_eq!(encoded["trigger"], "user_requested");
+        assert_eq!(encoded["engine"], "snapcompact");
+        let restored: AgentEvent = serde_json::from_value(encoded)?;
+        assert!(
+            matches!(
+                restored,
+                AgentEvent::ContextCompacted {
+                    trigger: Some(CompactionTrigger::UserRequested),
+                    engine: Some(CompactionEngine::Snapcompact),
+                    ..
+                }
+            ),
+            "{restored:?}"
+        );
+
+        let future: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "context_compacted",
+            "original_count": 10,
+            "new_count": 4,
+            "original_tokens": 1_000,
+            "new_tokens": 400,
+            "trigger": "scheduled",
+            "engine": "streaming_summary",
+        }))?;
+        assert!(
+            matches!(
+                future,
+                AgentEvent::ContextCompacted {
+                    trigger: None,
+                    engine: None,
+                    ..
+                }
+            ),
+            "{future:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn terminal_reason_round_trips_provider_kind_and_accepts_future_variants()
     -> serde_json::Result<()> {
         let provider = TerminalReason::ProviderError {
@@ -1702,6 +1839,8 @@ mod tests {
                 new_count: 5,
                 original_tokens: 100,
                 new_tokens: 50,
+                trigger: Some(CompactionTrigger::Overflow),
+                engine: Some(CompactionEngine::PruneFirst),
             },
             AgentEvent::SubagentProgress {
                 subagent_id: "s".into(),

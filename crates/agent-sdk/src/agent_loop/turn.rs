@@ -10,7 +10,7 @@ use super::types::{
 
 use crate::authority::EventAuthority;
 use crate::context::{CompactionConfig, CompactionPurpose, ContextCompactor, LlmContextCompactor};
-use crate::events::AgentEvent;
+use crate::events::{AgentEvent, CompactionTrigger};
 use crate::hooks::{AgentHooks, ToolAuditSink};
 use crate::llm::{
     ChatRequest, ChatResponse, Content, ContentBlock, LlmProvider, Message, StopReason,
@@ -250,6 +250,7 @@ where
             );
             return compact_messages_for_threshold(ThresholdCompactionParams {
                 compactor: compactor.as_ref(),
+                engine: None,
                 messages,
                 message_store,
                 thread_id,
@@ -285,7 +286,8 @@ where
         } else {
             default_compactor
         }
-        .with_guardrail_hooks(Arc::clone(hooks));
+        .with_guardrail_hooks(Arc::clone(hooks))
+        .with_provisional_artifacts();
         if default_compactor.needs_compaction(&messages) {
             debug!(
                 "Context compaction triggered (turn={}, message_count={})",
@@ -294,6 +296,7 @@ where
             );
             return compact_messages_for_threshold(ThresholdCompactionParams {
                 compactor: &default_compactor,
+                engine: Some(compact_config.engine),
                 messages,
                 message_store,
                 thread_id,
@@ -330,6 +333,8 @@ struct StoredCompactionResult {
 
 struct ThresholdCompactionParams<'a, C: ?Sized, H, M> {
     compactor: &'a C,
+    /// `None` for a caller-supplied compactor.
+    engine: Option<crate::context::CompactionEngine>,
     messages: Vec<Message>,
     message_store: &'a Arc<M>,
     thread_id: &'a ThreadId,
@@ -363,6 +368,7 @@ enum CompactionOutcome {
 async fn compact_messages_for_threshold<C, H, M>(
     ThresholdCompactionParams {
         compactor,
+        engine,
         messages,
         message_store,
         thread_id,
@@ -403,6 +409,8 @@ where
                     result.new_count,
                     result.original_tokens,
                     result.new_tokens,
+                    CompactionTrigger::Threshold,
+                    engine,
                 ),
             )
             .await
@@ -529,6 +537,7 @@ where
         retained_count: result.retained_count,
         llm_usage: result.llm_usage,
     };
+    let published_artifacts = result.published_artifacts;
 
     #[cfg(feature = "otel")]
     record_compaction_result(&mut compaction_span, &stored_result, trigger);
@@ -553,6 +562,8 @@ where
             llm_usage: stored_result.llm_usage,
         };
     }
+
+    published_artifacts.commit();
 
     #[cfg(feature = "otel")]
     finish_compaction_span_success(&mut compaction_span);
@@ -1983,7 +1994,8 @@ where
         } else {
             default_compactor
         }
-        .with_guardrail_hooks(Arc::clone(hooks));
+        .with_guardrail_hooks(Arc::clone(hooks))
+        .with_provisional_artifacts();
         compact_history_and_store(
             &default_compactor,
             history,

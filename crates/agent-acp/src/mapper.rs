@@ -927,7 +927,14 @@ mod tests {
                 success: true,
                 final_error: None,
             },
-            AgentEvent::context_compacted(10, 4, 1_000, 400),
+            AgentEvent::context_compacted(
+                10,
+                4,
+                1_000,
+                400,
+                agent_sdk_foundation::CompactionTrigger::Threshold,
+                None,
+            ),
         ];
         for event in events {
             assert_eq!(mapper.map(&event), Mapped::Ignore);

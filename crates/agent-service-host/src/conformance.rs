@@ -2837,6 +2837,98 @@ mod tests {
         Ok(())
     }
 
+    async fn returned_and_persisted_generation(
+        message_store: &dyn MessageProjectionStore,
+        thread: &ThreadId,
+        returned: &agent_server::journal::MessageProjection,
+    ) -> Result<(u64, u64)> {
+        let persisted = message_store
+            .get(thread)
+            .await?
+            .context("projection row exists")?
+            .history_generation;
+        Ok((returned.history_generation, persisted))
+    }
+
+    /// Every rewrite (`append_compaction`, `replace_history`,
+    /// `append_repair`) advances the persisted `history_generation`, an
+    /// append-only commit keeps it, and it survives `replace_history`
+    /// clearing the compaction lineage.
+    async fn test_history_generation_round_trip(
+        message_store: &dyn MessageProjectionStore,
+    ) -> Result<()> {
+        use agent_sdk_foundation::llm::Message;
+
+        let thread = thread_id("conformance-history-generation");
+        let mut observed = Vec::new();
+
+        let step = message_store
+            .commit_messages(
+                &thread,
+                vec![Message::user("u1"), Message::assistant("a1")],
+                t_plus(1),
+            )
+            .await?;
+        observed.push(returned_and_persisted_generation(message_store, &thread, &step).await?);
+
+        let step = message_store
+            .append_compaction(&thread, vec![Message::user("summary-1")], 2, 0, t_plus(2))
+            .await?;
+        observed.push(returned_and_persisted_generation(message_store, &thread, &step).await?);
+
+        let step = message_store
+            .commit_messages(
+                &thread,
+                vec![Message::user("u2"), Message::assistant("a2")],
+                t_plus(3),
+            )
+            .await?;
+        observed.push(returned_and_persisted_generation(message_store, &thread, &step).await?);
+
+        let step = message_store
+            .append_compaction(&thread, vec![Message::user("summary-2")], 3, 0, t_plus(4))
+            .await?;
+        observed.push(returned_and_persisted_generation(message_store, &thread, &step).await?);
+
+        let step = message_store
+            .replace_history(&thread, vec![Message::user("rewritten")], t_plus(5))
+            .await?;
+        anyhow::ensure!(
+            step.compactions.is_empty(),
+            "replace_history clears the lineage: {:?}",
+            step.compactions,
+        );
+        observed.push(returned_and_persisted_generation(message_store, &thread, &step).await?);
+
+        let step = message_store
+            .commit_messages(&thread, vec![Message::assistant("a3")], t_plus(6))
+            .await?;
+        observed.push(returned_and_persisted_generation(message_store, &thread, &step).await?);
+
+        let step = message_store
+            .append_repair(
+                &thread,
+                vec![Message::user("repair-evidence")],
+                vec![Message::user("rewritten"), Message::assistant("a3")],
+                2,
+                t_plus(7),
+            )
+            .await?;
+        observed.push(returned_and_persisted_generation(message_store, &thread, &step).await?);
+
+        let step = message_store
+            .commit_messages(&thread, vec![Message::user("u4")], t_plus(8))
+            .await?;
+        observed.push(returned_and_persisted_generation(message_store, &thread, &step).await?);
+
+        let want = [0, 1, 1, 2, 3, 3, 4, 4].map(|generation| (generation, generation));
+        anyhow::ensure!(
+            observed == want,
+            "(returned, re-read) history_generation per step: got {observed:?}, want {want:?}",
+        );
+        Ok(())
+    }
+
     // ── Backend runners ──────────────────────────────────────────────
 
     // ── In-memory backend ────────────────────────────────────────────
@@ -3109,6 +3201,12 @@ mod tests {
     async fn conformance_in_memory_persist_intent_insert_if_absent() -> Result<()> {
         let store = agent_server::journal::execution_intent::InMemoryExecutionIntentStore::new();
         test_persist_intent_insert_if_absent(&store).await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_history_generation_round_trip() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_history_generation_round_trip(s.message.as_ref()).await
     }
 
     struct InMemoryStores {
@@ -3467,6 +3565,13 @@ mod tests {
     async fn conformance_sqlite_persist_intent_insert_if_absent() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_persist_intent_insert_if_absent(&store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_history_generation_round_trip() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_history_generation_round_trip(&store).await
     }
 
     /// Auto-promotion emits the promoted root's durable `task_wakeup`
@@ -4087,6 +4192,15 @@ mod tests {
             return Ok(());
         };
         test_persist_intent_insert_if_absent(&store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_history_generation_round_trip() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_history_generation_round_trip(&store).await
     }
 
     /// Postgres fork atomicity, happy path (findings #9/#26/#27): the

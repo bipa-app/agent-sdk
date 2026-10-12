@@ -233,7 +233,7 @@ impl LlmProvider for BlockingStreamProvider {
                 let _ = rx.await;
             }
             yield Ok(StreamDelta::TextDelta { delta: " (unexpected)".to_string(), block_index: 0 });
-            yield Ok(StreamDelta::Done { stop_reason: Some(StopReason::EndTurn), served_route: None });
+            yield Ok(StreamDelta::Done { stop_reason: Some(StopReason::EndTurn), served_route: None , served_model: None});
         })
     }
 
@@ -380,6 +380,7 @@ impl LlmProvider for SimpleTextProvider {
                 output_tokens: 1,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }
@@ -442,6 +443,9 @@ impl ContextCompactor for BlockingCompactor {
             new_tokens: 10,
             retained_count: 0,
             llm_usage: TokenUsage::default(),
+            published_artifacts: agent_sdk::context::PublishedArtifacts::default(),
+            response_model: None,
+            served_route: None,
         })
     }
 }

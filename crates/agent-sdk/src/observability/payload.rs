@@ -473,6 +473,7 @@ mod tests {
                 output_tokens: 5,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         };
         let result = PayloadRedactor::noop().convert_output_messages(&response);
@@ -500,6 +501,7 @@ mod tests {
                 output_tokens: 5,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         };
         let result = PayloadRedactor::noop().convert_output_messages(&response);
@@ -633,6 +635,7 @@ mod tests {
                 output_tokens: 0,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         };
         let result = baseline_redactor().convert_output_messages(&response);

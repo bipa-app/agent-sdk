@@ -245,11 +245,15 @@ where
 
     /// Reports the **`capable` tier's** route — pre-dispatch identity only.
     /// Post-dispatch attribution does not go through this method: the tier
-    /// that actually serves a stream stamps itself on
-    /// [`StreamDelta::Done::served_route`](crate::streaming::StreamDelta),
-    /// which this router forwards untouched.
+    /// that actually serves a stream stamps its route and model on
+    /// [`StreamDelta::Done`](crate::streaming::StreamDelta), which this
+    /// router forwards untouched.
     fn route(&self) -> &str {
         self.capable.route()
+    }
+
+    fn has_stable_request_route(&self) -> bool {
+        false
     }
 
     /// Pre-dispatch image pricing and limits come from the representative
@@ -393,6 +397,7 @@ mod tests {
                     output_tokens: 1,
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
+                    request_input_tokens: None,
                 },
             }))
         }
@@ -427,9 +432,30 @@ mod tests {
         assert!(!router.supports_historical_image_blocks());
     }
 
+    #[test]
+    fn dynamic_model_routing_reports_an_unstable_request_route() {
+        let tier = |name: &'static str| StaticProvider {
+            name,
+            reply: "MODERATE",
+            supports_historical_images: false,
+        };
+        let router = ModelRouter::new(
+            tier("classifier"),
+            tier("fast"),
+            tier("capable"),
+            tier("advanced"),
+        );
+        assert!(
+            !router.has_stable_request_route(),
+            "per-request classification may pick any tier; measured occupancy \
+             must never anchor on the representative capable identity",
+        );
+        assert!(tier("leaf").has_stable_request_route());
+    }
+
     /// A request classified `SIMPLE` streams from the `fast` tier, and the
-    /// stream's `Done` names that tier — not the `capable` tier the
-    /// router's own `route()` reports.
+    /// stream's `Done` names that tier's route and model — not the
+    /// `capable` tier the router's own `route()` and `model()` report.
     #[tokio::test]
     async fn streamed_dispatch_attributes_the_tier_that_served() -> Result<()> {
         let router = ModelRouter::new(
@@ -460,11 +486,19 @@ mod tests {
         let mut stream = router.chat_stream(request);
         let mut served = None;
         while let Some(item) = stream.next().await {
-            if let StreamDelta::Done { served_route, .. } = item? {
-                served = served_route;
+            if let StreamDelta::Done {
+                served_route,
+                served_model,
+                ..
+            } = item?
+            {
+                served = Some((served_route, served_model));
             }
         }
-        assert_eq!(served.as_deref(), Some("fast-tier"));
+        assert_eq!(
+            served,
+            Some((Some("fast-tier".to_owned()), Some("fast-tier".to_owned())))
+        );
         Ok(())
     }
 

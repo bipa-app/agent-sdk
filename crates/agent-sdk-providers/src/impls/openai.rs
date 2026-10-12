@@ -1033,6 +1033,7 @@ impl LlmProvider for OpenAIProvider {
             // stream's serving route stays this provider's, not the inner
             // Responses provider's.
             let served_route = self.route().to_owned();
+            let served_model = self.model().to_owned();
             return Box::pin(async_stream::stream! {
                 let mut stream = std::pin::pin!(responses_provider.chat_stream(request));
                 while let Some(item) = futures::StreamExt::next(&mut stream).await {
@@ -1040,6 +1041,7 @@ impl LlmProvider for OpenAIProvider {
                         Ok(StreamDelta::Done { stop_reason, .. }) => Ok(StreamDelta::Done {
                             stop_reason,
                             served_route: Some(served_route.clone()),
+                            served_model: Some(served_model.clone()),
                         }),
                         other => other,
                     };
@@ -1048,6 +1050,7 @@ impl LlmProvider for OpenAIProvider {
         }
 
         let served_route = self.route().to_owned();
+        let served_model = self.model().to_owned();
         Box::pin(async_stream::stream! {
             let reasoning_config = match self.resolve_openai_reasoning(request.thinking.as_ref()) {
                 Ok(reasoning) => reasoning,
@@ -1259,6 +1262,7 @@ impl LlmProvider for OpenAIProvider {
                                 StreamDelta::Done { stop_reason, .. } => StreamDelta::Done {
                                     stop_reason,
                                     served_route: Some(served_route.clone()),
+                                    served_model: Some(served_model.clone()),
                                 },
                                 other => other,
                             });
@@ -1545,11 +1549,12 @@ fn build_stream_end_deltas(
         deltas.push(StreamDelta::Usage(u));
     }
 
-    // Emit done. The serving route is stamped by the yield loop that owns
-    // the provider handle; this helper only sees parsed wire state.
+    // Emit done. The serving route and model are stamped by the yield loop
+    // that owns the provider handle; this helper only sees parsed wire state.
     deltas.push(StreamDelta::Done {
         stop_reason: Some(stop_reason),
         served_route: None,
+        served_model: None,
     });
 
     deltas
@@ -1663,6 +1668,7 @@ fn process_sse_data(data: &str) -> Vec<SseProcessResult> {
                 .prompt_tokens_details
                 .as_ref()
                 .map_or(0, |details| details.cache_write_tokens),
+            request_input_tokens: Some(u.prompt_tokens),
         }));
     }
 
@@ -1871,6 +1877,7 @@ fn decode_chat_response(
                 .prompt_tokens_details
                 .as_ref()
                 .map_or(0, |details| details.cache_write_tokens),
+            request_input_tokens: Some(api_response.usage.prompt_tokens),
         },
     }))
 }
@@ -4543,6 +4550,7 @@ mod tests {
                 cached_input_tokens: 10,
                 cache_creation_input_tokens: 6,
                 served_speed: None,
+                request_input_tokens: Some(42),
             })]
         ));
     }

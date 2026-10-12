@@ -478,6 +478,7 @@ impl LlmProvider for OpenAIResponsesProvider {
     fn chat_stream(&self, mut request: ChatRequest) -> StreamBox<'_> {
         self.downgrade_unsupported_original_image_detail(&mut request);
         let served_route = self.route().to_owned();
+        let served_model = self.model().to_owned();
         Box::pin(async_stream::stream! {
             let reasoning_config = match self.resolve_openai_reasoning(request.thinking.as_ref()) {
                 Ok(reasoning) => reasoning,
@@ -860,6 +861,7 @@ impl LlmProvider for OpenAIResponsesProvider {
                                 yield Ok(StreamDelta::Done {
                                     stop_reason: Some(stop_reason),
                                     served_route: Some(served_route.clone()),
+                                    served_model: Some(served_model.clone()),
                                 });
                                 return;
                             }
@@ -882,6 +884,7 @@ impl LlmProvider for OpenAIResponsesProvider {
                                 yield Ok(StreamDelta::Done {
                                     stop_reason: Some(stop_reason),
                                     served_route: Some(served_route.clone()),
+                                    served_model: Some(served_model.clone()),
                                 });
                                 return;
                             }
@@ -1473,6 +1476,7 @@ fn map_usage(usage: Option<ApiUsage>, service_tier: Option<&str>) -> Usage {
             output_tokens: 0,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         },
         |u| Usage {
             served_speed,
@@ -1486,6 +1490,7 @@ fn map_usage(usage: Option<ApiUsage>, service_tier: Option<&str>) -> Usage {
                 .input_tokens_details
                 .as_ref()
                 .map_or(0, |details| details.cache_write_tokens),
+            request_input_tokens: Some(u.input_tokens),
         },
     )
 }
@@ -2640,6 +2645,11 @@ mod tests {
         assert_eq!(usage.output_tokens, 7);
         assert_eq!(usage.cached_input_tokens, 10);
         assert_eq!(usage.cache_creation_input_tokens, 6);
+        assert_eq!(
+            usage.request_input_tokens,
+            Some(42),
+            "one physical request: request occupancy equals its total input"
+        );
         Ok(())
     }
 

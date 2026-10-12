@@ -230,6 +230,7 @@ impl VertexProvider {
                 output_tokens: api_response.usage.output,
                 cached_input_tokens: api_response.usage.cached_input_tokens(),
                 cache_creation_input_tokens: api_response.usage.cache_creation_input_tokens(),
+                request_input_tokens: Some(api_response.usage.total_input_tokens()),
             },
         }
     }
@@ -501,6 +502,7 @@ impl VertexProvider {
 
     fn chat_stream_gemini(&self, request: ChatRequest) -> StreamBox<'_> {
         let served_route = self.route().to_owned();
+        let served_model = self.model().to_owned();
         Box::pin(async_stream::stream! {
             let thinking = match self.resolve_thinking_config(request.thinking.as_ref()) {
                 Ok(thinking) => thinking,
@@ -571,6 +573,7 @@ impl VertexProvider {
                     Ok(StreamDelta::Done { stop_reason, .. }) => Ok(StreamDelta::Done {
                         stop_reason,
                         served_route: Some(served_route.clone()),
+                        served_model: Some(served_model.clone()),
                     }),
                     other => other,
                 };
@@ -811,6 +814,7 @@ impl VertexProvider {
     #[allow(clippy::too_many_lines)]
     fn chat_stream_claude(&self, request: ChatRequest) -> StreamBox<'_> {
         let served_route = self.route().to_owned();
+        let served_model = self.model().to_owned();
         Box::pin(async_stream::stream! {
                     let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
                         // Forcing a specific tool is incompatible with extended thinking
@@ -967,6 +971,7 @@ impl VertexProvider {
                                 yield Ok(StreamDelta::Done {
                                     stop_reason: pending_stop_reason.take(),
                                     served_route: Some(served_route.clone()),
+                                    served_model: Some(served_model.clone()),
                                 });
                             }
                         }
@@ -991,6 +996,7 @@ impl VertexProvider {
                             yield Ok(StreamDelta::Done {
                                 stop_reason: pending_stop_reason.take(),
                                 served_route: Some(served_route.clone()),
+                                served_model: Some(served_model.clone()),
                             });
                         }
                     }

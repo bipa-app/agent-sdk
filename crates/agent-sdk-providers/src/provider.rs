@@ -685,6 +685,31 @@ pub trait LlmProvider: Send + Sync {
         true
     }
 
+    /// Whether every request this instance dispatches is served by the one
+    /// backend that [`provider()`](Self::provider), [`model()`](Self::model),
+    /// [`route()`](Self::route), and [`capabilities()`](Self::capabilities)
+    /// describe.
+    ///
+    /// Stable means a measurement taken on one request describes the next:
+    /// the durable runtime sizes its per-model compaction threshold from
+    /// `capabilities()` and trusts the previous request's measured prompt
+    /// tokens as the occupancy of the next one only on a stable route.
+    ///
+    /// The `true` default is correct only for a leaf bound to one endpoint
+    /// and model. **Override it to return `false`** in any implementation
+    /// that can pick among several backends, per request or over time
+    /// (failover chains, classifier routers, load balancers, replay), even
+    /// when it reports a representative `provider()` / `model()`: keeping
+    /// the default silently lets consumers compare one backend's
+    /// measurements with another's. A wrapper around exactly one inner
+    /// provider delegates to it. Without a stable route, consumers trust a
+    /// measurement only when the stream's [`StreamDelta::Done`]
+    /// `served_route` and `served_model` equal `route()` and `model()`: one
+    /// route can serve several models.
+    fn has_stable_request_route(&self) -> bool {
+        true
+    }
+
     /// Streaming chat completion.
     ///
     /// Returns a stream of [`StreamDelta`] events. The default implementation
@@ -751,6 +776,7 @@ pub trait LlmProvider: Send + Sync {
                         yield Ok(StreamDelta::Done {
                             stop_reason: response.stop_reason,
                             served_route: Some(self.route().to_owned()),
+                            served_model: Some(self.model().to_owned()),
                         });
                     }
                     ChatOutcome::RateLimited(retry_after) => {
@@ -1089,6 +1115,7 @@ pub async fn collect_stream(mut stream: StreamBox<'_>, model: String) -> Result<
         output_tokens: 0,
         cached_input_tokens: 0,
         cache_creation_input_tokens: 0,
+        request_input_tokens: None,
     });
     let stop_reason = accumulator.take_stop_reason();
     let content = accumulator.into_content_blocks();

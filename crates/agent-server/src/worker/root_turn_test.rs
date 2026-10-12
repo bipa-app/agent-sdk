@@ -157,6 +157,7 @@ impl LlmProvider for MockTextProvider {
                 output_tokens: 50,
                 cached_input_tokens: 10,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }
@@ -226,6 +227,7 @@ impl LlmProvider for MockToolCallProvider {
                 output_tokens: 60,
                 cached_input_tokens: 15,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }
@@ -2132,7 +2134,37 @@ async fn resume_with_compaction_fixture(
     };
     assert_eq!(compactor_impl.calls(), 1);
     assert_eq!(resume_provider.calls(), 1);
+    assert_resume_row_opens_after_compaction(stores, &parent.id).await?;
     Ok((commit, expected_source_count))
+}
+
+async fn assert_resume_row_opens_after_compaction(
+    stores: &TestStores,
+    task_id: &AgentTaskId,
+) -> Result<()> {
+    let mut attempts = stores.attempts.list_by_task(task_id).await?;
+    attempts.sort_by_key(|attempt| attempt.attempt_number);
+    let [.., compaction_row, resume_row] = attempts.as_slice() else {
+        bail!("expected the compaction and resume rows, got {attempts:?}");
+    };
+    assert_eq!(
+        compaction_row
+            .response_blob
+            .as_ref()
+            .and_then(|blob| blob.get("operation"))
+            .and_then(serde_json::Value::as_str),
+        Some("context_compaction"),
+    );
+    let compaction_closed_at = compaction_row
+        .closed_at
+        .context("the compaction row closes before the resume call")?;
+    assert!(
+        resume_row.opened_at >= compaction_closed_at,
+        "the resume row opened at {} but the summarizer row it follows closed at \
+         {compaction_closed_at}",
+        resume_row.opened_at,
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -4598,6 +4630,7 @@ impl LlmProvider for FlakyProvider {
                 output_tokens: 50,
                 cached_input_tokens: 10,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }
@@ -4682,10 +4715,12 @@ impl LlmProvider for OfflineThenSuccessProvider {
                 output_tokens: 3,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             }));
             yield Ok(StreamDelta::Done {
                 stop_reason: Some(StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             });
         })
     }
@@ -5284,6 +5319,7 @@ impl LlmProvider for ScriptedProvider {
                     output_tokens: 50,
                     cached_input_tokens: 10,
                     cache_creation_input_tokens: 0,
+                    request_input_tokens: None,
                 },
             })),
         }
@@ -5723,6 +5759,7 @@ impl LlmProvider for CapturingProvider {
                 output_tokens: 5,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }
@@ -5885,6 +5922,7 @@ impl LlmProvider for SteeringCaptureProvider {
                 output_tokens: 30,
                 cached_input_tokens: 5,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }
@@ -6578,6 +6616,7 @@ impl LlmProvider for SteeringRedirectProvider {
                 output_tokens: 40,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }
@@ -10373,6 +10412,7 @@ impl LlmProvider for BoundaryFailProvider {
                 output_tokens: 50,
                 cached_input_tokens: 10,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }
@@ -10416,6 +10456,7 @@ impl LlmProvider for SecondWaveProvider<'_> {
                 output_tokens: 50,
                 cached_input_tokens: 10,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }
@@ -10457,6 +10498,7 @@ impl LlmProvider for TextThenToolProvider<'_> {
                     output_tokens: 5,
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
+                    request_input_tokens: None,
                 },
             }));
         }
@@ -10476,6 +10518,7 @@ impl LlmProvider for TextThenToolProvider<'_> {
                 output_tokens: 5,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }
@@ -11402,6 +11445,7 @@ impl LlmProvider for RoutedBackend {
                 output_tokens: 5,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }
@@ -11490,10 +11534,12 @@ impl LlmProvider for RoutelessStreamProvider {
                 output_tokens: 5,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             }));
             yield Ok(StreamDelta::Done {
                 stop_reason: Some(StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             });
         })
     }
@@ -11612,6 +11658,7 @@ fn scripted_response(content: Vec<ContentBlock>, stop_reason: StopReason) -> Cha
             output_tokens: 20,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: Some(100),
         },
     }
 }

@@ -2142,6 +2142,7 @@ async fn terminal_stop_reason_ignores_tool_blocks_before_execution_and_persisten
             output_tokens: 20,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         },
     })]);
 
@@ -4747,6 +4748,9 @@ impl ContextCompactor for ShrinkCompactor {
             new_tokens: 10,
             retained_count: 0,
             llm_usage: crate::types::TokenUsage::default(),
+            published_artifacts: crate::context::PublishedArtifacts::default(),
+            response_model: None,
+            served_route: None,
         })
     }
 }
@@ -5289,6 +5293,7 @@ async fn streaming_retry_uses_fresh_message_id_per_attempt() -> anyhow::Result<(
             StreamDelta::Done {
                 stop_reason: Some(crate::llm::StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             },
         ]),
     ]);
@@ -5382,6 +5387,7 @@ async fn streaming_rate_limit_retry_honours_the_provider_hint() -> anyhow::Resul
             StreamDelta::Done {
                 stop_reason: Some(crate::llm::StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             },
         ]),
     ]);
@@ -5441,6 +5447,7 @@ async fn streaming_retry_bills_the_failed_attempts_usage() -> anyhow::Result<()>
             output_tokens: output,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         })
     };
     let provider = StreamScriptProvider::new(vec![
@@ -5467,6 +5474,7 @@ async fn streaming_retry_bills_the_failed_attempts_usage() -> anyhow::Result<()>
             StreamDelta::Done {
                 stop_reason: Some(crate::llm::StopReason::ToolUse),
                 served_route: None,
+                served_model: None,
             },
         ]),
         StreamScriptStep::Frames(vec![
@@ -5478,6 +5486,7 @@ async fn streaming_retry_bills_the_failed_attempts_usage() -> anyhow::Result<()>
             StreamDelta::Done {
                 stop_reason: Some(crate::llm::StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             },
         ]),
     ]);
@@ -5548,6 +5557,7 @@ async fn failover_after_usage_bills_both_providers() -> anyhow::Result<()> {
             output_tokens: output,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         })
     };
     let primary = std::sync::Arc::new(StreamScriptProvider::new(vec![StreamScriptStep::Frames(
@@ -5569,6 +5579,7 @@ async fn failover_after_usage_bills_both_providers() -> anyhow::Result<()> {
             StreamDelta::Done {
                 stop_reason: Some(crate::llm::StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             },
         ],
     )]));
@@ -5632,6 +5643,7 @@ async fn cancelled_stream_bills_the_usage_it_already_streamed() -> anyhow::Resul
             output_tokens: 10,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         }),
     ])]);
     let config = AgentConfig {
@@ -5690,6 +5702,7 @@ async fn streaming_rate_limit_without_a_hint_uses_exponential_backoff() -> anyho
             StreamDelta::Done {
                 stop_reason: Some(crate::llm::StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             },
         ]),
     ]);
@@ -5911,6 +5924,7 @@ impl crate::llm::LlmProvider for PricedProvider {
                 output_tokens: 1_000,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }
@@ -6908,6 +6922,7 @@ fn refusal_response() -> ChatOutcome {
             output_tokens: 20,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         },
     })
 }
@@ -8450,6 +8465,54 @@ async fn test_compaction_usage_counts_toward_budget() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn threshold_compaction_event_records_trigger_and_configured_engine() -> anyhow::Result<()> {
+    let message_store = Arc::new(InMemoryStore::new());
+    let thread_id = ThreadId::new();
+    seed_compactable_history(&message_store, &thread_id).await?;
+
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![
+            MockProvider::text_response("compact summary"),
+            MockProvider::text_response("done"),
+        ]))
+        .hooks(AllowAllHooks)
+        .with_compaction(
+            tiny_compaction_config().with_engine(crate::context::CompactionEngine::PruneFirst),
+        )
+        .message_store(Arc::clone(&message_store))
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let (_, events) = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    let compacted: Vec<&AgentEvent> = events
+        .iter()
+        .map(|envelope| &envelope.event)
+        .filter(|event| matches!(event, AgentEvent::ContextCompacted { .. }))
+        .collect();
+    assert_eq!(compacted.len(), 1, "{compacted:?}");
+    assert!(
+        matches!(
+            compacted[0],
+            AgentEvent::ContextCompacted {
+                trigger: Some(crate::events::CompactionTrigger::Threshold),
+                engine: Some(crate::context::CompactionEngine::PruneFirst),
+                ..
+            }
+        ),
+        "{compacted:?}"
+    );
+    Ok(())
+}
+
 /// Priced provider on a different catalog entry than [`PricedProvider`]:
 /// anthropic / claude-fable-5 ($10/M input, $50/M output), fixed usage
 /// 2000 in / 1000 out = $0.07 per call.
@@ -8471,6 +8534,7 @@ impl crate::llm::LlmProvider for FablePricedProvider {
                 output_tokens: 1_000,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }))
     }
@@ -9849,6 +9913,7 @@ async fn connectivity_wait_does_not_consume_transient_retry_budget() -> anyhow::
             StreamDelta::Done {
                 stop_reason: Some(crate::llm::StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             },
         ]),
     ]);
@@ -10039,6 +10104,7 @@ async fn offline_probe_failures_reset_the_reachable_death_budget() -> anyhow::Re
             StreamDelta::Done {
                 stop_reason: Some(crate::llm::StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             },
         ]),
     ])
@@ -10147,6 +10213,7 @@ async fn keep_alives_hold_a_silent_stream_open_past_the_inactivity_timeout() -> 
         StreamDelta::Done {
             stop_reason: Some(crate::llm::StopReason::EndTurn),
             served_route: None,
+            served_model: None,
         },
     ));
     let provider = StreamScriptProvider::new(vec![StreamScriptStep::PacedFrames(frames)]);
@@ -10377,6 +10444,7 @@ async fn uri_checkpoint_hydrates_every_streaming_retry_attempt() -> anyhow::Resu
             StreamDelta::Done {
                 stop_reason: Some(StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             },
         ]),
     ]);
@@ -10420,6 +10488,120 @@ async fn uri_checkpoint_hydrates_every_streaming_retry_attempt() -> anyhow::Resu
     assert_eq!(
         captured_frame_data(&durable_request)?,
         format!("artifact://{frame_id}")
+    );
+    Ok(())
+}
+
+#[derive(Default)]
+struct RejectingCompactionStore {
+    inner: InMemoryStore,
+}
+
+#[async_trait]
+impl MessageStore for RejectingCompactionStore {
+    async fn append(&self, thread_id: &ThreadId, message: Message) -> anyhow::Result<()> {
+        self.inner.append(thread_id, message).await
+    }
+    async fn get_history(&self, thread_id: &ThreadId) -> anyhow::Result<Vec<Message>> {
+        self.inner.get_history(thread_id).await
+    }
+    async fn replace_history(
+        &self,
+        thread_id: &ThreadId,
+        messages: Vec<Message>,
+    ) -> anyhow::Result<()> {
+        self.inner.replace_history(thread_id, messages).await
+    }
+    async fn clear(&self, thread_id: &ThreadId) -> anyhow::Result<()> {
+        self.inner.clear(thread_id).await
+    }
+    async fn append_compaction(
+        &self,
+        _thread_id: &ThreadId,
+        _messages: Vec<Message>,
+        _source_message_count: usize,
+        _retained_message_count: usize,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("synthetic compaction append failure")
+    }
+    async fn get_transcript(&self, thread_id: &ThreadId) -> anyhow::Result<Vec<Message>> {
+        self.inner.get_transcript(thread_id).await
+    }
+}
+
+fn saved_artifact_count(store: &crate::ArtifactStore) -> anyhow::Result<usize> {
+    let mut count = 0;
+    for entry in std::fs::read_dir(store.dir())? {
+        let file_name = entry?.file_name();
+        let file_name = file_name.to_string_lossy();
+        if file_name.ends_with(".log")
+            && file_name.as_bytes().first().is_some_and(u8::is_ascii_digit)
+        {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+#[tokio::test]
+async fn failed_compaction_append_reclaims_published_snapcompact_artifacts() -> anyhow::Result<()> {
+    use base64::Engine as _;
+
+    let dir = tempfile::tempdir()?;
+    let artifact_store = Arc::new(crate::ArtifactStore::new(dir.path()));
+    let message_store = RejectingCompactionStore::default();
+    let thread_id = ThreadId::new();
+    message_store
+        .replace_history(
+            &thread_id,
+            vec![
+                Message::user_with_content(vec![
+                    ContentBlock::Text {
+                        text: format!("rollback-marker\n{}", "x".repeat(90_000)),
+                    },
+                    ContentBlock::Image {
+                        source: crate::llm::ContentSource::new(
+                            "image/png",
+                            base64::engine::general_purpose::STANDARD
+                                .encode(b"\x89PNG\r\n\x1a\nrollback-image"),
+                        ),
+                    },
+                ]),
+                Message::assistant("done"),
+            ],
+        )
+        .await?;
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![
+            MockProvider::text_response("fallback summary"),
+            MockProvider::text_response("answer"),
+        ]))
+        .hooks(AllowAllHooks)
+        .message_store(message_store)
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .with_compaction(
+            CompactionConfig::default()
+                .with_engine(crate::context::CompactionEngine::Snapcompact)
+                .with_threshold_tokens(0)
+                .with_retain_recent(0)
+                .with_min_messages(1),
+        )
+        .build_with_stores();
+
+    let _ = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("continue".to_owned()),
+        ToolContext::new(()).with_artifact_store(Arc::clone(&artifact_store)),
+    )
+    .await;
+
+    assert_eq!(
+        saved_artifact_count(&artifact_store)?,
+        0,
+        "a compaction whose durable append failed must not leave its \
+         Snapcompact artifacts behind"
     );
     Ok(())
 }

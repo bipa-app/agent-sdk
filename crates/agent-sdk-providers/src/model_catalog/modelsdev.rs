@@ -577,6 +577,7 @@ mod tests {
             output_tokens: 100_000,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            request_input_tokens: None,
         };
         let cost = tier
             .pricing

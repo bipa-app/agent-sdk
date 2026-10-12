@@ -37,6 +37,7 @@ const fn usage() -> Usage {
         output_tokens: 1,
         cached_input_tokens: 0,
         cache_creation_input_tokens: 0,
+        request_input_tokens: Some(1),
     }
 }
 

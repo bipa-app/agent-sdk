@@ -26,6 +26,7 @@ mod tests {
 
     use super::migrations::{
         AWAITING_QUESTION_MIGRATION_VERSION, DURABLE_CORE_MIGRATOR,
+        HISTORY_GENERATION_MIGRATION_VERSION, HISTORY_GENERATION_VALIDATION_MIGRATION_VERSION,
         INPUT_INJECTION_KIND_MIGRATION_VERSION, PURGE_SEED_MIGRATION_VERSION,
         TASK_TERMINAL_REASON_MIGRATION_VERSION, THREAD_PURGE_LIFECYCLE_MIGRATION_VERSION,
         durable_core_migrations, event_journal_outbox_migration, outbox_message_kind_migration,
@@ -119,6 +120,16 @@ mod tests {
             versions.contains(&PURGE_SEED_MIGRATION_VERSION),
             "bundle is missing this PR's migration \
              {PURGE_SEED_MIGRATION_VERSION}, got {versions:?}",
+        );
+        ensure!(
+            versions.contains(&HISTORY_GENERATION_MIGRATION_VERSION),
+            "bundle is missing this PR's migration \
+             {HISTORY_GENERATION_MIGRATION_VERSION}, got {versions:?}",
+        );
+        ensure!(
+            versions.contains(&HISTORY_GENERATION_VALIDATION_MIGRATION_VERSION),
+            "bundle is missing this PR's migration \
+             {HISTORY_GENERATION_VALIDATION_MIGRATION_VERSION}, got {versions:?}",
         );
         Ok(())
     }

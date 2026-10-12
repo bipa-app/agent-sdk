@@ -4031,12 +4031,16 @@ fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelo
             new_count,
             original_tokens,
             new_tokens,
+            trigger,
+            engine,
         } => Ok(pb::event_envelope::Event::ContextCompacted(
             pb::ContextCompactedEvent {
                 original_count: map_u64(*original_count, "original_count")?,
                 new_count: map_u64(*new_count, "new_count")?,
                 original_tokens: map_u64(*original_tokens, "original_tokens")?,
                 new_tokens: map_u64(*new_tokens, "new_tokens")?,
+                trigger: map_compaction_trigger(*trigger).into(),
+                engine: map_compaction_engine(*engine).into(),
             },
         )),
         AgentEvent::SubagentProgress { .. } => map_subagent_progress_payload(event),
@@ -4044,6 +4048,30 @@ fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelo
             map_auto_retry_payload(event)
         }
         _ => Err(Status::internal("unsupported event variant").into()),
+    }
+}
+
+const fn map_compaction_trigger(
+    trigger: Option<agent_sdk_foundation::CompactionTrigger>,
+) -> pb::CompactionTrigger {
+    use agent_sdk_foundation::CompactionTrigger;
+    match trigger {
+        None => pb::CompactionTrigger::Unspecified,
+        Some(CompactionTrigger::Threshold) => pb::CompactionTrigger::Threshold,
+        Some(CompactionTrigger::Overflow) => pb::CompactionTrigger::Overflow,
+        Some(CompactionTrigger::UserRequested) => pb::CompactionTrigger::UserRequested,
+    }
+}
+
+const fn map_compaction_engine(
+    engine: Option<agent_sdk_foundation::CompactionEngine>,
+) -> pb::CompactionEngine {
+    use agent_sdk_foundation::CompactionEngine;
+    match engine {
+        None => pb::CompactionEngine::Unspecified,
+        Some(CompactionEngine::Legacy) => pb::CompactionEngine::Legacy,
+        Some(CompactionEngine::PruneFirst) => pb::CompactionEngine::PruneFirst,
+        Some(CompactionEngine::Snapcompact) => pb::CompactionEngine::Snapcompact,
     }
 }
 
@@ -4644,6 +4672,7 @@ mod tests {
                 output_tokens: 5,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }
     }
@@ -4670,6 +4699,7 @@ mod tests {
                 output_tokens: 6,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         }
     }
@@ -9102,6 +9132,38 @@ mod tests {
             pb::AccountRotationReason::AuthenticationFailed,
         );
         assert_eq!(rotation.retry_after_seconds, Some(37));
+        Ok(())
+    }
+
+    #[test]
+    fn context_compacted_projects_trigger_and_engine() -> Result<()> {
+        let payload = map_event_payload(&AgentEvent::context_compacted(
+            40,
+            6,
+            900_000,
+            30_000,
+            agent_sdk_foundation::CompactionTrigger::Overflow,
+            Some(agent_sdk_foundation::CompactionEngine::PruneFirst),
+        ))?;
+        let EventPayload::ContextCompacted(compacted) = payload else {
+            bail!("ContextCompacted must map to a ContextCompacted event");
+        };
+        assert_eq!((compacted.original_count, compacted.new_count), (40, 6));
+        assert_eq!(compacted.trigger(), pb::CompactionTrigger::Overflow);
+        assert_eq!(compacted.engine(), pb::CompactionEngine::PruneFirst);
+
+        let legacy: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "context_compacted",
+            "original_count": 40,
+            "new_count": 6,
+            "original_tokens": 900_000,
+            "new_tokens": 30_000,
+        }))?;
+        let EventPayload::ContextCompacted(legacy) = map_event_payload(&legacy)? else {
+            bail!("ContextCompacted must map to a ContextCompacted event");
+        };
+        assert_eq!(legacy.trigger(), pb::CompactionTrigger::Unspecified);
+        assert_eq!(legacy.engine(), pb::CompactionEngine::Unspecified);
         Ok(())
     }
 

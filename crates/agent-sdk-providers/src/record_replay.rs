@@ -286,6 +286,12 @@ impl LlmProvider for RecordReplayProvider {
     fn provider(&self) -> &'static str {
         "record-replay"
     }
+
+    /// Never stable in either mode, so a recording and its replay make the
+    /// same compaction decisions: replay has no live route to promise.
+    fn has_stable_request_route(&self) -> bool {
+        false
+    }
 }
 
 // ── Cassette file format ──────────────────────────────────────────────
@@ -418,6 +424,9 @@ enum CassetteDelta {
         /// `default` keeps them replayable.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         served_route: Option<String>,
+        /// Absent in cassettes recorded before serving-model attribution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        served_model: Option<String>,
     },
     Error {
         message: String,
@@ -485,9 +494,11 @@ impl CassetteDelta {
             StreamDelta::Done {
                 stop_reason,
                 served_route,
+                served_model,
             } => Self::Done {
                 stop_reason: *stop_reason,
                 served_route: served_route.clone(),
+                served_model: served_model.clone(),
             },
             StreamDelta::Error { message, kind } => Self::Error {
                 message: message.clone(),
@@ -543,9 +554,11 @@ impl CassetteDelta {
             Self::Done {
                 stop_reason,
                 served_route,
+                served_model,
             } => StreamDelta::Done {
                 stop_reason,
                 served_route,
+                served_model,
             },
             Self::Error {
                 message,
@@ -777,6 +790,7 @@ mod tests {
                 output_tokens: 3,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                request_input_tokens: None,
             },
         })
     }
@@ -835,6 +849,29 @@ mod tests {
         let recorder = RecordReplayProvider::record(inner, temp_cassette_path());
 
         assert!(!recorder.supports_historical_image_blocks());
+    }
+
+    #[tokio::test]
+    async fn record_and_replay_never_promise_a_stable_route() -> Result<()> {
+        let stable_inner = Arc::new(InnerProvider {
+            model: "inner-model",
+            chat_outcome: success_outcome("recorded answer"),
+            deltas: Vec::new(),
+            supports_historical_images: false,
+        });
+        assert!(stable_inner.has_stable_request_route());
+        let path = temp_cassette_path();
+        let recorder = RecordReplayProvider::record(stable_inner, &path);
+        assert!(
+            !recorder.has_stable_request_route(),
+            "a recording must anchor exactly as its replay will",
+        );
+
+        let _ = recorder.chat(request()).await?;
+        let player = RecordReplayProvider::replay(&path)?;
+        assert!(!player.has_stable_request_route());
+        let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 
     #[tokio::test]
@@ -964,6 +1001,7 @@ mod tests {
                 StreamDelta::Done {
                     stop_reason: Some(StopReason::EndTurn),
                     served_route: None,
+                    served_model: None,
                 },
             ],
             supports_historical_images: false,
@@ -1000,11 +1038,12 @@ mod tests {
         Ok(())
     }
 
-    /// A recorded `served_route` survives the cassette round trip, and a
-    /// pre-attribution cassette — one whose `Done` entry has no
-    /// `served_route` key at all — still replays, reporting `None`.
+    /// A recorded serving identity survives the cassette round trip, and a
+    /// pre-attribution cassette — one whose `Done` entry has neither the
+    /// `served_route` nor the `served_model` key — still replays, reporting
+    /// `None` for both.
     #[tokio::test]
-    async fn served_route_round_trips_and_legacy_cassettes_still_replay() -> Result<()> {
+    async fn served_identity_round_trips_and_legacy_cassettes_still_replay() -> Result<()> {
         let path = temp_cassette_path();
         let inner = Arc::new(InnerProvider {
             model: "inner-model",
@@ -1012,6 +1051,7 @@ mod tests {
             deltas: vec![StreamDelta::Done {
                 stop_reason: Some(StopReason::EndTurn),
                 served_route: Some("gateway-x".to_owned()),
+                served_model: Some("model-x".to_owned()),
             }],
             supports_historical_images: false,
         });
@@ -1027,17 +1067,26 @@ mod tests {
         let mut served = None;
         let mut stream = player.chat_stream(request());
         while let Some(item) = stream.next().await {
-            if let StreamDelta::Done { served_route, .. } = item? {
-                served = served_route;
+            if let StreamDelta::Done {
+                served_route,
+                served_model,
+                ..
+            } = item?
+            {
+                served = Some((served_route, served_model));
             }
         }
         drop(stream);
-        assert_eq!(served.as_deref(), Some("gateway-x"));
+        assert_eq!(
+            served,
+            Some((Some("gateway-x".to_owned()), Some("model-x".to_owned())))
+        );
 
-        // Strip the field from the file — the exact shape a cassette
-        // recorded before the field existed has on disk.
+        // Strip the fields from the file — the exact shape a cassette
+        // recorded before them has on disk.
         let json = std::fs::read_to_string(&path)?;
         assert!(json.contains("served_route"));
+        assert!(json.contains("served_model"));
         let mut cassette: serde_json::Value = serde_json::from_str(&json)?;
         for entry in cassette["entries"]
             .as_array_mut()
@@ -1047,6 +1096,7 @@ mod tests {
                 for delta in deltas {
                     if let Some(done) = delta.get_mut("Done").and_then(|d| d.as_object_mut()) {
                         done.remove("served_route");
+                        done.remove("served_model");
                     }
                 }
             }
@@ -1054,14 +1104,19 @@ mod tests {
         std::fs::write(&path, serde_json::to_string_pretty(&cassette)?)?;
 
         let legacy_player = RecordReplayProvider::replay(&path)?;
-        let mut legacy_served = Some("sentinel".to_owned());
+        let mut legacy_served = None;
         let mut stream = legacy_player.chat_stream(request());
         while let Some(item) = stream.next().await {
-            if let StreamDelta::Done { served_route, .. } = item? {
-                legacy_served = served_route;
+            if let StreamDelta::Done {
+                served_route,
+                served_model,
+                ..
+            } = item?
+            {
+                legacy_served = Some((served_route, served_model));
             }
         }
-        assert_eq!(legacy_served, None);
+        assert_eq!(legacy_served, Some((None, None)));
 
         let _ = std::fs::remove_file(&path);
         Ok(())

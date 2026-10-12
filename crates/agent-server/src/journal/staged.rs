@@ -45,6 +45,7 @@ use agent_sdk_foundation::types::{AgentState, ThreadId};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent_sdk_tools::stores::{MessageStore, StateStore};
 
@@ -76,6 +77,9 @@ pub struct StagedMessageStore {
     /// this process-local view with the compacted result. Subsequent appends are
     /// therefore the only delta still owed to the projection.
     seed_len: RwLock<usize>,
+    /// Durable `history_generation` this view descends from; advanced with
+    /// every mid-turn compaction that swaps the view.
+    history_generation: AtomicU64,
 }
 
 impl StagedMessageStore {
@@ -87,7 +91,24 @@ impl StagedMessageStore {
             thread_id,
             messages: RwLock::new(seed_messages),
             seed_len: RwLock::new(seed_len),
+            history_generation: AtomicU64::new(0),
         }
+    }
+
+    #[must_use]
+    pub fn with_history_generation(self, generation: u64) -> Self {
+        self.history_generation.store(generation, Ordering::SeqCst);
+        self
+    }
+
+    pub fn history_generation(&self) -> u64 {
+        self.history_generation.load(Ordering::SeqCst)
+    }
+
+    /// Advance after a durable `append_compaction` whose result this view
+    /// now exposes.
+    pub fn bump_history_generation(&self) {
+        self.history_generation.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Create a staged store whose visible history includes an uncommitted
@@ -111,6 +132,7 @@ impl StagedMessageStore {
             thread_id,
             messages: RwLock::new(messages),
             seed_len: RwLock::new(committed_seed_len),
+            history_generation: AtomicU64::new(0),
         })
     }
 
@@ -467,7 +489,8 @@ impl StagedStores {
                 thread_id.clone(),
                 messages,
                 committed_seed_len,
-            )?,
+            )?
+            .with_history_generation(view.history_generation),
             state: StagedStateStore::new(thread_id, Some(seed_state)),
         })
     }
@@ -752,6 +775,7 @@ mod tests {
             committed_messages: Vec::new(),
             draft_messages: Vec::new(),
             next_turn_number: 1,
+            history_generation: 0,
         };
 
         let staged = StagedStores::from_recovery_view(&view)?;
@@ -794,6 +818,7 @@ mod tests {
             committed_messages: sample_messages(),
             draft_messages: Vec::new(),
             next_turn_number: 4,
+            history_generation: 0,
         };
 
         let staged = StagedStores::from_recovery_view(&view)?;
@@ -825,6 +850,7 @@ mod tests {
             committed_messages: committed,
             draft_messages: draft.clone(),
             next_turn_number: 1,
+            history_generation: 0,
         };
 
         let staged = StagedStores::from_recovery_view(&view)?;
@@ -898,6 +924,7 @@ mod tests {
             committed_messages: committed.clone(),
             draft_messages: draft,
             next_turn_number: 2,
+            history_generation: 0,
         };
 
         let staged = StagedStores::from_recovery_view_committed_only(&view)?;
@@ -955,6 +982,7 @@ mod tests {
             committed_messages: compacted.clone(),
             draft_messages: Vec::new(),
             next_turn_number: 2,
+            history_generation: 0,
         };
 
         let staged = StagedStores::from_recovery_view_committed_only(&view)?;
@@ -985,6 +1013,7 @@ mod tests {
             committed_messages: sample_messages(),
             draft_messages: Vec::new(),
             next_turn_number: 1,
+            history_generation: 0,
         };
 
         let staged = StagedStores::from_recovery_view(&view)?;

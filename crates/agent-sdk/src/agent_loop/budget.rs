@@ -88,6 +88,7 @@ fn estimate_scoped(
         output_tokens: usage.output_tokens,
         cached_input_tokens: usage.cached_input_tokens,
         cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        request_input_tokens: None,
     };
     let provider = provenance.provider.as_str();
     let model = provenance.model.as_str();

@@ -58,6 +58,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`true`, `{}`, `{"description": ...}`) and free-form objects, including
   no-argument tools declared as `{"type": "object", "properties": {}}`. A
   strict response format with such a schema fails locally with the reason.
+- **Breaking:** `Usage` gains `request_input_tokens` (the input size of one
+  provider request, `None` when unknown), and `CompactionConfig` gains
+  `model_aware_threshold`, `model_context_reserve_tokens` and
+  `model_context_window_tokens`. Struct literals must set them; prefer
+  `..Default::default()` or the `with_*` builders.
+- `RecordReplayProvider` never reports a stable request route, in record or
+  replay mode, so a recording and its replay make the same compaction
+  decisions. `RefreshingProvider::route()` now reports the wrapped
+  provider's route.
+- **Breaking:** `StreamDelta::Done` gains `served_model`, the
+  `LlmProvider::model` of the provider that served the stream, stamped by
+  every built-in provider next to `served_route` and forwarded untouched by
+  fallback, router, refresh, and record/replay wrappers. Code that builds a
+  `Done` sets it (`None` when unknown); patterns without `..` name it. One
+  route can serve several models, so the durable worker anchors the measured
+  compaction trigger of a provider without a stable request route only on a
+  request whose served route and model both match the provider's own.
+  Cassettes recorded without the field replay it as `None`.
+- **Behaviour change for clients:** a turn's `UserInput` now carries the
+  root-turn task id in `emitter_task_id` (`AgentEvent::UserInput`, proto
+  `UserInputEvent.emitter_task_id`). Before, only input injected into a
+  running turn carried it, so a client that reads its presence as "injected"
+  now misclassifies every prompt. Compare it with the `emitter_task_id` of the
+  turn's `Start` instead: injected input names a different task. Rows
+  journaled before the change stay unstamped.
+- **Breaking:** `CompactionResult` gains `published_artifacts`,
+  `response_model`, and `served_route`, and is now `#[must_use]`;
+  `FailedCompaction` gains `response_model` and `served_route`. Custom
+  compactors that build them with struct literals set
+  `published_artifacts: PublishedArtifacts::default()` and the identity
+  fields to `None` when they make no summarization call. Results keep owning
+  their Snapcompact artifacts: `LlmContextCompactor::with_provisional_artifacts`
+  opts in to deleting them when the result is dropped before
+  `PublishedArtifacts::commit`, which callers run right after their durable
+  compaction append succeeds. The agent loop and the durable worker opt in, so
+  a compaction that is cancelled, refused, or fails to persist no longer
+  leaves orphaned artifacts.
 - Compaction now appends range-addressed lineage entries and rebuilds the
   effective LLM view without deleting committed transcript messages.
 - Auto-compaction prunes artifact-backed and superseded read outputs before

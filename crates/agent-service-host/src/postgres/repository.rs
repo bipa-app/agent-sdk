@@ -117,6 +117,7 @@ const REPOSITORIES: &[RepositoryBoundary] = &[
             "`replace_history` rewrites only `agent_sdk_message_heads` during SDK compaction",
             "compaction never deletes or updates rows in `agent_sdk_message_commits`",
             "recovery remains checkpoint-driven; raw committed message batches stay available for audit/rebuild work",
+            "`history_generation` persists on every head write and round-trips on every head read; only the domain's rewrite transitions (`replace_history`, compaction, repair) advance it and no storage path derives it from the compaction lineage",
         ],
         transaction_notes: "Under the current SDK contract, `commit_messages` runs only inside the successful `commit_completed_turn` transaction: append immutable raw batch row, then advance the mutable projection head. `replace_history` is a compaction-only, head-only update and must leave `agent_sdk_message_commits` untouched.",
     },

@@ -105,11 +105,15 @@ const APPLIED_REPAIRS_LEDGER_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/sqlite/0021_applied_repairs_ledger.sql"
 ));
+const MESSAGE_HEAD_HISTORY_GENERATION_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/sqlite/0022_message_head_history_generation.sql"
+));
 
 /// `sqlx`-managed migration bundle for the `SQLite` durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/sqlite");
 
-const MIGRATIONS: [SqliteMigration; 20] = [
+const MIGRATIONS: [SqliteMigration; 21] = [
     SqliteMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -210,6 +214,11 @@ const MIGRATIONS: [SqliteMigration; 20] = [
         summary: "one-shot data-repair ledger for the startup history-repair sweep",
         sql: APPLIED_REPAIRS_LEDGER_SQL,
     },
+    SqliteMigration {
+        version: "0022",
+        summary: "monotonic history rewrite lineage on message heads",
+        sql: MESSAGE_HEAD_HISTORY_GENERATION_SQL,
+    },
 ];
 
 /// Version of the migration this PR introduces: the typed terminal
@@ -238,6 +247,11 @@ pub(crate) const AWAITING_QUESTION_MIGRATION_VERSION: i64 = 18;
 /// Version of the migration this PR introduces: the fence-time purge seed.
 #[cfg(test)]
 pub(crate) const PURGE_SEED_MIGRATION_VERSION: i64 = 19;
+
+/// Version of the migration this PR introduces: the monotonic
+/// `history_generation` rewrite-lineage column on message heads.
+#[cfg(test)]
+pub(crate) const HISTORY_GENERATION_MIGRATION_VERSION: i64 = 22;
 
 /// The reviewable executable migration bundle for the `SQLite` durable core.
 #[must_use]
