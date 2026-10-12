@@ -1256,26 +1256,34 @@ mod postgres {
             .collect())
     }
 
-    /// Block until some session of this database waits on a row lock.
-    async fn until_a_session_waits_on_a_lock(store: &PostgresDurableStore) -> Result<()> {
+    /// The backend process of the session behind `conn`.
+    async fn backend_pid(conn: &mut sqlx::PgConnection) -> Result<i32> {
+        Ok(sqlx::query_scalar!(r#"SELECT pg_backend_pid() AS "pid!""#)
+            .fetch_one(conn)
+            .await?)
+    }
+
+    /// Block until some session waits on a lock `holder` holds. Lock waits
+    /// elsewhere in the database, such as another test's, do not count.
+    async fn until_blocked_by(store: &PostgresDurableStore, holder: i32) -> Result<()> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            let waiting = sqlx::query_scalar!(
+            let blocked = sqlx::query_scalar!(
                 r#"
-SELECT count(*) AS "waiting!"
+SELECT count(*) AS "blocked!"
 FROM pg_stat_activity
-WHERE wait_event_type = 'Lock'
-  AND datname = current_database()
-"#
+WHERE $1 = ANY (pg_blocking_pids(pid))
+"#,
+                holder,
             )
             .fetch_one(store.pool())
             .await?;
-            if waiting > 0 {
+            if blocked > 0 {
                 return Ok(());
             }
             anyhow::ensure!(
                 std::time::Instant::now() < deadline,
-                "no session ever waited on a lock",
+                "no session ever waited on the holder's locks",
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -1617,6 +1625,7 @@ WHERE wait_event_type = 'Lock'
         transition: impl std::future::Future<Output = Result<T>> + Send + 'static,
     ) -> Result<T> {
         let mut holder = store.pool().begin().await?;
+        let holder_pid = backend_pid(&mut holder).await?;
         sqlx::query_scalar!(
             "SELECT thread_id FROM agent_sdk_threads WHERE thread_id = $1 FOR UPDATE",
             tid,
@@ -1624,7 +1633,7 @@ WHERE wait_event_type = 'Lock'
         .fetch_one(&mut *holder)
         .await?;
         let transition = tokio::spawn(transition);
-        until_a_session_waits_on_a_lock(store).await?;
+        until_blocked_by(store, holder_pid).await?;
         sqlx::query_scalar!(
             "SELECT id FROM agent_sdk_tasks WHERE id = $1 FOR UPDATE",
             root.as_str(),
@@ -1773,6 +1782,7 @@ WHERE wait_event_type = 'Lock'
         let (root, _worker, _lease) = super::running_root(&store, tid, 0).await?;
 
         let mut ending = store.pool().begin().await?;
+        let ending_pid = backend_pid(&mut ending).await?;
         sqlx::query_scalar!(
             "SELECT id FROM agent_sdk_tasks WHERE id = $1 FOR UPDATE",
             root.id.as_str(),
@@ -1789,7 +1799,7 @@ WHERE wait_event_type = 'Lock'
                     .map_err(|error| anyhow::anyhow!("{error}"))
             })
         };
-        until_a_session_waits_on_a_lock(&store).await?;
+        until_blocked_by(&store, ending_pid).await?;
         let ended_at = OffsetDateTime::now_utc();
         sqlx::query!(
             r"
