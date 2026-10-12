@@ -1168,7 +1168,8 @@ mod postgres {
     use agent_sdk_foundation::TerminalReason;
     use agent_server::journal::store::{AgentTaskStore, SubmitDisposition, SubmitRootTurnParams};
     use agent_server::journal::task::{
-        AgentTask, AgentTaskId, LeaseId, SubmittedInputItem, TaskKind, TaskStatus, WorkerId,
+        AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, TaskKind, TaskStatus,
+        WorkerId,
     };
 
     use super::super::{pg_test_store, spawn_subagent_fixture, t_plus, thread_id};
@@ -1190,9 +1191,9 @@ mod postgres {
         }
     }
 
-    /// Input left queued under a root that has ended: nothing will ever
-    /// deliver it.
-    async fn stranded_input(store: &PostgresDurableStore, tid: &str) -> Result<Vec<AgentTaskId>> {
+    /// Rows still live under a root that has ended: nothing will ever
+    /// deliver or run them.
+    async fn stranded_rows(store: &PostgresDurableStore, tid: &str) -> Result<Vec<AgentTaskId>> {
         let tasks = store.list_by_thread(&thread_id(tid)).await?;
         let ended = |id: &AgentTaskId| {
             tasks
@@ -1201,9 +1202,8 @@ mod postgres {
         };
         Ok(tasks
             .iter()
-            .filter(|task| task.kind == TaskKind::InputInjection)
-            .filter(|task| task.status == TaskStatus::Queued)
-            .filter(|task| task.parent_id.as_ref().is_some_and(ended))
+            .filter(|task| task.parent_id.is_some() && !task.status.is_terminal())
+            .filter(|task| ended(&task.root_id))
             .map(|task| task.id.clone())
             .collect())
     }
@@ -1283,7 +1283,7 @@ WHERE wait_event_type = 'Lock'
                     }
                 }
             }
-            stranded.extend(stranded_input(&store, &tid).await?);
+            stranded.extend(stranded_rows(&store, &tid).await?);
         }
         assert!(
             deadlocks == 0 && other_errors.is_empty() && stranded.is_empty(),
@@ -1292,6 +1292,92 @@ WHERE wait_event_type = 'Lock'
             stranded.len(),
         );
         Ok(())
+    }
+
+    const CANCEL_RACE_ROUNDS: i64 = 100;
+
+    /// Stop a running root while `racing` adds to its tree, round after
+    /// round. However the two interleave, the stop must leave nothing live
+    /// under the cancelled root: whatever reached the tree first is
+    /// cancelled with it.
+    async fn race_cancel_against<F>(name: &str, racing: F) -> Result<()>
+    where
+        F: AsyncFn(PostgresDurableStore, String, AgentTaskId, WorkerId, LeaseId, i64) -> Result<()>,
+    {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let mut failures = Vec::new();
+        let mut stranded = Vec::new();
+        for round in 0..CANCEL_RACE_ROUNDS {
+            let tid = format!("pg-cancel-{name}-{round}");
+            let at = round * 100;
+            let (root, worker, lease) = super::running_root(&store, &tid, at).await?;
+            let cancelling = {
+                let store = store.clone();
+                let root = root.id.clone();
+                tokio::spawn(async move { store.cancel_tree(&root, t_plus(at + 5)).await })
+            };
+            let adding = racing(
+                store.clone(),
+                tid.clone(),
+                root.id.clone(),
+                worker,
+                lease,
+                at,
+            );
+            let added = adding.await;
+            if let Err(error) = cancelling.await? {
+                failures.push(format!("round {round}: cancel: {error:#}"));
+            }
+            if let Err(error) = added {
+                failures.push(format!("round {round}: {name}: {error:#}"));
+            }
+            stranded.extend(stranded_rows(&store, &tid).await?);
+        }
+        assert!(
+            failures.is_empty() && stranded.is_empty(),
+            "over {CANCEL_RACE_ROUNDS} rounds: {} rows stranded under a cancelled root, \
+             failures {failures:#?}",
+            stranded.len(),
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_cancel_racing_input_strands_nothing() -> Result<()> {
+        race_cancel_against("inject", async |store, tid, _root, _worker, _lease, at| {
+            store
+                .submit_root_turn_idempotent(injection_at(&tid, "sent while stopping", at + 4))
+                .await
+                .map(|_| ())
+                .map_err(|error| anyhow::anyhow!("{error}"))
+        })
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_cancel_racing_a_tool_spawn_strands_nothing() -> Result<()> {
+        race_cancel_against("spawn", async |store, tid, root, worker, lease, at| {
+            let spawned = store
+                .spawn_tool_children(
+                    &root,
+                    &worker,
+                    &lease,
+                    vec![ChildSpawnSpec::new(3); 2],
+                    super::super::suspension_payload(&tid),
+                    None,
+                    Vec::new(),
+                    t_plus(at + 4),
+                )
+                .await;
+            match spawned {
+                Ok(_) => Ok(()),
+                Err(error) if format!("{error:#}").contains("deadlock") => Err(error),
+                Err(_rejected_after_the_stop) => Ok(()),
+            }
+        })
+        .await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1518,10 +1604,7 @@ WHERE id = $1
             TaskKind::RootTurn,
             "input whose root ended meanwhile must become a turn, not wait under it",
         );
-        assert_eq!(
-            stranded_input(&store, tid).await?,
-            Vec::<AgentTaskId>::new()
-        );
+        assert_eq!(stranded_rows(&store, tid).await?, Vec::<AgentTaskId>::new());
         Ok(())
     }
 

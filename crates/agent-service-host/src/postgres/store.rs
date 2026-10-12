@@ -3090,13 +3090,17 @@ async fn commit_cancel_markers_tx(
     Ok(markers)
 }
 
+/// Lock the thread of every root turn in `tasks` not yet in `locked`,
+/// recording purge-fenced ones in `fenced`. Returns whether any thread was
+/// newly locked.
 async fn lock_cancel_threads_tx(
     tx: &mut Transaction<'_, Postgres>,
     tasks: &[AgentTask],
+    locked: &mut std::collections::HashSet<ThreadId>,
+    fenced: &mut std::collections::HashSet<ThreadId>,
     now: OffsetDateTime,
-) -> Result<std::collections::HashSet<ThreadId>> {
-    let mut locked = std::collections::HashSet::new();
-    let mut fenced = std::collections::HashSet::new();
+) -> Result<bool> {
+    let mut newly_locked = false;
     for task in tasks {
         if task.kind != TaskKind::RootTurn
             || !task.is_root()
@@ -3104,6 +3108,7 @@ async fn lock_cancel_threads_tx(
         {
             continue;
         }
+        newly_locked = true;
         PostgresDurableStore::bootstrap_thread_row_tx(tx, &task.thread_id, now).await?;
         let thread = PostgresDurableStore::lock_thread_tx(tx, &task.thread_id)
             .await?
@@ -3112,7 +3117,7 @@ async fn lock_cancel_threads_tx(
             fenced.insert(task.thread_id.clone());
         }
     }
-    Ok(fenced)
+    Ok(newly_locked)
 }
 
 async fn task_id_exists_tx(
@@ -5005,8 +5010,7 @@ ORDER BY descendant.root_id
         // could both emit a marker and both report the transition, and
         // a stale snapshot could clobber a concurrently-Completed root
         // with Cancelled.
-        let all_tasks = Self::collect_subtree_tx(&mut tx, root_id).await?;
-
+        //
         // Phase 1 — thread-row locks, FIRST. Every thread that MIGHT
         // need a terminal marker is bootstrapped and locked before any
         // task-row lock is taken, keeping this transaction's lock
@@ -5019,7 +5023,27 @@ ORDER BY descendant.root_id
         // but kind / is_root / thread_id cannot. BFS order keeps the
         // thread-lock order deterministic (parent thread before its
         // descendants' threads) for concurrent overlapping cancels.
-        let fenced_threads = lock_cancel_threads_tx(&mut tx, &all_tasks, now).await?;
+        //
+        // Every write that adds a row to a tree — an injection, a spawn —
+        // holds its thread's lock, so the walk is taken again once the
+        // threads are held: rows committed while this cancel waited for
+        // the locks are cancelled with the rest. A walk that reaches a
+        // new thread (a subagent spawned meanwhile) locks it and walks
+        // once more.
+        let mut all_tasks = Self::collect_subtree_tx(&mut tx, root_id).await?;
+        let mut locked_threads = std::collections::HashSet::new();
+        let mut fenced_threads = std::collections::HashSet::new();
+        while lock_cancel_threads_tx(
+            &mut tx,
+            &all_tasks,
+            &mut locked_threads,
+            &mut fenced_threads,
+            now,
+        )
+        .await?
+        {
+            all_tasks = Self::collect_subtree_tx(&mut tx, root_id).await?;
+        }
 
         // Phase 2 — CAS cancel transitions. Apply the cancel UPDATEs
         // deepest-first so the per-row locks are taken in the same
