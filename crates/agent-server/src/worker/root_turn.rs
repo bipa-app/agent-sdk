@@ -10115,7 +10115,7 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(trigger_envelope.max_tokens, 202_752 / 4);
+        assert_eq!(trigger_envelope.max_tokens, 202_752 / 2);
         assert!(trigger_envelope.max_tokens_explicit);
         assert_eq!(dispatched.max_tokens, trigger_envelope.max_tokens);
         assert_eq!(
@@ -10188,7 +10188,7 @@ mod tests {
                 None
             )
             .max_tokens,
-            202_752 / 4,
+            202_752 / 2,
         );
     }
 
@@ -10205,9 +10205,15 @@ mod tests {
             thinking: ThinkingPolicy::Adaptive { effort: None },
             ..plain.clone()
         };
+        let opus_48 = agent_sdk_providers::AnthropicProvider::new("key", "claude-opus-4-8");
+        assert_eq!(
+            build_request_envelope(&plain, &opus_48, trigger(&cfg), &thread_id, None).max_tokens,
+            50_000,
+        );
         assert_eq!(
             build_request_envelope(&plain, &opus, trigger(&cfg), &thread_id, None).max_tokens,
-            50_000,
+            100_000,
+            "Opus 5.5 thinks without a thinking config",
         );
         assert_eq!(
             build_request_envelope(&adaptive, &opus, trigger(&cfg), &thread_id, None).max_tokens,
@@ -10305,6 +10311,114 @@ mod tests {
         Ok(())
     }
 
+    /// The body a 55,000-token-thinking Sonnet 4.5 receives through the
+    /// provider `wrap` builds, for a 64,000-token request with no
+    /// definition-level thinking under a 200,000-token window override.
+    async fn thinking_wire_body(
+        wrap: impl FnOnce(String) -> Box<dyn LlmProvider>,
+    ) -> Result<serde_json::Value> {
+        use futures::StreamExt as _;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"captured"}}"#,
+            ))
+            .mount(&server)
+            .await;
+        let provider = wrap(server.uri());
+        let definition = AgentDefinition {
+            max_tokens: 64_000,
+            thinking: ThinkingPolicy::Disabled,
+            ..context_definition(None)
+        };
+        let thread_id = agent_sdk_foundation::ThreadId::from_string("thread_wrapped_thinking");
+        let staged = crate::journal::staged::StagedMessageStore::new(thread_id.clone(), Vec::new());
+        let cfg = model_aware().with_model_context_window_tokens(200_000);
+        let request = build_chat_request(
+            &definition,
+            provider.as_ref(),
+            trigger(&cfg),
+            &staged,
+            &thread_id,
+            &super::super::user_input::UserInput::text("next step"),
+            None,
+        )
+        .await?;
+        let mut stream = provider.chat_stream(request);
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        let received = server
+            .received_requests()
+            .await
+            .context("mock server records requests")?;
+        let mut bodies = Vec::new();
+        for sent in &received {
+            let body: serde_json::Value = serde_json::from_slice(&sent.body)?;
+            if body.get("thinking").is_some() {
+                bodies.push(body);
+            }
+        }
+        let [body] = bodies.as_slice() else {
+            anyhow::bail!("expected one thinking request, got {}", bodies.len());
+        };
+        Ok(body.clone())
+    }
+
+    fn thinking_sonnet(base_url: &str) -> agent_sdk_providers::AnthropicProvider {
+        agent_sdk_providers::AnthropicProvider::sonnet_45("key")
+            .with_thinking(llm::ThinkingConfig::new(55_000))
+            .with_base_url(base_url)
+    }
+
+    #[tokio::test]
+    async fn wrappers_without_a_stable_route_keep_the_request_under_a_window_override() -> Result<()>
+    {
+        let cassettes = tempfile::tempdir()?;
+        let cassette = cassettes.path().join("record.json");
+        let failover = thinking_wire_body(|url| {
+            Box::new(agent_sdk_providers::FallbackProvider::new(
+                std::sync::Arc::new(thinking_sonnet(&url)),
+            ))
+        })
+        .await?;
+        let router = thinking_wire_body(|url| {
+            Box::new(agent_sdk_providers::ModelRouter::new(
+                agent_sdk_providers::AnthropicProvider::sonnet_45("key").with_base_url(&url),
+                thinking_sonnet(&url),
+                thinking_sonnet(&url),
+                thinking_sonnet(&url),
+            ))
+        })
+        .await?;
+        let record = thinking_wire_body(move |url| {
+            Box::new(agent_sdk_providers::RecordReplayProvider::record(
+                std::sync::Arc::new(thinking_sonnet(&url)),
+                cassette,
+            ))
+        })
+        .await?;
+        for (wrapper, body) in [
+            ("failover", failover),
+            ("router", router),
+            ("record", record),
+        ] {
+            assert_eq!(
+                body["thinking"]["budget_tokens"], 55_000,
+                "{wrapper}: {body}"
+            );
+            assert_eq!(
+                body["max_tokens"], 64_000,
+                "{wrapper}: max_tokens must exceed the provider-configured thinking budget: {body}",
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn envelope_sizes_output_only_on_a_stable_route() {
         let thread_id = agent_sdk_foundation::ThreadId::from_string("thread_output_budget");
@@ -10325,7 +10439,7 @@ mod tests {
         assert_eq!(
             build_request_envelope(&definition, &refreshing, trigger(&cfg), &thread_id, None)
                 .max_tokens,
-            202_752 / 4,
+            202_752 / 2,
         );
         assert_eq!(failover.model(), "z-ai/glm-5.1");
         assert_eq!(

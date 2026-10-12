@@ -2604,7 +2604,7 @@ async fn success_close_stamps_the_measured_request_facts() -> Result<()> {
 async fn small_window_worker_under_a_large_root_budget_skips_premature_compaction() -> Result<()> {
     let fixtures = Fixtures::new();
     // ~96k estimated tokens: over the 71,680 threshold a 131,072-token
-    // reserve leaves on GLM-5.1's 202,752 window, under the 152,064 one.
+    // reserve leaves on GLM-5.1's 202,752 window, under the 101,376 one.
     seed_projection_history(&fixtures.messages, &thread_id(), 12, &"x".repeat(16_000)).await?;
 
     let cfg = CompactionConfig::default().with_model_aware_threshold(true);
@@ -2641,9 +2641,9 @@ async fn small_window_worker_under_a_large_root_budget_skips_premature_compactio
     );
     let requests = glm.captured_requests()?;
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].max_tokens, 202_752 / 4);
+    assert_eq!(requests[0].max_tokens, 202_752 / 2);
     let expected_envelope = ChatRequest {
-        max_tokens: 202_752 / 4,
+        max_tokens: 202_752 / 2,
         ..sample_envelope()
     };
     let attempts = fixtures.attempts.list_by_task(&task_id).await?;

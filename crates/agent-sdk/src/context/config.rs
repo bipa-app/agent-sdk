@@ -116,18 +116,19 @@ pub struct CompactionConfig {
     /// else the serving model's registered context window. The reserve is
     /// [`model_context_reserve_tokens`](Self::model_context_reserve_tokens),
     /// else the model's registered `max_output_tokens` bounded the way the
-    /// worker bounds requests (a quarter of the registered window, at least
-    /// 32,000), else [`DEFAULT_MODEL_CONTEXT_RESERVE_TOKENS`], and never less
-    /// than the `max_tokens` the call requests. Without a known window
-    /// (unknown model, or a provider whose route is not stable per request),
+    /// worker bounds requests (a quarter of that window, at least 32,000),
+    /// else [`DEFAULT_MODEL_CONTEXT_RESERVE_TOKENS`], and never less than the
+    /// `max_tokens` the call requests. Without a window (no override, and an
+    /// unknown model or a provider whose route is not stable per request),
     /// `threshold_tokens` applies unchanged.
     ///
     /// While this threshold drives automatic compaction (`auto_compact` on
-    /// and a compaction provider wired), the worker also caps each
-    /// request's `max_tokens` at a quarter of the same window plus the
-    /// reasoning the request carries: its thinking budget, or another
-    /// quarter for adaptive or effort-only thinking. Otherwise only the
-    /// model's registered `max_output_tokens` caps it.
+    /// and a compaction provider wired) and the serving model's capabilities
+    /// are known, the worker also caps each request's `max_tokens` at a
+    /// quarter of the same window plus the reasoning the request carries:
+    /// its thinking budget, or another quarter for adaptive, effort-only or
+    /// on-by-default reasoning. Otherwise only the model's registered
+    /// `max_output_tokens` caps it.
     /// Default: false
     #[serde(default)]
     pub model_aware_threshold: bool,

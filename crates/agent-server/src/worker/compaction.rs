@@ -52,7 +52,7 @@ use agent_sdk::context::{
 use agent_sdk_foundation::TokenUsage;
 use agent_sdk_foundation::events::{AgentEvent, CompactionTrigger};
 use agent_sdk_foundation::llm::{ChatRequest, ThinkingConfig, ThinkingMode};
-use agent_sdk_providers::{LlmProvider, ModelCapabilities};
+use agent_sdk_providers::{DefaultReasoning, LlmProvider, ModelCapabilities};
 use agent_sdk_tools::stores::MessageStore;
 use anyhow::{Context, Result};
 use time::OffsetDateTime;
@@ -350,8 +350,9 @@ pub(crate) enum ReasoningAllowance {
     None,
     /// An explicit thinking budget.
     Budget(u32),
-    /// Reasoning sized by effort or by the model, which may take as much as
-    /// the visible share.
+    /// Reasoning sized by effort or by the model (configured without a
+    /// budget, or on by default), which may take as much as the visible
+    /// share.
     Unbudgeted,
 }
 
@@ -371,20 +372,27 @@ pub(crate) enum OutputSizing {
 impl OutputSizing {
     /// The window share only pays off where a model-aware threshold drives
     /// the pre-call trigger, and it shares the window that threshold uses.
-    /// `thinking` is the configuration the provider will send: the
-    /// request's, else the provider's own.
+    /// It also needs the serving model's capability row: without one (an
+    /// unknown model, or a route that may dispatch elsewhere and hides the
+    /// served provider's thinking) the request's reasoning is unknown and a
+    /// smaller request could starve it. `thinking` is the configuration the
+    /// provider will send: the request's, else the provider's own.
     pub(crate) fn for_request(
         trigger: Option<ModelAwareTrigger<'_>>,
         capabilities: Option<&ModelCapabilities>,
         thinking: Option<&ThinkingConfig>,
     ) -> Self {
-        let Some(window) =
-            trigger.and_then(|trigger| effective_window_tokens(trigger.0, capabilities))
-        else {
+        let (Some(trigger), Some(capabilities)) = (trigger, capabilities) else {
+            return Self::ModelMax;
+        };
+        let Some(window) = effective_window_tokens(trigger.0, Some(capabilities)) else {
             return Self::ModelMax;
         };
         let reasoning = match thinking.map(|thinking| &thinking.mode) {
-            None => ReasoningAllowance::None,
+            None => match capabilities.default_reasoning {
+                DefaultReasoning::On => ReasoningAllowance::Unbudgeted,
+                DefaultReasoning::Off => ReasoningAllowance::None,
+            },
             Some(ThinkingMode::Enabled { budget_tokens }) => {
                 ReasoningAllowance::Budget(*budget_tokens)
             }
@@ -1534,8 +1542,8 @@ mod tests {
             (
                 "z-ai/glm-5.1",
                 Box::new(openrouter("z-ai/glm-5.1")),
-                202_752 / 4,
-                202_752 - 202_752 / 4,
+                202_752 / 2,
+                202_752 - 202_752 / 2,
             ),
             (
                 "moonshotai/kimi-k3",
@@ -1748,7 +1756,6 @@ mod tests {
             agent_sdk_foundation::llm::Effort::High,
         ));
         let o3 = registered("openai", "o3");
-        assert_eq!(sized(100_000, o3, None), 50_000);
         assert_eq!(
             sized(100_000, o3, effort.as_ref()),
             100_000,
@@ -1762,14 +1769,55 @@ mod tests {
     }
 
     #[test]
+    fn models_that_reason_by_default_get_the_reasoning_share() {
+        let override_cfg = model_aware().with_model_context_window_tokens(200_000);
+        let override_sized = |model: &str| {
+            let capabilities = registered("anthropic", model);
+            serving_max_tokens(
+                ROOT_REQUESTED_MAX_TOKENS,
+                capabilities,
+                OutputSizing::for_request(
+                    model_aware_trigger(Some(&override_cfg), true),
+                    capabilities,
+                    None,
+                ),
+            )
+        };
+        assert_eq!(sized(100_000, registered("openai", "o3"), None), 100_000);
+        assert_eq!(override_sized("claude-opus-5-5"), 100_000);
+        assert_eq!(override_sized("claude-opus-4-8"), 50_000);
+        let glm = registered("openai", "z-ai/glm-5.1");
+        let glm_request = sized(ROOT_REQUESTED_MAX_TOKENS, glm, None);
+        assert_eq!(glm_request, 202_752 / 2);
+        assert_eq!(
+            effective_threshold_tokens(&model_aware(), glm, glm_request),
+            (202_752 - 202_752 / 2, "model_aware"),
+        );
+        assert_eq!(
+            sized(
+                64_000,
+                registered("anthropic", "claude-sonnet-4-5-20250929"),
+                None
+            ),
+            50_000,
+            "a model that thinks only when asked gets the visible share alone",
+        );
+    }
+
+    #[test]
     fn window_override_sizes_output_like_the_threshold() {
         let cfg = model_aware()
             .with_model_context_window_tokens(200_000)
             .with_threshold_tokens(80_000);
         let opus = agent_sdk_providers::AnthropicProvider::new("key", "claude-opus-5-5");
+        let opus_48 = agent_sdk_providers::AnthropicProvider::new("key", "claude-opus-4-8");
+        assert_eq!(
+            worker_budget(&cfg, &opus_48, ROOT_REQUESTED_MAX_TOKENS),
+            (50_000, (150_000, "model_aware")),
+        );
         assert_eq!(
             worker_budget(&cfg, &opus, ROOT_REQUESTED_MAX_TOKENS),
-            (50_000, (150_000, "model_aware")),
+            (100_000, (100_000, "model_aware")),
         );
         assert_eq!(
             thinking_worker_budget(
@@ -1788,8 +1836,8 @@ mod tests {
             };
             assert_eq!(
                 worker_budget(&cfg, &provider, ROOT_REQUESTED_MAX_TOKENS),
-                (50_000, (150_000, "model_aware")),
-                "{route}",
+                (128_000, (200_000 - 128_000, "model_aware")),
+                "{route}: no capability row, so the request's reasoning is unknown",
             );
         }
         assert_eq!(
@@ -1839,7 +1887,7 @@ mod tests {
             |provider: &dyn LlmProvider| worker_budget(&cfg, provider, ROOT_REQUESTED_MAX_TOKENS);
         assert_eq!(
             budget(&refreshing),
-            (202_752 / 4, (202_752 - 202_752 / 4, "model_aware")),
+            (202_752 / 2, (202_752 - 202_752 / 2, "model_aware")),
             "refreshing",
         );
         assert_eq!(
