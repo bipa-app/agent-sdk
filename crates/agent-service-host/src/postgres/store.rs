@@ -108,13 +108,13 @@ use super::migrations::apply_durable_core_migrations;
 ///
 /// 1. thread rows, a parent's thread before its subagents' threads;
 /// 2. task rows by descending `depth`, and by `id` within a depth
-///    ([`task_lock_order`]): a child before its parent, siblings by id.
+///    (`task_lock_order`): a child before its parent, siblings by id.
 ///
 /// A child's terminal transition locks the child, then its parent; a cancel
 /// locks its whole tree in this order once its threads are held; a re-park
 /// or mixed spawn locks the children it re-attaches by id before their
 /// parent. A transition that ends a root locks the root's thread first (see
-/// [`Self::lock_for_transition_tx`]). A root's input injections are locked
+/// `lock_for_transition_tx`). A root's input injections are locked
 /// only by transactions that already hold the root's thread, so their order
 /// relative to the root does not matter.
 #[derive(Clone)]
@@ -3188,16 +3188,16 @@ LIMIT 1
     record.map(AgentTask::try_from).transpose()
 }
 
-/// Lock the existing children a parent re-attaches, in the store's task-row
-/// order (by id among siblings), before the parent's own row: a child's
-/// terminal transition locks the child and then its parent, so holding the
-/// parent while reaching for a child deadlocks against it.
 /// The position of `task` in the store's task-row lock order (see
 /// [`PostgresDurableStore`]): deeper rows first, then by id.
 const fn task_lock_order(task: &AgentTask) -> (std::cmp::Reverse<u32>, &AgentTaskId) {
     (std::cmp::Reverse(task.depth), &task.id)
 }
 
+/// Lock the existing children a parent re-attaches, in the store's task-row
+/// order (by id among siblings), before the parent's own row: a child's
+/// terminal transition locks the child and then its parent, so holding the
+/// parent while reaching for a child deadlocks against it.
 async fn lock_reattached_children_tx<'a>(
     tx: &mut Transaction<'_, Postgres>,
     parent_id: &AgentTaskId,
