@@ -30,7 +30,9 @@ use std::time::Duration as StdDuration;
 
 use agent_sdk::context::{CompactionConfig, CompactionEngine};
 use agent_sdk_foundation::ThreadId;
-use agent_sdk_foundation::events::{AgentEvent, CompactionTrigger};
+use agent_sdk_foundation::events::{
+    AgentEvent, CompactionThreshold, CompactionTrigger, OccupancySource, ThresholdSource,
+};
 use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Message, StopReason, Usage,
 };
@@ -2250,6 +2252,153 @@ async fn history_appended_after_measured_attempt_triggers_proactively() -> Resul
         .await?
         .context("projection")?;
     assert_eq!(projection.compactions.len(), 1);
+    Ok(())
+}
+
+fn bash_pair(id: &str, output: String) -> [Message; 2] {
+    [
+        Message {
+            role: agent_sdk_foundation::llm::Role::Assistant,
+            content: Content::Blocks(vec![ContentBlock::ToolUse {
+                id: id.to_owned(),
+                name: "bash".to_owned(),
+                input: serde_json::json!({ "command": id }),
+                thought_signature: None,
+            }]),
+        },
+        Message {
+            role: agent_sdk_foundation::llm::Role::User,
+            content: Content::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: id.to_owned(),
+                content: output,
+                artifact: None,
+                is_error: None,
+            }]),
+        },
+    ]
+}
+
+fn result_content<'a>(messages: &'a [Message], id: &str) -> Option<&'a str> {
+    messages.iter().find_map(|message| match &message.content {
+        Content::Blocks(blocks) => blocks.iter().find_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } if tool_use_id == id => Some(content.as_str()),
+            _ => None,
+        }),
+        Content::Text(_) => None,
+    })
+}
+
+/// The incident shape: a measured request a little over a fixed threshold
+/// for a model the registry does not know, whose history is mostly command
+/// output. Prune-first elides the oldest output and nothing more, calls no
+/// summarizer, and the event reports what crossed which threshold.
+#[tokio::test]
+async fn measured_overshoot_elides_the_oldest_output_and_reports_the_trigger() -> Result<()> {
+    use crate::journal::staged::StagedMessageStore;
+
+    let fixtures = Fixtures::new();
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    let mut history = vec![Message::user("fix the cargo deny failures")];
+    history.extend(bash_pair("big-1", "1".repeat(44_000)));
+    history.extend(bash_pair("mid", "m".repeat(9_000)));
+    history.extend(bash_pair("big-2", "2".repeat(44_000)));
+    for id in ["a", "b", "c", "d", "e", "f", "g"] {
+        history.extend(bash_pair(id, "s".repeat(200)));
+    }
+    assert_eq!(history.len(), 21);
+    seed_anchor_attempt(
+        &fixtures,
+        &task.id,
+        1,
+        81_000,
+        19,
+        0,
+        t0() + Duration::seconds(5),
+    )
+    .await?;
+    fixtures
+        .messages
+        .commit_messages(&thread_id(), history.clone(), t0() + Duration::seconds(6))
+        .await?;
+
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::PruneFirst)
+        .with_threshold_tokens(80_000)
+        .with_model_aware_threshold(true);
+    let scripted = Arc::new(ScriptedProvider::new(vec![ok_response(
+        "[summary] must not be requested",
+    )]));
+    let provider: Arc<dyn LlmProvider> = scripted.clone();
+    let deps = fixtures.deps_with_compaction(&cfg, &provider);
+    let staged = StagedMessageStore::new(thread_id(), history);
+
+    let outcome = super::compaction::maybe_compact_staged_history(
+        &deps,
+        provider.as_ref(),
+        &staged,
+        &thread_id(),
+        0,
+        &sample_envelope(),
+        t0() + Duration::seconds(20),
+    )
+    .await?;
+
+    assert!(outcome.applied);
+    assert_eq!(
+        scripted.calls(),
+        0,
+        "elision reached the target; no summary"
+    );
+    let compacted = staged.get_history(&thread_id()).await?;
+    assert_eq!(compacted.len(), 21);
+    let elided = result_content(&compacted, "big-1").context("big-1 missing")?;
+    assert!(
+        elided.starts_with("[Tool result content elided;"),
+        "{elided}"
+    );
+    for (id, expected) in [
+        ("mid", "m".repeat(9_000)),
+        ("big-2", "2".repeat(44_000)),
+        ("g", "s".repeat(200)),
+    ] {
+        assert_eq!(
+            result_content(&compacted, id),
+            Some(expected.as_str()),
+            "{id}"
+        );
+    }
+
+    let events = fixtures.events.get_events(&thread_id()).await?;
+    let (occupancy, threshold) = events
+        .iter()
+        .find_map(|event| match &event.event {
+            AgentEvent::ContextCompacted {
+                occupancy,
+                threshold,
+                ..
+            } => Some((*occupancy, *threshold)),
+            _ => None,
+        })
+        .context("no ContextCompacted event")?;
+    let occupancy = occupancy.context("occupancy missing")?;
+    assert_eq!(occupancy.source, OccupancySource::Measured);
+    assert!(
+        occupancy.tokens > 81_000 && occupancy.tokens < 81_200,
+        "the anchor plus the two appended messages, got {}",
+        occupancy.tokens
+    );
+    assert_eq!(
+        threshold,
+        Some(CompactionThreshold {
+            tokens: 80_000,
+            source: ThresholdSource::FixedUnknownModel,
+            context_window_tokens: None,
+        })
+    );
     Ok(())
 }
 

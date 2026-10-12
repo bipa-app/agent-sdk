@@ -8510,6 +8510,32 @@ async fn threshold_compaction_event_records_trigger_and_configured_engine() -> a
         ),
         "{compacted:?}"
     );
+    let AgentEvent::ContextCompacted {
+        original_tokens,
+        occupancy,
+        threshold,
+        ..
+    } = compacted[0]
+    else {
+        anyhow::bail!("filtered to ContextCompacted");
+    };
+    let threshold_tokens = tiny_compaction_config().threshold_tokens;
+    assert_eq!(
+        *occupancy,
+        Some(crate::events::CompactionOccupancy {
+            tokens: *original_tokens,
+            source: crate::events::OccupancySource::Estimated,
+        }),
+        "the in-process trigger compares the history estimate"
+    );
+    assert_eq!(
+        *threshold,
+        Some(crate::events::CompactionThreshold {
+            tokens: threshold_tokens,
+            source: crate::events::ThresholdSource::Fixed,
+            context_window_tokens: None,
+        })
+    );
     Ok(())
 }
 

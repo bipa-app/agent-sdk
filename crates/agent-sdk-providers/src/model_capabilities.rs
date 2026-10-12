@@ -1424,7 +1424,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
 /// Capabilities of `model_id` served by `provider`.
 ///
 /// An exact id wins. Otherwise the id and every row compare with their
-/// snapshot qualifier removed, so a dated snapshot (`-YYYYMMDD`, OpenAI's
+/// snapshot qualifier removed, so a dated snapshot (`-YYYYMMDD`, or
 /// `-YYYY-MM-DD`), a Google Cloud `@` version or a `-latest` alias of a
 /// registered model resolves to that model's row, and an undated alias
 /// resolves to its dated row.
@@ -1448,7 +1448,7 @@ pub fn get_model_capabilities(
 
 /// `model_id` without its snapshot qualifier: a Google Cloud `@version`, a
 /// `-latest` alias suffix, or a trailing snapshot date (`-YYYYMMDD`, or
-/// OpenAI's `-YYYY-MM-DD`).
+/// `-YYYY-MM-DD` as `OpenAI` dates them).
 #[must_use]
 pub(crate) fn snapshot_family(model_id: &str) -> &str {
     let id = model_id

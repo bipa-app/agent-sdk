@@ -87,6 +87,9 @@ const MAX_TOOL_RESULT_CHARS: usize = 500;
 const TRUNCATED_SUMMARY_MARKER: &str =
     "\n\n[summary truncated: exceeded the configured summary_max_tokens budget]";
 const PRUNED_TOOL_RESULT_PREFIX: &str = "[Tool result content elided;";
+/// The newest messages elision never touches even when `retain_recent` is
+/// smaller: the last tool call and the result the model is about to read.
+const MIN_PROTECTED_TAIL_MESSAGES_FOR_ELISION: usize = 2;
 const MAX_SUMMARY_MESSAGES_JSON_BYTES: usize = 64 * 1024;
 const MAX_SUMMARY_MESSAGE_SNAPSHOT_BYTES: usize = 8 * 1024;
 const MAX_SUMMARY_PRIOR_JSON_BYTES: usize = 16 * 1024;
@@ -527,6 +530,10 @@ pub struct LlmContextCompactor<P: LlmProvider + ?Sized, H: AgentHooks = DefaultH
     /// default) never fences, preserving run-to-completion behavior.
     cancellation: Option<CancellationToken>,
     provisional_artifacts: bool,
+    /// Estimated history size a prune-first compaction elides tool output
+    /// down to before it falls back to summarization; see
+    /// [`Self::with_history_target_tokens`].
+    history_target_tokens: Option<usize>,
     system_prompt: String,
     summary_prompt_prefix: String,
     summary_prompt_suffix: String,
@@ -543,6 +550,7 @@ impl<P: LlmProvider + ?Sized> LlmContextCompactor<P> {
             artifact_store: None,
             cancellation: None,
             provisional_artifacts: false,
+            history_target_tokens: None,
             system_prompt: COMPACTION_SYSTEM_PROMPT.to_string(),
             summary_prompt_prefix: COMPACTION_SUMMARY_PROMPT_PREFIX.to_string(),
             summary_prompt_suffix: COMPACTION_SUMMARY_PROMPT_SUFFIX.to_string(),
@@ -578,6 +586,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
             config: self.config,
             cancellation: self.cancellation,
             provisional_artifacts: self.provisional_artifacts,
+            history_target_tokens: self.history_target_tokens,
             hooks: Some(hooks),
             artifact_store: self.artifact_store,
             system_prompt: self.system_prompt,
@@ -621,6 +630,21 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
     #[must_use]
     pub const fn with_provisional_artifacts(mut self) -> Self {
         self.provisional_artifacts = true;
+        self
+    }
+
+    /// Bound how far a prune-first compaction shrinks the history.
+    ///
+    /// The engine first elides reads a newer read of the same path
+    /// superseded, then elides the oldest remaining tool results outside the
+    /// `retain_recent` tail, stopping as soon as the estimated history fits
+    /// `tokens`. It summarizes only when elision cannot reach the target.
+    /// Without a target, prune-first elides superseded reads only and
+    /// accepts them when the history fits `threshold_tokens`. Other engines
+    /// ignore the target.
+    #[must_use]
+    pub const fn with_history_target_tokens(mut self, tokens: usize) -> Self {
+        self.history_target_tokens = Some(tokens);
         self
     }
     /// Override the prompts used for LLM-based summarization.
@@ -858,6 +882,82 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
         }
 
         newest_pruned_message
+    }
+
+    /// The prune-first engine's pruning pass: superseded reads, then, with a
+    /// history target, the oldest tool output. Returns the index of the
+    /// newest message changed; other engines change nothing.
+    fn prune_first(&self, messages: &mut [Message]) -> Option<usize> {
+        if !self.config.uses_prune_first_engine() {
+            return None;
+        }
+        let superseded = Self::prune_tool_outputs(messages);
+        let elided = self
+            .history_target_tokens
+            .and_then(|target| self.elide_oldest_tool_outputs(messages, target));
+        superseded.max(elided)
+    }
+
+    /// Elide tool results oldest first, outside the protected tail, until
+    /// the estimated history fits `target_tokens`. Each elided result keeps
+    /// its block, so every `tool_use` keeps its `tool_result`, and names the
+    /// artifact that recovers its output when one resolves. Returns the index
+    /// of the newest message changed.
+    fn elide_oldest_tool_outputs(
+        &self,
+        messages: &mut [Message],
+        target_tokens: usize,
+    ) -> Option<usize> {
+        let mut tokens = self.estimate_tokens(messages);
+        let protected_from = messages.len().saturating_sub(
+            self.config
+                .retain_recent
+                .max(MIN_PROTECTED_TAIL_MESSAGES_FOR_ELISION),
+        );
+        let mut newest_elided = None;
+        for (index, message) in messages.iter_mut().enumerate().take(protected_from) {
+            if tokens <= target_tokens {
+                break;
+            }
+            let Content::Blocks(blocks) = &mut message.content else {
+                continue;
+            };
+            for block in blocks.iter_mut() {
+                if tokens <= target_tokens {
+                    break;
+                }
+                let ContentBlock::ToolResult {
+                    content, artifact, ..
+                } = block
+                else {
+                    continue;
+                };
+                if content.starts_with(PRUNED_TOOL_RESULT_PREFIX) {
+                    continue;
+                }
+                let notice = self.artifact_recovery_uri(content, artifact.as_ref()).map_or_else(
+                    || {
+                        format!(
+                            "{PRUNED_TOOL_RESULT_PREFIX} removed to free context. Run the tool again if you need its output]"
+                        )
+                    },
+                    |uri| {
+                        format!(
+                            "{PRUNED_TOOL_RESULT_PREFIX} removed to free context. Read {uri} to recover the output]"
+                        )
+                    },
+                );
+                let freed = TokenEstimator::estimate_text(content)
+                    .saturating_sub(TokenEstimator::estimate_text(&notice));
+                if freed == 0 {
+                    continue;
+                }
+                *content = notice;
+                tokens = tokens.saturating_sub(freed);
+                newest_elided = Some(index);
+            }
+        }
+        newest_elided
     }
 
     /// Shift split point backwards until a `tool_use`/`tool_result` pair is not
@@ -3003,17 +3103,16 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
     ) -> Result<CompactionResult, FailedCompaction> {
         let original_count = messages.len();
         let original_tokens = self.estimate_tokens(&messages);
-        let newest_pruned_message = self
-            .config
-            .uses_prune_first_engine()
-            .then(|| Self::prune_tool_outputs(&mut messages))
-            .flatten();
+        let newest_pruned_message = self.prune_first(&mut messages);
         let pruned_tokens =
             newest_pruned_message.map_or(original_tokens, |_| self.estimate_tokens(&messages));
 
         if let Some(pruned_index) = newest_pruned_message
             && pruned_tokens < original_tokens
-            && pruned_tokens <= self.config.threshold_tokens
+            && pruned_tokens
+                <= self
+                    .history_target_tokens
+                    .unwrap_or(self.config.threshold_tokens)
         {
             let new_count = messages.len();
             return Ok(CompactionResult {
@@ -5085,6 +5184,124 @@ mod tests {
         let notice =
             tool_result_content(&result.messages, "old-read").context("pruned old read missing")?;
         assert!(notice.contains("superseded by a newer read of src/lib.rs"));
+        Ok(())
+    }
+
+    /// The incident shape: a long tool loop whose big outputs are command
+    /// output, not superseded reads, a little over its target.
+    fn command_loop_history() -> Vec<Message> {
+        let mut messages = vec![Message::user("fix the cargo deny failures")];
+        push_tool_pair(&mut messages, "big-1", "bash", None, "1".repeat(44_000));
+        push_tool_pair(&mut messages, "mid", "bash", None, "m".repeat(9_000));
+        push_tool_pair(&mut messages, "big-2", "bash", None, "2".repeat(44_000));
+        for id in [
+            "small-a", "small-b", "small-c", "small-d", "small-e", "small-f", "small-g",
+        ] {
+            push_tool_pair(&mut messages, id, "bash", None, "s".repeat(200));
+        }
+        messages
+    }
+
+    fn prune_first_compactor(
+        requests: &Arc<Mutex<Vec<String>>>,
+        history_target_tokens: usize,
+    ) -> LlmContextCompactor<MockProvider> {
+        let provider = Arc::new(MockProvider::new_with_request_log(
+            "summary",
+            Arc::clone(requests),
+        ));
+        let config = CompactionConfig::default()
+            .with_engine(crate::context::CompactionEngine::PruneFirst)
+            .with_threshold_tokens(80_000)
+            .with_min_messages(1);
+        LlmContextCompactor::new(provider, config).with_history_target_tokens(history_target_tokens)
+    }
+
+    #[tokio::test]
+    async fn history_target_elides_only_the_oldest_output_it_needs() -> Result<()> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let messages = command_loop_history();
+        let original_tokens = TokenEstimator::estimate_history(&messages);
+        let target = original_tokens - 5_000;
+        let compactor = prune_first_compactor(&requests, target);
+
+        let result = compactor.compact_history(messages).await?;
+
+        assert!(
+            requests
+                .lock()
+                .map_err(|_| anyhow::anyhow!("request log poisoned"))?
+                .is_empty(),
+            "a target elision can reach must not summarize"
+        );
+        assert_eq!(result.new_count, result.original_count);
+        assert!(result.new_tokens <= target);
+        let elided = tool_result_content(&result.messages, "big-1").context("big-1 missing")?;
+        assert!(elided.starts_with(PRUNED_TOOL_RESULT_PREFIX), "{elided}");
+        assert!(elided.contains("Run the tool again"), "{elided}");
+        for (id, expected) in [
+            ("mid", "m".repeat(9_000)),
+            ("big-2", "2".repeat(44_000)),
+            ("small-g", "s".repeat(200)),
+        ] {
+            assert_eq!(
+                tool_result_content(&result.messages, id),
+                Some(expected.as_str()),
+                "{id} must stay intact"
+            );
+        }
+        assert_eq!(result.retained_count, result.new_count - 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn history_target_never_elides_the_retained_tail() -> Result<()> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let compactor = prune_first_compactor(&requests, 0);
+
+        let result = compactor.compact_history(command_loop_history()).await?;
+
+        assert_eq!(
+            requests
+                .lock()
+                .map_err(|_| anyhow::anyhow!("request log poisoned"))?
+                .len(),
+            1,
+            "a target elision cannot reach falls back to summarization"
+        );
+        for id in ["small-c", "small-d", "small-e", "small-f", "small-g"] {
+            assert_eq!(
+                tool_result_content(&result.messages, id),
+                Some("s".repeat(200).as_str()),
+                "{id} sits in the retained tail and must stay intact"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prune_first_without_a_target_still_summarizes_command_output() -> Result<()> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(MockProvider::new_with_request_log(
+            "summary",
+            Arc::clone(&requests),
+        ));
+        let config = CompactionConfig::default()
+            .with_engine(crate::context::CompactionEngine::PruneFirst)
+            .with_threshold_tokens(80_000)
+            .with_min_messages(1);
+        let compactor = LlmContextCompactor::new(provider, config);
+
+        let result = compactor.compact_history(command_loop_history()).await?;
+
+        assert_eq!(
+            requests
+                .lock()
+                .map_err(|_| anyhow::anyhow!("request log poisoned"))?
+                .len(),
+            1
+        );
+        assert!(result.new_count < result.original_count);
         Ok(())
     }
 
