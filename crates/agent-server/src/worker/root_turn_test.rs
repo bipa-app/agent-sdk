@@ -7932,11 +7932,14 @@ async fn cancelling_an_early_resume_mid_call_closes_its_running_call() -> Result
     Ok(())
 }
 
-#[tokio::test]
-async fn a_failed_early_resumed_parent_closes_its_running_call() -> Result<()> {
-    let stores = TestStores::new();
+/// Fail a parent whose early resume left `call_2` running, and return the
+/// next turn's first provider request. `call_1` finished after the first
+/// early resume and its late result is delivered once.
+async fn fail_an_early_resumed_parent_over_a_running_call(
+    stores: &TestStores,
+) -> Result<Vec<agent_sdk_foundation::llm::Message>> {
     let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
-        &stores,
+        stores,
         vec![
             bash_call("call_0"),
             bash_call("call_1"),
@@ -7946,7 +7949,7 @@ async fn a_failed_early_resumed_parent_closes_its_running_call() -> Result<()> {
     ))
     .await?;
     complete_child_at(
-        &stores,
+        stores,
         &children[0],
         &ok_result("done-0"),
         t_plus(8),
@@ -7954,9 +7957,9 @@ async fn a_failed_early_resumed_parent_closes_its_running_call() -> Result<()> {
     )
     .await?;
     let provider = RequestLogProvider::new("Two calls are still running.");
-    run_child_resume(&stores, &parent.id, &provider, t_plus(10), t_plus(12)).await?;
+    run_child_resume(stores, &parent.id, &provider, t_plus(10), t_plus(12)).await?;
     complete_child_at(
-        &stores,
+        stores,
         &children[1],
         &ok_result("done-1"),
         t_plus(20),
@@ -7965,7 +7968,7 @@ async fn a_failed_early_resumed_parent_closes_its_running_call() -> Result<()> {
     .await?;
 
     let error = run_child_resume(
-        &stores,
+        stores,
         &parent.id,
         &InvalidRequestProvider,
         t_plus(22),
@@ -7997,9 +8000,41 @@ async fn a_failed_early_resumed_parent_closes_its_running_call() -> Result<()> {
     assert_eq!(delivered.len(), 1);
     assert!(delivered[0].contains("done-1"), "{}", delivered[0]);
 
-    let request = follow_up_request(&stores, "Try the third command again.", t_plus(30)).await?;
-    assert_running_call_closed(&request, "call_2", "still_running");
+    let request = follow_up_request(stores, "Try the third command again.", t_plus(30)).await?;
     assert_eq!(late_results_for(&request, "call_1").len(), 1);
+    Ok(request)
+}
+
+/// Failing the parent settles the call it left running, so the next turn
+/// is told the call was cancelled.
+#[tokio::test]
+async fn a_failed_early_resumed_parent_closes_its_running_call() -> Result<()> {
+    let stores = TestStores::new();
+    let request = Box::pin(fail_an_early_resumed_parent_over_a_running_call(&stores)).await?;
+    assert_running_call_closed(&request, "call_2", "cancelled");
+    Ok(())
+}
+
+/// When settling the failed parent's children fails, the call may still be
+/// running: the next turn is told so, and not to call it again until it is
+/// confirmed stopped or finished.
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+async fn failpoint_unsettled_failed_parent_reports_its_call_still_running() -> Result<()> {
+    let scenario = fail::FailScenario::setup();
+    fail::cfg("settle.cancel_descendants", "return").map_err(anyhow::Error::msg)?;
+    let stores = TestStores::new();
+    let request = Box::pin(fail_an_early_resumed_parent_over_a_running_call(&stores)).await;
+    fail::remove("settle.cancel_descendants");
+    drop(scenario);
+    let request = request?;
+    assert_running_call_closed(&request, "call_2", "still_running");
+    let closed = late_results_for(&request, "call_2");
+    assert!(
+        closed[0].contains("Do not call it again until it is confirmed stopped or finished"),
+        "{}",
+        closed[0],
+    );
     Ok(())
 }
 
@@ -8480,11 +8515,14 @@ enum TurnExit {
     CancelParked,
     /// `cancel_root_turn` during a steering wake's LLM call.
     CancelMidSteering,
-    /// The child wake's LLM call fails and the root is failed.
+    /// The child wake's LLM call fails and the root is failed, which
+    /// settles its live children.
     FailMidResume,
     /// The public `aggregate_child_outcomes` + `resume_root_turn` pair.
     AggregateResume,
     /// The child wake's lease expires until the sweep fails the row closed.
+    /// Nothing settles its live children here (the host's orphan sweep
+    /// would), so a call still running is reported as such.
     FailClosedByLeaseExpiry,
     /// A steering wake's LLM call fails and the wake is reverted; the
     /// children's fan-in then commits the turn.
@@ -9181,11 +9219,12 @@ fn expected_closures(
         (_, SurvivorAtExit::Finished) | (TurnExit::RevertFailedSteering, SurvivorAtExit::Live) => {
             "success"
         }
-        (TurnExit::FailMidResume | TurnExit::FailClosedByLeaseExpiry, SurvivorAtExit::Live) => {
-            "still_running"
-        }
+        (TurnExit::FailClosedByLeaseExpiry, SurvivorAtExit::Live) => "still_running",
         (
-            TurnExit::CancelParked | TurnExit::CancelMidSteering | TurnExit::AggregateResume,
+            TurnExit::CancelParked
+            | TurnExit::CancelMidSteering
+            | TurnExit::FailMidResume
+            | TurnExit::AggregateResume,
             SurvivorAtExit::Live,
         ) => "cancelled",
     };

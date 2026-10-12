@@ -726,6 +726,11 @@ pub async fn settle_live_descendants(
     if !root.is_some_and(|root| root.status.is_terminal()) {
         return Ok(Vec::new());
     }
+    crate::fail_point!("settle.cancel_descendants", |_| {
+        Err(anyhow::anyhow!(
+            "injected failure settling live descendants"
+        ))
+    });
     let outcome = deps
         .task_store
         .cancel_tree(task_id, now)
