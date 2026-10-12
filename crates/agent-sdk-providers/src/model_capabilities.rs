@@ -376,7 +376,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         provider: "anthropic",
         model_id: "claude-sonnet-4-6",
         context_window: Some(1_000_000),
-        max_output_tokens: Some(64_000),
+        max_output_tokens: Some(128_000),
         pricing: Some(Pricing::flat(3.0, 15.0).with_notes("Anthropic Sonnet tier pricing; verify exact current SKU mapping before billing-critical use.")),
         supports_thinking: true,
         supports_adaptive_thinking: true,
@@ -769,54 +769,54 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
     ModelCapabilities {
         provider: "openai",
         model_id: "o1-mini",
-        context_window: Some(200_000),
-        max_output_tokens: Some(100_000),
+        context_window: Some(128_000),
+        max_output_tokens: Some(65_536),
         pricing: Some(Pricing::flat(0.55, 2.20)),
         supports_thinking: true,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
         source_url: OPENAI_PRICING_URL,
         source_status: SourceStatus::Official,
-        notes: Some("Pricing verified from OpenAI pricing page. Context/max output still need clean extraction from models docs."),
+        notes: Some("Pricing verified from OpenAI pricing page. Context window 128,000 and max output 65,536 from the OpenAI model page (developers.openai.com/api/docs/models/o1-mini)."),
     },
     ModelCapabilities {
         provider: "openai",
         model_id: "gpt-4.1",
         context_window: Some(1_000_000),
-        max_output_tokens: Some(16_384),
+        max_output_tokens: Some(32_768),
         pricing: Some(Pricing::flat(1.0, 4.0)),
         supports_thinking: false,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
         source_url: OPENAI_PRICING_URL,
         source_status: SourceStatus::Official,
-        notes: Some("Pricing verified from OpenAI pricing page. Context window from model family docs/notes."),
+        notes: Some("Pricing verified from OpenAI pricing page. Context window from model family docs/notes. Max output 32,768 from the OpenAI model page (developers.openai.com/api/docs/models)."),
     },
     ModelCapabilities {
         provider: "openai",
         model_id: "gpt-4.1-mini",
         context_window: Some(1_000_000),
-        max_output_tokens: Some(16_384),
+        max_output_tokens: Some(32_768),
         pricing: Some(Pricing::flat(0.20, 0.80)),
         supports_thinking: false,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
         source_url: OPENAI_PRICING_URL,
         source_status: SourceStatus::Official,
-        notes: Some("Pricing verified from OpenAI pricing page. Context window from model family docs/notes."),
+        notes: Some("Pricing verified from OpenAI pricing page. Context window from model family docs/notes. Max output 32,768 from the OpenAI model page (developers.openai.com/api/docs/models)."),
     },
     ModelCapabilities {
         provider: "openai",
         model_id: "gpt-4.1-nano",
         context_window: Some(1_000_000),
-        max_output_tokens: Some(16_384),
+        max_output_tokens: Some(32_768),
         pricing: Some(Pricing::flat(0.05, 0.20)),
         supports_thinking: false,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
         source_url: OPENAI_PRICING_URL,
         source_status: SourceStatus::Official,
-        notes: Some("Pricing verified from OpenAI pricing page. Context window from model family docs/notes."),
+        notes: Some("Pricing verified from OpenAI pricing page. Context window from model family docs/notes. Max output 32,768 from the OpenAI model page (developers.openai.com/api/docs/models)."),
     },
     ModelCapabilities {
         provider: "openai",
@@ -1060,14 +1060,14 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         provider: "openai",
         model_id: "moonshotai/kimi-k3",
         context_window: Some(1_048_576),
-        max_output_tokens: Some(65_535),
+        max_output_tokens: None,
         pricing: None,
         supports_thinking: true,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
         source_url: OPENROUTER_KIMI_K3_URL,
         source_status: SourceStatus::Derived,
-        notes: Some("Exact OpenRouter slug; Baseten serves the same weights as moonshotai/Kimi-K3, which the case-insensitive lookup folds here. Reasoning model with a 1,048,576-token window (OpenRouter model metadata; Baseten documents a 1M window). OpenRouter endpoints cap completions between 65,535 and 943,718 tokens (Baseten 262,144) and route requests to any of them, so max_output_tokens is the lowest of those caps: a larger request can be rejected by whichever endpoint serves it. Pricing is None because the static `openai` key cannot tell the gateway base URLs apart and their rates differ; dynamic route catalogs remain the pricing authority."),
+        notes: Some("Exact OpenRouter slug; Baseten serves the same weights as moonshotai/Kimi-K3, which the case-insensitive lookup folds here. Reasoning model with a 1,048,576-token window (OpenRouter model metadata; Baseten documents a 1M window). OpenRouter endpoints cap completions between 65,535 and 943,718 tokens (Baseten 262,144), and OpenRouter routes a request only to endpoints that support its max_tokens, so no single ceiling applies and max_output_tokens stays None: a fixed cap would cut requests some route serves. Callers size output through their own max_tokens. Pricing is None because the static `openai` key cannot tell the gateway base URLs apart and their rates differ; dynamic route catalogs remain the pricing authority."),
     },
     ModelCapabilities {
         provider: "openai",
@@ -1420,8 +1420,29 @@ mod tests {
     fn test_lookup_anthropic_sonnet_46() {
         let caps = get_model_capabilities("anthropic", "claude-sonnet-4-6").unwrap();
         assert_eq!(caps.context_window, Some(1_000_000));
-        assert_eq!(caps.max_output_tokens, Some(64_000));
+        assert_eq!(caps.max_output_tokens, Some(128_000));
         assert!(caps.supports_adaptive_thinking);
+    }
+
+    #[test]
+    fn openai_output_ceilings_match_the_model_pages() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        for (model, window, max_output) in [
+            ("gpt-4.1", 1_000_000, 32_768),
+            ("gpt-4.1-mini", 1_000_000, 32_768),
+            ("gpt-4.1-nano", 1_000_000, 32_768),
+            ("o1-mini", 128_000, 65_536),
+        ] {
+            let caps = get_model_capabilities("openai", model)
+                .with_context(|| format!("{model} capabilities missing"))?;
+            assert_eq!(
+                (caps.context_window, caps.max_output_tokens),
+                (Some(window), Some(max_output)),
+                "{model}",
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -1663,7 +1684,7 @@ mod tests {
             .context("missing capabilities for moonshotai/kimi-k3")?;
         assert!(k3.supports_thinking);
         assert_eq!(k3.context_window, Some(1_048_576));
-        assert_eq!(k3.max_output_tokens, Some(65_535));
+        assert_eq!(k3.max_output_tokens, None);
         assert!(k3.pricing.is_none());
 
         let fireworks = get_model_capabilities("openai", "accounts/fireworks/models/kimi-k3")
@@ -1676,7 +1697,7 @@ mod tests {
         let baseten = get_model_capabilities("openai", "moonshotai/Kimi-K3")
             .context("missing capabilities for moonshotai/Kimi-K3")?;
         assert_eq!(baseten.model_id, "moonshotai/kimi-k3");
-        assert_eq!(baseten.max_output_tokens, Some(65_535));
+        assert_eq!(baseten.max_output_tokens, None);
         Ok(())
     }
 
