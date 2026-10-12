@@ -1,6 +1,9 @@
 //! The host settles the live descendants of a terminal root: once at
 //! startup, finishing whatever a previous process left half-done, and on
-//! every sweep tick, right after expired leases are failed closed.
+//! every sweep tick, right after expired leases are failed closed. A failed
+//! root trips the confirmation drives of exactly the tasks it cancelled.
+
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use time::OffsetDateTime;
@@ -10,15 +13,23 @@ use agent_sdk_foundation::{
     AgentContinuation, AgentState, ContinuationEnvelope, TerminalReason, ThreadId, TokenUsage, llm,
 };
 use agent_server::ChildJoinPolicy;
+use agent_server::journal::SubagentInvocationSpawn;
+use agent_server::journal::store::AgentTaskStore;
 use agent_server::journal::task::{
-    AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskStatus, WorkerId,
+    AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, SuspensionPayload,
+    TaskStatus, WorkerId,
 };
 
 use crate::config::{ServiceConfig, WorkerConfig};
 #[cfg(feature = "sqlite")]
 use crate::config::{StorageBackend, StorageConfig};
-use crate::host::{ServiceHost, settle_orphaned_descendants};
+use crate::host::{
+    AttemptClosePolicy, OwnedRootTask, ServiceHost, fail_root_task_if_owned,
+    settle_orphaned_descendants,
+};
 use crate::stores::StoreRegistry;
+
+use super::FlakyTaskStore;
 
 fn payload(thread: &ThreadId) -> SuspensionPayload {
     SuspensionPayload {
@@ -325,5 +336,196 @@ async fn host_startup_settles_orphans_left_by_a_previous_process() -> Result<()>
 
     assert_children_settled(&stores, &tree).await?;
     assert_eq!(task(&stores, &tree.root).await?.status, TaskStatus::Failed);
+    Ok(())
+}
+
+/// A root parked on one subagent whose child-thread root is itself parked on
+/// a tool child awaiting an approved confirmation's drive, then woken early
+/// and leased: the failing root's only direct child is the invocation.
+async fn running_root_over_a_child_thread_drive(
+    stores: &StoreRegistry,
+    thread: &ThreadId,
+) -> Result<(AgentTaskId, AgentTaskId, WorkerId, LeaseId)> {
+    let now = OffsetDateTime::now_utc();
+    let horizon = now + time::Duration::hours(1);
+    let root = AgentTask::new_root_turn(thread.clone(), now, 3);
+    stores.task_store.submit_root_turn(root.clone()).await?;
+    let worker = WorkerId::new();
+    let lease = LeaseId::new();
+    stores
+        .task_store
+        .try_acquire_task(&root.id, worker.clone(), lease.clone(), horizon, now)
+        .await?
+        .context("root must acquire")?;
+    let child_thread = ThreadId::from_string(format!("{}-child", thread.0));
+    stores
+        .thread_store
+        .get_or_create(&child_thread, now)
+        .await?;
+    let (_, _invocation, child_root) = stores
+        .task_store
+        .spawn_subagent_invocation(
+            &root.id,
+            &worker,
+            &lease,
+            SubagentInvocationSpawn {
+                child_thread_id: child_thread.clone(),
+                spec: super::subagent_timeout_spec("inspect", 60_000),
+                child_root_input: vec![SubmittedInputItem::Text {
+                    text: "inspect".into(),
+                }],
+                spawn_index: 0,
+                child_caller_metadata: None,
+                payload: payload(thread),
+            },
+            Vec::new(),
+            now,
+        )
+        .await?;
+
+    let child_worker = WorkerId::new();
+    let child_lease = LeaseId::new();
+    stores
+        .task_store
+        .try_acquire_task(
+            &child_root.id,
+            child_worker.clone(),
+            child_lease.clone(),
+            horizon,
+            now,
+        )
+        .await?
+        .context("child root must acquire")?;
+    let (_, tools) = stores
+        .task_store
+        .spawn_tool_children(
+            &child_root.id,
+            &child_worker,
+            &child_lease,
+            vec![ChildSpawnSpec::new(3)],
+            payload(&child_thread),
+            None,
+            Vec::new(),
+            now,
+        )
+        .await?;
+    let tool_worker = WorkerId::new();
+    let tool_lease = LeaseId::new();
+    stores
+        .task_store
+        .try_acquire_task(
+            &tools[0].id,
+            tool_worker.clone(),
+            tool_lease.clone(),
+            horizon,
+            now,
+        )
+        .await?
+        .context("tool child must acquire")?;
+    stores
+        .task_store
+        .pause_on_confirmation(
+            &tools[0].id,
+            &tool_worker,
+            &tool_lease,
+            payload(&child_thread).continuation,
+            None,
+            now,
+        )
+        .await?;
+
+    let (worker, lease) = resume_early(stores, &root.id, horizon).await?;
+    Ok((root.id, tools[0].id.clone(), worker, lease))
+}
+
+async fn fail_owned_root(
+    stores: &StoreRegistry,
+    thread: &ThreadId,
+    root: &AgentTaskId,
+    worker: &WorkerId,
+    lease: &LeaseId,
+) -> Result<()> {
+    fail_root_task_if_owned(
+        stores,
+        OwnedRootTask {
+            task: root,
+            thread,
+            worker,
+            lease,
+        },
+        &anyhow::anyhow!("steering resume failed"),
+        TerminalReason::InternalError,
+        0,
+        AttemptClosePolicy::CloseOpenAttempts,
+        OffsetDateTime::now_utc(),
+    )
+    .await
+}
+
+/// A failed root trips the confirmation drive of every task its failure
+/// cancelled, however deep: here a tool child on the thread of the failed
+/// root's subagent.
+#[tokio::test]
+async fn failing_a_root_trips_the_drives_it_cancelled_on_a_child_thread() -> Result<()> {
+    let stores = StoreRegistry::in_memory(super::sample_registry());
+    let thread = ThreadId::from_string("t-deep-drive");
+    let (root, tool, worker, lease) =
+        running_root_over_a_child_thread_drive(&stores, &thread).await?;
+    let drive = CancellationToken::new();
+    let _drive_registration = stores
+        .confirm_drive_cancels
+        .register(tool.clone(), drive.clone());
+
+    fail_owned_root(&stores, &thread, &root, &worker, &lease).await?;
+
+    let cancelled = task(&stores, &tool).await?;
+    assert_eq!(cancelled.status, TaskStatus::Cancelled);
+    assert_eq!(
+        cancelled.terminal_reason,
+        Some(TerminalReason::ParentCancelled)
+    );
+    assert!(
+        drive.is_cancelled(),
+        "the drive of a task the failure cancelled must be tripped",
+    );
+    Ok(())
+}
+
+/// A failed root whose settlement did not land trips no drive: the task
+/// behind it is still live and owns its drive until the orphan sweep
+/// cancels it, which trips the drive then.
+#[tokio::test]
+async fn failing_a_root_trips_no_drive_its_settlement_did_not_cancel() -> Result<()> {
+    let stores = StoreRegistry::in_memory(super::sample_registry());
+    let thread = ThreadId::from_string("t-unsettled-drive");
+    let tree = park_on_live_children(&stores, &thread, 3).await?;
+    let horizon = OffsetDateTime::now_utc() + time::Duration::hours(1);
+    let (worker, lease) = resume_early(&stores, &tree.root, horizon).await?;
+    let confirming = tree.children[0].clone();
+    let drive = CancellationToken::new();
+    let _drive_registration = stores
+        .confirm_drive_cancels
+        .register(confirming.clone(), drive.clone());
+
+    let mut unsettled = stores.clone();
+    unsettled.task_store =
+        Arc::new(FlakyTaskStore::new(Arc::clone(&stores.task_store)).failing_cancel_trees(1))
+            as Arc<dyn AgentTaskStore>;
+    fail_owned_root(&unsettled, &thread, &tree.root, &worker, &lease).await?;
+
+    assert_eq!(task(&stores, &tree.root).await?.status, TaskStatus::Failed);
+    assert_eq!(
+        task(&stores, &confirming).await?.status,
+        TaskStatus::AwaitingConfirmation,
+        "precondition: the settlement did not land",
+    );
+    assert!(
+        !drive.is_cancelled(),
+        "a drive whose task is still live must not be tripped",
+    );
+
+    settle_orphaned_descendants(&stores, OffsetDateTime::now_utc()).await?;
+    assert_children_settled(&stores, &tree).await?;
+    assert!(drive.is_cancelled(), "the sweep's settlement trips it");
     Ok(())
 }

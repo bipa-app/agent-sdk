@@ -582,6 +582,19 @@ pub async fn fail_root_turn(
         now,
     )
     .await
+    .map(|failed| failed.task)
+}
+
+/// A root turn failed by [`fail_root_turn_with_reason`] or
+/// [`fail_root_turn_leaving_attempts_open_with_reason`].
+#[derive(Debug)]
+pub struct FailedRootTurn {
+    /// The root row after its terminal transition.
+    pub task: AgentTask,
+    /// The descendants the failure settled (see [`settle_live_descendants`]);
+    /// empty when that best-effort step failed and is left to the host's
+    /// orphan sweep.
+    pub settled: Vec<AgentTaskId>,
 }
 
 /// Fail a root turn with a caller-classified terminal reason.
@@ -593,7 +606,7 @@ pub async fn fail_root_turn_with_reason(
     params: FailRootTurnParams<'_>,
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
-) -> Result<AgentTask> {
+) -> Result<FailedRootTurn> {
     best_effort_close_open_attempts(params.task_id, deps.attempt_store, now).await;
     fail_root_turn_inner(params, deps, now).await
 }
@@ -618,7 +631,7 @@ pub async fn fail_root_turn_leaving_attempts_open_with_reason(
     params: FailRootTurnParams<'_>,
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
-) -> Result<AgentTask> {
+) -> Result<FailedRootTurn> {
     fail_root_turn_inner(params, deps, now).await
 }
 
@@ -626,7 +639,7 @@ async fn fail_root_turn_inner(
     params: FailRootTurnParams<'_>,
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
-) -> Result<AgentTask> {
+) -> Result<FailedRootTurn> {
     let FailRootTurnParams {
         task_id,
         worker_id,
@@ -661,9 +674,12 @@ async fn fail_root_turn_inner(
 
     // Best-effort for the same reason; the host's orphan sweep settles
     // whatever this misses.
-    if let Err(error) = settle_live_descendants(task_id, deps, now).await {
-        log::warn!("settle descendants of failed root {task_id}: {error:#}");
-    }
+    let settled = settle_live_descendants(task_id, deps, now)
+        .await
+        .unwrap_or_else(|error| {
+            log::warn!("settle descendants of failed root {task_id}: {error:#}");
+            Vec::new()
+        });
 
     // Finalize the root `invoke_agent` span with the error outcome and
     // its full duration (no-op if a prior process owns the live span).
@@ -675,7 +691,10 @@ async fn fail_root_turn_inner(
         "error",
     );
 
-    Ok(failed_task)
+    Ok(FailedRootTurn {
+        task: failed_task,
+        settled,
+    })
 }
 
 /// Settle every descendant still live under the terminal root `task_id`.

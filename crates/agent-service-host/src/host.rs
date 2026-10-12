@@ -3235,65 +3235,33 @@ async fn fail_root_task_if_owned(
         return Ok(());
     }
 
-    match attempt_close {
+    let params = FailRootTurnParams {
+        task_id,
+        worker_id,
+        lease_id,
+        thread_id,
+        error,
+        reason,
+    };
+    let failed = match attempt_close {
         AttemptClosePolicy::CloseOpenAttempts => {
-            fail_root_turn_with_reason(
-                FailRootTurnParams {
-                    task_id,
-                    worker_id,
-                    lease_id,
-                    thread_id,
-                    error,
-                    reason: reason.clone(),
-                },
-                &stores.root_turn_deps(),
-                now,
-            )
-            .await
-            .context("mark root task failed")?;
+            fail_root_turn_with_reason(params, &stores.root_turn_deps(), now).await
         }
         AttemptClosePolicy::LeaveOpenForLiveWorker => {
-            fail_root_turn_leaving_attempts_open_with_reason(
-                FailRootTurnParams {
-                    task_id,
-                    worker_id,
-                    lease_id,
-                    thread_id,
-                    error,
-                    reason,
-                },
-                &stores.root_turn_deps(),
-                now,
-            )
-            .await
-            .context("mark root task failed")?;
+            fail_root_turn_leaving_attempts_open_with_reason(params, &stores.root_turn_deps(), now)
+                .await
         }
     }
-    trip_child_confirm_drives(stores, task_id).await;
+    .context("mark root task failed")?;
+    // A drive the failure cancelled would otherwise only notice at its next
+    // heartbeat rejection; ids without a live drive are no-ops.
+    for id in &failed.settled {
+        stores.confirm_drive_cancels.cancel(id);
+    }
 
     let new_events = newly_committed_events(stores, thread_id, event_watermark).await?;
     publish_events(stores, &new_events);
     Ok(())
-}
-
-/// Trip the live approved-confirmation drives of a failed root's children,
-/// which the failure just cancelled; otherwise a drive only notices at its
-/// next heartbeat rejection. Ids without a live drive are no-ops.
-async fn trip_child_confirm_drives(stores: &StoreRegistry, root: &AgentTaskId) {
-    match stores.task_store.list_children(root).await {
-        Ok(children) => {
-            for child in children {
-                stores.confirm_drive_cancels.cancel(&child.id);
-            }
-        }
-        Err(err) => {
-            warn!(
-                root = %root,
-                error = %err,
-                "could not list a failed root's children to trip their confirmation drives",
-            );
-        }
-    }
 }
 
 /// Store-free eligibility precheck for subagent deadline enforcement:
@@ -9253,6 +9221,7 @@ mod tests {
         fail_task_failures_remaining: AtomicUsize,
         fail_task_attempts: AtomicUsize,
         heartbeat_rejections_remaining: AtomicUsize,
+        cancel_tree_failures_remaining: AtomicUsize,
         /// When non-zero, `list_children` (the subtree probe's expansion
         /// call) sleeps this many milliseconds before delegating, and fires
         /// `probe_started` as it begins — so a test can prove the heartbeat
@@ -9276,6 +9245,7 @@ mod tests {
                 fail_task_failures_remaining: AtomicUsize::new(0),
                 fail_task_attempts: AtomicUsize::new(0),
                 heartbeat_rejections_remaining: AtomicUsize::new(0),
+                cancel_tree_failures_remaining: AtomicUsize::new(0),
                 list_children_stall_ms: AtomicUsize::new(0),
                 probe_started: Arc::new(tokio::sync::Notify::new()),
                 fail_task_now: Arc::new(std::sync::Mutex::new(None)),
@@ -9314,6 +9284,12 @@ mod tests {
 
         fn failing_finds(self, count: usize) -> Self {
             self.find_failures_remaining.store(count, Ordering::SeqCst);
+            self
+        }
+
+        fn failing_cancel_trees(self, count: usize) -> Self {
+            self.cancel_tree_failures_remaining
+                .store(count, Ordering::SeqCst);
             self
         }
 
@@ -9755,6 +9731,9 @@ mod tests {
             root_id: &AgentTaskId,
             now: time::OffsetDateTime,
         ) -> Result<agent_server::journal::store::CancelTreeOutcome> {
+            if Self::take_injected_failure(&self.cancel_tree_failures_remaining) {
+                bail!("injected transient cancel_tree failure");
+            }
             self.inner.cancel_tree(root_id, now).await
         }
         async fn resume_from_confirmation(

@@ -147,9 +147,9 @@ pub use definition::{
 };
 pub use registry::{AgentDefinitionRegistry, InMemoryAgentDefinitionRegistry};
 pub use root_turn::{
-    FailRootTurnParams, RootStreamFailure, RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes,
-    best_effort_close_open_attempts, cancel_root_turn, execute_root_turn, fail_root_turn,
-    fail_root_turn_leaving_attempts_open_with_reason, fail_root_turn_with_reason,
+    FailRootTurnParams, FailedRootTurn, RootStreamFailure, RootTurnDeps, RootTurnOutcome,
+    aggregate_child_outcomes, best_effort_close_open_attempts, cancel_root_turn, execute_root_turn,
+    fail_root_turn, fail_root_turn_leaving_attempts_open_with_reason, fail_root_turn_with_reason,
     resume_for_steering, resume_from_children, resume_from_question, resume_root_turn,
     revert_steering_wake, settle_live_descendants, terminal_reason_for_root_error,
 };
