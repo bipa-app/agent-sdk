@@ -582,18 +582,35 @@ pub async fn fail_root_turn(
         now,
     )
     .await
+    .task
+}
+
+/// The outcome of [`fail_root_turn_with_reason`] or
+/// [`fail_root_turn_leaving_attempts_open_with_reason`].
+#[derive(Debug)]
+#[must_use]
+pub struct FailedRootTurn {
+    /// The root row after its terminal transition, or why the store
+    /// refused the transition.
+    pub task: Result<AgentTask>,
+    /// The descendants the failure cancelled, from both passes: the
+    /// settlement before the terminal transition and
+    /// [`settle_live_descendants`] after it. Holds what the first pass
+    /// cancelled even when the transition was then refused. Empty when
+    /// neither pass settled anything, which the host's orphan sweep then
+    /// catches up on.
+    pub settled: Vec<AgentTaskId>,
 }
 
 /// Fail a root turn with a caller-classified terminal reason.
 ///
-/// # Errors
-///
-/// Returns an error if the store rejects the terminal transition.
+/// The store's refusal of the terminal transition is reported in
+/// [`FailedRootTurn::task`], alongside whatever was settled before it.
 pub async fn fail_root_turn_with_reason(
     params: FailRootTurnParams<'_>,
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
-) -> Result<AgentTask> {
+) -> FailedRootTurn {
     best_effort_close_open_attempts(params.task_id, deps.attempt_store, now).await;
     fail_root_turn_inner(params, deps, now).await
 }
@@ -610,15 +627,11 @@ pub async fn fail_root_turn_with_reason(
 /// The live worker's own abort path (mid-stream cancel close, or its
 /// terminal commit) owns its attempts; this variant only performs the
 /// durable fail + error event.
-///
-/// # Errors
-///
-/// Returns an error if the store rejects the terminal transition.
 pub async fn fail_root_turn_leaving_attempts_open_with_reason(
     params: FailRootTurnParams<'_>,
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
-) -> Result<AgentTask> {
+) -> FailedRootTurn {
     fail_root_turn_inner(params, deps, now).await
 }
 
@@ -626,7 +639,7 @@ async fn fail_root_turn_inner(
     params: FailRootTurnParams<'_>,
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
-) -> Result<AgentTask> {
+) -> FailedRootTurn {
     let FailRootTurnParams {
         task_id,
         worker_id,
@@ -636,7 +649,11 @@ async fn fail_root_turn_inner(
         reason,
     } = params;
     let error_msg = format!("{error:#}");
-    let (failed_task, _parent) = deps
+    // Before the root ends: its terminal transition promotes the thread's
+    // next turn, which must not find these children live.
+    let mut settled =
+        settle_descendants_before_failing(task_id, worker_id, lease_id, deps, now).await;
+    let failed_task = match deps
         .task_store
         .fail_task_with_reason(
             task_id,
@@ -647,7 +664,22 @@ async fn fail_root_turn_inner(
             now,
         )
         .await
-        .context("fail root task")?;
+        .context("fail root task")
+    {
+        Ok((failed_task, _parent)) => failed_task,
+        Err(refused) => {
+            return FailedRootTurn {
+                task: Err(refused),
+                settled,
+            };
+        }
+    };
+    crate::fail_point!("fail_root.after_terminal_transition", |_| {
+        FailedRootTurn {
+            task: Ok(failed_task.clone()),
+            settled: settled.clone(),
+        }
+    });
 
     // Best-effort: the task is durably Failed; event commit failure
     // must not override that outcome. Consistent with
@@ -659,6 +691,17 @@ async fn fail_root_turn_inner(
         .commit_event(thread_id, error_event, now)
         .await;
 
+    // Best-effort for the same reason; the host's orphan sweep settles
+    // whatever this misses.
+    settled.extend(
+        settle_live_descendants(task_id, deps, now)
+            .await
+            .unwrap_or_else(|error| {
+                log::warn!("settle descendants of failed root {task_id}: {error:#}");
+                Vec::new()
+            }),
+    );
+
     // Finalize the root `invoke_agent` span with the error outcome and
     // its full duration (no-op if a prior process owns the live span).
     #[cfg(feature = "otel")]
@@ -669,7 +712,92 @@ async fn fail_root_turn_inner(
         "error",
     );
 
-    Ok(failed_task)
+    FailedRootTurn {
+        task: Ok(failed_task),
+        settled,
+    }
+}
+
+/// Cancel the live descendants of the root `task_id` this worker still
+/// holds, before the root's own terminal transition, and forward the
+/// child threads' closing markers. Best-effort: on failure the root's
+/// descendants stay live for [`settle_live_descendants`] or the host's
+/// orphan sweep.
+async fn settle_descendants_before_failing(
+    task_id: &AgentTaskId,
+    worker_id: &WorkerId,
+    lease_id: &LeaseId,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Vec<AgentTaskId> {
+    let outcome = async {
+        crate::fail_point!("settle.cancel_descendants", |_| {
+            Err(anyhow::anyhow!(
+                "injected failure settling live descendants"
+            ))
+        });
+        deps.task_store
+            .cancel_descendants_of_owned(task_id, worker_id, lease_id, now)
+            .await
+    }
+    .await;
+    match outcome {
+        Ok(outcome) => {
+            if !outcome.markers.is_empty() {
+                deps.event_notifier.notify(&outcome.markers);
+            }
+            outcome.transitioned
+        }
+        Err(error) => {
+            log::warn!("settle descendants of failing root {task_id}: {error:#}");
+            Vec::new()
+        }
+    }
+}
+
+/// Settle every descendant still live under the terminal root `task_id`.
+///
+/// A terminal root's fan-in never runs again, so a descendant left live —
+/// running, never started, or parked on a confirmation nobody will answer —
+/// only strands whatever waits on it, and is cancelled. The input the turn
+/// never delivered was already settled by the root's own terminal
+/// transition (see [`crate::journal::store::release_undelivered_input`]). A
+/// root that is not terminal is left alone: settling never cancels live
+/// work.
+///
+/// Child-thread roots reached through a live subagent invocation are
+/// cancelled with their closing marker, which is forwarded here to the
+/// threads' live followers. Returns the ids that transitioned; idempotent.
+///
+/// # Errors
+/// Returns an error if the root cannot be read or the cascade is rejected.
+pub async fn settle_live_descendants(
+    task_id: &AgentTaskId,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<Vec<AgentTaskId>> {
+    let root = deps
+        .task_store
+        .get(task_id)
+        .await
+        .context("read root before settling its descendants")?;
+    if !root.is_some_and(|root| root.status.is_terminal()) {
+        return Ok(Vec::new());
+    }
+    crate::fail_point!("settle.cancel_descendants", |_| {
+        Err(anyhow::anyhow!(
+            "injected failure settling live descendants"
+        ))
+    });
+    let outcome = deps
+        .task_store
+        .cancel_tree(task_id, now)
+        .await
+        .context("cancel live descendants of a terminal root")?;
+    if !outcome.markers.is_empty() {
+        deps.event_notifier.notify(&outcome.markers);
+    }
+    Ok(outcome.transitioned)
 }
 
 /// Cancel a root turn and its entire subtree.
@@ -981,9 +1109,23 @@ async fn best_effort_close_attempts(
 /// failure so it can commit the completed prefix before the task goes
 /// terminal. Callers detect it via
 /// `error.chain().any(|c| c.is::<RootTurnCancelledMarker>())` — see
-/// [`is_root_turn_cancelled`].
+/// [`root_turn_cancelled_at`].
+///
+/// Carries the instant the cancel was observed, so every record of it — the
+/// closed attempt and the salvaged turn — is dated to that one moment.
 #[derive(Debug)]
-pub(crate) struct RootTurnCancelledMarker;
+pub(crate) struct RootTurnCancelledMarker {
+    pub(crate) cancelled_at: OffsetDateTime,
+}
+
+impl RootTurnCancelledMarker {
+    /// A cancel observed at this instant.
+    fn observed_now() -> Self {
+        Self {
+            cancelled_at: OffsetDateTime::now_utc(),
+        }
+    }
+}
 
 impl std::fmt::Display for RootTurnCancelledMarker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -993,13 +1135,14 @@ impl std::fmt::Display for RootTurnCancelledMarker {
 
 impl std::error::Error for RootTurnCancelledMarker {}
 
-/// True when `error` carries a [`RootTurnCancelledMarker`] anywhere in
-/// its cause chain — i.e. the turn bailed because it was cancelled
-/// mid-stream rather than for any other reason.
-pub(crate) fn is_root_turn_cancelled(error: &anyhow::Error) -> bool {
+/// The instant the cancel was observed, when `error` carries a
+/// [`RootTurnCancelledMarker`] anywhere in its cause chain — i.e. the turn
+/// bailed because it was cancelled rather than for any other reason.
+pub(crate) fn root_turn_cancelled_at(error: &anyhow::Error) -> Option<OffsetDateTime> {
     error
         .chain()
-        .any(|cause| cause.downcast_ref::<RootTurnCancelledMarker>().is_some())
+        .find_map(|cause| cause.downcast_ref::<RootTurnCancelledMarker>())
+        .map(|marker| marker.cancelled_at)
 }
 
 /// Typed cause attached to every root-turn failure a provider stream
@@ -1281,12 +1424,17 @@ fn staged_or_recovery_snapshot(inputs: &RootWorkerInputs) -> serde_json::Value {
 /// untouched so the new lease holder owns turn `N`. Every error is
 /// logged and swallowed — a partial-commit failure must never mask
 /// the cancellation the caller is about to surface.
+///
+/// Stamped with `cancelled_at`, the instant the cancel was observed, not
+/// the turn's start: a stream that hung for hours before the stop would
+/// otherwise date the cancel to the moment the turn began.
 async fn commit_cancelled_partial_turn(
     inputs: &RootWorkerInputs,
     candidate: Vec<llm::Message>,
     deps: &RootTurnDeps<'_>,
-    now: OffsetDateTime,
+    cancelled_at: OffsetDateTime,
 ) {
+    let now = cancelled_at;
     let task_id = &inputs.bootstrap.task_id;
     let thread_id = &inputs.bootstrap.thread_id;
 
@@ -1341,17 +1489,16 @@ async fn salvage_cancelled_resume(
     inputs: &RootWorkerInputs,
     error: &anyhow::Error,
     deps: &RootTurnDeps<'_>,
-    now: OffsetDateTime,
 ) {
-    if !is_root_turn_cancelled(error) {
+    let Some(cancelled_at) = root_turn_cancelled_at(error) else {
         return;
-    }
+    };
     let candidate = inputs
         .staged_stores
         .messages
         .snapshot_appended_messages()
         .unwrap_or_default();
-    commit_cancelled_partial_turn(inputs, candidate, deps, now).await;
+    commit_cancelled_partial_turn(inputs, candidate, deps, cancelled_at).await;
 }
 
 /// Seam A: commit the completed prefix of a **parked** cancelled turn.
@@ -1932,7 +2079,7 @@ async fn execute_root_turn_inner(
             // error unchanged. The candidate is the user prompt (`Some`
             // on non-resume turns) plus any staged post-seed delta, so
             // the agent at least remembers what was asked.
-            if is_root_turn_cancelled(&error) {
+            if let Some(cancelled_at) = root_turn_cancelled_at(&error) {
                 let mut candidate: Vec<llm::Message> =
                     user_input.clone().into_message().into_iter().collect();
                 match inputs.staged_stores.messages.snapshot_appended_messages() {
@@ -1943,7 +2090,7 @@ async fn execute_root_turn_inner(
                         inputs.bootstrap.thread_id,
                     ),
                 }
-                commit_cancelled_partial_turn(&inputs, candidate, deps, now).await;
+                commit_cancelled_partial_turn(&inputs, candidate, deps, cancelled_at).await;
             }
             return Err(error);
         }
@@ -2950,7 +3097,7 @@ async fn prepare_pre_call_compaction(
     )
     .await?;
     if deps.is_cancelled() {
-        return Err(anyhow::Error::new(RootTurnCancelledMarker)
+        return Err(anyhow::Error::new(RootTurnCancelledMarker::observed_now())
             .context("root turn cancelled after completed pre-call compaction"));
     }
     Ok(PreCallCompaction {
@@ -3276,7 +3423,10 @@ enum StreamAttemptError {
     /// [`RootTurnDeps::cancel`] token.  The turn attempt was already
     /// closed with `Cancelled`; the retry wrapper bails immediately,
     /// skipping both retry/backoff and the commit path.
-    Cancelled { message: String },
+    Cancelled {
+        message: String,
+        cancelled_at: OffsetDateTime,
+    },
 }
 
 impl StreamAttemptError {
@@ -3460,16 +3610,17 @@ async fn ensure_retry_not_cancelled(
     // path owns this row once the task is terminal, so close it here — with
     // the evidence of the call it was about to make, so a turn cancelled
     // mid-retry-storm still names the route it was hammering.
+    let cancelled_at = OffsetDateTime::now_utc();
     close_attempt_with(
         attempt,
         TurnAttemptOutcome::Cancelled,
         &ZERO_ATTEMPT_USAGE,
         Some(evidence),
         deps.attempt_store,
-        OffsetDateTime::now_utc(),
+        cancelled_at,
     )
     .await;
-    Err(anyhow::Error::new(RootTurnCancelledMarker)
+    Err(anyhow::Error::new(RootTurnCancelledMarker { cancelled_at })
         .context("root turn cancelled before LLM attempt"))
 }
 
@@ -3672,13 +3823,18 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
                 }
                 return Err(root_stream_failure(kind, message));
             }
-            Err(StreamAttemptError::Cancelled { message }) => {
+            Err(StreamAttemptError::Cancelled {
+                message,
+                cancelled_at,
+            }) => {
                 // The turn was cancelled mid-stream — the attempt is
                 // already closed `Cancelled`. Bail immediately with the
                 // cancel marker so the caller that still owns the staged
                 // buffer commits the completed prefix (seam B); skip both
                 // retry/backoff and the normal commit path.
-                return Err(anyhow::Error::new(RootTurnCancelledMarker).context(message));
+                return Err(
+                    anyhow::Error::new(RootTurnCancelledMarker { cancelled_at }).context(message)
+                );
             }
         }
     }
@@ -3721,16 +3877,17 @@ async fn race_wait_against_cancel<T>(
     tokio::select! {
         biased;
         () = cancel.cancelled() => {
+            let cancelled_at = OffsetDateTime::now_utc();
             close_attempt_with(
                 current_attempt,
                 TurnAttemptOutcome::Cancelled,
                 &ZERO_ATTEMPT_USAGE,
                 Some(evidence),
                 deps.attempt_store,
-                OffsetDateTime::now_utc(),
+                cancelled_at,
             )
             .await;
-            Err(anyhow::Error::new(RootTurnCancelledMarker).context(cancel_context))
+            Err(anyhow::Error::new(RootTurnCancelledMarker { cancelled_at }).context(cancel_context))
         }
         value = wait => Ok(value),
     }
@@ -4094,7 +4251,7 @@ async fn try_recover_with_compaction(
         )
         .await?;
         if deps.is_cancelled() {
-            return Err(anyhow::Error::new(RootTurnCancelledMarker)
+            return Err(anyhow::Error::new(RootTurnCancelledMarker::observed_now())
                 .context("root turn cancelled after completed overflow compaction"));
         }
     }
@@ -4383,17 +4540,19 @@ async fn call_llm_once(
         }
     };
     if deps.is_cancelled() {
+        let cancelled_at = OffsetDateTime::now_utc();
         close_attempt_with(
             attempt,
             TurnAttemptOutcome::Cancelled,
             &ZERO_ATTEMPT_USAGE,
             Some(evidence),
             deps.attempt_store,
-            OffsetDateTime::now_utc(),
+            cancelled_at,
         )
         .await;
         return Err(StreamAttemptError::Cancelled {
             message: "root turn cancelled during provider request hydration".to_owned(),
+            cancelled_at,
         });
     }
     // Publish the pending occupancy snapshot BEFORE the provider sees
@@ -4488,7 +4647,7 @@ async fn call_llm_once_instrumented(
                 | StreamAttemptError::Fatal { message, kind } => {
                     (kind.wire_label(), message.as_str())
                 }
-                StreamAttemptError::Cancelled { message } => ("cancelled", message.as_str()),
+                StreamAttemptError::Cancelled { message, .. } => ("cancelled", message.as_str()),
             };
             loop_instrument::finish_chat_span_error(
                 &mut span,
@@ -4656,21 +4815,23 @@ async fn finish_failed_stream_attempt(
 
 /// Close an attempt whose root turn was cancelled mid-stream via the
 /// [`RootTurnDeps::cancel`] token and build the matching non-retryable
-/// error (see [`StreamAttemptError::Cancelled`]).
+/// error (see [`StreamAttemptError::Cancelled`]). Closed at `cancelled_at`
+/// for the same reason as [`commit_cancelled_partial_turn`].
 async fn close_cancelled_attempt(
     ctx: StreamAttemptCtx<'_, '_>,
     usage: &llm::Usage,
-    now: OffsetDateTime,
+    cancelled_at: OffsetDateTime,
 ) -> StreamAttemptError {
     flush_and_close(CloseStreamAttemptParams {
         ctx,
         outcome: TurnAttemptOutcome::Cancelled,
         usage,
-        now,
+        now: cancelled_at,
     })
     .await;
     StreamAttemptError::Cancelled {
         message: "root turn cancelled mid-stream".to_owned(),
+        cancelled_at,
     }
 }
 
@@ -4737,7 +4898,8 @@ async fn poll_stream_item(
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
-                    return Err(close_cancelled_attempt(ctx, &usage, now).await);
+                    let cancelled_at = OffsetDateTime::now_utc();
+                    return Err(close_cancelled_attempt(ctx, &usage, cancelled_at).await);
                 }
                 polled = tokio::time::timeout(stall_budget, stream.next()) => polled,
             }
@@ -7396,7 +7558,7 @@ async fn resume_root_turn_with_fan_in(
     } = match streamed {
         Ok(streamed) => streamed,
         Err(error) => {
-            salvage_cancelled_resume(&inputs, &error, deps, now).await;
+            salvage_cancelled_resume(&inputs, &error, deps).await;
             return Err(error);
         }
     };
@@ -9186,7 +9348,7 @@ async fn run_steering_exchange(
     } = match streamed {
         Ok(streamed) => streamed,
         Err(error) => {
-            salvage_cancelled_resume(&inputs, &error, deps, now).await;
+            salvage_cancelled_resume(&inputs, &error, deps).await;
             return Err(error);
         }
     };

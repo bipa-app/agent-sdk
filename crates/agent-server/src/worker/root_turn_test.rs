@@ -8,9 +8,9 @@
 use super::root_turn::{
     FanInAnswer, PartialCancelCommit, RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes,
     cancel_root_turn, commit_partial_turn_on_cancel, drain_boundary_injections, execute_root_turn,
-    fail_root_turn, fan_in_blocks, interim_answer, is_root_turn_cancelled, provider_valid_split,
-    resume_for_steering, resume_from_children, resume_from_question, resume_root_turn,
-    revert_steering_wake, settle_attempt_after_lost_ownership, terminal_reason_for_root_error,
+    fail_root_turn, fan_in_blocks, interim_answer, provider_valid_split, resume_for_steering,
+    resume_from_children, resume_from_question, resume_root_turn, revert_steering_wake,
+    root_turn_cancelled_at, settle_attempt_after_lost_ownership, terminal_reason_for_root_error,
 };
 use crate::journal::checkpoint::CheckpointKind;
 use std::sync::Arc;
@@ -4992,7 +4992,7 @@ async fn connectivity_wait_stops_promptly_on_cancel() -> Result<()> {
     let Err(error) = result else {
         bail!("cancelled connectivity wait unexpectedly completed")
     };
-    assert!(is_root_turn_cancelled(&error));
+    assert!(root_turn_cancelled_at(&error).is_some());
 
     let attempts = stores.attempts.list_by_task(&task_id).await?;
     assert_eq!(attempts.len(), 1);
@@ -5060,7 +5060,7 @@ async fn connectivity_wait_registry_tracks_the_park_and_cancel_clears_it() -> Re
     let Err(error) = result else {
         bail!("cancelled connectivity wait unexpectedly completed")
     };
-    assert!(is_root_turn_cancelled(&error));
+    assert!(root_turn_cancelled_at(&error).is_some());
     assert!(
         !registry.is_waiting(&thread_a()),
         "the guard must retract the entry when cancellation unwinds the wait"
@@ -7795,6 +7795,37 @@ async fn follow_up_request(
     at: time::OffsetDateTime,
 ) -> Result<Vec<agent_sdk_foundation::llm::Message>> {
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    turn_request(stores, task, prompt, at).await
+}
+
+/// Acquire the admitted root `task` and run it as the thread's next turn,
+/// returning its first provider request.
+async fn next_turn_request(
+    stores: &TestStores,
+    task: &AgentTaskId,
+    prompt: &str,
+    at: time::OffsetDateTime,
+) -> Result<Vec<agent_sdk_foundation::llm::Message>> {
+    let task = stores
+        .tasks
+        .try_acquire_task(
+            task,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            at + time::Duration::seconds(300),
+            at,
+        )
+        .await?
+        .context("the next turn must be acquirable")?;
+    turn_request(stores, task, prompt, at).await
+}
+
+async fn turn_request(
+    stores: &TestStores,
+    task: AgentTask,
+    prompt: &str,
+    at: time::OffsetDateTime,
+) -> Result<Vec<agent_sdk_foundation::llm::Message>> {
     let inputs = build_root_worker_inputs(
         sample_bootstrap(task),
         &stores.threads,
@@ -7923,7 +7954,7 @@ async fn cancelling_an_early_resume_mid_call_closes_its_running_call() -> Result
 
     let result = resume_from_children(inputs, &acquired, &provider, &deps, t_plus(11)).await;
     let error = result.err().context("a cancelled early resume must fail")?;
-    assert!(is_root_turn_cancelled(&error), "{error:#}");
+    assert!(root_turn_cancelled_at(&error).is_some(), "{error:#}");
 
     let committed = stores.messages.get_history(&thread_a()).await?;
     assert_eq!(find_tool_result(&committed, "call_0"), Some("done-0"));
@@ -7932,11 +7963,14 @@ async fn cancelling_an_early_resume_mid_call_closes_its_running_call() -> Result
     Ok(())
 }
 
-#[tokio::test]
-async fn a_failed_early_resumed_parent_closes_its_running_call() -> Result<()> {
-    let stores = TestStores::new();
+/// A parent whose second early resume fails while `call_2` still runs;
+/// `call_1` finished after the first early resume. Returns the parent and
+/// the resume's error.
+async fn early_resumed_parent_failing_over_a_running_call(
+    stores: &TestStores,
+) -> Result<(AgentTaskId, anyhow::Error)> {
     let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
-        &stores,
+        stores,
         vec![
             bash_call("call_0"),
             bash_call("call_1"),
@@ -7946,7 +7980,7 @@ async fn a_failed_early_resumed_parent_closes_its_running_call() -> Result<()> {
     ))
     .await?;
     complete_child_at(
-        &stores,
+        stores,
         &children[0],
         &ok_result("done-0"),
         t_plus(8),
@@ -7954,9 +7988,9 @@ async fn a_failed_early_resumed_parent_closes_its_running_call() -> Result<()> {
     )
     .await?;
     let provider = RequestLogProvider::new("Two calls are still running.");
-    run_child_resume(&stores, &parent.id, &provider, t_plus(10), t_plus(12)).await?;
+    run_child_resume(stores, &parent.id, &provider, t_plus(10), t_plus(12)).await?;
     complete_child_at(
-        &stores,
+        stores,
         &children[1],
         &ok_result("done-1"),
         t_plus(20),
@@ -7965,7 +7999,7 @@ async fn a_failed_early_resumed_parent_closes_its_running_call() -> Result<()> {
     .await?;
 
     let error = run_child_resume(
-        &stores,
+        stores,
         &parent.id,
         &InvalidRequestProvider,
         t_plus(22),
@@ -7974,8 +8008,19 @@ async fn a_failed_early_resumed_parent_closes_its_running_call() -> Result<()> {
     .await
     .err()
     .context("the second early resume must fail")?;
+    Ok((parent.id, error))
+}
+
+/// Fail a parent whose early resume left `call_2` running, and return the
+/// next turn's first provider request. `call_1`'s late result is delivered
+/// once.
+async fn fail_an_early_resumed_parent_over_a_running_call(
+    stores: &TestStores,
+) -> Result<Vec<agent_sdk_foundation::llm::Message>> {
+    let (parent, error) =
+        Box::pin(early_resumed_parent_failing_over_a_running_call(stores)).await?;
     fail_root_turn(
-        &parent.id,
+        &parent,
         &WorkerId::from_string("worker_test"),
         &LeaseId::from_string("lease_test"),
         &thread_a(),
@@ -7997,9 +8042,84 @@ async fn a_failed_early_resumed_parent_closes_its_running_call() -> Result<()> {
     assert_eq!(delivered.len(), 1);
     assert!(delivered[0].contains("done-1"), "{}", delivered[0]);
 
-    let request = follow_up_request(&stores, "Try the third command again.", t_plus(30)).await?;
-    assert_running_call_closed(&request, "call_2", "still_running");
+    let request = follow_up_request(stores, "Try the third command again.", t_plus(30)).await?;
     assert_eq!(late_results_for(&request, "call_1").len(), 1);
+    Ok(request)
+}
+
+/// Failing the parent settles the call it left running, so the next turn
+/// is told the call was cancelled.
+#[tokio::test]
+async fn a_failed_early_resumed_parent_closes_its_running_call() -> Result<()> {
+    let stores = TestStores::new();
+    let request = Box::pin(fail_an_early_resumed_parent_over_a_running_call(&stores)).await?;
+    assert_running_call_closed(&request, "call_2", "cancelled");
+    Ok(())
+}
+
+/// The thread's next turn, queued behind the failing parent, can start the
+/// moment the parent's terminal transition promotes it, before anything
+/// after that transition runs. The parent's children were settled before
+/// it, so that turn is told the call was cancelled.
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+async fn failpoint_next_turn_starting_on_the_failure_finds_its_call_cancelled() -> Result<()> {
+    let scenario = fail::FailScenario::setup();
+    let stores = TestStores::new();
+    let (parent, error) =
+        Box::pin(early_resumed_parent_failing_over_a_running_call(&stores)).await?;
+    let queued = stores
+        .tasks
+        .submit_root_turn(AgentTask::new_root_turn(thread_a(), t_plus(24), 3))
+        .await?;
+    assert_eq!(queued.status, TaskStatus::Queued);
+
+    fail::cfg("fail_root.after_terminal_transition", "return").map_err(anyhow::Error::msg)?;
+    let failed = fail_root_turn(
+        &parent,
+        &WorkerId::from_string("worker_test"),
+        &LeaseId::from_string("lease_test"),
+        &thread_a(),
+        &error,
+        &stores.deps(),
+        t_plus(25),
+    )
+    .await;
+    fail::remove("fail_root.after_terminal_transition");
+    drop(scenario);
+    failed?;
+
+    let request = next_turn_request(
+        &stores,
+        &queued.id,
+        "Try the third command again.",
+        t_plus(30),
+    )
+    .await?;
+    assert_running_call_closed(&request, "call_2", "cancelled");
+    Ok(())
+}
+
+/// When settling the failed parent's children fails, the call may still be
+/// running: the next turn is told so, and not to call it again until it is
+/// confirmed stopped or finished.
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+async fn failpoint_unsettled_failed_parent_reports_its_call_still_running() -> Result<()> {
+    let scenario = fail::FailScenario::setup();
+    fail::cfg("settle.cancel_descendants", "return").map_err(anyhow::Error::msg)?;
+    let stores = TestStores::new();
+    let request = Box::pin(fail_an_early_resumed_parent_over_a_running_call(&stores)).await;
+    fail::remove("settle.cancel_descendants");
+    drop(scenario);
+    let request = request?;
+    assert_running_call_closed(&request, "call_2", "still_running");
+    let closed = late_results_for(&request, "call_2");
+    assert!(
+        closed[0].contains("Do not call it again until it is confirmed stopped or finished"),
+        "{}",
+        closed[0],
+    );
     Ok(())
 }
 
@@ -8480,11 +8600,13 @@ enum TurnExit {
     CancelParked,
     /// `cancel_root_turn` during a steering wake's LLM call.
     CancelMidSteering,
-    /// The child wake's LLM call fails and the root is failed.
+    /// The child wake's LLM call fails and the root is failed, which
+    /// settles its live children.
     FailMidResume,
     /// The public `aggregate_child_outcomes` + `resume_root_turn` pair.
     AggregateResume,
-    /// The child wake's lease expires until the sweep fails the row closed.
+    /// The child wake's lease expires until the sweep fails the row closed,
+    /// which settles its live children in the same step.
     FailClosedByLeaseExpiry,
     /// A steering wake's LLM call fails and the wake is reverted; the
     /// children's fan-in then commits the turn.
@@ -8966,6 +9088,49 @@ async fn expire_wake_until_failed_closed(
     bail!("the wake was never failed closed")
 }
 
+/// A woken root's lease keeps expiring until the sweep fails it closed,
+/// which promotes the turn queued behind it. That fail-close settles the
+/// root's still-running child before the promotion, so the promoted turn
+/// is told the call was cancelled.
+#[tokio::test]
+async fn a_root_failed_closed_by_the_sweep_settles_its_children_before_its_successor() -> Result<()>
+{
+    let stores = TestStores::new();
+    let deps = stores.deps();
+    let (parent, children) = Box::pin(park_early_resumed_batch(&stores, &deps)).await?;
+    complete_child_at(
+        &stores,
+        &children[2],
+        &ok_result("done-2"),
+        t_plus(20),
+        t_plus(21),
+    )
+    .await?;
+    let successor = stores
+        .tasks
+        .submit_root_turn(AgentTask::new_root_turn(thread_a(), t_plus(22), 3))
+        .await?;
+    assert_eq!(successor.status, TaskStatus::Queued);
+
+    expire_wake_until_failed_closed(&stores, &parent.id).await?;
+
+    let settled = stores.tasks.get(&children[1].id).await?.context("child")?;
+    assert_eq!(settled.status, TaskStatus::Cancelled);
+    assert_eq!(
+        settled.terminal_reason,
+        Some(TerminalReason::ParentCancelled)
+    );
+    let request = next_turn_request(
+        &stores,
+        &successor.id,
+        "What happened to the build steps?",
+        t_plus(300),
+    )
+    .await?;
+    assert_running_call_closed(&request, "call_1", "cancelled");
+    Ok(())
+}
+
 async fn cancel_mid_steering(
     stores: &TestStores,
     deps: &RootTurnDeps<'_>,
@@ -9007,7 +9172,7 @@ async fn cancel_mid_steering(
     let error = result
         .err()
         .context("the steering call must be cancelled")?;
-    anyhow::ensure!(is_root_turn_cancelled(&error), "{error:#}");
+    anyhow::ensure!(root_turn_cancelled_at(&error).is_some(), "{error:#}");
     Ok(())
 }
 
@@ -9181,11 +9346,12 @@ fn expected_closures(
         (_, SurvivorAtExit::Finished) | (TurnExit::RevertFailedSteering, SurvivorAtExit::Live) => {
             "success"
         }
-        (TurnExit::FailMidResume | TurnExit::FailClosedByLeaseExpiry, SurvivorAtExit::Live) => {
-            "still_running"
-        }
         (
-            TurnExit::CancelParked | TurnExit::CancelMidSteering | TurnExit::AggregateResume,
+            TurnExit::CancelParked
+            | TurnExit::CancelMidSteering
+            | TurnExit::FailMidResume
+            | TurnExit::AggregateResume
+            | TurnExit::FailClosedByLeaseExpiry,
             SurvivorAtExit::Live,
         ) => "cancelled",
     };
@@ -9442,7 +9608,7 @@ async fn cancelling_a_compacted_early_resume_mid_call_closes_its_running_call() 
     .await
     .err()
     .context("the early resume must be cancelled")?;
-    anyhow::ensure!(is_root_turn_cancelled(&error), "{error:#}");
+    anyhow::ensure!(root_turn_cancelled_at(&error).is_some(), "{error:#}");
 
     let projection = stores
         .messages
@@ -10513,6 +10679,7 @@ async fn fresh_turn_mid_stream_cancel_commits_user_prompt() -> Result<()> {
     let mut deps = stores.deps();
     deps.cancel = Some(&cancel);
 
+    let before_cancel = time::OffsetDateTime::now_utc();
     let result = execute_root_turn(
         inputs,
         "What is the capital of France?",
@@ -10521,6 +10688,7 @@ async fn fresh_turn_mid_stream_cancel_commits_user_prompt() -> Result<()> {
         t_plus(5),
     )
     .await;
+    let after_cancel = time::OffsetDateTime::now_utc();
     let error = result.err().context("cancelled turn must return Err")?;
     assert!(
         format!("{error:#}").to_lowercase().contains("cancel"),
@@ -10555,6 +10723,24 @@ async fn fresh_turn_mid_stream_cancel_commits_user_prompt() -> Result<()> {
         .context("synthetic cancel-commit attempt")?;
     assert!(synthetic.is_closed());
     assert_eq!(synthetic.outcome, Some(TurnAttemptOutcome::Cancelled));
+
+    // Both records carry the one instant the cancel was observed, not the
+    // turn's start (`t_plus(5)`): a turn that hung for hours before the user
+    // stopped it must not read as cancelled the instant it began.
+    let streamed = attempts
+        .iter()
+        .find(|a| a.provider != "cancel-commit")
+        .context("the cancelled provider attempt")?;
+    assert_eq!(streamed.outcome, Some(TurnAttemptOutcome::Cancelled));
+    let cancelled_at = streamed
+        .closed_at
+        .context("the cancelled attempt is closed")?;
+    assert_eq!(synthetic.opened_at, cancelled_at);
+    assert_eq!(synthetic.closed_at, Some(cancelled_at));
+    assert!(
+        (before_cancel..=after_cancel).contains(&cancelled_at),
+        "the cancel is dated when it landed: {cancelled_at} outside {before_cancel}..={after_cancel}",
+    );
 
     // The next turn's recovered context contains the committed prompt.
     let view = crate::journal::thread_recover::recover_thread(

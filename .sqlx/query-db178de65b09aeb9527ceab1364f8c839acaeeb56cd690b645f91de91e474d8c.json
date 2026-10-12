@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS (\n    SELECT 1\n    FROM agent_sdk_tasks\n    WHERE kind = 'subagent'\n      AND state_json -> 'invocation' ->> 'child_root_task_id' = $1\n) AS \"linked!\"\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "linked!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "db178de65b09aeb9527ceab1364f8c839acaeeb56cd690b645f91de91e474d8c"
+}

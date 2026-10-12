@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nSELECT DISTINCT descendant.root_id\nFROM agent_sdk_tasks AS descendant\nJOIN agent_sdk_tasks AS root ON root.id = descendant.root_id\nWHERE descendant.status IN (\n        'queued', 'pending', 'running', 'waiting_on_children',\n        'awaiting_confirmation', 'awaiting_question'\n    )\n  AND descendant.parent_id IS NOT NULL\n  AND root.status IN ('completed', 'failed', 'cancelled')\nORDER BY descendant.root_id\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "root_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_tasks",
+            "name": "root_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "1d80c62d3e9ebf95b77bfb389e800c29fae12b5145f1a55937f52e31e3247425"
+}

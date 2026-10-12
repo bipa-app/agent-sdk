@@ -417,7 +417,15 @@ impl TaskStatus {
     /// transition again.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+        match self {
+            Self::Completed | Self::Failed | Self::Cancelled => true,
+            Self::Queued
+            | Self::Pending
+            | Self::Running
+            | Self::WaitingOnChildren
+            | Self::AwaitingConfirmation
+            | Self::AwaitingQuestion => false,
+        }
     }
 
     /// `true` if this row is still in the active lifecycle (any non-terminal
@@ -444,8 +452,11 @@ impl TaskStatus {
     /// - [`TaskStatus::Running`] — a root that a worker has leased.
     /// - [`TaskStatus::WaitingOnChildren`] — a root that is paused on its
     ///   spawned tool-runtime children.
-    /// - [`TaskStatus::AwaitingConfirmation`] — a root that is paused on
-    ///   an out-of-band confirmation.
+    /// - [`TaskStatus::AwaitingQuestion`] — a root that is paused on a
+    ///   durable question to the user.
+    /// - [`TaskStatus::AwaitingConfirmation`] — a paused status, so it
+    ///   blocks too, though only a tool child pauses on a confirmation and
+    ///   a root never holds it.
     ///
     /// [`TaskStatus::Queued`] is deliberately **not** blocking: a queued
     /// root has been durably admitted to the same-thread FIFO queue and is
@@ -541,6 +552,8 @@ pub enum TaskSchemaError {
     AttemptExceedsMax { attempt: u32, max: u32 },
     #[error("Queued is only valid for root_turn tasks")]
     QueuedOnlyForRootTurns,
+    #[error("only a tool_runtime task's confirmation can be rejected (got {kind:?})")]
+    ConfirmationRejectedOnlyForToolRuntime { kind: TaskKind },
     #[error("invalid transition: {from:?} -> {to:?}")]
     InvalidTransition { from: TaskStatus, to: TaskStatus },
     #[error("heartbeat worker_id does not match the task's current lease")]
@@ -892,10 +905,18 @@ impl AgentTask {
     /// transport's idempotency record points at the durable injection row.
     ///
     /// # Errors
-    /// Returns a schema error when `parent` cannot own children.
+    /// Returns a schema error when `parent` cannot own children, and an
+    /// invalid-transition error when `parent` has ended: no boundary would
+    /// ever deliver input waiting on it.
     pub fn into_input_injection(mut self, parent: &Self) -> Result<Self, TaskSchemaError> {
         if parent.kind.is_leaf() {
             return Err(TaskSchemaError::ToolRuntimeCannotSpawnChildren);
+        }
+        if parent.status.is_terminal() {
+            return Err(TaskSchemaError::InvalidTransition {
+                from: parent.status,
+                to: TaskStatus::Queued,
+            });
         }
         self.kind = TaskKind::InputInjection;
         self.status = TaskStatus::Queued;
@@ -941,6 +962,32 @@ impl AgentTask {
         self.advance_last_activity_at(now);
         self.validate()?;
         Ok(self)
+    }
+
+    /// The thread's next root turn for this undelivered injection: the same
+    /// input, caller metadata and trace parent, queued at the injection's
+    /// own submission time so the thread's FIFO orders it ahead of anything
+    /// submitted after it.
+    ///
+    /// # Errors
+    /// Returns an invalid-transition error unless this is a queued
+    /// input-injection row.
+    pub fn next_turn_from_undelivered_input(&self) -> Result<Self, TaskSchemaError> {
+        if self.kind != TaskKind::InputInjection || self.status != TaskStatus::Queued {
+            return Err(TaskSchemaError::InvalidTransition {
+                from: self.status,
+                to: TaskStatus::Queued,
+            });
+        }
+        let mut turn = Self::new_root_turn_with_optional_caller(
+            self.thread_id.clone(),
+            self.submitted_input.clone(),
+            self.caller_metadata.clone(),
+            self.created_at,
+            self.max_attempts,
+        );
+        turn.otel_traceparent.clone_from(&self.otel_traceparent);
+        turn.admit_as_queued(self.created_at)
     }
 
     /// Allocate a fresh child task under `parent`.
@@ -1955,6 +2002,27 @@ impl AgentTask {
         Ok((approved, prepared_operation))
     }
 
+    /// Approve a paused confirmation back to [`TaskStatus::Pending`] for a
+    /// later acquisition.
+    ///
+    /// The approval continues the attempt that paused, so the attempt that
+    /// pause was charged is refunded: the pickup re-enters it instead of
+    /// spending a new one. A pickup that keeps crashing stays bounded:
+    /// every acquisition after a reclaimed lease is charged as usual.
+    ///
+    /// # Errors
+    /// Returns [`TaskSchemaError::InvalidTransition`] if the task is not in
+    /// [`TaskStatus::AwaitingConfirmation`].
+    pub fn approve_confirmation_for_pickup(
+        self,
+        now: OffsetDateTime,
+    ) -> Result<(Self, Option<ListenExecutionContext>), TaskSchemaError> {
+        let (mut approved, prepared_operation) = self.resume_from_confirmation(now)?;
+        approved.attempt = approved.attempt.saturating_sub(1);
+        approved.validate()?;
+        Ok((approved, prepared_operation))
+    }
+
     /// Pause a running root turn on a durable user question.
     ///
     /// # Errors
@@ -2113,6 +2181,37 @@ impl AgentTask {
     /// already in a terminal state.
     pub fn fail(self, error: String, now: OffsetDateTime) -> Result<Self, TaskSchemaError> {
         self.fail_with_terminal_reason(error, TerminalReason::InternalError, now)
+    }
+
+    /// Fail a tool child whose confirmation the user rejected.
+    ///
+    /// Only a tool child parks on a confirmation, and failing it this way
+    /// leaves its parent to fan in. A root or invocation ending here would
+    /// skip the settlement a root's own terminal transitions carry, so any
+    /// other kind is refused.
+    ///
+    /// # Errors
+    /// Returns [`TaskSchemaError::ConfirmationRejectedOnlyForToolRuntime`]
+    /// for any kind but [`TaskKind::ToolRuntime`], and
+    /// [`TaskSchemaError::InvalidTransition`] unless the task is awaiting
+    /// confirmation.
+    pub fn reject_confirmation(
+        self,
+        error: String,
+        now: OffsetDateTime,
+    ) -> Result<Self, TaskSchemaError> {
+        if self.kind != TaskKind::ToolRuntime {
+            return Err(TaskSchemaError::ConfirmationRejectedOnlyForToolRuntime {
+                kind: self.kind,
+            });
+        }
+        if self.status != TaskStatus::AwaitingConfirmation {
+            return Err(TaskSchemaError::InvalidTransition {
+                from: self.status,
+                to: TaskStatus::Failed,
+            });
+        }
+        self.fail_with_terminal_reason(error, TerminalReason::ConfirmationRejected, now)
     }
 
     /// Mark the task [`TaskStatus::Failed`] with an explicit typed reason.

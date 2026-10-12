@@ -109,11 +109,19 @@ const MESSAGE_HEAD_HISTORY_GENERATION_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/sqlite/0022_message_head_history_generation.sql"
 ));
+const SUBAGENT_CHILD_ROOT_LINK_INDEX_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/sqlite/0024_subagent_child_root_link_index.sql"
+));
+const DROP_PARKED_SUBAGENT_CHILD_ROOT_INDEX_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/sqlite/0025_drop_parked_subagent_child_root_index.sql"
+));
 
 /// `sqlx`-managed migration bundle for the `SQLite` durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/sqlite");
 
-const MIGRATIONS: [SqliteMigration; 21] = [
+const MIGRATIONS: [SqliteMigration; 23] = [
     SqliteMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -218,6 +226,16 @@ const MIGRATIONS: [SqliteMigration; 21] = [
         version: "0022",
         summary: "monotonic history rewrite lineage on message heads",
         sql: MESSAGE_HEAD_HISTORY_GENERATION_SQL,
+    },
+    SqliteMigration {
+        version: "0024",
+        summary: "index every subagent invocation's child-root link, whatever its status",
+        sql: SUBAGENT_CHILD_ROOT_LINK_INDEX_SQL,
+    },
+    SqliteMigration {
+        version: "0025",
+        summary: "drop the parked-invocation child-root index 0024 supersedes",
+        sql: DROP_PARKED_SUBAGENT_CHILD_ROOT_INDEX_SQL,
     },
 ];
 

@@ -25,7 +25,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use time::OffsetDateTime;
 
 use agent_server::journal::checkpoint::{
@@ -62,14 +62,16 @@ use agent_server::journal::relay::{
 };
 use agent_server::journal::retention::{RetentionCursor, RetentionStore};
 use agent_server::journal::store::{
-    AgentTaskStore, CancelTreeOutcome, ChildProbe, MixedChildrenSpawn, QuestionAnswerApplied,
-    QuestionPause, ReattachedChild, RequeueOutcome, SpawnedMixedChildren, SubagentBatchSpawn,
-    SubagentInvocationSpawn, SubmitDisposition, SubmitRootIdempotency, SubmitRootTurnError,
-    SubmitRootTurnOutcome, SubmitRootTurnParams, apply_question_answer, apply_question_pause,
-    has_precompleted_tool_child, live_mixed_child_count, mixed_child_ids_in_slot_order,
-    new_mixed_tool_child, publish_transactional_mixed_parent, submitted_task_disposition,
-    validate_mixed_children_spawn, validate_precompleted_boundary_events,
-    validate_subagent_event_count, validate_tool_child_specs_for_pure_spawn,
+    AgentTaskStore, CancelScope, CancelTreeOutcome, ChildProbe, MixedChildrenSpawn,
+    QuestionAnswerApplied, QuestionPause, ReattachedChild, RequeueOutcome, SpawnedMixedChildren,
+    SubagentBatchSpawn, SubagentInvocationSpawn, SubmitDisposition, SubmitRootIdempotency,
+    SubmitRootTurnError, SubmitRootTurnOutcome, SubmitRootTurnParams, apply_question_answer,
+    apply_question_pause, cancel_reason, has_precompleted_tool_child, is_owned_by,
+    live_mixed_child_count, mixed_child_ids_in_slot_order, new_mixed_tool_child,
+    publish_transactional_mixed_parent, release_undelivered_input, settles_undelivered_input,
+    submitted_task_disposition, validate_mixed_children_spawn,
+    validate_precompleted_boundary_events, validate_subagent_event_count,
+    validate_tool_child_specs_for_pure_spawn,
 };
 use agent_server::journal::subagent_spawn_transaction::{
     AtomicSubagentSpawnCommitter, SubagentSpawnCommit, SubagentSpawnEvent, SubagentSpawnOutcome,
@@ -99,9 +101,37 @@ use agent_server::journal::turn_attempt_store::TurnAttemptStore;
 use super::migrations::apply_durable_core_migrations;
 
 /// `sqlx`-backed durable-core store.
+///
+/// # Lock order
+///
+/// Every transaction takes its row locks in one global order, so none can
+/// wait on another that waits on it:
+///
+/// 1. thread rows, a parent's thread before its subagents' threads;
+/// 2. task rows by descending `depth`, and by `id` within a depth
+///    (`task_lock_order`): a child before its parent, siblings by id.
+///
+/// A child's terminal transition locks the child, then its parent; a cancel
+/// locks its whole tree in this order once its threads are held; a re-park
+/// or mixed spawn locks the children it re-attaches by id before their
+/// parent. A transition that ends a root locks the root's thread first (see
+/// `lock_for_transition_tx`). A root's input injections are locked
+/// only by transactions that already hold the root's thread, so their order
+/// relative to the root does not matter.
 #[derive(Clone)]
 pub struct PostgresDurableStore {
     pool: PgPool,
+}
+
+/// A thread row this transaction holds `FOR UPDATE`.
+struct HeldThreadLock(Thread);
+
+/// A task row locked for a transition that may end it (see
+/// [`PostgresDurableStore::lock_for_transition_tx`]).
+struct LockedForTransition {
+    task: AgentTask,
+    /// A root turn's thread, locked before the root.
+    root_thread: Option<HeldThreadLock>,
 }
 
 impl PostgresDurableStore {
@@ -370,14 +400,326 @@ FOR UPDATE
         tx: &mut Transaction<'_, Postgres>,
         thread_id: &ThreadId,
         operation: ThreadOperation,
-    ) -> Result<()> {
+    ) -> Result<HeldThreadLock> {
         let thread = Self::lock_thread_tx(tx, thread_id).await?.ok_or_else(|| {
             anyhow::Error::new(ThreadNotFound {
                 thread_id: thread_id.clone(),
             })
         })?;
         thread.require_active(operation)?;
-        Ok(())
+        Ok(HeldThreadLock(thread))
+    }
+
+    /// Walk the tree under `root_id` once every thread of a root turn in it
+    /// is locked, returning the walk and the purge-fenced threads.
+    async fn walk_tree_under_thread_locks_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        root_id: &AgentTaskId,
+        now: OffsetDateTime,
+    ) -> Result<(Vec<AgentTask>, std::collections::HashSet<ThreadId>)> {
+        let mut all_tasks = Self::collect_subtree_tx(tx, root_id).await?;
+        let mut locked_threads = std::collections::HashSet::new();
+        let mut fenced_threads = std::collections::HashSet::new();
+        while lock_cancel_threads_tx(
+            tx,
+            &all_tasks,
+            &mut locked_threads,
+            &mut fenced_threads,
+            now,
+        )
+        .await?
+        {
+            all_tasks = Self::collect_subtree_tx(tx, root_id).await?;
+        }
+        Ok((all_tasks, fenced_threads))
+    }
+
+    /// `cancel_tree` over `scope`, refused unless `owner` (when given)
+    /// still holds `root_id`. The owner check reads `root_id` under its
+    /// row lock, taken at its place in the task-row order, so it is atomic
+    /// with the cancels.
+    async fn cancel_scoped(
+        &self,
+        root_id: &AgentTaskId,
+        scope: CancelScope,
+        owner: Option<(&WorkerId, &LeaseId)>,
+        now: OffsetDateTime,
+    ) -> Result<CancelTreeOutcome> {
+        let mut tx = self.begin().await?;
+        let Some(_) = Self::load_task_tx(&mut tx, root_id, false).await? else {
+            return Err(anyhow!(
+                "cancel_tree rejected: task {root_id} does not exist"
+            ));
+        };
+        let (outcome, _top) = Self::cancel_scoped_tx(&mut tx, root_id, scope, owner, now).await?;
+        tx.commit().await.context("commit cancel_tree")?;
+        Ok(outcome)
+    }
+
+    /// The body of `cancel_scoped`, inside the caller's transaction. Also
+    /// returns `root_id`'s row as read under its lock, before any
+    /// transition.
+    async fn cancel_scoped_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        root_id: &AgentTaskId,
+        scope: CancelScope,
+        owner: Option<(&WorkerId, &LeaseId)>,
+        now: OffsetDateTime,
+    ) -> Result<(CancelTreeOutcome, Option<AgentTask>)> {
+        // Collect the given task + descendants (mirror in-memory
+        // `collect_subtree`: children-BFS, root-first, following
+        // SubagentInvocation linkage across threads). A mid-tree id
+        // cancels only its own subtree instead of no-opping on a
+        // `root_id = $1` scan.
+        //
+        // The snapshot only shapes the WALK (ids, depths, kinds,
+        // thread ids — all row-invariant). Statuses in it are advisory:
+        // under READ COMMITTED a concurrent cancel_tree / terminal CAS
+        // can settle any of these rows between this read and our
+        // UPDATEs, so every transition below is gated on a locked
+        // re-read — otherwise two racing cancels of the same root
+        // could both emit a marker and both report the transition, and
+        // a stale snapshot could clobber a concurrently-Completed root
+        // with Cancelled.
+        //
+        // Phase 1 — thread-row locks, FIRST. Every thread that MIGHT
+        // need a terminal marker is bootstrapped and locked before any
+        // task-row lock is taken, keeping this transaction's lock
+        // order (thread rows → task rows) consistent with
+        // `submit_root_turn` so a concurrent submit cannot deadlock
+        // the cancel. The candidate set is every root-turn root in the
+        // snapshot regardless of its snapshot status — status can
+        // change before the locked re-read below (e.g. a queued root
+        // promoted to Pending by a concurrent terminal transition),
+        // but kind / is_root / thread_id cannot. BFS order keeps the
+        // thread-lock order deterministic (parent thread before its
+        // descendants' threads) for concurrent overlapping cancels.
+        //
+        // Every write that adds a row to a tree — an injection, a spawn —
+        // holds its thread's lock, so the walk is taken again once the
+        // threads are held: rows committed while this cancel waited for
+        // the locks are cancelled with the rest. A walk that reaches a
+        // new thread (a subagent spawned meanwhile) locks it and walks
+        // once more.
+        let (all_tasks, fenced_threads) =
+            Self::walk_tree_under_thread_locks_tx(tx, root_id, now).await?;
+
+        // Phase 2 — CAS cancel transitions, taking the row locks in the
+        // store's task-row order (see `PostgresDurableStore`): deepest
+        // first, then by id. Each row is re-read FOR UPDATE and skipped if
+        // it settled concurrently — the transition, the returned
+        // `transitioned` slice, and the marker gating below all derive
+        // from the locked re-read, never from the snapshot.
+        let mut top = None;
+        let mut cancel_order: Vec<&AgentTask> = all_tasks.iter().collect();
+        cancel_order.sort_by(|a, b| task_lock_order(a).cmp(&task_lock_order(b)));
+
+        let mut cancelled_ids: std::collections::BTreeSet<AgentTaskId> =
+            std::collections::BTreeSet::new();
+        // Track cancelled root-turn roots (and their threads) so we can
+        // wake their linked invocations and promote queued successors.
+        let mut cancelled_root_ids: Vec<AgentTaskId> = Vec::new();
+        let mut cancelled_root_threads: Vec<ThreadId> = Vec::new();
+        // Blocking roots actually transitioned by THIS call, keyed by
+        // id so phase 3 can emit their markers in BFS order. The
+        // continuation usage is captured from the locked re-read
+        // before `cancel` clears the typed state.
+        let mut marker_candidates: std::collections::BTreeMap<
+            AgentTaskId,
+            (ThreadId, Option<TokenUsage>, TerminalReason),
+        > = std::collections::BTreeMap::new();
+        for row in cancel_order {
+            let Some(current) = Self::load_task_tx(tx, &row.id, true).await? else {
+                continue;
+            };
+            if current.id == *root_id {
+                if let Some((worker, lease)) = owner
+                    && !is_owned_by(&current, worker, lease)
+                {
+                    return Err(anyhow!(
+                        "cancel rejected: task {root_id} is not running under this worker and lease"
+                    ));
+                }
+                top = Some(current.clone());
+            }
+            let Some(reason) = cancel_reason(scope, root_id, &current) else {
+                continue;
+            };
+            let is_root_turn_root = current.kind == TaskKind::RootTurn && current.is_root();
+            let thread_id = current.thread_id.clone();
+            if is_root_turn_root && current.status.blocks_root_admission() {
+                marker_candidates.insert(
+                    current.id.clone(),
+                    (
+                        thread_id.clone(),
+                        current
+                            .state
+                            .continuation()
+                            .map(|continuation| continuation.payload.total_usage.clone()),
+                        reason.clone(),
+                    ),
+                );
+            }
+            let cancelled = current
+                .cancel_with_reason(reason, now)
+                .context("cancel_tree: cancel transition failed")?;
+            Self::update_task_tx(tx, &cancelled).await?;
+            cancelled_ids.insert(cancelled.id.clone());
+            if is_root_turn_root {
+                cancelled_root_ids.push(cancelled.id.clone());
+                cancelled_root_threads.push(thread_id);
+            }
+        }
+        // Build the returned slice in BFS (root-first) order for parity.
+        let transitioned: Vec<AgentTaskId> = all_tasks
+            .iter()
+            .filter(|task| cancelled_ids.contains(&task.id))
+            .map(|task| task.id.clone())
+            .collect();
+
+        // Phase 3 — terminal `Cancelled` markers: exactly
+        // one per blocking root this call ACTUALLY transitioned (the
+        // pre-cancel occupant of its thread's active-root slot), on
+        // that root's OWN thread — cascade-cancelled child-thread
+        // roots included, queued roots never. Atomic with the cancel
+        // transitions above, so a crash can neither lose a marker nor
+        // emit one without its cancellation, and a racing duplicate
+        // cancel (whose re-read saw the row already terminal) emits
+        // nothing. The thread rows were locked in phase 1, so the
+        // sequence allocation here re-locks held rows (no new lock
+        // edges). Emitted in BFS order.
+        let markers = commit_cancel_markers_tx(tx, &all_tasks, marker_candidates, now).await?;
+
+        // Phase 7.6: wake linked SubagentInvocation tasks that were
+        // WaitingOnChildren on a now-cancelled child root. This
+        // mirrors the in-memory store's resume_linked_subagent_invocation.
+        // The woken invocation transitions to Pending (not Cancelled),
+        // so it must NOT be added to the transitioned vec.
+        for cancelled_child_root in &cancelled_root_ids {
+            Self::resume_linked_subagent_invocation_tx(tx, cancelled_child_root, now).await?;
+        }
+
+        // Each cancelled root frees its thread's active-root slot; promote
+        // the next queued root in the same transaction (emitting its
+        // durable wakeup) so cancelling the active root never strands its
+        // queued successors.
+        for thread_id in &cancelled_root_threads {
+            if !fenced_threads.contains(thread_id) {
+                Self::promote_next_queued_root_tx(tx, thread_id, now).await?;
+            }
+        }
+
+        // Mid-tree cancel: when the cancelled subtree hangs under a
+        // parent OUTSIDE the subtree (e.g. the host's subagent-deadline
+        // sweep cancelling a parked root's tool children), recompute
+        // that parked parent's pending_child_count so it resumes —
+        // mirroring the in-memory store, whose per-row cancel
+        // propagates every terminal transition to the row's parent.
+        // Only the subtree's TOP row can have an out-of-subtree parent
+        // (every deeper row's parent lies inside the subtree and is
+        // itself cancelled), so one propagation suffices. Taking the
+        // parent lock after the child updates preserves the
+        // child-then-parent lock order the deepest-first cancel loop
+        // establishes.
+        if transitioned.first().is_some_and(|id| id == root_id)
+            && let Some(cancelled_top) = Self::load_task_tx(tx, root_id, false).await?
+            && cancelled_top.parent_id.is_some()
+        {
+            Self::propagate_terminal_to_parent_tx(tx, &cancelled_top, None, now, "cancel_tree")
+                .await?;
+        }
+
+        Ok((
+            CancelTreeOutcome {
+                transitioned,
+                markers,
+            },
+            top,
+        ))
+    }
+
+    /// The thread's active root, locked: an injection's parentage is
+    /// decided on the row as it stands, so input is never attached to a
+    /// root that ended while the submission was deciding. The caller holds
+    /// the thread lock (thread → task).
+    async fn lock_active_root_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        thread_id: &ThreadId,
+    ) -> Result<Option<AgentTask>> {
+        let record = sqlx::query_as!(
+            TaskRecord,
+            r"
+SELECT
+    id,
+    kind,
+    status,
+    parent_id,
+    root_id,
+    depth,
+    thread_id,
+    submitted_input_json,
+    caller_metadata_json,
+    worker_id,
+    lease_id,
+    lease_expires_at,
+    last_heartbeat_at,
+    state_json,
+    attempt,
+    max_attempts,
+    last_error,
+    terminal_reason_json,
+    pending_child_count,
+    spawn_index,
+    result_payload,
+    otel_traceparent,
+    created_at,
+    updated_at,
+    completed_at,
+    last_activity_at
+FROM agent_sdk_tasks
+WHERE thread_id = $1
+  AND kind = 'root_turn'
+  AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation', 'awaiting_question')
+ORDER BY created_at, id
+LIMIT 1
+FOR UPDATE
+",
+            thread_key(thread_id),
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| format!("lock active root of {thread_id}"))?;
+        record.map(TryInto::try_into).transpose()
+    }
+
+    /// Lock `id` for a transition that may end it, in the thread → task
+    /// order every root-ending transition keeps: a root turn's thread row
+    /// is locked before the root's own row, and handed back as the proof
+    /// its thread-scoped steps need (handing undelivered input over,
+    /// promoting the queue head). Taking the thread lock after the root's
+    /// instead deadlocks against a submission or a cancel, which hold the
+    /// thread while they reach for the root.
+    async fn lock_for_transition_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        id: &AgentTaskId,
+    ) -> Result<Option<LockedForTransition>> {
+        let Some(screened) = Self::load_task_tx(tx, id, false).await? else {
+            return Ok(None);
+        };
+        let root_thread = if screened.kind == TaskKind::RootTurn && screened.is_root() {
+            let thread = Self::lock_thread_tx(tx, &screened.thread_id)
+                .await?
+                .with_context(|| {
+                    format!("thread {} of root {id} is missing", screened.thread_id)
+                })?;
+            Some(HeldThreadLock(thread))
+        } else {
+            None
+        };
+        let Some(task) = Self::load_task_tx(tx, id, true).await? else {
+            return Ok(None);
+        };
+        Ok(Some(LockedForTransition { task, root_thread }))
     }
 
     async fn get_thread_pool(&self, thread_id: &ThreadId) -> Result<Option<Thread>> {
@@ -1456,6 +1798,12 @@ WHERE id = $1
         Self::bootstrap_thread_row_tx(tx, &task.thread_id, task.created_at).await?;
 
         if let Some(parent) = Self::lock_parent_for_child_tx(tx, task).await? {
+            if task.kind == TaskKind::InputInjection && parent.status.is_terminal() {
+                return Err(anyhow!(
+                    "insert rejected: injection parent {} has ended",
+                    parent.id
+                ));
+            }
             if parent.kind.is_leaf() {
                 let parent_id = task.parent_id.as_ref().context("parent id")?;
                 let parent_kind = parent.kind;
@@ -1700,6 +2048,7 @@ WHERE parent_id = $1
     async fn propagate_terminal_to_parent_tx(
         tx: &mut Transaction<'_, Postgres>,
         child: &AgentTask,
+        root_thread: Option<&HeldThreadLock>,
         now: OffsetDateTime,
         error_prefix: &str,
     ) -> Result<()> {
@@ -1717,6 +2066,7 @@ WHERE parent_id = $1
             // next queued root in the same transaction so a sweep-failed
             // root never strands its queued successors.
             if child.kind == TaskKind::RootTurn && child.is_root() {
+                Self::release_undelivered_input_tx(tx, child, root_thread, now).await?;
                 Self::resume_linked_subagent_invocation_tx(tx, &child.id, now).await?;
                 Self::promote_next_queued_root_tx(tx, &child.thread_id, now).await?;
             }
@@ -1750,12 +2100,13 @@ WHERE parent_id = $1
     ///
     /// Journaling that event locks `old`'s thread row, so for a root the
     /// caller must already hold the thread lock taken before the task
-    /// lock (thread → task); otherwise use
+    /// lock (thread → task) and pass it as `root_thread`; otherwise use
     /// [`Self::fail_closed_root_thread_first`].
-    async fn fail_closed_tx(
+    async fn fail_closed_with_thread_tx(
         tx: &mut Transaction<'_, Postgres>,
         old: &AgentTask,
         reason: FailureReason,
+        root_thread: Option<&HeldThreadLock>,
         now: OffsetDateTime,
         error_prefix: &str,
     ) -> Result<()> {
@@ -1776,24 +2127,79 @@ WHERE parent_id = $1
             )
             .await?;
         }
-        Self::propagate_terminal_to_parent_tx(tx, &failed, now, error_prefix).await
+        Self::propagate_terminal_to_parent_tx(tx, &failed, root_thread, now, error_prefix).await
     }
 
-    /// Fail a root closed in its own transaction that locks the thread
-    /// before the task, for callers that classified the row under a task
-    /// lock taken first. The row is re-validated under the new locks and
-    /// left alone when it no longer classifies as fail-closed in
+    /// [`Self::fail_closed_with_thread_tx`] for a row that is not a root
+    /// turn, which needs no thread lock: a root fails closed under its
+    /// thread's lock, through [`Self::fail_closed_root_thread_first`].
+    async fn fail_closed_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        old: &AgentTask,
+        reason: FailureReason,
+        now: OffsetDateTime,
+        error_prefix: &str,
+    ) -> Result<()> {
+        Self::fail_closed_with_thread_tx(tx, old, reason, None, now, error_prefix).await
+    }
+
+    /// Fail closed, each in its own transaction, the roots whose last
+    /// lease lapsed, adding a record to `released` for each one failed.
+    /// Each root commits on its own, so one that fails must not cost the
+    /// caller the records of those already committed: it stays expired
+    /// and the next sweep retries it.
+    async fn fail_close_expired_roots(
+        &self,
+        roots: Vec<AgentTaskId>,
+        now: OffsetDateTime,
+        released: &mut Vec<RecoveryRecord>,
+    ) {
+        for id in roots {
+            match self
+                .fail_closed_root_thread_first(
+                    &id,
+                    RecoveryContext::ExpiredLease,
+                    now,
+                    "release_expired_leases",
+                )
+                .await
+            {
+                Ok(Some((reason, settled))) => {
+                    released.push(RecoveryRecord::failed_closed(id, reason).with_settled(settled));
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    task_id = %id,
+                    error = %format!("{error:#}"),
+                    "release_expired_leases: fail-close failed; the next sweep retries it",
+                ),
+            }
+        }
+    }
+
+    /// Fail a root closed in its own transaction, in the store's lock
+    /// order: its tree's threads first, then its rows by depth
+    /// descending, then id. Child-thread roots share the root's depth, so
+    /// the root is not necessarily the last row locked. Its live
+    /// descendants are cancelled before it fails, and its successor is
+    /// promoted only after nothing under it is left live.
+    /// The row is re-validated under its lock and left alone, with every
+    /// cancel rolled back, when it no longer classifies as fail-closed in
     /// `context` (another worker claimed it, a heartbeat extended its
     /// lease, ...).
     ///
-    /// Returns the reason when this call failed the row.
+    /// Returns the reason and what was settled when this call failed the
+    /// row.
     async fn fail_closed_root_thread_first(
         &self,
         id: &AgentTaskId,
         context: RecoveryContext,
         now: OffsetDateTime,
         error_prefix: &str,
-    ) -> Result<Option<FailureReason>> {
+    ) -> Result<Option<(FailureReason, CancelTreeOutcome)>> {
+        agent_server::fail_point!("fail_closed_root_thread_first", |_| Err(anyhow!(
+            "injected fail-close failure for {id}"
+        )));
         let mut tx = self.begin().await?;
         let Some(screened) = Self::load_task_tx(&mut tx, id, false).await? else {
             tx.rollback()
@@ -1802,18 +2208,26 @@ WHERE parent_id = $1
             return Ok(None);
         };
         Self::bootstrap_thread_row_tx(&mut tx, &screened.thread_id, now).await?;
-        let thread = Self::lock_thread_tx(&mut tx, &screened.thread_id)
-            .await?
-            .with_context(|| format!("thread {} missing after bootstrap", screened.thread_id))?;
-        let Some(old) = Self::load_task_tx(&mut tx, id, true).await? else {
+        let (settled, locked) =
+            Self::cancel_scoped_tx(&mut tx, id, CancelScope::Descendants, None, now).await?;
+        let Some(old) = locked else {
             tx.rollback()
                 .await
                 .context("rollback vanished fail-close")?;
             return Ok(None);
         };
+        anyhow::ensure!(
+            old.kind == TaskKind::RootTurn && old.is_root(),
+            "{error_prefix}: {id} is not a root"
+        );
+        let thread = HeldThreadLock(
+            Self::lock_thread_tx(&mut tx, &old.thread_id)
+                .await?
+                .with_context(|| format!("thread {} missing after bootstrap", old.thread_id))?,
+        );
         let still_eligible = match context {
             RecoveryContext::AcquisitionAttempt => {
-                old.status.can_be_leased() && !thread.status.is_purge_fenced()
+                old.status.can_be_leased() && !thread.0.status.is_purge_fenced()
             }
             RecoveryContext::ExpiredLease => {
                 old.status == TaskStatus::Running
@@ -1827,11 +2241,19 @@ WHERE parent_id = $1
         };
         match action {
             RecoveryAction::FailClosed(reason) => {
-                Self::fail_closed_tx(&mut tx, &old, reason, now, error_prefix).await?;
+                Self::fail_closed_with_thread_tx(
+                    &mut tx,
+                    &old,
+                    reason,
+                    Some(&thread),
+                    now,
+                    error_prefix,
+                )
+                .await?;
                 tx.commit()
                     .await
                     .with_context(|| format!("commit {error_prefix} fail-close"))?;
-                Ok(Some(reason))
+                Ok(Some((reason, settled)))
             }
             RecoveryAction::NoAction | RecoveryAction::Requeue => {
                 tx.rollback()
@@ -1851,7 +2273,10 @@ WHERE parent_id = $1
         error_prefix: &'static str,
         transition: impl FnOnce(AgentTask) -> Result<AgentTask, agent_server::journal::TaskSchemaError>,
     ) -> Result<(AgentTask, Option<AgentTask>)> {
-        let old_child = Self::load_task_tx(tx, child_id, true)
+        let LockedForTransition {
+            task: old_child,
+            root_thread,
+        } = Self::lock_for_transition_tx(tx, child_id)
             .await?
             .ok_or_else(|| anyhow!("{error_prefix} rejected: task {child_id} does not exist"))?;
 
@@ -1914,6 +2339,7 @@ WHERE parent_id = $1
             // thread completes, `execute_subagent_task` never runs,
             // and the parent thread's `SubagentProgress { completed:
             // true }` event never fires.
+            Self::release_undelivered_input_tx(tx, &new_child, root_thread.as_ref(), now).await?;
             let resumed =
                 Self::resume_linked_subagent_invocation_tx(tx, &new_child.id, now).await?;
             // Crash-safe queued-root promotion: a terminal root frees the
@@ -1927,6 +2353,102 @@ WHERE parent_id = $1
         };
 
         Ok((new_child, parent))
+    }
+
+    /// Settle the input injections `root` never delivered, inside the
+    /// transaction that ended it and before its thread's queue head is
+    /// promoted (see [`release_undelivered_input`]).
+    ///
+    /// A root that completed or failed must arrive with its thread lock,
+    /// taken before the root's own (see [`Self::lock_for_transition_tx`]):
+    /// the hand-over admits turns into that thread, and the lock is what
+    /// keeps a purge fence or a submission from slipping in between.
+    async fn release_undelivered_input_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        root: &AgentTask,
+        root_thread: Option<&HeldThreadLock>,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        if !settles_undelivered_input(root) {
+            return Ok(());
+        }
+        let thread = root_thread.with_context(|| {
+            format!(
+                "root {} ended without its thread locked first: every root-ending transition \
+                 locks the thread row before the root's",
+                root.id,
+            )
+        })?;
+        let undelivered = sqlx::query_as!(
+            TaskRecord,
+            r"
+SELECT
+    id,
+    kind,
+    status,
+    parent_id,
+    root_id,
+    depth,
+    thread_id,
+    submitted_input_json,
+    caller_metadata_json,
+    worker_id,
+    lease_id,
+    lease_expires_at,
+    last_heartbeat_at,
+    state_json,
+    attempt,
+    max_attempts,
+    last_error,
+    terminal_reason_json,
+    pending_child_count,
+    spawn_index,
+    result_payload,
+    otel_traceparent,
+    created_at,
+    updated_at,
+    completed_at,
+    last_activity_at
+FROM agent_sdk_tasks
+WHERE parent_id = $1
+  AND kind = 'input_injection'
+  AND status = 'queued'
+ORDER BY created_at, id
+FOR UPDATE
+",
+            root.id.as_str(),
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .with_context(|| format!("load undelivered input of {}", root.id))?;
+        if undelivered.is_empty() {
+            return Ok(());
+        }
+        let hand_over = thread.0.require_active(ThreadOperation::Submit).is_ok()
+            && !Self::links_child_thread_root_tx(tx, &root.id).await?;
+        for record in undelivered {
+            let released = release_undelivered_input(AgentTask::try_from(record)?, hand_over, now)?;
+            Self::update_task_tx(tx, &released.injection).await?;
+            if let Some(next_turn) = &released.next_turn {
+                Self::insert_task_tx(tx, next_turn).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `root` is a subagent's child-thread root: some invocation
+    /// links it, whatever that invocation's status. A plain read, so a
+    /// concurrent lock on the invocation row cannot hide the link.
+    async fn links_child_thread_root_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        root: &AgentTaskId,
+    ) -> Result<bool> {
+        let linked =
+            sqlx::query_file_scalar!("src/postgres/links_child_thread_root.sql", root.as_str())
+                .fetch_one(&mut **tx)
+                .await
+                .with_context(|| format!("look up the invocation linking {root}"))?;
+        Ok(linked)
     }
 
     /// Phase 7.6: find a `Subagent` invocation task that is
@@ -2180,6 +2702,12 @@ FOR UPDATE
         params: SubagentSpawnCommit,
     ) -> Result<SubagentSpawnOutcome> {
         let mut tx = self.begin().await?;
+        let screened_parent = Self::load_task_tx(&mut tx, &params.parent_id, false)
+            .await?
+            .ok_or_else(|| anyhow!("spawn rejected: task {} does not exist", params.parent_id))?;
+        Self::lock_thread_tx(&mut tx, &screened_parent.thread_id)
+            .await?
+            .with_context(|| format!("thread {} missing", screened_parent.thread_id))?;
         Self::bootstrap_thread_row_tx(&mut tx, &params.spawn.child_thread_id, params.now).await?;
         let child_thread = Self::lock_thread_tx(&mut tx, &params.spawn.child_thread_id)
             .await?
@@ -2847,13 +3375,17 @@ async fn commit_cancel_markers_tx(
     Ok(markers)
 }
 
+/// Lock the thread of every root turn in `tasks` not yet in `locked`,
+/// recording purge-fenced ones in `fenced`. Returns whether any thread was
+/// newly locked.
 async fn lock_cancel_threads_tx(
     tx: &mut Transaction<'_, Postgres>,
     tasks: &[AgentTask],
+    locked: &mut std::collections::HashSet<ThreadId>,
+    fenced: &mut std::collections::HashSet<ThreadId>,
     now: OffsetDateTime,
-) -> Result<std::collections::HashSet<ThreadId>> {
-    let mut locked = std::collections::HashSet::new();
-    let mut fenced = std::collections::HashSet::new();
+) -> Result<bool> {
+    let mut newly_locked = false;
     for task in tasks {
         if task.kind != TaskKind::RootTurn
             || !task.is_root()
@@ -2861,6 +3393,7 @@ async fn lock_cancel_threads_tx(
         {
             continue;
         }
+        newly_locked = true;
         PostgresDurableStore::bootstrap_thread_row_tx(tx, &task.thread_id, now).await?;
         let thread = PostgresDurableStore::lock_thread_tx(tx, &task.thread_id)
             .await?
@@ -2869,7 +3402,7 @@ async fn lock_cancel_threads_tx(
             fenced.insert(task.thread_id.clone());
         }
     }
-    Ok(fenced)
+    Ok(newly_locked)
 }
 
 async fn task_id_exists_tx(
@@ -2932,33 +3465,50 @@ LIMIT 1
     record.map(AgentTask::try_from).transpose()
 }
 
-async fn prepare_reattached_rows_tx(
+/// The position of `task` in the store's task-row lock order (see
+/// [`PostgresDurableStore`]): deeper rows first, then by id.
+const fn task_lock_order(task: &AgentTask) -> (std::cmp::Reverse<u32>, &AgentTaskId) {
+    (std::cmp::Reverse(task.depth), &task.id)
+}
+
+/// Lock the existing children a parent re-attaches, in the store's task-row
+/// order (by id among siblings), before the parent's own row: a child's
+/// terminal transition locks the child and then its parent, so holding the
+/// parent while reaching for a child deadlocks against it.
+async fn lock_reattached_children_tx<'a>(
     tx: &mut Transaction<'_, Postgres>,
     parent_id: &AgentTaskId,
+    child_ids: impl IntoIterator<Item = &'a AgentTaskId>,
+    rejected: &str,
+) -> Result<BTreeMap<AgentTaskId, AgentTask>> {
+    let ids: BTreeSet<&AgentTaskId> = child_ids.into_iter().collect();
+    let mut locked = BTreeMap::new();
+    for child_id in ids {
+        let child = PostgresDurableStore::load_task_tx(tx, child_id, true)
+            .await?
+            .with_context(|| format!("{rejected}: re-attach child {child_id} missing"))?;
+        ensure!(
+            child.parent_id.as_ref() == Some(parent_id),
+            "{rejected}: re-attach child {child_id} is not a child of {parent_id}"
+        );
+        locked.insert(child_id.clone(), child);
+    }
+    Ok(locked)
+}
+
+fn prepare_reattached_rows(
+    mut locked: BTreeMap<AgentTaskId, AgentTask>,
     reattach: Vec<ReattachedChild>,
     now: OffsetDateTime,
 ) -> Result<Vec<AgentTask>> {
     let mut rows = Vec::with_capacity(reattach.len());
-    let mut ids = BTreeSet::new();
     for attached in reattach {
-        ensure!(
-            ids.insert(attached.child_id.clone()),
-            "spawn rejected: duplicate re-attach child {}",
-            attached.child_id
-        );
-        let mut child = PostgresDurableStore::load_task_tx(tx, &attached.child_id, true)
-            .await?
-            .with_context(|| {
-                format!(
-                    "spawn rejected: re-attach child {} missing",
-                    attached.child_id
-                )
-            })?;
-        ensure!(
-            child.parent_id.as_ref() == Some(parent_id),
-            "spawn rejected: re-attach child {} is not a child of {parent_id}",
-            attached.child_id
-        );
+        let mut child = locked.remove(&attached.child_id).with_context(|| {
+            format!(
+                "spawn rejected: duplicate re-attach child {}",
+                attached.child_id
+            )
+        })?;
         child.spawn_index = Some(attached.spawn_index);
         child.updated_at = now;
         child
@@ -3124,7 +3674,7 @@ SELECT EXISTS (
         // would put every concurrent submit behind the same tuple for the rest
         // of the transaction, which the unchanged back-pressure path must not
         // pay for. Only an injection request, which has to inspect the root's
-        // status to decide parentage, reads it.
+        // status to decide parentage, reads it, and locks it.
         let (thread_has_blocking_root, active_root) = match disposition {
             SubmitDisposition::NextTurn => (
                 sqlx::query_scalar!(
@@ -3146,7 +3696,7 @@ SELECT EXISTS (
                 None,
             ),
             SubmitDisposition::InjectAtBoundary => {
-                let root = active_root_for_thread_exec(&mut *tx, &task.thread_id)
+                let root = Self::lock_active_root_tx(&mut tx, &task.thread_id)
                     .await
                     .map_err(SubmitRootTurnError::Other)?;
                 (root.is_some(), root)
@@ -3583,9 +4133,20 @@ ORDER BY created_at, id
         }
         match classify_recovery(&old, RecoveryContext::AcquisitionAttempt) {
             RecoveryAction::NoAction => {}
+            RecoveryAction::FailClosed(_) if old.kind == TaskKind::RootTurn && old.is_root() => {
+                tx.rollback()
+                    .await
+                    .context("rollback before thread-first fail-close")?;
+                self.fail_closed_root_thread_first(
+                    id,
+                    RecoveryContext::AcquisitionAttempt,
+                    now,
+                    "try_acquire_task",
+                )
+                .await?;
+                return Ok(None);
+            }
             RecoveryAction::FailClosed(reason) => {
-                // `require_active_thread_tx` above already holds the thread
-                // lock, so the terminal event keeps thread → task order.
                 Self::fail_closed_tx(&mut tx, &old, reason, now, "try_acquire_task").await?;
                 tx.commit().await.context("commit fail-closed acquire")?;
                 return Ok(None);
@@ -3669,7 +4230,9 @@ ORDER BY created_at, id
                     tx.commit().await.context("commit acquire_next_runnable")?;
                     return Ok(Some(claimed));
                 }
-                RecoveryAction::FailClosed(reason) if reason.terminal_event(&old).is_some() => {
+                RecoveryAction::FailClosed(_)
+                    if old.kind == TaskKind::RootTurn && old.is_root() =>
+                {
                     tx.rollback()
                         .await
                         .context("rollback before thread-first fail-close")?;
@@ -3857,7 +4420,9 @@ FOR UPDATE SKIP LOCKED
                     Self::update_task_tx(&mut tx, &released_row).await?;
                     RecoveryRecord::requeued(old.id.clone())
                 }
-                RecoveryAction::FailClosed(reason) if reason.terminal_event(&old).is_some() => {
+                RecoveryAction::FailClosed(_)
+                    if old.kind == TaskKind::RootTurn && old.is_root() =>
+                {
                     exhausted_roots.push(old.id);
                     continue;
                 }
@@ -3880,19 +4445,8 @@ FOR UPDATE SKIP LOCKED
 
         // The batch locked these roots before their threads; journaling
         // their terminal events needs thread → task order.
-        for id in exhausted_roots {
-            if let Some(reason) = self
-                .fail_closed_root_thread_first(
-                    &id,
-                    RecoveryContext::ExpiredLease,
-                    now,
-                    "release_expired_leases",
-                )
-                .await?
-            {
-                released.push(RecoveryRecord::failed_closed(id, reason));
-            }
-        }
+        self.fail_close_expired_roots(exhausted_roots, now, &mut released)
+            .await;
         Ok(released)
     }
 
@@ -4044,6 +4598,8 @@ FOR UPDATE SKIP LOCKED
         now: OffsetDateTime,
     ) -> Result<AgentTask> {
         let mut tx = self.begin().await?;
+        let mut locked =
+            lock_reattached_children_tx(&mut tx, parent_id, &reattach, "repark rejected").await?;
         let old = Self::load_task_tx(&mut tx, parent_id, true)
             .await?
             .ok_or_else(|| anyhow!("repark rejected: task {parent_id} does not exist"))?;
@@ -4079,14 +4635,9 @@ FOR UPDATE SKIP LOCKED
         // positions matching the new continuation's tool-use order.
         let mut live = 0_u32;
         for (idx, child_id) in reattach.iter().enumerate() {
-            let mut child = Self::load_task_tx(&mut tx, child_id, true)
-                .await?
-                .ok_or_else(|| anyhow!("repark rejected: re-attach child {child_id} missing"))?;
-            if child.parent_id.as_ref() != Some(parent_id) {
-                return Err(anyhow!(
-                    "repark rejected: re-attach child {child_id} is not a child of {parent_id}"
-                ));
-            }
+            let mut child = locked.remove(child_id).with_context(|| {
+                format!("repark rejected: duplicate re-attach child {child_id}")
+            })?;
             child.spawn_index =
                 Some(u32::try_from(idx).context("repark rejected: reattach index exceeds u32")?);
             child.updated_at = now;
@@ -4164,7 +4715,7 @@ FOR UPDATE SKIP LOCKED
             mut events,
         } = pause;
         let mut tx = self.begin().await?;
-        let old = Self::load_task_tx(&mut tx, id, true)
+        let LockedForTransition { task: old, .. } = Self::lock_for_transition_tx(&mut tx, id)
             .await?
             .ok_or_else(|| anyhow!("question pause rejected: task {id} does not exist"))?;
         let paused = apply_question_pause(&old, worker, lease, payload, questions.clone(), now)?;
@@ -4450,6 +5001,13 @@ FOR UPDATE SKIP LOCKED
             Self::require_active_thread_tx(&mut tx, child_thread_id, ThreadOperation::Spawn)
                 .await?;
         }
+        let locked_reattach = lock_reattached_children_tx(
+            &mut tx,
+            parent_id,
+            reattach.iter().map(|attached| &attached.child_id),
+            "spawn rejected",
+        )
+        .await?;
         let old_parent = Self::load_task_tx(&mut tx, parent_id, true)
             .await?
             .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
@@ -4465,7 +5023,7 @@ FOR UPDATE SKIP LOCKED
             tool_rows.push(child);
         }
 
-        let reattached_rows = prepare_reattached_rows_tx(&mut tx, parent_id, reattach, now).await?;
+        let reattached_rows = prepare_reattached_rows(locked_reattach, reattach, now)?;
         let child_ids = mixed_child_ids_in_slot_order(&prepared, &tool_rows, &reattached_rows)?;
         let child_count =
             u32::try_from(child_ids.len()).context("spawn rejected: child count exceeds u32")?;
@@ -4611,6 +5169,27 @@ ORDER BY created_at, id
         records.into_iter().map(TryInto::try_into).collect()
     }
 
+    async fn list_terminal_roots_with_live_descendants(&self) -> Result<Vec<AgentTaskId>> {
+        let roots = sqlx::query_scalar!(
+            r"
+SELECT DISTINCT descendant.root_id
+FROM agent_sdk_tasks AS descendant
+JOIN agent_sdk_tasks AS root ON root.id = descendant.root_id
+WHERE descendant.status IN (
+        'queued', 'pending', 'running', 'waiting_on_children',
+        'awaiting_confirmation', 'awaiting_question'
+    )
+  AND descendant.parent_id IS NOT NULL
+  AND root.status IN ('completed', 'failed', 'cancelled')
+ORDER BY descendant.root_id
+",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("list terminal roots with live descendants")?;
+        Ok(roots.into_iter().map(AgentTaskId::from_string).collect())
+    }
+
     async fn complete_task(
         &self,
         child_id: &AgentTaskId,
@@ -4710,172 +5289,19 @@ ORDER BY created_at, id
         root_id: &AgentTaskId,
         now: OffsetDateTime,
     ) -> Result<CancelTreeOutcome> {
-        let mut tx = self.begin().await?;
-        let Some(_) = Self::load_task_tx(&mut tx, root_id, false).await? else {
-            return Err(anyhow!(
-                "cancel_tree rejected: task {root_id} does not exist"
-            ));
-        };
+        self.cancel_scoped(root_id, CancelScope::Tree, None, now)
+            .await
+    }
 
-        // Collect the given task + descendants (mirror in-memory
-        // `collect_subtree`: children-BFS, root-first, following
-        // SubagentInvocation linkage across threads). A mid-tree id
-        // cancels only its own subtree instead of no-opping on a
-        // `root_id = $1` scan.
-        //
-        // The snapshot only shapes the WALK (ids, depths, kinds,
-        // thread ids — all row-invariant). Statuses in it are advisory:
-        // under READ COMMITTED a concurrent cancel_tree / terminal CAS
-        // can settle any of these rows between this read and our
-        // UPDATEs, so every transition below is gated on a locked
-        // re-read — otherwise two racing cancels of the same root
-        // could both emit a marker and both report the transition, and
-        // a stale snapshot could clobber a concurrently-Completed root
-        // with Cancelled.
-        let all_tasks = Self::collect_subtree_tx(&mut tx, root_id).await?;
-
-        // Phase 1 — thread-row locks, FIRST. Every thread that MIGHT
-        // need a terminal marker is bootstrapped and locked before any
-        // task-row lock is taken, keeping this transaction's lock
-        // order (thread rows → task rows) consistent with
-        // `submit_root_turn` so a concurrent submit cannot deadlock
-        // the cancel. The candidate set is every root-turn root in the
-        // snapshot regardless of its snapshot status — status can
-        // change before the locked re-read below (e.g. a queued root
-        // promoted to Pending by a concurrent terminal transition),
-        // but kind / is_root / thread_id cannot. BFS order keeps the
-        // thread-lock order deterministic (parent thread before its
-        // descendants' threads) for concurrent overlapping cancels.
-        let fenced_threads = lock_cancel_threads_tx(&mut tx, &all_tasks, now).await?;
-
-        // Phase 2 — CAS cancel transitions. Apply the cancel UPDATEs
-        // deepest-first so the per-row locks are taken in the same
-        // child-then-parent order as the terminal transition paths
-        // (`complete_task` / `fail_task`), removing the lock-order
-        // inversion that could deadlock (40P01) a concurrent
-        // `cancel_tree(root)` + `complete_task(child-of-root)`. Each
-        // row is re-read FOR UPDATE and skipped if it settled
-        // concurrently — the transition, the returned `transitioned`
-        // slice, and the marker gating below all derive from the
-        // locked re-read, never from the snapshot.
-        let mut cancel_order: Vec<&AgentTask> = all_tasks.iter().collect();
-        cancel_order.sort_by_key(|t| std::cmp::Reverse(t.depth));
-
-        let mut cancelled_ids: std::collections::BTreeSet<AgentTaskId> =
-            std::collections::BTreeSet::new();
-        // Track cancelled root-turn roots (and their threads) so we can
-        // wake their linked invocations and promote queued successors.
-        let mut cancelled_root_ids: Vec<AgentTaskId> = Vec::new();
-        let mut cancelled_root_threads: Vec<ThreadId> = Vec::new();
-        // Blocking roots actually transitioned by THIS call, keyed by
-        // id so phase 3 can emit their markers in BFS order. The
-        // continuation usage is captured from the locked re-read
-        // before `cancel` clears the typed state.
-        let mut marker_candidates: std::collections::BTreeMap<
-            AgentTaskId,
-            (ThreadId, Option<TokenUsage>, TerminalReason),
-        > = std::collections::BTreeMap::new();
-        for row in cancel_order {
-            let Some(current) = Self::load_task_tx(&mut tx, &row.id, true).await? else {
-                continue;
-            };
-            if current.status.is_terminal() {
-                continue;
-            }
-            let is_root_turn_root = current.kind == TaskKind::RootTurn && current.is_root();
-            let thread_id = current.thread_id.clone();
-            let reason = if current.id == *root_id {
-                TerminalReason::UserCancel
-            } else {
-                TerminalReason::ParentCancelled
-            };
-            if is_root_turn_root && current.status.blocks_root_admission() {
-                marker_candidates.insert(
-                    current.id.clone(),
-                    (
-                        thread_id.clone(),
-                        current
-                            .state
-                            .continuation()
-                            .map(|continuation| continuation.payload.total_usage.clone()),
-                        reason.clone(),
-                    ),
-                );
-            }
-            let cancelled = current
-                .cancel_with_reason(reason, now)
-                .context("cancel_tree: cancel transition failed")?;
-            Self::update_task_tx(&mut tx, &cancelled).await?;
-            cancelled_ids.insert(cancelled.id.clone());
-            if is_root_turn_root {
-                cancelled_root_ids.push(cancelled.id.clone());
-                cancelled_root_threads.push(thread_id);
-            }
-        }
-        // Build the returned slice in BFS (root-first) order for parity.
-        let transitioned: Vec<AgentTaskId> = all_tasks
-            .iter()
-            .filter(|task| cancelled_ids.contains(&task.id))
-            .map(|task| task.id.clone())
-            .collect();
-
-        // Phase 3 — terminal `Cancelled` markers: exactly
-        // one per blocking root this call ACTUALLY transitioned (the
-        // pre-cancel occupant of its thread's active-root slot), on
-        // that root's OWN thread — cascade-cancelled child-thread
-        // roots included, queued roots never. Atomic with the cancel
-        // transitions above, so a crash can neither lose a marker nor
-        // emit one without its cancellation, and a racing duplicate
-        // cancel (whose re-read saw the row already terminal) emits
-        // nothing. The thread rows were locked in phase 1, so the
-        // sequence allocation here re-locks held rows (no new lock
-        // edges). Emitted in BFS order.
-        let markers = commit_cancel_markers_tx(&mut tx, &all_tasks, marker_candidates, now).await?;
-
-        // Phase 7.6: wake linked SubagentInvocation tasks that were
-        // WaitingOnChildren on a now-cancelled child root. This
-        // mirrors the in-memory store's resume_linked_subagent_invocation.
-        // The woken invocation transitions to Pending (not Cancelled),
-        // so it must NOT be added to the transitioned vec.
-        for cancelled_child_root in &cancelled_root_ids {
-            Self::resume_linked_subagent_invocation_tx(&mut tx, cancelled_child_root, now).await?;
-        }
-
-        // Each cancelled root frees its thread's active-root slot; promote
-        // the next queued root in the same transaction (emitting its
-        // durable wakeup) so cancelling the active root never strands its
-        // queued successors.
-        for thread_id in &cancelled_root_threads {
-            if !fenced_threads.contains(thread_id) {
-                Self::promote_next_queued_root_tx(&mut tx, thread_id, now).await?;
-            }
-        }
-
-        // Mid-tree cancel: when the cancelled subtree hangs under a
-        // parent OUTSIDE the subtree (e.g. the host's subagent-deadline
-        // sweep cancelling a parked root's tool children), recompute
-        // that parked parent's pending_child_count so it resumes —
-        // mirroring the in-memory store, whose per-row cancel
-        // propagates every terminal transition to the row's parent.
-        // Only the subtree's TOP row can have an out-of-subtree parent
-        // (every deeper row's parent lies inside the subtree and is
-        // itself cancelled), so one propagation suffices. Taking the
-        // parent lock after the child updates preserves the
-        // child-then-parent lock order the deepest-first cancel loop
-        // establishes.
-        if transitioned.first().is_some_and(|id| id == root_id)
-            && let Some(cancelled_top) = Self::load_task_tx(&mut tx, root_id, false).await?
-            && cancelled_top.parent_id.is_some()
-        {
-            Self::propagate_terminal_to_parent_tx(&mut tx, &cancelled_top, now, "cancel_tree")
-                .await?;
-        }
-
-        tx.commit().await.context("commit cancel_tree")?;
-        Ok(CancelTreeOutcome {
-            transitioned,
-            markers,
-        })
+    async fn cancel_descendants_of_owned(
+        &self,
+        parent: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        now: OffsetDateTime,
+    ) -> Result<CancelTreeOutcome> {
+        self.cancel_scoped(parent, CancelScope::Descendants, Some((worker, lease)), now)
+            .await
     }
 
     async fn resume_from_confirmation(
@@ -4895,8 +5321,8 @@ ORDER BY created_at, id
         }
         let (resumed, prepared_operation) = old
             .clone()
-            .resume_from_confirmation(now)
-            .context("resume rejected: resume_from_confirmation transition failed")?;
+            .approve_confirmation_for_pickup(now)
+            .context("resume rejected: approve_confirmation_for_pickup transition failed")?;
         Self::update_task_tx(&mut tx, &resumed).await?;
         tx.commit()
             .await
@@ -4951,7 +5377,7 @@ ORDER BY created_at, id
         }
         let failed = old
             .clone()
-            .fail_with_terminal_reason(error, TerminalReason::ConfirmationRejected, now)
+            .reject_confirmation(error, now)
             .context("reject_confirmation: fail transition failed")?;
         Self::update_task_tx(&mut tx, &failed).await?;
 
@@ -7582,6 +8008,31 @@ mod tests {
         )))
     }
 
+    /// The child-thread link a root's undelivered input is classified by
+    /// is read through an index, never a scan of every task: with
+    /// sequential scans priced out, the plan still finds an index to use.
+    #[tokio::test]
+    async fn child_thread_link_is_looked_up_through_an_index() -> Result<()> {
+        let Some((store, _guard)) = test_store().await? else {
+            return Ok(());
+        };
+        let mut tx = store.pool.begin().await?;
+        sqlx::query!("SET LOCAL enable_seqscan = off")
+            .execute(&mut *tx)
+            .await?;
+        let probe = include_str!("links_child_thread_root.sql").replace("$1", "'task_probe'");
+        let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("EXPLAIN {probe}")))
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.rollback().await?;
+        assert!(
+            plan.iter().all(|line| !line.contains("Seq Scan"))
+                && plan.iter().any(|line| line.contains("Index")),
+            "the link must be looked up through an index, not scanned: {plan:#?}",
+        );
+        Ok(())
+    }
+
     /// Durable coverage of the Postgres `claim_thread_creation_tx`:
     /// replay, typed conflict, and a REAL cross-connection race on the
     /// same pool (spawned tasks released by one barrier).
@@ -8015,6 +8466,76 @@ INSERT INTO agent_sdk_turn_attempts (
             );
         }
 
+        Ok(())
+    }
+
+    /// A one-attempt root whose lease lapses at `t_plus(secs + 5)`.
+    #[cfg(feature = "failpoints")]
+    async fn lapsed_last_attempt_root(
+        store: &PostgresDurableStore,
+        thread: &str,
+        secs: i64,
+    ) -> Result<AgentTaskId> {
+        let root = AgentTask::new_root_turn(thread_id(thread), t_plus(secs), 1);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await?;
+        store
+            .try_acquire_task(
+                &id,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(secs + 5),
+                t_plus(secs + 1),
+            )
+            .await?
+            .context("root claimed")?;
+        Ok(id)
+    }
+
+    /// A root whose fail-close errors mid-sweep costs the caller nothing
+    /// the sweep already committed: the earlier root's record comes back,
+    /// and the next sweep fails the one that errored.
+    #[cfg(feature = "failpoints")]
+    #[tokio::test]
+    async fn a_failed_fail_close_keeps_the_sweeps_committed_records() -> Result<()> {
+        use crate::fail;
+
+        let Some((store, _schema_guard)) = test_store().await? else {
+            return Ok(());
+        };
+        let first = lapsed_last_attempt_root(&store, "t-pg-sweep-first", 0).await?;
+        let second = lapsed_last_attempt_root(&store, "t-pg-sweep-second", 10).await?;
+
+        let _scenario = fail::FailScenario::setup();
+        fail::cfg("fail_closed_root_thread_first", "1*off->return")
+            .map_err(|error| anyhow::anyhow!("configure fail-close failpoint: {error}"))?;
+        let swept = store.release_expired_leases(t_plus(100)).await;
+        fail::remove("fail_closed_root_thread_first");
+
+        let swept = swept?;
+        let ids: Vec<&AgentTaskId> = swept.iter().map(|record| &record.id).collect();
+        assert_eq!(ids, vec![&first], "the committed root's record comes back");
+        assert!(swept[0].action.is_fail_closed());
+        let status = |id: AgentTaskId| {
+            let store = &store;
+            async move {
+                AgentTaskStore::get(store, &id)
+                    .await?
+                    .map(|task| task.status)
+                    .context("row exists")
+            }
+        };
+        assert_eq!(status(first.clone()).await?, TaskStatus::Failed);
+        assert_eq!(status(second.clone()).await?, TaskStatus::Running);
+
+        let retried = store.release_expired_leases(t_plus(101)).await?;
+        let ids: Vec<&AgentTaskId> = retried.iter().map(|record| &record.id).collect();
+        assert_eq!(
+            ids,
+            vec![&second],
+            "the next sweep retries the root that errored"
+        );
+        assert_eq!(status(second).await?, TaskStatus::Failed);
         Ok(())
     }
 

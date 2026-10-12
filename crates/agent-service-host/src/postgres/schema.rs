@@ -308,6 +308,12 @@ const AGENT_SDK_TASK_INDEXES: &[IndexContract] = &[
         predicate: None,
         purpose: "Keeps task-tree traversals and root-scoped inspection predictable.",
     },
+    IndexContract {
+        name: "agent_sdk_tasks_subagent_child_root_idx",
+        key_columns: "((state_json -> 'invocation' ->> 'child_root_task_id'))",
+        predicate: Some("kind = 'subagent'"),
+        purpose: "Finds the invocation linking a child-thread root, parked or not.",
+    },
 ];
 
 const AGENT_SDK_THREAD_COLUMNS: &[ColumnContract] = &[

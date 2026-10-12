@@ -72,7 +72,7 @@ use agent_server::worker::{
     fail_root_turn_with_reason, guarded_tool_execution, pause_tool_for_confirmation,
     resolve_bootstrap_context, resolve_subagent_bootstrap, resolve_tool_bootstrap,
     resume_for_steering, resume_from_children, resume_from_question, revert_steering_wake,
-    terminal_reason_for_root_error,
+    settle_live_descendants, terminal_reason_for_root_error,
 };
 
 use super::broker::{BrokerAdapter, InMemoryBrokerAdapter};
@@ -374,6 +374,17 @@ impl ServiceHost {
             use tokio::signal::unix::{SignalKind, signal};
             signal(SignalKind::terminate()).context("registering SIGTERM handler")?
         };
+
+        // Before any worker can pick up a task a previous process left
+        // under a terminal root.
+        match settle_orphaned_descendants(&self.stores, time::OffsetDateTime::now_utc()).await {
+            Ok(0) => {}
+            Ok(count) => info!(
+                count,
+                "settled live descendants of terminal roots at startup"
+            ),
+            Err(e) => warn!(error = %e, "startup orphan settlement failed; the sweep retries"),
+        }
 
         let wakeup_signal = WakeupSignal::shared();
         // Hand the same signal to the execution runtime *before* the
@@ -786,6 +797,12 @@ async fn lease_sweep_loop(
                     }
                 }
 
+                // After the drain, so a root it just failed closed has its
+                // descendants settled in the same tick.
+                if let Err(e) = settle_orphaned_descendants(&stores, now).await {
+                    warn!(error = %e, "orphan settlement failed");
+                }
+
                 // Subagent deadline enforcement for PARKED child roots
                 // (issue #299): a child root suspended on its own tool
                 // children has no live heartbeat, so a hung tool child
@@ -819,6 +836,75 @@ async fn lease_sweep_loop(
     }
 }
 
+/// Settle the live descendants of every terminal root.
+///
+/// A terminal root's fan-in never runs again, so a descendant still live
+/// under it waits forever: one left by a process death between the root's
+/// terminal transition and its settlement, or by a store-side fail-close
+/// (lease expiry, exhausted budget) that never reaches a worker. The check
+/// is structural — a terminal root over a live descendant — never an age, and
+/// idempotent: a settled tree yields nothing on the next pass.
+///
+/// A live child-thread root is not reachable from here once its invocation
+/// is terminal, because the linkage lives on the invocation's paused state.
+///
+/// # Errors
+/// Returns an error if the orphaned roots cannot be listed. Per-root
+/// failures are logged and retried on the next pass.
+async fn settle_orphaned_descendants(
+    stores: &StoreRegistry,
+    now: time::OffsetDateTime,
+) -> Result<usize> {
+    let roots = stores
+        .task_store
+        .list_terminal_roots_with_live_descendants()
+        .await
+        .context("list terminal roots with live descendants")?;
+
+    let deps = stores.root_turn_deps();
+    let mut settled = 0usize;
+    for root_id in roots {
+        match settle_live_descendants(&root_id, &deps, now).await {
+            Ok(transitioned) => {
+                for id in &transitioned {
+                    stores.confirm_drive_cancels.cancel(id);
+                }
+                if !transitioned.is_empty() {
+                    info!(
+                        root = %root_id,
+                        count = transitioned.len(),
+                        "settled live descendants of a terminal root",
+                    );
+                }
+                settled = settled.saturating_add(transitioned.len());
+            }
+            Err(err) => {
+                warn!(
+                    root = %root_id,
+                    error = %err,
+                    "orphan settlement failed for a root; retrying next sweep",
+                );
+            }
+        }
+    }
+    Ok(settled)
+}
+
+/// Wake same-process followers of the child threads a settlement closed,
+/// and trip the approved-confirmation drives of the tasks it cancelled,
+/// which would otherwise notice only at their next heartbeat rejection.
+fn forward_settlement(
+    stores: &StoreRegistry,
+    settled: &agent_server::journal::store::CancelTreeOutcome,
+) {
+    if !settled.markers.is_empty() {
+        stores.event_notifier.notify(&settled.markers);
+    }
+    for id in &settled.transitioned {
+        stores.confirm_drive_cancels.cancel(id);
+    }
+}
+
 /// Rounds of [`AgentTaskStore::release_expired_leases`] one sweep tick
 /// may run while draining a backlog — a guard against a pathological
 /// store that keeps reporting full batches (the remainder defers to
@@ -848,6 +934,9 @@ async fn drain_expired_leases(stores: &StoreRegistry, now: time::OffsetDateTime)
             .release_expired_leases(now)
             .await
             .context("release expired leases")?;
+        for record in &records {
+            forward_settlement(stores, &record.settled);
+        }
         total = total.saturating_add(records.len());
         if records.len() < agent_server::journal::store::LEASE_RELEASE_BATCH {
             return Ok(total);
@@ -3164,40 +3253,30 @@ async fn fail_root_task_if_owned(
         return Ok(());
     }
 
-    match attempt_close {
+    let params = FailRootTurnParams {
+        task_id,
+        worker_id,
+        lease_id,
+        thread_id,
+        error,
+        reason,
+    };
+    let failed = match attempt_close {
         AttemptClosePolicy::CloseOpenAttempts => {
-            fail_root_turn_with_reason(
-                FailRootTurnParams {
-                    task_id,
-                    worker_id,
-                    lease_id,
-                    thread_id,
-                    error,
-                    reason: reason.clone(),
-                },
-                &stores.root_turn_deps(),
-                now,
-            )
-            .await
-            .context("mark root task failed")?;
+            fail_root_turn_with_reason(params, &stores.root_turn_deps(), now).await
         }
         AttemptClosePolicy::LeaveOpenForLiveWorker => {
-            fail_root_turn_leaving_attempts_open_with_reason(
-                FailRootTurnParams {
-                    task_id,
-                    worker_id,
-                    lease_id,
-                    thread_id,
-                    error,
-                    reason,
-                },
-                &stores.root_turn_deps(),
-                now,
-            )
-            .await
-            .context("mark root task failed")?;
+            fail_root_turn_leaving_attempts_open_with_reason(params, &stores.root_turn_deps(), now)
+                .await
         }
+    };
+    // Tripped whatever the transition did: a drive whose task the failure
+    // cancelled would otherwise notice only at its next heartbeat rejection.
+    // Ids without a live drive are no-ops.
+    for id in &failed.settled {
+        stores.confirm_drive_cancels.cancel(id);
     }
+    failed.task.context("mark root task failed")?;
 
     let new_events = newly_committed_events(stores, thread_id, event_watermark).await?;
     publish_events(stores, &new_events);
@@ -9161,6 +9240,7 @@ mod tests {
         fail_task_failures_remaining: AtomicUsize,
         fail_task_attempts: AtomicUsize,
         heartbeat_rejections_remaining: AtomicUsize,
+        cancel_failures_remaining: AtomicUsize,
         /// When non-zero, `list_children` (the subtree probe's expansion
         /// call) sleeps this many milliseconds before delegating, and fires
         /// `probe_started` as it begins — so a test can prove the heartbeat
@@ -9184,6 +9264,7 @@ mod tests {
                 fail_task_failures_remaining: AtomicUsize::new(0),
                 fail_task_attempts: AtomicUsize::new(0),
                 heartbeat_rejections_remaining: AtomicUsize::new(0),
+                cancel_failures_remaining: AtomicUsize::new(0),
                 list_children_stall_ms: AtomicUsize::new(0),
                 probe_started: Arc::new(tokio::sync::Notify::new()),
                 fail_task_now: Arc::new(std::sync::Mutex::new(None)),
@@ -9222,6 +9303,12 @@ mod tests {
 
         fn failing_finds(self, count: usize) -> Self {
             self.find_failures_remaining.store(count, Ordering::SeqCst);
+            self
+        }
+
+        fn failing_cancels(self, count: usize) -> Self {
+            self.cancel_failures_remaining
+                .store(count, Ordering::SeqCst);
             self
         }
 
@@ -9578,6 +9665,9 @@ mod tests {
         async fn list_parked_subagent_invocations(&self) -> Result<Vec<AgentTask>> {
             self.inner.list_parked_subagent_invocations().await
         }
+        async fn list_terminal_roots_with_live_descendants(&self) -> Result<Vec<AgentTaskId>> {
+            self.inner.list_terminal_roots_with_live_descendants().await
+        }
         async fn complete_task(
             &self,
             task_id: &AgentTaskId,
@@ -9660,7 +9750,24 @@ mod tests {
             root_id: &AgentTaskId,
             now: time::OffsetDateTime,
         ) -> Result<agent_server::journal::store::CancelTreeOutcome> {
+            if Self::take_injected_failure(&self.cancel_failures_remaining) {
+                bail!("injected transient cancel_tree failure");
+            }
             self.inner.cancel_tree(root_id, now).await
+        }
+        async fn cancel_descendants_of_owned(
+            &self,
+            parent: &AgentTaskId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+            now: time::OffsetDateTime,
+        ) -> Result<agent_server::journal::store::CancelTreeOutcome> {
+            if Self::take_injected_failure(&self.cancel_failures_remaining) {
+                bail!("injected transient cancel_descendants_of_owned failure");
+            }
+            self.inner
+                .cancel_descendants_of_owned(parent, worker, lease, now)
+                .await
         }
         async fn resume_from_confirmation(
             &self,
@@ -10773,4 +10880,6 @@ mod tests {
         assert_eq!(completed.status, TaskStatus::Completed);
         Ok(())
     }
+
+    mod settlement;
 }

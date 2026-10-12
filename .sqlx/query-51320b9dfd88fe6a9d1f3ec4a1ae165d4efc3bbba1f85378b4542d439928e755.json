@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nSELECT indisvalid AS \"valid!\"\nFROM pg_index\nWHERE indexrelid = to_regclass('agent_sdk_tasks_subagent_child_root_idx')\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "valid!",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "pg_index",
+            "name": "indisvalid"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "51320b9dfd88fe6a9d1f3ec4a1ae165d4efc3bbba1f85378b4542d439928e755"
+}

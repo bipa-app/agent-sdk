@@ -61,14 +61,16 @@ use agent_server::journal::relay::{
 };
 use agent_server::journal::retention::{RetentionCursor, RetentionStore};
 use agent_server::journal::store::{
-    AgentTaskStore, CancelTreeOutcome, ChildProbe, MixedChildrenSpawn, QuestionAnswerApplied,
-    QuestionPause, ReattachedChild, RequeueOutcome, SpawnedMixedChildren, SubagentBatchSpawn,
-    SubagentInvocationSpawn, SubmitDisposition, SubmitRootTurnError, SubmitRootTurnOutcome,
-    SubmitRootTurnParams, ToolChildSpawn, apply_question_answer, apply_question_pause,
-    has_precompleted_tool_child, live_mixed_child_count, mixed_child_ids_in_slot_order,
-    new_mixed_tool_child, publish_transactional_mixed_parent, submitted_task_disposition,
-    validate_mixed_children_spawn, validate_precompleted_boundary_events,
-    validate_subagent_event_count, validate_tool_child_specs_for_pure_spawn,
+    AgentTaskStore, CancelScope, CancelTreeOutcome, ChildProbe, MixedChildrenSpawn,
+    QuestionAnswerApplied, QuestionPause, ReattachedChild, RequeueOutcome, SpawnedMixedChildren,
+    SubagentBatchSpawn, SubagentInvocationSpawn, SubmitDisposition, SubmitRootTurnError,
+    SubmitRootTurnOutcome, SubmitRootTurnParams, ToolChildSpawn, apply_question_answer,
+    apply_question_pause, cancel_reason, has_precompleted_tool_child, is_owned_by,
+    live_mixed_child_count, mixed_child_ids_in_slot_order, new_mixed_tool_child,
+    publish_transactional_mixed_parent, release_undelivered_input, settles_undelivered_input,
+    submitted_task_disposition, validate_mixed_children_spawn,
+    validate_precompleted_boundary_events, validate_subagent_event_count,
+    validate_tool_child_specs_for_pure_spawn,
 };
 use agent_server::journal::subagent_spawn_transaction::{
     AtomicSubagentSpawnCommitter, SubagentSpawnCommit, SubagentSpawnEvent, SubagentSpawnOutcome,
@@ -284,6 +286,164 @@ macro_rules! task_columns {
 }
 
 impl SqliteDurableStore {
+    /// `cancel_tree` over `scope`, refused unless `owner` (when given)
+    /// still holds `root_id`.
+    async fn cancel_scoped(
+        &self,
+        root_id: &AgentTaskId,
+        scope: CancelScope,
+        owner: Option<(&WorkerId, &LeaseId)>,
+        now: OffsetDateTime,
+    ) -> Result<CancelTreeOutcome> {
+        let mut tx = self.begin().await?;
+        let Some(top) = Self::load_task_tx(&mut tx, root_id).await? else {
+            return Err(anyhow!(
+                "cancel_tree rejected: task {root_id} does not exist"
+            ));
+        };
+        if let Some((worker, lease)) = owner
+            && !is_owned_by(&top, worker, lease)
+        {
+            return Err(anyhow!(
+                "cancel rejected: task {root_id} is not running under this worker and lease"
+            ));
+        }
+        let outcome = Self::cancel_scoped_tx(&mut tx, root_id, scope, now).await?;
+        tx.commit().await.context("commit cancel_tree")?;
+        Ok(outcome)
+    }
+
+    /// The body of `cancel_scoped`, inside the caller's transaction.
+    async fn cancel_scoped_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        root_id: &AgentTaskId,
+        scope: CancelScope,
+        now: OffsetDateTime,
+    ) -> Result<CancelTreeOutcome> {
+        // Collect the given task + descendants (mirror in-memory
+        // `collect_subtree`: children-BFS, root-first, following
+        // SubagentInvocation linkage across threads). A mid-tree id
+        // cancels only its own subtree instead of no-opping on a
+        // `root_id = $1` scan. SQLite serializes writers via
+        // BEGIN IMMEDIATE, so there is no lock-order deadlock to avoid;
+        // cancelling in BFS order keeps the returned `transitioned` slice
+        // identical to the in-memory reference store.
+        //
+        // Unlike Postgres (READ COMMITTED row locks), `begin()` here
+        // takes the database write lock up front (`BEGIN IMMEDIATE`),
+        // so no concurrent writer can settle any of these rows between
+        // this snapshot and the UPDATEs below — the snapshot IS the
+        // transaction's consistent view. Two racing `cancel_tree`
+        // calls fully serialize: the loser's snapshot already sees
+        // terminal rows and it transitions / emits nothing. A
+        // Postgres-style locked re-read would re-read identical data,
+        // so this backend intentionally uses snapshot-driven
+        // transitions (pinned by the
+        // `conformance_sqlite_concurrent_cancels_single_marker` race
+        // test).
+        let all_tasks = Self::collect_subtree_tx(tx, root_id).await?;
+        let candidate_threads: std::collections::HashSet<ThreadId> = all_tasks
+            .iter()
+            .map(|task| task.thread_id.clone())
+            .collect();
+        let mut fenced_threads = std::collections::HashSet::new();
+        for thread_id in candidate_threads {
+            if Self::get_thread_tx(tx, &thread_id)
+                .await?
+                .is_some_and(|thread| thread.status.is_purge_fenced())
+            {
+                fenced_threads.insert(thread_id);
+            }
+        }
+
+        let mut transitioned = Vec::with_capacity(all_tasks.len());
+        // Track cancelled root-turn roots (and their threads) so we can
+        // wake their linked invocations and promote queued successors.
+        let mut cancelled_root_ids: Vec<AgentTaskId> = Vec::new();
+        let mut cancelled_root_threads: Vec<ThreadId> = Vec::new();
+        // Terminal `Cancelled` markers: one per blocking root this
+        // call transitions (pre-cancel occupant of its thread's
+        // active-root slot), on that root's OWN thread —
+        // cascade-cancelled child-thread roots included, queued roots
+        // never. Atomic with the cancel transitions: a crash can
+        // neither lose the marker nor emit it without the
+        // cancellation, and an idempotent retry (terminal tree) emits
+        // nothing.
+        let mut markers: Vec<CommittedEvent> = Vec::new();
+        for row in all_tasks {
+            let Some(reason) = cancel_reason(scope, root_id, &row) else {
+                continue;
+            };
+            let is_root_turn_root = row.kind == TaskKind::RootTurn && row.is_root();
+            let thread_id = row.thread_id.clone();
+            if is_root_turn_root && row.status.blocks_root_admission() {
+                let continuation_usage = row
+                    .state
+                    .continuation()
+                    .map(|continuation| continuation.payload.total_usage.clone());
+                let committed = Self::insert_cancelled_marker_tx(
+                    tx,
+                    &thread_id,
+                    &row.id,
+                    continuation_usage,
+                    reason.clone(),
+                    now,
+                )
+                .await?;
+                markers.push(committed);
+            }
+            let cancelled = row
+                .cancel_with_reason(reason, now)
+                .context("cancel_tree: cancel transition failed")?;
+            Self::update_task_tx(tx, &cancelled).await?;
+            if is_root_turn_root {
+                cancelled_root_ids.push(cancelled.id.clone());
+                cancelled_root_threads.push(thread_id);
+            }
+            transitioned.push(cancelled.id);
+        }
+
+        // Phase 7.6: wake linked SubagentInvocation tasks that were
+        // WaitingOnChildren on a now-cancelled child root. This
+        // mirrors the in-memory store's resume_linked_subagent_invocation.
+        // The woken invocation transitions to Pending (not Cancelled),
+        // so it must NOT be added to the transitioned vec.
+        for cancelled_child_root in &cancelled_root_ids {
+            Self::resume_linked_subagent_invocation_tx(tx, cancelled_child_root, now).await?;
+        }
+
+        // Each cancelled root frees its thread's active-root slot; promote
+        // the next queued root in the same transaction (emitting its
+        // durable wakeup) so cancelling the active root never strands its
+        // queued successors.
+        for thread_id in &cancelled_root_threads {
+            if !fenced_threads.contains(thread_id) {
+                Self::promote_next_queued_root_tx(tx, thread_id, now).await?;
+            }
+        }
+
+        // Mid-tree cancel: when the cancelled subtree hangs under a
+        // parent OUTSIDE the subtree (e.g. the host's subagent-deadline
+        // sweep cancelling a parked root's tool children), recompute
+        // that parked parent's pending_child_count so it resumes —
+        // mirroring the in-memory store, whose per-row cancel
+        // propagates every terminal transition to the row's parent.
+        // Only the subtree's TOP row can have an out-of-subtree parent
+        // (every deeper row's parent lies inside the subtree and is
+        // itself cancelled), so one propagation suffices.
+        if transitioned.first().is_some_and(|id| id == root_id)
+            && let Some(cancelled_top) = Self::load_task_tx(tx, root_id).await?
+            && cancelled_top.parent_id.is_some()
+        {
+            Self::propagate_terminal_to_parent_tx(tx, &cancelled_top, now, "cancel_tree").await?;
+        }
+
+        Ok(CancelTreeOutcome {
+            transitioned,
+            markers,
+        })
+    }
+
     async fn begin(&self) -> Result<Transaction<'_, Sqlite>> {
         // BEGIN IMMEDIATE acquires the RESERVED lock up front so that
         // under WAL mode we fail fast with plain SQLITE_BUSY (which
@@ -1481,6 +1641,7 @@ LIMIT 1
             // `execute_subagent_task` never runs and the parent
             // thread's `SubagentProgress { completed: true }` event
             // never fires. UI surfaces stay in `Running` forever.
+            Self::release_undelivered_input_tx(tx, &new_child, now).await?;
             let resumed =
                 Self::resume_linked_subagent_invocation_tx(tx, &new_child.id, now).await?;
             // Crash-safe queued-root promotion: a terminal root frees the
@@ -1521,6 +1682,7 @@ LIMIT 1
             // transaction so a sweep-failed root never strands its
             // queued successors.
             if child.kind == TaskKind::RootTurn && child.is_root() {
+                Self::release_undelivered_input_tx(tx, child, now).await?;
                 Self::resume_linked_subagent_invocation_tx(tx, &child.id, now).await?;
                 Self::promote_next_queued_root_tx(tx, &child.thread_id, now).await?;
             }
@@ -1555,7 +1717,12 @@ LIMIT 1
         reason: FailureReason,
         now: OffsetDateTime,
         error_prefix: &str,
-    ) -> Result<()> {
+    ) -> Result<CancelTreeOutcome> {
+        let settled = if old.kind == TaskKind::RootTurn && old.is_root() {
+            Self::cancel_scoped_tx(tx, &old.id, CancelScope::Descendants, now).await?
+        } else {
+            CancelTreeOutcome::default()
+        };
         let failed = old
             .clone()
             .fail_with_reason(reason, now)
@@ -1573,7 +1740,62 @@ LIMIT 1
             )
             .await?;
         }
-        Self::propagate_terminal_to_parent_tx(tx, &failed, now, error_prefix).await
+        Self::propagate_terminal_to_parent_tx(tx, &failed, now, error_prefix).await?;
+        Ok(settled)
+    }
+
+    /// Settle the input injections `root` never delivered, inside the
+    /// transaction that ended it and before its thread's queue head is
+    /// promoted (see [`release_undelivered_input`]).
+    async fn release_undelivered_input_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        root: &AgentTask,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        if !settles_undelivered_input(root) {
+            return Ok(());
+        }
+        let records = sqlx::query_as::<_, TaskRecord>(concat!(
+            "SELECT ",
+            task_columns!(),
+            " FROM agent_sdk_tasks \
+             WHERE parent_id = ?1 AND kind = 'input_injection' AND status = 'queued' \
+             ORDER BY created_at, id",
+        ))
+        .bind(root.id.as_str())
+        .fetch_all(&mut **tx)
+        .await
+        .with_context(|| format!("load undelivered input of {}", root.id))?;
+        if records.is_empty() {
+            return Ok(());
+        }
+        let thread_open = Self::get_thread_tx(tx, &root.thread_id)
+            .await?
+            .is_none_or(|thread| thread.require_active(ThreadOperation::Submit).is_ok());
+        let hand_over = thread_open && !Self::links_child_thread_root_tx(tx, &root.id).await?;
+        for record in records {
+            let released = release_undelivered_input(AgentTask::try_from(record)?, hand_over, now)?;
+            Self::update_task_tx(tx, &released.injection).await?;
+            if let Some(next_turn) = &released.next_turn {
+                Self::insert_task_tx(tx, next_turn).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `root` is a subagent's child-thread root: some invocation
+    /// links it, whatever that invocation's status (see
+    /// [`release_undelivered_input`]).
+    async fn links_child_thread_root_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        root: &AgentTaskId,
+    ) -> Result<bool> {
+        let root_id = root.as_str();
+        let linked = sqlx::query_file_scalar!("src/sqlite/links_child_thread_root.sql", root_id)
+            .fetch_one(&mut **tx)
+            .await
+            .with_context(|| format!("look up the invocation linking {root}"))?;
+        Ok(linked)
     }
 
     /// Phase 7.6: find a `Subagent` invocation task that is
@@ -3257,7 +3479,8 @@ impl AgentTaskStore for SqliteDurableStore {
         match classify_recovery(&old, RecoveryContext::AcquisitionAttempt) {
             RecoveryAction::NoAction => {}
             RecoveryAction::FailClosed(reason) => {
-                Self::fail_closed_tx(&mut tx, &old, reason, now, "try_acquire_task").await?;
+                let _settled =
+                    Self::fail_closed_tx(&mut tx, &old, reason, now, "try_acquire_task").await?;
                 tx.commit().await.context("commit fail-closed acquire")?;
                 return Ok(None);
             }
@@ -3327,8 +3550,9 @@ impl AgentTaskStore for SqliteDurableStore {
                     return Ok(Some(claimed));
                 }
                 RecoveryAction::FailClosed(reason) => {
-                    Self::fail_closed_tx(&mut tx, &old, reason, now, "acquire_next_runnable")
-                        .await?;
+                    let _settled =
+                        Self::fail_closed_tx(&mut tx, &old, reason, now, "acquire_next_runnable")
+                            .await?;
                     tx.commit()
                         .await
                         .context("commit fail-closed runnable head")?;
@@ -3450,7 +3674,13 @@ impl AgentTaskStore for SqliteDurableStore {
 
         let mut released = Vec::with_capacity(expired.len());
         for record in expired {
-            let old = AgentTask::try_from(record)?;
+            let Some(old) = Self::load_task_tx(&mut tx, &AgentTask::try_from(record)?.id).await?
+            else {
+                continue;
+            };
+            if old.status.is_terminal() {
+                continue;
+            }
             if old.status != TaskStatus::Running {
                 let status = old.status;
                 return Err(anyhow!(
@@ -3468,9 +3698,10 @@ impl AgentTaskStore for SqliteDurableStore {
                     RecoveryRecord::requeued(old.id.clone())
                 }
                 RecoveryAction::FailClosed(reason) => {
-                    Self::fail_closed_tx(&mut tx, &old, reason, now, "release_expired_leases")
-                        .await?;
-                    RecoveryRecord::failed_closed(old.id.clone(), reason)
+                    let settled =
+                        Self::fail_closed_tx(&mut tx, &old, reason, now, "release_expired_leases")
+                            .await?;
+                    RecoveryRecord::failed_closed(old.id.clone(), reason).with_settled(settled)
                 }
                 RecoveryAction::NoAction => {
                     return Err(anyhow!(
@@ -4157,6 +4388,14 @@ impl AgentTaskStore for SqliteDurableStore {
         records.into_iter().map(TryInto::try_into).collect()
     }
 
+    async fn list_terminal_roots_with_live_descendants(&self) -> Result<Vec<AgentTaskId>> {
+        let roots = sqlx::query_file_scalar!("src/sqlite/terminal_roots_with_live_descendants.sql")
+            .fetch_all(&self.pool)
+            .await
+            .context("list terminal roots with live descendants")?;
+        Ok(roots.into_iter().map(AgentTaskId::from_string).collect())
+    }
+
     async fn complete_task(
         &self,
         child_id: &AgentTaskId,
@@ -4256,142 +4495,19 @@ impl AgentTaskStore for SqliteDurableStore {
         root_id: &AgentTaskId,
         now: OffsetDateTime,
     ) -> Result<CancelTreeOutcome> {
-        let mut tx = self.begin().await?;
-        let Some(_) = Self::load_task_tx(&mut tx, root_id).await? else {
-            return Err(anyhow!(
-                "cancel_tree rejected: task {root_id} does not exist"
-            ));
-        };
+        self.cancel_scoped(root_id, CancelScope::Tree, None, now)
+            .await
+    }
 
-        // Collect the given task + descendants (mirror in-memory
-        // `collect_subtree`: children-BFS, root-first, following
-        // SubagentInvocation linkage across threads). A mid-tree id
-        // cancels only its own subtree instead of no-opping on a
-        // `root_id = $1` scan. SQLite serializes writers via
-        // BEGIN IMMEDIATE, so there is no lock-order deadlock to avoid;
-        // cancelling in BFS order keeps the returned `transitioned` slice
-        // identical to the in-memory reference store.
-        //
-        // Unlike Postgres (READ COMMITTED row locks), `begin()` here
-        // takes the database write lock up front (`BEGIN IMMEDIATE`),
-        // so no concurrent writer can settle any of these rows between
-        // this snapshot and the UPDATEs below — the snapshot IS the
-        // transaction's consistent view. Two racing `cancel_tree`
-        // calls fully serialize: the loser's snapshot already sees
-        // terminal rows and it transitions / emits nothing. A
-        // Postgres-style locked re-read would re-read identical data,
-        // so this backend intentionally uses snapshot-driven
-        // transitions (pinned by the
-        // `conformance_sqlite_concurrent_cancels_single_marker` race
-        // test).
-        let all_tasks = Self::collect_subtree_tx(&mut tx, root_id).await?;
-        let candidate_threads: std::collections::HashSet<ThreadId> = all_tasks
-            .iter()
-            .map(|task| task.thread_id.clone())
-            .collect();
-        let mut fenced_threads = std::collections::HashSet::new();
-        for thread_id in candidate_threads {
-            if Self::get_thread_tx(&mut tx, &thread_id)
-                .await?
-                .is_some_and(|thread| thread.status.is_purge_fenced())
-            {
-                fenced_threads.insert(thread_id);
-            }
-        }
-
-        let mut transitioned = Vec::with_capacity(all_tasks.len());
-        // Track cancelled root-turn roots (and their threads) so we can
-        // wake their linked invocations and promote queued successors.
-        let mut cancelled_root_ids: Vec<AgentTaskId> = Vec::new();
-        let mut cancelled_root_threads: Vec<ThreadId> = Vec::new();
-        // Terminal `Cancelled` markers: one per blocking root this
-        // call transitions (pre-cancel occupant of its thread's
-        // active-root slot), on that root's OWN thread —
-        // cascade-cancelled child-thread roots included, queued roots
-        // never. Atomic with the cancel transitions: a crash can
-        // neither lose the marker nor emit it without the
-        // cancellation, and an idempotent retry (terminal tree) emits
-        // nothing.
-        let mut markers: Vec<CommittedEvent> = Vec::new();
-        for row in all_tasks {
-            if row.status.is_terminal() {
-                continue;
-            }
-            let is_root_turn_root = row.kind == TaskKind::RootTurn && row.is_root();
-            let thread_id = row.thread_id.clone();
-            let reason = if row.id == *root_id {
-                TerminalReason::UserCancel
-            } else {
-                TerminalReason::ParentCancelled
-            };
-            if is_root_turn_root && row.status.blocks_root_admission() {
-                let continuation_usage = row
-                    .state
-                    .continuation()
-                    .map(|continuation| continuation.payload.total_usage.clone());
-                let committed = Self::insert_cancelled_marker_tx(
-                    &mut tx,
-                    &thread_id,
-                    &row.id,
-                    continuation_usage,
-                    reason.clone(),
-                    now,
-                )
-                .await?;
-                markers.push(committed);
-            }
-            let cancelled = row
-                .cancel_with_reason(reason, now)
-                .context("cancel_tree: cancel transition failed")?;
-            Self::update_task_tx(&mut tx, &cancelled).await?;
-            if is_root_turn_root {
-                cancelled_root_ids.push(cancelled.id.clone());
-                cancelled_root_threads.push(thread_id);
-            }
-            transitioned.push(cancelled.id);
-        }
-
-        // Phase 7.6: wake linked SubagentInvocation tasks that were
-        // WaitingOnChildren on a now-cancelled child root. This
-        // mirrors the in-memory store's resume_linked_subagent_invocation.
-        // The woken invocation transitions to Pending (not Cancelled),
-        // so it must NOT be added to the transitioned vec.
-        for cancelled_child_root in &cancelled_root_ids {
-            Self::resume_linked_subagent_invocation_tx(&mut tx, cancelled_child_root, now).await?;
-        }
-
-        // Each cancelled root frees its thread's active-root slot; promote
-        // the next queued root in the same transaction (emitting its
-        // durable wakeup) so cancelling the active root never strands its
-        // queued successors.
-        for thread_id in &cancelled_root_threads {
-            if !fenced_threads.contains(thread_id) {
-                Self::promote_next_queued_root_tx(&mut tx, thread_id, now).await?;
-            }
-        }
-
-        // Mid-tree cancel: when the cancelled subtree hangs under a
-        // parent OUTSIDE the subtree (e.g. the host's subagent-deadline
-        // sweep cancelling a parked root's tool children), recompute
-        // that parked parent's pending_child_count so it resumes —
-        // mirroring the in-memory store, whose per-row cancel
-        // propagates every terminal transition to the row's parent.
-        // Only the subtree's TOP row can have an out-of-subtree parent
-        // (every deeper row's parent lies inside the subtree and is
-        // itself cancelled), so one propagation suffices.
-        if transitioned.first().is_some_and(|id| id == root_id)
-            && let Some(cancelled_top) = Self::load_task_tx(&mut tx, root_id).await?
-            && cancelled_top.parent_id.is_some()
-        {
-            Self::propagate_terminal_to_parent_tx(&mut tx, &cancelled_top, now, "cancel_tree")
-                .await?;
-        }
-
-        tx.commit().await.context("commit cancel_tree")?;
-        Ok(CancelTreeOutcome {
-            transitioned,
-            markers,
-        })
+    async fn cancel_descendants_of_owned(
+        &self,
+        parent: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        now: OffsetDateTime,
+    ) -> Result<CancelTreeOutcome> {
+        self.cancel_scoped(parent, CancelScope::Descendants, Some((worker, lease)), now)
+            .await
     }
 
     async fn resume_from_confirmation(
@@ -4411,8 +4527,8 @@ impl AgentTaskStore for SqliteDurableStore {
         }
         let (resumed, prepared_operation) = old
             .clone()
-            .resume_from_confirmation(now)
-            .context("resume rejected: resume_from_confirmation transition failed")?;
+            .approve_confirmation_for_pickup(now)
+            .context("resume rejected: approve_confirmation_for_pickup transition failed")?;
         Self::update_task_tx(&mut tx, &resumed).await?;
         tx.commit()
             .await
@@ -4467,7 +4583,7 @@ impl AgentTaskStore for SqliteDurableStore {
         }
         let failed = old
             .clone()
-            .fail_with_terminal_reason(error, TerminalReason::ConfirmationRejected, now)
+            .reject_confirmation(error, now)
             .context("reject_confirmation: fail transition failed")?;
         Self::update_task_tx(&mut tx, &failed).await?;
 
@@ -8897,6 +9013,86 @@ mod input_injection_migration_test {
             .await?
             .context("injection survives as cancelled journal row")?;
         assert_eq!(cancelled.status, TaskStatus::Cancelled);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod orphan_listing_plan_test {
+    use super::*;
+
+    /// Retained history dwarfing the live rows: 400 finished tasks and one
+    /// live child under a finished root.
+    const SKEWED_HISTORY: &str = r#"
+INSERT INTO agent_sdk_threads (thread_id, status, committed_turns, total_input_tokens, total_output_tokens, created_at, updated_at)
+VALUES ('plan', 'active', 0, 0, 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 199)
+INSERT INTO agent_sdk_tasks (id, kind, status, parent_id, root_id, depth, thread_id, attempt, max_attempts, terminal_reason_json, created_at, updated_at, completed_at)
+SELECT printf('root-%04d', i), 'root_turn', 'completed', NULL, printf('root-%04d', i), 0, 'plan', 1, 3, '{"kind":"completed"}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z' FROM n;
+WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 199)
+INSERT INTO agent_sdk_tasks (id, kind, status, parent_id, root_id, depth, thread_id, attempt, max_attempts, terminal_reason_json, created_at, updated_at, completed_at)
+SELECT printf('done-%04d', i), 'tool_runtime', 'completed', printf('root-%04d', i), printf('root-%04d', i), 1, 'plan', 1, 3, '{"kind":"completed"}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z' FROM n;
+INSERT INTO agent_sdk_tasks (id, kind, status, parent_id, root_id, depth, thread_id, attempt, max_attempts, created_at, updated_at)
+VALUES ('live-0007', 'tool_runtime', 'pending', 'root-0007', 'root-0007', 1, 'plan', 0, 3, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+"#;
+
+    async fn plan(store: &SqliteDurableStore) -> Result<Vec<String>> {
+        let steps: Vec<(i64, i64, i64, String)> = sqlx::query_as(concat!(
+            "EXPLAIN QUERY PLAN ",
+            include_str!("terminal_roots_with_live_descendants.sql"),
+        ))
+        .fetch_all(&store.pool)
+        .await?;
+        Ok(steps.into_iter().map(|(_, _, _, detail)| detail).collect())
+    }
+
+    fn assert_reads_only_live_rows(plan: &[String], label: &str) {
+        assert!(
+            plan.iter()
+                .any(|step| step.starts_with("SEARCH descendant") && step.contains("(status=?)")),
+            "{label}: the listing must look the live rows up by status, not scan the history: \
+             {plan:?}",
+        );
+    }
+
+    /// The child-thread link a root's undelivered input is classified by
+    /// is read through an index, never a scan of every task.
+    #[tokio::test]
+    async fn child_thread_link_is_looked_up_through_an_index() -> Result<()> {
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+        let steps: Vec<(i64, i64, i64, String)> = sqlx::query_as(concat!(
+            "EXPLAIN QUERY PLAN ",
+            include_str!("links_child_thread_root.sql"),
+        ))
+        .fetch_all(&store.pool)
+        .await?;
+        let plan: Vec<String> = steps.into_iter().map(|(_, _, _, detail)| detail).collect();
+        assert!(
+            plan.iter()
+                .any(|step| step.starts_with("SEARCH agent_sdk_tasks USING")),
+            "the link must be searched through an index, not scanned: {plan:?}",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn orphan_listing_reads_only_the_live_rows_with_and_without_statistics() -> Result<()> {
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+        sqlx::raw_sql(SKEWED_HISTORY).execute(&store.pool).await?;
+        assert_reads_only_live_rows(&plan(&store).await?, "without statistics");
+
+        sqlx::query("ANALYZE").execute(&store.pool).await?;
+        assert_reads_only_live_rows(&plan(&store).await?, "after ANALYZE");
+
+        sqlx::raw_sql("DELETE FROM sqlite_stat4; ANALYZE sqlite_schema;")
+            .execute(&store.pool)
+            .await?;
+        assert_reads_only_live_rows(&plan(&store).await?, "with averaged statistics only");
+
+        assert_eq!(
+            store.list_terminal_roots_with_live_descendants().await?,
+            vec![AgentTaskId::from_string("root-0007")],
+        );
         Ok(())
     }
 }

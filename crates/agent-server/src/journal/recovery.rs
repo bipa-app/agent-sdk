@@ -102,6 +102,7 @@
 use agent_sdk_foundation::events::{AgentEvent, TerminalReason};
 use serde::{Deserialize, Serialize};
 
+use super::store::CancelTreeOutcome;
 use super::task::{AgentTask, AgentTaskId, TaskKind, TaskStatus};
 
 /// Canonical fail-closed reasons written on Phase 2.5 recovery
@@ -277,13 +278,38 @@ impl RecoveryAction {
 /// the caller can distinguish "requeued for another attempt" from
 /// "failed closed because the budget was used up" without a second
 /// round trip to `get()`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct RecoveryRecord {
     /// The id of the row the sweep touched.
     pub id: AgentTaskId,
     /// What Phase 2.5 did with the row.
     pub action: RecoveryAction,
+    /// What a root's fail-close settled in the same step: its live
+    /// descendants, cancelled before its successor was promoted, and the
+    /// closing markers committed on their child threads. The caller trips
+    /// their confirmation drives and wakes same-process followers. Empty
+    /// for a requeue or a row that is not a root.
+    pub settled: CancelTreeOutcome,
 }
+
+impl PartialEq for RecoveryRecord {
+    fn eq(&self, other: &Self) -> bool {
+        let marker_ids = |record: &Self| {
+            record
+                .settled
+                .markers
+                .iter()
+                .map(|marker| marker.event_id)
+                .collect::<Vec<_>>()
+        };
+        self.id == other.id
+            && self.action == other.action
+            && self.settled.transitioned == other.settled.transitioned
+            && marker_ids(self) == marker_ids(other)
+    }
+}
+
+impl Eq for RecoveryRecord {}
 
 impl RecoveryRecord {
     /// Construct a record for a row that was requeued.
@@ -292,6 +318,10 @@ impl RecoveryRecord {
         Self {
             id,
             action: RecoveryAction::Requeue,
+            settled: CancelTreeOutcome {
+                transitioned: Vec::new(),
+                markers: Vec::new(),
+            },
         }
     }
 
@@ -302,7 +332,18 @@ impl RecoveryRecord {
         Self {
             id,
             action: RecoveryAction::FailClosed(reason),
+            settled: CancelTreeOutcome {
+                transitioned: Vec::new(),
+                markers: Vec::new(),
+            },
         }
+    }
+
+    /// This record with what the row's fail-close settled.
+    #[must_use]
+    pub fn with_settled(mut self, settled: CancelTreeOutcome) -> Self {
+        self.settled = settled;
+        self
     }
 }
 

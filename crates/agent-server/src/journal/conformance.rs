@@ -477,6 +477,9 @@ mod in_memory_bundle {
         async fn list_parked_subagent_invocations(&self) -> Result<Vec<AgentTask>> {
             self.task.list_parked_subagent_invocations().await
         }
+        async fn list_terminal_roots_with_live_descendants(&self) -> Result<Vec<AgentTaskId>> {
+            self.task.list_terminal_roots_with_live_descendants().await
+        }
         async fn complete_task(
             &self,
             task_id: &AgentTaskId,
@@ -529,6 +532,17 @@ mod in_memory_bundle {
             now: OffsetDateTime,
         ) -> Result<crate::journal::store::CancelTreeOutcome> {
             self.task.cancel_tree(root_id, now).await
+        }
+        async fn cancel_descendants_of_owned(
+            &self,
+            parent: &AgentTaskId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+            now: OffsetDateTime,
+        ) -> Result<crate::journal::store::CancelTreeOutcome> {
+            self.task
+                .cancel_descendants_of_owned(parent, worker, lease, now)
+                .await
         }
         async fn resume_from_confirmation(
             &self,

@@ -904,6 +904,136 @@ pub const fn resolve_injection_parent(
     }
 }
 
+/// What a cancel covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelScope {
+    /// The top row and everything under it: a user's stop.
+    Tree,
+    /// Everything under the top row, but not the top row itself nor the
+    /// input injections waiting on it: a failing root's settlement before
+    /// its own terminal transition.
+    Descendants,
+}
+
+/// The reason a cancel of `scope` from `top` cancels `row` with, or `None`
+/// when it leaves `row` alone. Shared by every backend so the scopes mean
+/// the same thing on each.
+#[must_use]
+pub fn cancel_reason(
+    scope: CancelScope,
+    top: &AgentTaskId,
+    row: &AgentTask,
+) -> Option<TerminalReason> {
+    if row.status.is_terminal() {
+        return None;
+    }
+    match scope {
+        CancelScope::Tree => Some(if row.id == *top {
+            TerminalReason::UserCancel
+        } else {
+            TerminalReason::ParentCancelled
+        }),
+        CancelScope::Descendants => {
+            let waiting_on_top =
+                row.kind == TaskKind::InputInjection && row.parent_id.as_ref() == Some(top);
+            (row.id != *top && !waiting_on_top).then_some(TerminalReason::ParentCancelled)
+        }
+    }
+}
+
+/// Whether `task` is running under `worker` and `lease`.
+#[must_use]
+pub fn is_owned_by(task: &AgentTask, worker: &WorkerId, lease: &LeaseId) -> bool {
+    task.status == TaskStatus::Running
+        && task.worker_id.as_ref() == Some(worker)
+        && task.lease_id.as_ref() == Some(lease)
+}
+
+/// Whether `root`'s terminal transition settles its undelivered input.
+///
+/// True once a root turn completed or failed. A cancelled root's input is
+/// cancelled with the rest of its tree by the cancel itself.
+#[must_use]
+pub const fn settles_undelivered_input(root: &AgentTask) -> bool {
+    match root.status {
+        TaskStatus::Completed | TaskStatus::Failed => root.kind.is_root() && root.is_root(),
+        TaskStatus::Cancelled
+        | TaskStatus::Queued
+        | TaskStatus::Pending
+        | TaskStatus::Running
+        | TaskStatus::WaitingOnChildren
+        | TaskStatus::AwaitingConfirmation
+        | TaskStatus::AwaitingQuestion => false,
+    }
+}
+
+/// Whether an ending root's thread still admits new turns, which decides if
+/// the root's undelivered input may become one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThreadAdmission {
+    Open,
+    Fenced,
+}
+
+/// The rows one undelivered input injection of an ended root becomes.
+#[derive(Debug)]
+pub struct ReleasedInput {
+    /// The injection, completed when handed over, otherwise cancelled.
+    pub injection: AgentTask,
+    /// The thread's next turn carrying the input, when handed over.
+    pub next_turn: Option<AgentTask>,
+}
+
+/// Settle one undelivered input injection of a root that just completed or
+/// failed (see [`settles_undelivered_input`]).
+///
+/// Under a top-level root on a thread still open to submissions
+/// (`hand_over`), the input becomes the thread's next turn and the injection
+/// completes as handed over. Under a child-thread root it is cancelled with
+/// the root's tree: nothing awaits a later turn on a subagent's thread, so a
+/// turn there would run unowned beside the parent. A root is a child-thread
+/// root when some subagent invocation links it — a plain read of the link,
+/// never the outcome of waking the invocation, which a concurrent lock on
+/// the invocation's row can skip. On a thread being purged the input is
+/// cancelled too.
+///
+/// Every backend applies this inside the root's terminal transition, before
+/// the thread's next queued root is promoted, so the handed-over turn takes
+/// its place in the queue by its submission time and no terminal root is
+/// left holding live input. Input that cannot become a turn is cancelled
+/// rather than blocking the transition.
+///
+/// # Errors
+/// Returns an error if `injection` is not a queued input injection.
+pub fn release_undelivered_input(
+    injection: AgentTask,
+    hand_over: bool,
+    now: OffsetDateTime,
+) -> Result<ReleasedInput> {
+    if hand_over {
+        match injection.next_turn_from_undelivered_input() {
+            Ok(next_turn) => {
+                return Ok(ReleasedInput {
+                    injection: injection
+                        .complete_input_injection(now)
+                        .context("hand over undelivered input")?,
+                    next_turn: Some(next_turn),
+                });
+            }
+            Err(error) => log::warn!(
+                "cancelling undelivered input {}: it cannot become the next turn: {error}",
+                injection.id,
+            ),
+        }
+    }
+    Ok(ReleasedInput {
+        injection: injection
+            .cancel_with_reason(TerminalReason::ParentCancelled, now)
+            .context("cancel undelivered input")?,
+        next_turn: None,
+    })
+}
+
 /// Shared shape gate for root-turn admission.
 ///
 /// Both [`AgentTaskStore::submit_root_turn`] and
@@ -1488,6 +1618,14 @@ pub fn apply_question_answer(
 /// | [`reject_confirmation`](Self::reject_confirmation) | `AwaitingConfirmation` → `Failed` + parent recompute | status CAS |
 /// | [`cancel_tree`](Self::cancel_tree) | subtree → `Cancelled` | existence check |
 /// | [`release_expired_leases`](Self::release_expired_leases) | `Running` → `Pending` / `Failed` | lease-expiry CAS, recovery matrix |
+///
+/// ## A root's undelivered input
+///
+/// Every transition that ends a root turn as `Completed` or `Failed` —
+/// owner CAS or store-side fail-close — settles the input injections it
+/// never delivered in the same atomic step, before the thread's next
+/// queued root is promoted (see [`release_undelivered_input`]). No
+/// terminal root is ever left holding live input.
 
 #[async_trait]
 pub trait AgentTaskStore: Send + Sync {
@@ -1800,7 +1938,10 @@ pub trait AgentTaskStore: Send + Sync {
     ///   [`super::recovery::classify_recovery`] before returning, so
     ///   the caller sees the same `None` it would see for any other
     ///   non-runnable row and the worker pool is never poisoned by a
-    ///   row that will never make progress.
+    ///   row that will never make progress. A root turn failed closed
+    ///   here settles its live descendants in the same transition, as
+    ///   in [`AgentTaskStore::release_expired_leases`], but they are
+    ///   not reported back.
     /// - Returns `Err` only on true store-level failures: validation
     ///   errors or downstream write errors.
     ///
@@ -1943,11 +2084,16 @@ pub trait AgentTaskStore: Send + Sync {
     ///   (`UnsafePreparedOperationRecovery`) both take this path,
     ///   so the journal never enters an endless requeue loop and
     ///   never risks double-executing an in-flight external
-    ///   operation.
+    ///   operation. A root turn's fail-close cancels its live
+    ///   descendants with [`TerminalReason::ParentCancelled`] in the
+    ///   same transition, before its thread's next queued turn is
+    ///   promoted, and reports them in [`RecoveryRecord::settled`].
     ///
     /// Returns one [`RecoveryRecord`] per swept row in expiry order
     /// so callers can log and react per-outcome without a second
-    /// round trip to `get()`.
+    /// round trip to `get()`. A row a root's fail-close settles in the
+    /// same call is listed in that root's record, and has a record of its
+    /// own only if the store reached it first.
     ///
     /// Each call reclaims at most [`LEASE_RELEASE_BATCH`] rows (in
     /// expiry order) so a mass worker outage cannot turn one sweep
@@ -1957,7 +2103,10 @@ pub trait AgentTaskStore: Send + Sync {
     ///
     /// # Errors
     /// Returns an error if a release or fail-closed transition, or
-    /// the underlying store write, fails.
+    /// the underlying store write, fails. A store that commits a root's
+    /// fail-close apart from the rest of the call instead logs that
+    /// root's failure and returns the records it did commit; the root
+    /// stays expired for the next call.
     async fn release_expired_leases(&self, now: OffsetDateTime) -> Result<Vec<RecoveryRecord>>;
 
     /// Return a `Running` row this worker still owns to the runnable
@@ -2492,6 +2641,18 @@ pub trait AgentTaskStore: Send + Sync {
     /// Returns an error only for store-level read failures.
     async fn list_parked_subagent_invocations(&self) -> Result<Vec<AgentTask>>;
 
+    /// The ids of every terminal root that still owns a live (non-terminal)
+    /// descendant, each once, in id order.
+    ///
+    /// The candidate feed for the host's orphan settlement, which runs on
+    /// every sweep tick: it is driven from the live rows and returns ids
+    /// only, so its cost tracks the live work rather than the retained
+    /// terminal history, and no row payload is decoded.
+    ///
+    /// # Errors
+    /// Returns an error only for store-level read failures.
+    async fn list_terminal_roots_with_live_descendants(&self) -> Result<Vec<AgentTaskId>>;
+
     /// Transition a running child to [`TaskStatus::Completed`] and,
     /// under the same write lock, recompute the parent's
     /// `pending_child_count` from the live-children index so the
@@ -2697,6 +2858,29 @@ pub trait AgentTaskStore: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<CancelTreeOutcome>;
 
+    /// Cancel every live row under `parent`, a task still running under
+    /// `worker` and `lease`, leaving `parent` itself and the input
+    /// injections waiting on it untouched (see [`cancel_reason`]).
+    ///
+    /// The settlement a failing root runs before its own terminal
+    /// transition, so the turn that transition promotes never finds them
+    /// live. Every cancelled row gets [`TerminalReason::ParentCancelled`];
+    /// child-thread roots reached through a subagent invocation are
+    /// cancelled with their closing marker and their threads' queues
+    /// promote, as in [`Self::cancel_tree`]. `parent` keeps its thread's
+    /// slot.
+    ///
+    /// # Errors
+    /// Returns an error, cancelling nothing, when `parent` is not running
+    /// under `worker` and `lease`, or when the cascade is rejected.
+    async fn cancel_descendants_of_owned(
+        &self,
+        parent: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        now: OffsetDateTime,
+    ) -> Result<CancelTreeOutcome>;
+
     /// Resume a [`TaskStatus::AwaitingConfirmation`] task back to
     /// [`TaskStatus::Pending`], atomically extracting the prepared
     /// listen/execute operation and clearing the typed
@@ -2709,6 +2893,9 @@ pub trait AgentTaskStore: Send + Sync {
     /// non-listen tools). Both are extracted under a single write
     /// lock so there is no window for a concurrent rejection to
     /// invalidate the snapshot.
+    ///
+    /// The resumed row's pickup continues the attempt that paused rather
+    /// than spending a new one (see [`AgentTask::approve_confirmation_for_pickup`]).
     ///
     /// # Errors
     /// - `task does not exist` — if no row with `id` is stored.
@@ -2992,6 +3179,145 @@ impl InMemoryAgentTaskStore {
         self
     }
 
+    /// [`AgentTaskStore::cancel_tree`] over `scope`, refused unless `owner`
+    /// (when given) still holds `root_id`.
+    async fn cancel_scoped(
+        &self,
+        root_id: &AgentTaskId,
+        scope: CancelScope,
+        owner: Option<(&WorkerId, &LeaseId)>,
+        now: OffsetDateTime,
+    ) -> Result<CancelTreeOutcome> {
+        let mut inner = self.inner.write().await;
+
+        let Some(top) = inner.by_id.get(root_id) else {
+            return Err(anyhow!(
+                "cancel_tree rejected: task {root_id} does not exist"
+            ));
+        };
+        if let Some((worker, lease)) = owner
+            && !is_owned_by(top, worker, lease)
+        {
+            return Err(anyhow!(
+                "cancel rejected: task {root_id} is not running under this worker and lease"
+            ));
+        }
+        let outcome = self
+            .cancel_scoped_locked(&mut inner, root_id, scope, now)
+            .await?;
+        drop(inner);
+        Ok(outcome)
+    }
+
+    /// The body of [`Self::cancel_scoped`], under the caller's write lock.
+    async fn cancel_scoped_locked(
+        &self,
+        inner: &mut Inner,
+        root_id: &AgentTaskId,
+        scope: CancelScope,
+        now: OffsetDateTime,
+    ) -> Result<CancelTreeOutcome> {
+        // Snapshot the subtree ids under the write lock and then
+        // walk them in BFS order. The cancel transition is pure and
+        // does not mutate `by_parent`, so the snapshot stays
+        // consistent for the duration of the sweep even though we
+        // are holding a mutable borrow of `inner`.
+        //
+        // The snapshot, every transition, and the
+        // marker gating all run under this one write lock, so no
+        // concurrent writer can settle a row mid-sweep (and
+        // `cancel_row_in_place` re-reads `by_id` for each id anyway) —
+        // this backend is immune to the stale-snapshot race the
+        // Postgres path had to close with locked re-reads.
+        let subtree = inner.collect_subtree(root_id);
+
+        // Decide, under this lock, exactly which rows will cancel and
+        // which of them are due a terminal marker. The predicate mirrors
+        // `cancel_row_in_place`'s gate (row present, not already
+        // terminal), and the marker payload is read here because the
+        // cancel clears the typed state it prefers.
+        //
+        // The decision is exact, not a guess: the write lock excludes
+        // every concurrent writer, and a row can only reach a terminal
+        // state through its OWN `cancel_row_in_place` below —
+        // `propagate_terminal_child_transition` recomputes a PARENT's
+        // pending-child count, it never settles a descendant. So each
+        // predicted row still transitions when the loop reaches it,
+        // which is what keeps markers exactly-once: an idempotent retry
+        // over a terminal tree predicts nothing and emits nothing.
+        let mut to_cancel = Vec::with_capacity(subtree.len());
+        let mut marker_candidates: Vec<CancelMarkerCandidate> = Vec::new();
+        for id in subtree {
+            let Some(row) = inner.by_id.get(&id) else {
+                continue;
+            };
+            let Some(reason) = cancel_reason(scope, root_id, row) else {
+                continue;
+            };
+            if row.kind == TaskKind::RootTurn && row.is_root() && row.status.blocks_root_admission()
+            {
+                marker_candidates.push(CancelMarkerCandidate {
+                    thread_id: row.thread_id.clone(),
+                    task_id: row.id.clone(),
+                    continuation_usage: row
+                        .state
+                        .continuation()
+                        .map(|continuation| continuation.payload.total_usage.clone()),
+                    reason: reason.clone(),
+                });
+            }
+            to_cancel.push((id, reason));
+        }
+
+        let cancel_ids: Vec<AgentTaskId> = to_cancel.iter().map(|(id, _)| id.clone()).collect();
+        let fenced_threads = self.fenced_threads_for_cancel(inner, &cancel_ids).await?;
+
+        // The whole marker set is journaled BEFORE any row flips, while
+        // STILL holding the task-store write lock.
+        //
+        // Ordering is the invariant, not an optimisation: a `Cancelled`
+        // row always has its marker in the journal. A sink failure
+        // returns here with not one transition applied, so the tree stays
+        // intact and a retry can complete it — there is no state in which
+        // a follower sees a cancelled emitter with no marker to close it.
+        // No rollback exists across separate stores, so the only way to
+        // get that half is to run the fallible writes first.
+        //
+        // What this ordering does NOT buy — and the flips cannot be
+        // paired per row to buy it, because a flip clears the typed state
+        // carrying `SubagentInvocation` linkage, and a half-flipped
+        // cascade is unreachable to the `collect_subtree` a retry depends
+        // on: a failure PART-WAY through a multi-thread cascade's markers
+        // leaves the already-journaled ones behind on roots that stay
+        // live, and marker closes are ungated, so a follower can close
+        // `TurnCancelled` on a task that then completes. The retry does
+        // not compound it — the append is idempotent per candidate, so
+        // one marker per effective cancel survives and the retry's flips
+        // make the orphan honest. See `CancellationMarkerSink`; the SQL
+        // backends commit the set in one transaction and have neither
+        // window.
+        //
+        // Holding the lock across the sink's awaits is what orders the
+        // markers ahead of anything a promoted successor emits: the
+        // successor cannot be acquired (so cannot commit its `Start`)
+        // until this lock drops — matching the SQL backends. The sink
+        // stores are in-process leaf stores that never call back into
+        // the task store, so holding the lock across them cannot
+        // deadlock.
+        let markers = self
+            .commit_cancellation_markers(marker_candidates, now)
+            .await?;
+
+        // The transitions: pure, synchronous, no await. Once the markers
+        // are durable nothing can interrupt the flips they describe.
+        let transitioned = inner.cancel_rows(to_cancel, &fenced_threads, now)?;
+
+        Ok(CancelTreeOutcome {
+            transitioned,
+            markers,
+        })
+    }
+
     /// Whether the thread is mid-purge (`Deleting` / `Deleted`). Bare
     /// stores (no sink) see no thread lifecycle and fence nothing.
     async fn thread_is_fenced(&self, thread_id: &ThreadId) -> Result<bool> {
@@ -3005,6 +3331,40 @@ impl InMemoryAgentTaskStore {
             thread.status,
             super::thread::ThreadStatus::Deleting | super::thread::ThreadStatus::Deleted
         ))
+    }
+
+    /// Whether the thread of `task_id` admits the input it never delivered
+    /// as a new turn, read under the caller's write lock as admission does.
+    /// Only a root holding undelivered input consults the thread store.
+    async fn thread_admission_locked(
+        &self,
+        inner: &Inner,
+        task_id: &AgentTaskId,
+    ) -> Result<ThreadAdmission> {
+        let Some(task) = inner.by_id.get(task_id) else {
+            return Ok(ThreadAdmission::Fenced);
+        };
+        if !task.is_root() || inner.undelivered_input(task_id).is_empty() {
+            return Ok(ThreadAdmission::Fenced);
+        }
+        let thread_id = task.thread_id.clone();
+        let open = match &self.marker_sink {
+            Some(sink) => sink
+                .thread_store
+                .get(&thread_id)
+                .await?
+                .is_none_or(|thread| {
+                    thread
+                        .require_active(super::thread::ThreadOperation::Submit)
+                        .is_ok()
+                }),
+            None => true,
+        };
+        Ok(if open {
+            ThreadAdmission::Open
+        } else {
+            ThreadAdmission::Fenced
+        })
     }
 
     async fn require_thread_active(
@@ -3373,13 +3733,21 @@ impl InMemoryAgentTaskStore {
         old: &AgentTask,
         reason: FailureReason,
         now: OffsetDateTime,
-    ) -> Result<()> {
+    ) -> Result<CancelTreeOutcome> {
         let failed = old
             .clone()
             .fail_with_reason(reason, now)
             .context("fail_closed_locked: fail_with_reason transition failed")?;
+        let settled = if old.kind == TaskKind::RootTurn && old.is_root() {
+            self.cancel_scoped_locked(inner, &old.id, CancelScope::Descendants, now)
+                .await?
+        } else {
+            CancelTreeOutcome::default()
+        };
+        let thread = self.thread_admission_locked(inner, &old.id).await?;
         self.commit_fail_closed_event(old, reason, now).await?;
-        inner.publish_failed_row(old, &failed, now)
+        inner.publish_failed_row(old, &failed, thread, now)?;
+        Ok(settled)
     }
 
     /// Journal the terminal event that closes `task`'s turn when it fails
@@ -3762,12 +4130,18 @@ impl Inner {
         &mut self,
         old: &AgentTask,
         failed: &AgentTask,
+        thread: ThreadAdmission,
         now: OffsetDateTime,
     ) -> Result<()> {
         self.rebalance_after_row_change(old, failed);
         self.by_id.insert(failed.id.clone(), failed.clone());
-        let _ =
-            self.propagate_terminal_child_transition(failed, now, "publish_failed_row", false)?;
+        let _ = self.propagate_terminal_child_transition(
+            failed,
+            thread,
+            now,
+            "publish_failed_row",
+            false,
+        )?;
         Ok(())
     }
 
@@ -3880,6 +4254,7 @@ impl Inner {
         self.by_id.insert(cancelled.id.clone(), cancelled.clone());
         let _ = self.propagate_terminal_child_transition(
             &cancelled,
+            ThreadAdmission::Fenced,
             now,
             "cancel_tree",
             suppress_root_promotion,
@@ -3940,8 +4315,8 @@ impl Inner {
     fn apply_task_terminal_transition(
         &mut self,
         child_id: &AgentTaskId,
-        worker: &WorkerId,
-        lease: &LeaseId,
+        (worker, lease): (&WorkerId, &LeaseId),
+        thread: ThreadAdmission,
         now: OffsetDateTime,
         error_prefix: &'static str,
         transition: impl FnOnce(AgentTask) -> Result<AgentTask, super::task::TaskSchemaError>,
@@ -3980,7 +4355,7 @@ impl Inner {
         self.by_id.insert(new_child.id.clone(), new_child.clone());
 
         let parent =
-            self.propagate_terminal_child_transition(&new_child, now, error_prefix, false)?;
+            self.propagate_terminal_child_transition(&new_child, thread, now, error_prefix, false)?;
 
         Ok((new_child, parent))
     }
@@ -3988,6 +4363,7 @@ impl Inner {
     fn propagate_terminal_child_transition(
         &mut self,
         new_child: &AgentTask,
+        thread: ThreadAdmission,
         now: OffsetDateTime,
         error_prefix: &'static str,
         suppress_root_promotion: bool,
@@ -4033,11 +4409,73 @@ impl Inner {
             // (`cancel_row_in_place`) — not only the host's post-commit
             // promotion path. Promotion is idempotent, so the host's
             // later `promote_next_queued_root` becomes a no-op.
+            self.release_undelivered_input_locked(new_child, thread, now)?;
+            let resumed = self.resume_linked_subagent_invocation(new_child, now, error_prefix)?;
             let _promoted = self.promote_next_queued_root_locked(&new_child.thread_id, now)?;
-            self.resume_linked_subagent_invocation(new_child, now, error_prefix)
+            Ok(resumed)
         } else {
             Ok(None)
         }
+    }
+
+    /// The queued injections of `root`, oldest first.
+    fn undelivered_input(&self, root: &AgentTaskId) -> Vec<AgentTask> {
+        let mut undelivered: Vec<AgentTask> = self
+            .by_parent
+            .get(root)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.by_id.get(id))
+            .filter(|child| {
+                child.kind == TaskKind::InputInjection && child.status == TaskStatus::Queued
+            })
+            .cloned()
+            .collect();
+        undelivered.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        undelivered
+    }
+
+    /// Whether `root` is a subagent's child-thread root: some invocation
+    /// links it, whatever that invocation's status (see
+    /// [`release_undelivered_input`]).
+    fn links_child_thread_root(&self, root: &AgentTaskId) -> bool {
+        self.by_id.values().any(|task| {
+            task.kind == TaskKind::Subagent
+                && task
+                    .state
+                    .subagent_invocation()
+                    .is_some_and(|invocation| invocation.child_root_task_id == *root)
+        })
+    }
+
+    /// Apply [`release_undelivered_input`] to every queued injection of the
+    /// just-ended `root`, oldest first, before its thread's queue head is
+    /// promoted.
+    fn release_undelivered_input_locked(
+        &mut self,
+        root: &AgentTask,
+        thread: ThreadAdmission,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        if !settles_undelivered_input(root) {
+            return Ok(());
+        }
+        let undelivered = self.undelivered_input(&root.id);
+        if undelivered.is_empty() {
+            return Ok(());
+        }
+        let hand_over = thread == ThreadAdmission::Open && !self.links_child_thread_root(&root.id);
+        for old in undelivered {
+            let released = release_undelivered_input(old.clone(), hand_over, now)?;
+            self.rebalance_after_row_change(&old, &released.injection);
+            self.by_id
+                .insert(released.injection.id.clone(), released.injection);
+            if let Some(next_turn) = released.next_turn {
+                self.add_to_indexes(&next_turn);
+                self.by_id.insert(next_turn.id.clone(), next_turn);
+            }
+        }
+        Ok(())
     }
 
     fn resume_linked_subagent_invocation(
@@ -4903,7 +5341,8 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         match classify_recovery(&old, RecoveryContext::AcquisitionAttempt) {
             RecoveryAction::NoAction => {}
             RecoveryAction::FailClosed(reason) => {
-                self.fail_closed_locked(&mut inner, &old, reason, now)
+                let _settled = self
+                    .fail_closed_locked(&mut inner, &old, reason, now)
                     .await?;
                 return Ok(None);
             }
@@ -4999,7 +5438,8 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                     // whole worker pool. The fail-closed transition
                     // removes the row from the runnable index, so
                     // the next loop iteration picks up a fresh head.
-                    self.fail_closed_locked(&mut inner, &old, reason, now)
+                    let _settled = self
+                        .fail_closed_locked(&mut inner, &old, reason, now)
                         .await?;
                 }
                 RecoveryAction::Requeue => {
@@ -5068,6 +5508,9 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             let old = inner.by_id.get(&id).cloned().ok_or_else(|| {
                 anyhow!("release_expired_leases: leased index held missing row {id}")
             })?;
+            if old.status.is_terminal() {
+                continue;
+            }
             // Defense in depth: only `Running` rows belong in the
             // expiry index. A non-Running row here is an internal
             // bookkeeping bug.
@@ -5094,9 +5537,10 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                     RecoveryRecord::requeued(id)
                 }
                 RecoveryAction::FailClosed(reason) => {
-                    self.fail_closed_locked(&mut inner, &old, reason, now)
+                    let settled = self
+                        .fail_closed_locked(&mut inner, &old, reason, now)
                         .await?;
-                    RecoveryRecord::failed_closed(id, reason)
+                    RecoveryRecord::failed_closed(id, reason).with_settled(settled)
                 }
                 RecoveryAction::NoAction => {
                     // The expiry sweep should only ever classify
@@ -5855,6 +6299,27 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         Ok(result)
     }
 
+    async fn list_terminal_roots_with_live_descendants(&self) -> Result<Vec<AgentTaskId>> {
+        let inner = self.inner.read().await;
+        let roots: BTreeSet<AgentTaskId> = inner
+            .by_status
+            .iter()
+            .filter(|(status, _)| !status.is_terminal())
+            .flat_map(|(_, ids)| ids)
+            .filter_map(|id| inner.by_id.get(id))
+            .filter(|task| task.parent_id.is_some())
+            .filter(|task| {
+                inner
+                    .by_id
+                    .get(&task.root_id)
+                    .is_some_and(|root| root.status.is_terminal())
+            })
+            .map(|task| task.root_id.clone())
+            .collect();
+        drop(inner);
+        Ok(roots.into_iter().collect())
+    }
+
     async fn complete_task(
         &self,
         child_id: &AgentTaskId,
@@ -5863,10 +6328,11 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Option<AgentTask>)> {
         let mut inner = self.inner.write().await;
+        let thread = self.thread_admission_locked(&inner, child_id).await?;
         let result = inner.apply_task_terminal_transition(
             child_id,
-            worker,
-            lease,
+            (worker, lease),
+            thread,
             now,
             "complete_task",
             |child| child.complete(now),
@@ -5884,10 +6350,11 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Option<AgentTask>)> {
         let mut inner = self.inner.write().await;
+        let thread = self.thread_admission_locked(&inner, child_id).await?;
         let result = inner.apply_task_terminal_transition(
             child_id,
-            worker,
-            lease,
+            (worker, lease),
+            thread,
             now,
             "complete_task_with_result",
             |child| child.complete_with_result(result_payload, now),
@@ -5925,10 +6392,11 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Option<AgentTask>)> {
         let mut inner = self.inner.write().await;
+        let thread = self.thread_admission_locked(&inner, child_id).await?;
         let result = inner.apply_task_terminal_transition(
             child_id,
-            worker,
-            lease,
+            (worker, lease),
+            thread,
             now,
             "fail_task_with_reason",
             move |child| child.fail_with_terminal_reason(error, reason, now),
@@ -5942,119 +6410,19 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         root_id: &AgentTaskId,
         now: OffsetDateTime,
     ) -> Result<CancelTreeOutcome> {
-        let mut inner = self.inner.write().await;
+        self.cancel_scoped(root_id, CancelScope::Tree, None, now)
+            .await
+    }
 
-        if !inner.by_id.contains_key(root_id) {
-            return Err(anyhow!(
-                "cancel_tree rejected: task {root_id} does not exist"
-            ));
-        }
-
-        // Snapshot the subtree ids under the write lock and then
-        // walk them in BFS order. The cancel transition is pure and
-        // does not mutate `by_parent`, so the snapshot stays
-        // consistent for the duration of the sweep even though we
-        // are holding a mutable borrow of `inner`.
-        //
-        // The snapshot, every transition, and the
-        // marker gating all run under this one write lock, so no
-        // concurrent writer can settle a row mid-sweep (and
-        // `cancel_row_in_place` re-reads `by_id` for each id anyway) —
-        // this backend is immune to the stale-snapshot race the
-        // Postgres path had to close with locked re-reads.
-        let subtree = inner.collect_subtree(root_id);
-
-        // Decide, under this lock, exactly which rows will cancel and
-        // which of them are due a terminal marker. The predicate mirrors
-        // `cancel_row_in_place`'s gate (row present, not already
-        // terminal), and the marker payload is read here because the
-        // cancel clears the typed state it prefers.
-        //
-        // The decision is exact, not a guess: the write lock excludes
-        // every concurrent writer, and a row can only reach a terminal
-        // state through its OWN `cancel_row_in_place` below —
-        // `propagate_terminal_child_transition` recomputes a PARENT's
-        // pending-child count, it never settles a descendant. So each
-        // predicted row still transitions when the loop reaches it,
-        // which is what keeps markers exactly-once: an idempotent retry
-        // over a terminal tree predicts nothing and emits nothing.
-        let mut to_cancel = Vec::with_capacity(subtree.len());
-        let mut marker_candidates: Vec<CancelMarkerCandidate> = Vec::new();
-        for id in subtree {
-            let Some(row) = inner.by_id.get(&id) else {
-                continue;
-            };
-            if row.status.is_terminal() {
-                continue;
-            }
-            let reason = if id == *root_id {
-                TerminalReason::UserCancel
-            } else {
-                TerminalReason::ParentCancelled
-            };
-            if row.kind == TaskKind::RootTurn && row.is_root() && row.status.blocks_root_admission()
-            {
-                marker_candidates.push(CancelMarkerCandidate {
-                    thread_id: row.thread_id.clone(),
-                    task_id: row.id.clone(),
-                    continuation_usage: row
-                        .state
-                        .continuation()
-                        .map(|continuation| continuation.payload.total_usage.clone()),
-                    reason: reason.clone(),
-                });
-            }
-            to_cancel.push((id, reason));
-        }
-
-        let cancel_ids: Vec<AgentTaskId> = to_cancel.iter().map(|(id, _)| id.clone()).collect();
-        let fenced_threads = self.fenced_threads_for_cancel(&inner, &cancel_ids).await?;
-
-        // The whole marker set is journaled BEFORE any row flips, while
-        // STILL holding the task-store write lock.
-        //
-        // Ordering is the invariant, not an optimisation: a `Cancelled`
-        // row always has its marker in the journal. A sink failure
-        // returns here with not one transition applied, so the tree stays
-        // intact and a retry can complete it — there is no state in which
-        // a follower sees a cancelled emitter with no marker to close it.
-        // No rollback exists across separate stores, so the only way to
-        // get that half is to run the fallible writes first.
-        //
-        // What this ordering does NOT buy — and the flips cannot be
-        // paired per row to buy it, because a flip clears the typed state
-        // carrying `SubagentInvocation` linkage, and a half-flipped
-        // cascade is unreachable to the `collect_subtree` a retry depends
-        // on: a failure PART-WAY through a multi-thread cascade's markers
-        // leaves the already-journaled ones behind on roots that stay
-        // live, and marker closes are ungated, so a follower can close
-        // `TurnCancelled` on a task that then completes. The retry does
-        // not compound it — the append is idempotent per candidate, so
-        // one marker per effective cancel survives and the retry's flips
-        // make the orphan honest. See `CancellationMarkerSink`; the SQL
-        // backends commit the set in one transaction and have neither
-        // window.
-        //
-        // Holding the lock across the sink's awaits is what orders the
-        // markers ahead of anything a promoted successor emits: the
-        // successor cannot be acquired (so cannot commit its `Start`)
-        // until this lock drops — matching the SQL backends. The sink
-        // stores are in-process leaf stores that never call back into
-        // the task store, so holding the lock across them cannot
-        // deadlock.
-        let markers = self
-            .commit_cancellation_markers(marker_candidates, now)
-            .await?;
-
-        // The transitions: pure, synchronous, no await. Once the markers
-        // are durable nothing can interrupt the flips they describe.
-        let transitioned = inner.cancel_rows(to_cancel, &fenced_threads, now)?;
-
-        drop(inner);
-        Ok(CancelTreeOutcome {
-            transitioned,
-            markers,
-        })
+    async fn cancel_descendants_of_owned(
+        &self,
+        parent: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        now: OffsetDateTime,
+    ) -> Result<CancelTreeOutcome> {
+        self.cancel_scoped(parent, CancelScope::Descendants, Some((worker, lease)), now)
+            .await
     }
 
     async fn resume_from_confirmation(
@@ -6078,8 +6446,8 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
 
         let (resumed, prepared_operation) = old
             .clone()
-            .resume_from_confirmation(now)
-            .context("resume rejected: resume_from_confirmation transition failed")?;
+            .approve_confirmation_for_pickup(now)
+            .context("resume rejected: approve_confirmation_for_pickup transition failed")?;
         inner.rebalance_after_row_change(&old, &resumed);
         inner.by_id.insert(resumed.id.clone(), resumed.clone());
         drop(inner);
@@ -6141,7 +6509,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
 
         let failed = old
             .clone()
-            .fail_with_terminal_reason(error, TerminalReason::ConfirmationRejected, now)
+            .reject_confirmation(error, now)
             .context("reject_confirmation: fail transition failed")?;
         inner.rebalance_after_row_change(&old, &failed);
         inner.by_id.insert(failed.id.clone(), failed.clone());

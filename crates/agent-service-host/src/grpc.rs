@@ -6720,6 +6720,9 @@ mod tests {
         async fn list_parked_subagent_invocations(&self) -> Result<Vec<AgentTask>> {
             self.inner.list_parked_subagent_invocations().await
         }
+        async fn list_terminal_roots_with_live_descendants(&self) -> Result<Vec<AgentTaskId>> {
+            self.inner.list_terminal_roots_with_live_descendants().await
+        }
         async fn complete_task(
             &self,
             task_id: &AgentTaskId,
@@ -6796,6 +6799,17 @@ mod tests {
             now: OffsetDateTime,
         ) -> Result<agent_server::journal::store::CancelTreeOutcome> {
             self.inner.cancel_tree(root_id, now).await
+        }
+        async fn cancel_descendants_of_owned(
+            &self,
+            parent: &AgentTaskId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+            now: OffsetDateTime,
+        ) -> Result<agent_server::journal::store::CancelTreeOutcome> {
+            self.inner
+                .cancel_descendants_of_owned(parent, worker, lease, now)
+                .await
         }
         async fn resume_from_confirmation(
             &self,
