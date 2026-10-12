@@ -1055,6 +1055,15 @@ pub(crate) struct RootTurnCancelledMarker {
     pub(crate) cancelled_at: OffsetDateTime,
 }
 
+impl RootTurnCancelledMarker {
+    /// A cancel observed at this instant.
+    fn observed_now() -> Self {
+        Self {
+            cancelled_at: OffsetDateTime::now_utc(),
+        }
+    }
+}
+
 impl std::fmt::Display for RootTurnCancelledMarker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("root turn cancelled")
@@ -3025,10 +3034,8 @@ async fn prepare_pre_call_compaction(
     )
     .await?;
     if deps.is_cancelled() {
-        return Err(anyhow::Error::new(RootTurnCancelledMarker {
-            cancelled_at: OffsetDateTime::now_utc(),
-        })
-        .context("root turn cancelled after completed pre-call compaction"));
+        return Err(anyhow::Error::new(RootTurnCancelledMarker::observed_now())
+            .context("root turn cancelled after completed pre-call compaction"));
     }
     Ok(PreCallCompaction {
         abandoned_usage: token_usage_as_llm_usage(&outcome.llm_usage),
@@ -4181,10 +4188,8 @@ async fn try_recover_with_compaction(
         )
         .await?;
         if deps.is_cancelled() {
-            return Err(anyhow::Error::new(RootTurnCancelledMarker {
-                cancelled_at: OffsetDateTime::now_utc(),
-            })
-            .context("root turn cancelled after completed overflow compaction"));
+            return Err(anyhow::Error::new(RootTurnCancelledMarker::observed_now())
+                .context("root turn cancelled after completed overflow compaction"));
         }
     }
 
