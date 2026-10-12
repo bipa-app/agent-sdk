@@ -232,6 +232,18 @@
 //! | [`ToolTier::Observe`] | Read-only, always allowed | Get balance, read file |
 //! | [`ToolTier::Confirm`] | Requires user confirmation | Send email, transfer funds |
 //!
+//! ### Tool Ordering
+//!
+//! When a model emits several tool calls in one response, they take effect
+//! in the order it wrote them. [`ToolConcurrency`] decides how a call is
+//! ordered, independently of its tier: adjacent
+//! [`ToolConcurrency::ReadOnly`] calls run together, and every
+//! [`ToolConcurrency::Exclusive`] call (the default) runs alone, after
+//! every earlier call and before every later one. The agent loop also runs
+//! a read-only call alone when it needs confirmation, because hooks resolve
+//! confirmation inline. Declare `ReadOnly` only for a tool that changes
+//! nothing. See [`agent_sdk_foundation::batch_order`] for the full rule.
+//!
 //! ### Lifecycle Hooks
 //!
 //! Implement [`AgentHooks`] to intercept and control agent behavior:
