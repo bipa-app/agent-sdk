@@ -3030,10 +3030,11 @@ async fn execute_tool_task(
 /// Nudge the pool after a tool child reached a terminal state.
 ///
 /// The same transition may have made the parent runnable (it was the
-/// batch's last live child) or released siblings the batch's execution
-/// order held behind it, possibly a whole wave of reads. Waking every
-/// parked worker and leaving one permit for the worker that is finishing
-/// this child lets them start now instead of on the next acquisition tick.
+/// batch's last live child) or let siblings the batch's execution order
+/// held behind it become acquirable, possibly a whole wave of reads.
+/// Waking every parked worker and leaving one permit for the worker that is
+/// finishing this child lets them start now instead of on the next
+/// acquisition tick.
 pub(crate) fn wake_after_tool_child_settled(runtime: &ExecutionRuntime) {
     if let Some(signal) = runtime.wakeup_signal() {
         signal.wake_all_now();

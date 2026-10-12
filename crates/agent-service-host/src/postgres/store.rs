@@ -62,7 +62,7 @@ use agent_server::journal::relay::{
 };
 use agent_server::journal::retention::{RetentionCursor, RetentionStore};
 use agent_server::journal::sibling_order::{
-    hold_tool_children_behind_siblings, mixed_spawn_waits, pure_spawn_waits, release_ready_siblings,
+    decoded_wait_list, hold_tool_children_behind_siblings, mixed_spawn_waits, pure_spawn_waits,
 };
 use agent_server::journal::store::{
     AgentTaskStore, CancelScope, CancelTreeOutcome, ChildProbe, MixedChildrenSpawn,
@@ -1713,80 +1713,23 @@ INSERT INTO agent_sdk_tasks (
         Ok(())
     }
 
-    /// Write `task` over its row. A terminal child also releases every
-    /// sibling its batch's execution order held behind it, in the same
-    /// transaction, so no terminal write can strand a held sibling.
-    async fn update_task_tx(tx: &mut Transaction<'_, Postgres>, task: &AgentTask) -> Result<()> {
-        Self::write_task_row_tx(tx, task).await?;
-        if task.status.is_terminal()
-            && let Some(parent_id) = &task.parent_id
-        {
-            Self::release_ready_siblings_tx(tx, parent_id, task.updated_at).await?;
-        }
-        Ok(())
-    }
-
-    /// Release the held children of `parent_id` whose earlier siblings
-    /// have all finished.
+    /// The ids of `task`'s siblings that are not yet terminal, empty when
+    /// the task waits on nothing.
     ///
-    /// Locking the parent first serializes concurrent sibling completions:
-    /// the second to take the lock reads the first's committed terminal
-    /// row, so the last predecessor to finish always releases the child.
-    async fn release_ready_siblings_tx(
+    /// Takes no locks: a sibling only ever moves toward a terminal state,
+    /// so a sibling read as finished stays finished.
+    async fn load_unfinished_siblings_tx(
         tx: &mut Transaction<'_, Postgres>,
-        parent_id: &AgentTaskId,
-        now: OffsetDateTime,
-    ) -> Result<()> {
-        Self::load_task_tx(tx, parent_id, true).await?;
-        let held: Vec<AgentTask> = sqlx::query_as!(
-            TaskRecord,
-            r"
-SELECT
-    id,
-    kind,
-    status,
-    parent_id,
-    root_id,
-    depth,
-    thread_id,
-    submitted_input_json,
-    caller_metadata_json,
-    worker_id,
-    lease_id,
-    lease_expires_at,
-    last_heartbeat_at,
-    state_json,
-    attempt,
-    max_attempts,
-    last_error,
-    terminal_reason_json,
-    pending_child_count,
-    spawn_index,
-    result_payload,
-    otel_traceparent,
-    created_at,
-    updated_at,
-    completed_at,
-    last_activity_at,
-    after_siblings_json
-FROM agent_sdk_tasks
-WHERE parent_id = $1
-  AND status = 'pending'
-  AND after_siblings_json IS NOT NULL
-FOR UPDATE
-",
-            parent_id.as_str(),
-        )
-        .fetch_all(&mut **tx)
-        .await
-        .with_context(|| format!("load children of {parent_id} held behind siblings"))?
-        .into_iter()
-        .map(AgentTask::try_from)
-        .collect::<Result<_>>()?;
-        if held.is_empty() {
-            return Ok(());
-        }
-        let unfinished: BTreeSet<AgentTaskId> = sqlx::query_scalar!(
+        task: &AgentTask,
+    ) -> Result<BTreeSet<AgentTaskId>> {
+        let Some(parent_id) = task
+            .parent_id
+            .as_ref()
+            .filter(|_| !task.after_siblings.is_empty())
+        else {
+            return Ok(BTreeSet::new());
+        };
+        Ok(sqlx::query_scalar!(
             r"
 SELECT id
 FROM agent_sdk_tasks
@@ -1800,14 +1743,10 @@ WHERE parent_id = $1
         .with_context(|| format!("load unfinished children of {parent_id}"))?
         .into_iter()
         .map(AgentTaskId::from_string)
-        .collect();
-        for ready in release_ready_siblings(&held, &unfinished, now)? {
-            Self::write_task_row_tx(tx, &ready).await?;
-        }
-        Ok(())
+        .collect())
     }
 
-    async fn write_task_row_tx(tx: &mut Transaction<'_, Postgres>, task: &AgentTask) -> Result<()> {
+    async fn update_task_tx(tx: &mut Transaction<'_, Postgres>, task: &AgentTask) -> Result<()> {
         let result = sqlx::query!(
             r"
 UPDATE agent_sdk_tasks
@@ -3563,7 +3502,15 @@ SELECT
     after_siblings_json
 FROM agent_sdk_tasks
 WHERE status = 'pending'
-  AND after_siblings_json IS NULL
+  AND (
+      after_siblings_json IS NULL
+      OR NOT EXISTS (
+          SELECT 1
+          FROM jsonb_array_elements_text(agent_sdk_tasks.after_siblings_json) AS waited(id)
+          JOIN agent_sdk_tasks AS sibling ON sibling.id = waited.id
+          WHERE sibling.status NOT IN ('completed', 'failed', 'cancelled')
+      )
+  )
   AND thread_id NOT IN (
       SELECT thread_id FROM agent_sdk_threads WHERE status IN ('deleting', 'deleted')
   )
@@ -4241,7 +4188,8 @@ ORDER BY created_at, id
             tx.rollback().await.context("rollback vanished acquire")?;
             return Ok(None);
         };
-        if !old.is_leasable() {
+        let unfinished = Self::load_unfinished_siblings_tx(&mut tx, &old).await?;
+        if !old.status.can_be_leased() || old.waits_on_any(&unfinished) {
             tx.rollback()
                 .await
                 .context("rollback non-runnable acquire")?;
@@ -4275,7 +4223,8 @@ ORDER BY created_at, id
         }
         let claimed = old
             .clone()
-            .mark_running(worker, lease, expires_at, now)
+            .admit_after_siblings(&unfinished)
+            .and_then(|admitted| admitted.mark_running(worker, lease, expires_at, now))
             .context("try_acquire_task rejected: mark_running transition failed")?;
         Self::update_task_tx(&mut tx, &claimed).await?;
         tx.commit().await.context("commit try_acquire_task")?;
@@ -4334,11 +4283,15 @@ ORDER BY created_at, id
                 }
             }
 
+            let unfinished = Self::load_unfinished_siblings_tx(&mut tx, &old).await?;
             match classify_recovery(&old, RecoveryContext::AcquisitionAttempt) {
                 RecoveryAction::NoAction => {
                     let claimed = old
                         .clone()
-                        .mark_running(worker.clone(), lease.clone(), expires_at, now)
+                        .admit_after_siblings(&unfinished)
+                        .and_then(|admitted| {
+                            admitted.mark_running(worker.clone(), lease.clone(), expires_at, now)
+                        })
                         .context(
                             "acquire_next_runnable rejected: mark_running transition failed",
                         )?;
@@ -4925,7 +4878,7 @@ FOR UPDATE SKIP LOCKED
             }
             children.push(child);
         }
-        hold_tool_children_behind_siblings(&mut children, &waits)?;
+        hold_tool_children_behind_siblings(&mut children, &[], &waits)?;
 
         let child_count = u32::try_from(children.len())
             .context("spawn rejected: child count exceeds u32::MAX")?;
@@ -5142,9 +5095,12 @@ FOR UPDATE SKIP LOCKED
             ensure_spawn_task_id_available_tx(&mut tx, &child.id, "child").await?;
             tool_rows.push(child);
         }
-        hold_tool_children_behind_siblings(&mut tool_rows, &mixed_spawn_waits(&tool_children))?;
-
         let reattached_rows = prepare_reattached_rows(locked_reattach, reattach, now)?;
+        hold_tool_children_behind_siblings(
+            &mut tool_rows,
+            &reattached_rows,
+            &mixed_spawn_waits(&tool_children),
+        )?;
         let child_ids = mixed_child_ids_in_slot_order(&prepared, &tool_rows, &reattached_rows)?;
         let child_count =
             u32::try_from(child_ids.len()).context("spawn rejected: child count exceeds u32")?;
@@ -7423,10 +7379,11 @@ impl TryFrom<TaskRecord> for AgentTask {
     type Error = anyhow::Error;
 
     fn try_from(record: TaskRecord) -> Result<Self> {
+        let status = enum_from_wire(&record.status, "task status")?;
         let task = Self {
             id: AgentTaskId::from_string(record.id),
             kind: enum_from_wire(&record.kind, "task kind")?,
-            status: enum_from_wire(&record.status, "task status")?,
+            status,
             parent_id: record.parent_id.map(AgentTaskId::from_string),
             root_id: AgentTaskId::from_string(record.root_id),
             depth: u32_from_i64(record.depth, "task depth")?,
@@ -7457,11 +7414,14 @@ impl TryFrom<TaskRecord> for AgentTask {
                 .spawn_index
                 .map(|value| u32_from_i64(value, "task spawn_index"))
                 .transpose()?,
-            after_siblings: record
-                .after_siblings_json
-                .map(|value| json_from_value(value, "task after_siblings_json"))
-                .transpose()?
-                .unwrap_or_default(),
+            after_siblings: decoded_wait_list(
+                status,
+                record
+                    .after_siblings_json
+                    .map(|value| json_from_value(value, "task after_siblings_json"))
+                    .transpose()?
+                    .unwrap_or_default(),
+            ),
             result_payload: record.result_payload,
             otel_traceparent: record.otel_traceparent,
             created_at: record.created_at,

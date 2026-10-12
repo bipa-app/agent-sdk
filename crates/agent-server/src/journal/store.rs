@@ -3936,7 +3936,7 @@ impl Inner {
     /// always removes the row from both indexes before re-inserting.
     fn register_runnable_lease_indexes(&mut self, task: &AgentTask) {
         match task.status {
-            TaskStatus::Pending if task.is_leasable() => {
+            TaskStatus::Pending => {
                 self.runnable_by_created_at
                     .insert((task.created_at, task.id.clone()));
             }
@@ -4360,28 +4360,19 @@ impl Inner {
         Ok((new_child, parent))
     }
 
-    /// Release every held child of `parent_id` whose earlier siblings have
-    /// all finished, under the caller's write lock.
-    fn release_ready_siblings(
-        &mut self,
-        parent_id: &AgentTaskId,
-        now: OffsetDateTime,
-    ) -> Result<()> {
-        let children: Vec<AgentTask> = self
-            .by_parent
-            .get(parent_id)
-            .into_iter()
-            .flatten()
-            .filter_map(|id| self.by_id.get(id).cloned())
-            .collect();
-        let (held, unfinished) = super::sibling_order::held_and_unfinished(&children);
-        for ready in super::sibling_order::release_ready_siblings(&held, &unfinished, now)? {
-            if let Some(old) = self.by_id.get(&ready.id).cloned() {
-                self.rebalance_after_row_change(&old, &ready);
-            }
-            self.by_id.insert(ready.id.clone(), ready);
+    /// The ids of `task`'s siblings that are not yet terminal, empty when
+    /// the task waits on nothing.
+    fn unfinished_siblings(&self, task: &AgentTask) -> BTreeSet<AgentTaskId> {
+        match (&task.parent_id, task.after_siblings.is_empty()) {
+            (Some(parent_id), false) => super::sibling_order::unfinished_ids(
+                self.by_parent
+                    .get(parent_id)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|id| self.by_id.get(id)),
+            ),
+            (Some(_) | None, true) | (None, false) => BTreeSet::new(),
         }
-        Ok(())
     }
 
     fn propagate_terminal_child_transition(
@@ -4407,8 +4398,6 @@ impl Inner {
                     new_child.id
                 ));
             };
-            self.release_ready_siblings(parent_id, now)
-                .with_context(|| format!("{error_prefix}: release ordered siblings"))?;
             if old_parent.status == TaskStatus::WaitingOnChildren {
                 let live = self.count_live_children(parent_id);
                 let new_parent = old_parent
@@ -4723,10 +4712,6 @@ impl Inner {
             }
             children.push(child);
         }
-        super::sibling_order::hold_tool_children_behind_siblings(
-            &mut children,
-            &super::sibling_order::mixed_spawn_waits(tool_children),
-        )?;
         Ok(children)
     }
 
@@ -5022,18 +5007,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         // helper so that Phase 2.3's acquire / heartbeat / sweep call
         // sites can share the same logic with `update()`.
         inner.rebalance_after_row_change(&old, &task);
-        let finished_child_of = task
-            .status
-            .is_terminal()
-            .then(|| task.parent_id.clone())
-            .flatten();
-        let now = task.updated_at;
         inner.by_id.insert(task.id.clone(), task);
-        if let Some(parent_id) = finished_child_of {
-            inner
-                .release_ready_siblings(&parent_id, now)
-                .context("update: release ordered siblings")?;
-        }
         drop(inner);
         Ok(())
     }
@@ -5367,11 +5341,13 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         let Some(old) = inner.by_id.get(id).cloned() else {
             return Ok(None);
         };
-        // CAS guard: only `Pending` rows not held behind earlier siblings
-        // are runnable. Every other row (`Queued`, waiting states,
-        // `Running`, terminal states) silently returns `None` so callers
-        // can loop on scan-and-claim without caring about lost races.
-        if !old.is_leasable() {
+        // CAS guard: only `Pending` rows whose earlier siblings have all
+        // finished are runnable. Every other row (`Queued`, waiting
+        // states, `Running`, terminal states) silently returns `None` so
+        // callers can loop on scan-and-claim without caring about lost
+        // races.
+        let unfinished = inner.unfinished_siblings(&old);
+        if !old.status.can_be_leased() || old.waits_on_any(&unfinished) {
             return Ok(None);
         }
         // Phase 2.5: consult the recovery matrix before transitioning
@@ -5400,7 +5376,8 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         }
         let claimed = old
             .clone()
-            .mark_running(worker, lease, expires_at, now)
+            .admit_after_siblings(&unfinished)
+            .and_then(|admitted| admitted.mark_running(worker, lease, expires_at, now))
             .context("try_acquire_task rejected: mark_running transition failed")?;
         inner.rebalance_after_row_change(&old, &claimed);
         inner.by_id.insert(claimed.id.clone(), claimed.clone());
@@ -5450,6 +5427,10 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             if self.thread_is_fenced(&old.thread_id).await? {
                 continue;
             }
+            let unfinished = inner.unfinished_siblings(&old);
+            if old.waits_on_any(&unfinished) {
+                continue;
+            }
             // Defense in depth: the index should only contain
             // `Pending` rows. A non-runnable row here is an internal
             // bookkeeping bug.
@@ -5464,7 +5445,8 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                 RecoveryAction::NoAction => {
                     let claimed = old
                         .clone()
-                        .mark_running(worker, lease, expires_at, now)
+                        .admit_after_siblings(&unfinished)
+                        .and_then(|admitted| admitted.mark_running(worker, lease, expires_at, now))
                         .context(
                             "acquire_next_runnable rejected: mark_running transition failed",
                         )?;
@@ -6004,7 +5986,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             }
             children.push(child);
         }
-        super::sibling_order::hold_tool_children_behind_siblings(&mut children, &waits)?;
+        super::sibling_order::hold_tool_children_behind_siblings(&mut children, &[], &waits)?;
 
         // Transition the parent to WaitingOnChildren first so the
         // typed state carries the continuation before the children
@@ -6237,13 +6219,18 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         let rollback_rows =
             inner.mixed_spawn_rollback_rows(&old_parent, &reattach, &delivered_injection_ids);
         let (prepared, _) = inner.build_batch_invocation_pairs(&old_parent, subagents, now)?;
-        let tool_rows = inner.build_mixed_tool_children(
+        let mut tool_rows = inner.build_mixed_tool_children(
             &old_parent,
             &tool_children,
             child_otel_traceparent.as_deref(),
             now,
         )?;
         let reattached_rows = inner.build_reattached_children(parent_id, &reattach, now)?;
+        super::sibling_order::hold_tool_children_behind_siblings(
+            &mut tool_rows,
+            &reattached_rows,
+            &super::sibling_order::mixed_spawn_waits(&tool_children),
+        )?;
         let child_ids = mixed_child_ids_in_slot_order(&prepared, &tool_rows, &reattached_rows)?;
         let child_count =
             u32::try_from(child_ids.len()).context("spawn rejected: child count exceeds u32")?;
@@ -6556,11 +6543,6 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             .context("reject_confirmation: fail transition failed")?;
         inner.rebalance_after_row_change(&old, &failed);
         inner.by_id.insert(failed.id.clone(), failed.clone());
-        if let Some(parent_id) = &failed.parent_id {
-            inner
-                .release_ready_siblings(parent_id, now)
-                .context("reject_confirmation: release ordered siblings")?;
-        }
 
         // Recompute the parent's pending_child_count the same way
         // `apply_task_terminal_transition` does in complete_task /

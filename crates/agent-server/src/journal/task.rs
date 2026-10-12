@@ -76,6 +76,7 @@ use agent_sdk_foundation::{
     ThreadId,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fmt;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -744,8 +745,8 @@ pub struct AgentTask {
     pub spawn_index: Option<u32>,
 
     /// Earlier children of the same batch that must reach a terminal state
-    /// before this tool child may run. Empty for every row a worker may
-    /// lease once it is pending. See [`super::sibling_order`].
+    /// before this pending tool child may run. Acquisition checks it and
+    /// clears it as it leases the row. See [`super::sibling_order`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub after_siblings: Vec<AgentTaskId>,
 
@@ -1600,30 +1601,30 @@ impl AgentTask {
         Ok(self)
     }
 
-    /// Make a held tool child runnable once every sibling it waited for has
-    /// finished.
-    ///
-    /// # Errors
-    /// Returns [`TaskSchemaError::InvalidTransition`] if the row is not a
-    /// `Pending` row waiting on siblings.
-    pub fn release_from_siblings(mut self, now: OffsetDateTime) -> Result<Self, TaskSchemaError> {
-        if self.status != TaskStatus::Pending || self.after_siblings.is_empty() {
-            return Err(TaskSchemaError::InvalidTransition {
-                from: self.status,
-                to: TaskStatus::Pending,
-            });
-        }
-        self.after_siblings.clear();
-        self.updated_at = now;
-        self.validate()?;
-        Ok(self)
+    /// `true` while a sibling this row waits for is in `unfinished`, the
+    /// ids of its parent's children that are not yet terminal. A sibling
+    /// missing from the parent counts as finished.
+    #[must_use]
+    pub fn waits_on_any(&self, unfinished: &BTreeSet<AgentTaskId>) -> bool {
+        self.after_siblings.iter().any(|id| unfinished.contains(id))
     }
 
-    /// `true` when a worker may lease this row now: it is `Pending` and not
-    /// held behind earlier siblings.
-    #[must_use]
-    pub const fn is_leasable(&self) -> bool {
-        self.status.can_be_leased() && self.after_siblings.is_empty()
+    /// Clear the wait list of a tool child whose earlier siblings have all
+    /// finished. Acquisition takes this step right before
+    /// [`Self::mark_running`], which refuses a row that still has one.
+    ///
+    /// # Errors
+    /// Returns [`TaskSchemaError::HeldBySiblings`] while a sibling it
+    /// waits for is in `unfinished`.
+    pub fn admit_after_siblings(
+        mut self,
+        unfinished: &BTreeSet<AgentTaskId>,
+    ) -> Result<Self, TaskSchemaError> {
+        if self.waits_on_any(unfinished) {
+            return Err(TaskSchemaError::HeldBySiblings);
+        }
+        self.after_siblings.clear();
+        Ok(self)
     }
 
     /// Pause a running task until `child_count` children reach terminal

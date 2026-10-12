@@ -6668,6 +6668,7 @@ async fn apply_batch_routing(
         &mut application.specs,
         &pending.pending_tool_calls,
         &application.routing,
+        &application.reattach,
     )?;
     spawn_routed_batch(inputs, deps, application, now).await
 }
@@ -6796,11 +6797,16 @@ async fn spawn_routed_batch(
 /// before spawn never runs, so both are detached from the order. Every
 /// other call is shared only when its tool is read-only; the tier plays no
 /// part, because a durable child pauses for confirmation on its own.
-/// Re-attached survivors are not in `specs` and keep their own waits.
+///
+/// `reattach` are the still-live calls of an earlier batch that this spawn
+/// carries over (an early or steering resume). They came first, so a new
+/// call waits for each of them unless both are read-only. The store skips
+/// any that is a subagent.
 fn order_tool_children(
     specs: &mut [ChildSpawnSpec],
     pending: &[PendingToolCallInfo],
     routing: &super::subagent_spawn_selector::BatchRouting,
+    reattach: &[ReattachedChild],
 ) -> Result<()> {
     let subagent_slots: BTreeSet<usize> = match routing {
         super::subagent_spawn_selector::BatchRouting::AllTools => BTreeSet::new(),
@@ -6812,25 +6818,46 @@ fn order_tool_children(
             plans.iter().map(|(index, _)| *index).collect()
         }
     };
+    let slot_of = |index: usize| match pending.get(index).map(|call| call.concurrency) {
+        Some(ToolConcurrency::ReadOnly) => BatchSlot::Shared,
+        Some(ToolConcurrency::Exclusive) | None => BatchSlot::Exclusive,
+    };
     let slots: Vec<BatchSlot> = specs
         .iter()
         .enumerate()
         .map(|(index, spec)| {
             if spec.precompleted_result.is_some() || subagent_slots.contains(&index) {
-                return BatchSlot::Detached;
-            }
-            match pending.get(index).map(|call| call.concurrency) {
-                Some(ToolConcurrency::ReadOnly) => BatchSlot::Shared,
-                Some(ToolConcurrency::Exclusive) | None => BatchSlot::Exclusive,
+                BatchSlot::Detached
+            } else {
+                slot_of(index)
             }
         })
         .collect();
-    for (spec, after) in specs.iter_mut().zip(wait_lists(&slots)) {
+    let survivors: Vec<(u32, BatchSlot)> = reattach
+        .iter()
+        .map(|survivor| {
+            let index = usize::try_from(survivor.spawn_index)
+                .context("re-attached spawn index exceeds usize")?;
+            Ok((survivor.spawn_index, slot_of(index)))
+        })
+        .collect::<Result<_>>()?;
+    for ((slot, spec), after) in slots.iter().zip(specs.iter_mut()).zip(wait_lists(&slots)) {
         spec.after = after
             .into_iter()
             .map(u32::try_from)
             .collect::<Result<_, _>>()
             .context("tool spawn index exceeds u32")?;
+        if *slot == BatchSlot::Detached {
+            continue;
+        }
+        spec.after.extend(
+            survivors
+                .iter()
+                .filter(|(_, survivor)| {
+                    *slot == BatchSlot::Exclusive || *survivor == BatchSlot::Exclusive
+                })
+                .map(|(index, _)| *index),
+        );
     }
     Ok(())
 }

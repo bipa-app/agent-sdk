@@ -1845,6 +1845,9 @@ pub async fn run_journal_store_conformance<S: JournalStore + Clone + 'static>(
     case_cancel_tree_cancels_held_tool_children(store).await?;
     report.passed("cancel_tree_cancels_held_tool_children");
 
+    case_a_waiting_child_needs_no_release_write(store).await?;
+    report.passed("a_waiting_child_needs_no_release_write");
+
     Ok(report)
 }
 
@@ -1917,8 +1920,8 @@ async fn finish_claimed<S: AgentTaskStore + ?Sized>(
 
 /// A batch `[edit, read, read, bash]` whose reads wait for the edit and
 /// whose command waits for all three: acquisition never hands out a
-/// held child, the last of a child's predecessors to finish releases it,
-/// and a failed predecessor counts as finished.
+/// waiting child, a child becomes acquirable once the last of its
+/// predecessors finishes, and a failed predecessor counts as finished.
 async fn case_ordered_tool_children_run_in_batch_order<S: JournalStore>(store: &S) -> Result<()> {
     let thread = tid("conf-ordered-tool-children");
     let fixture = mixed_batch_fixture(store, &thread, 0).await?;
@@ -2053,6 +2056,67 @@ async fn case_ordered_mixed_batch_holds_only_tool_children<S: JournalStore>(
     ensure!(
         claimed_ids(&claim_all_runnable(store, t_plus(5)).await?).contains(&&last.id),
         "the held tool child must not wait for the subagent"
+    );
+    Ok(())
+}
+
+/// Readiness is read at acquisition, never written: a predecessor's
+/// terminal transition leaves the waiting child's row untouched, and the
+/// child is acquirable all the same, its wait list cleared as it is leased.
+async fn case_a_waiting_child_needs_no_release_write<S: JournalStore>(store: &S) -> Result<()> {
+    let thread = tid("conf-ordered-no-release-write");
+    let fixture = mixed_batch_fixture(store, &thread, 0).await?;
+    let (_parent, children) = AgentTaskStore::spawn_tool_children(
+        store,
+        &fixture.parent_id,
+        &fixture.worker,
+        &fixture.lease,
+        vec![
+            ChildSpawnSpec::new(1),
+            ChildSpawnSpec::new(1).after_siblings(vec![0]),
+        ],
+        suspension_with_pending_tools(&thread, 2),
+        None,
+        Vec::new(),
+        t_plus(2),
+    )
+    .await?;
+    let [first, waiting] = children.as_slice() else {
+        anyhow::bail!("the spawn must return two children");
+    };
+    let claimed = AgentTaskStore::try_acquire_task(
+        store,
+        &first.id,
+        WorkerId::new(),
+        LeaseId::new(),
+        t_plus(600),
+        t_plus(3),
+    )
+    .await?
+    .context("the first child must be acquirable")?;
+    finish_claimed(store, &claimed, true, t_plus(4)).await?;
+
+    let untouched = AgentTaskStore::get(store, &waiting.id)
+        .await?
+        .context("waiting child must exist")?;
+    ensure!(
+        untouched.after_siblings == [first.id.clone()]
+            && untouched.updated_at == waiting.updated_at,
+        "a predecessor finishing must not write the waiting child"
+    );
+    let leased = AgentTaskStore::try_acquire_task(
+        store,
+        &waiting.id,
+        WorkerId::new(),
+        LeaseId::new(),
+        t_plus(600),
+        t_plus(5),
+    )
+    .await?
+    .context("a child whose predecessors all finished must be acquirable")?;
+    ensure!(
+        leased.after_siblings.is_empty(),
+        "acquisition clears the wait list it admitted"
     );
     Ok(())
 }

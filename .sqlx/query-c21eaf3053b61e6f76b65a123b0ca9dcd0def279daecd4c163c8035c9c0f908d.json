@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\nSELECT\n    id,\n    kind,\n    status,\n    parent_id,\n    root_id,\n    depth,\n    thread_id,\n    submitted_input_json,\n    caller_metadata_json,\n    worker_id,\n    lease_id,\n    lease_expires_at,\n    last_heartbeat_at,\n    state_json,\n    attempt,\n    max_attempts,\n    last_error,\n    terminal_reason_json,\n    pending_child_count,\n    spawn_index,\n    result_payload,\n    otel_traceparent,\n    created_at,\n    updated_at,\n    completed_at,\n    last_activity_at,\n    after_siblings_json\nFROM agent_sdk_tasks\nWHERE parent_id = $1\n  AND status = 'pending'\n  AND after_siblings_json IS NOT NULL\nFOR UPDATE\n",
+  "query": "\nSELECT\n    id,\n    kind,\n    status,\n    parent_id,\n    root_id,\n    depth,\n    thread_id,\n    submitted_input_json,\n    caller_metadata_json,\n    worker_id,\n    lease_id,\n    lease_expires_at,\n    last_heartbeat_at,\n    state_json,\n    attempt,\n    max_attempts,\n    last_error,\n    terminal_reason_json,\n    pending_child_count,\n    spawn_index,\n    result_payload,\n    otel_traceparent,\n    created_at,\n    updated_at,\n    completed_at,\n    last_activity_at,\n    after_siblings_json\nFROM agent_sdk_tasks\nWHERE status = 'pending'\n  AND (\n      after_siblings_json IS NULL\n      OR NOT EXISTS (\n          SELECT 1\n          FROM jsonb_array_elements_text(agent_sdk_tasks.after_siblings_json) AS waited(id)\n          JOIN agent_sdk_tasks AS sibling ON sibling.id = waited.id\n          WHERE sibling.status NOT IN ('completed', 'failed', 'cancelled')\n      )\n  )\n  AND thread_id NOT IN (\n      SELECT thread_id FROM agent_sdk_threads WHERE status IN ('deleting', 'deleted')\n  )\nORDER BY created_at, id\nLIMIT 1\n",
   "describe": {
     "columns": [
       {
@@ -302,9 +302,7 @@
       }
     ],
     "parameters": {
-      "Left": [
-        "Text"
-      ]
+      "Left": []
     },
     "nullable": [
       false,
@@ -336,5 +334,5 @@
       true
     ]
   },
-  "hash": "bd7b94a55a860e91bbc07e42ce71c660ff0720f99f630bac27a305970700a6ae"
+  "hash": "c21eaf3053b61e6f76b65a123b0ca9dcd0def279daecd4c163c8035c9c0f908d"
 }

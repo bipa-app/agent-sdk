@@ -12771,28 +12771,44 @@ async fn subagent_spawns_fan_out_together_while_tool_calls_keep_model_order() ->
         assert_eq!(invocation.kind, TaskKind::Subagent);
         let root = child_root_of(&stores, invocation).await?;
         assert!(
-            root.is_leasable(),
+            acquirable(&stores, &root.id, t_plus(6)).await?,
             "every subagent in the batch must start at once, without waiting for the edit"
         );
     }
-    assert!(edit.is_leasable(), "the first call starts at once");
     assert_eq!(
         test.after_siblings,
         std::slice::from_ref(&edit.id),
         "the command waits for the edit before it, not for the subagents"
     );
-
-    complete_child_at(&stores, edit, &ok_result("edited"), t_plus(6), t_plus(7)).await?;
-    let test = stores
-        .tasks
-        .get(&test.id)
-        .await?
-        .context("command child must exist")?;
     assert!(
-        test.is_leasable(),
+        !acquirable(&stores, &test.id, t_plus(6)).await?,
+        "the command waits while the edit runs"
+    );
+
+    complete_child_at(&stores, edit, &ok_result("edited"), t_plus(7), t_plus(8)).await?;
+    assert!(
+        acquirable(&stores, &test.id, t_plus(9)).await?,
         "the command runs once the edit finished, while the subagents still run"
     );
     Ok(())
+}
+
+async fn acquirable(
+    stores: &TestStores,
+    id: &AgentTaskId,
+    at: time::OffsetDateTime,
+) -> Result<bool> {
+    Ok(stores
+        .tasks
+        .try_acquire_task(
+            id,
+            WorkerId::from_string("probe_worker"),
+            LeaseId::from_string("probe_lease"),
+            at + time::Duration::seconds(600),
+            at,
+        )
+        .await?
+        .is_some())
 }
 
 #[tokio::test]
@@ -12938,6 +12954,68 @@ async fn partial_resume_atomically_reattaches_survivor_and_spawns_mixed_batch() 
         }
         other => panic!("expected atomic mixed re-park, got {other:?}"),
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_resumed_turns_new_command_waits_for_the_live_call_it_carries_over() -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
+        &stores,
+        vec![bash_call("old_0"), bash_call("old_1")],
+        ChildJoinPolicy::Any,
+    ))
+    .await?;
+    complete_child_at(
+        &stores,
+        &children[0],
+        &ok_result("old-done"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+
+    let acquired = acquire_parent(&stores, &parent.id, t_plus(10)).await?;
+    let mut bootstrap = sample_bootstrap_with_tools(acquired.clone());
+    bootstrap.definition = sample_definition_with_subagent_tools();
+    bootstrap.definition.policy.child_join_policy = ChildJoinPolicy::Any;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(10),
+    )
+    .await?;
+    let selector = MixedSpawnSelector;
+    let mut deps = stores.deps();
+    deps.subagent_spawn_selector = Some(&selector);
+    let provider = MockToolCallProvider::new(subagent_then_tool_calls());
+    let outcome = resume_from_children(inputs, &acquired, &provider, &deps, t_plus(15)).await?;
+    let RootTurnOutcome::Suspended { child_tasks, .. } = outcome else {
+        bail!("a resume that issues new calls must suspend");
+    };
+    let [spawned_subagent, new_command] = child_tasks.as_slice() else {
+        bail!("two new children expected, got {}", child_tasks.len());
+    };
+    let carried = &children[1];
+
+    assert_eq!(spawned_subagent.kind, TaskKind::Subagent);
+    assert_eq!(
+        new_command.after_siblings,
+        std::slice::from_ref(&carried.id),
+        "the new command waits for the command still live from the earlier batch"
+    );
+    assert!(!acquirable(&stores, &new_command.id, t_plus(16)).await?);
+    complete_child_at(
+        &stores,
+        carried,
+        &ok_result("carried-done"),
+        t_plus(17),
+        t_plus(18),
+    )
+    .await?;
+    assert!(acquirable(&stores, &new_command.id, t_plus(19)).await?);
     Ok(())
 }
 
