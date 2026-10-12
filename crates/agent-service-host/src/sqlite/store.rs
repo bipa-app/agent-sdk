@@ -284,23 +284,6 @@ macro_rules! task_columns {
     };
 }
 
-/// Driven from the live rows: `unlikely` tells the planner they are a sliver
-/// of the retained history, which per-index averages (ANALYZE without STAT4
-/// samples) cannot show, and the unary `+` keeps it from driving from the
-/// terminal roots instead. Without both, such statistics make it scan every
-/// row.
-pub(crate) const TERMINAL_ROOTS_WITH_LIVE_DESCENDANTS_SQL: &str = "\
-SELECT DISTINCT descendant.root_id
-FROM agent_sdk_tasks AS descendant
-JOIN agent_sdk_tasks AS root ON root.id = descendant.root_id
-WHERE unlikely(descendant.status IN (
-        'queued', 'pending', 'running', 'waiting_on_children',
-        'awaiting_confirmation', 'awaiting_question'
-    ))
-  AND descendant.parent_id IS NOT NULL
-  AND +root.status IN ('completed', 'failed', 'cancelled')
-ORDER BY descendant.root_id";
-
 impl SqliteDurableStore {
     async fn begin(&self) -> Result<Transaction<'_, Sqlite>> {
         // BEGIN IMMEDIATE acquires the RESERVED lock up front so that
@@ -4239,7 +4222,7 @@ impl AgentTaskStore for SqliteDurableStore {
     }
 
     async fn list_terminal_roots_with_live_descendants(&self) -> Result<Vec<AgentTaskId>> {
-        let roots = sqlx::query_scalar::<_, String>(TERMINAL_ROOTS_WITH_LIVE_DESCENDANTS_SQL)
+        let roots = sqlx::query_file_scalar!("src/sqlite/terminal_roots_with_live_descendants.sql")
             .fetch_all(&self.pool)
             .await
             .context("list terminal roots with live descendants")?;
@@ -9010,9 +8993,10 @@ VALUES ('live-0007', 'tool_runtime', 'pending', 'root-0007', 'root-0007', 1, 'pl
 "#;
 
     async fn plan(store: &SqliteDurableStore) -> Result<Vec<String>> {
-        let steps: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "EXPLAIN QUERY PLAN {TERMINAL_ROOTS_WITH_LIVE_DESCENDANTS_SQL}"
-        )))
+        let steps: Vec<(i64, i64, i64, String)> = sqlx::query_as(concat!(
+            "EXPLAIN QUERY PLAN ",
+            include_str!("terminal_roots_with_live_descendants.sql"),
+        ))
         .fetch_all(&store.pool)
         .await?;
         Ok(steps.into_iter().map(|(_, _, _, detail)| detail).collect())

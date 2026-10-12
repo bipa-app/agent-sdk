@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "-- Driven from the live rows: `unlikely` tells the planner they are a sliver\n-- of the retained history, which per-index averages (ANALYZE without STAT4\n-- samples) cannot show, and the unary `+` keeps it from driving from the\n-- terminal roots instead. Without both, such statistics make it scan every\n-- row.\nSELECT DISTINCT descendant.root_id AS \"root_id!: String\"\nFROM agent_sdk_tasks AS descendant\nJOIN agent_sdk_tasks AS root ON root.id = descendant.root_id\nWHERE unlikely(descendant.status IN (\n        'queued', 'pending', 'running', 'waiting_on_children',\n        'awaiting_confirmation', 'awaiting_question'\n    ))\n  AND descendant.parent_id IS NOT NULL\n  AND +root.status IN ('completed', 'failed', 'cancelled')\nORDER BY descendant.root_id\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "root_id!: String",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_tasks",
+            "name": "root_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "3c3fdd1c5955f3631ef4b119b68dd65a5f055b56e8137195fccecf72b18e9337"
+}
