@@ -102,12 +102,13 @@ fn chat_store(base_url: &str, config: Option<&OpenAIReasoningConfig>) -> Option<
         .or_else(|| is_official_openai_base_url(base_url).then_some(false))
 }
 
-pub(super) fn official_cache_key<'a>(
+pub(super) fn prompt_cache_key_for<'a>(
     base_url: &str,
+    forward_to_any_host: bool,
     session_id: Option<&'a str>,
 ) -> Option<Cow<'a, str>> {
     session_id
-        .filter(|_| is_official_openai_base_url(base_url))
+        .filter(|_| forward_to_any_host || is_official_openai_base_url(base_url))
         .map(bounded_prompt_cache_key)
 }
 
@@ -246,6 +247,7 @@ pub struct OpenAIProvider {
     speed: Option<SpeedTier>,
     /// Extra headers applied to every request (e.g. for gateway authentication).
     extra_headers: Vec<(String, String)>,
+    prompt_cache_key_forwarding: bool,
 }
 
 impl OpenAIProvider {
@@ -264,6 +266,7 @@ impl OpenAIProvider {
             reasoning: None,
             speed: None,
             extra_headers: Vec::new(),
+            prompt_cache_key_forwarding: false,
         }
     }
 
@@ -308,6 +311,7 @@ impl OpenAIProvider {
             reasoning: None,
             speed: None,
             extra_headers: Vec::new(),
+            prompt_cache_key_forwarding: false,
         }
     }
 
@@ -561,6 +565,22 @@ impl OpenAIProvider {
     pub fn with_extra_headers(mut self, headers: Vec<(String, String)>) -> Self {
         self.extra_headers = headers;
         self
+    }
+
+    /// Send `prompt_cache_key` to a base URL other than `api.openai.com`.
+    ///
+    /// Off by default because `OpenAI`-compatible servers may reject the
+    /// field. Enable it for a pass-through proxy to `OpenAI`, such as Azure
+    /// `OpenAI` or Cloudflare AI Gateway's `OpenAI` route. It applies to Chat
+    /// Completions and to requests rerouted to the Responses API.
+    #[must_use]
+    pub const fn with_prompt_cache_key_forwarding(mut self, enabled: bool) -> Self {
+        self.prompt_cache_key_forwarding = enabled;
+        self
+    }
+
+    pub(super) fn prompt_cache_key<'a>(&self, session_id: Option<&'a str>) -> Option<Cow<'a, str>> {
+        prompt_cache_key_for(&self.base_url, self.prompt_cache_key_forwarding, session_id)
     }
 
     /// Apply auth + extra headers. Skips `Authorization` when `api_key` is
@@ -866,7 +886,8 @@ impl OpenAIProvider {
             self.base_url.clone(),
         )
         .with_client(self.client.clone())
-        .with_extra_headers(self.extra_headers.clone());
+        .with_extra_headers(self.extra_headers.clone())
+        .with_prompt_cache_key_forwarding(self.prompt_cache_key_forwarding);
         if let Some(thinking) = self.thinking.clone() {
             provider = provider.with_thinking(thinking);
         }
@@ -942,7 +963,7 @@ impl LlmProvider for OpenAIProvider {
         let safety_identifier = reasoning_config
             .as_ref()
             .and_then(OpenAIReasoningConfig::safety_identifier);
-        let prompt_cache_key = official_cache_key(&self.base_url, request.session_id.as_deref());
+        let prompt_cache_key = self.prompt_cache_key(request.session_id.as_deref());
         let max_tokens = self.effective_max_tokens(&request);
         // Take `tools` out before `messages` pins a borrow of `request`
         // (the built messages hold references to its image sources).
@@ -1134,8 +1155,7 @@ impl LlmProvider for OpenAIProvider {
             let safety_identifier = reasoning_config
                 .as_ref()
                 .and_then(OpenAIReasoningConfig::safety_identifier);
-            let prompt_cache_key =
-                official_cache_key(&self.base_url, request.session_id.as_deref());
+            let prompt_cache_key = self.prompt_cache_key(request.session_id.as_deref());
             let max_tokens = self.effective_max_tokens(&request);
             // Take `tools` out before `messages` pins a borrow of `request`
             // (the built messages hold references to its image sources).
@@ -5386,12 +5406,16 @@ mod tests {
         );
         assert_eq!(chat_store("https://gateway.example/v1", None), None);
         assert_eq!(
-            official_cache_key(DEFAULT_BASE_URL, Some("thread-42")).as_deref(),
+            prompt_cache_key_for(DEFAULT_BASE_URL, false, Some("thread-42")).as_deref(),
             Some("thread-42")
         );
         assert_eq!(
-            official_cache_key("https://gateway.example/v1", Some("thread-42")),
+            prompt_cache_key_for("https://gateway.example/v1", false, Some("thread-42")),
             None
+        );
+        assert_eq!(
+            prompt_cache_key_for("https://gateway.example/v1", true, Some("thread-42")).as_deref(),
+            Some("thread-42")
         );
     }
 
@@ -5532,7 +5556,7 @@ mod tests {
             store: None,
             parallel_tool_calls: None,
             safety_identifier: None,
-            prompt_cache_key: official_cache_key(DEFAULT_BASE_URL, Some(session_id)),
+            prompt_cache_key: prompt_cache_key_for(DEFAULT_BASE_URL, false, Some(session_id)),
             service_tier: None,
         };
 
@@ -6096,6 +6120,93 @@ mod tests {
         request.service_tier = None;
         let json = serde_json::to_string(&request)?;
         assert!(!json.contains("service_tier"), "{json}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prompt_cache_key_forwarding_reaches_both_surfaces_of_a_custom_base_url()
+    -> anyhow::Result<()> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl_1",
+                "object": "chat.completion",
+                "model": MODEL_GPT4O,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_1",
+                "model": MODEL_GPT4O,
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                }],
+                "status": "completed",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+
+        let chat_completions = OpenAIProvider::with_base_url("key", MODEL_GPT4O, server.uri());
+        let rerouted = chat_completions.clone().with_reasoning(
+            OpenAIReasoningConfig::new().with_api_surface(OpenAIApiSurface::Responses),
+        );
+        for provider in [
+            chat_completions.clone(),
+            rerouted.clone(),
+            chat_completions.with_prompt_cache_key_forwarding(true),
+            rerouted.with_prompt_cache_key_forwarding(true),
+        ] {
+            let request = ChatRequest::new(
+                String::new(),
+                vec![agent_sdk_foundation::llm::Message::user("hello")],
+            )
+            .with_session_id("thread-42");
+            let outcome = provider.chat(request).await?;
+            anyhow::ensure!(
+                matches!(outcome, ChatOutcome::Success(_)),
+                "request did not complete: {outcome:?}"
+            );
+        }
+
+        let received = server
+            .received_requests()
+            .await
+            .context("mock server did not record requests")?;
+        let sent = received
+            .iter()
+            .map(|sent| {
+                let body: serde_json::Value = serde_json::from_slice(&sent.body)?;
+                Ok((
+                    sent.url.path().to_owned(),
+                    body.get("prompt_cache_key").cloned(),
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let key = Some(serde_json::Value::from("thread-42"));
+        assert_eq!(
+            sent,
+            vec![
+                ("/chat/completions".to_owned(), None),
+                ("/responses".to_owned(), None),
+                ("/chat/completions".to_owned(), key.clone()),
+                ("/responses".to_owned(), key),
+            ]
+        );
         Ok(())
     }
 

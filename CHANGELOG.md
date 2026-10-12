@@ -104,7 +104,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of a turn's opening request, or a plain user message appended mid-turn,
   starts without it.
 - `OpenAIResponsesProvider` sends `prompt_cache_key` only to the official
-  `api.openai.com` base URL, matching the Chat Completions provider.
+  `api.openai.com` base URL, matching the Chat Completions provider. A
+  pass-through proxy to `OpenAI` (Azure `OpenAI`, Cloudflare AI Gateway's
+  `OpenAI` route) keeps it with `with_prompt_cache_key_forwarding(true)` on
+  `OpenAIProvider`, `OpenAIResponsesProvider` or `CloudflareAIGatewayProvider`;
+  on `OpenAIProvider` it covers Chat Completions and the Responses reroute.
 - The durable worker sends the thread id as `ChatRequest::session_id` on
   every root-turn request, so Codex, Responses and Chat Completions requests
   carry a stable per-thread `prompt_cache_key`. The id is part of the measured

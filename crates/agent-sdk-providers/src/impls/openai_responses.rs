@@ -20,7 +20,7 @@ use futures::StreamExt;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
-use super::openai::{is_official_openai_base_url, official_cache_key};
+use super::openai::{is_official_openai_base_url, prompt_cache_key_for};
 use super::openai_reasoning::{
     OpenAIAllowedToolsMode, OpenAIPromptCacheMode, OpenAIPromptCacheTtl, OpenAIReasoningConfig,
     OpenAIReasoningContext, OpenAIReasoningEffort, OpenAIReasoningMode, OpenAIReasoningSummary,
@@ -99,6 +99,7 @@ pub struct OpenAIResponsesProvider {
     speed: Option<SpeedTier>,
     /// Extra headers applied to every request (e.g. for gateway / BYOK auth).
     extra_headers: Vec<(String, String)>,
+    prompt_cache_key_forwarding: bool,
 }
 
 impl OpenAIResponsesProvider {
@@ -114,6 +115,7 @@ impl OpenAIResponsesProvider {
             reasoning: None,
             speed: None,
             extra_headers: Vec::new(),
+            prompt_cache_key_forwarding: false,
         }
     }
 
@@ -129,6 +131,7 @@ impl OpenAIResponsesProvider {
             reasoning: None,
             speed: None,
             extra_headers: Vec::new(),
+            prompt_cache_key_forwarding: false,
         }
     }
 
@@ -141,6 +144,21 @@ impl OpenAIResponsesProvider {
     pub fn with_extra_headers(mut self, headers: Vec<(String, String)>) -> Self {
         self.extra_headers = headers;
         self
+    }
+
+    /// Send `prompt_cache_key` to a base URL other than `api.openai.com`.
+    ///
+    /// Off by default because Responses-compatible servers may reject the
+    /// field. Enable it for a pass-through proxy to `OpenAI`, such as Azure
+    /// `OpenAI` or Cloudflare AI Gateway's `OpenAI` route.
+    #[must_use]
+    pub const fn with_prompt_cache_key_forwarding(mut self, enabled: bool) -> Self {
+        self.prompt_cache_key_forwarding = enabled;
+        self
+    }
+
+    fn prompt_cache_key<'a>(&self, session_id: Option<&'a str>) -> Option<Cow<'a, str>> {
+        prompt_cache_key_for(&self.base_url, self.prompt_cache_key_forwarding, session_id)
     }
 
     /// Reuse an existing pooled `reqwest::Client` instead of building a fresh one.
@@ -439,7 +457,7 @@ impl LlmProvider for OpenAIResponsesProvider {
             prompt_cache_options,
             store,
             include: include_encrypted_reasoning.then_some(ENCRYPTED_REASONING_INCLUDE),
-            prompt_cache_key: official_cache_key(&self.base_url, request.session_id.as_deref()),
+            prompt_cache_key: self.prompt_cache_key(request.session_id.as_deref()),
             safety_identifier: reasoning_config
                 .as_ref()
                 .and_then(OpenAIReasoningConfig::safety_identifier),
@@ -570,7 +588,8 @@ impl LlmProvider for OpenAIResponsesProvider {
                 store,
                 include: include_encrypted_reasoning
                     .then(|| ENCRYPTED_REASONING_INCLUDE.iter().map(|value| (*value).to_owned()).collect()),
-                prompt_cache_key: official_cache_key(&self.base_url, request.session_id.as_deref())
+                prompt_cache_key: self
+                    .prompt_cache_key(request.session_id.as_deref())
                     .map(Cow::into_owned),
                 safety_identifier: reasoning_config
                     .as_ref()
@@ -2423,6 +2442,22 @@ mod tests {
 
         let sent = prompt_cache_keys_sent(&provider, &server, "thread-42").await?;
         assert_eq!(sent, vec![None, None]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prompt_cache_key_forwarding_reaches_a_custom_base_url() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        let provider = OpenAIResponsesProvider::with_base_url(
+            "test-key".to_owned(),
+            MODEL_GPT6_SOL.to_owned(),
+            server.uri(),
+        )
+        .with_prompt_cache_key_forwarding(true);
+
+        let sent = prompt_cache_keys_sent(&provider, &server, "thread-42").await?;
+        let expected = Some(serde_json::Value::from("thread-42"));
+        assert_eq!(sent, vec![expected.clone(), expected]);
         Ok(())
     }
 
