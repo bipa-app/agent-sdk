@@ -973,6 +973,9 @@ pub(super) async fn test_root_end_on_a_purging_thread_discards_undelivered_input
     thread_store: &dyn ThreadStore,
 ) -> Result<()> {
     let tid = "settle-purging-input";
+    thread_store
+        .get_or_create(&thread_id(tid), t_plus(9_000))
+        .await?;
     let (root, worker, lease) = running_root(task_store, tid, 9_000).await?;
     let injection = inject(task_store, tid, "one more thing", 9_002).await?;
     thread_store
@@ -1075,6 +1078,16 @@ mod in_memory {
     async fn settlement_in_memory_child_thread_root_end_discards_input() -> Result<()> {
         let s = fresh_in_memory_stores();
         super::test_child_thread_root_end_discards_undelivered_input(
+            s.task.as_ref(),
+            s.thread.as_ref(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn settlement_in_memory_root_end_on_a_purging_thread_discards_input() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        super::test_root_end_on_a_purging_thread_discards_undelivered_input(
             s.task.as_ref(),
             s.thread.as_ref(),
         )

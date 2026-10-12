@@ -922,6 +922,14 @@ pub const fn settles_undelivered_input(root: &AgentTask) -> bool {
     }
 }
 
+/// Whether an ending root's thread still admits new turns, which decides if
+/// the root's undelivered input may become one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThreadAdmission {
+    Open,
+    Fenced,
+}
+
 /// The rows one undelivered input injection of an ended root becomes.
 #[derive(Debug)]
 pub struct ReleasedInput {
@@ -3107,6 +3115,40 @@ impl InMemoryAgentTaskStore {
         ))
     }
 
+    /// Whether the thread of `task_id` admits the input it never delivered
+    /// as a new turn, read under the caller's write lock as admission does.
+    /// Only a root holding undelivered input consults the thread store.
+    async fn thread_admission_locked(
+        &self,
+        inner: &Inner,
+        task_id: &AgentTaskId,
+    ) -> Result<ThreadAdmission> {
+        let Some(task) = inner.by_id.get(task_id) else {
+            return Ok(ThreadAdmission::Fenced);
+        };
+        if !task.is_root() || inner.undelivered_input(task_id).is_empty() {
+            return Ok(ThreadAdmission::Fenced);
+        }
+        let thread_id = task.thread_id.clone();
+        let open = match &self.marker_sink {
+            Some(sink) => sink
+                .thread_store
+                .get(&thread_id)
+                .await?
+                .is_none_or(|thread| {
+                    thread
+                        .require_active(super::thread::ThreadOperation::Submit)
+                        .is_ok()
+                }),
+            None => true,
+        };
+        Ok(if open {
+            ThreadAdmission::Open
+        } else {
+            ThreadAdmission::Fenced
+        })
+    }
+
     async fn require_thread_active(
         &self,
         thread_id: &ThreadId,
@@ -3478,8 +3520,9 @@ impl InMemoryAgentTaskStore {
             .clone()
             .fail_with_reason(reason, now)
             .context("fail_closed_locked: fail_with_reason transition failed")?;
+        let thread = self.thread_admission_locked(inner, &old.id).await?;
         self.commit_fail_closed_event(old, reason, now).await?;
-        inner.publish_failed_row(old, &failed, now)
+        inner.publish_failed_row(old, &failed, thread, now)
     }
 
     /// Journal the terminal event that closes `task`'s turn when it fails
@@ -3862,12 +3905,18 @@ impl Inner {
         &mut self,
         old: &AgentTask,
         failed: &AgentTask,
+        thread: ThreadAdmission,
         now: OffsetDateTime,
     ) -> Result<()> {
         self.rebalance_after_row_change(old, failed);
         self.by_id.insert(failed.id.clone(), failed.clone());
-        let _ =
-            self.propagate_terminal_child_transition(failed, now, "publish_failed_row", false)?;
+        let _ = self.propagate_terminal_child_transition(
+            failed,
+            thread,
+            now,
+            "publish_failed_row",
+            false,
+        )?;
         Ok(())
     }
 
@@ -3980,6 +4029,7 @@ impl Inner {
         self.by_id.insert(cancelled.id.clone(), cancelled.clone());
         let _ = self.propagate_terminal_child_transition(
             &cancelled,
+            ThreadAdmission::Fenced,
             now,
             "cancel_tree",
             suppress_root_promotion,
@@ -4040,8 +4090,8 @@ impl Inner {
     fn apply_task_terminal_transition(
         &mut self,
         child_id: &AgentTaskId,
-        worker: &WorkerId,
-        lease: &LeaseId,
+        (worker, lease): (&WorkerId, &LeaseId),
+        thread: ThreadAdmission,
         now: OffsetDateTime,
         error_prefix: &'static str,
         transition: impl FnOnce(AgentTask) -> Result<AgentTask, super::task::TaskSchemaError>,
@@ -4080,7 +4130,7 @@ impl Inner {
         self.by_id.insert(new_child.id.clone(), new_child.clone());
 
         let parent =
-            self.propagate_terminal_child_transition(&new_child, now, error_prefix, false)?;
+            self.propagate_terminal_child_transition(&new_child, thread, now, error_prefix, false)?;
 
         Ok((new_child, parent))
     }
@@ -4088,6 +4138,7 @@ impl Inner {
     fn propagate_terminal_child_transition(
         &mut self,
         new_child: &AgentTask,
+        thread: ThreadAdmission,
         now: OffsetDateTime,
         error_prefix: &'static str,
         suppress_root_promotion: bool,
@@ -4133,7 +4184,7 @@ impl Inner {
             // (`cancel_row_in_place`) — not only the host's post-commit
             // promotion path. Promotion is idempotent, so the host's
             // later `promote_next_queued_root` becomes a no-op.
-            self.release_undelivered_input_locked(new_child, now)?;
+            self.release_undelivered_input_locked(new_child, thread, now)?;
             let resumed = self.resume_linked_subagent_invocation(new_child, now, error_prefix)?;
             let _promoted = self.promote_next_queued_root_locked(&new_child.thread_id, now)?;
             Ok(resumed)
@@ -4174,11 +4225,11 @@ impl Inner {
 
     /// Apply [`release_undelivered_input`] to every queued injection of the
     /// just-ended `root`, oldest first, before its thread's queue head is
-    /// promoted. The in-memory store sees no thread lifecycle here, so it
-    /// treats the thread as open.
+    /// promoted.
     fn release_undelivered_input_locked(
         &mut self,
         root: &AgentTask,
+        thread: ThreadAdmission,
         now: OffsetDateTime,
     ) -> Result<()> {
         if !settles_undelivered_input(root) {
@@ -4188,7 +4239,7 @@ impl Inner {
         if undelivered.is_empty() {
             return Ok(());
         }
-        let hand_over = !self.links_child_thread_root(&root.id);
+        let hand_over = thread == ThreadAdmission::Open && !self.links_child_thread_root(&root.id);
         for old in undelivered {
             let released = release_undelivered_input(old.clone(), hand_over, now)?;
             self.rebalance_after_row_change(&old, &released.injection);
@@ -6046,10 +6097,11 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Option<AgentTask>)> {
         let mut inner = self.inner.write().await;
+        let thread = self.thread_admission_locked(&inner, child_id).await?;
         let result = inner.apply_task_terminal_transition(
             child_id,
-            worker,
-            lease,
+            (worker, lease),
+            thread,
             now,
             "complete_task",
             |child| child.complete(now),
@@ -6067,10 +6119,11 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Option<AgentTask>)> {
         let mut inner = self.inner.write().await;
+        let thread = self.thread_admission_locked(&inner, child_id).await?;
         let result = inner.apply_task_terminal_transition(
             child_id,
-            worker,
-            lease,
+            (worker, lease),
+            thread,
             now,
             "complete_task_with_result",
             |child| child.complete_with_result(result_payload, now),
@@ -6108,10 +6161,11 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Option<AgentTask>)> {
         let mut inner = self.inner.write().await;
+        let thread = self.thread_admission_locked(&inner, child_id).await?;
         let result = inner.apply_task_terminal_transition(
             child_id,
-            worker,
-            lease,
+            (worker, lease),
+            thread,
             now,
             "fail_task_with_reason",
             move |child| child.fail_with_terminal_reason(error, reason, now),
