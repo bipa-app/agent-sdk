@@ -8486,6 +8486,9 @@ enum TurnExit {
     AggregateResume,
     /// The child wake's lease expires until the sweep fails the row closed.
     FailClosedByLeaseExpiry,
+    /// A steering wake's LLM call fails and the wake is reverted; the
+    /// children's fan-in then commits the turn.
+    RevertFailedSteering,
 }
 
 /// `call_1`'s child when the turn ends. `AggregateResume` needs every child
@@ -8718,6 +8721,12 @@ async fn end_early_resumed_turn(
             }
             expire_wake_until_failed_closed(stores, &parent.id).await?;
         }
+        TurnExit::RevertFailedSteering => {
+            Box::pin(revert_failed_steering(
+                stores, deps, &parent, &children, finish,
+            ))
+            .await?;
+        }
     }
     Ok(())
 }
@@ -8867,6 +8876,84 @@ async fn cancel_mid_steering(
     Ok(())
 }
 
+/// Fail a steering wake's LLM call (after its pre-call compaction, when
+/// compaction is on), revert the wake, then finish the children and fan in.
+async fn revert_failed_steering(
+    stores: &TestStores,
+    deps: &RootTurnDeps<'_>,
+    parent: &AgentTask,
+    children: &[AgentTask],
+    finish: Option<AgentTask>,
+) -> Result<()> {
+    stores
+        .tasks
+        .enqueue_steering_resume(
+            &parent.id,
+            vec![ContentBlock::Text {
+                text: "how is it going?".into(),
+            }],
+            t_plus(20),
+        )
+        .await?
+        .context("woken")?;
+    let acquired = acquire_parent(stores, &parent.id, t_plus(21)).await?;
+    let inputs = resume_inputs(stores, &acquired, t_plus(21)).await?;
+    let provider = FinishThenFailProvider {
+        stores: stores.clone(),
+        finish: finish.clone(),
+    };
+    let error = Box::pin(resume_for_steering(
+        inputs,
+        &acquired,
+        &provider,
+        deps,
+        t_plus(22),
+    ))
+    .await
+    .err()
+    .context("the steering call must fail")?;
+    revert_steering_wake(
+        &acquired,
+        &WorkerId::from_string("worker_test"),
+        &LeaseId::from_string("lease_test"),
+        &error,
+        deps,
+        t_plus(45),
+    )
+    .await?;
+    if finish.is_none() {
+        complete_child_at(
+            stores,
+            &children[1],
+            &ok_result("done-1"),
+            t_plus(46),
+            t_plus(47),
+        )
+        .await?;
+    }
+    complete_child_at(
+        stores,
+        &children[2],
+        &ok_result("done-2"),
+        t_plus(48),
+        t_plus(49),
+    )
+    .await?;
+    let acquired = acquire_parent(stores, &parent.id, t_plus(50)).await?;
+    let inputs = resume_inputs(stores, &acquired, t_plus(50)).await?;
+    let provider = RequestLogProvider::new("All finished.");
+    let outcome = Box::pin(resume_from_children(
+        inputs,
+        &acquired,
+        &provider,
+        deps,
+        t_plus(51),
+    ))
+    .await?;
+    anyhow::ensure!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+    Ok(())
+}
+
 async fn fail_mid_resume(
     stores: &TestStores,
     deps: &RootTurnDeps<'_>,
@@ -8956,7 +9043,9 @@ fn expected_closures(
     survivor: SurvivorAtExit,
 ) -> [(&'static str, &'static str); 2] {
     let call_1 = match (exit, survivor) {
-        (_, SurvivorAtExit::Finished) => "success",
+        (_, SurvivorAtExit::Finished) | (TurnExit::RevertFailedSteering, SurvivorAtExit::Live) => {
+            "success"
+        }
         (TurnExit::FailMidResume | TurnExit::FailClosedByLeaseExpiry, SurvivorAtExit::Live) => {
             "still_running"
         }
@@ -8967,9 +9056,10 @@ fn expected_closures(
     };
     let call_2 = match exit {
         TurnExit::CancelParked | TurnExit::CancelMidSteering => "cancelled",
-        TurnExit::FailMidResume | TurnExit::AggregateResume | TurnExit::FailClosedByLeaseExpiry => {
-            "success"
-        }
+        TurnExit::FailMidResume
+        | TurnExit::AggregateResume
+        | TurnExit::FailClosedByLeaseExpiry
+        | TurnExit::RevertFailedSteering => "success",
     };
     [("call_1", call_1), ("call_2", call_2)]
 }
@@ -9066,6 +9156,7 @@ async fn every_turn_exit_closes_interim_only_calls_once_with_their_real_state() 
         TurnExit::FailMidResume,
         TurnExit::AggregateResume,
         TurnExit::FailClosedByLeaseExpiry,
+        TurnExit::RevertFailedSteering,
     ] {
         for compaction in [false, true] {
             for survivor in [SurvivorAtExit::Live, SurvivorAtExit::Finished] {

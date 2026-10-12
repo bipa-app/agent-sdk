@@ -19,7 +19,7 @@ use agent_sdk_foundation::ThreadId;
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Message, StopReason, Tool,
-    Usage, provider_tool_sequence_error_index,
+    Usage, late_tool_result, provider_tool_sequence_error_index,
 };
 use agent_sdk_foundation::{ToolResult, ToolTier};
 use agent_sdk_providers::LlmProvider;
@@ -36,9 +36,11 @@ use crate::journal::message_store::{InMemoryMessageProjectionStore, MessageProje
 use crate::journal::outbox::InMemoryOutboxStore;
 use crate::journal::store::{
     AgentTaskStore, CancellationMarkerSink, InMemoryAgentTaskStore,
-    InMemoryAtomicSpawnEventCommitter, RequeueOutcome,
+    InMemoryAtomicSpawnEventCommitter, RequeueOutcome, SubmitDisposition, SubmitRootTurnParams,
 };
-use crate::journal::task::{AgentTask, AgentTaskId, LeaseId, TaskStatus, WorkerId};
+use crate::journal::task::{
+    AgentTask, AgentTaskId, LeaseId, SubmittedInputItem, TaskStatus, WorkerId,
+};
 use crate::journal::task_state::TaskState;
 use crate::journal::thread_store::InMemoryThreadStore;
 use crate::journal::turn_attempt_store::InMemoryTurnAttemptStore;
@@ -418,6 +420,34 @@ fn tool_use_ids(messages: &[Message]) -> Vec<String> {
         })
         .filter_map(|block| match block {
             ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn tool_result_ids(messages: &[Message]) -> Vec<String> {
+    messages
+        .iter()
+        .flat_map(|message| match &message.content {
+            Content::Blocks(blocks) => blocks.as_slice(),
+            Content::Text(_) => &[],
+        })
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn late_result_ids(messages: &[Message]) -> Vec<String> {
+    messages
+        .iter()
+        .flat_map(|message| match &message.content {
+            Content::Blocks(blocks) => blocks.as_slice(),
+            Content::Text(_) => &[],
+        })
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => late_tool_result::tool_use_id(text),
             _ => None,
         })
         .collect()
@@ -855,6 +885,16 @@ async fn overflow_compaction_at_default_retention_never_refolds_snapcompact() ->
 async fn fold_then_die(harness: &Harness, main: &ScriptedMainProvider) -> Result<AgentTaskId> {
     let (task_id, children) = start_tool_turn(harness, main).await?;
     harness.complete_children(&children, 1_000).await?;
+    fold_then_die_after_children(harness, main, &task_id).await?;
+    Ok(task_id)
+}
+
+async fn fold_then_die_after_children(
+    harness: &Harness,
+    main: &ScriptedMainProvider,
+    task_id: &AgentTaskId,
+) -> Result<()> {
+    let task_id = task_id.clone();
 
     main.push(ChatOutcome::InvalidRequest(
         "upstream rejected the request".into(),
@@ -886,7 +926,7 @@ async fn fold_then_die(harness: &Harness, main: &ScriptedMainProvider) -> Result
         )
         .await?;
     ensure!(matches!(requeued, RequeueOutcome::Requeued(_)));
-    Ok(task_id)
+    Ok(())
 }
 
 /// The host re-runs a resume that died after its compaction from the same
@@ -925,6 +965,69 @@ async fn resume_rerun_after_a_compacting_attempt_died_does_not_restage_the_folde
         projection.messages.len(),
     );
     Ok(())
+}
+
+/// An input injected while the turn was parked is drained by the resume and
+/// stays queued until the turn commits, so the rerun drains it again. The
+/// dead attempt's fold already holds the fan-in and the injection after the
+/// parked messages; the rerun must rebuild that same fan-in (not read
+/// `call_1` as answered by the fold it is about to skip) so neither is
+/// staged a second time.
+#[tokio::test]
+async fn resume_rerun_does_not_restage_an_injection_the_dead_attempt_folded() -> Result<()> {
+    let harness = Harness::new(
+        CompactionEngine::Legacy,
+        Trigger::Threshold,
+        Retention::Nothing,
+    )?;
+    let main = ScriptedMainProvider::new();
+    let (task_id, children) = start_tool_turn(&harness, &main).await?;
+    harness.complete_children(&children, 1_000).await?;
+    harness
+        .tasks
+        .submit_root_turn_idempotent(SubmitRootTurnParams {
+            task: AgentTask::new_root_turn_with_input(
+                thread_id(),
+                vec![SubmittedInputItem::Text {
+                    text: "use the concise format".into(),
+                }],
+                at(1_001),
+                3,
+            ),
+            idempotency: None,
+            max_queued_depth: None,
+            disposition: SubmitDisposition::InjectAtBoundary,
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("injection submit failed: {error}"))?;
+    fold_then_die_after_children(&harness, &main, &task_id).await?;
+    let folded = harness.projection().await?;
+    ensure!(
+        folded.messages.len() == 4,
+        "precondition: the dead attempt folded the prompt, call_1, its result and the \
+         injection; the transcript has {}",
+        folded.messages.len(),
+    );
+
+    main.push(text("all done"))?;
+    let parent = harness.acquire(&task_id, 2_000).await?;
+    let inputs = harness.inputs(parent.clone(), 2_000).await?;
+    let outcome = resume_from_children(inputs, &parent, &main, &harness.deps(), at(2_010)).await?;
+    ensure!(
+        matches!(outcome, RootTurnOutcome::Completed { .. }),
+        "the rerun must commit the turn"
+    );
+
+    let projection = harness.projection().await?;
+    ensure!(
+        projection.messages.len() == 5,
+        "prompt, call_1, its result, the injection and the final reply, each once; the \
+         transcript has {}",
+        projection.messages.len(),
+    );
+    ensure!(tool_result_ids(&projection.messages) == ["call_1"]);
+    ensure_provider_valid(&projection.messages, "raw transcript after the rerun")?;
+    ensure_requests_have_unique_tool_use_ids(&main, "rerun with an injection")
 }
 
 /// Cancelling the requeued row commits its parked `suspended_messages`
@@ -1001,17 +1104,34 @@ async fn wake_for_steering(harness: &Harness, task_id: &AgentTaskId, now: i64) -
     Ok(())
 }
 
+/// Every call the turn issued, in order, and the ones whose outcome arrives
+/// as a late result after an interim answer.
+struct TurnCalls<'a> {
+    issued: &'a [&'a str],
+    late: &'a [&'a str],
+}
+
 async fn ensure_turn_holds_each_tool_call_once(
     harness: &Harness,
     main: &ScriptedMainProvider,
-    expected: &[String],
+    calls: &TurnCalls<'_>,
     label: &str,
 ) -> Result<()> {
     let projection = harness.projection().await?;
     ensure!(
-        tool_use_ids(&projection.messages) == expected,
+        tool_use_ids(&projection.messages) == calls.issued,
         "{label}: the transcript must hold every tool call exactly once, in order: {:?}",
         tool_use_ids(&projection.messages),
+    );
+    ensure!(
+        tool_result_ids(&projection.messages) == calls.issued,
+        "{label}: every call must have exactly one tool_result: {:?}",
+        tool_result_ids(&projection.messages),
+    );
+    ensure!(
+        late_result_ids(&projection.messages) == calls.late,
+        "{label}: each interim-answered call must close with exactly one late result: {:?}",
+        late_result_ids(&projection.messages),
     );
     ensure!(
         projection.draft_messages.is_empty(),
@@ -1127,7 +1247,10 @@ async fn steering_wake_that_compacts_reparks_only_the_unfolded_turn() -> Result<
     ensure_turn_holds_each_tool_call_once(
         &harness,
         &main,
-        &["call_1".to_owned(), "call_2".to_owned()],
+        &TurnCalls {
+            issued: &["call_1", "call_2"],
+            late: &["call_2"],
+        },
         "steering re-park",
     )
     .await
@@ -1154,47 +1277,46 @@ async fn steering_wake_that_compacts_and_calls_a_tool_parks_only_the_new_call() 
     ensure_turn_holds_each_tool_call_once(
         &harness,
         &main,
-        &[
-            "call_1".to_owned(),
-            "call_2".to_owned(),
-            "call_3".to_owned(),
-        ],
+        &TurnCalls {
+            issued: &["call_1", "call_2", "call_3"],
+            late: &[],
+        },
         "steering tool call",
     )
     .await
 }
 
-/// A steering exchange that compacted and then failed is reverted to its
-/// pre-wake parked state, but its fold already holds that whole parked turn
-/// (and the steering message that answered it). The revert must re-park none
-/// of it, and a cancel of the reverted row must commit none of it again.
-#[tokio::test]
-async fn cancel_after_a_compacted_steering_wake_was_reverted_commits_nothing_twice() -> Result<()> {
-    let harness = Harness::new(
-        CompactionEngine::Legacy,
-        Trigger::Threshold,
-        Retention::Nothing,
-    )?;
-    let main = ScriptedMainProvider::new();
-    let (task_id, children) = start_turn_calling(&harness, &main, &["call_1", "call_2"]).await?;
+/// Parks two tool calls, finishes `call_1`, and wakes the parent for
+/// steering. The exchange compacts, folding the parked turn and the steering
+/// message (`call_1`'s real result, `call_2`'s interim answer, the note),
+/// then its call fails and the wake is reverted to its pre-wake parked state.
+/// The fold already holds that whole parked turn, so the revert must re-park
+/// none of it.
+async fn revert_compacted_steering_wake(
+    harness: &Harness,
+    main: &ScriptedMainProvider,
+) -> Result<(AgentTaskId, Vec<AgentTask>, MessageProjection)> {
+    let (task_id, children) = start_turn_calling(harness, main, &["call_1", "call_2"]).await?;
     let finished = children.first().context("first tool child")?;
     harness
         .complete_children(std::slice::from_ref(finished), 1_000)
         .await?;
-    wake_for_steering(&harness, &task_id, 1_010).await?;
+    wake_for_steering(harness, &task_id, 1_010).await?;
 
     main.push(ChatOutcome::InvalidRequest(
         "upstream rejected the request".into(),
     ))?;
     let parent = harness.acquire(&task_id, 1_020).await?;
+    let before = harness.projection().await?;
     let inputs = harness.inputs(parent.clone(), 1_020).await?;
-    let Err(error) = resume_for_steering(inputs, &parent, &main, &harness.deps(), at(1_030)).await
+    let Err(error) = resume_for_steering(inputs, &parent, main, &harness.deps(), at(1_030)).await
     else {
         bail!("the steering exchange must fail after compacting");
     };
     let folded = harness.projection().await?;
     ensure!(
-        folded.compactions.len() == 1 && folded.draft_messages.is_empty(),
+        folded.compactions.len() == before.compactions.len() + 1
+            && folded.draft_messages.is_empty(),
         "precondition: the failed exchange folded the parked turn into the transcript",
     );
     ensure!(tool_use_ids(&folded.messages) == ["call_1", "call_2"]);
@@ -1214,6 +1336,19 @@ async fn cancel_after_a_compacted_steering_wake_was_reverted_commits_nothing_twi
         "the revert must not re-park messages the failed exchange folded: {:?}",
         tool_use_ids(parked_messages(&reverted)?),
     );
+    Ok((task_id, children, folded))
+}
+
+/// A cancel of the reverted row must commit none of the folded turn again.
+#[tokio::test]
+async fn cancel_after_a_compacted_steering_wake_was_reverted_commits_nothing_twice() -> Result<()> {
+    let harness = Harness::new(
+        CompactionEngine::Legacy,
+        Trigger::Threshold,
+        Retention::Nothing,
+    )?;
+    let main = ScriptedMainProvider::new();
+    let (task_id, _, folded) = revert_compacted_steering_wake(&harness, &main).await?;
 
     cancel_root_turn(&task_id, &harness.deps(), at(1_050)).await?;
     let projection = harness.projection().await?;
@@ -1228,4 +1363,60 @@ async fn cancel_after_a_compacted_steering_wake_was_reverted_commits_nothing_twi
         &projection.context_history(),
         "effective view after the cancel",
     )
+}
+
+/// The revert cannot take back what the fold delivered: `call_1`'s real
+/// result and `call_2`'s interim answer. When `call_2` finishes, the fan-in
+/// must deliver its outcome once, as a late result, and nothing for
+/// `call_1`; neither a second `tool_result` nor an orphaned one may reach a
+/// request or the transcript, and the next turn starts from a valid one.
+async fn fan_in_after_a_reverted_compacted_steering_wake(retention: Retention) -> Result<()> {
+    let harness = Harness::new(CompactionEngine::Legacy, Trigger::Threshold, retention)?;
+    if matches!(retention, Retention::Default) {
+        harness.seed_history(SEEDED_TURNS).await?;
+    }
+    let main = ScriptedMainProvider::new();
+    let (task_id, children, _) = revert_compacted_steering_wake(&harness, &main).await?;
+    let survivor = children.get(1).context("call_2's child")?;
+
+    finish_turn(&harness, &main, &task_id, std::slice::from_ref(survivor)).await?;
+    let calls = TurnCalls {
+        issued: &["call_1", "call_2"],
+        late: &["call_2"],
+    };
+    let label = format!("fan-in after a reverted steering wake ({retention:?})");
+    ensure_turn_holds_each_tool_call_once(&harness, &main, &calls, &label).await?;
+    if matches!(retention, Retention::Default) {
+        let effective = harness.projection().await?.context_history();
+        ensure!(
+            late_result_ids(&effective) == ["call_2"],
+            "{label}: default retention keeps the late result in the effective view: {:?}",
+            late_result_ids(&effective),
+        );
+    }
+
+    main.push(text("next answer"))?;
+    let next = AgentTask::new_root_turn(thread_id(), at(3_000), 3);
+    let next_id = next.id.clone();
+    harness.tasks.submit_root_turn(next).await?;
+    let next = harness.acquire(&next_id, 3_010).await?;
+    let inputs = harness.inputs(next, 3_010).await?;
+    let outcome =
+        execute_root_turn(inputs, "next question", &main, &harness.deps(), at(3_020)).await?;
+    ensure!(
+        matches!(outcome, RootTurnOutcome::Completed { .. }),
+        "{label}: the next turn must commit"
+    );
+    ensure_turn_holds_each_tool_call_once(&harness, &main, &calls, &format!("{label}, next turn"))
+        .await
+}
+
+#[tokio::test]
+async fn fan_in_after_a_reverted_compacted_steering_wake_closes_each_call_once() -> Result<()> {
+    fan_in_after_a_reverted_compacted_steering_wake(Retention::Nothing).await
+}
+
+#[tokio::test]
+async fn fan_in_after_a_reverted_compacted_steering_wake_at_default_retention() -> Result<()> {
+    fan_in_after_a_reverted_compacted_steering_wake(Retention::Default).await
 }

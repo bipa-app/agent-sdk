@@ -7212,9 +7212,10 @@ pub async fn resume_root_turn(
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<RootTurnOutcome> {
+    let answers = earlier_answers(deps, &inputs.bootstrap.thread_id, &suspended_messages).await?;
     let fan_in = fan_in_for_child_results(
         &continuation,
-        &suspended_messages,
+        &answers,
         child_results,
         inputs.bootstrap.task.state.child_ids(),
         deps.task_store,
@@ -7234,15 +7235,14 @@ pub async fn resume_root_turn(
 
 async fn fan_in_for_child_results(
     continuation: &AgentContinuation,
-    suspended_messages: &[llm::Message],
+    answers: &BTreeMap<String, EarlierAnswer>,
     child_results: Vec<(String, ToolResult)>,
     child_ids: &[AgentTaskId],
     task_store: &dyn AgentTaskStore,
 ) -> Result<llm::Message> {
-    let answered = answered_tool_use_ids(suspended_messages);
     let children = if child_results
         .iter()
-        .any(|(tool_use_id, _)| answered.contains(tool_use_id.as_str()))
+        .any(|(tool_use_id, _)| answers.contains_key(tool_use_id))
     {
         children_by_spawn_index(child_ids, task_store).await?
     } else {
@@ -7251,20 +7251,22 @@ async fn fan_in_for_child_results(
     let mut tool_results = Vec::with_capacity(child_results.len());
     let mut late_results = Vec::new();
     for (tool_use_id, result) in child_results {
-        if answered.contains(tool_use_id.as_str()) {
-            let (index, call) = continuation
-                .pending_tool_calls
-                .iter()
-                .enumerate()
-                .find(|(_, call)| call.id == tool_use_id)
-                .with_context(|| format!("answered call {tool_use_id} is not pending"))?;
-            late_results.push(LateToolResult {
-                call: call.clone(),
-                status: late_status(children.get(&index).map(|child| child.status), &result),
-                result,
-            });
-        } else {
-            tool_results.push((tool_use_id, FanInAnswer::Finished(result)));
+        match answers.get(&tool_use_id) {
+            Some(EarlierAnswer::Interim) => {
+                let (index, call) = continuation
+                    .pending_tool_calls
+                    .iter()
+                    .enumerate()
+                    .find(|(_, call)| call.id == tool_use_id)
+                    .with_context(|| format!("answered call {tool_use_id} is not pending"))?;
+                late_results.push(LateToolResult {
+                    call: call.clone(),
+                    status: late_status(children.get(&index).map(|child| child.status), &result),
+                    result,
+                });
+            }
+            Some(EarlierAnswer::Delivered) => {}
+            None => tool_results.push((tool_use_id, FanInAnswer::Finished(result))),
         }
     }
     Ok(llm::Message::user_with_content(fan_in_blocks(
@@ -7782,7 +7784,9 @@ fn build_resumed_draft_messages(
 ) -> Vec<llm::Message> {
     let mut messages = Vec::with_capacity(suspended_messages.len() + 1);
     messages.extend_from_slice(suspended_messages);
-    messages.push(fan_in.clone());
+    if !message_blocks(fan_in).is_empty() {
+        messages.push(fan_in.clone());
+    }
     messages
 }
 
@@ -8140,14 +8144,10 @@ pub async fn resume_from_children(
             std::mem::discriminant(other),
         ),
     };
-    let interim = build_steering_interim(
-        &continuation,
-        &suspended_messages,
-        &child_ids,
-        deps.task_store,
-    )
-    .await
-    .context("build child resume fan-in")?;
+    let answers = earlier_answers(deps, &parent.thread_id, &suspended_messages).await?;
+    let interim = build_steering_interim(&continuation, &answers, &child_ids, deps.task_store)
+        .await
+        .context("build child resume fan-in")?;
     if !interim.surviving.is_empty() {
         return Box::pin(run_steering_exchange(
             inputs,
@@ -8368,24 +8368,64 @@ pub(crate) enum FanInAnswer {
     StillRunning(AgentTaskId),
 }
 
-/// Ids that already have a `tool_result` in the parked history, i.e.
-/// the calls an earlier early resume answered with the interim payload.
-fn answered_tool_use_ids(messages: &[llm::Message]) -> BTreeSet<&str> {
-    messages
-        .iter()
-        .filter_map(|message| match &message.content {
-            llm::Content::Blocks(blocks) => Some(blocks),
-            llm::Content::Text(_) => None,
-        })
-        .flatten()
-        .filter_map(|block| {
-            if let llm::ContentBlock::ToolResult { tool_use_id, .. } = block {
-                Some(tool_use_id.as_str())
-            } else {
-                None
+/// How the turn's history already answers a pending call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EarlierAnswer {
+    /// Only the interim payload: the call's outcome follows as a late result.
+    Interim,
+    /// The call's outcome already reached the transcript: its real
+    /// `tool_result`, or a late result after its interim one.
+    Delivered,
+}
+
+/// The calls the turn's history already answers.
+///
+/// Every `tool_result` in `parked` is an interim answer an earlier early
+/// resume wrote. A compaction may also have folded answers of this turn
+/// into the raw transcript before the fold `parked` continues — the
+/// interim answers of an early resume that re-parked only what it had not
+/// folded, or the real results a failed steering exchange delivered before
+/// its wake was reverted — so that history is read too, telling interim
+/// answers from delivered outcomes.
+async fn earlier_answers(
+    deps: &RootTurnDeps<'_>,
+    thread_id: &agent_sdk_foundation::ThreadId,
+    parked: &[llm::Message],
+) -> Result<BTreeMap<String, EarlierAnswer>> {
+    let projection = deps
+        .message_store
+        .get(thread_id)
+        .await
+        .context("read the transcript for earlier answers")?;
+    let mut answers = BTreeMap::new();
+    if let Some(projection) = &projection {
+        let history = projection.history_before_in_flight(parked);
+        let delivered = scan_transcript(history, &[]).delivered;
+        for block in history.iter().flat_map(message_blocks) {
+            if let llm::ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                ..
+            } = block
+            {
+                let answer = if interim_answer(content, *is_error).is_some()
+                    && !delivered.contains(tool_use_id)
+                {
+                    EarlierAnswer::Interim
+                } else {
+                    EarlierAnswer::Delivered
+                };
+                answers.insert(tool_use_id.clone(), answer);
             }
-        })
-        .collect()
+        }
+    }
+    for block in parked.iter().flat_map(message_blocks) {
+        if let llm::ContentBlock::ToolResult { tool_use_id, .. } = block {
+            answers.insert(tool_use_id.clone(), EarlierAnswer::Interim);
+        }
+    }
+    Ok(answers)
 }
 
 /// The parked batch's children keyed by the pending-call index each one
@@ -8417,12 +8457,11 @@ async fn children_by_spawn_index(
 /// gets nothing new.
 async fn build_steering_interim(
     continuation: &AgentContinuation,
-    suspended_messages: &[llm::Message],
+    answers: &BTreeMap<String, EarlierAnswer>,
     child_ids: &[AgentTaskId],
     task_store: &dyn AgentTaskStore,
 ) -> Result<SteeringInterim> {
     let pending = &continuation.pending_tool_calls;
-    let answered = answered_tool_use_ids(suspended_messages);
     let by_index = children_by_spawn_index(child_ids, task_store).await?;
 
     let mut tool_results = Vec::with_capacity(pending.len());
@@ -8432,26 +8471,29 @@ async fn build_steering_interim(
         let child = by_index.get(&idx).with_context(|| {
             format!("steering wake: no child resolves pending tool call at index {idx}")
         })?;
-        let already_answered = answered.contains(call.id.as_str());
-        if child.status.is_terminal() {
-            let result = extract_child_tool_result(child)?;
-            if already_answered {
+        let survivor = || SurvivingChild {
+            child_id: child.id.clone(),
+            pending_index: idx,
+        };
+        match (answers.get(&call.id), child.status.is_terminal()) {
+            (Some(EarlierAnswer::Delivered), _) => {}
+            (Some(EarlierAnswer::Interim), true) => {
+                let result = extract_child_tool_result(child)?;
                 late_results.push(LateToolResult {
                     call: call.clone(),
                     status: late_status(Some(child.status), &result),
                     result,
                 });
-            } else {
+            }
+            (None, true) => {
+                let result = extract_child_tool_result(child)?;
                 tool_results.push((call.id.clone(), FanInAnswer::Finished(result)));
             }
-        } else {
-            if !already_answered {
+            (Some(EarlierAnswer::Interim), false) => surviving.push(survivor()),
+            (None, false) => {
                 tool_results.push((call.id.clone(), FanInAnswer::StillRunning(child.id.clone())));
+                surviving.push(survivor());
             }
-            surviving.push(SurvivingChild {
-                child_id: child.id.clone(),
-                pending_index: idx,
-            });
         }
     }
 
@@ -8996,14 +9038,10 @@ pub async fn resume_for_steering(
         ),
     };
 
-    let interim = build_steering_interim(
-        &continuation,
-        &suspended_messages,
-        &child_ids,
-        deps.task_store,
-    )
-    .await
-    .context("build steering interim fan-in")?;
+    let answers = earlier_answers(deps, &parent.thread_id, &suspended_messages).await?;
+    let interim = build_steering_interim(&continuation, &answers, &child_ids, deps.task_store)
+        .await
+        .context("build steering interim fan-in")?;
 
     // Box-pin the heavy body so `resume_for_steering`'s own future
     // stays under the `clippy::large_futures` threshold — same pattern

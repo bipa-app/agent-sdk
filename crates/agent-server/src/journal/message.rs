@@ -82,6 +82,16 @@ pub enum MessageProjectionError {
     )]
     CompactionBreaksToolSequence { index: usize },
 }
+/// Where an in-flight sequence continues the folds since the last commit;
+/// see [`MessageProjection::folded_in_flight_overlap`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FoldedOverlap {
+    /// Raw index of the fold the sequence continues.
+    pub fold_start: usize,
+    /// Leading messages of the sequence the raw transcript already holds.
+    pub len: usize,
+}
+
 /// One append-only compaction boundary in a message projection.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompactionEntry {
@@ -170,17 +180,6 @@ fn demote_untrusted_compaction_summary(mut message: llm::Message) -> llm::Messag
         }
     }
     message
-}
-
-fn calls_tools(message: &llm::Message) -> bool {
-    message.role == llm::Role::Assistant
-        && matches!(
-            &message.content,
-            llm::Content::Blocks(blocks)
-                if blocks
-                    .iter()
-                    .any(|block| matches!(block, llm::ContentBlock::ToolUse { .. }))
-        )
 }
 
 fn is_generated_compaction_summary(message: &llm::Message) -> bool {
@@ -446,25 +445,27 @@ impl MessageProjection {
         history
     }
 
-    /// Leading `in_flight` messages that the raw transcript already holds
-    /// because a compaction folded them in from the draft since the last
-    /// commit.
+    /// Where `in_flight` continues the folds a compaction moved in from the
+    /// draft since the last commit, or `None` when it shares nothing with
+    /// them.
     ///
     /// The folds since the last commit form one contiguous run at the end of
     /// [`Self::messages`], and every in-flight sequence a worker rebuilds (a
     /// parked suspension, a resume or steering draft, a cancel candidate)
-    /// starts at one of its fold boundaries. This returns the longest prefix
-    /// `in_flight` shares with the run from any boundary: the whole run tail
-    /// when `in_flight` extends it, all of `in_flight` when the run already
-    /// holds it, and the shared part when the two diverge. A resume that
-    /// compacted and then died is re-run, or cancelled, from the same parked
-    /// messages; this is how either recognizes what its predecessor folded.
+    /// starts at one of its fold boundaries. The overlap is the longest
+    /// prefix `in_flight` shares with the run from any boundary: the whole
+    /// run tail when `in_flight` extends it, all of `in_flight` when the run
+    /// already holds it, and the shared part when the two diverge. A resume
+    /// that compacted and then died is re-run, or cancelled, from the same
+    /// parked messages; this is how either recognizes what its predecessor
+    /// folded.
     ///
-    /// A shared prefix counts only when it holds an assistant tool call:
-    /// tool-use ids never recur, while a prompt text can repeat across turns.
+    /// A shared prefix counts only when it holds an assistant message: a
+    /// prompt text can repeat across turns, while a stale fold would match
+    /// only a model reply repeated verbatim at a fold boundary.
     #[must_use]
-    pub fn folded_in_flight_prefix_len(&self, in_flight: &[llm::Message]) -> usize {
-        let mut folded = 0;
+    pub fn folded_in_flight_overlap(&self, in_flight: &[llm::Message]) -> Option<FoldedOverlap> {
+        let mut overlap: Option<FoldedOverlap> = None;
         let mut run_start = self.messages.len();
         for entry in self.compactions.iter().rev() {
             if entry.draft_fold_start.saturating_add(entry.draft_fold_len) != run_start {
@@ -482,11 +483,37 @@ impl MessageProjection {
                 .zip(in_flight)
                 .take_while(|(durable, candidate)| durable == candidate)
                 .count();
-            if in_flight.iter().take(shared).any(calls_tools) {
-                folded = folded.max(shared);
+            let anchored = in_flight
+                .iter()
+                .take(shared)
+                .any(|message| message.role == llm::Role::Assistant);
+            if anchored && overlap.is_none_or(|best| shared > best.len) {
+                overlap = Some(FoldedOverlap {
+                    fold_start: run_start,
+                    len: shared,
+                });
             }
         }
-        folded
+        overlap
+    }
+
+    /// Leading `in_flight` messages the raw transcript already holds; see
+    /// [`Self::folded_in_flight_overlap`].
+    #[must_use]
+    pub fn folded_in_flight_prefix_len(&self, in_flight: &[llm::Message]) -> usize {
+        self.folded_in_flight_overlap(in_flight)
+            .map_or(0, |overlap| overlap.len)
+    }
+
+    /// The raw transcript that precedes `in_flight`: everything before the
+    /// fold it continues, or all of [`Self::messages`] when it continues
+    /// none.
+    #[must_use]
+    pub fn history_before_in_flight(&self, in_flight: &[llm::Message]) -> &[llm::Message] {
+        let end = self
+            .folded_in_flight_overlap(in_flight)
+            .map_or(self.messages.len(), |overlap| overlap.fold_start);
+        self.messages.get(..end).unwrap_or_default()
     }
 
     /// Replace the in-flight draft messages.
@@ -1588,6 +1615,40 @@ mod tests {
     }
 
     #[test]
+    fn a_folded_reply_without_a_tool_call_anchors_the_overlap() -> anyhow::Result<()> {
+        let (p, first) = projection_with_folded_turn()?;
+        let reply = llm::Message::assistant("call_1 is still running");
+        let p = p
+            .set_draft(
+                vec![reply.clone(), llm::Message::user("late result")],
+                t_plus(4),
+            )
+            .append_compaction(summary(), 3, 0, t_plus(5))?;
+
+        let parked = std::slice::from_ref(&reply);
+        assert_eq!(
+            p.folded_in_flight_overlap(parked),
+            Some(FoldedOverlap {
+                fold_start: 5,
+                len: 1
+            }),
+            "a steering reply parked before its resume folded is durable",
+        );
+        assert_eq!(p.history_before_in_flight(parked).len(), 5);
+        assert_eq!(
+            p.history_before_in_flight(&first).len(),
+            2,
+            "the history before a sequence ends where the fold it continues starts",
+        );
+        assert_eq!(
+            p.history_before_in_flight(&tool_round("call_9")).len(),
+            p.messages.len(),
+            "a sequence that continues no fold follows the whole transcript",
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_repeated_prompt_alone_does_not_match_an_earlier_fold() -> anyhow::Result<()> {
         let (p, in_flight) = projection_with_folded_turn()?;
         let prompt = in_flight.first().context("prompt")?.clone();
@@ -1595,7 +1656,7 @@ mod tests {
         assert_eq!(
             p.folded_in_flight_prefix_len(std::slice::from_ref(&prompt)),
             0,
-            "a shared prefix without a tool call identifies no turn",
+            "a shared prefix without an assistant message identifies no turn",
         );
 
         let mut next_turn = vec![prompt];
