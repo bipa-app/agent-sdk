@@ -70,7 +70,7 @@ failpoints = ["dep:fail", "fail/failpoints"]
 # what a test double would fake by construction. The workspace pins
 # `default-features = false`, so provider features are requested here rather
 # than inherited.
-agent-sdk-providers = { workspace = true, features = ["anthropic", "gemini", "openai", "openai-codex"] }
+agent-sdk-providers = { workspace = true, features = ["anthropic", "gemini", "openai", "openai-codex", "record-replay"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "test-util"] }
 async-stream = { workspace = true }
 # The compaction/multimodal integration tests decode artifact-backed frame
@@ -80,6 +80,8 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 proptest = { workspace = true }
 tempfile = { workspace = true }
+# Captures the request body a real provider puts on the wire.
+wiremock = { workspace = true }
 
 [lints]
 workspace = true

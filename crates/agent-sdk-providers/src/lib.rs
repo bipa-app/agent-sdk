@@ -114,7 +114,7 @@ pub use impls::{
 
 // Model capabilities
 pub use model_capabilities::{
-    ModelCapabilities, PricePoint, Pricing, SourceStatus, get_model_capabilities,
+    DefaultReasoning, ModelCapabilities, PricePoint, Pricing, SourceStatus, get_model_capabilities,
     supported_model_capabilities,
 };
 pub use model_features::{

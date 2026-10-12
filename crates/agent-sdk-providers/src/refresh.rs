@@ -322,6 +322,10 @@ where
         self.thinking.as_ref()
     }
 
+    fn configures_unbudgeted_reasoning(&self) -> bool {
+        self.template.configures_unbudgeted_reasoning()
+    }
+
     // Delegate capability shaping to the wrapped provider so that wrapping
     // never silently changes request shaping (e.g. losing Vertex's max-token
     // clamp or a provider's adaptive-thinking validation). These methods are

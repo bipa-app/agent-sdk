@@ -204,6 +204,15 @@ pub struct AgentDefinition {
     /// The agent's system prompt.
     pub system_prompt: String,
     /// Maximum tokens per LLM response.
+    ///
+    /// The worker sends at most the serving model's registered
+    /// `max_output_tokens`, and while a
+    /// [`model_aware_threshold`](agent_sdk::context::CompactionConfig::model_aware_threshold)
+    /// drives automatic compaction and the serving model's capabilities are
+    /// known, at most a quarter of that threshold's window plus the
+    /// request's reasoning. A value set explicitly for this
+    /// agent and one inherited from a parent are capped alike: the field
+    /// cannot tell them apart.
     pub max_tokens: u32,
     /// Static tool definitions. Used when [`tools_fn`](Self::tools_fn)
     /// is `None`, and as the fallback for deserialized definitions

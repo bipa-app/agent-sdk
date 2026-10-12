@@ -51,8 +51,8 @@ use agent_sdk::context::{
 };
 use agent_sdk_foundation::TokenUsage;
 use agent_sdk_foundation::events::{AgentEvent, CompactionTrigger};
-use agent_sdk_foundation::llm::ChatRequest;
-use agent_sdk_providers::{LlmProvider, ModelCapabilities};
+use agent_sdk_foundation::llm::{ChatRequest, ThinkingConfig, ThinkingMode};
+use agent_sdk_providers::{DefaultReasoning, LlmProvider, ModelCapabilities};
 use agent_sdk_tools::stores::MessageStore;
 use anyhow::{Context, Result};
 use time::OffsetDateTime;
@@ -334,11 +334,170 @@ fn saturating_usize(tokens: u32) -> usize {
     usize::try_from(tokens).unwrap_or(usize::MAX)
 }
 
+/// Visible output may claim at most this fraction of the serving window, so
+/// at least three quarters stay available to the prompt and history.
+const OUTPUT_WINDOW_SHARE_DIVISOR: u32 = 4;
+
+/// Floor of the visible-output window share, so small-window models keep the
+/// output budget the Anthropic and Vertex providers default to when a caller
+/// sets none.
+const MIN_OUTPUT_WINDOW_SHARE_TOKENS: u32 = 32_000;
+
+/// Output a request may spend on reasoning on top of its visible share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReasoningAllowance {
+    /// The request configures no reasoning.
+    None,
+    /// An explicit thinking budget.
+    Budget(u32),
+    /// Reasoning sized by effort or by the model (configured without a
+    /// budget, or on by default), which may take as much as the visible
+    /// share.
+    Unbudgeted,
+}
+
+/// How [`serving_max_tokens`] bounds a host's output budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OutputSizing {
+    /// Only the model's registered `max_output_tokens`.
+    ModelMax,
+    /// Also the visible-output share of `window`, plus the reasoning
+    /// allowance.
+    WindowShare {
+        window: u32,
+        reasoning: ReasoningAllowance,
+    },
+}
+
+impl OutputSizing {
+    /// The window share only pays off where a model-aware threshold drives
+    /// the pre-call trigger, and it shares the window that threshold uses.
+    /// It also needs the serving model's capability row: without one (an
+    /// unknown model, or a route that may dispatch elsewhere and hides the
+    /// served provider's thinking) the request's reasoning is unknown and a
+    /// smaller request could starve it. `thinking` is the configuration the
+    /// provider will send: the request's, else the provider's own.
+    /// `provider_reasons` is the provider's own effort-only reasoning
+    /// setting, which applies when `thinking` is `None`.
+    pub(crate) fn for_request(
+        trigger: Option<ModelAwareTrigger<'_>>,
+        capabilities: Option<&ModelCapabilities>,
+        thinking: Option<&ThinkingConfig>,
+        provider_reasons: bool,
+    ) -> Self {
+        let (Some(trigger), Some(capabilities)) = (trigger, capabilities) else {
+            return Self::ModelMax;
+        };
+        let Some(window) = effective_window_tokens(trigger.0, Some(capabilities)) else {
+            return Self::ModelMax;
+        };
+        let reasoning = match thinking.map(|thinking| &thinking.mode) {
+            None if provider_reasons => ReasoningAllowance::Unbudgeted,
+            None => match capabilities.default_reasoning {
+                DefaultReasoning::On => ReasoningAllowance::Unbudgeted,
+                DefaultReasoning::Off => ReasoningAllowance::None,
+            },
+            Some(ThinkingMode::Enabled { budget_tokens }) => {
+                ReasoningAllowance::Budget(*budget_tokens)
+            }
+            Some(ThinkingMode::Adaptive | ThinkingMode::Default) => ReasoningAllowance::Unbudgeted,
+        };
+        Self::WindowShare {
+            window: u32::try_from(window).unwrap_or(u32::MAX),
+            reasoning,
+        }
+    }
+}
+
+/// A compaction config whose model-aware threshold drives the pre-call
+/// trigger; only [`model_aware_trigger`] builds one.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ModelAwareTrigger<'a>(&'a CompactionConfig);
+
+/// `cfg` when its model-aware threshold drives the pre-call trigger:
+/// automatic compaction is on and a compaction provider can run it. The
+/// message-count minimum is not consulted, so a request's size, and with it
+/// the envelope fingerprint, never changes as history grows.
+pub(crate) fn model_aware_trigger(
+    cfg: Option<&CompactionConfig>,
+    has_compaction_provider: bool,
+) -> Option<ModelAwareTrigger<'_>> {
+    cfg.filter(|cfg| has_compaction_provider && cfg.auto_compact && cfg.model_aware_threshold)
+        .map(ModelAwareTrigger)
+}
+
+/// The window the model-aware threshold derives from: the configured
+/// override, else the serving model's registered window.
+fn effective_window_tokens(
+    cfg: &CompactionConfig,
+    capabilities: Option<&ModelCapabilities>,
+) -> Option<usize> {
+    cfg.model_context_window_tokens
+        .or_else(|| {
+            capabilities
+                .and_then(|caps| caps.context_window)
+                .map(saturating_usize)
+        })
+        .filter(|window| *window > 0)
+}
+
+/// Capabilities of the model that will serve the next request. A dynamic
+/// dispatcher (failover chain, per-request router) may serve the call from a
+/// route its representative capabilities do not describe, so it contributes
+/// none.
+pub(crate) fn serving_capabilities(
+    provider: &dyn LlmProvider,
+) -> Option<&'static ModelCapabilities> {
+    if provider.has_stable_request_route() {
+        provider.capabilities()
+    } else {
+        None
+    }
+}
+
+/// `max_tokens` to request from the serving model for a host-requested
+/// output budget.
+///
+/// The request is always capped at the model's registered
+/// `max_output_tokens`, above which the provider rejects the call. Under
+/// [`OutputSizing::WindowShare`] it is also capped at a quarter of the
+/// window, floored at [`MIN_OUTPUT_WINDOW_SHARE_TOKENS`], plus the
+/// reasoning allowance, because every output token reserved is an input
+/// token the compaction trigger must give up; reasoning rides on top so it
+/// never eats into the visible share. A request with neither bound keeps
+/// its budget.
+pub(crate) fn serving_max_tokens(
+    requested: u32,
+    capabilities: Option<&ModelCapabilities>,
+    sizing: OutputSizing,
+) -> u32 {
+    let model_max = capabilities
+        .and_then(|caps| caps.max_output_tokens)
+        .filter(|tokens| *tokens > 0);
+    let window_share = match sizing {
+        OutputSizing::ModelMax => None,
+        OutputSizing::WindowShare { window, reasoning } => {
+            let share = (window / OUTPUT_WINDOW_SHARE_DIVISOR).max(MIN_OUTPUT_WINDOW_SHARE_TOKENS);
+            let allowance = match reasoning {
+                ReasoningAllowance::None => 0,
+                ReasoningAllowance::Budget(budget) => budget,
+                ReasoningAllowance::Unbudgeted => share,
+            };
+            Some(share.saturating_add(allowance))
+        }
+    };
+    [model_max, window_share]
+        .into_iter()
+        .flatten()
+        .fold(requested, u32::min)
+}
+
 /// Trigger threshold for one call; see
-/// [`CompactionConfig::model_aware_threshold`]. A zero
-/// `requested_max_tokens` floors the reserve at the row's
-/// `max_output_tokens` instead. A reserve that consumes the whole window
-/// leaves `threshold_tokens` unchanged.
+/// [`CompactionConfig::model_aware_threshold`]. The row's
+/// `max_output_tokens` reserves only what [`serving_max_tokens`] would
+/// request of it, and a zero `requested_max_tokens` floors the reserve at
+/// that amount instead. A reserve that consumes the whole window leaves
+/// `threshold_tokens` unchanged.
 fn effective_threshold_tokens(
     cfg: &CompactionConfig,
     capabilities: Option<&ModelCapabilities>,
@@ -347,19 +506,21 @@ fn effective_threshold_tokens(
     if !cfg.model_aware_threshold {
         return (cfg.threshold_tokens, "fixed");
     }
-    let row_window = capabilities
-        .and_then(|caps| caps.context_window)
-        .map(saturating_usize);
-    let Some(window) = cfg
-        .model_context_window_tokens
-        .or(row_window)
-        .filter(|window| *window > 0)
-    else {
+    let Some(window) = effective_window_tokens(cfg, capabilities) else {
         return (cfg.threshold_tokens, "fixed_unknown_model");
     };
     let row_max_output = capabilities
         .and_then(|caps| caps.max_output_tokens)
-        .map(saturating_usize);
+        .map(|tokens| {
+            saturating_usize(serving_max_tokens(
+                tokens,
+                capabilities,
+                OutputSizing::WindowShare {
+                    window: u32::try_from(window).unwrap_or(u32::MAX),
+                    reasoning: ReasoningAllowance::None,
+                },
+            ))
+        });
     let requested_output = Some(requested_max_tokens)
         .filter(|tokens| *tokens > 0)
         .map(saturating_usize)
@@ -379,20 +540,18 @@ fn effective_threshold_tokens(
         )
 }
 
-/// Threshold for a call served by `main_provider`. A dynamic dispatcher
-/// (failover chain, per-request router) may serve the call from a route its
-/// representative capabilities do not describe, so it contributes none.
+/// Threshold for a call served by `main_provider`; see
+/// [`serving_capabilities`].
 fn serving_threshold_tokens(
     cfg: &CompactionConfig,
     main_provider: &dyn LlmProvider,
     requested_max_tokens: u32,
 ) -> (usize, &'static str) {
-    let capabilities = if main_provider.has_stable_request_route() {
-        main_provider.capabilities()
-    } else {
-        None
-    };
-    effective_threshold_tokens(cfg, capabilities, requested_max_tokens)
+    effective_threshold_tokens(
+        cfg,
+        serving_capabilities(main_provider),
+        requested_max_tokens,
+    )
 }
 
 /// The compactor's own budgets (prune-only acceptance, Snapcompact frame
@@ -1080,8 +1239,11 @@ mod tests {
             registered("anthropic", "claude-fable-5"),
             FABLE_REQUESTED_MAX_TOKENS,
         );
-        assert_eq!(threshold, 200_000 - 128_000);
+        assert_eq!(threshold, 200_000 - 200_000 / 4);
         assert_eq!(source, "model_aware");
+        let (threshold, _) =
+            effective_threshold_tokens(&cfg, registered("anthropic", "claude-fable-5"), 128_000);
+        assert_eq!(threshold, 200_000 - 128_000);
     }
 
     #[test]
@@ -1290,6 +1452,464 @@ mod tests {
         assert_eq!(
             serving_threshold_tokens(&cfg, &bare, 4_096),
             (cfg.threshold_tokens, "fixed_unknown_model"),
+        );
+    }
+
+    const ROOT_REQUESTED_MAX_TOKENS: u32 = 128_000;
+
+    fn openrouter(model: &str) -> agent_sdk_providers::OpenAIProvider {
+        agent_sdk_providers::OpenAIProvider::with_base_url(
+            "key",
+            model,
+            "https://openrouter.ai/api/v1",
+        )
+    }
+
+    /// The dispatched `max_tokens` and the threshold the pre-call trigger
+    /// derives from that same request.
+    fn worker_budget(
+        cfg: &CompactionConfig,
+        provider: &dyn LlmProvider,
+        requested: u32,
+    ) -> (u32, (usize, &'static str)) {
+        thinking_worker_budget(cfg, provider, requested, None)
+    }
+
+    fn thinking_worker_budget(
+        cfg: &CompactionConfig,
+        provider: &dyn LlmProvider,
+        requested: u32,
+        thinking: Option<&ThinkingConfig>,
+    ) -> (u32, (usize, &'static str)) {
+        let capabilities = serving_capabilities(provider);
+        let max_tokens = serving_max_tokens(
+            requested,
+            capabilities,
+            OutputSizing::for_request(
+                model_aware_trigger(Some(cfg), true),
+                capabilities,
+                thinking,
+                false,
+            ),
+        );
+        (
+            max_tokens,
+            serving_threshold_tokens(cfg, provider, max_tokens),
+        )
+    }
+
+    fn model_aware() -> CompactionConfig {
+        CompactionConfig::default().with_model_aware_threshold(true)
+    }
+
+    /// `max_tokens` for a request under a model-aware trigger.
+    fn sized(
+        requested: u32,
+        capabilities: Option<&ModelCapabilities>,
+        thinking: Option<&ThinkingConfig>,
+    ) -> u32 {
+        serving_max_tokens(
+            requested,
+            capabilities,
+            OutputSizing::for_request(
+                model_aware_trigger(Some(&model_aware()), true),
+                capabilities,
+                thinking,
+                false,
+            ),
+        )
+    }
+
+    #[test]
+    fn inherited_root_output_budget_is_sized_to_the_serving_model() {
+        use agent_sdk_providers::{AnthropicProvider, OpenAICodexResponsesProvider};
+
+        let cfg = CompactionConfig::default()
+            .with_model_aware_threshold(true)
+            .with_threshold_tokens(80_000);
+        let routes: Vec<(&str, Box<dyn LlmProvider>, u32, usize)> = vec![
+            (
+                "claude-fable-5-1",
+                Box::new(AnthropicProvider::new("key", "claude-fable-5-1")),
+                128_000,
+                1_000_000 - 128_000,
+            ),
+            (
+                "claude-opus-5-5",
+                Box::new(AnthropicProvider::new("key", "claude-opus-5-5")),
+                128_000,
+                1_000_000 - 128_000,
+            ),
+            (
+                "gpt-6.1-sol",
+                Box::new(OpenAICodexResponsesProvider::new(
+                    "key".into(),
+                    "gpt-6.1-sol".into(),
+                )),
+                128_000,
+                1_050_000 - 128_000,
+            ),
+            (
+                "z-ai/glm-5.1",
+                Box::new(openrouter("z-ai/glm-5.1")),
+                202_752 / 2,
+                202_752 - 202_752 / 2,
+            ),
+            (
+                "moonshotai/kimi-k3",
+                Box::new(openrouter("moonshotai/kimi-k3")),
+                128_000,
+                1_048_576 - 128_000,
+            ),
+            (
+                "accounts/fireworks/models/kimi-k3",
+                Box::new(agent_sdk_providers::OpenAIProvider::with_base_url(
+                    "key",
+                    "accounts/fireworks/models/kimi-k3",
+                    "https://api.fireworks.ai/inference/v1",
+                )),
+                128_000,
+                1_048_576 - 128_000,
+            ),
+        ];
+        for (model, provider, expected_max_tokens, expected_threshold) in routes {
+            assert_eq!(
+                worker_budget(&cfg, provider.as_ref(), ROOT_REQUESTED_MAX_TOKENS),
+                (expected_max_tokens, (expected_threshold, "model_aware")),
+                "{model}",
+            );
+        }
+        let unknown = RouteStub {
+            provider: "mock",
+            model: "mock-model",
+            stable: true,
+        };
+        assert_eq!(
+            worker_budget(&cfg, &unknown, ROOT_REQUESTED_MAX_TOKENS),
+            (128_000, (80_000, "fixed_unknown_model")),
+        );
+    }
+
+    #[test]
+    fn registered_output_cap_reserve_is_sized_like_the_request() {
+        let cfg = CompactionConfig::default().with_model_aware_threshold(true);
+        let glm = registered("openai", "z-ai/glm-5.1");
+        assert_eq!(
+            effective_threshold_tokens(&cfg, glm, 32_000),
+            (202_752 - 202_752 / 4, "model_aware"),
+        );
+        assert_eq!(
+            effective_threshold_tokens(&cfg, glm, 0),
+            (202_752 - 202_752 / 4, "model_aware"),
+        );
+    }
+
+    #[test]
+    fn requests_above_the_model_max_output_are_clamped_to_it() {
+        let fable = registered("anthropic", "claude-fable-5-1");
+        let flash = registered("gemini", "gemini-2.0-flash");
+        assert_eq!(
+            serving_max_tokens(200_000, fable, OutputSizing::ModelMax),
+            128_000
+        );
+        assert_eq!(sized(200_000, fable, None), 128_000);
+        assert_eq!(
+            serving_max_tokens(128_000, flash, OutputSizing::ModelMax),
+            8_192
+        );
+        assert_eq!(sized(128_000, flash, None), 8_192);
+        assert_eq!(
+            sized(200_000, fable, Some(&ThinkingConfig::new(150_000))),
+            128_000
+        );
+    }
+
+    #[test]
+    fn unknown_models_keep_the_requested_output_budget() {
+        assert_eq!(
+            serving_max_tokens(128_000, None, OutputSizing::ModelMax),
+            128_000
+        );
+        assert_eq!(sized(128_000, None, None), 128_000);
+        assert_eq!(
+            sized(128_000, registered("mock", "mock-model"), None),
+            128_000
+        );
+    }
+
+    #[test]
+    fn window_share_needs_a_model_aware_trigger_that_can_run() {
+        let cfg = model_aware();
+        assert!(model_aware_trigger(Some(&cfg), true).is_some());
+        assert!(model_aware_trigger(None, true).is_none());
+        assert!(model_aware_trigger(Some(&CompactionConfig::default()), true).is_none());
+        assert!(
+            model_aware_trigger(Some(&cfg), false).is_none(),
+            "no compaction provider can run the trigger",
+        );
+        assert!(
+            model_aware_trigger(Some(&model_aware().with_auto_compact(false)), true).is_none(),
+            "automatic compaction is off",
+        );
+
+        let sonnet = registered("anthropic", "claude-sonnet-4-5-20250929");
+        assert_eq!(
+            OutputSizing::for_request(None, sonnet, None, false),
+            OutputSizing::ModelMax,
+        );
+        let trigger = model_aware_trigger(Some(&cfg), true);
+        assert_eq!(
+            OutputSizing::for_request(trigger, None, None, false),
+            OutputSizing::ModelMax,
+            "no window to share",
+        );
+        for (thinking, reasoning) in [
+            (None, ReasoningAllowance::None),
+            (
+                Some(ThinkingConfig::new(55_000)),
+                ReasoningAllowance::Budget(55_000),
+            ),
+            (
+                Some(ThinkingConfig::adaptive()),
+                ReasoningAllowance::Unbudgeted,
+            ),
+            (
+                Some(ThinkingConfig::default_with_effort(
+                    agent_sdk_foundation::llm::Effort::High,
+                )),
+                ReasoningAllowance::Unbudgeted,
+            ),
+        ] {
+            assert_eq!(
+                OutputSizing::for_request(trigger, sonnet, thinking.as_ref(), false),
+                OutputSizing::WindowShare {
+                    window: 200_000,
+                    reasoning,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn without_a_model_aware_threshold_only_the_model_max_bounds_output() {
+        for (provider, model, requested, expected) in [
+            ("anthropic", "claude-sonnet-4-5-20250929", 64_000, 64_000),
+            ("anthropic", "claude-haiku-4-5-20251001", 64_000, 64_000),
+            ("openai", "gpt-5", 128_000, 128_000),
+            ("openai", "o3", 100_000, 100_000),
+            ("openai", "deepseek/deepseek-v4-pro", 384_000, 384_000),
+            ("openai", "minimax/minimax-m2.5", 128_000, 128_000),
+            ("openai", "z-ai/glm-5.1", 128_000, 128_000),
+            ("openai", "z-ai/glm-5.1", 100_000, 100_000),
+            ("openai", "z-ai/glm-5.1", 200_000, 131_072),
+        ] {
+            assert_eq!(
+                serving_max_tokens(
+                    requested,
+                    registered(provider, model),
+                    OutputSizing::ModelMax
+                ),
+                expected,
+                "{model} at {requested}",
+            );
+        }
+        let glm = openrouter("z-ai/glm-5.1");
+        assert_eq!(
+            worker_budget(
+                &CompactionConfig::default().with_threshold_tokens(80_000),
+                &glm,
+                ROOT_REQUESTED_MAX_TOKENS,
+            ),
+            (128_000, (80_000, "fixed")),
+        );
+    }
+
+    #[test]
+    fn window_share_bounds_output_only_where_it_binds() -> anyhow::Result<()> {
+        let registered_kimi = registered("openai", "accounts/fireworks/models/kimi-k3")
+            .context("fireworks kimi k3 row")?;
+        assert_eq!(registered_kimi.max_output_tokens, None);
+        assert_eq!(registered_kimi.default_reasoning, DefaultReasoning::On);
+        assert_eq!(sized(600_000, Some(registered_kimi), None), 1_048_576 / 2);
+        let kimi = registered_kimi.with_default_reasoning(DefaultReasoning::Off);
+        assert_eq!(sized(128_000, Some(&kimi), None), 128_000);
+        assert_eq!(sized(400_000, Some(&kimi), None), 1_048_576 / 4);
+
+        let small_window = kimi.with_context_window(Some(100_000));
+        assert_eq!(sized(128_000, Some(&small_window), None), 32_000);
+        assert_eq!(sized(16_000, Some(&small_window), None), 16_000);
+        Ok(())
+    }
+
+    #[test]
+    fn reasoning_rides_on_top_of_the_window_share() {
+        let budget = |tokens| Some(ThinkingConfig::new(tokens));
+        let sonnet = registered("anthropic", "claude-sonnet-4-5-20250929");
+        assert_eq!(sized(64_000, sonnet, None), 50_000);
+        assert_eq!(sized(64_000, sonnet, budget(10_000).as_ref()), 60_000);
+        assert_eq!(
+            sized(64_000, sonnet, budget(49_999).as_ref()),
+            64_000,
+            "the model max, not the window share, bounds a budget near the share",
+        );
+        assert_eq!(sized(128_000, sonnet, budget(55_000).as_ref()), 64_000);
+
+        let glm = registered("openai", "z-ai/glm-5.1");
+        let budgeted = sized(128_000, glm, budget(51_000).as_ref());
+        assert_eq!(budgeted, 202_752 / 4 + 51_000);
+        assert_eq!(
+            effective_threshold_tokens(&model_aware(), glm, budgeted),
+            (202_752 - (202_752 / 4 + 51_000), "model_aware"),
+        );
+
+        let effort = Some(ThinkingConfig::default_with_effort(
+            agent_sdk_foundation::llm::Effort::High,
+        ));
+        let o3 = registered("openai", "o3");
+        assert_eq!(
+            sized(100_000, o3, effort.as_ref()),
+            100_000,
+            "unbudgeted reasoning keeps a second share, here the whole model max",
+        );
+        assert_eq!(
+            sized(100_000, o3, Some(&ThinkingConfig::adaptive())),
+            100_000
+        );
+        assert_eq!(sized(128_000, glm, effort.as_ref()), 202_752 / 2);
+    }
+
+    #[test]
+    fn models_that_reason_by_default_get_the_reasoning_share() {
+        let override_cfg = model_aware().with_model_context_window_tokens(200_000);
+        let override_sized = |model: &str| {
+            let capabilities = registered("anthropic", model);
+            serving_max_tokens(
+                ROOT_REQUESTED_MAX_TOKENS,
+                capabilities,
+                OutputSizing::for_request(
+                    model_aware_trigger(Some(&override_cfg), true),
+                    capabilities,
+                    None,
+                    false,
+                ),
+            )
+        };
+        assert_eq!(sized(100_000, registered("openai", "o3"), None), 100_000);
+        assert_eq!(override_sized("claude-opus-5-5"), 100_000);
+        assert_eq!(override_sized("claude-opus-4-8"), 50_000);
+        let glm = registered("openai", "z-ai/glm-5.1");
+        let glm_request = sized(ROOT_REQUESTED_MAX_TOKENS, glm, None);
+        assert_eq!(glm_request, 202_752 / 2);
+        assert_eq!(
+            effective_threshold_tokens(&model_aware(), glm, glm_request),
+            (202_752 - 202_752 / 2, "model_aware"),
+        );
+        assert_eq!(
+            sized(
+                64_000,
+                registered("anthropic", "claude-sonnet-4-5-20250929"),
+                None
+            ),
+            50_000,
+            "a model that thinks only when asked gets the visible share alone",
+        );
+    }
+
+    #[test]
+    fn window_override_sizes_output_like_the_threshold() {
+        let cfg = model_aware()
+            .with_model_context_window_tokens(200_000)
+            .with_threshold_tokens(80_000);
+        let opus = agent_sdk_providers::AnthropicProvider::new("key", "claude-opus-5-5");
+        let opus_48 = agent_sdk_providers::AnthropicProvider::new("key", "claude-opus-4-8");
+        assert_eq!(
+            worker_budget(&cfg, &opus_48, ROOT_REQUESTED_MAX_TOKENS),
+            (50_000, (150_000, "model_aware")),
+        );
+        assert_eq!(
+            worker_budget(&cfg, &opus, ROOT_REQUESTED_MAX_TOKENS),
+            (100_000, (100_000, "model_aware")),
+        );
+        assert_eq!(
+            thinking_worker_budget(
+                &cfg,
+                &opus,
+                ROOT_REQUESTED_MAX_TOKENS,
+                Some(&ThinkingConfig::adaptive()),
+            ),
+            (100_000, (100_000, "model_aware")),
+        );
+        for (route, stable) in [("unknown", true), ("unstable", false)] {
+            let provider = RouteStub {
+                provider: "mock",
+                model: "mock-model",
+                stable,
+            };
+            assert_eq!(
+                worker_budget(&cfg, &provider, ROOT_REQUESTED_MAX_TOKENS),
+                (128_000, (200_000 - 128_000, "model_aware")),
+                "{route}: no capability row, so the request's reasoning is unknown",
+            );
+        }
+        assert_eq!(
+            worker_budget(
+                &model_aware().with_threshold_tokens(80_000),
+                &opus,
+                ROOT_REQUESTED_MAX_TOKENS,
+            ),
+            (128_000, (872_000, "model_aware")),
+        );
+    }
+
+    #[test]
+    fn unstable_routes_trust_no_output_cap() {
+        let router = RouteStub {
+            provider: "openai",
+            model: "z-ai/glm-5.1",
+            stable: false,
+        };
+        assert!(serving_capabilities(&router).is_none());
+        assert_eq!(sized(128_000, serving_capabilities(&router), None), 128_000);
+    }
+
+    #[test]
+    fn in_tree_wrappers_size_output_from_the_same_row_as_the_threshold() {
+        use agent_sdk_providers::{FallbackProvider, ModelRouter, RefreshingProvider};
+
+        let cfg = CompactionConfig::default()
+            .with_model_aware_threshold(true)
+            .with_threshold_tokens(80_000);
+        let glm = openrouter("z-ai/glm-5.1");
+        let template = glm.clone();
+        let refreshing = RefreshingProvider::new(glm.clone(), move || {
+            let provider = template.clone();
+            async move { Ok(provider) }
+        });
+        let failover = FallbackProvider::new(Arc::new(glm.clone()));
+        let model_router = ModelRouter::new(
+            openrouter("mock-classifier"),
+            openrouter("mock-fast"),
+            glm,
+            openrouter("mock-advanced"),
+        );
+        assert_eq!(failover.model(), "z-ai/glm-5.1");
+        assert_eq!(LlmProvider::model(&model_router), "z-ai/glm-5.1");
+        let budget =
+            |provider: &dyn LlmProvider| worker_budget(&cfg, provider, ROOT_REQUESTED_MAX_TOKENS);
+        assert_eq!(
+            budget(&refreshing),
+            (202_752 / 2, (202_752 - 202_752 / 2, "model_aware")),
+            "refreshing",
+        );
+        assert_eq!(
+            budget(&failover),
+            (ROOT_REQUESTED_MAX_TOKENS, (80_000, "fixed_unknown_model")),
+            "failover",
+        );
+        assert_eq!(
+            budget(&model_router),
+            (ROOT_REQUESTED_MAX_TOKENS, (80_000, "fixed_unknown_model")),
+            "router",
         );
     }
 

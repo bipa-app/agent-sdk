@@ -1352,6 +1352,12 @@ impl LlmProvider for OpenAIProvider {
         self.thinking.as_ref()
     }
 
+    fn configures_unbudgeted_reasoning(&self) -> bool {
+        self.reasoning
+            .as_ref()
+            .is_some_and(OpenAIReasoningConfig::requests_reasoning)
+    }
+
     fn configured_speed(&self) -> Option<SpeedTier> {
         self.speed
     }
@@ -2968,6 +2974,46 @@ where
 mod tests {
     use super::*;
     use anyhow::Context as _;
+
+    #[test]
+    fn effort_only_reasoning_is_reported_to_request_sizing() {
+        use crate::impls::openai_reasoning::OpenAIReasoningEffort;
+
+        let effort = |effort| OpenAIReasoningConfig::new().with_effort(effort);
+        let chat = |reasoning: Option<OpenAIReasoningConfig>| {
+            let provider = OpenAIProvider::new("key", "gpt-5.4");
+            match reasoning {
+                Some(reasoning) => provider.with_reasoning(reasoning),
+                None => provider,
+            }
+        };
+        assert!(!chat(None).configures_unbudgeted_reasoning());
+        assert!(!chat(Some(OpenAIReasoningConfig::new())).configures_unbudgeted_reasoning());
+        assert!(!chat(Some(effort(OpenAIReasoningEffort::None))).configures_unbudgeted_reasoning());
+        assert!(
+            chat(Some(effort(OpenAIReasoningEffort::Minimal))).configures_unbudgeted_reasoning()
+        );
+        assert!(chat(Some(effort(OpenAIReasoningEffort::High))).configures_unbudgeted_reasoning());
+
+        let responses = crate::impls::openai_responses::OpenAIResponsesProvider::new(
+            "key".to_owned(),
+            "gpt-5.4".to_owned(),
+        );
+        assert!(!responses.configures_unbudgeted_reasoning());
+        assert!(
+            responses
+                .with_reasoning(effort(OpenAIReasoningEffort::High))
+                .configures_unbudgeted_reasoning()
+        );
+
+        let template = chat(Some(effort(OpenAIReasoningEffort::High)));
+        let refreshed = template.clone();
+        let refreshing = crate::refresh::RefreshingProvider::new(template, move || {
+            let provider = refreshed.clone();
+            async move { Ok(provider) }
+        });
+        assert!(refreshing.configures_unbudgeted_reasoning());
+    }
 
     #[test]
     fn compaction_summary_is_framed_as_untrusted_historical_data() {

@@ -355,6 +355,14 @@ impl LlmProvider for CloudflareAIGatewayProvider {
         }
     }
 
+    fn configures_unbudgeted_reasoning(&self) -> bool {
+        match &self.inner {
+            Inner::Anthropic(p) => p.configures_unbudgeted_reasoning(),
+            Inner::OpenAI(p) => p.configures_unbudgeted_reasoning(),
+            Inner::Gemini(p) => p.configures_unbudgeted_reasoning(),
+        }
+    }
+
     fn has_stable_request_route(&self) -> bool {
         match &self.inner {
             Inner::Anthropic(p) => p.has_stable_request_route(),
@@ -500,6 +508,27 @@ mod tests {
         let p = CloudflareAIGatewayProvider::gemini_pro("t", "a", "g");
         let caps = p.capabilities().unwrap();
         assert_eq!(caps.provider, "gemini");
+    }
+
+    #[test]
+    fn output_sizing_inputs_follow_the_inner_provider() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        let p = CloudflareAIGatewayProvider::anthropic(
+            "t".to_owned(),
+            "a",
+            "g",
+            "claude-sonnet-4-5-20250929".to_owned(),
+        );
+        assert!(p.has_stable_request_route());
+        let caps = p
+            .capabilities()
+            .context("sonnet 4.5 row through the gateway")?;
+        assert_eq!(
+            (caps.context_window, caps.max_output_tokens),
+            (Some(200_000), Some(64_000)),
+        );
+        Ok(())
     }
 
     #[test]

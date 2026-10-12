@@ -842,6 +842,17 @@ pub trait LlmProvider: Send + Sync {
         None
     }
 
+    /// Whether this provider's own reasoning setting, outside
+    /// `ChatRequest::thinking` and
+    /// [`configured_thinking`](Self::configured_thinking), makes the model
+    /// reason on every request without a token budget (an effort-only
+    /// reasoning config, for example). Request sizing counts that reasoning
+    /// against `max_tokens`. A wrapper around exactly one inner provider
+    /// delegates to it.
+    fn configures_unbudgeted_reasoning(&self) -> bool {
+        false
+    }
+
     /// Canonical capability metadata for this provider/model, if known.
     fn capabilities(&self) -> Option<&'static ModelCapabilities> {
         get_model_capabilities(self.provider(), self.model()).or_else(|| match self.provider() {
@@ -988,7 +999,7 @@ pub trait LlmProvider: Send + Sync {
     /// does not explicitly override `AgentConfig.max_tokens`.
     fn default_max_tokens(&self) -> u32 {
         self.capabilities()
-            .and_then(|caps| caps.max_output_tokens)
+            .and_then(ModelCapabilities::default_output_tokens)
             .or_else(|| default_max_output_tokens(self.provider(), self.model()))
             .unwrap_or(4096)
     }

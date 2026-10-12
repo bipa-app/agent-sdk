@@ -2601,6 +2601,124 @@ async fn success_close_stamps_the_measured_request_facts() -> Result<()> {
 }
 
 #[tokio::test]
+async fn small_window_worker_under_a_large_root_budget_skips_premature_compaction() -> Result<()> {
+    let fixtures = Fixtures::new();
+    // ~96k estimated tokens: over the 71,680 threshold a 131,072-token
+    // reserve leaves on GLM-5.1's 202,752 window, under the 101,376 one.
+    seed_projection_history(&fixtures.messages, &thread_id(), 12, &"x".repeat(16_000)).await?;
+
+    let cfg = CompactionConfig::default().with_model_aware_threshold(true);
+    let summarizer = Arc::new(ScriptedProvider::new(vec![ok_response(
+        "[summary] must not be needed",
+    )]));
+    let compaction_provider: Arc<dyn LlmProvider> = summarizer.clone();
+    let deps = fixtures.deps_with_compaction(&cfg, &compaction_provider);
+    let glm = ScriptedProvider {
+        provider_name: "openai",
+        model_name: "z-ai/glm-5.1",
+        ..ScriptedProvider::new(vec![ok_response("done")])
+    };
+
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    let task_id = task.id.clone();
+    let mut bootstrap = sample_bootstrap(task);
+    bootstrap.definition.max_tokens = 128_000;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &fixtures.threads,
+        &fixtures.checkpoints,
+        &fixtures.messages,
+        t0(),
+    )
+    .await?;
+
+    execute_root_turn(inputs, "next", &glm, &deps, t0() + Duration::seconds(1)).await?;
+
+    assert_eq!(
+        summarizer.calls(),
+        0,
+        "no compaction below the GLM-sized threshold"
+    );
+    let requests = glm.captured_requests()?;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].max_tokens, 202_752 / 2);
+    let expected_envelope = ChatRequest {
+        max_tokens: 202_752 / 2,
+        ..sample_envelope()
+    };
+    let attempts = fixtures.attempts.list_by_task(&task_id).await?;
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(
+        attempts[0]
+            .response_blob
+            .as_ref()
+            .and_then(|blob| blob.get("request_fingerprint"))
+            .and_then(serde_json::Value::as_str),
+        Some(
+            super::compaction::request_envelope_fingerprint(
+                "openai",
+                "z-ai/glm-5.1",
+                &expected_envelope,
+            )?
+            .as_str()
+        ),
+        "the stamped fingerprint must be the envelope the pre-call trigger rebuilds",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn worker_without_a_model_aware_threshold_requests_up_to_the_model_max() -> Result<()> {
+    let fixtures = Fixtures::new();
+    let fixed = CompactionConfig::default();
+    let model_aware = CompactionConfig::default().with_model_aware_threshold(true);
+    let manual = CompactionConfig::default()
+        .with_model_aware_threshold(true)
+        .with_auto_compact(false);
+    let summarizer: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider::new(Vec::new()));
+    let deps_variants = [
+        fixtures.deps_without_compaction(),
+        fixtures.deps_with_compaction(&fixed, &summarizer),
+        fixtures.deps_with_compaction(&manual, &summarizer),
+        RootTurnDeps {
+            compaction_config: Some(&model_aware),
+            ..fixtures.deps_without_compaction()
+        },
+    ];
+    let mut sent = Vec::new();
+    for (index, deps) in deps_variants.iter().enumerate() {
+        for requested in [128_000, 200_000] {
+            let glm = ScriptedProvider {
+                provider_name: "openai",
+                model_name: "z-ai/glm-5.1",
+                ..ScriptedProvider::new(vec![ok_response("done")])
+            };
+            let thread = ThreadId::from_string(format!("thread_fixed_{index}_{requested}"));
+            seed_projection_history(&fixtures.messages, &thread, 2, "abc").await?;
+            let task = create_and_acquire_root_task(&fixtures.tasks, &thread).await?;
+            let mut bootstrap = sample_bootstrap(task);
+            bootstrap.definition.max_tokens = requested;
+            let inputs = build_root_worker_inputs(
+                bootstrap,
+                &fixtures.threads,
+                &fixtures.checkpoints,
+                &fixtures.messages,
+                t0(),
+            )
+            .await?;
+            execute_root_turn(inputs, "next", &glm, deps, t0() + Duration::seconds(1)).await?;
+            sent.extend(
+                glm.captured_requests()?
+                    .iter()
+                    .map(|request| request.max_tokens),
+            );
+        }
+    }
+    assert_eq!(sent, [128_000, 131_072].repeat(deps_variants.len()));
+    Ok(())
+}
+
+#[tokio::test]
 async fn fresh_user_prompt_counts_toward_the_proactive_trigger() -> Result<()> {
     let fixtures = Fixtures::new();
     // Near-empty bodies would make compaction a no-progress skip.
