@@ -1722,10 +1722,7 @@ mod tests {
         assert_eq!(sized(128_000, Some(kimi), None), 128_000);
         assert_eq!(sized(400_000, Some(kimi), None), 1_048_576 / 4);
 
-        let small_window = ModelCapabilities {
-            context_window: Some(100_000),
-            ..*kimi
-        };
+        let small_window = kimi.with_context_window(Some(100_000));
         assert_eq!(sized(128_000, Some(&small_window), None), 32_000);
         assert_eq!(sized(16_000, Some(&small_window), None), 16_000);
         Ok(())

@@ -201,6 +201,7 @@ pub enum DefaultReasoning {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct ModelCapabilities {
     pub provider: &'static str,
     pub model_id: &'static str,
@@ -229,6 +230,18 @@ pub struct ModelCapabilities {
 }
 
 impl ModelCapabilities {
+    #[must_use]
+    pub const fn with_context_window(mut self, context_window: Option<u32>) -> Self {
+        self.context_window = context_window;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_default_reasoning(mut self, default_reasoning: DefaultReasoning) -> Self {
+        self.default_reasoning = default_reasoning;
+        self
+    }
+
     /// Output budget for a request whose caller sets none.
     #[must_use]
     pub const fn default_output_tokens(&self) -> Option<u32> {
