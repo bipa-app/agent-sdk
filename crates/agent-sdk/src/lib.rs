@@ -232,6 +232,18 @@
 //! | [`ToolTier::Observe`] | Read-only, always allowed | Get balance, read file |
 //! | [`ToolTier::Confirm`] | Requires user confirmation | Send email, transfer funds |
 //!
+//! ### Tool Ordering
+//!
+//! When a model emits several tool calls in one response, they take effect
+//! in the order it wrote them. [`ToolConcurrency`] decides how a call is
+//! ordered, independently of its tier: adjacent
+//! [`ToolConcurrency::ReadOnly`] calls run together, and every
+//! [`ToolConcurrency::Exclusive`] call (the default) runs alone, after
+//! every earlier call and before every later one. The agent loop also runs
+//! a read-only call alone when it needs confirmation, because hooks resolve
+//! confirmation inline. Declare `ReadOnly` only for a tool that changes
+//! nothing. See [`agent_sdk_foundation::batch_order`] for the full rule.
+//!
 //! ### Lifecycle Hooks
 //!
 //! Implement [`AgentHooks`] to intercept and control agent behavior:
@@ -507,8 +519,8 @@ pub use events::{AccountRotationReason, AgentEvent, AgentEventEnvelope, Sequence
 pub use types::{
     AgentConfig, AgentError, AgentInput, AgentRunState, AgentState, BudgetLimitKind,
     ExecutionStatus, ExternalToolResult, PendingToolCallInfo, RetryConfig, RunOptions, ThreadId,
-    TokenUsage, ToolExecution, ToolInvocation, ToolOutcome, ToolResult, ToolRuntime, ToolTier,
-    TurnOptions, UsageLimits,
+    TokenUsage, ToolConcurrency, ToolExecution, ToolInvocation, ToolOutcome, ToolResult,
+    ToolRuntime, ToolTier, TurnOptions, UsageLimits,
 };
 
 // agent-sdk-tools (via thin modules)
@@ -769,8 +781,8 @@ pub mod prelude {
     pub use crate::tool;
     pub use crate::{
         AgentConfig, AgentEvent, AgentInput, CancellationToken, DynamicToolName,
-        InMemoryEventStore, SimpleTool, Tool, ToolContext, ToolName, ToolRegistry, ToolResult,
-        ToolTier, TypedTool,
+        InMemoryEventStore, SimpleTool, Tool, ToolConcurrency, ToolContext, ToolName, ToolRegistry,
+        ToolResult, ToolTier, TypedTool,
     };
 }
 

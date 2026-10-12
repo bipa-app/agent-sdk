@@ -301,6 +301,9 @@ mod in_memory_bundle {
                 .acquire_next_runnable(worker, lease, lease_expires_at, now)
                 .await
         }
+        async fn ready_held_children(&self, parent_id: &AgentTaskId) -> Result<Vec<AgentTaskId>> {
+            self.task.ready_held_children(parent_id).await
+        }
         async fn heartbeat_task(
             &self,
             task_id: &AgentTaskId,
@@ -954,6 +957,7 @@ fn suspension_with_pending_tools(thread: &ThreadId, count: usize) -> SuspensionP
             name: format!("tool_{idx}"),
             display_name: format!("Tool {idx}"),
             tier: agent_sdk_foundation::ToolTier::Confirm,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
             input: serde_json::json!({ "slot": idx }),
             effective_input: serde_json::json!({ "slot": idx }),
             listen_context: None,
@@ -1835,7 +1839,450 @@ pub async fn run_journal_store_conformance<S: JournalStore + Clone + 'static>(
     case_mixed_batch_rejects_uncovered_slot(store).await?;
     report.passed("mixed_batch_rejects_uncovered_slot");
 
+    case_ordered_tool_children_run_in_batch_order(store).await?;
+    report.passed("ordered_tool_children_run_in_batch_order");
+
+    case_ordered_mixed_batch_holds_only_tool_children(store).await?;
+    report.passed("ordered_mixed_batch_holds_only_tool_children");
+
+    case_cancel_tree_cancels_held_tool_children(store).await?;
+    report.passed("cancel_tree_cancels_held_tool_children");
+
+    case_a_waiting_child_needs_no_release_write(store).await?;
+    report.passed("a_waiting_child_needs_no_release_write");
+
+    case_a_held_backlog_never_hides_ready_work(store).await?;
+    report.passed("a_held_backlog_never_hides_ready_work");
+
     Ok(report)
+}
+
+// ── ordered tool children ────────────────────────────────────────────
+
+/// Claim every runnable row, in scan order. The battery's earlier cases
+/// may leave runnable rows on other threads; claiming them is harmless
+/// because these cases run last.
+async fn claim_all_runnable<S: AgentTaskStore + ?Sized>(
+    store: &S,
+    at: OffsetDateTime,
+) -> Result<Vec<AgentTask>> {
+    let mut claimed = Vec::new();
+    while let Some(task) = AgentTaskStore::acquire_next_runnable(
+        store,
+        WorkerId::new(),
+        LeaseId::new(),
+        at + Duration::seconds(600),
+        at,
+    )
+    .await?
+    {
+        claimed.push(task);
+        ensure!(claimed.len() < 10_000, "the runnable scan never drained");
+    }
+    Ok(claimed)
+}
+
+fn claimed_ids(claimed: &[AgentTask]) -> Vec<&AgentTaskId> {
+    claimed.iter().map(|task| &task.id).collect()
+}
+
+fn claimed_row<'a>(claimed: &'a [AgentTask], id: &AgentTaskId) -> Result<&'a AgentTask> {
+    claimed
+        .iter()
+        .find(|task| &task.id == id)
+        .with_context(|| format!("{id} must have been claimed"))
+}
+
+async fn finish_claimed<S: AgentTaskStore + ?Sized>(
+    store: &S,
+    claimed: &AgentTask,
+    succeed: bool,
+    at: OffsetDateTime,
+) -> Result<()> {
+    let worker = claimed
+        .worker_id
+        .clone()
+        .context("claimed row has a worker")?;
+    let lease = claimed
+        .lease_id
+        .clone()
+        .context("claimed row has a lease")?;
+    if succeed {
+        AgentTaskStore::complete_task_with_result(
+            store,
+            &claimed.id,
+            &worker,
+            &lease,
+            serde_json::json!({"ok": true}),
+            at,
+        )
+        .await?;
+    } else {
+        AgentTaskStore::fail_task(store, &claimed.id, &worker, &lease, "boom".to_owned(), at)
+            .await?;
+    }
+    Ok(())
+}
+
+/// A batch `[edit, read, read, bash]` whose reads wait for the edit and
+/// whose command waits for all three: acquisition never hands out a
+/// waiting child, a child becomes acquirable once the last of its
+/// predecessors finishes, and a failed predecessor counts as finished.
+async fn case_ordered_tool_children_run_in_batch_order<S: JournalStore>(store: &S) -> Result<()> {
+    let thread = tid("conf-ordered-tool-children");
+    let fixture = mixed_batch_fixture(store, &thread, 0).await?;
+    let (_parent, children) = AgentTaskStore::spawn_tool_children(
+        store,
+        &fixture.parent_id,
+        &fixture.worker,
+        &fixture.lease,
+        vec![
+            ChildSpawnSpec::new(1),
+            ChildSpawnSpec::new(1).after_siblings(vec![0]),
+            ChildSpawnSpec::new(1).after_siblings(vec![0]),
+            ChildSpawnSpec::new(1).after_siblings(vec![0, 1, 2]),
+        ],
+        suspension_with_pending_tools(&thread, 4),
+        None,
+        Vec::new(),
+        t_plus(2),
+    )
+    .await?;
+    let [edit, read_a, read_b, bash] = children.as_slice() else {
+        anyhow::bail!("the spawn must return four children");
+    };
+
+    let claimed = claim_all_runnable(store, t_plus(3)).await?;
+    let ids = claimed_ids(&claimed);
+    ensure!(ids.contains(&&edit.id), "the first call must be runnable");
+    for held in [read_a, read_b, bash] {
+        ensure!(
+            !ids.contains(&&held.id),
+            "a held child must never be acquired"
+        );
+        ensure!(
+            AgentTaskStore::try_acquire_task(
+                store,
+                &held.id,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(600),
+                t_plus(3),
+            )
+            .await?
+            .is_none(),
+            "a held child must not be acquirable by id"
+        );
+    }
+
+    finish_claimed(store, claimed_row(&claimed, &edit.id)?, true, t_plus(4)).await?;
+    let claimed = claim_all_runnable(store, t_plus(5)).await?;
+    let ids = claimed_ids(&claimed);
+    ensure!(
+        ids.contains(&&read_a.id) && ids.contains(&&read_b.id),
+        "finishing the edit must release both reads together"
+    );
+    ensure!(
+        !ids.contains(&&bash.id),
+        "the command still waits for the reads"
+    );
+
+    finish_claimed(store, claimed_row(&claimed, &read_a.id)?, false, t_plus(6)).await?;
+    ensure!(
+        claim_all_runnable(store, t_plus(7))
+            .await?
+            .iter()
+            .all(|task| task.id != bash.id),
+        "the command waits for the second read"
+    );
+    finish_claimed(store, claimed_row(&claimed, &read_b.id)?, true, t_plus(8)).await?;
+    let claimed = claim_all_runnable(store, t_plus(9)).await?;
+    ensure!(
+        claimed_ids(&claimed).contains(&&bash.id),
+        "the last read finishing must release the command"
+    );
+    Ok(())
+}
+
+/// In a mixed batch only tool children are held: a subagent's child root
+/// starts at once, and a tool child after it waits only for the tool
+/// child it names.
+async fn case_ordered_mixed_batch_holds_only_tool_children<S: JournalStore>(
+    store: &S,
+) -> Result<()> {
+    let thread = tid("conf-ordered-mixed");
+    let fixture = mixed_batch_fixture(store, &thread, 1).await?;
+    let mut spawn = mixed_batch_spawn(
+        &fixture,
+        suspension_with_pending_tools(&thread, 3),
+        &[1],
+        &[0, 2],
+    )?;
+    for tool in &mut spawn.tool_children {
+        if tool.spawn_index == 2 {
+            tool.spec = ChildSpawnSpec::new(3).after_siblings(vec![0]);
+        }
+    }
+    let spawned = AgentTaskStore::spawn_mixed_children(
+        store,
+        &fixture.parent_id,
+        &fixture.worker,
+        &fixture.lease,
+        spawn,
+        spawn_events(1),
+        t_plus(2),
+    )
+    .await?;
+    let first = spawned
+        .tool_children
+        .iter()
+        .find(|child| child.spawn_index == Some(0))
+        .context("tool child at slot 0")?;
+    let last = spawned
+        .tool_children
+        .iter()
+        .find(|child| child.spawn_index == Some(2))
+        .context("tool child at slot 2")?;
+    let child_root = &spawned
+        .subagents
+        .first()
+        .context("one subagent invocation")?
+        .1;
+
+    let claimed = claim_all_runnable(store, t_plus(3)).await?;
+    let ids = claimed_ids(&claimed);
+    ensure!(ids.contains(&&child_root.id), "the subagent starts at once");
+    ensure!(
+        ids.contains(&&first.id),
+        "the first tool child starts at once"
+    );
+    ensure!(!ids.contains(&&last.id), "the later tool child is held");
+
+    finish_claimed(store, claimed_row(&claimed, &first.id)?, true, t_plus(4)).await?;
+    ensure!(
+        claimed_ids(&claim_all_runnable(store, t_plus(5)).await?).contains(&&last.id),
+        "the held tool child must not wait for the subagent"
+    );
+    Ok(())
+}
+
+/// Readiness is read at acquisition, never written: a predecessor's
+/// terminal transition leaves the waiting child's row untouched, and the
+/// child is acquirable all the same, its wait list cleared as it is leased.
+async fn case_a_waiting_child_needs_no_release_write<S: JournalStore>(store: &S) -> Result<()> {
+    let thread = tid("conf-ordered-no-release-write");
+    let fixture = mixed_batch_fixture(store, &thread, 0).await?;
+    let (_parent, children) = AgentTaskStore::spawn_tool_children(
+        store,
+        &fixture.parent_id,
+        &fixture.worker,
+        &fixture.lease,
+        vec![
+            ChildSpawnSpec::new(1),
+            ChildSpawnSpec::new(1).after_siblings(vec![0]),
+        ],
+        suspension_with_pending_tools(&thread, 2),
+        None,
+        Vec::new(),
+        t_plus(2),
+    )
+    .await?;
+    let [first, waiting] = children.as_slice() else {
+        anyhow::bail!("the spawn must return two children");
+    };
+    let claimed = AgentTaskStore::try_acquire_task(
+        store,
+        &first.id,
+        WorkerId::new(),
+        LeaseId::new(),
+        t_plus(600),
+        t_plus(3),
+    )
+    .await?
+    .context("the first child must be acquirable")?;
+    finish_claimed(store, &claimed, true, t_plus(4)).await?;
+
+    let untouched = AgentTaskStore::get(store, &waiting.id)
+        .await?
+        .context("waiting child must exist")?;
+    ensure!(
+        untouched.after_siblings == [first.id.clone()]
+            && untouched.updated_at == waiting.updated_at,
+        "a predecessor finishing must not write the waiting child"
+    );
+    let leased = AgentTaskStore::try_acquire_task(
+        store,
+        &waiting.id,
+        WorkerId::new(),
+        LeaseId::new(),
+        t_plus(600),
+        t_plus(5),
+    )
+    .await?
+    .context("a child whose predecessors all finished must be acquirable")?;
+    ensure!(
+        leased.after_siblings.is_empty(),
+        "acquisition clears the wait list it admitted"
+    );
+    Ok(())
+}
+
+/// A parent parked on `[first, held]`, `held` waiting for `first`, with
+/// `first` leased so `held` stays held. Returns the parent, the leased
+/// `first`, and `held`.
+async fn park_held_behind_running_sibling<S: JournalStore>(
+    store: &S,
+    thread: &ThreadId,
+    at: OffsetDateTime,
+) -> Result<(AgentTaskId, AgentTask, AgentTask)> {
+    let fixture = mixed_batch_fixture(store, thread, 0).await?;
+    let (_parent, children) = AgentTaskStore::spawn_tool_children(
+        store,
+        &fixture.parent_id,
+        &fixture.worker,
+        &fixture.lease,
+        vec![
+            ChildSpawnSpec::new(1),
+            ChildSpawnSpec::new(1).after_siblings(vec![0]),
+        ],
+        suspension_with_pending_tools(thread, 2),
+        None,
+        Vec::new(),
+        at,
+    )
+    .await?;
+    let [first, held] = children.as_slice() else {
+        anyhow::bail!("the spawn must return two children");
+    };
+    let first = AgentTaskStore::try_acquire_task(
+        store,
+        &first.id,
+        WorkerId::new(),
+        LeaseId::new(),
+        at + Duration::seconds(600),
+        at,
+    )
+    .await?
+    .context("the first child must be acquirable")?;
+    Ok((fixture.parent_id, first, held.clone()))
+}
+
+/// More held rows than one backstop probe examines, each behind a running
+/// sibling. A ready row newer than all of them is leased by the first
+/// acquisition. A held row released behind the whole backlog is reported
+/// for its parent at once, and the bounded backstop reaches it within a
+/// few acquisitions however far its cursor has moved.
+async fn case_a_held_backlog_never_hides_ready_work<S: JournalStore>(store: &S) -> Result<()> {
+    use super::sibling_order::HELD_PROBE_WINDOW;
+
+    claim_all_runnable(store, t_plus(2)).await?;
+    for index in 0..=HELD_PROBE_WINDOW {
+        park_held_behind_running_sibling(
+            store,
+            &tid(&format!("conf-held-backlog-{index}")),
+            t_plus(2),
+        )
+        .await?;
+    }
+    let (last_parent, last_first, last_held) =
+        park_held_behind_running_sibling(store, &tid("conf-held-backlog-last"), t_plus(3)).await?;
+
+    let thread = tid("conf-held-backlog-ready");
+    let fixture = mixed_batch_fixture(store, &thread, 0).await?;
+    let (_parent, ready) = AgentTaskStore::spawn_tool_children(
+        store,
+        &fixture.parent_id,
+        &fixture.worker,
+        &fixture.lease,
+        vec![ChildSpawnSpec::new(1)],
+        suspension_with_pending_tools(&thread, 1),
+        None,
+        Vec::new(),
+        t_plus(4),
+    )
+    .await?;
+    let ready = ready.first().context("one ready child")?;
+    let leased = AgentTaskStore::acquire_next_runnable(
+        store,
+        WorkerId::new(),
+        LeaseId::new(),
+        t_plus(600),
+        t_plus(5),
+    )
+    .await?
+    .context("the ready row must be leased")?;
+    ensure!(
+        leased.id == ready.id,
+        "a held backlog must not hide a newer ready row, got {}",
+        leased.id
+    );
+
+    ensure!(
+        AgentTaskStore::ready_held_children(store, &last_parent)
+            .await?
+            .is_empty(),
+        "a held row whose sibling still runs is not ready"
+    );
+    finish_claimed(store, &last_first, true, t_plus(6)).await?;
+    ensure!(
+        AgentTaskStore::ready_held_children(store, &last_parent).await? == [last_held.id.clone()],
+        "the settled sibling's parent must report the row it released"
+    );
+
+    let held_rows = HELD_PROBE_WINDOW + 2;
+    let bound = held_rows.div_ceil(HELD_PROBE_WINDOW) + 1;
+    for _ in 0..bound {
+        match AgentTaskStore::acquire_next_runnable(
+            store,
+            WorkerId::new(),
+            LeaseId::new(),
+            t_plus(600),
+            t_plus(7),
+        )
+        .await?
+        {
+            Some(task) if task.id == last_held.id => return Ok(()),
+            Some(task) => anyhow::bail!("only the released held row is runnable, got {}", task.id),
+            None => {}
+        }
+    }
+    anyhow::bail!(
+        "the backstop must reach a released row behind {} blocked ones within {bound} acquisitions",
+        HELD_PROBE_WINDOW + 1
+    )
+}
+
+/// Cancelling the tree cancels a held child like any other pending row.
+async fn case_cancel_tree_cancels_held_tool_children<S: JournalStore>(store: &S) -> Result<()> {
+    let thread = tid("conf-ordered-cancel");
+    let fixture = mixed_batch_fixture(store, &thread, 0).await?;
+    let (_parent, children) = AgentTaskStore::spawn_tool_children(
+        store,
+        &fixture.parent_id,
+        &fixture.worker,
+        &fixture.lease,
+        vec![
+            ChildSpawnSpec::new(1),
+            ChildSpawnSpec::new(1).after_siblings(vec![0]),
+        ],
+        suspension_with_pending_tools(&thread, 2),
+        None,
+        Vec::new(),
+        t_plus(2),
+    )
+    .await?;
+    AgentTaskStore::cancel_tree(store, &fixture.parent_id, t_plus(3)).await?;
+    for child in &children {
+        let row = AgentTaskStore::get(store, &child.id)
+            .await?
+            .context("child must survive cancellation")?;
+        ensure!(
+            row.status == TaskStatus::Cancelled,
+            "every child, held or not, must be cancelled, got {:?}",
+            row.status
+        );
+    }
+    Ok(())
 }
 
 // ── append preserves insertion order ─────────────────────────────────

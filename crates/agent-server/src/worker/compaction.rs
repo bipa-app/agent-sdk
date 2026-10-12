@@ -2371,6 +2371,7 @@ mod tests {
             input_schema: serde_json::json!({ "type": "object" }),
             display_name: "lookup".into(),
             tier: agent_sdk_foundation::ToolTier::Observe,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
         }]);
         assert_ne!(
             base,

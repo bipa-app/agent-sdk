@@ -284,6 +284,10 @@ mod tests {
 
         assert_eq!(Tool::<()>::name(&tool), PrimitiveToolName::Write);
         assert_eq!(Tool::<()>::tier(&tool), ToolTier::Confirm);
+        assert_eq!(
+            Tool::<()>::concurrency(&tool),
+            crate::ToolConcurrency::Exclusive
+        );
 
         let schema = Tool::<()>::input_schema(&tool);
         assert!(schema["properties"].get("path").is_some());

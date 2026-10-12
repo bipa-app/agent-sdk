@@ -46,8 +46,8 @@ use agent_sdk::llm::{
 use agent_sdk::{
     AgentConfig, AgentEvent, AgentInput, AgentRunState, AgentState, AllowAllHooks,
     CancellationToken, DynamicToolName, EventStore, InMemoryEventStore, InMemoryStore,
-    MessageStore, StateStore, ThreadId, Tool, ToolContext, ToolRegistry, ToolResult, ToolTier,
-    builder,
+    MessageStore, StateStore, ThreadId, Tool, ToolConcurrency, ToolContext, ToolRegistry,
+    ToolResult, ToolTier, builder,
 };
 use anyhow::{Context as _, Result, anyhow};
 use async_trait::async_trait;
@@ -355,7 +355,7 @@ fn read_requests(handle: &Arc<std::sync::RwLock<Vec<ChatRequest>>>) -> Result<Ve
 
 // ── Tools used to land a cancel deterministically ────────────────────
 
-/// `Observe`-tier tool that signals "started" once, then parks on a
+/// Read-only `Observe`-tier tool that signals "started" once, then parks on a
 /// never-resolved receiver. It does NOT consult the cancel token — the
 /// SDK boundary must cancel it. Multiple instances can share one
 /// "all started" barrier so a parallel batch can be fully in-flight
@@ -397,6 +397,9 @@ impl Tool<()> for ParkingObserveTool {
     }
     fn tier(&self) -> ToolTier {
         ToolTier::Observe
+    }
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::ReadOnly
     }
 
     async fn execute(

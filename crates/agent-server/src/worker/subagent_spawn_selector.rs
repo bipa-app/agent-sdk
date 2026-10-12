@@ -326,6 +326,7 @@ mod tests {
             name: name.to_owned(),
             display_name: name.to_owned(),
             tier: ToolTier::Confirm,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
             input: json!({"task": "x"}),
             effective_input: json!({"task": "x"}),
             listen_context: None,

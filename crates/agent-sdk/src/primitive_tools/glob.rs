@@ -1,4 +1,6 @@
-use crate::{Environment, PrimitiveToolName, Tool, ToolContext, ToolResult, ToolTier};
+use crate::{
+    Environment, PrimitiveToolName, Tool, ToolConcurrency, ToolContext, ToolResult, ToolTier,
+};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -48,6 +50,10 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for GlobToo
 
     fn tier(&self) -> ToolTier {
         ToolTier::Observe
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::ReadOnly
     }
 
     fn input_schema(&self) -> Value {
@@ -375,6 +381,10 @@ mod tests {
 
         assert_eq!(Tool::<()>::name(&tool), PrimitiveToolName::Glob);
         assert_eq!(Tool::<()>::tier(&tool), ToolTier::Observe);
+        assert_eq!(
+            Tool::<()>::concurrency(&tool),
+            crate::ToolConcurrency::ReadOnly
+        );
         assert!(Tool::<()>::description(&tool).contains("glob"));
 
         let schema = Tool::<()>::input_schema(&tool);

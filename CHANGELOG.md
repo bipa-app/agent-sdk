@@ -38,6 +38,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   return a typed capability error without fabricating vectors.
 
 ### Changed
+- **Breaking: a batch's mutating calls run alone and in model order.** A
+  model that emits `[edit, edit, bash "cargo test"]` in one response expects
+  the test to see both edits. The durable worker spawned every call of a batch
+  as a runnable child, so the command could start, and finish, before either
+  edit; the in-process loop did the same for any call whose tool was
+  `ToolTier::Observe`, the tier hosts give mutating tools to skip prompts.
+  `ToolConcurrency` is a new tool property, independent of the tier:
+  `Exclusive` by default, `ReadOnly` for `read`, `grep`, `glob`, `todo_read`,
+  `web_search`, and `link_fetch`. `agent_sdk_foundation::batch_order` holds
+  the rule both runtimes follow: consecutive read-only calls run together,
+  every other call runs alone, and a call starts only after every earlier
+  call it could affect or observe has finished. The durable worker records
+  each later child's waits in `after_siblings`, and acquisition leases it
+  only once every sibling it names is terminal; no write releases anything.
+  The FIFO scan reads only rows that wait on nothing, so held rows never
+  slow it down. When a tool child settles, the host asks the new
+  `AgentTaskStore::ready_held_children` for the siblings it released and
+  hands them to the pool with `WakeupSignal::hint_tasks`, waking one
+  worker per row instead of the whole pool; a bounded probe over held rows
+  is the backstop.
+  New calls of a resumed turn also wait for the still-live calls it carries
+  over. Subagent spawns, and calls settled before spawn, neither wait nor
+  hold anything back, so a coordinator's spawns still fan out together.
+  The tool traits gain `concurrency()`, which defaults to `Exclusive`
+  (including on the `Erased*Tool` traits), and the derives accept
+  `concurrency = ...`. Breaking: `llm::Tool`, `PendingToolCallInfo`,
+  `ChildSpawnSpec`, and `AgentTask` gain a public field, and
+  `TaskSchemaError` gains `InvalidSiblingWait` and `HeldBySiblings`, and
+  `PostgresDurableStore::from_pool` is no longer `const`. A call
+  after a durable child that awaits confirmation now waits for that
+  decision, so confirmations in one batch are asked one at a time.
+  Migration 0026 adds the nullable `after_siblings_json` column and three
+  partial indexes over pending rows (`agent_sdk_tasks_ready_fifo_idx`,
+  `agent_sdk_tasks_held_fifo_idx`, `agent_sdk_tasks_held_by_parent_idx`)
+  on both Postgres and SQLite, and drops `agent_sdk_tasks_runnable_fifo_idx`,
+  which the ready index replaces.
+
+  **Rollback and rolling deploys:** an older build refuses to start
+  against a database that has migration 0026 applied
+  (`VersionMissing(26)`): the durable migrator does not ignore unknown
+  applied versions, a policy that predates this change. To roll back,
+  revert 0026 by hand first, in one transaction: drop the three indexes,
+  recreate `agent_sdk_tasks_runnable_fifo_idx` (`ON agent_sdk_tasks
+  (created_at, id) WHERE status = 'pending'`), `ALTER TABLE agent_sdk_tasks
+  DROP COLUMN after_siblings_json`, and `DELETE FROM _sqlx_migrations WHERE
+  version = 26`. Batches parked at
+  that point lose their order. This build loads rows an older build wrote during a mixed
+  deploy: it ignores a wait list on any row that is not pending, and it
+  leases a pending row left with a wait list once every sibling it names
+  has finished.
 - **Breaking:** `ToolExecutionStore::get_execution` now takes the thread id
   (`get_execution(&thread_id, tool_call_id)`), and `InMemoryExecutionStore`
   and `SqliteStore` key executions by thread and tool-call id. Providers only

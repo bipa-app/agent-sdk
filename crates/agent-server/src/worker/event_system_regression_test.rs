@@ -90,6 +90,7 @@ fn definition_with_tools() -> AgentDefinition {
             input_schema: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
             display_name: "Bash".into(),
             tier: ToolTier::Observe,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
         }],
         ..sample_definition()
     }
@@ -104,6 +105,7 @@ fn definition_with_two_tools() -> AgentDefinition {
                 input_schema: serde_json::json!({}),
                 display_name: "Read".into(),
                 tier: ToolTier::Observe,
+                concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
             },
             Tool {
                 name: "write".into(),
@@ -111,6 +113,7 @@ fn definition_with_two_tools() -> AgentDefinition {
                 input_schema: serde_json::json!({}),
                 display_name: "Write".into(),
                 tier: ToolTier::Observe,
+                concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
             },
         ],
         ..sample_definition()

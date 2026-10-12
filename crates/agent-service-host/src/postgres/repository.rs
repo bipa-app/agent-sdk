@@ -35,6 +35,7 @@ const AGENT_TASK_READS: &[&str] = &[
     "list_by_status",
     "active_root_for_thread",
     "list_queued_roots",
+    "ready_held_children",
 ];
 
 const AGENT_TASK_WRITES: &[&str] = &[

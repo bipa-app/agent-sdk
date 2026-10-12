@@ -173,6 +173,7 @@ fn sample_definition_with_tools() -> AgentDefinition {
                 input_schema: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
                 display_name: "Bash".into(),
                 tier: ToolTier::Observe,
+                concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
             },
             Tool {
                 name: "transfer".into(),
@@ -180,6 +181,7 @@ fn sample_definition_with_tools() -> AgentDefinition {
                 input_schema: serde_json::json!({"type": "object", "properties": {"amount": {"type": "number"}}}),
                 display_name: "Transfer".into(),
                 tier: ToolTier::Confirm,
+                concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
             },
         ],
         thinking: ThinkingPolicy::default(),

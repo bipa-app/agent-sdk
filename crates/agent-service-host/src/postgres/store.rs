@@ -61,6 +61,10 @@ use agent_server::journal::relay::{
     TASK_WAKEUP_OUTBOX_MAX_ATTEMPTS, TaskWakeupEmitter, TaskWakeupTrigger,
 };
 use agent_server::journal::retention::{RetentionCursor, RetentionStore};
+use agent_server::journal::sibling_order::{
+    HELD_PROBE_WINDOW, HeldProbe, HeldRow, decoded_wait_list, hold_tool_children_behind_siblings,
+    mixed_spawn_waits, pure_spawn_waits,
+};
 use agent_server::journal::store::{
     AgentTaskStore, CancelScope, CancelTreeOutcome, ChildProbe, MixedChildrenSpawn,
     QuestionAnswerApplied, QuestionPause, ReattachedChild, RequeueOutcome, SpawnedMixedChildren,
@@ -121,7 +125,11 @@ use super::migrations::apply_durable_core_migrations;
 #[derive(Clone)]
 pub struct PostgresDurableStore {
     pool: PgPool,
+    held_probe: HeldProbe<HeldKey>,
 }
+
+/// A held row's position in the backstop probe's `(created_at, id)` order.
+type HeldKey = (OffsetDateTime, String);
 
 /// A thread row this transaction holds `FOR UPDATE`.
 struct HeldThreadLock(Thread);
@@ -137,8 +145,11 @@ struct LockedForTransition {
 impl PostgresDurableStore {
     /// Construct the store from an existing pool.
     #[must_use]
-    pub const fn from_pool(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn from_pool(pool: PgPool) -> Self {
+        Self {
+            pool,
+            held_probe: HeldProbe::default(),
+        }
     }
 
     /// Build a lazily connecting Postgres pool.
@@ -675,7 +686,8 @@ SELECT
     created_at,
     updated_at,
     completed_at,
-    last_activity_at
+    last_activity_at,
+    after_siblings_json
 FROM agent_sdk_tasks
 WHERE thread_id = $1
   AND kind = 'root_turn'
@@ -1327,7 +1339,8 @@ SELECT
     created_at,
     updated_at,
     completed_at,
-    last_activity_at
+    last_activity_at,
+    after_siblings_json
 FROM agent_sdk_tasks
 WHERE id = $1
 FOR UPDATE
@@ -1366,7 +1379,8 @@ SELECT
     created_at,
     updated_at,
     completed_at,
-    last_activity_at
+    last_activity_at,
+    after_siblings_json
 FROM agent_sdk_tasks
 WHERE id = $1
 ",
@@ -1409,7 +1423,8 @@ SELECT
     created_at,
     updated_at,
     completed_at,
-    last_activity_at
+    last_activity_at,
+    after_siblings_json
 FROM agent_sdk_tasks
 WHERE id = $1
 ",
@@ -1455,7 +1470,8 @@ SELECT
     created_at,
     updated_at,
     completed_at,
-    last_activity_at
+    last_activity_at,
+    after_siblings_json
 FROM agent_sdk_tasks
 WHERE id = $1
 ",
@@ -1661,10 +1677,11 @@ INSERT INTO agent_sdk_tasks (
     created_at,
     updated_at,
     completed_at,
-    last_activity_at
+    last_activity_at,
+    after_siblings_json
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-    $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26
+    $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27
 )
 ",
             task.id.as_str(),
@@ -1696,11 +1713,277 @@ INSERT INTO agent_sdk_tasks (
             task.updated_at,
             task.completed_at,
             task.last_activity_at,
+            after_siblings_json(task)?,
         )
         .execute(&mut **tx)
         .await
         .with_context(|| format!("insert task {}", task.id))?;
         Ok(())
+    }
+
+    /// The siblings `task` waits for that exist and are not yet terminal,
+    /// the same check the acquisition scan makes.
+    ///
+    /// Takes no locks: a sibling only ever moves toward a terminal state,
+    /// so a sibling read as finished stays finished.
+    async fn load_unfinished_siblings_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        task: &AgentTask,
+    ) -> Result<BTreeSet<AgentTaskId>> {
+        if task.after_siblings.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let waited: Vec<String> = task
+            .after_siblings
+            .iter()
+            .map(|id| id.as_str().to_owned())
+            .collect();
+        Ok(sqlx::query_scalar!(
+            r"
+SELECT id
+FROM agent_sdk_tasks
+WHERE id = ANY($1::text[])
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+",
+            &waited,
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .with_context(|| format!("load the unfinished siblings {} waits for", task.id))?
+        .into_iter()
+        .map(AgentTaskId::from_string)
+        .collect())
+    }
+
+    /// Lease the oldest pending row that waits on nothing.
+    async fn acquire_ready_head(
+        &self,
+        worker: WorkerId,
+        lease: LeaseId,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>> {
+        loop {
+            let mut tx = self.begin().await?;
+            let head = load_runnable_head_tx(&mut tx).await?;
+            let Some(head) = head else {
+                tx.rollback()
+                    .await
+                    .context("rollback empty runnable scan")?;
+                return Ok(None);
+            };
+            let Some(old) = Self::load_task_tx(&mut tx, &head, true).await? else {
+                tx.rollback()
+                    .await
+                    .context("rollback vanished runnable head")?;
+                continue;
+            };
+            match old.status {
+                TaskStatus::Pending => {}
+                // The head scan takes no lock, so another worker may claim,
+                // fail closed, or cancel the head (and its claimer move it
+                // on) before this FOR UPDATE load. The scan only returns
+                // pending rows, so rescanning moves past the lost head.
+                TaskStatus::Running
+                | TaskStatus::WaitingOnChildren
+                | TaskStatus::AwaitingConfirmation
+                | TaskStatus::AwaitingQuestion
+                | TaskStatus::Completed
+                | TaskStatus::Failed
+                | TaskStatus::Cancelled => {
+                    tx.rollback()
+                        .await
+                        .context("rollback raced runnable head")?;
+                    continue;
+                }
+                TaskStatus::Queued => {
+                    let status = old.status;
+                    tx.rollback()
+                        .await
+                        .context("rollback corrupt runnable head")?;
+                    return Err(anyhow!(
+                        "acquire_next_runnable: runnable index held non-pending row {} in status {status:?}",
+                        old.id
+                    ));
+                }
+            }
+
+            let unfinished = Self::load_unfinished_siblings_tx(&mut tx, &old).await?;
+            match classify_recovery(&old, RecoveryContext::AcquisitionAttempt) {
+                RecoveryAction::NoAction => {
+                    let claimed = old
+                        .clone()
+                        .admit_after_siblings(&unfinished)
+                        .and_then(|admitted| {
+                            admitted.mark_running(worker.clone(), lease.clone(), expires_at, now)
+                        })
+                        .context(
+                            "acquire_next_runnable rejected: mark_running transition failed",
+                        )?;
+                    Self::update_task_tx(&mut tx, &claimed).await?;
+                    tx.commit().await.context("commit acquire_next_runnable")?;
+                    return Ok(Some(claimed));
+                }
+                RecoveryAction::FailClosed(_)
+                    if old.kind == TaskKind::RootTurn && old.is_root() =>
+                {
+                    tx.rollback()
+                        .await
+                        .context("rollback before thread-first fail-close")?;
+                    self.fail_closed_root_thread_first(
+                        &old.id,
+                        RecoveryContext::AcquisitionAttempt,
+                        now,
+                        "acquire_next_runnable",
+                    )
+                    .await?;
+                }
+                RecoveryAction::FailClosed(reason) => {
+                    Self::fail_closed_tx(&mut tx, &old, reason, now, "acquire_next_runnable")
+                        .await?;
+                    tx.commit()
+                        .await
+                        .context("commit fail-closed runnable head")?;
+                }
+                RecoveryAction::Requeue => {
+                    tx.rollback()
+                        .await
+                        .context("rollback invalid acquire_next_runnable recovery")?;
+                    return Err(anyhow!(
+                        "acquire_next_runnable: recovery matrix produced Requeue for acquisition-time row {}",
+                        old.id
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Lease a held row whose siblings have all finished, examining one
+    /// bounded window of held rows from the probe's cursor.
+    async fn acquire_ready_held(
+        &self,
+        worker: WorkerId,
+        lease: LeaseId,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>> {
+        let cursor = self.held_probe.cursor();
+        let after_cursor = self
+            .load_held_window(cursor.as_ref(), HELD_PROBE_WINDOW)
+            .await?;
+        let from_start = if cursor.is_some() && after_cursor.len() < HELD_PROBE_WINDOW {
+            self.load_held_window(None, HELD_PROBE_WINDOW - after_cursor.len())
+                .await?
+        } else {
+            Vec::new()
+        };
+        for id in self
+            .held_probe
+            .advance(cursor.is_some(), after_cursor, from_start)
+        {
+            match AgentTaskStore::try_acquire_task(
+                self,
+                &id,
+                worker.clone(),
+                lease.clone(),
+                expires_at,
+                now,
+            )
+            .await
+            {
+                Ok(Some(task)) => return Ok(Some(task)),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    task_id = %id,
+                    error = %format!("{error:#}"),
+                    "held probe skipped a row it could not lease"
+                ),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Up to `limit` held rows after `after` (from the start when `None`)
+    /// in `(created_at, id)` order, each with whether every sibling it
+    /// waits for is terminal or gone. Rows of threads mid-purge are left
+    /// out, as in the ready scan.
+    async fn load_held_window(
+        &self,
+        after: Option<&HeldKey>,
+        limit: usize,
+    ) -> Result<Vec<HeldRow<HeldKey>>> {
+        let limit = i64::try_from(limit).context("held probe window exceeds i64")?;
+        let rows = match after {
+            Some((created_at, id)) => sqlx::query!(
+                r#"
+SELECT
+    held.id,
+    held.created_at,
+    NOT EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements_text(held.after_siblings_json) AS waited(id)
+        JOIN agent_sdk_tasks AS sibling ON sibling.id = waited.id
+        WHERE sibling.status NOT IN ('completed', 'failed', 'cancelled')
+    ) AS "ready!"
+FROM agent_sdk_tasks AS held
+WHERE held.status >= 'pending' AND held.status <= 'pending'
+  AND held.after_siblings_json IS NOT NULL
+  AND held.kind = 'tool_runtime'
+  AND (held.created_at, held.id) > ($1, $2)
+  AND held.thread_id NOT IN (
+      SELECT thread_id FROM agent_sdk_threads WHERE status IN ('deleting', 'deleted')
+  )
+ORDER BY held.created_at, held.id
+LIMIT $3
+"#,
+                *created_at,
+                id.as_str(),
+                limit,
+            )
+            .fetch_all(&self.pool)
+            .await
+            .context("load held rows after the probe cursor")?
+            .into_iter()
+            .map(|row| (row.id, row.created_at, row.ready))
+            .collect::<Vec<_>>(),
+            None => sqlx::query!(
+                r#"
+SELECT
+    held.id,
+    held.created_at,
+    NOT EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements_text(held.after_siblings_json) AS waited(id)
+        JOIN agent_sdk_tasks AS sibling ON sibling.id = waited.id
+        WHERE sibling.status NOT IN ('completed', 'failed', 'cancelled')
+    ) AS "ready!"
+FROM agent_sdk_tasks AS held
+WHERE held.status >= 'pending' AND held.status <= 'pending'
+  AND held.after_siblings_json IS NOT NULL
+  AND held.kind = 'tool_runtime'
+  AND held.thread_id NOT IN (
+      SELECT thread_id FROM agent_sdk_threads WHERE status IN ('deleting', 'deleted')
+  )
+ORDER BY held.created_at, held.id
+LIMIT $1
+"#,
+                limit,
+            )
+            .fetch_all(&self.pool)
+            .await
+            .context("load held rows from the start")?
+            .into_iter()
+            .map(|row| (row.id, row.created_at, row.ready))
+            .collect(),
+        };
+        Ok(rows
+            .into_iter()
+            .map(|(id, created_at, ready)| HeldRow {
+                id: AgentTaskId::from_string(id.clone()),
+                key: (created_at, id),
+                ready,
+            })
+            .collect())
     }
 
     async fn update_task_tx(tx: &mut Transaction<'_, Postgres>, task: &AgentTask) -> Result<()> {
@@ -1732,7 +2015,8 @@ SET
     completed_at = $23,
     caller_metadata_json = $24,
     otel_traceparent = $25,
-    last_activity_at = $26
+    last_activity_at = $26,
+    after_siblings_json = $27
 WHERE id = $1
 ",
             task.id.as_str(),
@@ -1764,6 +2048,7 @@ WHERE id = $1
             sanitize_optional_jsonb(task.caller_metadata.clone()),
             task.otel_traceparent.clone(),
             task.last_activity_at,
+            after_siblings_json(task)?,
         )
         .execute(&mut **tx)
         .await
@@ -2408,7 +2693,8 @@ SELECT
     created_at,
     updated_at,
     completed_at,
-    last_activity_at
+    last_activity_at,
+    after_siblings_json
 FROM agent_sdk_tasks
 WHERE parent_id = $1
   AND kind = 'input_injection'
@@ -2505,7 +2791,8 @@ SELECT
     created_at,
     updated_at,
     completed_at,
-    last_activity_at
+    last_activity_at,
+    after_siblings_json
 FROM agent_sdk_tasks
 WHERE kind = 'subagent'
   AND status = 'waiting_on_children'
@@ -2595,7 +2882,8 @@ SELECT
     created_at,
     updated_at,
     completed_at,
-    last_activity_at
+    last_activity_at,
+    after_siblings_json
 FROM agent_sdk_tasks
 WHERE thread_id = $1
   AND kind = 'root_turn'
@@ -3214,7 +3502,8 @@ SELECT
     created_at,
     updated_at,
     completed_at,
-    last_activity_at
+    last_activity_at,
+    after_siblings_json
 FROM agent_sdk_tasks
 WHERE thread_id = $1
   AND kind = 'root_turn'
@@ -3419,39 +3708,18 @@ async fn task_id_exists_tx(
     Ok(id.is_some())
 }
 
-async fn load_runnable_head_tx(tx: &mut Transaction<'_, Postgres>) -> Result<Option<AgentTask>> {
-    let record = sqlx::query_as!(
-        TaskRecord,
+/// The id of the oldest pending row that waits on nothing.
+///
+/// `status` is spelled as a range so only `agent_sdk_tasks_ready_fifo_idx`
+/// can serve the order (see migration 0026); reading only the id keeps the
+/// scan inside that index.
+async fn load_runnable_head_tx(tx: &mut Transaction<'_, Postgres>) -> Result<Option<AgentTaskId>> {
+    Ok(sqlx::query_scalar!(
         r"
-SELECT
-    id,
-    kind,
-    status,
-    parent_id,
-    root_id,
-    depth,
-    thread_id,
-    submitted_input_json,
-    caller_metadata_json,
-    worker_id,
-    lease_id,
-    lease_expires_at,
-    last_heartbeat_at,
-    state_json,
-    attempt,
-    max_attempts,
-    last_error,
-    terminal_reason_json,
-    pending_child_count,
-    spawn_index,
-    result_payload,
-    otel_traceparent,
-    created_at,
-    updated_at,
-    completed_at,
-    last_activity_at
+SELECT id
 FROM agent_sdk_tasks
-WHERE status = 'pending'
+WHERE status >= 'pending' AND status <= 'pending'
+  AND after_siblings_json IS NULL
   AND thread_id NOT IN (
       SELECT thread_id FROM agent_sdk_threads WHERE status IN ('deleting', 'deleted')
   )
@@ -3461,8 +3729,8 @@ LIMIT 1
     )
     .fetch_optional(&mut **tx)
     .await
-    .context("load runnable head")?;
-    record.map(AgentTask::try_from).transpose()
+    .context("load runnable head")?
+    .map(AgentTaskId::from_string))
 }
 
 /// The position of `task` in the store's task-row lock order (see
@@ -3852,7 +4120,8 @@ SELECT
     created_at,
     updated_at,
     completed_at,
-    last_activity_at
+    last_activity_at,
+    after_siblings_json
 FROM agent_sdk_tasks
 WHERE thread_id = $1
 ORDER BY created_at, id
@@ -3895,7 +4164,8 @@ SELECT
     created_at,
     updated_at,
     completed_at,
-    last_activity_at
+    last_activity_at,
+    after_siblings_json
 FROM agent_sdk_tasks
 WHERE parent_id = $1
 ORDER BY created_at, id
@@ -4019,7 +4289,8 @@ SELECT
     created_at,
     updated_at,
     completed_at,
-    last_activity_at
+    last_activity_at,
+    after_siblings_json
 FROM agent_sdk_tasks
 WHERE status = $1
 ORDER BY created_at, id
@@ -4066,7 +4337,8 @@ SELECT
     created_at,
     updated_at,
     completed_at,
-    last_activity_at
+    last_activity_at,
+    after_siblings_json
 FROM agent_sdk_tasks
 WHERE thread_id = $1
   AND kind = 'root_turn'
@@ -4125,7 +4397,8 @@ ORDER BY created_at, id
             tx.rollback().await.context("rollback vanished acquire")?;
             return Ok(None);
         };
-        if !old.status.can_be_leased() {
+        let unfinished = Self::load_unfinished_siblings_tx(&mut tx, &old).await?;
+        if !old.status.can_be_leased() || old.waits_on_any(&unfinished) {
             tx.rollback()
                 .await
                 .context("rollback non-runnable acquire")?;
@@ -4159,7 +4432,8 @@ ORDER BY created_at, id
         }
         let claimed = old
             .clone()
-            .mark_running(worker, lease, expires_at, now)
+            .admit_after_siblings(&unfinished)
+            .and_then(|admitted| admitted.mark_running(worker, lease, expires_at, now))
             .context("try_acquire_task rejected: mark_running transition failed")?;
         Self::update_task_tx(&mut tx, &claimed).await?;
         tx.commit().await.context("commit try_acquire_task")?;
@@ -4173,95 +4447,47 @@ ORDER BY created_at, id
         expires_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<Option<AgentTask>> {
-        loop {
-            let mut tx = self.begin().await?;
-            let head = load_runnable_head_tx(&mut tx).await?;
-            let Some(head) = head else {
-                tx.rollback()
-                    .await
-                    .context("rollback empty runnable scan")?;
-                return Ok(None);
-            };
-            let Some(old) = Self::load_task_tx(&mut tx, &head.id, true).await? else {
-                tx.rollback()
-                    .await
-                    .context("rollback vanished runnable head")?;
-                continue;
-            };
-            match old.status {
-                TaskStatus::Pending => {}
-                // The head scan takes no lock, so another worker may claim,
-                // fail closed, or cancel the head (and its claimer move it
-                // on) before this FOR UPDATE load. The scan only returns
-                // pending rows, so rescanning moves past the lost head.
-                TaskStatus::Running
-                | TaskStatus::WaitingOnChildren
-                | TaskStatus::AwaitingConfirmation
-                | TaskStatus::AwaitingQuestion
-                | TaskStatus::Completed
-                | TaskStatus::Failed
-                | TaskStatus::Cancelled => {
-                    tx.rollback()
-                        .await
-                        .context("rollback raced runnable head")?;
-                    continue;
-                }
-                TaskStatus::Queued => {
-                    let status = old.status;
-                    tx.rollback()
-                        .await
-                        .context("rollback corrupt runnable head")?;
-                    return Err(anyhow!(
-                        "acquire_next_runnable: runnable index held non-pending row {} in status {status:?}",
-                        old.id
-                    ));
-                }
-            }
-
-            match classify_recovery(&old, RecoveryContext::AcquisitionAttempt) {
-                RecoveryAction::NoAction => {
-                    let claimed = old
-                        .clone()
-                        .mark_running(worker.clone(), lease.clone(), expires_at, now)
-                        .context(
-                            "acquire_next_runnable rejected: mark_running transition failed",
-                        )?;
-                    Self::update_task_tx(&mut tx, &claimed).await?;
-                    tx.commit().await.context("commit acquire_next_runnable")?;
-                    return Ok(Some(claimed));
-                }
-                RecoveryAction::FailClosed(_)
-                    if old.kind == TaskKind::RootTurn && old.is_root() =>
-                {
-                    tx.rollback()
-                        .await
-                        .context("rollback before thread-first fail-close")?;
-                    self.fail_closed_root_thread_first(
-                        &old.id,
-                        RecoveryContext::AcquisitionAttempt,
-                        now,
-                        "acquire_next_runnable",
-                    )
-                    .await?;
-                }
-                RecoveryAction::FailClosed(reason) => {
-                    Self::fail_closed_tx(&mut tx, &old, reason, now, "acquire_next_runnable")
-                        .await?;
-                    tx.commit()
-                        .await
-                        .context("commit fail-closed runnable head")?;
-                }
-                RecoveryAction::Requeue => {
-                    tx.rollback()
-                        .await
-                        .context("rollback invalid acquire_next_runnable recovery")?;
-                    return Err(anyhow!(
-                        "acquire_next_runnable: recovery matrix produced Requeue for acquisition-time row {}",
-                        old.id
-                    ));
-                }
-            }
+        if self.held_probe.probes_first()
+            && let Some(task) = self
+                .acquire_ready_held(worker.clone(), lease.clone(), expires_at, now)
+                .await?
+        {
+            return Ok(Some(task));
         }
+        if let Some(task) = self
+            .acquire_ready_head(worker.clone(), lease.clone(), expires_at, now)
+            .await?
+        {
+            return Ok(Some(task));
+        }
+        self.acquire_ready_held(worker, lease, expires_at, now)
+            .await
+    }
+
+    async fn ready_held_children(&self, parent_id: &AgentTaskId) -> Result<Vec<AgentTaskId>> {
+        Ok(sqlx::query_scalar!(
+            r"
+SELECT held.id
+FROM agent_sdk_tasks AS held
+WHERE held.parent_id = $1
+  AND held.status >= 'pending' AND held.status <= 'pending'
+  AND held.after_siblings_json IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements_text(held.after_siblings_json) AS waited(id)
+      JOIN agent_sdk_tasks AS sibling ON sibling.id = waited.id
+      WHERE sibling.status NOT IN ('completed', 'failed', 'cancelled')
+  )
+ORDER BY held.created_at, held.id
+",
+            parent_id.as_str(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("load the ready held children of {parent_id}"))?
+        .into_iter()
+        .map(AgentTaskId::from_string)
+        .collect())
     }
 
     async fn heartbeat_task(
@@ -4319,7 +4545,8 @@ RETURNING
     created_at,
     updated_at,
     completed_at,
-    last_activity_at
+    last_activity_at,
+    after_siblings_json
 ",
             id.as_str(),
             worker.as_str(),
@@ -4385,7 +4612,8 @@ SELECT
     created_at,
     updated_at,
     completed_at,
-    last_activity_at
+    last_activity_at,
+    after_siblings_json
 FROM agent_sdk_tasks
 WHERE status = 'running'
   AND lease_expires_at <= $1
@@ -4772,6 +5000,7 @@ FOR UPDATE SKIP LOCKED
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Vec<AgentTask>)> {
         validate_tool_child_specs_for_pure_spawn(&specs)?;
+        let waits = pure_spawn_waits(&specs)?;
 
         let mut tx = self.begin().await?;
         let screened_parent = Self::load_task_tx(&mut tx, parent_id, false)
@@ -4806,6 +5035,7 @@ FOR UPDATE SKIP LOCKED
             }
             children.push(child);
         }
+        hold_tool_children_behind_siblings(&mut children, &[], &waits)?;
 
         let child_count = u32::try_from(children.len())
             .context("spawn rejected: child count exceeds u32::MAX")?;
@@ -5022,8 +5252,12 @@ FOR UPDATE SKIP LOCKED
             ensure_spawn_task_id_available_tx(&mut tx, &child.id, "child").await?;
             tool_rows.push(child);
         }
-
         let reattached_rows = prepare_reattached_rows(locked_reattach, reattach, now)?;
+        hold_tool_children_behind_siblings(
+            &mut tool_rows,
+            &reattached_rows,
+            &mixed_spawn_waits(&tool_children),
+        )?;
         let child_ids = mixed_child_ids_in_slot_order(&prepared, &tool_rows, &reattached_rows)?;
         let child_count =
             u32::try_from(child_ids.len()).context("spawn rejected: child count exceeds u32")?;
@@ -5110,7 +5344,8 @@ SELECT
     created_at,
     updated_at,
     completed_at,
-    last_activity_at
+    last_activity_at,
+    after_siblings_json
 FROM agent_sdk_tasks
 WHERE kind = 'subagent'
   AND status = 'waiting_on_children'
@@ -5156,7 +5391,8 @@ SELECT
     created_at,
     updated_at,
     completed_at,
-    last_activity_at
+    last_activity_at,
+    after_siblings_json
 FROM agent_sdk_tasks
 WHERE kind = 'subagent'
   AND status = 'waiting_on_children'
@@ -7293,16 +7529,18 @@ struct TaskRecord {
     updated_at: OffsetDateTime,
     completed_at: Option<OffsetDateTime>,
     last_activity_at: Option<OffsetDateTime>,
+    after_siblings_json: Option<serde_json::Value>,
 }
 
 impl TryFrom<TaskRecord> for AgentTask {
     type Error = anyhow::Error;
 
     fn try_from(record: TaskRecord) -> Result<Self> {
+        let status = enum_from_wire(&record.status, "task status")?;
         let task = Self {
             id: AgentTaskId::from_string(record.id),
             kind: enum_from_wire(&record.kind, "task kind")?,
-            status: enum_from_wire(&record.status, "task status")?,
+            status,
             parent_id: record.parent_id.map(AgentTaskId::from_string),
             root_id: AgentTaskId::from_string(record.root_id),
             depth: u32_from_i64(record.depth, "task depth")?,
@@ -7333,6 +7571,14 @@ impl TryFrom<TaskRecord> for AgentTask {
                 .spawn_index
                 .map(|value| u32_from_i64(value, "task spawn_index"))
                 .transpose()?,
+            after_siblings: decoded_wait_list(
+                status,
+                record
+                    .after_siblings_json
+                    .map(|value| json_from_value(value, "task after_siblings_json"))
+                    .transpose()?
+                    .unwrap_or_default(),
+            ),
             result_payload: record.result_payload,
             otel_traceparent: record.otel_traceparent,
             created_at: record.created_at,
@@ -7724,6 +7970,15 @@ impl TryFrom<ExecutionIntentRecord> for ExecutionIntent {
 
 const fn thread_key(thread_id: &ThreadId) -> &str {
     thread_id.0.as_str()
+}
+
+/// The persisted form of a task's wait list: `NULL` when it waits on
+/// nothing, so acquisition can filter on `IS NULL`.
+fn after_siblings_json(task: &AgentTask) -> Result<Option<serde_json::Value>> {
+    if task.after_siblings.is_empty() {
+        return Ok(None);
+    }
+    json_to_value(&task.after_siblings, "task after_siblings").map(Some)
 }
 
 fn json_to_value<T: Serialize + ?Sized>(value: &T, label: &str) -> Result<serde_json::Value> {

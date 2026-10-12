@@ -228,6 +228,7 @@ mod tests {
             name: name.to_owned(),
             display_name: name.to_owned(),
             tier: crate::types::ToolTier::Observe,
+            concurrency: crate::ToolConcurrency::Exclusive,
             input: serde_json::json!({"command": "make build"}),
             effective_input: serde_json::Value::Null,
             listen_context: None,

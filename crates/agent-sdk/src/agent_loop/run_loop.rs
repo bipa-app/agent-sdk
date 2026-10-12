@@ -750,7 +750,7 @@ where
         provenance,
     };
     for pending in cont.pending_tool_calls.iter().skip(cont.awaiting_index + 1) {
-        // A parallel Observe batch may have already executed this tool before
+        // A shared wave may have already executed this tool before
         // pausing for confirmation on an earlier sibling; its result was
         // carried forward in the continuation's `completed_results` (and is
         // therefore already in `tool_results`). Skip re-execution to avoid
@@ -4407,6 +4407,7 @@ mod tests {
                 name: "echo".into(),
                 display_name: "Echo".into(),
                 tier: crate::types::ToolTier::Observe,
+                concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
                 input: serde_json::json!({}),
                 effective_input: serde_json::json!({}),
                 listen_context: None,
@@ -4443,6 +4444,7 @@ mod tests {
                     name: "echo".into(),
                     display_name: "Echo".into(),
                     tier: crate::types::ToolTier::Observe,
+                    concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
                     input: serde_json::json!({}),
                     effective_input: serde_json::json!({}),
                     listen_context: None,
@@ -4452,6 +4454,7 @@ mod tests {
                     name: "write".into(),
                     display_name: "Write".into(),
                     tier: crate::types::ToolTier::Confirm,
+                    concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
                     input: serde_json::json!({}),
                     effective_input: serde_json::json!({}),
                     listen_context: None,
@@ -4498,6 +4501,7 @@ mod tests {
                 name: "echo".into(),
                 display_name: "Echo".into(),
                 tier: crate::types::ToolTier::Observe,
+                concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
                 input: serde_json::json!({}),
                 effective_input: serde_json::json!({}),
                 listen_context: None,

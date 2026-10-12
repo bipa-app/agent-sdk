@@ -37,12 +37,13 @@
 #[cfg(test)]
 use agent_sdk_foundation::ThreadId;
 use agent_sdk_foundation::audit::AuditProvenance;
+use agent_sdk_foundation::batch_order::{BatchSlot, wait_lists};
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::llm::late_tool_result::LateToolResultStatus;
 use agent_sdk_foundation::llm::{self, ChatRequest};
 use agent_sdk_foundation::{
     AgentContinuation, AgentState, ContinuationEnvelope, PendingToolCallInfo, QuestionOption,
-    QuestionPayload, TerminalReason, TokenUsage, ToolResult, ToolTier,
+    QuestionPayload, TerminalReason, TokenUsage, ToolConcurrency, ToolResult, ToolTier,
 };
 use agent_sdk_providers::LlmProvider;
 use agent_sdk_providers::streaming::{StreamAccumulator, StreamBox, StreamDelta, StreamErrorKind};
@@ -222,9 +223,15 @@ impl RootTurnDeps<'_> {
     /// claim one — the `Pending → Running` CAS in `acquire_next_runnable`
     /// still serialises them, so a broadcast only ever costs a few
     /// no-op wakeups, never a double execution.
+    ///
+    /// The broadcast reaches only workers already parked, so it also
+    /// leaves one buffered permit: if every worker was still busy, the
+    /// first to park picks the batch up instead of waiting for its tick,
+    /// and each child it settles wakes the next worker.
     fn wake_workers_for_batch(&self) {
         if let Some(signal) = self.wakeup {
             signal.wake_all_now();
+            signal.notify_workers();
         }
     }
 
@@ -6652,7 +6659,27 @@ async fn spawn_mixed_routed_children(
 /// children" call site from the "re-spawn tool children on resume"
 /// site — only used in error context strings so backtraces still
 /// point at the right call.
+///
+/// Every tool child is spawned with the wait list
+/// [`order_tool_children`] derives, so no spawn path can skip the batch's
+/// execution order.
 async fn apply_batch_routing(
+    inputs: &RootWorkerInputs,
+    deps: &RootTurnDeps<'_>,
+    mut application: BatchRoutingApplication,
+    now: OffsetDateTime,
+) -> Result<(AgentTask, Vec<AgentTask>, Vec<CommittedEvent>)> {
+    let pending = &application.batch.payload.continuation.payload;
+    order_tool_children(
+        &mut application.specs,
+        &pending.pending_tool_calls,
+        &application.routing,
+        &application.reattach,
+    )?;
+    spawn_routed_batch(inputs, deps, application, now).await
+}
+
+async fn spawn_routed_batch(
     inputs: &RootWorkerInputs,
     deps: &RootTurnDeps<'_>,
     application: BatchRoutingApplication,
@@ -6767,6 +6794,78 @@ async fn apply_batch_routing(
         deps.wake_workers_for_batch();
     }
     Ok(spawned)
+}
+
+/// Record on each tool child the earlier siblings it must wait for, in the
+/// execution order [`agent_sdk_foundation::batch_order`] defines.
+///
+/// Subagent spawns fan out as before, and a call whose result was settled
+/// before spawn never runs, so both are detached from the order. Every
+/// other call is shared only when its tool is read-only; the tier plays no
+/// part, because a durable child pauses for confirmation on its own.
+///
+/// `reattach` are the still-live calls of an earlier batch that this spawn
+/// carries over (an early or steering resume). They came first, so a new
+/// call waits for each of them unless both are read-only. The store skips
+/// any that is a subagent.
+fn order_tool_children(
+    specs: &mut [ChildSpawnSpec],
+    pending: &[PendingToolCallInfo],
+    routing: &super::subagent_spawn_selector::BatchRouting,
+    reattach: &[ReattachedChild],
+) -> Result<()> {
+    let subagent_slots: BTreeSet<usize> = match routing {
+        super::subagent_spawn_selector::BatchRouting::AllTools => BTreeSet::new(),
+        super::subagent_spawn_selector::BatchRouting::SingleSubagent { spawn_index, .. } => {
+            BTreeSet::from([*spawn_index])
+        }
+        super::subagent_spawn_selector::BatchRouting::MultiSubagent { plans }
+        | super::subagent_spawn_selector::BatchRouting::Mixed { plans, .. } => {
+            plans.iter().map(|(index, _)| *index).collect()
+        }
+    };
+    let slot_of = |index: usize| match pending.get(index).map(|call| call.concurrency) {
+        Some(ToolConcurrency::ReadOnly) => BatchSlot::Shared,
+        Some(ToolConcurrency::Exclusive) | None => BatchSlot::Exclusive,
+    };
+    let slots: Vec<BatchSlot> = specs
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| {
+            if spec.precompleted_result.is_some() || subagent_slots.contains(&index) {
+                BatchSlot::Detached
+            } else {
+                slot_of(index)
+            }
+        })
+        .collect();
+    let survivors: Vec<(u32, BatchSlot)> = reattach
+        .iter()
+        .map(|survivor| {
+            let index = usize::try_from(survivor.spawn_index)
+                .context("re-attached spawn index exceeds usize")?;
+            Ok((survivor.spawn_index, slot_of(index)))
+        })
+        .collect::<Result<_>>()?;
+    for ((slot, spec), after) in slots.iter().zip(specs.iter_mut()).zip(wait_lists(&slots)) {
+        spec.after = after
+            .into_iter()
+            .map(u32::try_from)
+            .collect::<Result<_, _>>()
+            .context("tool spawn index exceeds u32")?;
+        if *slot == BatchSlot::Detached {
+            continue;
+        }
+        spec.after.extend(
+            survivors
+                .iter()
+                .filter(|(_, survivor)| {
+                    *slot == BatchSlot::Exclusive || *survivor == BatchSlot::Exclusive
+                })
+                .map(|(index, _)| *index),
+        );
+    }
+    Ok(())
 }
 
 /// Close the parent's turn attempt, treating
@@ -7225,6 +7324,7 @@ fn extract_pending_tool_calls(
                     name: name.clone(),
                     display_name: def.map_or_else(|| name.clone(), |d| d.display_name.clone()),
                     tier: def.map_or(ToolTier::Confirm, |d| d.tier),
+                    concurrency: def.map_or(ToolConcurrency::Exclusive, |d| d.concurrency),
                     input: input.clone(),
                     effective_input: input.clone(),
                     listen_context: None,
@@ -8901,6 +9001,7 @@ async fn undelivered_call_closures(
             name: name.to_owned(),
             display_name: name.to_owned(),
             tier: agent_sdk_foundation::ToolTier::Confirm,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
             input: input.clone(),
             effective_input: serde_json::Value::Null,
             listen_context: None,
@@ -10495,6 +10596,7 @@ mod tests {
                 name: "bash".to_owned(),
                 display_name: "Bash".to_owned(),
                 tier: ToolTier::Observe,
+                concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
                 input: serde_json::json!({"command": "true"}),
                 effective_input: serde_json::json!({"command": "true"}),
                 listen_context: None,

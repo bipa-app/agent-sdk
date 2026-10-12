@@ -1999,6 +1999,7 @@ mod tests {
             input_schema: serde_json::json!({ "type": "object" }),
             display_name: name.to_string(),
             tier: agent_sdk_foundation::ToolTier::Observe,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
         }
     }
 

@@ -48,10 +48,15 @@ mod tests {
             "mixed_batch_losing_cas_spawns_nothing",
             "mixed_batch_rejects_cancelled_parent",
             "mixed_batch_rejects_uncovered_slot",
+            "ordered_tool_children_run_in_batch_order",
+            "ordered_mixed_batch_holds_only_tool_children",
+            "cancel_tree_cancels_held_tool_children",
+            "a_waiting_child_needs_no_release_write",
+            "a_held_backlog_never_hides_ready_work",
         ] {
             assert!(
                 report.passed.contains(&case.to_owned()),
-                "the mixed-batch case {case} must run on every backend",
+                "the batch case {case} must run on every backend",
             );
         }
         assert!(

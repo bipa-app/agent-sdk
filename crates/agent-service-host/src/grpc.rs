@@ -497,6 +497,7 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
     } = params;
 
     let task_id = bootstrap.task_id.clone();
+    let parent_id = bootstrap.parent_task.id.clone();
     let thread_id = bootstrap.thread_id.clone();
     let worker_id = bootstrap.worker_id.clone();
     let lease_id = bootstrap.lease_id.clone();
@@ -610,6 +611,12 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
         }
     }
     drop(artifact_store_guard);
+    crate::host::settle_tool_child(
+        runtime.wakeup_signal(),
+        stores.task_store.as_ref(),
+        Some(&parent_id),
+    )
+    .await;
 
     match crate::host::committed_events_from(stores.event_repo.as_ref(), &thread_id, watermark)
         .await
@@ -1291,6 +1298,12 @@ impl GrpcControlService {
                 )
                 .await
                 .map_err(internal_status("applying confirmation decision"))?;
+                crate::host::settle_tool_child(
+                    self.shared.runtime.wakeup_signal(),
+                    self.shared.stores.task_store.as_ref(),
+                    current_task.parent_id.as_ref(),
+                )
+                .await;
             }
         }
 
@@ -6264,6 +6277,7 @@ mod tests {
             }),
             display_name: "Transfer".into(),
             tier: ToolTier::Confirm,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
         };
         let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(vec![
             transfer_tool,
@@ -6590,6 +6604,9 @@ mod tests {
                 .acquire_next_runnable(worker, lease, expires_at, now)
                 .await
         }
+        async fn ready_held_children(&self, parent_id: &AgentTaskId) -> Result<Vec<AgentTaskId>> {
+            self.inner.ready_held_children(parent_id).await
+        }
         async fn heartbeat_task(
             &self,
             task_id: &AgentTaskId,
@@ -6913,6 +6930,7 @@ mod tests {
             }),
             display_name: "Lookup".into(),
             tier: ToolTier::Observe,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
         };
         let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(vec![
             lookup_tool,
@@ -7648,6 +7666,7 @@ mod tests {
             name: "bash".to_owned(),
             display_name: "bash".to_owned(),
             tier: agent_sdk_foundation::ToolTier::Observe,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
             input: serde_json::json!({"command": "make"}),
             effective_input: serde_json::Value::Null,
             listen_context: None,
@@ -8479,6 +8498,7 @@ mod tests {
                 name: "ask_user".into(),
                 display_name: "Ask User".into(),
                 tier: ToolTier::Observe,
+                concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
                 input: serde_json::json!({"question": "Choose?"}),
                 effective_input: serde_json::json!({"question": "Choose?"}),
                 listen_context: None,
@@ -8702,11 +8722,11 @@ mod tests {
             description: "Transfer funds".into(),
             input_schema: json!({
                 "type": "object",
-                "properties": { "amount": { "type": "number" } },
-                "required": ["amount"]
+                "properties": { "amount": { "type": "number" } }, "required": ["amount"]
             }),
             display_name: "Transfer".into(),
             tier: ToolTier::Confirm,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
         };
         let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(vec![
             transfer_tool,

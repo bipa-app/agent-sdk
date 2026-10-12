@@ -482,6 +482,7 @@ async fn tier_c_live_completion_and_stream_and_tool() -> anyhow::Result<()> {
         }),
         display_name: "Weather".into(),
         tier: agent_sdk_foundation::ToolTier::Observe,
+        concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
     };
     let (tool_blocks, _raw, _stop) = drain(
         &provider,

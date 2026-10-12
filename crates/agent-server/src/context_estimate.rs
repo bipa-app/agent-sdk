@@ -633,6 +633,7 @@ mod tests {
                     input_schema: serde_json::json!({"type": "object"}),
                     display_name: "Read".to_owned(),
                     tier: ToolTier::Observe,
+                    concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
                 },
             ]);
 

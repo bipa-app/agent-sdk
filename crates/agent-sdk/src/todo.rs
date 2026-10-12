@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{PrimitiveToolName, Tool, ToolContext, ToolResult, ToolTier};
+use crate::{PrimitiveToolName, Tool, ToolConcurrency, ToolContext, ToolResult, ToolTier};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -448,6 +448,10 @@ impl<Ctx: Send + Sync + 'static> Tool<Ctx> for TodoReadTool {
 
     fn tier(&self) -> ToolTier {
         ToolTier::Observe
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::ReadOnly
     }
 
     async fn execute(&self, _ctx: &ToolContext<Ctx>, _input: Value) -> Result<ToolResult> {

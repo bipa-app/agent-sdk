@@ -3249,6 +3249,7 @@ mod tests {
             input_schema: input_schema.clone(),
             display_name: "Configure".to_owned(),
             tier: agent_sdk_foundation::ToolTier::Confirm,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
         };
 
         let api_tool = convert_tool(tool);

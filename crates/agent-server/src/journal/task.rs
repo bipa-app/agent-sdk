@@ -76,6 +76,7 @@ use agent_sdk_foundation::{
     ThreadId,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fmt;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -248,6 +249,11 @@ pub struct ChildSpawnSpec {
     /// Durable result for a mixed-batch child that must never enter the
     /// runnable index.
     pub precompleted_result: Option<serde_json::Value>,
+    /// Spawn indices of earlier tool children in the same spawn that must
+    /// reach a terminal state before this child becomes runnable. Empty
+    /// for a child that may start at once. See
+    /// [`super::sibling_order`].
+    pub after: Vec<u32>,
 }
 
 impl ChildSpawnSpec {
@@ -257,7 +263,15 @@ impl ChildSpawnSpec {
         Self {
             max_attempts,
             precompleted_result: None,
+            after: Vec::new(),
         }
+    }
+
+    /// Hold this child until the siblings at `after` have finished.
+    #[must_use]
+    pub fn after_siblings(mut self, after: Vec<u32>) -> Self {
+        self.after = after;
+        self
     }
 
     /// Persist this child as terminal inside a mixed spawn transaction.
@@ -570,6 +584,10 @@ pub enum TaskSchemaError {
         "paused status {status:?} requires a matching TaskState payload, found TaskState::None"
     )]
     PausedStatusMissingPayload { status: TaskStatus },
+    #[error("only a pending tool_runtime child may wait on earlier siblings")]
+    InvalidSiblingWait,
+    #[error("a task waiting on earlier siblings cannot be leased")]
+    HeldBySiblings,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -726,6 +744,12 @@ pub struct AgentTask {
     #[serde(default)]
     pub spawn_index: Option<u32>,
 
+    /// Earlier children of the same batch that must reach a terminal state
+    /// before this pending tool child may run. Acquisition checks it and
+    /// clears it as it leases the row. See [`super::sibling_order`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after_siblings: Vec<AgentTaskId>,
+
     // ── durable tool result (used by 5.4) ──────────────────
     /// Serialized tool result persisted when a tool-runtime child
     /// task reaches [`TaskStatus::Completed`].
@@ -810,6 +834,7 @@ impl AgentTask {
             terminal_reason: None,
             pending_child_count: 0,
             spawn_index: None,
+            after_siblings: Vec::new(),
             result_payload: None,
             otel_traceparent: None,
             created_at: now,
@@ -1029,6 +1054,7 @@ impl AgentTask {
             terminal_reason: None,
             pending_child_count: 0,
             spawn_index: None,
+            after_siblings: Vec::new(),
             result_payload: None,
             // Inherited from the parent by default; the tool-boundary
             // spawn path overrides this with the root turn's
@@ -1089,6 +1115,7 @@ impl AgentTask {
             terminal_reason: None,
             pending_child_count: 1,
             spawn_index: Some(spawn_index),
+            after_siblings: Vec::new(),
             result_payload: None,
             // A subagent invocation runs its own root turn on the child
             // thread; inherit the parent's trace parent so the spawned
@@ -1277,8 +1304,21 @@ impl AgentTask {
         }
 
         self.validate_state_status_invariant()?;
+        self.validate_sibling_wait()
+    }
 
-        Ok(())
+    /// Only a pending tool child may wait on earlier siblings.
+    const fn validate_sibling_wait(&self) -> Result<(), TaskSchemaError> {
+        if self.after_siblings.is_empty()
+            || matches!(
+                (self.status, self.kind),
+                (TaskStatus::Pending, TaskKind::ToolRuntime)
+            )
+        {
+            Ok(())
+        } else {
+            Err(TaskSchemaError::InvalidSiblingWait)
+        }
     }
 
     /// Check the Phase 2.4 state ↔ status invariant.
@@ -1445,6 +1485,9 @@ impl AgentTask {
                 to: TaskStatus::Running,
             });
         }
+        if !self.after_siblings.is_empty() {
+            return Err(TaskSchemaError::HeldBySiblings);
+        }
         if !self.state.resumes_in_flight_turn() {
             let next_attempt = self.attempt.saturating_add(1);
             if next_attempt > self.max_attempts {
@@ -1532,6 +1575,55 @@ impl AgentTask {
         self.last_heartbeat_at = None;
         self.updated_at = now;
         self.validate()?;
+        Ok(self)
+    }
+
+    /// Hold a freshly built tool child behind earlier siblings of its
+    /// batch, so acquisition skips it until they all finish.
+    ///
+    /// # Errors
+    /// - [`TaskSchemaError::InvalidTransition`] if the row is not a fresh
+    ///   `Pending` row that waits on nothing yet.
+    /// - [`TaskSchemaError::InvalidSiblingWait`] if the row is not a tool
+    ///   child.
+    pub fn wait_on_siblings(mut self, after: Vec<AgentTaskId>) -> Result<Self, TaskSchemaError> {
+        if self.status != TaskStatus::Pending
+            || !self.state.is_none()
+            || !self.after_siblings.is_empty()
+        {
+            return Err(TaskSchemaError::InvalidTransition {
+                from: self.status,
+                to: TaskStatus::Pending,
+            });
+        }
+        self.after_siblings = after;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// `true` while a sibling this row waits for is in `unfinished`, the
+    /// ids of tasks that exist and are not yet terminal. A sibling that no
+    /// longer exists counts as finished.
+    #[must_use]
+    pub fn waits_on_any(&self, unfinished: &BTreeSet<AgentTaskId>) -> bool {
+        self.after_siblings.iter().any(|id| unfinished.contains(id))
+    }
+
+    /// Clear the wait list of a tool child whose earlier siblings have all
+    /// finished. Acquisition takes this step right before
+    /// [`Self::mark_running`], which refuses a row that still has one.
+    ///
+    /// # Errors
+    /// Returns [`TaskSchemaError::HeldBySiblings`] while a sibling it
+    /// waits for is in `unfinished`.
+    pub fn admit_after_siblings(
+        mut self,
+        unfinished: &BTreeSet<AgentTaskId>,
+    ) -> Result<Self, TaskSchemaError> {
+        if self.waits_on_any(unfinished) {
+            return Err(TaskSchemaError::HeldBySiblings);
+        }
+        self.after_siblings.clear();
         Ok(self)
     }
 
@@ -2238,6 +2330,7 @@ impl AgentTask {
         self.last_heartbeat_at = None;
         self.pending_child_count = 0;
         self.state = TaskState::None;
+        self.after_siblings.clear();
         self.last_error = Some(error);
         self.terminal_reason = Some(reason);
         self.completed_at = Some(now);
@@ -2313,6 +2406,7 @@ impl AgentTask {
         self.last_heartbeat_at = None;
         self.pending_child_count = 0;
         self.state = TaskState::None;
+        self.after_siblings.clear();
         self.terminal_reason = Some(reason);
         self.completed_at = Some(now);
         // ADR-0003 I3. Cancellation is the third terminal outcome, and the

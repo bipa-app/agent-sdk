@@ -398,6 +398,7 @@ mod tests {
             input_schema: serde_json::json!({ "type": "object" }),
             display_name: name.into(),
             tier: ToolTier::Observe,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
         }
     }
 

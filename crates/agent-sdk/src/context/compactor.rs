@@ -4209,6 +4209,7 @@ mod tests {
             name: "bash".to_owned(),
             display_name: "bash".to_owned(),
             tier: crate::types::ToolTier::Observe,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
             input: serde_json::json!({"command": "make"}),
             effective_input: serde_json::Value::Null,
             listen_context: None,

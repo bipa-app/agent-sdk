@@ -87,6 +87,198 @@ async fn park_root_on_tool_children(
     })
 }
 
+/// Rows an older build that never knew `after_siblings_json` leased or
+/// finished keep the wait list they carried. They must still load, on their
+/// own and as children of their parent.
+async fn test_stale_wait_lists_still_load(
+    task_store: &dyn AgentTaskStore,
+    parked: &ParkedRoot,
+) -> Result<()> {
+    for child in &parked.children[1..] {
+        let row = task_store
+            .get(&child.id)
+            .await?
+            .context("a row with a stale wait list must load")?;
+        anyhow::ensure!(
+            row.after_siblings.is_empty(),
+            "a wait list on a {:?} row is ignored",
+            row.status
+        );
+    }
+    let children = task_store.list_children(&parked.root.id).await?;
+    anyhow::ensure!(
+        children.len() == parked.children.len(),
+        "every child must list, got {}",
+        children.len()
+    );
+    task_store.cancel_tree(&parked.root.id, t_plus(6)).await?;
+    for child in task_store.list_children(&parked.root.id).await? {
+        anyhow::ensure!(
+            child.status.is_terminal(),
+            "cancelling the tree must settle {} ({:?})",
+            child.id,
+            child.status
+        );
+    }
+    Ok(())
+}
+
+/// A tool child settles: the sibling held behind it is hinted to the pool,
+/// and a worker leases it by id from the hint alone.
+async fn test_a_settled_child_hints_the_sibling_it_released(
+    task_store: &dyn AgentTaskStore,
+    tid: &str,
+) -> Result<()> {
+    let root = AgentTask::new_root_turn(thread_id(tid), t_plus(0), 3);
+    task_store.submit_root_turn(root.clone()).await?;
+    let worker = WorkerId::new();
+    let lease = LeaseId::new();
+    task_store
+        .try_acquire_task(
+            &root.id,
+            worker.clone(),
+            lease.clone(),
+            t_plus(10_000),
+            t_plus(1),
+        )
+        .await?
+        .context("root must acquire")?;
+    let (_parent, children) = task_store
+        .spawn_tool_children(
+            &root.id,
+            &worker,
+            &lease,
+            vec![
+                ChildSpawnSpec::new(1),
+                ChildSpawnSpec::new(1).after_siblings(vec![0]),
+            ],
+            suspension_payload(tid),
+            None,
+            Vec::new(),
+            t_plus(2),
+        )
+        .await?;
+    let [first, held] = children.as_slice() else {
+        anyhow::bail!("two children must be spawned");
+    };
+    let child_worker = WorkerId::new();
+    let child_lease = LeaseId::new();
+    task_store
+        .try_acquire_task(
+            &first.id,
+            child_worker.clone(),
+            child_lease.clone(),
+            t_plus(10_000),
+            t_plus(3),
+        )
+        .await?
+        .context("the first child must acquire")?;
+    task_store
+        .complete_task_with_result(
+            &first.id,
+            &child_worker,
+            &child_lease,
+            serde_json::json!({"ok": true}),
+            t_plus(4),
+        )
+        .await?;
+
+    let signal = agent_server::journal::WakeupSignal::default();
+    crate::host::settle_tool_child(Some(&signal), task_store, Some(&root.id)).await;
+    let leased = crate::host::acquire_hinted_task(
+        task_store,
+        &signal,
+        &WorkerId::new(),
+        time::Duration::minutes(10),
+    )
+    .await
+    .context("the hinted sibling must be leased by id")?;
+    anyhow::ensure!(
+        leased.id == held.id && leased.status == TaskStatus::Running,
+        "the hint must lease the released sibling, got {leased:?}"
+    );
+    anyhow::ensure!(!signal.has_hints(), "the hint was consumed");
+    Ok(())
+}
+
+/// Claim every runnable row through the acquisition scan.
+async fn claim_all_runnable(task_store: &dyn AgentTaskStore, at: i64) -> Result<Vec<AgentTask>> {
+    let mut claimed = Vec::new();
+    while let Some(task) = task_store
+        .acquire_next_runnable(
+            WorkerId::new(),
+            LeaseId::new(),
+            t_plus(at + 10_000),
+            t_plus(at),
+        )
+        .await?
+    {
+        claimed.push(task);
+        anyhow::ensure!(claimed.len() < 10_000, "the runnable scan never drained");
+    }
+    Ok(claimed)
+}
+
+/// `parked.children[1]` was requeued by an older build with its wait list
+/// on `parked.children[0]` intact. The scan holds it while that sibling
+/// runs and hands it out once the sibling finishes, with no write to it in
+/// between.
+async fn test_requeued_wait_list_is_acquired_once_its_siblings_finish(
+    task_store: &dyn AgentTaskStore,
+    parked: &ParkedRoot,
+) -> Result<()> {
+    let [first, requeued, _] = parked.children.as_slice() else {
+        anyhow::bail!("three children must be parked");
+    };
+    let held = task_store
+        .get(&requeued.id)
+        .await?
+        .context("the requeued row must load")?;
+    anyhow::ensure!(
+        held.status == TaskStatus::Pending && held.after_siblings == [first.id.clone()],
+        "the requeued row keeps its wait list: {held:?}"
+    );
+
+    let claimed = claim_all_runnable(task_store, 5).await?;
+    let first_claim = claimed
+        .iter()
+        .find(|task| task.id == first.id)
+        .context("the sibling it waits for must be acquired")?;
+    anyhow::ensure!(
+        claimed.iter().all(|task| task.id != requeued.id),
+        "a row whose sibling still runs must not be acquired"
+    );
+
+    task_store
+        .complete_task_with_result(
+            &first.id,
+            first_claim.worker_id.as_ref().context("claimed worker")?,
+            first_claim.lease_id.as_ref().context("claimed lease")?,
+            serde_json::json!({"ok": true}),
+            t_plus(6),
+        )
+        .await?;
+    let untouched = task_store
+        .get(&requeued.id)
+        .await?
+        .context("the requeued row must load")?;
+    anyhow::ensure!(
+        untouched.after_siblings == [first.id.clone()] && untouched.updated_at == held.updated_at,
+        "the sibling finishing must not write the waiting row"
+    );
+
+    let claimed = claim_all_runnable(task_store, 7).await?;
+    let leased = claimed
+        .iter()
+        .find(|task| task.id == requeued.id)
+        .context("the row must be acquired once its sibling finished")?;
+    anyhow::ensure!(
+        leased.after_siblings.is_empty(),
+        "acquisition clears the wait list it admitted"
+    );
+    Ok(())
+}
+
 async fn drive_child(
     task_store: &dyn AgentTaskStore,
     tid: &str,
@@ -1420,6 +1612,58 @@ mod sqlite {
     }
 
     #[tokio::test]
+    async fn settlement_sqlite_stale_wait_lists_from_an_older_build_still_load() -> Result<()> {
+        let store = store().await?;
+        let parked =
+            super::park_root_on_tool_children(&store, "sqlite-stale-waits", 3, 3, 0).await?;
+        let waits = serde_json::json!([parked.children[0].id.as_str()]);
+        let at = super::t_plus(5);
+        sqlx::query(
+            "UPDATE agent_sdk_tasks SET status = 'running', worker_id = 'older-build', \
+             lease_id = 'older-lease', lease_expires_at = ?2, last_heartbeat_at = ?2, \
+             attempt = 1, after_siblings_json = ?3 WHERE id = ?1",
+        )
+        .bind(parked.children[1].id.as_str())
+        .bind(at)
+        .bind(&waits)
+        .execute(store.pool())
+        .await?;
+        sqlx::query(
+            "UPDATE agent_sdk_tasks SET status = 'completed', completed_at = ?2, \
+             terminal_reason_json = ?3, after_siblings_json = ?4 WHERE id = ?1",
+        )
+        .bind(parked.children[2].id.as_str())
+        .bind(at)
+        .bind(serde_json::to_value(super::TerminalReason::Completed)?)
+        .bind(&waits)
+        .execute(store.pool())
+        .await?;
+        super::test_stale_wait_lists_still_load(&store, &parked).await
+    }
+
+    #[tokio::test]
+    async fn settlement_sqlite_a_settled_child_hints_the_sibling_it_released() -> Result<()> {
+        let store = store().await?;
+        super::test_a_settled_child_hints_the_sibling_it_released(&store, "sqlite-hint").await
+    }
+
+    #[tokio::test]
+    async fn settlement_sqlite_requeued_wait_list_from_an_older_build_runs_in_order() -> Result<()>
+    {
+        let store = store().await?;
+        let parked =
+            super::park_root_on_tool_children(&store, "sqlite-requeued-waits", 3, 3, 0).await?;
+        sqlx::query(
+            "UPDATE agent_sdk_tasks SET attempt = 1, after_siblings_json = ?2 WHERE id = ?1",
+        )
+        .bind(parked.children[1].id.as_str())
+        .bind(serde_json::json!([parked.children[0].id.as_str()]))
+        .execute(store.pool())
+        .await?;
+        super::test_requeued_wait_list_is_acquired_once_its_siblings_finish(&store, &parked).await
+    }
+
+    #[tokio::test]
     async fn settlement_sqlite_cancel_child_in_every_live_state_wakes_parent() -> Result<()> {
         let store = store().await?;
         super::test_cancel_child_in_every_live_state_wakes_parent(&store).await
@@ -1760,6 +2004,7 @@ SELECT count(*) AS "blocked!" FROM blocked
                 name: "read_file".into(),
                 display_name: "Read File".into(),
                 tier: ToolTier::Observe,
+                concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
                 input: serde_json::json!({ "path": format!("f{index}") }),
                 effective_input: serde_json::json!({ "path": format!("f{index}") }),
                 listen_context: None,
@@ -2318,6 +2563,158 @@ WHERE id = $1
             &TerminalReason::ParentCancelled,
             "undelivered input of the child root",
         );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_stale_wait_lists_from_an_older_build_still_load() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let parked = super::park_root_on_tool_children(&store, "pg-stale-waits", 3, 3, 0).await?;
+        let waits = serde_json::json!([parked.children[0].id.as_str()]);
+        let at = t_plus(5);
+        sqlx::query(
+            "UPDATE agent_sdk_tasks SET status = 'running', worker_id = 'older-build', \
+             lease_id = 'older-lease', lease_expires_at = $2, last_heartbeat_at = $2, \
+             attempt = 1, after_siblings_json = $3 WHERE id = $1",
+        )
+        .bind(parked.children[1].id.as_str())
+        .bind(at)
+        .bind(&waits)
+        .execute(store.pool())
+        .await?;
+        sqlx::query(
+            "UPDATE agent_sdk_tasks SET status = 'completed', completed_at = $2, \
+             terminal_reason_json = $3, after_siblings_json = $4 WHERE id = $1",
+        )
+        .bind(parked.children[2].id.as_str())
+        .bind(at)
+        .bind(serde_json::to_value(TerminalReason::Completed)?)
+        .bind(&waits)
+        .execute(store.pool())
+        .await?;
+        super::test_stale_wait_lists_still_load(&store, &parked).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_a_settled_child_hints_the_sibling_it_released() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        super::test_a_settled_child_hints_the_sibling_it_released(&store, "pg-hint").await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_requeued_wait_list_from_an_older_build_runs_in_order() -> Result<()>
+    {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let parked =
+            super::park_root_on_tool_children(&store, "pg-requeued-waits", 3, 3, 0).await?;
+        sqlx::query(
+            "UPDATE agent_sdk_tasks SET attempt = 1, after_siblings_json = $2 WHERE id = $1",
+        )
+        .bind(parked.children[1].id.as_str())
+        .bind(serde_json::json!([parked.children[0].id.as_str()]))
+        .execute(store.pool())
+        .await?;
+        super::test_requeued_wait_list_is_acquired_once_its_siblings_finish(&store, &parked).await
+    }
+
+    /// A child's completion and a cancel of its tree, staged so the cancel
+    /// holds the first child's row while the completion holds the last
+    /// child's. Neither may take a lock out of the store's child-before-
+    /// parent order: the completion commits, and the cancel settles the rest.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_child_completion_racing_a_cancel_never_deadlocks() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let tid = "pg-completion-vs-cancel";
+        let parked = super::park_root_on_tool_children(&store, tid, 3, 3, 0).await?;
+        let mut by_id = parked.children.clone();
+        by_id.sort_by(|a, b| a.id.cmp(&b.id));
+        let [first, middle, last] = by_id.as_slice() else {
+            anyhow::bail!("three children must be parked");
+        };
+        let worker = WorkerId::new();
+        let lease = LeaseId::new();
+        store
+            .try_acquire_task(
+                &last.id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(10_000),
+                t_plus(5),
+            )
+            .await?
+            .context("the last child must acquire")?;
+
+        let mut holder = store.pool().begin().await?;
+        let holder_pid = backend_pid(&mut holder).await?;
+        sqlx::query_scalar!(
+            "SELECT id FROM agent_sdk_tasks WHERE id = $1 FOR UPDATE",
+            middle.id.as_str(),
+        )
+        .fetch_one(&mut *holder)
+        .await?;
+        let cancelling = {
+            let store = store.clone();
+            let root = parked.root.id.clone();
+            tokio::spawn(async move { store.cancel_tree(&root, t_plus(6)).await })
+        };
+        until_sessions_blocked_by(&store, holder_pid, 1).await?;
+
+        let completing = {
+            let store = store.clone();
+            let child = last.id.clone();
+            tokio::spawn(async move {
+                store
+                    .complete_task_with_result(
+                        &child,
+                        &worker,
+                        &lease,
+                        serde_json::json!({"ok": true}),
+                        t_plus(7),
+                    )
+                    .await
+                    .map(|_| ())
+            })
+        };
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(10), completing).await;
+        holder.commit().await?;
+        let cancelled = cancelling.await?;
+        let completed = completed.context(
+            "the completion waited on the cancel, which holds a parent lock out of order",
+        )??;
+        anyhow::ensure!(
+            completed.is_ok() && cancelled.is_ok(),
+            "completion {completed:?}, cancel {:?}",
+            cancelled.map(|_| ()),
+        );
+
+        let status = |id: &AgentTaskId| {
+            let store = store.clone();
+            let id = id.clone();
+            async move {
+                Ok::<_, anyhow::Error>(
+                    store
+                        .get(&id)
+                        .await?
+                        .context("child row must exist")?
+                        .status,
+                )
+            }
+        };
+        anyhow::ensure!(
+            status(&last.id).await? == TaskStatus::Completed,
+            "the completion's terminal write must land"
+        );
+        for child in [first, middle] {
+            anyhow::ensure!(status(&child.id).await? == TaskStatus::Cancelled);
+        }
         Ok(())
     }
 

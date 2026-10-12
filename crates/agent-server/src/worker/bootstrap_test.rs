@@ -50,6 +50,7 @@ fn sample_tools() -> Vec<Tool> {
             }),
             display_name: "Read File".into(),
             tier: agent_sdk_foundation::ToolTier::Observe,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
         },
         Tool {
             name: "write_file".into(),
@@ -64,6 +65,7 @@ fn sample_tools() -> Vec<Tool> {
             }),
             display_name: "Write File".into(),
             tier: agent_sdk_foundation::ToolTier::Confirm,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
         },
     ]
 }

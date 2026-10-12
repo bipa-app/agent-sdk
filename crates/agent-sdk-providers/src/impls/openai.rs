@@ -3214,6 +3214,7 @@ mod tests {
             input_schema: serde_json::json!({"type": "object"}),
             display_name: name.to_owned(),
             tier: agent_sdk_foundation::ToolTier::Observe,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
         }
     }
 
@@ -4099,6 +4100,7 @@ mod tests {
             }),
             display_name: "Test Tool".to_string(),
             tier: agent_sdk_foundation::ToolTier::Observe,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
         };
 
         let compatible_tool = convert_tool(tool.clone(), false);
@@ -4136,6 +4138,7 @@ mod tests {
             input_schema: input_schema.clone(),
             display_name: "Configure".to_owned(),
             tier: agent_sdk_foundation::ToolTier::Confirm,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
         };
 
         let api_tool = convert_tool(tool, true);
@@ -4815,6 +4818,7 @@ mod tests {
                 input_schema: serde_json::json!({"type": "object"}),
                 display_name: "Read File".to_string(),
                 tier: agent_sdk_foundation::ToolTier::Observe,
+                concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
             }]),
             max_tokens: 1024,
             max_tokens_explicit: true,

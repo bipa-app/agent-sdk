@@ -280,6 +280,7 @@ fn sample_definition_with_tools() -> AgentDefinition {
             input_schema: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
             display_name: "Bash".into(),
             tier: agent_sdk_foundation::ToolTier::Observe,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
         }],
         ..sample_definition()
     }
@@ -5490,6 +5491,7 @@ async fn pending_tool_tier_uses_per_turn_tools_fn_not_static_list() -> Result<()
             input_schema: serde_json::json!({"type": "object"}),
             display_name: "Bash (static)".into(),
             tier: agent_sdk_foundation::ToolTier::Observe,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
         }],
         thinking: ThinkingPolicy::default(),
         thinking_display: None,
@@ -5502,6 +5504,7 @@ async fn pending_tool_tier_uses_per_turn_tools_fn_not_static_list() -> Result<()
                 input_schema: serde_json::json!({"type": "object"}),
                 display_name: "Bash (hardened)".into(),
                 tier: agent_sdk_foundation::ToolTier::Confirm,
+                concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
             }]
         })),
         tool_input_sanitizer: None,
@@ -8734,6 +8737,9 @@ async fn park_early_resumed_batch(
 }
 
 /// Park three Any-policy calls behind a prompt long enough to compact.
+///
+/// The calls are read-only, so they share one wave and may finish in any
+/// order, which the early-resume exits below rely on.
 async fn park_any_batch(stores: &TestStores) -> Result<(AgentTask, Vec<AgentTask>)> {
     let provider = MockToolCallProvider::new(vec![
         bash_call("call_0"),
@@ -8743,6 +8749,9 @@ async fn park_any_batch(stores: &TestStores) -> Result<(AgentTask, Vec<AgentTask
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let mut bootstrap = sample_bootstrap_with_tools(task);
     bootstrap.definition.policy.child_join_policy = ChildJoinPolicy::Any;
+    for tool in &mut bootstrap.definition.tools {
+        tool.concurrency = agent_sdk_foundation::ToolConcurrency::ReadOnly;
+    }
     let inputs = build_root_worker_inputs(
         bootstrap,
         &stores.threads,
@@ -10024,6 +10033,7 @@ async fn quoted_late_results_do_not_close_a_call() -> Result<()> {
         name: "bash".to_owned(),
         display_name: "bash".to_owned(),
         tier: agent_sdk_foundation::ToolTier::Confirm,
+        concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
         input: serde_json::json!({"command": "call_1"}),
         effective_input: serde_json::Value::Null,
         listen_context: None,
@@ -12587,6 +12597,7 @@ fn sample_definition_with_subagent_tools() -> AgentDefinition {
                 input_schema: serde_json::json!({"type": "object", "properties": {"task": {"type": "string"}}}),
                 display_name: "Subagent: Explore".into(),
                 tier: agent_sdk_foundation::ToolTier::Confirm,
+                concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
             },
             Tool {
                 name: "bash".into(),
@@ -12594,6 +12605,7 @@ fn sample_definition_with_subagent_tools() -> AgentDefinition {
                 input_schema: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
                 display_name: "Bash".into(),
                 tier: agent_sdk_foundation::ToolTier::Observe,
+                concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
             },
         ],
         ..sample_definition()
@@ -12718,6 +12730,144 @@ async fn mixed_batch_spawns_subagent_slot_and_tool_child_in_one_turn() -> Result
     Ok(())
 }
 
+fn subagent_call(id: &str) -> (String, String, serde_json::Value) {
+    (
+        id.into(),
+        "subagent_explore".into(),
+        serde_json::json!({"task": id}),
+    )
+}
+
+async fn child_root_of(stores: &TestStores, invocation: &AgentTask) -> Result<AgentTask> {
+    let linkage = invocation
+        .state
+        .subagent_invocation()
+        .context("invocation must carry durable linkage")?;
+    stores
+        .tasks
+        .get(&linkage.child_root_task_id)
+        .await?
+        .context("child root must be persisted")
+}
+
+#[tokio::test]
+async fn subagent_spawns_fan_out_together_while_tool_calls_keep_model_order() -> Result<()> {
+    let stores = TestStores::new();
+    let (_parent, children) = Box::pin(suspend_on_mixed_batch(
+        &stores,
+        vec![
+            bash_call("call_edit"),
+            subagent_call("call_sub_a"),
+            subagent_call("call_sub_b"),
+            bash_call("call_test"),
+        ],
+    ))
+    .await?;
+    let [edit, sub_a, sub_b, test] = children.as_slice() else {
+        bail!("the batch must spawn four children, got {}", children.len());
+    };
+
+    for invocation in [sub_a, sub_b] {
+        assert_eq!(invocation.kind, TaskKind::Subagent);
+        let root = child_root_of(&stores, invocation).await?;
+        assert!(
+            acquirable(&stores, &root.id, t_plus(6)).await?,
+            "every subagent in the batch must start at once, without waiting for the edit"
+        );
+    }
+    assert_eq!(
+        test.after_siblings,
+        std::slice::from_ref(&edit.id),
+        "the command waits for the edit before it, not for the subagents"
+    );
+    assert!(
+        !acquirable(&stores, &test.id, t_plus(6)).await?,
+        "the command waits while the edit runs"
+    );
+
+    complete_child_at(&stores, edit, &ok_result("edited"), t_plus(7), t_plus(8)).await?;
+    assert!(
+        acquirable(&stores, &test.id, t_plus(9)).await?,
+        "the command runs once the edit finished, while the subagents still run"
+    );
+    Ok(())
+}
+
+async fn acquirable(
+    stores: &TestStores,
+    id: &AgentTaskId,
+    at: time::OffsetDateTime,
+) -> Result<bool> {
+    Ok(stores
+        .tasks
+        .try_acquire_task(
+            id,
+            WorkerId::from_string("probe_worker"),
+            LeaseId::from_string("probe_lease"),
+            at + time::Duration::seconds(600),
+            at,
+        )
+        .await?
+        .is_some())
+}
+
+#[tokio::test]
+async fn a_failed_early_resumed_turn_cancels_the_calls_its_batch_still_held() -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
+        &stores,
+        vec![
+            bash_call("call_0"),
+            bash_call("call_1"),
+            bash_call("call_2"),
+        ],
+        ChildJoinPolicy::Any,
+    ))
+    .await?;
+    let [first, released, held] = children.as_slice() else {
+        bail!(
+            "the batch must spawn three children, got {}",
+            children.len()
+        );
+    };
+    complete_child_at(&stores, first, &ok_result("done-0"), t_plus(8), t_plus(9)).await?;
+    let held_row = stores
+        .tasks
+        .get(&held.id)
+        .await?
+        .context("held child must exist")?;
+    assert!(
+        !held_row.after_siblings.is_empty(),
+        "precondition: the last call still waits for the second"
+    );
+
+    acquire_parent(&stores, &parent.id, t_plus(10)).await?;
+    fail_root_turn(
+        &parent.id,
+        &WorkerId::from_string("worker_test"),
+        &LeaseId::from_string("lease_test"),
+        &thread_a(),
+        &anyhow::anyhow!("the early resume failed"),
+        &stores.deps(),
+        t_plus(12),
+    )
+    .await?;
+
+    for child in [released, held] {
+        let row = stores
+            .tasks
+            .get(&child.id)
+            .await?
+            .context("child must exist")?;
+        assert_eq!(
+            row.status,
+            TaskStatus::Cancelled,
+            "a call that never started must not outlive its failed turn"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn partial_resume_atomically_reattaches_survivor_and_spawns_mixed_batch() -> Result<()> {
     let stores = TestStores::new();
@@ -12804,6 +12954,68 @@ async fn partial_resume_atomically_reattaches_survivor_and_spawns_mixed_batch() 
         }
         other => panic!("expected atomic mixed re-park, got {other:?}"),
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_resumed_turns_new_command_waits_for_the_live_call_it_carries_over() -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
+        &stores,
+        vec![bash_call("old_0"), bash_call("old_1")],
+        ChildJoinPolicy::Any,
+    ))
+    .await?;
+    complete_child_at(
+        &stores,
+        &children[0],
+        &ok_result("old-done"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+
+    let acquired = acquire_parent(&stores, &parent.id, t_plus(10)).await?;
+    let mut bootstrap = sample_bootstrap_with_tools(acquired.clone());
+    bootstrap.definition = sample_definition_with_subagent_tools();
+    bootstrap.definition.policy.child_join_policy = ChildJoinPolicy::Any;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(10),
+    )
+    .await?;
+    let selector = MixedSpawnSelector;
+    let mut deps = stores.deps();
+    deps.subagent_spawn_selector = Some(&selector);
+    let provider = MockToolCallProvider::new(subagent_then_tool_calls());
+    let outcome = resume_from_children(inputs, &acquired, &provider, &deps, t_plus(15)).await?;
+    let RootTurnOutcome::Suspended { child_tasks, .. } = outcome else {
+        bail!("a resume that issues new calls must suspend");
+    };
+    let [spawned_subagent, new_command] = child_tasks.as_slice() else {
+        bail!("two new children expected, got {}", child_tasks.len());
+    };
+    let carried = &children[1];
+
+    assert_eq!(spawned_subagent.kind, TaskKind::Subagent);
+    assert_eq!(
+        new_command.after_siblings,
+        std::slice::from_ref(&carried.id),
+        "the new command waits for the command still live from the earlier batch"
+    );
+    assert!(!acquirable(&stores, &new_command.id, t_plus(16)).await?);
+    complete_child_at(
+        &stores,
+        carried,
+        &ok_result("carried-done"),
+        t_plus(17),
+        t_plus(18),
+    )
+    .await?;
+    assert!(acquirable(&stores, &new_command.id, t_plus(19)).await?);
     Ok(())
 }
 

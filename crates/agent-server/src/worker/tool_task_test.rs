@@ -143,6 +143,7 @@ fn sample_definition_with_tools() -> AgentDefinition {
                 input_schema: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
                 display_name: "Bash".into(),
                 tier: ToolTier::Observe,
+                concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
             },
             Tool {
                 name: "read_file".into(),
@@ -150,6 +151,7 @@ fn sample_definition_with_tools() -> AgentDefinition {
                 input_schema: serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}}),
                 display_name: "Read File".into(),
                 tier: ToolTier::Observe,
+                concurrency: agent_sdk_foundation::ToolConcurrency::ReadOnly,
             },
         ],
         thinking: ThinkingPolicy::default(),
@@ -424,9 +426,19 @@ async fn bootstrap_maps_multiple_children_to_correct_tool_calls() -> Result<()> 
 
     assert_eq!(children.len(), 2);
 
-    // Acquire and bootstrap each child.
+    // Acquire and bootstrap each child. The read waits for the command
+    // before it, so the command finishes first.
     let child_0 = acquire_child(&stores.tasks, &children[0].id).await?;
     let ctx_0 = resolve_tool_bootstrap(child_0, &stores.tasks, ActivityBeacon::default()).await?;
+    execute_tool_task(
+        ctx_0.clone(),
+        &stores.tasks,
+        &stores.events,
+        &CancellationToken::new(),
+        |_info, _collector| async { Ok(ToolResult::success("listed")) },
+        t_plus(10),
+    )
+    .await?;
 
     // Need a fresh lease for the second child.
     let child_1 = stores

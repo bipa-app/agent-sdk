@@ -17,8 +17,9 @@
 //!
 //! Derives a `SimpleTool` impl (the untyped, `Value`-in baseline) from
 //! struct-level `#[tool(...)]` attributes. The derive wires up `name` /
-//! `display_name` / `description` / `input_schema` / `tier`; you supply the
-//! behaviour by implementing `agent_sdk::ToolLogic` (with `type Input = Value`).
+//! `display_name` / `description` / `input_schema` / `tier` / `concurrency`;
+//! you supply the behaviour by implementing `agent_sdk::ToolLogic` (with
+//! `type Input = Value`).
 //!
 //! ```ignore
 //! use agent_sdk::{Tool, ToolContext, ToolLogic, ToolResult};
@@ -95,7 +96,8 @@ use proc_macro::TokenStream;
 ///
 /// See the [crate-level docs](crate) for the full attribute list and an
 /// example. Required: `name` and `description`. Optional: `display_name`,
-/// `tier`, `schema` (a `serde_json::Value` expression; defaults to
+/// `tier`, `concurrency` (an `agent_sdk::ToolConcurrency`; defaults to
+/// `Exclusive`), `schema` (a `serde_json::Value` expression; defaults to
 /// `{"type":"object"}`), and `context` (the `Ctx` type; defaults to `()`).
 ///
 /// The struct must implement `agent_sdk::ToolLogic<Ctx>` with

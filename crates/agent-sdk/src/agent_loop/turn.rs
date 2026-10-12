@@ -25,9 +25,10 @@ use crate::stores::{EventStore, MessageStore, StateStore, ToolExecutionStore};
 use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::{
     AgentConfig, AgentContinuation, AgentError, PendingToolCallInfo, ThreadId, TokenUsage,
-    ToolResult, ToolRuntime, ToolTier, TurnOptions, UsageLimits,
+    ToolConcurrency, ToolResult, ToolRuntime, ToolTier, TurnOptions, UsageLimits,
 };
 use agent_sdk_foundation::audit::AuditProvenance;
+use agent_sdk_foundation::batch_order::{BatchSlot, execution_waves};
 
 use futures::StreamExt;
 use log::{debug, info, warn};
@@ -1551,30 +1552,45 @@ where
     tool_uses
         .iter()
         .map(|(id, name, input)| {
-            // Resolve the tool metadata in one pass so `display_name`
-            // and `tier` stay in lockstep. Unknown tools fall back to
-            // the strictest tier so downstream audit/policy layers see
-            // a conservative default rather than silently observe.
-            let (display_name, tier) = tools
+            // Resolve the tool metadata in one pass so `display_name`,
+            // `tier`, and `concurrency` stay in lockstep. Unknown tools
+            // fall back to the strictest values so downstream audit,
+            // policy, and ordering layers see a conservative default.
+            let (display_name, tier, concurrency) = tools
                 .get(name)
-                .map(|tool| (tool.display_name().to_string(), tool.tier()))
-                .or_else(|| {
-                    tools
-                        .get_async(name)
-                        .map(|tool| (tool.display_name().to_string(), tool.tier()))
+                .map(|tool| {
+                    (
+                        tool.display_name().to_string(),
+                        tool.tier(),
+                        tool.concurrency(),
+                    )
                 })
                 .or_else(|| {
-                    tools
-                        .get_listen(name)
-                        .map(|tool| (tool.display_name().to_string(), tool.tier()))
+                    tools.get_async(name).map(|tool| {
+                        (
+                            tool.display_name().to_string(),
+                            tool.tier(),
+                            tool.concurrency(),
+                        )
+                    })
                 })
-                .unwrap_or_else(|| (String::new(), crate::types::ToolTier::Confirm));
+                .or_else(|| {
+                    tools.get_listen(name).map(|tool| {
+                        (
+                            tool.display_name().to_string(),
+                            tool.tier(),
+                            tool.concurrency(),
+                        )
+                    })
+                })
+                .unwrap_or_else(|| (String::new(), ToolTier::Confirm, ToolConcurrency::Exclusive));
 
             PendingToolCallInfo {
                 id: id.clone(),
                 name: name.clone(),
                 display_name,
                 tier,
+                concurrency,
                 input: input.clone(),
                 effective_input: input.clone(),
                 listen_context: None,
@@ -1636,25 +1652,25 @@ where
         stop_reason,
     };
 
-    // Tool calls are walked in the order the model emitted them. Adjacent
-    // `ToolTier::Observe` calls are run concurrently via `join_all` because
-    // they are read-only by contract and safe to overlap. Anything else
-    // (currently only `ToolTier::Confirm`, plus the listen path that may
-    // suspend for confirmation) stays strictly serial: a confirmation gate
-    // is a sequencing decision and the next tool's input may depend on the
-    // previous tool's effect on the world.
+    // Tool calls run in the waves `batch_order` derives from the model's
+    // order: adjacent calls that are read-only and need no confirmation
+    // overlap, and every other call runs alone, after everything before it
+    // and before everything after it. A confirmation gate is a sequencing
+    // decision resolved inline by hooks here, so a call that needs one
+    // never overlaps even when its tool is read-only.
     //
     // Result order is preserved to match the input order, so downstream
     // consumers (tool-result message assembly, audit logs, replay) see no
     // observable change beyond reduced wall time.
-    let mut idx = 0;
-    while idx < pending_tool_calls.len() {
-        let first_tier = pending_tool_calls[idx].tier;
+    let slots: Vec<BatchSlot> = pending_tool_calls.iter().map(in_process_slot).collect();
+    for wave in execution_waves(&slots) {
+        let (Some(&idx), Some(&last)) = (wave.first(), wave.last()) else {
+            continue;
+        };
+        if slots[idx] == BatchSlot::Shared {
+            let end = last + 1;
 
-        if first_tier == ToolTier::Observe {
-            let end = observe_run_end(&pending_tool_calls, idx);
-
-            // Adjacent observe-tier calls run concurrently, but the
+            // A shared wave runs concurrently, but the
             // in-flight count is bounded by `max_parallel_tools`
             // (`None` = unbounded for the batch, `Some(1)` = sequential).
             // `buffered` polls up to `concurrency` futures at once and
@@ -1711,7 +1727,6 @@ where
                 }
                 return Err(early);
             }
-            idx = end;
         } else {
             let outcome = execute_tool_call(&pending_tool_calls[idx], &execution_ctx).await;
             if let Some(early) = handle_tool_outcome(
@@ -1722,7 +1737,6 @@ where
             ) {
                 return Err(early);
             }
-            idx += 1;
         }
     }
 
@@ -1768,14 +1782,16 @@ fn apply_tool_reminders(
     }
 }
 
-/// Find the end (exclusive) of the run of consecutive `ToolTier::Observe`
-/// calls that starts at `start`.
-fn observe_run_end(pending: &[PendingToolCallInfo], start: usize) -> usize {
-    let mut end = start;
-    while end < pending.len() && pending[end].tier == ToolTier::Observe {
-        end += 1;
+/// Map a call onto its in-process [`BatchSlot`]: shared only when its tool
+/// is read-only and needs no confirmation.
+const fn in_process_slot(call: &PendingToolCallInfo) -> BatchSlot {
+    match (call.concurrency, call.tier) {
+        (ToolConcurrency::ReadOnly, ToolTier::Observe) => BatchSlot::Shared,
+        (ToolConcurrency::ReadOnly, ToolTier::Confirm)
+        | (ToolConcurrency::Exclusive, ToolTier::Observe | ToolTier::Confirm) => {
+            BatchSlot::Exclusive
+        }
     }
-    end
 }
 
 /// Process a single tool execution outcome. On `Completed`, append to the

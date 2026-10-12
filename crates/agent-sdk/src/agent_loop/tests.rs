@@ -13,8 +13,8 @@ use crate::stores::{
 };
 use crate::tools::{ListenToolUpdate, ToolContext, ToolRegistry};
 use crate::types::{
-    AgentConfig, AgentInput, AgentRunState, BudgetLimitKind, ContinuationEnvelope, ToolInvocation,
-    ToolResult, ToolTier, TurnOptions, TurnOutcome, UsageLimits,
+    AgentConfig, AgentInput, AgentRunState, BudgetLimitKind, ContinuationEnvelope, ToolConcurrency,
+    ToolInvocation, ToolResult, ToolTier, TurnOptions, TurnOutcome, UsageLimits,
 };
 use crate::types::{AgentState, RetryConfig};
 use anyhow::Context;
@@ -426,7 +426,7 @@ async fn test_over_budget_tool_output_spills_to_artifact_store() -> anyhow::Resu
 
 /// A read-only tool whose `execute` blocks on a shared [`tokio::sync::Barrier`]
 /// until `party_size` concurrent invocations have arrived. Used to prove the
-/// agent loop fans out `ToolTier::Observe` calls in parallel: a serial loop
+/// agent loop fans out read-only `ToolTier::Observe` calls in parallel: a serial loop
 /// would deadlock the barrier (only one party ever arrives) and the test's
 /// surrounding `tokio::time::timeout` would fail.
 struct BarrierTool {
@@ -462,6 +462,10 @@ impl crate::tools::Tool<()> for BarrierTool {
 
     fn tier(&self) -> ToolTier {
         ToolTier::Observe
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::ReadOnly
     }
 
     async fn execute(
@@ -548,6 +552,182 @@ async fn test_observe_tools_run_in_parallel() -> anyhow::Result<()> {
         "expected all three barrier calls to complete successfully, got {tool_end_ids:?}"
     );
 
+    Ok(())
+}
+
+/// Records when each call starts and ends, yielding in between so that two
+/// calls allowed to overlap interleave in the log.
+///
+/// Every probe is `ToolTier::Observe`, the tier a host gives a mutating
+/// tool when it skips confirmation prompts, so only `concurrency` decides
+/// whether calls overlap.
+struct OrderProbeTool {
+    name: &'static str,
+    concurrency: ToolConcurrency,
+    log: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl OrderProbeTool {
+    fn record(&self, entry: String) -> anyhow::Result<()> {
+        self.log
+            .lock()
+            .map_err(|_| anyhow::anyhow!("order log poisoned"))?
+            .push(entry);
+        Ok(())
+    }
+}
+
+impl crate::tools::Tool<()> for OrderProbeTool {
+    type Name = crate::tools::DynamicToolName;
+
+    fn name(&self) -> crate::tools::DynamicToolName {
+        crate::tools::DynamicToolName::new(self.name)
+    }
+
+    fn description(&self) -> &'static str {
+        "Records the start and end of each call."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        json!({ "type": "object", "properties": { "id": { "type": "string" } } })
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Observe
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        self.concurrency
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &ToolContext<()>,
+        input: serde_json::Value,
+    ) -> anyhow::Result<ToolResult> {
+        let id = input
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .context("probe call needs an id")?
+            .to_owned();
+        self.record(format!("start {id}"))?;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        self.record(format!("end {id}"))?;
+        Ok(ToolResult::success(id))
+    }
+}
+
+async fn run_order_probe_batch(calls: Vec<(&str, &str, &str)>) -> anyhow::Result<Vec<String>> {
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let uses = calls
+        .iter()
+        .map(|(call_id, tool, id)| (*call_id, *tool, json!({ "id": id })))
+        .collect();
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_uses_response(uses),
+        MockProvider::text_response("done"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    for (name, concurrency) in [
+        ("read", ToolConcurrency::ReadOnly),
+        ("edit", ToolConcurrency::Exclusive),
+        ("bash", ToolConcurrency::Exclusive),
+    ] {
+        tools.register(OrderProbeTool {
+            name,
+            concurrency,
+            log: Arc::clone(&log),
+        });
+    }
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .event_store(new_event_store())
+        .build();
+    let (state, _) = run_recorded(
+        &agent,
+        ThreadId::new(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    anyhow::ensure!(
+        matches!(state, AgentRunState::Done { .. }),
+        "expected the run to finish, got {state:?}"
+    );
+    let entries = log
+        .lock()
+        .map_err(|_| anyhow::anyhow!("order log poisoned"))?
+        .clone();
+    Ok(entries)
+}
+
+#[tokio::test]
+async fn edits_then_command_run_in_model_order() -> anyhow::Result<()> {
+    let log = run_order_probe_batch(vec![
+        ("call_1", "edit", "edit1"),
+        ("call_2", "edit", "edit2"),
+        ("call_3", "bash", "test"),
+    ])
+    .await?;
+
+    assert_eq!(
+        log,
+        [
+            "start edit1",
+            "end edit1",
+            "start edit2",
+            "end edit2",
+            "start test",
+            "end test",
+        ],
+        "the command must start only after both edits finished"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_only_batch_runs_concurrently() -> anyhow::Result<()> {
+    let log = run_order_probe_batch(vec![
+        ("call_1", "read", "r1"),
+        ("call_2", "read", "r2"),
+        ("call_3", "read", "r3"),
+    ])
+    .await?;
+
+    assert_eq!(
+        log[..3],
+        ["start r1", "start r2", "start r3"],
+        "every read must start before any read ends: {log:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn reads_split_around_an_edit() -> anyhow::Result<()> {
+    let log = run_order_probe_batch(vec![
+        ("call_1", "read", "r1"),
+        ("call_2", "read", "r2"),
+        ("call_3", "edit", "edit"),
+        ("call_4", "read", "r3"),
+    ])
+    .await?;
+
+    assert_eq!(
+        log[..2],
+        ["start r1", "start r2"],
+        "the first two reads must overlap: {log:?}"
+    );
+    let mut first_wave_ends = log[2..4].to_vec();
+    first_wave_ends.sort();
+    assert_eq!(first_wave_ends, ["end r1", "end r2"], "{log:?}");
+    assert_eq!(
+        log[4..],
+        ["start edit", "end edit", "start r3", "end r3"],
+        "the edit runs after both reads and before the last read"
+    );
     Ok(())
 }
 
@@ -2972,6 +3152,7 @@ async fn test_unknown_continuation_version_rejected() -> anyhow::Result<()> {
                 name: "echo".into(),
                 display_name: "Echo".into(),
                 tier: ToolTier::Observe,
+                concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
                 input: serde_json::json!({}),
                 effective_input: serde_json::json!({}),
                 listen_context: None,
@@ -5946,7 +6127,7 @@ enum ProbeToolName {
 
 impl crate::tools::ToolName for ProbeToolName {}
 
-/// Observe-tier tool that records the peak number of concurrently-executing
+/// Read-only observe-tier tool that records the peak number of concurrently-executing
 /// invocations. Yields twice mid-execution so that, if two invocations are
 /// allowed to overlap, the in-flight counter is observed at 2.
 struct ConcurrencyProbeTool {
@@ -5975,6 +6156,10 @@ impl crate::tools::Tool<()> for ConcurrencyProbeTool {
 
     fn tier(&self) -> ToolTier {
         ToolTier::Observe
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::ReadOnly
     }
 
     async fn execute(

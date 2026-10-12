@@ -117,11 +117,15 @@ const DROP_PARKED_SUBAGENT_CHILD_ROOT_INDEX_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/sqlite/0025_drop_parked_subagent_child_root_index.sql"
 ));
+const TASK_AFTER_SIBLINGS_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/sqlite/0026_task_after_siblings.sql"
+));
 
 /// `sqlx`-managed migration bundle for the `SQLite` durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/sqlite");
 
-const MIGRATIONS: [SqliteMigration; 23] = [
+const MIGRATIONS: [SqliteMigration; 24] = [
     SqliteMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -237,6 +241,11 @@ const MIGRATIONS: [SqliteMigration; 23] = [
         summary: "drop the parked-invocation child-root index 0024 supersedes",
         sql: DROP_PARKED_SUBAGENT_CHILD_ROOT_INDEX_SQL,
     },
+    SqliteMigration {
+        version: "0026",
+        summary: "earlier batch siblings a pending tool child waits for",
+        sql: TASK_AFTER_SIBLINGS_SQL,
+    },
 ];
 
 /// Version of the migration this PR introduces: the typed terminal
@@ -270,6 +279,17 @@ pub(crate) const PURGE_SEED_MIGRATION_VERSION: i64 = 19;
 /// `history_generation` rewrite-lineage column on message heads.
 #[cfg(test)]
 pub(crate) const HISTORY_GENERATION_MIGRATION_VERSION: i64 = 22;
+
+/// Version of the migration that records the earlier batch siblings a
+/// pending tool child waits for.
+#[cfg(test)]
+pub(crate) const TASK_AFTER_SIBLINGS_MIGRATION_VERSION: i64 = 26;
+
+/// The reviewable SQL of the after-siblings column migration.
+#[cfg(test)]
+pub(crate) const fn task_after_siblings_migration() -> &'static str {
+    TASK_AFTER_SIBLINGS_SQL
+}
 
 /// The reviewable executable migration bundle for the `SQLite` durable core.
 #[must_use]
