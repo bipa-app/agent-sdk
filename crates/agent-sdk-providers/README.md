@@ -17,7 +17,7 @@ directly):
 |---------|----------|
 | `anthropic` | Anthropic (Claude) |
 | `openai` | OpenAI Chat Completions |
-| `openai-codex` | OpenAI Codex / Responses (WebSocket) |
+| `openai-codex` | OpenAI Codex / Responses (HTTP SSE by default; WebSocket opt-in via `with_transport(CodexTransport::WebSocket)`) |
 | `gemini` | Google Gemini |
 | `vertex` | Google Vertex AI |
 | `cloudflare` | Cloudflare AI Gateway |

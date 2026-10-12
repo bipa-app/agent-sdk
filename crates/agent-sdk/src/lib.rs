@@ -392,7 +392,7 @@
 //! |---------|---------|-------|-------------|
 //! | `anthropic`    | **Yes** | — | Anthropic Messages API provider |
 //! | `openai`       | No  | — | `OpenAI` Chat Completions + Responses providers |
-//! | `openai-codex` | No  | `tokio-tungstenite` | `OpenAI` Codex / `ChatGPT` WebSocket provider |
+//! | `openai-codex` | No  | `tokio-tungstenite` | `OpenAI` Codex / `ChatGPT` provider (HTTP SSE by default; WebSocket opt-in via `with_transport(CodexTransport::WebSocket)`) |
 //! | `gemini`       | No  | — | Google Gemini provider |
 //! | `vertex`       | No  | — | Google Vertex AI provider (implies `anthropic` + `gemini`) |
 //! | `cloudflare`   | No  | — | Cloudflare AI Gateway proxy (implies `anthropic` + `openai` + `gemini`) |

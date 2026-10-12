@@ -259,9 +259,10 @@ pub struct AgentDefinition {
     /// models and Gemini thought signatures behave the same way has not been
     /// verified.
     ///
-    /// With a `session_id`, Codex websocket requests resend the full input
-    /// after a request that carried this context instead of a
-    /// `previous_response_id` delta.
+    /// Over the opt-in Codex WebSocket transport, the request after one that
+    /// carried this context resends the full input instead of a
+    /// `previous_response_id` delta. HTTP SSE, the default, always sends the
+    /// full input.
     #[serde(skip)]
     pub request_context_fn: Option<RequestContextFn>,
     /// Extended thinking configuration.
