@@ -398,7 +398,8 @@ fn build_compactor(
     let compactor = LlmContextCompactor::<dyn LlmProvider>::new(
         Arc::clone(provider),
         cfg.clone().with_threshold_tokens(threshold_tokens),
-    );
+    )
+    .with_provisional_artifacts();
     let compactor = if cfg.uses_prune_first_engine() {
         compactor.with_purpose(purpose)
     } else {

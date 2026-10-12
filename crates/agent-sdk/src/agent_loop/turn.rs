@@ -286,7 +286,8 @@ where
         } else {
             default_compactor
         }
-        .with_guardrail_hooks(Arc::clone(hooks));
+        .with_guardrail_hooks(Arc::clone(hooks))
+        .with_provisional_artifacts();
         if default_compactor.needs_compaction(&messages) {
             debug!(
                 "Context compaction triggered (turn={}, message_count={})",
@@ -1993,7 +1994,8 @@ where
         } else {
             default_compactor
         }
-        .with_guardrail_hooks(Arc::clone(hooks));
+        .with_guardrail_hooks(Arc::clone(hooks))
+        .with_provisional_artifacts();
         compact_history_and_store(
             &default_compactor,
             history,

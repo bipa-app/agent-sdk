@@ -65,6 +65,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now misclassifies every prompt. Compare it with the `emitter_task_id` of the
   turn's `Start` instead: injected input names a different task. Rows
   journaled before the change stay unstamped.
+- **Breaking:** `CompactionResult` gains `published_artifacts`,
+  `response_model`, and `served_route`, and is now `#[must_use]`;
+  `FailedCompaction` gains `response_model` and `served_route`. Custom
+  compactors that build them with struct literals set
+  `published_artifacts: PublishedArtifacts::default()` and the identity
+  fields to `None` when they make no summarization call. Results keep owning
+  their Snapcompact artifacts: `LlmContextCompactor::with_provisional_artifacts`
+  opts in to deleting them when the result is dropped before
+  `PublishedArtifacts::commit`, which callers run right after their durable
+  compaction append succeeds. The agent loop and the durable worker opt in, so
+  a compaction that is cancelled, refused, or fails to persist no longer
+  leaves orphaned artifacts.
 - Compaction now appends range-addressed lineage entries and rebuilds the
   effective LLM view without deleting committed transcript messages.
 - Auto-compaction prunes artifact-backed and superseded read outputs before

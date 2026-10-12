@@ -272,6 +272,7 @@ pub trait ContextCompactor: Send + Sync {
 
 /// Result of a compaction operation.
 #[derive(Debug, Clone)]
+#[must_use]
 pub struct CompactionResult {
     /// The new compacted message history.
     pub messages: Vec<Message>,
@@ -292,10 +293,11 @@ pub struct CompactionResult {
     /// cumulative usage — otherwise summarization tokens would be invisible
     /// to `UsageLimits` budgets and under-reported on `Done`.
     pub llm_usage: TokenUsage,
-    /// Artifacts this run published. A result from
-    /// [`ContextCompactor::compact_history_with_usage`] reclaims them when
-    /// dropped without [`PublishedArtifacts::commit`]; commit right after the
-    /// durable compaction append succeeds, never before.
+    /// Artifacts this run published, already committed unless the compactor
+    /// opted into
+    /// [`LlmContextCompactor::with_provisional_artifacts`]; a provisional
+    /// result reclaims them when dropped without
+    /// [`PublishedArtifacts::commit`].
     pub published_artifacts: PublishedArtifacts,
     /// Model the summarization response reported; `None` when no
     /// summarization call ran.
@@ -524,6 +526,7 @@ pub struct LlmContextCompactor<P: LlmProvider + ?Sized, H: AgentHooks = DefaultH
     /// worker immediately before each artifact publish site. `None` (the
     /// default) never fences, preserving run-to-completion behavior.
     cancellation: Option<CancellationToken>,
+    provisional_artifacts: bool,
     system_prompt: String,
     summary_prompt_prefix: String,
     summary_prompt_suffix: String,
@@ -539,6 +542,7 @@ impl<P: LlmProvider + ?Sized> LlmContextCompactor<P> {
             hooks: None,
             artifact_store: None,
             cancellation: None,
+            provisional_artifacts: false,
             system_prompt: COMPACTION_SYSTEM_PROMPT.to_string(),
             summary_prompt_prefix: COMPACTION_SUMMARY_PROMPT_PREFIX.to_string(),
             summary_prompt_suffix: COMPACTION_SUMMARY_PROMPT_SUFFIX.to_string(),
@@ -573,6 +577,7 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
             provider: self.provider,
             config: self.config,
             cancellation: self.cancellation,
+            provisional_artifacts: self.provisional_artifacts,
             hooks: Some(hooks),
             artifact_store: self.artifact_store,
             system_prompt: self.system_prompt,
@@ -603,6 +608,19 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
     #[must_use]
     pub fn with_cancellation(mut self, token: CancellationToken) -> Self {
         self.cancellation = Some(token);
+        self
+    }
+
+    /// Keep the artifacts a successful
+    /// [`compact_history_with_usage`](ContextCompactor::compact_history_with_usage)
+    /// publishes provisional: the result's
+    /// [`CompactionResult::published_artifacts`] deletes them when dropped
+    /// unless [`PublishedArtifacts::commit`] runs first. Commit right after
+    /// the durable compaction append succeeds, never before. Without this,
+    /// every result owns its artifacts outright.
+    #[must_use]
+    pub const fn with_provisional_artifacts(mut self) -> Self {
+        self.provisional_artifacts = true;
         self
     }
     /// Override the prompts used for LLM-based summarization.
@@ -3326,11 +3344,18 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> ContextCompactor for LlmContextComp
         Ok(result)
     }
 
+    /// The returned [`CompactionResult::published_artifacts`] are committed
+    /// unless this compactor was built with
+    /// [`with_provisional_artifacts`](Self::with_provisional_artifacts).
     async fn compact_history_with_usage(
         &self,
         messages: Vec<Message>,
     ) -> Result<CompactionResult, FailedCompaction> {
-        self.compact_history_inner(messages).await
+        let result = self.compact_history_inner(messages).await?;
+        if !self.provisional_artifacts {
+            result.published_artifacts.commit();
+        }
+        Ok(result)
     }
 }
 
@@ -4590,7 +4615,7 @@ mod tests {
             )
             .with_purpose(purpose);
 
-            compactor.compact_history(summarizable_messages()).await?;
+            let _ = compactor.compact_history(summarizable_messages()).await?;
 
             let recorded = requests
                 .lock()
@@ -6438,12 +6463,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_result_dropped_uncommitted_reclaims_published_artifacts() -> Result<()> {
+    async fn provisional_result_dropped_uncommitted_reclaims_published_artifacts() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Arc::new(ArtifactStore::new(temp.path()));
         let provider = Arc::new(MockProvider::new("fallback summary"));
         let compactor = LlmContextCompactor::new(provider, snapcompact_test_config())
-            .with_artifact_store(Arc::clone(&store));
+            .with_artifact_store(Arc::clone(&store))
+            .with_provisional_artifacts();
 
         let result = compactor
             .compact_history_with_usage(published_attachment_messages())
@@ -6470,12 +6496,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn committed_result_retains_published_artifacts_on_drop() -> Result<()> {
+    async fn committed_provisional_result_retains_published_artifacts_on_drop() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Arc::new(ArtifactStore::new(temp.path()));
         let provider = Arc::new(MockProvider::new("fallback summary"));
         let compactor = LlmContextCompactor::new(provider, snapcompact_test_config())
-            .with_artifact_store(Arc::clone(&store));
+            .with_artifact_store(Arc::clone(&store))
+            .with_provisional_artifacts();
 
         let result = compactor
             .compact_history_with_usage(published_attachment_messages())
@@ -6492,6 +6519,33 @@ mod tests {
                 read_artifact_bytes(&store, id)?,
                 SNAPCOMPACT_TEST_PNG,
                 "committed artifacts must survive the result drop byte-for-byte"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn default_compaction_results_own_their_published_artifacts() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Arc::new(ArtifactStore::new(temp.path()));
+        let provider = Arc::new(MockProvider::new("fallback summary"));
+        let compactor = LlmContextCompactor::new(provider, snapcompact_test_config())
+            .with_artifact_store(Arc::clone(&store));
+
+        let result = compactor
+            .compact_history_with_usage(published_attachment_messages())
+            .await
+            .map_err(|failure| failure.error)?;
+        let published_ids: Vec<u64> = result.published_artifacts.ids().to_vec();
+        assert_ne!(published_ids.len(), 0);
+        drop(result);
+
+        for id in published_ids {
+            assert_eq!(
+                read_artifact_bytes(&store, id)?,
+                SNAPCOMPACT_TEST_PNG,
+                "without the provisional opt-in a caller that never commits \
+                 must keep the artifacts its persisted history references"
             );
         }
         Ok(())

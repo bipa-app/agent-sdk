@@ -10481,3 +10481,117 @@ async fn uri_checkpoint_hydrates_every_streaming_retry_attempt() -> anyhow::Resu
     );
     Ok(())
 }
+
+#[derive(Default)]
+struct RejectingCompactionStore {
+    inner: InMemoryStore,
+}
+
+#[async_trait]
+impl MessageStore for RejectingCompactionStore {
+    async fn append(&self, thread_id: &ThreadId, message: Message) -> anyhow::Result<()> {
+        self.inner.append(thread_id, message).await
+    }
+    async fn get_history(&self, thread_id: &ThreadId) -> anyhow::Result<Vec<Message>> {
+        self.inner.get_history(thread_id).await
+    }
+    async fn replace_history(
+        &self,
+        thread_id: &ThreadId,
+        messages: Vec<Message>,
+    ) -> anyhow::Result<()> {
+        self.inner.replace_history(thread_id, messages).await
+    }
+    async fn clear(&self, thread_id: &ThreadId) -> anyhow::Result<()> {
+        self.inner.clear(thread_id).await
+    }
+    async fn append_compaction(
+        &self,
+        _thread_id: &ThreadId,
+        _messages: Vec<Message>,
+        _source_message_count: usize,
+        _retained_message_count: usize,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("synthetic compaction append failure")
+    }
+    async fn get_transcript(&self, thread_id: &ThreadId) -> anyhow::Result<Vec<Message>> {
+        self.inner.get_transcript(thread_id).await
+    }
+}
+
+fn saved_artifact_count(store: &crate::ArtifactStore) -> anyhow::Result<usize> {
+    let mut count = 0;
+    for entry in std::fs::read_dir(store.dir())? {
+        let file_name = entry?.file_name();
+        let file_name = file_name.to_string_lossy();
+        if file_name.ends_with(".log")
+            && file_name.as_bytes().first().is_some_and(u8::is_ascii_digit)
+        {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+#[tokio::test]
+async fn failed_compaction_append_reclaims_published_snapcompact_artifacts() -> anyhow::Result<()> {
+    use base64::Engine as _;
+
+    let dir = tempfile::tempdir()?;
+    let artifact_store = Arc::new(crate::ArtifactStore::new(dir.path()));
+    let message_store = RejectingCompactionStore::default();
+    let thread_id = ThreadId::new();
+    message_store
+        .replace_history(
+            &thread_id,
+            vec![
+                Message::user_with_content(vec![
+                    ContentBlock::Text {
+                        text: format!("rollback-marker\n{}", "x".repeat(90_000)),
+                    },
+                    ContentBlock::Image {
+                        source: crate::llm::ContentSource::new(
+                            "image/png",
+                            base64::engine::general_purpose::STANDARD
+                                .encode(b"\x89PNG\r\n\x1a\nrollback-image"),
+                        ),
+                    },
+                ]),
+                Message::assistant("done"),
+            ],
+        )
+        .await?;
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![
+            MockProvider::text_response("fallback summary"),
+            MockProvider::text_response("answer"),
+        ]))
+        .hooks(AllowAllHooks)
+        .message_store(message_store)
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .with_compaction(
+            CompactionConfig::default()
+                .with_engine(crate::context::CompactionEngine::Snapcompact)
+                .with_threshold_tokens(0)
+                .with_retain_recent(0)
+                .with_min_messages(1),
+        )
+        .build_with_stores();
+
+    let _ = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("continue".to_owned()),
+        ToolContext::new(()).with_artifact_store(Arc::clone(&artifact_store)),
+    )
+    .await;
+
+    assert_eq!(
+        saved_artifact_count(&artifact_store)?,
+        0,
+        "a compaction whose durable append failed must not leave its \
+         Snapcompact artifacts behind"
+    );
+    Ok(())
+}
