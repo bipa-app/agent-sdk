@@ -15,6 +15,7 @@ use agent_server::worker::ConfirmationDecision;
 
 /// One decision about to be applied.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct ConfirmationDecisionRequest<'a> {
     pub thread_id: &'a ThreadId,
     /// The parked task the decision targets.
@@ -24,8 +25,29 @@ pub struct ConfirmationDecisionRequest<'a> {
     /// its own turn. `None` when the journal row names no call.
     pub awaited_call: Option<&'a PendingToolCallInfo>,
     pub decision: &'a ConfirmationDecision,
-    /// The caller says no person made this decision.
+    /// The caller says no person made this decision. The caller sets it, so
+    /// it stops honest automatic clients only; it is not an authorization
+    /// boundary.
     pub automatic: bool,
+}
+
+impl<'a> ConfirmationDecisionRequest<'a> {
+    /// A request for `task`, with [`Self::awaited_call`] read from the task.
+    #[must_use]
+    pub fn new(
+        thread_id: &'a ThreadId,
+        task: &'a AgentTask,
+        decision: &'a ConfirmationDecision,
+        automatic: bool,
+    ) -> Self {
+        Self {
+            thread_id,
+            task,
+            awaited_call: awaited_call(task),
+            decision,
+            automatic,
+        }
+    }
 }
 
 /// Checks a confirmation decision before the control plane applies it.

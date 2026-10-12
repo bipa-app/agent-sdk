@@ -40,9 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registers a `ConfirmationDecisionGuard` (`agent_service_host::confirmation_guard`)
   that sees each `DecideConfirmation` before anything applies: the parked task,
   the call it awaits (`awaited_call`), the decision and the request's
-  `automatic` flag. A refusal leaves the task parked and fails with
-  `FAILED_PRECONDITION`; it runs before the idempotency claim, so a retry is
-  refused the same way.
+  `automatic` flag. The caller sets `automatic`, so it stops honest automatic
+  clients and is not an authorization boundary. A refusal leaves the task
+  parked and fails with `FAILED_PRECONDITION`; it runs before the idempotency
+  claim, so a retry is refused the same way. Hosts build a
+  `ConfirmationDecisionRequest` (non-exhaustive) with
+  `ConfirmationDecisionRequest::new`.
 - **`DecideConfirmationRequest.automatic`** (`agent.service.v1`, field 5) marks
   a decision no person made. An unset field encodes nothing, so stored
   idempotency fingerprints are unchanged, but Rust struct literals of
@@ -212,10 +215,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - A task parked on one call of a multi-call batch now names its own call in
-  `ListThreadTasks`, `GetTask` and the `DecideConfirmation` response. Every
-  sibling used to name the batch's first call, because the snapshot read the
-  shared continuation's `awaiting_index`, so a person could be shown one tool
-  while approving another.
+  `ListThreadTasks` and `GetTask`. Every sibling used to name the batch's
+  first call, because the snapshot read the shared continuation's
+  `awaiting_index`, so a person could be shown one tool while approving
+  another.
 
 - **Repeating tool-call ids from OpenAI-compatible gateways** - On routes
   other than `api.openai.com`, the Chat Completions and Responses providers

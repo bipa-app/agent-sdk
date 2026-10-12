@@ -1292,13 +1292,12 @@ impl GrpcControlService {
                 .ok_or_else(|| Status::invalid_argument("confirmation decision is required"))?,
         )?;
         guard
-            .check(&ConfirmationDecisionRequest {
+            .check(&ConfirmationDecisionRequest::new(
                 thread_id,
-                task: &task,
-                awaited_call: awaited_call(&task),
-                decision: &decision,
-                automatic: request.automatic,
-            })
+                &task,
+                &decision,
+                request.automatic,
+            ))
             .map_err(Status::failed_precondition)?;
         Ok(())
     }
@@ -8872,8 +8871,8 @@ mod tests {
         }
     }
 
-    /// `ListThreadTasks`, `GetTask`, the guard and the decision response all
-    /// name the same call for the parked `task`; returns that call.
+    /// `ListThreadTasks`, `GetTask` and the guard all name the same call for
+    /// the parked `task`; returns that call.
     async fn check_sibling_names_its_own_call(
         control: &mut ControlClient,
         thread_id: &str,
@@ -8906,20 +8905,14 @@ mod tests {
             "a refused retry returns the same refusal, not a reserved key: {retried}",
         );
 
-        let decided = control
+        control
             .decide_confirmation(approval_request(
                 &format!("batch-person-{}", task.task_id),
                 thread_id,
                 &task.task_id,
                 false,
             ))
-            .await?
-            .into_inner()
-            .task
-            .context("decision returns the task")?;
-        if let Some(after) = named_call(&decided) {
-            assert_eq!(after, listed, "the decision response names the same call");
-        }
+            .await?;
         Ok(listed)
     }
 

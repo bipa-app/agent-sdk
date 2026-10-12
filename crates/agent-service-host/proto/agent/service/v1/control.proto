@@ -239,7 +239,8 @@ message DecideConfirmationRequest {
 
   // True when no person made this decision (a standing or automatic
   // approval). A host's ConfirmationDecisionGuard may refuse it; the field
-  // changes nothing on a host without one.
+  // changes nothing on a host without one. The caller sets it, so it stops
+  // honest automatic clients only; it is not an authorization boundary.
   bool automatic = 5;
 }
 
