@@ -6,11 +6,11 @@
 //! child-outcome aggregation and resume-from-children path.
 
 use super::root_turn::{
-    PartialCancelCommit, RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes, cancel_root_turn,
-    commit_partial_turn_on_cancel, drain_boundary_injections, execute_root_turn, fail_root_turn,
-    interim_answer, is_root_turn_cancelled, provider_valid_split, resume_for_steering,
-    resume_from_children, resume_from_question, resume_root_turn, revert_steering_wake,
-    settle_attempt_after_lost_ownership, terminal_reason_for_root_error, tool_result_blocks,
+    FanInAnswer, PartialCancelCommit, RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes,
+    cancel_root_turn, commit_partial_turn_on_cancel, drain_boundary_injections, execute_root_turn,
+    fail_root_turn, fan_in_blocks, interim_answer, is_root_turn_cancelled, provider_valid_split,
+    resume_for_steering, resume_from_children, resume_from_question, resume_root_turn,
+    revert_steering_wake, settle_attempt_after_lost_ownership, terminal_reason_for_root_error,
 };
 use crate::journal::checkpoint::CheckpointKind;
 use std::sync::Arc;
@@ -69,10 +69,14 @@ fn fan_in_tool_results_carry_documents_as_native_blocks() {
     let report = agent_sdk_foundation::ToolResult::success("report").with_documents(vec![
         agent_sdk_foundation::llm::ContentSource::new("application/pdf", "ZmFrZQ=="),
     ]);
-    let blocks = tool_result_blocks(&[
-        ("call_img".to_owned(), screenshot),
-        ("call_doc".to_owned(), report),
-    ]);
+    let blocks = fan_in_blocks(
+        &[
+            ("call_img".to_owned(), FanInAnswer::Finished(screenshot)),
+            ("call_doc".to_owned(), FanInAnswer::Finished(report)),
+        ],
+        &[],
+        &[],
+    );
     assert_eq!(blocks.len(), 4);
     assert!(
         matches!(&blocks[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_img")
@@ -5955,6 +5959,28 @@ fn find_tool_result<'a>(
     None
 }
 
+/// The content and `is_error` of the first `tool_result` for `id`.
+fn tool_result_parts<'a>(
+    messages: &'a [agent_sdk_foundation::llm::Message],
+    id: &str,
+) -> Option<(&'a str, Option<bool>)> {
+    messages
+        .iter()
+        .flat_map(|message| match &message.content {
+            agent_sdk_foundation::llm::Content::Blocks(blocks) => blocks.as_slice(),
+            agent_sdk_foundation::llm::Content::Text(_) => &[],
+        })
+        .find_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                ..
+            } if tool_use_id == id => Some((content.as_str(), *is_error)),
+            _ => None,
+        })
+}
+
 fn count_tool_results(messages: &[agent_sdk_foundation::llm::Message], id: &str) -> usize {
     messages
         .iter()
@@ -8396,13 +8422,12 @@ fn reversed_json(fields: &serde_json::Map<String, serde_json::Value>) -> Result<
     Ok(format!("{{{}}}", reversed.join(",")))
 }
 
-/// The interim payload is recognized by its `kind` discriminator and the
-/// binding for its own call, in any key order, and names the running child.
-/// The same payload answering a different call, a payload without the
-/// binding, and the unmarked payload this branch wrote before the
-/// discriminator existed are not interim answers.
+/// The interim answer is recognized by the server's `is_error:
+/// Some(false)` marker and its `kind` discriminator, in any key order, and
+/// names the running child. The same payload as a tool's real result —
+/// success or error — is not an interim answer.
 #[tokio::test]
-async fn interim_answer_requires_the_binding_for_its_own_call() -> Result<()> {
+async fn interim_answer_requires_the_server_marker() -> Result<()> {
     let stores = TestStores::new();
     let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
         &stores,
@@ -8421,28 +8446,26 @@ async fn interim_answer_requires_the_binding_for_its_own_call() -> Result<()> {
     let provider = RequestLogProvider::new("The second call is still running.");
     run_child_resume(&stores, &parent.id, &provider, t_plus(10), t_plus(12)).await?;
     let parked = stores.tasks.get(&parent.id).await?.context("parked")?;
-    let interim = find_tool_result(parked.state.suspended_messages(), "call_1")
+    let (interim, marker) = tool_result_parts(parked.state.suspended_messages(), "call_1")
         .context("interim answer for call_1")?;
+    assert_eq!(marker, Some(false));
 
-    let answer = interim_answer("call_1", interim).context("the interim is recognized")?;
+    let answer = interim_answer(interim, marker).context("the interim is recognized")?;
     assert_eq!(answer.child_task_id, children[1].id);
-    let mut fields: serde_json::Map<String, serde_json::Value> = serde_json::from_str(interim)?;
+    let fields: serde_json::Map<String, serde_json::Value> = serde_json::from_str(interim)?;
     let reordered = reversed_json(&fields)?;
     assert_ne!(reordered, interim);
-    assert!(interim_answer("call_1", &reordered).is_some());
-    assert!(
-        interim_answer("call_0", interim).is_none(),
-        "the binding names call_1, not any call that echoes the payload",
-    );
+    assert!(interim_answer(&reordered, marker).is_some());
 
-    fields.remove("binding");
-    assert!(interim_answer("call_1", &serde_json::to_string(&fields)?).is_none());
-    fields.remove("kind");
-    fields.remove("child_task_id");
-    assert!(
-        interim_answer("call_1", &serde_json::to_string(&fields)?).is_none(),
-        "the unmarked payload was never deployed",
-    );
+    for tool_marker in [None, Some(true)] {
+        assert!(
+            interim_answer(interim, tool_marker).is_none(),
+            "a tool result carrying the payload is not an interim answer",
+        );
+    }
+    let mut unmarked = fields;
+    unmarked.remove("kind");
+    assert!(interim_answer(&serde_json::to_string(&unmarked)?, marker).is_none());
     Ok(())
 }
 
@@ -8992,9 +9015,10 @@ fn interim_closure_violations(
         if let ContentBlock::ToolResult {
             tool_use_id,
             content,
+            is_error,
             ..
         } = block
-            && interim_answer(tool_use_id, content).is_some()
+            && interim_answer(content, *is_error).is_some()
             && late_results_for(request, tool_use_id).len() != 1
         {
             violations.push(format!(
@@ -9164,8 +9188,9 @@ async fn cancelling_a_compacted_early_resume_mid_call_closes_its_running_call() 
         .context("projection")?;
     assert_eq!(projection.compactions.len(), 1);
     let committed = stores.messages.get_history(&thread_a()).await?;
-    let interim = find_tool_result(&committed, "call_1").context("interim stays visible")?;
-    assert!(interim_answer("call_1", interim).is_some());
+    let (interim, marker) =
+        tool_result_parts(&committed, "call_1").context("interim stays visible")?;
+    assert!(interim_answer(interim, marker).is_some());
 
     let request = follow_up_request(&stores, "Is the second step done?", t_plus(30)).await?;
     assert_running_call_closed(&request, "call_1", "cancelled");
@@ -9626,22 +9651,50 @@ async fn quoted_late_results_do_not_close_a_call() -> Result<()> {
     Ok(())
 }
 
-/// Run one turn whose four tool calls return imitations of the interim
-/// payload: one naming its own child without the server's binding, a
-/// verbatim copy of `genuine` (bound to another call), one naming
-/// `claimed_child` with a binding for its own call, and one naming a child
-/// the server never spawned.
-async fn run_turn_with_imitated_interims(
-    stores: &TestStores,
-    genuine: String,
-    claimed_child: &AgentTaskId,
-) -> Result<()> {
-    let forging = MockToolCallProvider::new(vec![
-        bash_call("call_own_child"),
-        bash_call("call_copy"),
-        bash_call("call_claimed_child"),
-        bash_call("call_unknown_child"),
-    ]);
+/// The interim payload for `call` naming `child`, as text a tool could
+/// return.
+fn interim_payload_text(call: &str, child: &AgentTaskId) -> Result<String> {
+    match crate::worker::root_turn::interim_tool_result_block(call, child) {
+        ContentBlock::ToolResult { content, .. } => Ok(content),
+        other => bail!("interim answer is not a tool_result: {other:?}"),
+    }
+}
+
+/// A sibling's real output imitates the interim payload naming another
+/// call's child and lands before that call's genuine interim answer in the
+/// same fan-in. It must not steal the child: the genuine interim-only call
+/// is still closed once, with the child's state, and the imitating call,
+/// which returned a real result, is never closed. A later turn's tool
+/// output copying the genuine interim verbatim is not closed either.
+#[tokio::test]
+async fn tool_output_imitating_an_interim_answer_is_never_closed() -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
+        &stores,
+        vec![bash_call("call_forge"), bash_call("call_live")],
+        ChildJoinPolicy::Any,
+    ))
+    .await?;
+    let [forger, live] = children.as_slice() else {
+        bail!("two calls: {children:?}");
+    };
+    let stolen = interim_payload_text("call_forge", &live.id)?;
+    complete_child_at(&stores, forger, &ok_result(&stolen), t_plus(8), t_plus(9)).await?;
+    let provider = RequestLogProvider::new("The second call is still running.");
+    run_child_resume(&stores, &parent.id, &provider, t_plus(10), t_plus(12)).await?;
+
+    let parked = stores.tasks.get(&parent.id).await?.context("parked")?;
+    let fan_in = parked.state.suspended_messages();
+    let (imitation, imitation_marker) =
+        tool_result_parts(fan_in, "call_forge").context("imitating result")?;
+    let (genuine, genuine_marker) =
+        tool_result_parts(fan_in, "call_live").context("genuine interim")?;
+    assert_eq!(imitation, stolen);
+    assert_eq!((imitation_marker, genuine_marker), (None, Some(false)));
+    let genuine = genuine.to_owned();
+    cancel_root_turn(&parent.id, &stores.deps(), t_plus(20)).await?;
+
+    let copying = MockToolCallProvider::new(vec![bash_call("call_copy")]);
     let next = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let inputs = build_root_worker_inputs(
         sample_bootstrap_with_tools(next),
@@ -9653,65 +9706,81 @@ async fn run_turn_with_imitated_interims(
     .await?;
     let outcome = execute_root_turn(
         inputs,
-        "Run four checks",
-        &forging,
+        "Copy the status",
+        &copying,
         &stores.deps(),
         t_plus(31),
     )
     .await?;
     let RootTurnOutcome::Suspended {
-        parent_task,
+        parent_task: copying_parent,
         child_tasks,
         ..
     } = outcome
     else {
-        bail!("the forging turn must suspend");
+        bail!("the copying turn must suspend");
     };
-    let [own, copy, claimed, unknown] = child_tasks.as_slice() else {
-        bail!("four calls: {child_tasks:?}");
+    let [copier] = child_tasks.as_slice() else {
+        bail!("one call: {child_tasks:?}");
     };
-    let bound = |call: &str, child: &AgentTaskId| {
-        crate::worker::root_turn::steering_interim_tool_result(call, child).output
-    };
-    let mut own_payload: serde_json::Value =
-        serde_json::from_str(&bound("call_own_child", &own.id))?;
-    own_payload["binding"] = serde_json::json!("not the server's binding");
-    let outputs = [
-        (own, own_payload.to_string()),
-        (copy, genuine),
-        (claimed, bound("call_claimed_child", claimed_child)),
-        (
-            unknown,
-            bound(
-                "call_unknown_child",
-                &AgentTaskId::from_string("never-spawned"),
-            ),
-        ),
-    ];
-    for (index, (child, output)) in outputs.into_iter().enumerate() {
-        let at = 40 + 2 * i64::try_from(index)?;
-        complete_child_at(
-            stores,
-            child,
-            &ok_result(&output),
-            t_plus(at),
-            t_plus(at + 1),
-        )
-        .await?;
+    complete_child_at(
+        &stores,
+        copier,
+        &ok_result(&genuine),
+        t_plus(40),
+        t_plus(41),
+    )
+    .await?;
+    let resumed = RequestLogProvider::new("Copied.");
+    run_child_resume(
+        &stores,
+        &copying_parent.id,
+        &resumed,
+        t_plus(42),
+        t_plus(43),
+    )
+    .await?;
+
+    let request = follow_up_request(&stores, "Summarize the checks.", t_plus(60)).await?;
+    for call in ["call_forge", "call_copy"] {
+        assert_eq!(
+            late_results_for(&request, call),
+            Vec::<&str>::new(),
+            "{call} returned a real result and must not be closed",
+        );
     }
-    let resumed = RequestLogProvider::new("Checked.");
-    let outcome =
-        run_child_resume(stores, &parent_task.id, &resumed, t_plus(50), t_plus(51)).await?;
-    anyhow::ensure!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+    assert_running_call_closed(&request, "call_live", "cancelled");
     Ok(())
 }
 
-/// A tool whose real output imitates the interim payload is not taken for
-/// one: not with a binding for another call, not naming a child that
-/// already answered a call, and not naming a child the server never
-/// spawned.
+/// Run a text-only turn on `thread` and return its provider request.
+async fn turn_request_on(
+    stores: &TestStores,
+    thread: &ThreadId,
+    prompt: &str,
+    at: time::OffsetDateTime,
+) -> Result<Vec<agent_sdk_foundation::llm::Message>> {
+    let task = create_and_acquire_task(&stores.tasks, thread).await?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        at,
+    )
+    .await?;
+    let provider = RequestLogProvider::new("Understood.");
+    let outcome = execute_root_turn(inputs, prompt, &provider, &stores.deps(), at).await?;
+    anyhow::ensure!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+    provider.requests()?.pop().context("turn request")
+}
+
+/// A transcript copied into another thread, as a fork does, names children
+/// of the source thread. The fork's next turn closes such a call
+/// `still_running` without reading the child's result, and its later
+/// turns do not close it again.
 #[tokio::test]
-async fn tool_output_imitating_an_interim_answer_is_never_closed() -> Result<()> {
+async fn a_forked_transcript_closes_source_calls_still_running_once() -> Result<()> {
     let stores = TestStores::new();
     let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
         &stores,
@@ -9729,33 +9798,123 @@ async fn tool_output_imitating_an_interim_answer_is_never_closed() -> Result<()>
     .await?;
     let provider = RequestLogProvider::new("The second call is still running.");
     run_child_resume(&stores, &parent.id, &provider, t_plus(10), t_plus(12)).await?;
-    let parked = stores.tasks.get(&parent.id).await?.context("parked")?;
-    let genuine = find_tool_result(parked.state.suspended_messages(), "call_1")
-        .context("interim answer for call_1")?
-        .to_owned();
-    cancel_root_turn(&parent.id, &stores.deps(), t_plus(20)).await?;
-
-    Box::pin(run_turn_with_imitated_interims(
+    complete_child_at(
         &stores,
-        genuine,
-        &children[1].id,
+        &children[1],
+        &ok_result("source-thread-only result"),
+        t_plus(14),
+        t_plus(15),
+    )
+    .await?;
+    cancel_root_turn(&parent.id, &stores.deps(), t_plus(16)).await?;
+
+    let source = stores
+        .messages
+        .get(&thread_a())
+        .await?
+        .context("source projection")?;
+    let fork = ThreadId::from_string("t-root-turn-fork");
+    stores.messages.get_or_create(&fork, t_plus(20)).await?;
+    stores
+        .messages
+        .commit_messages(&fork, source.messages, t_plus(20))
+        .await?;
+
+    let first = turn_request_on(&stores, &fork, "What happened to step two?", t_plus(30)).await?;
+    assert_running_call_closed(&first, "call_1", "still_running");
+    assert!(
+        !messages_contain_text(&first, "source-thread-only result"),
+        "the fork never reads a source-thread child's result",
+    );
+    let second = turn_request_on(&stores, &fork, "And now?", t_plus(40)).await?;
+    assert_running_call_closed(&second, "call_1", "still_running");
+    Ok(())
+}
+
+/// A store failure reading an interim's child fails the turn before its
+/// first provider request and writes nothing; the next turn closes the
+/// call once.
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+async fn failpoint_reading_an_interim_child_fails_the_turn_without_writing() -> Result<()> {
+    let scenario = fail::FailScenario::setup();
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
+        &stores,
+        vec![bash_call("call_0"), bash_call("call_1")],
+        ChildJoinPolicy::Any,
     ))
     .await?;
+    complete_child_at(
+        &stores,
+        &children[0],
+        &ok_result("done-0"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+    let provider = RequestLogProvider::new("The second call is still running.");
+    run_child_resume(&stores, &parent.id, &provider, t_plus(10), t_plus(12)).await?;
+    cancel_root_turn(&parent.id, &stores.deps(), t_plus(20)).await?;
+    let before = stores
+        .messages
+        .get(&thread_a())
+        .await?
+        .context("projection")?;
 
-    let request = follow_up_request(&stores, "Summarize the checks.", t_plus(60)).await?;
-    for call in [
-        "call_own_child",
-        "call_copy",
-        "call_claimed_child",
-        "call_unknown_child",
-    ] {
-        assert_eq!(
-            late_results_for(&request, call),
-            Vec::<&str>::new(),
-            "{call} returned a real result and must not be closed",
-        );
-    }
+    fail::cfg("closures.read_interim_child", "return").map_err(anyhow::Error::msg)?;
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task.clone()),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(30),
+    )
+    .await?;
+    let failing = RequestLogProvider::new("unused");
+    let error = execute_root_turn(
+        inputs,
+        "Where is step two?",
+        &failing,
+        &stores.deps(),
+        t_plus(31),
+    )
+    .await
+    .err()
+    .context("a failed child read must fail the turn")?;
+    fail::remove("closures.read_interim_child");
+    assert!(
+        format!("{error:#}").contains("injected failure reading an interim child"),
+        "{error:#}",
+    );
+    assert!(
+        failing.requests()?.is_empty(),
+        "no provider request was sent"
+    );
+    let after = stores
+        .messages
+        .get(&thread_a())
+        .await?
+        .context("projection")?;
+    assert_eq!(
+        serde_json::to_value((&after.messages, &after.draft_messages))?,
+        serde_json::to_value((&before.messages, &before.draft_messages))?,
+    );
+
+    fail_root_turn(
+        &task.id,
+        &WorkerId::from_string("worker_test"),
+        &LeaseId::from_string("lease_test"),
+        &thread_a(),
+        &error,
+        &stores.deps(),
+        t_plus(32),
+    )
+    .await?;
+    let request = follow_up_request(&stores, "Where is step two?", t_plus(40)).await?;
     assert_running_call_closed(&request, "call_1", "cancelled");
+    drop(scenario);
     Ok(())
 }
 

@@ -7209,7 +7209,7 @@ async fn fan_in_for_child_results(
                 result,
             });
         } else {
-            tool_results.push((tool_use_id, result));
+            tool_results.push((tool_use_id, FanInAnswer::Finished(result)));
         }
     }
     Ok(llm::Message::user_with_content(fan_in_blocks(
@@ -7722,31 +7722,13 @@ async fn buffer_resume_messages(
     Ok(())
 }
 
-/// Tool-result blocks for each completed child task, followed by the
-/// results' native binary attachments (images/documents).
-///
-/// Two passes, matching the in-process loop's `append_tool_results`:
-/// Anthropic requires EVERY `tool_result` block to precede any other
-/// content in the user message, so attachments are appended after the
-/// full result run, in result order. Dropping the attachments instead
-/// silences every multimodal tool result on the daemon path.
-/// Artifact-backed sources (`artifact://…` data) ride along untouched;
-/// the pre-call hydration seam restores their bytes for the provider
-/// request.
-pub(crate) fn tool_result_blocks(child_results: &[(String, ToolResult)]) -> Vec<llm::ContentBlock> {
-    let mut blocks: Vec<llm::ContentBlock> = Vec::new();
-    for (tool_use_id, result) in child_results {
-        blocks.push(llm::ContentBlock::ToolResult {
-            tool_use_id: tool_use_id.clone(),
-            content: result.output.clone(),
-            artifact: result.artifact.clone(),
-            is_error: if result.success { None } else { Some(true) },
-        });
+fn tool_result_block(tool_use_id: &str, result: &ToolResult) -> llm::ContentBlock {
+    llm::ContentBlock::ToolResult {
+        tool_use_id: tool_use_id.to_owned(),
+        content: result.output.clone(),
+        artifact: result.artifact.clone(),
+        is_error: if result.success { None } else { Some(true) },
     }
-    for (_, result) in child_results {
-        blocks.extend(tool_result_attachments(result));
-    }
-    blocks
 }
 
 fn tool_result_attachments(result: &ToolResult) -> impl Iterator<Item = llm::ContentBlock> + '_ {
@@ -8234,44 +8216,36 @@ pub async fn resume_from_question(
 // Phase 5.5: steering wake (R2) — early resume of a parked parent
 // ─────────────────────────────────────────────────────────────────────
 
-/// Interim tool-result payload for a call whose child is still running
-/// when an early resume fans in. Honest — never a fabricated child
-/// result — and explicit that the call must not be issued again: its
-/// real result arrives at a later fan-in as a late result (see
-/// [`llm::late_tool_result`]).
-pub(crate) fn steering_interim_tool_result(
+/// The interim `tool_result` for a call whose child is still running when
+/// an early resume fans in. Honest — never a fabricated child result — and
+/// explicit that the call must not be issued again: its real result arrives
+/// later as a late result (see [`llm::late_tool_result`]).
+///
+/// It is the only `tool_result` the server writes with `is_error:
+/// Some(false)`: a tool's result maps to `None` or `Some(true)`, so tool
+/// output can never pass for an interim answer. The fan-in writes it for
+/// exactly the child spawned for the call, so the child it names is that
+/// call's own.
+pub(crate) fn interim_tool_result_block(
     tool_use_id: &str,
     child_id: &AgentTaskId,
-) -> ToolResult {
+) -> llm::ContentBlock {
     let payload = serde_json::json!({
         "kind": INTERIM_KIND,
         "status": "running",
         "child_task_id": child_id.as_str(),
-        "binding": interim_binding(tool_use_id, child_id),
         "note": INTERIM_NOTE,
     });
-    ToolResult {
-        success: true,
-        output: payload.to_string(),
+    llm::ContentBlock::ToolResult {
+        tool_use_id: tool_use_id.to_owned(),
+        content: payload.to_string(),
         artifact: None,
-        data: None,
-        documents: Vec::new(),
-        duration_ms: None,
+        is_error: Some(false),
     }
 }
 
 const INTERIM_KIND: &str = "interim_tool_result";
 const INTERIM_NOTE: &str = "This call is still executing. Do not call it again: it keeps running, and its final result will be delivered automatically in a later message as a late_tool_result for this tool_use_id.";
-
-const INTERIM_BINDING_NAMESPACE: Uuid = Uuid::from_u128(0x5c1e_7a0d_3f84_4b62_9e1a_c4d7_0b38_f215);
-
-/// Server-derived token binding an interim answer to the call it answers
-/// and the child running that call, so a tool whose output imitates the
-/// interim payload is not taken for one.
-fn interim_binding(tool_use_id: &str, child_id: &AgentTaskId) -> String {
-    let name = format!("{}\n{tool_use_id}", child_id.as_str());
-    Uuid::new_v5(&INTERIM_BINDING_NAMESPACE, name.as_bytes()).to_string()
-}
 
 /// An interim `tool_result` found in a transcript.
 pub(crate) struct InterimAnswer {
@@ -8279,13 +8253,11 @@ pub(crate) struct InterimAnswer {
     pub(crate) child_task_id: AgentTaskId,
 }
 
-/// Recognize `content`, the `tool_result` for `tool_use_id`, as an interim
-/// answer: it carries the `kind` discriminator and the binding derived for
-/// this call and the child it names. Whether that child really ran an
-/// earlier root turn's call on this thread is checked against the store
-/// (see [`undelivered_call_closures`]).
-pub(crate) fn interim_answer(tool_use_id: &str, content: &str) -> Option<InterimAnswer> {
-    if !content.starts_with('{') || !content.contains(INTERIM_KIND) {
+/// Recognize a `tool_result` as an interim answer: it carries the server's
+/// `is_error: Some(false)` marker and the `kind` discriminator (see
+/// [`interim_tool_result_block`]).
+pub(crate) fn interim_answer(content: &str, is_error: Option<bool>) -> Option<InterimAnswer> {
+    if is_error != Some(false) || !content.starts_with('{') || !content.contains(INTERIM_KIND) {
         return None;
     }
     let value: serde_json::Value = serde_json::from_str(content).ok()?;
@@ -8294,8 +8266,7 @@ pub(crate) fn interim_answer(tool_use_id: &str, content: &str) -> Option<Interim
         return None;
     }
     let child_task_id = AgentTaskId::from_string(field("child_task_id")?);
-    (field("binding") == Some(interim_binding(tool_use_id, &child_task_id).as_str()))
-        .then_some(InterimAnswer { child_task_id })
+    Some(InterimAnswer { child_task_id })
 }
 
 /// A child still running at early-resume time. It stays bound to its
@@ -8312,7 +8283,7 @@ struct SurvivingChild {
 
 /// Final outcome of a call whose interim `tool_result` an earlier early
 /// resume already delivered.
-struct LateToolResult {
+pub(crate) struct LateToolResult {
     call: PendingToolCallInfo,
     status: LateToolResultStatus,
     result: ToolResult,
@@ -8352,18 +8323,25 @@ struct SteeringExchange {
 
 /// Fan-in plan for a parked batch, built at resume time.
 struct SteeringInterim {
-    /// One `(tool_use_id, ToolResult)` per call still awaiting its
-    /// `tool_result`, in pending order: real payloads for finished
-    /// children, typed `status: running` payloads for still-running
-    /// ones. Every unanswered `tool_use` is covered — the wire contract
-    /// forbids a partial fan-in.
-    tool_results: Vec<(String, ToolResult)>,
+    /// One answer per call still awaiting its `tool_result`, in pending
+    /// order: the real result of a finished child, the interim answer for a
+    /// running one. Every unanswered `tool_use` is covered — the wire
+    /// contract forbids a partial fan-in.
+    tool_results: Vec<(String, FanInAnswer)>,
     /// Finished calls an earlier early resume already answered with the
     /// interim payload. A second `tool_result` for the same `tool_use`
     /// would break provider pairing, so these are delivered as text.
     late_results: Vec<LateToolResult>,
     /// Still-running children, in pending order.
     surviving: Vec<SurvivingChild>,
+}
+
+/// How a fan-in answers a call that has no `tool_result` yet.
+pub(crate) enum FanInAnswer {
+    /// The child finished: its real result.
+    Finished(ToolResult),
+    /// The child is still running: the interim answer naming it.
+    StillRunning(AgentTaskId),
 }
 
 /// Ids that already have a `tool_result` in the parked history, i.e.
@@ -8440,14 +8418,11 @@ async fn build_steering_interim(
                     result,
                 });
             } else {
-                tool_results.push((call.id.clone(), result));
+                tool_results.push((call.id.clone(), FanInAnswer::Finished(result)));
             }
         } else {
             if !already_answered {
-                tool_results.push((
-                    call.id.clone(),
-                    steering_interim_tool_result(&call.id, &child.id),
-                ));
+                tool_results.push((call.id.clone(), FanInAnswer::StillRunning(child.id.clone())));
             }
             surviving.push(SurvivingChild {
                 child_id: child.id.clone(),
@@ -8479,12 +8454,30 @@ fn build_fan_in_message(
     Ok(llm::Message::user_with_content(blocks))
 }
 
-fn fan_in_blocks(
-    tool_results: &[(String, ToolResult)],
+/// The fan-in's blocks: every `tool_result` first, in pending order (the
+/// provider requires them to lead), then the finished results' native
+/// attachments (images, documents) in the same order, then each late
+/// result with its attachments, then any steering content.
+/// Artifact-backed sources (`artifact://…` data) ride along untouched; the
+/// pre-call hydration seam restores their bytes for the provider request.
+pub(crate) fn fan_in_blocks(
+    answers: &[(String, FanInAnswer)],
     late_results: &[LateToolResult],
     steering: &[llm::ContentBlock],
 ) -> Vec<llm::ContentBlock> {
-    let mut blocks = tool_result_blocks(tool_results);
+    let mut blocks: Vec<llm::ContentBlock> = answers
+        .iter()
+        .map(|(tool_use_id, answer)| match answer {
+            FanInAnswer::Finished(result) => tool_result_block(tool_use_id, result),
+            FanInAnswer::StillRunning(child_id) => interim_tool_result_block(tool_use_id, child_id),
+        })
+        .collect();
+    for (_, answer) in answers {
+        match answer {
+            FanInAnswer::Finished(result) => blocks.extend(tool_result_attachments(result)),
+            FanInAnswer::StillRunning(_) => {}
+        }
+    }
     for late in late_results {
         blocks.push(llm::ContentBlock::Text {
             text: late.render(),
@@ -8517,7 +8510,7 @@ async fn undelivered_call_closures(
     raw: &[llm::Message],
     draft: &[llm::Message],
     task_store: &dyn AgentTaskStore,
-) -> UndeliveredCallClosures {
+) -> Result<UndeliveredCallClosures> {
     let scan = scan_transcript(raw, draft);
     let mut closures = UndeliveredCallClosures {
         carried: scan
@@ -8532,13 +8525,11 @@ async fn undelivered_call_closures(
         if scan.carried.iter().any(|(carried, _)| *carried == id) {
             continue;
         }
-        let child = match interim_child(thread_id, &child_id, task_store).await {
-            Ok(Some(child)) => child,
-            Ok(None) => continue,
-            Err(error) => {
-                log::warn!("closing late results: check child {child_id} failed: {error:#}");
-                continue;
-            }
+        let Some(child) = interim_child(thread_id, &child_id, task_store)
+            .await
+            .with_context(|| format!("read child {child_id} of an interim-only call"))?
+        else {
+            continue;
         };
         let (name, input) = scan
             .calls
@@ -8558,7 +8549,7 @@ async fn undelivered_call_closures(
         late.push(late_result_after_turn_ended(call, child));
     }
     closures.new = fan_in_blocks(&[], &late, &[]);
-    closures
+    Ok(closures)
 }
 
 /// What the child an interim names tells the closure.
@@ -8577,6 +8568,9 @@ async fn interim_child(
     child_id: &AgentTaskId,
     task_store: &dyn AgentTaskStore,
 ) -> Result<Option<InterimChild>> {
+    crate::fail_point!("closures.read_interim_child", |_| {
+        Err(anyhow::anyhow!("injected failure reading an interim child"))
+    });
     let Some(child) = task_store.get(child_id).await? else {
         return Ok(None);
     };
@@ -8619,15 +8613,14 @@ struct TranscriptScan<'a> {
 /// shows every interim answer.
 ///
 /// Only server-written blocks count: an interim is a user-message
-/// `tool_result` carrying the binding for its own call (see
-/// [`interim_answer`]), and each child may answer one call. A late result
-/// is a user-message text block laid out exactly as the server renders
-/// it, for a call already answered with an interim earlier in the
-/// transcript. A model reply or a user prompt that quotes either one
-/// therefore never opens or closes a call.
+/// `tool_result` with the server's marker (see [`interim_answer`]), which
+/// names the child spawned for that very call. A late result is a
+/// user-message text block laid out exactly as the server renders it, for
+/// a call already answered with an interim earlier in the transcript. Tool
+/// output, a model reply or a user prompt that imitates either one
+/// therefore never opens or closes a call, whatever its position.
 fn scan_transcript<'a>(raw: &'a [llm::Message], draft: &'a [llm::Message]) -> TranscriptScan<'a> {
     let mut interim_calls = BTreeSet::new();
-    let mut claimed_children = BTreeSet::new();
     let mut open = Vec::new();
     let mut carried: Vec<(String, &llm::ContentBlock)> = Vec::new();
     let mut delivered = BTreeSet::new();
@@ -8644,11 +8637,11 @@ fn scan_transcript<'a>(raw: &'a [llm::Message], draft: &'a [llm::Message]) -> Tr
                 llm::ContentBlock::ToolResult {
                     tool_use_id,
                     content,
+                    is_error,
                     ..
                 } => {
                     if !interim_calls.contains(tool_use_id)
-                        && let Some(answer) = interim_answer(tool_use_id, content)
-                        && claimed_children.insert(answer.child_task_id.clone())
+                        && let Some(answer) = interim_answer(content, *is_error)
                     {
                         interim_calls.insert(tool_use_id.clone());
                         open.push((tool_use_id.clone(), answer.child_task_id));
@@ -8760,7 +8753,7 @@ async fn close_undelivered_calls(
         &projection.draft_messages,
         deps.task_store,
     )
-    .await;
+    .await?;
     if !new.is_empty() {
         let closing = llm::Message::user_with_content(new.clone());
         let mut draft = projection.draft_messages;

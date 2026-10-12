@@ -177,11 +177,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cancelled` if it was cancelled, or `still_running`, which tells the model
   not to re-issue the call until it is confirmed stopped or finished. This
   holds even when compaction already folded the interim result into history.
-  The interim payload carries a `kind` discriminator, the child's task id,
-  and a binding derived from that child and its call, so tool output that
-  imitates it is not taken for one. Only a user-message block laid out
-  exactly as the server renders it counts as a late result. Compaction and
-  fork retain the artifact a late result's spilled output points at.
+  The interim `tool_result` is the only one the server writes with
+  `is_error: false` (a tool's result is `None` or `true`), and it carries a
+  `kind` discriminator and the task id of the child spawned for that call,
+  so tool output that imitates it is never taken for one. Only a
+  user-message block laid out exactly as the server renders it counts as a
+  late result. Compaction and fork retain the artifact a late result's
+  spilled output points at.
 
   **Rollback:** do not roll the server back to a build without late results
   while any early-resumed parent is parked. Those rows keep already-answered
