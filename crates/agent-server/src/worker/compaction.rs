@@ -47,10 +47,13 @@ use std::sync::Arc;
 
 use agent_sdk::context::{
     CompactionConfig, CompactionPurpose, ContextCompactor, DEFAULT_MODEL_CONTEXT_RESERVE_TOKENS,
-    FailedCompaction, LlmContextCompactor,
+    FailedCompaction, LlmContextCompactor, compaction_target_tokens,
 };
 use agent_sdk_foundation::TokenUsage;
-use agent_sdk_foundation::events::{AgentEvent, CompactionTrigger};
+use agent_sdk_foundation::events::{
+    AgentEvent, CompactionOccupancy, CompactionThreshold, CompactionTrigger, OccupancySource,
+    ThresholdSource,
+};
 use agent_sdk_foundation::llm::{ChatRequest, ThinkingConfig, ThinkingMode};
 use agent_sdk_providers::{DefaultReasoning, LlmProvider, ModelCapabilities};
 use agent_sdk_tools::stores::MessageStore;
@@ -287,10 +290,10 @@ fn attempt_measured_anchor(
 fn trigger_tokens(
     measured: Option<usize>,
     estimated_fallback: impl FnOnce() -> usize,
-) -> (usize, &'static str) {
+) -> (usize, OccupancySource) {
     measured.map_or_else(
-        || (estimated_fallback(), "estimated_fallback"),
-        |tokens| (tokens, "measured"),
+        || (estimated_fallback(), OccupancySource::Estimated),
+        |tokens| (tokens, OccupancySource::Measured),
     )
 }
 
@@ -492,22 +495,32 @@ pub(crate) fn serving_max_tokens(
         .fold(requested, u32::min)
 }
 
-/// Trigger threshold for one call; see
-/// [`CompactionConfig::model_aware_threshold`]. The row's
-/// `max_output_tokens` reserves only what [`serving_max_tokens`] would
-/// request of it, and a zero `requested_max_tokens` floors the reserve at
-/// that amount instead. A reserve that consumes the whole window leaves
-/// `threshold_tokens` unchanged.
-fn effective_threshold_tokens(
+/// Trigger threshold for one call to a model with `capabilities`, as the
+/// pre-call trigger computes it.
+///
+/// See [`CompactionConfig::model_aware_threshold`]. The row's
+/// `max_output_tokens` reserves only what the worker would request of it,
+/// and a zero `requested_max_tokens` floors the reserve at that amount
+/// instead. A reserve that consumes the whole window leaves
+/// `threshold_tokens` unchanged. Hosts that show the threshold call this
+/// rather than re-deriving it.
+#[must_use]
+pub fn effective_threshold(
     cfg: &CompactionConfig,
     capabilities: Option<&ModelCapabilities>,
     requested_max_tokens: u32,
-) -> (usize, &'static str) {
+) -> CompactionThreshold {
+    let window = effective_window_tokens(cfg, capabilities);
+    let fixed = |source| CompactionThreshold {
+        tokens: cfg.threshold_tokens,
+        source,
+        context_window_tokens: window,
+    };
     if !cfg.model_aware_threshold {
-        return (cfg.threshold_tokens, "fixed");
+        return fixed(ThresholdSource::Fixed);
     }
-    let Some(window) = effective_window_tokens(cfg, capabilities) else {
-        return (cfg.threshold_tokens, "fixed_unknown_model");
+    let Some(window) = window else {
+        return fixed(ThresholdSource::FixedUnknownModel);
     };
     let row_max_output = capabilities
         .and_then(|caps| caps.max_output_tokens)
@@ -534,24 +547,62 @@ fn effective_threshold_tokens(
     window
         .checked_sub(reserve)
         .filter(|threshold| *threshold > 0)
-        .map_or(
-            (cfg.threshold_tokens, "fixed_invalid_model_window"),
-            |threshold| (threshold, "model_aware"),
+        .map_or_else(
+            || fixed(ThresholdSource::FixedInvalidModelWindow),
+            |tokens| CompactionThreshold {
+                tokens,
+                source: ThresholdSource::ModelAware,
+                context_window_tokens: Some(window),
+            },
         )
 }
 
 /// Threshold for a call served by `main_provider`; see
 /// [`serving_capabilities`].
+fn serving_threshold(
+    cfg: &CompactionConfig,
+    main_provider: &dyn LlmProvider,
+    requested_max_tokens: u32,
+) -> CompactionThreshold {
+    effective_threshold(
+        cfg,
+        serving_capabilities(main_provider),
+        requested_max_tokens,
+    )
+}
+
+#[cfg(test)]
+fn effective_threshold_tokens(
+    cfg: &CompactionConfig,
+    capabilities: Option<&ModelCapabilities>,
+    requested_max_tokens: u32,
+) -> (usize, &'static str) {
+    let threshold = effective_threshold(cfg, capabilities, requested_max_tokens);
+    (threshold.tokens, threshold.source.as_str())
+}
+
+#[cfg(test)]
 fn serving_threshold_tokens(
     cfg: &CompactionConfig,
     main_provider: &dyn LlmProvider,
     requested_max_tokens: u32,
 ) -> (usize, &'static str) {
-    effective_threshold_tokens(
-        cfg,
-        serving_capabilities(main_provider),
-        requested_max_tokens,
-    )
+    let threshold = serving_threshold(cfg, main_provider, requested_max_tokens);
+    (threshold.tokens, threshold.source.as_str())
+}
+
+/// Estimated history size that brings a request at `occupancy` to the
+/// compaction target below `threshold`. Everything in the occupancy that is
+/// not the staged history (system prompt, tools, the pending prompt, and the
+/// estimator's error against the measured count) stays put, so it comes off
+/// the target first.
+const fn history_target_tokens(
+    occupancy: usize,
+    history_tokens: usize,
+    threshold: &CompactionThreshold,
+) -> usize {
+    let fixed_overhead = occupancy.saturating_sub(history_tokens);
+    compaction_target_tokens(threshold.tokens).saturating_sub(fixed_overhead)
 }
 
 /// The compactor's own budgets (prune-only acceptance, Snapcompact frame
@@ -591,6 +642,16 @@ fn build_compactor(
 pub(crate) struct PlannedCompaction {
     compactor: LlmContextCompactor<dyn LlmProvider>,
     history: Vec<agent_sdk_foundation::llm::Message>,
+    cause: CompactionCause,
+}
+
+/// What started a compaction and what its trigger compared, for the
+/// `ContextCompacted` event.
+#[derive(Clone, Copy, Debug)]
+struct CompactionCause {
+    trigger: CompactionTrigger,
+    occupancy: Option<CompactionOccupancy>,
+    threshold: CompactionThreshold,
 }
 
 /// Decide, without side effects, whether a pre-call compaction should run.
@@ -636,13 +697,12 @@ pub(crate) async fn plan_pre_call_compaction(
         return Ok(None);
     }
 
-    let (threshold_tokens, threshold_source) =
-        serving_threshold_tokens(cfg, main_provider, expected_request.max_tokens);
+    let threshold = serving_threshold(cfg, main_provider, expected_request.max_tokens);
     let compactor = build_compactor(
         deps,
         provider_arc,
         cfg,
-        threshold_tokens,
+        threshold.tokens,
         CompactionPurpose::PreSpawn,
     );
     let (trigger_tokens, trigger_source) =
@@ -658,25 +718,52 @@ pub(crate) async fn plan_pre_call_compaction(
             .await?;
             trigger_tokens(measured, || compactor.estimate_tokens(&history))
         } else {
-            (compactor.estimate_tokens(&history), "legacy_estimated")
+            (
+                compactor.estimate_tokens(&history),
+                OccupancySource::Estimated,
+            )
         };
     let trigger_tokens = trigger_tokens.saturating_add(pending_input_tokens);
-    if trigger_tokens <= threshold_tokens {
+    if trigger_tokens <= threshold.tokens {
         return Ok(None);
     }
+    let compactor = if cfg.uses_prune_first_engine() {
+        let history_tokens = compactor.estimate_tokens(&history);
+        compactor.with_history_target_tokens(history_target_tokens(
+            trigger_tokens,
+            history_tokens,
+            &threshold,
+        ))
+    } else {
+        compactor
+    };
 
     log::info!(
         "Pre-call auto-compaction planned (thread={thread_id}, message_count={}, \
-         trigger_tokens={trigger_tokens}, trigger_source={trigger_source}, \
+         trigger_tokens={trigger_tokens}, trigger_source={trigger_source:?}, \
          pending_input_tokens={pending_input_tokens}, \
-         threshold_tokens={threshold_tokens}, threshold_source={threshold_source}, \
+         threshold_tokens={}, threshold_source={}, context_window_tokens={:?}, \
          provider={}, model={}, engine={:?}, purpose=pre_spawn)",
         history.len(),
+        threshold.tokens,
+        threshold.source.as_str(),
+        threshold.context_window_tokens,
         main_provider.provider(),
         main_provider.model(),
         cfg.engine,
     );
-    Ok(Some(PlannedCompaction { compactor, history }))
+    Ok(Some(PlannedCompaction {
+        compactor,
+        history,
+        cause: CompactionCause {
+            trigger: CompactionTrigger::Threshold,
+            occupancy: Some(CompactionOccupancy {
+                tokens: trigger_tokens,
+                source: trigger_source,
+            }),
+            threshold,
+        },
+    }))
 }
 
 /// Anchor tokens plus the estimate of the staged suffix the anchor did not
@@ -743,7 +830,11 @@ pub(crate) async fn run_planned_compaction(
     thread_id: &agent_sdk_foundation::ThreadId,
     now: OffsetDateTime,
 ) -> CompactionResult<CompactionOutcome> {
-    let PlannedCompaction { compactor, history } = planned;
+    let PlannedCompaction {
+        compactor,
+        history,
+        cause,
+    } = planned;
     apply_compaction(
         deps,
         staged_messages,
@@ -751,7 +842,7 @@ pub(crate) async fn run_planned_compaction(
         history,
         thread_id,
         now,
-        CompactionTrigger::Threshold,
+        cause,
     )
     .await
     .map_err(|failure| failure.with_context("pre-call compaction"))
@@ -835,12 +926,12 @@ pub(crate) async fn compact_after_overflow(
         return Ok(CompactionOutcome::not_run());
     }
 
-    let (threshold_tokens, _) = serving_threshold_tokens(cfg, main_provider, requested_max_tokens);
+    let threshold = serving_threshold(cfg, main_provider, requested_max_tokens);
     let compactor = build_compactor(
         deps,
         provider_arc,
         cfg,
-        threshold_tokens,
+        threshold.tokens,
         CompactionPurpose::Overflow,
     );
 
@@ -857,7 +948,11 @@ pub(crate) async fn compact_after_overflow(
         history,
         thread_id,
         now,
-        CompactionTrigger::Overflow,
+        CompactionCause {
+            trigger: CompactionTrigger::Overflow,
+            occupancy: None,
+            threshold,
+        },
     )
     .await
     .map_err(|failure| failure.with_context("overflow recovery compaction"))
@@ -908,7 +1003,7 @@ async fn apply_compaction(
     history: Vec<agent_sdk_foundation::llm::Message>,
     thread_id: &agent_sdk_foundation::ThreadId,
     now: OffsetDateTime,
-    trigger: CompactionTrigger,
+    cause: CompactionCause,
 ) -> CompactionResult<CompactionOutcome> {
     let compact = compactor.compact_history_with_usage(history);
     let completed = if let Some(cancel) = deps.cancel {
@@ -991,14 +1086,16 @@ async fn apply_compaction(
         .map_err(|error| spend.failure(error))?;
     staged_messages.bump_history_generation();
 
-    let event = AgentEvent::context_compacted(
-        result.original_count,
-        result.new_count,
-        result.original_tokens,
-        result.new_tokens,
-        trigger,
-        deps.compaction_config.map(|cfg| cfg.engine),
-    );
+    let event = AgentEvent::ContextCompacted {
+        original_count: result.original_count,
+        new_count: result.new_count,
+        original_tokens: result.original_tokens,
+        new_tokens: result.new_tokens,
+        trigger: Some(cause.trigger),
+        engine: deps.compaction_config.map(|cfg| cfg.engine),
+        occupancy: cause.occupancy,
+        threshold: Some(cause.threshold),
+    };
     let committed = deps
         .event_repo
         .commit_event(thread_id, event, now)
@@ -1100,7 +1197,7 @@ mod tests {
     fn measured_usage_prevents_large_window_estimator_regression() {
         let (tokens, source) = trigger_tokens(Some(88_000), || 1_200_000);
         assert_eq!(tokens, 88_000);
-        assert_eq!(source, "measured");
+        assert_eq!(source, OccupancySource::Measured);
         assert!(tokens <= 1_000_000);
     }
 
@@ -1108,7 +1205,7 @@ mod tests {
     fn estimator_is_used_only_before_measured_usage_exists() {
         let (tokens, source) = trigger_tokens(None, || 120_000);
         assert_eq!(tokens, 120_000);
-        assert_eq!(source, "estimated_fallback");
+        assert_eq!(source, OccupancySource::Estimated);
     }
 
     #[test]
@@ -1138,6 +1235,58 @@ mod tests {
 
     fn registered(provider: &str, model: &str) -> Option<&'static ModelCapabilities> {
         agent_sdk_providers::get_model_capabilities(provider, model)
+    }
+
+    #[test]
+    fn history_target_sheds_only_the_overshoot_and_headroom_from_history() {
+        let threshold = CompactionThreshold {
+            tokens: 80_000,
+            source: ThresholdSource::FixedUnknownModel,
+            context_window_tokens: None,
+        };
+        let fixed_overhead = 83_414 - 28_379;
+        assert_eq!(
+            history_target_tokens(83_414, 28_379, &threshold),
+            72_000 - fixed_overhead
+        );
+        assert_eq!(
+            history_target_tokens(200_000, 10_000, &threshold),
+            0,
+            "an overhead past the target leaves nothing for history"
+        );
+    }
+
+    #[test]
+    fn every_threshold_names_the_window_it_knows() {
+        let model_aware = CompactionConfig::default()
+            .with_threshold_tokens(80_000)
+            .with_model_aware_threshold(true);
+        let opus_45 = registered("anthropic", "claude-opus-4-5-20251101");
+        assert_eq!(
+            effective_threshold(&model_aware, opus_45, 0),
+            CompactionThreshold {
+                tokens: 150_000,
+                source: ThresholdSource::ModelAware,
+                context_window_tokens: Some(200_000),
+            }
+        );
+        assert_eq!(
+            effective_threshold(&model_aware, None, 0),
+            CompactionThreshold {
+                tokens: 80_000,
+                source: ThresholdSource::FixedUnknownModel,
+                context_window_tokens: None,
+            }
+        );
+        let fixed = CompactionConfig::default().with_threshold_tokens(80_000);
+        assert_eq!(
+            effective_threshold(&fixed, opus_45, 0),
+            CompactionThreshold {
+                tokens: 80_000,
+                source: ThresholdSource::Fixed,
+                context_window_tokens: Some(200_000),
+            }
+        );
     }
 
     const FABLE_REQUESTED_MAX_TOKENS: u32 = 32_000;

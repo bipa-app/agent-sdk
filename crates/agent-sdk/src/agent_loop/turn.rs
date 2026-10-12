@@ -9,8 +9,14 @@ use super::types::{
 };
 
 use crate::authority::EventAuthority;
-use crate::context::{CompactionConfig, CompactionPurpose, ContextCompactor, LlmContextCompactor};
-use crate::events::{AgentEvent, CompactionTrigger};
+use crate::context::{
+    CompactionConfig, CompactionPurpose, ContextCompactor, LlmContextCompactor,
+    compaction_target_tokens,
+};
+use crate::events::{
+    AgentEvent, CompactionOccupancy, CompactionThreshold, CompactionTrigger, OccupancySource,
+    ThresholdSource,
+};
 use crate::hooks::{AgentHooks, ToolAuditSink};
 use crate::llm::{
     ChatRequest, ChatResponse, Content, ContentBlock, LlmProvider, Message, StopReason,
@@ -251,6 +257,8 @@ where
             return compact_messages_for_threshold(ThresholdCompactionParams {
                 compactor: compactor.as_ref(),
                 engine: None,
+                occupancy: None,
+                threshold: None,
                 messages,
                 message_store,
                 thread_id,
@@ -277,7 +285,11 @@ where
         let default_compactor =
             LlmContextCompactor::new(Arc::clone(provider), compact_config.clone());
         let default_compactor = if compact_config.uses_prune_first_engine() {
-            default_compactor.with_purpose(CompactionPurpose::PreSpawn)
+            default_compactor
+                .with_purpose(CompactionPurpose::PreSpawn)
+                .with_history_target_tokens(compaction_target_tokens(
+                    compact_config.threshold_tokens,
+                ))
         } else {
             default_compactor
         };
@@ -294,9 +306,19 @@ where
                 turn,
                 messages.len()
             );
+            let occupancy = CompactionOccupancy {
+                tokens: default_compactor.estimate_tokens(&messages),
+                source: OccupancySource::Estimated,
+            };
             return compact_messages_for_threshold(ThresholdCompactionParams {
                 compactor: &default_compactor,
                 engine: Some(compact_config.engine),
+                occupancy: Some(occupancy),
+                threshold: Some(CompactionThreshold {
+                    tokens: compact_config.threshold_tokens,
+                    source: ThresholdSource::Fixed,
+                    context_window_tokens: None,
+                }),
                 messages,
                 message_store,
                 thread_id,
@@ -335,6 +357,9 @@ struct ThresholdCompactionParams<'a, C: ?Sized, H, M> {
     compactor: &'a C,
     /// `None` for a caller-supplied compactor.
     engine: Option<crate::context::CompactionEngine>,
+    /// `None` for a caller-supplied compactor, whose trigger is its own.
+    occupancy: Option<CompactionOccupancy>,
+    threshold: Option<CompactionThreshold>,
     messages: Vec<Message>,
     message_store: &'a Arc<M>,
     thread_id: &'a ThreadId,
@@ -369,6 +394,8 @@ async fn compact_messages_for_threshold<C, H, M>(
     ThresholdCompactionParams {
         compactor,
         engine,
+        occupancy,
+        threshold,
         messages,
         message_store,
         thread_id,
@@ -404,14 +431,16 @@ where
                 turn,
                 hooks,
                 authority,
-                AgentEvent::context_compacted(
-                    result.original_count,
-                    result.new_count,
-                    result.original_tokens,
-                    result.new_tokens,
-                    CompactionTrigger::Threshold,
+                AgentEvent::ContextCompacted {
+                    original_count: result.original_count,
+                    new_count: result.new_count,
+                    original_tokens: result.original_tokens,
+                    new_tokens: result.new_tokens,
+                    trigger: Some(CompactionTrigger::Threshold),
                     engine,
-                ),
+                    occupancy,
+                    threshold,
+                },
             )
             .await
             {

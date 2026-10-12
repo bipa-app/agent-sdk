@@ -754,21 +754,10 @@ impl AnthropicProvider {
         self
     }
 
+    /// Whether the model's row says it takes adaptive thinking only.
     fn is_adaptive_thinking_model(&self) -> bool {
-        matches!(
-            self.model.as_str(),
-            MODEL_HAIKU_55
-                | MODEL_SONNET_46
-                | MODEL_SONNET_5
-                | MODEL_SONNET_55
-                | MODEL_OPUS_46
-                | MODEL_OPUS_47
-                | MODEL_OPUS_48
-                | MODEL_OPUS_5
-                | MODEL_OPUS_55
-                | MODEL_FABLE_5
-                | MODEL_FABLE_51
-        )
+        crate::model_capabilities::get_model_capabilities("anthropic", &self.model)
+            .is_some_and(|caps| caps.rejects_budget_thinking)
     }
 }
 
@@ -1481,38 +1470,28 @@ mod tests {
     }
 
     #[test]
-    fn budget_rejection_list_matches_registry_flag() {
-        // The provider's private adaptive-only list and the public
-        // registry flag must never drift: callers promote budget-mode
-        // preferences based on the flag, and the provider rejects
-        // budget requests based on the list.
-        for model in [
-            MODEL_HAIKU_35,
-            MODEL_SONNET_35,
-            MODEL_SONNET_4,
-            MODEL_OPUS_4,
-            MODEL_HAIKU_45,
-            MODEL_HAIKU_55,
-            MODEL_SONNET_45,
-            MODEL_SONNET_46,
-            MODEL_SONNET_5,
-            MODEL_SONNET_55,
-            MODEL_OPUS_46,
-            MODEL_OPUS_47,
-            MODEL_OPUS_48,
-            MODEL_OPUS_5,
-            MODEL_OPUS_55,
-            MODEL_FABLE_5,
-            MODEL_FABLE_51,
-        ] {
-            let provider = AnthropicProvider::new("test-key", model);
-            let flag = crate::model_capabilities::get_model_capabilities("anthropic", model)
-                .is_some_and(|caps| caps.rejects_budget_thinking);
+    fn every_adaptive_only_row_rejects_budget_thinking_up_front() {
+        let anthropic_rows = crate::model_capabilities::supported_model_capabilities()
+            .iter()
+            .filter(|caps| caps.provider == "anthropic");
+        for caps in anthropic_rows {
+            let provider = AnthropicProvider::new("test-key", caps.model_id);
+            let budget = provider.validate_thinking_config(Some(&ThinkingConfig::new(4_096)));
+            assert_eq!(
+                budget.is_err(),
+                caps.rejects_budget_thinking,
+                "budget thinking on {}: {budget:?}",
+                caps.model_id,
+            );
             assert_eq!(
                 provider.is_adaptive_thinking_model(),
-                flag,
-                "provider list and registry flag disagree for {model}",
+                caps.rejects_budget_thinking,
+                "the interleaved-thinking beta follows the row for {}",
+                caps.model_id,
             );
+        }
+        for mythos in ["claude-mythos-5", "claude-mythos-5-1"] {
+            assert!(AnthropicProvider::new("test-key", mythos).is_adaptive_thinking_model());
         }
     }
 

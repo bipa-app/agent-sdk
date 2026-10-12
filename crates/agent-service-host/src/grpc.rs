@@ -4045,6 +4045,8 @@ fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelo
             new_tokens,
             trigger,
             engine,
+            occupancy,
+            threshold,
         } => Ok(pb::event_envelope::Event::ContextCompacted(
             pb::ContextCompactedEvent {
                 original_count: map_u64(*original_count, "original_count")?,
@@ -4053,6 +4055,8 @@ fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelo
                 new_tokens: map_u64(*new_tokens, "new_tokens")?,
                 trigger: map_compaction_trigger(*trigger).into(),
                 engine: map_compaction_engine(*engine).into(),
+                occupancy: occupancy.map(map_compaction_occupancy).transpose()?,
+                threshold: threshold.map(map_compaction_threshold).transpose()?,
             },
         )),
         AgentEvent::SubagentProgress { .. } => map_subagent_progress_payload(event),
@@ -4060,6 +4064,54 @@ fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelo
             map_auto_retry_payload(event)
         }
         _ => Err(Status::internal("unsupported event variant").into()),
+    }
+}
+
+fn map_compaction_occupancy(
+    occupancy: agent_sdk_foundation::CompactionOccupancy,
+) -> RpcResult<pb::CompactionOccupancy> {
+    Ok(pb::CompactionOccupancy {
+        tokens: map_u64(occupancy.tokens, "occupancy.tokens")?,
+        source: map_occupancy_source(occupancy.source).into(),
+    })
+}
+
+fn map_compaction_threshold(
+    threshold: agent_sdk_foundation::CompactionThreshold,
+) -> RpcResult<pb::CompactionThreshold> {
+    Ok(pb::CompactionThreshold {
+        tokens: map_u64(threshold.tokens, "threshold.tokens")?,
+        source: map_threshold_source(threshold.source).into(),
+        context_window_tokens: threshold
+            .context_window_tokens
+            .map(|tokens| map_u64(tokens, "threshold.context_window_tokens"))
+            .transpose()?,
+    })
+}
+
+const fn map_occupancy_source(
+    source: agent_sdk_foundation::OccupancySource,
+) -> pb::CompactionOccupancySource {
+    use agent_sdk_foundation::OccupancySource;
+    match source {
+        OccupancySource::Measured => pb::CompactionOccupancySource::Measured,
+        OccupancySource::Estimated => pb::CompactionOccupancySource::Estimated,
+        OccupancySource::Unknown => pb::CompactionOccupancySource::Unspecified,
+    }
+}
+
+const fn map_threshold_source(
+    source: agent_sdk_foundation::ThresholdSource,
+) -> pb::CompactionThresholdSource {
+    use agent_sdk_foundation::ThresholdSource;
+    match source {
+        ThresholdSource::ModelAware => pb::CompactionThresholdSource::ModelAware,
+        ThresholdSource::Fixed => pb::CompactionThresholdSource::Fixed,
+        ThresholdSource::FixedUnknownModel => pb::CompactionThresholdSource::FixedUnknownModel,
+        ThresholdSource::FixedInvalidModelWindow => {
+            pb::CompactionThresholdSource::FixedInvalidModelWindow
+        }
+        ThresholdSource::Unknown => pb::CompactionThresholdSource::Unspecified,
     }
 }
 
@@ -9290,6 +9342,42 @@ mod tests {
         };
         assert_eq!(legacy.trigger(), pb::CompactionTrigger::Unspecified);
         assert_eq!(legacy.engine(), pb::CompactionEngine::Unspecified);
+        assert_eq!((legacy.occupancy, legacy.threshold), (None, None));
+        Ok(())
+    }
+
+    #[test]
+    fn context_compacted_projects_occupancy_and_threshold() -> Result<()> {
+        let payload = map_event_payload(&AgentEvent::ContextCompacted {
+            original_count: 21,
+            new_count: 21,
+            original_tokens: 28_379,
+            new_tokens: 14_000,
+            trigger: Some(agent_sdk_foundation::CompactionTrigger::Threshold),
+            engine: Some(agent_sdk_foundation::CompactionEngine::PruneFirst),
+            occupancy: Some(agent_sdk_foundation::CompactionOccupancy {
+                tokens: 83_414,
+                source: agent_sdk_foundation::OccupancySource::Measured,
+            }),
+            threshold: Some(agent_sdk_foundation::CompactionThreshold {
+                tokens: 136_000,
+                source: agent_sdk_foundation::ThresholdSource::ModelAware,
+                context_window_tokens: Some(200_000),
+            }),
+        })?;
+        let EventPayload::ContextCompacted(compacted) = payload else {
+            bail!("ContextCompacted must map to a ContextCompacted event");
+        };
+        let occupancy = compacted.occupancy.context("occupancy dropped")?;
+        assert_eq!(occupancy.tokens, 83_414);
+        assert_eq!(occupancy.source(), pb::CompactionOccupancySource::Measured);
+        let threshold = compacted.threshold.context("threshold dropped")?;
+        assert_eq!(threshold.tokens, 136_000);
+        assert_eq!(
+            threshold.source(),
+            pb::CompactionThresholdSource::ModelAware
+        );
+        assert_eq!(threshold.context_window_tokens, Some(200_000));
         Ok(())
     }
 

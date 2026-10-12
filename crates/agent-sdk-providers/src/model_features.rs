@@ -554,12 +554,21 @@ const MODEL_FEATURES: &[ModelFeatures] = &[
     },
 ];
 
-/// Return the static feature profile for an exact model ID or alias.
+/// Return the static feature profile for a model ID or alias.
+///
+/// An exact ID wins, ignoring case; another snapshot spelling otherwise
+/// resolves the same way [`get_model_capabilities`](crate::get_model_capabilities)
+/// does. Profiles are keyed by model ID alone.
 #[must_use]
 pub fn get_model_features(model_id: &str) -> Option<&'static ModelFeatures> {
     MODEL_FEATURES
         .iter()
-        .find(|features| features.model_id == model_id)
+        .find(|features| features.model_id.eq_ignore_ascii_case(model_id))
+        .or_else(|| {
+            MODEL_FEATURES.iter().find(|features| {
+                crate::model_capabilities::snapshot_resolves_to(model_id, features.model_id)
+            })
+        })
 }
 
 /// Return all model feature profiles bundled with this SDK release.
@@ -768,5 +777,18 @@ mod tests {
                     .all(|candidate| candidate.model_id != features.model_id)
             );
         }
+    }
+
+    #[test]
+    fn snapshot_spellings_resolve_like_capabilities() {
+        for spelling in ["GPT-5.6-SOL", "gpt-5.6-sol-latest"] {
+            let resolved = get_model_features(spelling).map(|features| features.model_id);
+            assert_eq!(resolved, Some("gpt-5.6-sol"), "{spelling}");
+        }
+        assert!(
+            get_model_features("gpt-5.6-sol-2026-05-01").is_none(),
+            "an unlisted dated snapshot may differ from the undated profile"
+        );
+        assert!(get_model_features("gpt-5.6-sol-2026-13-01").is_none());
     }
 }

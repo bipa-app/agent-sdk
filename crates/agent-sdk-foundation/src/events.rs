@@ -118,6 +118,73 @@ pub enum CompactionEngine {
     Snapcompact,
 }
 
+/// How the occupancy that crossed a compaction threshold was obtained.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OccupancySource {
+    /// The provider's input-token count for the latest request with the
+    /// same system prompt and tools, plus an estimate of what was appended
+    /// since.
+    Measured,
+    /// A character-count estimate of the history alone.
+    Estimated,
+    /// A source introduced by a newer producer.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Where a compaction threshold came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThresholdSource {
+    /// The serving model's context window less the output reserve.
+    ModelAware,
+    /// The host's fixed threshold; the host did not ask for a model-aware one.
+    Fixed,
+    /// The host's fixed threshold, because the serving model's context
+    /// window is unknown.
+    FixedUnknownModel,
+    /// The host's fixed threshold, because the output reserve fills the
+    /// serving model's whole context window.
+    FixedInvalidModelWindow,
+    /// A source introduced by a newer producer.
+    #[serde(other)]
+    Unknown,
+}
+
+impl ThresholdSource {
+    /// Stable `snake_case` name, as serialized.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ModelAware => "model_aware",
+            Self::Fixed => "fixed",
+            Self::FixedUnknownModel => "fixed_unknown_model",
+            Self::FixedInvalidModelWindow => "fixed_invalid_model_window",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// The request occupancy that crossed a compaction threshold: the system
+/// prompt, tools and history of the request about to be sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionOccupancy {
+    pub tokens: usize,
+    pub source: OccupancySource,
+}
+
+/// The threshold a compaction trigger compared the occupancy against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionThreshold {
+    pub tokens: usize,
+    pub source: ThresholdSource,
+    /// Context window the threshold was derived from; `None` when it is
+    /// unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_tokens: Option<usize>,
+}
+
 /// Decodes an optional event field, mapping values this build does not know
 /// to `None` so journal rows from newer producers stay readable.
 fn known_or_none<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
@@ -520,6 +587,24 @@ pub enum AgentEvent {
             deserialize_with = "known_or_none"
         )]
         engine: Option<CompactionEngine>,
+        /// Occupancy that crossed the threshold. `None` when no occupancy
+        /// was compared (an overflow or a user request) and on events
+        /// journaled before it was recorded. Unlike `original_tokens`, it
+        /// counts the system prompt and tools as well as the history.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "known_or_none"
+        )]
+        occupancy: Option<CompactionOccupancy>,
+        /// Threshold the trigger compared against. `None` for custom
+        /// compactors and events journaled before it was recorded.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "known_or_none"
+        )]
+        threshold: Option<CompactionThreshold>,
     },
 
     /// Progress update from a running subagent
@@ -949,6 +1034,8 @@ impl AgentEvent {
             new_tokens,
             trigger: Some(trigger),
             engine,
+            occupancy: None,
+            threshold: None,
         }
     }
 }
@@ -1547,6 +1634,98 @@ mod tests {
     }
 
     #[test]
+    fn context_compacted_records_occupancy_and_threshold() -> serde_json::Result<()> {
+        let event = AgentEvent::ContextCompacted {
+            original_count: 21,
+            new_count: 21,
+            original_tokens: 28_379,
+            new_tokens: 15_000,
+            trigger: Some(CompactionTrigger::Threshold),
+            engine: Some(CompactionEngine::PruneFirst),
+            occupancy: Some(CompactionOccupancy {
+                tokens: 83_414,
+                source: OccupancySource::Measured,
+            }),
+            threshold: Some(CompactionThreshold {
+                tokens: 136_000,
+                source: ThresholdSource::ModelAware,
+                context_window_tokens: Some(200_000),
+            }),
+        };
+        let encoded = serde_json::to_value(&event)?;
+        assert_eq!(
+            encoded["occupancy"],
+            serde_json::json!({"tokens": 83_414, "source": "measured"})
+        );
+        assert_eq!(
+            encoded["threshold"],
+            serde_json::json!({
+                "tokens": 136_000,
+                "source": "model_aware",
+                "context_window_tokens": 200_000,
+            })
+        );
+        let restored: AgentEvent = serde_json::from_value(encoded)?;
+        assert_eq!(
+            serde_json::to_value(&restored)?,
+            serde_json::to_value(&event)?
+        );
+
+        let future: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "context_compacted",
+            "original_count": 21,
+            "new_count": 12,
+            "original_tokens": 28_379,
+            "new_tokens": 1_514,
+            "occupancy": {"tokens": 83_414, "source": "provider_counted", "margin": 3},
+            "threshold": {"tokens": 80_000, "source": "operator_pinned"},
+        }))?;
+        assert!(
+            matches!(
+                future,
+                AgentEvent::ContextCompacted {
+                    occupancy: Some(CompactionOccupancy {
+                        tokens: 83_414,
+                        source: OccupancySource::Unknown,
+                    }),
+                    threshold: Some(CompactionThreshold {
+                        tokens: 80_000,
+                        source: ThresholdSource::Unknown,
+                        context_window_tokens: None,
+                    }),
+                    ..
+                }
+            ),
+            "{future:?}"
+        );
+
+        let legacy: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "context_compacted",
+            "original_count": 21,
+            "new_count": 12,
+            "original_tokens": 28_379,
+            "new_tokens": 1_514,
+            "trigger": "threshold",
+            "engine": "prune_first",
+        }))?;
+        assert!(
+            matches!(
+                legacy,
+                AgentEvent::ContextCompacted {
+                    occupancy: None,
+                    threshold: None,
+                    ..
+                }
+            ),
+            "{legacy:?}"
+        );
+        let reencoded = serde_json::to_value(&legacy)?;
+        assert!(reencoded.get("occupancy").is_none());
+        assert!(reencoded.get("threshold").is_none());
+        Ok(())
+    }
+
+    #[test]
     fn terminal_reason_round_trips_provider_kind_and_accepts_future_variants()
     -> serde_json::Result<()> {
         let provider = TerminalReason::ProviderError {
@@ -1841,6 +2020,15 @@ mod tests {
                 new_tokens: 50,
                 trigger: Some(CompactionTrigger::Overflow),
                 engine: Some(CompactionEngine::PruneFirst),
+                occupancy: Some(CompactionOccupancy {
+                    tokens: 83_414,
+                    source: OccupancySource::Measured,
+                }),
+                threshold: Some(CompactionThreshold {
+                    tokens: 80_000,
+                    source: ThresholdSource::FixedUnknownModel,
+                    context_window_tokens: None,
+                }),
             },
             AgentEvent::SubagentProgress {
                 subagent_id: "s".into(),

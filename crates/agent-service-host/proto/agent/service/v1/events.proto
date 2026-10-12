@@ -359,13 +359,60 @@ enum CompactionEngine {
   COMPACTION_ENGINE_SNAPCOMPACT = 3;
 }
 
+// How the occupancy that crossed a compaction threshold was obtained.
+// UNSPECIFIED for a source this build does not know.
+enum CompactionOccupancySource {
+  COMPACTION_OCCUPANCY_SOURCE_UNSPECIFIED = 0;
+  // The provider's input-token count for the latest request with the same
+  // system prompt and tools, plus an estimate of what was appended since.
+  COMPACTION_OCCUPANCY_SOURCE_MEASURED = 1;
+  // A character-count estimate of the history alone.
+  COMPACTION_OCCUPANCY_SOURCE_ESTIMATED = 2;
+}
+
+// Where a compaction threshold came from. UNSPECIFIED for a source this
+// build does not know.
+enum CompactionThresholdSource {
+  COMPACTION_THRESHOLD_SOURCE_UNSPECIFIED = 0;
+  // The serving model's context window less the output reserve.
+  COMPACTION_THRESHOLD_SOURCE_MODEL_AWARE = 1;
+  // The host's fixed threshold; the host did not ask for a model-aware one.
+  COMPACTION_THRESHOLD_SOURCE_FIXED = 2;
+  // The host's fixed threshold, because the serving model's context window
+  // is unknown.
+  COMPACTION_THRESHOLD_SOURCE_FIXED_UNKNOWN_MODEL = 3;
+  // The host's fixed threshold, because the output reserve fills the
+  // serving model's whole context window.
+  COMPACTION_THRESHOLD_SOURCE_FIXED_INVALID_MODEL_WINDOW = 4;
+}
+
+// The request occupancy (system prompt, tools and history) that crossed a
+// compaction threshold.
+message CompactionOccupancy {
+  uint64 tokens = 1;
+  CompactionOccupancySource source = 2;
+}
+
+message CompactionThreshold {
+  uint64 tokens = 1;
+  CompactionThresholdSource source = 2;
+  // Context window the threshold was derived from; absent when unknown.
+  optional uint64 context_window_tokens = 3;
+}
+
 message ContextCompactedEvent {
   uint64 original_count = 1;
   uint64 new_count = 2;
+  // Estimates of the history alone, before and after.
   uint64 original_tokens = 3;
   uint64 new_tokens = 4;
   CompactionTrigger trigger = 5;
   CompactionEngine engine = 6;
+  // Absent when no occupancy was compared (an overflow or a user request)
+  // and from older producers.
+  CompactionOccupancy occupancy = 7;
+  // Absent for custom compactors and from older producers.
+  CompactionThreshold threshold = 8;
 }
 
 message SubagentProgressEvent {

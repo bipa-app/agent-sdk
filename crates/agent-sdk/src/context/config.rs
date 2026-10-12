@@ -25,6 +25,16 @@ pub const DEFAULT_SUMMARY_MAX_TOKENS: usize = 4_096;
 /// `max_tokens` a call requests.
 pub const DEFAULT_MODEL_CONTEXT_RESERVE_TOKENS: usize = 16_384;
 
+/// Occupancy a threshold-triggered compaction aims for: a tenth below the
+/// threshold, so the requests right after it do not cross the threshold
+/// again at once.
+#[must_use]
+pub const fn compaction_target_tokens(threshold_tokens: usize) -> usize {
+    threshold_tokens - threshold_tokens / COMPACTION_HEADROOM_DIVISOR
+}
+
+const COMPACTION_HEADROOM_DIVISOR: usize = 10;
+
 const fn default_max_retained_tail_tokens() -> usize {
     DEFAULT_MAX_RETAINED_TAIL_TOKENS
 }

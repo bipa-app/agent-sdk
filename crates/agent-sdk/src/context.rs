@@ -41,5 +41,8 @@ pub use compactor::{
     CompactionPurpose, CompactionResult, ContextCompactor, FailedCompaction, LlmContextCompactor,
     NoProgressCompaction, PublishedArtifacts, SnapcompactResourceLimit, SummarizationEmpty,
 };
-pub use config::{CompactionConfig, CompactionEngine, DEFAULT_MODEL_CONTEXT_RESERVE_TOKENS};
+pub use config::{
+    CompactionConfig, CompactionEngine, DEFAULT_MODEL_CONTEXT_RESERVE_TOKENS,
+    compaction_target_tokens,
+};
 pub use estimator::TokenEstimator;
