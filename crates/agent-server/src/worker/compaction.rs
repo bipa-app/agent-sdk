@@ -1524,6 +1524,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn in_tree_wrappers_size_output_from_the_same_row_as_the_threshold() {
+        use agent_sdk_providers::{FallbackProvider, ModelRouter, RefreshingProvider};
+
+        let cfg = CompactionConfig::default()
+            .with_model_aware_threshold(true)
+            .with_threshold_tokens(80_000);
+        let glm = openrouter("z-ai/glm-5.1");
+        let template = glm.clone();
+        let refreshing = RefreshingProvider::new(glm.clone(), move || {
+            let provider = template.clone();
+            async move { Ok(provider) }
+        });
+        let failover = FallbackProvider::new(Arc::new(glm.clone()));
+        let model_router = ModelRouter::new(
+            openrouter("mock-classifier"),
+            openrouter("mock-fast"),
+            glm,
+            openrouter("mock-advanced"),
+        );
+        assert_eq!(failover.model(), "z-ai/glm-5.1");
+        assert_eq!(LlmProvider::model(&model_router), "z-ai/glm-5.1");
+        let budget =
+            |provider: &dyn LlmProvider| worker_budget(&cfg, provider, ROOT_REQUESTED_MAX_TOKENS);
+        assert_eq!(
+            budget(&refreshing),
+            (202_752 / 4, (202_752 - 202_752 / 4, "model_aware")),
+            "refreshing",
+        );
+        assert_eq!(
+            budget(&failover),
+            (ROOT_REQUESTED_MAX_TOKENS, (80_000, "fixed_unknown_model")),
+            "failover",
+        );
+        assert_eq!(
+            budget(&model_router),
+            (ROOT_REQUESTED_MAX_TOKENS, (80_000, "fixed_unknown_model")),
+            "router",
+        );
+    }
+
     fn anchor_time() -> anyhow::Result<OffsetDateTime> {
         OffsetDateTime::from_unix_timestamp(1_700_000_000).map_err(anyhow::Error::from)
     }

@@ -10123,6 +10123,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn envelope_sizes_output_only_on_a_stable_route() {
+        let definition = AgentDefinition {
+            max_tokens: 128_000,
+            ..context_definition(None)
+        };
+        let glm =
+            OpenAIProvider::with_base_url("key", "z-ai/glm-5.1", "https://openrouter.ai/api/v1");
+        let template = glm.clone();
+        let refreshing = agent_sdk_providers::RefreshingProvider::new(glm.clone(), move || {
+            let provider = template.clone();
+            async move { Ok(provider) }
+        });
+        let failover = agent_sdk_providers::FallbackProvider::new(std::sync::Arc::new(glm));
+
+        assert_eq!(
+            build_request_envelope(&definition, &refreshing, None).max_tokens,
+            202_752 / 4,
+        );
+        assert_eq!(failover.model(), "z-ai/glm-5.1");
+        assert_eq!(
+            build_request_envelope(&definition, &failover, None).max_tokens,
+            128_000,
+            "a failover chain may be served by a model its representative row \
+             does not describe",
+        );
+    }
+
     fn identity_continuation(
         thread_id: &agent_sdk_foundation::ThreadId,
         ids: &[&str],
