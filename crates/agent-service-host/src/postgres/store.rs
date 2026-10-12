@@ -67,9 +67,10 @@ use agent_server::journal::store::{
     SubagentInvocationSpawn, SubmitDisposition, SubmitRootIdempotency, SubmitRootTurnError,
     SubmitRootTurnOutcome, SubmitRootTurnParams, apply_question_answer, apply_question_pause,
     has_precompleted_tool_child, live_mixed_child_count, mixed_child_ids_in_slot_order,
-    new_mixed_tool_child, publish_transactional_mixed_parent, submitted_task_disposition,
-    validate_mixed_children_spawn, validate_precompleted_boundary_events,
-    validate_subagent_event_count, validate_tool_child_specs_for_pure_spawn,
+    new_mixed_tool_child, publish_transactional_mixed_parent, release_undelivered_input,
+    settles_undelivered_input, submitted_task_disposition, validate_mixed_children_spawn,
+    validate_precompleted_boundary_events, validate_subagent_event_count,
+    validate_tool_child_specs_for_pure_spawn,
 };
 use agent_server::journal::subagent_spawn_transaction::{
     AtomicSubagentSpawnCommitter, SubagentSpawnCommit, SubagentSpawnEvent, SubagentSpawnOutcome,
@@ -1717,7 +1718,9 @@ WHERE parent_id = $1
             // next queued root in the same transaction so a sweep-failed
             // root never strands its queued successors.
             if child.kind == TaskKind::RootTurn && child.is_root() {
-                Self::resume_linked_subagent_invocation_tx(tx, &child.id, now).await?;
+                let resumed =
+                    Self::resume_linked_subagent_invocation_tx(tx, &child.id, now).await?;
+                Self::release_undelivered_input_tx(tx, child, resumed.is_some(), now).await?;
                 Self::promote_next_queued_root_tx(tx, &child.thread_id, now).await?;
             }
             return Ok(());
@@ -1916,6 +1919,7 @@ WHERE parent_id = $1
             // true }` event never fires.
             let resumed =
                 Self::resume_linked_subagent_invocation_tx(tx, &new_child.id, now).await?;
+            Self::release_undelivered_input_tx(tx, &new_child, resumed.is_some(), now).await?;
             // Crash-safe queued-root promotion: a terminal root frees the
             // thread's active-root slot, so promote the FIFO head in the
             // SAME transaction rather than relying solely on the host's
@@ -1927,6 +1931,58 @@ WHERE parent_id = $1
         };
 
         Ok((new_child, parent))
+    }
+
+    /// Settle the input injections `root` never delivered, inside the
+    /// transaction that ended it and before its thread's queue head is
+    /// promoted (see [`release_undelivered_input`]). The thread row is
+    /// locked so a concurrent purge fence cannot slip between the check and
+    /// the admission.
+    async fn release_undelivered_input_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        root: &AgentTask,
+        child_thread_root: bool,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        if !settles_undelivered_input(root) {
+            return Ok(());
+        }
+        let records = sqlx::query_as::<_, TaskRecord>(
+            r"
+SELECT
+    id, kind, status, parent_id, root_id, depth, thread_id,
+    submitted_input_json, caller_metadata_json, worker_id, lease_id,
+    lease_expires_at, last_heartbeat_at, state_json, attempt, max_attempts,
+    last_error, terminal_reason_json, pending_child_count, spawn_index, result_payload,
+    otel_traceparent, created_at, updated_at, completed_at, last_activity_at
+FROM agent_sdk_tasks
+WHERE parent_id = $1 AND kind = 'input_injection' AND status = 'queued'
+ORDER BY created_at, id
+FOR UPDATE
+",
+        )
+        .bind(root.id.as_str())
+        .fetch_all(&mut **tx)
+        .await
+        .with_context(|| format!("load undelivered input of {}", root.id))?;
+        if records.is_empty() {
+            return Ok(());
+        }
+        let thread_open = Self::lock_thread_tx(tx, &root.thread_id)
+            .await?
+            .is_none_or(|thread| thread.require_active(ThreadOperation::Submit).is_ok());
+        for record in records {
+            let released = release_undelivered_input(
+                AgentTask::try_from(record)?,
+                !child_thread_root && thread_open,
+                now,
+            )?;
+            Self::update_task_tx(tx, &released.injection).await?;
+            if let Some(next_turn) = &released.next_turn {
+                Self::insert_task_tx(tx, next_turn).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Phase 7.6: find a `Subagent` invocation task that is

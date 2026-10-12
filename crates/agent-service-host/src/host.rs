@@ -9253,7 +9253,6 @@ mod tests {
         fail_task_failures_remaining: AtomicUsize,
         fail_task_attempts: AtomicUsize,
         heartbeat_rejections_remaining: AtomicUsize,
-        injection_completion_failures_remaining: AtomicUsize,
         /// When non-zero, `list_children` (the subtree probe's expansion
         /// call) sleeps this many milliseconds before delegating, and fires
         /// `probe_started` as it begins — so a test can prove the heartbeat
@@ -9277,7 +9276,6 @@ mod tests {
                 fail_task_failures_remaining: AtomicUsize::new(0),
                 fail_task_attempts: AtomicUsize::new(0),
                 heartbeat_rejections_remaining: AtomicUsize::new(0),
-                injection_completion_failures_remaining: AtomicUsize::new(0),
                 list_children_stall_ms: AtomicUsize::new(0),
                 probe_started: Arc::new(tokio::sync::Notify::new()),
                 fail_task_now: Arc::new(std::sync::Mutex::new(None)),
@@ -9316,12 +9314,6 @@ mod tests {
 
         fn failing_finds(self, count: usize) -> Self {
             self.find_failures_remaining.store(count, Ordering::SeqCst);
-            self
-        }
-
-        fn failing_injection_completions(self, count: usize) -> Self {
-            self.injection_completion_failures_remaining
-                .store(count, Ordering::SeqCst);
             self
         }
 
@@ -9423,9 +9415,6 @@ mod tests {
             id: &AgentTaskId,
             now: time::OffsetDateTime,
         ) -> Result<Option<AgentTask>> {
-            if Self::take_injected_failure(&self.injection_completion_failures_remaining) {
-                bail!("injected transient injection completion failure");
-            }
             self.inner.complete_input_injection(id, now).await
         }
         async fn list_by_status(&self, status: TaskStatus) -> Result<Vec<AgentTask>> {

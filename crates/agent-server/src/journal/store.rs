@@ -904,6 +904,80 @@ pub const fn resolve_injection_parent(
     }
 }
 
+/// Whether `root`'s terminal transition settles its undelivered input.
+///
+/// True once a root turn completed or failed. A cancelled root's input is
+/// cancelled with the rest of its tree by the cancel itself.
+#[must_use]
+pub const fn settles_undelivered_input(root: &AgentTask) -> bool {
+    match root.status {
+        TaskStatus::Completed | TaskStatus::Failed => root.kind.is_root() && root.is_root(),
+        TaskStatus::Cancelled
+        | TaskStatus::Queued
+        | TaskStatus::Pending
+        | TaskStatus::Running
+        | TaskStatus::WaitingOnChildren
+        | TaskStatus::AwaitingConfirmation
+        | TaskStatus::AwaitingQuestion => false,
+    }
+}
+
+/// The rows one undelivered input injection of an ended root becomes.
+#[derive(Debug)]
+pub struct ReleasedInput {
+    /// The injection, completed when handed over, otherwise cancelled.
+    pub injection: AgentTask,
+    /// The thread's next turn carrying the input, when handed over.
+    pub next_turn: Option<AgentTask>,
+}
+
+/// Settle one undelivered input injection of a root that just completed or
+/// failed (see [`settles_undelivered_input`]).
+///
+/// Under a top-level root on a thread still open to submissions
+/// (`hand_over`), the input becomes the thread's next turn and the injection
+/// completes as handed over. Under a child-thread root it is cancelled with
+/// the root's tree: nothing awaits a later turn on a subagent's thread, so a
+/// turn there would run unowned beside the parent. On a thread being purged
+/// it is cancelled too.
+///
+/// Every backend applies this inside the root's terminal transition, before
+/// the thread's next queued root is promoted, so the handed-over turn takes
+/// its place in the queue by its submission time and no terminal root is
+/// left holding live input. Input that cannot become a turn is cancelled
+/// rather than blocking the transition.
+///
+/// # Errors
+/// Returns an error if `injection` is not a queued input injection.
+pub fn release_undelivered_input(
+    injection: AgentTask,
+    hand_over: bool,
+    now: OffsetDateTime,
+) -> Result<ReleasedInput> {
+    if hand_over {
+        match injection.next_turn_from_undelivered_input() {
+            Ok(next_turn) => {
+                return Ok(ReleasedInput {
+                    injection: injection
+                        .complete_input_injection(now)
+                        .context("hand over undelivered input")?,
+                    next_turn: Some(next_turn),
+                });
+            }
+            Err(error) => log::warn!(
+                "cancelling undelivered input {}: it cannot become the next turn: {error}",
+                injection.id,
+            ),
+        }
+    }
+    Ok(ReleasedInput {
+        injection: injection
+            .cancel_with_reason(TerminalReason::ParentCancelled, now)
+            .context("cancel undelivered input")?,
+        next_turn: None,
+    })
+}
+
 /// Shared shape gate for root-turn admission.
 ///
 /// Both [`AgentTaskStore::submit_root_turn`] and
@@ -1488,6 +1562,14 @@ pub fn apply_question_answer(
 /// | [`reject_confirmation`](Self::reject_confirmation) | `AwaitingConfirmation` → `Failed` + parent recompute | status CAS |
 /// | [`cancel_tree`](Self::cancel_tree) | subtree → `Cancelled` | existence check |
 /// | [`release_expired_leases`](Self::release_expired_leases) | `Running` → `Pending` / `Failed` | lease-expiry CAS, recovery matrix |
+///
+/// ## A root's undelivered input
+///
+/// Every transition that ends a root turn as `Completed` or `Failed` —
+/// owner CAS or store-side fail-close — settles the input injections it
+/// never delivered in the same atomic step, before the thread's next
+/// queued root is promoted (see [`release_undelivered_input`]). No
+/// terminal root is ever left holding live input.
 
 #[async_trait]
 pub trait AgentTaskStore: Send + Sync {
@@ -4048,11 +4130,51 @@ impl Inner {
             // (`cancel_row_in_place`) — not only the host's post-commit
             // promotion path. Promotion is idempotent, so the host's
             // later `promote_next_queued_root` becomes a no-op.
+            let resumed = self.resume_linked_subagent_invocation(new_child, now, error_prefix)?;
+            self.release_undelivered_input_locked(new_child, resumed.is_some(), now)?;
             let _promoted = self.promote_next_queued_root_locked(&new_child.thread_id, now)?;
-            self.resume_linked_subagent_invocation(new_child, now, error_prefix)
+            Ok(resumed)
         } else {
             Ok(None)
         }
+    }
+
+    /// Apply [`release_undelivered_input`] to every queued injection of the
+    /// just-ended `root`, oldest first, before its thread's queue head is
+    /// promoted. The in-memory store sees no thread lifecycle here, so it
+    /// treats the thread as open.
+    fn release_undelivered_input_locked(
+        &mut self,
+        root: &AgentTask,
+        child_thread_root: bool,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        if !settles_undelivered_input(root) {
+            return Ok(());
+        }
+        let mut undelivered: Vec<AgentTask> = self
+            .by_parent
+            .get(&root.id)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.by_id.get(id))
+            .filter(|child| {
+                child.kind == TaskKind::InputInjection && child.status == TaskStatus::Queued
+            })
+            .cloned()
+            .collect();
+        undelivered.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        for old in undelivered {
+            let released = release_undelivered_input(old.clone(), !child_thread_root, now)?;
+            self.rebalance_after_row_change(&old, &released.injection);
+            self.by_id
+                .insert(released.injection.id.clone(), released.injection);
+            if let Some(next_turn) = released.next_turn {
+                self.add_to_indexes(&next_turn);
+                self.by_id.insert(next_turn.id.clone(), next_turn);
+            }
+        }
+        Ok(())
     }
 
     fn resume_linked_subagent_invocation(

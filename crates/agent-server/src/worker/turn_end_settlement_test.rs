@@ -1,6 +1,7 @@
 //! A root turn that ends while descendants are still live settles them:
-//! nothing is left waiting on a fan-in that can never run again, and input
-//! the turn never delivered becomes the thread's next turn.
+//! nothing is left waiting on a fan-in that can never run again. Input the
+//! turn never delivered becomes the thread's next turn, in submission order,
+//! unless the turn was a subagent's, whose input dies with it.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -408,7 +409,7 @@ async fn assert_readmitted(
 }
 
 #[tokio::test]
-async fn settling_a_completed_root_readmits_its_undelivered_injection() -> Result<()> {
+async fn completing_a_root_readmits_its_undelivered_injection() -> Result<()> {
     let stores = Stores::new();
     let thread = ThreadId::from_string("settle-late-injection");
     let (root, worker, lease) = running_root(&stores, &thread).await?;
@@ -418,8 +419,6 @@ async fn settling_a_completed_root_readmits_its_undelivered_injection() -> Resul
         .complete_task(&root.id, &worker, &lease, t_plus(3))
         .await?;
 
-    let settled = settle_live_descendants(&root.id, &stores.deps(), t_plus(10)).await?;
-    assert_eq!(settled, vec![injection.id.clone()]);
     assert_readmitted(&stores, &thread, &root.id, &injection).await?;
     assert_eq!(
         status_of(&stores, &root.id).await?.status,
@@ -427,8 +426,8 @@ async fn settling_a_completed_root_readmits_its_undelivered_injection() -> Resul
         "the ended root keeps its outcome",
     );
 
-    let again = settle_live_descendants(&root.id, &stores.deps(), t_plus(20)).await?;
-    assert!(again.is_empty(), "settlement is idempotent: {again:?}");
+    let settled = settle_live_descendants(&root.id, &stores.deps(), t_plus(10)).await?;
+    assert!(settled.is_empty(), "nothing is left to settle: {settled:?}");
     assert_eq!(root_turns(&stores, &thread).await?.len(), 2);
     Ok(())
 }
@@ -452,4 +451,141 @@ async fn failed_root_turn_readmits_its_undelivered_injection() -> Result<()> {
     .await?;
 
     assert_readmitted(&stores, &thread, &root.id, &injection).await
+}
+
+/// Input injected into the failing turn runs before input submitted after
+/// it as the next turn, even when that later submission was already queued
+/// behind the turn when it failed.
+#[tokio::test]
+async fn failed_root_turn_readmits_its_input_ahead_of_a_later_submission() -> Result<()> {
+    let stores = Stores::new();
+    let thread = ThreadId::from_string("fail-injection-before-successor");
+    let (root, worker, lease) = running_root(&stores, &thread).await?;
+    let injection = inject(&stores, &thread, "also check the tests", 2).await?;
+    let successor = stores
+        .tasks
+        .submit_root_turn(AgentTask::new_root_turn(thread.clone(), t_plus(3), 3))
+        .await?;
+    assert_eq!(successor.status, TaskStatus::Queued);
+
+    fail_root_turn(
+        &root.id,
+        &worker,
+        &lease,
+        &thread,
+        &anyhow::anyhow!("provider refused"),
+        &stores.deps(),
+        t_plus(10),
+    )
+    .await?;
+
+    let turns = root_turns(&stores, &thread).await?;
+    let readmitted = turns
+        .iter()
+        .find(|turn| turn.id != root.id && turn.id != successor.id)
+        .context("the injected input must become a turn")?;
+    assert_eq!(readmitted.created_at, injection.created_at);
+    assert_eq!(
+        readmitted.status,
+        TaskStatus::Pending,
+        "the earlier input takes the freed slot",
+    );
+    assert_eq!(
+        status_of(&stores, &successor.id).await?.status,
+        TaskStatus::Queued,
+        "the later submission waits behind it",
+    );
+    Ok(())
+}
+
+/// A subagent's thread whose root ends with input still undelivered: the
+/// subagent's invocation takes the outcome, and the input dies with the
+/// root instead of starting a turn nobody awaits beside the parent.
+async fn assert_child_thread_input_dies_with_its_root(
+    end: impl AsyncFnOnce(&Stores, &AgentTask, WorkerId, LeaseId) -> Result<()>,
+) -> Result<()> {
+    let stores = Stores::new();
+    let thread = ThreadId::from_string("child-root-injection-parent");
+    let child_thread = ThreadId::from_string("child-root-injection-child");
+    stores
+        .threads
+        .get_or_create(&child_thread, t_plus(0))
+        .await?;
+    let (root, worker, lease) = running_root(&stores, &thread).await?;
+    let (_, invocation, child_root) = stores
+        .tasks
+        .spawn_subagent_invocation(
+            &root.id,
+            &worker,
+            &lease,
+            SubagentInvocationSpawn {
+                child_thread_id: child_thread.clone(),
+                spec: spec(),
+                child_root_input: vec![SubmittedInputItem::Text {
+                    text: "Inspect".into(),
+                }],
+                spawn_index: 0,
+                child_caller_metadata: None,
+                payload: payload(&thread),
+            },
+            Vec::new(),
+            t_plus(2),
+        )
+        .await?;
+    let (_, child_worker, child_lease) = acquire(&stores, &child_root.id, 3).await?;
+    let injection = inject(&stores, &child_thread, "look at the logs too", 4).await?;
+    assert_eq!(injection.parent_id.as_ref(), Some(&child_root.id));
+
+    end(&stores, &child_root, child_worker, child_lease).await?;
+    let settled = settle_live_descendants(&child_root.id, &stores.deps(), t_plus(20)).await?;
+
+    let child_turns = root_turns(&stores, &child_thread).await?;
+    assert_eq!(
+        child_turns.iter().map(|turn| &turn.id).collect::<Vec<_>>(),
+        vec![&child_root.id],
+        "no turn may start on the subagent's thread: {child_turns:?}",
+    );
+    let discarded = status_of(&stores, &injection.id).await?;
+    assert_eq!(discarded.status, TaskStatus::Cancelled);
+    assert_eq!(
+        discarded.terminal_reason,
+        Some(TerminalReason::ParentCancelled)
+    );
+    assert_eq!(
+        status_of(&stores, &invocation.id).await?.status,
+        TaskStatus::Pending,
+        "the invocation wakes with the child's outcome",
+    );
+    assert!(settled.is_empty(), "nothing is left to settle: {settled:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_child_thread_root_discards_its_undelivered_input() -> Result<()> {
+    assert_child_thread_input_dies_with_its_root(async |stores, child_root, worker, lease| {
+        fail_root_turn(
+            &child_root.id,
+            &worker,
+            &lease,
+            &child_root.thread_id,
+            &anyhow::anyhow!("provider refused"),
+            &stores.deps(),
+            t_plus(10),
+        )
+        .await?;
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn completed_child_thread_root_discards_its_undelivered_input() -> Result<()> {
+    assert_child_thread_input_dies_with_its_root(async |stores, child_root, worker, lease| {
+        stores
+            .tasks
+            .complete_task(&child_root.id, &worker, &lease, t_plus(10))
+            .await?;
+        Ok(())
+    })
+    .await
 }

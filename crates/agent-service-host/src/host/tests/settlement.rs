@@ -1,9 +1,6 @@
 //! The host settles the live descendants of a terminal root: once at
 //! startup, finishing whatever a previous process left half-done, and on
-//! every sweep tick, right after expired leases are failed closed. Input a
-//! finished turn never delivered becomes the thread's next turn.
-
-use std::sync::Arc;
+//! every sweep tick, right after expired leases are failed closed.
 
 use anyhow::{Context, Result};
 use time::OffsetDateTime;
@@ -13,10 +10,8 @@ use agent_sdk_foundation::{
     AgentContinuation, AgentState, ContinuationEnvelope, TerminalReason, ThreadId, TokenUsage, llm,
 };
 use agent_server::ChildJoinPolicy;
-use agent_server::journal::store::{AgentTaskStore, SubmitDisposition, SubmitRootTurnParams};
 use agent_server::journal::task::{
-    AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, SuspensionPayload,
-    TaskKind, TaskStatus, WorkerId,
+    AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskStatus, WorkerId,
 };
 
 use crate::config::{ServiceConfig, WorkerConfig};
@@ -24,8 +19,6 @@ use crate::config::{ServiceConfig, WorkerConfig};
 use crate::config::{StorageBackend, StorageConfig};
 use crate::host::{ServiceHost, settle_orphaned_descendants};
 use crate::stores::StoreRegistry;
-
-use super::FlakyTaskStore;
 
 fn payload(thread: &ThreadId) -> SuspensionPayload {
     SuspensionPayload {
@@ -333,134 +326,4 @@ async fn host_startup_settles_orphans_left_by_a_previous_process() -> Result<()>
     assert_children_settled(&stores, &tree).await?;
     assert_eq!(task(&stores, &tree.root).await?.status, TaskStatus::Failed);
     Ok(())
-}
-
-/// A turn that completed while input submitted into it was still waiting
-/// for a boundary: the input arrived after the turn's last one.
-async fn complete_root_over_late_injection(
-    stores: &StoreRegistry,
-    thread: &ThreadId,
-) -> Result<(AgentTaskId, AgentTask)> {
-    let now = OffsetDateTime::now_utc();
-    let root = AgentTask::new_root_turn(thread.clone(), now, 3);
-    stores.task_store.submit_root_turn(root.clone()).await?;
-    let worker = WorkerId::new();
-    let lease = LeaseId::new();
-    stores
-        .task_store
-        .try_acquire_task(
-            &root.id,
-            worker.clone(),
-            lease.clone(),
-            now + time::Duration::hours(1),
-            now,
-        )
-        .await?
-        .context("root must acquire")?;
-    let injection = stores
-        .task_store
-        .submit_root_turn_idempotent(SubmitRootTurnParams {
-            task: AgentTask::new_root_turn_with_input(
-                thread.clone(),
-                vec![SubmittedInputItem::Text {
-                    text: "also check the tests".into(),
-                }],
-                now,
-                3,
-            ),
-            idempotency: None,
-            max_queued_depth: None,
-            disposition: SubmitDisposition::InjectAtBoundary,
-        })
-        .await
-        .map_err(|error| anyhow::anyhow!("{error}"))?
-        .task;
-    assert_eq!(injection.kind, TaskKind::InputInjection);
-    stores
-        .task_store
-        .complete_task(&root.id, &worker, &lease, now)
-        .await?;
-    Ok((root.id, injection))
-}
-
-async fn next_turns(
-    stores: &StoreRegistry,
-    thread: &ThreadId,
-    ended_root: &AgentTaskId,
-) -> Result<Vec<AgentTask>> {
-    Ok(stores
-        .task_store
-        .list_by_thread(thread)
-        .await?
-        .into_iter()
-        .filter(|task| task.kind == TaskKind::RootTurn && task.id != *ended_root)
-        .collect())
-}
-
-/// A crash between admitting the next turn and handing the injection over
-/// is retried on the next pass without admitting the input twice.
-async fn assert_late_injection_becomes_one_next_turn(stores: StoreRegistry) -> Result<()> {
-    let thread = ThreadId::from_string("t-late-injection");
-    let (root, injection) = complete_root_over_late_injection(&stores, &thread).await?;
-
-    let mut crashing = stores.clone();
-    crashing.task_store = Arc::new(
-        FlakyTaskStore::new(Arc::clone(&stores.task_store)).failing_injection_completions(1),
-    ) as Arc<dyn AgentTaskStore>;
-    let settled = settle_orphaned_descendants(&crashing, OffsetDateTime::now_utc()).await?;
-    assert_eq!(settled, 0, "the interrupted hand-over settles nothing");
-    assert_eq!(
-        task(&stores, &injection.id).await?.status,
-        TaskStatus::Queued,
-        "the input is neither dropped nor marked handed over",
-    );
-    assert_eq!(next_turns(&stores, &thread, &root).await?.len(), 1);
-
-    let settled = settle_orphaned_descendants(&crashing, OffsetDateTime::now_utc()).await?;
-    assert_eq!(settled, 1);
-    let next = next_turns(&stores, &thread, &root).await?;
-    assert_eq!(next.len(), 1, "the retry must not admit the input twice");
-    assert_eq!(next[0].status, TaskStatus::Pending);
-    assert_eq!(
-        serde_json::to_value(&next[0].submitted_input)?,
-        serde_json::to_value(&injection.submitted_input)?,
-    );
-    let handed_over = task(&stores, &injection.id).await?;
-    assert_eq!(handed_over.status, TaskStatus::Completed);
-    assert_eq!(handed_over.terminal_reason, Some(TerminalReason::Completed));
-
-    assert_eq!(
-        stores
-            .task_store
-            .list_terminal_roots_with_live_descendants()
-            .await?,
-        Vec::<AgentTaskId>::new(),
-    );
-    assert_eq!(
-        settle_orphaned_descendants(&stores, OffsetDateTime::now_utc()).await?,
-        0,
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn orphan_sweep_readmits_a_late_injection_once_in_memory() -> Result<()> {
-    assert_late_injection_becomes_one_next_turn(StoreRegistry::in_memory(super::sample_registry()))
-        .await
-}
-
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn orphan_sweep_readmits_a_late_injection_once_on_sqlite() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let storage = StorageConfig {
-        backend: StorageBackend::Sqlite {
-            path: Some(dir.path().join("late-injection.db").display().to_string()),
-            max_connections: None,
-        },
-        ..StorageConfig::default()
-    };
-    let stores = StoreRegistry::from_config(&storage, super::sample_registry())?;
-    stores.initialize().await?;
-    assert_late_injection_becomes_one_next_turn(stores).await
 }

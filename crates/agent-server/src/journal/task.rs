@@ -951,6 +951,32 @@ impl AgentTask {
         Ok(self)
     }
 
+    /// The thread's next root turn for this undelivered injection: the same
+    /// input, caller metadata and trace parent, queued at the injection's
+    /// own submission time so the thread's FIFO orders it ahead of anything
+    /// submitted after it.
+    ///
+    /// # Errors
+    /// Returns an invalid-transition error unless this is a queued
+    /// input-injection row.
+    pub fn next_turn_from_undelivered_input(&self) -> Result<Self, TaskSchemaError> {
+        if self.kind != TaskKind::InputInjection || self.status != TaskStatus::Queued {
+            return Err(TaskSchemaError::InvalidTransition {
+                from: self.status,
+                to: TaskStatus::Queued,
+            });
+        }
+        let mut turn = Self::new_root_turn_with_optional_caller(
+            self.thread_id.clone(),
+            self.submitted_input.clone(),
+            self.caller_metadata.clone(),
+            self.created_at,
+            self.max_attempts,
+        );
+        turn.otel_traceparent.clone_from(&self.otel_traceparent);
+        turn.admit_as_queued(self.created_at)
+    }
+
     /// Allocate a fresh child task under `parent`.
     ///
     /// The child inherits `parent.root_id` and `parent.thread_id`, sets

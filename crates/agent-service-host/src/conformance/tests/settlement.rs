@@ -13,6 +13,7 @@ use agent_server::journal::task::{
     WorkerId,
 };
 use agent_server::journal::task_state::TaskState;
+use agent_server::journal::thread::{PurgeScope, PurgeSeed};
 use agent_server::journal::thread_store::ThreadStore;
 
 use super::{
@@ -535,7 +536,9 @@ pub(super) async fn test_approved_confirmation_pickup_keeps_the_paused_attempt(
 #[derive(Clone, Copy, Debug)]
 enum LiveDescendant {
     Tool(LiveChild),
-    UndeliveredInjection,
+    /// Undelivered input under an ended root, as a store from before root
+    /// transitions settled their input could still hold it.
+    StrandedInjection,
     ParkedSubagentInvocation,
 }
 
@@ -555,7 +558,7 @@ const TASK_STATUSES: [TaskStatus; 9] = [
 /// descendant can be in is proven to be found.
 const fn live_descendant_in(status: TaskStatus) -> Option<LiveDescendant> {
     match status {
-        TaskStatus::Queued => Some(LiveDescendant::UndeliveredInjection),
+        TaskStatus::Queued => Some(LiveDescendant::StrandedInjection),
         TaskStatus::Pending => Some(LiveDescendant::Tool(LiveChild::Pending)),
         TaskStatus::Running => Some(LiveDescendant::Tool(LiveChild::RunningLiveLease)),
         TaskStatus::WaitingOnChildren => Some(LiveDescendant::ParkedSubagentInvocation),
@@ -646,12 +649,21 @@ async fn end_root_over(
                 .await?;
             Ok(parked.root.id)
         }
-        LiveDescendant::UndeliveredInjection => {
+        LiveDescendant::StrandedInjection => {
             let (root, worker, lease) = running_root(task_store, tid, at).await?;
-            inject(task_store, tid, "one more thing", at + 5).await?;
-            task_store
+            let (ended, _) = task_store
                 .complete_task(&root.id, &worker, &lease, t_plus(at + 10))
                 .await?;
+            let stranded = AgentTask::new_root_turn_with_input(
+                thread_id(tid),
+                vec![SubmittedInputItem::Text {
+                    text: "one more thing".into(),
+                }],
+                t_plus(at + 5),
+                3,
+            )
+            .into_input_injection(&ended)?;
+            task_store.insert(stranded).await?;
             Ok(root.id)
         }
         LiveDescendant::ParkedSubagentInvocation => {
@@ -738,6 +750,275 @@ pub(super) async fn test_list_terminal_roots_with_live_descendants(
     Ok(())
 }
 
+/// The ways a root turn ends without a cancel.
+#[derive(Clone, Copy, Debug)]
+enum RootEnd {
+    Completed,
+    Failed,
+    /// Its last lease lapsed and the sweep failed it closed.
+    FailedClosed,
+}
+
+const ROOT_ENDS: [RootEnd; 3] = [RootEnd::Completed, RootEnd::Failed, RootEnd::FailedClosed];
+
+/// Lease `id` for one attempt that `end` can finish: a lease that lapses
+/// almost at once for [`RootEnd::FailedClosed`], a long one otherwise.
+async fn lease_for(
+    task_store: &dyn AgentTaskStore,
+    id: &AgentTaskId,
+    end: RootEnd,
+    at: i64,
+) -> Result<(WorkerId, LeaseId)> {
+    let lease_expires_at = match end {
+        RootEnd::Completed | RootEnd::Failed => t_plus(at + 10_000),
+        RootEnd::FailedClosed => t_plus(at + 1),
+    };
+    let worker = WorkerId::new();
+    let lease = LeaseId::new();
+    task_store
+        .try_acquire_task(
+            id,
+            worker.clone(),
+            lease.clone(),
+            lease_expires_at,
+            t_plus(at),
+        )
+        .await?
+        .with_context(|| format!("{id} must acquire"))?;
+    Ok((worker, lease))
+}
+
+/// End the root `id`, leased by [`lease_for`], the way `end` says.
+async fn end_root(
+    task_store: &dyn AgentTaskStore,
+    id: &AgentTaskId,
+    (worker, lease): (WorkerId, LeaseId),
+    end: RootEnd,
+    at: i64,
+) -> Result<()> {
+    match end {
+        RootEnd::Completed => {
+            task_store
+                .complete_task(id, &worker, &lease, t_plus(at))
+                .await?;
+        }
+        RootEnd::Failed => {
+            task_store
+                .fail_task_with_reason(
+                    id,
+                    &worker,
+                    &lease,
+                    "provider refused".to_owned(),
+                    TerminalReason::InternalError,
+                    t_plus(at),
+                )
+                .await?;
+        }
+        RootEnd::FailedClosed => {
+            let mut now = at;
+            loop {
+                let records = task_store.release_expired_leases(t_plus(now)).await?;
+                let record = records
+                    .iter()
+                    .find(|record| record.id == *id)
+                    .with_context(|| format!("the lapsed lease of {id} must be reclaimed"))?;
+                match &record.action {
+                    RecoveryAction::FailClosed(_) => break,
+                    RecoveryAction::Requeue => {
+                        lease_for(task_store, id, RootEnd::FailedClosed, now + 1).await?;
+                        now += 10;
+                    }
+                    RecoveryAction::NoAction => {
+                        anyhow::bail!("a lapsed lease of {id} must be acted on")
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn root_turns_of(task_store: &dyn AgentTaskStore, tid: &str) -> Result<Vec<AgentTask>> {
+    let mut turns: Vec<AgentTask> = task_store
+        .list_by_thread(&thread_id(tid))
+        .await?
+        .into_iter()
+        .filter(|task| task.kind == TaskKind::RootTurn)
+        .collect();
+    turns.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+    Ok(turns)
+}
+
+fn text_of(task: &AgentTask) -> Result<serde_json::Value> {
+    Ok(serde_json::to_value(&task.submitted_input)?)
+}
+
+/// However a top-level root ends on its own, the input injected into it that
+/// no boundary delivered becomes the thread's next turns in the same step,
+/// each keeping its submission time — so the thread runs it in submission
+/// order with what was queued as the next turn meanwhile: input sent before
+/// a queued successor runs first, input sent after it waits behind it.
+pub(super) async fn test_root_end_hands_undelivered_input_over_in_submission_order(
+    task_store: &dyn AgentTaskStore,
+) -> Result<()> {
+    for (index, end) in ROOT_ENDS.into_iter().enumerate() {
+        let tid = format!("settle-handover-{index}");
+        let at = 8_000 + i64::try_from(index)? * 1_000;
+        let max_attempts = match end {
+            RootEnd::Completed | RootEnd::Failed => 3,
+            RootEnd::FailedClosed => 1,
+        };
+        let root = AgentTask::new_root_turn(thread_id(&tid), t_plus(at), max_attempts);
+        task_store.submit_root_turn(root.clone()).await?;
+        let lease = lease_for(task_store, &root.id, end, at + 1).await?;
+        let before = inject(task_store, &tid, "before the successor", at + 2).await?;
+        let successor = task_store
+            .submit_root_turn(AgentTask::new_root_turn(thread_id(&tid), t_plus(at + 3), 3))
+            .await?;
+        assert_eq!(successor.status, TaskStatus::Queued, "{end:?}");
+        let after = inject(task_store, &tid, "after the successor", at + 4).await?;
+
+        end_root(task_store, &root.id, lease, end, at + 10).await?;
+
+        for injection in [&before, &after] {
+            let handed_over = fetch(task_store, &injection.id).await?;
+            assert_eq!(handed_over.status, TaskStatus::Completed, "{end:?}");
+            assert_eq!(
+                handed_over.terminal_reason,
+                Some(TerminalReason::Completed),
+                "{end:?}",
+            );
+        }
+        let turns = root_turns_of(task_store, &tid).await?;
+        let next: Vec<&AgentTask> = turns.iter().filter(|turn| turn.id != root.id).collect();
+        assert_eq!(next.len(), 3, "{end:?}: {turns:?}");
+        assert_eq!(text_of(next[0])?, text_of(&before)?, "{end:?}");
+        assert_eq!(next[0].created_at, before.created_at, "{end:?}");
+        assert_eq!(next[0].status, TaskStatus::Pending, "{end:?}");
+        assert_eq!(next[1].id, successor.id, "{end:?}");
+        assert_eq!(next[1].status, TaskStatus::Queued, "{end:?}");
+        assert_eq!(text_of(next[2])?, text_of(&after)?, "{end:?}");
+        assert_eq!(next[2].status, TaskStatus::Queued, "{end:?}");
+        assert!(
+            !task_store
+                .list_terminal_roots_with_live_descendants()
+                .await?
+                .contains(&root.id),
+            "{end:?}: the ended root holds no live input",
+        );
+
+        let first = lease_for(task_store, &next[0].id, RootEnd::Completed, at + 20).await?;
+        end_root(task_store, &next[0].id, first, RootEnd::Completed, at + 21).await?;
+        assert_eq!(
+            fetch(task_store, &successor.id).await?.status,
+            TaskStatus::Pending,
+            "{end:?}: the successor runs next",
+        );
+        assert_eq!(
+            fetch(task_store, &next[2].id).await?.status,
+            TaskStatus::Queued,
+            "{end:?}: the later input waits behind it",
+        );
+    }
+    Ok(())
+}
+
+/// However a subagent's child-thread root ends on its own, the input
+/// injected into it that no boundary delivered dies with it: the invocation
+/// takes the root's outcome, and no turn starts on the child thread — one
+/// would run unowned beside the parent, with no deadline and nobody
+/// awaiting its result.
+pub(super) async fn test_child_thread_root_end_discards_undelivered_input(
+    task_store: &dyn AgentTaskStore,
+    thread_store: &dyn ThreadStore,
+) -> Result<()> {
+    for (index, end) in ROOT_ENDS.into_iter().enumerate() {
+        let tid = format!("settle-child-input-{index}");
+        let (_parent, invocation, child_root) =
+            spawn_subagent_fixture(task_store, thread_store, &tid).await?;
+        let child_tid = child_root.thread_id.0.clone();
+        let lease = lease_for(task_store, &child_root.id, end, 3).await?;
+        let injection = inject(task_store, &child_tid, "look at the logs too", 4).await?;
+        assert_eq!(
+            injection.parent_id.as_ref(),
+            Some(&child_root.id),
+            "{end:?}"
+        );
+
+        end_root(task_store, &child_root.id, lease, end, 10).await?;
+
+        let turns = root_turns_of(task_store, &child_tid).await?;
+        assert_eq!(
+            turns.iter().map(|turn| &turn.id).collect::<Vec<_>>(),
+            vec![&child_root.id],
+            "{end:?}: no turn may start on the subagent's thread",
+        );
+        assert_settled(
+            &fetch(task_store, &injection.id).await?,
+            &TerminalReason::ParentCancelled,
+            &format!("{end:?} undelivered input"),
+        );
+        assert_eq!(
+            fetch(task_store, &invocation.id).await?.status,
+            TaskStatus::Pending,
+            "{end:?}: the invocation takes the child's outcome",
+        );
+        assert!(
+            !task_store
+                .list_terminal_roots_with_live_descendants()
+                .await?
+                .contains(&child_root.id),
+            "{end:?}: the ended child root holds no live input",
+        );
+    }
+    Ok(())
+}
+
+/// Input left undelivered by a root that ends while its thread is being
+/// purged is discarded: the purge fence admits no new turn.
+pub(super) async fn test_root_end_on_a_purging_thread_discards_undelivered_input(
+    task_store: &dyn AgentTaskStore,
+    thread_store: &dyn ThreadStore,
+) -> Result<()> {
+    let tid = "settle-purging-input";
+    let (root, worker, lease) = running_root(task_store, tid, 9_000).await?;
+    let injection = inject(task_store, tid, "one more thing", 9_002).await?;
+    thread_store
+        .begin_purge(
+            &thread_id(tid),
+            PurgeSeed {
+                root_thread_id: thread_id(tid),
+                scope: PurgeScope::Thread,
+                started_at: t_plus(9_003),
+            },
+        )
+        .await?;
+
+    end_root(
+        task_store,
+        &root.id,
+        (worker, lease),
+        RootEnd::Failed,
+        9_010,
+    )
+    .await?;
+
+    assert_settled(
+        &fetch(task_store, &injection.id).await?,
+        &TerminalReason::ParentCancelled,
+        "undelivered input on a purging thread",
+    );
+    assert_eq!(
+        root_turns_of(task_store, tid)
+            .await?
+            .iter()
+            .map(|turn| &turn.id)
+            .collect::<Vec<_>>(),
+        vec![&root.id],
+    );
+    Ok(())
+}
+
 // ── Backend runners ──────────────────────────────────────────────────
 
 mod in_memory {
@@ -791,6 +1072,22 @@ mod in_memory {
         super::test_list_terminal_roots_with_live_descendants(s.task.as_ref(), s.thread.as_ref())
             .await
     }
+
+    #[tokio::test]
+    async fn settlement_in_memory_root_end_hands_input_over_in_order() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        super::test_root_end_hands_undelivered_input_over_in_submission_order(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn settlement_in_memory_child_thread_root_end_discards_input() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        super::test_child_thread_root_end_discards_undelivered_input(
+            s.task.as_ref(),
+            s.thread.as_ref(),
+        )
+        .await
+    }
 }
 
 #[cfg(feature = "sqlite")]
@@ -837,6 +1134,24 @@ mod sqlite {
     async fn settlement_sqlite_lists_terminal_roots_with_live_descendants() -> Result<()> {
         let store = store().await?;
         super::test_list_terminal_roots_with_live_descendants(&store, &store).await
+    }
+
+    #[tokio::test]
+    async fn settlement_sqlite_root_end_hands_input_over_in_order() -> Result<()> {
+        let store = store().await?;
+        super::test_root_end_hands_undelivered_input_over_in_submission_order(&store).await
+    }
+
+    #[tokio::test]
+    async fn settlement_sqlite_child_thread_root_end_discards_input() -> Result<()> {
+        let store = store().await?;
+        super::test_child_thread_root_end_discards_undelivered_input(&store, &store).await
+    }
+
+    #[tokio::test]
+    async fn settlement_sqlite_root_end_on_a_purging_thread_discards_input() -> Result<()> {
+        let store = store().await?;
+        super::test_root_end_on_a_purging_thread_discards_undelivered_input(&store, &store).await
     }
 }
 
@@ -892,5 +1207,29 @@ mod postgres {
             return Ok(());
         };
         super::test_list_terminal_roots_with_live_descendants(&store, &store).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_root_end_hands_input_over_in_order() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        super::test_root_end_hands_undelivered_input_over_in_submission_order(&store).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_child_thread_root_end_discards_input() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        super::test_child_thread_root_end_discards_undelivered_input(&store, &store).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_root_end_on_a_purging_thread_discards_input() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        super::test_root_end_on_a_purging_thread_discards_undelivered_input(&store, &store).await
     }
 }
