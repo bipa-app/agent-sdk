@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT held.id AS \"id!\", held.created_at AS \"created_at!\", NOT EXISTS (SELECT 1 FROM json_each(held.after_siblings_json) AS waited JOIN agent_sdk_tasks AS sibling ON sibling.id = waited.value WHERE sibling.status NOT IN ('completed', 'failed', 'cancelled')) AS \"ready!: bool\" FROM agent_sdk_tasks AS held WHERE held.status = 'pending' AND held.after_siblings_json IS NOT NULL AND held.thread_id NOT IN (SELECT thread_id FROM agent_sdk_threads WHERE status IN ('deleting', 'deleted')) ORDER BY held.created_at, held.id LIMIT ?1",
+  "query": "SELECT held.id AS \"id!\", held.created_at AS \"created_at!\", NOT EXISTS (SELECT 1 FROM json_each(held.after_siblings_json) AS waited JOIN agent_sdk_tasks AS sibling ON sibling.id = waited.value WHERE sibling.status NOT IN ('completed', 'failed', 'cancelled')) AS \"ready!: bool\" FROM agent_sdk_tasks AS held INDEXED BY agent_sdk_tasks_held_fifo_idx WHERE held.status >= 'pending' AND held.status <= 'pending' AND held.after_siblings_json IS NOT NULL AND held.thread_id NOT IN (SELECT thread_id FROM agent_sdk_threads WHERE status IN ('deleting', 'deleted')) ORDER BY held.created_at, held.id LIMIT ?1",
   "describe": {
     "columns": [
       {
@@ -41,5 +41,5 @@
       false
     ]
   },
-  "hash": "fe872a6b40734eef5100910e092161870f18e852cd52b1f02fb9ebee81d6b762"
+  "hash": "79e33bc091ae08a7c1fae2653c9d2a9a63e8ec91f10c0ec47677fab17262efc0"
 }

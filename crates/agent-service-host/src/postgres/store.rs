@@ -1772,7 +1772,7 @@ WHERE id = ANY($1::text[])
                     .context("rollback empty runnable scan")?;
                 return Ok(None);
             };
-            let Some(old) = Self::load_task_tx(&mut tx, &head.id, true).await? else {
+            let Some(old) = Self::load_task_tx(&mut tx, &head, true).await? else {
                 tx.rollback()
                     .await
                     .context("rollback vanished runnable head")?;
@@ -1920,7 +1920,7 @@ SELECT
         WHERE sibling.status NOT IN ('completed', 'failed', 'cancelled')
     ) AS "ready!"
 FROM agent_sdk_tasks AS held
-WHERE held.status = 'pending'
+WHERE held.status >= 'pending' AND held.status <= 'pending'
   AND held.after_siblings_json IS NOT NULL
   AND (held.created_at, held.id) > ($1, $2)
   AND held.thread_id NOT IN (
@@ -1951,7 +1951,7 @@ SELECT
         WHERE sibling.status NOT IN ('completed', 'failed', 'cancelled')
     ) AS "ready!"
 FROM agent_sdk_tasks AS held
-WHERE held.status = 'pending'
+WHERE held.status >= 'pending' AND held.status <= 'pending'
   AND held.after_siblings_json IS NOT NULL
   AND held.thread_id NOT IN (
       SELECT thread_id FROM agent_sdk_threads WHERE status IN ('deleting', 'deleted')
@@ -3700,40 +3700,17 @@ async fn task_id_exists_tx(
     Ok(id.is_some())
 }
 
-async fn load_runnable_head_tx(tx: &mut Transaction<'_, Postgres>) -> Result<Option<AgentTask>> {
-    let record = sqlx::query_as!(
-        TaskRecord,
+/// The id of the oldest pending row that waits on nothing.
+///
+/// `status` is spelled as a range so only `agent_sdk_tasks_ready_fifo_idx`
+/// can serve the order (see migration 0026); reading only the id keeps the
+/// scan inside that index.
+async fn load_runnable_head_tx(tx: &mut Transaction<'_, Postgres>) -> Result<Option<AgentTaskId>> {
+    Ok(sqlx::query_scalar!(
         r"
-SELECT
-    id,
-    kind,
-    status,
-    parent_id,
-    root_id,
-    depth,
-    thread_id,
-    submitted_input_json,
-    caller_metadata_json,
-    worker_id,
-    lease_id,
-    lease_expires_at,
-    last_heartbeat_at,
-    state_json,
-    attempt,
-    max_attempts,
-    last_error,
-    terminal_reason_json,
-    pending_child_count,
-    spawn_index,
-    result_payload,
-    otel_traceparent,
-    created_at,
-    updated_at,
-    completed_at,
-    last_activity_at,
-    after_siblings_json
+SELECT id
 FROM agent_sdk_tasks
-WHERE status = 'pending'
+WHERE status >= 'pending' AND status <= 'pending'
   AND after_siblings_json IS NULL
   AND thread_id NOT IN (
       SELECT thread_id FROM agent_sdk_threads WHERE status IN ('deleting', 'deleted')
@@ -3744,8 +3721,8 @@ LIMIT 1
     )
     .fetch_optional(&mut **tx)
     .await
-    .context("load runnable head")?;
-    record.map(AgentTask::try_from).transpose()
+    .context("load runnable head")?
+    .map(AgentTaskId::from_string))
 }
 
 /// The position of `task` in the store's task-row lock order (see
@@ -4485,7 +4462,7 @@ ORDER BY created_at, id
 SELECT held.id
 FROM agent_sdk_tasks AS held
 WHERE held.parent_id = $1
-  AND held.status = 'pending'
+  AND held.status >= 'pending' AND held.status <= 'pending'
   AND held.after_siblings_json IS NOT NULL
   AND NOT EXISTS (
       SELECT 1

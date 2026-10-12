@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT held.id AS \"id!\" FROM agent_sdk_tasks AS held INDEXED BY agent_sdk_tasks_held_by_parent_idx WHERE held.parent_id = ?1 AND held.status >= 'pending' AND held.status <= 'pending' AND held.after_siblings_json IS NOT NULL AND NOT EXISTS (SELECT 1 FROM json_each(held.after_siblings_json) AS waited JOIN agent_sdk_tasks AS sibling ON sibling.id = waited.value WHERE sibling.status NOT IN ('completed', 'failed', 'cancelled')) ORDER BY held.created_at, held.id",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_tasks",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "42c95fcb3fca6e9ccde5bd30438eb8420863ec4ed6bc18eae2aabb0bf3f94c62"
+}

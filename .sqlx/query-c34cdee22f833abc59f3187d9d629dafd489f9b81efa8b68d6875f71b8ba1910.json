@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nSELECT id\nFROM agent_sdk_tasks\nWHERE status >= 'pending' AND status <= 'pending'\n  AND after_siblings_json IS NULL\n  AND thread_id NOT IN (\n      SELECT thread_id FROM agent_sdk_threads WHERE status IN ('deleting', 'deleted')\n  )\nORDER BY created_at, id\nLIMIT 1\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_tasks",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "c34cdee22f833abc59f3187d9d629dafd489f9b81efa8b68d6875f71b8ba1910"
+}

@@ -1351,10 +1351,14 @@ INSERT INTO agent_sdk_tasks (
             // Threads mid-purge are excluded IN the scan: one fenced
             // thread's oldest pending row must never stall every other
             // thread's acquires (its rows are cancelled by the purge).
+            // SQLite has no statistics to choose the ready index over
+            // agent_sdk_tasks_by_status_idx, which would walk every held
+            // row, so the scan names it (see migration 0026).
             let record = sqlx::query_as::<_, TaskRecord>(concat!(
                 "SELECT ",
                 task_columns!(),
-                " FROM agent_sdk_tasks WHERE status = 'pending' \
+                " FROM agent_sdk_tasks INDEXED BY agent_sdk_tasks_ready_fifo_idx \
+                 WHERE status >= 'pending' AND status <= 'pending' \
                  AND after_siblings_json IS NULL \
                  AND thread_id NOT IN (SELECT thread_id FROM agent_sdk_threads \
                  WHERE status IN ('deleting', 'deleted')) \
@@ -1460,7 +1464,7 @@ INSERT INTO agent_sdk_tasks (
         let limit = i64::try_from(limit).context("held probe window exceeds i64")?;
         let rows: Vec<(String, String, bool)> = match after {
             Some((created_at, id)) => sqlx::query!(
-                r#"SELECT held.id AS "id!", held.created_at AS "created_at!", NOT EXISTS (SELECT 1 FROM json_each(held.after_siblings_json) AS waited JOIN agent_sdk_tasks AS sibling ON sibling.id = waited.value WHERE sibling.status NOT IN ('completed', 'failed', 'cancelled')) AS "ready!: bool" FROM agent_sdk_tasks AS held WHERE held.status = 'pending' AND held.after_siblings_json IS NOT NULL AND (held.created_at, held.id) > (?1, ?2) AND held.thread_id NOT IN (SELECT thread_id FROM agent_sdk_threads WHERE status IN ('deleting', 'deleted')) ORDER BY held.created_at, held.id LIMIT ?3"#,
+                r#"SELECT held.id AS "id!", held.created_at AS "created_at!", NOT EXISTS (SELECT 1 FROM json_each(held.after_siblings_json) AS waited JOIN agent_sdk_tasks AS sibling ON sibling.id = waited.value WHERE sibling.status NOT IN ('completed', 'failed', 'cancelled')) AS "ready!: bool" FROM agent_sdk_tasks AS held INDEXED BY agent_sdk_tasks_held_fifo_idx WHERE held.status >= 'pending' AND held.status <= 'pending' AND held.after_siblings_json IS NOT NULL AND (held.created_at, held.id) > (?1, ?2) AND held.thread_id NOT IN (SELECT thread_id FROM agent_sdk_threads WHERE status IN ('deleting', 'deleted')) ORDER BY held.created_at, held.id LIMIT ?3"#,
                 created_at,
                 id,
                 limit,
@@ -1472,7 +1476,7 @@ INSERT INTO agent_sdk_tasks (
             .map(|row| (row.id, row.created_at, row.ready))
             .collect(),
             None => sqlx::query!(
-                r#"SELECT held.id AS "id!", held.created_at AS "created_at!", NOT EXISTS (SELECT 1 FROM json_each(held.after_siblings_json) AS waited JOIN agent_sdk_tasks AS sibling ON sibling.id = waited.value WHERE sibling.status NOT IN ('completed', 'failed', 'cancelled')) AS "ready!: bool" FROM agent_sdk_tasks AS held WHERE held.status = 'pending' AND held.after_siblings_json IS NOT NULL AND held.thread_id NOT IN (SELECT thread_id FROM agent_sdk_threads WHERE status IN ('deleting', 'deleted')) ORDER BY held.created_at, held.id LIMIT ?1"#,
+                r#"SELECT held.id AS "id!", held.created_at AS "created_at!", NOT EXISTS (SELECT 1 FROM json_each(held.after_siblings_json) AS waited JOIN agent_sdk_tasks AS sibling ON sibling.id = waited.value WHERE sibling.status NOT IN ('completed', 'failed', 'cancelled')) AS "ready!: bool" FROM agent_sdk_tasks AS held INDEXED BY agent_sdk_tasks_held_fifo_idx WHERE held.status >= 'pending' AND held.status <= 'pending' AND held.after_siblings_json IS NOT NULL AND held.thread_id NOT IN (SELECT thread_id FROM agent_sdk_threads WHERE status IN ('deleting', 'deleted')) ORDER BY held.created_at, held.id LIMIT ?1"#,
                 limit,
             )
             .fetch_all(&self.pool)
@@ -3711,7 +3715,7 @@ impl AgentTaskStore for SqliteDurableStore {
     async fn ready_held_children(&self, parent_id: &AgentTaskId) -> Result<Vec<AgentTaskId>> {
         let parent_key = parent_id.as_str();
         Ok(sqlx::query_scalar!(
-            r#"SELECT held.id AS "id!" FROM agent_sdk_tasks AS held WHERE held.parent_id = ?1 AND held.status = 'pending' AND held.after_siblings_json IS NOT NULL AND NOT EXISTS (SELECT 1 FROM json_each(held.after_siblings_json) AS waited JOIN agent_sdk_tasks AS sibling ON sibling.id = waited.value WHERE sibling.status NOT IN ('completed', 'failed', 'cancelled')) ORDER BY held.created_at, held.id"#,
+            r#"SELECT held.id AS "id!" FROM agent_sdk_tasks AS held INDEXED BY agent_sdk_tasks_held_by_parent_idx WHERE held.parent_id = ?1 AND held.status >= 'pending' AND held.status <= 'pending' AND held.after_siblings_json IS NOT NULL AND NOT EXISTS (SELECT 1 FROM json_each(held.after_siblings_json) AS waited JOIN agent_sdk_tasks AS sibling ON sibling.id = waited.value WHERE sibling.status NOT IN ('completed', 'failed', 'cancelled')) ORDER BY held.created_at, held.id"#,
             parent_key,
         )
         .fetch_all(&self.pool)
