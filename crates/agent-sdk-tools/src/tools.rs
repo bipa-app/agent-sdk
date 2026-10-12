@@ -1277,8 +1277,12 @@ pub trait ErasedTool<Ctx>: Send + Sync {
     fn input_schema(&self) -> Value;
     /// Get the tool's permission tier.
     fn tier(&self) -> ToolTier;
-    /// Get the tool's ordering class within a model batch.
-    fn concurrency(&self) -> ToolConcurrency;
+    /// Get the tool's ordering class within a model batch. Defaults to
+    /// [`ToolConcurrency::Exclusive`], so an implementor that does not
+    /// override it runs alone and in model order.
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Exclusive
+    }
     /// Execute the tool with the given input.
     async fn execute(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult>;
 }
@@ -1362,8 +1366,12 @@ pub trait ErasedAsyncTool<Ctx>: Send + Sync {
     fn input_schema(&self) -> Value;
     /// Get the tool's permission tier.
     fn tier(&self) -> ToolTier;
-    /// Get the tool's ordering class within a model batch.
-    fn concurrency(&self) -> ToolConcurrency;
+    /// Get the tool's ordering class within a model batch. Defaults to
+    /// [`ToolConcurrency::Exclusive`], so an implementor that does not
+    /// override it runs alone and in model order.
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Exclusive
+    }
     /// Execute the tool with the given input.
     async fn execute(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolOutcome>;
     /// Stream status updates for an in-progress operation (type-erased).
@@ -1460,8 +1468,12 @@ pub trait ErasedListenTool<Ctx>: Send + Sync {
     fn input_schema(&self) -> Value;
     /// Get the tool's permission tier.
     fn tier(&self) -> ToolTier;
-    /// Get the tool's ordering class within a model batch.
-    fn concurrency(&self) -> ToolConcurrency;
+    /// Get the tool's ordering class within a model batch. Defaults to
+    /// [`ToolConcurrency::Exclusive`], so an implementor that does not
+    /// override it runs alone and in model order.
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Exclusive
+    }
     /// Start listen stream.
     fn listen_stream<'a>(
         &'a self,
