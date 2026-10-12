@@ -847,6 +847,8 @@ pub async fn cancel_root_turn(
 /// The steering exchange writes nothing to the task row before it
 /// fails, so the durable `ReadyToResume` state still carries the
 /// original continuation, suspended messages, and child ids untouched.
+/// Its pre-call compaction may have folded those suspended messages into
+/// the transcript already; the re-park keeps only the ones it did not.
 /// This re-parks the parent on exactly those children via
 /// [`AgentTaskStore::repark_after_steering`], which derives the live
 /// child count from the journal and either parks again in
@@ -870,6 +872,7 @@ pub async fn cancel_root_turn(
 /// # Errors
 /// - The `parent`'s durable state carries no continuation (defends the
 ///   state ↔ status invariant).
+/// - The thread's message projection cannot be read.
 /// - The store rejects the re-park (CAS: not running / not owned / not
 ///   a steering resume — e.g. a sweep already requeued the row).
 pub async fn revert_steering_wake(
@@ -889,9 +892,16 @@ pub async fn revert_steering_wake(
         .continuation()
         .context("steering revert: durable state carries no continuation")?
         .clone();
+    let suspended_messages = without_folded_prefix(
+        deps,
+        &parent.thread_id,
+        parent.state.suspended_messages().to_vec(),
+    )
+    .await
+    .context("steering revert: drop parked messages the failed exchange folded")?;
     let payload = SuspensionPayload {
         continuation,
-        suspended_messages: parent.state.suspended_messages().to_vec(),
+        suspended_messages,
         child_join_policy: parent.state.child_join_policy(),
     };
     // The original child ids, in spawn order — the re-park re-indexes
@@ -1094,6 +1104,10 @@ pub(crate) struct PartialCancelCommit<'a> {
 /// Durably commit the largest provider-valid prefix of a cancelled
 /// turn's accumulated messages, returning the retained suffix.
 ///
+/// The candidate's leading messages that a compaction already folded into
+/// the transcript are skipped first ([`without_folded_prefix`]); a candidate
+/// the transcript already holds in full commits nothing.
+///
 /// A no-op when the prefix is empty (`commit_completed_turn` rejects
 /// empty batches anyway) or when the turn was already committed. The
 /// partial commit rides `commit_completed_turn`'s in-transaction
@@ -1118,6 +1132,7 @@ pub(crate) async fn commit_partial_turn_on_cancel(
         agent_state_snapshot,
     } = params;
 
+    let candidate = without_folded_prefix(deps, thread_id, candidate).await?;
     let (prefix, suffix) = provider_valid_split(candidate);
 
     // Split-and-close, not split-and-drop (ENG-9651): the suffix's dangling
@@ -7038,9 +7053,11 @@ fn unfolded_turn_messages(inputs: &RootWorkerInputs) -> Result<Vec<llm::Message>
 /// durable transcript.
 ///
 /// A resume that compacted and then died (provider weather, lease loss, a
-/// lost turn slot) is re-run from the same parked messages, while the fold
-/// it made is durable; restaging them would duplicate them in the next
-/// request and the next fold.
+/// lost turn slot) leaves its parked messages in the task row while the fold
+/// it made is durable. Every site that stages, re-parks or commits in-flight
+/// messages passes them through here, so none of them reaches the transcript
+/// twice: restaged, they would be folded again; committed, they would leave
+/// each tool call in the raw transcript twice.
 async fn without_folded_prefix(
     deps: &RootTurnDeps<'_>,
     thread_id: &agent_sdk_foundation::ThreadId,
@@ -7057,7 +7074,7 @@ async fn without_folded_prefix(
     if folded > 0 {
         log::warn!(
             "thread {thread_id}: an earlier compaction already folded {folded} of {} in-flight \
-             messages into the transcript; staging only the rest",
+             messages into the transcript; skipping them",
             in_flight.len(),
         );
         in_flight.drain(..folded);
@@ -7435,9 +7452,14 @@ async fn stage_resume_call(
     let mut resumed = build_resumed_draft_messages(suspended_messages, fan_in);
     resumed.extend(injected.messages.iter().cloned());
     let resumed_draft = without_folded_prefix(deps, thread_id, resumed).await?;
-    buffer_resume_messages(&inputs.staged_stores, thread_id, continuation, &resumed_draft)
-        .await
-        .context("buffer resume messages")?;
+    buffer_resume_messages(
+        &inputs.staged_stores,
+        thread_id,
+        continuation,
+        &resumed_draft,
+    )
+    .await
+    .context("buffer resume messages")?;
 
     // 3. Refresh the projection draft before either proactive or reactive
     //    compaction can run. The staged source is now exactly

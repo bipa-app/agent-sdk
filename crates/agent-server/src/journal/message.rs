@@ -172,6 +172,17 @@ fn demote_untrusted_compaction_summary(mut message: llm::Message) -> llm::Messag
     message
 }
 
+fn calls_tools(message: &llm::Message) -> bool {
+    message.role == llm::Role::Assistant
+        && matches!(
+            &message.content,
+            llm::Content::Blocks(blocks)
+                if blocks
+                    .iter()
+                    .any(|block| matches!(block, llm::ContentBlock::ToolUse { .. }))
+        )
+}
+
 fn is_generated_compaction_summary(message: &llm::Message) -> bool {
     let is_legacy_singleton = message.role == llm::Role::User
         && matches!(
@@ -440,31 +451,42 @@ impl MessageProjection {
     /// commit.
     ///
     /// The folds since the last commit form one contiguous run at the end of
-    /// [`Self::messages`]. This returns the length of the longest fold-aligned
-    /// tail of that run that `in_flight` starts with verbatim, or 0. A resume
-    /// that compacted and then died is re-run from the same parked messages;
-    /// this is how the rerun recognizes what its predecessor already folded.
-    /// A run folded for another in-flight sequence cannot match, since its
-    /// tool-use ids never recur.
+    /// [`Self::messages`], and every in-flight sequence a worker rebuilds (a
+    /// parked suspension, a resume or steering draft, a cancel candidate)
+    /// starts at one of its fold boundaries. This returns the longest prefix
+    /// `in_flight` shares with the run from any boundary: the whole run tail
+    /// when `in_flight` extends it, all of `in_flight` when the run already
+    /// holds it, and the shared part when the two diverge. A resume that
+    /// compacted and then died is re-run, or cancelled, from the same parked
+    /// messages; this is how either recognizes what its predecessor folded.
+    ///
+    /// A shared prefix counts only when it holds an assistant tool call:
+    /// tool-use ids never recur, while a prompt text can repeat across turns.
     #[must_use]
     pub fn folded_in_flight_prefix_len(&self, in_flight: &[llm::Message]) -> usize {
-        let mut fold_starts = Vec::new();
+        let mut folded = 0;
         let mut run_start = self.messages.len();
         for entry in self.compactions.iter().rev() {
             if entry.draft_fold_start.saturating_add(entry.draft_fold_len) != run_start {
                 break;
             }
-            if entry.draft_fold_len > 0 {
-                fold_starts.push(entry.draft_fold_start);
-            }
             run_start = entry.draft_fold_start;
+            if entry.draft_fold_len == 0 {
+                continue;
+            }
+            let shared = self
+                .messages
+                .get(run_start..)
+                .unwrap_or_default()
+                .iter()
+                .zip(in_flight)
+                .take_while(|(durable, candidate)| durable == candidate)
+                .count();
+            if in_flight.iter().take(shared).any(calls_tools) {
+                folded = folded.max(shared);
+            }
         }
-        fold_starts
-            .iter()
-            .rev()
-            .filter_map(|start| self.messages.get(*start..))
-            .find(|folded| in_flight.starts_with(folded))
-            .map_or(0, <[llm::Message]>::len)
+        folded
     }
 
     /// Replace the in-flight draft messages.
@@ -1509,8 +1531,8 @@ mod tests {
         );
         assert_eq!(
             p.folded_in_flight_prefix_len(&in_flight[..2]),
-            0,
-            "a sequence that does not contain the whole fold is not that fold",
+            2,
+            "a parked suspension the fold already holds is durable in full",
         );
         assert_eq!(
             p.folded_in_flight_prefix_len(&in_flight[1..]),
@@ -1518,6 +1540,14 @@ mod tests {
             "a match must start at a fold boundary",
         );
         assert_eq!(p.folded_in_flight_prefix_len(&tool_round("call_9")), 0);
+
+        let mut diverged = in_flight[..2].to_vec();
+        diverged.push(llm::Message::user("a different continuation"));
+        assert_eq!(
+            p.folded_in_flight_prefix_len(&diverged),
+            2,
+            "only the shared prefix of a diverging sequence is durable",
+        );
 
         let committed = p.append_committed(vec![llm::Message::assistant("final")], t_plus(4))?;
         assert_eq!(
@@ -1542,10 +1572,39 @@ mod tests {
         whole_turn.push(llm::Message::user("not folded"));
         assert_eq!(p.folded_in_flight_prefix_len(&whole_turn), 5);
 
-        let mut since_second_fold = second;
+        let mut since_second_fold = second.clone();
         since_second_fold.push(llm::Message::user("not folded"));
         assert_eq!(p.folded_in_flight_prefix_len(&since_second_fold), 2);
-        assert_eq!(p.folded_in_flight_prefix_len(&first), 0);
+        assert_eq!(
+            p.folded_in_flight_prefix_len(&first),
+            3,
+            "a suspension parked before both folds is durable in full",
+        );
+
+        let mut across_boundary = first;
+        across_boundary.extend(second.into_iter().take(1));
+        assert_eq!(p.folded_in_flight_prefix_len(&across_boundary), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn a_repeated_prompt_alone_does_not_match_an_earlier_fold() -> anyhow::Result<()> {
+        let (p, in_flight) = projection_with_folded_turn()?;
+        let prompt = in_flight.first().context("prompt")?.clone();
+
+        assert_eq!(
+            p.folded_in_flight_prefix_len(std::slice::from_ref(&prompt)),
+            0,
+            "a shared prefix without a tool call identifies no turn",
+        );
+
+        let mut next_turn = vec![prompt];
+        next_turn.extend(tool_round("call_9"));
+        assert_eq!(
+            p.folded_in_flight_prefix_len(&next_turn),
+            0,
+            "a later turn with the same prompt text is not the folded turn",
+        );
         Ok(())
     }
 

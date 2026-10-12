@@ -18,7 +18,8 @@ use agent_sdk::context::{CompactionConfig, CompactionEngine};
 use agent_sdk_foundation::ThreadId;
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Message, StopReason, Tool, Usage,
+    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Message, StopReason, Tool,
+    Usage, provider_tool_sequence_error_index,
 };
 use agent_sdk_foundation::{ToolResult, ToolTier};
 use agent_sdk_providers::LlmProvider;
@@ -44,7 +45,8 @@ use crate::journal::turn_attempt_store::InMemoryTurnAttemptStore;
 use crate::worker::bootstrap::WorkerBootstrapContext;
 use crate::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
 use crate::worker::root_turn::{
-    RootTurnDeps, RootTurnOutcome, execute_root_turn, resume_from_children,
+    RootTurnDeps, RootTurnOutcome, cancel_root_turn, execute_root_turn, resume_for_steering,
+    resume_from_children, revert_steering_wake,
 };
 
 const RESUME_ROUNDS: usize = 3;
@@ -55,6 +57,17 @@ enum Trigger {
     Threshold,
     Overflow,
 }
+
+/// How much of the recent raw transcript each compaction keeps verbatim.
+/// With `Default`, the folded in-flight messages stay in the effective view,
+/// so a duplicate shows there as well as in the raw transcript.
+#[derive(Clone, Copy, Debug)]
+enum Retention {
+    Nothing,
+    Default,
+}
+
+const SEEDED_TURNS: usize = 6;
 
 fn t0() -> OffsetDateTime {
     OffsetDateTime::UNIX_EPOCH + Duration::seconds(1_700_000_000)
@@ -84,14 +97,21 @@ fn usage() -> Usage {
 }
 
 fn tool_call(id: &str) -> ChatOutcome {
+    tool_calls(&[id])
+}
+
+fn tool_calls(ids: &[&str]) -> ChatOutcome {
     ChatOutcome::Success(ChatResponse {
-        id: format!("msg_{id}"),
-        content: vec![ContentBlock::ToolUse {
-            id: id.to_owned(),
-            name: "bash".to_owned(),
-            input: serde_json::json!({ "command": bulk(id) }),
-            thought_signature: None,
-        }],
+        id: format!("msg_{}", ids.join("_")),
+        content: ids
+            .iter()
+            .map(|id| ContentBlock::ToolUse {
+                id: (*id).to_owned(),
+                name: "bash".to_owned(),
+                input: serde_json::json!({ "command": bulk(id) }),
+                thought_signature: None,
+            })
+            .collect(),
         model: "mock-model".into(),
         stop_reason: Some(StopReason::ToolUse),
         usage: usage(),
@@ -204,7 +224,7 @@ struct Harness {
 }
 
 impl Harness {
-    fn new(engine: CompactionEngine, trigger: Trigger) -> Result<Self> {
+    fn new(engine: CompactionEngine, trigger: Trigger, retention: Retention) -> Result<Self> {
         let threads = InMemoryThreadStore::new();
         let events = InMemoryEventRepository::new();
         let outbox = InMemoryOutboxStore::new();
@@ -222,6 +242,14 @@ impl Harness {
             Trigger::Threshold => 1,
             Trigger::Overflow => usize::MAX,
         };
+        let config = CompactionConfig::default()
+            .with_engine(engine)
+            .with_threshold_tokens(threshold)
+            .with_min_messages(2);
+        let config = match retention {
+            Retention::Nothing => config.with_retain_recent(0),
+            Retention::Default => config,
+        };
         let artifact_dir = tempfile::tempdir().context("artifact tempdir")?;
         let artifact_store = Arc::new(agent_sdk::ArtifactStore::new(
             artifact_dir.path().join("t-compaction-resume"),
@@ -234,11 +262,7 @@ impl Harness {
             checkpoints: InMemoryCheckpointStore::new(),
             events,
             event_notifier: Arc::new(EventNotifier::new()),
-            config: CompactionConfig::default()
-                .with_engine(engine)
-                .with_threshold_tokens(threshold)
-                .with_min_messages(2)
-                .with_retain_recent(0),
+            config,
             summarizer: Arc::new(SummaryProvider {
                 calls: AtomicUsize::new(0),
             }),
@@ -265,6 +289,24 @@ impl Harness {
             activity: None,
             connectivity_waits: None,
         }
+    }
+
+    /// Commit `turns` prior exchanges straight into the projection, so a
+    /// compaction at default retention has older history to summarize.
+    async fn seed_history(&self, turns: usize) -> Result<usize> {
+        let messages: Vec<Message> = (0..turns)
+            .flat_map(|turn| {
+                [
+                    Message::user(bulk(&format!("earlier question {turn}"))),
+                    Message::assistant(bulk(&format!("earlier answer {turn}"))),
+                ]
+            })
+            .collect();
+        let seeded = messages.len();
+        self.messages
+            .commit_messages(&thread_id(), messages, t0())
+            .await?;
+        Ok(seeded)
     }
 
     async fn projection(&self) -> Result<MessageProjection> {
@@ -409,6 +451,16 @@ fn ensure_disjoint_from_transcript(
     Ok(())
 }
 
+fn ensure_provider_valid(messages: &[Message], label: &str) -> Result<()> {
+    match provider_tool_sequence_error_index(messages) {
+        None => Ok(()),
+        Some(index) => bail!(
+            "{label}: tool_use/tool_result sequence breaks at message {index}: {:?}",
+            tool_use_ids(messages),
+        ),
+    }
+}
+
 fn suspended_parts(outcome: RootTurnOutcome) -> Result<(AgentTask, Vec<AgentTask>)> {
     match outcome {
         RootTurnOutcome::Suspended {
@@ -453,7 +505,15 @@ async fn start_tool_turn(
     harness: &Harness,
     main: &ScriptedMainProvider,
 ) -> Result<(AgentTaskId, Vec<AgentTask>)> {
-    main.push(tool_call("call_1"))?;
+    start_turn_calling(harness, main, &["call_1"]).await
+}
+
+async fn start_turn_calling(
+    harness: &Harness,
+    main: &ScriptedMainProvider,
+    ids: &[&str],
+) -> Result<(AgentTaskId, Vec<AgentTask>)> {
+    main.push(tool_calls(ids))?;
     let task = AgentTask::new_root_turn(thread_id(), t0(), 3);
     let task_id = task.id.clone();
     harness.tasks.submit_root_turn(task).await?;
@@ -527,7 +587,17 @@ fn ensure_round_folded_only_unfolded_messages(check: &ResumeRound<'_>) -> Result
     )
 }
 
-async fn ensure_turn_committed_each_message_once(harness: &Harness) -> Result<()> {
+/// The transcript and compaction lineage a tool turn started from: seeded
+/// history, plus whatever the fresh call compacted before the first resume.
+struct TurnBaseline {
+    seeded: usize,
+    compactions: usize,
+}
+
+async fn ensure_turn_committed_each_message_once(
+    harness: &Harness,
+    baseline: &TurnBaseline,
+) -> Result<()> {
     let projection = harness.projection().await?;
     let expected_ids: Vec<String> = (1..=RESUME_ROUNDS)
         .map(|round| format!("call_{round}"))
@@ -537,16 +607,21 @@ async fn ensure_turn_committed_each_message_once(harness: &Harness) -> Result<()
         "the committed transcript must hold every tool call exactly once, in order: {:?}",
         tool_use_ids(&projection.messages),
     );
-    let expected_raw_len = 2 + RESUME_ROUNDS * 2;
+    let expected_raw_len = baseline.seeded + 2 + RESUME_ROUNDS * 2;
     ensure!(
         projection.messages.len() == expected_raw_len,
-        "prompt + one (tool_use, tool_result) pair per round + the final reply is \
-         {expected_raw_len} messages; the transcript has {}",
+        "seeded history + prompt + one (tool_use, tool_result) pair per round + the final \
+         reply is {expected_raw_len} messages; the transcript has {}",
         projection.messages.len(),
     );
     ensure!(projection.draft_messages.is_empty());
+    ensure_provider_valid(&projection.messages, "raw transcript")?;
+    ensure_provider_valid(&projection.context_history(), "effective view")?;
 
     let counts = compaction_counts(harness).await?;
+    let counts = counts
+        .get(baseline.compactions..)
+        .context("compactions since the fresh call")?;
     ensure!(counts.len() == RESUME_ROUNDS);
     for (index, (original, new)) in counts.iter().enumerate() {
         ensure!(
@@ -567,10 +642,22 @@ async fn ensure_turn_committed_each_message_once(harness: &Harness) -> Result<()
 /// Runs one turn that calls a tool, then resumes it `RESUME_ROUNDS` times
 /// with a compaction in every resume. Each resume but the last asks for one
 /// more tool; the last answers in text and commits the turn.
-async fn run_compacted_tool_turn(engine: CompactionEngine, trigger: Trigger) -> Result<()> {
-    let harness = Harness::new(engine, trigger)?;
+async fn run_compacted_tool_turn(
+    engine: CompactionEngine,
+    trigger: Trigger,
+    retention: Retention,
+) -> Result<()> {
+    let harness = Harness::new(engine, trigger, retention)?;
+    let seeded = match retention {
+        Retention::Nothing => 0,
+        Retention::Default => harness.seed_history(SEEDED_TURNS).await?,
+    };
     let main = ScriptedMainProvider::new();
     let (task_id, mut children) = start_tool_turn(&harness, &main).await?;
+    let baseline = TurnBaseline {
+        seeded,
+        compactions: compaction_counts(&harness).await?.len(),
+    };
 
     for round in 1..=RESUME_ROUNDS {
         let now = i64::try_from(round)? * 1_000;
@@ -607,6 +694,13 @@ async fn run_compacted_tool_turn(engine: CompactionEngine, trigger: Trigger) -> 
             after: &after,
         })?;
         ensure_requests_have_unique_tool_use_ids(&main, &format!("round {round}"))?;
+        if matches!(retention, Retention::Default) {
+            ensure!(
+                tool_use_ids(&after.context_history()).contains(&format!("call_{round}")),
+                "round {round}: default retention must keep this round's tool call in the \
+                 effective view, where a re-staged copy would show",
+            );
+        }
 
         match outcome {
             RootTurnOutcome::Suspended { child_tasks, .. } => {
@@ -630,64 +724,153 @@ async fn run_compacted_tool_turn(engine: CompactionEngine, trigger: Trigger) -> 
             }
         }
     }
-    ensure_turn_committed_each_message_once(&harness).await
+    ensure_turn_committed_each_message_once(&harness, &baseline).await
 }
 
 #[tokio::test]
 async fn threshold_compaction_between_tool_rounds_never_refolds_legacy() -> Result<()> {
-    run_compacted_tool_turn(CompactionEngine::Legacy, Trigger::Threshold).await
+    run_compacted_tool_turn(
+        CompactionEngine::Legacy,
+        Trigger::Threshold,
+        Retention::Nothing,
+    )
+    .await
 }
 
 #[tokio::test]
 async fn threshold_compaction_between_tool_rounds_never_refolds_prune_first() -> Result<()> {
-    run_compacted_tool_turn(CompactionEngine::PruneFirst, Trigger::Threshold).await
+    run_compacted_tool_turn(
+        CompactionEngine::PruneFirst,
+        Trigger::Threshold,
+        Retention::Nothing,
+    )
+    .await
 }
 
 #[tokio::test]
 async fn threshold_compaction_between_tool_rounds_never_refolds_snapcompact() -> Result<()> {
-    run_compacted_tool_turn(CompactionEngine::Snapcompact, Trigger::Threshold).await
+    run_compacted_tool_turn(
+        CompactionEngine::Snapcompact,
+        Trigger::Threshold,
+        Retention::Nothing,
+    )
+    .await
 }
 
 #[tokio::test]
 async fn overflow_compaction_between_tool_rounds_never_refolds_legacy() -> Result<()> {
-    run_compacted_tool_turn(CompactionEngine::Legacy, Trigger::Overflow).await
+    run_compacted_tool_turn(
+        CompactionEngine::Legacy,
+        Trigger::Overflow,
+        Retention::Nothing,
+    )
+    .await
 }
 
 #[tokio::test]
 async fn overflow_compaction_between_tool_rounds_never_refolds_prune_first() -> Result<()> {
-    run_compacted_tool_turn(CompactionEngine::PruneFirst, Trigger::Overflow).await
+    run_compacted_tool_turn(
+        CompactionEngine::PruneFirst,
+        Trigger::Overflow,
+        Retention::Nothing,
+    )
+    .await
 }
 
 #[tokio::test]
 async fn overflow_compaction_between_tool_rounds_never_refolds_snapcompact() -> Result<()> {
-    run_compacted_tool_turn(CompactionEngine::Snapcompact, Trigger::Overflow).await
+    run_compacted_tool_turn(
+        CompactionEngine::Snapcompact,
+        Trigger::Overflow,
+        Retention::Nothing,
+    )
+    .await
 }
 
-/// A resume whose compaction already folded the turn into the transcript can
-/// still die afterwards (provider weather, lease loss, a lost turn slot); the
-/// host then re-runs it from the same parked `suspended_messages`. The rerun
-/// must recognize the folded messages instead of staging them a second time.
 #[tokio::test]
-async fn resume_rerun_after_a_compacting_attempt_died_does_not_restage_the_folded_turn()
--> Result<()> {
-    let harness = Harness::new(CompactionEngine::Legacy, Trigger::Threshold)?;
-    let main = ScriptedMainProvider::new();
-    let (task_id, children) = start_tool_turn(&harness, &main).await?;
+async fn threshold_compaction_at_default_retention_never_refolds_legacy() -> Result<()> {
+    run_compacted_tool_turn(
+        CompactionEngine::Legacy,
+        Trigger::Threshold,
+        Retention::Default,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn threshold_compaction_at_default_retention_never_refolds_prune_first() -> Result<()> {
+    run_compacted_tool_turn(
+        CompactionEngine::PruneFirst,
+        Trigger::Threshold,
+        Retention::Default,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn threshold_compaction_at_default_retention_never_refolds_snapcompact() -> Result<()> {
+    run_compacted_tool_turn(
+        CompactionEngine::Snapcompact,
+        Trigger::Threshold,
+        Retention::Default,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn overflow_compaction_at_default_retention_never_refolds_legacy() -> Result<()> {
+    run_compacted_tool_turn(
+        CompactionEngine::Legacy,
+        Trigger::Overflow,
+        Retention::Default,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn overflow_compaction_at_default_retention_never_refolds_prune_first() -> Result<()> {
+    run_compacted_tool_turn(
+        CompactionEngine::PruneFirst,
+        Trigger::Overflow,
+        Retention::Default,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn overflow_compaction_at_default_retention_never_refolds_snapcompact() -> Result<()> {
+    run_compacted_tool_turn(
+        CompactionEngine::Snapcompact,
+        Trigger::Overflow,
+        Retention::Default,
+    )
+    .await
+}
+
+/// Starts a tool turn, completes its child and runs a resume that compacts,
+/// folding the in-flight turn into the transcript, and then dies on its
+/// provider call. The host then requeues the row with its `ReadyToResume`
+/// state intact, as it does on provider weather, lease loss or a lost turn
+/// slot: the parked `suspended_messages` predate the fold.
+async fn fold_then_die(harness: &Harness, main: &ScriptedMainProvider) -> Result<AgentTaskId> {
+    let (task_id, children) = start_tool_turn(harness, main).await?;
     harness.complete_children(&children, 1_000).await?;
 
     main.push(ChatOutcome::InvalidRequest(
         "upstream rejected the request".into(),
     ))?;
     let parent = harness.acquire(&task_id, 1_010).await?;
+    let before = harness.projection().await?;
     let inputs = harness.inputs(parent.clone(), 1_010).await?;
-    let died = resume_from_children(inputs, &parent, &main, &harness.deps(), at(1_020)).await;
+    let died = resume_from_children(inputs, &parent, main, &harness.deps(), at(1_020)).await;
     ensure!(
         died.is_err(),
-        "the first resume attempt must die after compacting"
+        "the resume attempt must die after compacting"
     );
     let folded = harness.projection().await?;
     ensure!(
-        folded.compactions.len() == 1 && folded.draft_messages.is_empty(),
+        folded.compactions.len() == before.compactions.len() + 1
+            && folded.draft_messages.is_empty(),
         "precondition: the dead attempt folded the in-flight turn into the transcript",
     );
     ensure!(tool_use_ids(&folded.messages) == ["call_1"]);
@@ -703,6 +886,22 @@ async fn resume_rerun_after_a_compacting_attempt_died_does_not_restage_the_folde
         )
         .await?;
     ensure!(matches!(requeued, RequeueOutcome::Requeued(_)));
+    Ok(task_id)
+}
+
+/// The host re-runs a resume that died after its compaction from the same
+/// parked `suspended_messages`; the rerun must recognize the folded messages
+/// instead of staging them a second time.
+#[tokio::test]
+async fn resume_rerun_after_a_compacting_attempt_died_does_not_restage_the_folded_turn()
+-> Result<()> {
+    let harness = Harness::new(
+        CompactionEngine::Legacy,
+        Trigger::Threshold,
+        Retention::Nothing,
+    )?;
+    let main = ScriptedMainProvider::new();
+    let task_id = fold_then_die(&harness, &main).await?;
 
     main.push(text("all done"))?;
     let parent = harness.acquire(&task_id, 2_000).await?;
@@ -726,4 +925,307 @@ async fn resume_rerun_after_a_compacting_attempt_died_does_not_restage_the_folde
         projection.messages.len(),
     );
     Ok(())
+}
+
+/// Cancelling the requeued row commits its parked `suspended_messages`
+/// (`[prompt, call_1]`), all of which the dead attempt's fold already holds
+/// together with `call_1`'s real result. Committing them again would leave
+/// `call_1` in the transcript twice, once with a synthetic cancelled result.
+async fn cancel_after_a_folded_resume_died(retention: Retention) -> Result<()> {
+    let harness = Harness::new(CompactionEngine::Legacy, Trigger::Threshold, retention)?;
+    if matches!(retention, Retention::Default) {
+        harness.seed_history(SEEDED_TURNS).await?;
+    }
+    let main = ScriptedMainProvider::new();
+    let task_id = fold_then_die(&harness, &main).await?;
+    let parked = harness.tasks.get(&task_id).await?.context("parked row")?;
+    ensure!(
+        parked.status == TaskStatus::Pending
+            && matches!(parked.state, TaskState::ReadyToResume { .. }),
+        "precondition: the requeued row is parked ready to resume",
+    );
+    let folded = harness.projection().await?;
+
+    let cancelled = cancel_root_turn(&task_id, &harness.deps(), at(1_040)).await?;
+    ensure!(cancelled.contains(&task_id));
+
+    let projection = harness.projection().await?;
+    ensure!(
+        projection.messages.len() == folded.messages.len(),
+        "the fold already holds the whole parked turn, so the cancel commits nothing: \
+         the transcript grew from {} to {} messages",
+        folded.messages.len(),
+        projection.messages.len(),
+    );
+    ensure!(
+        tool_use_ids(&projection.messages) == ["call_1"],
+        "raw transcript after the cancel: {:?}",
+        tool_use_ids(&projection.messages),
+    );
+    ensure_provider_valid(&projection.messages, "raw transcript after the cancel")?;
+    let effective = projection.context_history();
+    ensure_unique_tool_use_ids(&effective, "effective view after the cancel")?;
+    ensure_provider_valid(&effective, "effective view after the cancel")?;
+    if matches!(retention, Retention::Default) {
+        ensure!(
+            tool_use_ids(&effective) == ["call_1"],
+            "default retention keeps the folded call in the effective view: {:?}",
+            tool_use_ids(&effective),
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn parked_cancel_after_a_folded_resume_died_commits_nothing_twice() -> Result<()> {
+    cancel_after_a_folded_resume_died(Retention::Nothing).await
+}
+
+#[tokio::test]
+async fn parked_cancel_after_a_folded_resume_died_at_default_retention() -> Result<()> {
+    cancel_after_a_folded_resume_died(Retention::Default).await
+}
+
+async fn wake_for_steering(harness: &Harness, task_id: &AgentTaskId, now: i64) -> Result<()> {
+    harness
+        .tasks
+        .enqueue_steering_resume(
+            task_id,
+            vec![ContentBlock::Text {
+                text: "how is it going?".into(),
+            }],
+            at(now),
+        )
+        .await?
+        .context("the parked parent must wake for steering")?;
+    Ok(())
+}
+
+async fn ensure_turn_holds_each_tool_call_once(
+    harness: &Harness,
+    main: &ScriptedMainProvider,
+    expected: &[String],
+    label: &str,
+) -> Result<()> {
+    let projection = harness.projection().await?;
+    ensure!(
+        tool_use_ids(&projection.messages) == expected,
+        "{label}: the transcript must hold every tool call exactly once, in order: {:?}",
+        tool_use_ids(&projection.messages),
+    );
+    ensure!(
+        projection.draft_messages.is_empty(),
+        "{label}: the committed turn leaves no draft",
+    );
+    ensure_provider_valid(&projection.messages, &format!("{label}: raw transcript"))?;
+    let effective = projection.context_history();
+    ensure_unique_tool_use_ids(&effective, &format!("{label}: effective view"))?;
+    ensure_provider_valid(&effective, &format!("{label}: effective view"))?;
+    ensure_requests_have_unique_tool_use_ids(main, label)
+}
+
+/// Runs a steering wake while one of two tool children is still running and
+/// checks that the steering exchange compacted, folding the parked turn and
+/// the steering message, before its reply.
+async fn compacting_steering_wake(
+    harness: &Harness,
+    main: &ScriptedMainProvider,
+    reply: ChatOutcome,
+    finish_survivor_first: bool,
+) -> Result<(AgentTaskId, AgentTask, RootTurnOutcome)> {
+    let (task_id, children) = start_turn_calling(harness, main, &["call_1", "call_2"]).await?;
+    let [finished, survivor] = children.as_slice() else {
+        bail!("expected two tool children, got {}", children.len());
+    };
+    harness
+        .complete_children(std::slice::from_ref(finished), 1_000)
+        .await?;
+    wake_for_steering(harness, &task_id, 1_010).await?;
+    if finish_survivor_first {
+        harness
+            .complete_children(std::slice::from_ref(survivor), 1_015)
+            .await?;
+    }
+
+    main.push(reply)?;
+    let parent = harness.acquire(&task_id, 1_020).await?;
+    ensure!(parent.state.is_steering_resume());
+    let before = harness.projection().await?;
+    let inputs = harness.inputs(parent.clone(), 1_020).await?;
+    let outcome = resume_for_steering(inputs, &parent, main, &harness.deps(), at(1_030)).await?;
+    let after = harness.projection().await?;
+    ensure!(
+        after.compactions.len() == before.compactions.len() + 1,
+        "precondition: the steering exchange compacted",
+    );
+    let entry = after.compactions.last().context("steering compaction")?;
+    ensure!(
+        entry.draft_fold_len == parked_messages(&parent)?.len() + 1,
+        "the steering fold holds the parked turn and the steering message",
+    );
+    Ok((task_id, survivor.clone(), outcome))
+}
+
+async fn ensure_reparked_only_unfolded(task: &AgentTask, harness: &Harness) -> Result<()> {
+    let parked = parked_messages(task)?;
+    let projection = harness.projection().await?;
+    ensure_disjoint_from_transcript(parked, &projection.messages, "steering re-park")?;
+    ensure!(
+        parked.len() == 1,
+        "the steering exchange folded the parked turn, so the re-park holds only its new \
+         assistant message; it holds {}",
+        parked.len(),
+    );
+    Ok(())
+}
+
+async fn finish_turn(
+    harness: &Harness,
+    main: &ScriptedMainProvider,
+    task_id: &AgentTaskId,
+    children: &[AgentTask],
+) -> Result<()> {
+    harness.complete_children(children, 2_000).await?;
+    main.push(text("all done"))?;
+    let parent = harness.acquire(task_id, 2_010).await?;
+    let inputs = harness.inputs(parent.clone(), 2_010).await?;
+    let outcome = resume_from_children(inputs, &parent, main, &harness.deps(), at(2_020)).await?;
+    ensure!(
+        matches!(outcome, RootTurnOutcome::Completed { .. }),
+        "the fan-in must commit the turn"
+    );
+    Ok(())
+}
+
+/// A steering wake whose exchange compacts re-parks on the survivor through
+/// `prepare_steering_repark`. The fold already holds the parked turn and the
+/// steering message, so the re-park must carry only the steering answer; the
+/// survivor's fan-in then commits each call once.
+#[tokio::test]
+async fn steering_wake_that_compacts_reparks_only_the_unfolded_turn() -> Result<()> {
+    let harness = Harness::new(
+        CompactionEngine::Legacy,
+        Trigger::Threshold,
+        Retention::Nothing,
+    )?;
+    let main = ScriptedMainProvider::new();
+    let (task_id, survivor, outcome) = compacting_steering_wake(
+        &harness,
+        &main,
+        text("call_1 is done, call_2 is still running"),
+        false,
+    )
+    .await?;
+    let (reparked, spawned) = suspended_parts(outcome)?;
+    ensure!(
+        spawned.is_empty(),
+        "the re-park re-attaches the survivor instead of spawning"
+    );
+    ensure_reparked_only_unfolded(&reparked, &harness).await?;
+
+    finish_turn(&harness, &main, &task_id, std::slice::from_ref(&survivor)).await?;
+    ensure_turn_holds_each_tool_call_once(
+        &harness,
+        &main,
+        &["call_1".to_owned(), "call_2".to_owned()],
+        "steering re-park",
+    )
+    .await
+}
+
+/// A steering wake that finds every child finished and answers with a new
+/// tool call re-suspends through the resume path; with the parked turn and
+/// the steering message folded, only the new call may be parked.
+#[tokio::test]
+async fn steering_wake_that_compacts_and_calls_a_tool_parks_only_the_new_call() -> Result<()> {
+    let harness = Harness::new(
+        CompactionEngine::Legacy,
+        Trigger::Threshold,
+        Retention::Nothing,
+    )?;
+    let main = ScriptedMainProvider::new();
+    let (task_id, _, outcome) =
+        compacting_steering_wake(&harness, &main, tool_call("call_3"), true).await?;
+    let (suspended, spawned) = suspended_parts(outcome)?;
+    ensure!(spawned.len() == 1, "the new tool call spawns one child");
+    ensure_reparked_only_unfolded(&suspended, &harness).await?;
+
+    finish_turn(&harness, &main, &task_id, &spawned).await?;
+    ensure_turn_holds_each_tool_call_once(
+        &harness,
+        &main,
+        &[
+            "call_1".to_owned(),
+            "call_2".to_owned(),
+            "call_3".to_owned(),
+        ],
+        "steering tool call",
+    )
+    .await
+}
+
+/// A steering exchange that compacted and then failed is reverted to its
+/// pre-wake parked state, but its fold already holds that whole parked turn
+/// (and the steering message that answered it). The revert must re-park none
+/// of it, and a cancel of the reverted row must commit none of it again.
+#[tokio::test]
+async fn cancel_after_a_compacted_steering_wake_was_reverted_commits_nothing_twice() -> Result<()> {
+    let harness = Harness::new(
+        CompactionEngine::Legacy,
+        Trigger::Threshold,
+        Retention::Nothing,
+    )?;
+    let main = ScriptedMainProvider::new();
+    let (task_id, children) = start_turn_calling(&harness, &main, &["call_1", "call_2"]).await?;
+    let finished = children.first().context("first tool child")?;
+    harness
+        .complete_children(std::slice::from_ref(finished), 1_000)
+        .await?;
+    wake_for_steering(&harness, &task_id, 1_010).await?;
+
+    main.push(ChatOutcome::InvalidRequest(
+        "upstream rejected the request".into(),
+    ))?;
+    let parent = harness.acquire(&task_id, 1_020).await?;
+    let inputs = harness.inputs(parent.clone(), 1_020).await?;
+    let Err(error) = resume_for_steering(inputs, &parent, &main, &harness.deps(), at(1_030)).await
+    else {
+        bail!("the steering exchange must fail after compacting");
+    };
+    let folded = harness.projection().await?;
+    ensure!(
+        folded.compactions.len() == 1 && folded.draft_messages.is_empty(),
+        "precondition: the failed exchange folded the parked turn into the transcript",
+    );
+    ensure!(tool_use_ids(&folded.messages) == ["call_1", "call_2"]);
+
+    let reverted = revert_steering_wake(
+        &parent,
+        &WorkerId::from_string("worker_resume"),
+        &LeaseId::from_string("lease_resume"),
+        &error,
+        &harness.deps(),
+        at(1_040),
+    )
+    .await?;
+    ensure!(reverted.status == TaskStatus::WaitingOnChildren);
+    ensure!(
+        parked_messages(&reverted)?.is_empty(),
+        "the revert must not re-park messages the failed exchange folded: {:?}",
+        tool_use_ids(parked_messages(&reverted)?),
+    );
+
+    cancel_root_turn(&task_id, &harness.deps(), at(1_050)).await?;
+    let projection = harness.projection().await?;
+    ensure!(
+        projection.messages.len() == folded.messages.len(),
+        "the cancel must commit nothing the fold holds: the transcript grew from {} to {}",
+        folded.messages.len(),
+        projection.messages.len(),
+    );
+    ensure_provider_valid(&projection.messages, "raw transcript after the cancel")?;
+    ensure_unique_tool_use_ids(
+        &projection.context_history(),
+        "effective view after the cancel",
+    )
 }
