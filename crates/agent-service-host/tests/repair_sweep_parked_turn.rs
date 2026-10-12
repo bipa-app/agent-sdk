@@ -134,6 +134,7 @@ fn definition() -> AgentDefinition {
             input_schema: serde_json::json!({"type": "object"}),
             display_name: "Bash".into(),
             tier: ToolTier::Observe,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
         }],
         thinking: ThinkingPolicy::default(),
         thinking_display: None,

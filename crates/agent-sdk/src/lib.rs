@@ -507,8 +507,8 @@ pub use events::{AccountRotationReason, AgentEvent, AgentEventEnvelope, Sequence
 pub use types::{
     AgentConfig, AgentError, AgentInput, AgentRunState, AgentState, BudgetLimitKind,
     ExecutionStatus, ExternalToolResult, PendingToolCallInfo, RetryConfig, RunOptions, ThreadId,
-    TokenUsage, ToolExecution, ToolInvocation, ToolOutcome, ToolResult, ToolRuntime, ToolTier,
-    TurnOptions, UsageLimits,
+    TokenUsage, ToolConcurrency, ToolExecution, ToolInvocation, ToolOutcome, ToolResult,
+    ToolRuntime, ToolTier, TurnOptions, UsageLimits,
 };
 
 // agent-sdk-tools (via thin modules)
@@ -769,8 +769,8 @@ pub mod prelude {
     pub use crate::tool;
     pub use crate::{
         AgentConfig, AgentEvent, AgentInput, CancellationToken, DynamicToolName,
-        InMemoryEventStore, SimpleTool, Tool, ToolContext, ToolName, ToolRegistry, ToolResult,
-        ToolTier, TypedTool,
+        InMemoryEventStore, SimpleTool, Tool, ToolConcurrency, ToolContext, ToolName, ToolRegistry,
+        ToolResult, ToolTier, TypedTool,
     };
 }
 

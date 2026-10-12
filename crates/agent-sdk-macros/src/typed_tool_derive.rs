@@ -44,6 +44,14 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
 
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
+    let concurrency_fn = attr.opt_expr("concurrency").map(|c| {
+        quote! {
+            fn concurrency(&self) -> ::agent_sdk::ToolConcurrency {
+                #c
+            }
+        }
+    });
+
     let tier_body = attr.opt_expr("tier").map_or_else(
         || quote! { ::agent_sdk::ToolTier::Observe },
         |t| quote! { #t },
@@ -80,6 +88,8 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
             fn tier(&self) -> ::agent_sdk::ToolTier {
                 #tier_body
             }
+
+            #concurrency_fn
 
             fn execute(
                 &self,

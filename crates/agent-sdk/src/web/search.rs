@@ -1,7 +1,7 @@
 //! Web search tool implementation.
 
 use crate::tools::{PrimitiveToolName, Tool, ToolContext};
-use crate::types::{ToolResult, ToolTier};
+use crate::types::{ToolConcurrency, ToolResult, ToolTier};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::fmt::Write;
@@ -119,6 +119,10 @@ where
     fn tier(&self) -> ToolTier {
         // Web search is read-only, so Observe tier
         ToolTier::Observe
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::ReadOnly
     }
 
     async fn execute(&self, _ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {

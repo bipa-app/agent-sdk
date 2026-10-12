@@ -73,6 +73,7 @@ fn definition() -> AgentDefinition {
             }),
             display_name: "Weather".into(),
             tier: ToolTier::Observe,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
         }],
         max_tokens: 1024,
         thinking: ThinkingPolicy::Disabled,

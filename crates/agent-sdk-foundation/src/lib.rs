@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 pub mod audit;
+pub mod batch_order;
 pub mod events;
 pub mod llm;
 pub mod privacy;
@@ -38,6 +39,6 @@ pub use types::{
     AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState,
     CONTINUATION_VERSION, ContinuationEnvelope, ExecutionStatus, ExternalToolResult,
     ListenExecutionContext, PendingToolCallInfo, QuestionAnswer, QuestionOption, QuestionPayload,
-    RetryConfig, ThreadId, TokenUsage, ToolExecution, ToolInvocation, ToolOutcome, ToolResult,
-    ToolResultArtifact, ToolRuntime, ToolTier, TurnOptions, TurnOutcome, TurnSummary,
+    RetryConfig, ThreadId, TokenUsage, ToolConcurrency, ToolExecution, ToolInvocation, ToolOutcome,
+    ToolResult, ToolResultArtifact, ToolRuntime, ToolTier, TurnOptions, TurnOutcome, TurnSummary,
 };

@@ -343,6 +343,7 @@ fn child_definition_with_tools() -> AgentDefinition {
             input_schema: json!({"type":"object","properties":{"command":{"type":"string"}}}),
             display_name: "Bash".into(),
             tier: ToolTier::Observe,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
         }],
         ..sample_definition()
     }
@@ -377,6 +378,7 @@ fn parent_suspension_payload(parent_thread: &ThreadId, tool_id: &str) -> Suspens
         name: "subagent_researcher".into(),
         display_name: "Subagent: Researcher".into(),
         tier: ToolTier::Confirm,
+        concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
         input: json!({ "task": "Investigate durable reuse" }),
         effective_input: json!({ "task": "Investigate durable reuse" }),
         listen_context: None,

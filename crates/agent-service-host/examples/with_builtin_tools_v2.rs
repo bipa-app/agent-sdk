@@ -223,6 +223,7 @@ fn make_bootstrap(
             name: tool_name.into(),
             display_name: tool_name.into(),
             tier: ToolTier::Observe,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
             input: input.clone(),
             effective_input: input,
             listen_context: None,

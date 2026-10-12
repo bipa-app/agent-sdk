@@ -732,6 +732,10 @@ mod tests {
 
         assert_eq!(Tool::<()>::name(&tool), PrimitiveToolName::Bash);
         assert_eq!(Tool::<()>::tier(&tool), ToolTier::Confirm);
+        assert_eq!(
+            Tool::<()>::concurrency(&tool),
+            crate::ToolConcurrency::Exclusive
+        );
         assert!(Tool::<()>::description(&tool).contains("Execute"));
 
         let schema = Tool::<()>::input_schema(&tool);

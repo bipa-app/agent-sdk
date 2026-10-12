@@ -1,5 +1,7 @@
 use crate::llm::ContentSource;
-use crate::{Environment, PrimitiveToolName, Tool, ToolContext, ToolResult, ToolTier};
+use crate::{
+    Environment, PrimitiveToolName, Tool, ToolConcurrency, ToolContext, ToolResult, ToolTier,
+};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -104,6 +106,10 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for ReadToo
 
     fn tier(&self) -> ToolTier {
         ToolTier::Observe
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::ReadOnly
     }
 
     fn input_schema(&self) -> Value {
@@ -1248,6 +1254,23 @@ mod tests {
 
         assert_eq!(Tool::<()>::name(&tool), PrimitiveToolName::Read);
         assert_eq!(Tool::<()>::tier(&tool), ToolTier::Observe);
+        assert_eq!(
+            Tool::<()>::concurrency(&tool),
+            crate::ToolConcurrency::ReadOnly
+        );
+        let mut registry = crate::ToolRegistry::<()>::new();
+        registry.register(create_test_tool(
+            Arc::new(InMemoryFileSystem::new("/workspace")),
+            AgentCapabilities::full_access(),
+        ));
+        assert_eq!(
+            registry
+                .to_llm_tools()
+                .first()
+                .map(|definition| definition.concurrency),
+            Some(crate::ToolConcurrency::ReadOnly),
+            "the registry must advertise the tool's concurrency"
+        );
 
         let schema = Tool::<()>::input_schema(&tool);
         assert!(schema["properties"].get("path").is_some());

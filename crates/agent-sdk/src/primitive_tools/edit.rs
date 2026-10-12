@@ -493,6 +493,10 @@ mod tests {
 
         assert_eq!(Tool::<()>::name(&tool), PrimitiveToolName::Edit);
         assert_eq!(Tool::<()>::tier(&tool), ToolTier::Confirm);
+        assert_eq!(
+            Tool::<()>::concurrency(&tool),
+            crate::ToolConcurrency::Exclusive
+        );
         assert!(Tool::<()>::description(&tool).contains("Edit"));
 
         let schema = Tool::<()>::input_schema(&tool);

@@ -90,11 +90,11 @@ pub struct AgentConfig {
     /// instead of starting another turn. `None` (default) disables
     /// budgeting entirely.
     pub usage_limits: Option<UsageLimits>,
-    /// Maximum number of read-only (`ToolTier::Observe`) tool calls the SDK
-    /// runs concurrently within a single parallel batch.
+    /// Maximum number of read-only tool calls the SDK runs concurrently
+    /// within one wave of a batch (see [`crate::batch_order`]).
     ///
     /// `None` (default) keeps the historical unbounded behavior — every
-    /// adjacent observe-tier call in a turn is dispatched at once.
+    /// call in a shared wave is dispatched at once.
     /// `Some(1)` forces strictly sequential execution; `Some(n)` caps the
     /// in-flight count at `n`. `Some(0)` is not meaningful and is treated
     /// as `Some(1)` (sequential). Result ordering is always preserved.
@@ -359,6 +359,27 @@ pub enum ToolTier {
     Confirm,
 }
 
+/// Whether a tool call may overlap with its siblings in one model batch.
+///
+/// This is independent of [`ToolTier`]: the tier decides whether a call
+/// needs confirmation, this decides how it is ordered. A host may lower a
+/// mutating tool to [`ToolTier::Observe`] to skip prompts without making
+/// it safe to run beside the calls the model issued before and after it.
+/// See [`crate::batch_order`] for the execution rule.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolConcurrency {
+    /// Only reads state, so adjacent read-only calls may run at the same
+    /// time.
+    ReadOnly,
+    /// May change state or observe changes made by earlier calls. Runs
+    /// alone, after every earlier call in its batch and before every
+    /// later one. The default for any tool that does not declare itself
+    /// read-only.
+    #[default]
+    Exclusive,
+}
+
 /// Snapshot of agent state for checkpointing
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentState {
@@ -511,6 +532,13 @@ pub struct PendingToolCallInfo {
     /// when deserialized from a continuation that predates this field.
     #[serde(default = "default_pending_tier")]
     pub tier: ToolTier,
+    /// Ordering class of the tool, captured with [`Self::tier`].
+    ///
+    /// Defaults to [`ToolConcurrency::Exclusive`] when deserialized from
+    /// a continuation that predates this field, so an old batch runs in
+    /// model order.
+    #[serde(default)]
+    pub concurrency: ToolConcurrency,
     /// Tool input parameters as requested by the LLM.
     pub input: serde_json::Value,
     /// Effective input after SDK preparation (e.g. listen-context enrichment).
@@ -1485,6 +1513,7 @@ mod tests {
                 name: "echo".into(),
                 display_name: "Echo".into(),
                 tier: ToolTier::Confirm,
+                concurrency: crate::ToolConcurrency::Exclusive,
                 input: serde_json::json!({"message": "hi"}),
                 effective_input: serde_json::json!({"message": "hi"}),
                 listen_context: None,

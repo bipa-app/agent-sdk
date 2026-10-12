@@ -11,8 +11,8 @@
 //! the exact runtime surface the agent loop uses.
 
 use agent_sdk::{
-    SimpleTool, ToolContext, ToolLogic, ToolName, ToolRegistry, ToolResult, ToolTier, TypedTool,
-    tool,
+    SimpleTool, ToolConcurrency, ToolContext, ToolLogic, ToolName, ToolRegistry, ToolResult,
+    ToolTier, TypedTool, tool,
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -134,7 +134,53 @@ async fn derived_tool_defaults_schema_and_tier() -> Result<()> {
     let ping = Ping;
     assert_eq!(SimpleTool::input_schema(&ping), json!({ "type": "object" }));
     assert_eq!(SimpleTool::tier(&ping), ToolTier::Observe);
+    assert_eq!(SimpleTool::concurrency(&ping), ToolConcurrency::Exclusive);
     assert_eq!(SimpleTool::display_name(&ping), "");
+    Ok(())
+}
+
+#[tokio::test]
+async fn derived_tools_declare_concurrency_through_the_registry() -> Result<()> {
+    #[derive(agent_sdk::Tool)]
+    #[tool(
+        name = "lookup",
+        description = "Look something up",
+        concurrency = ToolConcurrency::ReadOnly,
+    )]
+    struct Lookup;
+
+    impl ToolLogic<()> for Lookup {
+        type Input = Value;
+
+        async fn execute(&self, _ctx: &ToolContext<()>, _input: Value) -> Result<ToolResult> {
+            Ok(ToolResult::success("found"))
+        }
+    }
+
+    #[derive(agent_sdk::TypedTool)]
+    #[tool(
+        name = "peek",
+        description = "Peek at something",
+        input = Value,
+        concurrency = ToolConcurrency::ReadOnly,
+    )]
+    struct Peek;
+
+    impl ToolLogic<()> for Peek {
+        type Input = Value;
+
+        async fn execute(&self, _ctx: &ToolContext<()>, _input: Value) -> Result<ToolResult> {
+            Ok(ToolResult::success("seen"))
+        }
+    }
+
+    let mut registry = ToolRegistry::<()>::new();
+    registry.register_simple(Lookup);
+    registry.register_typed(Peek);
+    for name in ["lookup", "peek"] {
+        let tool = registry.get(name).context("tool registered")?;
+        assert_eq!(tool.concurrency(), ToolConcurrency::ReadOnly, "{name}");
+    }
     Ok(())
 }
 

@@ -1450,6 +1450,7 @@ mod tests {
             input_schema: serde_json::json!({"type": "object"}),
             display_name: "Test Tool".to_string(),
             tier: agent_sdk_foundation::ToolTier::Observe,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
         }];
 
         let api_tools = convert_tools_to_config(tools);
@@ -1987,6 +1988,7 @@ mod tests {
             }),
             display_name: "Make".to_string(),
             tier: agent_sdk_foundation::ToolTier::Observe,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
         }];
 
         let config = convert_tools_to_config(tools);
@@ -2038,6 +2040,7 @@ mod tests {
             }),
             display_name: "Plan Apply".to_string(),
             tier: agent_sdk_foundation::ToolTier::Observe,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
         }];
 
         let config = convert_tools_to_config(tools);

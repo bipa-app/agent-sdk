@@ -143,6 +143,7 @@ fn sample_definition_with_tools() -> AgentDefinition {
                 input_schema: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
                 display_name: "Bash".into(),
                 tier: ToolTier::Observe,
+                concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
             },
             Tool {
                 name: "read_file".into(),
@@ -150,6 +151,7 @@ fn sample_definition_with_tools() -> AgentDefinition {
                 input_schema: serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}}),
                 display_name: "Read File".into(),
                 tier: ToolTier::Observe,
+                concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
             },
         ],
         thinking: ThinkingPolicy::default(),

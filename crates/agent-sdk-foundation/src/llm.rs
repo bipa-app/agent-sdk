@@ -1211,6 +1211,9 @@ pub struct Tool {
     pub display_name: String,
     /// Permission tier for this tool.
     pub tier: super::types::ToolTier,
+    /// Ordering class for this tool within a model batch.
+    #[serde(default)]
+    pub concurrency: super::types::ToolConcurrency,
 }
 
 #[derive(Debug, Clone)]

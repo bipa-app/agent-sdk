@@ -45,7 +45,7 @@ use crate::seed::{HostDependencies, ToolContextSeed};
 use crate::stores::EventStore;
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::llm;
-use agent_sdk_foundation::types::{ToolOutcome, ToolResult, ToolTier};
+use agent_sdk_foundation::types::{ToolConcurrency, ToolOutcome, ToolResult, ToolTier};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::Stream;
@@ -590,6 +590,14 @@ pub trait Tool<Ctx>: Send + Sync {
         ToolTier::Confirm
     }
 
+    /// Whether calls to this tool may overlap with adjacent calls in one
+    /// model batch. Defaults to [`ToolConcurrency::Exclusive`], so the call
+    /// runs alone and in model order. Override only for a tool that
+    /// changes nothing, such as a file read or a search.
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Exclusive
+    }
+
     /// Execute the tool with the given input.
     ///
     /// # Errors
@@ -717,6 +725,14 @@ pub trait TypedTool<Ctx>: Send + Sync {
         ToolTier::Confirm
     }
 
+    /// Whether calls to this tool may overlap with adjacent calls in one
+    /// model batch. Defaults to [`ToolConcurrency::Exclusive`], so the call
+    /// runs alone and in model order. Override only for a tool that
+    /// changes nothing, such as a file read or a search.
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Exclusive
+    }
+
     /// Execute the tool with the already-validated, typed input.
     ///
     /// The runtime guarantees `input` deserialized cleanly from the model's
@@ -828,6 +844,10 @@ where
 
     fn tier(&self) -> ToolTier {
         TypedTool::tier(&self.inner)
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        TypedTool::concurrency(&self.inner)
     }
 
     async fn execute(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {
@@ -968,6 +988,14 @@ pub trait SimpleTool<Ctx>: Send + Sync {
         ToolTier::Confirm
     }
 
+    /// Whether calls to this tool may overlap with adjacent calls in one
+    /// model batch. Defaults to [`ToolConcurrency::Exclusive`], so the call
+    /// runs alone and in model order. Override only for a tool that
+    /// changes nothing, such as a file read or a search.
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Exclusive
+    }
+
     /// Execute the tool with the given input.
     ///
     /// # Errors
@@ -1026,6 +1054,10 @@ where
 
     fn tier(&self) -> ToolTier {
         SimpleTool::tier(&self.inner)
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        SimpleTool::concurrency(&self.inner)
     }
 
     fn execute(
@@ -1111,6 +1143,14 @@ pub trait AsyncTool<Ctx>: Send + Sync {
         ToolTier::Confirm
     }
 
+    /// Whether calls to this tool may overlap with adjacent calls in one
+    /// model batch. Defaults to [`ToolConcurrency::Exclusive`], so the call
+    /// runs alone and in model order. Override only for a tool that
+    /// changes nothing, such as a file read or a search.
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Exclusive
+    }
+
     /// Execute the tool. Returns immediately with one of:
     /// - Success/Failed: Operation completed synchronously
     /// - `InProgress`: Operation started, use `check_status()` to stream updates
@@ -1167,6 +1207,14 @@ pub trait ListenExecuteTool<Ctx>: Send + Sync {
     /// Permission tier for this tool.
     fn tier(&self) -> ToolTier {
         ToolTier::Confirm
+    }
+
+    /// Whether calls to this tool may overlap with adjacent calls in one
+    /// model batch. Defaults to [`ToolConcurrency::Exclusive`], so the call
+    /// runs alone and in model order. Override only for a tool that
+    /// changes nothing, such as a file read or a search.
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Exclusive
     }
 
     /// Start and stream runtime preparation updates.
@@ -1229,6 +1277,8 @@ pub trait ErasedTool<Ctx>: Send + Sync {
     fn input_schema(&self) -> Value;
     /// Get the tool's permission tier.
     fn tier(&self) -> ToolTier;
+    /// Get the tool's ordering class within a model batch.
+    fn concurrency(&self) -> ToolConcurrency;
     /// Execute the tool with the given input.
     async fn execute(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult>;
 }
@@ -1283,6 +1333,10 @@ where
         self.inner.tier()
     }
 
+    fn concurrency(&self) -> ToolConcurrency {
+        self.inner.concurrency()
+    }
+
     async fn execute(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {
         self.inner.execute(ctx, input).await
     }
@@ -1308,6 +1362,8 @@ pub trait ErasedAsyncTool<Ctx>: Send + Sync {
     fn input_schema(&self) -> Value;
     /// Get the tool's permission tier.
     fn tier(&self) -> ToolTier;
+    /// Get the tool's ordering class within a model batch.
+    fn concurrency(&self) -> ToolConcurrency;
     /// Execute the tool with the given input.
     async fn execute(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolOutcome>;
     /// Stream status updates for an in-progress operation (type-erased).
@@ -1368,6 +1424,10 @@ where
         self.inner.tier()
     }
 
+    fn concurrency(&self) -> ToolConcurrency {
+        self.inner.concurrency()
+    }
+
     async fn execute(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolOutcome> {
         self.inner.execute(ctx, input).await
     }
@@ -1400,6 +1460,8 @@ pub trait ErasedListenTool<Ctx>: Send + Sync {
     fn input_schema(&self) -> Value;
     /// Get the tool's permission tier.
     fn tier(&self) -> ToolTier;
+    /// Get the tool's ordering class within a model batch.
+    fn concurrency(&self) -> ToolConcurrency;
     /// Start listen stream.
     fn listen_stream<'a>(
         &'a self,
@@ -1470,6 +1532,10 @@ where
 
     fn tier(&self) -> ToolTier {
         self.inner.tier()
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        self.inner.concurrency()
     }
 
     fn listen_stream<'a>(
@@ -1809,7 +1875,7 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
     #[must_use]
     pub fn to_llm_tools(&self) -> Vec<llm::Tool> {
         /// Build the LLM tool descriptor from the accessors every erased tool
-        /// trait shares. Extracted so the five-field `llm::Tool` literal —
+        /// trait shares. Extracted so the `llm::Tool` literal —
         /// whose byte content is prompt-cache load-bearing — exists in exactly
         /// one place across the sync / async / listen iterators.
         fn descriptor(
@@ -1818,6 +1884,7 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
             description: &str,
             input_schema: Value,
             tier: ToolTier,
+            concurrency: ToolConcurrency,
         ) -> llm::Tool {
             llm::Tool {
                 name: name.to_string(),
@@ -1825,6 +1892,7 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
                 input_schema,
                 display_name: display_name.to_string(),
                 tier,
+                concurrency,
             }
         }
 
@@ -1838,6 +1906,7 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
                     tool.description(),
                     tool.input_schema(),
                     tool.tier(),
+                    tool.concurrency(),
                 )
             })
             .collect();
@@ -1849,6 +1918,7 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
                 tool.description(),
                 tool.input_schema(),
                 tool.tier(),
+                tool.concurrency(),
             )
         }));
 
@@ -1859,6 +1929,7 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
                 tool.description(),
                 tool.input_schema(),
                 tool.tier(),
+                tool.concurrency(),
             )
         }));
 
@@ -1951,6 +2022,7 @@ mod tests {
         let llm_tools = registry.to_llm_tools();
         assert_eq!(llm_tools.len(), 1);
         assert_eq!(llm_tools[0].name, "mock_tool");
+        assert_eq!(llm_tools[0].concurrency, ToolConcurrency::Exclusive);
     }
 
     #[test]

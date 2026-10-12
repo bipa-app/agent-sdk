@@ -4218,6 +4218,7 @@ mod tests {
                                 name: "ask_user".into(),
                                 display_name: "Ask User".into(),
                                 tier: ToolTier::Observe,
+                                concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
                                 input: serde_json::json!({"question": "Where?"}),
                                 effective_input: serde_json::json!({"question": "Where?"}),
                                 listen_context: None,
@@ -4418,6 +4419,7 @@ mod tests {
                 input_schema: serde_json::json!({"type": "object"}),
                 display_name: "Ask User".into(),
                 tier: ToolTier::Observe,
+                concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
             }],
             ..sample_definition()
         };
@@ -6320,6 +6322,7 @@ mod tests {
             input_schema: serde_json::json!({ "type": "object" }),
             display_name: "Probe".into(),
             tier: agent_sdk_foundation::ToolTier::Observe,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
         }
     }
 
@@ -7266,6 +7269,7 @@ mod tests {
                         name: tool_name.to_owned(),
                         display_name: tool_name.to_owned(),
                         tier,
+                        concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
                         input: input.clone(),
                         effective_input: input.clone(),
                         listen_context: None,

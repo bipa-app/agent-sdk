@@ -7002,6 +7002,7 @@ INSERT INTO agent_sdk_turn_attempts (
             name: "ask_user".into(),
             display_name: "Ask User".into(),
             tier: ToolTier::Observe,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
             input: serde_json::json!({"question": "Where?"}),
             effective_input: serde_json::json!({"question": "Where?"}),
             listen_context: None,

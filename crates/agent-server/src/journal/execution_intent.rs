@@ -847,6 +847,7 @@ mod tests {
             name: "test_tool".into(),
             display_name: "Test Tool".into(),
             tier,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
             input: serde_json::json!({}),
             effective_input: serde_json::json!({}),
             listen_context: if listen {
