@@ -25,7 +25,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use time::OffsetDateTime;
 
 use agent_server::journal::checkpoint::{
@@ -3171,33 +3171,44 @@ LIMIT 1
     record.map(AgentTask::try_from).transpose()
 }
 
-async fn prepare_reattached_rows_tx(
+/// Lock the existing children a parent re-attaches, in id order, before the
+/// parent's own row is locked: a child's terminal transition locks the child
+/// and then its parent, so holding the parent while reaching for a child
+/// deadlocks against it.
+async fn lock_reattached_children_tx<'a>(
     tx: &mut Transaction<'_, Postgres>,
     parent_id: &AgentTaskId,
+    child_ids: impl IntoIterator<Item = &'a AgentTaskId>,
+    rejected: &str,
+) -> Result<BTreeMap<AgentTaskId, AgentTask>> {
+    let ids: BTreeSet<&AgentTaskId> = child_ids.into_iter().collect();
+    let mut locked = BTreeMap::new();
+    for child_id in ids {
+        let child = PostgresDurableStore::load_task_tx(tx, child_id, true)
+            .await?
+            .with_context(|| format!("{rejected}: re-attach child {child_id} missing"))?;
+        ensure!(
+            child.parent_id.as_ref() == Some(parent_id),
+            "{rejected}: re-attach child {child_id} is not a child of {parent_id}"
+        );
+        locked.insert(child_id.clone(), child);
+    }
+    Ok(locked)
+}
+
+fn prepare_reattached_rows(
+    mut locked: BTreeMap<AgentTaskId, AgentTask>,
     reattach: Vec<ReattachedChild>,
     now: OffsetDateTime,
 ) -> Result<Vec<AgentTask>> {
     let mut rows = Vec::with_capacity(reattach.len());
-    let mut ids = BTreeSet::new();
     for attached in reattach {
-        ensure!(
-            ids.insert(attached.child_id.clone()),
-            "spawn rejected: duplicate re-attach child {}",
-            attached.child_id
-        );
-        let mut child = PostgresDurableStore::load_task_tx(tx, &attached.child_id, true)
-            .await?
-            .with_context(|| {
-                format!(
-                    "spawn rejected: re-attach child {} missing",
-                    attached.child_id
-                )
-            })?;
-        ensure!(
-            child.parent_id.as_ref() == Some(parent_id),
-            "spawn rejected: re-attach child {} is not a child of {parent_id}",
-            attached.child_id
-        );
+        let mut child = locked.remove(&attached.child_id).with_context(|| {
+            format!(
+                "spawn rejected: duplicate re-attach child {}",
+                attached.child_id
+            )
+        })?;
         child.spawn_index = Some(attached.spawn_index);
         child.updated_at = now;
         child
@@ -4292,6 +4303,8 @@ FOR UPDATE SKIP LOCKED
         now: OffsetDateTime,
     ) -> Result<AgentTask> {
         let mut tx = self.begin().await?;
+        let mut locked =
+            lock_reattached_children_tx(&mut tx, parent_id, &reattach, "repark rejected").await?;
         let old = Self::load_task_tx(&mut tx, parent_id, true)
             .await?
             .ok_or_else(|| anyhow!("repark rejected: task {parent_id} does not exist"))?;
@@ -4327,14 +4340,9 @@ FOR UPDATE SKIP LOCKED
         // positions matching the new continuation's tool-use order.
         let mut live = 0_u32;
         for (idx, child_id) in reattach.iter().enumerate() {
-            let mut child = Self::load_task_tx(&mut tx, child_id, true)
-                .await?
-                .ok_or_else(|| anyhow!("repark rejected: re-attach child {child_id} missing"))?;
-            if child.parent_id.as_ref() != Some(parent_id) {
-                return Err(anyhow!(
-                    "repark rejected: re-attach child {child_id} is not a child of {parent_id}"
-                ));
-            }
+            let mut child = locked.remove(child_id).with_context(|| {
+                format!("repark rejected: duplicate re-attach child {child_id}")
+            })?;
             child.spawn_index =
                 Some(u32::try_from(idx).context("repark rejected: reattach index exceeds u32")?);
             child.updated_at = now;
@@ -4698,6 +4706,13 @@ FOR UPDATE SKIP LOCKED
             Self::require_active_thread_tx(&mut tx, child_thread_id, ThreadOperation::Spawn)
                 .await?;
         }
+        let locked_reattach = lock_reattached_children_tx(
+            &mut tx,
+            parent_id,
+            reattach.iter().map(|attached| &attached.child_id),
+            "spawn rejected",
+        )
+        .await?;
         let old_parent = Self::load_task_tx(&mut tx, parent_id, true)
             .await?
             .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
@@ -4713,7 +4728,7 @@ FOR UPDATE SKIP LOCKED
             tool_rows.push(child);
         }
 
-        let reattached_rows = prepare_reattached_rows_tx(&mut tx, parent_id, reattach, now).await?;
+        let reattached_rows = prepare_reattached_rows(locked_reattach, reattach, now)?;
         let child_ids = mixed_child_ids_in_slot_order(&prepared, &tool_rows, &reattached_rows)?;
         let child_count =
             u32::try_from(child_ids.len()).context("spawn rejected: child count exceeds u32")?;

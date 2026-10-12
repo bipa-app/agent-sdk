@@ -1165,11 +1165,14 @@ mod postgres {
     use anyhow::{Context, Result};
     use time::OffsetDateTime;
 
-    use agent_sdk_foundation::TerminalReason;
-    use agent_server::journal::store::{AgentTaskStore, SubmitDisposition, SubmitRootTurnParams};
+    use agent_sdk_foundation::{PendingToolCallInfo, TerminalReason, ToolTier};
+    use agent_server::journal::store::{
+        AgentTaskStore, MixedChildrenSpawn, ReattachedChild, SubmitDisposition,
+        SubmitRootTurnParams, ToolChildSpawn,
+    };
     use agent_server::journal::task::{
-        AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, TaskKind, TaskStatus,
-        WorkerId,
+        AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, SuspensionPayload,
+        TaskKind, TaskStatus, WorkerId,
     };
 
     use super::super::{pg_test_store, spawn_subagent_fixture, t_plus, thread_id};
@@ -1377,6 +1380,173 @@ WHERE wait_event_type = 'Lock'
                 Err(_rejected_after_the_stop) => Ok(()),
             }
         })
+        .await
+    }
+
+    /// A suspension waiting on `count` tool calls.
+    fn payload_with_calls(tid: &str, count: usize) -> SuspensionPayload {
+        let mut payload = super::super::suspension_payload(tid);
+        payload.continuation.payload.pending_tool_calls = (0..count)
+            .map(|index| PendingToolCallInfo {
+                id: format!("call-{index}"),
+                name: "read_file".into(),
+                display_name: "Read File".into(),
+                tier: ToolTier::Observe,
+                input: serde_json::json!({ "path": format!("f{index}") }),
+                effective_input: serde_json::json!({ "path": format!("f{index}") }),
+                listen_context: None,
+            })
+            .collect();
+        payload
+    }
+
+    /// Re-park a root, woken early over two tool children, while the first
+    /// child completes, round after round. Neither side may deadlock, and
+    /// the re-parked root must count exactly the children still live.
+    async fn race_repark_against_child_completion<F>(name: &str, repark: F) -> Result<()>
+    where
+        F: AsyncFn(
+            PostgresDurableStore,
+            String,
+            AgentTaskId,
+            Vec<AgentTaskId>,
+            WorkerId,
+            LeaseId,
+            i64,
+        ) -> Result<()>,
+    {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let mut failures = Vec::new();
+        let mut miscounted = Vec::new();
+        for round in 0..RACE_ROUNDS {
+            let tid = format!("pg-repark-{name}-{round}");
+            let at = round * 100;
+            let parked = super::park_root_on_tool_children(&store, &tid, 2, 3, at).await?;
+            let children: Vec<AgentTaskId> = parked
+                .children
+                .iter()
+                .map(|child| child.id.clone())
+                .collect();
+            let child_worker = WorkerId::new();
+            let child_lease = LeaseId::new();
+            store
+                .try_acquire_task(
+                    &children[0],
+                    child_worker.clone(),
+                    child_lease.clone(),
+                    t_plus(at + 10_000),
+                    t_plus(at + 3),
+                )
+                .await?
+                .context("child must acquire")?;
+            let (worker, lease) = super::resume_root_early(&store, &parked.root.id, at + 5).await?;
+
+            let completing = {
+                let store = store.clone();
+                let child = children[0].clone();
+                tokio::spawn(async move {
+                    store
+                        .complete_task(&child, &child_worker, &child_lease, t_plus(at + 9))
+                        .await
+                        .map(|_| ())
+                })
+            };
+            let reparked = repark(
+                store.clone(),
+                tid.clone(),
+                parked.root.id.clone(),
+                children,
+                worker,
+                lease,
+                at,
+            )
+            .await;
+            for (side, outcome) in [("child completion", completing.await?), (name, reparked)] {
+                if let Err(error) = outcome {
+                    failures.push(format!("round {round}: {side}: {error:#}"));
+                }
+            }
+            let root = super::fetch(&store, &parked.root.id).await?;
+            let live = store
+                .list_children(&parked.root.id)
+                .await?
+                .iter()
+                .filter(|child| !child.status.is_terminal())
+                .count();
+            if u32::try_from(live)? != root.pending_child_count {
+                miscounted.push(format!(
+                    "round {round}: {live} live children, root counts {}",
+                    root.pending_child_count,
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty() && miscounted.is_empty(),
+            "over {RACE_ROUNDS} rounds: failures {failures:#?}, miscounted {miscounted:#?}",
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_steering_repark_racing_a_child_completion() -> Result<()> {
+        race_repark_against_child_completion(
+            "repark",
+            async |store, tid, root, children, worker, lease, at| {
+                store
+                    .repark_after_steering(
+                        &root,
+                        &worker,
+                        &lease,
+                        payload_with_calls(&tid, 2),
+                        children,
+                        t_plus(at + 8),
+                    )
+                    .await
+                    .map(|_| ())
+            },
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_mixed_spawn_reattach_racing_a_child_completion() -> Result<()> {
+        race_repark_against_child_completion(
+            "mixed spawn",
+            async |store, tid, root, children, worker, lease, at| {
+                let reattach = children
+                    .into_iter()
+                    .zip(0_u32..)
+                    .map(|(child_id, spawn_index)| ReattachedChild {
+                        child_id,
+                        spawn_index,
+                    })
+                    .collect();
+                store
+                    .spawn_mixed_children(
+                        &root,
+                        &worker,
+                        &lease,
+                        MixedChildrenSpawn {
+                            delivered_injection_ids: Vec::new(),
+                            boundary_events: Vec::new(),
+                            subagents: Vec::new(),
+                            tool_children: vec![ToolChildSpawn {
+                                spawn_index: 2,
+                                spec: ChildSpawnSpec::new(3),
+                            }],
+                            reattach,
+                            payload: payload_with_calls(&tid, 3),
+                            child_otel_traceparent: None,
+                        },
+                        Vec::new(),
+                        t_plus(at + 8),
+                    )
+                    .await
+                    .map(|_| ())
+            },
+        )
         .await
     }
 
