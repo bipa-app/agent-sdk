@@ -184,7 +184,7 @@ async fn test_a_settled_child_hints_the_sibling_it_released(
         .await?;
 
     let signal = agent_server::journal::WakeupSignal::default();
-    crate::host::hint_released_siblings(&signal, task_store, &root.id).await;
+    crate::host::settle_tool_child(Some(&signal), task_store, Some(&root.id)).await;
     let leased = crate::host::acquire_hinted_task(
         task_store,
         &signal,

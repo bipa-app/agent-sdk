@@ -586,7 +586,7 @@ async fn the_lease_sweep_forwards_what_its_fail_close_settled() -> Result<()> {
     let child_thread = task(&stores, &tool).await?.thread_id;
     let mut follower = stores.event_notifier.subscribe(&child_thread);
 
-    drain_expired_leases(&stores, OffsetDateTime::now_utc()).await?;
+    drain_expired_leases(&stores, None, OffsetDateTime::now_utc()).await?;
 
     assert_eq!(task(&stores, &root).await?.status, TaskStatus::Failed);
     let cancelled = task(&stores, &tool).await?;

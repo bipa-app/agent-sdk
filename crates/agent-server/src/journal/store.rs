@@ -3497,14 +3497,20 @@ impl InMemoryAgentTaskStore {
             let Some(thread_id) = thread_id else {
                 continue;
             };
-            if self.thread_is_fenced(&thread_id).await? {
-                continue;
-            }
-            if let Some(task) = self
-                .try_acquire_task(&id, worker.clone(), lease.clone(), expires_at, now)
-                .await?
-            {
-                return Ok(Some(task));
+            let acquired = match self.thread_is_fenced(&thread_id).await {
+                Ok(true) => continue,
+                Ok(false) => {
+                    self.try_acquire_task(&id, worker.clone(), lease.clone(), expires_at, now)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            match acquired {
+                Ok(Some(task)) => return Ok(Some(task)),
+                Ok(None) => {}
+                Err(error) => {
+                    log::warn!("held probe skipped {id}, which it could not lease: {error:#}");
+                }
             }
         }
         Ok(None)

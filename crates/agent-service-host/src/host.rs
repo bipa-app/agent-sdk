@@ -396,6 +396,7 @@ impl ServiceHost {
         self.runtime.set_wakeup_signal(Arc::clone(&wakeup_signal));
         let sweep_handle = tokio::spawn(lease_sweep_loop(
             self.stores.clone(),
+            Arc::clone(&wakeup_signal),
             self.config.worker.sweep_interval(),
             self.config.worker.heartbeat_interval(),
             Arc::clone(&self.health),
@@ -764,6 +765,7 @@ async fn wait_for_shutdown(shutdown: &CancellationToken) -> Result<()> {
 /// interval.  Updates the health surface on every cycle.
 async fn lease_sweep_loop(
     stores: StoreRegistry,
+    wakeup_signal: Arc<WakeupSignal>,
     interval: std::time::Duration,
     heartbeat_interval: std::time::Duration,
     health: Arc<HealthSurface>,
@@ -784,7 +786,7 @@ async fn lease_sweep_loop(
             }
             _ = ticker.tick() => {
                 let now = time::OffsetDateTime::now_utc();
-                match drain_expired_leases(&stores, now).await {
+                match drain_expired_leases(&stores, Some(&wakeup_signal), now).await {
                     Ok(count) if count > 0 => {
                         info!(count, "released expired leases");
                         metrics.record_lease_sweep(count);
@@ -926,7 +928,11 @@ const MAX_LEASE_SWEEP_ROUNDS: usize = 40;
 /// # Errors
 /// Propagates the first store failure; rows reclaimed by earlier
 /// rounds stay reclaimed (each round commits independently).
-async fn drain_expired_leases(stores: &StoreRegistry, now: time::OffsetDateTime) -> Result<usize> {
+async fn drain_expired_leases(
+    stores: &StoreRegistry,
+    signal: Option<&WakeupSignal>,
+    now: time::OffsetDateTime,
+) -> Result<usize> {
     let mut total = 0usize;
     for _ in 0..MAX_LEASE_SWEEP_ROUNDS {
         let records = stores
@@ -936,6 +942,7 @@ async fn drain_expired_leases(stores: &StoreRegistry, now: time::OffsetDateTime)
             .context("release expired leases")?;
         for record in &records {
             forward_settlement(stores, &record.settled);
+            settle_failed_closed_tool_child(stores, signal, record).await;
         }
         total = total.saturating_add(records.len());
         if records.len() < agent_server::journal::store::LEASE_RELEASE_BATCH {
@@ -948,6 +955,30 @@ async fn drain_expired_leases(stores: &StoreRegistry, now: time::OffsetDateTime)
         "expired-lease drain hit its round guard; remaining backlog defers to the next tick",
     );
     Ok(total)
+}
+
+/// Settle a tool child the lease sweep failed closed (see
+/// [`settle_tool_child`]). A requeued row is not terminal and releases
+/// nothing.
+async fn settle_failed_closed_tool_child(
+    stores: &StoreRegistry,
+    signal: Option<&WakeupSignal>,
+    record: &agent_server::journal::recovery::RecoveryRecord,
+) {
+    match &record.action {
+        agent_server::journal::recovery::RecoveryAction::FailClosed(_) => {}
+        agent_server::journal::recovery::RecoveryAction::NoAction
+        | agent_server::journal::recovery::RecoveryAction::Requeue => return,
+    }
+    match stores.task_store.get(&record.id).await {
+        Ok(Some(task)) if task.kind == TaskKind::ToolRuntime => {
+            settle_tool_child(signal, stores.task_store.as_ref(), task.parent_id.as_ref()).await;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            warn!(task_id = %record.id, error = %error, "load a failed-closed row to settle it");
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -2977,7 +3008,34 @@ async fn revert_failed_steering_wake(
     Ok(())
 }
 
+/// Run a tool child and settle it, on every exit (see
+/// [`settle_tool_child`]).
 async fn execute_tool_task(
+    task: AgentTask,
+    stores: &StoreRegistry,
+    runtime: Arc<ExecutionRuntime>,
+    cancel: &CancellationToken,
+    activity: &ActivityBeacon,
+) -> Result<()> {
+    let parent_id = task.parent_id.clone();
+    let result = Box::pin(run_tool_task(
+        task,
+        stores,
+        Arc::clone(&runtime),
+        cancel,
+        activity,
+    ))
+    .await;
+    settle_tool_child(
+        runtime.wakeup_signal(),
+        stores.task_store.as_ref(),
+        parent_id.as_ref(),
+    )
+    .await;
+    result
+}
+
+async fn run_tool_task(
     task: AgentTask,
     stores: &StoreRegistry,
     runtime: Arc<ExecutionRuntime>,
@@ -3058,49 +3116,36 @@ async fn execute_tool_task(
     )
     .await;
 
-    let result = finish_tool_task_execution(
-        outcome,
-        &task,
-        stores,
-        runtime.as_ref(),
-        &worker_id,
-        &lease_id,
-    )
-    .await;
+    let result = finish_tool_task_execution(outcome, &task, stores, &worker_id, &lease_id).await;
     drop(artifact_store_guard);
     result
 }
 
-/// Nudge the pool after a tool child of `parent_id` reached a terminal
-/// state.
+/// The one settle path for a tool child that may have reached a terminal
+/// state: the worker's every exit from [`execute_tool_task`], the lease
+/// sweep's fail-close, and both confirmation decisions all end here.
 ///
-/// The transition may have let held siblings become acquirable, possibly
-/// a whole wave of reads: each is handed to the pool as a hint and gets a
-/// worker of its own, which leases it by id. It may also have made the
-/// parent runnable (the batch's last live child), which one more worker
-/// finds through the ready scan. A failed lookup only costs latency: the
-/// acquisition backstop still reaches those rows.
-pub(crate) async fn wake_after_tool_child_settled(
-    runtime: &ExecutionRuntime,
+/// The transition may have let held siblings under `parent_id` become
+/// acquirable, possibly a whole wave of reads: each is handed to the pool as
+/// a hint and gets a worker of its own, which leases it by id. It may also
+/// have made a parent runnable (the batch's last live child), which one more
+/// worker finds through the ready scan, so that wake is sent even without a
+/// parent. A failed lookup only costs latency: the acquisition backstop
+/// still reaches those rows.
+pub(crate) async fn settle_tool_child(
+    signal: Option<&WakeupSignal>,
     task_store: &dyn AgentTaskStore,
-    parent_id: &AgentTaskId,
+    parent_id: Option<&AgentTaskId>,
 ) {
-    if let Some(signal) = runtime.wakeup_signal() {
-        hint_released_siblings(signal, task_store, parent_id).await;
-    }
-}
-
-/// Hint the held children of `parent_id` that are now ready, and wake one
-/// more worker for a parent the settle may have made runnable.
-pub(crate) async fn hint_released_siblings(
-    signal: &WakeupSignal,
-    task_store: &dyn AgentTaskStore,
-    parent_id: &AgentTaskId,
-) {
-    match task_store.ready_held_children(parent_id).await {
-        Ok(ready) => signal.hint_tasks(ready),
-        Err(error) => {
-            warn!(parent_id = %parent_id, error = %error, "look up siblings a settled tool child released");
+    let Some(signal) = signal else {
+        return;
+    };
+    if let Some(parent_id) = parent_id {
+        match task_store.ready_held_children(parent_id).await {
+            Ok(ready) => signal.hint_tasks(ready),
+            Err(error) => {
+                warn!(parent_id = %parent_id, error = %error, "look up siblings a settled tool child released");
+            }
         }
     }
     signal.notify_workers();
@@ -3110,7 +3155,6 @@ async fn finish_tool_task_execution(
     outcome: Result<ToolTaskOutcome>,
     task: &AgentTask,
     stores: &StoreRegistry,
-    runtime: &ExecutionRuntime,
     worker_id: &WorkerId,
     lease_id: &LeaseId,
 ) -> Result<()> {
@@ -3124,9 +3168,6 @@ async fn finish_tool_task_execution(
             },
         ) => {
             publish_events(stores, &committed_events);
-            if let Some(parent_id) = &task.parent_id {
-                wake_after_tool_child_settled(runtime, stores.task_store.as_ref(), parent_id).await;
-            }
             Ok(())
         }
         Ok(ToolTaskOutcome::Cancelled) => Ok(()),
@@ -8161,6 +8202,167 @@ mod tests {
         Ok(())
     }
 
+    /// A child root parked on two Observe-tier `probe` calls, the second held
+    /// behind the first, with a wakeup signal installed on the runtime.
+    /// Returns the stores, the runtime, its signal, and both children.
+    async fn park_probe_behind_probe(
+        thread: &str,
+        max_attempts: u32,
+    ) -> Result<(
+        StoreRegistry,
+        Arc<ExecutionRuntime>,
+        Arc<WakeupSignal>,
+        AgentTask,
+        AgentTask,
+    )> {
+        use agent_sdk_foundation::ThreadId;
+
+        let runtime = subagent_timeout_runtime_with_executor(
+            Arc::new(SubagentScriptProvider::new()),
+            Arc::new(FailingStampingToolExecutor {
+                executed_at: Arc::new(std::sync::Mutex::new(None)),
+            }),
+        )?;
+        let signal = WakeupSignal::shared();
+        runtime.set_wakeup_signal(Arc::clone(&signal));
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(probe_definition()));
+        let host = ServiceHost::new(ServiceConfig::default(), registry, runtime.clone())?;
+        let stores = host.stores().clone();
+
+        let at = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
+        let (_parent, _invocation, child_root) =
+            persist_subagent_fixture(&stores, &ThreadId::from_string(thread), 30 * 60 * 1_000, at)
+                .await?;
+        let worker = WorkerId::from_string("w-park-probes");
+        let lease = LeaseId::new();
+        stores
+            .task_store
+            .try_acquire_task(
+                &child_root.id,
+                worker.clone(),
+                lease.clone(),
+                time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+                at,
+            )
+            .await?
+            .context("child root must acquire before parking")?;
+        let mut suspension =
+            pending_call_suspension_with_tier(&child_root.thread_id, "probe", ToolTier::Observe);
+        let mut second = suspension
+            .continuation
+            .payload
+            .pending_tool_calls
+            .first()
+            .cloned()
+            .context("one pending call")?;
+        second.id = "call_probe_second".into();
+        suspension
+            .continuation
+            .payload
+            .pending_tool_calls
+            .push(second);
+        let (_parked, children) = stores
+            .task_store
+            .spawn_tool_children(
+                &child_root.id,
+                &worker,
+                &lease,
+                vec![
+                    agent_server::journal::task::ChildSpawnSpec::new(max_attempts),
+                    agent_server::journal::task::ChildSpawnSpec::new(max_attempts)
+                        .after_siblings(vec![0]),
+                ],
+                suspension,
+                None,
+                Vec::new(),
+                at,
+            )
+            .await?;
+        let [first, held] = children.as_slice() else {
+            anyhow::bail!("two tool children must be spawned");
+        };
+        Ok((stores, runtime, signal, first.clone(), held.clone()))
+    }
+
+    /// A tool child whose guarded execution errors is failed by
+    /// `execute_tool_task`'s own fail arm, and that exit still hands the
+    /// sibling it released to the pool.
+    #[tokio::test]
+    async fn a_tool_child_that_fails_hints_the_sibling_it_released() -> Result<()> {
+        let (stores, runtime, signal, first, held) =
+            park_probe_behind_probe("t-failed-child-hint", 3).await?;
+        let acquired = stores
+            .task_store
+            .try_acquire_task(
+                &first.id,
+                WorkerId::from_string("w-failed-child"),
+                LeaseId::new(),
+                time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+                time::OffsetDateTime::now_utc(),
+            )
+            .await?
+            .context("the first child must acquire")?;
+        let flaky =
+            Arc::new(FlakyTaskStore::new(Arc::clone(&stores.task_store)).failing_fail_tasks(1));
+        let mut flaky_stores = stores.clone();
+        flaky_stores.task_store = Arc::clone(&flaky) as Arc<dyn AgentTaskStore>;
+
+        Box::pin(execute_tool_task(
+            acquired,
+            &flaky_stores,
+            runtime,
+            &CancellationToken::new(),
+            &ActivityBeacon::new(),
+        ))
+        .await?;
+
+        let row = stores
+            .task_store
+            .get(&first.id)
+            .await?
+            .context("the first child must exist")?;
+        assert_eq!(row.status, TaskStatus::Failed);
+        assert!(
+            flaky.recorded_fail_now().is_some(),
+            "the fail arm must have failed the child"
+        );
+        assert_eq!(signal.take_hint(), Some(held.id));
+        Ok(())
+    }
+
+    /// A tool child whose lease expires with no attempt left is failed closed
+    /// by the lease sweep, and the sweep hands the sibling it released to the
+    /// pool.
+    #[tokio::test]
+    async fn a_tool_child_the_lease_sweep_fails_closed_hints_the_sibling_it_released() -> Result<()>
+    {
+        let (stores, _runtime, signal, first, held) =
+            park_probe_behind_probe("t-swept-child-hint", 1).await?;
+        let leased_at = time::OffsetDateTime::now_utc() - time::Duration::minutes(2);
+        stores
+            .task_store
+            .try_acquire_task(
+                &first.id,
+                WorkerId::from_string("w-dead"),
+                LeaseId::new(),
+                leased_at + time::Duration::seconds(30),
+                leased_at,
+            )
+            .await?
+            .context("the first child must acquire")?;
+
+        drain_expired_leases(&stores, Some(&signal), time::OffsetDateTime::now_utc()).await?;
+
+        let row = stores
+            .task_store
+            .get(&first.id)
+            .await?
+            .context("the first child must exist")?;
+        assert_eq!(row.status, TaskStatus::Failed);
+        assert_eq!(signal.take_hint(), Some(held.id));
+        Ok(())
+    }
+
     /// ADR-0003 never-kill-on-unknown — a row that is NOT THERE is unknown
     /// activity, not silence.
     ///
@@ -10927,7 +11129,7 @@ mod tests {
             task_ids.push(task_id);
         }
 
-        let drained = drain_expired_leases(&stores, now).await?;
+        let drained = drain_expired_leases(&stores, None, now).await?;
         assert_eq!(
             drained, backlog,
             "one sweep tick must drain the whole backlog, not one batch",

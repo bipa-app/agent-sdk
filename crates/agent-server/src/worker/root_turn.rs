@@ -223,9 +223,15 @@ impl RootTurnDeps<'_> {
     /// claim one — the `Pending → Running` CAS in `acquire_next_runnable`
     /// still serialises them, so a broadcast only ever costs a few
     /// no-op wakeups, never a double execution.
+    ///
+    /// The broadcast reaches only workers already parked, so it also
+    /// leaves one buffered permit: if every worker was still busy, the
+    /// first to park picks the batch up instead of waiting for its tick,
+    /// and each child it settles wakes the next worker.
     fn wake_workers_for_batch(&self) {
         if let Some(signal) = self.wakeup {
             signal.wake_all_now();
+            signal.notify_workers();
         }
     }
 
