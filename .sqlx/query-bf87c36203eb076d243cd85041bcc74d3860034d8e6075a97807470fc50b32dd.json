@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\nSELECT\n    id,\n    kind,\n    status,\n    parent_id,\n    root_id,\n    depth,\n    thread_id,\n    submitted_input_json,\n    caller_metadata_json,\n    worker_id,\n    lease_id,\n    lease_expires_at,\n    last_heartbeat_at,\n    state_json,\n    attempt,\n    max_attempts,\n    last_error,\n    terminal_reason_json,\n    pending_child_count,\n    spawn_index,\n    result_payload,\n    otel_traceparent,\n    created_at,\n    updated_at,\n    completed_at,\n    last_activity_at\nFROM agent_sdk_tasks\nWHERE parent_id = $1\n  AND kind = 'input_injection'\n  AND status = 'queued'\nORDER BY created_at, id\nFOR UPDATE\n",
+  "query": "\nSELECT\n    id,\n    kind,\n    status,\n    parent_id,\n    root_id,\n    depth,\n    thread_id,\n    submitted_input_json,\n    caller_metadata_json,\n    worker_id,\n    lease_id,\n    lease_expires_at,\n    last_heartbeat_at,\n    state_json,\n    attempt,\n    max_attempts,\n    last_error,\n    terminal_reason_json,\n    pending_child_count,\n    spawn_index,\n    result_payload,\n    otel_traceparent,\n    created_at,\n    updated_at,\n    completed_at,\n    last_activity_at,\n    after_siblings_json\nFROM agent_sdk_tasks\nWHERE kind = 'subagent'\n  AND status = 'waiting_on_children'\nORDER BY created_at, id\n",
   "describe": {
     "columns": [
       {
@@ -288,12 +288,21 @@
             "name": "last_activity_at"
           }
         }
+      },
+      {
+        "ordinal": 26,
+        "name": "after_siblings_json",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_tasks",
+            "name": "after_siblings_json"
+          }
+        }
       }
     ],
     "parameters": {
-      "Left": [
-        "Text"
-      ]
+      "Left": []
     },
     "nullable": [
       false,
@@ -321,8 +330,9 @@
       false,
       false,
       true,
+      true,
       true
     ]
   },
-  "hash": "5508b5d9ffb34de72c02051b5308b50590a2cf8f53c3b9be279153c592d7581e"
+  "hash": "bf87c36203eb076d243cd85041bcc74d3860034d8e6075a97807470fc50b32dd"
 }

@@ -37,12 +37,13 @@
 #[cfg(test)]
 use agent_sdk_foundation::ThreadId;
 use agent_sdk_foundation::audit::AuditProvenance;
+use agent_sdk_foundation::batch_order::{BatchSlot, wait_lists};
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::llm::late_tool_result::LateToolResultStatus;
 use agent_sdk_foundation::llm::{self, ChatRequest};
 use agent_sdk_foundation::{
     AgentContinuation, AgentState, ContinuationEnvelope, PendingToolCallInfo, QuestionOption,
-    QuestionPayload, TerminalReason, TokenUsage, ToolResult, ToolTier,
+    QuestionPayload, TerminalReason, TokenUsage, ToolConcurrency, ToolResult, ToolTier,
 };
 use agent_sdk_providers::LlmProvider;
 use agent_sdk_providers::streaming::{StreamAccumulator, StreamBox, StreamDelta, StreamErrorKind};
@@ -6652,7 +6653,26 @@ async fn spawn_mixed_routed_children(
 /// children" call site from the "re-spawn tool children on resume"
 /// site — only used in error context strings so backtraces still
 /// point at the right call.
+///
+/// Every tool child is spawned with the wait list
+/// [`order_tool_children`] derives, so no spawn path can skip the batch's
+/// execution order.
 async fn apply_batch_routing(
+    inputs: &RootWorkerInputs,
+    deps: &RootTurnDeps<'_>,
+    mut application: BatchRoutingApplication,
+    now: OffsetDateTime,
+) -> Result<(AgentTask, Vec<AgentTask>, Vec<CommittedEvent>)> {
+    let pending = &application.batch.payload.continuation.payload;
+    order_tool_children(
+        &mut application.specs,
+        &pending.pending_tool_calls,
+        &application.routing,
+    )?;
+    spawn_routed_batch(inputs, deps, application, now).await
+}
+
+async fn spawn_routed_batch(
     inputs: &RootWorkerInputs,
     deps: &RootTurnDeps<'_>,
     application: BatchRoutingApplication,
@@ -6767,6 +6787,52 @@ async fn apply_batch_routing(
         deps.wake_workers_for_batch();
     }
     Ok(spawned)
+}
+
+/// Record on each tool child the earlier siblings it must wait for, in the
+/// execution order [`agent_sdk_foundation::batch_order`] defines.
+///
+/// Subagent spawns fan out as before, and a call whose result was settled
+/// before spawn never runs, so both are detached from the order. Every
+/// other call is shared only when its tool is read-only; the tier plays no
+/// part, because a durable child pauses for confirmation on its own.
+/// Re-attached survivors are not in `specs` and keep their own waits.
+fn order_tool_children(
+    specs: &mut [ChildSpawnSpec],
+    pending: &[PendingToolCallInfo],
+    routing: &super::subagent_spawn_selector::BatchRouting,
+) -> Result<()> {
+    let subagent_slots: BTreeSet<usize> = match routing {
+        super::subagent_spawn_selector::BatchRouting::AllTools => BTreeSet::new(),
+        super::subagent_spawn_selector::BatchRouting::SingleSubagent { spawn_index, .. } => {
+            BTreeSet::from([*spawn_index])
+        }
+        super::subagent_spawn_selector::BatchRouting::MultiSubagent { plans }
+        | super::subagent_spawn_selector::BatchRouting::Mixed { plans, .. } => {
+            plans.iter().map(|(index, _)| *index).collect()
+        }
+    };
+    let slots: Vec<BatchSlot> = specs
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| {
+            if spec.precompleted_result.is_some() || subagent_slots.contains(&index) {
+                return BatchSlot::Detached;
+            }
+            match pending.get(index).map(|call| call.concurrency) {
+                Some(ToolConcurrency::ReadOnly) => BatchSlot::Shared,
+                Some(ToolConcurrency::Exclusive) | None => BatchSlot::Exclusive,
+            }
+        })
+        .collect();
+    for (spec, after) in specs.iter_mut().zip(wait_lists(&slots)) {
+        spec.after = after
+            .into_iter()
+            .map(u32::try_from)
+            .collect::<Result<_, _>>()
+            .context("tool spawn index exceeds u32")?;
+    }
+    Ok(())
 }
 
 /// Close the parent's turn attempt, treating
@@ -7225,7 +7291,7 @@ fn extract_pending_tool_calls(
                     name: name.clone(),
                     display_name: def.map_or_else(|| name.clone(), |d| d.display_name.clone()),
                     tier: def.map_or(ToolTier::Confirm, |d| d.tier),
-                    concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+                    concurrency: def.map_or(ToolConcurrency::Exclusive, |d| d.concurrency),
                     input: input.clone(),
                     effective_input: input.clone(),
                     listen_context: None,

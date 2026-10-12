@@ -47,9 +47,9 @@ mod tests {
     use super::migrations::{
         AWAITING_QUESTION_MIGRATION_VERSION, DURABLE_CORE_MIGRATOR,
         HISTORY_GENERATION_MIGRATION_VERSION, INPUT_INJECTION_KIND_MIGRATION_VERSION,
-        PURGE_SEED_MIGRATION_VERSION, TASK_TERMINAL_REASON_MIGRATION_VERSION,
-        THREAD_PURGE_LIFECYCLE_MIGRATION_VERSION, durable_core_migrations,
-        outbox_message_kind_migration,
+        PURGE_SEED_MIGRATION_VERSION, TASK_AFTER_SIBLINGS_MIGRATION_VERSION,
+        TASK_TERMINAL_REASON_MIGRATION_VERSION, THREAD_PURGE_LIFECYCLE_MIGRATION_VERSION,
+        durable_core_migrations, outbox_message_kind_migration, task_after_siblings_migration,
     };
 
     #[test]
@@ -138,7 +138,21 @@ mod tests {
             "bundle is missing this PR's migration \
              {HISTORY_GENERATION_MIGRATION_VERSION}, got {versions:?}",
         );
+        ensure!(
+            versions.contains(&TASK_AFTER_SIBLINGS_MIGRATION_VERSION),
+            "bundle is missing this PR's migration \
+             {TASK_AFTER_SIBLINGS_MIGRATION_VERSION}, got {versions:?}",
+        );
         Ok(())
+    }
+
+    #[test]
+    fn task_after_siblings_migration_is_additive_and_nullable() {
+        crate::migration_contract::assert_additive_nullable_migration(
+            task_after_siblings_migration(),
+            "agent_sdk_tasks",
+            1,
+        );
     }
 
     #[test]

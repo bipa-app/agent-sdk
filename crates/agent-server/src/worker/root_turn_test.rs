@@ -8737,6 +8737,9 @@ async fn park_early_resumed_batch(
 }
 
 /// Park three Any-policy calls behind a prompt long enough to compact.
+///
+/// The calls are read-only, so they share one wave and may finish in any
+/// order, which the early-resume exits below rely on.
 async fn park_any_batch(stores: &TestStores) -> Result<(AgentTask, Vec<AgentTask>)> {
     let provider = MockToolCallProvider::new(vec![
         bash_call("call_0"),
@@ -8746,6 +8749,9 @@ async fn park_any_batch(stores: &TestStores) -> Result<(AgentTask, Vec<AgentTask
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let mut bootstrap = sample_bootstrap_with_tools(task);
     bootstrap.definition.policy.child_join_policy = ChildJoinPolicy::Any;
+    for tool in &mut bootstrap.definition.tools {
+        tool.concurrency = agent_sdk_foundation::ToolConcurrency::ReadOnly;
+    }
     let inputs = build_root_worker_inputs(
         bootstrap,
         &stores.threads,
@@ -12721,6 +12727,128 @@ async fn mixed_batch_spawns_subagent_slot_and_tool_child_in_one_turn() -> Result
     assert_eq!(child_root.status, TaskStatus::Pending);
     assert_eq!(child_root.thread_id, linkage.child_thread_id);
 
+    Ok(())
+}
+
+fn subagent_call(id: &str) -> (String, String, serde_json::Value) {
+    (
+        id.into(),
+        "subagent_explore".into(),
+        serde_json::json!({"task": id}),
+    )
+}
+
+async fn child_root_of(stores: &TestStores, invocation: &AgentTask) -> Result<AgentTask> {
+    let linkage = invocation
+        .state
+        .subagent_invocation()
+        .context("invocation must carry durable linkage")?;
+    stores
+        .tasks
+        .get(&linkage.child_root_task_id)
+        .await?
+        .context("child root must be persisted")
+}
+
+#[tokio::test]
+async fn subagent_spawns_fan_out_together_while_tool_calls_keep_model_order() -> Result<()> {
+    let stores = TestStores::new();
+    let (_parent, children) = Box::pin(suspend_on_mixed_batch(
+        &stores,
+        vec![
+            bash_call("call_edit"),
+            subagent_call("call_sub_a"),
+            subagent_call("call_sub_b"),
+            bash_call("call_test"),
+        ],
+    ))
+    .await?;
+    let [edit, sub_a, sub_b, test] = children.as_slice() else {
+        bail!("the batch must spawn four children, got {}", children.len());
+    };
+
+    for invocation in [sub_a, sub_b] {
+        assert_eq!(invocation.kind, TaskKind::Subagent);
+        let root = child_root_of(&stores, invocation).await?;
+        assert!(
+            root.is_leasable(),
+            "every subagent in the batch must start at once, without waiting for the edit"
+        );
+    }
+    assert!(edit.is_leasable(), "the first call starts at once");
+    assert_eq!(
+        test.after_siblings,
+        std::slice::from_ref(&edit.id),
+        "the command waits for the edit before it, not for the subagents"
+    );
+
+    complete_child_at(&stores, edit, &ok_result("edited"), t_plus(6), t_plus(7)).await?;
+    let test = stores
+        .tasks
+        .get(&test.id)
+        .await?
+        .context("command child must exist")?;
+    assert!(
+        test.is_leasable(),
+        "the command runs once the edit finished, while the subagents still run"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_early_resumed_turn_cancels_the_calls_its_batch_still_held() -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
+        &stores,
+        vec![
+            bash_call("call_0"),
+            bash_call("call_1"),
+            bash_call("call_2"),
+        ],
+        ChildJoinPolicy::Any,
+    ))
+    .await?;
+    let [first, released, held] = children.as_slice() else {
+        bail!(
+            "the batch must spawn three children, got {}",
+            children.len()
+        );
+    };
+    complete_child_at(&stores, first, &ok_result("done-0"), t_plus(8), t_plus(9)).await?;
+    let held_row = stores
+        .tasks
+        .get(&held.id)
+        .await?
+        .context("held child must exist")?;
+    assert!(
+        !held_row.after_siblings.is_empty(),
+        "precondition: the last call still waits for the second"
+    );
+
+    acquire_parent(&stores, &parent.id, t_plus(10)).await?;
+    fail_root_turn(
+        &parent.id,
+        &WorkerId::from_string("worker_test"),
+        &LeaseId::from_string("lease_test"),
+        &thread_a(),
+        &anyhow::anyhow!("the early resume failed"),
+        &stores.deps(),
+        t_plus(12),
+    )
+    .await?;
+
+    for child in [released, held] {
+        let row = stores
+            .tasks
+            .get(&child.id)
+            .await?
+            .context("child must exist")?;
+        assert_eq!(
+            row.status,
+            TaskStatus::Cancelled,
+            "a call that never started must not outlive its failed turn"
+        );
+    }
     Ok(())
 }
 

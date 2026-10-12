@@ -191,6 +191,7 @@ fn make_bootstrap(
         terminal_reason: None,
         pending_child_count: 1,
         spawn_index: None,
+        after_siblings: Vec::new(),
         result_payload: None,
         otel_traceparent: None,
         created_at: OffsetDateTime::now_utc(),

@@ -150,6 +150,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Breaking: a batch's mutating calls run alone and in model order** - A
+  model that emits `[edit, edit, bash "cargo test"]` in one response expects
+  the test to see both edits. The durable worker spawned every call of a batch
+  as a runnable child, so the command could start, and finish, before either
+  edit; the in-process loop did the same for any call whose tool was
+  `ToolTier::Observe`, the tier hosts give mutating tools to skip prompts.
+  `ToolConcurrency` is a new tool property, independent of the tier:
+  `Exclusive` by default, `ReadOnly` for `read`, `grep`, `glob`, `todo_read`,
+  `web_search`, and `link_fetch`. `agent_sdk_foundation::batch_order` holds
+  the rule both runtimes follow: consecutive read-only calls run together,
+  every other call runs alone, and a call starts only after every earlier
+  call it could affect or observe has finished. The durable worker writes a
+  later child `Pending` with `after_siblings` set, acquisition skips it, and
+  the store releases it in the same write that makes its last predecessor
+  terminal. Subagent spawns, and calls settled before spawn, neither wait nor
+  hold anything back, so a coordinator's spawns still fan out together.
+  `Tool`, `SimpleTool`, `TypedTool`, `AsyncTool`, and `ListenExecuteTool`
+  gain `concurrency()`, the derives accept `concurrency = ...`, and
+  `llm::Tool`, `PendingToolCallInfo`, `ChildSpawnSpec`, and `AgentTask` gain
+  a field. A call after a durable child that awaits confirmation now waits
+  for that decision, so confirmations in one batch are asked one at a time.
+  Migration 0026 adds the nullable `after_siblings_json` column on both
+  Postgres and SQLite.
+
+  **Rollback:** an older build ignores `after_siblings_json` and leases a held
+  child as soon as it is pending, so a batch parked across the rollback loses
+  its ordering. Nothing fails; drain parked batches first if that matters.
+
 - **Repeating tool-call ids from OpenAI-compatible gateways** - On routes
   other than `api.openai.com`, the Chat Completions and Responses providers
   replace tool-call ids that only count calls (`bash:0`, `functions.read:3`,

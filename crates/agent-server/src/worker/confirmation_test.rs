@@ -205,6 +205,22 @@ fn sample_definition_with_confirm_tools() -> AgentDefinition {
                 tier: ToolTier::Confirm,
                 concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
             },
+            Tool {
+                name: "lookup_account".into(),
+                description: "Read an account, after confirmation".into(),
+                input_schema: serde_json::json!({"type": "object", "properties": {"id": {"type": "string"}}}),
+                display_name: "Lookup Account".into(),
+                tier: ToolTier::Confirm,
+                concurrency: agent_sdk_foundation::ToolConcurrency::ReadOnly,
+            },
+            Tool {
+                name: "read_file".into(),
+                description: "Read a file".into(),
+                input_schema: serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+                display_name: "Read File".into(),
+                tier: ToolTier::Observe,
+                concurrency: agent_sdk_foundation::ToolConcurrency::ReadOnly,
+            },
         ],
         thinking: ThinkingPolicy::default(),
         thinking_display: None,
@@ -954,13 +970,13 @@ async fn multi_child_confirmation_does_not_affect_siblings() -> Result<()> {
         vec![
             (
                 "call_1".into(),
-                "transfer".into(),
-                serde_json::json!({"amount": 100}),
+                "lookup_account".into(),
+                serde_json::json!({"id": "acct-1"}),
             ),
             (
                 "call_2".into(),
-                "bash".into(),
-                serde_json::json!({"command": "echo ok"}),
+                "read_file".into(),
+                serde_json::json!({"path": "/tmp/report"}),
             ),
         ],
     )
@@ -969,13 +985,13 @@ async fn multi_child_confirmation_does_not_affect_siblings() -> Result<()> {
     assert_eq!(parent.pending_child_count, 2);
     assert_eq!(children.len(), 2);
 
-    // Acquire child 0 (transfer, Confirm tier) → pause.
+    // Acquire child 0 (read-only, Confirm tier) → pause.
     let child_0 = acquire_child(&stores.tasks, &children[0].id).await?;
     let bootstrap_0 =
         resolve_tool_bootstrap(child_0, &stores.tasks, ActivityBeacon::default()).await?;
     pause_tool_for_confirmation(&bootstrap_0, &stores.tasks, &stores.events, t_plus(15)).await?;
 
-    // Acquire child 1 (bash, Observe tier) → execute directly.
+    // Child 1 shares child 0's read-only wave → execute directly.
     let child_1 = acquire_child_with(
         &stores.tasks,
         &children[1].id,
@@ -991,7 +1007,7 @@ async fn multi_child_confirmation_does_not_affect_siblings() -> Result<()> {
         &stores.tasks,
         &stores.events,
         &cancel,
-        |_info, _collector| async { Ok(ToolResult::success("echo output")) },
+        |_info, _collector| async { Ok(ToolResult::success("report")) },
         t_plus(20),
     )
     .await?;
@@ -1027,6 +1043,94 @@ async fn multi_child_confirmation_does_not_affect_siblings() -> Result<()> {
     };
 
     // Now both children are terminal → parent should be Pending.
+    let parent = parent.context("parent should be returned")?;
+    assert_eq!(parent.status, TaskStatus::Pending);
+    assert_eq!(parent.pending_child_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_command_after_a_pending_confirmation_waits_for_the_decision() -> Result<()> {
+    let stores = TestStores::new();
+    let cancel = CancellationToken::new();
+
+    let (_parent, children) = suspend_root_with_tools(
+        &stores,
+        vec![
+            (
+                "call_1".into(),
+                "transfer".into(),
+                serde_json::json!({"amount": 100}),
+            ),
+            (
+                "call_2".into(),
+                "bash".into(),
+                serde_json::json!({"command": "echo ok"}),
+            ),
+        ],
+    )
+    .await?;
+
+    let child_0 = acquire_child(&stores.tasks, &children[0].id).await?;
+    let bootstrap_0 =
+        resolve_tool_bootstrap(child_0, &stores.tasks, ActivityBeacon::default()).await?;
+    pause_tool_for_confirmation(&bootstrap_0, &stores.tasks, &stores.events, t_plus(15)).await?;
+
+    let held = stores
+        .tasks
+        .try_acquire_task(
+            &children[1].id,
+            WorkerId::from_string("child_worker_2"),
+            LeaseId::from_string("child_lease_2"),
+            t_plus(320),
+            t_plus(20),
+        )
+        .await?;
+    assert!(
+        held.is_none(),
+        "the command must not start while the transfer before it awaits confirmation"
+    );
+
+    let outcome_0 = apply_confirmation_decision(
+        &children[0].id,
+        ConfirmationDecision::Rejected {
+            reason: "denied".into(),
+        },
+        &stores.tasks,
+        &stores.events,
+        t_plus(25),
+    )
+    .await?;
+    let ConfirmationDecisionOutcome::Rejected { parent, .. } = outcome_0 else {
+        panic!("expected Rejected");
+    };
+    let parent = parent.context("parent should be returned")?;
+    assert_eq!(parent.status, TaskStatus::WaitingOnChildren);
+    assert_eq!(parent.pending_child_count, 1);
+
+    let child_1 = acquire_child_with(
+        &stores.tasks,
+        &children[1].id,
+        WorkerId::from_string("child_worker_2"),
+        LeaseId::from_string("child_lease_2"),
+        t_plus(30),
+    )
+    .await?;
+    let bootstrap_1 =
+        resolve_tool_bootstrap(child_1, &stores.tasks, ActivityBeacon::default()).await?;
+    let outcome_1 = super::tool_task::execute_tool_task(
+        bootstrap_1,
+        &stores.tasks,
+        &stores.events,
+        &cancel,
+        |_info, _collector| async { Ok(ToolResult::success("echo output")) },
+        t_plus(35),
+    )
+    .await?;
+    let ToolTaskOutcome::Completed { parent, .. } = outcome_1 else {
+        panic!("Expected Completed for child 1");
+    };
     let parent = parent.context("parent should be returned")?;
     assert_eq!(parent.status, TaskStatus::Pending);
     assert_eq!(parent.pending_child_count, 0);

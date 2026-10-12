@@ -610,6 +610,7 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
         }
     }
     drop(artifact_store_guard);
+    crate::host::wake_after_tool_child_settled(&runtime);
 
     match crate::host::committed_events_from(stores.event_repo.as_ref(), &thread_id, watermark)
         .await
@@ -1291,6 +1292,7 @@ impl GrpcControlService {
                 )
                 .await
                 .map_err(internal_status("applying confirmation decision"))?;
+                crate::host::wake_after_tool_child_settled(&self.shared.runtime);
             }
         }
 
@@ -8654,8 +8656,7 @@ mod tests {
             description: "Transfer funds".into(),
             input_schema: json!({
                 "type": "object",
-                "properties": { "amount": { "type": "number" } },
-                "required": ["amount"]
+                "properties": { "amount": { "type": "number" } }, "required": ["amount"]
             }),
             display_name: "Transfer".into(),
             tier: ToolTier::Confirm,

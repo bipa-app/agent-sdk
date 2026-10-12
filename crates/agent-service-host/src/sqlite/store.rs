@@ -60,6 +60,9 @@ use agent_server::journal::relay::{
     TASK_WAKEUP_OUTBOX_MAX_ATTEMPTS, TaskWakeupEmitter, TaskWakeupTrigger,
 };
 use agent_server::journal::retention::{RetentionCursor, RetentionStore};
+use agent_server::journal::sibling_order::{
+    hold_tool_children_behind_siblings, mixed_spawn_waits, pure_spawn_waits, release_ready_siblings,
+};
 use agent_server::journal::store::{
     AgentTaskStore, CancelScope, CancelTreeOutcome, ChildProbe, MixedChildrenSpawn,
     QuestionAnswerApplied, QuestionPause, ReattachedChild, RequeueOutcome, SpawnedMixedChildren,
@@ -281,7 +284,8 @@ macro_rules! task_columns {
          submitted_input_json, caller_metadata_json, worker_id, lease_id, \
          lease_expires_at, last_heartbeat_at, state_json, attempt, max_attempts, \
          last_error, terminal_reason_json, pending_child_count, spawn_index, result_payload, \
-         otel_traceparent, created_at, updated_at, completed_at, last_activity_at"
+         otel_traceparent, created_at, updated_at, completed_at, last_activity_at, \
+         after_siblings_json"
     };
 }
 
@@ -1251,6 +1255,7 @@ INSERT INTO agent_sdk_turn_checkpoints (
             .transpose()?;
         let pending_child_count = i64::from(task.pending_child_count);
         let spawn_index = task.spawn_index.map(i64::from);
+        let after_siblings_json = after_siblings_json(task)?;
         sqlx::query!(
             r"
 INSERT INTO agent_sdk_tasks (
@@ -1258,10 +1263,11 @@ INSERT INTO agent_sdk_tasks (
     submitted_input_json, caller_metadata_json, worker_id, lease_id, lease_expires_at,
     last_heartbeat_at, state_json, attempt, max_attempts, last_error, terminal_reason_json,
     pending_child_count, spawn_index, result_payload,
-    created_at, updated_at, completed_at, otel_traceparent, last_activity_at
+    created_at, updated_at, completed_at, otel_traceparent, last_activity_at,
+    after_siblings_json
 ) VALUES (
     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26
+    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
 )
 ",
             id,
@@ -1290,6 +1296,7 @@ INSERT INTO agent_sdk_tasks (
             task.completed_at,
             task.otel_traceparent,
             task.last_activity_at,
+            after_siblings_json,
         )
         .execute(&mut **tx)
         .await
@@ -1297,7 +1304,59 @@ INSERT INTO agent_sdk_tasks (
         Ok(())
     }
 
+    /// Write `task` over its row. A terminal child also releases every
+    /// sibling its batch's execution order held behind it, in the same
+    /// transaction, so no terminal write can strand a held sibling.
     async fn update_task_tx(tx: &mut Transaction<'_, Sqlite>, task: &AgentTask) -> Result<()> {
+        Self::write_task_row_tx(tx, task).await?;
+        if task.status.is_terminal()
+            && let Some(parent_id) = &task.parent_id
+        {
+            Self::release_ready_siblings_tx(tx, parent_id, task.updated_at).await?;
+        }
+        Ok(())
+    }
+
+    async fn release_ready_siblings_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        parent_id: &AgentTaskId,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let held: Vec<AgentTask> = sqlx::query_as::<_, TaskRecord>(concat!(
+            "SELECT ",
+            task_columns!(),
+            " FROM agent_sdk_tasks WHERE parent_id = ?1 AND status = 'pending' \
+             AND after_siblings_json IS NOT NULL",
+        ))
+        .bind(parent_id.as_str())
+        .fetch_all(&mut **tx)
+        .await
+        .with_context(|| format!("load children of {parent_id} held behind siblings"))?
+        .into_iter()
+        .map(TryInto::try_into)
+        .collect::<Result<_>>()?;
+        if held.is_empty() {
+            return Ok(());
+        }
+        let parent_key = parent_id.as_str();
+        let unfinished: BTreeSet<AgentTaskId> = sqlx::query_scalar!(
+            r"SELECT id FROM agent_sdk_tasks WHERE parent_id = ?1 AND status NOT IN ('completed', 'failed', 'cancelled')",
+            parent_key,
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .with_context(|| format!("load unfinished children of {parent_id}"))?
+        .into_iter()
+        .flatten()
+        .map(AgentTaskId::from_string)
+        .collect();
+        for ready in release_ready_siblings(&held, &unfinished, now)? {
+            Self::write_task_row_tx(tx, &ready).await?;
+        }
+        Ok(())
+    }
+
+    async fn write_task_row_tx(tx: &mut Transaction<'_, Sqlite>, task: &AgentTask) -> Result<()> {
         let id = task.id.as_str();
         let kind = enum_to_wire(&task.kind)?;
         let status = enum_to_wire(&task.status)?;
@@ -1319,6 +1378,7 @@ INSERT INTO agent_sdk_tasks (
             .transpose()?;
         let pending_child_count = i64::from(task.pending_child_count);
         let spawn_index = task.spawn_index.map(i64::from);
+        let after_siblings_json = after_siblings_json(task)?;
         let result = sqlx::query!(
             r"
 UPDATE agent_sdk_tasks SET
@@ -1332,7 +1392,8 @@ UPDATE agent_sdk_tasks SET
     created_at = ?21, updated_at = ?22, completed_at = ?23,
     caller_metadata_json = ?24,
     otel_traceparent = ?25,
-    last_activity_at = ?26
+    last_activity_at = ?26,
+    after_siblings_json = ?27
 WHERE id = ?1
 ",
             id,
@@ -1361,6 +1422,7 @@ WHERE id = ?1
             caller_metadata_json,
             task.otel_traceparent,
             task.last_activity_at,
+            after_siblings_json,
         )
         .execute(&mut **tx)
         .await
@@ -2932,6 +2994,7 @@ async fn prepare_mixed_tool_and_reattach_rows_tx(
         }
         tool_rows.push(child);
     }
+    hold_tool_children_behind_siblings(&mut tool_rows, &mixed_spawn_waits(tool_children))?;
 
     let mut reattached_rows = Vec::with_capacity(reattach.len());
     let mut reattached_ids = BTreeSet::new();
@@ -3450,7 +3513,7 @@ impl AgentTaskStore for SqliteDurableStore {
             return Ok(None);
         };
         Self::require_active_thread_tx(&mut tx, &old.thread_id, ThreadOperation::Acquire).await?;
-        if !old.status.can_be_leased() {
+        if !old.is_leasable() {
             return Ok(None);
         }
         match classify_recovery(&old, RecoveryContext::AcquisitionAttempt) {
@@ -3495,6 +3558,7 @@ impl AgentTaskStore for SqliteDurableStore {
                 "SELECT ",
                 task_columns!(),
                 " FROM agent_sdk_tasks WHERE status = 'pending' \
+                 AND after_siblings_json IS NULL \
                  AND thread_id NOT IN (SELECT thread_id FROM agent_sdk_threads \
                  WHERE status IN ('deleting', 'deleted')) \
                  ORDER BY created_at, id LIMIT 1",
@@ -3998,6 +4062,7 @@ impl AgentTaskStore for SqliteDurableStore {
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Vec<AgentTask>)> {
         validate_tool_child_specs_for_pure_spawn(&specs)?;
+        let waits = pure_spawn_waits(&specs)?;
         let mut tx = self.begin().await?;
         let old_parent = Self::load_task_tx(&mut tx, parent_id)
             .await?
@@ -4024,6 +4089,7 @@ impl AgentTaskStore for SqliteDurableStore {
             }
             children.push(child);
         }
+        hold_tool_children_behind_siblings(&mut children, &waits)?;
 
         let child_count = u32::try_from(children.len())
             .context("spawn rejected: child count exceeds u32::MAX")?;
@@ -5939,6 +6005,7 @@ struct TaskRecord {
     updated_at: OffsetDateTime,
     completed_at: Option<OffsetDateTime>,
     last_activity_at: Option<OffsetDateTime>,
+    after_siblings_json: Option<serde_json::Value>,
 }
 
 impl TryFrom<TaskRecord> for AgentTask {
@@ -5972,6 +6039,11 @@ impl TryFrom<TaskRecord> for AgentTask {
                 .spawn_index
                 .map(|v| u32_from_i64(v, "task spawn_index"))
                 .transpose()?,
+            after_siblings: r
+                .after_siblings_json
+                .map(|value| json_from_value(value, "task after_siblings_json"))
+                .transpose()?
+                .unwrap_or_default(),
             result_payload: r.result_payload,
             otel_traceparent: r.otel_traceparent,
             created_at: r.created_at,
@@ -6416,6 +6488,15 @@ impl TryFrom<ToolAuditEventRecord> for ToolAuditEvent {
 
 const fn thread_key(thread_id: &ThreadId) -> &str {
     thread_id.0.as_str()
+}
+
+/// The persisted form of a task's wait list: `NULL` when it waits on
+/// nothing, so acquisition can filter on `IS NULL`.
+fn after_siblings_json(task: &AgentTask) -> Result<Option<serde_json::Value>> {
+    if task.after_siblings.is_empty() {
+        return Ok(None);
+    }
+    json_to_value(&task.after_siblings, "task after_siblings").map(Some)
 }
 
 fn json_to_value<T: Serialize + ?Sized>(value: &T, label: &str) -> Result<serde_json::Value> {

@@ -600,6 +600,7 @@ mod replay_determinism_test;
 mod replay_test;
 pub mod retention;
 pub mod retention_janitor;
+pub mod sibling_order;
 pub mod staged;
 pub mod store;
 pub mod subagent_spawn_transaction;

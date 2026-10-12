@@ -132,11 +132,15 @@ const DROP_PARKED_SUBAGENT_CHILD_ROOT_INDEX_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/postgres/0025_drop_parked_subagent_child_root_index.sql"
 ));
+const TASK_AFTER_SIBLINGS_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/postgres/0026_task_after_siblings.sql"
+));
 
 /// `sqlx`-managed migration bundle for the Postgres durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/postgres");
 
-const MIGRATIONS: [PostgresMigration; 23] = [
+const MIGRATIONS: [PostgresMigration; 24] = [
     PostgresMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -252,6 +256,11 @@ const MIGRATIONS: [PostgresMigration; 23] = [
         summary: "drop the parked-invocation child-root index 0024 supersedes",
         sql: DROP_PARKED_SUBAGENT_CHILD_ROOT_INDEX_SQL,
     },
+    PostgresMigration {
+        version: "0026",
+        summary: "earlier batch siblings a pending tool child waits for",
+        sql: TASK_AFTER_SIBLINGS_SQL,
+    },
 ];
 
 /// Version of the migration this PR introduces: the typed terminal
@@ -290,6 +299,11 @@ pub(crate) const HISTORY_GENERATION_MIGRATION_VERSION: i64 = 22;
 /// outside the column migration's ACCESS EXCLUSIVE lock.
 #[cfg(test)]
 pub(crate) const HISTORY_GENERATION_VALIDATION_MIGRATION_VERSION: i64 = 23;
+
+/// Version of the migration that records the earlier batch siblings a
+/// pending tool child waits for.
+#[cfg(test)]
+pub(crate) const TASK_AFTER_SIBLINGS_MIGRATION_VERSION: i64 = 26;
 
 /// The reviewable executable migration bundle for the current durable core.
 #[must_use]
@@ -380,8 +394,8 @@ mod tests {
     use sqlx::postgres::PgConnection;
 
     use super::{
-        DURABLE_CORE_MIGRATOR, PostgresMigration, TURN_ATTEMPT_EVIDENCE_SQL,
-        durable_core_migrations,
+        DURABLE_CORE_MIGRATOR, PostgresMigration, TASK_AFTER_SIBLINGS_SQL,
+        TURN_ATTEMPT_EVIDENCE_SQL, durable_core_migrations,
     };
 
     async fn history_generation_check_is_validated(conn: &mut PgConnection) -> Result<bool> {
@@ -592,6 +606,15 @@ WHERE indexrelid = to_regclass('agent_sdk_tasks_subagent_child_root_idx')
             TURN_ATTEMPT_EVIDENCE_SQL,
             "agent_sdk_turn_attempts",
             5,
+        );
+    }
+
+    #[test]
+    fn task_after_siblings_migration_is_additive_and_nullable() {
+        crate::migration_contract::assert_additive_nullable_migration(
+            TASK_AFTER_SIBLINGS_SQL,
+            "agent_sdk_tasks",
+            1,
         );
     }
 }

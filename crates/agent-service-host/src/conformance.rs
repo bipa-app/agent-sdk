@@ -929,10 +929,7 @@ mod tests {
             )
             .await?;
 
-        let spec = ChildSpawnSpec {
-            max_attempts: 3,
-            precompleted_result: None,
-        };
+        let spec = ChildSpawnSpec::new(3);
         let payload = SuspensionPayload {
             continuation: agent_sdk_foundation::ContinuationEnvelope::wrap(
                 agent_sdk_foundation::AgentContinuation {
@@ -2613,10 +2610,7 @@ mod tests {
             )
             .await?;
 
-        let spec = ChildSpawnSpec {
-            max_attempts: 3,
-            precompleted_result: None,
-        };
+        let spec = ChildSpawnSpec::new(3);
         let payload = SuspensionPayload {
             continuation: agent_sdk_foundation::ContinuationEnvelope::wrap(
                 agent_sdk_foundation::AgentContinuation {

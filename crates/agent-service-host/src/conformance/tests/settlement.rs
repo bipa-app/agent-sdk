@@ -1760,6 +1760,7 @@ SELECT count(*) AS "blocked!" FROM blocked
                 name: "read_file".into(),
                 display_name: "Read File".into(),
                 tier: ToolTier::Observe,
+                concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
                 input: serde_json::json!({ "path": format!("f{index}") }),
                 effective_input: serde_json::json!({ "path": format!("f{index}") }),
                 listen_context: None,

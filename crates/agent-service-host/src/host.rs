@@ -3027,6 +3027,20 @@ async fn execute_tool_task(
     result
 }
 
+/// Nudge the pool after a tool child reached a terminal state.
+///
+/// The same transition may have made the parent runnable (it was the
+/// batch's last live child) or released siblings the batch's execution
+/// order held behind it, possibly a whole wave of reads. Waking every
+/// parked worker and leaving one permit for the worker that is finishing
+/// this child lets them start now instead of on the next acquisition tick.
+pub(crate) fn wake_after_tool_child_settled(runtime: &ExecutionRuntime) {
+    if let Some(signal) = runtime.wakeup_signal() {
+        signal.wake_all_now();
+        signal.notify_workers();
+    }
+}
+
 async fn finish_tool_task_execution(
     outcome: Result<ToolTaskOutcome>,
     task: &AgentTask,
@@ -3038,29 +3052,14 @@ async fn finish_tool_task_execution(
     match outcome {
         Ok(
             ToolTaskOutcome::Completed {
-                committed_events,
-                parent,
-                ..
+                committed_events, ..
             }
             | ToolTaskOutcome::Failed {
-                committed_events,
-                parent,
-                ..
+                committed_events, ..
             },
         ) => {
             publish_events(stores, &committed_events);
-            // When this was the batch's last outstanding child, the
-            // journal flips the parent from `WaitingOnChildren` to
-            // `Pending` (runnable) in the same terminal transition. Nudge
-            // a parked worker so it resumes the parent turn immediately
-            // rather than waiting out the acquisition ticker. A `None`
-            // parent (still other live children) or a non-runnable parent
-            // leaves the poll backstop to handle it.
-            if parent.is_some_and(|p| p.status.is_runnable())
-                && let Some(signal) = runtime.wakeup_signal()
-            {
-                signal.notify_workers();
-            }
+            wake_after_tool_child_settled(runtime);
             Ok(())
         }
         Ok(ToolTaskOutcome::Cancelled) => Ok(()),
@@ -6247,8 +6246,8 @@ mod tests {
     // `ServiceHost::run` → `ExecutionRuntime` → the worker paths:
     //   * `apply_batch_routing` fires `wake_all_now()` once a tool-child
     //     batch is durably runnable, and
-    //   * `execute_tool_task` fires `notify_workers()` when the last
-    //     child flips the parent to `Pending`.
+    //   * `execute_tool_task` wakes the pool whenever a child settles,
+    //     which covers the last child flipping the parent to `Pending`.
     // A scripted provider drives one 2-tool batch then a text close; a
     // recording tool executor timestamps each child so the batch's
     // "start together" property is observable.
@@ -6322,7 +6321,7 @@ mod tests {
             input_schema: serde_json::json!({ "type": "object" }),
             display_name: "Probe".into(),
             tier: agent_sdk_foundation::ToolTier::Observe,
-            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            concurrency: agent_sdk_foundation::ToolConcurrency::ReadOnly,
         }
     }
 
@@ -6397,8 +6396,8 @@ mod tests {
         // initial root pickup, the only thing that can move work across a
         // task hop within the assertion window is the in-process wakeup
         // nudge wired by Fix 1. If either nudge failed to fire — the
-        // batch spawn's `wake_all_now` (child pickup) or the last child's
-        // `notify_workers` (parent resume) — the flow would stall until
+        // batch spawn's `wake_all_now` (child pickup) or the settled
+        // child's wake (parent resume) — the flow would stall until
         // the 30 s ticker, far outside the 5 s window below.
         let config = ServiceConfig {
             worker: crate::config::WorkerConfig {
@@ -6503,6 +6502,208 @@ mod tests {
 
         token.cancel();
         host_handle.await??;
+        Ok(())
+    }
+
+    /// Records when each tool child starts and ends, holding every call
+    /// open long enough that siblings allowed to overlap would.
+    struct OrderRecordingExecutor {
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl crate::runtime::ToolCallExecutor for OrderRecordingExecutor {
+        async fn execute_tool_call(
+            &self,
+            bootstrap: &agent_server::worker::ToolTaskBootstrap,
+            _collector: agent_server::worker::ToolEventCollector,
+            _cancel: tokio_util::sync::CancellationToken,
+            _artifact_store: Option<Arc<agent_sdk::ArtifactStore>>,
+        ) -> Result<agent_sdk_foundation::ToolResult> {
+            let id = bootstrap.tool_call.id.clone();
+            self.log
+                .lock()
+                .map_err(|_| anyhow::anyhow!("order log poisoned"))?
+                .push(format!("start {id}"));
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            self.log
+                .lock()
+                .map_err(|_| anyhow::anyhow!("order log poisoned"))?
+                .push(format!("end {id}"));
+            Ok(agent_sdk_foundation::ToolResult::success(id))
+        }
+    }
+
+    /// A tool advertised the way a host that skips confirmation prompts
+    /// advertises it: `Observe`, so only `concurrency` orders it.
+    fn ordered_tool(
+        name: &str,
+        concurrency: agent_sdk_foundation::ToolConcurrency,
+    ) -> agent_sdk_foundation::llm::Tool {
+        agent_sdk_foundation::llm::Tool {
+            name: name.into(),
+            description: format!("{name} for ordering tests"),
+            input_schema: serde_json::json!({ "type": "object" }),
+            display_name: name.into(),
+            tier: agent_sdk_foundation::ToolTier::Observe,
+            concurrency,
+        }
+    }
+
+    /// Run one model batch through a worker pool large enough to run every
+    /// call at once, and return the executor's start/end log.
+    ///
+    /// The acquisition ticker is 30 s and nothing else polls, so every hop
+    /// after the first kick, including each release of a held call, must
+    /// be driven by the in-process nudges.
+    async fn run_batch_through_worker_pool(calls: &[(&str, &str)]) -> Result<Vec<String>> {
+        use agent_sdk_foundation::ThreadId;
+        use agent_sdk_foundation::ToolConcurrency::{Exclusive, ReadOnly};
+        use std::time::Duration;
+
+        let config = ServiceConfig {
+            worker: crate::config::WorkerConfig {
+                pool_size: 6,
+                acquisition_interval_secs: 30,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let log = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let provider = Arc::new(ScriptedBatchProvider::new(vec![
+            tool_use_batch_response("resp_batch", calls),
+            text_response("resp_final", "done"),
+        ]));
+        let executor = Arc::new(OrderRecordingExecutor {
+            log: Arc::clone(&log),
+        });
+        let runtime = tool_runtime(provider, executor)?;
+        let runtime_kick = Arc::clone(&runtime);
+        let mut definition = sample_definition();
+        definition.tools = vec![
+            ordered_tool("read", ReadOnly),
+            ordered_tool("edit", Exclusive),
+            ordered_tool("bash", Exclusive),
+        ];
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(definition));
+        let host = ServiceHost::new(config, registry, runtime)?;
+        let stores = host.stores().clone();
+        let token = host.shutdown_token();
+
+        let task = AgentTask::new_root_turn_with_input(
+            ThreadId::from_string("t-batch-order"),
+            vec![SubmittedInputItem::Text {
+                text: "run the batch".into(),
+            }],
+            time::OffsetDateTime::now_utc(),
+            3,
+        );
+        let root_id = task.id.clone();
+        stores.task_store.submit_root_turn(task).await?;
+        let host_handle = tokio::spawn(async move { host.run().await });
+
+        let mut kicked = false;
+        for _ in 0..200 {
+            if let Some(signal) = runtime_kick.wakeup_signal() {
+                signal.notify_workers();
+                kicked = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        anyhow::ensure!(kicked, "run() must install the wakeup signal");
+
+        let mut completed = false;
+        for _ in 0..500 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let row = stores
+                .task_store
+                .get(&root_id)
+                .await?
+                .context("root task must still exist")?;
+            if row.status == TaskStatus::Completed {
+                completed = true;
+                break;
+            }
+        }
+        token.cancel();
+        host_handle.await??;
+        anyhow::ensure!(
+            completed,
+            "the turn must finish within 10 s on wakeup nudges alone"
+        );
+        let entries = log
+            .lock()
+            .map_err(|_| anyhow::anyhow!("order log poisoned"))?
+            .clone();
+        Ok(entries)
+    }
+
+    #[tokio::test]
+    async fn worker_pool_runs_a_command_only_after_the_edits_before_it() -> Result<()> {
+        let log = run_batch_through_worker_pool(&[
+            ("edit_1", "edit"),
+            ("edit_2", "edit"),
+            ("test", "bash"),
+        ])
+        .await?;
+
+        assert_eq!(
+            log,
+            [
+                "start edit_1",
+                "end edit_1",
+                "start edit_2",
+                "end edit_2",
+                "start test",
+                "end test",
+            ],
+            "each call must run alone, in the order the model wrote it"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn worker_pool_runs_a_read_only_batch_concurrently() -> Result<()> {
+        let log = run_batch_through_worker_pool(&[("r1", "read"), ("r2", "read"), ("r3", "read")])
+            .await?;
+
+        let mut starts = log[..3].to_vec();
+        starts.sort();
+        assert_eq!(
+            starts,
+            ["start r1", "start r2", "start r3"],
+            "every read must start before any read ends: {log:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn worker_pool_splits_reads_around_an_edit() -> Result<()> {
+        let log = run_batch_through_worker_pool(&[
+            ("r1", "read"),
+            ("r2", "read"),
+            ("edit", "edit"),
+            ("r3", "read"),
+        ])
+        .await?;
+
+        let mut first_wave = log[..4].to_vec();
+        first_wave.sort();
+        assert_eq!(
+            first_wave,
+            ["end r1", "end r2", "start r1", "start r2"],
+            "the first two reads run together before anything else: {log:?}"
+        );
+        assert!(
+            log[..2].iter().all(|entry| entry.starts_with("start")),
+            "the first two reads must overlap: {log:?}"
+        );
+        assert_eq!(
+            log[4..],
+            ["start edit", "end edit", "start r3", "end r3"],
+            "the edit runs after both reads and before the last read"
+        );
         Ok(())
     }
 
