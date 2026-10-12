@@ -537,7 +537,8 @@ pub(super) async fn test_approved_confirmation_pickup_keeps_the_paused_attempt(
 enum LiveDescendant {
     Tool(LiveChild),
     /// Undelivered input under an ended root, as a store from before root
-    /// transitions settled their input could still hold it.
+    /// transitions settled their input could still hold it; written here
+    /// through the structural `update`, which bypasses every transition.
     StrandedInjection,
     ParkedSubagentInvocation,
 }
@@ -650,20 +651,11 @@ async fn end_root_over(
             Ok(parked.root.id)
         }
         LiveDescendant::StrandedInjection => {
-            let (root, worker, lease) = running_root(task_store, tid, at).await?;
-            let (ended, _) = task_store
-                .complete_task(&root.id, &worker, &lease, t_plus(at + 10))
+            let (root, _worker, _lease) = running_root(task_store, tid, at).await?;
+            inject(task_store, tid, "one more thing", at + 5).await?;
+            task_store
+                .update(root.clone().complete(t_plus(at + 10))?)
                 .await?;
-            let stranded = AgentTask::new_root_turn_with_input(
-                thread_id(tid),
-                vec![SubmittedInputItem::Text {
-                    text: "one more thing".into(),
-                }],
-                t_plus(at + 5),
-                3,
-            )
-            .into_input_injection(&ended)?;
-            task_store.insert(stranded).await?;
             Ok(root.id)
         }
         LiveDescendant::ParkedSubagentInvocation => {
@@ -1158,12 +1150,367 @@ mod sqlite {
 #[cfg(feature = "postgres")]
 mod postgres {
     use anyhow::{Context, Result};
+    use time::OffsetDateTime;
 
     use agent_sdk_foundation::TerminalReason;
-    use agent_server::journal::store::AgentTaskStore;
-    use agent_server::journal::task::{LeaseId, WorkerId};
+    use agent_server::journal::store::{AgentTaskStore, SubmitDisposition, SubmitRootTurnParams};
+    use agent_server::journal::task::{
+        AgentTask, AgentTaskId, LeaseId, SubmittedInputItem, TaskKind, TaskStatus, WorkerId,
+    };
 
-    use super::super::{pg_test_store, spawn_subagent_fixture, t_plus};
+    use super::super::{pg_test_store, spawn_subagent_fixture, t_plus, thread_id};
+    use crate::postgres::store::PostgresDurableStore;
+
+    const RACE_ROUNDS: i64 = 40;
+
+    fn injection_at(tid: &str, text: &str, at: i64) -> SubmitRootTurnParams {
+        SubmitRootTurnParams {
+            task: AgentTask::new_root_turn_with_input(
+                thread_id(tid),
+                vec![SubmittedInputItem::Text { text: text.into() }],
+                t_plus(at),
+                3,
+            ),
+            idempotency: None,
+            max_queued_depth: None,
+            disposition: SubmitDisposition::InjectAtBoundary,
+        }
+    }
+
+    /// Input left queued under a root that has ended: nothing will ever
+    /// deliver it.
+    async fn stranded_input(store: &PostgresDurableStore, tid: &str) -> Result<Vec<AgentTaskId>> {
+        let tasks = store.list_by_thread(&thread_id(tid)).await?;
+        let ended = |id: &AgentTaskId| {
+            tasks
+                .iter()
+                .any(|task| task.id == *id && task.status.is_terminal())
+        };
+        Ok(tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::InputInjection)
+            .filter(|task| task.status == TaskStatus::Queued)
+            .filter(|task| task.parent_id.as_ref().is_some_and(ended))
+            .map(|task| task.id.clone())
+            .collect())
+    }
+
+    /// Block until some session of this database waits on a row lock.
+    async fn until_a_session_waits_on_a_lock(store: &PostgresDurableStore) -> Result<()> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let waiting = sqlx::query_scalar!(
+                r#"
+SELECT count(*) AS "waiting!"
+FROM pg_stat_activity
+WHERE wait_event_type = 'Lock'
+  AND datname = current_database()
+"#
+            )
+            .fetch_one(store.pool())
+            .await?;
+            if waiting > 0 {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "no session ever waited on a lock",
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Complete a running root while a submission injects into it, round
+    /// after round. Every round must commit both sides — no deadlock — and
+    /// leave no input under the ended root: the input either reached the
+    /// root before it ended and was handed over, or found it ended and
+    /// became a turn of its own.
+    async fn race_completion_against_input(pending_input: bool) -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let mut deadlocks = 0_u32;
+        let mut other_errors = Vec::new();
+        let mut stranded = Vec::new();
+        for round in 0..RACE_ROUNDS {
+            let tid = format!("pg-race-{pending_input}-{round}");
+            let at = round * 100;
+            let (root, worker, lease) = super::running_root(&store, &tid, at).await?;
+            if pending_input {
+                super::inject(&store, &tid, "sent before the race", at + 2).await?;
+            }
+            let completing = {
+                let store = store.clone();
+                let root = root.id.clone();
+                tokio::spawn(async move {
+                    store
+                        .complete_task(&root, &worker, &lease, t_plus(at + 5))
+                        .await
+                        .map(|_| ())
+                })
+            };
+            let submitting = {
+                let store = store.clone();
+                let params = injection_at(&tid, "sent during the race", at + 4);
+                tokio::spawn(async move {
+                    store
+                        .submit_root_turn_idempotent(params)
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| anyhow::anyhow!("{error}"))
+                })
+            };
+            for outcome in [completing.await?, submitting.await?] {
+                if let Err(error) = outcome {
+                    let message = format!("{error:#}");
+                    if message.contains("deadlock") {
+                        deadlocks += 1;
+                    } else {
+                        other_errors.push(format!("round {round}: {message}"));
+                    }
+                }
+            }
+            stranded.extend(stranded_input(&store, &tid).await?);
+        }
+        assert!(
+            deadlocks == 0 && other_errors.is_empty() && stranded.is_empty(),
+            "over {RACE_ROUNDS} rounds: {deadlocks} deadlocked, {} stranded input, other \
+             errors {other_errors:#?}",
+            stranded.len(),
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_completion_racing_input_over_pending_input() -> Result<()> {
+        race_completion_against_input(true).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_completion_racing_the_first_input() -> Result<()> {
+        race_completion_against_input(false).await
+    }
+
+    /// Run `transition` on `root` while another transaction holds the
+    /// root's thread, then have that holder reach for the root itself, as a
+    /// submission or a cancel does. With thread before root on both sides the
+    /// transition queues behind the holder and both finish; locking the root
+    /// first deadlocks them.
+    async fn behind_a_thread_holder<T: Send + 'static>(
+        store: &PostgresDurableStore,
+        tid: &str,
+        root: &AgentTaskId,
+        transition: impl std::future::Future<Output = Result<T>> + Send + 'static,
+    ) -> Result<T> {
+        let mut holder = store.pool().begin().await?;
+        sqlx::query_scalar!(
+            "SELECT thread_id FROM agent_sdk_threads WHERE thread_id = $1 FOR UPDATE",
+            tid,
+        )
+        .fetch_one(&mut *holder)
+        .await?;
+        let transition = tokio::spawn(transition);
+        until_a_session_waits_on_a_lock(store).await?;
+        sqlx::query_scalar!(
+            "SELECT id FROM agent_sdk_tasks WHERE id = $1 FOR UPDATE",
+            root.as_str(),
+        )
+        .fetch_one(&mut *holder)
+        .await
+        .context("the thread's holder must still reach the root")?;
+        holder.commit().await?;
+        transition
+            .await?
+            .context("the transition must finish behind the thread's holder")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_completion_waits_behind_a_thread_holder() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let tid = "pg-thread-holder";
+        let (root, worker, lease) = super::running_root(&store, tid, 0).await?;
+        let pending = super::inject(&store, tid, "not yet delivered", 2).await?;
+
+        let completing = {
+            let store = store.clone();
+            let root = root.id.clone();
+            async move { store.complete_task(&root, &worker, &lease, t_plus(5)).await }
+        };
+        behind_a_thread_holder(&store, tid, &root.id, completing).await?;
+
+        assert_eq!(
+            super::fetch(&store, &root.id).await?.status,
+            TaskStatus::Completed
+        );
+        assert_eq!(
+            super::fetch(&store, &pending.id).await?.status,
+            TaskStatus::Completed,
+            "the pending input is handed over",
+        );
+        Ok(())
+    }
+
+    /// A root pausing on a question journals the question on its thread, so
+    /// it too locks the thread before itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_question_pause_waits_behind_a_thread_holder() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let tid = "pg-question-holder";
+        let (root, worker, lease) = super::running_root(&store, tid, 0).await?;
+
+        let pausing = {
+            let store = store.clone();
+            let root = root.id.clone();
+            async move {
+                store
+                    .pause_on_question(
+                        &root,
+                        &worker,
+                        &lease,
+                        super::super::question_pause(tid, 1),
+                        t_plus(5),
+                    )
+                    .await
+            }
+        };
+        behind_a_thread_holder(&store, tid, &root.id, pausing).await?;
+
+        assert_eq!(
+            super::fetch(&store, &root.id).await?.status,
+            TaskStatus::AwaitingQuestion,
+        );
+        Ok(())
+    }
+
+    /// A root spawning a subagent journals the spawn on its own thread, so
+    /// the spawn locks that thread before the root as well.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_subagent_spawn_waits_behind_a_thread_holder() -> Result<()> {
+        use agent_server::journal::SubagentInvocationSpawn;
+        use agent_server::journal::subagent_spawn_transaction::{
+            AtomicSubagentSpawnCommitter, SubagentSpawnCommit, SubagentSpawnEvent,
+        };
+
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let tid = "pg-spawn-holder";
+        let child_thread = thread_id("pg-spawn-holder-child");
+        agent_server::journal::thread_store::ThreadStore::get_or_create(
+            &store,
+            &child_thread,
+            t_plus(0),
+        )
+        .await?;
+        let (root, worker, lease) = super::running_root(&store, tid, 0).await?;
+
+        let spawning = {
+            let store = store.clone();
+            let root = root.id.clone();
+            async move {
+                store
+                    .commit_subagent_spawn_atomic(SubagentSpawnCommit {
+                        delivered_injection_ids: Vec::new(),
+                        parent_id: root,
+                        worker,
+                        lease,
+                        spawn: SubagentInvocationSpawn {
+                            child_thread_id: child_thread,
+                            spec: super::super::sample_subagent_spec(),
+                            child_root_input: super::super::sample_subagent_input(),
+                            spawn_index: 0,
+                            child_caller_metadata: None,
+                            payload: super::super::suspension_payload(tid),
+                        },
+                        event: SubagentSpawnEvent {
+                            subagent_id: "call-1".into(),
+                            subagent_name: "explore".into(),
+                        },
+                        outbox_max_attempts: 3,
+                        now: t_plus(5),
+                    })
+                    .await
+                    .map(|_| ())
+            }
+        };
+        behind_a_thread_holder(&store, tid, &root.id, spawning).await?;
+
+        assert_eq!(
+            super::fetch(&store, &root.id).await?.status,
+            TaskStatus::WaitingOnChildren,
+        );
+        Ok(())
+    }
+
+    /// Input submitted while its root is ending under a lock becomes a turn
+    /// of its own once the root has ended, instead of waiting on a root no
+    /// boundary will ever reach again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_input_never_lands_under_a_root_that_ended_meanwhile() -> Result<()>
+    {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let tid = "pg-ended-meanwhile";
+        let (root, _worker, _lease) = super::running_root(&store, tid, 0).await?;
+
+        let mut ending = store.pool().begin().await?;
+        sqlx::query_scalar!(
+            "SELECT id FROM agent_sdk_tasks WHERE id = $1 FOR UPDATE",
+            root.id.as_str(),
+        )
+        .fetch_one(&mut *ending)
+        .await?;
+        let submitting = {
+            let store = store.clone();
+            let params = injection_at(tid, "sent while the root ends", 3);
+            tokio::spawn(async move {
+                store
+                    .submit_root_turn_idempotent(params)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{error}"))
+            })
+        };
+        until_a_session_waits_on_a_lock(&store).await?;
+        let ended_at = OffsetDateTime::now_utc();
+        sqlx::query!(
+            r"
+UPDATE agent_sdk_tasks
+SET status = 'completed',
+    worker_id = NULL,
+    lease_id = NULL,
+    lease_expires_at = NULL,
+    last_heartbeat_at = NULL,
+    terminal_reason_json = $2,
+    completed_at = $3,
+    updated_at = $3,
+    last_activity_at = $3
+WHERE id = $1
+",
+            root.id.as_str(),
+            serde_json::to_value(TerminalReason::Completed)?,
+            ended_at,
+        )
+        .execute(&mut *ending)
+        .await?;
+        ending.commit().await?;
+
+        let admitted = submitting.await??.task;
+        assert_eq!(
+            admitted.kind,
+            TaskKind::RootTurn,
+            "input whose root ended meanwhile must become a turn, not wait under it",
+        );
+        assert_eq!(
+            stranded_input(&store, tid).await?,
+            Vec::<AgentTaskId>::new()
+        );
+        Ok(())
+    }
 
     /// A child-thread root's undelivered input dies with it even while
     /// another transaction holds the subagent invocation's row, which the

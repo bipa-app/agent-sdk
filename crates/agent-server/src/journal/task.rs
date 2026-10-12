@@ -900,10 +900,18 @@ impl AgentTask {
     /// transport's idempotency record points at the durable injection row.
     ///
     /// # Errors
-    /// Returns a schema error when `parent` cannot own children.
+    /// Returns a schema error when `parent` cannot own children, and an
+    /// invalid-transition error when `parent` has ended: no boundary would
+    /// ever deliver input waiting on it.
     pub fn into_input_injection(mut self, parent: &Self) -> Result<Self, TaskSchemaError> {
         if parent.kind.is_leaf() {
             return Err(TaskSchemaError::ToolRuntimeCannotSpawnChildren);
+        }
+        if parent.status.is_terminal() {
+            return Err(TaskSchemaError::InvalidTransition {
+                from: parent.status,
+                to: TaskStatus::Queued,
+            });
         }
         self.kind = TaskKind::InputInjection;
         self.status = TaskStatus::Queued;
