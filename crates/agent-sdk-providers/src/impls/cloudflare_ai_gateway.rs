@@ -355,6 +355,14 @@ impl LlmProvider for CloudflareAIGatewayProvider {
         }
     }
 
+    fn configures_unbudgeted_reasoning(&self) -> bool {
+        match &self.inner {
+            Inner::Anthropic(p) => p.configures_unbudgeted_reasoning(),
+            Inner::OpenAI(p) => p.configures_unbudgeted_reasoning(),
+            Inner::Gemini(p) => p.configures_unbudgeted_reasoning(),
+        }
+    }
+
     fn has_stable_request_route(&self) -> bool {
         match &self.inner {
             Inner::Anthropic(p) => p.has_stable_request_route(),

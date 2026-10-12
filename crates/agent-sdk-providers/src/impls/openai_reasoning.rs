@@ -286,6 +286,23 @@ impl OpenAIReasoningConfig {
         self.effort
     }
 
+    /// Whether this config asks the model to reason: an effort other than
+    /// `none`. Without an effort the model's own default applies.
+    #[must_use]
+    pub const fn requests_reasoning(&self) -> bool {
+        match self.effort {
+            None | Some(OpenAIReasoningEffort::None) => false,
+            Some(
+                OpenAIReasoningEffort::Minimal
+                | OpenAIReasoningEffort::Low
+                | OpenAIReasoningEffort::Medium
+                | OpenAIReasoningEffort::High
+                | OpenAIReasoningEffort::XHigh
+                | OpenAIReasoningEffort::Max,
+            ) => true,
+        }
+    }
+
     /// Configured reasoning execution mode, if any.
     #[must_use]
     pub const fn mode(&self) -> Option<OpenAIReasoningMode> {

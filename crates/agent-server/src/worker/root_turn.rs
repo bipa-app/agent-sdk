@@ -3224,6 +3224,7 @@ fn build_request_envelope(
             model_aware_trigger,
             capabilities,
             thinking.as_ref().or_else(|| provider.configured_thinking()),
+            provider.configures_unbudgeted_reasoning(),
         ),
     );
 
@@ -10223,6 +10224,38 @@ mod tests {
             build_request_envelope(&adaptive, &opus, trigger(&model_aware()), &thread_id, None)
                 .max_tokens,
             128_000,
+        );
+    }
+
+    #[test]
+    fn envelope_counts_provider_owned_effort_reasoning() {
+        use agent_sdk_providers::{OpenAIReasoningConfig, OpenAIReasoningEffort};
+
+        let thread_id = agent_sdk_foundation::ThreadId::from_string("thread_output_budget");
+        let cfg = model_aware().with_model_context_window_tokens(200_000);
+        let definition = AgentDefinition {
+            max_tokens: 128_000,
+            ..context_definition(None)
+        };
+        let gpt = |effort: Option<OpenAIReasoningEffort>| {
+            let provider = OpenAIProvider::new("key", "gpt-5.4");
+            match effort {
+                Some(effort) => {
+                    provider.with_reasoning(OpenAIReasoningConfig::new().with_effort(effort))
+                }
+                None => provider,
+            }
+        };
+        let sized = |provider: &OpenAIProvider| {
+            build_request_envelope(&definition, provider, trigger(&cfg), &thread_id, None)
+                .max_tokens
+        };
+        assert_eq!(sized(&gpt(None)), 50_000);
+        assert_eq!(sized(&gpt(Some(OpenAIReasoningEffort::None))), 50_000);
+        assert_eq!(
+            sized(&gpt(Some(OpenAIReasoningEffort::High))),
+            100_000,
+            "effort-only reasoning on a model that does not reason by default",
         );
     }
 

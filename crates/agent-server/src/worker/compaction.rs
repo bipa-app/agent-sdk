@@ -377,10 +377,13 @@ impl OutputSizing {
     /// served provider's thinking) the request's reasoning is unknown and a
     /// smaller request could starve it. `thinking` is the configuration the
     /// provider will send: the request's, else the provider's own.
+    /// `provider_reasons` is the provider's own effort-only reasoning
+    /// setting, which applies when `thinking` is `None`.
     pub(crate) fn for_request(
         trigger: Option<ModelAwareTrigger<'_>>,
         capabilities: Option<&ModelCapabilities>,
         thinking: Option<&ThinkingConfig>,
+        provider_reasons: bool,
     ) -> Self {
         let (Some(trigger), Some(capabilities)) = (trigger, capabilities) else {
             return Self::ModelMax;
@@ -389,6 +392,7 @@ impl OutputSizing {
             return Self::ModelMax;
         };
         let reasoning = match thinking.map(|thinking| &thinking.mode) {
+            None if provider_reasons => ReasoningAllowance::Unbudgeted,
             None => match capabilities.default_reasoning {
                 DefaultReasoning::On => ReasoningAllowance::Unbudgeted,
                 DefaultReasoning::Off => ReasoningAllowance::None,
@@ -1481,7 +1485,12 @@ mod tests {
         let max_tokens = serving_max_tokens(
             requested,
             capabilities,
-            OutputSizing::for_request(model_aware_trigger(Some(cfg), true), capabilities, thinking),
+            OutputSizing::for_request(
+                model_aware_trigger(Some(cfg), true),
+                capabilities,
+                thinking,
+                false,
+            ),
         );
         (
             max_tokens,
@@ -1506,6 +1515,7 @@ mod tests {
                 model_aware_trigger(Some(&model_aware()), true),
                 capabilities,
                 thinking,
+                false,
             ),
         )
     }
@@ -1644,12 +1654,12 @@ mod tests {
 
         let sonnet = registered("anthropic", "claude-sonnet-4-5-20250929");
         assert_eq!(
-            OutputSizing::for_request(None, sonnet, None),
+            OutputSizing::for_request(None, sonnet, None, false),
             OutputSizing::ModelMax,
         );
         let trigger = model_aware_trigger(Some(&cfg), true);
         assert_eq!(
-            OutputSizing::for_request(trigger, None, None),
+            OutputSizing::for_request(trigger, None, None, false),
             OutputSizing::ModelMax,
             "no window to share",
         );
@@ -1671,7 +1681,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                OutputSizing::for_request(trigger, sonnet, thinking.as_ref()),
+                OutputSizing::for_request(trigger, sonnet, thinking.as_ref(), false),
                 OutputSizing::WindowShare {
                     window: 200_000,
                     reasoning,
@@ -1780,6 +1790,7 @@ mod tests {
                     model_aware_trigger(Some(&override_cfg), true),
                     capabilities,
                     None,
+                    false,
                 ),
             )
         };

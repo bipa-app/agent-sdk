@@ -990,6 +990,12 @@ impl LlmProvider for OpenAIResponsesProvider {
         self.thinking.as_ref()
     }
 
+    fn configures_unbudgeted_reasoning(&self) -> bool {
+        self.reasoning
+            .as_ref()
+            .is_some_and(OpenAIReasoningConfig::requests_reasoning)
+    }
+
     fn configured_speed(&self) -> Option<SpeedTier> {
         self.speed
     }
