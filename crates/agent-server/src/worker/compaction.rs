@@ -51,7 +51,7 @@ use agent_sdk::context::{
 };
 use agent_sdk_foundation::TokenUsage;
 use agent_sdk_foundation::events::{AgentEvent, CompactionTrigger};
-use agent_sdk_foundation::llm::ChatRequest;
+use agent_sdk_foundation::llm::{ChatRequest, ThinkingConfig, ThinkingMode};
 use agent_sdk_providers::{LlmProvider, ModelCapabilities};
 use agent_sdk_tools::stores::MessageStore;
 use anyhow::{Context, Result};
@@ -334,13 +334,45 @@ fn saturating_usize(tokens: u32) -> usize {
     usize::try_from(tokens).unwrap_or(usize::MAX)
 }
 
-/// A response may claim at most this fraction of the serving window, so at
-/// least three quarters stay available to the prompt and history.
+/// Visible output may claim at most this fraction of the serving window, so
+/// at least three quarters stay available to the prompt and history.
 const OUTPUT_WINDOW_SHARE_DIVISOR: u32 = 4;
 
-/// Floor of the window share, so small-window models keep the output budget
-/// the Anthropic and Vertex providers default to when a caller sets none.
+/// Floor of the visible-output window share, so small-window models keep the
+/// output budget the Anthropic and Vertex providers default to when a caller
+/// sets none.
 const MIN_OUTPUT_WINDOW_SHARE_TOKENS: u32 = 32_000;
+
+/// How [`serving_max_tokens`] bounds a host's output budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OutputSizing {
+    /// Only the model's registered `max_output_tokens`.
+    ModelMax,
+    /// Also the visible-output window share, with the request's thinking
+    /// budget on top of it.
+    WindowShare { thinking_budget: Option<u32> },
+}
+
+impl OutputSizing {
+    /// The window share only pays off where the compaction threshold follows
+    /// the serving model ([`CompactionConfig::model_aware_threshold`]); a
+    /// fixed threshold gains nothing from a smaller request. `thinking` is
+    /// the configuration the provider will send: the request's, else the
+    /// provider's own.
+    pub(crate) fn for_request(
+        cfg: Option<&CompactionConfig>,
+        thinking: Option<&ThinkingConfig>,
+    ) -> Self {
+        if !cfg.is_some_and(|cfg| cfg.model_aware_threshold) {
+            return Self::ModelMax;
+        }
+        let thinking_budget = thinking.and_then(|thinking| match thinking.mode {
+            ThinkingMode::Enabled { budget_tokens } => Some(budget_tokens),
+            ThinkingMode::Adaptive | ThinkingMode::Default => None,
+        });
+        Self::WindowShare { thinking_budget }
+    }
+}
 
 /// Capabilities of the model that will serve the next request. A dynamic
 /// dispatcher (failover chain, per-request router) may serve the call from a
@@ -359,26 +391,33 @@ pub(crate) fn serving_capabilities(
 /// `max_tokens` to request from the serving model for a host-requested
 /// output budget.
 ///
-/// The request is capped at the model's registered `max_output_tokens`
-/// (above it the provider rejects the call) and at a quarter of its context
-/// window, floored at [`MIN_OUTPUT_WINDOW_SHARE_TOKENS`], because every
-/// output token reserved is an input token the compaction trigger must give
-/// up. The window share yields when it would not exceed an enabled thinking
-/// budget, which Anthropic requires `max_tokens` to exceed. Unknown models
-/// keep the request unchanged.
+/// The request is always capped at the model's registered
+/// `max_output_tokens`, above which the provider rejects the call. Under
+/// [`OutputSizing::WindowShare`] it is also capped at a quarter of the
+/// context window, floored at [`MIN_OUTPUT_WINDOW_SHARE_TOKENS`], plus the
+/// thinking budget, because every output token reserved is an input token
+/// the compaction trigger must give up; the budget rides on top so thinking
+/// never eats into the visible share. Unknown models keep the request
+/// unchanged.
 pub(crate) fn serving_max_tokens(
     requested: u32,
     capabilities: Option<&ModelCapabilities>,
-    thinking_budget: Option<u32>,
+    sizing: OutputSizing,
 ) -> u32 {
     let model_max = capabilities
         .and_then(|caps| caps.max_output_tokens)
         .filter(|tokens| *tokens > 0);
-    let window_share = capabilities
-        .and_then(|caps| caps.context_window)
-        .filter(|window| *window > 0)
-        .map(|window| (window / OUTPUT_WINDOW_SHARE_DIVISOR).max(MIN_OUTPUT_WINDOW_SHARE_TOKENS))
-        .filter(|share| thinking_budget.is_none_or(|budget| *share > budget));
+    let window_share = match sizing {
+        OutputSizing::ModelMax => None,
+        OutputSizing::WindowShare { thinking_budget } => capabilities
+            .and_then(|caps| caps.context_window)
+            .filter(|window| *window > 0)
+            .map(|window| {
+                (window / OUTPUT_WINDOW_SHARE_DIVISOR)
+                    .max(MIN_OUTPUT_WINDOW_SHARE_TOKENS)
+                    .saturating_add(thinking_budget.unwrap_or(0))
+            }),
+    };
     [model_max, window_share]
         .into_iter()
         .flatten()
@@ -411,7 +450,15 @@ fn effective_threshold_tokens(
     };
     let row_max_output = capabilities
         .and_then(|caps| caps.max_output_tokens)
-        .map(|tokens| saturating_usize(serving_max_tokens(tokens, capabilities, None)));
+        .map(|tokens| {
+            saturating_usize(serving_max_tokens(
+                tokens,
+                capabilities,
+                OutputSizing::WindowShare {
+                    thinking_budget: None,
+                },
+            ))
+        });
     let requested_output = Some(requested_max_tokens)
         .filter(|tokens| *tokens > 0)
         .map(saturating_usize)
@@ -1358,7 +1405,11 @@ mod tests {
         provider: &dyn LlmProvider,
         requested: u32,
     ) -> (u32, (usize, &'static str)) {
-        let max_tokens = serving_max_tokens(requested, serving_capabilities(provider), None);
+        let max_tokens = serving_max_tokens(
+            requested,
+            serving_capabilities(provider),
+            OutputSizing::for_request(Some(cfg), None),
+        );
         (
             max_tokens,
             serving_threshold_tokens(cfg, provider, max_tokens),
@@ -1449,21 +1500,31 @@ mod tests {
         );
     }
 
+    const SHARE: OutputSizing = OutputSizing::WindowShare {
+        thinking_budget: None,
+    };
+
     #[test]
     fn requests_above_the_model_max_output_are_clamped_to_it() {
-        assert_eq!(
-            serving_max_tokens(200_000, registered("anthropic", "claude-fable-5-1"), None),
-            128_000,
-        );
-        assert_eq!(
-            serving_max_tokens(128_000, registered("gemini", "gemini-2.0-flash"), None),
-            8_192,
-        );
+        for sizing in [OutputSizing::ModelMax, SHARE] {
+            assert_eq!(
+                serving_max_tokens(200_000, registered("anthropic", "claude-fable-5-1"), sizing),
+                128_000,
+                "{sizing:?}",
+            );
+            assert_eq!(
+                serving_max_tokens(128_000, registered("gemini", "gemini-2.0-flash"), sizing),
+                8_192,
+                "{sizing:?}",
+            );
+        }
         assert_eq!(
             serving_max_tokens(
                 200_000,
                 registered("anthropic", "claude-fable-5-1"),
-                Some(150_000)
+                OutputSizing::WindowShare {
+                    thinking_budget: Some(150_000),
+                },
             ),
             128_000,
         );
@@ -1471,10 +1532,72 @@ mod tests {
 
     #[test]
     fn unknown_models_keep_the_requested_output_budget() {
-        assert_eq!(serving_max_tokens(128_000, None, None), 128_000);
+        for sizing in [OutputSizing::ModelMax, SHARE] {
+            assert_eq!(serving_max_tokens(128_000, None, sizing), 128_000);
+            assert_eq!(
+                serving_max_tokens(128_000, registered("mock", "mock-model"), sizing),
+                128_000,
+            );
+        }
+    }
+
+    #[test]
+    fn window_share_follows_the_model_aware_threshold() {
+        let model_aware = CompactionConfig::default().with_model_aware_threshold(true);
+        let fixed = CompactionConfig::default();
+        let budgeted = ThinkingConfig::new(55_000);
         assert_eq!(
-            serving_max_tokens(128_000, registered("mock", "mock-model"), None),
-            128_000,
+            OutputSizing::for_request(None, Some(&budgeted)),
+            OutputSizing::ModelMax,
+        );
+        assert_eq!(
+            OutputSizing::for_request(Some(&fixed), Some(&budgeted)),
+            OutputSizing::ModelMax,
+        );
+        assert_eq!(
+            OutputSizing::for_request(Some(&model_aware), Some(&budgeted)),
+            OutputSizing::WindowShare {
+                thinking_budget: Some(55_000),
+            },
+        );
+        assert_eq!(
+            OutputSizing::for_request(Some(&model_aware), Some(&ThinkingConfig::adaptive())),
+            SHARE,
+        );
+        assert_eq!(OutputSizing::for_request(Some(&model_aware), None), SHARE);
+    }
+
+    #[test]
+    fn without_a_model_aware_threshold_only_the_model_max_bounds_output() {
+        for (provider, model, requested, expected) in [
+            ("anthropic", "claude-sonnet-4-5-20250929", 64_000, 64_000),
+            ("anthropic", "claude-haiku-4-5-20251001", 64_000, 64_000),
+            ("openai", "gpt-5", 128_000, 128_000),
+            ("openai", "o3", 100_000, 100_000),
+            ("openai", "deepseek/deepseek-v4-pro", 384_000, 384_000),
+            ("openai", "minimax/minimax-m2.5", 128_000, 128_000),
+            ("openai", "z-ai/glm-5.1", 128_000, 128_000),
+            ("openai", "z-ai/glm-5.1", 100_000, 100_000),
+            ("openai", "z-ai/glm-5.1", 200_000, 131_072),
+        ] {
+            assert_eq!(
+                serving_max_tokens(
+                    requested,
+                    registered(provider, model),
+                    OutputSizing::ModelMax
+                ),
+                expected,
+                "{model} at {requested}",
+            );
+        }
+        let glm = openrouter("z-ai/glm-5.1");
+        assert_eq!(
+            worker_budget(
+                &CompactionConfig::default().with_threshold_tokens(80_000),
+                &glm,
+                ROOT_REQUESTED_MAX_TOKENS,
+            ),
+            (128_000, (80_000, "fixed")),
         );
     }
 
@@ -1483,31 +1606,56 @@ mod tests {
         let kimi = registered("openai", "accounts/fireworks/models/kimi-k3")
             .context("fireworks kimi k3 row")?;
         assert_eq!(kimi.max_output_tokens, None);
-        assert_eq!(serving_max_tokens(128_000, Some(kimi), None), 128_000);
-        assert_eq!(serving_max_tokens(400_000, Some(kimi), None), 1_048_576 / 4);
+        assert_eq!(serving_max_tokens(128_000, Some(kimi), SHARE), 128_000);
+        assert_eq!(
+            serving_max_tokens(400_000, Some(kimi), SHARE),
+            1_048_576 / 4
+        );
 
         let small_window = ModelCapabilities {
             context_window: Some(100_000),
             ..*kimi
         };
         assert_eq!(
-            serving_max_tokens(128_000, Some(&small_window), None),
+            serving_max_tokens(128_000, Some(&small_window), SHARE),
             32_000
         );
         assert_eq!(
-            serving_max_tokens(16_000, Some(&small_window), None),
+            serving_max_tokens(16_000, Some(&small_window), SHARE),
             16_000
         );
         Ok(())
     }
 
     #[test]
-    fn window_share_never_starves_an_enabled_thinking_budget() {
+    fn thinking_budget_rides_on_top_of_the_window_share() {
+        let thinking = |budget| OutputSizing::WindowShare {
+            thinking_budget: Some(budget),
+        };
         let sonnet = registered("anthropic", "claude-sonnet-4-5-20250929");
-        assert_eq!(serving_max_tokens(64_000, sonnet, None), 50_000);
-        assert_eq!(serving_max_tokens(64_000, sonnet, Some(10_000)), 50_000);
-        assert_eq!(serving_max_tokens(64_000, sonnet, Some(55_000)), 64_000);
-        assert_eq!(serving_max_tokens(128_000, sonnet, Some(55_000)), 64_000);
+        assert_eq!(serving_max_tokens(64_000, sonnet, SHARE), 50_000);
+        assert_eq!(serving_max_tokens(64_000, sonnet, thinking(10_000)), 60_000);
+        assert_eq!(
+            serving_max_tokens(64_000, sonnet, thinking(49_999)),
+            64_000,
+            "the model max, not the window share, bounds a budget near the share",
+        );
+        assert_eq!(
+            serving_max_tokens(128_000, sonnet, thinking(55_000)),
+            64_000
+        );
+
+        let glm = registered("openai", "z-ai/glm-5.1");
+        let budgeted = serving_max_tokens(128_000, glm, thinking(51_000));
+        assert_eq!(budgeted, 202_752 / 4 + 51_000);
+        assert_eq!(
+            effective_threshold_tokens(
+                &CompactionConfig::default().with_model_aware_threshold(true),
+                glm,
+                budgeted,
+            ),
+            (202_752 - (202_752 / 4 + 51_000), "model_aware"),
+        );
     }
 
     #[test]
@@ -1519,7 +1667,7 @@ mod tests {
         };
         assert!(serving_capabilities(&router).is_none());
         assert_eq!(
-            serving_max_tokens(128_000, serving_capabilities(&router), None),
+            serving_max_tokens(128_000, serving_capabilities(&router), SHARE),
             128_000,
         );
     }

@@ -80,6 +80,8 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 proptest = { workspace = true }
 tempfile = { workspace = true }
+# Captures the request body a real provider puts on the wire.
+wiremock = { workspace = true }
 
 [lints]
 workspace = true

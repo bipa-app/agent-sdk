@@ -1758,6 +1758,7 @@ async fn run_boundary_injection_call(
     let chat_request = build_chat_request(
         definition,
         provider,
+        deps.compaction_config,
         &inputs.staged_stores.messages,
         thread_id,
         &resume_input,
@@ -2034,6 +2035,7 @@ async fn execute_root_turn_inner(
     let chat_request = build_chat_request(
         definition,
         provider,
+        deps.compaction_config,
         &inputs.staged_stores.messages,
         thread_id,
         &user_input,
@@ -3026,6 +3028,7 @@ async fn prepare_pre_call_compaction(
     let expected_request = build_request_envelope(
         definition,
         provider,
+        deps.compaction_config,
         thread_id,
         inputs.bootstrap.task.caller_metadata.as_ref(),
     );
@@ -3186,18 +3189,10 @@ async fn assemble_provider_request_messages(
 fn build_request_envelope(
     definition: &AgentDefinition,
     provider: &dyn LlmProvider,
+    compaction_config: Option<&agent_sdk::context::CompactionConfig>,
     thread_id: &agent_sdk_foundation::ThreadId,
     caller_metadata: Option<&serde_json::Value>,
 ) -> ChatRequest {
-    let thinking_budget = match &definition.thinking {
-        ThinkingPolicy::Enabled { budget_tokens } => Some(*budget_tokens),
-        ThinkingPolicy::Disabled | ThinkingPolicy::Adaptive { .. } => None,
-    };
-    let max_tokens = super::compaction::serving_max_tokens(
-        definition.max_tokens,
-        super::compaction::serving_capabilities(provider),
-        thinking_budget,
-    );
     let thinking = match &definition.thinking {
         ThinkingPolicy::Disabled => None,
         ThinkingPolicy::Enabled { budget_tokens } => Some(llm::ThinkingConfig::new(*budget_tokens)),
@@ -3213,6 +3208,14 @@ fn build_request_envelope(
         Some(display) => cfg.with_display(display),
         None => cfg,
     });
+    let max_tokens = super::compaction::serving_max_tokens(
+        definition.max_tokens,
+        super::compaction::serving_capabilities(provider),
+        super::compaction::OutputSizing::for_request(
+            compaction_config,
+            thinking.as_ref().or_else(|| provider.configured_thinking()),
+        ),
+    );
 
     // Resolve tool list: `tools_fn` takes precedence over `tools` when
     // set AND caller_metadata is present, enabling per-turn filtering
@@ -3242,15 +3245,22 @@ fn build_request_envelope(
 async fn build_chat_request(
     definition: &AgentDefinition,
     provider: &dyn LlmProvider,
+    compaction_config: Option<&agent_sdk::context::CompactionConfig>,
     staged_messages: &crate::journal::staged::StagedMessageStore,
     thread_id: &agent_sdk_foundation::ThreadId,
     user_input: &super::user_input::UserInput,
     caller_metadata: Option<&serde_json::Value>,
 ) -> Result<ChatRequest> {
-    let mut request = build_request_envelope(definition, provider, thread_id, caller_metadata);
+    let mut request = build_request_envelope(
+        definition,
+        provider,
+        compaction_config,
+        thread_id,
+        caller_metadata,
+    );
     if request.max_tokens < definition.max_tokens {
         let capabilities = super::compaction::serving_capabilities(provider);
-        log::info!(
+        log::debug!(
             "thread {thread_id}: max_tokens {} sized to {} for provider={} route={} model={} \
              (max_output_tokens={:?}, context_window={:?})",
             definition.max_tokens,
@@ -7764,6 +7774,7 @@ async fn stage_resume_call(
     let chat_request = build_chat_request(
         definition,
         provider,
+        deps.compaction_config,
         &inputs.staged_stores.messages,
         thread_id,
         &resume_input,
@@ -9557,6 +9568,7 @@ async fn stage_and_call_steering_llm(
     let chat_request = build_chat_request(
         definition,
         provider,
+        deps.compaction_config,
         &inputs.staged_stores.messages,
         thread_id,
         &resume_input,
@@ -9909,6 +9921,10 @@ mod tests {
         OpenAIProvider::new("key", "mock-model")
     }
 
+    fn model_aware() -> agent_sdk::context::CompactionConfig {
+        agent_sdk::context::CompactionConfig::default().with_model_aware_threshold(true)
+    }
+
     fn tool_round_history() -> Vec<llm::Message> {
         vec![
             llm::Message::user("plan the migration"),
@@ -9937,6 +9953,7 @@ mod tests {
         let request = build_chat_request(
             &definition,
             &uncapped_provider(),
+            None,
             &staged,
             &thread_id,
             &super::super::user_input::UserInput::resume(),
@@ -9965,6 +9982,7 @@ mod tests {
         let fresh = build_chat_request(
             &definition,
             &uncapped_provider(),
+            None,
             &staged,
             &thread_id,
             &super::super::user_input::UserInput::text("next step"),
@@ -10018,6 +10036,7 @@ mod tests {
         let baseline = build_chat_request(
             &context_definition(None),
             &uncapped_provider(),
+            None,
             &staged,
             &thread_id,
             &input,
@@ -10039,6 +10058,7 @@ mod tests {
             let request = build_chat_request(
                 &context_definition(Some(hook)),
                 &uncapped_provider(),
+                None,
                 &staged,
                 &thread_id,
                 &input,
@@ -10064,10 +10084,20 @@ mod tests {
         };
         let glm =
             OpenAIProvider::with_base_url("key", "z-ai/glm-5.1", "https://openrouter.ai/api/v1");
+        let cfg = model_aware();
 
-        let trigger_envelope = build_request_envelope(&definition, &glm, &thread_id, None);
-        let dispatched =
-            build_chat_request(&definition, &glm, &staged, &thread_id, &input, None).await?;
+        let trigger_envelope =
+            build_request_envelope(&definition, &glm, Some(&cfg), &thread_id, None);
+        let dispatched = build_chat_request(
+            &definition,
+            &glm,
+            Some(&cfg),
+            &staged,
+            &thread_id,
+            &input,
+            None,
+        )
+        .await?;
 
         assert_eq!(trigger_envelope.max_tokens, 202_752 / 4);
         assert!(trigger_envelope.max_tokens_explicit);
@@ -10087,44 +10117,152 @@ mod tests {
 
         let fable = agent_sdk_providers::AnthropicProvider::new("key", "claude-fable-5-1");
         assert_eq!(
-            build_request_envelope(&definition, &fable, &thread_id, None).max_tokens,
+            build_request_envelope(&definition, &fable, Some(&cfg), &thread_id, None).max_tokens,
             128_000,
         );
         assert_eq!(
-            build_request_envelope(&definition, &uncapped_provider(), &thread_id, None).max_tokens,
+            build_request_envelope(
+                &definition,
+                &uncapped_provider(),
+                Some(&cfg),
+                &thread_id,
+                None
+            )
+            .max_tokens,
             128_000,
         );
         Ok(())
     }
 
     #[test]
-    fn envelope_window_share_yields_to_an_enabled_thinking_budget() {
+    fn envelope_without_a_model_aware_threshold_caps_only_at_the_model_max() {
         let thread_id = agent_sdk_foundation::ThreadId::from_string("thread_output_budget");
+        let glm =
+            OpenAIProvider::with_base_url("key", "z-ai/glm-5.1", "https://openrouter.ai/api/v1");
         let sonnet =
             agent_sdk_providers::AnthropicProvider::new("key", "claude-sonnet-4-5-20250929");
-        let budgeted = AgentDefinition {
-            max_tokens: 64_000,
-            thinking: ThinkingPolicy::Enabled {
-                budget_tokens: 55_000,
-            },
+        let fixed = agent_sdk::context::CompactionConfig::default();
+        let requesting = |max_tokens| AgentDefinition {
+            max_tokens,
             ..context_definition(None)
         };
+        for cfg in [None, Some(&fixed)] {
+            assert_eq!(
+                build_request_envelope(&requesting(128_000), &glm, cfg, &thread_id, None)
+                    .max_tokens,
+                128_000,
+            );
+            assert_eq!(
+                build_request_envelope(&requesting(200_000), &glm, cfg, &thread_id, None)
+                    .max_tokens,
+                131_072,
+            );
+            assert_eq!(
+                build_request_envelope(&requesting(64_000), &sonnet, cfg, &thread_id, None)
+                    .max_tokens,
+                64_000,
+            );
+        }
         assert_eq!(
-            build_request_envelope(&budgeted, &sonnet, &thread_id, None).max_tokens,
-            64_000,
-        );
-        let unbudgeted = AgentDefinition {
-            thinking: ThinkingPolicy::Disabled,
-            ..budgeted
-        };
-        assert_eq!(
-            build_request_envelope(&unbudgeted, &sonnet, &thread_id, None).max_tokens,
-            50_000,
+            build_request_envelope(
+                &requesting(128_000),
+                &glm,
+                Some(&model_aware()),
+                &thread_id,
+                None
+            )
+            .max_tokens,
+            202_752 / 4,
         );
     }
 
     #[test]
+    fn envelope_adds_the_thinking_budget_to_the_window_share() {
+        let thread_id = agent_sdk_foundation::ThreadId::from_string("thread_output_budget");
+        let sonnet =
+            agent_sdk_providers::AnthropicProvider::new("key", "claude-sonnet-4-5-20250929");
+        let cfg = model_aware();
+        let budgeted = |budget_tokens| AgentDefinition {
+            max_tokens: 64_000,
+            thinking: ThinkingPolicy::Enabled { budget_tokens },
+            ..context_definition(None)
+        };
+        assert_eq!(
+            build_request_envelope(&budgeted(55_000), &sonnet, Some(&cfg), &thread_id, None)
+                .max_tokens,
+            64_000,
+        );
+        assert_eq!(
+            build_request_envelope(&budgeted(10_000), &sonnet, Some(&cfg), &thread_id, None)
+                .max_tokens,
+            60_000,
+        );
+        let unbudgeted = AgentDefinition {
+            thinking: ThinkingPolicy::Disabled,
+            ..budgeted(55_000)
+        };
+        assert_eq!(
+            build_request_envelope(&unbudgeted, &sonnet, Some(&cfg), &thread_id, None).max_tokens,
+            50_000,
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_configured_thinking_budget_is_sized_into_the_wire_request() -> Result<()> {
+        use futures::StreamExt as _;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        let sonnet = agent_sdk_providers::AnthropicProvider::sonnet_45("key")
+            .with_thinking(llm::ThinkingConfig::new(55_000))
+            .with_base_url(server.uri());
+        let definition = AgentDefinition {
+            max_tokens: 64_000,
+            thinking: ThinkingPolicy::Disabled,
+            ..context_definition(None)
+        };
+        let thread_id = agent_sdk_foundation::ThreadId::from_string("thread_configured_thinking");
+        let staged = crate::journal::staged::StagedMessageStore::new(thread_id.clone(), Vec::new());
+
+        let request = build_chat_request(
+            &definition,
+            &sonnet,
+            Some(&model_aware()),
+            &staged,
+            &thread_id,
+            &super::super::user_input::UserInput::text("next step"),
+            None,
+        )
+        .await?;
+        let mut stream = sonnet.chat_stream(request);
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        let received = server
+            .received_requests()
+            .await
+            .context("mock server records requests")?;
+        let [sent] = received.as_slice() else {
+            anyhow::bail!("expected one provider request, got {}", received.len());
+        };
+        let body: serde_json::Value = serde_json::from_slice(&sent.body)?;
+        assert_eq!(body["thinking"]["budget_tokens"], 55_000, "{body}");
+        assert_eq!(
+            body["max_tokens"], 64_000,
+            "max_tokens must exceed the provider-configured thinking budget: {body}",
+        );
+        Ok(())
+    }
+
+    #[test]
     fn envelope_sizes_output_only_on_a_stable_route() {
+        let thread_id = agent_sdk_foundation::ThreadId::from_string("thread_output_budget");
         let definition = AgentDefinition {
             max_tokens: 128_000,
             ..context_definition(None)
@@ -10137,14 +10275,16 @@ mod tests {
             async move { Ok(provider) }
         });
         let failover = agent_sdk_providers::FallbackProvider::new(std::sync::Arc::new(glm));
+        let cfg = model_aware();
 
         assert_eq!(
-            build_request_envelope(&definition, &refreshing, None).max_tokens,
+            build_request_envelope(&definition, &refreshing, Some(&cfg), &thread_id, None)
+                .max_tokens,
             202_752 / 4,
         );
         assert_eq!(failover.model(), "z-ai/glm-5.1");
         assert_eq!(
-            build_request_envelope(&definition, &failover, None).max_tokens,
+            build_request_envelope(&definition, &failover, Some(&cfg), &thread_id, None).max_tokens,
             128_000,
             "a failover chain may be served by a model its representative row \
              does not describe",

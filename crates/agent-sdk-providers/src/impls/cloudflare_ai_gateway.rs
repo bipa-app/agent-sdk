@@ -503,6 +503,27 @@ mod tests {
     }
 
     #[test]
+    fn output_sizing_inputs_follow_the_inner_provider() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        let p = CloudflareAIGatewayProvider::anthropic(
+            "t".to_owned(),
+            "a",
+            "g",
+            "claude-sonnet-4-5-20250929".to_owned(),
+        );
+        assert!(p.has_stable_request_route());
+        let caps = p
+            .capabilities()
+            .context("sonnet 4.5 row through the gateway")?;
+        assert_eq!(
+            (caps.context_window, caps.max_output_tokens),
+            (Some(200_000), Some(64_000)),
+        );
+        Ok(())
+    }
+
+    #[test]
     fn historical_images_stay_disabled_without_an_inner_accounting_profile() {
         let anthropic = CloudflareAIGatewayProvider::anthropic_sonnet("t", "a", "g");
         assert!(!anthropic.supports_historical_image_blocks());

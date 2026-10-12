@@ -2668,6 +2668,48 @@ async fn small_window_worker_under_a_large_root_budget_skips_premature_compactio
 }
 
 #[tokio::test]
+async fn worker_without_a_model_aware_threshold_requests_up_to_the_model_max() -> Result<()> {
+    let fixtures = Fixtures::new();
+    let fixed = CompactionConfig::default();
+    let summarizer: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider::new(Vec::new()));
+    let deps_variants = [
+        fixtures.deps_without_compaction(),
+        fixtures.deps_with_compaction(&fixed, &summarizer),
+    ];
+    let mut sent = Vec::new();
+    for (index, deps) in deps_variants.iter().enumerate() {
+        for requested in [128_000, 200_000] {
+            let glm = ScriptedProvider {
+                provider_name: "openai",
+                model_name: "z-ai/glm-5.1",
+                ..ScriptedProvider::new(vec![ok_response("done")])
+            };
+            let thread = ThreadId::from_string(format!("thread_fixed_{index}_{requested}"));
+            seed_projection_history(&fixtures.messages, &thread, 2, "abc").await?;
+            let task = create_and_acquire_root_task(&fixtures.tasks, &thread).await?;
+            let mut bootstrap = sample_bootstrap(task);
+            bootstrap.definition.max_tokens = requested;
+            let inputs = build_root_worker_inputs(
+                bootstrap,
+                &fixtures.threads,
+                &fixtures.checkpoints,
+                &fixtures.messages,
+                t0(),
+            )
+            .await?;
+            execute_root_turn(inputs, "next", &glm, deps, t0() + Duration::seconds(1)).await?;
+            sent.extend(
+                glm.captured_requests()?
+                    .iter()
+                    .map(|request| request.max_tokens),
+            );
+        }
+    }
+    assert_eq!(sent, vec![128_000, 131_072, 128_000, 131_072]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn fresh_user_prompt_counts_toward_the_proactive_trigger() -> Result<()> {
     let fixtures = Fixtures::new();
     // Near-empty bodies would make compaction a no-progress skip.
