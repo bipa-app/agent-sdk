@@ -103,6 +103,8 @@ mod bootstrap_test;
 #[cfg(test)]
 mod compaction_integration_test;
 #[cfg(test)]
+mod compaction_resume_test;
+#[cfg(test)]
 mod confirmation_test;
 #[cfg(test)]
 mod context_estimate_worker_test;

@@ -161,10 +161,9 @@ pub trait MessageProjectionStore: Send + Sync {
     /// Replace the in-flight draft messages for `thread_id`.
     ///
     /// Called by the worker at every tool-boundary suspension with
-    /// the full `suspended_messages` list captured at that point.
+    /// the turn's messages that the raw transcript does not hold yet.
     /// The draft is overwritten (not appended) because each
-    /// suspension carries the complete in-flight history through
-    /// that boundary.
+    /// suspension carries that whole suffix.
     ///
     /// Behavior:
     /// 1. Loads or bootstraps the projection row for `thread_id`.
@@ -229,6 +228,16 @@ impl InMemoryMessageProjectionStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Store `projection` as is, the way a row another build wrote decodes.
+    #[cfg(test)]
+    pub(crate) async fn put(&self, projection: MessageProjection) {
+        self.inner
+            .write()
+            .await
+            .by_thread
+            .insert(projection.thread_id.clone(), projection);
     }
 }
 

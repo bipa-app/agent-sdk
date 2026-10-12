@@ -8486,6 +8486,9 @@ enum TurnExit {
     AggregateResume,
     /// The child wake's lease expires until the sweep fails the row closed.
     FailClosedByLeaseExpiry,
+    /// A steering wake's LLM call fails and the wake is reverted; the
+    /// children's fan-in then commits the turn.
+    RevertFailedSteering,
 }
 
 /// `call_1`'s child when the turn ends. `AggregateResume` needs every child
@@ -8584,6 +8587,32 @@ async fn park_early_resumed_batch(
     stores: &TestStores,
     deps: &RootTurnDeps<'_>,
 ) -> Result<(AgentTask, Vec<AgentTask>)> {
+    let (parent, children) = Box::pin(park_any_batch(stores)).await?;
+    complete_child_at(
+        stores,
+        &children[0],
+        &ok_result("done-0"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+    let acquired = acquire_parent(stores, &parent.id, t_plus(10)).await?;
+    let inputs = resume_inputs(stores, &acquired, t_plus(10)).await?;
+    let early = RequestLogProvider::new("Two calls are still running.");
+    let outcome = Box::pin(resume_from_children(
+        inputs,
+        &acquired,
+        &early,
+        deps,
+        t_plus(12),
+    ))
+    .await?;
+    assert!(matches!(outcome, RootTurnOutcome::Suspended { .. }));
+    Ok((parent, children))
+}
+
+/// Park three Any-policy calls behind a prompt long enough to compact.
+async fn park_any_batch(stores: &TestStores) -> Result<(AgentTask, Vec<AgentTask>)> {
     let provider = MockToolCallProvider::new(vec![
         bash_call("call_0"),
         bash_call("call_1"),
@@ -8610,26 +8639,6 @@ async fn park_early_resumed_batch(
     else {
         bail!("the batch must park");
     };
-    complete_child_at(
-        stores,
-        &children[0],
-        &ok_result("done-0"),
-        t_plus(8),
-        t_plus(9),
-    )
-    .await?;
-    let acquired = acquire_parent(stores, &parent.id, t_plus(10)).await?;
-    let inputs = resume_inputs(stores, &acquired, t_plus(10)).await?;
-    let early = RequestLogProvider::new("Two calls are still running.");
-    let outcome = Box::pin(resume_from_children(
-        inputs,
-        &acquired,
-        &early,
-        deps,
-        t_plus(12),
-    ))
-    .await?;
-    assert!(matches!(outcome, RootTurnOutcome::Suspended { .. }));
     Ok((parent, children))
 }
 
@@ -8664,6 +8673,135 @@ async fn resume_inputs(
         at,
     )
     .await
+}
+
+/// How a matrix cell ends its turn.
+#[derive(Clone, Copy, Debug)]
+enum CellExit {
+    /// The early resume re-parks, then the turn ends through `TurnExit`.
+    AfterEarlyResume(TurnExit),
+    /// The first early resume compacts (when compaction is on) and dies on
+    /// its provider call while `call_1` finishes; the host requeues it, as
+    /// for provider weather, and the rerun fans in. `call_2` is still
+    /// running at the rerun when the survivor is `Live`, and has finished
+    /// when it is `Finished`.
+    WeatherRequeuedEarlyResume,
+}
+
+async fn end_cell_turn(
+    stores: &TestStores,
+    deps: &RootTurnDeps<'_>,
+    exit: CellExit,
+    compaction: CellCompaction,
+    survivor: SurvivorAtExit,
+) -> Result<()> {
+    match exit {
+        CellExit::AfterEarlyResume(exit) => {
+            Box::pin(end_early_resumed_turn(stores, deps, exit, survivor)).await
+        }
+        CellExit::WeatherRequeuedEarlyResume => {
+            Box::pin(requeue_dead_early_resume(
+                stores, deps, compaction, survivor,
+            ))
+            .await
+        }
+    }
+}
+
+async fn requeue_dead_early_resume(
+    stores: &TestStores,
+    deps: &RootTurnDeps<'_>,
+    compaction: CellCompaction,
+    survivor: SurvivorAtExit,
+) -> Result<()> {
+    let (parent, children) = Box::pin(park_any_batch(stores)).await?;
+    complete_child_at(
+        stores,
+        &children[0],
+        &ok_result("done-0"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+    let before = stores.messages.get(&thread_a()).await?;
+    let acquired = acquire_parent(stores, &parent.id, t_plus(10)).await?;
+    let inputs = resume_inputs(stores, &acquired, t_plus(10)).await?;
+    let dying = FinishThenFailProvider {
+        stores: stores.clone(),
+        finish: Some(children[1].clone()),
+    };
+    let died = Box::pin(resume_from_children(
+        inputs,
+        &acquired,
+        &dying,
+        deps,
+        t_plus(12),
+    ))
+    .await;
+    anyhow::ensure!(died.is_err(), "the early resume must die");
+    let after = stores.messages.get(&thread_a()).await?;
+    let folds = |projection: &Option<crate::journal::message::MessageProjection>| {
+        projection
+            .as_ref()
+            .map_or(0, |projection| projection.compactions.len())
+    };
+    anyhow::ensure!(
+        (folds(&after) > folds(&before)) == matches!(compaction, CellCompaction::Retain(_)),
+        "precondition: the dying early resume compacted exactly when compaction is on",
+    );
+    let requeued = stores
+        .tasks
+        .requeue_owned_task(
+            &parent.id,
+            &WorkerId::from_string("worker_test"),
+            &LeaseId::from_string("lease_test"),
+            None,
+            t_plus(50),
+        )
+        .await?;
+    anyhow::ensure!(matches!(
+        requeued,
+        crate::journal::store::RequeueOutcome::Requeued(_)
+    ));
+
+    if survivor == SurvivorAtExit::Live {
+        let acquired = acquire_parent(stores, &parent.id, t_plus(60)).await?;
+        let inputs = resume_inputs(stores, &acquired, t_plus(60)).await?;
+        let rerun = RequestLogProvider::new("call_2 is still running.");
+        let outcome = Box::pin(resume_from_children(
+            inputs,
+            &acquired,
+            &rerun,
+            deps,
+            t_plus(61),
+        ))
+        .await?;
+        anyhow::ensure!(
+            matches!(outcome, RootTurnOutcome::Suspended { .. }),
+            "the rerun re-parks on the still-running call",
+        );
+    }
+    complete_child_at(
+        stores,
+        &children[2],
+        &ok_result("done-2"),
+        t_plus(70),
+        t_plus(71),
+    )
+    .await?;
+    let acquired = acquire_parent(stores, &parent.id, t_plus(80)).await?;
+    let inputs = resume_inputs(stores, &acquired, t_plus(80)).await?;
+    let fan_in = RequestLogProvider::new("All finished.");
+    let outcome = Box::pin(resume_from_children(
+        inputs,
+        &acquired,
+        &fan_in,
+        deps,
+        t_plus(81),
+    ))
+    .await?;
+    anyhow::ensure!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+    Ok(())
 }
 
 /// End the early-resumed turn through `exit`.
@@ -8717,6 +8855,12 @@ async fn end_early_resumed_turn(
                     .await?;
             }
             expire_wake_until_failed_closed(stores, &parent.id).await?;
+        }
+        TurnExit::RevertFailedSteering => {
+            Box::pin(revert_failed_steering(
+                stores, deps, &parent, &children, finish,
+            ))
+            .await?;
         }
     }
     Ok(())
@@ -8867,6 +9011,84 @@ async fn cancel_mid_steering(
     Ok(())
 }
 
+/// Fail a steering wake's LLM call (after its pre-call compaction, when
+/// compaction is on), revert the wake, then finish the children and fan in.
+async fn revert_failed_steering(
+    stores: &TestStores,
+    deps: &RootTurnDeps<'_>,
+    parent: &AgentTask,
+    children: &[AgentTask],
+    finish: Option<AgentTask>,
+) -> Result<()> {
+    stores
+        .tasks
+        .enqueue_steering_resume(
+            &parent.id,
+            vec![ContentBlock::Text {
+                text: "how is it going?".into(),
+            }],
+            t_plus(20),
+        )
+        .await?
+        .context("woken")?;
+    let acquired = acquire_parent(stores, &parent.id, t_plus(21)).await?;
+    let inputs = resume_inputs(stores, &acquired, t_plus(21)).await?;
+    let provider = FinishThenFailProvider {
+        stores: stores.clone(),
+        finish: finish.clone(),
+    };
+    let error = Box::pin(resume_for_steering(
+        inputs,
+        &acquired,
+        &provider,
+        deps,
+        t_plus(22),
+    ))
+    .await
+    .err()
+    .context("the steering call must fail")?;
+    revert_steering_wake(
+        &acquired,
+        &WorkerId::from_string("worker_test"),
+        &LeaseId::from_string("lease_test"),
+        &error,
+        deps,
+        t_plus(45),
+    )
+    .await?;
+    if finish.is_none() {
+        complete_child_at(
+            stores,
+            &children[1],
+            &ok_result("done-1"),
+            t_plus(46),
+            t_plus(47),
+        )
+        .await?;
+    }
+    complete_child_at(
+        stores,
+        &children[2],
+        &ok_result("done-2"),
+        t_plus(48),
+        t_plus(49),
+    )
+    .await?;
+    let acquired = acquire_parent(stores, &parent.id, t_plus(50)).await?;
+    let inputs = resume_inputs(stores, &acquired, t_plus(50)).await?;
+    let provider = RequestLogProvider::new("All finished.");
+    let outcome = Box::pin(resume_from_children(
+        inputs,
+        &acquired,
+        &provider,
+        deps,
+        t_plus(51),
+    ))
+    .await?;
+    anyhow::ensure!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+    Ok(())
+}
+
 async fn fail_mid_resume(
     stores: &TestStores,
     deps: &RootTurnDeps<'_>,
@@ -8956,7 +9178,9 @@ fn expected_closures(
     survivor: SurvivorAtExit,
 ) -> [(&'static str, &'static str); 2] {
     let call_1 = match (exit, survivor) {
-        (_, SurvivorAtExit::Finished) => "success",
+        (_, SurvivorAtExit::Finished) | (TurnExit::RevertFailedSteering, SurvivorAtExit::Live) => {
+            "success"
+        }
         (TurnExit::FailMidResume | TurnExit::FailClosedByLeaseExpiry, SurvivorAtExit::Live) => {
             "still_running"
         }
@@ -8967,11 +9191,32 @@ fn expected_closures(
     };
     let call_2 = match exit {
         TurnExit::CancelParked | TurnExit::CancelMidSteering => "cancelled",
-        TurnExit::FailMidResume | TurnExit::AggregateResume | TurnExit::FailClosedByLeaseExpiry => {
-            "success"
-        }
+        TurnExit::FailMidResume
+        | TurnExit::AggregateResume
+        | TurnExit::FailClosedByLeaseExpiry
+        | TurnExit::RevertFailedSteering => "success",
     };
     [("call_1", call_1), ("call_2", call_2)]
+}
+
+/// The status each interim-answered call of a cell must be closed with.
+fn expected_cell_closures(
+    exit: CellExit,
+    compaction: CellCompaction,
+    survivor: SurvivorAtExit,
+) -> Vec<(&'static str, &'static str)> {
+    match (exit, compaction, survivor) {
+        (CellExit::AfterEarlyResume(exit), _, _) => expected_closures(exit, survivor).to_vec(),
+        (CellExit::WeatherRequeuedEarlyResume, CellCompaction::Retain(_), _) => {
+            vec![("call_1", "success"), ("call_2", "success")]
+        }
+        (CellExit::WeatherRequeuedEarlyResume, CellCompaction::Off, SurvivorAtExit::Live) => {
+            vec![("call_2", "success")]
+        }
+        (CellExit::WeatherRequeuedEarlyResume, CellCompaction::Off, SurvivorAtExit::Finished) => {
+            Vec::new()
+        }
+    }
 }
 
 /// Late-result ids in `messages` that appear more than once.
@@ -9052,35 +9297,53 @@ fn interim_closure_violations(
     violations
 }
 
+/// A matrix cell's compaction: off, or on with this many retained messages.
+#[derive(Clone, Copy, Debug)]
+enum CellCompaction {
+    Off,
+    Retain(usize),
+}
+
 #[tokio::test]
 async fn every_turn_exit_closes_interim_only_calls_once_with_their_real_state() -> Result<()> {
-    let config = CompactionConfig::default()
-        .with_threshold_tokens(1)
-        .with_min_messages(2)
-        .with_retain_recent(2);
     let compactor: Arc<dyn LlmProvider> = Arc::new(MockTextProvider::new("[summary]"));
     let mut failures = Vec::new();
     for exit in [
-        TurnExit::CancelParked,
-        TurnExit::CancelMidSteering,
-        TurnExit::FailMidResume,
-        TurnExit::AggregateResume,
-        TurnExit::FailClosedByLeaseExpiry,
+        CellExit::AfterEarlyResume(TurnExit::CancelParked),
+        CellExit::AfterEarlyResume(TurnExit::CancelMidSteering),
+        CellExit::AfterEarlyResume(TurnExit::FailMidResume),
+        CellExit::AfterEarlyResume(TurnExit::AggregateResume),
+        CellExit::AfterEarlyResume(TurnExit::FailClosedByLeaseExpiry),
+        CellExit::AfterEarlyResume(TurnExit::RevertFailedSteering),
+        CellExit::WeatherRequeuedEarlyResume,
     ] {
-        for compaction in [false, true] {
+        for compaction in [
+            CellCompaction::Off,
+            CellCompaction::Retain(0),
+            CellCompaction::Retain(2),
+            CellCompaction::Retain(10),
+        ] {
             for survivor in [SurvivorAtExit::Live, SurvivorAtExit::Finished] {
                 for follow_up in [FollowUp::TextOnly, FollowUp::SuspendsOnTool] {
                     let cell = format!(
-                        "{exit:?} compaction={compaction} survivor={survivor:?} \
+                        "{exit:?} compaction={compaction:?} survivor={survivor:?} \
                          follow_up={follow_up:?}"
                     );
                     let stores = TestStores::new();
-                    let deps = if compaction {
-                        stores.deps_with_compaction(&config, &compactor)
-                    } else {
-                        stores.deps()
+                    let config = match compaction {
+                        CellCompaction::Off => None,
+                        CellCompaction::Retain(retained) => Some(
+                            CompactionConfig::default()
+                                .with_threshold_tokens(1)
+                                .with_min_messages(2)
+                                .with_retain_recent(retained),
+                        ),
                     };
-                    Box::pin(end_early_resumed_turn(&stores, &deps, exit, survivor))
+                    let deps = config.as_ref().map_or_else(
+                        || stores.deps(),
+                        |config| stores.deps_with_compaction(config, &compactor),
+                    );
+                    Box::pin(end_cell_turn(&stores, &deps, exit, compaction, survivor))
                         .await
                         .with_context(|| cell.clone())?;
                     let request = Box::pin(run_follow_up(&stores, &deps, follow_up))
@@ -9091,7 +9354,7 @@ async fn every_turn_exit_closes_interim_only_calls_once_with_their_real_state() 
                         .get(&thread_a())
                         .await?
                         .context("projection")?;
-                    if projection.compactions.is_empty() == compaction {
+                    if projection.compactions.is_empty() == config.is_some() {
                         failures.push(format!(
                             "{cell}: compactions={}",
                             projection.compactions.len()
@@ -9101,7 +9364,7 @@ async fn every_turn_exit_closes_interim_only_calls_once_with_their_real_state() 
                         interim_closure_violations(
                             &request,
                             &projection,
-                            &expected_closures(exit, survivor),
+                            &expected_cell_closures(exit, compaction, survivor),
                         )
                         .into_iter()
                         .map(|violation| format!("{cell}: {violation}")),

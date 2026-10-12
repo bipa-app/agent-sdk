@@ -82,6 +82,16 @@ pub enum MessageProjectionError {
     )]
     CompactionBreaksToolSequence { index: usize },
 }
+/// Where a compaction folded a parked turn's messages into the raw
+/// transcript; see [`MessageProjection::parked_fold`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParkedFold {
+    /// Raw index of the first folded parked message.
+    pub start: usize,
+    /// How many parked messages the fold holds: all of them.
+    pub len: usize,
+}
+
 /// One append-only compaction boundary in a message projection.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompactionEntry {
@@ -98,6 +108,20 @@ pub struct CompactionEntry {
     pub generated_summary: bool,
     /// Number of messages in the effective source view seen by the compactor.
     pub source_message_count: usize,
+    /// Raw messages this entry moved in from the in-flight draft:
+    /// `messages[draft_fold_start..draft_fold_start + draft_fold_len]`.
+    /// Rows written before these fields existed decode as an empty fold at
+    /// index 0.
+    #[serde(default)]
+    pub draft_fold_start: usize,
+    #[serde(default)]
+    pub draft_fold_len: usize,
+    /// Leading folded draft messages a parked turn resumed from: everything
+    /// through the draft's last assistant message, since a resume stages
+    /// only user messages (fan-in, injections, steering) after the parked
+    /// ones. Zero when the draft parked nothing.
+    #[serde(default)]
+    pub draft_parked_len: usize,
     /// When this compaction entry was appended.
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -162,6 +186,13 @@ fn demote_untrusted_compaction_summary(mut message: llm::Message) -> llm::Messag
         }
     }
     message
+}
+
+fn parked_head_len(draft: &[llm::Message]) -> usize {
+    draft
+        .iter()
+        .rposition(|message| message.role == llm::Role::Assistant)
+        .map_or(0, |index| index + 1)
 }
 
 fn is_generated_compaction_summary(message: &llm::Message) -> bool {
@@ -276,6 +307,9 @@ impl MessageProjection {
             });
         }
 
+        let draft_fold_start = self.messages.len();
+        let draft_fold_len = self.draft_messages.len();
+        let draft_parked_len = parked_head_len(&self.draft_messages);
         self.messages.append(&mut self.draft_messages);
         let visible_raw_count = self.messages.len().saturating_sub(prior_boundary);
         let retained_raw_count = retained_message_count.min(visible_raw_count);
@@ -311,6 +345,9 @@ impl MessageProjection {
             replacement_messages,
             generated_summary,
             source_message_count,
+            draft_fold_start,
+            draft_fold_len,
+            draft_parked_len,
             created_at: now,
         });
         self.history_generation = self.history_generation.saturating_add(1);
@@ -356,6 +393,9 @@ impl MessageProjection {
             .compactions
             .last()
             .map_or(0, |entry| entry.compacted_end);
+        let draft_fold_start = self.messages.len();
+        let draft_fold_len = self.draft_messages.len();
+        let draft_parked_len = parked_head_len(&self.draft_messages);
         self.messages.append(&mut self.draft_messages);
         self.messages.append(&mut repair_messages);
         let generated_summary = balanced_messages.first().is_some_and(|message| {
@@ -370,6 +410,9 @@ impl MessageProjection {
             replacement_messages: balanced_messages,
             generated_summary,
             source_message_count,
+            draft_fold_start,
+            draft_fold_len,
+            draft_parked_len,
             created_at: now,
         });
         self.history_generation = self.history_generation.saturating_add(1);
@@ -419,12 +462,56 @@ impl MessageProjection {
         history
     }
 
+    /// Where a compaction since the last commit folded `parked` — the
+    /// `suspended_messages` a parked turn resumes from — into the raw
+    /// transcript, or `None` when it has not.
+    ///
+    /// Every park writes its messages as the draft, and every resume persists
+    /// them at the head of its draft before it may compact; a fold clears the
+    /// draft. So parked messages the draft still leads with are not folded.
+    /// Otherwise the fold holding them is the newest one since the last
+    /// commit that recorded them as its parked head
+    /// ([`CompactionEntry::draft_parked_len`]) and holds them verbatim.
+    #[must_use]
+    pub fn parked_fold(&self, parked: &[llm::Message]) -> Option<ParkedFold> {
+        if parked.is_empty() || self.draft_messages.starts_with(parked) {
+            return None;
+        }
+        let mut run_start = self.messages.len();
+        for entry in self.compactions.iter().rev() {
+            if entry.draft_fold_start.saturating_add(entry.draft_fold_len) != run_start {
+                break;
+            }
+            run_start = entry.draft_fold_start;
+            let holds_parked = entry.draft_parked_len == parked.len()
+                && self
+                    .messages
+                    .get(run_start..run_start.saturating_add(parked.len()))
+                    == Some(parked);
+            if holds_parked {
+                return Some(ParkedFold {
+                    start: run_start,
+                    len: parked.len(),
+                });
+            }
+        }
+        None
+    }
+
+    /// The raw messages folded after `fold`'s parked ones: what the attempts
+    /// that resumed them staged before they died.
+    #[must_use]
+    pub fn after_parked(&self, fold: ParkedFold) -> &[llm::Message] {
+        self.messages
+            .get(fold.start.saturating_add(fold.len)..)
+            .unwrap_or_default()
+    }
+
     /// Replace the in-flight draft messages.
     ///
-    /// Called at every tool-boundary suspension with the full
-    /// `suspended_messages` list captured at that point. The draft
-    /// is overwritten (not appended) because each suspension carries
-    /// the complete in-flight history through that boundary.
+    /// Called at every tool-boundary suspension with the turn's messages
+    /// that the raw transcript does not hold yet. The draft is overwritten
+    /// (not appended) because each suspension carries that whole suffix.
     ///
     /// An empty `messages` argument is allowed and produces the same
     /// observable state as [`Self::clear_draft`], but
@@ -1383,6 +1470,227 @@ mod tests {
             serde_json::to_value(p.context_history())?,
             serde_json::to_value(compacted)?,
         );
+        Ok(())
+    }
+
+    // ── folded in-flight messages ─────────────────────────────────
+
+    fn tool_round(id: &str) -> Vec<llm::Message> {
+        vec![
+            llm::Message {
+                role: llm::Role::Assistant,
+                content: llm::Content::Blocks(vec![llm::ContentBlock::ToolUse {
+                    id: id.to_owned(),
+                    name: "bash".to_owned(),
+                    input: serde_json::json!({ "command": "true" }),
+                    thought_signature: None,
+                }]),
+            },
+            llm::Message::user_with_content(vec![llm::ContentBlock::ToolResult {
+                tool_use_id: id.to_owned(),
+                content: "ok".to_owned(),
+                artifact: None,
+                is_error: None,
+            }]),
+        ]
+    }
+
+    fn summary() -> Vec<llm::Message> {
+        vec![llm::Message::user("[summary]")]
+    }
+
+    /// `[prompt, call_1 tool_use, call_1 tool_result]`, folded by one
+    /// compaction after two committed messages.
+    fn projection_with_folded_turn() -> anyhow::Result<(MessageProjection, Vec<llm::Message>)> {
+        let mut in_flight = vec![llm::Message::user("prompt")];
+        in_flight.extend(tool_round("call_1"));
+        let p = MessageProjection::new(thread_id(), t0())
+            .append_committed(
+                vec![
+                    llm::Message::user("earlier"),
+                    llm::Message::assistant("reply"),
+                ],
+                t_plus(1),
+            )?
+            .set_draft(in_flight.clone(), t_plus(2))
+            .append_compaction(summary(), 5, 0, t_plus(3))?;
+        Ok((p, in_flight))
+    }
+
+    #[test]
+    fn append_compaction_records_the_raw_range_and_parked_head_it_folded() -> anyhow::Result<()> {
+        let (p, in_flight) = projection_with_folded_turn()?;
+        let entry = p.compactions.last().context("compaction entry")?;
+        assert_eq!(
+            (
+                entry.draft_fold_start,
+                entry.draft_fold_len,
+                entry.draft_parked_len
+            ),
+            (2, 3, 2),
+            "the parked head runs through the draft's last assistant message",
+        );
+        assert_eq!(p.messages[2..], in_flight[..]);
+
+        let repaired = p.set_draft(tool_round("call_2"), t_plus(4)).append_repair(
+            vec![llm::Message::user("repair evidence")],
+            summary(),
+            3,
+            t_plus(5),
+        )?;
+        let entry = repaired.compactions.last().context("repair entry")?;
+        assert_eq!(
+            (
+                entry.draft_fold_start,
+                entry.draft_fold_len,
+                entry.draft_parked_len
+            ),
+            (5, 2, 1),
+        );
+
+        let parked_nothing = repaired
+            .set_draft(vec![llm::Message::user("late result")], t_plus(6))
+            .append_compaction(summary(), 2, 0, t_plus(7))?;
+        let entry = parked_nothing.compactions.last().context("fold entry")?;
+        assert_eq!(
+            entry.draft_parked_len, 0,
+            "a draft without an assistant message parked nothing",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parked_messages_are_held_only_by_the_fold_that_recorded_them() -> anyhow::Result<()> {
+        let (p, in_flight) = projection_with_folded_turn()?;
+        let parked = &in_flight[..2];
+        let fold = p
+            .parked_fold(parked)
+            .context("the fold holds the parked messages")?;
+        assert_eq!(fold, ParkedFold { start: 2, len: 2 });
+        assert_eq!(
+            p.after_parked(fold),
+            &in_flight[2..],
+            "the dead attempt's fan-in follows them",
+        );
+
+        assert_eq!(
+            p.parked_fold(&in_flight[..1]),
+            None,
+            "a fold that parked two messages does not hold a one-message park",
+        );
+        assert_eq!(p.parked_fold(&in_flight), None, "nor a three-message one");
+        assert_eq!(p.parked_fold(&tool_round("call_9")), None);
+        assert_eq!(p.parked_fold(&[]), None);
+
+        let committed = p.append_committed(vec![llm::Message::assistant("final")], t_plus(4))?;
+        assert_eq!(
+            committed.parked_fold(parked),
+            None,
+            "a commit ends the in-flight run",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_rerun_fold_extends_what_follows_the_parked_messages() -> anyhow::Result<()> {
+        let (p, in_flight) = projection_with_folded_turn()?;
+        let late = llm::Message::user("late result");
+        let p = p
+            .set_draft(vec![late.clone()], t_plus(4))
+            .append_compaction(summary(), 2, 0, t_plus(5))?;
+
+        let fold = p
+            .parked_fold(&in_flight[..2])
+            .context("the first fold still holds the parked messages")?;
+        assert_eq!(fold, ParkedFold { start: 2, len: 2 });
+        let mut after = in_flight[2..].to_vec();
+        after.push(late);
+        assert_eq!(p.after_parked(fold), &after[..]);
+        Ok(())
+    }
+
+    /// Two steering wakes answer verbatim alike. A fold holds the first
+    /// answer as its parked head; the second answer, parked after that fold,
+    /// is the draft and must not pass for the folded one.
+    #[test]
+    fn a_reply_parked_after_an_identical_folded_one_is_not_folded() -> anyhow::Result<()> {
+        let (p, _) = projection_with_folded_turn()?;
+        let answer = llm::Message::assistant("Still working on it.");
+        let p = p
+            .set_draft(
+                vec![answer.clone(), llm::Message::user("how is it going?")],
+                t_plus(4),
+            )
+            .append_compaction(summary(), 3, 0, t_plus(5))?;
+        let reparked = std::slice::from_ref(&answer);
+        assert!(
+            p.parked_fold(reparked).is_some(),
+            "precondition: a fold holds an identical parked head",
+        );
+
+        let p = p.set_draft(reparked.to_vec(), t_plus(6));
+        assert_eq!(p.parked_fold(reparked), None);
+        Ok(())
+    }
+
+    /// A turn that ended without committing leaves its fold in the run; the
+    /// next turn, parked with the same prompt and reply, is not that fold.
+    #[test]
+    fn a_later_turn_parked_like_an_uncommitted_fold_is_not_folded() -> anyhow::Result<()> {
+        let parked = vec![
+            llm::Message::user("status?"),
+            llm::Message::assistant("Still working on it."),
+        ];
+        let mut draft = parked.clone();
+        draft.push(llm::Message::user("late result"));
+        let p = MessageProjection::new(thread_id(), t0())
+            .set_draft(draft, t_plus(1))
+            .append_compaction(summary(), 3, 0, t_plus(2))?;
+        assert!(
+            p.parked_fold(&parked).is_some(),
+            "precondition: the uncommitted fold holds that parked head",
+        );
+
+        let p = p.set_draft(parked.clone(), t_plus(3));
+        assert_eq!(p.parked_fold(&parked), None);
+        Ok(())
+    }
+
+    #[test]
+    fn folds_without_a_recorded_parked_head_or_behind_a_repair_hold_nothing() -> anyhow::Result<()>
+    {
+        let (p, in_flight) = projection_with_folded_turn()?;
+        let parked = &in_flight[..2];
+
+        for missing in [
+            &["draft_parked_len"][..],
+            &["draft_fold_start", "draft_fold_len", "draft_parked_len"],
+        ] {
+            let mut legacy = serde_json::to_value(&p)?;
+            for entry in legacy["compactions"]
+                .as_array_mut()
+                .context("compactions array")?
+            {
+                let fields = entry.as_object_mut().context("compaction entry object")?;
+                for field in missing {
+                    fields.remove(*field);
+                }
+            }
+            let legacy: MessageProjection = serde_json::from_value(legacy)?;
+            assert_eq!(
+                legacy.parked_fold(parked),
+                None,
+                "rows written without {missing:?} carry no evidence",
+            );
+        }
+
+        let repaired = p.append_repair(
+            vec![llm::Message::user("repair evidence")],
+            summary(),
+            1,
+            t_plus(4),
+        )?;
+        assert_eq!(repaired.parked_fold(parked), None);
         Ok(())
     }
 

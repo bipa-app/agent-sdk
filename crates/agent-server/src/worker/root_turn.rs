@@ -1397,16 +1397,23 @@ async fn best_effort_commit_parked_cancel(
     };
 
     // Prefer the durable draft (richer); fall back to the parked
-    // suspended_messages. Read BEFORE `cancel_tree` clears the state.
+    // suspended_messages. Read BEFORE `cancel_tree` clears the state. A draft
+    // never holds folded messages (a fold clears it), but the parked ones may
+    // predate a fold that holds them; those are not committed again.
+    let parked = task.state.suspended_messages();
     let candidate = match deps.message_store.get(&task.thread_id).await {
         Ok(Some(projection)) if !projection.draft_messages.is_empty() => projection.draft_messages,
-        Ok(_) => task.state.suspended_messages().to_vec(),
+        Ok(Some(projection)) => {
+            let folded = projection.parked_fold(parked).map_or(0, |fold| fold.len);
+            parked.get(folded..).unwrap_or_default().to_vec()
+        }
+        Ok(None) => parked.to_vec(),
         Err(error) => {
             log::warn!(
                 "cancel-commit: read draft failed on thread {}: {error:#}",
                 task.thread_id,
             );
-            task.state.suspended_messages().to_vec()
+            return;
         }
     };
     if candidate.is_empty() {
@@ -7018,14 +7025,101 @@ fn extract_pending_tool_calls(
 // Resume from completed child tool results (Phase 4.5)
 // ─────────────────────────────────────────────────────────────────────
 
-/// The prior turn's continuation plus the replay-history prefix
-/// (original user prompt + original assistant + the tool-results /
-/// steering-interim user message) threaded into a re-suspension's
-/// `suspended_messages`. Bundled so [`suspend_resumed_turn`] stays
-/// within the argument-count budget.
-struct ResumeSuspension<'a> {
-    continuation: &'a AgentContinuation,
-    history_prefix: Vec<llm::Message>,
+/// The running turn's messages that the durable projection does not hold
+/// yet: everything staged after the committed seed.
+///
+/// A compaction during this resume folds the persisted draft into the raw
+/// transcript and re-points the staged seed past it, so only messages staged
+/// after that fold remain. A re-suspension must carry exactly this suffix:
+/// parking anything the projection already holds makes the next resume
+/// re-stage it and the next compaction fold it a second time.
+fn unfolded_turn_messages(inputs: &RootWorkerInputs) -> Result<Vec<llm::Message>> {
+    inputs
+        .staged_stores
+        .messages
+        .snapshot_appended_messages()
+        .context("snapshot the turn's unfolded staged messages")
+}
+
+/// What the transcript already holds of a parked turn being resumed.
+///
+/// A resume that compacted and then died (provider weather, lease loss, a
+/// lost turn slot) leaves its parked messages in the task row while the fold
+/// it made, and what it staged after them, is durable. The rerun stages only
+/// what the transcript lacks: the unfolded parked messages, a fan-in built
+/// against every answer already durable, and the drained injections and
+/// steering content no fold holds yet.
+struct DurableResume {
+    /// Leading parked messages a compaction folded into the transcript.
+    folded: usize,
+    /// What attempts resuming those parked messages folded after them. Empty
+    /// when the parked messages are not folded.
+    continuation: Vec<llm::Message>,
+    /// How the transcript and the unfolded parked messages answer each call.
+    answers: BTreeMap<String, EarlierAnswer>,
+}
+
+impl DurableResume {
+    /// Read before the resume writes its own draft.
+    async fn read(
+        deps: &RootTurnDeps<'_>,
+        thread_id: &agent_sdk_foundation::ThreadId,
+        parked: &[llm::Message],
+    ) -> Result<Self> {
+        let projection = deps
+            .message_store
+            .get(thread_id)
+            .await
+            .context("read the transcript a resume continues")?;
+        let fold = projection
+            .as_ref()
+            .and_then(|projection| projection.parked_fold(parked));
+        let folded = fold.map_or(0, |fold| fold.len);
+        let continuation = projection
+            .as_ref()
+            .zip(fold)
+            .map(|(projection, fold)| projection.after_parked(fold).to_vec())
+            .unwrap_or_default();
+        let raw = projection
+            .as_ref()
+            .map_or(&[][..], |projection| projection.messages.as_slice());
+        let answers = earlier_answers(raw, parked.get(folded..).unwrap_or_default());
+        Ok(Self {
+            folded,
+            continuation,
+            answers,
+        })
+    }
+
+    fn unfolded<'a>(&self, parked: &'a [llm::Message]) -> &'a [llm::Message] {
+        parked.get(self.folded..).unwrap_or_default()
+    }
+
+    /// Drained injections no fold holds yet. Their rows stay queued until the
+    /// turn commits, so a rerun drains again the ones a dead attempt folded.
+    fn undelivered_injections(&self, injections: &[llm::Message]) -> Vec<llm::Message> {
+        let mut folded: Vec<&llm::Message> = self.continuation.iter().collect();
+        injections
+            .iter()
+            .filter(|message| {
+                folded
+                    .iter()
+                    .position(|durable| durable == message)
+                    .map(|index| folded.swap_remove(index))
+                    .is_none()
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Steering content a dead attempt already delivered at the end of its
+    /// fan-in.
+    fn delivered_steering(&self, steering: &[llm::ContentBlock]) -> bool {
+        !steering.is_empty()
+            && self.continuation.iter().any(|message| {
+                message.role == llm::Role::User && message_blocks(message).ends_with(steering)
+            })
+    }
 }
 
 /// Input-injection rows taken into an in-flight turn at one boundary.
@@ -7119,9 +7213,10 @@ pub(crate) async fn drain_boundary_injections(
 /// - `continuation`: the [`AgentContinuation`] extracted from the
 ///   parent's [`TaskState::ReadyToResume`] payload before the worker
 ///   acquired the task.
-/// - `suspended_messages`: the user prompt and full assistant response
-///   (including tool-use blocks) captured at the original suspension
-///   point, also from the [`TaskState::ReadyToResume`] payload.
+/// - `suspended_messages`: the turn's messages the durable projection did
+///   not hold at the previous suspension (initially the user prompt and
+///   the assistant tool-use response), also from the
+///   [`TaskState::ReadyToResume`] payload.
 /// - `child_results`: completed tool results, one per pending tool
 ///   call, keyed by tool-call ID. A call the parked history already
 ///   answered (an early resume's interim result) gets its result as a
@@ -7157,9 +7252,11 @@ pub async fn resume_root_turn(
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<RootTurnOutcome> {
+    let durable =
+        DurableResume::read(deps, &inputs.bootstrap.thread_id, &suspended_messages).await?;
     let fan_in = fan_in_for_child_results(
         &continuation,
-        &suspended_messages,
+        &durable.answers,
         child_results,
         inputs.bootstrap.task.state.child_ids(),
         deps.task_store,
@@ -7167,8 +7264,11 @@ pub async fn resume_root_turn(
     .await?;
     Box::pin(resume_root_turn_with_fan_in(
         inputs,
-        continuation,
-        suspended_messages,
+        ParkedResume {
+            continuation,
+            suspended_messages,
+            durable,
+        },
         fan_in,
         provider,
         deps,
@@ -7179,15 +7279,14 @@ pub async fn resume_root_turn(
 
 async fn fan_in_for_child_results(
     continuation: &AgentContinuation,
-    suspended_messages: &[llm::Message],
+    answers: &BTreeMap<String, EarlierAnswer>,
     child_results: Vec<(String, ToolResult)>,
     child_ids: &[AgentTaskId],
     task_store: &dyn AgentTaskStore,
-) -> Result<llm::Message> {
-    let answered = answered_tool_use_ids(suspended_messages);
+) -> Result<Option<llm::Message>> {
     let children = if child_results
         .iter()
-        .any(|(tool_use_id, _)| answered.contains(tool_use_id.as_str()))
+        .any(|(tool_use_id, _)| answers.contains_key(tool_use_id))
     {
         children_by_spawn_index(child_ids, task_store).await?
     } else {
@@ -7196,40 +7295,43 @@ async fn fan_in_for_child_results(
     let mut tool_results = Vec::with_capacity(child_results.len());
     let mut late_results = Vec::new();
     for (tool_use_id, result) in child_results {
-        if answered.contains(tool_use_id.as_str()) {
-            let (index, call) = continuation
-                .pending_tool_calls
-                .iter()
-                .enumerate()
-                .find(|(_, call)| call.id == tool_use_id)
-                .with_context(|| format!("answered call {tool_use_id} is not pending"))?;
-            late_results.push(LateToolResult {
-                call: call.clone(),
-                status: late_status(children.get(&index).map(|child| child.status), &result),
-                result,
-            });
-        } else {
-            tool_results.push((tool_use_id, FanInAnswer::Finished(result)));
+        match answers.get(&tool_use_id) {
+            Some(EarlierAnswer::Interim) => {
+                let (index, call) = continuation
+                    .pending_tool_calls
+                    .iter()
+                    .enumerate()
+                    .find(|(_, call)| call.id == tool_use_id)
+                    .with_context(|| format!("answered call {tool_use_id} is not pending"))?;
+                late_results.push(LateToolResult {
+                    call: call.clone(),
+                    status: late_status(children.get(&index).map(|child| child.status), &result),
+                    result,
+                });
+            }
+            Some(EarlierAnswer::Delivered) => {}
+            None => tool_results.push((tool_use_id, FanInAnswer::Finished(result))),
         }
     }
-    Ok(llm::Message::user_with_content(fan_in_blocks(
-        &tool_results,
-        &late_results,
-        &[],
-    )))
+    let blocks = fan_in_blocks(&tool_results, &late_results, &[]);
+    Ok((!blocks.is_empty()).then(|| llm::Message::user_with_content(blocks)))
 }
 
 /// [`resume_root_turn`] with a prebuilt fan-in user message, which may
 /// also carry late results of calls an earlier early resume answered.
 async fn resume_root_turn_with_fan_in(
     inputs: RootWorkerInputs,
-    continuation: AgentContinuation,
-    suspended_messages: Vec<llm::Message>,
-    fan_in: llm::Message,
+    parked: ParkedResume,
+    fan_in: Option<llm::Message>,
     provider: &dyn LlmProvider,
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<RootTurnOutcome> {
+    let ParkedResume {
+        continuation,
+        suspended_messages,
+        durable,
+    } = parked;
     let thread_id = &inputs.bootstrap.thread_id;
     let StagedResumeCall {
         resume_input,
@@ -7237,7 +7339,6 @@ async fn resume_root_turn_with_fan_in(
         attempt,
         abandoned_usage,
         chat_request,
-        resumed_draft,
         injected,
         #[cfg(feature = "otel")]
         resume_root_cx,
@@ -7245,8 +7346,9 @@ async fn resume_root_turn_with_fan_in(
         &inputs,
         ResumeFanIn {
             continuation: &continuation,
-            suspended_messages: &suspended_messages,
-            fan_in: &fan_in,
+            parked: durable.unfolded(&suspended_messages),
+            fan_in: fan_in.as_ref(),
+            durable: &durable,
         },
         provider,
         deps,
@@ -7310,10 +7412,7 @@ async fn resume_root_turn_with_fan_in(
     if response_requests_tool_dispatch(&response) {
         return suspend_resumed_turn(
             inputs,
-            ResumeSuspension {
-                continuation: &continuation,
-                history_prefix: resumed_draft,
-            },
+            &continuation,
             response,
             attempt,
             close,
@@ -7339,8 +7438,19 @@ async fn resume_root_turn_with_fan_in(
 /// captured at suspension, and the fan-in user message answering them.
 struct ResumeFanIn<'a> {
     continuation: &'a AgentContinuation,
-    suspended_messages: &'a [llm::Message],
-    fan_in: &'a llm::Message,
+    /// The parked messages no compaction has folded yet.
+    parked: &'a [llm::Message],
+    /// `None` when every outcome is already in the transcript.
+    fan_in: Option<&'a llm::Message>,
+    durable: &'a DurableResume,
+}
+
+/// A parked batch being resumed, with what the transcript already holds of
+/// it.
+struct ParkedResume {
+    continuation: AgentContinuation,
+    suspended_messages: Vec<llm::Message>,
+    durable: DurableResume,
 }
 
 /// Everything [`stage_resume_call`] prepares for the resume LLM call.
@@ -7351,9 +7461,6 @@ struct StagedResumeCall {
     /// Summarizer usage to fold into the turn's abandoned-spend accumulator.
     abandoned_usage: llm::Usage,
     chat_request: ChatRequest,
-    /// `[suspended…, fan-in, injections…]`, the replay prefix a
-    /// re-suspension carries forward.
-    resumed_draft: Vec<llm::Message>,
     injected: DrainedInjections,
     #[cfg(feature = "otel")]
     resume_root_cx: Option<opentelemetry::Context>,
@@ -7370,8 +7477,9 @@ async fn stage_resume_call(
 ) -> Result<StagedResumeCall> {
     let ResumeFanIn {
         continuation,
-        suspended_messages,
+        parked,
         fan_in,
+        durable,
     } = batch;
     let definition = inputs.definition();
     let thread_id = &inputs.bootstrap.thread_id;
@@ -7398,27 +7506,19 @@ async fn stage_resume_call(
             agent_sdk::observability::loop_instrument::remote_parent_context(&trace, &span)
         });
 
-    // 2. Buffer the suspended messages (user prompt + assistant with tool
-    //    calls), completed tool results, and boundary injections on top of the
-    //    committed-only resume seed.
+    // 2. Buffer the unfolded parked messages, the fan-in, and the boundary
+    //    injections no fold holds yet on top of the committed-only resume
+    //    seed.
+    let mut resumed_draft = build_resumed_draft_messages(parked, fan_in);
+    resumed_draft.extend(durable.undelivered_injections(&injected.messages));
     buffer_resume_messages(
-        &inputs.staged_stores.messages,
-        &inputs.staged_stores.state,
+        &inputs.staged_stores,
         thread_id,
         continuation,
-        suspended_messages,
-        fan_in,
+        &resumed_draft,
     )
     .await
     .context("buffer resume messages")?;
-    for message in &injected.messages {
-        inputs
-            .staged_stores
-            .messages
-            .append(thread_id, message.clone())
-            .await
-            .context("append boundary injection")?;
-    }
 
     // 3. Refresh the projection draft before either proactive or reactive
     //    compaction can run. The staged source is now exactly
@@ -7426,13 +7526,11 @@ async fn stage_resume_call(
     //    `append_compaction` can atomically fold and clear that same draft
     //    without making a paid provider call only to reject the result on a
     //    source-count mismatch.
-    let mut resumed_draft = build_resumed_draft_messages(suspended_messages, fan_in);
-    resumed_draft.extend(injected.messages.clone());
     persist_resume_draft_for_compaction(
         deps,
         thread_id,
         &inputs.bootstrap.task_id,
-        resumed_draft.clone(),
+        resumed_draft,
         now,
         "refresh draft with completed child results before resume LLM call",
     )
@@ -7486,7 +7584,6 @@ async fn stage_resume_call(
         attempt,
         abandoned_usage: pre_call.abandoned_usage,
         chat_request,
-        resumed_draft,
         injected,
         #[cfg(feature = "otel")]
         resume_root_cx,
@@ -7685,36 +7782,29 @@ async fn commit_resumed_turn(
     })
 }
 
-/// Buffer the suspended messages, tool results, and agent state into
-/// staged stores for the resume LLM call.
+/// Buffer the resumed in-flight messages and the continuation's agent state
+/// into the staged stores for the resume LLM call.
 ///
 /// After this function, the staged message store contains:
-/// `[checkpoint messages] + [user prompt] + [assistant with tool calls] + [tool results]`
+/// `[effective committed head] + [resumed in-flight messages]`
 async fn buffer_resume_messages(
-    staged_messages: &crate::journal::staged::StagedMessageStore,
-    staged_state: &crate::journal::staged::StagedStateStore,
+    staged: &crate::journal::staged::StagedStores,
     thread_id: &agent_sdk_foundation::ThreadId,
     continuation: &AgentContinuation,
-    suspended_messages: &[llm::Message],
-    fan_in: &llm::Message,
+    resumed: &[llm::Message],
 ) -> Result<()> {
-    // Append the suspended messages (user prompt + assistant response
-    // with tool-use blocks) captured at the original suspension point.
-    for msg in suspended_messages {
-        staged_messages
-            .append(thread_id, msg.clone())
+    for message in resumed {
+        staged
+            .messages
+            .append(thread_id, message.clone())
             .await
-            .context("append suspended message")?;
+            .context("append resumed in-flight message")?;
     }
-
-    staged_messages
-        .append(thread_id, fan_in.clone())
-        .await
-        .context("append tool results message")?;
 
     // Seed the agent state from the continuation's snapshot so the
     // staged state store reflects the state at the suspension point.
-    staged_state
+    staged
+        .state
         .save(&continuation.state)
         .await
         .context("save continuation agent state")?;
@@ -7747,22 +7837,21 @@ fn tool_result_attachments(result: &ToolResult) -> impl Iterator<Item = llm::Con
 
 fn build_resumed_draft_messages(
     suspended_messages: &[llm::Message],
-    fan_in: &llm::Message,
+    fan_in: Option<&llm::Message>,
 ) -> Vec<llm::Message> {
     let mut messages = Vec::with_capacity(suspended_messages.len() + 1);
     messages.extend_from_slice(suspended_messages);
-    messages.push(fan_in.clone());
+    messages.extend(fan_in.cloned());
     messages
 }
 
 /// Re-suspend a resumed turn when the LLM responds with more tool
-/// calls. Buffers the full conversation (original suspended messages +
-/// tool results + new assistant response) into the new suspension's
-/// `suspended_messages` so a subsequent resume can reconstruct the
-/// complete history.
+/// calls. The new suspension parks [`unfolded_turn_messages`] plus the new
+/// assistant response, so a subsequent resume reconstructs the turn from
+/// the projection's effective view without restaging anything it holds.
 async fn suspend_resumed_turn(
     inputs: RootWorkerInputs,
-    prior: ResumeSuspension<'_>,
+    prior: &AgentContinuation,
     mut response: llm::ChatResponse,
     attempt: TurnAttempt,
     close: ResumeCloseContext<'_>,
@@ -7782,7 +7871,7 @@ async fn suspend_resumed_turn(
 
     // Validate before closing this attempt: malformed provider identities must
     // not leave a successful attempt row without matching durable suspension.
-    let new_continuation = build_resume_continuation(&inputs, prior.continuation, &response)
+    let new_continuation = build_resume_continuation(&inputs, prior, &response)
         .context("build resume continuation")?;
     validate_pending_tool_call_identities_for_turn(&new_continuation, &inputs, deps).await?;
 
@@ -7798,16 +7887,10 @@ async fn suspend_resumed_turn(
     )
     .await?;
 
-    // Build suspended messages that capture the FULL conversation
-    // through this point: the caller-supplied replay-history prefix
-    // (original user prompt + original assistant + the tool-results /
-    // steering-interim user message) followed by the new assistant
-    // response. Threading the prefix through — rather than rebuilding it
-    // from `child_results` here — lets the steering all-terminal path
-    // preserve its interim-results-plus-note user message in the replay
-    // history instead of dropping the directive.
-    let mut new_suspended = prior.history_prefix;
-    // New assistant response (with new tool-use blocks).
+    // The staged suffix already holds whatever user message closed the
+    // previous tool batch (the fan-in, or the steering interim plus its
+    // note), so the steering all-terminal path keeps its directive.
+    let mut new_suspended = unfolded_turn_messages(&inputs)?;
     new_suspended.push(build_full_assistant_message(&response));
 
     // One child task per new tool call, inheriting the configured retry budget.
@@ -8116,20 +8199,20 @@ pub async fn resume_from_children(
             std::mem::discriminant(other),
         ),
     };
-    let interim = build_steering_interim(
-        &continuation,
-        &suspended_messages,
-        &child_ids,
-        deps.task_store,
-    )
-    .await
-    .context("build child resume fan-in")?;
+    let durable = DurableResume::read(deps, &parent.thread_id, &suspended_messages).await?;
+    let interim =
+        build_steering_interim(&continuation, &durable.answers, &child_ids, deps.task_store)
+            .await
+            .context("build child resume fan-in")?;
     if !interim.surviving.is_empty() {
         return Box::pin(run_steering_exchange(
             inputs,
             SteeringExchange {
-                continuation,
-                suspended_messages,
+                parked: ParkedResume {
+                    continuation,
+                    suspended_messages,
+                    durable,
+                },
                 steering: Vec::new(),
                 interim,
                 child_join_policy,
@@ -8140,11 +8223,14 @@ pub async fn resume_from_children(
         ))
         .await;
     }
-    let fan_in = build_fan_in_message(&interim, &[])?;
+    let fan_in = build_fan_in_message(&interim, &[], &durable)?;
     Box::pin(resume_root_turn_with_fan_in(
         inputs,
-        continuation,
-        suspended_messages,
+        ParkedResume {
+            continuation,
+            suspended_messages,
+            durable,
+        },
         fan_in,
         provider,
         deps,
@@ -8309,10 +8395,9 @@ impl LateToolResult {
 /// grouped so [`run_steering_exchange`] stays within the argument-count
 /// budget.
 struct SteeringExchange {
-    /// The original (unchanged) continuation from the parked batch.
-    continuation: AgentContinuation,
-    /// Messages buffered at the original suspension point.
-    suspended_messages: Vec<llm::Message>,
+    /// The parked batch: its unchanged continuation, the messages buffered
+    /// at suspension, and what the transcript already holds of them.
+    parked: ParkedResume,
     /// Opaque steering content appended to the interim user message.
     steering: Vec<llm::ContentBlock>,
     /// Interim fan-in plan (results for every pending id + survivors).
@@ -8344,24 +8429,71 @@ pub(crate) enum FanInAnswer {
     StillRunning(AgentTaskId),
 }
 
-/// Ids that already have a `tool_result` in the parked history, i.e.
-/// the calls an earlier early resume answered with the interim payload.
-fn answered_tool_use_ids(messages: &[llm::Message]) -> BTreeSet<&str> {
-    messages
+/// How the turn's history already answers a pending call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EarlierAnswer {
+    /// Only the interim payload: the call's outcome follows as a late result.
+    Interim,
+    /// The call's outcome already reached the transcript: its real
+    /// `tool_result`, or a late result after its interim one.
+    Delivered,
+}
+
+/// The calls the turn's history already answers.
+///
+/// Every `tool_result` in the unfolded parked messages is an interim answer
+/// an earlier early resume wrote. Compaction may also have folded answers
+/// of this turn into the raw transcript — interim answers an early resume
+/// folded before re-parking only its reply, or what a dead attempt staged
+/// after the parked messages — so the raw transcript is read too, telling
+/// interim answers from delivered outcomes.
+///
+/// A call whose `tool_use` the resume restages is the exception: its answer
+/// must follow that copy, so its answers elsewhere in the transcript do not
+/// count. That happens when no recorded fold holds parked messages a
+/// compaction did fold, as in a row an older build folded.
+fn earlier_answers(
+    raw: &[llm::Message],
+    unfolded_parked: &[llm::Message],
+) -> BTreeMap<String, EarlierAnswer> {
+    let restaged: BTreeSet<&str> = unfolded_parked
         .iter()
-        .filter_map(|message| match &message.content {
-            llm::Content::Blocks(blocks) => Some(blocks),
-            llm::Content::Text(_) => None,
-        })
-        .flatten()
+        .flat_map(message_blocks)
         .filter_map(|block| {
-            if let llm::ContentBlock::ToolResult { tool_use_id, .. } = block {
-                Some(tool_use_id.as_str())
+            if let llm::ContentBlock::ToolUse { id, .. } = block {
+                Some(id.as_str())
             } else {
                 None
             }
         })
-        .collect()
+        .collect();
+    let delivered = scan_transcript(raw, &[]).delivered;
+    let mut answers = BTreeMap::new();
+    for block in raw.iter().flat_map(message_blocks) {
+        if let llm::ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+            ..
+        } = block
+            && !restaged.contains(tool_use_id.as_str())
+        {
+            let answer = if interim_answer(content, *is_error).is_some()
+                && !delivered.contains(tool_use_id)
+            {
+                EarlierAnswer::Interim
+            } else {
+                EarlierAnswer::Delivered
+            };
+            answers.insert(tool_use_id.clone(), answer);
+        }
+    }
+    for block in unfolded_parked.iter().flat_map(message_blocks) {
+        if let llm::ContentBlock::ToolResult { tool_use_id, .. } = block {
+            answers.insert(tool_use_id.clone(), EarlierAnswer::Interim);
+        }
+    }
+    answers
 }
 
 /// The parked batch's children keyed by the pending-call index each one
@@ -8393,12 +8525,11 @@ async fn children_by_spawn_index(
 /// gets nothing new.
 async fn build_steering_interim(
     continuation: &AgentContinuation,
-    suspended_messages: &[llm::Message],
+    answers: &BTreeMap<String, EarlierAnswer>,
     child_ids: &[AgentTaskId],
     task_store: &dyn AgentTaskStore,
 ) -> Result<SteeringInterim> {
     let pending = &continuation.pending_tool_calls;
-    let answered = answered_tool_use_ids(suspended_messages);
     let by_index = children_by_spawn_index(child_ids, task_store).await?;
 
     let mut tool_results = Vec::with_capacity(pending.len());
@@ -8408,26 +8539,29 @@ async fn build_steering_interim(
         let child = by_index.get(&idx).with_context(|| {
             format!("steering wake: no child resolves pending tool call at index {idx}")
         })?;
-        let already_answered = answered.contains(call.id.as_str());
-        if child.status.is_terminal() {
-            let result = extract_child_tool_result(child)?;
-            if already_answered {
+        let survivor = || SurvivingChild {
+            child_id: child.id.clone(),
+            pending_index: idx,
+        };
+        match (answers.get(&call.id), child.status.is_terminal()) {
+            (Some(EarlierAnswer::Delivered), _) => {}
+            (Some(EarlierAnswer::Interim), true) => {
+                let result = extract_child_tool_result(child)?;
                 late_results.push(LateToolResult {
                     call: call.clone(),
                     status: late_status(Some(child.status), &result),
                     result,
                 });
-            } else {
+            }
+            (None, true) => {
+                let result = extract_child_tool_result(child)?;
                 tool_results.push((call.id.clone(), FanInAnswer::Finished(result)));
             }
-        } else {
-            if !already_answered {
+            (Some(EarlierAnswer::Interim), false) => surviving.push(survivor()),
+            (None, false) => {
                 tool_results.push((call.id.clone(), FanInAnswer::StillRunning(child.id.clone())));
+                surviving.push(survivor());
             }
-            surviving.push(SurvivingChild {
-                child_id: child.id.clone(),
-                pending_index: idx,
-            });
         }
     }
 
@@ -8445,13 +8579,22 @@ async fn build_steering_interim(
 fn build_fan_in_message(
     interim: &SteeringInterim,
     steering: &[llm::ContentBlock],
-) -> Result<llm::Message> {
+    durable: &DurableResume,
+) -> Result<Option<llm::Message>> {
+    let steering = if durable.delivered_steering(steering) {
+        &[]
+    } else {
+        steering
+    };
     let blocks = fan_in_blocks(&interim.tool_results, &interim.late_results, steering);
-    ensure!(
-        !blocks.is_empty(),
-        "child fan-in has nothing to deliver: every parked call is already answered and still running",
-    );
-    Ok(llm::Message::user_with_content(blocks))
+    if blocks.is_empty() {
+        ensure!(
+            !durable.continuation.is_empty(),
+            "child fan-in has nothing to deliver: every parked call is already answered and still running",
+        );
+        return Ok(None);
+    }
+    Ok(Some(llm::Message::user_with_content(blocks)))
 }
 
 /// The fan-in's blocks: every `tool_result` first, in pending order (the
@@ -8972,14 +9115,11 @@ pub async fn resume_for_steering(
         ),
     };
 
-    let interim = build_steering_interim(
-        &continuation,
-        &suspended_messages,
-        &child_ids,
-        deps.task_store,
-    )
-    .await
-    .context("build steering interim fan-in")?;
+    let durable = DurableResume::read(deps, &parent.thread_id, &suspended_messages).await?;
+    let interim =
+        build_steering_interim(&continuation, &durable.answers, &child_ids, deps.task_store)
+            .await
+            .context("build steering interim fan-in")?;
 
     // Box-pin the heavy body so `resume_for_steering`'s own future
     // stays under the `clippy::large_futures` threshold — same pattern
@@ -8987,8 +9127,11 @@ pub async fn resume_for_steering(
     Box::pin(run_steering_exchange(
         inputs,
         SteeringExchange {
-            continuation,
-            suspended_messages,
+            parked: ParkedResume {
+                continuation,
+                suspended_messages,
+                durable,
+            },
             steering,
             interim,
             child_join_policy,
@@ -9008,8 +9151,12 @@ async fn run_steering_exchange(
     now: OffsetDateTime,
 ) -> Result<RootTurnOutcome> {
     let SteeringExchange {
-        continuation,
-        suspended_messages,
+        parked:
+            ParkedResume {
+                continuation,
+                suspended_messages,
+                durable,
+            },
         steering,
         interim,
         child_join_policy,
@@ -9017,14 +9164,16 @@ async fn run_steering_exchange(
 
     // Stage the interim fan-in + steering note and run one bounded LLM
     // round.
-    let steering_message = build_fan_in_message(&interim, &steering)?;
+    let steering_message = build_fan_in_message(&interim, &steering, &durable)?;
     let streamed = stage_and_call_steering_llm(
         &inputs,
         deps,
         provider,
-        &suspended_messages,
-        &steering_message,
-        &continuation.state,
+        SteeringStage {
+            parked: durable.unfolded(&suspended_messages),
+            steering_message: steering_message.as_ref(),
+            state: &continuation.state,
+        },
         now,
     )
     .await;
@@ -9056,14 +9205,9 @@ async fn run_steering_exchange(
         // user message (interim results + note) is threaded into the
         // replay history so the directive survives for the next resume.
         if response_requests_tool_dispatch(&response) {
-            let mut history_prefix = suspended_messages;
-            history_prefix.push(steering_message);
             return suspend_resumed_turn(
                 inputs,
-                ResumeSuspension {
-                    continuation: &continuation,
-                    history_prefix,
-                },
+                &continuation,
                 response,
                 attempt,
                 ResumeCloseContext {
@@ -9105,9 +9249,7 @@ async fn run_steering_exchange(
         deps,
         SteeringRepark {
             continuation,
-            suspended_messages,
             child_join_policy,
-            steering_message,
             surviving: interim.surviving,
             response,
             content_ids,
@@ -9128,15 +9270,28 @@ async fn run_steering_exchange(
 /// original turn's `Start` anchors replay), exact persisted-draft
 /// compaction after staging, and the resume sentinel user input so
 /// `build_chat_request` appends no extra prompt.
+/// What a steering exchange stages on top of the committed-only seed.
+struct SteeringStage<'a> {
+    /// The parked messages no compaction has folded yet.
+    parked: &'a [llm::Message],
+    /// The interim fan-in and steering content, or `None` when a dead
+    /// attempt's folded fan-in already delivered all of it.
+    steering_message: Option<&'a llm::Message>,
+    state: &'a AgentState,
+}
+
 async fn stage_and_call_steering_llm(
     inputs: &RootWorkerInputs,
     deps: &RootTurnDeps<'_>,
     provider: &dyn LlmProvider,
-    suspended_messages: &[llm::Message],
-    steering_message: &llm::Message,
-    state: &AgentState,
+    stage: SteeringStage<'_>,
     now: OffsetDateTime,
 ) -> Result<StreamedTurn> {
+    let SteeringStage {
+        parked,
+        steering_message,
+        state,
+    } = stage;
     let definition = inputs.definition();
     let thread_id = &inputs.bootstrap.thread_id;
 
@@ -9150,22 +9305,18 @@ async fn stage_and_call_steering_llm(
             agent_sdk::observability::loop_instrument::remote_parent_context(&trace, &span)
         });
 
-    // Buffer suspended messages + the interim-results-and-steering user
-    // message on top of the committed-only seed.
-    for msg in suspended_messages {
+    // Buffer the unfolded parked messages + the interim-results-and-steering
+    // user message on top of the committed-only seed.
+    let mut draft = parked.to_vec();
+    draft.extend(steering_message.cloned());
+    for message in &draft {
         inputs
             .staged_stores
             .messages
-            .append(thread_id, msg.clone())
+            .append(thread_id, message.clone())
             .await
-            .context("append suspended message (steering)")?;
+            .context("append steering resume message")?;
     }
-    inputs
-        .staged_stores
-        .messages
-        .append(thread_id, steering_message.clone())
-        .await
-        .context("append steering interim + note message")?;
     inputs
         .staged_stores
         .state
@@ -9175,8 +9326,6 @@ async fn stage_and_call_steering_llm(
 
     // Persist the complete steering draft before compaction so the provider
     // source and the atomically folded projection source are identical.
-    let mut draft = suspended_messages.to_vec();
-    draft.push(steering_message.clone());
     persist_resume_draft_for_compaction(
         deps,
         thread_id,
@@ -9253,9 +9402,7 @@ async fn stage_and_call_steering_llm(
 /// budget.
 struct SteeringRepark {
     continuation: AgentContinuation,
-    suspended_messages: Vec<llm::Message>,
     child_join_policy: ChildJoinPolicy,
-    steering_message: llm::Message,
     surviving: Vec<SurvivingChild>,
     response: llm::ChatResponse,
     content_ids: ContentIds,
@@ -9359,9 +9506,7 @@ async fn prepare_steering_repark(
 ) -> Result<PreparedSteeringRepark> {
     let SteeringRepark {
         continuation: prior,
-        suspended_messages,
         child_join_policy,
-        steering_message,
         surviving,
         mut response,
         content_ids,
@@ -9429,9 +9574,7 @@ async fn prepare_steering_repark(
     attach_precompleted_results(&mut specs, &preflight_completions)?;
 
     let assistant_message = build_steering_assistant_message(&response, routing.is_some());
-    let mut suspended = Vec::with_capacity(suspended_messages.len() + 2);
-    suspended.extend(suspended_messages);
-    suspended.push(steering_message);
+    let mut suspended = unfolded_turn_messages(inputs)?;
     suspended.push(assistant_message);
     let payload = SuspensionPayload {
         continuation,
