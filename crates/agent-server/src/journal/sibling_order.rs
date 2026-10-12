@@ -463,7 +463,10 @@ mod tests {
             .map(|key| held(key, false))
             .collect();
         let last = full.last().map(|row| row.key);
-        assert!(clone.advance(false, full, Vec::new()).is_empty());
+        assert_eq!(
+            clone.advance(false, full, Vec::new()),
+            Vec::<AgentTaskId>::new()
+        );
         assert_eq!(probe.cursor(), last);
     }
 
