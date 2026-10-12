@@ -69,17 +69,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PostgresDurableStore::from_pool` is no longer `const`. A call
   after a durable child that awaits confirmation now waits for that
   decision, so confirmations in one batch are asked one at a time.
-  Migration 0026 adds the nullable `after_siblings_json` column and two
-  partial indexes over pending rows (ready and held) on both Postgres and
-  SQLite.
+  Migration 0026 adds the nullable `after_siblings_json` column and three
+  partial indexes over pending rows (`agent_sdk_tasks_ready_fifo_idx`,
+  `agent_sdk_tasks_held_fifo_idx`, `agent_sdk_tasks_held_by_parent_idx`)
+  on both Postgres and SQLite.
 
   **Rollback and rolling deploys:** an older build refuses to start
   against a database that has migration 0026 applied
   (`VersionMissing(26)`): the durable migrator does not ignore unknown
   applied versions, a policy that predates this change. To roll back,
-  revert 0026 by hand first (drop both indexes and the column, then delete
-  version 26 from `_sqlx_migrations`). Batches parked at that point lose
-  their order. This build loads rows an older build wrote during a mixed
+  revert 0026 by hand first, in one transaction: drop the three indexes,
+  `ALTER TABLE agent_sdk_tasks DROP COLUMN after_siblings_json`, and
+  `DELETE FROM _sqlx_migrations WHERE version = 26`. Batches parked at
+  that point lose their order. This build loads rows an older build wrote during a mixed
   deploy: it ignores a wait list on any row that is not pending, and it
   leases a pending row left with a wait list once every sibling it names
   has finished.
