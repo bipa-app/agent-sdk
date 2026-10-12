@@ -329,7 +329,7 @@ impl LlmProvider for VertexProvider {
         };
         let model_max = self
             .capabilities()
-            .and_then(|caps| caps.max_output_tokens)
+            .and_then(crate::model_capabilities::ModelCapabilities::default_output_tokens)
             .or_else(|| {
                 crate::model_capabilities::default_max_output_tokens(provider, self.model())
             })
