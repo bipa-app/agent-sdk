@@ -8470,6 +8470,7 @@ INSERT INTO agent_sdk_turn_attempts (
     }
 
     /// A one-attempt root whose lease lapses at `t_plus(secs + 5)`.
+    #[cfg(feature = "failpoints")]
     async fn lapsed_last_attempt_root(
         store: &PostgresDurableStore,
         thread: &str,
