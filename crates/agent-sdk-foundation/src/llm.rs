@@ -433,7 +433,11 @@ pub struct ChatRequest {
     /// writer that appends messages after them or replaces `messages` voids
     /// the marker instead of misplacing it. The Anthropic and Vertex Claude
     /// adapters keep their conversation cache breakpoint ahead of these
-    /// blocks; `OpenAI` explicit cache breakpoints do not consult them.
+    /// blocks; `OpenAI` explicit cache breakpoints do not consult them. A
+    /// Codex websocket session never sends a `previous_response_id` delta
+    /// after a request that carried them, because the next request no longer
+    /// starts with that input; it resends the full input instead, so the stale
+    /// reminder never stays in the server-side conversation.
     pub request_only_reminders: Vec<String>,
 }
 

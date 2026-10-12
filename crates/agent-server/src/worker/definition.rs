@@ -255,7 +255,13 @@ pub struct AgentDefinition {
     /// returned for a [`ProviderRequestKind::Continuation`] request drops the
     /// in-progress turn's thinking on them; hosts should return `None` there
     /// for those models. Claude Opus 4.5 and later, Sonnet 4.6 and later, and
-    /// Haiku 5.5 keep earlier thinking blocks.
+    /// Haiku 5.5 keep earlier thinking blocks. Whether `OpenAI` reasoning
+    /// models and Gemini thought signatures behave the same way has not been
+    /// verified.
+    ///
+    /// With a `session_id`, Codex websocket requests resend the full input
+    /// after a request that carried this context instead of a
+    /// `previous_response_id` delta.
     #[serde(skip)]
     pub request_context_fn: Option<RequestContextFn>,
     /// Extended thinking configuration.
