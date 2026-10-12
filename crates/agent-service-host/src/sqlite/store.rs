@@ -658,20 +658,8 @@ ON CONFLICT (thread_id) DO UPDATE SET
         thread_id: &ThreadId,
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
-        let record = sqlx::query_as::<_, MessageHeadRecord>(
-            r"
-SELECT thread_id, history_json, draft_messages_json, compactions_json, history_generation, version, created_at, updated_at
-FROM agent_sdk_message_heads
-WHERE thread_id = ?1
-",
-        )
-        .bind(thread_key(thread_id))
-        .fetch_optional(&mut **tx)
-        .await
-        .with_context(|| format!("get message head for {thread_id}"))?;
-
-        if let Some(r) = record {
-            r.try_into()
+        if let Some(projection) = read_message_head(&mut **tx, thread_id).await? {
+            Ok(projection)
         } else {
             let fresh = MessageProjection::new(thread_id.clone(), now);
             // Use INSERT … ON CONFLICT DO NOTHING (not the destructive
@@ -713,18 +701,7 @@ ON CONFLICT (thread_id) DO NOTHING
         &self,
         thread_id: &ThreadId,
     ) -> Result<Option<MessageProjection>> {
-        let record = sqlx::query_as::<_, MessageHeadRecord>(
-            r"
-SELECT thread_id, history_json, draft_messages_json, compactions_json, history_generation, version, created_at, updated_at
-FROM agent_sdk_message_heads
-WHERE thread_id = ?1
-",
-        )
-        .bind(thread_key(thread_id))
-        .fetch_optional(&self.pool)
-        .await
-        .with_context(|| format!("get message head {thread_id}"))?;
-        record.map(TryInto::try_into).transpose()
+        read_message_head(&self.pool, thread_id).await
     }
 
     async fn upsert_message_head_tx(
@@ -6052,6 +6029,28 @@ impl TryFrom<ThreadRecord> for Thread {
             .context("rehydrate thread from sqlite row validation")?;
         Ok(thread)
     }
+}
+
+/// Load and decode one message head exactly as every store read does.
+pub(super) async fn read_message_head<'e, E>(
+    executor: E,
+    thread_id: &ThreadId,
+) -> Result<Option<MessageProjection>>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    let record = sqlx::query_as::<_, MessageHeadRecord>(
+        r"
+SELECT thread_id, history_json, draft_messages_json, compactions_json, history_generation, version, created_at, updated_at
+FROM agent_sdk_message_heads
+WHERE thread_id = ?1
+",
+    )
+    .bind(thread_key(thread_id))
+    .fetch_optional(executor)
+    .await
+    .with_context(|| format!("get message head {thread_id}"))?;
+    record.map(TryInto::try_into).transpose()
 }
 
 #[derive(Debug, FromRow)]
