@@ -124,11 +124,15 @@ const VALIDATE_MESSAGE_HEAD_HISTORY_GENERATION_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/postgres/0023_validate_message_head_history_generation.sql"
 ));
+const SUBAGENT_CHILD_ROOT_LINK_INDEX_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/postgres/0024_subagent_child_root_link_index.sql"
+));
 
 /// `sqlx`-managed migration bundle for the Postgres durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/postgres");
 
-const MIGRATIONS: [PostgresMigration; 21] = [
+const MIGRATIONS: [PostgresMigration; 22] = [
     PostgresMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -233,6 +237,11 @@ const MIGRATIONS: [PostgresMigration; 21] = [
         version: "0023",
         summary: "validate the history rewrite lineage check outside the column migration",
         sql: VALIDATE_MESSAGE_HEAD_HISTORY_GENERATION_SQL,
+    },
+    PostgresMigration {
+        version: "0024",
+        summary: "index every subagent invocation's child-root link, whatever its status",
+        sql: SUBAGENT_CHILD_ROOT_LINK_INDEX_SQL,
     },
 ];
 

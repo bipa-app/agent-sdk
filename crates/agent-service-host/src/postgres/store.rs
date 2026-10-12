@@ -2149,20 +2149,11 @@ FOR UPDATE
         tx: &mut Transaction<'_, Postgres>,
         root: &AgentTaskId,
     ) -> Result<bool> {
-        let linked = sqlx::query_scalar!(
-            r#"
-SELECT EXISTS (
-    SELECT 1
-    FROM agent_sdk_tasks
-    WHERE kind = 'subagent'
-      AND state_json -> 'invocation' ->> 'child_root_task_id' = $1
-) AS "linked!"
-"#,
-            root.as_str(),
-        )
-        .fetch_one(&mut **tx)
-        .await
-        .with_context(|| format!("look up the invocation linking {root}"))?;
+        let linked =
+            sqlx::query_file_scalar!("src/postgres/links_child_thread_root.sql", root.as_str())
+                .fetch_one(&mut **tx)
+                .await
+                .with_context(|| format!("look up the invocation linking {root}"))?;
         Ok(linked)
     }
 
@@ -7883,6 +7874,31 @@ mod tests {
                 database_url,
             },
         )))
+    }
+
+    /// The child-thread link a root's undelivered input is classified by
+    /// is read through an index, never a scan of every task: with
+    /// sequential scans priced out, the plan still finds an index to use.
+    #[tokio::test]
+    async fn child_thread_link_is_looked_up_through_an_index() -> Result<()> {
+        let Some((store, _guard)) = test_store().await? else {
+            return Ok(());
+        };
+        let mut tx = store.pool.begin().await?;
+        sqlx::query!("SET LOCAL enable_seqscan = off")
+            .execute(&mut *tx)
+            .await?;
+        let probe = include_str!("links_child_thread_root.sql").replace("$1", "'task_probe'");
+        let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("EXPLAIN {probe}")))
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.rollback().await?;
+        assert!(
+            plan.iter().all(|line| !line.contains("Seq Scan"))
+                && plan.iter().any(|line| line.contains("Index")),
+            "the link must be looked up through an index, not scanned: {plan:#?}",
+        );
+        Ok(())
     }
 
     /// Durable coverage of the Postgres `claim_thread_creation_tx`:

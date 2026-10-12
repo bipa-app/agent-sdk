@@ -1626,17 +1626,10 @@ LIMIT 1
         root: &AgentTaskId,
     ) -> Result<bool> {
         let root_id = root.as_str();
-        let linked = sqlx::query_scalar!(
-            r#"SELECT EXISTS (
-                   SELECT 1 FROM agent_sdk_tasks
-                   WHERE kind = 'subagent'
-                     AND json_extract(state_json, '$.invocation.child_root_task_id') = ?1
-               ) AS "linked!: bool""#,
-            root_id,
-        )
-        .fetch_one(&mut **tx)
-        .await
-        .with_context(|| format!("look up the invocation linking {root}"))?;
+        let linked = sqlx::query_file_scalar!("src/sqlite/links_child_thread_root.sql", root_id)
+            .fetch_one(&mut **tx)
+            .await
+            .with_context(|| format!("look up the invocation linking {root}"))?;
         Ok(linked)
     }
 
@@ -9009,6 +9002,26 @@ VALUES ('live-0007', 'tool_runtime', 'pending', 'root-0007', 'root-0007', 1, 'pl
             "{label}: the listing must look the live rows up by status, not scan the history: \
              {plan:?}",
         );
+    }
+
+    /// The child-thread link a root's undelivered input is classified by
+    /// is read through an index, never a scan of every task.
+    #[tokio::test]
+    async fn child_thread_link_is_looked_up_through_an_index() -> Result<()> {
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+        let steps: Vec<(i64, i64, i64, String)> = sqlx::query_as(concat!(
+            "EXPLAIN QUERY PLAN ",
+            include_str!("links_child_thread_root.sql"),
+        ))
+        .fetch_all(&store.pool)
+        .await?;
+        let plan: Vec<String> = steps.into_iter().map(|(_, _, _, detail)| detail).collect();
+        assert!(
+            plan.iter()
+                .any(|step| step.starts_with("SEARCH agent_sdk_tasks USING")),
+            "the link must be searched through an index, not scanned: {plan:?}",
+        );
+        Ok(())
     }
 
     #[tokio::test]
