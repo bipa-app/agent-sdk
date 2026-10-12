@@ -582,31 +582,34 @@ pub async fn fail_root_turn(
         now,
     )
     .await
-    .map(|failed| failed.task)
+    .task
 }
 
-/// A root turn failed by [`fail_root_turn_with_reason`] or
+/// The outcome of [`fail_root_turn_with_reason`] or
 /// [`fail_root_turn_leaving_attempts_open_with_reason`].
 #[derive(Debug)]
 pub struct FailedRootTurn {
-    /// The root row after its terminal transition.
-    pub task: AgentTask,
-    /// The descendants the failure settled (see [`settle_live_descendants`]);
-    /// empty when that best-effort step failed and is left to the host's
-    /// orphan sweep.
+    /// The root row after its terminal transition, or why the store
+    /// refused the transition.
+    pub task: Result<AgentTask>,
+    /// The descendants the failure cancelled, from both passes: the
+    /// settlement before the terminal transition and
+    /// [`settle_live_descendants`] after it. Holds what the first pass
+    /// cancelled even when the transition was then refused. Empty when
+    /// neither pass settled anything, which the host's orphan sweep then
+    /// catches up on.
     pub settled: Vec<AgentTaskId>,
 }
 
 /// Fail a root turn with a caller-classified terminal reason.
 ///
-/// # Errors
-///
-/// Returns an error if the store rejects the terminal transition.
+/// The store's refusal of the terminal transition is reported in
+/// [`FailedRootTurn::task`], alongside whatever was settled before it.
 pub async fn fail_root_turn_with_reason(
     params: FailRootTurnParams<'_>,
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
-) -> Result<FailedRootTurn> {
+) -> FailedRootTurn {
     best_effort_close_open_attempts(params.task_id, deps.attempt_store, now).await;
     fail_root_turn_inner(params, deps, now).await
 }
@@ -623,15 +626,11 @@ pub async fn fail_root_turn_with_reason(
 /// The live worker's own abort path (mid-stream cancel close, or its
 /// terminal commit) owns its attempts; this variant only performs the
 /// durable fail + error event.
-///
-/// # Errors
-///
-/// Returns an error if the store rejects the terminal transition.
 pub async fn fail_root_turn_leaving_attempts_open_with_reason(
     params: FailRootTurnParams<'_>,
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
-) -> Result<FailedRootTurn> {
+) -> FailedRootTurn {
     fail_root_turn_inner(params, deps, now).await
 }
 
@@ -639,7 +638,7 @@ async fn fail_root_turn_inner(
     params: FailRootTurnParams<'_>,
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
-) -> Result<FailedRootTurn> {
+) -> FailedRootTurn {
     let FailRootTurnParams {
         task_id,
         worker_id,
@@ -653,7 +652,7 @@ async fn fail_root_turn_inner(
     // next turn, which must not find these children live.
     let mut settled =
         settle_descendants_before_failing(task_id, worker_id, lease_id, deps, now).await;
-    let (failed_task, _parent) = deps
+    let failed_task = match deps
         .task_store
         .fail_task_with_reason(
             task_id,
@@ -664,12 +663,21 @@ async fn fail_root_turn_inner(
             now,
         )
         .await
-        .context("fail root task")?;
+        .context("fail root task")
+    {
+        Ok((failed_task, _parent)) => failed_task,
+        Err(refused) => {
+            return FailedRootTurn {
+                task: Err(refused),
+                settled,
+            };
+        }
+    };
     crate::fail_point!("fail_root.after_terminal_transition", |_| {
-        Ok(FailedRootTurn {
-            task: failed_task.clone(),
+        FailedRootTurn {
+            task: Ok(failed_task.clone()),
             settled: settled.clone(),
-        })
+        }
     });
 
     // Best-effort: the task is durably Failed; event commit failure
@@ -703,10 +711,10 @@ async fn fail_root_turn_inner(
         "error",
     );
 
-    Ok(FailedRootTurn {
-        task: failed_task,
+    FailedRootTurn {
+        task: Ok(failed_task),
         settled,
-    })
+    }
 }
 
 /// Cancel the live descendants of the root `task_id` this worker still

@@ -3269,13 +3269,14 @@ async fn fail_root_task_if_owned(
             fail_root_turn_leaving_attempts_open_with_reason(params, &stores.root_turn_deps(), now)
                 .await
         }
-    }
-    .context("mark root task failed")?;
-    // A drive the failure cancelled would otherwise only notice at its next
-    // heartbeat rejection; ids without a live drive are no-ops.
+    };
+    // Tripped whatever the transition did: a drive whose task the failure
+    // cancelled would otherwise notice only at its next heartbeat rejection.
+    // Ids without a live drive are no-ops.
     for id in &failed.settled {
         stores.confirm_drive_cancels.cancel(id);
     }
+    failed.task.context("mark root task failed")?;
 
     let new_events = newly_committed_events(stores, thread_id, event_watermark).await?;
     publish_events(stores, &new_events);

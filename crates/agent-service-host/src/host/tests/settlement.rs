@@ -535,6 +535,40 @@ async fn failing_a_root_trips_no_drive_its_settlement_did_not_cancel() -> Result
     Ok(())
 }
 
+/// A root failure the store refuses still trips the drives of the tasks
+/// its settlement cancelled before the refusal.
+#[tokio::test]
+async fn a_refused_root_failure_still_trips_the_drives_it_cancelled() -> Result<()> {
+    let stores = StoreRegistry::in_memory(super::sample_registry());
+    let thread = ThreadId::from_string("t-refused-fail-drive");
+    let tree = park_on_live_children(&stores, &thread, 3).await?;
+    let horizon = OffsetDateTime::now_utc() + time::Duration::hours(1);
+    let (worker, lease) = resume_early(&stores, &tree.root, horizon).await?;
+    let confirming = tree.children[0].clone();
+    let drive = CancellationToken::new();
+    let _drive_registration = stores
+        .confirm_drive_cancels
+        .register(confirming.clone(), drive.clone());
+
+    let mut refusing = stores.clone();
+    refusing.task_store =
+        Arc::new(FlakyTaskStore::new(Arc::clone(&stores.task_store)).failing_fail_tasks(1))
+            as Arc<dyn AgentTaskStore>;
+    let refused = fail_owned_root(&refusing, &thread, &tree.root, &worker, &lease).await;
+
+    assert!(
+        refused.is_err(),
+        "precondition: the store refused the failure"
+    );
+    assert_eq!(task(&stores, &tree.root).await?.status, TaskStatus::Running);
+    assert_children_settled(&stores, &tree).await?;
+    assert!(
+        drive.is_cancelled(),
+        "the drive of a task the settlement cancelled must be tripped",
+    );
+    Ok(())
+}
+
 /// The lease sweep forwards what its fail-close settled: it trips the
 /// drives of the tasks it cancelled and wakes the followers of the child
 /// threads it closed.
