@@ -428,9 +428,12 @@ fn tool_use_ids(messages: &[Message]) -> Vec<String> {
             Content::Blocks(blocks) => blocks.as_slice(),
             Content::Text(_) => &[],
         })
-        .filter_map(|block| match block {
-            ContentBlock::ToolUse { id, .. } => Some(id.clone()),
-            _ => None,
+        .filter_map(|block| {
+            if let ContentBlock::ToolUse { id, .. } = block {
+                Some(id.clone())
+            } else {
+                None
+            }
         })
         .collect()
 }
@@ -442,9 +445,12 @@ fn tool_result_ids(messages: &[Message]) -> Vec<String> {
             Content::Blocks(blocks) => blocks.as_slice(),
             Content::Text(_) => &[],
         })
-        .filter_map(|block| match block {
-            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
-            _ => None,
+        .filter_map(|block| {
+            if let ContentBlock::ToolResult { tool_use_id, .. } = block {
+                Some(tool_use_id.clone())
+            } else {
+                None
+            }
         })
         .collect()
 }
@@ -456,9 +462,12 @@ fn late_result_ids(messages: &[Message]) -> Vec<String> {
             Content::Blocks(blocks) => blocks.as_slice(),
             Content::Text(_) => &[],
         })
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => late_tool_result::tool_use_id(text),
-            _ => None,
+        .filter_map(|block| {
+            if let ContentBlock::Text { text } = block {
+                late_tool_result::tool_use_id(text)
+            } else {
+                None
+            }
         })
         .collect()
 }
@@ -530,13 +539,17 @@ async fn compaction_counts(harness: &Harness) -> Result<Vec<(usize, usize)>> {
         .get_events(&thread_id())
         .await?
         .into_iter()
-        .filter_map(|committed| match committed.event {
-            AgentEvent::ContextCompacted {
+        .filter_map(|committed| {
+            if let AgentEvent::ContextCompacted {
                 original_count,
                 new_count,
                 ..
-            } => Some((original_count, new_count)),
-            _ => None,
+            } = committed.event
+            {
+                Some((original_count, new_count))
+            } else {
+                None
+            }
         })
         .collect())
 }
@@ -1833,4 +1846,125 @@ async fn steering_rerun_after_a_compacted_exchange_died_closes_each_call_once() 
 #[tokio::test]
 async fn steering_rerun_after_a_compacted_exchange_died_at_default_retention() -> Result<()> {
     steering_rerun_after_a_compacted_exchange_died(Retention::Default).await
+}
+
+/// Rewrite the thread's projection the way serde decodes a row an older
+/// build wrote: its compaction entries carry no fold range or parked head.
+async fn as_written_by_an_older_build(harness: &Harness) -> Result<()> {
+    let mut row = serde_json::to_value(harness.projection().await?)?;
+    for entry in row["compactions"]
+        .as_array_mut()
+        .context("compactions array")?
+    {
+        let fields = entry.as_object_mut().context("compaction entry object")?;
+        for field in ["draft_fold_start", "draft_fold_len", "draft_parked_len"] {
+            fields.remove(field);
+        }
+    }
+    harness.messages.put(serde_json::from_value(row)?).await;
+    Ok(())
+}
+
+fn ensure_requests_provider_valid(main: &ScriptedMainProvider, label: &str) -> Result<()> {
+    for (index, request) in main.requests()?.iter().enumerate() {
+        ensure_provider_valid(
+            &request.messages,
+            &format!("{label}: provider request {index}"),
+        )?;
+    }
+    Ok(())
+}
+
+/// What a resume on an older build's row must leave behind: no fold
+/// records the parked messages, so they are restaged once more, as on main,
+/// and every restaged call is answered next to its copy.
+async fn ensure_restaged_once_and_valid(
+    harness: &Harness,
+    main: &ScriptedMainProvider,
+    calls: &[&str],
+    label: &str,
+) -> Result<()> {
+    let projection = harness.projection().await?;
+    let twice: Vec<&str> = calls.iter().chain(calls).copied().collect();
+    ensure!(
+        tool_use_ids(&projection.messages) == twice,
+        "{label}: the restaged copy is the one duplicate main also writes: {:?}",
+        tool_use_ids(&projection.messages),
+    );
+    ensure!(
+        tool_result_ids(&projection.messages) == twice,
+        "{label}: each copy of a call must be answered once: {:?}",
+        tool_result_ids(&projection.messages),
+    );
+    ensure_provider_valid(&projection.messages, &format!("{label}: raw transcript"))?;
+    ensure_provider_valid(
+        &projection.context_history(),
+        &format!("{label}: effective view"),
+    )?;
+    ensure_requests_provider_valid(main, label)
+}
+
+/// A resume folded by an older build died; this build reruns it.
+async fn rerun_on_an_older_builds_fold(retention: Retention) -> Result<()> {
+    let harness = Harness::new(CompactionEngine::Legacy, Trigger::Threshold, retention)?;
+    if matches!(retention, Retention::Default) {
+        harness.seed_history(SEEDED_TURNS).await?;
+    }
+    let main = ScriptedMainProvider::new();
+    let task_id = fold_then_die(&harness, &main).await?;
+    as_written_by_an_older_build(&harness).await?;
+
+    main.push(text("all done"))?;
+    let parent = harness.acquire(&task_id, 2_000).await?;
+    let inputs = harness.inputs(parent.clone(), 2_000).await?;
+    let outcome = resume_from_children(inputs, &parent, &main, &harness.deps(), at(2_010)).await?;
+    let label = format!("rerun on an older build's fold ({retention:?})");
+    ensure!(
+        matches!(outcome, RootTurnOutcome::Completed { .. }),
+        "{label}: the rerun must commit the turn"
+    );
+    ensure_restaged_once_and_valid(&harness, &main, &["call_1"], &label).await
+}
+
+#[tokio::test]
+async fn rerun_on_an_older_builds_fold_restages_once_and_stays_valid() -> Result<()> {
+    rerun_on_an_older_builds_fold(Retention::Nothing).await
+}
+
+#[tokio::test]
+async fn rerun_on_an_older_builds_fold_at_default_retention() -> Result<()> {
+    rerun_on_an_older_builds_fold(Retention::Default).await
+}
+
+/// An older build folded a steering exchange that then failed and was
+/// reverted; this build fans the children in.
+async fn fan_in_after_an_older_builds_reverted_steering_fold(retention: Retention) -> Result<()> {
+    let harness = Harness::new(CompactionEngine::Legacy, Trigger::Threshold, retention)?;
+    if matches!(retention, Retention::Default) {
+        harness.seed_history(SEEDED_TURNS).await?;
+    }
+    let main = ScriptedMainProvider::new();
+    let (task_id, children, _) = revert_compacted_steering_wake(&harness, &main).await?;
+    as_written_by_an_older_build(&harness).await?;
+
+    let survivor = children.get(1).context("call_2's child")?;
+    finish_turn(&harness, &main, &task_id, std::slice::from_ref(survivor)).await?;
+    ensure_restaged_once_and_valid(
+        &harness,
+        &main,
+        &["call_1", "call_2"],
+        &format!("fan-in after an older build's reverted steering fold ({retention:?})"),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn fan_in_after_an_older_builds_reverted_steering_fold_restages_once_and_stays_valid()
+-> Result<()> {
+    fan_in_after_an_older_builds_reverted_steering_fold(Retention::Nothing).await
+}
+
+#[tokio::test]
+async fn fan_in_after_an_older_builds_reverted_steering_fold_at_default_retention() -> Result<()> {
+    fan_in_after_an_older_builds_reverted_steering_fold(Retention::Default).await
 }

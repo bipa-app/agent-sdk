@@ -8441,17 +8441,32 @@ enum EarlierAnswer {
 
 /// The calls the turn's history already answers.
 ///
-/// Every `tool_result` in `parked` is an interim answer an earlier early
-/// resume wrote. A compaction may also have folded answers of this turn
-/// into the raw transcript before the fold `parked` continues — the
-/// interim answers of an early resume that re-parked only what it had not
-/// folded, or the real results a failed steering exchange delivered before
-/// its wake was reverted — so that history is read too, telling interim
-/// answers from delivered outcomes.
+/// Every `tool_result` in the unfolded parked messages is an interim answer
+/// an earlier early resume wrote. Compaction may also have folded answers
+/// of this turn into the raw transcript — interim answers an early resume
+/// folded before re-parking only its reply, or what a dead attempt staged
+/// after the parked messages — so the raw transcript is read too, telling
+/// interim answers from delivered outcomes.
+///
+/// A call whose `tool_use` the resume restages is the exception: its answer
+/// must follow that copy, so its answers elsewhere in the transcript do not
+/// count. That happens when no recorded fold holds parked messages a
+/// compaction did fold, as in a row an older build folded.
 fn earlier_answers(
     raw: &[llm::Message],
     unfolded_parked: &[llm::Message],
 ) -> BTreeMap<String, EarlierAnswer> {
+    let restaged: BTreeSet<&str> = unfolded_parked
+        .iter()
+        .flat_map(message_blocks)
+        .filter_map(|block| {
+            if let llm::ContentBlock::ToolUse { id, .. } = block {
+                Some(id.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
     let delivered = scan_transcript(raw, &[]).delivered;
     let mut answers = BTreeMap::new();
     for block in raw.iter().flat_map(message_blocks) {
@@ -8461,6 +8476,7 @@ fn earlier_answers(
             is_error,
             ..
         } = block
+            && !restaged.contains(tool_use_id.as_str())
         {
             let answer = if interim_answer(content, *is_error).is_some()
                 && !delivered.contains(tool_use_id)

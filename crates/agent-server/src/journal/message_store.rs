@@ -229,6 +229,16 @@ impl InMemoryMessageProjectionStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Store `projection` as is, the way a row another build wrote decodes.
+    #[cfg(test)]
+    pub(crate) async fn put(&self, projection: MessageProjection) {
+        self.inner
+            .write()
+            .await
+            .by_thread
+            .insert(projection.thread_id.clone(), projection);
+    }
 }
 
 #[async_trait]
