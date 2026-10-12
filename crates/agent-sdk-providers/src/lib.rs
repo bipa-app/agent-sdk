@@ -11,7 +11,7 @@
 //! | Anthropic (Messages API) | [`impls::anthropic`] | SSE streaming |
 //! | OpenAI (Chat Completions) | [`impls::openai`] | SSE streaming |
 //! | OpenAI (Responses API) | [`impls::openai_responses`] | SSE streaming |
-//! | OpenAI Codex / ChatGPT | [`impls::openai_codex_responses`] | WebSocket |
+//! | OpenAI Codex / ChatGPT | [`impls::openai_codex_responses`] | SSE streaming (WebSocket opt-in) |
 //! | Google Gemini | [`impls::gemini`] | SSE streaming |
 //! | Google Vertex AI | [`impls::vertex`] | SSE streaming |
 //! | Cloudflare AI Gateway | [`impls::cloudflare_ai_gateway`] | Proxy wrapper |
@@ -98,12 +98,12 @@ pub use agent_sdk_foundation::llm::*;
 pub use impls::CloudflareAIGatewayProvider;
 #[cfg(feature = "gemini")]
 pub use impls::GeminiProvider;
-#[cfg(feature = "openai-codex")]
-pub use impls::OpenAICodexResponsesProvider;
 #[cfg(feature = "vertex")]
 pub use impls::VertexProvider;
 #[cfg(feature = "anthropic")]
 pub use impls::{AnthropicProvider, is_oauth_token};
+#[cfg(feature = "openai-codex")]
+pub use impls::{CodexTransport, OpenAICodexResponsesProvider};
 #[cfg(feature = "openai")]
 pub use impls::{
     OpenAIAllowedToolsMode, OpenAIApiSurface, OpenAIPromptCacheMode, OpenAIPromptCacheTtl,

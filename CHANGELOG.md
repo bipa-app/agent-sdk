@@ -95,6 +95,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compaction append succeeds. The agent loop and the durable worker opt in, so
   a compaction that is cancelled, refused, or fails to persist no longer
   leaves orphaned artifacts.
+- **Codex streams over HTTP SSE by default.** `OpenAICodexResponsesProvider`
+  sends each turn as one HTTP SSE request; the persistent WebSocket transport
+  is opt-in via `with_transport(CodexTransport::WebSocket)`. Both transports
+  derive prompt-cache affinity (`prompt_cache_key`, `session_id`) from
+  `ChatRequest::session_id` and replay the `x-codex-turn-state` sticky-routing
+  token on a turn's tool-result follow-ups, never into the next turn. A retry
+  of a turn's opening request, or a plain user message appended mid-turn,
+  starts without it.
+- `OpenAIResponsesProvider` sends `prompt_cache_key` only to the official
+  `api.openai.com` base URL, matching the Chat Completions provider. A
+  pass-through proxy to `OpenAI` (Azure `OpenAI`, Cloudflare AI Gateway's
+  `OpenAI` route) keeps it with `with_prompt_cache_key_forwarding(true)` on
+  `OpenAIProvider`, `OpenAIResponsesProvider` or `CloudflareAIGatewayProvider`;
+  on `OpenAIProvider` it covers Chat Completions and the Responses reroute.
+- The durable worker sends the thread id as `ChatRequest::session_id` on
+  every root-turn request, so Codex, Responses and Chat Completions requests
+  carry a stable per-thread `prompt_cache_key`. The id is part of the measured
+  compaction trigger's request fingerprint: attempts recorded before the
+  upgrade never anchor it, so each existing thread's first check afterwards
+  uses the full-history estimate.
 - Compaction now appends range-addressed lineage entries and rebuilds the
   effective LLM view without deleting committed transcript messages.
 - Auto-compaction prunes artifact-backed and superseded read outputs before

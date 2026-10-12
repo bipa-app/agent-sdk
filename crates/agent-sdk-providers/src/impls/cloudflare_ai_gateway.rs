@@ -252,6 +252,22 @@ impl CloudflareAIGatewayProvider {
         self
     }
 
+    /// Send `prompt_cache_key` through the gateway's `OpenAI` route, which
+    /// passes it on to `OpenAI`. Off by default; see
+    /// [`OpenAIProvider::with_prompt_cache_key_forwarding`]. The Anthropic and
+    /// Gemini routes have no such field and are unchanged.
+    #[must_use]
+    pub fn with_prompt_cache_key_forwarding(mut self, enabled: bool) -> Self {
+        match &mut self.inner {
+            Inner::OpenAI(p) => {
+                *p = std::mem::replace(p, OpenAIProvider::new(String::new(), String::new()))
+                    .with_prompt_cache_key_forwarding(enabled);
+            }
+            Inner::Anthropic(_) | Inner::Gemini(_) => {}
+        }
+        self
+    }
+
     /// Set the provider-owned thinking configuration.
     #[must_use]
     pub fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
@@ -522,6 +538,26 @@ mod tests {
         let p = CloudflareAIGatewayProvider::anthropic_sonnet("t", "a", "g");
         let cloned = p.clone();
         assert_eq!(p.model(), cloned.model());
+    }
+
+    #[test]
+    fn openai_route_forwards_prompt_cache_key_only_when_opted_in() -> anyhow::Result<()> {
+        let route = |forwarding| {
+            CloudflareAIGatewayProvider::openai_gpt54("cf-tok", "acct", "gw")
+                .with_prompt_cache_key_forwarding(forwarding)
+        };
+        let key_sent = |provider: CloudflareAIGatewayProvider| match provider.inner {
+            Inner::OpenAI(openai) => Ok(openai
+                .prompt_cache_key(Some("thread-42"))
+                .map(std::borrow::Cow::into_owned)),
+            Inner::Anthropic(_) | Inner::Gemini(_) => {
+                anyhow::bail!("the OpenAI constructor must build the OpenAI route")
+            }
+        };
+
+        assert_eq!(key_sent(route(false))?, None);
+        assert_eq!(key_sent(route(true))?, Some("thread-42".to_owned()));
+        Ok(())
     }
 
     #[test]

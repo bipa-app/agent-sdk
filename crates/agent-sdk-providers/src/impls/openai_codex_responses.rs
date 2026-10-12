@@ -13,7 +13,7 @@ use crate::streaming::{
 #[cfg(test)]
 use agent_sdk_foundation::llm::ChatResponse;
 use agent_sdk_foundation::llm::{
-    ChatOutcome, ChatRequest, Content, ContentBlock, Effort, ImageDetail, ResponseFormat,
+    ChatOutcome, ChatRequest, Content, ContentBlock, Effort, ImageDetail, ResponseFormat, Role,
     SpeedTier, StopReason, ThinkingConfig, ThinkingDisplay, ThinkingMode, ToolChoice, Usage,
 };
 use anyhow::{Context, Result};
@@ -56,8 +56,8 @@ const MAX_WEBSOCKET_SESSIONS: usize = 512;
 const OPENAI_CODEX_DISABLE_WEBSOCKETS_ENV: &str = "OPENAI_CODEX_DISABLE_WEBSOCKETS";
 
 /// Interpret a raw environment-variable value as a boolean. Absent or
-/// unrecognized values are treated as `false` so the default (WebSocket-first)
-/// behavior is preserved. Split out from the env read so the truthiness logic is
+/// unrecognized values are treated as `false`, leaving the configured
+/// [`CodexTransport`] in charge. Split out from the env read so the truthiness logic is
 /// unit-testable without mutating the process environment (`std::env::set_var`
 /// is `unsafe`, which `#![forbid(unsafe_code)]` rejects even in tests).
 fn parse_disable_websockets_value(value: Option<&str>) -> bool {
@@ -122,6 +122,21 @@ pub enum ReasoningEffort {
     Max,
 }
 
+/// Wire transport for Codex turns.
+///
+/// Prompt-cache affinity (`prompt_cache_key` and the `session_id` header) is
+/// derived from [`ChatRequest::session_id`] on both transports.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CodexTransport {
+    /// One HTTP SSE request per turn.
+    #[default]
+    HttpSse,
+    /// A persistent WebSocket per [`ChatRequest::session_id`] that sends
+    /// incremental input and falls back to HTTP SSE when the socket cannot
+    /// complete the turn. Requests without a session id use HTTP SSE.
+    WebSocket,
+}
+
 /// `OpenAI` Codex / `ChatGPT` subscription provider.
 ///
 /// This provider uses the `ChatGPT` Codex backend (`/backend-api/codex/responses`)
@@ -135,8 +150,9 @@ pub struct OpenAICodexResponsesProvider {
     thinking: Option<ThinkingConfig>,
     account_id: Option<String>,
     websocket_sessions: Arc<Mutex<HashMap<String, Arc<Mutex<WebsocketSessionState>>>>>,
-    /// Hard opt-out: when set, the WebSocket transport is never attempted and
-    /// every turn goes straight to HTTP. Sourced from
+    transport: CodexTransport,
+    /// Hard opt-out that overrides [`CodexTransport::WebSocket`]: every turn
+    /// goes straight to HTTP. Sourced from
     /// [`with_websockets_disabled`](Self::with_websockets_disabled) or the
     /// [`OPENAI_CODEX_DISABLE_WEBSOCKETS_ENV`] environment variable.
     websockets_disabled: bool,
@@ -175,6 +191,41 @@ struct WebsocketSessionState {
     last_used: Option<Instant>,
 }
 
+impl WebsocketSessionState {
+    /// The `x-codex-turn-state` sticky-routing token belongs to one user turn
+    /// and must not be carried into the next. Only the caller knows where a
+    /// turn starts, so the token is replayed only on requests whose last
+    /// message carries tool results: a turn's tool-result follow-ups and their
+    /// retries. Every other request starts without it, including a retry of a
+    /// turn's opening request and a plain user message appended mid-turn.
+    fn begin_request(&mut self, request: &ChatRequest) {
+        self.last_used = Some(Instant::now());
+        if !continues_user_turn(request) {
+            self.turn_state = None;
+        }
+    }
+
+    fn record_turn_state(&mut self, turn_state: String) {
+        self.last_used = Some(Instant::now());
+        self.turn_state.get_or_insert(turn_state);
+    }
+}
+
+fn continues_user_turn(request: &ChatRequest) -> bool {
+    request
+        .messages
+        .last()
+        .is_some_and(|message| match message.role {
+            Role::User => match &message.content {
+                Content::Blocks(blocks) => blocks
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolResult { .. })),
+                Content::Text(_) => false,
+            },
+            Role::Assistant => false,
+        })
+}
+
 impl OpenAICodexResponsesProvider {
     /// Create a new `OpenAI` Codex provider.
     #[must_use]
@@ -187,6 +238,7 @@ impl OpenAICodexResponsesProvider {
             thinking: None,
             account_id: None,
             websocket_sessions: Arc::new(Mutex::new(HashMap::new())),
+            transport: CodexTransport::default(),
             websockets_disabled: websockets_disabled_from_env(),
             websockets_unhealthy: Arc::new(AtomicBool::new(false)),
         }
@@ -203,6 +255,7 @@ impl OpenAICodexResponsesProvider {
             thinking: None,
             account_id: None,
             websocket_sessions: Arc::new(Mutex::new(HashMap::new())),
+            transport: CodexTransport::default(),
             websockets_disabled: websockets_disabled_from_env(),
             websockets_unhealthy: Arc::new(AtomicBool::new(false)),
         }
@@ -246,10 +299,18 @@ impl OpenAICodexResponsesProvider {
         self.with_thinking(ThinkingConfig::default().with_effort(map_reasoning_effort(effort)))
     }
 
-    /// Force the HTTP transport, skipping the WebSocket path entirely.
+    /// Select the wire transport. Defaults to [`CodexTransport::HttpSse`].
+    #[must_use]
+    pub const fn with_transport(mut self, transport: CodexTransport) -> Self {
+        self.transport = transport;
+        self
+    }
+
+    /// Force the HTTP transport even when [`CodexTransport::WebSocket`] is
+    /// selected.
     ///
     /// In a WebSocket-hostile environment (a corporate proxy / firewall that
-    /// black-holes the `wss` upgrade) the WebSocket-first transport stalls for
+    /// black-holes the `wss` upgrade) the WebSocket transport stalls for
     /// up to the connect + warmup timeout budget on every fresh session before
     /// falling back to HTTP. An operator who knows their network cannot do
     /// `wss` can set this to skip the penalty entirely. The
@@ -261,11 +322,16 @@ impl OpenAICodexResponsesProvider {
         self
     }
 
-    /// Whether the WebSocket transport should be skipped for this turn: either
-    /// it was hard-disabled (builder / env) or a prior session in this process
-    /// already proved the environment cannot complete the `wss` transport.
+    /// Whether the WebSocket transport should be skipped for this turn: it was
+    /// not selected, it was hard-disabled (builder / env), or a prior session
+    /// in this process already proved the environment cannot complete `wss`.
     fn skip_websocket(&self) -> bool {
-        self.websockets_disabled || self.websockets_unhealthy.load(Ordering::Relaxed)
+        match self.transport {
+            CodexTransport::HttpSse => true,
+            CodexTransport::WebSocket => {
+                self.websockets_disabled || self.websockets_unhealthy.load(Ordering::Relaxed)
+            }
+        }
     }
 
     /// The `ChatGPT`-backend Codex Responses contract does not accept
@@ -375,6 +441,19 @@ impl OpenAICodexResponsesProvider {
             .entry(session_id.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(WebsocketSessionState::default())))
             .clone()
+    }
+
+    async fn http_turn_state(&self, request: &ChatRequest) -> Option<String> {
+        let session_id = request.session_id.as_deref()?;
+        let session = self
+            .websocket_sessions
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()?;
+        let mut state = session.lock().await;
+        state.begin_request(request);
+        state.turn_state.clone()
     }
 
     async fn connect_websocket(
@@ -547,13 +626,13 @@ impl LlmProvider for OpenAICodexResponsesProvider {
 
             log::debug!("OpenAI Codex streaming request model={} max_tokens={}", self.model, request.max_tokens);
 
-            let mut sse_turn_state: Option<String> = None;
+            let sse_turn_state: Option<String>;
 
-            // Skip the WebSocket transport entirely when it is hard-disabled
-            // (builder / env) or a prior session already proved this environment
-            // cannot complete the `wss` transport. The turn falls through to the
-            // HTTP request path below without paying any WebSocket connect /
-            // warmup timeout penalty.
+            // Skip the WebSocket transport entirely when it was not selected, is
+            // hard-disabled (builder / env), or a prior session already proved
+            // this environment cannot complete the `wss` transport. The turn
+            // falls through to the HTTP request path below without paying any
+            // WebSocket connect / warmup timeout penalty.
             if let Some(session_id) = request.session_id.as_deref().filter(|_| !self.skip_websocket()) {
                 let session = self.websocket_session(session_id).await;
                 let mut websocket_session = session.lock().await;
@@ -583,7 +662,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                     websocket_session.last_response_items.clear();
                 }
                 websocket_session.in_flight = true;
-                websocket_session.last_used = Some(Instant::now());
+                websocket_session.begin_request(&request);
 
                 if !websocket_session.websocket_disabled {
                     'websocket_attempts: for attempt in 0..2 {
@@ -598,7 +677,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                 Ok((connection, turn_state)) => {
                                     websocket_session.connection = Some(connection);
                                     if let Some(turn_state) = turn_state {
-                                        websocket_session.turn_state = Some(turn_state);
+                                        websocket_session.record_turn_state(turn_state);
                                     }
                                     websocket_session.prewarmed = false;
                                 }
@@ -1585,6 +1664,8 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                 websocket_session.in_flight = false;
                 sse_turn_state = websocket_session.turn_state.clone();
                 drop(websocket_session);
+            } else {
+                sse_turn_state = self.http_turn_state(&request).await;
             }
 
             let headers = match self.build_headers(
@@ -1646,8 +1727,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                     .map(ToOwned::to_owned);
                 if let Some(turn_state) = turn_state {
                     let session = self.websocket_session(session_id).await;
-                    let mut websocket_session = session.lock().await;
-                    websocket_session.turn_state = Some(turn_state);
+                    session.lock().await.record_turn_state(turn_state);
                 }
             }
 
@@ -5354,6 +5434,283 @@ mod tests {
         Ok(())
     }
 
+    fn tool_followup_request(session_id: &str) -> ChatRequest {
+        ChatRequest::new(
+            "You are helpful.",
+            vec![
+                Message::user("hello"),
+                Message::assistant_with_tool_use(None, "call_1", "read", serde_json::json!({})),
+                Message::tool_result("call_1", "contents", false),
+            ],
+        )
+        .with_max_tokens(1024)
+        .with_session_id(session_id)
+    }
+
+    fn next_user_turn_request(session_id: &str) -> ChatRequest {
+        let mut request = tool_followup_request(session_id);
+        request.messages.push(Message::assistant("done"));
+        request.messages.push(Message::user("and now?"));
+        request
+    }
+
+    async fn http_turn_states_sent(
+        requests: Vec<ChatRequest>,
+    ) -> anyhow::Result<Vec<Option<String>>> {
+        let server = wiremock::MockServer::start().await;
+        let sse_with_turn_state = |turn_state: &str| {
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .insert_header(OPENAI_CODEX_TURN_STATE_HEADER, turn_state)
+                .set_body_string(HTTP_SSE_BODY)
+        };
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/backend-api/codex/responses"))
+            .and(wiremock::matchers::header_exists(
+                OPENAI_CODEX_TURN_STATE_HEADER,
+            ))
+            .respond_with(sse_with_turn_state("sticky-rotated"))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/backend-api/codex/responses"))
+            .respond_with(sse_with_turn_state("sticky-abc"))
+            .mount(&server)
+            .await;
+        let provider = OpenAICodexResponsesProvider::with_base_url(
+            oauth_token(),
+            MODEL_GPT53_CODEX.to_owned(),
+            format!("{}/backend-api", server.uri()),
+        );
+
+        for request in requests {
+            let outcome = provider.chat(request).await?;
+            anyhow::ensure!(
+                matches!(outcome, ChatOutcome::Success(_)),
+                "turn did not complete: {outcome:?}"
+            );
+        }
+
+        let received = server
+            .received_requests()
+            .await
+            .context("mock server did not record requests")?;
+        Ok(received
+            .iter()
+            .map(|request| {
+                request
+                    .headers
+                    .get(OPENAI_CODEX_TURN_STATE_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToOwned::to_owned)
+            })
+            .collect())
+    }
+
+    #[tokio::test]
+    async fn http_turn_state_is_replayed_within_a_turn_and_reset_for_the_next() -> anyhow::Result<()>
+    {
+        let sticky = Some("sticky-abc".to_owned());
+        assert_eq!(
+            http_turn_states_sent(vec![
+                streaming_request("thread-a"),
+                tool_followup_request("thread-a"),
+                tool_followup_request("thread-a"),
+                tool_followup_request("thread-b"),
+                next_user_turn_request("thread-a"),
+            ])
+            .await?,
+            vec![None, sticky.clone(), sticky, None, None],
+            "thread-a's tool follow-ups replay the turn's first token, thread-b never \
+             sees it, and thread-a's next user turn starts without it"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_turn_state_is_not_replayed_when_the_request_ends_in_plain_user_text()
+    -> anyhow::Result<()> {
+        assert_eq!(
+            http_turn_states_sent(vec![
+                streaming_request("thread-retry"),
+                streaming_request("thread-retry"),
+            ])
+            .await?,
+            vec![None, None],
+            "a retried opening request looks like a new turn, so it starts without the token"
+        );
+
+        let mut reminder = tool_followup_request("thread-reminder");
+        reminder.messages.push(Message::user("Two turns left."));
+        assert_eq!(
+            http_turn_states_sent(vec![
+                streaming_request("thread-reminder"),
+                tool_followup_request("thread-reminder"),
+                reminder,
+            ])
+            .await?,
+            vec![None, Some("sticky-abc".to_owned()), None],
+            "a plain user message after tool results looks like a new turn's prompt"
+        );
+        Ok(())
+    }
+
+    struct WsTurnStateServer {
+        base_url: String,
+        handshake_turn_states: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        http_requests: Arc<AtomicUsize>,
+    }
+
+    struct RecordHandshakeTurnState(Arc<std::sync::Mutex<Vec<Option<String>>>>);
+
+    impl tokio_tungstenite::tungstenite::handshake::server::Callback for RecordHandshakeTurnState {
+        fn on_request(
+            self,
+            request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+            mut response: tokio_tungstenite::tungstenite::handshake::server::Response,
+        ) -> std::result::Result<
+            tokio_tungstenite::tungstenite::handshake::server::Response,
+            tokio_tungstenite::tungstenite::handshake::server::ErrorResponse,
+        > {
+            let Ok(mut seen) = self.0.lock() else {
+                return Ok(response);
+            };
+            seen.push(
+                request
+                    .headers()
+                    .get(OPENAI_CODEX_TURN_STATE_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToOwned::to_owned),
+            );
+            if let Ok(token) = format!("ws-sticky-{}", seen.len()).parse() {
+                response
+                    .headers_mut()
+                    .insert(OPENAI_CODEX_TURN_STATE_HEADER, token);
+            }
+            Ok(response)
+        }
+    }
+
+    /// Answers every WebSocket handshake with a fresh `x-codex-turn-state`
+    /// (`ws-sticky-1`, `ws-sticky-2`, ...) and records the token the client
+    /// sent. Each real request completes and then the server closes the
+    /// socket, so the client's next request reconnects with a new handshake.
+    async fn spawn_ws_turn_state_server() -> anyhow::Result<WsTurnStateServer> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let handshake_turn_states = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let http_requests = Arc::new(AtomicUsize::new(0));
+        let handshakes_task = handshake_turn_states.clone();
+        let http_requests_task = http_requests.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let handshakes = handshakes_task.clone();
+                let http_requests = http_requests_task.clone();
+                tokio::spawn(async move {
+                    let mut peek = [0u8; 1024];
+                    let Ok(n) = stream.peek(&mut peek).await else {
+                        return;
+                    };
+                    let head = String::from_utf8_lossy(&peek[..n]).to_ascii_lowercase();
+                    if !head.contains("upgrade: websocket") {
+                        http_requests.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(
+                        stream,
+                        RecordHandshakeTurnState(handshakes),
+                    )
+                    .await
+                    else {
+                        return;
+                    };
+                    let completed = |id: &str| {
+                        WebSocketMessage::Text(
+                            format!(
+                                r#"{{"type":"response.completed","response":{{"id":"{id}"}}}}"#
+                            )
+                            .into(),
+                        )
+                    };
+                    while let Some(Ok(message)) = ws.next().await {
+                        let WebSocketMessage::Text(text) = message else {
+                            continue;
+                        };
+                        let Ok(body) = serde_json::from_str::<serde_json::Value>(&text) else {
+                            return;
+                        };
+                        if body["generate"] == serde_json::json!(false) {
+                            let _ = ws.send(completed("resp_warmup")).await;
+                            continue;
+                        }
+                        let delta = r#"{"type":"response.output_text.delta","delta":"hi"}"#;
+                        let _ = ws.send(WebSocketMessage::Text(delta.into())).await;
+                        let _ = ws.send(completed("resp_turn")).await;
+                        let _ = ws.send(WebSocketMessage::Close(None)).await;
+                    }
+                });
+            }
+        });
+
+        Ok(WsTurnStateServer {
+            base_url: format!("http://{addr}/backend-api"),
+            handshake_turn_states,
+            http_requests,
+        })
+    }
+
+    #[tokio::test]
+    async fn websocket_turn_state_is_replayed_within_a_turn_and_reset_for_the_next()
+    -> anyhow::Result<()> {
+        let server = spawn_ws_turn_state_server().await?;
+        let provider = OpenAICodexResponsesProvider::with_base_url(
+            oauth_token(),
+            MODEL_GPT53_CODEX.to_owned(),
+            server.base_url.clone(),
+        )
+        .with_transport(CodexTransport::WebSocket);
+
+        for request in [
+            streaming_request("thread-ws"),
+            tool_followup_request("thread-ws"),
+            tool_followup_request("thread-ws"),
+            next_user_turn_request("thread-ws"),
+        ] {
+            anyhow::ensure!(
+                drain_ok(&provider, request).await,
+                "the turn did not complete over the websocket"
+            );
+        }
+
+        assert!(
+            !provider.websockets_unhealthy.load(Ordering::Relaxed),
+            "every turn must complete on the websocket transport"
+        );
+        assert_eq!(server.http_requests.load(Ordering::Relaxed), 0);
+        let handshake_turn_states = server
+            .handshake_turn_states
+            .lock()
+            .map_err(|_| anyhow::anyhow!("handshake log lock poisoned"))?
+            .clone();
+        assert_eq!(
+            handshake_turn_states,
+            vec![
+                None,
+                Some("ws-sticky-1".to_owned()),
+                Some("ws-sticky-1".to_owned()),
+                None,
+            ],
+            "reconnects within a turn keep the turn's first token, and the next user \
+             turn reconnects without it"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn http_chat_429_reads_the_structured_reset_body() -> anyhow::Result<()> {
         // The collected streaming chat() path: no Retry-After header, a
@@ -5437,6 +5794,7 @@ mod tests {
             MODEL_GPT53_CODEX.to_string(),
             base_url,
         )
+        .with_transport(CodexTransport::WebSocket)
         .with_websockets_disabled(true);
 
         assert!(drain_ok(&provider, streaming_request("session-a")).await);
@@ -5751,6 +6109,7 @@ mod tests {
             MODEL_GPT53_CODEX.to_string(),
             base_url,
         )
+        .with_transport(CodexTransport::WebSocket)
         .with_websockets_disabled(disabled);
 
         assert!(drain_ok(&provider, streaming_request("session-env")).await);
@@ -5793,7 +6152,8 @@ mod tests {
             oauth_token(),
             MODEL_GPT53_CODEX.to_string(),
             base_url,
-        );
+        )
+        .with_transport(CodexTransport::WebSocket);
 
         // Simulate a prior session having latched the provider-level transport
         // signal after a connectivity failure.
@@ -5873,7 +6233,8 @@ mod tests {
             oauth_token(),
             MODEL_GPT53_CODEX.to_string(),
             base_url,
-        );
+        )
+        .with_transport(CodexTransport::WebSocket);
 
         // The websocket warmup hits a wrapped 401, disables the session's
         // websocket, and falls back to HTTP — which completes cleanly.
@@ -5892,5 +6253,107 @@ mod tests {
         assert!(session.lock().await.websocket_disabled);
 
         assert!(http_requests.load(Ordering::Relaxed) >= 1);
+    }
+
+    #[tokio::test]
+    async fn session_requests_carry_cache_affinity_over_http_by_default() -> anyhow::Result<()> {
+        let thread_a = "0b4e88a4-6f1c-4c55-9d2a-51c0e4a7f3b9";
+        let thread_b = "5d0f7a3e-2c41-4f8e-9a6b-3e1d7c9b2a40";
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/backend-api/codex/responses"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(HTTP_SSE_BODY),
+            )
+            .mount(&server)
+            .await;
+        let provider = OpenAICodexResponsesProvider::with_base_url(
+            oauth_token(),
+            MODEL_GPT53_CODEX.to_owned(),
+            format!("{}/backend-api", server.uri()),
+        );
+
+        for session_id in [thread_a, thread_a, thread_b] {
+            anyhow::ensure!(
+                drain_ok(&provider, streaming_request(session_id)).await,
+                "the turn for {session_id} did not complete cleanly"
+            );
+        }
+
+        let received = server
+            .received_requests()
+            .await
+            .context("mock server did not record requests")?;
+        let mut affinity = Vec::new();
+        for sent in &received {
+            anyhow::ensure!(
+                sent.method == wiremock::http::Method::POST,
+                "only HTTP SSE POSTs may reach the backend by default, got {} {}",
+                sent.method,
+                sent.url
+            );
+            let body: serde_json::Value = serde_json::from_slice(&sent.body)?;
+            let header = |name: &str| {
+                sent.headers
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToOwned::to_owned)
+            };
+            affinity.push((
+                body["prompt_cache_key"].as_str().map(ToOwned::to_owned),
+                header("session_id"),
+                header("x-client-request-id"),
+            ));
+        }
+        let expected = |id: &str| {
+            (
+                Some(id.to_owned()),
+                Some(id.to_owned()),
+                Some(id.to_owned()),
+            )
+        };
+        assert_eq!(
+            affinity,
+            vec![expected(thread_a), expected(thread_a), expected(thread_b)]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn websocket_transport_is_an_explicit_opt_in() {
+        let (base_url, ws_attempts, http_requests) = spawn_http_only_server().await;
+        let default_provider = OpenAICodexResponsesProvider::with_base_url(
+            oauth_token(),
+            MODEL_GPT53_CODEX.to_string(),
+            base_url.clone(),
+        );
+
+        assert!(drain_ok(&default_provider, streaming_request("default-session")).await);
+        assert_eq!(
+            ws_attempts.load(Ordering::Relaxed),
+            0,
+            "a session id alone must not open a websocket",
+        );
+        assert_eq!(http_requests.load(Ordering::Relaxed), 1);
+
+        let opted_in = OpenAICodexResponsesProvider::with_base_url(
+            oauth_token(),
+            MODEL_GPT53_CODEX.to_string(),
+            base_url,
+        )
+        .with_transport(CodexTransport::WebSocket);
+
+        assert!(drain_ok(&opted_in, streaming_request("opted-in-session")).await);
+        assert!(
+            ws_attempts.load(Ordering::Relaxed) >= 1,
+            "the websocket opt-in must attempt the upgrade",
+        );
+        assert_eq!(
+            http_requests.load(Ordering::Relaxed),
+            2,
+            "the refused upgrade falls back to HTTP SSE",
+        );
     }
 }

@@ -53,7 +53,9 @@ anthropic = []
 # is source-breaking for `run_structured` callers.
 structured-output = ["dep:jsonschema"]
 openai = []
-# The Codex / ChatGPT provider speaks WebSocket; gate the transport dep here.
+# The Codex / ChatGPT provider streams over HTTP SSE by default; its WebSocket
+# transport is opt-in via `with_transport(CodexTransport::WebSocket)` and needs
+# the dep gated here.
 openai-codex = ["dep:tokio-tungstenite", "tokio/net"]
 gemini = []
 # The Vertex provider reuses the Anthropic model constants and the Gemini
