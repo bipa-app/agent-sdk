@@ -122,10 +122,12 @@ pub struct CompactionConfig {
     /// (unknown model, or a provider whose route is not stable per request),
     /// `threshold_tokens` applies unchanged.
     ///
-    /// With this flag on, the worker also caps each request's `max_tokens`
-    /// at that quarter of the serving window plus any thinking budget the
-    /// request carries, so output never claims the prompt's share. Off, only
-    /// the model's registered `max_output_tokens` caps it.
+    /// While this threshold drives automatic compaction (`auto_compact` on
+    /// and a compaction provider wired), the worker also caps each
+    /// request's `max_tokens` at a quarter of the same window plus the
+    /// reasoning the request carries: its thinking budget, or another
+    /// quarter for adaptive or effort-only thinking. Otherwise only the
+    /// model's registered `max_output_tokens` caps it.
     /// Default: false
     #[serde(default)]
     pub model_aware_threshold: bool,

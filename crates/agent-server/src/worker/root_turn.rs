@@ -205,6 +205,14 @@ impl RootTurnDeps<'_> {
         self.cancel.is_some_and(CancellationToken::is_cancelled)
     }
 
+    /// See [`super::compaction::model_aware_trigger`].
+    pub(crate) fn model_aware_trigger(&self) -> Option<super::compaction::ModelAwareTrigger<'_>> {
+        super::compaction::model_aware_trigger(
+            self.compaction_config,
+            self.compaction_provider.is_some(),
+        )
+    }
+
     /// Nudge every parked worker that a batch of children just became
     /// runnable. No-op when no [`WakeupSignal`] is wired.
     ///
@@ -1758,7 +1766,7 @@ async fn run_boundary_injection_call(
     let chat_request = build_chat_request(
         definition,
         provider,
-        deps.compaction_config,
+        deps.model_aware_trigger(),
         &inputs.staged_stores.messages,
         thread_id,
         &resume_input,
@@ -2035,7 +2043,7 @@ async fn execute_root_turn_inner(
     let chat_request = build_chat_request(
         definition,
         provider,
-        deps.compaction_config,
+        deps.model_aware_trigger(),
         &inputs.staged_stores.messages,
         thread_id,
         &user_input,
@@ -3028,7 +3036,7 @@ async fn prepare_pre_call_compaction(
     let expected_request = build_request_envelope(
         definition,
         provider,
-        deps.compaction_config,
+        deps.model_aware_trigger(),
         thread_id,
         inputs.bootstrap.task.caller_metadata.as_ref(),
     );
@@ -3189,7 +3197,7 @@ async fn assemble_provider_request_messages(
 fn build_request_envelope(
     definition: &AgentDefinition,
     provider: &dyn LlmProvider,
-    compaction_config: Option<&agent_sdk::context::CompactionConfig>,
+    model_aware_trigger: Option<super::compaction::ModelAwareTrigger<'_>>,
     thread_id: &agent_sdk_foundation::ThreadId,
     caller_metadata: Option<&serde_json::Value>,
 ) -> ChatRequest {
@@ -3208,11 +3216,13 @@ fn build_request_envelope(
         Some(display) => cfg.with_display(display),
         None => cfg,
     });
+    let capabilities = super::compaction::serving_capabilities(provider);
     let max_tokens = super::compaction::serving_max_tokens(
         definition.max_tokens,
-        super::compaction::serving_capabilities(provider),
+        capabilities,
         super::compaction::OutputSizing::for_request(
-            compaction_config,
+            model_aware_trigger,
+            capabilities,
             thinking.as_ref().or_else(|| provider.configured_thinking()),
         ),
     );
@@ -3245,7 +3255,7 @@ fn build_request_envelope(
 async fn build_chat_request(
     definition: &AgentDefinition,
     provider: &dyn LlmProvider,
-    compaction_config: Option<&agent_sdk::context::CompactionConfig>,
+    model_aware_trigger: Option<super::compaction::ModelAwareTrigger<'_>>,
     staged_messages: &crate::journal::staged::StagedMessageStore,
     thread_id: &agent_sdk_foundation::ThreadId,
     user_input: &super::user_input::UserInput,
@@ -3254,7 +3264,7 @@ async fn build_chat_request(
     let mut request = build_request_envelope(
         definition,
         provider,
-        compaction_config,
+        model_aware_trigger,
         thread_id,
         caller_metadata,
     );
@@ -7774,7 +7784,7 @@ async fn stage_resume_call(
     let chat_request = build_chat_request(
         definition,
         provider,
-        deps.compaction_config,
+        deps.model_aware_trigger(),
         &inputs.staged_stores.messages,
         thread_id,
         &resume_input,
@@ -9568,7 +9578,7 @@ async fn stage_and_call_steering_llm(
     let chat_request = build_chat_request(
         definition,
         provider,
-        deps.compaction_config,
+        deps.model_aware_trigger(),
         &inputs.staged_stores.messages,
         thread_id,
         &resume_input,
@@ -9925,6 +9935,12 @@ mod tests {
         agent_sdk::context::CompactionConfig::default().with_model_aware_threshold(true)
     }
 
+    fn trigger(
+        cfg: &agent_sdk::context::CompactionConfig,
+    ) -> Option<super::super::compaction::ModelAwareTrigger<'_>> {
+        super::super::compaction::model_aware_trigger(Some(cfg), true)
+    }
+
     fn tool_round_history() -> Vec<llm::Message> {
         vec![
             llm::Message::user("plan the migration"),
@@ -10087,11 +10103,11 @@ mod tests {
         let cfg = model_aware();
 
         let trigger_envelope =
-            build_request_envelope(&definition, &glm, Some(&cfg), &thread_id, None);
+            build_request_envelope(&definition, &glm, trigger(&cfg), &thread_id, None);
         let dispatched = build_chat_request(
             &definition,
             &glm,
-            Some(&cfg),
+            trigger(&cfg),
             &staged,
             &thread_id,
             &input,
@@ -10117,14 +10133,14 @@ mod tests {
 
         let fable = agent_sdk_providers::AnthropicProvider::new("key", "claude-fable-5-1");
         assert_eq!(
-            build_request_envelope(&definition, &fable, Some(&cfg), &thread_id, None).max_tokens,
+            build_request_envelope(&definition, &fable, trigger(&cfg), &thread_id, None).max_tokens,
             128_000,
         );
         assert_eq!(
             build_request_envelope(
                 &definition,
                 &uncapped_provider(),
-                Some(&cfg),
+                trigger(&cfg),
                 &thread_id,
                 None
             )
@@ -10146,7 +10162,7 @@ mod tests {
             max_tokens,
             ..context_definition(None)
         };
-        for cfg in [None, Some(&fixed)] {
+        for cfg in [None, trigger(&fixed)] {
             assert_eq!(
                 build_request_envelope(&requesting(128_000), &glm, cfg, &thread_id, None)
                     .max_tokens,
@@ -10167,12 +10183,40 @@ mod tests {
             build_request_envelope(
                 &requesting(128_000),
                 &glm,
-                Some(&model_aware()),
+                trigger(&model_aware()),
                 &thread_id,
                 None
             )
             .max_tokens,
             202_752 / 4,
+        );
+    }
+
+    #[test]
+    fn envelope_shares_the_overridden_window() {
+        let thread_id = agent_sdk_foundation::ThreadId::from_string("thread_output_budget");
+        let opus = agent_sdk_providers::AnthropicProvider::new("key", "claude-opus-5-5");
+        let cfg = model_aware().with_model_context_window_tokens(200_000);
+        let plain = AgentDefinition {
+            max_tokens: 128_000,
+            ..context_definition(None)
+        };
+        let adaptive = AgentDefinition {
+            thinking: ThinkingPolicy::Adaptive { effort: None },
+            ..plain.clone()
+        };
+        assert_eq!(
+            build_request_envelope(&plain, &opus, trigger(&cfg), &thread_id, None).max_tokens,
+            50_000,
+        );
+        assert_eq!(
+            build_request_envelope(&adaptive, &opus, trigger(&cfg), &thread_id, None).max_tokens,
+            100_000,
+        );
+        assert_eq!(
+            build_request_envelope(&adaptive, &opus, trigger(&model_aware()), &thread_id, None)
+                .max_tokens,
+            128_000,
         );
     }
 
@@ -10188,12 +10232,12 @@ mod tests {
             ..context_definition(None)
         };
         assert_eq!(
-            build_request_envelope(&budgeted(55_000), &sonnet, Some(&cfg), &thread_id, None)
+            build_request_envelope(&budgeted(55_000), &sonnet, trigger(&cfg), &thread_id, None)
                 .max_tokens,
             64_000,
         );
         assert_eq!(
-            build_request_envelope(&budgeted(10_000), &sonnet, Some(&cfg), &thread_id, None)
+            build_request_envelope(&budgeted(10_000), &sonnet, trigger(&cfg), &thread_id, None)
                 .max_tokens,
             60_000,
         );
@@ -10202,7 +10246,8 @@ mod tests {
             ..budgeted(55_000)
         };
         assert_eq!(
-            build_request_envelope(&unbudgeted, &sonnet, Some(&cfg), &thread_id, None).max_tokens,
+            build_request_envelope(&unbudgeted, &sonnet, trigger(&cfg), &thread_id, None)
+                .max_tokens,
             50_000,
         );
     }
@@ -10233,7 +10278,7 @@ mod tests {
         let request = build_chat_request(
             &definition,
             &sonnet,
-            Some(&model_aware()),
+            trigger(&model_aware()),
             &staged,
             &thread_id,
             &super::super::user_input::UserInput::text("next step"),
@@ -10278,13 +10323,14 @@ mod tests {
         let cfg = model_aware();
 
         assert_eq!(
-            build_request_envelope(&definition, &refreshing, Some(&cfg), &thread_id, None)
+            build_request_envelope(&definition, &refreshing, trigger(&cfg), &thread_id, None)
                 .max_tokens,
             202_752 / 4,
         );
         assert_eq!(failover.model(), "z-ai/glm-5.1");
         assert_eq!(
-            build_request_envelope(&definition, &failover, Some(&cfg), &thread_id, None).max_tokens,
+            build_request_envelope(&definition, &failover, trigger(&cfg), &thread_id, None)
+                .max_tokens,
             128_000,
             "a failover chain may be served by a model its representative row \
              does not describe",

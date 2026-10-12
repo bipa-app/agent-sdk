@@ -2671,10 +2671,19 @@ async fn small_window_worker_under_a_large_root_budget_skips_premature_compactio
 async fn worker_without_a_model_aware_threshold_requests_up_to_the_model_max() -> Result<()> {
     let fixtures = Fixtures::new();
     let fixed = CompactionConfig::default();
+    let model_aware = CompactionConfig::default().with_model_aware_threshold(true);
+    let manual = CompactionConfig::default()
+        .with_model_aware_threshold(true)
+        .with_auto_compact(false);
     let summarizer: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider::new(Vec::new()));
     let deps_variants = [
         fixtures.deps_without_compaction(),
         fixtures.deps_with_compaction(&fixed, &summarizer),
+        fixtures.deps_with_compaction(&manual, &summarizer),
+        RootTurnDeps {
+            compaction_config: Some(&model_aware),
+            ..fixtures.deps_without_compaction()
+        },
     ];
     let mut sent = Vec::new();
     for (index, deps) in deps_variants.iter().enumerate() {
@@ -2705,7 +2714,7 @@ async fn worker_without_a_model_aware_threshold_requests_up_to_the_model_max() -
             );
         }
     }
-    assert_eq!(sent, vec![128_000, 131_072, 128_000, 131_072]);
+    assert_eq!(sent, [128_000, 131_072].repeat(deps_variants.len()));
     Ok(())
 }
 

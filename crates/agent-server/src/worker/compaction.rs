@@ -343,35 +343,90 @@ const OUTPUT_WINDOW_SHARE_DIVISOR: u32 = 4;
 /// sets none.
 const MIN_OUTPUT_WINDOW_SHARE_TOKENS: u32 = 32_000;
 
+/// Output a request may spend on reasoning on top of its visible share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReasoningAllowance {
+    /// The request configures no reasoning.
+    None,
+    /// An explicit thinking budget.
+    Budget(u32),
+    /// Reasoning sized by effort or by the model, which may take as much as
+    /// the visible share.
+    Unbudgeted,
+}
+
 /// How [`serving_max_tokens`] bounds a host's output budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OutputSizing {
     /// Only the model's registered `max_output_tokens`.
     ModelMax,
-    /// Also the visible-output window share, with the request's thinking
-    /// budget on top of it.
-    WindowShare { thinking_budget: Option<u32> },
+    /// Also the visible-output share of `window`, plus the reasoning
+    /// allowance.
+    WindowShare {
+        window: u32,
+        reasoning: ReasoningAllowance,
+    },
 }
 
 impl OutputSizing {
-    /// The window share only pays off where the compaction threshold follows
-    /// the serving model ([`CompactionConfig::model_aware_threshold`]); a
-    /// fixed threshold gains nothing from a smaller request. `thinking` is
-    /// the configuration the provider will send: the request's, else the
-    /// provider's own.
+    /// The window share only pays off where a model-aware threshold drives
+    /// the pre-call trigger, and it shares the window that threshold uses.
+    /// `thinking` is the configuration the provider will send: the
+    /// request's, else the provider's own.
     pub(crate) fn for_request(
-        cfg: Option<&CompactionConfig>,
+        trigger: Option<ModelAwareTrigger<'_>>,
+        capabilities: Option<&ModelCapabilities>,
         thinking: Option<&ThinkingConfig>,
     ) -> Self {
-        if !cfg.is_some_and(|cfg| cfg.model_aware_threshold) {
+        let Some(window) =
+            trigger.and_then(|trigger| effective_window_tokens(trigger.0, capabilities))
+        else {
             return Self::ModelMax;
+        };
+        let reasoning = match thinking.map(|thinking| &thinking.mode) {
+            None => ReasoningAllowance::None,
+            Some(ThinkingMode::Enabled { budget_tokens }) => {
+                ReasoningAllowance::Budget(*budget_tokens)
+            }
+            Some(ThinkingMode::Adaptive | ThinkingMode::Default) => ReasoningAllowance::Unbudgeted,
+        };
+        Self::WindowShare {
+            window: u32::try_from(window).unwrap_or(u32::MAX),
+            reasoning,
         }
-        let thinking_budget = thinking.and_then(|thinking| match thinking.mode {
-            ThinkingMode::Enabled { budget_tokens } => Some(budget_tokens),
-            ThinkingMode::Adaptive | ThinkingMode::Default => None,
-        });
-        Self::WindowShare { thinking_budget }
     }
+}
+
+/// A compaction config whose model-aware threshold drives the pre-call
+/// trigger; only [`model_aware_trigger`] builds one.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ModelAwareTrigger<'a>(&'a CompactionConfig);
+
+/// `cfg` when its model-aware threshold drives the pre-call trigger:
+/// automatic compaction is on and a compaction provider can run it. The
+/// message-count minimum is not consulted, so a request's size, and with it
+/// the envelope fingerprint, never changes as history grows.
+pub(crate) fn model_aware_trigger(
+    cfg: Option<&CompactionConfig>,
+    has_compaction_provider: bool,
+) -> Option<ModelAwareTrigger<'_>> {
+    cfg.filter(|cfg| has_compaction_provider && cfg.auto_compact && cfg.model_aware_threshold)
+        .map(ModelAwareTrigger)
+}
+
+/// The window the model-aware threshold derives from: the configured
+/// override, else the serving model's registered window.
+fn effective_window_tokens(
+    cfg: &CompactionConfig,
+    capabilities: Option<&ModelCapabilities>,
+) -> Option<usize> {
+    cfg.model_context_window_tokens
+        .or_else(|| {
+            capabilities
+                .and_then(|caps| caps.context_window)
+                .map(saturating_usize)
+        })
+        .filter(|window| *window > 0)
 }
 
 /// Capabilities of the model that will serve the next request. A dynamic
@@ -394,11 +449,11 @@ pub(crate) fn serving_capabilities(
 /// The request is always capped at the model's registered
 /// `max_output_tokens`, above which the provider rejects the call. Under
 /// [`OutputSizing::WindowShare`] it is also capped at a quarter of the
-/// context window, floored at [`MIN_OUTPUT_WINDOW_SHARE_TOKENS`], plus the
-/// thinking budget, because every output token reserved is an input token
-/// the compaction trigger must give up; the budget rides on top so thinking
-/// never eats into the visible share. Unknown models keep the request
-/// unchanged.
+/// window, floored at [`MIN_OUTPUT_WINDOW_SHARE_TOKENS`], plus the
+/// reasoning allowance, because every output token reserved is an input
+/// token the compaction trigger must give up; reasoning rides on top so it
+/// never eats into the visible share. A request with neither bound keeps
+/// its budget.
 pub(crate) fn serving_max_tokens(
     requested: u32,
     capabilities: Option<&ModelCapabilities>,
@@ -409,14 +464,15 @@ pub(crate) fn serving_max_tokens(
         .filter(|tokens| *tokens > 0);
     let window_share = match sizing {
         OutputSizing::ModelMax => None,
-        OutputSizing::WindowShare { thinking_budget } => capabilities
-            .and_then(|caps| caps.context_window)
-            .filter(|window| *window > 0)
-            .map(|window| {
-                (window / OUTPUT_WINDOW_SHARE_DIVISOR)
-                    .max(MIN_OUTPUT_WINDOW_SHARE_TOKENS)
-                    .saturating_add(thinking_budget.unwrap_or(0))
-            }),
+        OutputSizing::WindowShare { window, reasoning } => {
+            let share = (window / OUTPUT_WINDOW_SHARE_DIVISOR).max(MIN_OUTPUT_WINDOW_SHARE_TOKENS);
+            let allowance = match reasoning {
+                ReasoningAllowance::None => 0,
+                ReasoningAllowance::Budget(budget) => budget,
+                ReasoningAllowance::Unbudgeted => share,
+            };
+            Some(share.saturating_add(allowance))
+        }
     };
     [model_max, window_share]
         .into_iter()
@@ -438,14 +494,7 @@ fn effective_threshold_tokens(
     if !cfg.model_aware_threshold {
         return (cfg.threshold_tokens, "fixed");
     }
-    let row_window = capabilities
-        .and_then(|caps| caps.context_window)
-        .map(saturating_usize);
-    let Some(window) = cfg
-        .model_context_window_tokens
-        .or(row_window)
-        .filter(|window| *window > 0)
-    else {
+    let Some(window) = effective_window_tokens(cfg, capabilities) else {
         return (cfg.threshold_tokens, "fixed_unknown_model");
     };
     let row_max_output = capabilities
@@ -455,7 +504,8 @@ fn effective_threshold_tokens(
                 tokens,
                 capabilities,
                 OutputSizing::WindowShare {
-                    thinking_budget: None,
+                    window: u32::try_from(window).unwrap_or(u32::MAX),
+                    reasoning: ReasoningAllowance::None,
                 },
             ))
         });
@@ -1177,8 +1227,11 @@ mod tests {
             registered("anthropic", "claude-fable-5"),
             FABLE_REQUESTED_MAX_TOKENS,
         );
-        assert_eq!(threshold, 200_000 - 128_000);
+        assert_eq!(threshold, 200_000 - 200_000 / 4);
         assert_eq!(source, "model_aware");
+        let (threshold, _) =
+            effective_threshold_tokens(&cfg, registered("anthropic", "claude-fable-5"), 128_000);
+        assert_eq!(threshold, 200_000 - 128_000);
     }
 
     #[test]
@@ -1407,14 +1460,45 @@ mod tests {
         provider: &dyn LlmProvider,
         requested: u32,
     ) -> (u32, (usize, &'static str)) {
+        thinking_worker_budget(cfg, provider, requested, None)
+    }
+
+    fn thinking_worker_budget(
+        cfg: &CompactionConfig,
+        provider: &dyn LlmProvider,
+        requested: u32,
+        thinking: Option<&ThinkingConfig>,
+    ) -> (u32, (usize, &'static str)) {
+        let capabilities = serving_capabilities(provider);
         let max_tokens = serving_max_tokens(
             requested,
-            serving_capabilities(provider),
-            OutputSizing::for_request(Some(cfg), None),
+            capabilities,
+            OutputSizing::for_request(model_aware_trigger(Some(cfg), true), capabilities, thinking),
         );
         (
             max_tokens,
             serving_threshold_tokens(cfg, provider, max_tokens),
+        )
+    }
+
+    fn model_aware() -> CompactionConfig {
+        CompactionConfig::default().with_model_aware_threshold(true)
+    }
+
+    /// `max_tokens` for a request under a model-aware trigger.
+    fn sized(
+        requested: u32,
+        capabilities: Option<&ModelCapabilities>,
+        thinking: Option<&ThinkingConfig>,
+    ) -> u32 {
+        serving_max_tokens(
+            requested,
+            capabilities,
+            OutputSizing::for_request(
+                model_aware_trigger(Some(&model_aware()), true),
+                capabilities,
+                thinking,
+            ),
         )
     }
 
@@ -1502,71 +1586,90 @@ mod tests {
         );
     }
 
-    const SHARE: OutputSizing = OutputSizing::WindowShare {
-        thinking_budget: None,
-    };
-
     #[test]
     fn requests_above_the_model_max_output_are_clamped_to_it() {
-        for sizing in [OutputSizing::ModelMax, SHARE] {
-            assert_eq!(
-                serving_max_tokens(200_000, registered("anthropic", "claude-fable-5-1"), sizing),
-                128_000,
-                "{sizing:?}",
-            );
-            assert_eq!(
-                serving_max_tokens(128_000, registered("gemini", "gemini-2.0-flash"), sizing),
-                8_192,
-                "{sizing:?}",
-            );
-        }
+        let fable = registered("anthropic", "claude-fable-5-1");
+        let flash = registered("gemini", "gemini-2.0-flash");
         assert_eq!(
-            serving_max_tokens(
-                200_000,
-                registered("anthropic", "claude-fable-5-1"),
-                OutputSizing::WindowShare {
-                    thinking_budget: Some(150_000),
-                },
-            ),
-            128_000,
+            serving_max_tokens(200_000, fable, OutputSizing::ModelMax),
+            128_000
+        );
+        assert_eq!(sized(200_000, fable, None), 128_000);
+        assert_eq!(
+            serving_max_tokens(128_000, flash, OutputSizing::ModelMax),
+            8_192
+        );
+        assert_eq!(sized(128_000, flash, None), 8_192);
+        assert_eq!(
+            sized(200_000, fable, Some(&ThinkingConfig::new(150_000))),
+            128_000
         );
     }
 
     #[test]
     fn unknown_models_keep_the_requested_output_budget() {
-        for sizing in [OutputSizing::ModelMax, SHARE] {
-            assert_eq!(serving_max_tokens(128_000, None, sizing), 128_000);
-            assert_eq!(
-                serving_max_tokens(128_000, registered("mock", "mock-model"), sizing),
-                128_000,
-            );
-        }
+        assert_eq!(
+            serving_max_tokens(128_000, None, OutputSizing::ModelMax),
+            128_000
+        );
+        assert_eq!(sized(128_000, None, None), 128_000);
+        assert_eq!(
+            sized(128_000, registered("mock", "mock-model"), None),
+            128_000
+        );
     }
 
     #[test]
-    fn window_share_follows_the_model_aware_threshold() {
-        let model_aware = CompactionConfig::default().with_model_aware_threshold(true);
-        let fixed = CompactionConfig::default();
-        let budgeted = ThinkingConfig::new(55_000);
+    fn window_share_needs_a_model_aware_trigger_that_can_run() {
+        let cfg = model_aware();
+        assert!(model_aware_trigger(Some(&cfg), true).is_some());
+        assert!(model_aware_trigger(None, true).is_none());
+        assert!(model_aware_trigger(Some(&CompactionConfig::default()), true).is_none());
+        assert!(
+            model_aware_trigger(Some(&cfg), false).is_none(),
+            "no compaction provider can run the trigger",
+        );
+        assert!(
+            model_aware_trigger(Some(&model_aware().with_auto_compact(false)), true).is_none(),
+            "automatic compaction is off",
+        );
+
+        let sonnet = registered("anthropic", "claude-sonnet-4-5-20250929");
         assert_eq!(
-            OutputSizing::for_request(None, Some(&budgeted)),
+            OutputSizing::for_request(None, sonnet, None),
             OutputSizing::ModelMax,
         );
+        let trigger = model_aware_trigger(Some(&cfg), true);
         assert_eq!(
-            OutputSizing::for_request(Some(&fixed), Some(&budgeted)),
+            OutputSizing::for_request(trigger, None, None),
             OutputSizing::ModelMax,
+            "no window to share",
         );
-        assert_eq!(
-            OutputSizing::for_request(Some(&model_aware), Some(&budgeted)),
-            OutputSizing::WindowShare {
-                thinking_budget: Some(55_000),
-            },
-        );
-        assert_eq!(
-            OutputSizing::for_request(Some(&model_aware), Some(&ThinkingConfig::adaptive())),
-            SHARE,
-        );
-        assert_eq!(OutputSizing::for_request(Some(&model_aware), None), SHARE);
+        for (thinking, reasoning) in [
+            (None, ReasoningAllowance::None),
+            (
+                Some(ThinkingConfig::new(55_000)),
+                ReasoningAllowance::Budget(55_000),
+            ),
+            (
+                Some(ThinkingConfig::adaptive()),
+                ReasoningAllowance::Unbudgeted,
+            ),
+            (
+                Some(ThinkingConfig::default_with_effort(
+                    agent_sdk_foundation::llm::Effort::High,
+                )),
+                ReasoningAllowance::Unbudgeted,
+            ),
+        ] {
+            assert_eq!(
+                OutputSizing::for_request(trigger, sonnet, thinking.as_ref()),
+                OutputSizing::WindowShare {
+                    window: 200_000,
+                    reasoning,
+                },
+            );
+        }
     }
 
     #[test]
@@ -1608,55 +1711,94 @@ mod tests {
         let kimi = registered("openai", "accounts/fireworks/models/kimi-k3")
             .context("fireworks kimi k3 row")?;
         assert_eq!(kimi.max_output_tokens, None);
-        assert_eq!(serving_max_tokens(128_000, Some(kimi), SHARE), 128_000);
-        assert_eq!(
-            serving_max_tokens(400_000, Some(kimi), SHARE),
-            1_048_576 / 4
-        );
+        assert_eq!(sized(128_000, Some(kimi), None), 128_000);
+        assert_eq!(sized(400_000, Some(kimi), None), 1_048_576 / 4);
 
         let small_window = ModelCapabilities {
             context_window: Some(100_000),
             ..*kimi
         };
-        assert_eq!(
-            serving_max_tokens(128_000, Some(&small_window), SHARE),
-            32_000
-        );
-        assert_eq!(
-            serving_max_tokens(16_000, Some(&small_window), SHARE),
-            16_000
-        );
+        assert_eq!(sized(128_000, Some(&small_window), None), 32_000);
+        assert_eq!(sized(16_000, Some(&small_window), None), 16_000);
         Ok(())
     }
 
     #[test]
-    fn thinking_budget_rides_on_top_of_the_window_share() {
-        let thinking = |budget| OutputSizing::WindowShare {
-            thinking_budget: Some(budget),
-        };
+    fn reasoning_rides_on_top_of_the_window_share() {
+        let budget = |tokens| Some(ThinkingConfig::new(tokens));
         let sonnet = registered("anthropic", "claude-sonnet-4-5-20250929");
-        assert_eq!(serving_max_tokens(64_000, sonnet, SHARE), 50_000);
-        assert_eq!(serving_max_tokens(64_000, sonnet, thinking(10_000)), 60_000);
+        assert_eq!(sized(64_000, sonnet, None), 50_000);
+        assert_eq!(sized(64_000, sonnet, budget(10_000).as_ref()), 60_000);
         assert_eq!(
-            serving_max_tokens(64_000, sonnet, thinking(49_999)),
+            sized(64_000, sonnet, budget(49_999).as_ref()),
             64_000,
             "the model max, not the window share, bounds a budget near the share",
         );
-        assert_eq!(
-            serving_max_tokens(128_000, sonnet, thinking(55_000)),
-            64_000
-        );
+        assert_eq!(sized(128_000, sonnet, budget(55_000).as_ref()), 64_000);
 
         let glm = registered("openai", "z-ai/glm-5.1");
-        let budgeted = serving_max_tokens(128_000, glm, thinking(51_000));
+        let budgeted = sized(128_000, glm, budget(51_000).as_ref());
         assert_eq!(budgeted, 202_752 / 4 + 51_000);
         assert_eq!(
-            effective_threshold_tokens(
-                &CompactionConfig::default().with_model_aware_threshold(true),
-                glm,
-                budgeted,
-            ),
+            effective_threshold_tokens(&model_aware(), glm, budgeted),
             (202_752 - (202_752 / 4 + 51_000), "model_aware"),
+        );
+
+        let effort = Some(ThinkingConfig::default_with_effort(
+            agent_sdk_foundation::llm::Effort::High,
+        ));
+        let o3 = registered("openai", "o3");
+        assert_eq!(sized(100_000, o3, None), 50_000);
+        assert_eq!(
+            sized(100_000, o3, effort.as_ref()),
+            100_000,
+            "unbudgeted reasoning keeps a second share, here the whole model max",
+        );
+        assert_eq!(
+            sized(100_000, o3, Some(&ThinkingConfig::adaptive())),
+            100_000
+        );
+        assert_eq!(sized(128_000, glm, effort.as_ref()), 202_752 / 2);
+    }
+
+    #[test]
+    fn window_override_sizes_output_like_the_threshold() {
+        let cfg = model_aware()
+            .with_model_context_window_tokens(200_000)
+            .with_threshold_tokens(80_000);
+        let opus = agent_sdk_providers::AnthropicProvider::new("key", "claude-opus-5-5");
+        assert_eq!(
+            worker_budget(&cfg, &opus, ROOT_REQUESTED_MAX_TOKENS),
+            (50_000, (150_000, "model_aware")),
+        );
+        assert_eq!(
+            thinking_worker_budget(
+                &cfg,
+                &opus,
+                ROOT_REQUESTED_MAX_TOKENS,
+                Some(&ThinkingConfig::adaptive()),
+            ),
+            (100_000, (100_000, "model_aware")),
+        );
+        for (route, stable) in [("unknown", true), ("unstable", false)] {
+            let provider = RouteStub {
+                provider: "mock",
+                model: "mock-model",
+                stable,
+            };
+            assert_eq!(
+                worker_budget(&cfg, &provider, ROOT_REQUESTED_MAX_TOKENS),
+                (50_000, (150_000, "model_aware")),
+                "{route}",
+            );
+        }
+        assert_eq!(
+            worker_budget(
+                &model_aware().with_threshold_tokens(80_000),
+                &opus,
+                ROOT_REQUESTED_MAX_TOKENS,
+            ),
+            (128_000, (872_000, "model_aware")),
         );
     }
 
@@ -1668,10 +1810,7 @@ mod tests {
             stable: false,
         };
         assert!(serving_capabilities(&router).is_none());
-        assert_eq!(
-            serving_max_tokens(128_000, serving_capabilities(&router), SHARE),
-            128_000,
-        );
+        assert_eq!(sized(128_000, serving_capabilities(&router), None), 128_000);
     }
 
     #[test]
