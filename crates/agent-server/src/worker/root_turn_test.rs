@@ -8,7 +8,7 @@
 use super::root_turn::{
     PartialCancelCommit, RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes, cancel_root_turn,
     commit_partial_turn_on_cancel, drain_boundary_injections, execute_root_turn, fail_root_turn,
-    is_interim_payload, is_root_turn_cancelled, provider_valid_split, resume_for_steering,
+    interim_answer, is_root_turn_cancelled, provider_valid_split, resume_for_steering,
     resume_from_children, resume_from_question, resume_root_turn, revert_steering_wake,
     settle_attempt_after_lost_ownership, terminal_reason_for_root_error, tool_result_blocks,
 };
@@ -7805,11 +7805,6 @@ fn assert_running_call_closed(
         "closed as {status}: {}",
         closed[0],
     );
-    assert!(
-        !closed[0].contains("do not call it again"),
-        "a closed call may be issued again: {}",
-        closed[0],
-    );
 }
 
 #[tokio::test]
@@ -7842,11 +7837,15 @@ async fn cancelling_an_early_resumed_parent_closes_its_running_call() -> Result<
     assert_eq!(survivor.status, TaskStatus::Cancelled);
 
     let committed = stores.messages.get_history(&thread_a()).await?;
-    assert_running_call_closed(&committed, "call_1", "cancelled");
     assert_eq!(count_tool_results(&committed, "call_1"), 1);
 
     let request = follow_up_request(&stores, "Run the second command again.", t_plus(30)).await?;
     assert_running_call_closed(&request, "call_1", "cancelled");
+    let after = stores.messages.get_history(&thread_a()).await?;
+    assert_running_call_closed(&after, "call_1", "cancelled");
+
+    let next = follow_up_request(&stores, "And now?", t_plus(40)).await?;
+    assert_running_call_closed(&next, "call_1", "cancelled");
     Ok(())
 }
 
@@ -7902,7 +7901,8 @@ async fn cancelling_an_early_resume_mid_call_closes_its_running_call() -> Result
 
     let committed = stores.messages.get_history(&thread_a()).await?;
     assert_eq!(find_tool_result(&committed, "call_0"), Some("done-0"));
-    assert_running_call_closed(&committed, "call_1", "cancelled");
+    let request = follow_up_request(&stores, "Run the second command again.", t_plus(30)).await?;
+    assert_running_call_closed(&request, "call_1", "cancelled");
     Ok(())
 }
 
@@ -7970,7 +7970,6 @@ async fn a_failed_early_resumed_parent_closes_its_running_call() -> Result<()> {
     let delivered = late_results_for(&view.messages, "call_1");
     assert_eq!(delivered.len(), 1);
     assert!(delivered[0].contains("done-1"), "{}", delivered[0]);
-    assert_running_call_closed(&view.messages, "call_2", "still_running");
 
     let request = follow_up_request(&stores, "Try the third command again.", t_plus(30)).await?;
     assert_running_call_closed(&request, "call_2", "still_running");
@@ -8386,10 +8385,22 @@ async fn steering_fan_in_carries_result_and_late_result_attachments_in_order() -
     Ok(())
 }
 
-/// The interim payload serialized with its keys in another order (a build
-/// whose JSON maps preserve insertion order) is still recognized.
+/// Serialize `fields` with its keys in reverse order, as a build whose JSON
+/// maps preserve insertion order might.
+fn reversed_json(fields: &serde_json::Map<String, serde_json::Value>) -> Result<String> {
+    let reversed = fields
+        .iter()
+        .rev()
+        .map(|(key, value)| Ok(format!("{}:{value}", serde_json::to_string(key)?)))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(format!("{{{}}}", reversed.join(",")))
+}
+
+/// The interim payload is recognized by its `kind` discriminator and names
+/// the running child; the unmarked payload rows already hold stays
+/// recognized in any key order, without a child.
 #[tokio::test]
-async fn interim_payload_is_recognized_in_any_key_order() -> Result<()> {
+async fn interim_answer_names_its_child_and_accepts_the_unmarked_payload() -> Result<()> {
     let stores = TestStores::new();
     let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
         &stores,
@@ -8411,18 +8422,22 @@ async fn interim_payload_is_recognized_in_any_key_order() -> Result<()> {
     let interim = find_tool_result(parked.state.suspended_messages(), "call_1")
         .context("interim answer for call_1")?;
 
-    let fields: serde_json::Map<String, serde_json::Value> = serde_json::from_str(interim)?;
-    let reversed = fields
-        .iter()
-        .rev()
-        .map(|(key, value)| Ok(format!("{}:{value}", serde_json::to_string(key)?)))
-        .collect::<Result<Vec<_>>>()?;
-    let reordered = format!("{{{}}}", reversed.join(","));
+    let answer = interim_answer(interim).context("the interim is recognized")?;
+    assert_eq!(answer.child_task_id.as_ref(), Some(&children[1].id));
+    let mut fields: serde_json::Map<String, serde_json::Value> = serde_json::from_str(interim)?;
+    let marked_reordered = reversed_json(&fields)?;
+    assert_ne!(marked_reordered, interim);
+    assert!(interim_answer(&marked_reordered).is_some());
 
-    assert_ne!(reordered, interim, "the keys must actually move");
-    assert!(is_interim_payload(interim));
-    assert!(is_interim_payload(&reordered));
-    assert!(!is_interim_payload(r#"{"status":"running"}"#));
+    fields.remove("kind");
+    fields.remove("child_task_id");
+    let unmarked = serde_json::to_string(&fields)?;
+    let unmarked_answer = interim_answer(&unmarked).context("unmarked payload")?;
+    assert!(unmarked_answer.child_task_id.is_none());
+    assert!(interim_answer(&reversed_json(&fields)?).is_some());
+
+    assert!(interim_answer(r#"{"status":"running"}"#).is_none());
+    assert!(interim_answer(r#"{"status":"running","note":"other text"}"#).is_none());
     Ok(())
 }
 
@@ -8441,6 +8456,8 @@ enum TurnExit {
     FailMidResume,
     /// The public `aggregate_child_outcomes` + `resume_root_turn` pair.
     AggregateResume,
+    /// The child wake's lease expires until the sweep fails the row closed.
+    FailClosedByLeaseExpiry,
 }
 
 /// `call_1`'s child when the turn ends. `AggregateResume` needs every child
@@ -8659,8 +8676,51 @@ async fn end_early_resumed_turn(
             ))
             .await;
         }
+        TurnExit::FailClosedByLeaseExpiry => {
+            complete_child_at(
+                stores,
+                &children[2],
+                &ok_result("done-2"),
+                t_plus(20),
+                t_plus(21),
+            )
+            .await?;
+            if let Some(child) = &finish {
+                complete_child_at(stores, child, &ok_result("done-1"), t_plus(22), t_plus(23))
+                    .await?;
+            }
+            expire_wake_until_failed_closed(stores, &parent.id).await?;
+        }
     }
     follow_up_request(stores, "What happened to the build steps?", t_plus(50)).await
+}
+
+/// Acquire the woken parent and let each lease expire until the sweep
+/// fails the row closed.
+async fn expire_wake_until_failed_closed(
+    stores: &TestStores,
+    parent_id: &AgentTaskId,
+) -> Result<()> {
+    for round in 0..10 {
+        let at = 100 + round * 10;
+        stores
+            .tasks
+            .try_acquire_task(
+                parent_id,
+                WorkerId::from_string("dead_worker"),
+                LeaseId::from_string(format!("dead_lease_{round}")),
+                t_plus(at + 1),
+                t_plus(at),
+            )
+            .await?
+            .context("acquire the woken parent")?;
+        stores.tasks.release_expired_leases(t_plus(at + 2)).await?;
+        let row = stores.tasks.get(parent_id).await?.context("parent")?;
+        if row.status == TaskStatus::Failed {
+            return Ok(());
+        }
+    }
+    bail!("the wake was never failed closed")
 }
 
 async fn cancel_mid_steering(
@@ -8797,7 +8857,9 @@ fn expected_closures(
 ) -> [(&'static str, &'static str); 2] {
     let call_1 = match (exit, survivor) {
         (_, SurvivorAtExit::Finished) => "success",
-        (TurnExit::FailMidResume, SurvivorAtExit::Live) => "still_running",
+        (TurnExit::FailMidResume | TurnExit::FailClosedByLeaseExpiry, SurvivorAtExit::Live) => {
+            "still_running"
+        }
         (
             TurnExit::CancelParked | TurnExit::CancelMidSteering | TurnExit::AggregateResume,
             SurvivorAtExit::Live,
@@ -8805,7 +8867,9 @@ fn expected_closures(
     };
     let call_2 = match exit {
         TurnExit::CancelParked | TurnExit::CancelMidSteering => "cancelled",
-        TurnExit::FailMidResume | TurnExit::AggregateResume => "success",
+        TurnExit::FailMidResume | TurnExit::AggregateResume | TurnExit::FailClosedByLeaseExpiry => {
+            "success"
+        }
     };
     [("call_1", call_1), ("call_2", call_2)]
 }
@@ -8831,7 +8895,7 @@ fn interim_closure_violations(
             content,
             ..
         } = block
-            && is_interim_payload(content)
+            && interim_answer(content).is_some()
             && late_results_for(request, tool_use_id).len() != 1
         {
             violations.push(format!(
@@ -8867,6 +8931,7 @@ async fn every_turn_exit_closes_interim_only_calls_once_with_their_real_state() 
         TurnExit::CancelMidSteering,
         TurnExit::FailMidResume,
         TurnExit::AggregateResume,
+        TurnExit::FailClosedByLeaseExpiry,
     ] {
         for compaction in [false, true] {
             for survivor in [SurvivorAtExit::Live, SurvivorAtExit::Finished] {
@@ -8975,11 +9040,284 @@ async fn cancelling_a_compacted_early_resume_mid_call_closes_its_running_call() 
     assert_eq!(projection.compactions.len(), 1);
     let committed = stores.messages.get_history(&thread_a()).await?;
     let interim = find_tool_result(&committed, "call_1").context("interim stays visible")?;
-    assert!(is_interim_payload(interim));
-    assert_running_call_closed(&committed, "call_1", "cancelled");
+    assert!(interim_answer(interim).is_some());
 
     let request = follow_up_request(&stores, "Is the second step done?", t_plus(30)).await?;
     assert_running_call_closed(&request, "call_1", "cancelled");
+    Ok(())
+}
+
+/// A fail rejected because the worker no longer owns the row (it re-parked
+/// in between) must not touch the parked turn's draft.
+#[tokio::test]
+async fn a_rejected_fail_leaves_the_parked_draft_untouched() -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
+        &stores,
+        vec![bash_call("call_0"), bash_call("call_1")],
+        ChildJoinPolicy::Any,
+    ))
+    .await?;
+    complete_child_at(
+        &stores,
+        &children[0],
+        &ok_result("done-0"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+    let provider = RequestLogProvider::new("The second call is still running.");
+    run_child_resume(&stores, &parent.id, &provider, t_plus(10), t_plus(12)).await?;
+    let before = stores
+        .messages
+        .get(&thread_a())
+        .await?
+        .context("projection")?
+        .draft_messages;
+
+    let late_error = anyhow::anyhow!("failure reported after the worker re-parked");
+    let rejected = fail_root_turn(
+        &parent.id,
+        &WorkerId::from_string("worker_test"),
+        &LeaseId::from_string("lease_test"),
+        &thread_a(),
+        &late_error,
+        &stores.deps(),
+        t_plus(20),
+    )
+    .await;
+    assert!(
+        rejected.is_err(),
+        "the parked row is no longer owned by that lease"
+    );
+
+    let after = stores
+        .messages
+        .get(&thread_a())
+        .await?
+        .context("projection")?
+        .draft_messages;
+    assert_eq!(
+        serde_json::to_value(&after)?,
+        serde_json::to_value(&before)?
+    );
+    let row = stores.tasks.get(&parent.id).await?.context("parent")?;
+    assert_eq!(row.status, TaskStatus::WaitingOnChildren);
+    Ok(())
+}
+
+/// A call whose child finished with a result that no longer deserializes is
+/// closed as finished with an unreadable result, never as still running.
+#[tokio::test]
+async fn a_finished_call_with_an_unreadable_result_is_closed_as_an_error() -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
+        &stores,
+        vec![bash_call("call_0"), bash_call("call_1")],
+        ChildJoinPolicy::Any,
+    ))
+    .await?;
+    complete_child_at(
+        &stores,
+        &children[0],
+        &ok_result("done-0"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+    let provider = RequestLogProvider::new("The second call is still running.");
+    run_child_resume(&stores, &parent.id, &provider, t_plus(10), t_plus(12)).await?;
+    let worker = WorkerId::from_string("tool_w");
+    let lease = LeaseId::from_string("tool_l");
+    stores
+        .tasks
+        .try_acquire_task(
+            &children[1].id,
+            worker.clone(),
+            lease.clone(),
+            t_plus(900),
+            t_plus(20),
+        )
+        .await?
+        .context("acquire survivor")?;
+    stores
+        .tasks
+        .complete_task_with_result(
+            &children[1].id,
+            &worker,
+            &lease,
+            serde_json::json!("not a tool result"),
+            t_plus(21),
+        )
+        .await?;
+    cancel_root_turn(&parent.id, &stores.deps(), t_plus(30)).await?;
+
+    let request =
+        follow_up_request(&stores, "What did the second call return?", t_plus(40)).await?;
+    assert_running_call_closed(&request, "call_1", "error");
+    let closed = late_results_for(&request, "call_1");
+    assert!(closed[0].contains("could not be read"), "{}", closed[0]);
+    Ok(())
+}
+
+/// The next turn closes the call before its first request; when that turn
+/// suspends on a tool call of its own, its resume still carries the closure,
+/// and the committed history keeps it exactly once.
+#[tokio::test]
+async fn a_closure_survives_the_next_turn_suspending() -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
+        &stores,
+        vec![bash_call("call_0"), bash_call("call_1")],
+        ChildJoinPolicy::Any,
+    ))
+    .await?;
+    complete_child_at(
+        &stores,
+        &children[0],
+        &ok_result("done-0"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+    let provider = RequestLogProvider::new("The second call is still running.");
+    run_child_resume(&stores, &parent.id, &provider, t_plus(10), t_plus(12)).await?;
+    cancel_root_turn(&parent.id, &stores.deps(), t_plus(20)).await?;
+
+    let next = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap_with_tools(next),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(30),
+    )
+    .await?;
+    let rerun = MockToolCallProvider::new(vec![bash_call("call_rerun")]);
+    let outcome =
+        execute_root_turn(inputs, "Re-run it", &rerun, &stores.deps(), t_plus(31)).await?;
+    let RootTurnOutcome::Suspended {
+        parent_task: next_parent,
+        child_tasks,
+        ..
+    } = outcome
+    else {
+        bail!("the next turn must suspend on its own call");
+    };
+    let [rerun_child] = child_tasks.as_slice() else {
+        bail!("one new call: {child_tasks:?}");
+    };
+    complete_child_at(
+        &stores,
+        rerun_child,
+        &ok_result("rerun-done"),
+        t_plus(40),
+        t_plus(41),
+    )
+    .await?;
+    let resumed = RequestLogProvider::new("Re-ran it.");
+    let outcome =
+        run_child_resume(&stores, &next_parent.id, &resumed, t_plus(42), t_plus(43)).await?;
+    assert!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+
+    let request = resumed.requests()?.pop().context("resume request")?;
+    assert_running_call_closed(&request, "call_1", "cancelled");
+    let committed = stores.messages.get_history(&thread_a()).await?;
+    assert_running_call_closed(&committed, "call_1", "cancelled");
+    Ok(())
+}
+
+/// An attempt that persisted the closure and then died must not leave its
+/// retry without it: the retry renders nothing new, yet still carries the
+/// closure through its own suspension.
+#[tokio::test]
+async fn a_closure_persisted_by_a_dead_attempt_survives_the_retry_suspending() -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
+        &stores,
+        vec![bash_call("call_0"), bash_call("call_1")],
+        ChildJoinPolicy::Any,
+    ))
+    .await?;
+    complete_child_at(
+        &stores,
+        &children[0],
+        &ok_result("done-0"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+    let provider = RequestLogProvider::new("The second call is still running.");
+    run_child_resume(&stores, &parent.id, &provider, t_plus(10), t_plus(12)).await?;
+    cancel_root_turn(&parent.id, &stores.deps(), t_plus(20)).await?;
+
+    let next = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap_with_tools(next.clone()),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(30),
+    )
+    .await?;
+    execute_root_turn(
+        inputs,
+        "Re-run it",
+        &InvalidRequestProvider,
+        &stores.deps(),
+        t_plus(31),
+    )
+    .await
+    .err()
+    .context("the first attempt must die")?;
+    let worker = WorkerId::from_string("worker_test");
+    let lease = LeaseId::from_string("lease_test");
+    let requeued = stores
+        .tasks
+        .requeue_owned_task(&next.id, &worker, &lease, None, t_plus(32))
+        .await?;
+    assert!(matches!(
+        requeued,
+        crate::journal::store::RequeueOutcome::Requeued(_)
+    ));
+    let retry = stores
+        .tasks
+        .try_acquire_task(&next.id, worker, lease, t_plus(900), t_plus(33))
+        .await?
+        .context("re-acquire the retry")?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap_with_tools(retry),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(33),
+    )
+    .await?;
+    let rerun = MockToolCallProvider::new(vec![bash_call("call_rerun")]);
+    let outcome =
+        execute_root_turn(inputs, "Re-run it", &rerun, &stores.deps(), t_plus(34)).await?;
+    let RootTurnOutcome::Suspended { child_tasks, .. } = outcome else {
+        bail!("the retry must suspend on its own call");
+    };
+    let [rerun_child] = child_tasks.as_slice() else {
+        bail!("one new call: {child_tasks:?}");
+    };
+    complete_child_at(
+        &stores,
+        rerun_child,
+        &ok_result("rerun-done"),
+        t_plus(40),
+        t_plus(41),
+    )
+    .await?;
+    let resumed = RequestLogProvider::new("Re-ran it.");
+    let outcome = run_child_resume(&stores, &next.id, &resumed, t_plus(42), t_plus(43)).await?;
+    assert!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+
+    let request = resumed.requests()?.pop().context("resume request")?;
+    assert_running_call_closed(&request, "call_1", "cancelled");
+    let committed = stores.messages.get_history(&thread_a()).await?;
+    assert_running_call_closed(&committed, "call_1", "cancelled");
     Ok(())
 }
 
@@ -9172,7 +9510,6 @@ async fn partial_commit_empty_candidate_is_a_strict_no_op() -> Result<()> {
             candidate: Vec::new(),
             expected_turn: 1,
             agent_state_snapshot: serde_json::Value::Null,
-            closing: Vec::new(),
         },
         &stores.deps(),
         t_plus(1),
@@ -9213,7 +9550,6 @@ async fn partial_commit_unbalanced_candidate_closes_and_commits_the_dangling_use
             candidate,
             expected_turn: 1,
             agent_state_snapshot: serde_json::Value::Null,
-            closing: Vec::new(),
         },
         &stores.deps(),
         t_plus(1),
@@ -10112,7 +10448,6 @@ async fn failed_salvage_commit_closes_its_synthetic_attempt() -> Result<()> {
             candidate: vec![agent_sdk_foundation::llm::Message::user("salvage me")],
             expected_turn: 1,
             agent_state_snapshot: serde_json::json!({}),
-            closing: Vec::new(),
         },
         &deps,
         t_plus(1),

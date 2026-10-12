@@ -634,9 +634,6 @@ async fn fail_root_turn_inner(
         error,
         reason,
     } = params;
-    // Before the transition: it clears the parked batch, and no successor
-    // root can be admitted to race this draft write while the root is live.
-    close_interim_calls_in_draft(task_id, thread_id, deps, now).await;
     let error_msg = format!("{error:#}");
     let (failed_task, _parent) = deps
         .task_store
@@ -672,34 +669,6 @@ async fn fail_root_turn_inner(
     );
 
     Ok(failed_task)
-}
-
-/// Append the failing turn's closing late results to the draft the next
-/// turn folds into its history (see [`closing_late_results`]).
-async fn close_interim_calls_in_draft(
-    task_id: &AgentTaskId,
-    thread_id: &agent_sdk_foundation::ThreadId,
-    deps: &RootTurnDeps<'_>,
-    now: OffsetDateTime,
-) {
-    let Ok(Some(task)) = deps.task_store.get(task_id).await else {
-        return;
-    };
-    if task.state.continuation().is_none() {
-        return;
-    }
-    let Ok(projection) = deps.message_store.get(thread_id).await else {
-        return;
-    };
-    let mut draft = projection.map(|p| p.draft_messages).unwrap_or_default();
-    let closing = closing_late_results(&task, &draft, TurnEnd::Failed, deps).await;
-    if closing.is_empty() {
-        return;
-    }
-    append_to_trailing_user_message(&mut draft, closing);
-    if let Err(error) = deps.message_store.set_draft(thread_id, draft, now).await {
-        log::warn!("fail: closing interim-only calls failed on thread {thread_id}: {error:#}");
-    }
 }
 
 /// Cancel a root turn and its entire subtree.
@@ -1119,10 +1088,6 @@ pub(crate) struct PartialCancelCommit<'a> {
     pub(crate) expected_turn: u32,
     /// Agent-state snapshot for the checkpoint written at `expected_turn`.
     pub(crate) agent_state_snapshot: serde_json::Value,
-    /// Late results closing the parked batch's interim-only calls (see
-    /// [`closing_late_results`]). Committed even when `candidate` is empty:
-    /// compaction may already have folded the interim answers into history.
-    pub(crate) closing: Vec<llm::ContentBlock>,
 }
 
 /// Durably commit the largest provider-valid prefix of a cancelled
@@ -1150,7 +1115,6 @@ pub(crate) async fn commit_partial_turn_on_cancel(
         candidate,
         expected_turn,
         agent_state_snapshot,
-        closing,
     } = params;
 
     let (prefix, suffix) = provider_valid_split(candidate);
@@ -1164,10 +1128,7 @@ pub(crate) async fn commit_partial_turn_on_cancel(
     // edited.
     let closed_suffix =
         llm::repair_tool_sequence_in_place(&suffix, llm::USER_CANCELLED_TOOL_RESULT);
-    let mut committed = [prefix, closed_suffix].concat();
-    if !closing.is_empty() {
-        append_to_trailing_user_message(&mut committed, closing);
-    }
+    let committed = [prefix, closed_suffix].concat();
     if committed.is_empty() {
         // Nothing to commit. Strict no-op: no attempt row,
         // no thread mutation.
@@ -1328,9 +1289,8 @@ async fn commit_cancelled_partial_turn(
     let task_id = &inputs.bootstrap.task_id;
     let thread_id = &inputs.bootstrap.thread_id;
 
-    let end = match deps.task_store.get(task_id).await {
-        Ok(Some(task)) if task.status == TaskStatus::Cancelled => TurnEnd::Cancelled,
-        Ok(Some(task)) if task.status == TaskStatus::Failed => TurnEnd::Failed,
+    match deps.task_store.get(task_id).await {
+        Ok(Some(task)) if matches!(task.status, TaskStatus::Cancelled | TaskStatus::Failed) => {}
         // Not terminal (lease-lost requeue), missing, or unreadable:
         // do not partial-commit — a re-run will own turn N.
         Ok(_) => return,
@@ -1338,10 +1298,8 @@ async fn commit_cancelled_partial_turn(
             log::warn!("cancel-commit: re-read task {task_id} failed: {error:#}");
             return;
         }
-    };
+    }
 
-    // The bootstrap row is the parked batch this worker resumed.
-    let closing = closing_late_results(&inputs.bootstrap.task, &candidate, end, deps).await;
     let agent_state_snapshot = staged_or_recovery_snapshot(inputs);
     let suffix = match commit_partial_turn_on_cancel(
         PartialCancelCommit {
@@ -1350,7 +1308,6 @@ async fn commit_cancelled_partial_turn(
             candidate,
             expected_turn: inputs.recovery_view.next_turn_number,
             agent_state_snapshot,
-            closing,
         },
         deps,
         now,
@@ -1467,7 +1424,6 @@ async fn best_effort_commit_parked_cancel(
         }
     };
 
-    let closing = closing_late_results(task, &candidate, TurnEnd::Cancelled, deps).await;
     let suffix = match commit_partial_turn_on_cancel(
         PartialCancelCommit {
             thread_id: &task.thread_id,
@@ -1475,7 +1431,6 @@ async fn best_effort_commit_parked_cancel(
             candidate,
             expected_turn,
             agent_state_snapshot,
-            closing,
         },
         deps,
         now,
@@ -1875,6 +1830,10 @@ async fn execute_root_turn_inner(
     //     boundaries — and legacy-corrupted threads are repaired by an
     //     offline migration, never by the turn path (ENG-9651).
 
+    // 2.4b Close calls earlier turns left answered only by an interim
+    //      result, before compaction and the first provider request.
+    let closing = close_undelivered_calls(&inputs, deps, now).await?;
+
     // 2.5 Pre-call auto-compaction, on its own `<context-compaction>`
     //     attempt opened before the main attempt.
     //
@@ -2007,6 +1966,9 @@ async fn execute_root_turn_inner(
     // Capture a post-LLM timestamp so the turn attempt's duration_ms
     // reflects actual wall-clock latency instead of always being 0.
     let commit_now = OffsetDateTime::now_utc();
+    // A suspension carries only `staged_prefix`, not the staged draft, so
+    // the closures must lead there too.
+    let staged_prefix = closing.into_iter().chain(staged_prefix).collect();
     let close_ctx = TurnCloseContext {
         content_ids,
         user_input_committed,
@@ -8269,10 +8231,16 @@ pub async fn resume_from_question(
 /// result — and explicit that the call must not be issued again: its
 /// real result arrives at a later fan-in as a late result (see
 /// [`llm::late_tool_result`]).
-fn steering_interim_tool_result() -> ToolResult {
+fn steering_interim_tool_result(child_id: &AgentTaskId) -> ToolResult {
+    let payload = serde_json::json!({
+        "kind": INTERIM_KIND,
+        "status": "running",
+        "child_task_id": child_id.as_str(),
+        "note": INTERIM_NOTE,
+    });
     ToolResult {
         success: true,
-        output: steering_interim_payload().to_string(),
+        output: payload.to_string(),
         artifact: None,
         data: None,
         documents: Vec::new(),
@@ -8280,26 +8248,47 @@ fn steering_interim_tool_result() -> ToolResult {
     }
 }
 
-fn steering_interim_payload() -> serde_json::Value {
+const INTERIM_KIND: &str = "interim_tool_result";
+const INTERIM_NOTE: &str = "This call is still executing. Do not call it again: it keeps running, and its final result will be delivered automatically in a later message as a late_tool_result for this tool_use_id.";
+
+/// The note of the interim payload written before it carried a `kind` and
+/// the child's id. Rows parked by that build still hold it, so it stays
+/// frozen even if [`INTERIM_NOTE`] changes.
+const UNMARKED_INTERIM_NOTE: &str = "This call is still executing. Do not call it again: it keeps running, and its final result will be delivered automatically in a later message as a late_tool_result for this tool_use_id.";
+
+static UNMARKED_INTERIM: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(|| {
     serde_json::json!({
         "status": "running",
-        "note": "This call is still executing. Do not call it again: it keeps running, and its final result will be delivered automatically in a later message as a late_tool_result for this tool_use_id.",
+        "note": UNMARKED_INTERIM_NOTE,
     })
+});
+
+/// An interim `tool_result` found in a transcript.
+pub(crate) struct InterimAnswer {
+    /// The child running the call; `None` for an unmarked interim.
+    pub(crate) child_task_id: Option<AgentTaskId>,
 }
 
-static INTERIM_PAYLOAD: std::sync::LazyLock<(serde_json::Value, usize)> =
-    std::sync::LazyLock::new(|| {
-        let payload = steering_interim_payload();
-        let len = payload.to_string().len();
-        (payload, len)
-    });
-
-/// Whether `content` is the interim payload, compared as JSON so a build
-/// that serializes object keys in another order still recognizes it.
-pub(crate) fn is_interim_payload(content: &str) -> bool {
-    let (interim, len) = &*INTERIM_PAYLOAD;
-    content.len() == *len
-        && serde_json::from_str::<serde_json::Value>(content).is_ok_and(|value| value == *interim)
+/// Recognize `content` as an interim answer by its `kind` discriminator,
+/// or as the unmarked payload (compared as JSON, so key order does not
+/// matter).
+pub(crate) fn interim_answer(content: &str) -> Option<InterimAnswer> {
+    if !content.starts_with('{')
+        || !(content.contains(INTERIM_KIND) || content.contains(UNMARKED_INTERIM_NOTE))
+    {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    if value.get("kind").and_then(serde_json::Value::as_str) == Some(INTERIM_KIND) {
+        let child_task_id = value
+            .get("child_task_id")
+            .and_then(serde_json::Value::as_str)
+            .map(AgentTaskId::from_string);
+        return Some(InterimAnswer { child_task_id });
+    }
+    (value == *UNMARKED_INTERIM).then_some(InterimAnswer {
+        child_task_id: None,
+    })
 }
 
 /// A child still running at early-resume time. It stays bound to its
@@ -8448,7 +8437,7 @@ async fn build_steering_interim(
             }
         } else {
             if !already_answered {
-                tool_results.push((call.id.clone(), steering_interim_tool_result()));
+                tool_results.push((call.id.clone(), steering_interim_tool_result(&child.id)));
             }
             surviving.push(SurvivingChild {
                 child_id: child.id.clone(),
@@ -8496,168 +8485,207 @@ fn fan_in_blocks(
     blocks
 }
 
-/// How the turn holding a parked batch ended.
-#[derive(Clone, Copy)]
-enum TurnEnd {
-    /// `cancel_tree` cancels the batch's live children with the turn.
-    Cancelled,
-    /// Failing the turn leaves its live children running.
-    Failed,
-}
-
-/// Late results closing every interim-only call of `task`'s parked batch.
+/// Late results for the calls the thread's committed history answered only
+/// with the interim payload and never followed with a late result.
 ///
-/// Invariant: when a root turn ends, every pending call its transcript
-/// answered only with the interim payload, and never with a late result,
-/// gets exactly one closing late result stating the child's real state —
-/// its own result once it finished, `cancelled` when it was or is being
-/// cancelled with the turn, `still_running` when it outlives a failed turn.
-/// Every turn-ending writer (parked cancel, in-flight cancel, failure)
-/// takes its closing blocks from here.
+/// Invariant: once the turn holding such a call has ended — by any path:
+/// cancel, failure, lease expiry, a fail-closed sweep — the next root turn
+/// on the thread closes it exactly once, before its first provider
+/// request, with the child's real state: the child's own result once it
+/// finished, `cancelled` once it was cancelled, `still_running` while it
+/// may still run. A fresh root turn starts only after every earlier root on
+/// the thread has ended, so an interim-only call it finds can no longer be
+/// answered by its own turn.
 ///
-/// Interim answers are read from the raw transcript — the projection's
-/// messages, which compaction folds the draft into but never rewrites, the
-/// batch's suspended messages, and `tail` — so compaction cannot hide one.
-/// A late result counts as delivered only in the projection's messages or
-/// `tail`, which outlive the caller's write; a cancel commit clears the
-/// draft.
-async fn closing_late_results(
-    task: &AgentTask,
-    tail: &[llm::Message],
-    end: TurnEnd,
-    deps: &RootTurnDeps<'_>,
-) -> Vec<llm::ContentBlock> {
-    let Some(continuation) = task.state.continuation() else {
-        return Vec::new();
-    };
-    let committed = match deps.message_store.get(&task.thread_id).await {
-        Ok(projection) => projection.map(|p| p.messages).unwrap_or_default(),
-        Err(error) => {
-            log::warn!(
-                "closing late results: read projection failed on thread {}: {error:#}",
-                task.thread_id,
-            );
-            Vec::new()
-        }
-    };
-    let mut interim_answered = BTreeSet::new();
-    let mut late_delivered = BTreeSet::new();
-    for block in committed.iter().chain(tail).flat_map(message_blocks) {
-        if let llm::ContentBlock::Text { text } = block
-            && let Some(id) = llm::late_tool_result::tool_use_id(text)
-        {
-            late_delivered.insert(id);
-        }
-    }
-    let transcript = committed
-        .iter()
-        .chain(tail)
-        .chain(task.state.suspended_messages());
-    for block in transcript.flat_map(message_blocks) {
+/// Interim answers are read from the raw history plus the draft: compaction
+/// folds the draft into the raw history but never rewrites it, so a
+/// compacted turn still closes its calls. A late result in the raw history
+/// closes its call for good. One still only in the draft — a failed turn's
+/// fan-in, or a closure an earlier attempt of this turn persisted — is
+/// `carried` rather than rendered again: the draft is already staged, but a
+/// suspension would drop it.
+async fn undelivered_call_closures(
+    thread_id: &agent_sdk_foundation::ThreadId,
+    raw: &[llm::Message],
+    draft: &[llm::Message],
+    task_store: &dyn AgentTaskStore,
+) -> UndeliveredCallClosures {
+    let mut interim: Vec<(String, Option<AgentTaskId>)> = Vec::new();
+    let mut seen = BTreeSet::new();
+    for block in raw.iter().chain(draft).flat_map(message_blocks) {
         if let llm::ContentBlock::ToolResult {
             tool_use_id,
             content,
             ..
         } = block
-            && is_interim_payload(content)
+            && let Some(answer) = interim_answer(content)
+            && seen.insert(tool_use_id.clone())
         {
-            interim_answered.insert(tool_use_id.clone());
+            interim.push((tool_use_id.clone(), answer.child_task_id));
         }
     }
-    let open: Vec<(usize, &PendingToolCallInfo)> = continuation
-        .payload
-        .pending_tool_calls
+    let late_result_id = |block: &llm::ContentBlock| match block {
+        llm::ContentBlock::Text { text } => llm::late_tool_result::tool_use_id(text),
+        _ => None,
+    };
+    let committed: BTreeSet<String> = raw
         .iter()
-        .enumerate()
-        .filter(|(_, call)| {
-            interim_answered.contains(&call.id) && !late_delivered.contains(&call.id)
-        })
+        .flat_map(message_blocks)
+        .filter_map(late_result_id)
         .collect();
-    if open.is_empty() {
-        return Vec::new();
+    interim.retain(|(id, _)| !committed.contains(id));
+    let mut closures = UndeliveredCallClosures::default();
+    if interim.is_empty() {
+        return closures;
     }
-    let children = children_by_spawn_index(task.state.child_ids(), deps.task_store)
-        .await
-        .unwrap_or_else(|error| {
-            log::warn!("closing late results: read batch children failed: {error:#}");
-            BTreeMap::new()
-        });
-    let late: Vec<LateToolResult> = open
-        .into_iter()
-        .map(|(index, call)| closing_late_result(call.clone(), children.get(&index), end))
-        .collect();
-    fan_in_blocks(&[], &late, &[])
+
+    let mut carried_ids = BTreeSet::new();
+    for block in draft.iter().flat_map(message_blocks) {
+        if let Some(id) = late_result_id(block)
+            && interim.iter().any(|(open, _)| *open == id)
+            && carried_ids.insert(id)
+        {
+            closures.carried.push(block.clone());
+        }
+    }
+    interim.retain(|(id, _)| !carried_ids.contains(id));
+
+    let mut calls: BTreeMap<&str, (&str, &serde_json::Value)> = BTreeMap::new();
+    for block in raw.iter().chain(draft).flat_map(message_blocks) {
+        if let llm::ContentBlock::ToolUse {
+            id, name, input, ..
+        } = block
+            && interim.iter().any(|(open, _)| open == id)
+        {
+            calls.entry(id.as_str()).or_insert((name.as_str(), input));
+        }
+    }
+    let mut late = Vec::with_capacity(interim.len());
+    for (id, child_task_id) in interim {
+        let (name, input) = calls
+            .get(id.as_str())
+            .map_or(("unknown", &serde_json::Value::Null), |(name, input)| {
+                (*name, *input)
+            });
+        let call = PendingToolCallInfo {
+            id,
+            name: name.to_owned(),
+            display_name: name.to_owned(),
+            tier: agent_sdk_foundation::ToolTier::Confirm,
+            input: input.clone(),
+            effective_input: serde_json::Value::Null,
+            listen_context: None,
+        };
+        let child = match child_task_id {
+            Some(child_id) => task_store
+                .get(&child_id)
+                .await
+                .ok()
+                .flatten()
+                .filter(|child| child.thread_id == *thread_id && child.parent_id.is_some()),
+            None => None,
+        };
+        late.push(late_result_after_turn_ended(call, child.as_ref()));
+    }
+    closures.new = fan_in_blocks(&[], &late, &[]);
+    closures
 }
 
-fn closing_late_result(
+/// What [`undelivered_call_closures`] found for the starting turn.
+#[derive(Default)]
+struct UndeliveredCallClosures {
+    /// Late results already in the draft for calls the committed history
+    /// leaves open.
+    carried: Vec<llm::ContentBlock>,
+    /// Closures rendered now for the remaining open calls.
+    new: Vec<llm::ContentBlock>,
+}
+
+fn late_result_after_turn_ended(
     call: PendingToolCallInfo,
     child: Option<&AgentTask>,
-    end: TurnEnd,
 ) -> LateToolResult {
-    let finished = child
-        .filter(|child| child.status.is_terminal())
-        .and_then(|child| {
-            extract_child_tool_result(child)
-                .ok()
-                .map(|result| (child.status, result))
-        });
-    let (status, output) = match (finished, end) {
-        (Some((child_status, result)), _) => {
-            return LateToolResult {
-                call,
-                status: late_status(Some(child_status), &result),
-                result,
-            };
-        }
-        (None, TurnEnd::Cancelled) => (
-            LateToolResultStatus::Cancelled,
-            "The turn was cancelled before this call finished.",
-        ),
-        (None, TurnEnd::Failed) => (
-            LateToolResultStatus::StillRunning,
-            "The turn failed while this call was still running.",
-        ),
-    };
-    LateToolResult {
-        call,
+    let undelivered = |status, output: String| LateToolResult {
+        call: call.clone(),
         status,
         result: ToolResult {
             success: false,
-            output: output.to_owned(),
+            output,
             artifact: None,
             data: None,
             documents: Vec::new(),
             duration_ms: None,
         },
+    };
+    match child {
+        Some(child) if child.status.is_terminal() => match extract_child_tool_result(child) {
+            Ok(result) => LateToolResult {
+                status: late_status(Some(child.status), &result),
+                call,
+                result,
+            },
+            Err(error) => undelivered(
+                LateToolResultStatus::Error,
+                format!("The call finished, but its result could not be read: {error:#}"),
+            ),
+        },
+        Some(_) | None => undelivered(
+            LateToolResultStatus::StillRunning,
+            "The turn waiting on this call ended before its result arrived.".to_owned(),
+        ),
     }
+}
+
+/// Close the calls earlier turns left answered only by an interim result
+/// (see [`undelivered_call_closures`]) as one user message, appended — never
+/// edited in. New closures are persisted to the draft before the first
+/// provider request (compaction's source must match the staged history, and
+/// an attempt that dies before committing must not lose them) and staged
+/// for this turn. Returns every closure the turn must carry if it suspends.
+async fn close_undelivered_calls(
+    inputs: &RootWorkerInputs,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<Option<llm::Message>> {
+    let thread_id = &inputs.bootstrap.thread_id;
+    let Some(projection) = deps
+        .message_store
+        .get(thread_id)
+        .await
+        .context("read transcript for undelivered calls")?
+    else {
+        return Ok(None);
+    };
+    let UndeliveredCallClosures { mut carried, new } = undelivered_call_closures(
+        thread_id,
+        &projection.messages,
+        &projection.draft_messages,
+        deps.task_store,
+    )
+    .await;
+    if !new.is_empty() {
+        let closing = llm::Message::user_with_content(new.clone());
+        let mut draft = projection.draft_messages;
+        draft.push(closing.clone());
+        deps.message_store
+            .set_draft(thread_id, draft, now)
+            .await
+            .context("persist closing late results")?;
+        inputs
+            .staged_stores
+            .messages
+            .append(thread_id, closing)
+            .await
+            .context("stage closing late results")?;
+    }
+    carried.extend(new);
+    Ok((!carried.is_empty()).then(|| llm::Message::user_with_content(carried)))
 }
 
 fn message_blocks(message: &llm::Message) -> &[llm::ContentBlock] {
     match &message.content {
         llm::Content::Blocks(blocks) => blocks,
         llm::Content::Text(_) => &[],
-    }
-}
-
-fn append_to_trailing_user_message(
-    messages: &mut Vec<llm::Message>,
-    blocks: Vec<llm::ContentBlock>,
-) {
-    if let Some(last) = messages.last_mut()
-        && last.role == llm::Role::User
-    {
-        match &mut last.content {
-            llm::Content::Blocks(existing) => existing.extend(blocks),
-            llm::Content::Text(text) => {
-                let mut merged = vec![llm::ContentBlock::Text {
-                    text: std::mem::take(text),
-                }];
-                merged.extend(blocks);
-                last.content = llm::Content::Blocks(merged);
-            }
-        }
-    } else {
-        messages.push(llm::Message::user_with_content(blocks));
     }
 }
 

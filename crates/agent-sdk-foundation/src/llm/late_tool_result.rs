@@ -32,8 +32,8 @@ pub enum LateToolResultStatus {
     /// The call, or the turn waiting on it, was cancelled before its result
     /// was delivered.
     Cancelled,
-    /// The call outlived the turn waiting on it, so its result will never be
-    /// delivered, though it may still take effect.
+    /// The call may still be running, but the turn waiting on it ended, so
+    /// its result will never be delivered.
     StillRunning,
 }
 
@@ -59,9 +59,9 @@ impl LateToolResultStatus {
                  partly run: check its effects, then call it again if you still need it."
             ),
             Self::StillRunning => format!(
-                "The earlier `{name}` call {id} was still running when this turn stopped, so its \
-                 result will never be delivered. It may still complete and take effect: verify \
-                 its effects before calling it again."
+                "The earlier `{name}` call {id} may still be running, but the turn waiting on it \
+                 ended before its result arrived, so the result will never be delivered. Do not \
+                 call it again until it is confirmed stopped or finished."
             ),
         }
     }
@@ -259,15 +259,25 @@ mod tests {
 
     #[test]
     fn statuses_that_end_without_a_result_invite_a_checked_retry() {
-        for status in [
+        let cancelled = render(
+            &call("call_1", "bash"),
             LateToolResultStatus::Cancelled,
+            "never delivered",
+        );
+        assert!(cancelled.contains("status=\"cancelled\""));
+        assert!(cancelled.contains("check its effects"), "{cancelled}");
+
+        let running = render(
+            &call("call_1", "bash"),
             LateToolResultStatus::StillRunning,
-        ] {
-            let text = render(&call("call_1", "bash"), status, "never delivered");
-            assert!(text.contains(&format!("status=\"{}\"", status.label())));
-            assert!(text.contains("its effects"), "{text}");
-            assert!(!text.contains("do not call it again"), "{text}");
-        }
+            "never delivered",
+        );
+        assert!(running.contains("status=\"still_running\""));
+        assert!(
+            running.contains("Do not call it again until it is confirmed stopped or finished"),
+            "a call that may still run must not be re-issued on absent effects: {running}",
+        );
+        assert!(!running.contains("its effects"), "{running}");
         let done = render(&call("call_1", "bash"), LateToolResultStatus::Error, "boom");
         assert!(done.contains("do not call it again"));
     }
