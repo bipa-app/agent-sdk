@@ -8900,6 +8900,89 @@ async fn every_turn_exit_closes_interim_only_calls_once_with_their_real_state() 
     Ok(())
 }
 
+/// The first early resume compacts before its call, folding the interim
+/// answer into history and leaving the staged delta empty, then is
+/// cancelled mid-call: the closure must still be committed.
+#[tokio::test]
+async fn cancelling_a_compacted_early_resume_mid_call_closes_its_running_call() -> Result<()> {
+    let stores = TestStores::new();
+    let provider = MockToolCallProvider::new(vec![bash_call("call_0"), bash_call("call_1")]);
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let mut bootstrap = sample_bootstrap_with_tools(task);
+    bootstrap.definition.policy.child_join_policy = ChildJoinPolicy::Any;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let prompt = "Run both build steps and report back. ".repeat(400);
+    let outcome = execute_root_turn(inputs, prompt, &provider, &stores.deps(), t_plus(5)).await?;
+    let RootTurnOutcome::Suspended {
+        parent_task: parent,
+        child_tasks: children,
+        ..
+    } = outcome
+    else {
+        bail!("the batch must park");
+    };
+    complete_child_at(
+        &stores,
+        &children[0],
+        &ok_result("done-0"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+
+    let acquired = acquire_parent(&stores, &parent.id, t_plus(10)).await?;
+    let inputs = resume_inputs(&stores, &acquired, t_plus(10)).await?;
+    let config = CompactionConfig::default()
+        .with_threshold_tokens(1)
+        .with_min_messages(2)
+        .with_retain_recent(2);
+    let compactor: Arc<dyn LlmProvider> = Arc::new(MockTextProvider::new("[summary]"));
+    let cancel = CancellationToken::new();
+    let deps = RootTurnDeps {
+        cancel: Some(&cancel),
+        ..stores.deps_with_compaction(&config, &compactor)
+    };
+    let cancelling = FinishThenCancelProvider {
+        cancel: cancel.clone(),
+        stores: stores.clone(),
+        task_id: parent.id.clone(),
+        finish: None,
+    };
+    let error = Box::pin(resume_from_children(
+        inputs,
+        &acquired,
+        &cancelling,
+        &deps,
+        t_plus(12),
+    ))
+    .await
+    .err()
+    .context("the early resume must be cancelled")?;
+    anyhow::ensure!(is_root_turn_cancelled(&error), "{error:#}");
+
+    let projection = stores
+        .messages
+        .get(&thread_a())
+        .await?
+        .context("projection")?;
+    assert_eq!(projection.compactions.len(), 1);
+    let committed = stores.messages.get_history(&thread_a()).await?;
+    let interim = find_tool_result(&committed, "call_1").context("interim stays visible")?;
+    assert!(is_interim_payload(interim));
+    assert_running_call_closed(&committed, "call_1", "cancelled");
+
+    let request = follow_up_request(&stores, "Is the second step done?", t_plus(30)).await?;
+    assert_running_call_closed(&request, "call_1", "cancelled");
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Commit the completed prefix of a cancelled turn (partial commit)
 // ─────────────────────────────────────────────────────────────────────
