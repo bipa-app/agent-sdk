@@ -1931,8 +1931,8 @@ mod tests {
                 "pricing should be populated for {model_id}"
             );
             assert!(
-                caps.max_output_tokens.is_some_and(|m| m > 0),
-                "max_output_tokens should be non-zero for {model_id}"
+                caps.default_output_tokens().is_some_and(|m| m > 0),
+                "the default output budget should be non-zero for {model_id}"
             );
             assert!(
                 caps.context_window.is_some_and(|c| c > 0),
