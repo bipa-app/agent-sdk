@@ -98,12 +98,12 @@ pub use agent_sdk_foundation::llm::*;
 pub use impls::CloudflareAIGatewayProvider;
 #[cfg(feature = "gemini")]
 pub use impls::GeminiProvider;
-#[cfg(feature = "openai-codex")]
-pub use impls::{CodexTransport, OpenAICodexResponsesProvider};
 #[cfg(feature = "vertex")]
 pub use impls::VertexProvider;
 #[cfg(feature = "anthropic")]
 pub use impls::{AnthropicProvider, is_oauth_token};
+#[cfg(feature = "openai-codex")]
+pub use impls::{CodexTransport, OpenAICodexResponsesProvider};
 #[cfg(feature = "openai")]
 pub use impls::{
     OpenAIAllowedToolsMode, OpenAIApiSurface, OpenAIPromptCacheMode, OpenAIPromptCacheTtl,

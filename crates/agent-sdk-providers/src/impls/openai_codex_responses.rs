@@ -674,7 +674,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                 Ok((connection, turn_state)) => {
                                     websocket_session.connection = Some(connection);
                                     if let Some(turn_state) = turn_state {
-                                        websocket_session.turn_state = Some(turn_state);
+                                        websocket_session.record_turn_state(turn_state);
                                     }
                                     websocket_session.prewarmed = false;
                                 }
@@ -5513,6 +5513,161 @@ mod tests {
             vec![None, Some("sticky-abc"), Some("sticky-abc"), None, None,],
             "thread-a's tool follow-ups replay the turn's first token, thread-b never \
              sees it, and thread-a's next user turn starts without it"
+        );
+        Ok(())
+    }
+
+    struct WsTurnStateServer {
+        base_url: String,
+        handshake_turn_states: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        http_requests: Arc<AtomicUsize>,
+    }
+
+    struct RecordHandshakeTurnState(Arc<std::sync::Mutex<Vec<Option<String>>>>);
+
+    impl tokio_tungstenite::tungstenite::handshake::server::Callback for RecordHandshakeTurnState {
+        fn on_request(
+            self,
+            request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+            mut response: tokio_tungstenite::tungstenite::handshake::server::Response,
+        ) -> std::result::Result<
+            tokio_tungstenite::tungstenite::handshake::server::Response,
+            tokio_tungstenite::tungstenite::handshake::server::ErrorResponse,
+        > {
+            let Ok(mut seen) = self.0.lock() else {
+                return Ok(response);
+            };
+            seen.push(
+                request
+                    .headers()
+                    .get(OPENAI_CODEX_TURN_STATE_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToOwned::to_owned),
+            );
+            if let Ok(token) = format!("ws-sticky-{}", seen.len()).parse() {
+                response
+                    .headers_mut()
+                    .insert(OPENAI_CODEX_TURN_STATE_HEADER, token);
+            }
+            Ok(response)
+        }
+    }
+
+    /// Answers every WebSocket handshake with a fresh `x-codex-turn-state`
+    /// (`ws-sticky-1`, `ws-sticky-2`, ...) and records the token the client
+    /// sent. Each real request completes and then the server closes the
+    /// socket, so the client's next request reconnects with a new handshake.
+    async fn spawn_ws_turn_state_server() -> anyhow::Result<WsTurnStateServer> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let handshake_turn_states = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let http_requests = Arc::new(AtomicUsize::new(0));
+        let handshakes_task = handshake_turn_states.clone();
+        let http_requests_task = http_requests.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let handshakes = handshakes_task.clone();
+                let http_requests = http_requests_task.clone();
+                tokio::spawn(async move {
+                    let mut peek = [0u8; 1024];
+                    let Ok(n) = stream.peek(&mut peek).await else {
+                        return;
+                    };
+                    let head = String::from_utf8_lossy(&peek[..n]).to_ascii_lowercase();
+                    if !head.contains("upgrade: websocket") {
+                        http_requests.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(
+                        stream,
+                        RecordHandshakeTurnState(handshakes),
+                    )
+                    .await
+                    else {
+                        return;
+                    };
+                    let completed = |id: &str| {
+                        WebSocketMessage::Text(
+                            format!(
+                                r#"{{"type":"response.completed","response":{{"id":"{id}"}}}}"#
+                            )
+                            .into(),
+                        )
+                    };
+                    while let Some(Ok(message)) = ws.next().await {
+                        let WebSocketMessage::Text(text) = message else {
+                            continue;
+                        };
+                        let Ok(body) = serde_json::from_str::<serde_json::Value>(&text) else {
+                            return;
+                        };
+                        if body["generate"] == serde_json::json!(false) {
+                            let _ = ws.send(completed("resp_warmup")).await;
+                            continue;
+                        }
+                        let delta = r#"{"type":"response.output_text.delta","delta":"hi"}"#;
+                        let _ = ws.send(WebSocketMessage::Text(delta.into())).await;
+                        let _ = ws.send(completed("resp_turn")).await;
+                        let _ = ws.send(WebSocketMessage::Close(None)).await;
+                    }
+                });
+            }
+        });
+
+        Ok(WsTurnStateServer {
+            base_url: format!("http://{addr}/backend-api"),
+            handshake_turn_states,
+            http_requests,
+        })
+    }
+
+    #[tokio::test]
+    async fn websocket_turn_state_is_replayed_within_a_turn_and_reset_for_the_next()
+    -> anyhow::Result<()> {
+        let server = spawn_ws_turn_state_server().await?;
+        let provider = OpenAICodexResponsesProvider::with_base_url(
+            oauth_token(),
+            MODEL_GPT53_CODEX.to_owned(),
+            server.base_url.clone(),
+        )
+        .with_transport(CodexTransport::WebSocket);
+
+        for request in [
+            streaming_request("thread-ws"),
+            tool_followup_request("thread-ws"),
+            tool_followup_request("thread-ws"),
+            next_user_turn_request("thread-ws"),
+        ] {
+            anyhow::ensure!(
+                drain_ok(&provider, request).await,
+                "the turn did not complete over the websocket"
+            );
+        }
+
+        assert!(
+            !provider.websockets_unhealthy.load(Ordering::Relaxed),
+            "every turn must complete on the websocket transport"
+        );
+        assert_eq!(server.http_requests.load(Ordering::Relaxed), 0);
+        let handshake_turn_states = server
+            .handshake_turn_states
+            .lock()
+            .map_err(|_| anyhow::anyhow!("handshake log lock poisoned"))?
+            .clone();
+        assert_eq!(
+            handshake_turn_states,
+            vec![
+                None,
+                Some("ws-sticky-1".to_owned()),
+                Some("ws-sticky-1".to_owned()),
+                None,
+            ],
+            "reconnects within a turn keep the turn's first token, and the next user \
+             turn reconnects without it"
         );
         Ok(())
     }
