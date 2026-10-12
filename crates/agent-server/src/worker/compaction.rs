@@ -1716,11 +1716,14 @@ mod tests {
 
     #[test]
     fn window_share_bounds_output_only_where_it_binds() -> anyhow::Result<()> {
-        let kimi = registered("openai", "accounts/fireworks/models/kimi-k3")
+        let registered_kimi = registered("openai", "accounts/fireworks/models/kimi-k3")
             .context("fireworks kimi k3 row")?;
-        assert_eq!(kimi.max_output_tokens, None);
-        assert_eq!(sized(128_000, Some(kimi), None), 128_000);
-        assert_eq!(sized(400_000, Some(kimi), None), 1_048_576 / 4);
+        assert_eq!(registered_kimi.max_output_tokens, None);
+        assert_eq!(registered_kimi.default_reasoning, DefaultReasoning::On);
+        assert_eq!(sized(600_000, Some(registered_kimi), None), 1_048_576 / 2);
+        let kimi = registered_kimi.with_default_reasoning(DefaultReasoning::Off);
+        assert_eq!(sized(128_000, Some(&kimi), None), 128_000);
+        assert_eq!(sized(400_000, Some(&kimi), None), 1_048_576 / 4);
 
         let small_window = kimi.with_context_window(Some(100_000));
         assert_eq!(sized(128_000, Some(&small_window), None), 32_000);

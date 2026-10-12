@@ -412,7 +412,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         default_reasoning: DefaultReasoning::On,
         source_url: ANTHROPIC_MODELS_URL,
         source_status: SourceStatus::Official,
-        notes: Some("Adaptive thinking (not always on; default effort `high`). `ThinkingMode::Enabled { budget_tokens }` is rejected by the Anthropic API; the SDK fails fast in validate_thinking_config."),
+        notes: Some("Thinking is on by default and `thinking.type: \"disabled\"` returns 400 (Anthropic thinking docs); OpenRouter marks its reasoning mandatory. Default effort `high`. `ThinkingMode::Enabled { budget_tokens }` is rejected by the Anthropic API; the SDK fails fast in validate_thinking_config."),
     },
     ModelCapabilities {
         provider: "anthropic",
@@ -472,7 +472,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         default_reasoning: DefaultReasoning::On,
         source_url: ANTHROPIC_MODELS_URL,
         source_status: SourceStatus::Official,
-        notes: Some("Haiku 5.5 is adaptive-only: `ThinkingMode::Enabled { budget_tokens }` is rejected by the Anthropic API and the SDK fails fast in validate_thinking_config. Effort defaults to `medium` when unset; `xhigh` and `max` are accepted. Claude Code's model catalog marks it as rejecting `thinking.type: \"disabled\"`, which the SDK never sends."),
+        notes: Some("Haiku 5.5 is adaptive-only: `ThinkingMode::Enabled { budget_tokens }` is rejected by the Anthropic API and the SDK fails fast in validate_thinking_config. Effort defaults to `medium` when unset; `xhigh` and `max` are accepted. Claude Code's model catalog marks it as rejecting `thinking.type: \"disabled\"`, which the SDK never sends. Thinking is on by default (Anthropic thinking docs: \"Claude Haiku 5.5 also has thinking on by default\"); it accepts `thinking.type: \"disabled\"` at effort `high` or below."),
     },
     ModelCapabilities {
         provider: "anthropic",
@@ -982,10 +982,10 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking: true,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
-        default_reasoning: DefaultReasoning::Off,
+        default_reasoning: DefaultReasoning::On,
         source_url: GOOGLE_PRICING_URL,
         source_status: SourceStatus::Official,
-        notes: Some("Pricing sourced from Gemini 3.1 Pro Preview docs."),
+        notes: Some("Pricing sourced from Gemini 3.1 Pro Preview docs. Thinks by default and max_output_tokens covers thinking plus output (ai.google.dev/gemini-api/docs/thinking: \"gemini-3.1-pro-preview On (high)\"); OpenRouter marks its reasoning mandatory."),
     },
     ModelCapabilities {
         provider: "gemini",
@@ -997,10 +997,10 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking: true,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
-        default_reasoning: DefaultReasoning::Off,
+        default_reasoning: DefaultReasoning::On,
         source_url: GOOGLE_PRICING_URL,
         source_status: SourceStatus::Derived,
-        notes: Some("Legacy Gemini 3.1 Pro alias retained for compatibility; prefer gemini-3.1-pro-preview."),
+        notes: Some("Legacy Gemini 3.1 Pro alias retained for compatibility; prefer gemini-3.1-pro-preview. Thinks by default and max_output_tokens covers thinking plus output (ai.google.dev/gemini-api/docs/thinking: \"gemini-3.1-pro-preview On (high)\", the model this alias names)."),
     },
     ModelCapabilities {
         provider: "gemini",
@@ -1012,10 +1012,10 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking: true,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
-        default_reasoning: DefaultReasoning::Off,
+        default_reasoning: DefaultReasoning::On,
         source_url: GOOGLE_MODELS_URL,
         source_status: SourceStatus::Unverified,
-        notes: Some("Model presence confirmed from Google docs, but pricing was not extracted in this pass."),
+        notes: Some("Model presence confirmed from Google docs, but pricing was not extracted in this pass. Thinks by default: Google states \"Gemini models engage in dynamic thinking by default\" (ai.google.dev/gemini-api/docs/thinking) and OpenRouter reports its reasoning enabled by default at minimal effort; max_output_tokens covers thinking plus output."),
     },
     ModelCapabilities {
         provider: "gemini",
@@ -1027,10 +1027,10 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking: true,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
-        default_reasoning: DefaultReasoning::Off,
+        default_reasoning: DefaultReasoning::On,
         source_url: GOOGLE_MODELS_URL,
         source_status: SourceStatus::Unverified,
-        notes: Some("Model presence confirmed from Google docs, but pricing was not extracted in this pass."),
+        notes: Some("Model presence confirmed from Google docs, but pricing was not extracted in this pass. Thinks by default and max_output_tokens covers thinking plus output (ai.google.dev/gemini-api/docs/thinking: \"gemini-3-flash-preview On (high)\")."),
     },
     ModelCapabilities {
         provider: "gemini",
@@ -1042,10 +1042,10 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking: true,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
-        default_reasoning: DefaultReasoning::Off,
+        default_reasoning: DefaultReasoning::On,
         source_url: GOOGLE_MODELS_URL,
         source_status: SourceStatus::Derived,
-        notes: Some("Legacy Gemini 3.0 Flash model retained for compatibility; prefer gemini-3-flash-preview."),
+        notes: Some("Legacy Gemini 3.0 Flash model retained for compatibility; prefer gemini-3-flash-preview. Thinks by default and max_output_tokens covers thinking plus output (ai.google.dev/gemini-api/docs/thinking: \"gemini-3-flash-preview On (high)\", the model this alias names)."),
     },
     ModelCapabilities {
         provider: "gemini",
@@ -1057,10 +1057,10 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking: true,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
-        default_reasoning: DefaultReasoning::Off,
+        default_reasoning: DefaultReasoning::On,
         source_url: GOOGLE_MODELS_URL,
         source_status: SourceStatus::Unverified,
-        notes: Some("Model presence confirmed from Google docs, but pricing was not extracted in this pass."),
+        notes: Some("Model presence confirmed from Google docs, but pricing was not extracted in this pass. Thinks by default and max_output_tokens covers thinking plus output (ai.google.dev/gemini-api/docs/thinking: \"gemini-3-pro-preview On (high)\", the model this alias names)."),
     },
     ModelCapabilities {
         provider: "gemini",
@@ -1072,10 +1072,10 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking: true,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
-        default_reasoning: DefaultReasoning::Off,
+        default_reasoning: DefaultReasoning::On,
         source_url: GOOGLE_PRICING_URL,
         source_status: SourceStatus::Official,
-        notes: Some("Official docs state output pricing includes thinking tokens."),
+        notes: Some("Official docs state output pricing includes thinking tokens. Thinks by default and max_output_tokens covers thinking plus output (ai.google.dev/gemini-api/docs/thinking: \"gemini-2.5-flash On\")."),
     },
     ModelCapabilities {
         provider: "gemini",
@@ -1087,10 +1087,10 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking: true,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
-        default_reasoning: DefaultReasoning::Off,
+        default_reasoning: DefaultReasoning::On,
         source_url: GOOGLE_MODELS_URL,
         source_status: SourceStatus::Unverified,
-        notes: Some("Model presence confirmed from Google docs, but pricing was not extracted in this pass."),
+        notes: Some("Model presence confirmed from Google docs, but pricing was not extracted in this pass. Thinks by default and max_output_tokens covers thinking plus output (ai.google.dev/gemini-api/docs/thinking: \"gemini-2.5-pro On\"); OpenRouter marks its reasoning mandatory."),
     },
     ModelCapabilities {
         provider: "gemini",
@@ -1195,10 +1195,10 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking: false,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
-        default_reasoning: DefaultReasoning::Off,
+        default_reasoning: DefaultReasoning::On,
         source_url: KIMI_K25_AA_URL,
         source_status: SourceStatus::Unverified,
-        notes: Some("Exact native model_id used by the native constructor (Moonshot platform.kimi.ai base_url). Native pricing not on the first-party table (only k2.6 is enumerated); figures derived from Artificial Analysis. Context 262,144; 32768 is a generous within-window completion budget."),
+        notes: Some("Exact native model_id used by the native constructor (Moonshot platform.kimi.ai base_url). Native pricing not on the first-party table (only k2.6 is enumerated); figures derived from Artificial Analysis. Context 262,144; 32768 is a generous within-window completion budget. Reasoning is treated as on by default to match the OpenRouter row for the same weights, which OpenRouter reports as enabled by default; Moonshot's current docs no longer list K2.5, so the native default is unverified."),
     },
     ModelCapabilities {
         provider: "openai",
@@ -1228,7 +1228,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         default_reasoning: DefaultReasoning::On,
         source_url: OPENROUTER_KIMI_K3_URL,
         source_status: SourceStatus::Derived,
-        notes: Some("Exact OpenRouter slug; Baseten serves the same weights as moonshotai/Kimi-K3, which the case-insensitive lookup folds here. Reasoning model with a 1,048,576-token window (OpenRouter model metadata; Baseten documents a 1M window). OpenRouter endpoints cap completions between 65,535 and 943,718 tokens (Baseten 262,144), and OpenRouter routes a request only to endpoints that support its max_tokens, so no single ceiling applies and max_output_tokens stays None: a fixed cap would cut requests some route serves. Callers size output through their own max_tokens. Pricing is None because the static `openai` key cannot tell the gateway base URLs apart and their rates differ; dynamic route catalogs remain the pricing authority."),
+        notes: Some("Exact OpenRouter slug; Baseten serves the same weights as moonshotai/Kimi-K3, which the case-insensitive lookup folds here. Reasoning model with a 1,048,576-token window (OpenRouter model metadata; Baseten documents a 1M window). OpenRouter endpoints cap completions between 65,535 and 943,718 tokens (Baseten 262,144), and OpenRouter routes a request only to endpoints that support its max_tokens, so no single ceiling applies and max_output_tokens stays None: a fixed cap would cut requests some route serves. Callers size output through their own max_tokens. Pricing is None because the static `openai` key cannot tell the gateway base URLs apart and their rates differ; dynamic route catalogs remain the pricing authority. Reasons by default: Moonshot documents reasoning_effort defaulting to `max`, and OpenRouter reports reasoning enabled by default."),
     },
     ModelCapabilities {
         provider: "openai",
@@ -1240,10 +1240,10 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking: true,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
-        default_reasoning: DefaultReasoning::Off,
+        default_reasoning: DefaultReasoning::On,
         source_url: FIREWORKS_KIMI_K3_URL,
         source_status: SourceStatus::Derived,
-        notes: Some("Fireworks model path for Kimi K3. Fireworks documents a 1,048,576-token window and no fixed output cap (max_tokens is lowered to fit the window). Thinking metadata mirrors the moonshotai/kimi-k3 row; pricing is None for the same reason."),
+        notes: Some("Fireworks model path for Kimi K3. Fireworks documents a 1,048,576-token window and no fixed output cap (max_tokens is lowered to fit the window). Thinking metadata mirrors the moonshotai/kimi-k3 row; pricing is None for the same reason. Same weights as moonshotai/kimi-k3, which reasons by default (Moonshot: reasoning_effort defaults to `max`)."),
     },
     ModelCapabilities {
         provider: "openai",
@@ -1645,6 +1645,10 @@ mod tests {
             ("openai", "moonshotai/kimi-k3", On),
             ("openai", "minimax/minimax-m2.5", On),
             ("openai", "deepseek/deepseek-v4-pro", Off),
+            ("openai", "accounts/fireworks/models/kimi-k3", On),
+            ("openai", "kimi-k2.5", On),
+            ("gemini", "gemini-2.5-pro", On),
+            ("gemini", "gemini-3.1-pro-preview", On),
             ("gemini", "gemini-2.0-flash", Off),
         ] {
             let caps = get_model_capabilities(provider, model)
@@ -1873,15 +1877,23 @@ mod tests {
     }
 
     #[test]
-    fn test_lookup_open_non_reasoning_kimi_models() {
+    fn test_lookup_open_non_reasoning_kimi_models() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
         // Kimi K2.6 / K2.5 are registered as non-reasoning coding models.
-        let k26 = get_model_capabilities("openai", "moonshotai/kimi-k2.6").unwrap();
+        let k26 = get_model_capabilities("openai", "moonshotai/kimi-k2.6")
+            .context("moonshotai/kimi-k2.6 capabilities missing")?;
         assert!(!k26.supports_thinking);
         assert_eq!(k26.max_output_tokens, None);
         assert_eq!(k26.default_output_tokens(), Some(65_536));
-        assert!(k26.pricing.unwrap().input.unwrap().usd_per_million_tokens > 0.0);
+        let input = k26
+            .pricing
+            .and_then(|pricing| pricing.input)
+            .context("moonshotai/kimi-k2.6 input pricing missing")?;
+        assert!(input.usd_per_million_tokens > 0.0);
 
-        let k25 = get_model_capabilities("openai", "moonshotai/kimi-k2.5").unwrap();
+        let k25 = get_model_capabilities("openai", "moonshotai/kimi-k2.5")
+            .context("moonshotai/kimi-k2.5 capabilities missing")?;
         assert_eq!(k25.max_output_tokens, None);
         assert_eq!(k25.default_output_tokens(), Some(32_768));
         assert_eq!(
@@ -1889,9 +1901,11 @@ mod tests {
             Some(32_768)
         );
 
-        let k25_native = get_model_capabilities("openai", "kimi-k2.5").unwrap();
+        let k25_native = get_model_capabilities("openai", "kimi-k2.5")
+            .context("kimi-k2.5 capabilities missing")?;
         assert!(!k25_native.supports_thinking);
         assert_eq!(k25_native.max_output_tokens, Some(32_768));
+        Ok(())
     }
 
     #[test]
