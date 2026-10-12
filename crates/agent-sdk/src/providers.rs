@@ -44,7 +44,7 @@ pub use agent_sdk_providers::impls::CloudflareAIGatewayProvider;
 #[cfg(feature = "gemini")]
 pub use agent_sdk_providers::impls::GeminiProvider;
 #[cfg(feature = "openai-codex")]
-pub use agent_sdk_providers::impls::OpenAICodexResponsesProvider;
+pub use agent_sdk_providers::impls::{CodexTransport, OpenAICodexResponsesProvider};
 #[cfg(feature = "vertex")]
 pub use agent_sdk_providers::impls::VertexProvider;
 #[cfg(feature = "anthropic")]

@@ -99,7 +99,7 @@ pub use impls::CloudflareAIGatewayProvider;
 #[cfg(feature = "gemini")]
 pub use impls::GeminiProvider;
 #[cfg(feature = "openai-codex")]
-pub use impls::OpenAICodexResponsesProvider;
+pub use impls::{CodexTransport, OpenAICodexResponsesProvider};
 #[cfg(feature = "vertex")]
 pub use impls::VertexProvider;
 #[cfg(feature = "anthropic")]

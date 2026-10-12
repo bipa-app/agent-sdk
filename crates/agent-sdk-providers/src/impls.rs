@@ -45,7 +45,7 @@ pub use gemini::GeminiProvider;
 #[cfg(feature = "openai")]
 pub use openai::OpenAIProvider;
 #[cfg(feature = "openai-codex")]
-pub use openai_codex_responses::OpenAICodexResponsesProvider;
+pub use openai_codex_responses::{CodexTransport, OpenAICodexResponsesProvider};
 #[cfg(feature = "openai")]
 pub use openai_reasoning::{
     OpenAIAllowedToolsMode, OpenAIApiSurface, OpenAIPromptCacheMode, OpenAIPromptCacheTtl,
