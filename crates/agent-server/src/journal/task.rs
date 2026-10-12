@@ -452,8 +452,11 @@ impl TaskStatus {
     /// - [`TaskStatus::Running`] — a root that a worker has leased.
     /// - [`TaskStatus::WaitingOnChildren`] — a root that is paused on its
     ///   spawned tool-runtime children.
-    /// - [`TaskStatus::AwaitingConfirmation`] — a root that is paused on
-    ///   an out-of-band confirmation.
+    /// - [`TaskStatus::AwaitingQuestion`] — a root that is paused on a
+    ///   durable question to the user.
+    /// - [`TaskStatus::AwaitingConfirmation`] — a paused status, so it
+    ///   blocks too, though only a tool child pauses on a confirmation and
+    ///   a root never holds it.
     ///
     /// [`TaskStatus::Queued`] is deliberately **not** blocking: a queued
     /// root has been durably admitted to the same-thread FIFO queue and is
