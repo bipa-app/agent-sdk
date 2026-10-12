@@ -100,6 +100,23 @@ use agent_server::journal::turn_attempt_store::TurnAttemptStore;
 use super::migrations::apply_durable_core_migrations;
 
 /// `sqlx`-backed durable-core store.
+///
+/// # Lock order
+///
+/// Every transaction takes its row locks in one global order, so none can
+/// wait on another that waits on it:
+///
+/// 1. thread rows, a parent's thread before its subagents' threads;
+/// 2. task rows by descending `depth`, and by `id` within a depth
+///    ([`task_lock_order`]): a child before its parent, siblings by id.
+///
+/// A child's terminal transition locks the child, then its parent; a cancel
+/// locks its whole tree in this order once its threads are held; a re-park
+/// or mixed spawn locks the children it re-attaches by id before their
+/// parent. A transition that ends a root locks the root's thread first (see
+/// [`Self::lock_for_transition_tx`]). A root's input injections are locked
+/// only by transactions that already hold the root's thread, so their order
+/// relative to the root does not matter.
 #[derive(Clone)]
 pub struct PostgresDurableStore {
     pool: PgPool,
@@ -3171,10 +3188,16 @@ LIMIT 1
     record.map(AgentTask::try_from).transpose()
 }
 
-/// Lock the existing children a parent re-attaches, in id order, before the
-/// parent's own row is locked: a child's terminal transition locks the child
-/// and then its parent, so holding the parent while reaching for a child
-/// deadlocks against it.
+/// Lock the existing children a parent re-attaches, in the store's task-row
+/// order (by id among siblings), before the parent's own row: a child's
+/// terminal transition locks the child and then its parent, so holding the
+/// parent while reaching for a child deadlocks against it.
+/// The position of `task` in the store's task-row lock order (see
+/// [`PostgresDurableStore`]): deeper rows first, then by id.
+const fn task_lock_order(task: &AgentTask) -> (std::cmp::Reverse<u32>, &AgentTaskId) {
+    (std::cmp::Reverse(task.depth), &task.id)
+}
+
 async fn lock_reattached_children_tx<'a>(
     tx: &mut Transaction<'_, Postgres>,
     parent_id: &AgentTaskId,
@@ -5051,18 +5074,14 @@ ORDER BY descendant.root_id
             all_tasks = Self::collect_subtree_tx(&mut tx, root_id).await?;
         }
 
-        // Phase 2 — CAS cancel transitions. Apply the cancel UPDATEs
-        // deepest-first so the per-row locks are taken in the same
-        // child-then-parent order as the terminal transition paths
-        // (`complete_task` / `fail_task`), removing the lock-order
-        // inversion that could deadlock (40P01) a concurrent
-        // `cancel_tree(root)` + `complete_task(child-of-root)`. Each
-        // row is re-read FOR UPDATE and skipped if it settled
-        // concurrently — the transition, the returned `transitioned`
-        // slice, and the marker gating below all derive from the
-        // locked re-read, never from the snapshot.
+        // Phase 2 — CAS cancel transitions, taking the row locks in the
+        // store's task-row order (see `PostgresDurableStore`): deepest
+        // first, then by id. Each row is re-read FOR UPDATE and skipped if
+        // it settled concurrently — the transition, the returned
+        // `transitioned` slice, and the marker gating below all derive
+        // from the locked re-read, never from the snapshot.
         let mut cancel_order: Vec<&AgentTask> = all_tasks.iter().collect();
-        cancel_order.sort_by_key(|t| std::cmp::Reverse(t.depth));
+        cancel_order.sort_by(|a, b| task_lock_order(a).cmp(&task_lock_order(b)));
 
         let mut cancelled_ids: std::collections::BTreeSet<AgentTaskId> =
             std::collections::BTreeSet::new();

@@ -1266,24 +1266,40 @@ mod postgres {
     /// Block until some session waits on a lock `holder` holds. Lock waits
     /// elsewhere in the database, such as another test's, do not count.
     async fn until_blocked_by(store: &PostgresDurableStore, holder: i32) -> Result<()> {
+        until_sessions_blocked_by(store, holder, 1).await
+    }
+
+    /// Block until `waiters` sessions wait on locks `holder` holds, directly
+    /// or queued behind another session that does: a second waiter on a row
+    /// queues behind the first, not behind the row's holder.
+    async fn until_sessions_blocked_by(
+        store: &PostgresDurableStore,
+        holder: i32,
+        waiters: i64,
+    ) -> Result<()> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let blocked = sqlx::query_scalar!(
                 r#"
-SELECT count(*) AS "blocked!"
-FROM pg_stat_activity
-WHERE $1 = ANY (pg_blocking_pids(pid))
+WITH RECURSIVE blocked (pid) AS (
+    SELECT pid FROM pg_stat_activity WHERE $1 = ANY (pg_blocking_pids(pid))
+    UNION
+    SELECT waiting.pid
+    FROM pg_stat_activity AS waiting
+    JOIN blocked ON blocked.pid = ANY (pg_blocking_pids(waiting.pid))
+)
+SELECT count(*) AS "blocked!" FROM blocked
 "#,
                 holder,
             )
             .fetch_one(store.pool())
             .await?;
-            if blocked > 0 {
+            if blocked >= waiters {
                 return Ok(());
             }
             anyhow::ensure!(
                 std::time::Instant::now() < deadline,
-                "no session ever waited on the holder's locks",
+                "{waiters} sessions never waited on the holder's locks",
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -1538,6 +1554,127 @@ WHERE $1 = ANY (pg_blocking_pids(pid))
         assert!(
             failures.is_empty() && miscounted.is_empty(),
             "over {RACE_ROUNDS} rounds: failures {failures:#?}, miscounted {miscounted:#?}",
+        );
+        Ok(())
+    }
+
+    /// A root woken early over two tool children from two spawn batches:
+    /// `first` was spawned before `second`, and its id sorts after it, so
+    /// spawn order and id order disagree. `None` when the ids happen to
+    /// agree with spawn order.
+    async fn woken_over_children_ordered_against_their_ids(
+        store: &PostgresDurableStore,
+        tid: &str,
+        at: i64,
+    ) -> Result<Option<(AgentTaskId, AgentTaskId, AgentTaskId, WorkerId, LeaseId)>> {
+        let parked = super::park_root_on_tool_children(store, tid, 1, 3, at).await?;
+        let first = parked.children[0].id.clone();
+        let (worker, lease) = super::resume_root_early(store, &parked.root.id, at + 5).await?;
+        let spawned = store
+            .spawn_mixed_children(
+                &parked.root.id,
+                &worker,
+                &lease,
+                MixedChildrenSpawn {
+                    delivered_injection_ids: Vec::new(),
+                    boundary_events: Vec::new(),
+                    subagents: Vec::new(),
+                    tool_children: vec![ToolChildSpawn {
+                        spawn_index: 1,
+                        spec: ChildSpawnSpec::new(3),
+                    }],
+                    reattach: vec![ReattachedChild {
+                        child_id: first.clone(),
+                        spawn_index: 0,
+                    }],
+                    payload: payload_with_calls(tid, 2),
+                    child_otel_traceparent: None,
+                },
+                Vec::new(),
+                t_plus(at + 20),
+            )
+            .await?;
+        let second = spawned.tool_children[0].id.clone();
+        if first < second {
+            return Ok(None);
+        }
+        let (worker, lease) = super::resume_root_early(store, &parked.root.id, at + 30).await?;
+        Ok(Some((parked.root.id, first, second, worker, lease)))
+    }
+
+    /// A steering re-park and a stop of the same root, staged so each takes
+    /// its first child lock before reaching for the other's: with a single
+    /// order over sibling rows they queue instead of deadlocking.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_steering_repark_racing_a_cancel_never_deadlocks() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let mut staged = 0;
+        for round in 0..64 {
+            if staged == 5 {
+                break;
+            }
+            let tid = format!("pg-repark-cancel-{round}");
+            let at = round * 100;
+            let Some((root, first, second, worker, lease)) =
+                woken_over_children_ordered_against_their_ids(&store, &tid, at).await?
+            else {
+                continue;
+            };
+            staged += 1;
+
+            let mut holder = store.pool().begin().await?;
+            let holder_pid = backend_pid(&mut holder).await?;
+            sqlx::query_scalar!(
+                "SELECT id FROM agent_sdk_tasks WHERE id = $1 FOR UPDATE",
+                second.as_str(),
+            )
+            .fetch_one(&mut *holder)
+            .await?;
+            let reparking = {
+                let store = store.clone();
+                let root = root.clone();
+                let children = vec![first.clone(), second.clone()];
+                let payload = payload_with_calls(&tid, 2);
+                tokio::spawn(async move {
+                    store
+                        .repark_after_steering(
+                            &root,
+                            &worker,
+                            &lease,
+                            payload,
+                            children,
+                            t_plus(at + 40),
+                        )
+                        .await
+                        .map(|_| ())
+                })
+            };
+            until_sessions_blocked_by(&store, holder_pid, 1).await?;
+            let cancelling = {
+                let store = store.clone();
+                let root = root.clone();
+                tokio::spawn(async move { store.cancel_tree(&root, t_plus(at + 41)).await })
+            };
+            until_sessions_blocked_by(&store, holder_pid, 2).await?;
+            holder.commit().await?;
+
+            let reparked = reparking.await?;
+            let cancelled = cancelling.await?;
+            anyhow::ensure!(
+                reparked.is_ok() && cancelled.is_ok(),
+                "round {round}: re-park {reparked:?}, cancel {:?}",
+                cancelled.map(|_| ()),
+            );
+            anyhow::ensure!(
+                stranded_rows(&store, &tid).await?.is_empty(),
+                "round {round}: rows left live under the cancelled root",
+            );
+        }
+        anyhow::ensure!(
+            staged == 5,
+            "only {staged} rounds drew ids against spawn order"
         );
         Ok(())
     }
