@@ -5,8 +5,8 @@
 //! compaction storage seam refuses pair-cutting boundaries; the
 //! confirmation lifecycle closes gated calls on decision) prevent new
 //! corruption. This sweep is the offline migration for rows written by
-//! pre-fix builds: it runs once at store open, before any worker starts,
-//! and records each repaired thread in `agent_sdk_applied_repairs` so a
+//! pre-fix builds: it runs on every store open, in the daemon and in any
+//! other process that opens the same file, and records each repaired thread in `agent_sdk_applied_repairs` so a
 //! thread is repaired exactly once per corruption class. A thread that
 //! re-corrupts after being repaired is repaired exactly once more (the
 //! ledger keys on the corruption marker, not a global "done" flag), and
@@ -22,8 +22,7 @@
 //! and revisited by a later sweep once its turn has settled.
 //!
 //! Repair is mechanical and lossless-by-construction: the sweep operates
-//! on the provider-visible sequence (compaction-selected context history
-//! plus any in-flight draft), closes dangling `tool_use` blocks with a
+//! on the stored history plus any in-flight draft, closes dangling `tool_use` blocks with a
 //! synthetic "User cancelled" `tool_result`, drops orphan results, and
 //! persists through `MessageProjection::append_repair`, which keeps the
 //! raw committed transcript untouched and records the corrected view as
@@ -107,11 +106,20 @@ FROM agent_sdk_message_heads h
         // Validate BEFORE consulting the ledger: a thread that re-corrupts
         // after being repaired must be repaired again, not skipped because
         // a stale ledger row exists.
-        let sequence = provider_sequence(
+        let sequence = match provider_sequence(
             row.get("history_json"),
             row.get("draft_messages_json"),
             &thread_key,
-        )?;
+        ) {
+            Ok(sequence) => sequence,
+            Err(error) => {
+                report.unrepairable += 1;
+                tracing::error!(
+                    "startup repair sweep could not read thread {thread_key}: {error:#}"
+                );
+                continue;
+            }
+        };
         if llm::is_provider_valid_tool_sequence(&sequence) {
             continue;
         }
@@ -440,6 +448,30 @@ mod tests {
             "raw transcript preserved"
         );
         assert_eq!(after.compactions.len(), 1, "one append-only repair entry");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_thread_never_stops_the_sweep() -> Result<()> {
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+        let poisoned = seed_corrupted_thread(&store, "sweep-poisoned").await?;
+        sqlx::query("UPDATE agent_sdk_message_heads SET history_json = '[1]' WHERE thread_id = ?1")
+            .bind(poisoned.to_string())
+            .execute(store.pool())
+            .await?;
+        let healthy = seed_corrupted_thread(&store, "sweep-healthy").await?;
+
+        let report = run_startup_repair_sweep(store.pool(), t0()).await?;
+        assert_eq!(report.unrepairable, 1, "the unreadable thread is counted");
+        assert_eq!(report.repaired, 1, "the next thread is still repaired");
+
+        let after =
+            agent_server::journal::message_store::MessageProjectionStore::get(&store, &healthy)
+                .await?
+                .context("projection after")?;
+        assert!(llm::is_provider_valid_tool_sequence(
+            &after.context_history()
+        ));
         Ok(())
     }
 

@@ -238,6 +238,12 @@ impl SqliteDurableStore {
                 report.deferred,
                 report.unrepairable
             );
+        } else if report.deferred > 0 {
+            tracing::info!(
+                "startup history-repair sweep: scanned={}, deferred={} (threads whose live turn owns their open tool calls)",
+                report.scanned,
+                report.deferred
+            );
         }
         Ok(store)
     }
