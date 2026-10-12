@@ -45,7 +45,7 @@ use crate::journal::task_state::TaskState;
 use crate::journal::thread_store::InMemoryThreadStore;
 use crate::journal::turn_attempt_store::InMemoryTurnAttemptStore;
 use crate::worker::bootstrap::WorkerBootstrapContext;
-use crate::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
+use crate::worker::definition::{AgentDefinition, ChildJoinPolicy, RuntimePolicy, ThinkingPolicy};
 use crate::worker::root_turn::{
     RootTurnDeps, RootTurnOutcome, cancel_root_turn, execute_root_turn, resume_for_steering,
     resume_from_children, revert_steering_wake,
@@ -223,6 +223,7 @@ struct Harness {
     summarizer: Arc<dyn LlmProvider>,
     artifact_store: Arc<agent_sdk::ArtifactStore>,
     _artifact_dir: tempfile::TempDir,
+    child_join_policy: ChildJoinPolicy,
 }
 
 impl Harness {
@@ -270,6 +271,7 @@ impl Harness {
             }),
             artifact_store,
             _artifact_dir: artifact_dir,
+            child_join_policy: ChildJoinPolicy::All,
         })
     }
 
@@ -291,6 +293,11 @@ impl Harness {
             activity: None,
             connectivity_waits: None,
         }
+    }
+
+    fn with_child_join_policy(mut self, policy: ChildJoinPolicy) -> Self {
+        self.child_join_policy = policy;
+        self
     }
 
     /// Commit `turns` prior exchanges straight into the projection, so a
@@ -371,7 +378,7 @@ impl Harness {
         build_root_worker_inputs(
             WorkerBootstrapContext {
                 task,
-                definition: definition(),
+                definition: definition(self.child_join_policy),
                 thread_id,
                 task_id,
                 worker_id: WorkerId::from_string("worker_resume"),
@@ -386,7 +393,7 @@ impl Harness {
     }
 }
 
-fn definition() -> AgentDefinition {
+fn definition(child_join_policy: ChildJoinPolicy) -> AgentDefinition {
     AgentDefinition {
         provider: "mock".into(),
         model: "mock-model".into(),
@@ -407,7 +414,10 @@ fn definition() -> AgentDefinition {
         tools_fn: None,
         tool_input_sanitizer: None,
         request_context_fn: None,
-        policy: RuntimePolicy::server_default(),
+        policy: RuntimePolicy {
+            child_join_policy,
+            ..RuntimePolicy::server_default()
+        },
     }
 }
 
@@ -1290,8 +1300,8 @@ async fn steering_wake_that_compacts_and_calls_a_tool_parks_only_the_new_call() 
 /// steering. The exchange compacts, folding the parked turn and the steering
 /// message (`call_1`'s real result, `call_2`'s interim answer, the note),
 /// then its call fails and the wake is reverted to its pre-wake parked state.
-/// The fold already holds that whole parked turn, so the revert must re-park
-/// none of it.
+/// The revert re-parks the pre-wake messages the fold already holds; every
+/// consumer finds that fold, and what the failed exchange folded after them.
 async fn revert_compacted_steering_wake(
     harness: &Harness,
     main: &ScriptedMainProvider,
@@ -1331,10 +1341,15 @@ async fn revert_compacted_steering_wake(
     )
     .await?;
     ensure!(reverted.status == TaskStatus::WaitingOnChildren);
+    let parked = parked_messages(&reverted)?;
     ensure!(
-        parked_messages(&reverted)?.is_empty(),
-        "the revert must not re-park messages the failed exchange folded: {:?}",
-        tool_use_ids(parked_messages(&reverted)?),
+        tool_use_ids(parked) == ["call_1", "call_2"],
+        "the revert re-parks the pre-wake messages: {:?}",
+        tool_use_ids(parked),
+    );
+    ensure!(
+        harness.projection().await?.parked_fold(parked).is_some(),
+        "the failed exchange's fold holds the re-parked messages",
     );
     Ok((task_id, children, folded))
 }
@@ -1419,4 +1434,403 @@ async fn fan_in_after_a_reverted_compacted_steering_wake_closes_each_call_once()
 #[tokio::test]
 async fn fan_in_after_a_reverted_compacted_steering_wake_at_default_retention() -> Result<()> {
     fan_in_after_a_reverted_compacted_steering_wake(Retention::Default).await
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LastChild {
+    FinishedBeforeRerun,
+    LiveAtRerun,
+}
+
+/// `Any`-policy batch of three calls: `call_0` finishes and wakes the parent,
+/// whose early resume answers `call_1` and `call_2` with the interim payload,
+/// compacts (folding that answer into the transcript) and then dies on its
+/// provider call. The host requeues the row with its parked state intact,
+/// as `requeue_weather_failed_resume` does, and `call_1` finishes before the
+/// rerun. The rerun must not answer an already-answered call a second time,
+/// and must not fail on that account: the interims are durable, so the
+/// outcomes go out as late results.
+async fn rerun_after_a_compacted_early_resume_died(
+    retention: Retention,
+    last_child: LastChild,
+) -> Result<()> {
+    let harness = Harness::new(CompactionEngine::Legacy, Trigger::Threshold, retention)?
+        .with_child_join_policy(ChildJoinPolicy::Any);
+    if matches!(retention, Retention::Default) {
+        harness.seed_history(SEEDED_TURNS).await?;
+    }
+    let main = ScriptedMainProvider::new();
+    let (task_id, children) =
+        start_turn_calling(&harness, &main, &["call_0", "call_1", "call_2"]).await?;
+    let [first, sibling, last] = children.as_slice() else {
+        bail!("expected three tool children, got {}", children.len());
+    };
+    harness
+        .complete_children(std::slice::from_ref(first), 1_000)
+        .await?;
+
+    main.push(ChatOutcome::InvalidRequest(
+        "upstream rejected the request".into(),
+    ))?;
+    let parent = harness.acquire(&task_id, 1_010).await?;
+    let before = harness.projection().await?;
+    let inputs = harness.inputs(parent.clone(), 1_010).await?;
+    let died = resume_from_children(inputs, &parent, &main, &harness.deps(), at(1_020)).await;
+    ensure!(died.is_err(), "the early resume must die after compacting");
+    let folded = harness.projection().await?;
+    ensure!(
+        folded.compactions.len() == before.compactions.len() + 1
+            && folded.draft_messages.is_empty(),
+        "precondition: the dead early resume folded its interim answers into the transcript",
+    );
+    let requeued = harness
+        .tasks
+        .requeue_owned_task(
+            &task_id,
+            &WorkerId::from_string("worker_resume"),
+            &LeaseId::from_string("lease_resume"),
+            None,
+            at(1_030),
+        )
+        .await?;
+    ensure!(matches!(requeued, RequeueOutcome::Requeued(_)));
+
+    harness
+        .complete_children(std::slice::from_ref(sibling), 1_040)
+        .await?;
+    let label =
+        format!("rerun after a compacted early resume died ({retention:?}, {last_child:?})");
+    match last_child {
+        LastChild::FinishedBeforeRerun => {
+            harness
+                .complete_children(std::slice::from_ref(last), 1_045)
+                .await?;
+            main.push(text("all three are done"))?;
+            let parent = harness.acquire(&task_id, 1_050).await?;
+            let inputs = harness.inputs(parent.clone(), 1_050).await?;
+            let outcome =
+                resume_from_children(inputs, &parent, &main, &harness.deps(), at(1_060)).await?;
+            ensure!(
+                matches!(outcome, RootTurnOutcome::Completed { .. }),
+                "{label}: the rerun must commit the turn"
+            );
+        }
+        LastChild::LiveAtRerun => {
+            main.push(text("call_1 is done, call_2 is still running"))?;
+            let parent = harness.acquire(&task_id, 1_050).await?;
+            let inputs = harness.inputs(parent.clone(), 1_050).await?;
+            let outcome =
+                resume_from_children(inputs, &parent, &main, &harness.deps(), at(1_060)).await?;
+            let (reparked, spawned) = suspended_parts(outcome)?;
+            ensure!(
+                spawned.is_empty() && reparked.status == TaskStatus::WaitingOnChildren,
+                "{label}: the rerun re-parks on the still-running call",
+            );
+            finish_turn(&harness, &main, &task_id, std::slice::from_ref(last)).await?;
+        }
+    }
+    ensure_turn_holds_each_tool_call_once(
+        &harness,
+        &main,
+        &TurnCalls {
+            issued: &["call_0", "call_1", "call_2"],
+            late: &["call_1", "call_2"],
+        },
+        &label,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn rerun_after_a_compacted_early_resume_died_closes_each_call_once() -> Result<()> {
+    rerun_after_a_compacted_early_resume_died(Retention::Nothing, LastChild::FinishedBeforeRerun)
+        .await
+}
+
+#[tokio::test]
+async fn rerun_after_a_compacted_early_resume_died_at_default_retention() -> Result<()> {
+    rerun_after_a_compacted_early_resume_died(Retention::Default, LastChild::FinishedBeforeRerun)
+        .await
+}
+
+#[tokio::test]
+async fn rerun_after_a_compacted_early_resume_died_with_a_call_still_running() -> Result<()> {
+    rerun_after_a_compacted_early_resume_died(Retention::Nothing, LastChild::LiveAtRerun).await
+}
+
+#[tokio::test]
+async fn rerun_after_a_compacted_early_resume_died_with_a_call_still_running_at_default_retention()
+-> Result<()> {
+    rerun_after_a_compacted_early_resume_died(Retention::Default, LastChild::LiveAtRerun).await
+}
+
+fn assistant_texts(messages: &[Message], text: &str) -> usize {
+    messages
+        .iter()
+        .filter(|message| {
+            message.role == agent_sdk_foundation::llm::Role::Assistant
+                && match &message.content {
+                    Content::Text(content) => content == text,
+                    Content::Blocks(blocks) => blocks.iter().any(
+                        |block| matches!(block, ContentBlock::Text { text: content } if content == text),
+                    ),
+                }
+        })
+        .count()
+}
+
+const STILL_WORKING: &str = "Still working on it.";
+
+/// Two steering wakes whose exchanges compact both answer verbatim alike.
+/// The second answer is parked after the fold that holds the first one as
+/// its parked head; it is not that answer, and both must reach the
+/// transcript and the final request.
+#[tokio::test]
+async fn two_compacting_steering_wakes_answering_alike_keep_both_answers() -> Result<()> {
+    let harness = Harness::new(
+        CompactionEngine::Legacy,
+        Trigger::Threshold,
+        Retention::Default,
+    )?;
+    harness.seed_history(SEEDED_TURNS).await?;
+    let main = ScriptedMainProvider::new();
+    let (task_id, children) = start_turn_calling(&harness, &main, &["call_1", "call_2"]).await?;
+    let [finished, survivor] = children.as_slice() else {
+        bail!("expected two tool children, got {}", children.len());
+    };
+    harness
+        .complete_children(std::slice::from_ref(finished), 1_000)
+        .await?;
+
+    for now in [1_010, 1_110] {
+        let before = harness.projection().await?;
+        wake_for_steering(&harness, &task_id, now).await?;
+        main.push(text(STILL_WORKING))?;
+        let parent = harness.acquire(&task_id, now + 10).await?;
+        let inputs = harness.inputs(parent.clone(), now + 10).await?;
+        let outcome =
+            resume_for_steering(inputs, &parent, &main, &harness.deps(), at(now + 20)).await?;
+        let (reparked, _) = suspended_parts(outcome)?;
+        ensure!(reparked.status == TaskStatus::WaitingOnChildren);
+        ensure!(
+            harness.projection().await?.compactions.len() > before.compactions.len(),
+            "precondition: the steering exchange at {now} compacted",
+        );
+    }
+
+    finish_turn(&harness, &main, &task_id, std::slice::from_ref(survivor)).await?;
+    let projection = harness.projection().await?;
+    ensure!(
+        assistant_texts(&projection.messages, STILL_WORKING) == 2,
+        "both identical answers belong in the transcript; it holds {}",
+        assistant_texts(&projection.messages, STILL_WORKING),
+    );
+    let last = main.requests()?.pop().context("final request")?;
+    ensure!(
+        assistant_texts(&last.messages, STILL_WORKING) == 2,
+        "the final request must carry both answers; it carries {}",
+        assistant_texts(&last.messages, STILL_WORKING),
+    );
+    ensure_turn_holds_each_tool_call_once(
+        &harness,
+        &main,
+        &TurnCalls {
+            issued: &["call_1", "call_2"],
+            late: &["call_2"],
+        },
+        "two identical steering answers",
+    )
+    .await
+}
+
+/// Runs a fresh turn that answers in text, takes an input injected at that
+/// boundary, then calls `call_id` and parks:
+/// `[prompt, STILL_WORKING, injection, call]`.
+async fn park_after_an_injected_boundary(
+    harness: &Harness,
+    main: &ScriptedMainProvider,
+    call_id: &str,
+    now: i64,
+) -> Result<(AgentTaskId, Vec<AgentTask>)> {
+    main.push(text(STILL_WORKING))?;
+    main.push(tool_call(call_id))?;
+    let task = AgentTask::new_root_turn(thread_id(), at(now), 3);
+    let task_id = task.id.clone();
+    harness.tasks.submit_root_turn(task).await?;
+    let task = harness.acquire(&task_id, now + 1).await?;
+    harness
+        .tasks
+        .submit_root_turn_idempotent(SubmitRootTurnParams {
+            task: AgentTask::new_root_turn_with_input(
+                thread_id(),
+                vec![SubmittedInputItem::Text {
+                    text: "keep going".into(),
+                }],
+                at(now + 2),
+                3,
+            ),
+            idempotency: None,
+            max_queued_depth: None,
+            disposition: SubmitDisposition::InjectAtBoundary,
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("injection submit failed: {error}"))?;
+    let inputs = harness.inputs(task, now + 3).await?;
+    let outcome = execute_root_turn(inputs, "status?", main, &harness.deps(), at(now + 4)).await?;
+    let (parent, children) = suspended_parts(outcome)?;
+    ensure!(
+        parked_messages(&parent)?.len() == 4,
+        "precondition: the turn parked its prompt, reply, injection and call",
+    );
+    Ok((task_id, children))
+}
+
+/// A turn folds its parked messages and is cancelled without committing, so
+/// its fold stays in the run. The next turn parks the same prompt, reply and
+/// injection before a different call; it is not that fold, and its first
+/// messages must reach the transcript.
+#[tokio::test]
+async fn a_later_turn_parked_like_an_uncommitted_fold_keeps_its_messages() -> Result<()> {
+    let harness = Harness::new(
+        CompactionEngine::Legacy,
+        Trigger::Threshold,
+        Retention::Nothing,
+    )?;
+    let main = ScriptedMainProvider::new();
+    let (stale, children) = park_after_an_injected_boundary(&harness, &main, "call_1", 0).await?;
+    harness.complete_children(&children, 100).await?;
+    fold_then_die_after_children(&harness, &main, &stale).await?;
+    cancel_root_turn(&stale, &harness.deps(), at(1_040)).await?;
+    let stale_len = harness.projection().await?.messages.len();
+    ensure!(
+        assistant_texts(&harness.projection().await?.messages, STILL_WORKING) == 1,
+        "precondition: the cancelled turn's fold holds its reply once",
+    );
+
+    let (task_id, children) =
+        park_after_an_injected_boundary(&harness, &main, "call_9", 2_000).await?;
+    harness.complete_children(&children, 2_100).await?;
+    main.push(text("all done"))?;
+    let parent = harness.acquire(&task_id, 2_110).await?;
+    let inputs = harness.inputs(parent.clone(), 2_110).await?;
+    let outcome = resume_from_children(inputs, &parent, &main, &harness.deps(), at(2_120)).await?;
+    ensure!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+
+    let projection = harness.projection().await?;
+    let turn = projection
+        .messages
+        .get(stale_len..)
+        .context("the second turn's messages")?;
+    ensure!(
+        turn.len() == 6,
+        "prompt, reply, injection, call_9, its result and the final reply, each once; \
+         the second turn added {}",
+        turn.len(),
+    );
+    ensure!(assistant_texts(turn, STILL_WORKING) == 1);
+    ensure!(tool_use_ids(turn) == ["call_9"]);
+    ensure_provider_valid(&projection.messages, "raw transcript")
+}
+
+fn steering_notes(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .filter(|message| {
+            message.role == agent_sdk_foundation::llm::Role::User
+                && matches!(&message.content, Content::Blocks(blocks) if blocks.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if text == "how is it going?"),
+                ))
+        })
+        .count()
+}
+
+/// A steering exchange compacts, folding the parked turn and its steering
+/// message, then dies without a revert (lease loss, a crash); the row keeps
+/// its steering wake. `call_2` finishes before the rerun, so the rebuilt
+/// steering message differs from the folded one. The rerun must deliver
+/// `call_2`'s outcome once, as a late result, and the note not again.
+async fn steering_rerun_after_a_compacted_exchange_died(retention: Retention) -> Result<()> {
+    let harness = Harness::new(CompactionEngine::Legacy, Trigger::Threshold, retention)?;
+    if matches!(retention, Retention::Default) {
+        harness.seed_history(SEEDED_TURNS).await?;
+    }
+    let main = ScriptedMainProvider::new();
+    let (task_id, children) = start_turn_calling(&harness, &main, &["call_1", "call_2"]).await?;
+    let [finished, survivor] = children.as_slice() else {
+        bail!("expected two tool children, got {}", children.len());
+    };
+    harness
+        .complete_children(std::slice::from_ref(finished), 1_000)
+        .await?;
+    wake_for_steering(&harness, &task_id, 1_010).await?;
+
+    main.push(ChatOutcome::InvalidRequest(
+        "upstream rejected the request".into(),
+    ))?;
+    let parent = harness.acquire(&task_id, 1_020).await?;
+    let before = harness.projection().await?;
+    let inputs = harness.inputs(parent.clone(), 1_020).await?;
+    let died = resume_for_steering(inputs, &parent, &main, &harness.deps(), at(1_030)).await;
+    ensure!(
+        died.is_err(),
+        "the steering exchange must die after compacting"
+    );
+    ensure!(
+        harness.projection().await?.compactions.len() > before.compactions.len(),
+        "precondition: the dead steering exchange folded its message",
+    );
+    let requeued = harness
+        .tasks
+        .requeue_owned_task(
+            &task_id,
+            &WorkerId::from_string("worker_resume"),
+            &LeaseId::from_string("lease_resume"),
+            None,
+            at(1_035),
+        )
+        .await?;
+    ensure!(matches!(requeued, RequeueOutcome::Requeued(_)));
+
+    harness
+        .complete_children(std::slice::from_ref(survivor), 1_040)
+        .await?;
+    main.push(text("both are done"))?;
+    let parent = harness.acquire(&task_id, 1_050).await?;
+    ensure!(
+        parent.state.is_steering_resume(),
+        "precondition: the rerun is still a steering wake"
+    );
+    let inputs = harness.inputs(parent.clone(), 1_050).await?;
+    let outcome = resume_for_steering(inputs, &parent, &main, &harness.deps(), at(1_060)).await?;
+    let label = format!("steering rerun after a compacted exchange died ({retention:?})");
+    ensure!(
+        matches!(outcome, RootTurnOutcome::Completed { .. }),
+        "{label}: the rerun must commit the turn"
+    );
+    let projection = harness.projection().await?;
+    ensure!(
+        steering_notes(&projection.messages) == 1,
+        "{label}: the steering note belongs in the transcript once; it holds {}",
+        steering_notes(&projection.messages),
+    );
+    ensure_turn_holds_each_tool_call_once(
+        &harness,
+        &main,
+        &TurnCalls {
+            issued: &["call_1", "call_2"],
+            late: &["call_2"],
+        },
+        &label,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn steering_rerun_after_a_compacted_exchange_died_closes_each_call_once() -> Result<()> {
+    steering_rerun_after_a_compacted_exchange_died(Retention::Nothing).await
+}
+
+#[tokio::test]
+async fn steering_rerun_after_a_compacted_exchange_died_at_default_retention() -> Result<()> {
+    steering_rerun_after_a_compacted_exchange_died(Retention::Default).await
 }
