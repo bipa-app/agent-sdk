@@ -2103,7 +2103,10 @@ pub trait AgentTaskStore: Send + Sync {
     ///
     /// # Errors
     /// Returns an error if a release or fail-closed transition, or
-    /// the underlying store write, fails.
+    /// the underlying store write, fails. A store that commits a root's
+    /// fail-close apart from the rest of the call instead logs that
+    /// root's failure and returns the records it did commit; the root
+    /// stays expired for the next call.
     async fn release_expired_leases(&self, now: OffsetDateTime) -> Result<Vec<RecoveryRecord>>;
 
     /// Return a `Running` row this worker still owns to the runnable

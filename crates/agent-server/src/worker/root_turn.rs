@@ -588,6 +588,7 @@ pub async fn fail_root_turn(
 /// The outcome of [`fail_root_turn_with_reason`] or
 /// [`fail_root_turn_leaving_attempts_open_with_reason`].
 #[derive(Debug)]
+#[must_use]
 pub struct FailedRootTurn {
     /// The root row after its terminal transition, or why the store
     /// refused the transition.

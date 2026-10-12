@@ -2143,10 +2143,46 @@ WHERE parent_id = $1
         Self::fail_closed_with_thread_tx(tx, old, reason, None, now, error_prefix).await
     }
 
+    /// Fail closed, each in its own transaction, the roots whose last
+    /// lease lapsed, adding a record to `released` for each one failed.
+    /// Each root commits on its own, so one that fails must not cost the
+    /// caller the records of those already committed: it stays expired
+    /// and the next sweep retries it.
+    async fn fail_close_expired_roots(
+        &self,
+        roots: Vec<AgentTaskId>,
+        now: OffsetDateTime,
+        released: &mut Vec<RecoveryRecord>,
+    ) {
+        for id in roots {
+            match self
+                .fail_closed_root_thread_first(
+                    &id,
+                    RecoveryContext::ExpiredLease,
+                    now,
+                    "release_expired_leases",
+                )
+                .await
+            {
+                Ok(Some((reason, settled))) => {
+                    released.push(RecoveryRecord::failed_closed(id, reason).with_settled(settled));
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    task_id = %id,
+                    error = %format!("{error:#}"),
+                    "release_expired_leases: fail-close failed; the next sweep retries it",
+                ),
+            }
+        }
+    }
+
     /// Fail a root closed in its own transaction, in the store's lock
-    /// order: its tree's threads first, then its live descendants, which
-    /// are cancelled before it fails, then the root itself. The root's
-    /// successor is promoted only after nothing under it is left live.
+    /// order: its tree's threads first, then its rows by depth
+    /// descending, then id. Child-thread roots share the root's depth, so
+    /// the root is not necessarily the last row locked. Its live
+    /// descendants are cancelled before it fails, and its successor is
+    /// promoted only after nothing under it is left live.
     /// The row is re-validated under its lock and left alone, with every
     /// cancel rolled back, when it no longer classifies as fail-closed in
     /// `context` (another worker claimed it, a heartbeat extended its
@@ -2161,6 +2197,9 @@ WHERE parent_id = $1
         now: OffsetDateTime,
         error_prefix: &str,
     ) -> Result<Option<(FailureReason, CancelTreeOutcome)>> {
+        agent_server::fail_point!("fail_closed_root_thread_first", |_| Err(anyhow!(
+            "injected fail-close failure for {id}"
+        )));
         let mut tx = self.begin().await?;
         let Some(screened) = Self::load_task_tx(&mut tx, id, false).await? else {
             tx.rollback()
@@ -4406,19 +4445,8 @@ FOR UPDATE SKIP LOCKED
 
         // The batch locked these roots before their threads; journaling
         // their terminal events needs thread → task order.
-        for id in exhausted_roots {
-            if let Some((reason, settled)) = self
-                .fail_closed_root_thread_first(
-                    &id,
-                    RecoveryContext::ExpiredLease,
-                    now,
-                    "release_expired_leases",
-                )
-                .await?
-            {
-                released.push(RecoveryRecord::failed_closed(id, reason).with_settled(settled));
-            }
-        }
+        self.fail_close_expired_roots(exhausted_roots, now, &mut released)
+            .await;
         Ok(released)
     }
 
@@ -8438,6 +8466,75 @@ INSERT INTO agent_sdk_turn_attempts (
             );
         }
 
+        Ok(())
+    }
+
+    /// A one-attempt root whose lease lapses at `t_plus(secs + 5)`.
+    async fn lapsed_last_attempt_root(
+        store: &PostgresDurableStore,
+        thread: &str,
+        secs: i64,
+    ) -> Result<AgentTaskId> {
+        let root = AgentTask::new_root_turn(thread_id(thread), t_plus(secs), 1);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await?;
+        store
+            .try_acquire_task(
+                &id,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(secs + 5),
+                t_plus(secs + 1),
+            )
+            .await?
+            .context("root claimed")?;
+        Ok(id)
+    }
+
+    /// A root whose fail-close errors mid-sweep costs the caller nothing
+    /// the sweep already committed: the earlier root's record comes back,
+    /// and the next sweep fails the one that errored.
+    #[cfg(feature = "failpoints")]
+    #[tokio::test]
+    async fn a_failed_fail_close_keeps_the_sweeps_committed_records() -> Result<()> {
+        use crate::fail;
+
+        let Some((store, _schema_guard)) = test_store().await? else {
+            return Ok(());
+        };
+        let first = lapsed_last_attempt_root(&store, "t-pg-sweep-first", 0).await?;
+        let second = lapsed_last_attempt_root(&store, "t-pg-sweep-second", 10).await?;
+
+        let _scenario = fail::FailScenario::setup();
+        fail::cfg("fail_closed_root_thread_first", "1*off->return")
+            .map_err(|error| anyhow::anyhow!("configure fail-close failpoint: {error}"))?;
+        let swept = store.release_expired_leases(t_plus(100)).await;
+        fail::remove("fail_closed_root_thread_first");
+
+        let swept = swept?;
+        let ids: Vec<&AgentTaskId> = swept.iter().map(|record| &record.id).collect();
+        assert_eq!(ids, vec![&first], "the committed root's record comes back");
+        assert!(swept[0].action.is_fail_closed());
+        let status = |id: AgentTaskId| {
+            let store = &store;
+            async move {
+                AgentTaskStore::get(store, &id)
+                    .await?
+                    .map(|task| task.status)
+                    .context("row exists")
+            }
+        };
+        assert_eq!(status(first.clone()).await?, TaskStatus::Failed);
+        assert_eq!(status(second.clone()).await?, TaskStatus::Running);
+
+        let retried = store.release_expired_leases(t_plus(101)).await?;
+        let ids: Vec<&AgentTaskId> = retried.iter().map(|record| &record.id).collect();
+        assert_eq!(
+            ids,
+            vec![&second],
+            "the next sweep retries the root that errored"
+        );
+        assert_eq!(status(second).await?, TaskStatus::Failed);
         Ok(())
     }
 
