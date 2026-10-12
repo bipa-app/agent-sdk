@@ -494,6 +494,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
     fn chat_stream(&self, mut request: ChatRequest) -> StreamBox<'_> {
         self.downgrade_unsupported_original_image_detail(&mut request);
         let served_route = self.route().to_owned();
+        let served_model = self.model().to_owned();
         let trace = StreamTraceRecorder::new(&self.model);
         let abandoned = AbandonedStreamLog(trace.clone());
         let stream = async_stream::stream! {
@@ -1250,6 +1251,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                 yield Ok(StreamDelta::Done {
                                                     stop_reason,
                                                     served_route: Some(served_route.clone()),
+                                                    served_model: Some(served_model.clone()),
                                                 });
                                                 return;
                                             }
@@ -1500,6 +1502,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                     yield Ok(StreamDelta::Done {
                                                         stop_reason,
                                                         served_route: Some(served_route.clone()),
+                                                        served_model: Some(served_model.clone()),
                                                     });
                                                     return;
                                                 }
@@ -1711,6 +1714,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                         yield Ok(StreamDelta::Done {
                             stop_reason: Some(stop_reason),
                             served_route: Some(served_route.clone()),
+                            served_model: Some(served_model.clone()),
                         });
                         return;
                     }
@@ -1874,6 +1878,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
             yield Ok(StreamDelta::Done {
                 stop_reason: Some(stop_reason),
                 served_route: Some(served_route.clone()),
+                served_model: Some(served_model.clone()),
             });
         };
         Box::pin(stream.inspect(move |item| abandoned.observe(item)))
@@ -5592,6 +5597,7 @@ mod tests {
             Ok(StreamDelta::Done {
                 stop_reason: Some(StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             }),
             Ok(StreamDelta::Error {
                 message: "boom".to_owned(),

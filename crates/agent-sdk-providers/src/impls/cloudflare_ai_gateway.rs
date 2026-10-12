@@ -299,6 +299,7 @@ impl LlmProvider for CloudflareAIGatewayProvider {
         // the stream's serving route stays the gateway's, not the wire
         // shape it borrowed.
         let served_route = self.route().to_owned();
+        let served_model = self.model().to_owned();
         let mut inner = match &self.inner {
             Inner::Anthropic(p) => p.chat_stream(request),
             Inner::OpenAI(p) => p.chat_stream(request),
@@ -310,6 +311,7 @@ impl LlmProvider for CloudflareAIGatewayProvider {
                     Ok(StreamDelta::Done { stop_reason, .. }) => Ok(StreamDelta::Done {
                         stop_reason,
                         served_route: Some(served_route.clone()),
+                        served_model: Some(served_model.clone()),
                     }),
                     other => other,
                 };

@@ -960,6 +960,7 @@ impl LlmProvider for AnthropicProvider {
 
     fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
         let served_route = self.route().to_owned();
+        let served_model = self.model().to_owned();
         Box::pin(async_stream::stream! {
                     let is_oauth = self.is_oauth();
                     let original_tool_names: Vec<String> = request
@@ -1252,6 +1253,7 @@ impl LlmProvider for AnthropicProvider {
                                 yield Ok(StreamDelta::Done {
                                     stop_reason: pending_stop_reason.take(),
                                     served_route: Some(served_route.clone()),
+                                    served_model: Some(served_model.clone()),
                                 });
                             }
                         }
@@ -1297,6 +1299,7 @@ impl LlmProvider for AnthropicProvider {
                             yield Ok(StreamDelta::Done {
                                 stop_reason: pending_stop_reason.take(),
                                 served_route: Some(served_route.clone()),
+                                served_model: Some(served_model.clone()),
                             });
                         }
                     }

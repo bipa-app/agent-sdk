@@ -6871,6 +6871,7 @@ mod tests {
                 yield Ok(StreamDelta::Done {
                     stop_reason: Some(StopReason::EndTurn),
                     served_route: None,
+                    served_model: None,
                 });
             })
         }

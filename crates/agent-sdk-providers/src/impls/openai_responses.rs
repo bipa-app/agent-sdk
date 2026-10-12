@@ -478,6 +478,7 @@ impl LlmProvider for OpenAIResponsesProvider {
     fn chat_stream(&self, mut request: ChatRequest) -> StreamBox<'_> {
         self.downgrade_unsupported_original_image_detail(&mut request);
         let served_route = self.route().to_owned();
+        let served_model = self.model().to_owned();
         Box::pin(async_stream::stream! {
             let reasoning_config = match self.resolve_openai_reasoning(request.thinking.as_ref()) {
                 Ok(reasoning) => reasoning,
@@ -860,6 +861,7 @@ impl LlmProvider for OpenAIResponsesProvider {
                                 yield Ok(StreamDelta::Done {
                                     stop_reason: Some(stop_reason),
                                     served_route: Some(served_route.clone()),
+                                    served_model: Some(served_model.clone()),
                                 });
                                 return;
                             }
@@ -882,6 +884,7 @@ impl LlmProvider for OpenAIResponsesProvider {
                                 yield Ok(StreamDelta::Done {
                                     stop_reason: Some(stop_reason),
                                     served_route: Some(served_route.clone()),
+                                    served_model: Some(served_model.clone()),
                                 });
                                 return;
                             }

@@ -58,6 +58,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`true`, `{}`, `{"description": ...}`) and free-form objects, including
   no-argument tools declared as `{"type": "object", "properties": {}}`. A
   strict response format with such a schema fails locally with the reason.
+- **Breaking:** `StreamDelta::Done` gains `served_model`, the
+  `LlmProvider::model` of the provider that served the stream, stamped by
+  every built-in provider next to `served_route` and forwarded untouched by
+  fallback, router, refresh, and record/replay wrappers. Code that builds a
+  `Done` sets it (`None` when unknown); patterns without `..` name it. One
+  route can serve several models, so the durable worker anchors the measured
+  compaction trigger of a provider without a stable request route only on a
+  request whose served route and model both match the provider's own.
+  Cassettes recorded without the field replay it as `None`.
 - **Behaviour change for clients:** a turn's `UserInput` now carries the
   root-turn task id in `emitter_task_id` (`AgentEvent::UserInput`, proto
   `UserInputEvent.emitter_task_id`). Before, only input injected into a

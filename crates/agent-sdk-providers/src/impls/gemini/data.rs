@@ -785,6 +785,7 @@ fn gemini_stream_terminal(saw_finish_reason: bool, stop_reason: Option<StopReaso
             // Stamped by the provider-owned wrapper loop; this helper only
             // sees parsed wire state.
             served_route: None,
+            served_model: None,
         }
     } else {
         log::warn!(

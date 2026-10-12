@@ -262,6 +262,7 @@ async fn interleaved_text_and_tool_deltas_suspend_with_balanced_history() -> Res
         StreamDelta::Done {
             stop_reason: Some(StopReason::ToolUse),
             served_route: None,
+            served_model: None,
         },
     ]));
 
@@ -365,6 +366,7 @@ async fn out_of_order_block_index_sorts_into_block_order() -> Result<()> {
         StreamDelta::Done {
             stop_reason: Some(StopReason::ToolUse),
             served_route: None,
+            served_model: None,
         },
     ]));
 
@@ -412,6 +414,7 @@ async fn mid_stream_server_error_retries_then_succeeds() -> Result<()> {
         StreamDelta::Done {
             stop_reason: Some(StopReason::EndTurn),
             served_route: None,
+            served_model: None,
         },
     ])
     .fail_after(1, StreamErrorKind::ServerError, "upstream 503 mid-stream");
@@ -629,6 +632,7 @@ async fn mid_stream_stall_is_retried_then_succeeds() -> Result<()> {
         StreamDelta::Done {
             stop_reason: Some(StopReason::EndTurn),
             served_route: None,
+            served_model: None,
         },
     ])
     .with_delay(std::time::Duration::from_secs(200));
@@ -674,6 +678,7 @@ async fn keep_alives_hold_a_silent_stream_past_both_stall_budgets() -> Result<()
     deltas.push(StreamDelta::Done {
         stop_reason: Some(StopReason::EndTurn),
         served_route: None,
+        served_model: None,
     });
     let provider = StreamingScriptedProvider::single(
         TurnScript::from_deltas(deltas).with_delay(std::time::Duration::from_secs(100)),
@@ -729,6 +734,7 @@ fn answer_after(silence: std::time::Duration, keep_alive: bool) -> TurnScript {
         StreamDelta::Done {
             stop_reason: Some(StopReason::EndTurn),
             served_route: None,
+            served_model: None,
         },
     ));
     TurnScript::from_timed_deltas(timed)

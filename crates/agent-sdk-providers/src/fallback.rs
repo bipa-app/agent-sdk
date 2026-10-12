@@ -586,6 +586,7 @@ mod tests {
             StreamDelta::Done {
                 stop_reason: Some(StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             },
         ] {
             assert!(
@@ -652,6 +653,7 @@ mod tests {
                 Ok(StreamDelta::Done {
                     stop_reason: Some(StopReason::EndTurn),
                     served_route: None,
+                    served_model: None,
                 }),
             ],
         );
@@ -721,6 +723,7 @@ mod tests {
                 Ok(StreamDelta::Done {
                     stop_reason: Some(StopReason::EndTurn),
                     served_route: None,
+                    served_model: None,
                 }),
             ],
         );
@@ -765,6 +768,7 @@ mod tests {
                 Ok(StreamDelta::Done {
                     stop_reason: Some(StopReason::EndTurn),
                     served_route: None,
+                    served_model: None,
                 }),
             ],
         );
@@ -794,8 +798,9 @@ mod tests {
     }
 
     /// A failed-over stream's `Done` still names the backend that served
-    /// it: the chain forwards the secondary's `served_route` untouched,
-    /// even though the wrapper's own `route()` keeps naming the primary.
+    /// it: the chain forwards the secondary's `served_route` and
+    /// `served_model` untouched, even though the wrapper's own `route()` and
+    /// `model()` keep naming the primary.
     #[tokio::test]
     async fn failed_over_stream_attributes_the_serving_secondary() -> Result<()> {
         let primary = ScriptedProvider::streaming(
@@ -815,6 +820,7 @@ mod tests {
                 Ok(StreamDelta::Done {
                     stop_reason: Some(StopReason::EndTurn),
                     served_route: Some("secondary".to_owned()),
+                    served_model: Some("secondary-model".to_owned()),
                 }),
             ],
         );
@@ -824,11 +830,22 @@ mod tests {
         let mut stream = fb.chat_stream(request());
         let mut served = None;
         while let Some(item) = stream.next().await {
-            if let StreamDelta::Done { served_route, .. } = item? {
-                served = served_route;
+            if let StreamDelta::Done {
+                served_route,
+                served_model,
+                ..
+            } = item?
+            {
+                served = Some((served_route, served_model));
             }
         }
-        assert_eq!(served.as_deref(), Some("secondary"));
+        assert_eq!(
+            served,
+            Some((
+                Some("secondary".to_owned()),
+                Some("secondary-model".to_owned())
+            ))
+        );
         Ok(())
     }
 }

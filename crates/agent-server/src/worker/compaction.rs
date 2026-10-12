@@ -200,9 +200,17 @@ struct AnchorRequirements<'a> {
     history_len: usize,
     expected_request_fingerprint: &'a str,
     /// `Some` for a provider without a stable request route: only a request
-    /// whose stream confirmed this route served it measured the backend the
-    /// next call dispatches to first.
-    required_served_route: Option<&'a str>,
+    /// whose stream confirmed this route and model served it measured the
+    /// backend the next call dispatches to first.
+    required_served_identity: Option<ServedIdentity<'a>>,
+}
+
+/// The `(route, model)` pair a stream's `Done` stamps. A route alone can
+/// serve several models, so an anchor must match both.
+#[derive(Clone, Copy)]
+struct ServedIdentity<'a> {
+    route: &'a str,
+    model: &'a str,
 }
 
 /// `request_blob.user_prompt` of internal context-compaction attempts.
@@ -251,8 +259,9 @@ fn attempt_measured_anchor(
     {
         return None;
     }
-    if let Some(required_route) = requirements.required_served_route
-        && blob.get("served_route").and_then(serde_json::Value::as_str) != Some(required_route)
+    if let Some(required) = requirements.required_served_identity
+        && (blob.get("served_route").and_then(serde_json::Value::as_str) != Some(required.route)
+            || blob.get("served_model").and_then(serde_json::Value::as_str) != Some(required.model))
     {
         return None;
     }
@@ -435,7 +444,7 @@ pub(crate) struct PlannedCompaction {
 /// Trigger occupancy is the latest eligible measured anchor plus the
 /// estimated staged suffix it did not cover; the full history is estimated
 /// only when no anchor exists. A provider without a stable request route
-/// anchors only on requests its own representative route served.
+/// anchors only on requests its own representative route and model served.
 /// `expected_request` is the message-less envelope of the request about to
 /// be sent.
 pub(crate) async fn plan_pre_call_compaction(
@@ -542,8 +551,12 @@ async fn measured_occupancy(
         current_history_generation,
         history_len: history.len(),
         expected_request_fingerprint: &fingerprint,
-        required_served_route: (!main_provider.has_stable_request_route())
-            .then(|| main_provider.route()),
+        required_served_identity: (!main_provider.has_stable_request_route()).then(|| {
+            ServedIdentity {
+                route: main_provider.route(),
+                model: main_provider.model(),
+            }
+        }),
     };
     Ok(latest_measured_anchor(deps, thread_id, &requirements)
         .await?
@@ -1353,27 +1366,46 @@ mod tests {
             current_history_generation: 1,
             history_len: 24,
             expected_request_fingerprint: fingerprint,
-            required_served_route: None,
+            required_served_identity: None,
         }
     }
 
     #[test]
-    fn unstable_route_anchors_only_on_a_confirmed_serving_route() -> anyhow::Result<()> {
+    fn unstable_route_anchors_only_on_a_confirmed_serving_identity() -> anyhow::Result<()> {
         let fingerprint = mock_fingerprint()?;
         let unstable = AnchorRequirements {
-            required_served_route: Some("primary"),
+            required_served_identity: Some(ServedIdentity {
+                route: "primary",
+                model: "primary-model",
+            }),
             ..requirements(&fingerprint)
         };
         let served_by_primary = stamped_attempt(
             anchor_time()?,
-            &serde_json::json!({ "served_route": "primary" }),
+            &serde_json::json!({ "served_route": "primary", "served_model": "primary-model" }),
         )?;
         assert!(attempt_measured_anchor(&served_by_primary, &unstable).is_some());
         let failed_over = stamped_attempt(
             anchor_time()?,
-            &serde_json::json!({ "served_route": "secondary" }),
+            &serde_json::json!({ "served_route": "secondary", "served_model": "primary-model" }),
         )?;
         assert!(attempt_measured_anchor(&failed_over, &unstable).is_none());
+        let other_model_same_route = stamped_attempt(
+            anchor_time()?,
+            &serde_json::json!({ "served_route": "primary", "served_model": "other-model" }),
+        )?;
+        assert!(
+            attempt_measured_anchor(&other_model_same_route, &unstable).is_none(),
+            "a route can serve several models; another model's count never anchors",
+        );
+        let route_only = stamped_attempt(
+            anchor_time()?,
+            &serde_json::json!({ "served_route": "primary" }),
+        )?;
+        assert!(
+            attempt_measured_anchor(&route_only, &unstable).is_none(),
+            "a row without a stream-confirmed model cannot prove which model it measured",
+        );
         let unconfirmed = stamped_attempt(anchor_time()?, &serde_json::json!({}))?;
         assert!(
             attempt_measured_anchor(&unconfirmed, &unstable).is_none(),

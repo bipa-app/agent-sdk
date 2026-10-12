@@ -3173,8 +3173,8 @@ async fn unstable_route_uses_fixed_threshold_and_full_estimate() -> Result<()> {
 
 /// Summarizer calls made by one pre-call check through a primary → secondary
 /// failover chain whose only measured anchor was served by
-/// `anchor_served_route`.
-async fn failover_chain_summarizer_calls(anchor_served_route: &str) -> Result<usize> {
+/// `(anchor_route, anchor_model)`.
+async fn failover_chain_summarizer_calls(anchor_route: &str, anchor_model: &str) -> Result<usize> {
     use crate::journal::staged::StagedMessageStore;
 
     let fixtures = Fixtures::new();
@@ -3189,7 +3189,8 @@ async fn failover_chain_summarizer_calls(anchor_served_route: &str) -> Result<us
             "request_message_count": 24,
             "request_fingerprint": sample_envelope_fingerprint()?,
             "history_generation": 0,
-            "served_route": anchor_served_route,
+            "served_route": anchor_route,
+            "served_model": anchor_model,
         }),
         2_000,
         t0() + Duration::seconds(5),
@@ -3239,18 +3240,158 @@ async fn failover_chain_summarizer_calls(anchor_served_route: &str) -> Result<us
 }
 
 #[tokio::test]
-async fn failover_chain_anchors_on_the_route_that_served() -> Result<()> {
+async fn failover_chain_anchors_on_the_identity_that_served() -> Result<()> {
     assert_eq!(
-        failover_chain_summarizer_calls("mock").await?,
+        failover_chain_summarizer_calls("mock", "mock-model").await?,
         0,
         "the primary served the anchored request and is dispatched first again: \
          its measured 1k occupancy must win over the ~180k full-history estimate",
     );
     assert_eq!(
-        failover_chain_summarizer_calls("openai").await?,
+        failover_chain_summarizer_calls("openai", "gpt-secondary").await?,
         1,
         "the anchored request failed over to the secondary, which measured another \
          backend; the trigger must fall back to the full estimate",
+    );
+    assert_eq!(
+        failover_chain_summarizer_calls("mock", "other-model").await?,
+        1,
+        "the anchored request was served on the primary's route by another model; \
+         its count never anchors the primary",
+    );
+    Ok(())
+}
+
+/// Runs one real turn through `main` over a history the estimator puts near
+/// 120k tokens, then counts summarizer calls on the next pre-call check
+/// against a 50k threshold. The turn's close is the only anchor, and the
+/// backend that served it measured 100 tokens.
+async fn summarizer_calls_after_a_turn_through(main: &dyn LlmProvider) -> Result<usize> {
+    use crate::journal::staged::StagedMessageStore;
+
+    let fixtures = Fixtures::new();
+    let mut history = Vec::with_capacity(24);
+    for index in 0..12 {
+        history.push(Message::user(format!("u-{index}: {}", "x".repeat(20_000))));
+        history.push(Message::assistant(format!(
+            "a-{index}: {}",
+            "y".repeat(20_000)
+        )));
+    }
+    fixtures
+        .messages
+        .commit_messages(&thread_id(), history, t0())
+        .await?;
+
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    let task_id = task.id.clone();
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &fixtures.threads,
+        &fixtures.checkpoints,
+        &fixtures.messages,
+        t0(),
+    )
+    .await?;
+    execute_root_turn(
+        inputs,
+        "ping",
+        main,
+        &fixtures.deps_without_compaction(),
+        t0() + Duration::seconds(1),
+    )
+    .await?;
+
+    let attempts = fixtures.attempts.list_by_task(&task_id).await?;
+    let [attempt] = attempts.as_slice() else {
+        anyhow::bail!("expected one main attempt, got {attempts:?}");
+    };
+    let blob = attempt
+        .response_blob
+        .as_ref()
+        .context("the closed main attempt carries a response blob")?;
+    anyhow::ensure!(
+        blob.get("request_input_tokens") == Some(&serde_json::json!(100))
+            && blob
+                .get("request_fingerprint")
+                .and_then(serde_json::Value::as_str)
+                == Some(sample_envelope_fingerprint()?.as_str()),
+        "the turn must leave a measured anchor for the next check: {blob}",
+    );
+
+    let cfg = CompactionConfig::default()
+        .with_engine(CompactionEngine::PruneFirst)
+        .with_threshold_tokens(50_000);
+    let summarizer = Arc::new(ScriptedProvider::new(vec![ok_response(
+        "[summary] next turn",
+    )]));
+    let compaction_provider: Arc<dyn LlmProvider> = summarizer.clone();
+    let deps = fixtures.deps_with_compaction(&cfg, &compaction_provider);
+    let staged = StagedMessageStore::new(
+        thread_id(),
+        fixtures.messages.get_history(&thread_id()).await?,
+    );
+    super::compaction::maybe_compact_staged_history(
+        &deps,
+        main,
+        &staged,
+        &thread_id(),
+        0,
+        &sample_envelope(),
+        t0() + Duration::seconds(20),
+    )
+    .await?;
+    Ok(summarizer.calls())
+}
+
+#[tokio::test]
+async fn failover_to_another_model_on_the_same_route_never_anchors() -> Result<()> {
+    let served_by_primary =
+        agent_sdk_providers::FallbackProvider::new(Arc::new(ScriptedProvider::new(vec![
+            ok_response("primary answer"),
+        ])))
+        .with_fallback(Arc::new(ScriptedProvider::with_identity(
+            "mock",
+            "other-model",
+        )));
+    assert_eq!(
+        summarizer_calls_after_a_turn_through(&served_by_primary).await?,
+        0,
+        "control: the primary served the turn, so its 100 measured tokens anchor",
+    );
+
+    let failed_over =
+        agent_sdk_providers::FallbackProvider::new(Arc::new(ScriptedProvider::new(vec![
+            ChatOutcome::ServerError("primary unavailable".to_owned()),
+        ])))
+        .with_fallback(Arc::new(ScriptedProvider::with_identity(
+            "mock",
+            "other-model",
+        )));
+    assert_eq!(
+        summarizer_calls_after_a_turn_through(&failed_over).await?,
+        1,
+        "the secondary shares the primary's route but not its model; its count \
+         must not stand in for the ~120k-token estimate",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn router_fast_tier_on_the_capable_route_never_anchors() -> Result<()> {
+    let router = agent_sdk_providers::ModelRouter::new(
+        ScriptedProvider::new(vec![ok_response("SIMPLE")]),
+        ScriptedProvider::with_identity("mock", "mock-fast"),
+        ScriptedProvider::new(Vec::new()),
+        ScriptedProvider::new(Vec::new()),
+    );
+    assert_eq!(LlmProvider::route(&router), "mock");
+    assert_eq!(LlmProvider::model(&router), "mock-model");
+    assert_eq!(
+        summarizer_calls_after_a_turn_through(&router).await?,
+        1,
+        "the fast tier served the turn on the capable tier's route; its count \
+         must not anchor the router's representative model",
     );
     Ok(())
 }
@@ -3284,15 +3425,18 @@ async fn failover_close_stamps_the_route_that_served() -> Result<()> {
     let [attempt] = attempts.as_slice() else {
         anyhow::bail!("expected one main attempt, got {attempts:?}");
     };
-    assert_eq!(
+    let served = |key: &str| {
         attempt
             .response_blob
             .as_ref()
-            .and_then(|blob| blob.get("served_route"))
-            .and_then(serde_json::Value::as_str),
-        Some("openai"),
-        "the close must stamp the route the stream's Done named, not the \
-         chain's representative primary",
+            .and_then(|blob| blob.get(key))
+            .and_then(serde_json::Value::as_str)
+    };
+    assert_eq!(
+        (served("served_route"), served("served_model")),
+        (Some("openai"), Some("gpt-secondary")),
+        "the close must stamp the route and model the stream's Done named, not \
+         the chain's representative primary",
     );
     Ok(())
 }

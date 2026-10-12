@@ -768,6 +768,7 @@ mod tests {
             MockStreamItem::Ok(StreamDelta::Done {
                 stop_reason: Some(StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             }),
         ])?;
 
@@ -805,6 +806,7 @@ mod tests {
             MockStreamItem::Ok(StreamDelta::Done {
                 stop_reason: Some(StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             }),
         ])?;
 
@@ -877,6 +879,7 @@ mod tests {
             MockStreamItem::Ok(StreamDelta::Done {
                 stop_reason: Some(StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             }),
         ])?;
 
@@ -942,6 +945,7 @@ mod tests {
             MockStreamItem::Ok(StreamDelta::Done {
                 stop_reason: Some(StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             }),
         ])?;
 
@@ -988,6 +992,7 @@ mod tests {
             MockStreamItem::Ok(StreamDelta::Done {
                 stop_reason: Some(StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             }),
         ])?;
 

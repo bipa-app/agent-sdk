@@ -233,7 +233,7 @@ impl LlmProvider for BlockingStreamProvider {
                 let _ = rx.await;
             }
             yield Ok(StreamDelta::TextDelta { delta: " (unexpected)".to_string(), block_index: 0 });
-            yield Ok(StreamDelta::Done { stop_reason: Some(StopReason::EndTurn), served_route: None });
+            yield Ok(StreamDelta::Done { stop_reason: Some(StopReason::EndTurn), served_route: None , served_model: None});
         })
     }
 

@@ -5293,6 +5293,7 @@ async fn streaming_retry_uses_fresh_message_id_per_attempt() -> anyhow::Result<(
             StreamDelta::Done {
                 stop_reason: Some(crate::llm::StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             },
         ]),
     ]);
@@ -5386,6 +5387,7 @@ async fn streaming_rate_limit_retry_honours_the_provider_hint() -> anyhow::Resul
             StreamDelta::Done {
                 stop_reason: Some(crate::llm::StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             },
         ]),
     ]);
@@ -5472,6 +5474,7 @@ async fn streaming_retry_bills_the_failed_attempts_usage() -> anyhow::Result<()>
             StreamDelta::Done {
                 stop_reason: Some(crate::llm::StopReason::ToolUse),
                 served_route: None,
+                served_model: None,
             },
         ]),
         StreamScriptStep::Frames(vec![
@@ -5483,6 +5486,7 @@ async fn streaming_retry_bills_the_failed_attempts_usage() -> anyhow::Result<()>
             StreamDelta::Done {
                 stop_reason: Some(crate::llm::StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             },
         ]),
     ]);
@@ -5575,6 +5579,7 @@ async fn failover_after_usage_bills_both_providers() -> anyhow::Result<()> {
             StreamDelta::Done {
                 stop_reason: Some(crate::llm::StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             },
         ],
     )]));
@@ -5697,6 +5702,7 @@ async fn streaming_rate_limit_without_a_hint_uses_exponential_backoff() -> anyho
             StreamDelta::Done {
                 stop_reason: Some(crate::llm::StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             },
         ]),
     ]);
@@ -9907,6 +9913,7 @@ async fn connectivity_wait_does_not_consume_transient_retry_budget() -> anyhow::
             StreamDelta::Done {
                 stop_reason: Some(crate::llm::StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             },
         ]),
     ]);
@@ -10097,6 +10104,7 @@ async fn offline_probe_failures_reset_the_reachable_death_budget() -> anyhow::Re
             StreamDelta::Done {
                 stop_reason: Some(crate::llm::StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             },
         ]),
     ])
@@ -10205,6 +10213,7 @@ async fn keep_alives_hold_a_silent_stream_open_past_the_inactivity_timeout() -> 
         StreamDelta::Done {
             stop_reason: Some(crate::llm::StopReason::EndTurn),
             served_route: None,
+            served_model: None,
         },
     ));
     let provider = StreamScriptProvider::new(vec![StreamScriptStep::PacedFrames(frames)]);
@@ -10435,6 +10444,7 @@ async fn uri_checkpoint_hydrates_every_streaming_retry_attempt() -> anyhow::Resu
             StreamDelta::Done {
                 stop_reason: Some(StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             },
         ]),
     ]);

@@ -703,8 +703,9 @@ pub trait LlmProvider: Send + Sync {
     /// the default silently lets consumers compare one backend's
     /// measurements with another's. A wrapper around exactly one inner
     /// provider delegates to it. Without a stable route, consumers trust a
-    /// measurement only when the stream's
-    /// [`StreamDelta::Done`] `served_route` equals `route()`.
+    /// measurement only when the stream's [`StreamDelta::Done`]
+    /// `served_route` and `served_model` equal `route()` and `model()`: one
+    /// route can serve several models.
     fn has_stable_request_route(&self) -> bool {
         true
     }
@@ -775,6 +776,7 @@ pub trait LlmProvider: Send + Sync {
                         yield Ok(StreamDelta::Done {
                             stop_reason: response.stop_reason,
                             served_route: Some(self.route().to_owned()),
+                            served_model: Some(self.model().to_owned()),
                         });
                     }
                     ChatOutcome::RateLimited(retry_after) => {

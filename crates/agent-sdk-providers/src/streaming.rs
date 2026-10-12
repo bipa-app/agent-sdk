@@ -128,6 +128,12 @@ pub enum StreamDelta {
         /// `None` from providers that predate the field — consumers fall back
         /// to the dispatch handle's `route()`.
         served_route: Option<String>,
+        /// The [`LlmProvider::model`](crate::provider::LlmProvider::model) of
+        /// the provider that actually served this stream, stamped and
+        /// forwarded alongside `served_route`. One route can serve several
+        /// models, so only the pair names what measured the request. `None`
+        /// from providers that predate the field.
+        served_model: Option<String>,
     },
 
     /// A signature delta for a thinking block.
@@ -524,6 +530,8 @@ pub struct StreamAccumulator {
     stop_reason: Option<StopReason>,
     /// Serving route reported by the stream's `Done` marker
     served_route: Option<String>,
+    /// Serving model reported by the stream's `Done` marker
+    served_model: Option<String>,
 }
 
 /// Accumulator for a single tool use during streaming.
@@ -618,9 +626,11 @@ impl StreamAccumulator {
             StreamDelta::Done {
                 stop_reason,
                 served_route,
+                served_model,
             } => {
                 self.stop_reason = *stop_reason;
                 self.served_route.clone_from(served_route);
+                self.served_model.clone_from(served_model);
             }
             StreamDelta::Error { .. } | StreamDelta::KeepAlive => {}
         }
@@ -642,6 +652,12 @@ impl StreamAccumulator {
     #[must_use]
     pub fn served_route(&self) -> Option<&str> {
         self.served_route.as_deref()
+    }
+
+    /// The serving model the stream's `Done` marker reported, if any.
+    #[must_use]
+    pub fn served_model(&self) -> Option<&str> {
+        self.served_model.as_deref()
     }
 
     /// Convert accumulated content to `ContentBlock`s.
@@ -1064,6 +1080,7 @@ mod tests {
         acc.apply(&StreamDelta::Done {
             stop_reason: Some(StopReason::ToolUse),
             served_route: None,
+            served_model: None,
         });
 
         assert!(acc.usage().is_some());
@@ -1077,21 +1094,26 @@ mod tests {
     }
 
     #[test]
-    fn accumulator_captures_the_done_markers_served_route() {
+    fn accumulator_captures_the_done_markers_served_identity() {
         let mut acc = StreamAccumulator::new();
         assert_eq!(acc.served_route(), None);
+        assert_eq!(acc.served_model(), None);
         acc.apply(&StreamDelta::Done {
             stop_reason: Some(StopReason::EndTurn),
             served_route: Some("openrouter".to_owned()),
+            served_model: Some("moonshotai/kimi-k3".to_owned()),
         });
         assert_eq!(acc.served_route(), Some("openrouter"));
+        assert_eq!(acc.served_model(), Some("moonshotai/kimi-k3"));
 
         let mut without = StreamAccumulator::new();
         without.apply(&StreamDelta::Done {
             stop_reason: Some(StopReason::EndTurn),
             served_route: None,
+            served_model: None,
         });
         assert_eq!(without.served_route(), None);
+        assert_eq!(without.served_model(), None);
     }
 
     #[test]

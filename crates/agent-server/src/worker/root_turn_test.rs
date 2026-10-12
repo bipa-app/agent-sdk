@@ -4720,6 +4720,7 @@ impl LlmProvider for OfflineThenSuccessProvider {
             yield Ok(StreamDelta::Done {
                 stop_reason: Some(StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             });
         })
     }
@@ -11538,6 +11539,7 @@ impl LlmProvider for RoutelessStreamProvider {
             yield Ok(StreamDelta::Done {
                 stop_reason: Some(StopReason::EndTurn),
                 served_route: None,
+                served_model: None,
             });
         })
     }

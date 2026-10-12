@@ -427,6 +427,7 @@ impl LlmProvider for GeminiProvider {
 
     fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
         let served_route = self.route().to_owned();
+        let served_model = self.model().to_owned();
         Box::pin(async_stream::stream! {
             let thinking = match self.resolve_thinking_config(request.thinking.as_ref()) {
                 Ok(thinking) => thinking,
@@ -548,6 +549,7 @@ impl LlmProvider for GeminiProvider {
                     Ok(StreamDelta::Done { stop_reason, .. }) => Ok(StreamDelta::Done {
                         stop_reason,
                         served_route: Some(served_route.clone()),
+                        served_model: Some(served_model.clone()),
                     }),
                     other => other,
                 };

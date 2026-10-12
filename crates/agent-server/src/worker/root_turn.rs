@@ -364,6 +364,9 @@ struct AttemptEvidence {
     /// The route the stream's `Done` named; `None` when the provider did not
     /// stamp one and `route_provider` is only the pre-dispatch identity.
     served_route: Option<String>,
+    /// The model the stream's `Done` named; `None` when the provider did not
+    /// stamp one.
+    served_model: Option<String>,
 }
 
 impl AttemptEvidence {
@@ -405,6 +408,7 @@ impl AttemptEvidence {
             request_fingerprint,
             staged_history_generation: None,
             served_route: None,
+            served_model: None,
         }
     }
 
@@ -4854,7 +4858,7 @@ async fn call_llm_once_inner(
         .await);
     }
 
-    let evidence = evidence_with_served_route(evidence, &accumulator);
+    let evidence = evidence_with_served_identity(evidence, &accumulator);
     let response = synthesize_response(accumulator, provider, thread_id);
     Ok(OnceOutcome {
         response,
@@ -4868,7 +4872,7 @@ async fn call_llm_once_inner(
 /// router / refresh wrapper can differ from the configured route the
 /// pre-dispatch evidence captured. Streams from providers that predate
 /// the marker keep the pre-dispatch route.
-fn evidence_with_served_route(
+fn evidence_with_served_identity(
     evidence: &AttemptEvidence,
     accumulator: &StreamAccumulator,
 ) -> AttemptEvidence {
@@ -4877,6 +4881,7 @@ fn evidence_with_served_route(
         route.clone_into(&mut evidence.route_provider);
         evidence.served_route = Some(route.to_owned());
     }
+    evidence.served_model = accumulator.served_model().map(str::to_owned);
     evidence
 }
 
@@ -5307,6 +5312,9 @@ fn build_close_params(
     }
     if let Some(route) = &evidence.served_route {
         response_blob["served_route"] = serde_json::Value::from(route.clone());
+    }
+    if let Some(model) = &evidence.served_model {
+        response_blob["served_model"] = serde_json::Value::from(model.clone());
     }
 
     CloseAttemptParams {
