@@ -740,6 +740,7 @@ where
         tool_choice: None,
         response_format: None,
         cache: None,
+        request_only_reminders: Vec::new(),
     })
 }
 

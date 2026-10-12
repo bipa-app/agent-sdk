@@ -128,6 +128,7 @@ fn crash_test_definition() -> AgentDefinition {
         thinking_display: None,
         tools_fn: None,
         tool_input_sanitizer: None,
+        request_context_fn: None,
         policy: RuntimePolicy::server_default(),
     }
 }

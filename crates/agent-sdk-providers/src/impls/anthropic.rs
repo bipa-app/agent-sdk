@@ -477,7 +477,11 @@ impl AnthropicProvider {
     ) -> Vec<data::ApiMessage> {
         let mut messages = build_api_messages(request);
         if let Some(cache_control) = cache_control {
-            data::apply_cache_control_to_last_user_message(&mut messages, cache_control);
+            data::apply_cache_control_to_last_user_message(
+                &mut messages,
+                request.request_only_tail_blocks(),
+                cache_control,
+            );
         }
         messages
     }
@@ -2028,7 +2032,31 @@ mod tests {
             tool_choice: None,
             response_format: None,
             cache: None,
+            request_only_reminders: Vec::new(),
         }
+    }
+
+    #[test]
+    fn cached_messages_keep_the_breakpoint_off_request_only_context() -> anyhow::Result<()> {
+        let mut request = ChatRequest::new(
+            "system",
+            vec![agent_sdk_foundation::llm::Message::user("hello")],
+        );
+        request.append_request_only_reminder("plan: 0/1 done");
+        let CacheRegions {
+            messages: messages_cache,
+            ..
+        } = AnthropicProvider::cache_regions(&request);
+
+        let wire = serde_json::to_value(AnthropicProvider::build_cached_api_messages(
+            &request,
+            messages_cache,
+        ))?;
+
+        assert_eq!(wire[0]["content"][0]["text"], "hello");
+        assert_eq!(wire[0]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert!(wire[0]["content"][1].get("cache_control").is_none());
+        Ok(())
     }
 
     #[test]

@@ -46,63 +46,15 @@ use serde_json::Value;
 
 use crate::ToolResult;
 
-/// `<system-reminder>` / `</system-reminder>` tag forms escaped inside reminder
-/// content. Matched case-insensitively (ASCII).
-const REMINDER_TAGS: [&str; 2] = ["</system-reminder>", "<system-reminder>"];
-
-/// Escape every case-insensitive occurrence of a system-reminder tag by
-/// replacing its angle brackets with HTML entities, preserving the inner text
-/// (and its original case) so the content survives but cannot inject a live
-/// tag. Handles both opening and closing tags.
-fn escape_reminder_tags(content: &str) -> String {
-    let bytes = content.as_bytes();
-    let mut out = String::with_capacity(content.len());
-    let mut i = 0;
-
-    while i < bytes.len() {
-        let mut matched = false;
-        for tag in REMINDER_TAGS {
-            let tag_bytes = tag.as_bytes();
-            if i + tag_bytes.len() <= bytes.len()
-                && bytes[i..i + tag_bytes.len()].eq_ignore_ascii_case(tag_bytes)
-            {
-                let original = &content[i..i + tag_bytes.len()];
-                // `original` is `<...>`; escape only the surrounding brackets.
-                out.push_str("&lt;");
-                out.push_str(&original[1..original.len() - 1]);
-                out.push_str("&gt;");
-                i += tag_bytes.len();
-                matched = true;
-                break;
-            }
-        }
-        if matched {
-            continue;
-        }
-
-        if let Some(ch) = content[i..].chars().next() {
-            out.push(ch);
-            i += ch.len_utf8();
-        } else {
-            break;
-        }
-    }
-
-    out
-}
-
 /// Wraps content with system-reminder XML tags.
 ///
 /// Claude is trained to recognize `<system-reminder>` tags as system-level guidance
-/// that should be followed without being mentioned to users.
+/// that should be followed without being mentioned to users. Reminder tags in
+/// `content` are escaped case-insensitively so tool output or other untrusted
+/// input cannot inject a live tag.
 #[must_use]
 pub fn wrap_reminder(content: &str) -> String {
-    // Escape system-reminder tags in content to prevent injection of
-    // system-level instructions via tool output or other untrusted input.
-    // Matching is case-insensitive so variants like `</System-Reminder>` are
-    // also neutralized, and both opening and closing tags are escaped.
-    let sanitized = escape_reminder_tags(content.trim());
-    format!("<system-reminder>\n{sanitized}\n</system-reminder>")
+    agent_sdk_foundation::llm::wrap_system_reminder(content)
 }
 
 /// Appends a system reminder to a tool result's output.

@@ -2752,16 +2752,22 @@ async fn load_root_span_ids(
     )
 }
 
-/// Assemble and validate the messages for every root provider call.
+/// Assemble and validate the messages for every root provider call, replacing
+/// `request.messages` and its request-only reminders.
 ///
 /// Fresh inputs append their typed text/media blocks; resume inputs append
 /// nothing because staged history already carries the suspended exchange. Both
-/// initial calls and emergency-compaction retries use this boundary.
+/// initial calls and emergency-compaction retries use this boundary, so the
+/// definition's request-only context reaches every dispatched request while
+/// the staged store never sees it.
 async fn assemble_provider_request_messages(
+    request: &mut ChatRequest,
+    definition: &AgentDefinition,
     staged_messages: &crate::journal::staged::StagedMessageStore,
     thread_id: &agent_sdk_foundation::ThreadId,
     user_input: &super::user_input::UserInput,
-) -> Result<Vec<llm::Message>> {
+    caller_metadata: Option<&serde_json::Value>,
+) -> Result<()> {
     let mut messages = staged_messages
         .get_history(thread_id)
         .await
@@ -2769,12 +2775,28 @@ async fn assemble_provider_request_messages(
     if let Some(message) = user_input.clone().into_message() {
         messages.push(message);
     }
-    if let Some(index) = llm::provider_tool_sequence_error_index(&messages) {
+    let request_context =
+        definition.resolve_request_context(&super::definition::RequestContextInput {
+            thread_id,
+            messages: &messages,
+            kind: if user_input.is_resume() {
+                super::definition::ProviderRequestKind::Continuation
+            } else {
+                super::definition::ProviderRequestKind::FreshInput
+            },
+            caller_metadata,
+        });
+    request.messages = messages;
+    request.request_only_reminders.clear();
+    if let Some(text) = request_context {
+        request.append_request_only_reminder(&text);
+    }
+    if let Some(index) = llm::provider_tool_sequence_error_index(&request.messages) {
         bail!(
             "refusing provider request for thread {thread_id}: invalid tool_use/tool_result sequence at message index {index}"
         );
     }
-    Ok(messages)
+    Ok(())
 }
 
 async fn build_chat_request(
@@ -2784,9 +2806,6 @@ async fn build_chat_request(
     user_input: &super::user_input::UserInput,
     caller_metadata: Option<&serde_json::Value>,
 ) -> Result<ChatRequest> {
-    let messages =
-        assemble_provider_request_messages(staged_messages, thread_id, user_input).await?;
-
     let thinking = match &definition.thinking {
         ThinkingPolicy::Disabled => None,
         ThinkingPolicy::Enabled { budget_tokens } => Some(llm::ThinkingConfig::new(*budget_tokens)),
@@ -2808,9 +2827,9 @@ async fn build_chat_request(
     // based on caller identity.
     let resolved_tools = definition.resolve_tools(caller_metadata);
 
-    Ok(ChatRequest {
+    let mut request = ChatRequest {
         system: definition.system_prompt.clone(),
-        messages,
+        messages: Vec::new(),
         tools: if resolved_tools.is_empty() {
             None
         } else {
@@ -2826,7 +2845,18 @@ async fn build_chat_request(
         tool_choice: None,
         response_format: None,
         cache: None,
-    })
+        request_only_reminders: Vec::new(),
+    };
+    assemble_provider_request_messages(
+        &mut request,
+        definition,
+        staged_messages,
+        thread_id,
+        user_input,
+        caller_metadata,
+    )
+    .await?;
+    Ok(request)
 }
 
 /// Maximum retries for a transient LLM stream `ServerError`.  After
@@ -3853,10 +3883,16 @@ async fn try_recover_with_compaction(
     // via `buffer_turn_messages` after a successful turn). For the
     // resume path `user_input.into_message()` returns `None` and the
     // staged buffer already contains everything the LLM needs.
-    chat_request.messages =
-        assemble_provider_request_messages(&inputs.staged_stores.messages, thread_id, user_input)
-            .await
-            .context("rebuild provider request after emergency compaction")?;
+    assemble_provider_request_messages(
+        chat_request,
+        definition,
+        &inputs.staged_stores.messages,
+        thread_id,
+        user_input,
+        inputs.bootstrap.task.caller_metadata.as_ref(),
+    )
+    .await
+    .context("rebuild provider request after emergency compaction")?;
 
     let next_attempt = open_attempt(
         inputs,
@@ -8675,7 +8711,158 @@ async fn repark_after_steering_exchange(
 mod tests {
     use super::*;
     use crate::journal::message_store::InMemoryMessageProjectionStore;
+    use crate::worker::definition::{
+        ProviderRequestKind, RequestContextFn, RequestContextInput, RuntimePolicy,
+    };
     use agent_sdk_providers::OpenAIProvider;
+
+    fn context_definition(request_context_fn: Option<RequestContextFn>) -> AgentDefinition {
+        AgentDefinition {
+            provider: "mock".into(),
+            model: "mock-model".into(),
+            system_prompt: "system".into(),
+            max_tokens: 1024,
+            tools: Vec::new(),
+            tools_fn: None,
+            tool_input_sanitizer: None,
+            request_context_fn,
+            thinking: ThinkingPolicy::default(),
+            thinking_display: None,
+            policy: RuntimePolicy::server_default(),
+        }
+    }
+
+    fn tool_round_history() -> Vec<llm::Message> {
+        vec![
+            llm::Message::user("plan the migration"),
+            historical_tool_use("call_1"),
+            llm::Message::tool_result("call_1", "plan saved", false),
+        ]
+    }
+
+    #[tokio::test]
+    async fn request_context_is_appended_to_the_request_but_never_staged() -> Result<()> {
+        let thread_id = agent_sdk_foundation::ThreadId::from_string("thread_request_context");
+        let staged = crate::journal::staged::StagedMessageStore::new(
+            thread_id.clone(),
+            tool_round_history(),
+        );
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook_seen = std::sync::Arc::clone(&seen);
+        let hook: RequestContextFn = std::sync::Arc::new(move |input: &RequestContextInput<'_>| {
+            if let Ok(mut seen) = hook_seen.lock() {
+                seen.push((input.kind, input.messages.to_vec()));
+            }
+            Some(format!("plan: 0/2 done ({:?})", input.kind))
+        });
+        let definition = context_definition(Some(hook));
+
+        let request = build_chat_request(
+            &definition,
+            &staged,
+            &thread_id,
+            &super::super::user_input::UserInput::resume(),
+            None,
+        )
+        .await?;
+
+        let mut expected = tool_round_history();
+        expected[2] = llm::Message::user_with_content(vec![
+            llm::ContentBlock::ToolResult {
+                tool_use_id: "call_1".to_owned(),
+                content: "plan saved".to_owned(),
+                artifact: None,
+                is_error: None,
+            },
+            llm::ContentBlock::Text {
+                text: "<system-reminder>\nplan: 0/2 done (Continuation)\n</system-reminder>"
+                    .to_owned(),
+            },
+        ]);
+        assert_eq!(request.messages, expected);
+        assert_eq!(request.request_only_tail_blocks(), 1);
+        assert!(llm::is_provider_valid_tool_sequence(&request.messages));
+        assert_eq!(staged.get_history(&thread_id).await?, tool_round_history());
+
+        let fresh = build_chat_request(
+            &definition,
+            &staged,
+            &thread_id,
+            &super::super::user_input::UserInput::text("next step"),
+            None,
+        )
+        .await?;
+        assert_eq!(
+            fresh.messages.last(),
+            Some(&llm::Message::user_with_content(vec![
+                llm::ContentBlock::Text {
+                    text: "next step".to_owned()
+                },
+                llm::ContentBlock::Text {
+                    text: "<system-reminder>\nplan: 0/2 done (FreshInput)\n</system-reminder>"
+                        .to_owned(),
+                },
+            ]))
+        );
+        assert_eq!(fresh.request_only_tail_blocks(), 1);
+        assert_eq!(staged.get_history(&thread_id).await?, tool_round_history());
+
+        let seen = seen
+            .lock()
+            .map_err(|_| anyhow::anyhow!("hook record lock poisoned"))?
+            .clone();
+        let mut fresh_messages = tool_round_history();
+        fresh_messages.push(llm::Message::user_with_content(vec![
+            llm::ContentBlock::Text {
+                text: "next step".to_owned(),
+            },
+        ]));
+        assert_eq!(
+            seen,
+            vec![
+                (ProviderRequestKind::Continuation, tool_round_history()),
+                (ProviderRequestKind::FreshInput, fresh_messages),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn absent_or_empty_request_context_leaves_the_request_unchanged() -> Result<()> {
+        let thread_id = agent_sdk_foundation::ThreadId::from_string("thread_request_context");
+        let staged = crate::journal::staged::StagedMessageStore::new(
+            thread_id.clone(),
+            tool_round_history(),
+        );
+        let input = super::super::user_input::UserInput::text("next step");
+
+        let baseline =
+            build_chat_request(&context_definition(None), &staged, &thread_id, &input, None)
+                .await?;
+        let mut expected = tool_round_history();
+        expected.push(llm::Message::user_with_content(vec![
+            llm::ContentBlock::Text {
+                text: "next step".to_owned(),
+            },
+        ]));
+        assert_eq!(baseline.messages, expected);
+        assert_eq!(baseline.request_only_tail_blocks(), 0);
+
+        let none_hook: RequestContextFn = std::sync::Arc::new(|_| None);
+        let blank_hook: RequestContextFn = std::sync::Arc::new(|_| Some("  \n".to_owned()));
+        for hook in [none_hook, blank_hook] {
+            let request = build_chat_request(
+                &context_definition(Some(hook)),
+                &staged,
+                &thread_id,
+                &input,
+                None,
+            )
+            .await?;
+            assert_eq!(format!("{request:?}"), format!("{baseline:?}"));
+        }
+        Ok(())
+    }
 
     fn identity_continuation(
         thread_id: &agent_sdk_foundation::ThreadId,

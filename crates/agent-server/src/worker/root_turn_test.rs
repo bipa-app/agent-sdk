@@ -266,6 +266,7 @@ fn sample_definition() -> AgentDefinition {
         thinking_display: None,
         tools_fn: None,
         tool_input_sanitizer: None,
+        request_context_fn: None,
         policy: RuntimePolicy::server_default(),
     }
 }
@@ -5469,6 +5470,7 @@ async fn pending_tool_tier_uses_per_turn_tools_fn_not_static_list() -> Result<()
             }]
         })),
         tool_input_sanitizer: None,
+        request_context_fn: None,
         policy: RuntimePolicy::server_default(),
     };
 
@@ -11535,4 +11537,328 @@ async fn routeless_stream_keeps_the_configured_route_on_the_row() -> Result<()> 
          before the field existed",
     );
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Request-only context (`AgentDefinition::request_context_fn`)
+// ─────────────────────────────────────────────────────────────────────
+
+const REQUEST_ONLY_MARKER: &str = "REQUEST-ONLY-PLAN-7f3a";
+
+/// Serves scripted responses in order and records every request it sees.
+struct RecordingProvider {
+    responses: std::sync::Mutex<std::collections::VecDeque<ChatResponse>>,
+    requests: std::sync::Mutex<Vec<ChatRequest>>,
+}
+
+impl RecordingProvider {
+    fn new(responses: Vec<ChatResponse>) -> Self {
+        Self {
+            responses: std::sync::Mutex::new(responses.into()),
+            requests: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn single_request(&self) -> Result<ChatRequest> {
+        let requests = self
+            .requests
+            .lock()
+            .map_err(|_| anyhow::anyhow!("recorded requests lock poisoned"))?
+            .clone();
+        match <[ChatRequest; 1]>::try_from(requests) {
+            Ok([request]) => Ok(request),
+            Err(requests) => bail!(
+                "expected exactly one provider request, got {}",
+                requests.len()
+            ),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for RecordingProvider {
+    async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
+        self.requests
+            .lock()
+            .map_err(|_| anyhow::anyhow!("recorded requests lock poisoned"))?
+            .push(request);
+        let response = self
+            .responses
+            .lock()
+            .map_err(|_| anyhow::anyhow!("scripted responses lock poisoned"))?
+            .pop_front()
+            .context("scripted responses exhausted")?;
+        Ok(ChatOutcome::Success(response))
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
+fn scripted_response(content: Vec<ContentBlock>, stop_reason: StopReason) -> ChatResponse {
+    ChatResponse {
+        id: "msg_request_context".into(),
+        content,
+        model: "mock-model".into(),
+        stop_reason: Some(stop_reason),
+        usage: Usage {
+            served_speed: None,
+            input_tokens: 100,
+            output_tokens: 20,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        },
+    }
+}
+
+fn request_only_reminder(kind: &str) -> ContentBlock {
+    ContentBlock::Text {
+        text: format!("<system-reminder>\n{REQUEST_ONLY_MARKER} {kind}\n</system-reminder>"),
+    }
+}
+
+fn without_request_only_context(
+    request: &ChatRequest,
+) -> Result<Vec<agent_sdk_foundation::llm::Message>> {
+    let mut messages = request.messages.clone();
+    if request.request_only_tail_blocks() == 0 {
+        return Ok(messages);
+    }
+    let Some(agent_sdk_foundation::llm::Message {
+        content: agent_sdk_foundation::llm::Content::Blocks(blocks),
+        ..
+    }) = messages.last_mut()
+    else {
+        bail!("request-only context must end a block message");
+    };
+    let kept = blocks
+        .len()
+        .checked_sub(request.request_only_tail_blocks())
+        .context("request-only tail longer than the final message")?;
+    blocks.truncate(kept);
+    if blocks.is_empty() {
+        messages.pop();
+    }
+    Ok(messages)
+}
+
+async fn root_inputs_with_definition(
+    stores: &TestStores,
+    task: AgentTask,
+    definition: AgentDefinition,
+    now: time::OffsetDateTime,
+) -> Result<crate::journal::execution_context::RootWorkerInputs> {
+    let mut bootstrap = sample_bootstrap_with_tools(task);
+    bootstrap.definition = definition;
+    build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        now,
+    )
+    .await
+}
+
+async fn reacquire_parent(stores: &TestStores, parent_task: &AgentTask) -> Result<AgentTask> {
+    stores
+        .tasks
+        .try_acquire_task(
+            &parent_task.id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            t_plus(20),
+        )
+        .await?
+        .context("re-acquire parent")
+}
+
+async fn complete_child_tasks(stores: &TestStores, child_tasks: &[AgentTask]) -> Result<()> {
+    for child in child_tasks {
+        stores
+            .tasks
+            .try_acquire_task(
+                &child.id,
+                WorkerId::from_string("child_worker"),
+                LeaseId::from_string("child_lease"),
+                t_plus(600),
+                t_plus(10),
+            )
+            .await?
+            .context("acquire child")?;
+        stores
+            .tasks
+            .complete_task(
+                &child.id,
+                &WorkerId::from_string("child_worker"),
+                &LeaseId::from_string("child_lease"),
+                t_plus(15),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+async fn assert_no_durable_store_carries(
+    stores: &TestStores,
+    parent_task: &AgentTask,
+    commit: &crate::journal::commit::CommitOutcome,
+    marker: &str,
+) -> Result<()> {
+    let durable_dumps = [
+        (
+            "message projection",
+            format!("{:?}", stores.messages.get(&thread_a()).await?),
+        ),
+        (
+            "checkpoints",
+            format!(
+                "{:?}",
+                stores.checkpoints.list_by_thread(&thread_a()).await?
+            ),
+        ),
+        (
+            "journal events",
+            format!("{:?}", stores.events.get_events(&thread_a()).await?),
+        ),
+        (
+            "outbox",
+            format!("{:?}", stores.outbox.list_by_thread(&thread_a()).await?),
+        ),
+        (
+            "thread",
+            format!("{:?}", stores.threads.get(&thread_a()).await?),
+        ),
+        (
+            "parent task",
+            format!("{:?}", stores.tasks.get(&parent_task.id).await?),
+        ),
+        ("suspended parent", format!("{parent_task:?}")),
+        (
+            "turn attempts",
+            format!("{:?}", stores.attempts.list_by_task(&parent_task.id).await?),
+        ),
+        ("turn commit", format!("{commit:?}")),
+    ];
+    for (store, dump) in durable_dumps {
+        assert!(
+            !dump.contains(marker),
+            "{store} persisted request-only context: {dump}",
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn request_context_reaches_each_provider_request_but_no_durable_store() -> Result<()> {
+    let stores = TestStores::new();
+    let definition = AgentDefinition {
+        request_context_fn: Some(Arc::new(|input| {
+            Some(format!("{REQUEST_ONLY_MARKER} {:?}", input.kind))
+        })),
+        ..sample_definition_with_tools()
+    };
+
+    // Fresh turn: the model calls a tool and the turn suspends.
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let inputs = root_inputs_with_definition(&stores, task, definition.clone(), t0()).await?;
+    let first = RecordingProvider::new(vec![scripted_response(
+        vec![ContentBlock::ToolUse {
+            id: "call_1".into(),
+            name: "bash".into(),
+            input: serde_json::json!({"command": "ls"}),
+            thought_signature: None,
+        }],
+        StopReason::ToolUse,
+    )]);
+    let outcome = execute_root_turn(inputs, "Run tools", &first, &stores.deps(), t_plus(5)).await?;
+    let RootTurnOutcome::Suspended {
+        parent_task,
+        child_tasks,
+        ..
+    } = outcome
+    else {
+        bail!("expected the tool call to suspend the turn");
+    };
+    let first_request = first.single_request()?;
+    assert_eq!(first_request.request_only_tail_blocks(), 1);
+    assert_eq!(
+        first_request.messages.last(),
+        Some(&agent_sdk_foundation::llm::Message::user_with_content(
+            vec![
+                ContentBlock::Text {
+                    text: "Run tools".into()
+                },
+                request_only_reminder("FreshInput"),
+            ]
+        )),
+    );
+    let TaskState::WaitingOnChildren {
+        continuation,
+        suspended_messages,
+        ..
+    } = &parent_task.state
+    else {
+        bail!("expected WaitingOnChildren, got {:?}", parent_task.state);
+    };
+    complete_child_tasks(&stores, &child_tasks).await?;
+
+    // Continuation: the tool result goes back with this request's context.
+    let acquired = reacquire_parent(&stores, &parent_task).await?;
+    let inputs = root_inputs_with_definition(&stores, acquired, definition, t_plus(20)).await?;
+    let second = RecordingProvider::new(vec![scripted_response(
+        vec![ContentBlock::Text {
+            text: "Listed.".into(),
+        }],
+        StopReason::EndTurn,
+    )]);
+    let outcome = Box::pin(resume_root_turn(
+        inputs,
+        continuation.payload.clone(),
+        suspended_messages.clone(),
+        vec![(
+            "call_1".to_owned(),
+            agent_sdk_foundation::ToolResult::success("file1.txt"),
+        )],
+        &second,
+        &stores.deps(),
+        t_plus(25),
+    ))
+    .await?;
+    let RootTurnOutcome::Completed { commit, .. } = outcome else {
+        bail!("expected the resumed turn to complete");
+    };
+    let second_request = second.single_request()?;
+    assert_eq!(second_request.request_only_tail_blocks(), 1);
+    assert_eq!(
+        second_request.messages.last(),
+        Some(&agent_sdk_foundation::llm::Message::user_with_content(
+            vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: "file1.txt".into(),
+                    artifact: None,
+                    is_error: None,
+                },
+                request_only_reminder("Continuation"),
+            ]
+        )),
+    );
+    assert!(agent_sdk_foundation::llm::is_provider_valid_tool_sequence(
+        &second_request.messages
+    ));
+
+    // Committed history is exactly the dispatched conversation minus the
+    // request-only context, followed by the final answer.
+    let history = stores.messages.get_history(&thread_a()).await?;
+    let dispatched = without_request_only_context(&second_request)?;
+    assert_eq!(history.len(), dispatched.len() + 1);
+    assert_eq!(history[..dispatched.len()], dispatched[..]);
+    assert_no_durable_store_carries(&stores, &parent_task, &commit, REQUEST_ONLY_MARKER).await
 }

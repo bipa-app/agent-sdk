@@ -3746,6 +3746,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             cache: None,
+            request_only_reminders: Vec::new(),
         };
 
         let api_messages = build_api_messages(&request);
@@ -3773,6 +3774,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             cache: None,
+            request_only_reminders: Vec::new(),
         };
 
         let api_messages = build_api_messages(&request);
@@ -3793,7 +3795,63 @@ mod tests {
             tool_choice: None,
             response_format: None,
             cache: None,
+            request_only_reminders: Vec::new(),
         }
+    }
+
+    #[test]
+    fn test_build_api_messages_sends_request_context_after_a_compaction_record() {
+        let mut request = request_with_messages(vec![
+            agent_sdk_foundation::llm::Message::compaction_summary("earlier work"),
+        ]);
+        request.append_request_only_reminder("plan: 0/2 done");
+
+        let api_messages = build_api_messages(&request);
+
+        assert_eq!(api_messages.len(), 2);
+        assert_eq!(api_messages[0].role, ApiRole::User);
+        assert!(
+            api_messages[0]
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("earlier work"))
+        );
+        assert_eq!(api_messages[1].role, ApiRole::User);
+        assert_eq!(
+            api_messages[1].content.as_deref(),
+            Some("<system-reminder>\nplan: 0/2 done\n</system-reminder>")
+        );
+    }
+
+    #[test]
+    fn test_build_api_messages_sends_trailing_reminder_after_tool_messages() {
+        let mut messages = vec![
+            agent_sdk_foundation::llm::Message::user("plan the migration"),
+            agent_sdk_foundation::llm::Message::assistant_with_tool_use(
+                None,
+                "call_1",
+                "todo",
+                serde_json::json!({}),
+            ),
+            agent_sdk_foundation::llm::Message::tool_result("call_1", "plan saved", false),
+        ];
+        agent_sdk_foundation::llm::append_system_reminder(&mut messages, "plan: 0/2 done");
+
+        let request = request_with_messages(messages);
+        let api_messages = build_api_messages(&request);
+
+        assert_eq!(api_messages.len(), 4);
+        assert_eq!(api_messages[1].role, ApiRole::Assistant);
+        assert!(api_messages[1].tool_calls.is_some());
+        assert_eq!(api_messages[2].role, ApiRole::Tool);
+        assert_eq!(api_messages[2].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(api_messages[2].content.as_deref(), Some("plan saved"));
+        assert_eq!(api_messages[3].role, ApiRole::User);
+        assert_eq!(api_messages[3].tool_call_id, None);
+        assert_eq!(
+            api_messages[3].content.as_deref(),
+            Some("<system-reminder>\nplan: 0/2 done\n</system-reminder>")
+        );
     }
 
     #[test]
@@ -4689,6 +4747,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             cache: None,
+            request_only_reminders: Vec::new(),
         };
 
         for model in [
