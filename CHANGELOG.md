@@ -167,6 +167,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keep-alive restarts the 330s first-event budget, after it the 120s
   inter-event budget.
 
+- **Early resume never re-presents a running call** - A parent resumed while
+  tool children still run keeps each running call under its original id:
+  the call is answered once with an interim `tool_result`, and its final
+  outcome arrives once as a `<late_tool_result>` text block. If the turn ends
+  first, by any path (cancel, failure, lease expiry, a fail-closed sweep),
+  the next root turn on the thread closes each such call exactly once before
+  its first request, with the child's real state: its result if it finished,
+  `cancelled` if it was cancelled, or `still_running`, which tells the model
+  not to re-issue the call until it is confirmed stopped or finished. This
+  holds even when compaction already folded the interim result into history.
+  The interim `tool_result` is the only one the server writes with
+  `is_error: false` (a tool's result is `None` or `true`), and it carries a
+  `kind` discriminator and the task id of the child spawned for that call,
+  so tool output that imitates it is never taken for one. Only a
+  user-message block laid out exactly as the server renders it counts as a
+  late result. Compaction and fork retain the artifact a late result's
+  spilled output points at.
+
+  **Rollback:** do not roll the server back to a build without late results
+  while any early-resumed parent is parked. Those rows keep already-answered
+  calls in `pending_tool_calls`; an older build resuming one emits a second
+  `tool_result` for the same call, the provider-request guard refuses it, and
+  that turn fails. There is no cheap gate: the server never validates the
+  continuation envelope version, and a new task-state kind would need schema
+  migrations. Drain or cancel parked parents before rolling back.
+
 - **Workspace compatibility for cached token usage fields** - Updated server and host token usage fixtures, stores, and turn accounting so the new cached-input and cache-creation fields compile across all targets and continue accumulating real provider-reported values.
 
 - **Inline payload capture on LLM spans** - `ObservabilityStore` inline capture decisions now set `gen_ai.input.messages` and `gen_ai.output.messages` on LLM spans, and payload capture failures add a `payload_capture_failed` event without failing the agent run.

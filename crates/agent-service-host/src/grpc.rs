@@ -796,6 +796,18 @@ impl GrpcControlService {
                                 ids.insert(id);
                             }
                         }
+                        agent_sdk_foundation::llm::ContentBlock::Text { text } => {
+                            if let Some(output) =
+                                agent_sdk_foundation::llm::late_tool_result::output(text)
+                                && let Some(store) = source_store.as_deref()
+                                && let Some(id) =
+                                    store.verified_legacy_inline_artifact_id(output).map_err(
+                                        internal_status("verifying late tool result output"),
+                                    )?
+                            {
+                                ids.insert(id);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -7542,6 +7554,106 @@ mod tests {
             recovered,
             original.as_bytes(),
             "forked artifact must resolve byte-exact from summary metadata alone"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fork_copies_artifact_referenced_only_by_a_late_tool_result() -> Result<()> {
+        use agent_sdk_foundation::llm::late_tool_result::{self, LateToolResultStatus};
+        use std::io::Read as _;
+
+        let temp = tempfile::tempdir()?;
+        let artifact_storage = Arc::new(agent_sdk::ArtifactStorage::new(
+            temp.path().join("artifacts"),
+        ));
+        let source = ThreadId::from_string("late-artifact-source");
+        let destination = ThreadId::from_string("late-artifact-destination");
+        let source_store = artifact_storage.for_thread(&source)?;
+        let original = "late spilled tool bytes\n".repeat(10_000);
+        let saved = source_store.save("bash", &original)?;
+        let inline = agent_sdk::artifacts::cap_inline_output(
+            &original,
+            source_store.inline_budget(),
+            saved.id,
+        );
+        let call = agent_sdk_foundation::PendingToolCallInfo {
+            id: "late-call".to_owned(),
+            name: "bash".to_owned(),
+            display_name: "bash".to_owned(),
+            tier: agent_sdk_foundation::ToolTier::Observe,
+            input: serde_json::json!({"command": "make"}),
+            effective_input: serde_json::Value::Null,
+            listen_context: None,
+        };
+
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
+            Vec::new(),
+        )));
+        let stores = StoreRegistry::in_memory(registry);
+        let resolver = Arc::new(StaticProviderResolver::new());
+        resolver.set_fallback(Arc::new(ScriptedProvider::new(Vec::new())))?;
+        let runtime = Arc::new(
+            ExecutionRuntime::new(
+                resolver,
+                Arc::new(NoopToolExecutor),
+                Arc::new(AllowAllConfirmationPolicy),
+            )
+            .with_artifact_storage(Arc::clone(&artifact_storage)),
+        );
+        let shared = Arc::new(GrpcShared::new(
+            stores,
+            runtime,
+            HealthSurface::shared(),
+            CancellationToken::new(),
+            time::Duration::seconds(30),
+            std::time::Duration::from_secs(10),
+            AdmissionConfig::default(),
+        ));
+        shared
+            .stores
+            .thread_store
+            .get_or_create(&source, OffsetDateTime::UNIX_EPOCH)
+            .await?;
+        let mut checkpoint = close_gate_checkpoint(&source, "late-artifact-task", 1);
+        checkpoint.messages = vec![
+            llm::Message::user("run the build"),
+            llm::Message {
+                role: llm::Role::User,
+                content: llm::Content::Blocks(vec![ContentBlock::Text {
+                    text: late_tool_result::render(&call, LateToolResultStatus::Success, &inline),
+                }]),
+            },
+        ];
+        shared
+            .stores
+            .checkpoint_store
+            .commit_checkpoint(checkpoint)
+            .await?;
+
+        let service = GrpcControlService { shared };
+        service
+            .copy_thread_state(
+                &source,
+                &destination,
+                1,
+                Some(ThreadCreation::Fork {
+                    source_thread_id: source.clone(),
+                    fork_after_committed_turns: 1,
+                }),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .await?;
+
+        let mut recovered = Vec::new();
+        artifact_storage
+            .for_thread(&destination)?
+            .resolve(saved.id)?
+            .read_to_end(&mut recovered)?;
+        assert_eq!(
+            recovered,
+            original.as_bytes(),
+            "the fork must carry the artifact a late result points at",
         );
         Ok(())
     }

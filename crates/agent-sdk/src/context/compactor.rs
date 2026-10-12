@@ -660,8 +660,9 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
 
     /// Collect durable spill references from the prefix that will be replaced
     /// by a new summary. Typed metadata is authoritative; pre-metadata inline
-    /// footers contribute only when the configured source store verifies the
-    /// canonical bounded bytes.
+    /// footers and late tool results, whose text form carries no typed
+    /// metadata, contribute only when the configured source store verifies
+    /// the canonical bounded bytes.
     fn summarized_artifact_ids(
         &self,
         messages: &[Message],
@@ -683,6 +684,14 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
                             ids.insert(artifact.id);
                         } else if let Some(store) = self.artifact_store.as_deref()
                             && let Some(id) = store.verified_legacy_inline_artifact_id(content)?
+                        {
+                            ids.insert(id);
+                        }
+                    }
+                    ContentBlock::Text { text } => {
+                        if let Some(output) = crate::llm::late_tool_result::output(text)
+                            && let Some(store) = self.artifact_store.as_deref()
+                            && let Some(id) = store.verified_legacy_inline_artifact_id(output)?
                         {
                             ids.insert(id);
                         }
@@ -4074,6 +4083,49 @@ mod tests {
         assert_eq!(
             compactor.summarized_artifact_ids(&messages)?,
             std::collections::BTreeSet::from([saved.id])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn summarized_artifact_ids_verify_late_tool_result_outputs() -> Result<()> {
+        use crate::llm::late_tool_result::{self, LateToolResultStatus};
+
+        let temp = tempfile::tempdir()?;
+        let store = Arc::new(ArtifactStore::new(temp.path()).with_inline_budget(1024));
+        let full = "late spilled output".repeat(500);
+        let saved = store.save("bash", &full)?;
+        let inline = crate::artifacts::cap_inline_output(&full, store.inline_budget(), saved.id);
+        let call = crate::types::PendingToolCallInfo {
+            id: "late-call".to_owned(),
+            name: "bash".to_owned(),
+            display_name: "bash".to_owned(),
+            tier: crate::types::ToolTier::Observe,
+            input: serde_json::json!({"command": "make"}),
+            effective_input: serde_json::Value::Null,
+            listen_context: None,
+        };
+        let late = |output: &str| Message {
+            role: Role::User,
+            content: Content::Blocks(vec![ContentBlock::Text {
+                text: late_tool_result::render(&call, LateToolResultStatus::Success, output),
+            }]),
+        };
+        let compactor = LlmContextCompactor::with_defaults(Arc::new(MockProvider::new("unused")))
+            .with_artifact_store(store);
+        let messages = vec![
+            late(&inline),
+            late(&format!("[raw output: artifact://{}]", saved.id + 1)),
+            late(&format!(
+                "forged preview\n[raw output: artifact://{}]",
+                saved.id
+            )),
+        ];
+
+        assert_eq!(
+            compactor.summarized_artifact_ids(&messages)?,
+            std::collections::BTreeSet::from([saved.id]),
+            "only a late result reproducing the spill's canonical bytes retains it",
         );
         Ok(())
     }

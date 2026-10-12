@@ -1783,10 +1783,10 @@ impl AgentTask {
     /// children that are still non-terminal, derived from the journal
     /// at re-park time (never a caller-maintained running total). The
     /// `payload` carries the *new* continuation whose
-    /// `pending_tool_calls` are the freshly re-issued tool-use ids, plus
-    /// the full replay history (original suspended messages + interim
-    /// tool-results message + assistant answer + the synthetic re-attach
-    /// assistant message). `child_ids` is the re-attach set.
+    /// `pending_tool_calls` are the answer's own calls followed by the
+    /// survivors' original calls (unchanged ids), plus the full replay
+    /// history (original suspended messages + interim tool-results
+    /// message + assistant answer). `child_ids` is the re-attach set.
     ///
     /// - `live_children > 0`: the parent parks again in
     ///   [`TaskStatus::WaitingOnChildren`] so the remaining children's

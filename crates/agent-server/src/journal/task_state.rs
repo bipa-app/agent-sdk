@@ -261,7 +261,7 @@ pub enum TaskState {
     /// - `steering` **non-empty** → the bounded steering exchange
     ///   ([`crate::worker::resume_for_steering`]); children may still be
     ///   running. It answers the note with interim child results and
-    ///   re-parks on the survivors under freshly re-issued bindings.
+    ///   re-parks on the survivors, each still bound to its original call.
     ///
     /// Reusing this variant (rather than a new one) keeps the durable
     /// wire `kind` — and therefore every backend's state/status CHECK
