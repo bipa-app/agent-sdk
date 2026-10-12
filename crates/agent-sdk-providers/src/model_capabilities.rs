@@ -1423,11 +1423,13 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
 
 /// Capabilities of `model_id` served by `provider`.
 ///
-/// An exact id wins. Otherwise the id and every row compare with their
-/// snapshot qualifier removed, so a dated snapshot (`-YYYYMMDD`, or
-/// `-YYYY-MM-DD`), a Google Cloud `@` version or a `-latest` alias of a
-/// registered model resolves to that model's row, and an undated alias
-/// resolves to its dated row.
+/// An exact id wins. Otherwise the id resolves to the row of its snapshot
+/// family (the id without a `-YYYYMMDD` or `-YYYY-MM-DD` date, a Google
+/// Cloud `@` version or a `-latest` suffix) when that row describes the same
+/// snapshot: an undated alias or `-latest` names the row's snapshot, a
+/// dated id resolves to a row of the same date, and to an undated row only
+/// when the registry lists that date as the snapshot the row describes. Any other snapshot of
+/// a registered family may differ from its row, so it stays unknown.
 #[must_use]
 pub fn get_model_capabilities(
     provider: &str,
@@ -1440,57 +1442,96 @@ pub fn get_model_capabilities(
     };
     rows()
         .find(|caps| caps.model_id.eq_ignore_ascii_case(model_id))
-        .or_else(|| {
-            let family = snapshot_family(model_id);
-            rows().find(|caps| snapshot_family(caps.model_id).eq_ignore_ascii_case(family))
-        })
+        .or_else(|| rows().find(|caps| snapshot_resolves_to(model_id, caps.model_id)))
 }
 
-/// `model_id` without its snapshot qualifier: a Google Cloud `@version`, a
-/// `-latest` alias suffix, or a trailing snapshot date (`-YYYYMMDD`, or
-/// `-YYYY-MM-DD` as `OpenAI` dates them).
-#[must_use]
-pub(crate) fn snapshot_family(model_id: &str) -> &str {
-    let id = model_id
-        .split_once('@')
-        .map_or(model_id, |(family, _)| family);
-    if let Some(family) = id.strip_suffix("-latest") {
-        return family;
+/// Dated snapshots an undated row describes, as `(row, YYYY-MM-DD)`: the
+/// snapshot its alias points to on the vendor's model page. Other dated
+/// snapshots of that model may have other limits or prices
+/// (`gpt-4o-2024-05-13` allows 4,096 output tokens, not 16,384).
+const SNAPSHOTS_OF_UNDATED_ROWS: &[(&str, &str)] =
+    &[("gpt-5.5", "2026-04-23"), ("gpt-4o", "2024-08-06")];
+
+/// The qualifier a model id carries after its family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnapshotQualifier {
+    /// No date: the family name or a `-latest` alias.
+    Undated,
+    /// A snapshot date, as `YYYYMMDD`.
+    Dated(u32),
+    /// A Google Cloud `@` version that is not a date.
+    Version,
+}
+
+/// Whether `query`, which is not `row_id` itself, names the snapshot the
+/// row `row_id` describes.
+pub(crate) fn snapshot_resolves_to(query: &str, row_id: &str) -> bool {
+    let (query_family, query_snapshot) = split_snapshot(query);
+    let (row_family, row_snapshot) = split_snapshot(row_id);
+    if !query_family.eq_ignore_ascii_case(row_family) {
+        return false;
     }
-    if let Some((family, date)) = id.rsplit_once('-')
-        && is_compact_date(date)
+    match (query_snapshot, row_snapshot) {
+        (SnapshotQualifier::Undated, SnapshotQualifier::Undated | SnapshotQualifier::Dated(_)) => {
+            true
+        }
+        (SnapshotQualifier::Dated(query_date), SnapshotQualifier::Dated(row_date)) => {
+            query_date == row_date
+        }
+        (SnapshotQualifier::Dated(query_date), SnapshotQualifier::Undated) => {
+            SNAPSHOTS_OF_UNDATED_ROWS.iter().any(|(row, date)| {
+                row.eq_ignore_ascii_case(row_id) && dashed_date(date) == Some(query_date)
+            })
+        }
+        (SnapshotQualifier::Version, _) | (_, SnapshotQualifier::Version) => false,
+    }
+}
+
+/// `model_id` split into its family and its snapshot qualifier: a Google
+/// Cloud `@version`, a `-latest` alias suffix, or a trailing snapshot date
+/// (`-YYYYMMDD`, or `-YYYY-MM-DD` as `OpenAI` dates them).
+fn split_snapshot(model_id: &str) -> (&str, SnapshotQualifier) {
+    if let Some((family, version)) = model_id.split_once('@') {
+        let qualifier = compact_date(version).map_or(SnapshotQualifier::Version, |date| {
+            SnapshotQualifier::Dated(date)
+        });
+        return (family, qualifier);
+    }
+    if let Some(family) = model_id.strip_suffix("-latest") {
+        return (family, SnapshotQualifier::Undated);
+    }
+    if let Some((family, date)) = model_id.rsplit_once('-')
+        && let Some(date) = compact_date(date)
     {
-        return family;
+        return (family, SnapshotQualifier::Dated(date));
     }
-    if let Some(family) = id.get(..id.len().saturating_sub(11))
-        && let Some(date) = id.get(family.len()..)
+    if let Some(family) = model_id.get(..model_id.len().saturating_sub(11))
+        && let Some(date) = model_id.get(family.len()..)
         && let Some(date) = date.strip_prefix('-')
-        && is_dashed_date(date)
+        && let Some(date) = dashed_date(date)
     {
-        return family;
+        return (family, SnapshotQualifier::Dated(date));
     }
-    id
+    (model_id, SnapshotQualifier::Undated)
 }
 
-fn is_compact_date(token: &str) -> bool {
-    token.len() == 8
+fn compact_date(token: &str) -> Option<u32> {
+    (token.len() == 8
         && token.bytes().all(|byte| byte.is_ascii_digit())
-        && is_calendar_date(&token[..4], &token[4..6], &token[6..])
+        && is_calendar_date(&token[..4], &token[4..6], &token[6..]))
+    .then(|| token.parse().ok())
+    .flatten()
 }
 
-fn is_dashed_date(token: &str) -> bool {
+fn dashed_date(token: &str) -> Option<u32> {
     let mut parts = token.split('-');
     match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(year), Some(month), Some(day), None) => {
-            year.len() == 4
-                && month.len() == 2
-                && day.len() == 2
-                && [year, month, day]
-                    .iter()
-                    .all(|part| part.bytes().all(|byte| byte.is_ascii_digit()))
-                && is_calendar_date(year, month, day)
+        (Some(year), Some(month), Some(day), None)
+            if year.len() == 4 && month.len() == 2 && day.len() == 2 =>
+        {
+            compact_date(&format!("{year}{month}{day}"))
         }
-        _ => false,
+        _ => None,
     }
 }
 
@@ -1515,6 +1556,10 @@ pub const fn supported_model_capabilities() -> &'static [ModelCapabilities] {
 
 #[cfg(test)]
 mod tests {
+
+    fn snapshot_family(model_id: &str) -> &str {
+        super::split_snapshot(model_id).0
+    }
     use super::*;
 
     /// A row where reasoning is DEARER than output — `alibaba/qwen3-32b` in the
@@ -2192,21 +2237,59 @@ mod tests {
                 row.provider
             );
 
-            for spelling in [
+            let mut dates: Vec<u32> = SNAPSHOTS_OF_UNDATED_ROWS
+                .iter()
+                .filter(|(listed, _)| *listed == row.model_id)
+                .filter_map(|(_, date)| dashed_date(date))
+                .collect();
+            if let (_, SnapshotQualifier::Dated(date)) = split_snapshot(row.model_id) {
+                dates.push(date);
+            }
+            let mut spellings = vec![
                 row.model_id.to_owned(),
                 row.model_id.to_ascii_uppercase(),
                 family.to_owned(),
-                format!("{family}-20991231"),
-                format!("{family}-2099-12-31"),
-                format!("{family}@20991231"),
                 format!("{family}-latest"),
-            ] {
+            ];
+            for date in dates {
+                let (year, month, day) = (date / 10_000, date / 100 % 100, date % 100);
+                spellings.push(format!("{family}-{date}"));
+                spellings.push(format!("{family}-{year}-{month:02}-{day:02}"));
+                spellings.push(format!("{family}@{date}"));
+            }
+            for spelling in spellings {
                 let caps = get_model_capabilities(row.provider, &spelling)
                     .with_context(|| format!("{}/{spelling} resolves to nothing", row.provider))?;
                 assert_eq!(caps.model_id, row.model_id, "{}/{spelling}", row.provider);
             }
+            for unlisted in [
+                format!("{family}-20991231"),
+                format!("{family}-2099-12-31"),
+                format!("{family}@20991231"),
+                format!("{family}@002"),
+            ] {
+                assert!(
+                    get_model_capabilities(row.provider, &unlisted).is_none(),
+                    "{}/{unlisted} names a snapshot no row describes",
+                    row.provider
+                );
+            }
         }
         Ok(())
+    }
+
+    #[test]
+    fn snapshots_with_their_own_limits_stay_unknown() {
+        for (provider, spelling) in [
+            ("openai", "gpt-4o-2024-05-13"),
+            ("anthropic", "claude-3-5-sonnet-20240620"),
+        ] {
+            assert!(
+                get_model_capabilities(provider, spelling).is_none(),
+                "{provider}/{spelling} must not borrow another snapshot's limits"
+            );
+            assert_eq!(default_max_output_tokens(provider, spelling), None);
+        }
     }
 
     #[test]
