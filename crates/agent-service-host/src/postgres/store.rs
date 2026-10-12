@@ -1881,7 +1881,7 @@ WHERE id = ANY($1::text[])
             .held_probe
             .advance(cursor.is_some(), after_cursor, from_start)
         {
-            if let Some(task) = AgentTaskStore::try_acquire_task(
+            match AgentTaskStore::try_acquire_task(
                 self,
                 &id,
                 worker.clone(),
@@ -1889,9 +1889,15 @@ WHERE id = ANY($1::text[])
                 expires_at,
                 now,
             )
-            .await?
+            .await
             {
-                return Ok(Some(task));
+                Ok(Some(task)) => return Ok(Some(task)),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    task_id = %id,
+                    error = %format!("{error:#}"),
+                    "held probe skipped a row it could not lease"
+                ),
             }
         }
         Ok(None)
@@ -1922,6 +1928,7 @@ SELECT
 FROM agent_sdk_tasks AS held
 WHERE held.status >= 'pending' AND held.status <= 'pending'
   AND held.after_siblings_json IS NOT NULL
+  AND held.kind = 'tool_runtime'
   AND (held.created_at, held.id) > ($1, $2)
   AND held.thread_id NOT IN (
       SELECT thread_id FROM agent_sdk_threads WHERE status IN ('deleting', 'deleted')
@@ -1953,6 +1960,7 @@ SELECT
 FROM agent_sdk_tasks AS held
 WHERE held.status >= 'pending' AND held.status <= 'pending'
   AND held.after_siblings_json IS NOT NULL
+  AND held.kind = 'tool_runtime'
   AND held.thread_id NOT IN (
       SELECT thread_id FROM agent_sdk_threads WHERE status IN ('deleting', 'deleted')
   )

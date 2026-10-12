@@ -291,10 +291,28 @@ const AGENT_SDK_TASK_INDEXES: &[IndexContract] = &[
         purpose: "Provides deterministic FIFO promotion for queued roots.",
     },
     IndexContract {
-        name: "agent_sdk_tasks_runnable_fifo_idx",
+        name: "agent_sdk_tasks_ready_fifo_idx",
+        key_columns: "(created_at, id) INCLUDE (thread_id)",
+        predicate: Some(
+            "status >= 'pending' AND status <= 'pending' AND after_siblings_json IS NULL",
+        ),
+        purpose: "Drives global runnable scans across root and tool-runtime tasks, skipping rows held behind siblings.",
+    },
+    IndexContract {
+        name: "agent_sdk_tasks_held_fifo_idx",
         key_columns: "(created_at, id)",
-        predicate: Some("status = 'pending'"),
-        purpose: "Drives global runnable scans across root and tool-runtime tasks.",
+        predicate: Some(
+            "status >= 'pending' AND status <= 'pending' AND after_siblings_json IS NOT NULL AND kind = 'tool_runtime'",
+        ),
+        purpose: "Drives the bounded backstop probe over tool children held behind siblings.",
+    },
+    IndexContract {
+        name: "agent_sdk_tasks_held_by_parent_idx",
+        key_columns: "(parent_id, created_at, id)",
+        predicate: Some(
+            "status >= 'pending' AND status <= 'pending' AND after_siblings_json IS NOT NULL",
+        ),
+        purpose: "Finds one parent's held children when a sibling settles.",
     },
     IndexContract {
         name: "agent_sdk_tasks_running_lease_expiry_idx",

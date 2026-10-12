@@ -1436,7 +1436,7 @@ INSERT INTO agent_sdk_tasks (
             .held_probe
             .advance(cursor.is_some(), after_cursor, from_start)
         {
-            if let Some(task) = AgentTaskStore::try_acquire_task(
+            match AgentTaskStore::try_acquire_task(
                 self,
                 &id,
                 worker.clone(),
@@ -1444,9 +1444,15 @@ INSERT INTO agent_sdk_tasks (
                 expires_at,
                 now,
             )
-            .await?
+            .await
             {
-                return Ok(Some(task));
+                Ok(Some(task)) => return Ok(Some(task)),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    task_id = %id,
+                    error = %format!("{error:#}"),
+                    "held probe skipped a row it could not lease"
+                ),
             }
         }
         Ok(None)
@@ -1464,7 +1470,7 @@ INSERT INTO agent_sdk_tasks (
         let limit = i64::try_from(limit).context("held probe window exceeds i64")?;
         let rows: Vec<(String, String, bool)> = match after {
             Some((created_at, id)) => sqlx::query!(
-                r#"SELECT held.id AS "id!", held.created_at AS "created_at!", NOT EXISTS (SELECT 1 FROM json_each(held.after_siblings_json) AS waited JOIN agent_sdk_tasks AS sibling ON sibling.id = waited.value WHERE sibling.status NOT IN ('completed', 'failed', 'cancelled')) AS "ready!: bool" FROM agent_sdk_tasks AS held INDEXED BY agent_sdk_tasks_held_fifo_idx WHERE held.status >= 'pending' AND held.status <= 'pending' AND held.after_siblings_json IS NOT NULL AND (held.created_at, held.id) > (?1, ?2) AND held.thread_id NOT IN (SELECT thread_id FROM agent_sdk_threads WHERE status IN ('deleting', 'deleted')) ORDER BY held.created_at, held.id LIMIT ?3"#,
+                r#"SELECT held.id AS "id!", held.created_at AS "created_at!", NOT EXISTS (SELECT 1 FROM json_each(held.after_siblings_json) AS waited JOIN agent_sdk_tasks AS sibling ON sibling.id = waited.value WHERE sibling.status NOT IN ('completed', 'failed', 'cancelled')) AS "ready!: bool" FROM agent_sdk_tasks AS held INDEXED BY agent_sdk_tasks_held_fifo_idx WHERE held.status >= 'pending' AND held.status <= 'pending' AND held.after_siblings_json IS NOT NULL AND held.kind = 'tool_runtime' AND (held.created_at, held.id) > (?1, ?2) AND held.thread_id NOT IN (SELECT thread_id FROM agent_sdk_threads WHERE status IN ('deleting', 'deleted')) ORDER BY held.created_at, held.id LIMIT ?3"#,
                 created_at,
                 id,
                 limit,
@@ -1476,7 +1482,7 @@ INSERT INTO agent_sdk_tasks (
             .map(|row| (row.id, row.created_at, row.ready))
             .collect(),
             None => sqlx::query!(
-                r#"SELECT held.id AS "id!", held.created_at AS "created_at!", NOT EXISTS (SELECT 1 FROM json_each(held.after_siblings_json) AS waited JOIN agent_sdk_tasks AS sibling ON sibling.id = waited.value WHERE sibling.status NOT IN ('completed', 'failed', 'cancelled')) AS "ready!: bool" FROM agent_sdk_tasks AS held INDEXED BY agent_sdk_tasks_held_fifo_idx WHERE held.status >= 'pending' AND held.status <= 'pending' AND held.after_siblings_json IS NOT NULL AND held.thread_id NOT IN (SELECT thread_id FROM agent_sdk_threads WHERE status IN ('deleting', 'deleted')) ORDER BY held.created_at, held.id LIMIT ?1"#,
+                r#"SELECT held.id AS "id!", held.created_at AS "created_at!", NOT EXISTS (SELECT 1 FROM json_each(held.after_siblings_json) AS waited JOIN agent_sdk_tasks AS sibling ON sibling.id = waited.value WHERE sibling.status NOT IN ('completed', 'failed', 'cancelled')) AS "ready!: bool" FROM agent_sdk_tasks AS held INDEXED BY agent_sdk_tasks_held_fifo_idx WHERE held.status >= 'pending' AND held.status <= 'pending' AND held.after_siblings_json IS NOT NULL AND held.kind = 'tool_runtime' AND held.thread_id NOT IN (SELECT thread_id FROM agent_sdk_threads WHERE status IN ('deleting', 'deleted')) ORDER BY held.created_at, held.id LIMIT ?1"#,
                 limit,
             )
             .fetch_all(&self.pool)

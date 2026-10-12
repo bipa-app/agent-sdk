@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\nSELECT\n    held.id,\n    held.created_at,\n    NOT EXISTS (\n        SELECT 1\n        FROM jsonb_array_elements_text(held.after_siblings_json) AS waited(id)\n        JOIN agent_sdk_tasks AS sibling ON sibling.id = waited.id\n        WHERE sibling.status NOT IN ('completed', 'failed', 'cancelled')\n    ) AS \"ready!\"\nFROM agent_sdk_tasks AS held\nWHERE held.status >= 'pending' AND held.status <= 'pending'\n  AND held.after_siblings_json IS NOT NULL\n  AND (held.created_at, held.id) > ($1, $2)\n  AND held.thread_id NOT IN (\n      SELECT thread_id FROM agent_sdk_threads WHERE status IN ('deleting', 'deleted')\n  )\nORDER BY held.created_at, held.id\nLIMIT $3\n",
+  "query": "\nSELECT\n    held.id,\n    held.created_at,\n    NOT EXISTS (\n        SELECT 1\n        FROM jsonb_array_elements_text(held.after_siblings_json) AS waited(id)\n        JOIN agent_sdk_tasks AS sibling ON sibling.id = waited.id\n        WHERE sibling.status NOT IN ('completed', 'failed', 'cancelled')\n    ) AS \"ready!\"\nFROM agent_sdk_tasks AS held\nWHERE held.status >= 'pending' AND held.status <= 'pending'\n  AND held.after_siblings_json IS NOT NULL\n  AND held.kind = 'tool_runtime'\n  AND (held.created_at, held.id) > ($1, $2)\n  AND held.thread_id NOT IN (\n      SELECT thread_id FROM agent_sdk_threads WHERE status IN ('deleting', 'deleted')\n  )\nORDER BY held.created_at, held.id\nLIMIT $3\n",
   "describe": {
     "columns": [
       {
@@ -45,5 +45,5 @@
       null
     ]
   },
-  "hash": "3963af8ebe07e9638d65fcaf5846fa366e3ec1f4c2d6cfddfac3d24bb37a571a"
+  "hash": "72b3ea7fdfa757500b14e9a22ab4a7f67b393b748d5e397864654748ff31f3b7"
 }
