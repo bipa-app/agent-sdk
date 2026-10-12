@@ -25,7 +25,9 @@ all-features = true
 db-urls = ["https://github.com/rustsec/advisory-db"]
 # Yanked crates fail the build so a release never depends on one.
 yanked = "deny"
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is unmaintained (no vulnerability, no safe upgrade); it comes in via serde_yaml_ng. Migration tracked in #474." },
+]
 
 [licenses]
 # SPDX identifiers we accept. All permissive / weak-copyleft licenses common
