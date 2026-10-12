@@ -372,10 +372,7 @@ impl MessageProjection {
         if repair_messages.is_empty() {
             return Err(MessageProjectionError::EmptyCommit);
         }
-        let available = self
-            .context_history()
-            .len()
-            .saturating_add(self.draft_messages.len());
+        let available = self.provider_view().len();
         if source_message_count != available {
             return Err(MessageProjectionError::CompactionSourceMismatch {
                 available,
@@ -419,6 +416,17 @@ impl MessageProjection {
         self.version += 1;
         self.updated_at = now;
         Ok(self)
+    }
+
+    /// The sequence the next provider call is built from: [`Self::context_history`]
+    /// followed by the in-flight draft. [`Self::append_repair`] replaces exactly
+    /// this view, so a repair must validate and count it, never the raw
+    /// [`Self::messages`] transcript, which append-only repairs leave unchanged.
+    #[must_use]
+    pub fn provider_view(&self) -> Vec<llm::Message> {
+        let mut view = self.context_history();
+        view.extend(self.draft_messages.iter().cloned());
+        view
     }
 
     /// A generated summary is authoritative only in the first replacement slot

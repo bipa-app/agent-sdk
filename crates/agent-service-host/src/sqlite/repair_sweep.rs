@@ -22,20 +22,26 @@
 //! and revisited by a later sweep once its turn has settled.
 //!
 //! Repair is mechanical and lossless-by-construction: the sweep operates
-//! on the stored history plus any in-flight draft, closes dangling `tool_use` blocks with a
-//! synthetic "User cancelled" `tool_result`, drops orphan results, and
-//! persists through `MessageProjection::append_repair`, which keeps the
-//! raw committed transcript untouched and records the corrected view as
-//! an append-only compaction entry. Signature-bound (thinking) messages
-//! are never edited — the repair library only inserts synthetic user
-//! messages around them or removes a wholesale broken tail.
+//! on the provider view (`MessageProjection::provider_view`: the
+//! compaction-selected context history plus any in-flight draft), closes
+//! dangling `tool_use` blocks with a synthetic "User cancelled"
+//! `tool_result`, drops orphan results, and persists through
+//! `MessageProjection::append_repair`, which keeps the raw committed
+//! transcript untouched and records the corrected view as an append-only
+//! compaction entry. The raw transcript of a repaired thread therefore
+//! stays invalid forever; only the provider view is ever validated.
+//! Signature-bound (thinking) messages are never edited — the repair
+//! library only inserts synthetic user messages around them or removes a
+//! wholesale broken tail.
 
 use anyhow::{Context, Result};
-use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{Sqlite, SqlitePool, Transaction};
 use time::OffsetDateTime;
 
 use agent_sdk_foundation::ThreadId;
 use agent_sdk_foundation::llm;
+
+use super::store::read_message_head;
 
 /// Ledger key for the ENG-9651 tool-sequence repair class. Bumping this
 /// re-runs the sweep against every thread (idempotent — a valid thread
@@ -69,7 +75,7 @@ pub struct RepairSweepReport {
 /// # Errors
 ///
 /// Returns an error only on a storage-level failure (the sweep could not
-/// read the ledger or a projection). Per-thread repair failures are
+/// list the message heads). Per-thread read and repair failures are
 /// logged and counted in [`RepairSweepReport::unrepairable`] rather than
 /// aborting the sweep — one poisoned thread must not brick startup for
 /// every healthy thread.
@@ -79,9 +85,9 @@ pub async fn run_startup_repair_sweep(
 ) -> Result<RepairSweepReport> {
     let mut report = RepairSweepReport::default();
 
-    let rows = sqlx::query(
+    let threads: Vec<(String, i64)> = sqlx::query_as(
         r"
-SELECT h.thread_id, h.history_json, h.draft_messages_json,
+SELECT h.thread_id,
        EXISTS(
            SELECT 1 FROM agent_sdk_applied_repairs r
            WHERE r.thread_id = h.thread_id AND r.repair_key = ?1
@@ -94,24 +100,17 @@ FROM agent_sdk_message_heads h
     .await
     .context("scan message heads for repair sweep")?;
 
-    for row in rows {
+    for (thread_key, already_repaired) in threads {
         report.scanned += 1;
-        let thread_key: String = row.get("thread_id");
-        let already_repaired = row.get::<i64, _>("already_repaired") != 0;
+        let already_repaired = already_repaired != 0;
         let thread_id = ThreadId::from_string(thread_key.clone());
 
-        // The provider-visible sequence: committed history, then the
-        // in-flight draft (where a cancelled turn left its dangling
-        // tool_use, and where a parked turn keeps its pending one).
         // Validate BEFORE consulting the ledger: a thread that re-corrupts
         // after being repaired must be repaired again, not skipped because
         // a stale ledger row exists.
-        let sequence = match provider_sequence(
-            row.get("history_json"),
-            row.get("draft_messages_json"),
-            &thread_key,
-        ) {
-            Ok(sequence) => sequence,
+        let projection = match read_message_head(pool, &thread_id).await {
+            Ok(Some(projection)) => projection,
+            Ok(None) => continue,
             Err(error) => {
                 report.unrepairable += 1;
                 tracing::error!(
@@ -120,7 +119,7 @@ FROM agent_sdk_message_heads h
                 continue;
             }
         };
-        if llm::is_provider_valid_tool_sequence(&sequence) {
+        if llm::is_provider_valid_tool_sequence(&projection.provider_view()) {
             continue;
         }
 
@@ -168,21 +167,6 @@ fn note_recorruption(report: &mut RepairSweepReport, already_repaired: bool, thr
     }
 }
 
-fn provider_sequence(
-    history_json: &str,
-    draft_json: Option<&str>,
-    thread_key: &str,
-) -> Result<Vec<llm::Message>> {
-    let mut sequence: Vec<llm::Message> = serde_json::from_str(history_json)
-        .with_context(|| format!("decode history for {thread_key}"))?;
-    if let Some(draft_json) = draft_json {
-        let draft: Vec<llm::Message> = serde_json::from_str(draft_json)
-            .with_context(|| format!("decode draft for {thread_key}"))?;
-        sequence.extend(draft);
-    }
-    Ok(sequence)
-}
-
 /// What [`repair_one_thread`] did with a thread the scan found invalid.
 enum ThreadRepair {
     Repaired,
@@ -218,42 +202,14 @@ async fn repair_one_thread(
         return Ok(ThreadRepair::Deferred { live_task });
     }
 
-    let record = sqlx::query(
-        r"
-SELECT history_json, draft_messages_json, compactions_json, history_generation, version, created_at, updated_at
-FROM agent_sdk_message_heads
-WHERE thread_id = ?1
-",
-    )
-    .bind(thread_id.0.as_str())
-    .fetch_optional(&mut *tx)
-    .await
-    .with_context(|| format!("re-read projection for {thread_id}"))?;
-
-    let Some(record) = record else {
+    let Some(projection) = read_message_head(&mut *tx, thread_id)
+        .await
+        .with_context(|| format!("re-read projection for {thread_id}"))?
+    else {
         return Ok(ThreadRepair::Vanished);
     };
 
-    let history: Vec<llm::Message> =
-        serde_json::from_str(record.get::<&str, _>("history_json")).context("re-decode history")?;
-    let draft: Vec<llm::Message> = record
-        .get::<Option<&str>, _>("draft_messages_json")
-        .map(serde_json::from_str)
-        .transpose()
-        .context("re-decode draft")?
-        .unwrap_or_default();
-    let compactions: Vec<agent_server::journal::CompactionEntry> = record
-        .get::<Option<&str>, _>("compactions_json")
-        .map(serde_json::from_str)
-        .transpose()
-        .context("re-decode compactions")?
-        .unwrap_or_default();
-    let history_generation: i64 = record.get("history_generation");
-    let version: i64 = record.get("version");
-    let created_at: OffsetDateTime = record.get("created_at");
-    let updated_at: OffsetDateTime = record.get("updated_at");
-
-    let sequence: Vec<llm::Message> = history.iter().chain(&draft).cloned().collect();
+    let sequence = projection.provider_view();
     if llm::is_provider_valid_tool_sequence(&sequence) {
         return Ok(ThreadRepair::AlreadyValid);
     }
@@ -262,39 +218,12 @@ WHERE thread_id = ?1
         return Ok(ThreadRepair::Unrepairable);
     }
 
-    let projection = agent_server::journal::MessageProjection {
-        thread_id: thread_id.clone(),
-        messages: history,
-        draft_messages: draft,
-        compactions,
-        history_generation: u64::try_from(history_generation)
-            .context("projection history generation overflow")?,
-        version: u64::try_from(version).context("projection version overflow")?,
-        created_at,
-        updated_at,
-    };
-
-    // The repair_messages payload is the delta the repair synthesized
-    // (the synthetic closing results); the balanced view is the full
-    // corrected context history. source_message_count is the provider-
-    // visible length BEFORE the repair so the append-only entry records
-    // exactly what it replaced.
-    let source_message_count = sequence.len();
-    let repair_messages: Vec<llm::Message> = repaired
-        .iter()
-        .skip(source_message_count)
-        .cloned()
-        .collect();
-    let repair_messages = if repair_messages.is_empty() {
-        // The repair only removed messages (dropped an orphan tail) — the
-        // corrected view itself is the repair payload.
-        vec![llm::Message::user(llm::USER_CANCELLED_TOOL_RESULT)]
-    } else {
-        repair_messages
-    };
-
+    // Never the repaired view's tail: a repair can insert mid-sequence, so
+    // its tail may be an original message.
+    let evidence = llm::orphaned_tool_result_message(&sequence, llm::USER_CANCELLED_TOOL_RESULT)
+        .unwrap_or_else(|| llm::Message::user(llm::USER_CANCELLED_TOOL_RESULT));
     let updated = projection
-        .append_repair(repair_messages, repaired, source_message_count, now)
+        .append_repair(vec![evidence], repaired, sequence.len(), now)
         .context("append repair entry")?;
 
     persist_projection_tx(&mut tx, &updated).await?;
@@ -551,6 +480,140 @@ mod tests {
         let report = run_startup_repair_sweep(store.pool(), t0()).await?;
         assert_eq!(report.repaired, 0, "valid thread untouched");
         assert_eq!(report.unrepairable, 0);
+        Ok(())
+    }
+
+    async fn seed_history(
+        store: &SqliteDurableStore,
+        key: &str,
+        history: Vec<llm::Message>,
+    ) -> Result<ThreadId> {
+        let thread_id = ThreadId::from_string(key);
+        agent_server::journal::thread_store::ThreadStore::get_or_create(store, &thread_id, t0())
+            .await?;
+        agent_server::journal::message_store::MessageProjectionStore::replace_history(
+            store,
+            &thread_id,
+            history,
+            t0(),
+        )
+        .await?;
+        Ok(thread_id)
+    }
+
+    async fn load(
+        store: &SqliteDurableStore,
+        thread_id: &ThreadId,
+    ) -> Result<agent_server::journal::MessageProjection> {
+        agent_server::journal::message_store::MessageProjectionStore::get(store, thread_id)
+            .await?
+            .context("projection")
+    }
+
+    #[tokio::test]
+    async fn a_thread_repaired_by_dropping_an_orphan_result_is_never_repaired_again() -> Result<()>
+    {
+        // The repair strips the orphan result in place, so the view keeps its
+        // length while the raw transcript keeps the orphan and gains the
+        // cancellation marker: raw 5, view 4.
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+        let thread_id = seed_history(
+            &store,
+            "orphan-result",
+            vec![
+                llm::Message::user("first prompt"),
+                llm::Message::assistant("first reply"),
+                llm::Message::tool_result("call-ghost", "late output", false),
+                llm::Message::assistant("second reply"),
+            ],
+        )
+        .await?;
+
+        let first = run_startup_repair_sweep(store.pool(), t0()).await?;
+        anyhow::ensure!(first.repaired == 1, "first sweep: {first:?}");
+        let repaired = load(&store, &thread_id).await?;
+        anyhow::ensure!(repaired.messages.len() == 5 && repaired.provider_view().len() == 4);
+        anyhow::ensure!(!llm::is_provider_valid_tool_sequence(&repaired.messages));
+        let repaired = serde_json::to_value(repaired)?;
+
+        match repair_one_thread(store.pool(), &thread_id, t0()).await {
+            Ok(ThreadRepair::AlreadyValid) => {}
+            Ok(
+                ThreadRepair::Repaired
+                | ThreadRepair::Deferred { .. }
+                | ThreadRepair::Vanished
+                | ThreadRepair::Unrepairable,
+            ) => anyhow::bail!("a valid provider view must read as already valid"),
+            Err(error) => return Err(error.context("re-repairing a valid provider view")),
+        }
+        let second = run_startup_repair_sweep(store.pool(), t0()).await?;
+        anyhow::ensure!(
+            second.repaired == 0 && second.unrepairable == 0,
+            "second sweep: {second:?}"
+        );
+        anyhow::ensure!(projection_json(&store, &thread_id).await? == repaired);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_mid_history_dangling_call_is_repaired_once_without_duplicating_messages()
+    -> Result<()> {
+        // Closing a call mid-history inserts a message, so the view and the
+        // raw transcript keep equal lengths after the repair.
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+        let thread_id = seed_history(
+            &store,
+            "mid-history-call",
+            vec![
+                llm::Message::user("first prompt"),
+                llm::Message::assistant_with_tool_use(
+                    None,
+                    "call-mid",
+                    "bash",
+                    serde_json::json!({"command": "ls"}),
+                ),
+                llm::Message::user("second prompt"),
+                llm::Message::assistant("second reply"),
+            ],
+        )
+        .await?;
+
+        let first = run_startup_repair_sweep(store.pool(), t0()).await?;
+        anyhow::ensure!(first.repaired == 1, "first sweep: {first:?}");
+        let repaired = load(&store, &thread_id).await?;
+        let view = repaired.provider_view();
+        anyhow::ensure!(llm::is_provider_valid_tool_sequence(&view));
+        let replies = |messages: &[llm::Message]| {
+            messages
+                .iter()
+                .filter(|message| message.content.first_text() == Some("second reply"))
+                .count()
+        };
+        anyhow::ensure!(
+            replies(&view) == 1 && replies(&repaired.messages) == 1,
+            "the repair duplicated a reply: view {}, raw {}",
+            replies(&view),
+            replies(&repaired.messages)
+        );
+        anyhow::ensure!(
+            repaired.messages.last()
+                == Some(&llm::Message::tool_result(
+                    "call-mid",
+                    llm::USER_CANCELLED_TOOL_RESULT,
+                    true,
+                )),
+            "the raw evidence must be the synthetic result for the closed call"
+        );
+        let repaired = serde_json::to_value(repaired)?;
+
+        for round in 0..2 {
+            let report = run_startup_repair_sweep(store.pool(), t0()).await?;
+            anyhow::ensure!(
+                report.repaired == 0 && report.unrepairable == 0,
+                "sweep {round} after the repair: {report:?}"
+            );
+        }
+        anyhow::ensure!(projection_json(&store, &thread_id).await? == repaired);
         Ok(())
     }
 
