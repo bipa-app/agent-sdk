@@ -275,6 +275,13 @@ const OPENAI_GPT53_CODEX_URL: &str = "https://developers.openai.com/api/docs/mod
 const OPENAI_GPT52_PRO_URL: &str = "https://developers.openai.com/api/docs/models/gpt-5.2-pro";
 const GOOGLE_MODELS_URL: &str = "https://ai.google.dev/gemini-api/docs/models";
 const GOOGLE_PRICING_URL: &str = "https://ai.google.dev/gemini-api/docs/pricing";
+const ANTHROPIC_OPUS_45_URL: &str = "https://platform.claude.com/docs/en/models/opus-4-5/overview";
+const ANTHROPIC_MYTHOS_51_URL: &str =
+    "https://platform.claude.com/docs/en/models/mythos-5-1/overview";
+const ANTHROPIC_MYTHOS_5_URL: &str = "https://platform.claude.com/docs/en/models/mythos-5/overview";
+const OPENAI_GPT55_URL: &str = "https://developers.openai.com/api/docs/models/gpt-5.5";
+const GOOGLE_GEMINI35_FLASH_URL: &str =
+    "https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash";
 
 // Open-model routes. All reached through OpenAIProvider (provider()=="openai"),
 // whether via OpenRouter slugs or the native z.ai / Moonshot / MiniMax base URLs.
@@ -323,6 +330,36 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         source_url: ANTHROPIC_MODELS_URL,
         source_status: SourceStatus::Official,
         notes: Some("Fable 5 is adaptive-only: adaptive thinking is always on (applies even when `thinking` is unset) and `ThinkingMode::Enabled { budget_tokens }` is rejected by the Anthropic API. The SDK fails fast in validate_thinking_config. Raw chain of thought is never returned — thinking blocks arrive empty (the SDK requests thinking display=omitted). Safety classifiers may decline a request with stop_reason=refusal on an HTTP 200."),
+    },
+    ModelCapabilities {
+        provider: "anthropic",
+        model_id: "claude-mythos-5-1",
+        context_window: Some(1_000_000),
+        max_output_tokens: Some(128_000),
+        default_max_tokens: None,
+        pricing: Some(Pricing::flat_with_cached(10.0, 50.0, 0.25).with_cache_write(12.5).with_notes("Anthropic Mythos 5.1 official pricing: $10 input / $50 output per 1M tokens. Cache reads cost $0.25/M; cache writes cost $12.50/M (5m) or $20/M (1h).")),
+        supports_thinking: true,
+        supports_adaptive_thinking: true,
+        rejects_budget_thinking: true,
+        default_reasoning: DefaultReasoning::On,
+        source_url: ANTHROPIC_MYTHOS_51_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("The same model and specifications as Fable 5.1, served only to organizations verified through Anthropic's verification programs. Adaptive thinking is always on; effort defaults to `high`."),
+    },
+    ModelCapabilities {
+        provider: "anthropic",
+        model_id: "claude-mythos-5",
+        context_window: Some(1_000_000),
+        max_output_tokens: Some(128_000),
+        default_max_tokens: None,
+        pricing: Some(Pricing::flat_with_cached(10.0, 50.0, 1.0).with_cache_write(12.5).with_notes("Anthropic Mythos 5 official pricing: $10 input / $50 output per 1M tokens. Cache reads cost $1/M; cache writes cost $12.50/M (5m) or $20/M (1h).")),
+        supports_thinking: true,
+        supports_adaptive_thinking: true,
+        rejects_budget_thinking: true,
+        default_reasoning: DefaultReasoning::On,
+        source_url: ANTHROPIC_MYTHOS_5_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("The same model and specifications as Fable 5, served only to organizations verified through Anthropic's verification programs. Adaptive thinking is always on; effort defaults to `high`."),
     },
     ModelCapabilities {
         provider: "anthropic",
@@ -398,6 +435,21 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         source_url: ANTHROPIC_MODELS_URL,
         source_status: SourceStatus::Derived,
         notes: Some("Current Anthropic docs show this model alongside 200K/128K markers."),
+    },
+    ModelCapabilities {
+        provider: "anthropic",
+        model_id: "claude-opus-4-5-20251101",
+        context_window: Some(200_000),
+        max_output_tokens: Some(64_000),
+        default_max_tokens: None,
+        pricing: Some(Pricing::flat_with_cached(5.0, 25.0, 0.5).with_cache_write(6.25).with_notes("Anthropic Opus 4.5 official pricing: $5 input / $25 output per 1M tokens. Cache reads cost $0.50/M; cache writes cost $6.25/M (5m) or $10/M (1h).")),
+        supports_thinking: true,
+        supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
+        default_reasoning: DefaultReasoning::Off,
+        source_url: ANTHROPIC_OPUS_45_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("Legacy model, retiring no sooner than 2026-11-24. Extended (budget) thinking, not adaptive; the effort parameter defaults to `high`. The alias `claude-opus-4-5` and the Google Cloud ID `claude-opus-4-5@20251101` name this snapshot."),
     },
     ModelCapabilities {
         provider: "anthropic",
@@ -688,6 +740,23 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
     },
     ModelCapabilities {
         provider: "openai",
+        model_id: "gpt-5.5",
+        context_window: Some(1_050_000),
+        max_output_tokens: Some(128_000),
+        default_max_tokens: None,
+        pricing: Some(Pricing::flat_with_cached(5.0, 30.0, 0.5).with_notes(
+            "Standard tier base rates. Requests with more than 272K input tokens cost 2x input and 1.5x output for the full request.",
+        )),
+        supports_thinking: true,
+        supports_adaptive_thinking: true,
+        rejects_budget_thinking: false,
+        default_reasoning: DefaultReasoning::On,
+        source_url: OPENAI_GPT55_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("Snapshot `gpt-5.5-2026-04-23`. reasoning.effort accepts none, low, medium, high and xhigh; it defaults to medium, so the model reasons unless told not to."),
+    },
+    ModelCapabilities {
+        provider: "openai",
         model_id: "gpt-5.4",
         context_window: Some(1_050_000),
         max_output_tokens: Some(128_000),
@@ -972,6 +1041,21 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         notes: Some("Pricing verified from OpenAI pricing page. Context/max output from existing runtime assumptions."),
     },
     // Gemini
+    ModelCapabilities {
+        provider: "gemini",
+        model_id: "gemini-3.5-flash",
+        context_window: Some(1_048_576),
+        max_output_tokens: Some(65_536),
+        default_max_tokens: None,
+        pricing: None,
+        supports_thinking: true,
+        supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
+        default_reasoning: DefaultReasoning::On,
+        source_url: GOOGLE_GEMINI35_FLASH_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("Deprecated: Google routes `gemini-3.5-flash` requests to `gemini-3.6-flash`, and the pricing page no longer lists a 3.5 Flash rate. Limits are the model page's 1,048,576 input and 65,536 output tokens."),
+    },
     ModelCapabilities {
         provider: "gemini",
         model_id: "gemini-3.1-pro-preview",
@@ -1337,14 +1421,86 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
     },
 ];
 
+/// Capabilities of `model_id` served by `provider`.
+///
+/// An exact id wins. Otherwise the id and every row compare with their
+/// snapshot qualifier removed, so a dated snapshot (`-YYYYMMDD`, OpenAI's
+/// `-YYYY-MM-DD`), a Google Cloud `@` version or a `-latest` alias of a
+/// registered model resolves to that model's row, and an undated alias
+/// resolves to its dated row.
 #[must_use]
 pub fn get_model_capabilities(
     provider: &str,
     model_id: &str,
 ) -> Option<&'static ModelCapabilities> {
-    MODEL_CAPABILITIES.iter().find(|caps| {
-        caps.provider.eq_ignore_ascii_case(provider) && caps.model_id.eq_ignore_ascii_case(model_id)
-    })
+    let rows = || {
+        MODEL_CAPABILITIES
+            .iter()
+            .filter(move |caps| caps.provider.eq_ignore_ascii_case(provider))
+    };
+    rows()
+        .find(|caps| caps.model_id.eq_ignore_ascii_case(model_id))
+        .or_else(|| {
+            let family = snapshot_family(model_id);
+            rows().find(|caps| snapshot_family(caps.model_id).eq_ignore_ascii_case(family))
+        })
+}
+
+/// `model_id` without its snapshot qualifier: a Google Cloud `@version`, a
+/// `-latest` alias suffix, or a trailing snapshot date (`-YYYYMMDD`, or
+/// OpenAI's `-YYYY-MM-DD`).
+#[must_use]
+pub(crate) fn snapshot_family(model_id: &str) -> &str {
+    let id = model_id
+        .split_once('@')
+        .map_or(model_id, |(family, _)| family);
+    if let Some(family) = id.strip_suffix("-latest") {
+        return family;
+    }
+    if let Some((family, date)) = id.rsplit_once('-')
+        && is_compact_date(date)
+    {
+        return family;
+    }
+    if let Some(family) = id.get(..id.len().saturating_sub(11))
+        && let Some(date) = id.get(family.len()..)
+        && let Some(date) = date.strip_prefix('-')
+        && is_dashed_date(date)
+    {
+        return family;
+    }
+    id
+}
+
+fn is_compact_date(token: &str) -> bool {
+    token.len() == 8
+        && token.bytes().all(|byte| byte.is_ascii_digit())
+        && is_calendar_date(&token[..4], &token[4..6], &token[6..])
+}
+
+fn is_dashed_date(token: &str) -> bool {
+    let mut parts = token.split('-');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(year), Some(month), Some(day), None) => {
+            year.len() == 4
+                && month.len() == 2
+                && day.len() == 2
+                && [year, month, day]
+                    .iter()
+                    .all(|part| part.bytes().all(|byte| byte.is_ascii_digit()))
+                && is_calendar_date(year, month, day)
+        }
+        _ => false,
+    }
+}
+
+fn is_calendar_date(year: &str, month: &str, day: &str) -> bool {
+    let (Ok(year), Ok(month), Ok(day)) =
+        (year.parse::<u16>(), month.parse::<u8>(), day.parse::<u8>())
+    else {
+        return false;
+    };
+    (2000..=2099).contains(&year) && (1..=12).contains(&month) && (1..=31).contains(&day)
 }
 
 #[must_use]
@@ -2010,5 +2166,123 @@ mod tests {
             })
             .unwrap();
         assert!((cost - 0.01775).abs() < f64::EPSILON);
+    }
+
+    /// Every way a provider or a host spells a registered model — its
+    /// undated alias, a dated snapshot, a Google Cloud `@` version or a
+    /// `-latest` alias — resolves to that model's row, and no two rows of
+    /// one provider share a snapshot family, so the resolution is unique.
+    #[test]
+    fn every_snapshot_spelling_of_a_registered_model_resolves_to_its_row() -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        for row in MODEL_CAPABILITIES {
+            let family = snapshot_family(row.model_id);
+            let twins: Vec<&str> = MODEL_CAPABILITIES
+                .iter()
+                .filter(|other| {
+                    other.provider == row.provider && snapshot_family(other.model_id) == family
+                })
+                .map(|other| other.model_id)
+                .collect();
+            assert_eq!(
+                twins,
+                [row.model_id],
+                "{} rows share family {family}",
+                row.provider
+            );
+
+            for spelling in [
+                row.model_id.to_owned(),
+                row.model_id.to_ascii_uppercase(),
+                family.to_owned(),
+                format!("{family}-20991231"),
+                format!("{family}-2099-12-31"),
+                format!("{family}@20991231"),
+                format!("{family}-latest"),
+            ] {
+                let caps = get_model_capabilities(row.provider, &spelling)
+                    .with_context(|| format!("{}/{spelling} resolves to nothing", row.provider))?;
+                assert_eq!(caps.model_id, row.model_id, "{}/{spelling}", row.provider);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn opus_45_aliases_resolve_to_the_dated_snapshot() -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        for spelling in [
+            "claude-opus-4-5-20251101",
+            "claude-opus-4-5",
+            "claude-opus-4-5@20251101",
+        ] {
+            let caps =
+                get_model_capabilities("anthropic", spelling).context("opus 4.5 is unknown")?;
+            assert_eq!(caps.model_id, "claude-opus-4-5-20251101");
+            assert_eq!(caps.context_window, Some(200_000));
+            assert_eq!(caps.max_output_tokens, Some(64_000));
+            assert!(caps.supports_thinking);
+            assert!(!caps.supports_adaptive_thinking);
+            assert!(!caps.rejects_budget_thinking);
+            let pricing = caps.pricing.context("pricing missing")?;
+            assert_eq!(pricing.input, Some(PricePoint::new(5.0)));
+            assert_eq!(pricing.output, Some(PricePoint::new(25.0)));
+            assert_eq!(pricing.cached_input, Some(PricePoint::new(0.5)));
+            assert_eq!(pricing.cache_write, Some(PricePoint::new(6.25)));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dated_snapshots_of_undated_rows_resolve() -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        for (provider, spelling, expected) in [
+            ("openai", "gpt-5.5-2026-04-23", "gpt-5.5"),
+            ("openai", "gpt-4o-2024-08-06", "gpt-4o"),
+            (
+                "anthropic",
+                "claude-sonnet-4-5",
+                "claude-sonnet-4-5-20250929",
+            ),
+            ("anthropic", "claude-haiku-4-5", "claude-haiku-4-5-20251001"),
+            (
+                "anthropic",
+                "claude-haiku-4-5@20251001",
+                "claude-haiku-4-5-20251001",
+            ),
+            (
+                "anthropic",
+                "claude-3-5-haiku-latest",
+                "claude-3-5-haiku-20241022",
+            ),
+        ] {
+            let caps = get_model_capabilities(provider, spelling)
+                .with_context(|| format!("{provider}/{spelling} is unknown"))?;
+            assert_eq!(caps.model_id, expected, "{provider}/{spelling}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn only_calendar_dates_are_snapshot_qualifiers() {
+        for (spelling, family) in [
+            ("claude-opus-4-5-20251301", "claude-opus-4-5-20251301"),
+            ("claude-opus-4-5-2025110", "claude-opus-4-5-2025110"),
+            ("gpt-5.5-2026-13-01", "gpt-5.5-2026-13-01"),
+            ("gpt-5-mini", "gpt-5-mini"),
+            ("o3-mini", "o3-mini"),
+            ("gemini-3.1-pro-preview", "gemini-3.1-pro-preview"),
+            (
+                "accounts/fireworks/models/kimi-k3",
+                "accounts/fireworks/models/kimi-k3",
+            ),
+        ] {
+            assert_eq!(snapshot_family(spelling), family, "{spelling}");
+        }
+        assert!(get_model_capabilities("anthropic", "claude-opus-4-5-20251301").is_none());
+        assert!(get_model_capabilities("anthropic", "claude-opus-4-1-20250805").is_none());
     }
 }

@@ -554,12 +554,22 @@ const MODEL_FEATURES: &[ModelFeatures] = &[
     },
 ];
 
-/// Return the static feature profile for an exact model ID or alias.
+/// Return the static feature profile for a model ID or alias.
+///
+/// An exact ID wins; a dated snapshot otherwise resolves to its undated
+/// profile the same way [`get_model_capabilities`](crate::get_model_capabilities)
+/// does.
 #[must_use]
 pub fn get_model_features(model_id: &str) -> Option<&'static ModelFeatures> {
     MODEL_FEATURES
         .iter()
         .find(|features| features.model_id == model_id)
+        .or_else(|| {
+            let family = crate::model_capabilities::snapshot_family(model_id);
+            MODEL_FEATURES.iter().find(|features| {
+                crate::model_capabilities::snapshot_family(features.model_id) == family
+            })
+        })
 }
 
 /// Return all model feature profiles bundled with this SDK release.
@@ -768,5 +778,12 @@ mod tests {
                     .all(|candidate| candidate.model_id != features.model_id)
             );
         }
+    }
+
+    #[test]
+    fn dated_snapshot_resolves_to_its_undated_profile() {
+        let dated = get_model_features("gpt-5.6-sol-2026-05-01").map(|features| features.model_id);
+        assert_eq!(dated, Some("gpt-5.6-sol"));
+        assert!(get_model_features("gpt-5.6-sol-2026-13-01").is_none());
     }
 }

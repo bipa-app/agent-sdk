@@ -1681,7 +1681,7 @@ mod catalog_tests {
             "models": {
               "claude-haiku-4-5@20251001": {
                 "id": "claude-haiku-4-5@20251001",
-                "cost": { "input": 1, "output": 5 }
+                "cost": { "input": 2, "output": 7 }
               }
             }
           }
@@ -1695,14 +1695,19 @@ mod catalog_tests {
         };
         let provenance = AuditProvenance::new("vertex", "claude-haiku-4-5@20251001");
 
-        // The static table has no Vertex-suffixed SKU, and the `anthropic`
-        // alias cannot reach one either.
-        assert!(estimate_cost_usd(None, &provenance, &usage).is_none());
-
+        // The static table resolves the `@` version to its undated row:
         // $1/M in + $5/M out over 1M each = $6.
+        let static_cost = estimate_cost_usd(None, &provenance, &usage)
+            .context("the static table must resolve the Vertex SKU to its row")?;
+        assert!(
+            (static_cost - 6.0).abs() < 1e-9,
+            "unexpected static cost: {static_cost}"
+        );
+
+        // The feed's own rate wins: $2/M in + $7/M out over 1M each = $9.
         let cost = estimate_cost_usd(Some(&registry), &provenance, &usage)
             .context("the google-vertex-anthropic key must price this SKU")?;
-        assert!((cost - 6.0).abs() < 1e-9, "unexpected cost: {cost}");
+        assert!((cost - 9.0).abs() < 1e-9, "unexpected cost: {cost}");
 
         let limits = UsageLimits {
             max_cost_usd: Some(1.0),
