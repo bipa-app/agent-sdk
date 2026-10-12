@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id FROM agent_sdk_tasks WHERE thread_id = ?1 AND status NOT IN ('completed', 'failed', 'cancelled') LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_tasks",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "6fa187683f98fcd5186b3e9b7cc2f28e4c950b86c236d88b98b70c3417b0e787"
+}
