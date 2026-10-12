@@ -284,6 +284,23 @@ macro_rules! task_columns {
     };
 }
 
+/// Driven from the live rows: `unlikely` tells the planner they are a sliver
+/// of the retained history, which per-index averages (ANALYZE without STAT4
+/// samples) cannot show, and the unary `+` keeps it from driving from the
+/// terminal roots instead. Without both, such statistics make it scan every
+/// row.
+pub(crate) const TERMINAL_ROOTS_WITH_LIVE_DESCENDANTS_SQL: &str = "\
+SELECT DISTINCT descendant.root_id
+FROM agent_sdk_tasks AS descendant
+JOIN agent_sdk_tasks AS root ON root.id = descendant.root_id
+WHERE unlikely(descendant.status IN (
+        'queued', 'pending', 'running', 'waiting_on_children',
+        'awaiting_confirmation', 'awaiting_question'
+    ))
+  AND descendant.parent_id IS NOT NULL
+  AND +root.status IN ('completed', 'failed', 'cancelled')
+ORDER BY descendant.root_id";
+
 impl SqliteDurableStore {
     async fn begin(&self) -> Result<Transaction<'_, Sqlite>> {
         // BEGIN IMMEDIATE acquires the RESERVED lock up front so that
@@ -4205,20 +4222,10 @@ impl AgentTaskStore for SqliteDurableStore {
     }
 
     async fn list_terminal_roots_with_live_descendants(&self) -> Result<Vec<AgentTaskId>> {
-        // Pinned to the status index: with ANALYZE statistics the planner
-        // otherwise scans every row to skip the DISTINCT sort.
-        let roots = sqlx::query_scalar!(
-            r#"SELECT DISTINCT descendant.root_id AS "root_id!: String"
-               FROM agent_sdk_tasks AS descendant INDEXED BY agent_sdk_tasks_by_status_idx
-               JOIN agent_sdk_tasks AS root ON root.id = descendant.root_id
-               WHERE descendant.status IN ('queued', 'pending', 'running', 'waiting_on_children', 'awaiting_confirmation', 'awaiting_question')
-                 AND descendant.parent_id IS NOT NULL
-                 AND root.status IN ('completed', 'failed', 'cancelled')
-               ORDER BY descendant.root_id"#
-        )
-        .fetch_all(&self.pool)
-        .await
-        .context("list terminal roots with live descendants")?;
+        let roots = sqlx::query_scalar::<_, String>(TERMINAL_ROOTS_WITH_LIVE_DESCENDANTS_SQL)
+            .fetch_all(&self.pool)
+            .await
+            .context("list terminal roots with live descendants")?;
         Ok(roots.into_iter().map(AgentTaskId::from_string).collect())
     }
 
@@ -8962,6 +8969,65 @@ mod input_injection_migration_test {
             .await?
             .context("injection survives as cancelled journal row")?;
         assert_eq!(cancelled.status, TaskStatus::Cancelled);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod orphan_listing_plan_test {
+    use super::*;
+
+    /// Retained history dwarfing the live rows: 400 finished tasks and one
+    /// live child under a finished root.
+    const SKEWED_HISTORY: &str = r#"
+INSERT INTO agent_sdk_threads (thread_id, status, committed_turns, total_input_tokens, total_output_tokens, created_at, updated_at)
+VALUES ('plan', 'active', 0, 0, 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 199)
+INSERT INTO agent_sdk_tasks (id, kind, status, parent_id, root_id, depth, thread_id, attempt, max_attempts, terminal_reason_json, created_at, updated_at, completed_at)
+SELECT printf('root-%04d', i), 'root_turn', 'completed', NULL, printf('root-%04d', i), 0, 'plan', 1, 3, '{"kind":"completed"}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z' FROM n;
+WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 199)
+INSERT INTO agent_sdk_tasks (id, kind, status, parent_id, root_id, depth, thread_id, attempt, max_attempts, terminal_reason_json, created_at, updated_at, completed_at)
+SELECT printf('done-%04d', i), 'tool_runtime', 'completed', printf('root-%04d', i), printf('root-%04d', i), 1, 'plan', 1, 3, '{"kind":"completed"}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z' FROM n;
+INSERT INTO agent_sdk_tasks (id, kind, status, parent_id, root_id, depth, thread_id, attempt, max_attempts, created_at, updated_at)
+VALUES ('live-0007', 'tool_runtime', 'pending', 'root-0007', 'root-0007', 1, 'plan', 0, 3, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+"#;
+
+    async fn plan(store: &SqliteDurableStore) -> Result<Vec<String>> {
+        let steps: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {TERMINAL_ROOTS_WITH_LIVE_DESCENDANTS_SQL}"
+        )))
+        .fetch_all(&store.pool)
+        .await?;
+        Ok(steps.into_iter().map(|(_, _, _, detail)| detail).collect())
+    }
+
+    fn assert_reads_only_live_rows(plan: &[String], label: &str) {
+        assert!(
+            plan.iter()
+                .any(|step| step.starts_with("SEARCH descendant") && step.contains("(status=?)")),
+            "{label}: the listing must look the live rows up by status, not scan the history: \
+             {plan:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_listing_reads_only_the_live_rows_with_and_without_statistics() -> Result<()> {
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+        sqlx::raw_sql(SKEWED_HISTORY).execute(&store.pool).await?;
+        assert_reads_only_live_rows(&plan(&store).await?, "without statistics");
+
+        sqlx::query("ANALYZE").execute(&store.pool).await?;
+        assert_reads_only_live_rows(&plan(&store).await?, "after ANALYZE");
+
+        sqlx::raw_sql("DELETE FROM sqlite_stat4; ANALYZE sqlite_schema;")
+            .execute(&store.pool)
+            .await?;
+        assert_reads_only_live_rows(&plan(&store).await?, "with averaged statistics only");
+
+        assert_eq!(
+            store.list_terminal_roots_with_live_descendants().await?,
+            vec![AgentTaskId::from_string("root-0007")],
+        );
         Ok(())
     }
 }
