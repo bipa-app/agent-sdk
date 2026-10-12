@@ -988,7 +988,7 @@ pub trait LlmProvider: Send + Sync {
     /// does not explicitly override `AgentConfig.max_tokens`.
     fn default_max_tokens(&self) -> u32 {
         self.capabilities()
-            .and_then(|caps| caps.max_output_tokens)
+            .and_then(ModelCapabilities::default_output_tokens)
             .or_else(|| default_max_output_tokens(self.provider(), self.model()))
             .unwrap_or(4096)
     }
