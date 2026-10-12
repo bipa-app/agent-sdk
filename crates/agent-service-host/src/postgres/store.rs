@@ -1718,9 +1718,8 @@ WHERE parent_id = $1
             // next queued root in the same transaction so a sweep-failed
             // root never strands its queued successors.
             if child.kind == TaskKind::RootTurn && child.is_root() {
-                let resumed =
-                    Self::resume_linked_subagent_invocation_tx(tx, &child.id, now).await?;
-                Self::release_undelivered_input_tx(tx, child, resumed.is_some(), now).await?;
+                Self::release_undelivered_input_tx(tx, child, now).await?;
+                Self::resume_linked_subagent_invocation_tx(tx, &child.id, now).await?;
                 Self::promote_next_queued_root_tx(tx, &child.thread_id, now).await?;
             }
             return Ok(());
@@ -1917,9 +1916,9 @@ WHERE parent_id = $1
             // thread completes, `execute_subagent_task` never runs,
             // and the parent thread's `SubagentProgress { completed:
             // true }` event never fires.
+            Self::release_undelivered_input_tx(tx, &new_child, now).await?;
             let resumed =
                 Self::resume_linked_subagent_invocation_tx(tx, &new_child.id, now).await?;
-            Self::release_undelivered_input_tx(tx, &new_child, resumed.is_some(), now).await?;
             // Crash-safe queued-root promotion: a terminal root frees the
             // thread's active-root slot, so promote the FIFO head in the
             // SAME transaction rather than relying solely on the host's
@@ -1941,48 +1940,92 @@ WHERE parent_id = $1
     async fn release_undelivered_input_tx(
         tx: &mut Transaction<'_, Postgres>,
         root: &AgentTask,
-        child_thread_root: bool,
         now: OffsetDateTime,
     ) -> Result<()> {
         if !settles_undelivered_input(root) {
             return Ok(());
         }
-        let records = sqlx::query_as::<_, TaskRecord>(
+        let undelivered = sqlx::query_as!(
+            TaskRecord,
             r"
 SELECT
-    id, kind, status, parent_id, root_id, depth, thread_id,
-    submitted_input_json, caller_metadata_json, worker_id, lease_id,
-    lease_expires_at, last_heartbeat_at, state_json, attempt, max_attempts,
-    last_error, terminal_reason_json, pending_child_count, spawn_index, result_payload,
-    otel_traceparent, created_at, updated_at, completed_at, last_activity_at
+    id,
+    kind,
+    status,
+    parent_id,
+    root_id,
+    depth,
+    thread_id,
+    submitted_input_json,
+    caller_metadata_json,
+    worker_id,
+    lease_id,
+    lease_expires_at,
+    last_heartbeat_at,
+    state_json,
+    attempt,
+    max_attempts,
+    last_error,
+    terminal_reason_json,
+    pending_child_count,
+    spawn_index,
+    result_payload,
+    otel_traceparent,
+    created_at,
+    updated_at,
+    completed_at,
+    last_activity_at
 FROM agent_sdk_tasks
-WHERE parent_id = $1 AND kind = 'input_injection' AND status = 'queued'
+WHERE parent_id = $1
+  AND kind = 'input_injection'
+  AND status = 'queued'
 ORDER BY created_at, id
 FOR UPDATE
 ",
+            root.id.as_str(),
         )
-        .bind(root.id.as_str())
         .fetch_all(&mut **tx)
         .await
         .with_context(|| format!("load undelivered input of {}", root.id))?;
-        if records.is_empty() {
+        if undelivered.is_empty() {
             return Ok(());
         }
         let thread_open = Self::lock_thread_tx(tx, &root.thread_id)
             .await?
             .is_none_or(|thread| thread.require_active(ThreadOperation::Submit).is_ok());
-        for record in records {
-            let released = release_undelivered_input(
-                AgentTask::try_from(record)?,
-                !child_thread_root && thread_open,
-                now,
-            )?;
+        let hand_over = thread_open && !Self::links_child_thread_root_tx(tx, &root.id).await?;
+        for record in undelivered {
+            let released = release_undelivered_input(AgentTask::try_from(record)?, hand_over, now)?;
             Self::update_task_tx(tx, &released.injection).await?;
             if let Some(next_turn) = &released.next_turn {
                 Self::insert_task_tx(tx, next_turn).await?;
             }
         }
         Ok(())
+    }
+
+    /// Whether `root` is a subagent's child-thread root: some invocation
+    /// links it, whatever that invocation's status. A plain read, so a
+    /// concurrent lock on the invocation row cannot hide the link.
+    async fn links_child_thread_root_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        root: &AgentTaskId,
+    ) -> Result<bool> {
+        let linked = sqlx::query_scalar!(
+            r#"
+SELECT EXISTS (
+    SELECT 1
+    FROM agent_sdk_tasks
+    WHERE kind = 'subagent'
+      AND state_json -> 'invocation' ->> 'child_root_task_id' = $1
+) AS "linked!"
+"#,
+            root.as_str(),
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .with_context(|| format!("look up the invocation linking {root}"))?;
+        Ok(linked)
     }
 
     /// Phase 7.6: find a `Subagent` invocation task that is

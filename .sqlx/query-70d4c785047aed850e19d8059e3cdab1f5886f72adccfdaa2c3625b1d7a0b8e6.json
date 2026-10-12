@@ -1,0 +1,21 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT EXISTS (\n                   SELECT 1 FROM agent_sdk_tasks\n                   WHERE kind = 'subagent'\n                     AND json_extract(state_json, '$.invocation.child_root_task_id') = ?1\n               ) AS \"linked!: bool\"",
+  "describe": {
+    "columns": [
+      {
+        "name": "linked!: bool",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "70d4c785047aed850e19d8059e3cdab1f5886f72adccfdaa2c3625b1d7a0b8e6"
+}

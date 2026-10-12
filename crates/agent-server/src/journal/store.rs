@@ -938,8 +938,11 @@ pub struct ReleasedInput {
 /// (`hand_over`), the input becomes the thread's next turn and the injection
 /// completes as handed over. Under a child-thread root it is cancelled with
 /// the root's tree: nothing awaits a later turn on a subagent's thread, so a
-/// turn there would run unowned beside the parent. On a thread being purged
-/// it is cancelled too.
+/// turn there would run unowned beside the parent. A root is a child-thread
+/// root when some subagent invocation links it — a plain read of the link,
+/// never the outcome of waking the invocation, which a concurrent lock on
+/// the invocation's row can skip. On a thread being purged the input is
+/// cancelled too.
 ///
 /// Every backend applies this inside the root's terminal transition, before
 /// the thread's next queued root is promoted, so the handed-over turn takes
@@ -4130,8 +4133,8 @@ impl Inner {
             // (`cancel_row_in_place`) — not only the host's post-commit
             // promotion path. Promotion is idempotent, so the host's
             // later `promote_next_queued_root` becomes a no-op.
+            self.release_undelivered_input_locked(new_child, now)?;
             let resumed = self.resume_linked_subagent_invocation(new_child, now, error_prefix)?;
-            self.release_undelivered_input_locked(new_child, resumed.is_some(), now)?;
             let _promoted = self.promote_next_queued_root_locked(&new_child.thread_id, now)?;
             Ok(resumed)
         } else {
@@ -4139,22 +4142,11 @@ impl Inner {
         }
     }
 
-    /// Apply [`release_undelivered_input`] to every queued injection of the
-    /// just-ended `root`, oldest first, before its thread's queue head is
-    /// promoted. The in-memory store sees no thread lifecycle here, so it
-    /// treats the thread as open.
-    fn release_undelivered_input_locked(
-        &mut self,
-        root: &AgentTask,
-        child_thread_root: bool,
-        now: OffsetDateTime,
-    ) -> Result<()> {
-        if !settles_undelivered_input(root) {
-            return Ok(());
-        }
+    /// The queued injections of `root`, oldest first.
+    fn undelivered_input(&self, root: &AgentTaskId) -> Vec<AgentTask> {
         let mut undelivered: Vec<AgentTask> = self
             .by_parent
-            .get(&root.id)
+            .get(root)
             .into_iter()
             .flatten()
             .filter_map(|id| self.by_id.get(id))
@@ -4164,8 +4156,41 @@ impl Inner {
             .cloned()
             .collect();
         undelivered.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        undelivered
+    }
+
+    /// Whether `root` is a subagent's child-thread root: some invocation
+    /// links it, whatever that invocation's status (see
+    /// [`release_undelivered_input`]).
+    fn links_child_thread_root(&self, root: &AgentTaskId) -> bool {
+        self.by_id.values().any(|task| {
+            task.kind == TaskKind::Subagent
+                && task
+                    .state
+                    .subagent_invocation()
+                    .is_some_and(|invocation| invocation.child_root_task_id == *root)
+        })
+    }
+
+    /// Apply [`release_undelivered_input`] to every queued injection of the
+    /// just-ended `root`, oldest first, before its thread's queue head is
+    /// promoted. The in-memory store sees no thread lifecycle here, so it
+    /// treats the thread as open.
+    fn release_undelivered_input_locked(
+        &mut self,
+        root: &AgentTask,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        if !settles_undelivered_input(root) {
+            return Ok(());
+        }
+        let undelivered = self.undelivered_input(&root.id);
+        if undelivered.is_empty() {
+            return Ok(());
+        }
+        let hand_over = !self.links_child_thread_root(&root.id);
         for old in undelivered {
-            let released = release_undelivered_input(old.clone(), !child_thread_root, now)?;
+            let released = release_undelivered_input(old.clone(), hand_over, now)?;
             self.rebalance_after_row_change(&old, &released.injection);
             self.by_id
                 .insert(released.injection.id.clone(), released.injection);

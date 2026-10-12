@@ -1157,9 +1157,65 @@ mod sqlite {
 
 #[cfg(feature = "postgres")]
 mod postgres {
-    use anyhow::Result;
+    use anyhow::{Context, Result};
 
-    use super::super::pg_test_store;
+    use agent_sdk_foundation::TerminalReason;
+    use agent_server::journal::store::AgentTaskStore;
+    use agent_server::journal::task::{LeaseId, WorkerId};
+
+    use super::super::{pg_test_store, spawn_subagent_fixture, t_plus};
+
+    /// A child-thread root's undelivered input dies with it even while
+    /// another transaction holds the subagent invocation's row, which the
+    /// wake skips: the link is read, not locked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_child_thread_input_dies_while_its_invocation_is_locked()
+    -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let (_parent, invocation, child_root) =
+            spawn_subagent_fixture(&store, &store, "pg-locked-invocation").await?;
+        let child_tid = child_root.thread_id.0.clone();
+        let worker = WorkerId::new();
+        let lease = LeaseId::new();
+        store
+            .try_acquire_task(
+                &child_root.id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(10_000),
+                t_plus(3),
+            )
+            .await?
+            .context("child root must acquire")?;
+        let pending = super::inject(&store, &child_tid, "look at the logs too", 4).await?;
+
+        let mut holder = store.pool().begin().await?;
+        sqlx::query_scalar!(
+            "SELECT id FROM agent_sdk_tasks WHERE id = $1 FOR UPDATE",
+            invocation.id.as_str(),
+        )
+        .fetch_one(&mut *holder)
+        .await?;
+        store
+            .complete_task(&child_root.id, &worker, &lease, t_plus(10))
+            .await?;
+        holder.rollback().await?;
+
+        let turns = super::root_turns_of(&store, &child_tid).await?;
+        assert_eq!(
+            turns.iter().map(|turn| &turn.id).collect::<Vec<_>>(),
+            vec![&child_root.id],
+            "no turn may start on the subagent's thread",
+        );
+        super::assert_settled(
+            &super::fetch(&store, &pending.id).await?,
+            &TerminalReason::ParentCancelled,
+            "undelivered input of the child root",
+        );
+        Ok(())
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn settlement_postgres_cancel_child_in_every_live_state_wakes_parent() -> Result<()> {
