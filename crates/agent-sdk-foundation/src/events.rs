@@ -175,17 +175,19 @@ pub enum AgentEvent {
         emitter_task_id: Option<String>,
     },
 
-    /// The user prompt that opens a turn.
+    /// The user prompt that opens a turn, or input injected into a
+    /// running turn.
     ///
-    /// Committed by the worker on the **first attempt** of each
-    /// root-turn task, immediately before the matching
-    /// [`AgentEvent::Start`]. Carries the task's admitted
-    /// `submitted_input` lifted into the LLM-content shape
-    /// (`Vec<ContentBlock>` — text, image, document) so consumers
-    /// can render the prompt without reaching into the projection
-    /// or the task store. Retries of the same turn do not re-emit
-    /// the event; downstream readers can pair `UserInput` 1:1
-    /// with the *first* `Start { turn: N }` per turn.
+    /// A turn's prompt is committed **once per root-turn task**,
+    /// immediately before that task's first [`AgentEvent::Start`]; a
+    /// re-acquired task never commits it again, so readers can pair
+    /// each prompt 1:1 with the *first* `Start { turn: N }` per turn.
+    /// Input injected into a running turn is committed when the turn
+    /// drains it at a tool boundary, so it follows that turn's `Start`.
+    /// Carries the admitted `submitted_input` lifted into the
+    /// LLM-content shape (`Vec<ContentBlock>` — text, image, document)
+    /// so consumers can render it without reaching into the projection
+    /// or the task store.
     ///
     /// This is the durable, sequence-numbered admission event the
     /// projection never carried — `MessageProjection::messages`
@@ -203,8 +205,12 @@ pub enum AgentEvent {
         /// `ContentBlock` type lets the field round-trip through
         /// the same wire shapes the projection uses.
         content: Vec<ContentBlock>,
-        /// Durable task that admitted this input. Present for boundary
-        /// injections; absent on ordinary root prompts and legacy rows.
+        /// Durable task that admitted this input: the root-turn task for
+        /// a turn's prompt, the input-injection task for injected input.
+        /// Absent on rows journaled before prompts were stamped and on
+        /// runs without a durable task. Its presence does not mark an
+        /// injection: injected input names a different task than the
+        /// `emitter_task_id` of the turn's `Start`, a prompt names the same.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         emitter_task_id: Option<String>,
     },

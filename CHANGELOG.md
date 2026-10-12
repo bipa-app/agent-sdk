@@ -58,6 +58,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`true`, `{}`, `{"description": ...}`) and free-form objects, including
   no-argument tools declared as `{"type": "object", "properties": {}}`. A
   strict response format with such a schema fails locally with the reason.
+- **Behaviour change for clients:** a turn's `UserInput` now carries the
+  root-turn task id in `emitter_task_id` (`AgentEvent::UserInput`, proto
+  `UserInputEvent.emitter_task_id`). Before, only input injected into a
+  running turn carried it, so a client that reads its presence as "injected"
+  now misclassifies every prompt. Compare it with the `emitter_task_id` of the
+  turn's `Start` instead: injected input names a different task. Rows
+  journaled before the change stay unstamped.
 - Compaction now appends range-addressed lineage entries and rebuilds the
   effective LLM view without deleting committed transcript messages.
 - Auto-compaction prunes artifact-backed and superseded read outputs before
