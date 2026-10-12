@@ -638,7 +638,8 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
     /// The engine first elides reads a newer read of the same path
     /// superseded, then elides the oldest remaining tool results outside the
     /// `retain_recent` tail, stopping as soon as the estimated history fits
-    /// `tokens`. It summarizes only when elision cannot reach the target.
+    /// `tokens`. It summarizes only when elision cannot reach the target,
+    /// and then summarizes the history without that elision.
     /// Without a target, prune-first elides superseded reads only and
     /// accepts them when the history fits `threshold_tokens`. Other engines
     /// ignore the target.
@@ -885,16 +886,24 @@ impl<P: LlmProvider + ?Sized, H: AgentHooks> LlmContextCompactor<P, H> {
     }
 
     /// The prune-first engine's pruning pass: superseded reads, then, with a
-    /// history target, the oldest tool output. Returns the index of the
-    /// newest message changed; other engines change nothing.
+    /// history target, the oldest tool output. The elision is kept only when
+    /// it reaches the target, so a summarization fallback reads every output
+    /// but the superseded reads. Returns the index of the newest message
+    /// changed; other engines change nothing.
     fn prune_first(&self, messages: &mut [Message]) -> Option<usize> {
         if !self.config.uses_prune_first_engine() {
             return None;
         }
         let superseded = Self::prune_tool_outputs(messages);
-        let elided = self
-            .history_target_tokens
-            .and_then(|target| self.elide_oldest_tool_outputs(messages, target));
+        let Some(target) = self.history_target_tokens else {
+            return superseded;
+        };
+        let mut elided_messages = messages.to_vec();
+        let elided = self.elide_oldest_tool_outputs(&mut elided_messages, target);
+        if elided.is_none() || self.estimate_tokens(&elided_messages) > target {
+            return superseded;
+        }
+        messages.clone_from_slice(&elided_messages);
         superseded.max(elided)
     }
 
@@ -5268,6 +5277,14 @@ mod tests {
                 .len(),
             1,
             "a target elision cannot reach falls back to summarization"
+        );
+        let summary_request = requests
+            .lock()
+            .map_err(|_| anyhow::anyhow!("request log poisoned"))?
+            .concat();
+        assert!(
+            summary_request.contains(&"1".repeat(400)),
+            "the summarizer must read the outputs elision would have removed"
         );
         for id in ["small-c", "small-d", "small-e", "small-f", "small-g"] {
             assert_eq!(
