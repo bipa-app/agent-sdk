@@ -456,6 +456,72 @@ mod tests {
         outcome
     }
 
+    /// Every replica migrates at startup, and the migrator serializes them
+    /// on a session advisory lock. Two replicas migrating one fresh schema
+    /// at once must both succeed and leave the child-root link index valid:
+    /// a migration that waits on other sessions' snapshots while a second
+    /// replica waits for the lock deadlocks against it.
+    #[tokio::test]
+    async fn two_replicas_migrating_at_once_both_succeed() -> Result<()> {
+        use sqlx::postgres::PgPoolOptions;
+
+        let Ok(database_url) =
+            std::env::var("TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))
+        else {
+            return Ok(());
+        };
+        let schema = format!("two_replicas_{}", uuid::Uuid::new_v4().simple());
+        let mut admin = PgConnection::connect(&database_url)
+            .await
+            .context("connect postgres for the migration test")?;
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&mut admin)
+            .await
+            .with_context(|| format!("create test schema {schema}"))?;
+
+        let replica = || {
+            let search_path = format!("SET search_path TO {schema}");
+            PgPoolOptions::new()
+                .max_connections(2)
+                .after_connect(move |conn, _meta| {
+                    let sql = search_path.clone();
+                    Box::pin(async move {
+                        sqlx::query(sqlx::AssertSqlSafe(sql)).execute(conn).await?;
+                        Ok(())
+                    })
+                })
+                .connect(&database_url)
+        };
+        let (first, second) = (replica().await?, replica().await?);
+        let (first_run, second_run) = tokio::join!(
+            DURABLE_CORE_MIGRATOR.run(&first),
+            DURABLE_CORE_MIGRATOR.run(&second),
+        );
+        let link_index_valid = sqlx::query_scalar!(
+            r#"
+SELECT indisvalid AS "valid!"
+FROM pg_index
+WHERE indexrelid = to_regclass('agent_sdk_tasks_subagent_child_root_idx')
+"#
+        )
+        .fetch_optional(&first)
+        .await;
+        first.close().await;
+        second.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&mut admin)
+            .await
+            .with_context(|| format!("drop test schema {schema}"))?;
+
+        first_run.context("the first replica's migration")?;
+        second_run.context("the second replica's migration")?;
+        ensure!(
+            link_index_valid? == Some(true),
+            "the child-root link index must exist and be valid",
+        );
+        Ok(())
+    }
+
     /// Guard against the finding-#20 regression: the reviewable
     /// [`durable_core_migrations`] array silently omitted 0006/0007/0010,
     /// so the schema-contract tests (which concatenate only the reviewable
@@ -494,45 +560,30 @@ mod tests {
         );
     }
 
-    /// Index work on the task table runs CONCURRENTLY, outside a
-    /// transaction, so task writes continue while it runs. Each migration
-    /// holds that one statement (a multi-statement script would run as one
-    /// implicit transaction), and none accepts an existing index: a failed
-    /// concurrent build leaves an INVALID one, which must fail the retry.
+    /// The child-root link index is built and its predecessor dropped
+    /// inside the migration's own transaction, plainly: the migrator's
+    /// advisory lock serializes replicas, and a concurrent build would wait
+    /// on a replica blocked on that lock (see
+    /// `two_replicas_migrating_at_once_both_succeed`).
     #[test]
-    fn task_index_migrations_run_concurrently_outside_a_transaction() {
+    fn task_index_migrations_run_inside_their_transaction() -> Result<()> {
         for version in ["0024", "0025"] {
             let executable = DURABLE_CORE_MIGRATOR
                 .migrations
                 .iter()
                 .find(|migration| format!("{:04}", migration.version) == version)
-                .unwrap_or_else(|| panic!("migration {version} must be in the bundle"));
-            assert!(executable.no_tx, "{version} must run outside a transaction");
+                .with_context(|| format!("migration {version} must be in the bundle"))?;
+            ensure!(!executable.no_tx, "{version} must run inside a transaction");
             let reviewable = durable_core_migrations()
                 .iter()
                 .find(|migration| migration.version == version)
-                .unwrap_or_else(|| panic!("migration {version} must be reviewable"));
-            let body = reviewable
-                .sql
-                .lines()
-                .filter(|line| !line.trim_start().starts_with("--"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let statements: Vec<&str> = body
-                .split(';')
-                .map(str::trim)
-                .filter(|statement| !statement.is_empty())
-                .collect();
-            assert_eq!(statements.len(), 1, "{version}: {statements:?}");
-            assert!(
-                statements[0].contains("CONCURRENTLY"),
-                "{version}: {statements:?}"
-            );
-            assert!(
-                !statements[0].contains("IF NOT EXISTS"),
-                "{version}: {statements:?}"
+                .with_context(|| format!("migration {version} must be reviewable"))?;
+            ensure!(
+                !reviewable.sql.contains("CONCURRENTLY"),
+                "{version} must not build or drop concurrently",
             );
         }
+        Ok(())
     }
 
     #[test]
