@@ -4360,19 +4360,14 @@ impl Inner {
         Ok((new_child, parent))
     }
 
-    /// The ids of `task`'s siblings that are not yet terminal, empty when
-    /// the task waits on nothing.
+    /// The siblings `task` waits for that exist and are not yet terminal,
+    /// the same check the durable stores' acquisition scans make.
     fn unfinished_siblings(&self, task: &AgentTask) -> BTreeSet<AgentTaskId> {
-        match (&task.parent_id, task.after_siblings.is_empty()) {
-            (Some(parent_id), false) => super::sibling_order::unfinished_ids(
-                self.by_parent
-                    .get(parent_id)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|id| self.by_id.get(id)),
-            ),
-            (Some(_) | None, true) | (None, false) => BTreeSet::new(),
-        }
+        super::sibling_order::unfinished_ids(
+            task.after_siblings
+                .iter()
+                .filter_map(|id| self.by_id.get(id)),
+        )
     }
 
     fn propagate_terminal_child_transition(

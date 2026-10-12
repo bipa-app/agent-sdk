@@ -117,16 +117,14 @@ pub fn mixed_spawn_waits(tool_children: &[ToolChildSpawn]) -> Vec<(u32, Vec<u32>
         .collect()
 }
 
-/// The ids of `children` that are not yet terminal, the set
+/// The ids of `tasks` that are not yet terminal, the set
 /// [`AgentTask::waits_on_any`] and [`AgentTask::admit_after_siblings`]
 /// check a wait list against.
-pub fn unfinished_ids<'a>(
-    children: impl IntoIterator<Item = &'a AgentTask>,
-) -> BTreeSet<AgentTaskId> {
-    children
+pub fn unfinished_ids<'a>(tasks: impl IntoIterator<Item = &'a AgentTask>) -> BTreeSet<AgentTaskId> {
+    tasks
         .into_iter()
-        .filter(|child| !child.status.is_terminal())
-        .map(|child| child.id.clone())
+        .filter(|task| !task.status.is_terminal())
+        .map(|task| task.id.clone())
         .collect()
 }
 

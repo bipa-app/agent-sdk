@@ -1713,8 +1713,8 @@ INSERT INTO agent_sdk_tasks (
         Ok(())
     }
 
-    /// The ids of `task`'s siblings that are not yet terminal, empty when
-    /// the task waits on nothing.
+    /// The siblings `task` waits for that exist and are not yet terminal,
+    /// the same check the acquisition scan makes.
     ///
     /// Takes no locks: a sibling only ever moves toward a terminal state,
     /// so a sibling read as finished stays finished.
@@ -1722,25 +1722,26 @@ INSERT INTO agent_sdk_tasks (
         tx: &mut Transaction<'_, Postgres>,
         task: &AgentTask,
     ) -> Result<BTreeSet<AgentTaskId>> {
-        let Some(parent_id) = task
-            .parent_id
-            .as_ref()
-            .filter(|_| !task.after_siblings.is_empty())
-        else {
+        if task.after_siblings.is_empty() {
             return Ok(BTreeSet::new());
-        };
+        }
+        let waited: Vec<String> = task
+            .after_siblings
+            .iter()
+            .map(|id| id.as_str().to_owned())
+            .collect();
         Ok(sqlx::query_scalar!(
             r"
 SELECT id
 FROM agent_sdk_tasks
-WHERE parent_id = $1
+WHERE id = ANY($1::text[])
   AND status NOT IN ('completed', 'failed', 'cancelled')
 ",
-            parent_id.as_str(),
+            &waited,
         )
         .fetch_all(&mut **tx)
         .await
-        .with_context(|| format!("load unfinished children of {parent_id}"))?
+        .with_context(|| format!("load the unfinished siblings {} waits for", task.id))?
         .into_iter()
         .map(AgentTaskId::from_string)
         .collect())

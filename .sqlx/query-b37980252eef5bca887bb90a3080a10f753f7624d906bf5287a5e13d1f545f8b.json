@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\nSELECT id\nFROM agent_sdk_tasks\nWHERE parent_id = $1\n  AND status NOT IN ('completed', 'failed', 'cancelled')\n",
+  "query": "\nSELECT id\nFROM agent_sdk_tasks\nWHERE id = ANY($1::text[])\n  AND status NOT IN ('completed', 'failed', 'cancelled')\n",
   "describe": {
     "columns": [
       {
@@ -17,12 +17,12 @@
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "TextArray"
       ]
     },
     "nullable": [
       false
     ]
   },
-  "hash": "8aaf2b6f9d5524297d2dcef852ecbeb9d3c0d0f82a4771a4927a8a839b013e93"
+  "hash": "b37980252eef5bca887bb90a3080a10f753f7624d906bf5287a5e13d1f545f8b"
 }

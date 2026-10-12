@@ -1602,8 +1602,8 @@ impl AgentTask {
     }
 
     /// `true` while a sibling this row waits for is in `unfinished`, the
-    /// ids of its parent's children that are not yet terminal. A sibling
-    /// missing from the parent counts as finished.
+    /// ids of tasks that exist and are not yet terminal. A sibling that no
+    /// longer exists counts as finished.
     #[must_use]
     pub fn waits_on_any(&self, unfinished: &BTreeSet<AgentTaskId>) -> bool {
         self.after_siblings.iter().any(|id| unfinished.contains(id))

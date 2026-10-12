@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT id FROM agent_sdk_tasks WHERE parent_id = ?1 AND status NOT IN ('completed', 'failed', 'cancelled')",
+  "query": "SELECT sibling.id AS id FROM json_each(?1) AS waited JOIN agent_sdk_tasks AS sibling ON sibling.id = waited.value WHERE sibling.status NOT IN ('completed', 'failed', 'cancelled')",
   "describe": {
     "columns": [
       {
@@ -22,5 +22,5 @@
       true
     ]
   },
-  "hash": "126769950a2c1c81e29a950d92a4204abf8a98069364d2fd81d8870ef7d112ea"
+  "hash": "5e72c64f887b1fe1d6dba44ad6715de62083ebd5f011da6aaeee1d3d26bb6866"
 }
