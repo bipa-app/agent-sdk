@@ -52,6 +52,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   call it could affect or observe has finished. The durable worker records
   each later child's waits in `after_siblings`, and acquisition leases it
   only once every sibling it names is terminal; no write releases anything.
+  The FIFO scan reads only rows that wait on nothing, so held rows never
+  slow it down. When a tool child settles, the host asks the new
+  `AgentTaskStore::ready_held_children` for the siblings it released and
+  hands them to the pool with `WakeupSignal::hint_tasks`, waking one
+  worker per row instead of the whole pool; a bounded probe over held rows
+  is the backstop.
   New calls of a resumed turn also wait for the still-live calls it carries
   over. Subagent spawns, and calls settled before spawn, neither wait nor
   hold anything back, so a coordinator's spawns still fan out together.
@@ -59,18 +65,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (including on the `Erased*Tool` traits), and the derives accept
   `concurrency = ...`. Breaking: `llm::Tool`, `PendingToolCallInfo`,
   `ChildSpawnSpec`, and `AgentTask` gain a public field, and
-  `TaskSchemaError` gains `InvalidSiblingWait` and `HeldBySiblings`. A call
+  `TaskSchemaError` gains `InvalidSiblingWait` and `HeldBySiblings`, and
+  `PostgresDurableStore::from_pool` is no longer `const`. A call
   after a durable child that awaits confirmation now waits for that
   decision, so confirmations in one batch are asked one at a time.
-  Migration 0026 adds the nullable `after_siblings_json` column on both
-  Postgres and SQLite.
+  Migration 0026 adds the nullable `after_siblings_json` column and two
+  partial indexes over pending rows (ready and held) on both Postgres and
+  SQLite.
 
-  **Rollback and rolling deploys:** an older build ignores
-  `after_siblings_json` and leases a waiting child as soon as it is pending,
-  so a batch it picks up runs unordered. This build loads such rows: it
-  ignores a wait list on any row that is not pending, and it leases a pending
-  row an older build left with a wait list once every sibling it names has
-  finished. Drain parked batches before rolling back if ordering matters.
+  **Rollback and rolling deploys:** an older build refuses to start
+  against a database that has migration 0026 applied
+  (`VersionMissing(26)`): the durable migrator does not ignore unknown
+  applied versions, a policy that predates this change. To roll back,
+  revert 0026 by hand first (drop both indexes and the column, then delete
+  version 26 from `_sqlx_migrations`). Batches parked at that point lose
+  their order. This build loads rows an older build wrote during a mixed
+  deploy: it ignores a wait list on any row that is not pending, and it
+  leases a pending row left with a wait list once every sibling it names
+  has finished.
 - **Breaking:** `ToolExecutionStore::get_execution` now takes the thread id
   (`get_execution(&thread_id, tool_call_id)`), and `InMemoryExecutionStore`
   and `SqliteStore` key executions by thread and tool-call id. Providers only

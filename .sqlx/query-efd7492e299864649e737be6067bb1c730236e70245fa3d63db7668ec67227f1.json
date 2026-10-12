@@ -1,0 +1,45 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT held.id AS \"id!\", held.created_at AS \"created_at!\", NOT EXISTS (SELECT 1 FROM json_each(held.after_siblings_json) AS waited JOIN agent_sdk_tasks AS sibling ON sibling.id = waited.value WHERE sibling.status NOT IN ('completed', 'failed', 'cancelled')) AS \"ready!: bool\" FROM agent_sdk_tasks AS held WHERE held.status = 'pending' AND held.after_siblings_json IS NOT NULL AND (held.created_at, held.id) > (?1, ?2) AND held.thread_id NOT IN (SELECT thread_id FROM agent_sdk_threads WHERE status IN ('deleting', 'deleted')) ORDER BY held.created_at, held.id LIMIT ?3",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_tasks",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "name": "created_at!",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_tasks",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "name": "ready!: bool",
+        "ordinal": 2,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "efd7492e299864649e737be6067bb1c730236e70245fa3d63db7668ec67227f1"
+}

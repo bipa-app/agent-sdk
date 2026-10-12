@@ -1079,15 +1079,23 @@ async fn worker_loop(params: WorkerLoopParams) {
             return;
         }
 
-        let now = time::OffsetDateTime::now_utc();
-        let lease_id = LeaseId::new();
-        let expires_at = now + lease_duration;
-
-        match stores
-            .task_store
-            .acquire_next_runnable(worker_id.clone(), lease_id, expires_at, now)
-            .await
-        {
+        let hinted = acquire_hinted_task(
+            stores.task_store.as_ref(),
+            &wakeup_signal,
+            &worker_id,
+            lease_duration,
+        )
+        .await;
+        let acquired = if let Some(task) = hinted {
+            Ok(Some(task))
+        } else {
+            let now = time::OffsetDateTime::now_utc();
+            stores
+                .task_store
+                .acquire_next_runnable(worker_id.clone(), LeaseId::new(), now + lease_duration, now)
+                .await
+        };
+        match acquired {
             Ok(Some(task)) => {
                 info!(
                     %worker_id,
@@ -1121,6 +1129,42 @@ async fn worker_loop(params: WorkerLoopParams) {
             }
         }
     }
+}
+
+/// Lease the oldest hinted task that is still acquirable (see
+/// [`WakeupSignal::hint_tasks`]), waking another worker for any hint left
+/// behind. A hint that can no longer be leased is dropped.
+pub(crate) async fn acquire_hinted_task(
+    task_store: &dyn AgentTaskStore,
+    signal: &WakeupSignal,
+    worker_id: &WorkerId,
+    lease_duration: time::Duration,
+) -> Option<AgentTask> {
+    while let Some(id) = signal.take_hint() {
+        let now = time::OffsetDateTime::now_utc();
+        match task_store
+            .try_acquire_task(
+                &id,
+                worker_id.clone(),
+                LeaseId::new(),
+                now + lease_duration,
+                now,
+            )
+            .await
+        {
+            Ok(Some(task)) => {
+                if signal.has_hints() {
+                    signal.notify_workers();
+                }
+                return Some(task);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(%worker_id, task_id = %id, error = %error, "hinted task acquisition failed");
+            }
+        }
+    }
+    None
 }
 
 /// Run a task to completion while extending its lease in the
@@ -3027,19 +3071,39 @@ async fn execute_tool_task(
     result
 }
 
-/// Nudge the pool after a tool child reached a terminal state.
+/// Nudge the pool after a tool child of `parent_id` reached a terminal
+/// state.
 ///
-/// The same transition may have made the parent runnable (it was the
-/// batch's last live child) or let siblings the batch's execution order
-/// held behind it become acquirable, possibly a whole wave of reads.
-/// Waking every parked worker and leaving one permit for the worker that is
-/// finishing this child lets them start now instead of on the next
-/// acquisition tick.
-pub(crate) fn wake_after_tool_child_settled(runtime: &ExecutionRuntime) {
+/// The transition may have let held siblings become acquirable, possibly
+/// a whole wave of reads: each is handed to the pool as a hint and gets a
+/// worker of its own, which leases it by id. It may also have made the
+/// parent runnable (the batch's last live child), which one more worker
+/// finds through the ready scan. A failed lookup only costs latency: the
+/// acquisition backstop still reaches those rows.
+pub(crate) async fn wake_after_tool_child_settled(
+    runtime: &ExecutionRuntime,
+    task_store: &dyn AgentTaskStore,
+    parent_id: &AgentTaskId,
+) {
     if let Some(signal) = runtime.wakeup_signal() {
-        signal.wake_all_now();
-        signal.notify_workers();
+        hint_released_siblings(signal, task_store, parent_id).await;
     }
+}
+
+/// Hint the held children of `parent_id` that are now ready, and wake one
+/// more worker for a parent the settle may have made runnable.
+pub(crate) async fn hint_released_siblings(
+    signal: &WakeupSignal,
+    task_store: &dyn AgentTaskStore,
+    parent_id: &AgentTaskId,
+) {
+    match task_store.ready_held_children(parent_id).await {
+        Ok(ready) => signal.hint_tasks(ready),
+        Err(error) => {
+            warn!(parent_id = %parent_id, error = %error, "look up siblings a settled tool child released");
+        }
+    }
+    signal.notify_workers();
 }
 
 async fn finish_tool_task_execution(
@@ -3060,7 +3124,9 @@ async fn finish_tool_task_execution(
             },
         ) => {
             publish_events(stores, &committed_events);
-            wake_after_tool_child_settled(runtime);
+            if let Some(parent_id) = &task.parent_id {
+                wake_after_tool_child_settled(runtime, stores.task_store.as_ref(), parent_id).await;
+            }
             Ok(())
         }
         Ok(ToolTaskOutcome::Cancelled) => Ok(()),

@@ -1978,6 +1978,14 @@ pub trait AgentTaskStore: Send + Sync {
     /// is exactly the "one acquisition and lease model that prevents
     /// double ownership across task kinds" Phase 2.3 requires.
     ///
+    /// A tool child held behind its siblings is not in the FIFO scan, so
+    /// held rows never slow it down. When the scan finds nothing, and
+    /// every [`super::sibling_order::HELD_PROBE_FIRST_EVERY`] calls before
+    /// it, a bounded probe examines held rows from a rotating cursor and
+    /// leases one whose siblings have all finished. The fast path to a
+    /// held row is [`Self::ready_held_children`] plus
+    /// [`Self::try_acquire_task`]; see [`super::sibling_order`].
+    ///
     /// Phase 2.5 adds fail-closed skip-on-exhaustion semantics: every
     /// scanned row is first classified by
     /// [`super::recovery::classify_recovery`], and any head whose
@@ -2004,6 +2012,31 @@ pub trait AgentTaskStore: Send + Sync {
         expires_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<Option<AgentTask>>;
+
+    /// The held children of `parent_id` whose wait lists name only
+    /// siblings that are terminal or gone, oldest first.
+    ///
+    /// A host calls this after one of `parent_id`'s tool children settles,
+    /// so the siblings that settle released can be leased by id at once.
+    /// It takes no locks and writes nothing; [`Self::try_acquire_task`]
+    /// checks readiness again under the row lock. The default reads every
+    /// child; the stores read only the held ones.
+    ///
+    /// # Errors
+    /// Store-level read errors.
+    async fn ready_held_children(&self, parent_id: &AgentTaskId) -> Result<Vec<AgentTaskId>> {
+        let children = self.list_children(parent_id).await?;
+        let unfinished = super::sibling_order::unfinished_ids(&children);
+        Ok(children
+            .into_iter()
+            .filter(|child| {
+                child.status == TaskStatus::Pending
+                    && !child.after_siblings.is_empty()
+                    && !child.waits_on_any(&unfinished)
+            })
+            .map(|child| child.id)
+            .collect())
+    }
 
     /// Refresh the lease on a running task, guarded by the caller's
     /// `(worker, lease)` ownership tuple.
@@ -3022,6 +3055,10 @@ struct Inner {
     /// deterministic oldest-first FIFO ordering (tiebroken by `id`) for
     /// the work pool.
     runnable_by_created_at: BTreeSet<(OffsetDateTime, AgentTaskId)>,
+    /// Pending tool children held behind siblings, kept out of
+    /// `runnable_by_created_at` so the FIFO scan never walks them (see
+    /// [`super::sibling_order`]).
+    held_by_created_at: BTreeSet<(OffsetDateTime, AgentTaskId)>,
     /// Phase 2.3 global lease-expiry index: `(lease_expires_at, id)` of
     /// every row whose status is [`TaskStatus::Running`]. Ordered
     /// ascending so [`AgentTaskStore::release_expired_leases`] can walk
@@ -3061,6 +3098,8 @@ pub struct InMemoryAgentTaskStore {
     /// from cancellation markers because cancellation retains its own
     /// idempotent retry protocol.
     spawn_event_committer: Option<Arc<dyn AtomicSpawnEventCommitter>>,
+    /// Where the backstop probe over held rows resumes.
+    held_probe: super::sibling_order::HeldProbe<(OffsetDateTime, AgentTaskId)>,
 }
 
 /// Cancellation-safe rollback for the staged half of an in-memory mixed
@@ -3320,6 +3359,157 @@ impl InMemoryAgentTaskStore {
 
     /// Whether the thread is mid-purge (`Deleting` / `Deleted`). Bare
     /// stores (no sink) see no thread lifecycle and fence nothing.
+    /// Lease the oldest pending row that waits on nothing.
+    async fn acquire_ready_head(
+        &self,
+        worker: WorkerId,
+        lease: LeaseId,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>> {
+        // Phase 2.5: scan the oldest runnable rows in FIFO order and
+        // classify each head before claiming it. A single exhausted
+        // head must never poison the scan — if the classifier returns
+        // `FailClosed`, we fail the row closed in place and loop to
+        // the next head. The loop terminates when either the runnable
+        // pool drains (we return `None`) or a head classifies as
+        // `NoAction` (we claim it).
+        //
+        // `BTreeSet` iterates ascending, so `(created_at, id)` pulls
+        // the FIFO head. The index is populated across every kind
+        // and thread, so this single scan covers root turns and
+        // tool-runtime children — workers never need to double-check
+        // the kind and never accidentally lease a waiting / terminal
+        // / queued row (those statuses are absent from the index by
+        // construction).
+        // Scan the runnable rows in FIFO order, SKIPPING rows whose
+        // thread is mid-purge instead of erroring: one fenced thread's
+        // oldest pending row must never stall every other thread's
+        // acquires (the purge cancels those rows itself). The fence
+        // check runs under the same write lock as the claim, so a purge
+        // cannot slip between screening and acquisition.
+        let mut inner = self.inner.write().await;
+        let candidates: Vec<_> = inner
+            .runnable_by_created_at
+            .iter()
+            .map(|(_, id)| id.clone())
+            .collect();
+        let mut result = None;
+        for id in candidates {
+            let old = inner.by_id.get(&id).cloned().ok_or_else(|| {
+                anyhow!("acquire_next_runnable: runnable head {id} missing from by_id")
+            })?;
+            if self.thread_is_fenced(&old.thread_id).await? {
+                continue;
+            }
+            let unfinished = inner.unfinished_siblings(&old);
+            // Defense in depth: the index should only contain
+            // `Pending` rows. A non-runnable row here is an internal
+            // bookkeeping bug.
+            if !old.status.can_be_leased() {
+                let status = old.status;
+                return Err(anyhow!(
+                    "acquire_next_runnable: runnable index held non-pending row {id} in status {status:?}"
+                ));
+            }
+
+            match classify_recovery(&old, RecoveryContext::AcquisitionAttempt) {
+                RecoveryAction::NoAction => {
+                    let claimed = old
+                        .clone()
+                        .admit_after_siblings(&unfinished)
+                        .and_then(|admitted| admitted.mark_running(worker, lease, expires_at, now))
+                        .context(
+                            "acquire_next_runnable rejected: mark_running transition failed",
+                        )?;
+                    inner.rebalance_after_row_change(&old, &claimed);
+                    inner.by_id.insert(claimed.id.clone(), claimed.clone());
+                    result = Some(claimed);
+                    break;
+                }
+                RecoveryAction::FailClosed(reason) => {
+                    // Fail the exhausted head closed and keep
+                    // scanning so one bad row can never poison the
+                    // whole worker pool. The fail-closed transition
+                    // removes the row from the runnable index, so
+                    // the next loop iteration picks up a fresh head.
+                    let _settled = self
+                        .fail_closed_locked(&mut inner, &old, reason, now)
+                        .await?;
+                }
+                RecoveryAction::Requeue => {
+                    return Err(anyhow!(
+                        "acquire_next_runnable: recovery matrix produced Requeue for acquisition-time row {id}",
+                    ));
+                }
+            }
+        }
+        drop(inner);
+        Ok(result)
+    }
+
+    /// Lease a held row whose siblings have all finished, examining one
+    /// bounded window of held rows from the probe's cursor.
+    async fn acquire_ready_held(
+        &self,
+        worker: WorkerId,
+        lease: LeaseId,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>> {
+        use super::sibling_order::{HELD_PROBE_WINDOW, HeldRow};
+        use std::ops::Bound;
+
+        let cursor = self.held_probe.cursor();
+        let (after_cursor, from_start) = {
+            let inner = self.inner.read().await;
+            let read = |from: Option<&(OffsetDateTime, AgentTaskId)>, limit: usize| {
+                let lower = from.map_or(Bound::Unbounded, |key| Bound::Excluded(key.clone()));
+                inner
+                    .held_by_created_at
+                    .range((lower, Bound::Unbounded))
+                    .take(limit)
+                    .filter_map(|key| {
+                        inner.by_id.get(&key.1).map(|task| HeldRow {
+                            key: key.clone(),
+                            id: key.1.clone(),
+                            ready: !task.waits_on_any(&inner.unfinished_siblings(task)),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let after_cursor = read(cursor.as_ref(), HELD_PROBE_WINDOW);
+            let from_start = if cursor.is_some() && after_cursor.len() < HELD_PROBE_WINDOW {
+                read(None, HELD_PROBE_WINDOW - after_cursor.len())
+            } else {
+                Vec::new()
+            };
+            (after_cursor, from_start)
+        };
+        for id in self
+            .held_probe
+            .advance(cursor.is_some(), after_cursor, from_start)
+        {
+            let thread_id = {
+                let inner = self.inner.read().await;
+                inner.by_id.get(&id).map(|task| task.thread_id.clone())
+            };
+            let Some(thread_id) = thread_id else {
+                continue;
+            };
+            if self.thread_is_fenced(&thread_id).await? {
+                continue;
+            }
+            if let Some(task) = self
+                .try_acquire_task(&id, worker.clone(), lease.clone(), expires_at, now)
+                .await?
+            {
+                return Ok(Some(task));
+            }
+        }
+        Ok(None)
+    }
+
     async fn thread_is_fenced(&self, thread_id: &ThreadId) -> Result<bool> {
         let Some(sink) = &self.marker_sink else {
             return Ok(false);
@@ -3936,8 +4126,12 @@ impl Inner {
     /// always removes the row from both indexes before re-inserting.
     fn register_runnable_lease_indexes(&mut self, task: &AgentTask) {
         match task.status {
-            TaskStatus::Pending => {
+            TaskStatus::Pending if task.after_siblings.is_empty() => {
                 self.runnable_by_created_at
+                    .insert((task.created_at, task.id.clone()));
+            }
+            TaskStatus::Pending => {
+                self.held_by_created_at
                     .insert((task.created_at, task.id.clone()));
             }
             TaskStatus::Running => {
@@ -3954,8 +4148,9 @@ impl Inner {
     /// two indexes never hold stale entries.
     fn unregister_runnable_lease_indexes(&mut self, task: &AgentTask) {
         if task.status == TaskStatus::Pending {
-            self.runnable_by_created_at
-                .remove(&(task.created_at, task.id.clone()));
+            let key = (task.created_at, task.id.clone());
+            self.runnable_by_created_at.remove(&key);
+            self.held_by_created_at.remove(&key);
         }
         if task.status == TaskStatus::Running
             && let Some(expires_at) = task.lease_expires_at
@@ -5387,88 +5582,42 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         expires_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<Option<AgentTask>> {
-        // Phase 2.5: scan the oldest runnable rows in FIFO order and
-        // classify each head before claiming it. A single exhausted
-        // head must never poison the scan — if the classifier returns
-        // `FailClosed`, we fail the row closed in place and loop to
-        // the next head. The loop terminates when either the runnable
-        // pool drains (we return `None`) or a head classifies as
-        // `NoAction` (we claim it).
-        //
-        // `BTreeSet` iterates ascending, so `(created_at, id)` pulls
-        // the FIFO head. The index is populated across every kind
-        // and thread, so this single scan covers root turns and
-        // tool-runtime children — workers never need to double-check
-        // the kind and never accidentally lease a waiting / terminal
-        // / queued row (those statuses are absent from the index by
-        // construction).
-        // Scan the runnable rows in FIFO order, SKIPPING rows whose
-        // thread is mid-purge instead of erroring: one fenced thread's
-        // oldest pending row must never stall every other thread's
-        // acquires (the purge cancels those rows itself). The fence
-        // check runs under the same write lock as the claim, so a purge
-        // cannot slip between screening and acquisition.
-        let mut inner = self.inner.write().await;
-        let candidates: Vec<_> = inner
-            .runnable_by_created_at
-            .iter()
-            .map(|(_, id)| id.clone())
-            .collect();
-        let mut result = None;
-        for id in candidates {
-            let old = inner.by_id.get(&id).cloned().ok_or_else(|| {
-                anyhow!("acquire_next_runnable: runnable head {id} missing from by_id")
-            })?;
-            if self.thread_is_fenced(&old.thread_id).await? {
-                continue;
-            }
-            let unfinished = inner.unfinished_siblings(&old);
-            if old.waits_on_any(&unfinished) {
-                continue;
-            }
-            // Defense in depth: the index should only contain
-            // `Pending` rows. A non-runnable row here is an internal
-            // bookkeeping bug.
-            if !old.status.can_be_leased() {
-                let status = old.status;
-                return Err(anyhow!(
-                    "acquire_next_runnable: runnable index held non-pending row {id} in status {status:?}"
-                ));
-            }
-
-            match classify_recovery(&old, RecoveryContext::AcquisitionAttempt) {
-                RecoveryAction::NoAction => {
-                    let claimed = old
-                        .clone()
-                        .admit_after_siblings(&unfinished)
-                        .and_then(|admitted| admitted.mark_running(worker, lease, expires_at, now))
-                        .context(
-                            "acquire_next_runnable rejected: mark_running transition failed",
-                        )?;
-                    inner.rebalance_after_row_change(&old, &claimed);
-                    inner.by_id.insert(claimed.id.clone(), claimed.clone());
-                    result = Some(claimed);
-                    break;
-                }
-                RecoveryAction::FailClosed(reason) => {
-                    // Fail the exhausted head closed and keep
-                    // scanning so one bad row can never poison the
-                    // whole worker pool. The fail-closed transition
-                    // removes the row from the runnable index, so
-                    // the next loop iteration picks up a fresh head.
-                    let _settled = self
-                        .fail_closed_locked(&mut inner, &old, reason, now)
-                        .await?;
-                }
-                RecoveryAction::Requeue => {
-                    return Err(anyhow!(
-                        "acquire_next_runnable: recovery matrix produced Requeue for acquisition-time row {id}",
-                    ));
-                }
-            }
+        if self.held_probe.probes_first()
+            && let Some(task) = self
+                .acquire_ready_held(worker.clone(), lease.clone(), expires_at, now)
+                .await?
+        {
+            return Ok(Some(task));
         }
-        drop(inner);
-        Ok(result)
+        if let Some(task) = self
+            .acquire_ready_head(worker.clone(), lease.clone(), expires_at, now)
+            .await?
+        {
+            return Ok(Some(task));
+        }
+        self.acquire_ready_held(worker, lease, expires_at, now)
+            .await
+    }
+
+    async fn ready_held_children(&self, parent_id: &AgentTaskId) -> Result<Vec<AgentTaskId>> {
+        let mut ready: Vec<(OffsetDateTime, AgentTaskId)> = {
+            let inner = self.inner.read().await;
+            inner
+                .by_parent
+                .get(parent_id)
+                .into_iter()
+                .flatten()
+                .filter_map(|id| inner.by_id.get(id))
+                .filter(|child| {
+                    child.status == TaskStatus::Pending
+                        && !child.after_siblings.is_empty()
+                        && !child.waits_on_any(&inner.unfinished_siblings(child))
+                })
+                .map(|child| (child.created_at, child.id.clone()))
+                .collect()
+        };
+        ready.sort();
+        Ok(ready.into_iter().map(|(_, id)| id).collect())
     }
 
     async fn heartbeat_task(
@@ -11276,6 +11425,76 @@ mod tests {
                 .await?;
         }
         Ok(last_sweep)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_held_child_stays_out_of_the_fifo_index_until_it_is_leased() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-held-index").await?;
+        let (_parent, children) = store
+            .spawn_tool_children(
+                &parent.id,
+                &worker,
+                &lease,
+                vec![
+                    ChildSpawnSpec::new(1),
+                    ChildSpawnSpec::new(1).after_siblings(vec![0]),
+                ],
+                SuspensionPayload {
+                    continuation: sample_continuation("t-held-index"),
+                    suspended_messages: Vec::new(),
+                    child_join_policy: crate::ChildJoinPolicy::default(),
+                },
+                None,
+                Vec::new(),
+                t_plus(2),
+            )
+            .await?;
+        let [first, held] = children.as_slice() else {
+            anyhow::bail!("two children must be spawned");
+        };
+        let key = |task: &AgentTask| (task.created_at, task.id.clone());
+        {
+            let inner = store.inner.read().await;
+            assert!(inner.runnable_by_created_at.contains(&key(first)));
+            assert!(!inner.runnable_by_created_at.contains(&key(held)));
+            assert!(inner.held_by_created_at.contains(&key(held)));
+        }
+
+        let claimed = store
+            .try_acquire_task(
+                &first.id,
+                WorkerId::from_string("w-first"),
+                LeaseId::from_string("l-first"),
+                t_plus(60),
+                t_plus(3),
+            )
+            .await?
+            .context("the first child must acquire")?;
+        store
+            .complete_task_with_result(
+                &first.id,
+                &WorkerId::from_string("w-first"),
+                &LeaseId::from_string("l-first"),
+                serde_json::json!({"ok": true}),
+                t_plus(4),
+            )
+            .await?;
+        assert_eq!(claimed.id, first.id);
+        let leased = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w-held"),
+                LeaseId::from_string("l-held"),
+                t_plus(60),
+                t_plus(5),
+            )
+            .await?
+            .context("the released child must be reached")?;
+        assert_eq!(leased.id, held.id);
+        let inner = store.inner.read().await;
+        assert!(!inner.held_by_created_at.contains(&key(held)));
+        assert!(!inner.runnable_by_created_at.contains(&key(held)));
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread")]

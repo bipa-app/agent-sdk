@@ -1848,6 +1848,9 @@ pub async fn run_journal_store_conformance<S: JournalStore + Clone + 'static>(
     case_a_waiting_child_needs_no_release_write(store).await?;
     report.passed("a_waiting_child_needs_no_release_write");
 
+    case_a_held_backlog_never_hides_ready_work(store).await?;
+    report.passed("a_held_backlog_never_hides_ready_work");
+
     Ok(report)
 }
 
@@ -2119,6 +2122,131 @@ async fn case_a_waiting_child_needs_no_release_write<S: JournalStore>(store: &S)
         "acquisition clears the wait list it admitted"
     );
     Ok(())
+}
+
+/// A parent parked on `[first, held]`, `held` waiting for `first`, with
+/// `first` leased so `held` stays held. Returns the parent, the leased
+/// `first`, and `held`.
+async fn park_held_behind_running_sibling<S: JournalStore>(
+    store: &S,
+    thread: &ThreadId,
+    at: OffsetDateTime,
+) -> Result<(AgentTaskId, AgentTask, AgentTask)> {
+    let fixture = mixed_batch_fixture(store, thread, 0).await?;
+    let (_parent, children) = AgentTaskStore::spawn_tool_children(
+        store,
+        &fixture.parent_id,
+        &fixture.worker,
+        &fixture.lease,
+        vec![
+            ChildSpawnSpec::new(1),
+            ChildSpawnSpec::new(1).after_siblings(vec![0]),
+        ],
+        suspension_with_pending_tools(thread, 2),
+        None,
+        Vec::new(),
+        at,
+    )
+    .await?;
+    let [first, held] = children.as_slice() else {
+        anyhow::bail!("the spawn must return two children");
+    };
+    let first = AgentTaskStore::try_acquire_task(
+        store,
+        &first.id,
+        WorkerId::new(),
+        LeaseId::new(),
+        at + Duration::seconds(600),
+        at,
+    )
+    .await?
+    .context("the first child must be acquirable")?;
+    Ok((fixture.parent_id, first, held.clone()))
+}
+
+/// More held rows than one backstop probe examines, each behind a running
+/// sibling. A ready row newer than all of them is leased by the first
+/// acquisition. A held row released behind the whole backlog is reported
+/// for its parent at once, and the bounded backstop reaches it within a
+/// few acquisitions however far its cursor has moved.
+async fn case_a_held_backlog_never_hides_ready_work<S: JournalStore>(store: &S) -> Result<()> {
+    use super::sibling_order::HELD_PROBE_WINDOW;
+
+    claim_all_runnable(store, t_plus(2)).await?;
+    for index in 0..=HELD_PROBE_WINDOW {
+        park_held_behind_running_sibling(
+            store,
+            &tid(&format!("conf-held-backlog-{index}")),
+            t_plus(2),
+        )
+        .await?;
+    }
+    let (last_parent, last_first, last_held) =
+        park_held_behind_running_sibling(store, &tid("conf-held-backlog-last"), t_plus(3)).await?;
+
+    let thread = tid("conf-held-backlog-ready");
+    let fixture = mixed_batch_fixture(store, &thread, 0).await?;
+    let (_parent, ready) = AgentTaskStore::spawn_tool_children(
+        store,
+        &fixture.parent_id,
+        &fixture.worker,
+        &fixture.lease,
+        vec![ChildSpawnSpec::new(1)],
+        suspension_with_pending_tools(&thread, 1),
+        None,
+        Vec::new(),
+        t_plus(4),
+    )
+    .await?;
+    let ready = ready.first().context("one ready child")?;
+    let leased = AgentTaskStore::acquire_next_runnable(
+        store,
+        WorkerId::new(),
+        LeaseId::new(),
+        t_plus(600),
+        t_plus(5),
+    )
+    .await?
+    .context("the ready row must be leased")?;
+    ensure!(
+        leased.id == ready.id,
+        "a held backlog must not hide a newer ready row, got {}",
+        leased.id
+    );
+
+    ensure!(
+        AgentTaskStore::ready_held_children(store, &last_parent)
+            .await?
+            .is_empty(),
+        "a held row whose sibling still runs is not ready"
+    );
+    finish_claimed(store, &last_first, true, t_plus(6)).await?;
+    ensure!(
+        AgentTaskStore::ready_held_children(store, &last_parent).await? == [last_held.id.clone()],
+        "the settled sibling's parent must report the row it released"
+    );
+
+    let held_rows = HELD_PROBE_WINDOW + 2;
+    let bound = held_rows.div_ceil(HELD_PROBE_WINDOW) + 1;
+    for _ in 0..bound {
+        match AgentTaskStore::acquire_next_runnable(
+            store,
+            WorkerId::new(),
+            LeaseId::new(),
+            t_plus(600),
+            t_plus(7),
+        )
+        .await?
+        {
+            Some(task) if task.id == last_held.id => return Ok(()),
+            Some(task) => anyhow::bail!("only the released held row is runnable, got {}", task.id),
+            None => {}
+        }
+    }
+    anyhow::bail!(
+        "the backstop must reach a released row behind {} blocked ones within {bound} acquisitions",
+        HELD_PROBE_WINDOW + 1
+    )
 }
 
 /// Cancelling the tree cancels a held child like any other pending row.

@@ -77,7 +77,8 @@
 //! belt-and-suspenders) can prove that a silent broker still makes
 //! progress.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -87,14 +88,19 @@ use tokio_util::sync::CancellationToken;
 
 use super::outbox_message::TaskWakeupPayload;
 use super::store::AgentTaskStore;
-use super::task::{AgentTask, TaskStatus};
+use super::task::{AgentTask, AgentTaskId, TaskStatus};
+
+/// How many leased-by-id hints a [`WakeupSignal`] keeps. Older hints are
+/// dropped past this; the acquisition backstop still reaches their rows.
+pub const MAX_TASK_HINTS: usize = 1024;
 
 // ─────────────────────────────────────────────────────────────────────
 // Signal
 // ─────────────────────────────────────────────────────────────────────
 
-/// Lock-free "wake up, there is work" nudge between consumers and
-/// workers.
+/// "Wake up, there is work" nudge between consumers and workers, plus a
+/// bounded queue of tasks a producer knows are ready to lease by id (see
+/// [`Self::hint_tasks`]).
 ///
 /// Backed by a [`tokio::sync::Notify`] so:
 ///
@@ -108,12 +114,14 @@ use super::task::{AgentTask, TaskStatus};
 #[derive(Debug)]
 pub struct WakeupSignal {
     notify: Notify,
+    hints: Mutex<VecDeque<AgentTaskId>>,
 }
 
 impl Default for WakeupSignal {
     fn default() -> Self {
         Self {
             notify: Notify::new(),
+            hints: Mutex::new(VecDeque::new()),
         }
     }
 }
@@ -144,6 +152,45 @@ impl WakeupSignal {
     /// every worker out of the park in one go.
     pub fn wake_all_now(&self) {
         self.notify.notify_waiters();
+    }
+
+    /// Ask the pool to lease these tasks by id, and wake one worker per
+    /// task.
+    ///
+    /// A hint is advisory: the worker leases it with
+    /// [`AgentTaskStore::try_acquire_task`], which re-checks the row, so a
+    /// stale or duplicate hint costs one refused acquisition.
+    pub fn hint_tasks(&self, ids: impl IntoIterator<Item = AgentTaskId>) {
+        let ids: Vec<AgentTaskId> = ids.into_iter().collect();
+        let added = ids.len();
+        let mut hints = self.hints.lock().unwrap_or_else(PoisonError::into_inner);
+        for id in ids {
+            if hints.len() == MAX_TASK_HINTS {
+                hints.pop_front();
+            }
+            hints.push_back(id);
+        }
+        drop(hints);
+        for _ in 0..added {
+            self.notify.notify_one();
+        }
+    }
+
+    /// The oldest task a producer asked the pool to lease by id.
+    pub fn take_hint(&self) -> Option<AgentTaskId> {
+        self.hints
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+    }
+
+    /// Whether any hint is still waiting for a worker.
+    pub fn has_hints(&self) -> bool {
+        !self
+            .hints
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
     }
 
     /// Park until someone calls `notify_workers` (or a buffered permit

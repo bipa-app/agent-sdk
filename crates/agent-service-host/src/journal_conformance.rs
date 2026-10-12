@@ -52,6 +52,7 @@ mod tests {
             "ordered_mixed_batch_holds_only_tool_children",
             "cancel_tree_cancels_held_tool_children",
             "a_waiting_child_needs_no_release_write",
+            "a_held_backlog_never_hides_ready_work",
         ] {
             assert!(
                 report.passed.contains(&case.to_owned()),

@@ -497,6 +497,7 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
     } = params;
 
     let task_id = bootstrap.task_id.clone();
+    let parent_id = bootstrap.parent_task.id.clone();
     let thread_id = bootstrap.thread_id.clone();
     let worker_id = bootstrap.worker_id.clone();
     let lease_id = bootstrap.lease_id.clone();
@@ -610,7 +611,8 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
         }
     }
     drop(artifact_store_guard);
-    crate::host::wake_after_tool_child_settled(&runtime);
+    crate::host::wake_after_tool_child_settled(&runtime, stores.task_store.as_ref(), &parent_id)
+        .await;
 
     match crate::host::committed_events_from(stores.event_repo.as_ref(), &thread_id, watermark)
         .await
@@ -1292,7 +1294,14 @@ impl GrpcControlService {
                 )
                 .await
                 .map_err(internal_status("applying confirmation decision"))?;
-                crate::host::wake_after_tool_child_settled(&self.shared.runtime);
+                if let Some(parent_id) = &current_task.parent_id {
+                    crate::host::wake_after_tool_child_settled(
+                        &self.shared.runtime,
+                        self.shared.stores.task_store.as_ref(),
+                        parent_id,
+                    )
+                    .await;
+                }
             }
         }
 

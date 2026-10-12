@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nSELECT held.id\nFROM agent_sdk_tasks AS held\nWHERE held.parent_id = $1\n  AND held.status = 'pending'\n  AND held.after_siblings_json IS NOT NULL\n  AND NOT EXISTS (\n      SELECT 1\n      FROM jsonb_array_elements_text(held.after_siblings_json) AS waited(id)\n      JOIN agent_sdk_tasks AS sibling ON sibling.id = waited.id\n      WHERE sibling.status NOT IN ('completed', 'failed', 'cancelled')\n  )\nORDER BY held.created_at, held.id\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_tasks",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "d292b0dd5e167053b326237b72991aed9bf15ace9ae4f534f0811c38a066df42"
+}

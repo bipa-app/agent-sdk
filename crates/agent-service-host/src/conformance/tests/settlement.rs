@@ -123,6 +123,84 @@ async fn test_stale_wait_lists_still_load(
     Ok(())
 }
 
+/// A tool child settles: the sibling held behind it is hinted to the pool,
+/// and a worker leases it by id from the hint alone.
+async fn test_a_settled_child_hints_the_sibling_it_released(
+    task_store: &dyn AgentTaskStore,
+    tid: &str,
+) -> Result<()> {
+    let root = AgentTask::new_root_turn(thread_id(tid), t_plus(0), 3);
+    task_store.submit_root_turn(root.clone()).await?;
+    let worker = WorkerId::new();
+    let lease = LeaseId::new();
+    task_store
+        .try_acquire_task(
+            &root.id,
+            worker.clone(),
+            lease.clone(),
+            t_plus(10_000),
+            t_plus(1),
+        )
+        .await?
+        .context("root must acquire")?;
+    let (_parent, children) = task_store
+        .spawn_tool_children(
+            &root.id,
+            &worker,
+            &lease,
+            vec![
+                ChildSpawnSpec::new(1),
+                ChildSpawnSpec::new(1).after_siblings(vec![0]),
+            ],
+            suspension_payload(tid),
+            None,
+            Vec::new(),
+            t_plus(2),
+        )
+        .await?;
+    let [first, held] = children.as_slice() else {
+        anyhow::bail!("two children must be spawned");
+    };
+    let child_worker = WorkerId::new();
+    let child_lease = LeaseId::new();
+    task_store
+        .try_acquire_task(
+            &first.id,
+            child_worker.clone(),
+            child_lease.clone(),
+            t_plus(10_000),
+            t_plus(3),
+        )
+        .await?
+        .context("the first child must acquire")?;
+    task_store
+        .complete_task_with_result(
+            &first.id,
+            &child_worker,
+            &child_lease,
+            serde_json::json!({"ok": true}),
+            t_plus(4),
+        )
+        .await?;
+
+    let signal = agent_server::journal::WakeupSignal::default();
+    crate::host::hint_released_siblings(&signal, task_store, &root.id).await;
+    let leased = crate::host::acquire_hinted_task(
+        task_store,
+        &signal,
+        &WorkerId::new(),
+        time::Duration::minutes(10),
+    )
+    .await
+    .context("the hinted sibling must be leased by id")?;
+    anyhow::ensure!(
+        leased.id == held.id && leased.status == TaskStatus::Running,
+        "the hint must lease the released sibling, got {leased:?}"
+    );
+    anyhow::ensure!(!signal.has_hints(), "the hint was consumed");
+    Ok(())
+}
+
 /// Claim every runnable row through the acquisition scan.
 async fn claim_all_runnable(task_store: &dyn AgentTaskStore, at: i64) -> Result<Vec<AgentTask>> {
     let mut claimed = Vec::new();
@@ -1564,6 +1642,12 @@ mod sqlite {
     }
 
     #[tokio::test]
+    async fn settlement_sqlite_a_settled_child_hints_the_sibling_it_released() -> Result<()> {
+        let store = store().await?;
+        super::test_a_settled_child_hints_the_sibling_it_released(&store, "sqlite-hint").await
+    }
+
+    #[tokio::test]
     async fn settlement_sqlite_requeued_wait_list_from_an_older_build_runs_in_order() -> Result<()>
     {
         let store = store().await?;
@@ -2511,6 +2595,14 @@ WHERE id = $1
         .execute(store.pool())
         .await?;
         super::test_stale_wait_lists_still_load(&store, &parked).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_a_settled_child_hints_the_sibling_it_released() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        super::test_a_settled_child_hints_the_sibling_it_released(&store, "pg-hint").await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

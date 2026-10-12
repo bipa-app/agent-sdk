@@ -16,8 +16,24 @@
 //! Every child row exists from the spawn on, so cancellation, early resume,
 //! re-attachment, and fan-in see a waiting child exactly like a child that
 //! has not been leased yet.
+//!
+//! A held row can stay held for as long as a sibling runs or awaits a
+//! decision, so acquisition never walks held rows to find ready work. The
+//! FIFO scan reads only rows that wait on nothing. A held row is reached in
+//! one of two ways:
+//!
+//! - When a tool child settles, the host asks the store for the held
+//!   siblings under the same parent that are now ready
+//!   ([`AgentTaskStore::ready_held_children`](super::store::AgentTaskStore::ready_held_children))
+//!   and wakes a worker for each, which leases it by id.
+//! - As a backstop for a wake that never came (another host settled the
+//!   sibling, or this one crashed first), [`HeldProbe`] examines a bounded
+//!   window of held rows from a rotating cursor when the ready scan finds
+//!   nothing, and every [`HELD_PROBE_FIRST_EVERY`] acquisitions before it.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context, Result, ensure};
 
@@ -149,6 +165,133 @@ pub fn decoded_wait_list(status: TaskStatus, stored: Vec<AgentTaskId>) -> Vec<Ag
     }
 }
 
+/// How many held rows one backstop probe examines.
+pub const HELD_PROBE_WINDOW: usize = 32;
+
+/// Every this many acquisitions, the backstop probe runs before the ready
+/// scan, so a held row whose wake was missed is reached even while ready
+/// work never runs out.
+pub const HELD_PROBE_FIRST_EVERY: u64 = 16;
+
+/// One held row a backstop probe examined. `key` is the row's position in
+/// the `(created_at, id)` order the probe walks, as the backend compares it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeldRow<K> {
+    pub key: K,
+    pub id: AgentTaskId,
+    /// Every sibling the row waits for is terminal or gone.
+    pub ready: bool,
+}
+
+/// Where a store's backstop probe resumes, shared by every clone of the
+/// store.
+#[derive(Debug)]
+pub struct HeldProbe<K> {
+    state: Arc<HeldProbeState<K>>,
+}
+
+#[derive(Debug)]
+struct HeldProbeState<K> {
+    cursor: Mutex<Option<K>>,
+    acquisitions: AtomicU64,
+}
+
+impl<K> Clone for HeldProbe<K> {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+impl<K> Default for HeldProbe<K> {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(HeldProbeState {
+                cursor: Mutex::new(None),
+                acquisitions: AtomicU64::new(0),
+            }),
+        }
+    }
+}
+
+impl<K: Clone> HeldProbe<K> {
+    /// Count one acquisition, and say whether it probes held rows before
+    /// the ready scan.
+    #[must_use]
+    pub fn probes_first(&self) -> bool {
+        let count = self.state.acquisitions.fetch_add(1, Ordering::Relaxed);
+        count % HELD_PROBE_FIRST_EVERY == HELD_PROBE_FIRST_EVERY - 1
+    }
+
+    /// The row after which the next probe starts, `None` for the start.
+    #[must_use]
+    pub fn cursor(&self) -> Option<K> {
+        self.state
+            .cursor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Record one probe's reads (see [`plan_held_window`]) and return the
+    /// ready rows it found, in the order it examined them.
+    pub fn advance(
+        &self,
+        had_cursor: bool,
+        after_cursor: Vec<HeldRow<K>>,
+        from_start: Vec<HeldRow<K>>,
+    ) -> Vec<AgentTaskId> {
+        let (ready, next) =
+            plan_held_window(had_cursor, after_cursor, from_start, HELD_PROBE_WINDOW);
+        *self
+            .state
+            .cursor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = next;
+        ready
+    }
+}
+
+/// Combine one backstop probe's reads.
+///
+/// `after_cursor` holds up to `window` held rows after the cursor (from
+/// the start when there is none). When that read ran short after a cursor,
+/// the probe wraps: `from_start` holds up to the rest of the window, read
+/// again from the start. Returns the ready rows in the order examined, and
+/// where the next probe resumes: after the last row examined, or `None`
+/// once every held row has been examined.
+#[must_use]
+pub fn plan_held_window<K: Clone>(
+    had_cursor: bool,
+    after_cursor: Vec<HeldRow<K>>,
+    from_start: Vec<HeldRow<K>>,
+    window: usize,
+) -> (Vec<AgentTaskId>, Option<K>) {
+    let rest = window.saturating_sub(after_cursor.len());
+    let next = if rest == 0 {
+        after_cursor.last().map(|row| row.key.clone())
+    } else if had_cursor && from_start.len() >= rest {
+        from_start.last().map(|row| row.key.clone())
+    } else {
+        None
+    };
+    let wrapped = if had_cursor && rest > 0 {
+        from_start
+    } else {
+        Vec::new()
+    };
+    let mut seen = BTreeSet::new();
+    let ready = after_cursor
+        .into_iter()
+        .chain(wrapped)
+        .filter(|row| seen.insert(row.id.clone()))
+        .filter(|row| row.ready)
+        .map(|row| row.id)
+        .collect();
+    (ready, next)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +392,89 @@ mod tests {
             Some(TaskSchemaError::HeldBySiblings)
         );
         Ok(())
+    }
+
+    fn held(key: u32, ready: bool) -> HeldRow<u32> {
+        HeldRow {
+            key,
+            id: AgentTaskId::from_string(format!("task_{key}")),
+            ready,
+        }
+    }
+
+    fn ids(keys: &[u32]) -> Vec<AgentTaskId> {
+        keys.iter()
+            .map(|key| AgentTaskId::from_string(format!("task_{key}")))
+            .collect()
+    }
+
+    #[test]
+    fn a_full_window_resumes_after_its_last_row() {
+        let rows = vec![held(1, false), held(2, true), held(3, false)];
+        assert_eq!(
+            plan_held_window(false, rows, Vec::new(), 3),
+            (ids(&[2]), Some(3))
+        );
+    }
+
+    #[test]
+    fn a_short_window_without_a_cursor_covered_every_held_row() {
+        let rows = vec![held(1, true), held(2, false)];
+        assert_eq!(
+            plan_held_window(false, rows, Vec::new(), 3),
+            (ids(&[1]), None)
+        );
+    }
+
+    #[test]
+    fn a_short_window_after_a_cursor_wraps_to_the_start() {
+        let after = vec![held(8, false), held(9, true)];
+        let from_start = vec![held(1, true), held(2, false)];
+        assert_eq!(
+            plan_held_window(true, after, from_start, 4),
+            (ids(&[9, 1]), Some(2)),
+            "the wrapped rows fill the window, and the next probe resumes after them"
+        );
+    }
+
+    #[test]
+    fn a_wrap_that_runs_out_examined_every_held_row_once() {
+        let after = vec![held(2, true)];
+        let from_start = vec![held(1, true), held(2, true)];
+        assert_eq!(
+            plan_held_window(true, after, from_start, 4),
+            (ids(&[2, 1]), None)
+        );
+    }
+
+    #[test]
+    fn no_held_rows_restart_from_the_start() {
+        assert_eq!(
+            plan_held_window::<u32>(true, Vec::new(), Vec::new(), 4),
+            (Vec::new(), None)
+        );
+    }
+
+    #[test]
+    fn a_probe_cursor_is_shared_by_clones() {
+        let probe = HeldProbe::<u32>::default();
+        let clone = probe.clone();
+        let full: Vec<_> = (1..=u32::try_from(HELD_PROBE_WINDOW).unwrap_or(u32::MAX))
+            .map(|key| held(key, false))
+            .collect();
+        let last = full.last().map(|row| row.key);
+        assert!(clone.advance(false, full, Vec::new()).is_empty());
+        assert_eq!(probe.cursor(), last);
+    }
+
+    #[test]
+    fn every_nth_acquisition_probes_held_rows_first() {
+        let probe = HeldProbe::<u32>::default();
+        let first: Vec<bool> = (0..HELD_PROBE_FIRST_EVERY * 2)
+            .map(|_| probe.probes_first())
+            .collect();
+        assert_eq!(first.iter().filter(|probes| **probes).count(), 2);
+        assert!(first[usize::try_from(HELD_PROBE_FIRST_EVERY - 1).unwrap_or(0)]);
     }
 
     #[test]
