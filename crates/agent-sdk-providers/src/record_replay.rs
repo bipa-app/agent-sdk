@@ -287,15 +287,10 @@ impl LlmProvider for RecordReplayProvider {
         "record-replay"
     }
 
-    /// Replay may interleave recorded routes, so it is never stable.
+    /// Never stable in either mode, so a recording and its replay make the
+    /// same compaction decisions: replay has no live route to promise.
     fn has_stable_request_route(&self) -> bool {
-        match self.mode {
-            RecordReplayMode::Record => self
-                .inner
-                .as_ref()
-                .is_some_and(|inner| inner.has_stable_request_route()),
-            RecordReplayMode::Replay => false,
-        }
+        false
     }
 }
 
@@ -857,47 +852,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_stability_follows_mode_and_inner() -> Result<()> {
-        struct UnstableInner;
-        #[async_trait]
-        impl LlmProvider for UnstableInner {
-            async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
-                Ok(success_outcome("unused"))
-            }
-            fn model(&self) -> &'static str {
-                "router-model"
-            }
-            fn provider(&self) -> &'static str {
-                "router"
-            }
-            fn has_stable_request_route(&self) -> bool {
-                false
-            }
-        }
-
+    async fn record_and_replay_never_promise_a_stable_route() -> Result<()> {
         let stable_inner = Arc::new(InnerProvider {
             model: "inner-model",
             chat_outcome: success_outcome("recorded answer"),
             deltas: Vec::new(),
             supports_historical_images: false,
         });
+        assert!(stable_inner.has_stable_request_route());
         let path = temp_cassette_path();
         let recorder = RecordReplayProvider::record(stable_inner, &path);
-        assert!(recorder.has_stable_request_route());
-
-        let wrapping_router =
-            RecordReplayProvider::record(Arc::new(UnstableInner), temp_cassette_path());
         assert!(
-            !wrapping_router.has_stable_request_route(),
-            "record mode wrapping a dynamic dispatcher must stay unstable",
+            !recorder.has_stable_request_route(),
+            "a recording must anchor exactly as its replay will",
         );
 
         let _ = recorder.chat(request()).await?;
         let player = RecordReplayProvider::replay(&path)?;
-        assert!(
-            !player.has_stable_request_route(),
-            "replay serves recorded interactions from disk; no route promise exists",
-        );
+        assert!(!player.has_stable_request_route());
         let _ = std::fs::remove_file(&path);
         Ok(())
     }

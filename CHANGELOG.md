@@ -58,6 +58,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`true`, `{}`, `{"description": ...}`) and free-form objects, including
   no-argument tools declared as `{"type": "object", "properties": {}}`. A
   strict response format with such a schema fails locally with the reason.
+- **Breaking:** `Usage` gains `request_input_tokens` (the input size of one
+  provider request, `None` when unknown), and `CompactionConfig` gains
+  `model_aware_threshold`, `model_context_reserve_tokens` and
+  `model_context_window_tokens`. Struct literals must set them; prefer
+  `..Default::default()` or the `with_*` builders.
+- `RecordReplayProvider` never reports a stable request route, in record or
+  replay mode, so a recording and its replay make the same compaction
+  decisions. `RefreshingProvider::route()` now reports the wrapped
+  provider's route.
 - **Breaking:** `StreamDelta::Done` gains `served_model`, the
   `LlmProvider::model` of the provider that served the stream, stamped by
   every built-in provider next to `served_route` and forwarded untouched by

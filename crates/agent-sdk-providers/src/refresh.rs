@@ -355,6 +355,10 @@ where
     fn has_stable_request_route(&self) -> bool {
         self.template.has_stable_request_route()
     }
+
+    fn route(&self) -> &str {
+        self.template.route()
+    }
 }
 
 #[cfg(test)]
@@ -633,6 +637,21 @@ mod tests {
                 .is_err()
         );
         assert!(wrapped.validate_thinking_config(None).is_ok());
+    }
+
+    #[test]
+    fn wrapper_reports_the_wrapped_provider_route() {
+        let gateway = crate::impls::openai::OpenAIProvider::with_base_url(
+            "key",
+            "moonshotai/kimi-k3",
+            "https://openrouter.ai/api/v1",
+        );
+        let template = gateway.clone();
+        let wrapped = RefreshingProvider::new(gateway, move || {
+            let provider = template.clone();
+            async move { Ok(provider) }
+        });
+        assert_eq!(wrapped.route(), "openrouter");
     }
 
     #[tokio::test]
