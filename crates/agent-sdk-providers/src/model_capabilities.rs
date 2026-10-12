@@ -1556,11 +1556,11 @@ pub const fn supported_model_capabilities() -> &'static [ModelCapabilities] {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     fn snapshot_family(model_id: &str) -> &str {
-        super::split_snapshot(model_id).0
+        split_snapshot(model_id).0
     }
-    use super::*;
 
     /// A row where reasoning is DEARER than output — `alibaba/qwen3-32b` in the
     /// live feed ($2.80/M output, $8.40/M reasoning). Reasoning tokens ride
@@ -2276,6 +2276,31 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn every_listed_snapshot_names_exactly_one_undated_row() {
+        for (row_id, date) in SNAPSHOTS_OF_UNDATED_ROWS {
+            assert!(
+                dashed_date(date).is_some(),
+                "{row_id}: {date} is not a YYYY-MM-DD calendar date"
+            );
+            let rows: Vec<&str> = MODEL_CAPABILITIES
+                .iter()
+                .filter(|caps| caps.model_id == *row_id)
+                .map(|caps| caps.model_id)
+                .collect();
+            assert_eq!(
+                rows.len(),
+                1,
+                "{row_id} must name exactly one row: {rows:?}"
+            );
+            assert_eq!(
+                split_snapshot(row_id).1,
+                SnapshotQualifier::Undated,
+                "{row_id} must be an undated row"
+            );
+        }
     }
 
     #[test]
