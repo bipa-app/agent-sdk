@@ -1047,6 +1047,126 @@ pub(super) async fn test_reject_confirmation_refuses_a_root(
     Ok(())
 }
 
+/// A failing root's settlement cancels every live child under it, whatever
+/// state each is in, but leaves the root itself running and the input
+/// waiting on it queued for the root's own terminal transition. It refuses,
+/// cancelling nothing, a caller that no longer holds the root.
+pub(super) async fn test_cancel_descendants_spares_the_root_and_its_input(
+    task_store: &dyn AgentTaskStore,
+) -> Result<()> {
+    let tid = "settle-descendants";
+    let parked = park_root_on_tool_children(task_store, tid, 3, 3, 11_000).await?;
+    let children: Vec<AgentTaskId> = parked.children.iter().map(|c| c.id.clone()).collect();
+    drive_child(
+        task_store,
+        tid,
+        &children[0],
+        LiveChild::AwaitingConfirmation,
+        11_005,
+    )
+    .await?;
+    drive_child(
+        task_store,
+        tid,
+        &children[1],
+        LiveChild::RunningLiveLease,
+        11_007,
+    )
+    .await?;
+    let (worker, lease) = resume_root_early(task_store, &parked.root.id, 11_010).await?;
+    let pending = inject(task_store, tid, "one more thing", 11_012).await?;
+
+    let refused = task_store
+        .cancel_descendants_of_owned(&parked.root.id, &worker, &LeaseId::new(), t_plus(11_015))
+        .await;
+    assert!(
+        refused.is_err(),
+        "a stale lease must be refused: {refused:?}"
+    );
+    for child in &children {
+        assert!(
+            !fetch(task_store, child).await?.status.is_terminal(),
+            "a refused settlement cancels nothing",
+        );
+    }
+
+    let outcome = task_store
+        .cancel_descendants_of_owned(&parked.root.id, &worker, &lease, t_plus(11_020))
+        .await?;
+    let mut transitioned = outcome.transitioned.clone();
+    transitioned.sort();
+    let mut expected = children.clone();
+    expected.sort();
+    assert_eq!(transitioned, expected, "exactly the live children settle");
+    assert!(outcome.markers.is_empty(), "tool children carry no marker");
+    for child in &children {
+        assert_settled(
+            &fetch(task_store, child).await?,
+            &TerminalReason::ParentCancelled,
+            child.as_str(),
+        );
+    }
+    assert_eq!(
+        fetch(task_store, &pending.id).await?.status,
+        TaskStatus::Queued,
+        "the input waits for the root's own terminal transition",
+    );
+    let root = fetch(task_store, &parked.root.id).await?;
+    assert_eq!(
+        root.status,
+        TaskStatus::Running,
+        "the root itself is untouched"
+    );
+    assert_eq!(root.lease_id.as_ref(), Some(&lease));
+    Ok(())
+}
+
+/// The settlement crosses into a subagent's child thread: the invocation
+/// and its child-thread root are cancelled, the child thread gets its
+/// closing marker, and the failing parent's own thread gets none.
+pub(super) async fn test_cancel_descendants_closes_child_threads(
+    task_store: &dyn AgentTaskStore,
+    thread_store: &dyn ThreadStore,
+    event_repo: &dyn EventRepository,
+) -> Result<()> {
+    let (parent, invocation, child_root) =
+        spawn_subagent_fixture(task_store, thread_store, "settle-descendants-subagent").await?;
+    task_store
+        .try_acquire_task(
+            &child_root.id,
+            WorkerId::new(),
+            LeaseId::new(),
+            t_plus(10_000),
+            t_plus(3),
+        )
+        .await?
+        .context("child root must acquire")?;
+    let (worker, lease) = resume_root_early(task_store, &parent.id, 5).await?;
+
+    let outcome = task_store
+        .cancel_descendants_of_owned(&parent.id, &worker, &lease, t_plus(10))
+        .await?;
+    assert_eq!(outcome.transitioned.len(), 2, "{outcome:?}");
+    assert_eq!(outcome.markers.len(), 1, "only the child thread closes");
+    assert_eq!(outcome.markers[0].thread_id, child_root.thread_id);
+    assert_eq!(
+        cancelled_marker_count(event_repo, &parent.thread_id).await?,
+        0
+    );
+    for (task, label) in [(&invocation, "invocation"), (&child_root, "child root")] {
+        assert_settled(
+            &fetch(task_store, &task.id).await?,
+            &TerminalReason::ParentCancelled,
+            label,
+        );
+    }
+    assert_eq!(
+        fetch(task_store, &parent.id).await?.status,
+        TaskStatus::Running
+    );
+    Ok(())
+}
+
 // ── Backend runners ──────────────────────────────────────────────────
 
 mod in_memory {
@@ -1113,6 +1233,23 @@ mod in_memory {
         super::test_child_thread_root_end_discards_undelivered_input(
             s.task.as_ref(),
             s.thread.as_ref(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn settlement_in_memory_cancel_descendants_spares_the_root() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        super::test_cancel_descendants_spares_the_root_and_its_input(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn settlement_in_memory_cancel_descendants_closes_child_threads() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        super::test_cancel_descendants_closes_child_threads(
+            s.task.as_ref(),
+            s.thread.as_ref(),
+            s.event.as_ref(),
         )
         .await
     }
@@ -1190,6 +1327,18 @@ mod sqlite {
     async fn settlement_sqlite_child_thread_root_end_discards_input() -> Result<()> {
         let store = store().await?;
         super::test_child_thread_root_end_discards_undelivered_input(&store, &store).await
+    }
+
+    #[tokio::test]
+    async fn settlement_sqlite_cancel_descendants_spares_the_root() -> Result<()> {
+        let store = store().await?;
+        super::test_cancel_descendants_spares_the_root_and_its_input(&store).await
+    }
+
+    #[tokio::test]
+    async fn settlement_sqlite_cancel_descendants_closes_child_threads() -> Result<()> {
+        let store = store().await?;
+        super::test_cancel_descendants_closes_child_threads(&store, &store, &store).await
     }
 
     #[tokio::test]
@@ -2084,6 +2233,22 @@ WHERE id = $1
             return Ok(());
         };
         super::test_child_thread_root_end_discards_undelivered_input(&store, &store).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_cancel_descendants_spares_the_root() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        super::test_cancel_descendants_spares_the_root_and_its_input(&store).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_cancel_descendants_closes_child_threads() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        super::test_cancel_descendants_closes_child_threads(&store, &store, &store).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

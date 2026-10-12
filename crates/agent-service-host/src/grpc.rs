@@ -6800,6 +6800,17 @@ mod tests {
         ) -> Result<agent_server::journal::store::CancelTreeOutcome> {
             self.inner.cancel_tree(root_id, now).await
         }
+        async fn cancel_descendants_of_owned(
+            &self,
+            parent: &AgentTaskId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+            now: OffsetDateTime,
+        ) -> Result<agent_server::journal::store::CancelTreeOutcome> {
+            self.inner
+                .cancel_descendants_of_owned(parent, worker, lease, now)
+                .await
+        }
         async fn resume_from_confirmation(
             &self,
             task_id: &AgentTaskId,

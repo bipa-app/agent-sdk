@@ -649,6 +649,10 @@ async fn fail_root_turn_inner(
         reason,
     } = params;
     let error_msg = format!("{error:#}");
+    // Before the root ends: its terminal transition promotes the thread's
+    // next turn, which must not find these children live.
+    let mut settled =
+        settle_descendants_before_failing(task_id, worker_id, lease_id, deps, now).await;
     let (failed_task, _parent) = deps
         .task_store
         .fail_task_with_reason(
@@ -661,6 +665,12 @@ async fn fail_root_turn_inner(
         )
         .await
         .context("fail root task")?;
+    crate::fail_point!("fail_root.after_terminal_transition", |_| {
+        Ok(FailedRootTurn {
+            task: failed_task.clone(),
+            settled: settled.clone(),
+        })
+    });
 
     // Best-effort: the task is durably Failed; event commit failure
     // must not override that outcome. Consistent with
@@ -674,12 +684,14 @@ async fn fail_root_turn_inner(
 
     // Best-effort for the same reason; the host's orphan sweep settles
     // whatever this misses.
-    let settled = settle_live_descendants(task_id, deps, now)
-        .await
-        .unwrap_or_else(|error| {
-            log::warn!("settle descendants of failed root {task_id}: {error:#}");
-            Vec::new()
-        });
+    settled.extend(
+        settle_live_descendants(task_id, deps, now)
+            .await
+            .unwrap_or_else(|error| {
+                log::warn!("settle descendants of failed root {task_id}: {error:#}");
+                Vec::new()
+            }),
+    );
 
     // Finalize the root `invoke_agent` span with the error outcome and
     // its full duration (no-op if a prior process owns the live span).
@@ -695,6 +707,43 @@ async fn fail_root_turn_inner(
         task: failed_task,
         settled,
     })
+}
+
+/// Cancel the live descendants of the root `task_id` this worker still
+/// holds, before the root's own terminal transition, and forward the
+/// child threads' closing markers. Best-effort: on failure the root's
+/// descendants stay live for [`settle_live_descendants`] or the host's
+/// orphan sweep.
+async fn settle_descendants_before_failing(
+    task_id: &AgentTaskId,
+    worker_id: &WorkerId,
+    lease_id: &LeaseId,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Vec<AgentTaskId> {
+    let outcome = async {
+        crate::fail_point!("settle.cancel_descendants", |_| {
+            Err(anyhow::anyhow!(
+                "injected failure settling live descendants"
+            ))
+        });
+        deps.task_store
+            .cancel_descendants_of_owned(task_id, worker_id, lease_id, now)
+            .await
+    }
+    .await;
+    match outcome {
+        Ok(outcome) => {
+            if !outcome.markers.is_empty() {
+                deps.event_notifier.notify(&outcome.markers);
+            }
+            outcome.transitioned
+        }
+        Err(error) => {
+            log::warn!("settle descendants of failing root {task_id}: {error:#}");
+            Vec::new()
+        }
+    }
 }
 
 /// Settle every descendant still live under the terminal root `task_id`.

@@ -7795,6 +7795,37 @@ async fn follow_up_request(
     at: time::OffsetDateTime,
 ) -> Result<Vec<agent_sdk_foundation::llm::Message>> {
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    turn_request(stores, task, prompt, at).await
+}
+
+/// Acquire the admitted root `task` and run it as the thread's next turn,
+/// returning its first provider request.
+async fn next_turn_request(
+    stores: &TestStores,
+    task: &AgentTaskId,
+    prompt: &str,
+    at: time::OffsetDateTime,
+) -> Result<Vec<agent_sdk_foundation::llm::Message>> {
+    let task = stores
+        .tasks
+        .try_acquire_task(
+            task,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            at + time::Duration::seconds(300),
+            at,
+        )
+        .await?
+        .context("the next turn must be acquirable")?;
+    turn_request(stores, task, prompt, at).await
+}
+
+async fn turn_request(
+    stores: &TestStores,
+    task: AgentTask,
+    prompt: &str,
+    at: time::OffsetDateTime,
+) -> Result<Vec<agent_sdk_foundation::llm::Message>> {
     let inputs = build_root_worker_inputs(
         sample_bootstrap(task),
         &stores.threads,
@@ -7932,12 +7963,12 @@ async fn cancelling_an_early_resume_mid_call_closes_its_running_call() -> Result
     Ok(())
 }
 
-/// Fail a parent whose early resume left `call_2` running, and return the
-/// next turn's first provider request. `call_1` finished after the first
-/// early resume and its late result is delivered once.
-async fn fail_an_early_resumed_parent_over_a_running_call(
+/// A parent whose second early resume fails while `call_2` still runs;
+/// `call_1` finished after the first early resume. Returns the parent and
+/// the resume's error.
+async fn early_resumed_parent_failing_over_a_running_call(
     stores: &TestStores,
-) -> Result<Vec<agent_sdk_foundation::llm::Message>> {
+) -> Result<(AgentTaskId, anyhow::Error)> {
     let (parent, children) = Box::pin(suspend_leaving_children_running_with_policy(
         stores,
         vec![
@@ -7977,8 +8008,19 @@ async fn fail_an_early_resumed_parent_over_a_running_call(
     .await
     .err()
     .context("the second early resume must fail")?;
+    Ok((parent.id, error))
+}
+
+/// Fail a parent whose early resume left `call_2` running, and return the
+/// next turn's first provider request. `call_1`'s late result is delivered
+/// once.
+async fn fail_an_early_resumed_parent_over_a_running_call(
+    stores: &TestStores,
+) -> Result<Vec<agent_sdk_foundation::llm::Message>> {
+    let (parent, error) =
+        Box::pin(early_resumed_parent_failing_over_a_running_call(stores)).await?;
     fail_root_turn(
-        &parent.id,
+        &parent,
         &WorkerId::from_string("worker_test"),
         &LeaseId::from_string("lease_test"),
         &thread_a(),
@@ -8011,6 +8053,49 @@ async fn fail_an_early_resumed_parent_over_a_running_call(
 async fn a_failed_early_resumed_parent_closes_its_running_call() -> Result<()> {
     let stores = TestStores::new();
     let request = Box::pin(fail_an_early_resumed_parent_over_a_running_call(&stores)).await?;
+    assert_running_call_closed(&request, "call_2", "cancelled");
+    Ok(())
+}
+
+/// The thread's next turn, queued behind the failing parent, can start the
+/// moment the parent's terminal transition promotes it, before anything
+/// after that transition runs. The parent's children were settled before
+/// it, so that turn is told the call was cancelled.
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+async fn failpoint_next_turn_starting_on_the_failure_finds_its_call_cancelled() -> Result<()> {
+    let scenario = fail::FailScenario::setup();
+    let stores = TestStores::new();
+    let (parent, error) =
+        Box::pin(early_resumed_parent_failing_over_a_running_call(&stores)).await?;
+    let queued = stores
+        .tasks
+        .submit_root_turn(AgentTask::new_root_turn(thread_a(), t_plus(24), 3))
+        .await?;
+    assert_eq!(queued.status, TaskStatus::Queued);
+
+    fail::cfg("fail_root.after_terminal_transition", "return").map_err(anyhow::Error::msg)?;
+    let failed = fail_root_turn(
+        &parent,
+        &WorkerId::from_string("worker_test"),
+        &LeaseId::from_string("lease_test"),
+        &thread_a(),
+        &error,
+        &stores.deps(),
+        t_plus(25),
+    )
+    .await;
+    fail::remove("fail_root.after_terminal_transition");
+    drop(scenario);
+    failed?;
+
+    let request = next_turn_request(
+        &stores,
+        &queued.id,
+        "Try the third command again.",
+        t_plus(30),
+    )
+    .await?;
     assert_running_call_closed(&request, "call_2", "cancelled");
     Ok(())
 }

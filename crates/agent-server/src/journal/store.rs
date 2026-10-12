@@ -904,6 +904,51 @@ pub const fn resolve_injection_parent(
     }
 }
 
+/// What a cancel covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelScope {
+    /// The top row and everything under it: a user's stop.
+    Tree,
+    /// Everything under the top row, but not the top row itself nor the
+    /// input injections waiting on it: a failing root's settlement before
+    /// its own terminal transition.
+    Descendants,
+}
+
+/// The reason a cancel of `scope` from `top` cancels `row` with, or `None`
+/// when it leaves `row` alone. Shared by every backend so the scopes mean
+/// the same thing on each.
+#[must_use]
+pub fn cancel_reason(
+    scope: CancelScope,
+    top: &AgentTaskId,
+    row: &AgentTask,
+) -> Option<TerminalReason> {
+    if row.status.is_terminal() {
+        return None;
+    }
+    match scope {
+        CancelScope::Tree => Some(if row.id == *top {
+            TerminalReason::UserCancel
+        } else {
+            TerminalReason::ParentCancelled
+        }),
+        CancelScope::Descendants => {
+            let waiting_on_top =
+                row.kind == TaskKind::InputInjection && row.parent_id.as_ref() == Some(top);
+            (row.id != *top && !waiting_on_top).then_some(TerminalReason::ParentCancelled)
+        }
+    }
+}
+
+/// Whether `task` is running under `worker` and `lease`.
+#[must_use]
+pub fn is_owned_by(task: &AgentTask, worker: &WorkerId, lease: &LeaseId) -> bool {
+    task.status == TaskStatus::Running
+        && task.worker_id.as_ref() == Some(worker)
+        && task.lease_id.as_ref() == Some(lease)
+}
+
 /// Whether `root`'s terminal transition settles its undelivered input.
 ///
 /// True once a root turn completed or failed. A cancelled root's input is
@@ -2802,6 +2847,29 @@ pub trait AgentTaskStore: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<CancelTreeOutcome>;
 
+    /// Cancel every live row under `parent`, a task still running under
+    /// `worker` and `lease`, leaving `parent` itself and the input
+    /// injections waiting on it untouched (see [`cancel_reason`]).
+    ///
+    /// The settlement a failing root runs before its own terminal
+    /// transition, so the turn that transition promotes never finds them
+    /// live. Every cancelled row gets [`TerminalReason::ParentCancelled`];
+    /// child-thread roots reached through a subagent invocation are
+    /// cancelled with their closing marker and their threads' queues
+    /// promote, as in [`Self::cancel_tree`]. `parent` keeps its thread's
+    /// slot.
+    ///
+    /// # Errors
+    /// Returns an error, cancelling nothing, when `parent` is not running
+    /// under `worker` and `lease`, or when the cascade is rejected.
+    async fn cancel_descendants_of_owned(
+        &self,
+        parent: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        now: OffsetDateTime,
+    ) -> Result<CancelTreeOutcome>;
+
     /// Resume a [`TaskStatus::AwaitingConfirmation`] task back to
     /// [`TaskStatus::Pending`], atomically extracting the prepared
     /// listen/execute operation and clearing the typed
@@ -3098,6 +3166,132 @@ impl InMemoryAgentTaskStore {
     ) -> Self {
         self.spawn_event_committer = Some(committer);
         self
+    }
+
+    /// [`AgentTaskStore::cancel_tree`] over `scope`, refused unless `owner`
+    /// (when given) still holds `root_id`.
+    async fn cancel_scoped(
+        &self,
+        root_id: &AgentTaskId,
+        scope: CancelScope,
+        owner: Option<(&WorkerId, &LeaseId)>,
+        now: OffsetDateTime,
+    ) -> Result<CancelTreeOutcome> {
+        let mut inner = self.inner.write().await;
+
+        let Some(top) = inner.by_id.get(root_id) else {
+            return Err(anyhow!(
+                "cancel_tree rejected: task {root_id} does not exist"
+            ));
+        };
+        if let Some((worker, lease)) = owner
+            && !is_owned_by(top, worker, lease)
+        {
+            return Err(anyhow!(
+                "cancel rejected: task {root_id} is not running under this worker and lease"
+            ));
+        }
+
+        // Snapshot the subtree ids under the write lock and then
+        // walk them in BFS order. The cancel transition is pure and
+        // does not mutate `by_parent`, so the snapshot stays
+        // consistent for the duration of the sweep even though we
+        // are holding a mutable borrow of `inner`.
+        //
+        // The snapshot, every transition, and the
+        // marker gating all run under this one write lock, so no
+        // concurrent writer can settle a row mid-sweep (and
+        // `cancel_row_in_place` re-reads `by_id` for each id anyway) —
+        // this backend is immune to the stale-snapshot race the
+        // Postgres path had to close with locked re-reads.
+        let subtree = inner.collect_subtree(root_id);
+
+        // Decide, under this lock, exactly which rows will cancel and
+        // which of them are due a terminal marker. The predicate mirrors
+        // `cancel_row_in_place`'s gate (row present, not already
+        // terminal), and the marker payload is read here because the
+        // cancel clears the typed state it prefers.
+        //
+        // The decision is exact, not a guess: the write lock excludes
+        // every concurrent writer, and a row can only reach a terminal
+        // state through its OWN `cancel_row_in_place` below —
+        // `propagate_terminal_child_transition` recomputes a PARENT's
+        // pending-child count, it never settles a descendant. So each
+        // predicted row still transitions when the loop reaches it,
+        // which is what keeps markers exactly-once: an idempotent retry
+        // over a terminal tree predicts nothing and emits nothing.
+        let mut to_cancel = Vec::with_capacity(subtree.len());
+        let mut marker_candidates: Vec<CancelMarkerCandidate> = Vec::new();
+        for id in subtree {
+            let Some(row) = inner.by_id.get(&id) else {
+                continue;
+            };
+            let Some(reason) = cancel_reason(scope, root_id, row) else {
+                continue;
+            };
+            if row.kind == TaskKind::RootTurn && row.is_root() && row.status.blocks_root_admission()
+            {
+                marker_candidates.push(CancelMarkerCandidate {
+                    thread_id: row.thread_id.clone(),
+                    task_id: row.id.clone(),
+                    continuation_usage: row
+                        .state
+                        .continuation()
+                        .map(|continuation| continuation.payload.total_usage.clone()),
+                    reason: reason.clone(),
+                });
+            }
+            to_cancel.push((id, reason));
+        }
+
+        let cancel_ids: Vec<AgentTaskId> = to_cancel.iter().map(|(id, _)| id.clone()).collect();
+        let fenced_threads = self.fenced_threads_for_cancel(&inner, &cancel_ids).await?;
+
+        // The whole marker set is journaled BEFORE any row flips, while
+        // STILL holding the task-store write lock.
+        //
+        // Ordering is the invariant, not an optimisation: a `Cancelled`
+        // row always has its marker in the journal. A sink failure
+        // returns here with not one transition applied, so the tree stays
+        // intact and a retry can complete it — there is no state in which
+        // a follower sees a cancelled emitter with no marker to close it.
+        // No rollback exists across separate stores, so the only way to
+        // get that half is to run the fallible writes first.
+        //
+        // What this ordering does NOT buy — and the flips cannot be
+        // paired per row to buy it, because a flip clears the typed state
+        // carrying `SubagentInvocation` linkage, and a half-flipped
+        // cascade is unreachable to the `collect_subtree` a retry depends
+        // on: a failure PART-WAY through a multi-thread cascade's markers
+        // leaves the already-journaled ones behind on roots that stay
+        // live, and marker closes are ungated, so a follower can close
+        // `TurnCancelled` on a task that then completes. The retry does
+        // not compound it — the append is idempotent per candidate, so
+        // one marker per effective cancel survives and the retry's flips
+        // make the orphan honest. See `CancellationMarkerSink`; the SQL
+        // backends commit the set in one transaction and have neither
+        // window.
+        //
+        // Holding the lock across the sink's awaits is what orders the
+        // markers ahead of anything a promoted successor emits: the
+        // successor cannot be acquired (so cannot commit its `Start`)
+        // until this lock drops — matching the SQL backends. The sink
+        // stores are in-process leaf stores that never call back into
+        // the task store, so holding the lock across them cannot
+        // deadlock.
+        let markers = self
+            .commit_cancellation_markers(marker_candidates, now)
+            .await?;
+
+        // The transitions: pure, synchronous, no await. Once the markers
+        // are durable nothing can interrupt the flips they describe.
+        let transitioned = inner.cancel_rows(to_cancel, &fenced_threads, now)?;
+
+        drop(inner);
+        Ok(CancelTreeOutcome {
+            transitioned,
+            markers,
+        })
     }
 
     /// Whether the thread is mid-purge (`Deleting` / `Deleted`). Bare
@@ -6179,119 +6373,19 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         root_id: &AgentTaskId,
         now: OffsetDateTime,
     ) -> Result<CancelTreeOutcome> {
-        let mut inner = self.inner.write().await;
+        self.cancel_scoped(root_id, CancelScope::Tree, None, now)
+            .await
+    }
 
-        if !inner.by_id.contains_key(root_id) {
-            return Err(anyhow!(
-                "cancel_tree rejected: task {root_id} does not exist"
-            ));
-        }
-
-        // Snapshot the subtree ids under the write lock and then
-        // walk them in BFS order. The cancel transition is pure and
-        // does not mutate `by_parent`, so the snapshot stays
-        // consistent for the duration of the sweep even though we
-        // are holding a mutable borrow of `inner`.
-        //
-        // The snapshot, every transition, and the
-        // marker gating all run under this one write lock, so no
-        // concurrent writer can settle a row mid-sweep (and
-        // `cancel_row_in_place` re-reads `by_id` for each id anyway) —
-        // this backend is immune to the stale-snapshot race the
-        // Postgres path had to close with locked re-reads.
-        let subtree = inner.collect_subtree(root_id);
-
-        // Decide, under this lock, exactly which rows will cancel and
-        // which of them are due a terminal marker. The predicate mirrors
-        // `cancel_row_in_place`'s gate (row present, not already
-        // terminal), and the marker payload is read here because the
-        // cancel clears the typed state it prefers.
-        //
-        // The decision is exact, not a guess: the write lock excludes
-        // every concurrent writer, and a row can only reach a terminal
-        // state through its OWN `cancel_row_in_place` below —
-        // `propagate_terminal_child_transition` recomputes a PARENT's
-        // pending-child count, it never settles a descendant. So each
-        // predicted row still transitions when the loop reaches it,
-        // which is what keeps markers exactly-once: an idempotent retry
-        // over a terminal tree predicts nothing and emits nothing.
-        let mut to_cancel = Vec::with_capacity(subtree.len());
-        let mut marker_candidates: Vec<CancelMarkerCandidate> = Vec::new();
-        for id in subtree {
-            let Some(row) = inner.by_id.get(&id) else {
-                continue;
-            };
-            if row.status.is_terminal() {
-                continue;
-            }
-            let reason = if id == *root_id {
-                TerminalReason::UserCancel
-            } else {
-                TerminalReason::ParentCancelled
-            };
-            if row.kind == TaskKind::RootTurn && row.is_root() && row.status.blocks_root_admission()
-            {
-                marker_candidates.push(CancelMarkerCandidate {
-                    thread_id: row.thread_id.clone(),
-                    task_id: row.id.clone(),
-                    continuation_usage: row
-                        .state
-                        .continuation()
-                        .map(|continuation| continuation.payload.total_usage.clone()),
-                    reason: reason.clone(),
-                });
-            }
-            to_cancel.push((id, reason));
-        }
-
-        let cancel_ids: Vec<AgentTaskId> = to_cancel.iter().map(|(id, _)| id.clone()).collect();
-        let fenced_threads = self.fenced_threads_for_cancel(&inner, &cancel_ids).await?;
-
-        // The whole marker set is journaled BEFORE any row flips, while
-        // STILL holding the task-store write lock.
-        //
-        // Ordering is the invariant, not an optimisation: a `Cancelled`
-        // row always has its marker in the journal. A sink failure
-        // returns here with not one transition applied, so the tree stays
-        // intact and a retry can complete it — there is no state in which
-        // a follower sees a cancelled emitter with no marker to close it.
-        // No rollback exists across separate stores, so the only way to
-        // get that half is to run the fallible writes first.
-        //
-        // What this ordering does NOT buy — and the flips cannot be
-        // paired per row to buy it, because a flip clears the typed state
-        // carrying `SubagentInvocation` linkage, and a half-flipped
-        // cascade is unreachable to the `collect_subtree` a retry depends
-        // on: a failure PART-WAY through a multi-thread cascade's markers
-        // leaves the already-journaled ones behind on roots that stay
-        // live, and marker closes are ungated, so a follower can close
-        // `TurnCancelled` on a task that then completes. The retry does
-        // not compound it — the append is idempotent per candidate, so
-        // one marker per effective cancel survives and the retry's flips
-        // make the orphan honest. See `CancellationMarkerSink`; the SQL
-        // backends commit the set in one transaction and have neither
-        // window.
-        //
-        // Holding the lock across the sink's awaits is what orders the
-        // markers ahead of anything a promoted successor emits: the
-        // successor cannot be acquired (so cannot commit its `Start`)
-        // until this lock drops — matching the SQL backends. The sink
-        // stores are in-process leaf stores that never call back into
-        // the task store, so holding the lock across them cannot
-        // deadlock.
-        let markers = self
-            .commit_cancellation_markers(marker_candidates, now)
-            .await?;
-
-        // The transitions: pure, synchronous, no await. Once the markers
-        // are durable nothing can interrupt the flips they describe.
-        let transitioned = inner.cancel_rows(to_cancel, &fenced_threads, now)?;
-
-        drop(inner);
-        Ok(CancelTreeOutcome {
-            transitioned,
-            markers,
-        })
+    async fn cancel_descendants_of_owned(
+        &self,
+        parent: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        now: OffsetDateTime,
+    ) -> Result<CancelTreeOutcome> {
+        self.cancel_scoped(parent, CancelScope::Descendants, Some((worker, lease)), now)
+            .await
     }
 
     async fn resume_from_confirmation(

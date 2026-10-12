@@ -508,9 +508,10 @@ async fn failing_a_root_trips_no_drive_its_settlement_did_not_cancel() -> Result
         .register(confirming.clone(), drive.clone());
 
     let mut unsettled = stores.clone();
-    unsettled.task_store =
-        Arc::new(FlakyTaskStore::new(Arc::clone(&stores.task_store)).failing_cancel_trees(1))
-            as Arc<dyn AgentTaskStore>;
+    let both_settlements = 2;
+    unsettled.task_store = Arc::new(
+        FlakyTaskStore::new(Arc::clone(&stores.task_store)).failing_cancels(both_settlements),
+    ) as Arc<dyn AgentTaskStore>;
     fail_owned_root(&unsettled, &thread, &tree.root, &worker, &lease).await?;
 
     assert_eq!(task(&stores, &tree.root).await?.status, TaskStatus::Failed);

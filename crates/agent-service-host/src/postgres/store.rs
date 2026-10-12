@@ -62,13 +62,14 @@ use agent_server::journal::relay::{
 };
 use agent_server::journal::retention::{RetentionCursor, RetentionStore};
 use agent_server::journal::store::{
-    AgentTaskStore, CancelTreeOutcome, ChildProbe, MixedChildrenSpawn, QuestionAnswerApplied,
-    QuestionPause, ReattachedChild, RequeueOutcome, SpawnedMixedChildren, SubagentBatchSpawn,
-    SubagentInvocationSpawn, SubmitDisposition, SubmitRootIdempotency, SubmitRootTurnError,
-    SubmitRootTurnOutcome, SubmitRootTurnParams, apply_question_answer, apply_question_pause,
-    has_precompleted_tool_child, live_mixed_child_count, mixed_child_ids_in_slot_order,
-    new_mixed_tool_child, publish_transactional_mixed_parent, release_undelivered_input,
-    settles_undelivered_input, submitted_task_disposition, validate_mixed_children_spawn,
+    AgentTaskStore, CancelScope, CancelTreeOutcome, ChildProbe, MixedChildrenSpawn,
+    QuestionAnswerApplied, QuestionPause, ReattachedChild, RequeueOutcome, SpawnedMixedChildren,
+    SubagentBatchSpawn, SubagentInvocationSpawn, SubmitDisposition, SubmitRootIdempotency,
+    SubmitRootTurnError, SubmitRootTurnOutcome, SubmitRootTurnParams, apply_question_answer,
+    apply_question_pause, cancel_reason, has_precompleted_tool_child, is_owned_by,
+    live_mixed_child_count, mixed_child_ids_in_slot_order, new_mixed_tool_child,
+    publish_transactional_mixed_parent, release_undelivered_input, settles_undelivered_input,
+    submitted_task_disposition, validate_mixed_children_spawn,
     validate_precompleted_boundary_events, validate_subagent_event_count,
     validate_tool_child_specs_for_pure_spawn,
 };
@@ -407,6 +408,221 @@ FOR UPDATE
         })?;
         thread.require_active(operation)?;
         Ok(HeldThreadLock(thread))
+    }
+
+    /// Walk the tree under `root_id` once every thread of a root turn in it
+    /// is locked, returning the walk and the purge-fenced threads.
+    async fn walk_tree_under_thread_locks_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        root_id: &AgentTaskId,
+        now: OffsetDateTime,
+    ) -> Result<(Vec<AgentTask>, std::collections::HashSet<ThreadId>)> {
+        let mut all_tasks = Self::collect_subtree_tx(tx, root_id).await?;
+        let mut locked_threads = std::collections::HashSet::new();
+        let mut fenced_threads = std::collections::HashSet::new();
+        while lock_cancel_threads_tx(
+            tx,
+            &all_tasks,
+            &mut locked_threads,
+            &mut fenced_threads,
+            now,
+        )
+        .await?
+        {
+            all_tasks = Self::collect_subtree_tx(tx, root_id).await?;
+        }
+        Ok((all_tasks, fenced_threads))
+    }
+
+    /// `cancel_tree` over `scope`, refused unless `owner` (when given)
+    /// still holds `root_id`. The owner check reads `root_id` under its
+    /// row lock, taken at its place in the task-row order, so it is atomic
+    /// with the cancels.
+    async fn cancel_scoped(
+        &self,
+        root_id: &AgentTaskId,
+        scope: CancelScope,
+        owner: Option<(&WorkerId, &LeaseId)>,
+        now: OffsetDateTime,
+    ) -> Result<CancelTreeOutcome> {
+        let mut tx = self.begin().await?;
+        let Some(_) = Self::load_task_tx(&mut tx, root_id, false).await? else {
+            return Err(anyhow!(
+                "cancel_tree rejected: task {root_id} does not exist"
+            ));
+        };
+
+        // Collect the given task + descendants (mirror in-memory
+        // `collect_subtree`: children-BFS, root-first, following
+        // SubagentInvocation linkage across threads). A mid-tree id
+        // cancels only its own subtree instead of no-opping on a
+        // `root_id = $1` scan.
+        //
+        // The snapshot only shapes the WALK (ids, depths, kinds,
+        // thread ids — all row-invariant). Statuses in it are advisory:
+        // under READ COMMITTED a concurrent cancel_tree / terminal CAS
+        // can settle any of these rows between this read and our
+        // UPDATEs, so every transition below is gated on a locked
+        // re-read — otherwise two racing cancels of the same root
+        // could both emit a marker and both report the transition, and
+        // a stale snapshot could clobber a concurrently-Completed root
+        // with Cancelled.
+        //
+        // Phase 1 — thread-row locks, FIRST. Every thread that MIGHT
+        // need a terminal marker is bootstrapped and locked before any
+        // task-row lock is taken, keeping this transaction's lock
+        // order (thread rows → task rows) consistent with
+        // `submit_root_turn` so a concurrent submit cannot deadlock
+        // the cancel. The candidate set is every root-turn root in the
+        // snapshot regardless of its snapshot status — status can
+        // change before the locked re-read below (e.g. a queued root
+        // promoted to Pending by a concurrent terminal transition),
+        // but kind / is_root / thread_id cannot. BFS order keeps the
+        // thread-lock order deterministic (parent thread before its
+        // descendants' threads) for concurrent overlapping cancels.
+        //
+        // Every write that adds a row to a tree — an injection, a spawn —
+        // holds its thread's lock, so the walk is taken again once the
+        // threads are held: rows committed while this cancel waited for
+        // the locks are cancelled with the rest. A walk that reaches a
+        // new thread (a subagent spawned meanwhile) locks it and walks
+        // once more.
+        let (all_tasks, fenced_threads) =
+            Self::walk_tree_under_thread_locks_tx(&mut tx, root_id, now).await?;
+
+        // Phase 2 — CAS cancel transitions, taking the row locks in the
+        // store's task-row order (see `PostgresDurableStore`): deepest
+        // first, then by id. Each row is re-read FOR UPDATE and skipped if
+        // it settled concurrently — the transition, the returned
+        // `transitioned` slice, and the marker gating below all derive
+        // from the locked re-read, never from the snapshot.
+        let mut cancel_order: Vec<&AgentTask> = all_tasks.iter().collect();
+        cancel_order.sort_by(|a, b| task_lock_order(a).cmp(&task_lock_order(b)));
+
+        let mut cancelled_ids: std::collections::BTreeSet<AgentTaskId> =
+            std::collections::BTreeSet::new();
+        // Track cancelled root-turn roots (and their threads) so we can
+        // wake their linked invocations and promote queued successors.
+        let mut cancelled_root_ids: Vec<AgentTaskId> = Vec::new();
+        let mut cancelled_root_threads: Vec<ThreadId> = Vec::new();
+        // Blocking roots actually transitioned by THIS call, keyed by
+        // id so phase 3 can emit their markers in BFS order. The
+        // continuation usage is captured from the locked re-read
+        // before `cancel` clears the typed state.
+        let mut marker_candidates: std::collections::BTreeMap<
+            AgentTaskId,
+            (ThreadId, Option<TokenUsage>, TerminalReason),
+        > = std::collections::BTreeMap::new();
+        for row in cancel_order {
+            let Some(current) = Self::load_task_tx(&mut tx, &row.id, true).await? else {
+                continue;
+            };
+            if current.id == *root_id
+                && let Some((worker, lease)) = owner
+                && !is_owned_by(&current, worker, lease)
+            {
+                return Err(anyhow!(
+                    "cancel rejected: task {root_id} is not running under this worker and lease"
+                ));
+            }
+            let Some(reason) = cancel_reason(scope, root_id, &current) else {
+                continue;
+            };
+            let is_root_turn_root = current.kind == TaskKind::RootTurn && current.is_root();
+            let thread_id = current.thread_id.clone();
+            if is_root_turn_root && current.status.blocks_root_admission() {
+                marker_candidates.insert(
+                    current.id.clone(),
+                    (
+                        thread_id.clone(),
+                        current
+                            .state
+                            .continuation()
+                            .map(|continuation| continuation.payload.total_usage.clone()),
+                        reason.clone(),
+                    ),
+                );
+            }
+            let cancelled = current
+                .cancel_with_reason(reason, now)
+                .context("cancel_tree: cancel transition failed")?;
+            Self::update_task_tx(&mut tx, &cancelled).await?;
+            cancelled_ids.insert(cancelled.id.clone());
+            if is_root_turn_root {
+                cancelled_root_ids.push(cancelled.id.clone());
+                cancelled_root_threads.push(thread_id);
+            }
+        }
+        // Build the returned slice in BFS (root-first) order for parity.
+        let transitioned: Vec<AgentTaskId> = all_tasks
+            .iter()
+            .filter(|task| cancelled_ids.contains(&task.id))
+            .map(|task| task.id.clone())
+            .collect();
+
+        // Phase 3 — terminal `Cancelled` markers: exactly
+        // one per blocking root this call ACTUALLY transitioned (the
+        // pre-cancel occupant of its thread's active-root slot), on
+        // that root's OWN thread — cascade-cancelled child-thread
+        // roots included, queued roots never. Atomic with the cancel
+        // transitions above, so a crash can neither lose a marker nor
+        // emit one without its cancellation, and a racing duplicate
+        // cancel (whose re-read saw the row already terminal) emits
+        // nothing. The thread rows were locked in phase 1, so the
+        // sequence allocation here re-locks held rows (no new lock
+        // edges). Emitted in BFS order.
+        let markers = commit_cancel_markers_tx(&mut tx, &all_tasks, marker_candidates, now).await?;
+
+        // Phase 7.6: wake linked SubagentInvocation tasks that were
+        // WaitingOnChildren on a now-cancelled child root. This
+        // mirrors the in-memory store's resume_linked_subagent_invocation.
+        // The woken invocation transitions to Pending (not Cancelled),
+        // so it must NOT be added to the transitioned vec.
+        for cancelled_child_root in &cancelled_root_ids {
+            Self::resume_linked_subagent_invocation_tx(&mut tx, cancelled_child_root, now).await?;
+        }
+
+        // Each cancelled root frees its thread's active-root slot; promote
+        // the next queued root in the same transaction (emitting its
+        // durable wakeup) so cancelling the active root never strands its
+        // queued successors.
+        for thread_id in &cancelled_root_threads {
+            if !fenced_threads.contains(thread_id) {
+                Self::promote_next_queued_root_tx(&mut tx, thread_id, now).await?;
+            }
+        }
+
+        // Mid-tree cancel: when the cancelled subtree hangs under a
+        // parent OUTSIDE the subtree (e.g. the host's subagent-deadline
+        // sweep cancelling a parked root's tool children), recompute
+        // that parked parent's pending_child_count so it resumes —
+        // mirroring the in-memory store, whose per-row cancel
+        // propagates every terminal transition to the row's parent.
+        // Only the subtree's TOP row can have an out-of-subtree parent
+        // (every deeper row's parent lies inside the subtree and is
+        // itself cancelled), so one propagation suffices. Taking the
+        // parent lock after the child updates preserves the
+        // child-then-parent lock order the deepest-first cancel loop
+        // establishes.
+        if transitioned.first().is_some_and(|id| id == root_id)
+            && let Some(cancelled_top) = Self::load_task_tx(&mut tx, root_id, false).await?
+            && cancelled_top.parent_id.is_some()
+        {
+            Self::propagate_terminal_to_parent_tx(
+                &mut tx,
+                &cancelled_top,
+                None,
+                now,
+                "cancel_tree",
+            )
+            .await?;
+        }
+
+        tx.commit().await.context("commit cancel_tree")?;
+        Ok(CancelTreeOutcome {
+            transitioned,
+            markers,
+        })
     }
 
     /// The thread's active root, locked: an injection's parentage is
@@ -5017,193 +5233,19 @@ ORDER BY descendant.root_id
         root_id: &AgentTaskId,
         now: OffsetDateTime,
     ) -> Result<CancelTreeOutcome> {
-        let mut tx = self.begin().await?;
-        let Some(_) = Self::load_task_tx(&mut tx, root_id, false).await? else {
-            return Err(anyhow!(
-                "cancel_tree rejected: task {root_id} does not exist"
-            ));
-        };
+        self.cancel_scoped(root_id, CancelScope::Tree, None, now)
+            .await
+    }
 
-        // Collect the given task + descendants (mirror in-memory
-        // `collect_subtree`: children-BFS, root-first, following
-        // SubagentInvocation linkage across threads). A mid-tree id
-        // cancels only its own subtree instead of no-opping on a
-        // `root_id = $1` scan.
-        //
-        // The snapshot only shapes the WALK (ids, depths, kinds,
-        // thread ids — all row-invariant). Statuses in it are advisory:
-        // under READ COMMITTED a concurrent cancel_tree / terminal CAS
-        // can settle any of these rows between this read and our
-        // UPDATEs, so every transition below is gated on a locked
-        // re-read — otherwise two racing cancels of the same root
-        // could both emit a marker and both report the transition, and
-        // a stale snapshot could clobber a concurrently-Completed root
-        // with Cancelled.
-        //
-        // Phase 1 — thread-row locks, FIRST. Every thread that MIGHT
-        // need a terminal marker is bootstrapped and locked before any
-        // task-row lock is taken, keeping this transaction's lock
-        // order (thread rows → task rows) consistent with
-        // `submit_root_turn` so a concurrent submit cannot deadlock
-        // the cancel. The candidate set is every root-turn root in the
-        // snapshot regardless of its snapshot status — status can
-        // change before the locked re-read below (e.g. a queued root
-        // promoted to Pending by a concurrent terminal transition),
-        // but kind / is_root / thread_id cannot. BFS order keeps the
-        // thread-lock order deterministic (parent thread before its
-        // descendants' threads) for concurrent overlapping cancels.
-        //
-        // Every write that adds a row to a tree — an injection, a spawn —
-        // holds its thread's lock, so the walk is taken again once the
-        // threads are held: rows committed while this cancel waited for
-        // the locks are cancelled with the rest. A walk that reaches a
-        // new thread (a subagent spawned meanwhile) locks it and walks
-        // once more.
-        let mut all_tasks = Self::collect_subtree_tx(&mut tx, root_id).await?;
-        let mut locked_threads = std::collections::HashSet::new();
-        let mut fenced_threads = std::collections::HashSet::new();
-        while lock_cancel_threads_tx(
-            &mut tx,
-            &all_tasks,
-            &mut locked_threads,
-            &mut fenced_threads,
-            now,
-        )
-        .await?
-        {
-            all_tasks = Self::collect_subtree_tx(&mut tx, root_id).await?;
-        }
-
-        // Phase 2 — CAS cancel transitions, taking the row locks in the
-        // store's task-row order (see `PostgresDurableStore`): deepest
-        // first, then by id. Each row is re-read FOR UPDATE and skipped if
-        // it settled concurrently — the transition, the returned
-        // `transitioned` slice, and the marker gating below all derive
-        // from the locked re-read, never from the snapshot.
-        let mut cancel_order: Vec<&AgentTask> = all_tasks.iter().collect();
-        cancel_order.sort_by(|a, b| task_lock_order(a).cmp(&task_lock_order(b)));
-
-        let mut cancelled_ids: std::collections::BTreeSet<AgentTaskId> =
-            std::collections::BTreeSet::new();
-        // Track cancelled root-turn roots (and their threads) so we can
-        // wake their linked invocations and promote queued successors.
-        let mut cancelled_root_ids: Vec<AgentTaskId> = Vec::new();
-        let mut cancelled_root_threads: Vec<ThreadId> = Vec::new();
-        // Blocking roots actually transitioned by THIS call, keyed by
-        // id so phase 3 can emit their markers in BFS order. The
-        // continuation usage is captured from the locked re-read
-        // before `cancel` clears the typed state.
-        let mut marker_candidates: std::collections::BTreeMap<
-            AgentTaskId,
-            (ThreadId, Option<TokenUsage>, TerminalReason),
-        > = std::collections::BTreeMap::new();
-        for row in cancel_order {
-            let Some(current) = Self::load_task_tx(&mut tx, &row.id, true).await? else {
-                continue;
-            };
-            if current.status.is_terminal() {
-                continue;
-            }
-            let is_root_turn_root = current.kind == TaskKind::RootTurn && current.is_root();
-            let thread_id = current.thread_id.clone();
-            let reason = if current.id == *root_id {
-                TerminalReason::UserCancel
-            } else {
-                TerminalReason::ParentCancelled
-            };
-            if is_root_turn_root && current.status.blocks_root_admission() {
-                marker_candidates.insert(
-                    current.id.clone(),
-                    (
-                        thread_id.clone(),
-                        current
-                            .state
-                            .continuation()
-                            .map(|continuation| continuation.payload.total_usage.clone()),
-                        reason.clone(),
-                    ),
-                );
-            }
-            let cancelled = current
-                .cancel_with_reason(reason, now)
-                .context("cancel_tree: cancel transition failed")?;
-            Self::update_task_tx(&mut tx, &cancelled).await?;
-            cancelled_ids.insert(cancelled.id.clone());
-            if is_root_turn_root {
-                cancelled_root_ids.push(cancelled.id.clone());
-                cancelled_root_threads.push(thread_id);
-            }
-        }
-        // Build the returned slice in BFS (root-first) order for parity.
-        let transitioned: Vec<AgentTaskId> = all_tasks
-            .iter()
-            .filter(|task| cancelled_ids.contains(&task.id))
-            .map(|task| task.id.clone())
-            .collect();
-
-        // Phase 3 — terminal `Cancelled` markers: exactly
-        // one per blocking root this call ACTUALLY transitioned (the
-        // pre-cancel occupant of its thread's active-root slot), on
-        // that root's OWN thread — cascade-cancelled child-thread
-        // roots included, queued roots never. Atomic with the cancel
-        // transitions above, so a crash can neither lose a marker nor
-        // emit one without its cancellation, and a racing duplicate
-        // cancel (whose re-read saw the row already terminal) emits
-        // nothing. The thread rows were locked in phase 1, so the
-        // sequence allocation here re-locks held rows (no new lock
-        // edges). Emitted in BFS order.
-        let markers = commit_cancel_markers_tx(&mut tx, &all_tasks, marker_candidates, now).await?;
-
-        // Phase 7.6: wake linked SubagentInvocation tasks that were
-        // WaitingOnChildren on a now-cancelled child root. This
-        // mirrors the in-memory store's resume_linked_subagent_invocation.
-        // The woken invocation transitions to Pending (not Cancelled),
-        // so it must NOT be added to the transitioned vec.
-        for cancelled_child_root in &cancelled_root_ids {
-            Self::resume_linked_subagent_invocation_tx(&mut tx, cancelled_child_root, now).await?;
-        }
-
-        // Each cancelled root frees its thread's active-root slot; promote
-        // the next queued root in the same transaction (emitting its
-        // durable wakeup) so cancelling the active root never strands its
-        // queued successors.
-        for thread_id in &cancelled_root_threads {
-            if !fenced_threads.contains(thread_id) {
-                Self::promote_next_queued_root_tx(&mut tx, thread_id, now).await?;
-            }
-        }
-
-        // Mid-tree cancel: when the cancelled subtree hangs under a
-        // parent OUTSIDE the subtree (e.g. the host's subagent-deadline
-        // sweep cancelling a parked root's tool children), recompute
-        // that parked parent's pending_child_count so it resumes —
-        // mirroring the in-memory store, whose per-row cancel
-        // propagates every terminal transition to the row's parent.
-        // Only the subtree's TOP row can have an out-of-subtree parent
-        // (every deeper row's parent lies inside the subtree and is
-        // itself cancelled), so one propagation suffices. Taking the
-        // parent lock after the child updates preserves the
-        // child-then-parent lock order the deepest-first cancel loop
-        // establishes.
-        if transitioned.first().is_some_and(|id| id == root_id)
-            && let Some(cancelled_top) = Self::load_task_tx(&mut tx, root_id, false).await?
-            && cancelled_top.parent_id.is_some()
-        {
-            Self::propagate_terminal_to_parent_tx(
-                &mut tx,
-                &cancelled_top,
-                None,
-                now,
-                "cancel_tree",
-            )
-            .await?;
-        }
-
-        tx.commit().await.context("commit cancel_tree")?;
-        Ok(CancelTreeOutcome {
-            transitioned,
-            markers,
-        })
+    async fn cancel_descendants_of_owned(
+        &self,
+        parent: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        now: OffsetDateTime,
+    ) -> Result<CancelTreeOutcome> {
+        self.cancel_scoped(parent, CancelScope::Descendants, Some((worker, lease)), now)
+            .await
     }
 
     async fn resume_from_confirmation(

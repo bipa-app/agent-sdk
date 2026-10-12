@@ -533,6 +533,17 @@ mod in_memory_bundle {
         ) -> Result<crate::journal::store::CancelTreeOutcome> {
             self.task.cancel_tree(root_id, now).await
         }
+        async fn cancel_descendants_of_owned(
+            &self,
+            parent: &AgentTaskId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+            now: OffsetDateTime,
+        ) -> Result<crate::journal::store::CancelTreeOutcome> {
+            self.task
+                .cancel_descendants_of_owned(parent, worker, lease, now)
+                .await
+        }
         async fn resume_from_confirmation(
             &self,
             task_id: &AgentTaskId,
