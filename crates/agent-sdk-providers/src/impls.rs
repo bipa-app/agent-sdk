@@ -23,7 +23,7 @@ pub mod openai_reasoning;
 #[cfg(feature = "openai")]
 pub mod openai_responses;
 #[cfg(any(feature = "openai", feature = "openai-codex"))]
-pub mod openai_schema;
+pub(crate) mod openai_schema;
 #[cfg(feature = "openai")]
 pub(crate) mod tool_call_ids;
 #[cfg(feature = "vertex")]
@@ -54,5 +54,7 @@ pub use openai_reasoning::{
 };
 #[cfg(feature = "openai")]
 pub use openai_responses::OpenAIResponsesProvider;
+#[cfg(any(feature = "openai", feature = "openai-codex"))]
+pub use openai_schema::{StrictSchemaError, normalized_strict_schema};
 #[cfg(feature = "vertex")]
 pub use vertex::VertexProvider;

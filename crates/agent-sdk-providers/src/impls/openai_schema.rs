@@ -5,6 +5,7 @@ use std::fmt;
 /// Why a schema cannot be sent through `OpenAI` strict mode without losing
 /// meaning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StrictSchemaError {
     /// An object leaves its property names or values unconstrained.
     FreeFormObject,

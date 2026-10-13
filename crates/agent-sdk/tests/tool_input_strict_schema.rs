@@ -12,7 +12,7 @@ use agent_sdk::{
     AgentCapabilities, AskUserQuestionTool, InMemoryFileSystem, ToolContext, ToolRegistry,
     ToolResult,
 };
-use agent_sdk_providers::impls::openai_schema::normalized_strict_schema;
+use agent_sdk_providers::impls::normalized_strict_schema;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value, json};
 use tokio::sync::RwLock;
@@ -133,14 +133,23 @@ fn builtin_registry() -> ToolRegistry<()> {
     registry
 }
 
-/// Input decoding is the only place these tools produce a `serde_json`
-/// error, so one anywhere in the chain means the payload was refused.
+/// Typed tools refuse input with a `serde_json` error; hand-parsed tools
+/// (`web_search`, `link_fetch`) name the parameter they could not read.
+const INPUT_REJECTION_MARKERS: [&str; 2] = ["Invalid input", "Missing '"];
+
 fn rejected_as_input(outcome: &Result<ToolResult>) -> bool {
-    outcome.as_ref().is_err_and(|error| {
-        error
-            .chain()
-            .any(|cause| cause.downcast_ref::<serde_json::Error>().is_some())
-    })
+    let names_rejection = |message: &str| {
+        INPUT_REJECTION_MARKERS
+            .iter()
+            .any(|marker| message.contains(marker))
+    };
+    match outcome {
+        Ok(result) => !result.success && names_rejection(&result.output),
+        Err(error) => error.chain().any(|cause| {
+            cause.downcast_ref::<serde_json::Error>().is_some()
+                || names_rejection(&cause.to_string())
+        }),
+    }
 }
 
 #[tokio::test]
@@ -154,6 +163,17 @@ async fn every_builtin_tool_accepts_null_for_each_strict_nullable_field() -> Res
         rejected_as_input(&malformed),
         "a malformed payload must be detected as an input rejection"
     );
+    #[cfg(feature = "web")]
+    for hand_parsed in ["link_fetch", "web_search"] {
+        let tool = registry
+            .get(hand_parsed)
+            .with_context(|| format!("{hand_parsed} is registered"))?;
+        let missing = tool.execute(&ctx, json!({})).await;
+        ensure!(
+            rejected_as_input(&missing),
+            "{hand_parsed} refusing a payload must be detected as an input rejection"
+        );
+    }
 
     let mut nulled = Vec::new();
     let mut failures = Vec::new();
