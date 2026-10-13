@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `agent_sdk_providers::impls::normalized_strict_schema` and its error,
+  `StrictSchemaError` (`#[non_exhaustive]`), behind `openai`/`openai-codex`.
+  They return a tool schema as `OpenAI` strict mode receives it, so callers
+  can check that their tool inputs accept it.
 - **crates.io packaging readiness.** The SDK-surface crates (`agent-sdk-foundation`,
   `agent-sdk-tools`, `agent-sdk-providers`, `agent-sdk`, `agent-sdk-otel`,
   `agent-sdk-cli`) are now publishable: package metadata
@@ -237,6 +241,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Built-in tools accept `null` for every optional input field and treat it as
+  absent. `OpenAI` strict mode turns optional properties into required
+  nullable ones, so GPT models send `"offset": null`; `read` (`offset`),
+  `edit` (`replace_all`), `grep` (`recursive`, `case_insensitive`) and
+  `ask_user` (`options`, `multi_select`) used to refuse that call and cost a
+  round trip.
 - A task parked on one call of a multi-call batch now names its own call in
   `ListThreadTasks` and `GetTask`. Every sibling used to name the batch's
   first call, because the snapshot read the shared continuation's

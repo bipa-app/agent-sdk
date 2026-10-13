@@ -54,5 +54,7 @@ pub use openai_reasoning::{
 };
 #[cfg(feature = "openai")]
 pub use openai_responses::OpenAIResponsesProvider;
+#[cfg(any(feature = "openai", feature = "openai-codex"))]
+pub use openai_schema::{StrictSchemaError, normalized_strict_schema};
 #[cfg(feature = "vertex")]
 pub use vertex::VertexProvider;

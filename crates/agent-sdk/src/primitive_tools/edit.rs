@@ -30,7 +30,7 @@ struct EditInput {
     /// Replacement string
     new_string: String,
     /// Replace all occurrences (default: false)
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::null_as_default")]
     replace_all: bool,
 }
 
@@ -194,6 +194,46 @@ fn truncate_string(s: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
     use crate::{AgentCapabilities, InMemoryFileSystem};
+
+    fn parse_edit_input(input: Value) -> Result<EditInput, serde_json::Error> {
+        EditInput::deserialize(input)
+    }
+
+    #[test]
+    fn edit_input_treats_null_replace_all_as_false() -> anyhow::Result<()> {
+        let input = parse_edit_input(json!({
+            "path": "a",
+            "old_string": "x",
+            "new_string": "y",
+            "replace_all": null
+        }))?;
+        assert!(!input.replace_all);
+        Ok(())
+    }
+
+    #[test]
+    fn edit_input_keeps_explicit_and_absent_replace_all() -> anyhow::Result<()> {
+        let base = json!({"path": "a", "old_string": "x", "new_string": "y"});
+        assert!(!parse_edit_input(base.clone())?.replace_all);
+        let mut explicit = base;
+        explicit["replace_all"] = json!(true);
+        assert!(parse_edit_input(explicit)?.replace_all);
+        Ok(())
+    }
+
+    #[test]
+    fn edit_input_still_rejects_non_boolean_replace_all() {
+        let error = parse_edit_input(json!({
+            "path": "a",
+            "old_string": "x",
+            "new_string": "y",
+            "replace_all": "yes"
+        }))
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+        assert!(error.contains("expected a boolean"), "{error}");
+    }
 
     fn create_test_tool(
         fs: Arc<InMemoryFileSystem>,

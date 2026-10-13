@@ -68,10 +68,7 @@ struct ReadInput {
     #[serde(alias = "file_path")]
     path: String,
     /// 1-indexed line number to start reading from; defaults to 1.
-    #[serde(
-        default = "defaults::offset",
-        deserialize_with = "super::deserialize_usize_from_string_or_int"
-    )]
+    #[serde(default = "defaults::offset", deserialize_with = "deserialize_offset")]
     offset: usize,
     /// Maximum number of lines to return; defaults to 2000. Passing it
     /// explicitly also widens the total byte budget (see
@@ -87,6 +84,14 @@ mod defaults {
     pub const fn offset() -> usize {
         1
     }
+}
+
+fn deserialize_offset<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    super::deserialize_optional_usize_from_string_or_int(deserializer)
+        .map(|offset| offset.unwrap_or_else(defaults::offset))
 }
 
 impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for ReadTool<E> {
@@ -931,6 +936,54 @@ fn base64_encode(data: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::{AgentCapabilities, InMemoryFileSystem};
+
+    fn parse_read_input(input: Value) -> Result<ReadInput, serde_json::Error> {
+        ReadInput::deserialize(input)
+    }
+
+    #[test]
+    fn read_input_treats_null_offset_and_limit_as_absent() -> anyhow::Result<()> {
+        let input =
+            parse_read_input(json!({"path": "src/main.rs", "offset": null, "limit": null}))?;
+        assert_eq!(input.offset, 1);
+        assert_eq!(input.limit, None);
+        Ok(())
+    }
+
+    #[test]
+    fn read_input_keeps_accepting_numbers_numeric_strings_and_absence() -> anyhow::Result<()> {
+        let absent = parse_read_input(json!({"path": "a"}))?;
+        assert_eq!((absent.offset, absent.limit), (1, None));
+        let numbers = parse_read_input(json!({"path": "a", "offset": 7, "limit": 3}))?;
+        assert_eq!((numbers.offset, numbers.limit), (7, Some(3)));
+        let strings = parse_read_input(json!({"path": "a", "offset": " 7 ", "limit": "3"}))?;
+        assert_eq!((strings.offset, strings.limit), (7, Some(3)));
+        Ok(())
+    }
+
+    #[test]
+    fn read_input_still_rejects_invalid_offset_and_limit() {
+        for (field, value) in [
+            ("offset", json!("abc")),
+            ("offset", json!(-1)),
+            ("offset", json!(true)),
+            ("limit", json!("abc")),
+            ("limit", json!(1.5)),
+        ] {
+            let mut input = json!({"path": "a"});
+            input[field] = value.clone();
+            assert!(
+                parse_read_input(input).is_err(),
+                "{field}={value} must be rejected"
+            );
+        }
+        let error = parse_read_input(json!({"path": "a", "offset": "abc"}))
+            .map(|input| input.offset)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(error.contains("invalid numeric string 'abc'"), "{error}");
+    }
 
     fn create_test_tool(
         fs: Arc<InMemoryFileSystem>,
