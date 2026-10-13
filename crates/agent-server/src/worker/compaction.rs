@@ -1756,17 +1756,17 @@ mod tests {
     #[test]
     fn requests_above_the_model_max_output_are_clamped_to_it() {
         let fable = registered("anthropic", "claude-fable-5-1");
-        let flash = registered("gemini", "gemini-2.0-flash");
+        let argon = registered("gemini", "gemini-4-argon");
         assert_eq!(
             serving_max_tokens(200_000, fable, OutputSizing::ModelMax),
             128_000
         );
         assert_eq!(sized(200_000, fable, None), 128_000);
         assert_eq!(
-            serving_max_tokens(128_000, flash, OutputSizing::ModelMax),
-            8_192
+            serving_max_tokens(128_000, argon, OutputSizing::ModelMax),
+            65_536
         );
-        assert_eq!(sized(128_000, flash, None), 8_192);
+        assert_eq!(sized(128_000, argon, None), 65_536);
         assert_eq!(
             sized(200_000, fable, Some(&ThinkingConfig::new(150_000))),
             128_000

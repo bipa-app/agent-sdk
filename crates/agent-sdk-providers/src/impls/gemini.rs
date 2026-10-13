@@ -20,7 +20,8 @@ use async_trait::async_trait;
 use data::{
     ApiContent, ApiFunctionCallingConfig, ApiGenerateContentRequest, ApiGenerateContentResponse,
     ApiGenerationConfig, ApiPart, ApiUsageMetadata, build_api_contents, build_content_blocks,
-    convert_tools_to_config, gemini_response_schema, map_finish_reason, map_thinking_config,
+    convert_tools_to_config, default_thinking_level, explicit_cache_refusal,
+    gemini_response_schema, map_finish_reason, map_thinking_config, non_streaming_read_timeout,
 };
 use reqwest::StatusCode;
 
@@ -56,14 +57,22 @@ fn build_http_client() -> reqwest::Client {
         })
 }
 
+// Gemini 4 series
+pub const MODEL_GEMINI_4_ARGON: &str = "gemini-4-argon";
+
+// Gemini 3.x Flash series
+pub const MODEL_GEMINI_38_FLASH: &str = "gemini-3.8-flash";
+pub const MODEL_GEMINI_36_FLASH: &str = "gemini-3.6-flash";
+pub const MODEL_GEMINI_35_FLASH_LITE: &str = "gemini-3.5-flash-lite";
+
 // Gemini 3.1 series
 pub const MODEL_GEMINI_31_PRO: &str = "gemini-3.1-pro-preview";
-pub const MODEL_GEMINI_31_FLASH_LITE: &str = "gemini-3.1-flash-lite-preview";
+pub const MODEL_GEMINI_31_FLASH_LITE: &str = "gemini-3.1-flash-lite";
 
 // Gemini 3 series
 pub const MODEL_GEMINI_3_FLASH: &str = "gemini-3-flash-preview";
 
-// Legacy Gemini 3.0 Pro model kept for explicit opt-in.
+#[deprecated(note = "Google shut gemini-3-pro-preview down; use MODEL_GEMINI_4_ARGON")]
 pub const MODEL_GEMINI_3_PRO: &str = "gemini-3.0-pro";
 
 // Gemini 2.5 series
@@ -71,7 +80,9 @@ pub const MODEL_GEMINI_25_FLASH: &str = "gemini-2.5-flash";
 pub const MODEL_GEMINI_25_PRO: &str = "gemini-2.5-pro";
 
 // Gemini 2.0 series
+#[deprecated(note = "Google shut gemini-2.0-flash down; use MODEL_GEMINI_38_FLASH")]
 pub const MODEL_GEMINI_2_FLASH: &str = "gemini-2.0-flash";
+#[deprecated(note = "Google shut gemini-2.0-flash-lite down; use MODEL_GEMINI_35_FLASH_LITE")]
 pub const MODEL_GEMINI_2_FLASH_LITE: &str = "gemini-2.0-flash-lite";
 
 /// Google Gemini LLM provider.
@@ -152,16 +163,16 @@ impl GeminiProvider {
         Self::new(api_key, MODEL_GEMINI_3_FLASH)
     }
 
-    /// Create a provider using Gemini 3.1 Flash Lite Preview.
+    /// Create a provider using Gemini 3.1 Flash-Lite.
     #[must_use]
     pub fn flash_lite_31(api_key: String) -> Self {
         Self::new(api_key, MODEL_GEMINI_31_FLASH_LITE.to_owned())
     }
 
-    /// Create a provider using Gemini 2.0 Flash Lite (fastest, most cost-effective).
+    /// Create a provider using Gemini 3.5 Flash-Lite, the newest Flash-Lite model.
     #[must_use]
     pub fn flash_lite(api_key: String) -> Self {
-        Self::new(api_key, MODEL_GEMINI_2_FLASH_LITE.to_owned())
+        Self::new(api_key, MODEL_GEMINI_35_FLASH_LITE.to_owned())
     }
 
     /// Create a provider using Gemini 3.1 Pro Preview.
@@ -232,6 +243,11 @@ impl LlmProvider for GeminiProvider {
         if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
             return Ok(ChatOutcome::InvalidRequest(error.to_string()));
         }
+        if let Some(refusal) =
+            explicit_cache_refusal(self.model(), request.cached_content.as_deref())
+        {
+            return Ok(ChatOutcome::InvalidRequest(refusal));
+        }
         let contents = build_api_contents(&request.messages);
         let tools = request
             .tools
@@ -254,7 +270,9 @@ impl LlmProvider for GeminiProvider {
             })
         };
 
-        let thinking_config = thinking.as_ref().map(map_thinking_config);
+        let thinking_config = thinking
+            .as_ref()
+            .map(|thinking| map_thinking_config(thinking, default_thinking_level(self.model())));
         let (response_mime_type, response_schema) =
             request.response_format.as_ref().map_or((None, None), |rf| {
                 (
@@ -291,7 +309,10 @@ impl LlmProvider for GeminiProvider {
                 self.base_url, self.model
             ))
             .header("Content-Type", "application/json")
-            .timeout(std::time::Duration::from_secs(CHAT_READ_TIMEOUT_SECS));
+            .timeout(non_streaming_read_timeout(
+                &self.model,
+                CHAT_READ_TIMEOUT_SECS,
+            ));
         let response = self
             .apply_auth(builder)
             .json(&api_request)
@@ -446,6 +467,15 @@ impl LlmProvider for GeminiProvider {
                 });
                 return;
             }
+            if let Some(refusal) =
+                explicit_cache_refusal(self.model(), request.cached_content.as_deref())
+            {
+                yield Ok(StreamDelta::Error {
+                    message: refusal,
+                    kind: StreamErrorKind::InvalidRequest,
+                });
+                return;
+            }
             let contents = build_api_contents(&request.messages);
             let tools = request
             .tools
@@ -468,7 +498,9 @@ impl LlmProvider for GeminiProvider {
                 })
             };
 
-            let thinking_config = thinking.as_ref().map(map_thinking_config);
+            let thinking_config = thinking
+            .as_ref()
+            .map(|thinking| map_thinking_config(thinking, default_thinking_level(self.model())));
             let (response_mime_type, response_schema) = request
                 .response_format
                 .as_ref()
@@ -1021,7 +1053,7 @@ mod tests {
     fn test_flash_lite_factory_creates_flash_lite_provider() {
         let provider = GeminiProvider::flash_lite("test-api-key".to_string());
 
-        assert_eq!(provider.model(), MODEL_GEMINI_2_FLASH_LITE);
+        assert_eq!(provider.model(), MODEL_GEMINI_35_FLASH_LITE);
         assert_eq!(provider.provider(), "gemini");
     }
 
@@ -1051,23 +1083,15 @@ mod tests {
 
     #[test]
     fn test_model_constants_have_expected_values() {
+        assert_eq!(MODEL_GEMINI_4_ARGON, "gemini-4-argon");
+        assert_eq!(MODEL_GEMINI_38_FLASH, "gemini-3.8-flash");
+        assert_eq!(MODEL_GEMINI_36_FLASH, "gemini-3.6-flash");
+        assert_eq!(MODEL_GEMINI_35_FLASH_LITE, "gemini-3.5-flash-lite");
         assert_eq!(MODEL_GEMINI_31_PRO, "gemini-3.1-pro-preview");
-        assert_eq!(MODEL_GEMINI_31_FLASH_LITE, "gemini-3.1-flash-lite-preview");
+        assert_eq!(MODEL_GEMINI_31_FLASH_LITE, "gemini-3.1-flash-lite");
         assert_eq!(MODEL_GEMINI_3_FLASH, "gemini-3-flash-preview");
-        assert_eq!(MODEL_GEMINI_3_PRO, "gemini-3.0-pro");
         assert_eq!(MODEL_GEMINI_25_FLASH, "gemini-2.5-flash");
         assert_eq!(MODEL_GEMINI_25_PRO, "gemini-2.5-pro");
-        assert_eq!(MODEL_GEMINI_2_FLASH, "gemini-2.0-flash");
-        assert_eq!(MODEL_GEMINI_2_FLASH_LITE, "gemini-2.0-flash-lite");
-    }
-
-    #[test]
-    fn test_gemini_20_models_reject_thinking() {
-        let provider = GeminiProvider::flash_lite("test-api-key".to_string());
-        let error = provider
-            .validate_thinking_config(Some(&ThinkingConfig::new(10_000)))
-            .unwrap_err();
-        assert!(error.to_string().contains("thinking is not supported"));
     }
 
     #[test]
@@ -1122,5 +1146,39 @@ mod tests {
             provider.effective_max_tokens(&request),
             provider.default_max_tokens()
         );
+    }
+
+    #[test]
+    fn gemini_4_argon_requests_its_documented_output_default() {
+        let provider = GeminiProvider::new("test-api-key", MODEL_GEMINI_4_ARGON);
+        let request = request_with_max_tokens(4096, false);
+        assert_eq!(provider.effective_max_tokens(&request), 65_536);
+    }
+
+    #[tokio::test]
+    async fn gemini_4_argon_refuses_an_explicit_cache_reference() -> anyhow::Result<()> {
+        use futures::StreamExt as _;
+
+        let provider = GeminiProvider::new("test-api-key", MODEL_GEMINI_4_ARGON)
+            .with_base_url("http://127.0.0.1:9");
+        let mut request = request_with_max_tokens(1024, true);
+        request.cached_content = Some("cachedContents/example".to_owned());
+
+        let ChatOutcome::InvalidRequest(message) = provider.chat(request.clone()).await? else {
+            anyhow::bail!("chat must refuse before dispatch");
+        };
+        assert!(message.contains("cachedContent"), "{message}");
+
+        let first = provider
+            .chat_stream(request)
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("stream ended without a delta"))??;
+        let StreamDelta::Error { message, kind } = first else {
+            anyhow::bail!("stream must refuse before dispatch, got {first:?}");
+        };
+        assert_eq!(kind, StreamErrorKind::InvalidRequest);
+        assert!(message.contains("cachedContent"), "{message}");
+        Ok(())
     }
 }

@@ -168,15 +168,68 @@ pub struct ApiThinkingConfig {
     pub include_thoughts: Option<bool>,
 }
 
+/// `model` without a Google Cloud `@version` suffix.
+fn model_family(model: &str) -> &str {
+    model.split_once('@').map_or(model, |(family, _)| family)
+}
+
+fn is_gemini_4_argon(model: &str) -> bool {
+    model_family(model).eq_ignore_ascii_case("gemini-4-argon")
+}
+
+/// The `thinkingLevel` a Gemini model applies when a request names none
+/// (ai.google.dev/gemini-api/docs/thinking). A deprecated id takes the
+/// default of the model Google now serves it with.
+#[must_use]
+pub fn default_thinking_level(model: &str) -> &'static str {
+    let family = model_family(model).to_ascii_lowercase();
+    match family.as_str() {
+        "gemini-4-argon" | "gemini-3.8-flash" | "gemini-3.7-flash" | "gemini-3.6-flash"
+        | "gemini-3.5-flash" => "MEDIUM",
+        "gemini-3.5-flash-lite" => "MINIMAL",
+        _ => "HIGH",
+    }
+}
+
+/// Why a request cannot carry `cachedContent` for `model`, if it cannot.
+///
+/// Gemini 4 Argon has no explicit caching. Dropping the reference would
+/// silently drop the cached prefix from the conversation, so the request
+/// is refused instead.
+#[must_use]
+pub fn explicit_cache_refusal(model: &str, cached_content: Option<&str>) -> Option<String> {
+    (cached_content.is_some() && is_gemini_4_argon(model)).then(|| {
+        format!("explicit context caching (cachedContent) is not supported for model={model}")
+    })
+}
+
+/// Read timeout for a non-streaming request to `model`. Google asks for at
+/// least 15 minutes on Gemini 4 Argon, whose hard prompts take several
+/// minutes.
+#[must_use]
+pub fn non_streaming_read_timeout(model: &str, default_secs: u64) -> std::time::Duration {
+    const GEMINI_4_ARGON_READ_TIMEOUT_SECS: u64 = 900;
+    let secs = if is_gemini_4_argon(model) {
+        default_secs.max(GEMINI_4_ARGON_READ_TIMEOUT_SECS)
+    } else {
+        default_secs
+    };
+    std::time::Duration::from_secs(secs)
+}
+
 /// Map an agent-sdk `ThinkingConfig` to the Gemini API thinking level.
 ///
-/// Gemini 3 models use `thinkingLevel` with values:
-/// - `MINIMAL`: near-zero thinking (Flash/Flash-Lite only, not Pro)
+/// Gemini 3 and later models use `thinkingLevel` with values:
+/// - `MINIMAL`: near-zero thinking (some Flash/Flash-Lite models only)
 /// - `LOW`: minimal latency and cost
 /// - `MEDIUM`: balanced
-/// - `HIGH`: maximum reasoning depth (default, dynamic)
+/// - `HIGH`: maximum reasoning depth
+///
+/// A config with no effort and no budget sends `model_default_level`, the
+/// level [`default_thinking_level`] reports for the serving model.
 pub const fn map_thinking_config(
     config: &agent_sdk_foundation::llm::ThinkingConfig,
+    model_default_level: &'static str,
 ) -> ApiThinkingConfig {
     use agent_sdk_foundation::llm::{Effort, ThinkingDisplay, ThinkingMode};
     let include_thoughts = match config.display {
@@ -197,8 +250,7 @@ pub const fn map_thinking_config(
         };
     }
     let level = match &config.mode {
-        // Adaptive / provider-default → let the model decide (HIGH = dynamic)
-        ThinkingMode::Adaptive | ThinkingMode::Default => "HIGH",
+        ThinkingMode::Adaptive | ThinkingMode::Default => model_default_level,
         // Explicit budget: map to LOW / MEDIUM / HIGH
         ThinkingMode::Enabled { budget_tokens } => {
             if *budget_tokens <= 4_096 {
@@ -1149,11 +1201,11 @@ mod tests {
         use agent_sdk_foundation::llm::{ThinkingConfig, ThinkingDisplay};
 
         let config = ThinkingConfig::adaptive().with_display(ThinkingDisplay::Summarized);
-        let api = map_thinking_config(&config);
+        let api = map_thinking_config(&config, "HIGH");
         assert_eq!(api.include_thoughts, Some(true));
 
         let default_display = ThinkingConfig::adaptive();
-        let api = map_thinking_config(&default_display);
+        let api = map_thinking_config(&default_display, "HIGH");
         assert_eq!(api.include_thoughts, None);
     }
 
@@ -2125,5 +2177,87 @@ mod tests {
             .map(|v| v.as_str().unwrap_or_default())
             .collect();
         assert_eq!(required, vec!["name"]);
+    }
+
+    #[test]
+    fn provider_default_thinking_follows_each_models_documented_level() {
+        for (model, level) in [
+            ("gemini-4-argon", "MEDIUM"),
+            ("gemini-4-argon@001", "MEDIUM"),
+            ("gemini-3.8-flash", "MEDIUM"),
+            ("gemini-3.7-flash", "MEDIUM"),
+            ("gemini-3.6-flash", "MEDIUM"),
+            ("gemini-3.5-flash", "MEDIUM"),
+            ("gemini-3.5-flash-lite", "MINIMAL"),
+            ("gemini-3.1-pro-preview", "HIGH"),
+            ("gemini-3-flash-preview", "HIGH"),
+        ] {
+            assert_eq!(default_thinking_level(model), level, "{model}");
+        }
+    }
+
+    #[test]
+    fn gemini_4_argon_request_sends_medium_thinking_and_no_sampling_params() -> anyhow::Result<()> {
+        use agent_sdk_foundation::llm::{Effort, ThinkingConfig, ThinkingMode};
+
+        let provider_default = ThinkingConfig {
+            mode: ThinkingMode::Default,
+            ..ThinkingConfig::adaptive()
+        };
+        let request = ApiGenerateContentRequest {
+            contents: &[],
+            system_instruction: None,
+            tools: None,
+            tool_config: None,
+            generation_config: Some(ApiGenerationConfig {
+                max_output_tokens: Some(65_536),
+                thinking_config: Some(map_thinking_config(
+                    &provider_default,
+                    default_thinking_level("gemini-4-argon"),
+                )),
+                response_mime_type: None,
+                response_schema: None,
+            }),
+            cached_content: None,
+        };
+        let json = serde_json::to_value(&request)?;
+        let generation = &json["generationConfig"];
+        assert_eq!(generation["thinkingConfig"]["thinkingLevel"], "MEDIUM");
+        for sampling in ["temperature", "topP", "topK"] {
+            assert!(generation.get(sampling).is_none(), "{sampling} sent");
+        }
+
+        for (effort, level) in [
+            (Effort::Low, "LOW"),
+            (Effort::Medium, "MEDIUM"),
+            (Effort::High, "HIGH"),
+            (Effort::Max, "HIGH"),
+        ] {
+            let config = ThinkingConfig::default_with_effort(effort);
+            let api = map_thinking_config(&config, default_thinking_level("gemini-4-argon"));
+            assert_eq!(api.thinking_level, level, "{effort:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn only_gemini_4_argon_refuses_an_explicit_cache_reference() {
+        let cache = Some("cachedContents/example");
+        assert!(explicit_cache_refusal("gemini-4-argon", cache).is_some());
+        assert!(explicit_cache_refusal("gemini-4-argon@001", cache).is_some());
+        assert!(explicit_cache_refusal("gemini-4-argon", None).is_none());
+        assert!(explicit_cache_refusal("gemini-3.8-flash", cache).is_none());
+    }
+
+    #[test]
+    fn gemini_4_argon_waits_at_least_fifteen_minutes_for_a_response() {
+        assert_eq!(
+            non_streaming_read_timeout("gemini-4-argon", 300),
+            std::time::Duration::from_mins(15)
+        );
+        assert_eq!(
+            non_streaming_read_timeout("gemini-3.8-flash", 300),
+            std::time::Duration::from_secs(300)
+        );
     }
 }
