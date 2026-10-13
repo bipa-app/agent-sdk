@@ -345,11 +345,11 @@ struct AskUserInput {
     header: Option<String>,
 
     /// Optional list of choices for multiple-choice questions.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::primitive_tools::null_as_default")]
     options: Vec<OptionInput>,
 
     /// Whether multiple options can be selected.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::primitive_tools::null_as_default")]
     multi_select: bool,
 }
 
@@ -486,6 +486,62 @@ impl<Ctx: Send + Sync + 'static> Tool<Ctx> for AskUserQuestionTool {
 mod tests {
     use super::*;
     use crate::Tool;
+
+    fn parse_ask_user_input(input: Value) -> Result<AskUserInput, serde_json::Error> {
+        AskUserInput::deserialize(input)
+    }
+
+    #[test]
+    fn ask_user_input_treats_null_optional_fields_as_absent() -> anyhow::Result<()> {
+        let input = parse_ask_user_input(json!({
+            "question": "q",
+            "header": null,
+            "options": null,
+            "multi_select": null
+        }))?;
+        assert_eq!(input.header, None);
+        assert!(input.options.is_empty());
+        assert!(!input.multi_select);
+
+        let with_option = parse_ask_user_input(json!({
+            "question": "q",
+            "options": [{"label": "a", "description": null}]
+        }))?;
+        assert_eq!(with_option.options.len(), 1);
+        assert_eq!(with_option.options[0].description, None);
+        Ok(())
+    }
+
+    #[test]
+    fn ask_user_input_keeps_explicit_and_absent_fields() -> anyhow::Result<()> {
+        let absent = parse_ask_user_input(json!({"question": "q"}))?;
+        assert!(absent.options.is_empty());
+        assert!(!absent.multi_select);
+        let explicit = parse_ask_user_input(json!({
+            "question": "q",
+            "options": [{"label": "a", "description": "d"}],
+            "multi_select": true
+        }))?;
+        assert_eq!(explicit.options.len(), 1);
+        assert!(explicit.multi_select);
+        Ok(())
+    }
+
+    #[test]
+    fn ask_user_input_still_rejects_wrongly_typed_fields() {
+        for (field, value, expected) in [
+            ("options", json!("a"), "expected a sequence"),
+            ("multi_select", json!("yes"), "expected a boolean"),
+        ] {
+            let mut input = json!({"question": "q"});
+            input[field] = value;
+            let error = parse_ask_user_input(input)
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default();
+            assert!(error.contains(expected), "{field}: {error}");
+        }
+    }
 
     #[test]
     fn test_confirmation_request_new() {

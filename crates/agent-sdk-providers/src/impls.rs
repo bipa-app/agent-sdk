@@ -23,7 +23,7 @@ pub mod openai_reasoning;
 #[cfg(feature = "openai")]
 pub mod openai_responses;
 #[cfg(any(feature = "openai", feature = "openai-codex"))]
-pub(crate) mod openai_schema;
+pub mod openai_schema;
 #[cfg(feature = "openai")]
 pub(crate) mod tool_call_ids;
 #[cfg(feature = "vertex")]

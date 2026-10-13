@@ -30,15 +30,26 @@ struct GrepInput {
     #[serde(default)]
     path: Option<String>,
     /// Search recursively in directories (default: true)
-    #[serde(default = "default_recursive")]
+    #[serde(
+        default = "default_recursive",
+        deserialize_with = "deserialize_recursive"
+    )]
     recursive: bool,
     /// Case insensitive search (default: false)
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::null_as_default")]
     case_insensitive: bool,
 }
 
 const fn default_recursive() -> bool {
     true
+}
+
+fn deserialize_recursive<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<bool>::deserialize(deserializer)
+        .map(|recursive| recursive.unwrap_or_else(default_recursive))
 }
 
 impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for GrepTool<E> {
@@ -191,6 +202,52 @@ fn truncate_line(s: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
     use crate::{AgentCapabilities, InMemoryFileSystem};
+
+    fn parse_grep_input(input: Value) -> Result<GrepInput, serde_json::Error> {
+        GrepInput::deserialize(input)
+    }
+
+    #[test]
+    fn grep_input_treats_null_flags_as_their_defaults() -> anyhow::Result<()> {
+        let input = parse_grep_input(json!({
+            "pattern": "x",
+            "path": null,
+            "recursive": null,
+            "case_insensitive": null
+        }))?;
+        assert_eq!(input.path, None);
+        assert!(input.recursive);
+        assert!(!input.case_insensitive);
+        Ok(())
+    }
+
+    #[test]
+    fn grep_input_keeps_explicit_and_absent_flags() -> anyhow::Result<()> {
+        let absent = parse_grep_input(json!({"pattern": "x"}))?;
+        assert!(absent.recursive);
+        assert!(!absent.case_insensitive);
+        let explicit = parse_grep_input(json!({
+            "pattern": "x",
+            "recursive": false,
+            "case_insensitive": true
+        }))?;
+        assert!(!explicit.recursive);
+        assert!(explicit.case_insensitive);
+        Ok(())
+    }
+
+    #[test]
+    fn grep_input_still_rejects_non_boolean_flags() {
+        for field in ["recursive", "case_insensitive"] {
+            let mut input = json!({"pattern": "x"});
+            input[field] = json!("yes");
+            let error = parse_grep_input(input)
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default();
+            assert!(error.contains("expected a boolean"), "{field}: {error}");
+        }
+    }
 
     fn create_test_tool(
         fs: Arc<InMemoryFileSystem>,

@@ -125,16 +125,15 @@ pub(crate) fn truncate_str(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
-pub(super) fn deserialize_usize_from_string_or_int<'de, D>(
-    deserializer: D,
-) -> Result<usize, D::Error>
+/// Deserialize an optional tool-input field whose absence and explicit `null`
+/// both mean `T::default()`. `OpenAI` strict mode makes every optional property
+/// required-but-nullable, so models send `null` for fields they leave unset.
+pub(crate) fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
 {
-    match StringOrUsize::deserialize(deserializer)? {
-        StringOrUsize::Number(value) => Ok(value),
-        StringOrUsize::String(value) => parse_numeric_string(&value).map_err(de::Error::custom),
-    }
+    Option::<T>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 #[cfg(test)]

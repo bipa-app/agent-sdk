@@ -42,6 +42,11 @@ impl std::error::Error for StrictSchemaError {}
 /// be required. Optional properties therefore become nullable required
 /// properties. A schema with dynamic property names cannot be converted this
 /// way without changing its contract, so it is rejected before any mutation.
+///
+/// # Errors
+///
+/// Returns the [`StrictSchemaError`] that makes `schema` inexpressible in
+/// strict mode.
 pub fn normalized_strict_schema(
     schema: &serde_json::Value,
 ) -> Result<serde_json::Value, StrictSchemaError> {
