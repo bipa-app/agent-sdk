@@ -50,8 +50,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a decision no person made. An unset field encodes nothing, so stored
   idempotency fingerprints are unchanged, but Rust struct literals of
   `DecideConfirmationRequest` must add the field when they bump.
+- **Gemini 4 Argon and the current Gemini lineup.** The catalog adds
+  `gemini-4-argon` (1,048,576-token window shared by input, thinking and
+  output; 65,536 synchronous output; introductory $2 / $10 / $0.10 per 1M
+  tokens through 2026-11-30), `gemini-3.8-flash`, `gemini-3.6-flash`,
+  `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`, and `gemini-3.7-flash`
+  (deprecated; Google serves it as 3.8 Flash). Gemini and Vertex refuse a
+  `cached_content` reference on Argon, which has no explicit caching, and
+  wait up to 15 minutes for its non-streaming responses. New constants
+  `MODEL_GEMINI_4_ARGON`, `MODEL_GEMINI_38_FLASH`, `MODEL_GEMINI_36_FLASH`,
+  `MODEL_GEMINI_35_FLASH_LITE`.
 
 ### Changed
+- **Gemini catalog.** Rows for the shut-down `gemini-2.0-flash`,
+  `gemini-2.0-flash-lite`, `gemini-3.1-flash-lite-preview` and `gemini-3.0-pro`
+  are removed; those ids now resolve as unknown models.
+  `MODEL_GEMINI_31_FLASH_LITE` names the GA `gemini-3.1-flash-lite`,
+  `GeminiProvider::flash_lite` builds `gemini-3.5-flash-lite`, and
+  `MODEL_GEMINI_2_FLASH`, `MODEL_GEMINI_2_FLASH_LITE` and `MODEL_GEMINI_3_PRO`
+  are deprecated. A Gemini request with provider-default thinking sends the
+  serving model's documented default level (`MEDIUM` on Argon, 3.8 Flash and
+  3.6 Flash; `MINIMAL` on 3.5 Flash-Lite) instead of always `HIGH`.
 - **Breaking: a batch's mutating calls run alone and in model order.** A
   model that emits `[edit, edit, bash "cargo test"]` in one response expects
   the test to see both edits. The durable worker spawned every call of a batch

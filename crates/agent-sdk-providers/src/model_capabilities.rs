@@ -282,6 +282,8 @@ const ANTHROPIC_MYTHOS_5_URL: &str = "https://platform.claude.com/docs/en/models
 const OPENAI_GPT55_URL: &str = "https://developers.openai.com/api/docs/models/gpt-5.5";
 const GOOGLE_GEMINI35_FLASH_URL: &str =
     "https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash";
+const GOOGLE_GEMINI4_ARGON_URL: &str = "https://ai.google.dev/gemini-api/docs/latest-model";
+const GOOGLE_CHANGELOG_URL: &str = "https://ai.google.dev/gemini-api/docs/changelog";
 
 // Open-model routes. All reached through OpenAIProvider (provider()=="openai"),
 // whether via OpenRouter slugs or the native z.ai / Moonshot / MiniMax base URLs.
@@ -1043,6 +1045,66 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
     // Gemini
     ModelCapabilities {
         provider: "gemini",
+        model_id: "gemini-4-argon",
+        context_window: Some(1_048_576),
+        max_output_tokens: Some(65_536),
+        default_max_tokens: None,
+        pricing: Some(Pricing::flat_with_cached(2.0, 10.0, 0.10).with_notes("Introductory rate through 2026-11-30: $2 input / $10 output including thinking / $0.10 cached input per 1M tokens. From 2026-12-01 the rate is $4 / $20 / $0.20. Implicit caching only, on prompts of at least 4,096 tokens.")),
+        supports_thinking: true,
+        supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
+        default_reasoning: DefaultReasoning::On,
+        source_url: GOOGLE_GEMINI4_ARGON_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("GA 2026-10-13. Input, thinking and output share one 1,048,576-token window. A synchronous response defaults to and stops at 65,536 output tokens; longer decodes need background execution on the Interactions API. thinking_level low / medium / high, default medium; `minimal` is not accepted. temperature, top_p and top_k are ignored. Explicit caching (`cachedContents`) is not supported. Not on the Free tier."),
+    },
+    ModelCapabilities {
+        provider: "gemini",
+        model_id: "gemini-3.8-flash",
+        context_window: Some(1_048_576),
+        max_output_tokens: Some(65_536),
+        default_max_tokens: None,
+        pricing: Some(Pricing::flat_with_cached(0.75, 3.75, 0.075).with_notes("Introductory rate through 2026-12-31: $0.75 input / $3.75 output including thinking / $0.075 cached input per 1M tokens. From 2027-01-01 the rate is $1.50 / $7.50 / $0.15.")),
+        supports_thinking: true,
+        supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
+        default_reasoning: DefaultReasoning::On,
+        source_url: GOOGLE_PRICING_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("GA 2026-09-02. thinking_level low / medium / high, default medium; `minimal` returns an error (ai.google.dev/gemini-api/docs/models/gemini-3.8-flash). max_output_tokens covers thinking plus output."),
+    },
+    ModelCapabilities {
+        provider: "gemini",
+        model_id: "gemini-3.7-flash",
+        context_window: Some(1_048_576),
+        max_output_tokens: Some(65_536),
+        default_max_tokens: None,
+        pricing: None,
+        supports_thinking: true,
+        supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
+        default_reasoning: DefaultReasoning::On,
+        source_url: GOOGLE_CHANGELOG_URL,
+        source_status: SourceStatus::Derived,
+        notes: Some("Deprecated 2026-10-08: Google routes `gemini-3.7-flash` requests to `gemini-3.8-flash`, and the pricing page no longer lists a 3.7 Flash rate. Limits are those of gemini-3.8-flash, the model that serves it."),
+    },
+    ModelCapabilities {
+        provider: "gemini",
+        model_id: "gemini-3.6-flash",
+        context_window: Some(1_048_576),
+        max_output_tokens: Some(65_536),
+        default_max_tokens: None,
+        pricing: Some(Pricing::flat_with_cached(0.75, 3.75, 0.075).with_notes("Introductory rate through 2026-12-31: $0.75 input / $3.75 output including thinking / $0.075 cached input per 1M tokens. From 2027-01-01 the rate is $1.50 / $7.50 / $0.15.")),
+        supports_thinking: true,
+        supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
+        default_reasoning: DefaultReasoning::On,
+        source_url: GOOGLE_PRICING_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("thinking_level minimal / low / medium / high, default medium (ai.google.dev/gemini-api/docs/thinking). max_output_tokens covers thinking plus output."),
+    },
+    ModelCapabilities {
+        provider: "gemini",
         model_id: "gemini-3.5-flash",
         context_window: Some(1_048_576),
         max_output_tokens: Some(65_536),
@@ -1055,6 +1117,36 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         source_url: GOOGLE_GEMINI35_FLASH_URL,
         source_status: SourceStatus::Official,
         notes: Some("Deprecated: Google routes `gemini-3.5-flash` requests to `gemini-3.6-flash`, and the pricing page no longer lists a 3.5 Flash rate. Limits are the model page's 1,048,576 input and 65,536 output tokens."),
+    },
+    ModelCapabilities {
+        provider: "gemini",
+        model_id: "gemini-3.5-flash-lite",
+        context_window: Some(1_048_576),
+        max_output_tokens: Some(65_536),
+        default_max_tokens: None,
+        pricing: Some(Pricing::flat_with_cached(0.30, 2.50, 0.03).with_notes("Official text / image / video / audio pricing per 1M tokens.")),
+        supports_thinking: true,
+        supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
+        default_reasoning: DefaultReasoning::On,
+        source_url: GOOGLE_PRICING_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("thinking_level minimal / low / medium / high, default minimal (ai.google.dev/gemini-api/docs/thinking). max_output_tokens covers thinking plus output."),
+    },
+    ModelCapabilities {
+        provider: "gemini",
+        model_id: "gemini-3.1-flash-lite",
+        context_window: Some(1_048_576),
+        max_output_tokens: Some(65_536),
+        default_max_tokens: None,
+        pricing: Some(Pricing::flat_with_cached(0.25, 1.50, 0.025).with_notes("Official text / image / video pricing per 1M tokens. Audio input is priced separately at $0.50 (cached $0.05).")),
+        supports_thinking: true,
+        supports_adaptive_thinking: false,
+        rejects_budget_thinking: false,
+        default_reasoning: DefaultReasoning::On,
+        source_url: GOOGLE_PRICING_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("Thinks by default: Google states \"Gemini models engage in dynamic thinking by default\" (ai.google.dev/gemini-api/docs/thinking). max_output_tokens covers thinking plus output."),
     },
     ModelCapabilities {
         provider: "gemini",
@@ -1088,21 +1180,6 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
     },
     ModelCapabilities {
         provider: "gemini",
-        model_id: "gemini-3.1-flash-lite-preview",
-        context_window: Some(1_048_576),
-        max_output_tokens: Some(65_536),
-        default_max_tokens: None,
-        pricing: None,
-        supports_thinking: true,
-        supports_adaptive_thinking: false,
-        rejects_budget_thinking: false,
-        default_reasoning: DefaultReasoning::On,
-        source_url: GOOGLE_MODELS_URL,
-        source_status: SourceStatus::Unverified,
-        notes: Some("Model presence confirmed from Google docs, but pricing was not extracted in this pass. Thinks by default: Google states \"Gemini models engage in dynamic thinking by default\" (ai.google.dev/gemini-api/docs/thinking) and OpenRouter reports its reasoning enabled by default at minimal effort; max_output_tokens covers thinking plus output."),
-    },
-    ModelCapabilities {
-        provider: "gemini",
         model_id: "gemini-3-flash-preview",
         context_window: Some(1_048_576),
         max_output_tokens: Some(65_536),
@@ -1133,21 +1210,6 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
     },
     ModelCapabilities {
         provider: "gemini",
-        model_id: "gemini-3.0-pro",
-        context_window: Some(1_048_576),
-        max_output_tokens: Some(65_536),
-        default_max_tokens: None,
-        pricing: None,
-        supports_thinking: true,
-        supports_adaptive_thinking: false,
-        rejects_budget_thinking: false,
-        default_reasoning: DefaultReasoning::On,
-        source_url: GOOGLE_MODELS_URL,
-        source_status: SourceStatus::Unverified,
-        notes: Some("Model presence confirmed from Google docs, but pricing was not extracted in this pass. Thinks by default and max_output_tokens covers thinking plus output (ai.google.dev/gemini-api/docs/thinking: \"gemini-3-pro-preview On (high)\", the model this alias names)."),
-    },
-    ModelCapabilities {
-        provider: "gemini",
         model_id: "gemini-2.5-flash",
         context_window: Some(1_000_000),
         max_output_tokens: Some(65_536),
@@ -1175,36 +1237,6 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         source_url: GOOGLE_MODELS_URL,
         source_status: SourceStatus::Unverified,
         notes: Some("Model presence confirmed from Google docs, but pricing was not extracted in this pass. Thinks by default and max_output_tokens covers thinking plus output (ai.google.dev/gemini-api/docs/thinking: \"gemini-2.5-pro On\"); OpenRouter marks its reasoning mandatory."),
-    },
-    ModelCapabilities {
-        provider: "gemini",
-        model_id: "gemini-2.0-flash",
-        context_window: Some(1_000_000),
-        max_output_tokens: Some(8_192),
-        default_max_tokens: None,
-        pricing: Some(Pricing::flat(0.10, 0.40).with_notes("Official text/image/video pricing. Audio input is priced separately at $0.70 / 1M tokens.")),
-        supports_thinking: false,
-        supports_adaptive_thinking: false,
-        rejects_budget_thinking: false,
-        default_reasoning: DefaultReasoning::Off,
-        source_url: GOOGLE_PRICING_URL,
-        source_status: SourceStatus::Official,
-        notes: None,
-    },
-    ModelCapabilities {
-        provider: "gemini",
-        model_id: "gemini-2.0-flash-lite",
-        context_window: Some(1_000_000),
-        max_output_tokens: Some(8_192),
-        default_max_tokens: None,
-        pricing: Some(Pricing::flat(0.075, 0.30)),
-        supports_thinking: false,
-        supports_adaptive_thinking: false,
-        rejects_budget_thinking: false,
-        default_reasoning: DefaultReasoning::Off,
-        source_url: GOOGLE_PRICING_URL,
-        source_status: SourceStatus::Official,
-        notes: None,
     },
     // Open models (z.ai / Moonshot / DeepSeek / MiniMax). All routed through
     // OpenAIProvider, so provider == "openai" and the model_id is the exact
@@ -1850,7 +1882,9 @@ mod tests {
             ("openai", "kimi-k2.5", On),
             ("gemini", "gemini-2.5-pro", On),
             ("gemini", "gemini-3.1-pro-preview", On),
-            ("gemini", "gemini-2.0-flash", Off),
+            ("gemini", "gemini-4-argon", On),
+            ("gemini", "gemini-3.8-flash", On),
+            ("gemini", "gemini-3.5-flash-lite", On),
         ] {
             let caps = get_model_capabilities(provider, model)
                 .with_context(|| format!("{provider}/{model} capabilities missing"))?;
@@ -2031,6 +2065,81 @@ mod tests {
         assert!(caps.supports_adaptive_thinking);
         assert!(caps.supports_thinking);
         assert_eq!(caps.source_status, SourceStatus::Official);
+    }
+
+    #[test]
+    fn gemini_4_argon_row_matches_the_launch_docs() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        let argon = get_model_capabilities("gemini", "gemini-4-argon")
+            .context("gemini-4-argon capabilities missing")?;
+        assert_eq!(argon.context_window, Some(1_048_576));
+        assert_eq!(argon.max_output_tokens, Some(65_536));
+        assert_eq!(argon.default_output_tokens(), Some(65_536));
+        assert!(argon.supports_thinking);
+        assert!(!argon.supports_adaptive_thinking);
+        assert!(!argon.rejects_budget_thinking);
+        assert_eq!(argon.default_reasoning, DefaultReasoning::On);
+        assert_eq!(argon.source_status, SourceStatus::Official);
+
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cached_input_tokens: 500_000,
+            cache_creation_input_tokens: 0,
+            served_speed: None,
+            request_input_tokens: None,
+        };
+        let cost = argon
+            .estimate_cost_usd(&usage)
+            .context("gemini-4-argon is priced")?;
+        assert!((cost - (1.0 + 0.05 + 10.0)).abs() < 1e-9, "{cost}");
+        Ok(())
+    }
+
+    #[test]
+    fn gemini_catalog_lists_the_current_lineup() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        for (model, input, output, cached) in [
+            ("gemini-3.8-flash", 0.75, 3.75, 0.075),
+            ("gemini-3.6-flash", 0.75, 3.75, 0.075),
+            ("gemini-3.5-flash-lite", 0.30, 2.50, 0.03),
+            ("gemini-3.1-flash-lite", 0.25, 1.50, 0.025),
+        ] {
+            let caps = get_model_capabilities("gemini", model)
+                .with_context(|| format!("{model} capabilities missing"))?;
+            assert_eq!(
+                (caps.context_window, caps.max_output_tokens),
+                (Some(1_048_576), Some(65_536)),
+                "{model}",
+            );
+            assert!(caps.supports_thinking, "{model}");
+            let pricing = caps.pricing.with_context(|| format!("{model} unpriced"))?;
+            let rate = |point: Option<PricePoint>| point.map(|p| p.usd_per_million_tokens);
+            assert_eq!(rate(pricing.input), Some(input), "{model}");
+            assert_eq!(rate(pricing.output), Some(output), "{model}");
+            assert_eq!(rate(pricing.cached_input), Some(cached), "{model}");
+        }
+
+        for redirected in ["gemini-3.7-flash", "gemini-3.5-flash"] {
+            let caps = get_model_capabilities("gemini", redirected)
+                .with_context(|| format!("{redirected} must stay resolvable"))?;
+            assert_eq!(caps.max_output_tokens, Some(65_536), "{redirected}");
+        }
+
+        for shut_down in [
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+            "gemini-3.1-flash-lite-preview",
+            "gemini-3.0-pro",
+        ] {
+            assert!(
+                get_model_capabilities("gemini", shut_down).is_none(),
+                "{shut_down} is shut down"
+            );
+        }
+        Ok(())
     }
 
     #[test]

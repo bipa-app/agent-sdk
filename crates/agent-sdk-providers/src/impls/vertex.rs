@@ -17,7 +17,8 @@ use crate::impls::anthropic::{
 use crate::impls::gemini::data::{
     ApiContent, ApiFunctionCallingConfig, ApiGenerateContentRequest, ApiGenerateContentResponse,
     ApiGenerationConfig, ApiPart, ApiUsageMetadata, build_api_contents, build_content_blocks,
-    convert_tools_to_config, gemini_response_schema, map_finish_reason, map_thinking_config,
+    convert_tools_to_config, default_thinking_level, explicit_cache_refusal,
+    gemini_response_schema, map_finish_reason, map_thinking_config, non_streaming_read_timeout,
     stream_gemini_response,
 };
 use crate::provider::{LlmProvider, thinking_for_forced_tool};
@@ -35,7 +36,7 @@ use reqwest::StatusCode;
 pub const MODEL_GEMINI_3_FLASH: &str = "gemini-3-flash-preview";
 pub const MODEL_GEMINI_31_PRO: &str = "gemini-3.1-pro-preview";
 
-// Legacy Gemini 3.0 Pro model kept for explicit opt-in.
+#[deprecated(note = "Google shut gemini-3-pro-preview down; use MODEL_GEMINI_31_PRO")]
 pub const MODEL_GEMINI_3_PRO: &str = "gemini-3.0-pro";
 
 /// The Anthropic API version used for Claude models on Vertex AI.
@@ -352,6 +353,11 @@ impl VertexProvider {
         if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
             return Ok(ChatOutcome::InvalidRequest(error.to_string()));
         }
+        if let Some(refusal) =
+            explicit_cache_refusal(self.model(), request.cached_content.as_deref())
+        {
+            return Ok(ChatOutcome::InvalidRequest(refusal));
+        }
         let contents = build_api_contents(&request.messages);
         let tools = request
             .tools
@@ -374,7 +380,9 @@ impl VertexProvider {
             })
         };
 
-        let thinking_config = thinking.as_ref().map(map_thinking_config);
+        let thinking_config = thinking
+            .as_ref()
+            .map(|thinking| map_thinking_config(thinking, default_thinking_level(self.model())));
         let (response_mime_type, response_schema) =
             request.response_format.as_ref().map_or((None, None), |rf| {
                 (
@@ -410,7 +418,10 @@ impl VertexProvider {
             .client
             .post(&url)
             .header("Content-Type", "application/json")
-            .timeout(std::time::Duration::from_secs(CHAT_READ_TIMEOUT_SECS))
+            .timeout(non_streaming_read_timeout(
+                self.model(),
+                CHAT_READ_TIMEOUT_SECS,
+            ))
             .bearer_auth(&self.access_token)
             .json(&api_request)
             .send()
@@ -521,6 +532,15 @@ impl VertexProvider {
                 });
                 return;
             }
+            if let Some(refusal) =
+                explicit_cache_refusal(self.model(), request.cached_content.as_deref())
+            {
+                yield Ok(StreamDelta::Error {
+                    message: refusal,
+                    kind: StreamErrorKind::InvalidRequest,
+                });
+                return;
+            }
 
             let contents = build_api_contents(&request.messages);
             let tools = request
@@ -532,7 +552,9 @@ impl VertexProvider {
                 .as_ref()
                 .map(ApiFunctionCallingConfig::from_tool_choice);
             let system_instruction = build_gemini_system_instruction(&request.system);
-            let thinking_config = thinking.as_ref().map(map_thinking_config);
+            let thinking_config = thinking
+            .as_ref()
+            .map(|thinking| map_thinking_config(thinking, default_thinking_level(self.model())));
             let (response_mime_type, response_schema) =
                 gemini_response_format(request.response_format.as_ref());
 
@@ -1309,7 +1331,6 @@ mod tests {
     fn test_model_constants() {
         assert_eq!(MODEL_GEMINI_3_FLASH, "gemini-3-flash-preview");
         assert_eq!(MODEL_GEMINI_31_PRO, "gemini-3.1-pro-preview");
-        assert_eq!(MODEL_GEMINI_3_PRO, "gemini-3.0-pro");
     }
 
     #[test]
