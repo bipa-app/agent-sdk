@@ -62,6 +62,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MODEL_GEMINI_35_FLASH_LITE`.
 
 ### Changed
+- **GPT-5.6 prices.** `gpt-5.6-sol` (and the `gpt-5.6` alias) is now
+  $4 / $0.40 cached / $20 per 1M tokens, OpenAI's promotional rate through at
+  least 2026-11-21; `gpt-5.6-terra` $2 / $0.20 / $12; `gpt-5.6-luna`
+  $0.20 / $0.02 / $1.20.
 - **Gemini catalog.** Rows for the shut-down `gemini-2.0-flash`,
   `gemini-2.0-flash-lite`, `gemini-3.1-flash-lite-preview` and `gemini-3.0-pro`
   are removed; those ids now resolve as unknown models.

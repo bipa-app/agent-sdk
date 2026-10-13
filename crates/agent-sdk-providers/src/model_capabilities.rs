@@ -678,8 +678,8 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         context_window: Some(1_050_000),
         max_output_tokens: Some(128_000),
         default_max_tokens: None,
-        pricing: Some(Pricing::flat_with_cached(5.0, 30.0, 0.5).with_notes(
-            "Standard tier base rates. Cache writes cost $6.25/M input tokens. Requests with more than 272K input tokens cost 2x input and 1.5x output for the full request.",
+        pricing: Some(Pricing::flat_with_cached(4.0, 20.0, 0.4).with_notes(
+            "Standard tier promotional rates, available at least through 2026-11-21. Cache writes cost $5/M input tokens. Requests with more than 272K input tokens cost 2x input and 1.5x output for the full request.",
         )),
         supports_thinking: true,
         supports_adaptive_thinking: true,
@@ -695,8 +695,8 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         context_window: Some(1_050_000),
         max_output_tokens: Some(128_000),
         default_max_tokens: None,
-        pricing: Some(Pricing::flat_with_cached(5.0, 30.0, 0.5).with_notes(
-            "Standard tier base rates. Cache writes cost $6.25/M input tokens. Requests with more than 272K input tokens cost 2x input and 1.5x output for the full request.",
+        pricing: Some(Pricing::flat_with_cached(4.0, 20.0, 0.4).with_notes(
+            "Standard tier promotional rates, available at least through 2026-11-21. Cache writes cost $5/M input tokens. Requests with more than 272K input tokens cost 2x input and 1.5x output for the full request.",
         )),
         supports_thinking: true,
         supports_adaptive_thinking: true,
@@ -712,8 +712,8 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         context_window: Some(1_050_000),
         max_output_tokens: Some(128_000),
         default_max_tokens: None,
-        pricing: Some(Pricing::flat_with_cached(2.5, 15.0, 0.25).with_notes(
-            "Standard tier base rates. Cache writes cost $3.125/M input tokens. Requests with more than 272K input tokens cost 2x input and 1.5x output for the full request.",
+        pricing: Some(Pricing::flat_with_cached(2.0, 12.0, 0.2).with_notes(
+            "Standard tier base rates. Cache writes cost $2.50/M input tokens. Requests with more than 272K input tokens cost 2x input and 1.5x output for the full request.",
         )),
         supports_thinking: true,
         supports_adaptive_thinking: true,
@@ -729,8 +729,8 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         context_window: Some(1_050_000),
         max_output_tokens: Some(128_000),
         default_max_tokens: None,
-        pricing: Some(Pricing::flat_with_cached(1.0, 6.0, 0.1).with_notes(
-            "Standard tier base rates. Cache writes cost $1.25/M input tokens. Requests with more than 272K input tokens cost 2x input and 1.5x output for the full request.",
+        pricing: Some(Pricing::flat_with_cached(0.2, 1.2, 0.02).with_notes(
+            "Standard tier base rates. Cache writes cost $0.25/M input tokens. Requests with more than 272K input tokens cost 2x input and 1.5x output for the full request.",
         )),
         supports_thinking: true,
         supports_adaptive_thinking: true,
@@ -2002,10 +2002,10 @@ mod tests {
             ("gpt-6-sol", 2.0, 0.2, 10.0, "$2.50/M"),
             ("gpt-6.1-sol", 2.0, 0.1, 10.0, "$2.50/M"),
             ("gpt-6-luna", 0.1, 0.01, 0.5, "$0.125/M"),
-            ("gpt-5.6", 5.0, 0.5, 30.0, "$6.25/M"),
-            ("gpt-5.6-sol", 5.0, 0.5, 30.0, "$6.25/M"),
-            ("gpt-5.6-terra", 2.5, 0.25, 15.0, "$3.125/M"),
-            ("gpt-5.6-luna", 1.0, 0.1, 6.0, "$1.25/M"),
+            ("gpt-5.6", 4.0, 0.4, 20.0, "$5/M"),
+            ("gpt-5.6-sol", 4.0, 0.4, 20.0, "$5/M"),
+            ("gpt-5.6-terra", 2.0, 0.2, 12.0, "$2.50/M"),
+            ("gpt-5.6-luna", 0.2, 0.02, 1.2, "$0.25/M"),
         ] {
             let caps = get_model_capabilities("openai", model_id)
                 .with_context(|| format!("{model_id} capabilities missing"))?;
