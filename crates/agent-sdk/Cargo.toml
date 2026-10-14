@@ -133,6 +133,8 @@ trybuild = { workspace = true }
 # needed when the `macros-schema` feature is on, but dev-deps aren't
 # feature-gated, so it's always available to test code.
 schemars = { workspace = true }
+# Captures the request body the Gemini provider builds, offline.
+wiremock = { workspace = true }
 
 [[example]]
 name = "basic_agent"
