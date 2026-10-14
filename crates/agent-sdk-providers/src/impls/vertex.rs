@@ -16,7 +16,7 @@ use crate::impls::anthropic::{
 };
 use crate::impls::gemini::data::{
     ApiContent, ApiFunctionCallingConfig, ApiGenerateContentRequest, ApiGenerateContentResponse,
-    ApiGenerationConfig, ApiPart, ApiUsageMetadata, build_api_contents, build_content_blocks,
+    ApiGenerationConfig, ApiPart, build_api_contents, build_content_blocks,
     convert_tools_to_config, default_thinking_level, explicit_cache_refusal,
     gemini_response_schema, map_finish_reason, map_thinking_config, non_streaming_read_timeout,
     stream_gemini_response,
@@ -493,14 +493,7 @@ impl VertexProvider {
             .as_ref()
             .map(|r| map_finish_reason(r, has_tool_calls));
 
-        let usage = api_response
-            .usage_metadata
-            .unwrap_or(ApiUsageMetadata {
-                prompt: 0,
-                candidates: 0,
-                cached_content: 0,
-            })
-            .into_usage();
+        let usage = api_response.usage_metadata.unwrap_or_default().into_usage();
 
         Ok(ChatOutcome::Success(ChatResponse {
             id: String::new(),

@@ -678,7 +678,7 @@ pub enum ApiFinishReason {
     Other,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiUsageMetadata {
     #[serde(default, rename = "promptTokenCount")]
@@ -687,6 +687,8 @@ pub struct ApiUsageMetadata {
     pub candidates: u32,
     #[serde(default, rename = "cachedContentTokenCount")]
     pub cached_content: u32,
+    #[serde(default, rename = "thoughtsTokenCount")]
+    pub thoughts: u32,
 }
 
 impl ApiUsageMetadata {
@@ -694,7 +696,7 @@ impl ApiUsageMetadata {
         Usage {
             served_speed: None,
             input_tokens: self.prompt,
-            output_tokens: self.candidates,
+            output_tokens: self.candidates.saturating_add(self.thoughts),
             cached_input_tokens: self.cached_content,
             cache_creation_input_tokens: 0,
             request_input_tokens: Some(self.prompt),
@@ -1462,11 +1464,7 @@ mod tests {
             serde_json::from_str(json).unwrap_or_else(|e| panic!("parse failed: {e}"));
         assert_eq!(response.candidates.len(), 1);
         assert!(response.usage_metadata.is_some());
-        let usage = response.usage_metadata.unwrap_or(ApiUsageMetadata {
-            prompt: 0,
-            candidates: 0,
-            cached_content: 0,
-        });
+        let usage = response.usage_metadata.unwrap_or_default();
         assert_eq!(usage.prompt, 100);
         assert_eq!(usage.candidates, 50);
     }
@@ -1477,6 +1475,7 @@ mod tests {
             prompt: 120,
             candidates: 30,
             cached_content: 40,
+            thoughts: 0,
         }
         .into_usage();
 
@@ -1489,6 +1488,88 @@ mod tests {
         );
         assert_eq!(usage.cached_input_tokens, 40);
         assert_eq!(usage.cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn thoughts_token_count_bills_as_output() {
+        let response: ApiGenerateContentResponse = serde_json::from_str(
+            r#"{"candidates":[],"usageMetadata":{
+                "promptTokenCount":120,
+                "candidatesTokenCount":30,
+                "thoughtsTokenCount":580,
+                "cachedContentTokenCount":40,
+                "totalTokenCount":730
+            }}"#,
+        )
+        .unwrap_or_else(|e| panic!("parse failed: {e}"));
+        let metadata = response.usage_metadata.unwrap_or_default();
+        assert_eq!(metadata.thoughts, 580);
+
+        let usage = metadata.into_usage();
+        assert_eq!(usage.output_tokens, 610);
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.cached_input_tokens, 40);
+        assert_eq!(
+            usage.request_input_tokens,
+            Some(120),
+            "thinking is generated output, never prompt occupancy"
+        );
+    }
+
+    #[test]
+    fn streamed_usage_takes_the_final_cumulative_reading_with_thoughts() {
+        let mut state = GeminiStreamState::default();
+        let parse = |json: &str| -> ApiGenerateContentResponse {
+            serde_json::from_str(json).unwrap_or_else(|e| panic!("parse failed: {e}"))
+        };
+        let first = parse(
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"Hel"}]}}],
+                "usageMetadata":{"promptTokenCount":100,"thoughtsTokenCount":580,"totalTokenCount":680}}"#,
+        );
+        let last = parse(
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"lo"}]},"finishReason":"STOP"}],
+                "usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":20,
+                                 "thoughtsTokenCount":580,"totalTokenCount":700}}"#,
+        );
+
+        process_gemini_response(&mut state, first);
+        process_gemini_response(&mut state, last);
+
+        let usage = state.usage.unwrap_or_default();
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 600);
+        assert_eq!(usage.request_input_tokens, Some(100));
+    }
+
+    #[test]
+    fn gemini_cost_prices_thoughts_at_the_output_rate() {
+        let pricing =
+            crate::model_capabilities::get_model_capabilities("gemini", "gemini-3.8-flash")
+                .and_then(|caps| caps.pricing)
+                .unwrap_or_else(|| panic!("gemini-3.8-flash must be priced"));
+        let usage = ApiUsageMetadata {
+            prompt: 10_000,
+            candidates: 1_000,
+            cached_content: 0,
+            thoughts: 580,
+        }
+        .into_usage();
+
+        let cost = pricing
+            .estimate_cost_usd(&usage)
+            .unwrap_or_else(|| panic!("priced row must estimate"));
+        let input = pricing
+            .input
+            .unwrap_or_else(|| panic!("gemini-3.8-flash has an input rate"));
+        let output = pricing
+            .output
+            .unwrap_or_else(|| panic!("gemini-3.8-flash has an output rate"));
+        assert!(pricing.reasoning.is_none());
+        let expected = input.estimate_cost_usd(10_000) + output.estimate_cost_usd(1_580);
+        assert!(
+            (cost - expected).abs() < 1e-12,
+            "cost {cost} != expected {expected}"
+        );
     }
 
     #[test]
@@ -1841,11 +1922,7 @@ mod tests {
 
         let response: ApiGenerateContentResponse =
             serde_json::from_str(json).unwrap_or_else(|e| panic!("parse failed: {e}"));
-        let usage = response.usage_metadata.unwrap_or(ApiUsageMetadata {
-            prompt: 0,
-            candidates: 0,
-            cached_content: 0,
-        });
+        let usage = response.usage_metadata.unwrap_or_default();
         assert_eq!(usage.prompt, 10);
         assert_eq!(usage.candidates, 5);
         assert!(matches!(

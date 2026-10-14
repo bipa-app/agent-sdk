@@ -241,6 +241,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Gemini and Vertex Gemini count thinking tokens as output. Google reports
+  them in `thoughtsTokenCount`, outside `candidatesTokenCount`, and bills
+  them at the output rate, but the usage parser read only the candidate
+  count, so every thinking model's `output_tokens` and cost came in low.
+  `output_tokens` now includes thinking, as it already does for `OpenAI`
+  reasoning tokens and Anthropic thinking; input and context-occupancy
+  counts are unchanged.
 - Gemini and Vertex Gemini accept tool and response schemas whose `type` is
   a list, such as `"type": ["array", "null"]`. Gemini parses these schemas
   as its `Schema` proto, which takes one `type`, so it refused every request
