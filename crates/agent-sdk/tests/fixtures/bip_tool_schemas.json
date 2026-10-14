@@ -198,7 +198,7 @@
         "type": "boolean"
       },
       "issue": {
-        "description": "Issue identifier (e.g. ENG-8123) for a single-card deep view: full description, acceptance criteria, relations, last 5 comments, bound run.",
+        "description": "Issue identifier (e.g. ABC-123) for a single-card deep view: full description, acceptance criteria, relations, last 5 comments, bound run.",
         "type": "string"
       },
       "project": {
@@ -234,7 +234,7 @@
         "type": "integer"
       },
       "issue": {
-        "description": "Issue identifier, e.g. ENG-8123.",
+        "description": "Issue identifier, e.g. ABC-123.",
         "type": "string"
       },
       "priority": {
@@ -324,7 +324,7 @@
               "type": "array"
             },
             "identifier": {
-              "description": "Existing issue (e.g. ENG-8123) to update; omit to create.",
+              "description": "Existing issue (e.g. ABC-123) to update; omit to create.",
               "type": "string"
             },
             "implementing_project": {
@@ -646,7 +646,7 @@
         "type": "string"
       },
       "reviews_thread_id": {
-        "description": "The completed worker node this reviewer reviews, copied exactly from that worker result's `data.child_thread_id` (ENG-9467: a review references its executor's result by id; it never re-derives the unit). bip provisions the reviewer a throwaway worktree with that unit's diff applied; the reviewer's own writes are never merged.",
+        "description": "The completed worker node this reviewer reviews, copied exactly from that worker result's `data.child_thread_id` (ABC-456: a review references its executor's result by id; it never re-derives the unit). bip provisions the reviewer a throwaway worktree with that unit's diff applied; the reviewer's own writes are never merged.",
         "type": "string"
       },
       "task": {
@@ -681,7 +681,7 @@
     "additionalProperties": false,
     "properties": {
       "linear_issue": {
-        "description": "Linear issue identifier (e.g. ENG-8123) this node implements. bip fetches the card and builds the worker's brief from it (What to build + Acceptance criteria), refuses the spawn if the card is blocked by unfinished cards, flips the card to In Progress, and posts run-started / result comments automatically. When set, `task` becomes optional extra guidance appended to the card brief.",
+        "description": "Linear issue identifier (e.g. ABC-123) this node implements. bip fetches the card and builds the worker's brief from it (What to build + Acceptance criteria), refuses the spawn if the card is blocked by unfinished cards, flips the card to In Progress, and posts run-started / result comments automatically. When set, `task` becomes optional extra guidance appended to the card brief.",
         "type": "string"
       },
       "model": {

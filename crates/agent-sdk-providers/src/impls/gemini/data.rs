@@ -440,10 +440,12 @@ fn sanitize_schema_value(
 /// `enum` values as strings only:
 ///
 /// - `const: "v"` becomes `enum: ["v"]`; a non-string `const` is dropped.
-/// - An `enum` with a non-null, non-string value is dropped.
+/// - `null` entries leave `enum` and set `nullable: true` instead; an `enum`
+///   left with a non-string value, or with no value, is dropped.
 /// - `type: [T, "null"]` becomes `type: T, nullable: true`; a list with
 ///   several non-null types becomes an `anyOf` of single-type branches, each
-///   carrying the keywords that constrain its type.
+///   carrying the keywords that constrain its type. A node that already has
+///   an `anyOf` keeps it, and those keywords move into its matching branches.
 ///
 /// Every rewrite keeps or widens the accepted values; the runtime still
 /// validates tool input against the original schema.
@@ -454,20 +456,22 @@ fn rewrite_for_gemini_schema(node: &mut serde_json::Map<String, serde_json::Valu
     {
         node.insert("enum".to_owned(), serde_json::Value::Array(vec![constant]));
     }
-    if let Some(serde_json::Value::Array(values)) = node.get("enum")
-        && values.iter().any(|value| {
-            !matches!(
-                value,
-                serde_json::Value::String(_) | serde_json::Value::Null
-            )
-        })
-    {
-        node.remove("enum");
+    let mut nullable = false;
+    if let Some(serde_json::Value::Array(values)) = node.get_mut("enum") {
+        let before = values.len();
+        values.retain(|value| !value.is_null());
+        nullable = values.len() < before;
+        if values.is_empty() || !values.iter().all(serde_json::Value::is_string) {
+            node.remove("enum");
+        }
+    }
+    if nullable && !node.get("type").is_some_and(serde_json::Value::is_array) {
+        node.insert("nullable".to_owned(), serde_json::Value::Bool(true));
     }
     let Some(serde_json::Value::Array(kinds)) = node.get("type") else {
         return;
     };
-    let nullable = kinds.iter().any(|kind| kind == "null");
+    let nullable = nullable || kinds.iter().any(|kind| kind == "null");
     let mut non_null: Vec<String> = Vec::with_capacity(kinds.len());
     for kind in kinds.iter().filter_map(serde_json::Value::as_str) {
         if kind != "null" && !non_null.iter().any(|seen| seen == kind) {
@@ -483,7 +487,7 @@ fn rewrite_for_gemini_schema(node: &mut serde_json::Map<String, serde_json::Valu
         [kind] => {
             node.insert("type".to_owned(), serde_json::Value::from(kind.as_str()));
         }
-        [_, _, ..] if node.contains_key("anyOf") => {}
+        [_, _, ..] if node.contains_key("anyOf") => move_type_keywords_into_branches(node),
         [_, _, ..] => {
             let branches = split_type_branches(node, &non_null);
             node.insert("anyOf".to_owned(), serde_json::Value::Array(branches));
@@ -494,28 +498,62 @@ fn rewrite_for_gemini_schema(node: &mut serde_json::Map<String, serde_json::Valu
     }
 }
 
+/// A node with both a `type` list and its own `anyOf` keeps its branches:
+/// each type-specific keyword moves into the branches of its type, so none
+/// is left on the untyped parent.
+fn move_type_keywords_into_branches(node: &mut serde_json::Map<String, serde_json::Value>) {
+    let moved = remove_type_specific_keywords(node);
+    let Some(serde_json::Value::Array(branches)) = node.get_mut("anyOf") else {
+        return;
+    };
+    for branch in branches.iter_mut() {
+        let serde_json::Value::Object(branch) = branch else {
+            continue;
+        };
+        let Some(kind) = branch
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        for (key, value) in &moved {
+            if keyword_constrains(key, &kind) && !branch.contains_key(*key) {
+                branch.insert((*key).to_owned(), value.clone());
+            }
+        }
+    }
+}
+
+fn remove_type_specific_keywords(
+    node: &mut serde_json::Map<String, serde_json::Value>,
+) -> Vec<(&'static str, serde_json::Value)> {
+    GEMINI_TYPE_SPECIFIC_KEYS
+        .iter()
+        .filter_map(|(key, _)| node.remove(*key).map(|value| (*key, value)))
+        .collect()
+}
+
+fn keyword_constrains(key: &str, kind: &str) -> bool {
+    GEMINI_TYPE_SPECIFIC_KEYS
+        .iter()
+        .any(|(candidate, types)| *candidate == key && types.contains(&kind))
+}
+
 /// Build one single-type `anyOf` branch per entry of `kinds`, moving every
 /// type-specific keyword out of `node` into the branches of its types.
 fn split_type_branches(
     node: &mut serde_json::Map<String, serde_json::Value>,
     kinds: &[String],
 ) -> Vec<serde_json::Value> {
-    let mut moved: Vec<(&str, serde_json::Value)> = Vec::new();
-    for (key, _) in GEMINI_TYPE_SPECIFIC_KEYS {
-        if let Some(value) = node.remove(key) {
-            moved.push((key, value));
-        }
-    }
+    let moved = remove_type_specific_keywords(node);
     kinds
         .iter()
         .map(|kind| {
             let mut branch = serde_json::Map::new();
             branch.insert("type".to_owned(), serde_json::Value::from(kind.as_str()));
             for (key, value) in &moved {
-                let constrains = GEMINI_TYPE_SPECIFIC_KEYS
-                    .iter()
-                    .any(|(candidate, types)| candidate == key && types.contains(&kind.as_str()));
-                if constrains {
+                if keyword_constrains(key, kind) {
                     branch.insert((*key).to_owned(), value.clone());
                 }
             }
@@ -2492,6 +2530,8 @@ mod tests {
                 "level": { "type": "integer", "enum": [1, 2] },
                 "flag": { "type": "boolean", "const": true },
                 "choice": { "type": "string", "enum": ["a", null] },
+                "listed": { "type": ["string", "null"], "enum": ["x", "y", null] },
+                "only_null": { "type": "string", "enum": [null] },
                 "bound": { "type": "integer", "exclusiveMinimum": 0, "examples": [3] }
             }
         });
@@ -2512,11 +2552,53 @@ mod tests {
         );
         assert_eq!(
             sanitized["properties"]["choice"],
-            serde_json::json!({ "type": "string", "enum": ["a", null] })
+            serde_json::json!({ "type": "string", "enum": ["a"], "nullable": true })
+        );
+        assert_eq!(
+            sanitized["properties"]["listed"],
+            serde_json::json!({ "type": "string", "enum": ["x", "y"], "nullable": true })
+        );
+        assert_eq!(
+            sanitized["properties"]["only_null"],
+            serde_json::json!({ "type": "string", "nullable": true })
+        );
+        let serialized = serde_json::to_string(&sanitized).unwrap_or_default();
+        assert!(
+            !serialized.contains("null]"),
+            "a null enum value survived: {serialized}"
         );
         assert_eq!(
             sanitized["properties"]["bound"],
             serde_json::json!({ "type": "integer" })
+        );
+    }
+
+    #[test]
+    fn a_type_list_beside_any_of_moves_its_keywords_into_the_matching_branches() {
+        let schema = serde_json::json!({
+            "type": ["array", "string", "null"],
+            "items": { "type": "string" },
+            "minItems": 1,
+            "pattern": "^a",
+            "anyOf": [
+                { "type": "array" },
+                { "type": "string", "pattern": "^b" },
+                { "description": "untyped" }
+            ]
+        });
+
+        let sanitized = gemini_response_schema(&schema);
+
+        assert_eq!(
+            sanitized,
+            serde_json::json!({
+                "nullable": true,
+                "anyOf": [
+                    { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                    { "type": "string", "pattern": "^b" },
+                    { "description": "untyped" }
+                ]
+            })
         );
     }
 

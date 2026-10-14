@@ -103,9 +103,7 @@ fn rejected_constructs(schema: &Value, path: &str, found: &mut Vec<String>) {
         found.push(format!("{path}.type = {kind}"));
     }
     if let Some(Value::Array(values)) = node.get("enum")
-        && values
-            .iter()
-            .any(|value| !matches!(value, Value::String(_) | Value::Null))
+        && values.iter().any(|value| !value.is_string())
     {
         found.push(format!("{path}.enum has a non-string value"));
     }
@@ -191,7 +189,7 @@ async fn every_sent_tool_schema_parses_as_the_gemini_schema_proto() -> Result<()
 }
 
 #[tokio::test]
-async fn bip_nullable_arrays_are_sent_as_nullable() -> Result<()> {
+async fn bip_nullable_fields_are_sent_as_nullable() -> Result<()> {
     let body = gemini_request_body(bip_tools()?).await?;
 
     let declarations = body
@@ -210,6 +208,20 @@ async fn bip_nullable_arrays_are_sent_as_nullable() -> Result<()> {
     ensure!(
         inputs["items"] == json!({ "type": "string" }),
         "inputs items: {inputs}"
+    );
+
+    let browser = declarations
+        .iter()
+        .find(|declaration| declaration["name"] == "browser")
+        .context("browser is declared")?;
+    let scheme = browser
+        .pointer("/parameters/properties/scheme")
+        .context("browser.scheme is sent")?;
+    ensure!(scheme["type"] == "string", "scheme type: {scheme}");
+    ensure!(scheme["nullable"] == true, "scheme nullable: {scheme}");
+    ensure!(
+        scheme["enum"] == json!(["http", "https"]),
+        "scheme enum: {scheme}"
     );
     Ok(())
 }
