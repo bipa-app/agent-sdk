@@ -1,0 +1,832 @@
+{
+  "bash": {
+    "type": "object",
+    "properties": {
+      "command": {
+        "type": "string",
+        "description": "The shell command to execute"
+      },
+      "timeout_ms": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          }
+        ],
+        "description": "Foreground duration before the command automatically becomes a background job. Default: 120000 (2 minutes)"
+      },
+      "async": {
+        "type": "boolean",
+        "description": "Start as a daemon-managed background job immediately"
+      }
+    },
+    "required": [
+      "command"
+    ],
+    "additionalProperties": false
+  },
+  "browser": {
+    "additionalProperties": false,
+    "properties": {
+      "action": {
+        "description": "open requires scheme, host, and path; screenshot and snapshot take action alone; eval requires code; click requires selector XOR both x and y; type requires text and optionally selector/clear; select requires selector and value; scroll requires selector or delta_y; wait requires wait_for, with selector for selector waits and url_substring for url waits.",
+        "enum": [
+          "open",
+          "screenshot",
+          "snapshot",
+          "eval",
+          "click",
+          "type",
+          "select",
+          "scroll",
+          "wait"
+        ],
+        "type": "string"
+      },
+      "clear": {
+        "description": "type only; optionally clear a selector-targeted control before setting text. Null for every other action and focused typing.",
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "code": {
+        "description": "eval only; required UTF-8 JavaScript, at most 16384 bytes. Null for every other action.",
+        "maxLength": 16384,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "delta_y": {
+        "description": "scroll only; required for window scrolling and ignored in selector mode. Null for every other action.",
+        "maximum": 32768,
+        "minimum": -32768,
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "host": {
+        "description": "open only; required for open. Hostname or literal IP only; no credentials or URL delimiters. Null for every other action.",
+        "maxLength": 255,
+        "pattern": "^(\\[[0-9A-Fa-f:.]+\\]|[0-9A-Fa-f:.]+|[A-Za-z0-9.-]+)$",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "path": {
+        "description": "open only; required and fixed to the origin root. Paths are excluded so capability and signed URL material is never journaled. Null for every other action.",
+        "enum": [
+          "/",
+          null
+        ],
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "port": {
+        "description": "open only; optional port. Null for every other action.",
+        "maximum": 65535,
+        "minimum": 1,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "scheme": {
+        "description": "open only; required for open and null for every other action.",
+        "enum": [
+          "http",
+          "https",
+          null
+        ],
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "selector": {
+        "description": "CSS selector, at most 1024 UTF-8 bytes. Required for select and selector waits; optional selector mode for click/type/scroll. Null for actions that do not target elements.",
+        "maxLength": 1024,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "text": {
+        "description": "type only; required UTF-8 text, at most 16384 bytes. Null for every other action.",
+        "maxLength": 16384,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "timeout_ms": {
+        "description": "wait only; optional bounded deadline in milliseconds (1..=20000, default 10000). Null for every other action.",
+        "maximum": 20000,
+        "minimum": 1,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "url_substring": {
+        "description": "wait kind=url only; required URL substring, at most 1024 UTF-8 bytes. Match-only material that is never echoed in results. Null for every other wait kind and action.",
+        "maxLength": 1024,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "value": {
+        "description": "select only; required option value, at most 1024 UTF-8 bytes. Null for every other action.",
+        "maxLength": 1024,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "wait_for": {
+        "description": "wait only; required wait kind. selector requires selector; url requires url_substring; navigation/load take neither.",
+        "enum": [
+          "selector",
+          "url",
+          "navigation",
+          "load",
+          null
+        ],
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "x": {
+        "description": "click only; viewport CSS-pixel x coordinate. Requires y and excludes selector. Null for every other action.",
+        "maximum": 32768,
+        "minimum": 0,
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "y": {
+        "description": "click only; viewport CSS-pixel y coordinate. Requires x and excludes selector. Null for every other action.",
+        "maximum": 32768,
+        "minimum": 0,
+        "type": [
+          "number",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "action"
+    ],
+    "type": "object"
+  },
+  "linear_context": {
+    "additionalProperties": false,
+    "properties": {
+      "include_done": {
+        "description": "Include completed/canceled issues in the board snapshot. Default false.",
+        "type": "boolean"
+      },
+      "issue": {
+        "description": "Issue identifier (e.g. ABC-123) for a single-card deep view: full description, acceptance criteria, relations, last 5 comments, bound run.",
+        "type": "string"
+      },
+      "project": {
+        "description": "Project name, project ID, or Linear project URL. Omit to list active projects (id, name, state, teams) instead of a board.",
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "linear_issue_update": {
+    "additionalProperties": false,
+    "properties": {
+      "add_labels": {
+        "items": {
+          "type": "string"
+        },
+        "type": [
+          "array",
+          "null"
+        ]
+      },
+      "comment": {
+        "description": "Markdown comment to post on the issue.",
+        "type": "string"
+      },
+      "description_replace": {
+        "description": "Full description replacement. Prefer the section-level fields; this clobbers any human edits.",
+        "type": "string"
+      },
+      "estimate": {
+        "maximum": 21,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "issue": {
+        "description": "Issue identifier, e.g. ABC-123.",
+        "type": "string"
+      },
+      "priority": {
+        "maximum": 4,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "state": {
+        "description": "Workflow state name. Completed/canceled states are rejected.",
+        "type": "string"
+      },
+      "title": {
+        "type": "string"
+      },
+      "verification_criteria": {
+        "description": "Replaces the `## Acceptance criteria` section of the card body.",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      }
+    },
+    "required": [
+      "issue"
+    ],
+    "type": "object"
+  },
+  "linear_plan_apply": {
+    "additionalProperties": false,
+    "properties": {
+      "edges": {
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "blocked": {
+              "description": "ref or identifier of the issue that cannot start yet.",
+              "type": "string"
+            },
+            "blocking": {
+              "description": "ref or identifier of the issue that must finish first.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "blocked",
+            "blocking"
+          ],
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "issues": {
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "estimate": {
+              "maximum": 21,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "execution": {
+              "description": "afk = a worker can take this card to a merged diff unattended; hitl = needs human decisions mid-flight. Default afk.",
+              "enum": [
+                "afk",
+                "hitl"
+              ],
+              "type": "string"
+            },
+            "extra_sections": {
+              "description": "Additional card sections (e.g. \"What NOT to do\", \"Prior context to read first\") appended verbatim in order.",
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "body": {
+                    "type": "string"
+                  },
+                  "heading": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "heading",
+                  "body"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "identifier": {
+              "description": "Existing issue (e.g. ABC-123) to update; omit to create.",
+              "type": "string"
+            },
+            "implementing_project": {
+              "additionalProperties": false,
+              "properties": {
+                "base_branch": {
+                  "type": "string"
+                },
+                "branch_hint": {
+                  "type": "string"
+                },
+                "git_strategy": {
+                  "enum": [
+                    "worktree",
+                    "branch",
+                    "fresh-clone"
+                  ],
+                  "type": "string"
+                },
+                "project": {
+                  "description": "Short stable repo name from the project registry / mission attachment set.",
+                  "type": "string"
+                },
+                "worktree_hint": {
+                  "description": "Optional worktree-placement override (tilde-expanded).",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "project"
+              ],
+              "type": "object"
+            },
+            "labels": {
+              "description": "Label names; found or created on the team.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "milestone": {
+              "description": "Project-milestone name (e.g. \"M1: Developer Beta\"); found or created in the project.",
+              "type": "string"
+            },
+            "out_of_scope": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "parent_ref": {
+              "description": "ref or identifier of the parent (milestone/master) card.",
+              "type": "string"
+            },
+            "priority": {
+              "description": "0=none 1=urgent 2=high 3=medium 4=low",
+              "maximum": 4,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "ref": {
+              "description": "Local handle (e.g. \"t1\") that edges/parent_ref in this same call may reference before Linear ids exist.",
+              "type": "string"
+            },
+            "scope": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "state": {
+              "description": "Workflow state name. Defaults to the team's backlog state on create. Completed/canceled states are rejected.",
+              "type": "string"
+            },
+            "title": {
+              "type": "string"
+            },
+            "verification_criteria": {
+              "description": "Observable acceptance criteria (a test, command, or user-visible behavior a worker can actually check). These become the spawned worker's verification contract verbatim.",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "what_to_build": {
+              "description": "1-3 sentences of end-to-end demoable behavior. Rendered as `## What to build`.",
+              "type": "string"
+            },
+            "why": {
+              "description": "Motivation paragraph. Rendered as `## Why this exists`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "ref",
+            "title",
+            "what_to_build",
+            "verification_criteria"
+          ],
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "project": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "description": "Markdown; replaces the project description.",
+            "type": "string"
+          },
+          "id": {
+            "description": "Existing project id or name to update; omit to create a new project.",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "planned",
+              "started",
+              "paused"
+            ],
+            "type": "string"
+          },
+          "target_date": {
+            "description": "YYYY-MM-DD",
+            "type": "string"
+          },
+          "team": {
+            "description": "Team key (e.g. ENG). Required when creating.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "summary": {
+        "description": "1-3 sentences describing this board mutation; shown at the top of the user's approval prompt.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "summary"
+    ],
+    "type": "object"
+  },
+  "process_logs": {
+    "additionalProperties": false,
+    "properties": {
+      "name": {
+        "type": "string"
+      },
+      "tail_bytes": {
+        "maximum": 1048576,
+        "minimum": 0,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "name"
+    ],
+    "type": "object"
+  },
+  "process_ps": {
+    "additionalProperties": false,
+    "properties": {},
+    "type": "object"
+  },
+  "process_restart": {
+    "additionalProperties": false,
+    "properties": {
+      "name": {
+        "type": "string"
+      },
+      "ready_timeout_ms": {
+        "maximum": 600000,
+        "minimum": 1,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "name"
+    ],
+    "type": "object"
+  },
+  "process_send": {
+    "additionalProperties": false,
+    "properties": {
+      "name": {
+        "type": "string"
+      },
+      "text": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "name",
+      "text"
+    ],
+    "type": "object"
+  },
+  "process_start": {
+    "additionalProperties": false,
+    "properties": {
+      "command": {
+        "type": "string"
+      },
+      "name": {
+        "type": "string"
+      },
+      "ready_log": {
+        "type": "string"
+      },
+      "ready_port": {
+        "maximum": 65535,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "ready_timeout_ms": {
+        "maximum": 600000,
+        "minimum": 1,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "name",
+      "command"
+    ],
+    "type": "object"
+  },
+  "process_stop": {
+    "additionalProperties": false,
+    "properties": {
+      "name": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "name"
+    ],
+    "type": "object"
+  },
+  "subagent_cancel": {
+    "additionalProperties": false,
+    "properties": {
+      "reason": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "thread_id": {
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "thread_id",
+      "reason"
+    ],
+    "type": "object"
+  },
+  "subagent_inspect": {
+    "additionalProperties": false,
+    "properties": {
+      "thread_id": {
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "thread_id"
+    ],
+    "type": "object"
+  },
+  "subagent_message": {
+    "additionalProperties": false,
+    "properties": {
+      "message": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "thread_id": {
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "thread_id",
+      "message"
+    ],
+    "type": "object"
+  },
+  "subagent_review": {
+    "additionalProperties": false,
+    "properties": {
+      "model": {
+        "description": "Optional per-node model override. Beats the role's configured model. This spawn runs on its pre-assigned route (a reviewer's configured reviewer route) — leave the pair unset unless you must deliberately override that route, and then use an exact pair from `list_available_models`.",
+        "type": "string"
+      },
+      "nickname": {
+        "description": "Optional human-friendly nickname for progress events.",
+        "type": "string"
+      },
+      "project": {
+        "description": "Optional attached repo this subagent pins to — a path or repo name from the mission's attachment set. Omit to target the primary repo. Unknown values refuse the spawn and list the valid attachments.",
+        "type": "string"
+      },
+      "provider": {
+        "description": "Optional per-node provider override, paired with `model`. Beats the role's configured provider. Gateway providers ('openrouter', 'baseten', 'fireworks') route OpenAI-compatible models: bip resolves endpoints and credentials in code — name the provider, never an endpoint or key. This spawn runs on its pre-assigned route (a reviewer's configured reviewer route) — leave the pair unset unless you must deliberately override that route, and then use an exact pair from `list_available_models`.",
+        "enum": [
+          "anthropic",
+          "openai",
+          "openai-codex",
+          "gemini",
+          "openrouter",
+          "baseten",
+          "fireworks"
+        ],
+        "type": "string"
+      },
+      "reviews_thread_id": {
+        "description": "The completed worker node this reviewer reviews, copied exactly from that worker result's `data.child_thread_id` (ABC-456: a review references its executor's result by id; it never re-derives the unit). bip provisions the reviewer a throwaway worktree with that unit's diff applied; the reviewer's own writes are never merged.",
+        "type": "string"
+      },
+      "task": {
+        "description": "Task or question for the subagent to handle.",
+        "type": "string"
+      },
+      "thinking_effort": {
+        "description": "Optional per-node thinking-effort override. Raise it for deep-judgment nodes; leave it low for mechanical ones.",
+        "enum": [
+          "low",
+          "medium",
+          "high",
+          "max"
+        ],
+        "type": "string"
+      },
+      "thinking_mode": {
+        "description": "Optional per-node thinking-mode override.",
+        "enum": [
+          "enabled",
+          "adaptive"
+        ],
+        "type": "string"
+      }
+    },
+    "required": [
+      "reviews_thread_id"
+    ],
+    "type": "object"
+  },
+  "subagent_worker": {
+    "additionalProperties": false,
+    "properties": {
+      "linear_issue": {
+        "description": "Linear issue identifier (e.g. ABC-123) this node implements. bip fetches the card and builds the worker's brief from it (What to build + Acceptance criteria), refuses the spawn if the card is blocked by unfinished cards, flips the card to In Progress, and posts run-started / result comments automatically. When set, `task` becomes optional extra guidance appended to the card brief.",
+        "type": "string"
+      },
+      "model": {
+        "description": "Per-node model, exactly as `list_available_models` returned it. Beats the role's configured model. Required on this spawn: use an exact pair from `list_available_models`. Omitting the provider/model would silently run the node on the coordinator's own frontier model at frontier prices.",
+        "type": "string"
+      },
+      "nickname": {
+        "description": "Optional human-friendly nickname for progress events.",
+        "type": "string"
+      },
+      "project": {
+        "description": "Optional attached repo this subagent pins to — a path or repo name from the mission's attachment set. Omit to target the primary repo. Unknown values refuse the spawn and list the valid attachments.",
+        "type": "string"
+      },
+      "provider": {
+        "description": "Per-node provider, paired with `model` exactly as `list_available_models` returned it. Beats the role's configured provider. Gateway providers ('openrouter', 'baseten', 'fireworks') route OpenAI-compatible models: bip resolves endpoints and credentials in code — name the provider, never an endpoint or key. Required on this spawn: use an exact pair from `list_available_models`. Omitting the provider/model would silently run the node on the coordinator's own frontier model at frontier prices.",
+        "enum": [
+          "anthropic",
+          "openai",
+          "openai-codex",
+          "gemini",
+          "openrouter",
+          "baseten",
+          "fireworks"
+        ],
+        "type": "string"
+      },
+      "task": {
+        "description": "Task or question for the subagent to handle. Optional when `linear_issue` is set (becomes extra guidance appended to the card brief); required otherwise.",
+        "type": "string"
+      },
+      "thinking_effort": {
+        "description": "Optional per-node thinking-effort override. Raise it for deep-judgment nodes; leave it low for mechanical ones.",
+        "enum": [
+          "low",
+          "medium",
+          "high",
+          "max"
+        ],
+        "type": "string"
+      },
+      "thinking_mode": {
+        "description": "Optional per-node thinking-mode override.",
+        "enum": [
+          "enabled",
+          "adaptive"
+        ],
+        "type": "string"
+      },
+      "unit": {
+        "additionalProperties": false,
+        "description": "Typed unit-of-work contract (M2). MANDATORY — the runtime refuses a coordinator's read-write spawn without one.",
+        "properties": {
+          "deliverable": {
+            "description": "The exact artifact: files created/changed, answer shape, or branch state.",
+            "type": "string"
+          },
+          "depends_on": {
+            "description": "Unit ids that must be COMPLETE AND MERGED first. Naming a same-wave unit is refused — dependencies mean 'previous wave'.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "envelope": {
+            "additionalProperties": false,
+            "description": "Declared effort envelope (NOT a hard cap); feeds the watchdog escalation ladder.",
+            "properties": {
+              "max_llm_calls": {
+                "description": "Expected LLM calls (defaults: 60 worker, 30 read-only).",
+                "type": "integer"
+              },
+              "wall_secs": {
+                "description": "Expected wall time in seconds.",
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "id": {
+            "description": "Tree-unique unit id (e.g. \"U3\"). Duplicates are refused.",
+            "type": "string"
+          },
+          "inputs": {
+            "description": "Everything a FRESH agent needs: paths, prior unit ids whose results are prerequisites, doc URLs.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "objective": {
+            "description": "One imperative sentence (1-300 chars): what done means, not how.",
+            "type": "string"
+          },
+          "owns": {
+            "description": "Ownership globs. Same-wave units must own DISJOINT paths (validated at admission).",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "verify": {
+            "additionalProperties": false,
+            "description": "ONE command that proves the unit done. Mandatory for read-write units; bip runs it in the worker's worktree.",
+            "properties": {
+              "command": {
+                "description": "e.g. \"cargo test -p bip --test merge_gate\".",
+                "type": "string"
+              },
+              "cwd": {
+                "description": "Optional, relative to the unit's worktree root.",
+                "type": "string"
+              },
+              "timeout_secs": {
+                "description": "Optional; default 600s. If verification isn't cheap, the unit is too big.",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "command"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "id",
+          "objective",
+          "deliverable"
+        ],
+        "type": "object"
+      }
+    },
+    "required": [
+      "provider",
+      "model"
+    ],
+    "type": "object"
+  }
+}

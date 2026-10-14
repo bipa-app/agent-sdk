@@ -73,6 +73,7 @@ dependencies = [
  "trybuild",
  "url",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

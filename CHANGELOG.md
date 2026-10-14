@@ -241,6 +241,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Gemini and Vertex Gemini accept tool and response schemas whose `type` is
+  a list, such as `"type": ["array", "null"]`. Gemini parses these schemas
+  as its `Schema` proto, which takes one `type`, so it refused every request
+  carrying one with `400 Proto field is not repeating`. The schema
+  sanitizer now sends `[T, "null"]` as `type: T, nullable: true` and
+  several types as an `anyOf` of single-type branches. It also turns
+  `const` into a one-value `enum`, moves `null` out of an `enum` into
+  `nullable: true`, drops `enum`s with non-string values,
+  and strips `$comment`, `examples`, `exclusiveMinimum`, `exclusiveMaximum`,
+  `uniqueItems`, `prefixItems`, `deprecated` and `readOnly`, which Gemini
+  rejects in the same way. `default` and `example` values are now sent
+  verbatim instead of being sanitized as schemas.
 - Built-in tools accept `null` for every optional input field and treat it as
   absent. `OpenAI` strict mode turns optional properties into required
   nullable ones, so GPT models send `"offset": null`; `read` (`offset`),
