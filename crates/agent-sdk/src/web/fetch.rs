@@ -1,7 +1,7 @@
 //! Link fetch tool implementation.
 
 use crate::tools::{PrimitiveToolName, Tool, ToolContext};
-use crate::types::{ToolConcurrency, ToolReplay, ToolResult, ToolTier};
+use crate::types::{ToolConcurrency, ToolResult, ToolTier};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -277,10 +277,6 @@ where
 
     fn concurrency(&self) -> ToolConcurrency {
         ToolConcurrency::ReadOnly
-    }
-
-    fn replay(&self) -> ToolReplay {
-        ToolReplay::Safe
     }
 
     async fn execute(&self, _ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {

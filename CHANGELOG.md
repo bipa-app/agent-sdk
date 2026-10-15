@@ -72,7 +72,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that stopped while `bash`, `write` or `edit` ran ran the call again on
   recovery (a `git push` could happen twice). `ToolReplay` is a new tool
   property, independent of the tier: `Unsafe` by default, `Safe` for `read`,
-  `grep`, `glob`, `todo_read`, `web_search` and `link_fetch`. The tool traits
+  `grep`, `glob`, `todo_read`, `web_search` and `ask_user`. `link_fetch` stays
+  `Unsafe`: a repeated GET to a model-chosen URL can spend a one-time token or
+  fire a webhook. The tool traits
   gain `replay()`, the derives accept a `replay` attribute, and `llm::Tool`
   and `PendingToolCallInfo` carry the value (serde default `Unsafe`, so a
   continuation written before this change is never replayed).

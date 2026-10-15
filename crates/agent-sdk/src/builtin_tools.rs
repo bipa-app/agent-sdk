@@ -231,8 +231,8 @@ mod tests {
             },
         );
 
-        let safe = ["read", "glob", "grep", "todo_read", "link_fetch"];
-        let unsafe_ = ["write", "edit", "bash", "todo_write"];
+        let safe = ["read", "glob", "grep", "todo_read"];
+        let unsafe_ = ["write", "edit", "bash", "todo_write", "link_fetch"];
         let tools = registry.to_llm_tools();
         assert_eq!(tools.len(), safe.len() + unsafe_.len());
         for tool in tools {

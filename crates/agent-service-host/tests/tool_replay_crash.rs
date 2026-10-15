@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use agent_sdk::builtin_tools::{BuiltinToolsConfig, register_builtin_tools};
 use agent_sdk::todo::TodoState;
+use agent_sdk::user_interaction::AskUserQuestionTool;
 use agent_sdk::{
     AgentCapabilities, DynamicToolName, InMemoryFileSystem, Tool, ToolContext, ToolRegistry,
 };
@@ -95,10 +96,11 @@ fn auto_approved_tools() -> Vec<llm::Tool> {
             environment: Arc::new(InMemoryFileSystem::new("/workspace")),
             capabilities: AgentCapabilities::full_access(),
             todo_state: Some(Arc::new(RwLock::new(TodoState::new()))),
-            link_fetch: false,
+            link_fetch: true,
         },
     );
     registry.register(DeployTool);
+    registry.register(AskUserQuestionTool::with_channels(1).0);
     registry
         .to_llm_tools()
         .into_iter()
@@ -386,7 +388,7 @@ async fn crash_and_recover(
 
 #[tokio::test]
 async fn kill_nine_during_an_unsafe_tool_interrupts_it_instead_of_running_it_again() -> Result<()> {
-    for tool in ["bash", "write", "edit", UNDECLARED_TOOL] {
+    for tool in ["bash", "write", "edit", "link_fetch", UNDECLARED_TOOL] {
         let (_temp, store, child, runs) = crash_and_recover(tool).await?;
         ensure!(
             runs == 0,
@@ -434,25 +436,27 @@ async fn kill_nine_during_an_unsafe_tool_interrupts_it_instead_of_running_it_aga
 
 #[tokio::test]
 async fn kill_nine_during_a_safe_tool_runs_it_again() -> Result<()> {
-    let tool = "read";
-    let declared = auto_approved_tools()
-        .into_iter()
-        .find(|candidate| candidate.name == tool)
-        .context("read is not a built-in tool")?;
-    ensure!(
-        declared.replay == ToolReplay::Safe,
-        "read is not declared Safe"
-    );
+    let advertised = auto_approved_tools();
+    for tool in ["read", "ask_user"] {
+        let declared = advertised
+            .iter()
+            .find(|candidate| candidate.name == tool)
+            .with_context(|| format!("{tool} is not advertised"))?;
+        ensure!(
+            declared.replay == ToolReplay::Safe,
+            "{tool} is not declared Safe"
+        );
 
-    let (_temp, _store, child, runs) = crash_and_recover(tool).await?;
-    ensure!(
-        runs == 1,
-        "recovery ran the safe tool {runs} times, not once"
-    );
-    ensure!(
-        child.status == TaskStatus::Completed,
-        "the safe tool child is {:?}, not Completed",
-        child.status
-    );
+        let (_temp, _store, child, runs) = crash_and_recover(tool).await?;
+        ensure!(
+            runs == 1,
+            "{tool}: recovery ran the safe tool {runs} times, not once"
+        );
+        ensure!(
+            child.status == TaskStatus::Completed,
+            "{tool}: the safe tool child is {:?}, not Completed",
+            child.status
+        );
+    }
     Ok(())
 }
