@@ -778,7 +778,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         context_window: Some(400_000),
         max_output_tokens: Some(128_000),
         default_max_tokens: None,
-        pricing: Some(Pricing::flat_with_cached(1.50, 6.0, 0.375)),
+        pricing: Some(Pricing::flat_with_cached(1.75, 14.0, 0.175)),
         supports_thinking: true,
         supports_adaptive_thinking: true,
         rejects_budget_thinking: false,
@@ -808,7 +808,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         context_window: Some(400_000),
         max_output_tokens: Some(128_000),
         default_max_tokens: None,
-        pricing: Some(Pricing::flat_with_cached(0.125, 1.0, 0.0125)),
+        pricing: Some(Pricing::flat_with_cached(0.25, 2.0, 0.025)),
         supports_thinking: false,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
@@ -823,7 +823,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         context_window: Some(400_000),
         max_output_tokens: Some(128_000),
         default_max_tokens: None,
-        pricing: Some(Pricing::flat_with_cached(0.025, 0.20, 0.0025)),
+        pricing: Some(Pricing::flat_with_cached(0.05, 0.40, 0.005)),
         supports_thinking: false,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
@@ -898,7 +898,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         context_window: Some(200_000),
         max_output_tokens: Some(100_000),
         default_max_tokens: None,
-        pricing: Some(Pricing::flat(1.0, 4.0)),
+        pricing: Some(Pricing::flat_with_cached(2.0, 8.0, 0.50)),
         supports_thinking: true,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
@@ -913,7 +913,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         context_window: Some(200_000),
         max_output_tokens: Some(100_000),
         default_max_tokens: None,
-        pricing: Some(Pricing::flat(0.55, 2.20)),
+        pricing: Some(Pricing::flat_with_cached(1.10, 4.40, 0.55)),
         supports_thinking: true,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
@@ -928,7 +928,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         context_window: Some(200_000),
         max_output_tokens: Some(100_000),
         default_max_tokens: None,
-        pricing: Some(Pricing::flat(0.55, 2.20)),
+        pricing: Some(Pricing::flat_with_cached(1.10, 4.40, 0.275)),
         supports_thinking: true,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
@@ -943,7 +943,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         context_window: Some(200_000),
         max_output_tokens: Some(100_000),
         default_max_tokens: None,
-        pricing: Some(Pricing::flat(7.50, 30.0)),
+        pricing: Some(Pricing::flat_with_cached(15.0, 60.0, 7.50)),
         supports_thinking: true,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
@@ -973,7 +973,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         context_window: Some(1_000_000),
         max_output_tokens: Some(32_768),
         default_max_tokens: None,
-        pricing: Some(Pricing::flat(1.0, 4.0)),
+        pricing: Some(Pricing::flat_with_cached(2.0, 8.0, 0.50)),
         supports_thinking: false,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
@@ -988,7 +988,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         context_window: Some(1_000_000),
         max_output_tokens: Some(32_768),
         default_max_tokens: None,
-        pricing: Some(Pricing::flat(0.20, 0.80)),
+        pricing: Some(Pricing::flat_with_cached(0.40, 1.60, 0.10)),
         supports_thinking: false,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
@@ -1003,7 +1003,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         context_window: Some(1_000_000),
         max_output_tokens: Some(32_768),
         default_max_tokens: None,
-        pricing: Some(Pricing::flat(0.05, 0.20)),
+        pricing: Some(Pricing::flat_with_cached(0.10, 0.40, 0.025)),
         supports_thinking: false,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
@@ -1018,7 +1018,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         context_window: Some(128_000),
         max_output_tokens: Some(16_384),
         default_max_tokens: None,
-        pricing: Some(Pricing::flat(1.25, 5.0)),
+        pricing: Some(Pricing::flat_with_cached(2.50, 10.0, 1.25)),
         supports_thinking: false,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
@@ -1033,7 +1033,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         context_window: Some(128_000),
         max_output_tokens: Some(16_384),
         default_max_tokens: None,
-        pricing: Some(Pricing::flat(0.075, 0.30)),
+        pricing: Some(Pricing::flat_with_cached(0.15, 0.60, 0.075)),
         supports_thinking: false,
         supports_adaptive_thinking: false,
         rejects_budget_thinking: false,
@@ -1973,8 +1973,40 @@ mod tests {
     fn test_lookup_openai_pricing() {
         let caps = get_model_capabilities("openai", "gpt-4o").unwrap();
         let pricing = caps.pricing.unwrap();
-        assert!((pricing.input.unwrap().usd_per_million_tokens - 1.25).abs() < f64::EPSILON);
-        assert!((pricing.output.unwrap().usd_per_million_tokens - 5.0).abs() < f64::EPSILON);
+        assert!((pricing.input.unwrap().usd_per_million_tokens - 2.5).abs() < f64::EPSILON);
+        assert!((pricing.output.unwrap().usd_per_million_tokens - 10.0).abs() < f64::EPSILON);
+    }
+
+    /// Standard-tier rates from <https://developers.openai.com/api/docs/pricing>
+    /// (2026-10-15). These rows once carried the Batch tier, half of each rate.
+    #[test]
+    fn openai_rows_carry_standard_tier_rates() {
+        for (model, input, output, cached) in [
+            ("gpt-5.3-codex", 1.75, 14.0, 0.175),
+            ("gpt-5-mini", 0.25, 2.0, 0.025),
+            ("gpt-5-nano", 0.05, 0.40, 0.005),
+            ("o1", 15.0, 60.0, 7.50),
+            ("o3", 2.0, 8.0, 0.50),
+            ("o3-mini", 1.10, 4.40, 0.55),
+            ("o4-mini", 1.10, 4.40, 0.275),
+            ("gpt-4.1", 2.0, 8.0, 0.50),
+            ("gpt-4.1-mini", 0.40, 1.60, 0.10),
+            ("gpt-4.1-nano", 0.10, 0.40, 0.025),
+            ("gpt-4o", 2.50, 10.0, 1.25),
+            ("gpt-4o-mini", 0.15, 0.60, 0.075),
+        ] {
+            let pricing = get_model_capabilities("openai", model)
+                .and_then(|caps| caps.pricing)
+                .unwrap_or_else(|| panic!("{model} must be priced"));
+            let rate = |r: Option<PricePoint>| r.map(|r| r.usd_per_million_tokens);
+            assert_eq!(rate(pricing.input), Some(input), "{model} input");
+            assert_eq!(rate(pricing.output), Some(output), "{model} output");
+            assert_eq!(
+                rate(pricing.cached_input),
+                Some(cached),
+                "{model} cached input"
+            );
+        }
     }
 
     #[test]
@@ -2314,7 +2346,7 @@ mod tests {
                 request_input_tokens: None,
             })
             .unwrap();
-        assert!((cost - 0.0075).abs() < f64::EPSILON);
+        assert!((cost - 0.015).abs() < f64::EPSILON);
     }
 
     #[test]

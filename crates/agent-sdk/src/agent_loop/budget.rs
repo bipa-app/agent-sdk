@@ -847,8 +847,8 @@ mod tests {
     #[test]
     fn estimate_cost_for_gpt_4o_matches_pricing() -> anyhow::Result<()> {
         use anyhow::Context;
-        // gpt-4o: $1.25 / 1M input, $5.00 / 1M output.
-        // 2000 input + 1000 output = 0.0025 + 0.005 = 0.0075 USD.
+        // gpt-4o: $2.50 / 1M input, $10.00 / 1M output.
+        // 2000 input + 1000 output = 0.005 + 0.01 = 0.015 USD.
         let provenance = AuditProvenance::new("openai", "gpt-4o");
         let usage = TokenUsage {
             input_tokens: 2_000,
@@ -856,7 +856,7 @@ mod tests {
             ..Default::default()
         };
         let cost = estimate_cost_usd(None, &provenance, &usage).context("gpt-4o has pricing")?;
-        assert!((cost - 0.0075).abs() < 1e-9, "unexpected cost: {cost}");
+        assert!((cost - 0.015).abs() < 1e-9, "unexpected cost: {cost}");
         Ok(())
     }
 
@@ -1270,7 +1270,7 @@ mod catalog_tests {
         let statically_priced = estimate_cost_usd(None, &provenance, &usage)
             .context("gpt-4o is priced in the static table")?;
         assert!((cost - statically_priced).abs() < 1e-12);
-        assert!((cost - 0.0075).abs() < 1e-9, "unexpected cost: {cost}");
+        assert!((cost - 0.015).abs() < 1e-9, "unexpected cost: {cost}");
         Ok(())
     }
 
@@ -1546,12 +1546,12 @@ mod catalog_tests {
             ..Default::default()
         };
 
-        // Direct: static rate ($1.25/M in + $5/M out = $6.25), never the
+        // Direct: static rate ($2.50/M in + $10/M out = $12.50), never the
         // router's ($10/M + $15/M = $25).
         let direct = AuditProvenance::new("openai", "gpt-4o");
         let cost = estimate_cost_usd(Some(&registry), &direct, &usage)
             .context("gpt-4o is priced in the static table")?;
-        assert!((cost - 6.25).abs() < 1e-9, "unexpected direct cost: {cost}");
+        assert!((cost - 12.5).abs() < 1e-9, "unexpected direct cost: {cost}");
         let uncatalogued = estimate_cost_usd(None, &direct, &usage)
             .context("gpt-4o is priced in the static table")?;
         assert!((cost - uncatalogued).abs() < 1e-12);
