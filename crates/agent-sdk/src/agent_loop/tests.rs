@@ -6239,7 +6239,7 @@ async fn test_usage_budget_total_tokens_breach_stops_run() -> anyhow::Result<()>
 
 #[tokio::test]
 async fn test_under_budget_done_reports_estimated_cost() -> anyhow::Result<()> {
-    // gpt-4o pricing for 2000 in / 1000 out = $0.0025 + $0.005 = $0.0075.
+    // gpt-4o pricing for 2000 in / 1000 out = $0.005 + $0.01 = $0.015.
     let agent = builder::<()>()
         .provider(PricedProvider)
         .config(AgentConfig {
@@ -6267,7 +6267,7 @@ async fn test_under_budget_done_reports_estimated_cost() -> anyhow::Result<()> {
             ..
         } => {
             assert!(
-                (cost - 0.0075).abs() < 1e-9,
+                (cost - 0.015).abs() < 1e-9,
                 "unexpected estimated cost: {cost}"
             );
         }
@@ -6281,7 +6281,7 @@ async fn test_under_budget_done_reports_estimated_cost() -> anyhow::Result<()> {
         } => Some(*estimated_cost_usd),
         _ => None,
     });
-    assert_eq!(done_cost, Some(Some(0.0075)));
+    assert_eq!(done_cost, Some(Some(0.015)));
 
     Ok(())
 }
@@ -8761,9 +8761,9 @@ impl crate::llm::LlmProvider for FablePricedProvider {
 
 #[tokio::test]
 async fn test_cost_accumulates_per_model_across_rotation() -> anyhow::Result<()> {
-    // Turn 1 on gpt-4o costs $0.0075 (2000 in / 1000 out); turn 2 on
+    // Turn 1 on gpt-4o costs $0.015 (2000 in / 1000 out); turn 2 on
     // claude-fable-5 costs $0.07. The accumulated total must be the true
-    // sum ($0.0775), NOT the whole aggregate repriced at the newest model's
+    // sum ($0.085), NOT the whole aggregate repriced at the newest model's
     // rates (4000/2000 at fable = $0.14).
     let message_store = Arc::new(InMemoryStore::new());
     let state_store = Arc::new(InMemoryStore::new());
@@ -8791,7 +8791,7 @@ async fn test_cost_accumulates_per_model_across_rotation() -> anyhow::Result<()>
     else {
         anyhow::bail!("expected Done with a cost from the first run, got {state:?}");
     };
-    assert!((first_cost - 0.0075).abs() < 1e-9, "got {first_cost}");
+    assert!((first_cost - 0.015).abs() < 1e-9, "got {first_cost}");
 
     let fable_agent = builder::<()>()
         .provider(FablePricedProvider)
@@ -8815,9 +8815,9 @@ async fn test_cost_accumulates_per_model_across_rotation() -> anyhow::Result<()>
         anyhow::bail!("expected Done with a cost from the second run, got {state:?}");
     };
     assert!(
-        (total_cost - 0.0775).abs() < 1e-9,
+        (total_cost - 0.085).abs() < 1e-9,
         "each turn must be priced at the model that served it: got {total_cost}, \
-         expected 0.0775 (repricing the aggregate at fable rates would give 0.14)",
+         expected 0.085 (repricing the aggregate at fable rates would give 0.14)",
     );
 
     Ok(())
@@ -8827,8 +8827,8 @@ async fn test_cost_accumulates_per_model_across_rotation() -> anyhow::Result<()>
 async fn test_legacy_snapshot_cost_seeds_from_aggregate_once() -> anyhow::Result<()> {
     // A state snapshot predating cost accumulation (accumulated_cost_usd:
     // None with existing usage) is seeded once by repricing the aggregate
-    // at the current provenance, then accumulates normally: seed $0.0075
-    // (2000/1000 at gpt-4o) + turn 2's $0.0075 = $0.015.
+    // at the current provenance, then accumulates normally: seed $0.015
+    // (2000/1000 at gpt-4o) + turn 2's $0.015 = $0.03.
     let message_store = Arc::new(InMemoryStore::new());
     let state_store = Arc::new(InMemoryStore::new());
     let thread_id = ThreadId::new();
@@ -8872,7 +8872,7 @@ async fn test_legacy_snapshot_cost_seeds_from_aggregate_once() -> anyhow::Result
         anyhow::bail!("expected Done with a cost, got {state:?}");
     };
     assert!(
-        (cost - 0.015).abs() < 1e-9,
+        (cost - 0.03).abs() < 1e-9,
         "legacy aggregate must seed once at current rates and then accumulate, got {cost}",
     );
 
