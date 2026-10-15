@@ -1749,6 +1749,7 @@ mod tests {
             display_name: "Test Tool".to_string(),
             tier: agent_sdk_foundation::ToolTier::Observe,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
         }];
 
         let api_tools = convert_tools_to_config(tools);
@@ -2283,6 +2284,7 @@ mod tests {
             display_name: "Make".to_string(),
             tier: agent_sdk_foundation::ToolTier::Observe,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
         }];
 
         let config = convert_tools_to_config(tools);
@@ -2335,6 +2337,7 @@ mod tests {
             display_name: "Plan Apply".to_string(),
             tier: agent_sdk_foundation::ToolTier::Observe,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
         }];
 
         let config = convert_tools_to_config(tools);

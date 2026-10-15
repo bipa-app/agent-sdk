@@ -244,6 +244,15 @@
 //! confirmation inline. Declare `ReadOnly` only for a tool that changes
 //! nothing. See [`agent_sdk_foundation::batch_order`] for the full rule.
 //!
+//! ### Tool Replay
+//!
+//! A durable host may stop while a tool call runs. [`ToolReplay`] decides
+//! what recovery does with that call, independently of its tier: a
+//! [`ToolReplay::Safe`] call runs again, and a [`ToolReplay::Unsafe`] call
+//! (the default) is not run again and gives the model an interrupted
+//! result. Declare `Safe` only for a tool whose second run changes nothing
+//! the first run did not.
+//!
 //! ### Lifecycle Hooks
 //!
 //! Implement [`AgentHooks`] to intercept and control agent behavior:
@@ -519,8 +528,8 @@ pub use events::{AccountRotationReason, AgentEvent, AgentEventEnvelope, Sequence
 pub use types::{
     AgentConfig, AgentError, AgentInput, AgentRunState, AgentState, BudgetLimitKind,
     ExecutionStatus, ExternalToolResult, PendingToolCallInfo, RetryConfig, RunOptions, ThreadId,
-    TokenUsage, ToolConcurrency, ToolExecution, ToolInvocation, ToolOutcome, ToolResult,
-    ToolRuntime, ToolTier, TurnOptions, UsageLimits,
+    TokenUsage, ToolConcurrency, ToolExecution, ToolInvocation, ToolOutcome, ToolReplay,
+    ToolResult, ToolRuntime, ToolTier, TurnOptions, UsageLimits,
 };
 
 // agent-sdk-tools (via thin modules)
@@ -782,7 +791,7 @@ pub mod prelude {
     pub use crate::{
         AgentConfig, AgentEvent, AgentInput, CancellationToken, DynamicToolName,
         InMemoryEventStore, SimpleTool, Tool, ToolConcurrency, ToolContext, ToolName, ToolRegistry,
-        ToolResult, ToolTier, TypedTool,
+        ToolReplay, ToolResult, ToolTier, TypedTool,
     };
 }
 

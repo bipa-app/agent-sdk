@@ -91,6 +91,7 @@ fn definition_with_tools() -> AgentDefinition {
             display_name: "Bash".into(),
             tier: ToolTier::Observe,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
         }],
         ..sample_definition()
     }
@@ -106,6 +107,7 @@ fn definition_with_two_tools() -> AgentDefinition {
                 display_name: "Read".into(),
                 tier: ToolTier::Observe,
                 concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+                replay: agent_sdk_foundation::ToolReplay::Unsafe,
             },
             Tool {
                 name: "write".into(),
@@ -114,6 +116,7 @@ fn definition_with_two_tools() -> AgentDefinition {
                 display_name: "Write".into(),
                 tier: ToolTier::Observe,
                 concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+                replay: agent_sdk_foundation::ToolReplay::Unsafe,
             },
         ],
         ..sample_definition()

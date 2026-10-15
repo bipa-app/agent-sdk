@@ -196,6 +196,7 @@ fn sample_definition_with_confirm_tools() -> AgentDefinition {
                 display_name: "Bash".into(),
                 tier: ToolTier::Observe,
                 concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+                replay: agent_sdk_foundation::ToolReplay::Unsafe,
             },
             Tool {
                 name: "transfer".into(),
@@ -204,6 +205,7 @@ fn sample_definition_with_confirm_tools() -> AgentDefinition {
                 display_name: "Transfer".into(),
                 tier: ToolTier::Confirm,
                 concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+                replay: agent_sdk_foundation::ToolReplay::Unsafe,
             },
             Tool {
                 name: "lookup_account".into(),
@@ -212,6 +214,7 @@ fn sample_definition_with_confirm_tools() -> AgentDefinition {
                 display_name: "Lookup Account".into(),
                 tier: ToolTier::Confirm,
                 concurrency: agent_sdk_foundation::ToolConcurrency::ReadOnly,
+                replay: agent_sdk_foundation::ToolReplay::Unsafe,
             },
             Tool {
                 name: "read_file".into(),
@@ -220,6 +223,7 @@ fn sample_definition_with_confirm_tools() -> AgentDefinition {
                 display_name: "Read File".into(),
                 tier: ToolTier::Observe,
                 concurrency: agent_sdk_foundation::ToolConcurrency::ReadOnly,
+                replay: agent_sdk_foundation::ToolReplay::Unsafe,
             },
         ],
         thinking: ThinkingPolicy::default(),

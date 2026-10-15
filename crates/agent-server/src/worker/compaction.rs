@@ -2372,6 +2372,7 @@ mod tests {
             display_name: "lookup".into(),
             tier: agent_sdk_foundation::ToolTier::Observe,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
         }]);
         assert_ne!(
             base,

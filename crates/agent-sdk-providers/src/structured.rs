@@ -666,6 +666,7 @@ fn apply_tool_forcing(request: &mut ChatRequest, response_format: &ResponseForma
         display_name: "Structured response".to_owned(),
         tier: ToolTier::Observe,
         concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+        replay: agent_sdk_foundation::ToolReplay::Unsafe,
     };
 
     match request.tools {

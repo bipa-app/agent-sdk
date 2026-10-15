@@ -669,6 +669,7 @@ mod tests {
             display_name: tool_name.into(),
             tier: agent_sdk_foundation::ToolTier::Observe,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
             input: serde_json::json!({"question": "Which target?", "command": "cargo build"}),
             effective_input: serde_json::json!({"question": "Which target?", "command": "cargo build"}),
             listen_context: None,

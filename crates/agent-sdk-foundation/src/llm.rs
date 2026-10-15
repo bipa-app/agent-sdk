@@ -1214,6 +1214,9 @@ pub struct Tool {
     /// Ordering class for this tool within a model batch.
     #[serde(default)]
     pub concurrency: super::types::ToolConcurrency,
+    /// Whether recovery may run a call of this tool again.
+    #[serde(default)]
+    pub replay: super::types::ToolReplay,
 }
 
 #[derive(Debug, Clone)]

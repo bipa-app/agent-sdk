@@ -28,6 +28,14 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
         }
     });
 
+    let replay_fn = attr.opt_expr("replay").map(|r| {
+        quote! {
+            fn replay(&self) -> ::agent_sdk::ToolReplay {
+                #r
+            }
+        }
+    });
+
     let tier_body = attr.opt_expr("tier").map_or_else(
         || quote! { ::agent_sdk::ToolTier::Observe },
         |t| quote! { #t },
@@ -63,6 +71,8 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
             }
 
             #concurrency_fn
+
+            #replay_fn
 
             fn execute(
                 &self,

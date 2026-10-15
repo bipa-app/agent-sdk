@@ -135,6 +135,7 @@ fn definition() -> AgentDefinition {
             display_name: "Bash".into(),
             tier: ToolTier::Observe,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
         }],
         thinking: ThinkingPolicy::default(),
         thinking_display: None,

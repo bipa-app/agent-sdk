@@ -3215,6 +3215,7 @@ mod tests {
             display_name: name.to_owned(),
             tier: agent_sdk_foundation::ToolTier::Observe,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
         }
     }
 
@@ -4101,6 +4102,7 @@ mod tests {
             display_name: "Test Tool".to_string(),
             tier: agent_sdk_foundation::ToolTier::Observe,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
         };
 
         let compatible_tool = convert_tool(tool.clone(), false);
@@ -4139,6 +4141,7 @@ mod tests {
             display_name: "Configure".to_owned(),
             tier: agent_sdk_foundation::ToolTier::Confirm,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
         };
 
         let api_tool = convert_tool(tool, true);
@@ -4819,6 +4822,7 @@ mod tests {
                 display_name: "Read File".to_string(),
                 tier: agent_sdk_foundation::ToolTier::Observe,
                 concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+                replay: agent_sdk_foundation::ToolReplay::Unsafe,
             }]),
             max_tokens: 1024,
             max_tokens_explicit: true,

@@ -344,6 +344,7 @@ fn child_definition_with_tools() -> AgentDefinition {
             display_name: "Bash".into(),
             tier: ToolTier::Observe,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
         }],
         ..sample_definition()
     }
@@ -379,6 +380,7 @@ fn parent_suspension_payload(parent_thread: &ThreadId, tool_id: &str) -> Suspens
         display_name: "Subagent: Researcher".into(),
         tier: ToolTier::Confirm,
         concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+        replay: agent_sdk_foundation::ToolReplay::Unsafe,
         input: json!({ "task": "Investigate durable reuse" }),
         effective_input: json!({ "task": "Investigate durable reuse" }),
         listen_context: None,

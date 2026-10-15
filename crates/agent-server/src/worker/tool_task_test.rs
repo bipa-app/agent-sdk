@@ -144,6 +144,7 @@ fn sample_definition_with_tools() -> AgentDefinition {
                 display_name: "Bash".into(),
                 tier: ToolTier::Observe,
                 concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+                replay: agent_sdk_foundation::ToolReplay::Unsafe,
             },
             Tool {
                 name: "read_file".into(),
@@ -152,6 +153,7 @@ fn sample_definition_with_tools() -> AgentDefinition {
                 display_name: "Read File".into(),
                 tier: ToolTier::Observe,
                 concurrency: agent_sdk_foundation::ToolConcurrency::ReadOnly,
+                replay: agent_sdk_foundation::ToolReplay::Unsafe,
             },
         ],
         thinking: ThinkingPolicy::default(),

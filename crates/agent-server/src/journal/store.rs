@@ -12201,6 +12201,7 @@ mod tests {
                 display_name: format!("Tool {idx}"),
                 tier: agent_sdk_foundation::ToolTier::Confirm,
                 concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+                replay: agent_sdk_foundation::ToolReplay::Unsafe,
                 input: serde_json::json!({}),
                 effective_input: serde_json::json!({}),
                 listen_context: None,

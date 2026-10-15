@@ -380,6 +380,26 @@ pub enum ToolConcurrency {
     Exclusive,
 }
 
+/// Whether a tool call may run again after the process stopped during it.
+///
+/// This is independent of [`ToolTier`]: the tier decides whether a call
+/// needs confirmation, this decides what recovery does with a call that
+/// started but never recorded a result. A [`ToolReplay::Safe`] call runs
+/// again. A [`ToolReplay::Unsafe`] call is not run again; the model gets
+/// an interrupted result instead.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolReplay {
+    /// Running the call again has no effect beyond the first run, so
+    /// recovery runs it again.
+    Safe,
+    /// The call may have changed state outside the journal, so recovery
+    /// does not run it again. The default for any tool that does not
+    /// declare itself replay-safe.
+    #[default]
+    Unsafe,
+}
+
 /// Snapshot of agent state for checkpointing
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentState {
@@ -539,6 +559,13 @@ pub struct PendingToolCallInfo {
     /// model order.
     #[serde(default)]
     pub concurrency: ToolConcurrency,
+    /// Replay class of the tool, captured with [`Self::tier`].
+    ///
+    /// Defaults to [`ToolReplay::Unsafe`] when deserialized from a
+    /// continuation that predates this field, so recovery never runs an
+    /// old call again.
+    #[serde(default)]
+    pub replay: ToolReplay,
     /// Tool input parameters as requested by the LLM.
     pub input: serde_json::Value,
     /// Effective input after SDK preparation (e.g. listen-context enrichment).
@@ -1514,6 +1541,7 @@ mod tests {
                 display_name: "Echo".into(),
                 tier: ToolTier::Confirm,
                 concurrency: crate::ToolConcurrency::Exclusive,
+                replay: crate::ToolReplay::Unsafe,
                 input: serde_json::json!({"message": "hi"}),
                 effective_input: serde_json::json!({"message": "hi"}),
                 listen_context: None,
