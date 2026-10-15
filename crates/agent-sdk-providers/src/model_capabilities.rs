@@ -474,7 +474,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         context_window: Some(1_000_000),
         max_output_tokens: Some(128_000),
         default_max_tokens: None,
-        pricing: Some(Pricing::flat(3.0, 15.0).with_notes("Anthropic Sonnet 5 standard pricing $3/$15 per 1M; introductory $2/$10 through 2026-08-31. A new tokenizer produces ~30% more tokens than Sonnet 4.6, so equivalent-text cost differs even at unchanged per-token rates.")),
+        pricing: Some(Pricing::flat_with_cached(2.0, 10.0, 0.2).with_cache_write(2.5).with_notes("Anthropic Sonnet 5 official pricing: $2 input / $10 output per 1M tokens. The launch's introductory $2/$10 became the standard price; the increase to $3/$15 scheduled for 2026-09-01 did not happen. Cache reads cost $0.20/M; cache writes cost $2.50/M (5m) or $4/M (1h). A new tokenizer produces ~30% more tokens than Sonnet 4.6, so equivalent-text cost differs even at unchanged per-token rates.")),
         supports_thinking: true,
         supports_adaptive_thinking: true,
         rejects_budget_thinking: true,
@@ -1815,13 +1815,24 @@ mod tests {
     }
 
     #[test]
-    fn test_lookup_anthropic_sonnet_5() {
-        let caps = get_model_capabilities("anthropic", "claude-sonnet-5").unwrap();
+    fn test_lookup_anthropic_sonnet_5() -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let caps =
+            get_model_capabilities("anthropic", "claude-sonnet-5").context("sonnet 5 missing")?;
         assert_eq!(caps.context_window, Some(1_000_000));
         assert_eq!(caps.max_output_tokens, Some(128_000));
         assert!(caps.supports_thinking);
         // Like Opus 4.8: manual budget_tokens 400s; adaptive supported, not required.
         assert!(caps.supports_adaptive_thinking);
+        let pricing = caps.pricing.context("pricing missing")?;
+        let input = pricing.input.context("input price missing")?;
+        let output = pricing.output.context("output price missing")?;
+        assert!((input.usd_per_million_tokens - 2.0).abs() < f64::EPSILON);
+        assert!((output.usd_per_million_tokens - 10.0).abs() < f64::EPSILON);
+        assert_eq!(pricing.cached_input, Some(PricePoint::new(0.2)));
+        assert_eq!(pricing.cache_write, Some(PricePoint::new(2.5)));
+        Ok(())
     }
 
     #[test]
