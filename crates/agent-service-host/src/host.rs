@@ -4326,6 +4326,7 @@ mod tests {
                                 display_name: "Ask User".into(),
                                 tier: ToolTier::Observe,
                                 concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+                                replay: agent_sdk_foundation::ToolReplay::Unsafe,
                                 input: serde_json::json!({"question": "Where?"}),
                                 effective_input: serde_json::json!({"question": "Where?"}),
                                 listen_context: None,
@@ -4527,6 +4528,7 @@ mod tests {
                 display_name: "Ask User".into(),
                 tier: ToolTier::Observe,
                 concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+                replay: agent_sdk_foundation::ToolReplay::Unsafe,
             }],
             ..sample_definition()
         };
@@ -6430,6 +6432,7 @@ mod tests {
             display_name: "Probe".into(),
             tier: agent_sdk_foundation::ToolTier::Observe,
             concurrency: agent_sdk_foundation::ToolConcurrency::ReadOnly,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
         }
     }
 
@@ -6655,6 +6658,7 @@ mod tests {
             display_name: name.into(),
             tier: agent_sdk_foundation::ToolTier::Observe,
             concurrency,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
         }
     }
 
@@ -7579,6 +7583,7 @@ mod tests {
                         display_name: tool_name.to_owned(),
                         tier,
                         concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+                        replay: agent_sdk_foundation::ToolReplay::Unsafe,
                         input: input.clone(),
                         effective_input: input.clone(),
                         listen_context: None,

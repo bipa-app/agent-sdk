@@ -45,7 +45,7 @@ use crate::seed::{HostDependencies, ToolContextSeed};
 use crate::stores::EventStore;
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::llm;
-use agent_sdk_foundation::types::{ToolConcurrency, ToolOutcome, ToolResult, ToolTier};
+use agent_sdk_foundation::types::{ToolConcurrency, ToolOutcome, ToolReplay, ToolResult, ToolTier};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::Stream;
@@ -598,6 +598,15 @@ pub trait Tool<Ctx>: Send + Sync {
         ToolConcurrency::Exclusive
     }
 
+    /// Whether recovery may run a call of this tool again after the
+    /// process stopped during it. Defaults to [`ToolReplay::Unsafe`], so
+    /// the model gets an interrupted result instead. Override only for a
+    /// tool whose second run changes nothing, such as a file read or a
+    /// search.
+    fn replay(&self) -> ToolReplay {
+        ToolReplay::Unsafe
+    }
+
     /// Execute the tool with the given input.
     ///
     /// # Errors
@@ -733,6 +742,15 @@ pub trait TypedTool<Ctx>: Send + Sync {
         ToolConcurrency::Exclusive
     }
 
+    /// Whether recovery may run a call of this tool again after the
+    /// process stopped during it. Defaults to [`ToolReplay::Unsafe`], so
+    /// the model gets an interrupted result instead. Override only for a
+    /// tool whose second run changes nothing, such as a file read or a
+    /// search.
+    fn replay(&self) -> ToolReplay {
+        ToolReplay::Unsafe
+    }
+
     /// Execute the tool with the already-validated, typed input.
     ///
     /// The runtime guarantees `input` deserialized cleanly from the model's
@@ -848,6 +866,10 @@ where
 
     fn concurrency(&self) -> ToolConcurrency {
         TypedTool::concurrency(&self.inner)
+    }
+
+    fn replay(&self) -> ToolReplay {
+        TypedTool::replay(&self.inner)
     }
 
     async fn execute(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {
@@ -996,6 +1018,15 @@ pub trait SimpleTool<Ctx>: Send + Sync {
         ToolConcurrency::Exclusive
     }
 
+    /// Whether recovery may run a call of this tool again after the
+    /// process stopped during it. Defaults to [`ToolReplay::Unsafe`], so
+    /// the model gets an interrupted result instead. Override only for a
+    /// tool whose second run changes nothing, such as a file read or a
+    /// search.
+    fn replay(&self) -> ToolReplay {
+        ToolReplay::Unsafe
+    }
+
     /// Execute the tool with the given input.
     ///
     /// # Errors
@@ -1058,6 +1089,10 @@ where
 
     fn concurrency(&self) -> ToolConcurrency {
         SimpleTool::concurrency(&self.inner)
+    }
+
+    fn replay(&self) -> ToolReplay {
+        SimpleTool::replay(&self.inner)
     }
 
     fn execute(
@@ -1151,6 +1186,15 @@ pub trait AsyncTool<Ctx>: Send + Sync {
         ToolConcurrency::Exclusive
     }
 
+    /// Whether recovery may run a call of this tool again after the
+    /// process stopped during it. Defaults to [`ToolReplay::Unsafe`], so
+    /// the model gets an interrupted result instead. Override only for a
+    /// tool whose second run changes nothing, such as a file read or a
+    /// search.
+    fn replay(&self) -> ToolReplay {
+        ToolReplay::Unsafe
+    }
+
     /// Execute the tool. Returns immediately with one of:
     /// - Success/Failed: Operation completed synchronously
     /// - `InProgress`: Operation started, use `check_status()` to stream updates
@@ -1215,6 +1259,15 @@ pub trait ListenExecuteTool<Ctx>: Send + Sync {
     /// changes nothing, such as a file read or a search.
     fn concurrency(&self) -> ToolConcurrency {
         ToolConcurrency::Exclusive
+    }
+
+    /// Whether recovery may run a call of this tool again after the
+    /// process stopped during it. Defaults to [`ToolReplay::Unsafe`], so
+    /// the model gets an interrupted result instead. Override only for a
+    /// tool whose second run changes nothing, such as a file read or a
+    /// search.
+    fn replay(&self) -> ToolReplay {
+        ToolReplay::Unsafe
     }
 
     /// Start and stream runtime preparation updates.
@@ -1283,6 +1336,12 @@ pub trait ErasedTool<Ctx>: Send + Sync {
     fn concurrency(&self) -> ToolConcurrency {
         ToolConcurrency::Exclusive
     }
+    /// Get the tool's replay class after a crash. Defaults to
+    /// [`ToolReplay::Unsafe`], so an implementor that does not override it
+    /// is never run again by recovery.
+    fn replay(&self) -> ToolReplay {
+        ToolReplay::Unsafe
+    }
     /// Execute the tool with the given input.
     async fn execute(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult>;
 }
@@ -1341,6 +1400,10 @@ where
         self.inner.concurrency()
     }
 
+    fn replay(&self) -> ToolReplay {
+        self.inner.replay()
+    }
+
     async fn execute(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {
         self.inner.execute(ctx, input).await
     }
@@ -1371,6 +1434,12 @@ pub trait ErasedAsyncTool<Ctx>: Send + Sync {
     /// override it runs alone and in model order.
     fn concurrency(&self) -> ToolConcurrency {
         ToolConcurrency::Exclusive
+    }
+    /// Get the tool's replay class after a crash. Defaults to
+    /// [`ToolReplay::Unsafe`], so an implementor that does not override it
+    /// is never run again by recovery.
+    fn replay(&self) -> ToolReplay {
+        ToolReplay::Unsafe
     }
     /// Execute the tool with the given input.
     async fn execute(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolOutcome>;
@@ -1436,6 +1505,10 @@ where
         self.inner.concurrency()
     }
 
+    fn replay(&self) -> ToolReplay {
+        self.inner.replay()
+    }
+
     async fn execute(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolOutcome> {
         self.inner.execute(ctx, input).await
     }
@@ -1473,6 +1546,12 @@ pub trait ErasedListenTool<Ctx>: Send + Sync {
     /// override it runs alone and in model order.
     fn concurrency(&self) -> ToolConcurrency {
         ToolConcurrency::Exclusive
+    }
+    /// Get the tool's replay class after a crash. Defaults to
+    /// [`ToolReplay::Unsafe`], so an implementor that does not override it
+    /// is never run again by recovery.
+    fn replay(&self) -> ToolReplay {
+        ToolReplay::Unsafe
     }
     /// Start listen stream.
     fn listen_stream<'a>(
@@ -1548,6 +1627,10 @@ where
 
     fn concurrency(&self) -> ToolConcurrency {
         self.inner.concurrency()
+    }
+
+    fn replay(&self) -> ToolReplay {
+        self.inner.replay()
     }
 
     fn listen_stream<'a>(
@@ -1897,6 +1980,7 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
             input_schema: Value,
             tier: ToolTier,
             concurrency: ToolConcurrency,
+            replay: ToolReplay,
         ) -> llm::Tool {
             llm::Tool {
                 name: name.to_string(),
@@ -1905,6 +1989,7 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
                 display_name: display_name.to_string(),
                 tier,
                 concurrency,
+                replay,
             }
         }
 
@@ -1919,6 +2004,7 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
                     tool.input_schema(),
                     tool.tier(),
                     tool.concurrency(),
+                    tool.replay(),
                 )
             })
             .collect();
@@ -1931,6 +2017,7 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
                 tool.input_schema(),
                 tool.tier(),
                 tool.concurrency(),
+                tool.replay(),
             )
         }));
 
@@ -1942,6 +2029,7 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
                 tool.input_schema(),
                 tool.tier(),
                 tool.concurrency(),
+                tool.replay(),
             )
         }));
 

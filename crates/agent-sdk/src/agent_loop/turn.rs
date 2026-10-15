@@ -25,7 +25,7 @@ use crate::stores::{EventStore, MessageStore, StateStore, ToolExecutionStore};
 use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::{
     AgentConfig, AgentContinuation, AgentError, PendingToolCallInfo, ThreadId, TokenUsage,
-    ToolConcurrency, ToolResult, ToolRuntime, ToolTier, TurnOptions, UsageLimits,
+    ToolConcurrency, ToolReplay, ToolResult, ToolRuntime, ToolTier, TurnOptions, UsageLimits,
 };
 use agent_sdk_foundation::audit::AuditProvenance;
 use agent_sdk_foundation::batch_order::{BatchSlot, execution_waves};
@@ -1553,16 +1553,17 @@ where
         .iter()
         .map(|(id, name, input)| {
             // Resolve the tool metadata in one pass so `display_name`,
-            // `tier`, and `concurrency` stay in lockstep. Unknown tools
+            // `tier`, `concurrency`, and `replay` stay in lockstep. Unknown tools
             // fall back to the strictest values so downstream audit,
             // policy, and ordering layers see a conservative default.
-            let (display_name, tier, concurrency) = tools
+            let (display_name, tier, concurrency, replay) = tools
                 .get(name)
                 .map(|tool| {
                     (
                         tool.display_name().to_string(),
                         tool.tier(),
                         tool.concurrency(),
+                        tool.replay(),
                     )
                 })
                 .or_else(|| {
@@ -1571,6 +1572,7 @@ where
                             tool.display_name().to_string(),
                             tool.tier(),
                             tool.concurrency(),
+                            tool.replay(),
                         )
                     })
                 })
@@ -1580,10 +1582,18 @@ where
                             tool.display_name().to_string(),
                             tool.tier(),
                             tool.concurrency(),
+                            tool.replay(),
                         )
                     })
                 })
-                .unwrap_or_else(|| (String::new(), ToolTier::Confirm, ToolConcurrency::Exclusive));
+                .unwrap_or_else(|| {
+                    (
+                        String::new(),
+                        ToolTier::Confirm,
+                        ToolConcurrency::Exclusive,
+                        ToolReplay::Unsafe,
+                    )
+                });
 
             PendingToolCallInfo {
                 id: id.clone(),
@@ -1591,6 +1601,7 @@ where
                 display_name,
                 tier,
                 concurrency,
+                replay,
                 input: input.clone(),
                 effective_input: input.clone(),
                 listen_context: None,

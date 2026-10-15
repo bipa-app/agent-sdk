@@ -399,6 +399,7 @@ mod tests {
             display_name: name.into(),
             tier: ToolTier::Observe,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
         }
     }
 

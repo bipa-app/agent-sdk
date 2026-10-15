@@ -66,6 +66,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MODEL_GEMINI_35_FLASH_LITE`.
 
 ### Changed
+- **Breaking: replay after a crash is a tool declaration, not the tier.**
+  `classify_tool_effect` made every `ToolTier::Observe` call replay-safe, and
+  hosts lower mutating tools to `Observe` to skip prompts, so a durable host
+  that stopped while `bash`, `write` or `edit` ran ran the call again on
+  recovery (a `git push` could happen twice). `ToolReplay` is a new tool
+  property, independent of the tier: `Unsafe` by default, `Safe` for `read`,
+  `grep`, `glob`, `todo_read`, `web_search` and `ask_user`. `link_fetch` stays
+  `Unsafe`: a repeated GET to a model-chosen URL can spend a one-time token or
+  fire a webhook. The tool traits
+  gain `replay()`, the derives accept a `replay` attribute, and `llm::Tool`
+  and `PendingToolCallInfo` carry the value (serde default `Unsafe`, so a
+  continuation written before this change is never replayed).
+  `classify_tool_effect` reads only this value: a `Safe` call runs again, and
+  an `Unsafe` call writes its execution intent before it runs. When recovery
+  finds that intent in flight, the tool is not run again: the child fails
+  with an `interrupted:` result (`TOOL_INTERRUPTED_PREFIX`), one
+  `ToolCallEnd` closes the call, and the intent becomes `Failed`. Struct
+  literals of `llm::Tool` and `PendingToolCallInfo` must add `replay`.
 - **GPT-5.6 prices.** `gpt-5.6-sol` (and the `gpt-5.6` alias) is now
   $4 / $0.40 cached / $20 per 1M tokens, OpenAI's promotional rate through at
   least 2026-11-21; `gpt-5.6-terra` $2 / $0.20 / $12; `gpt-5.6-luna`

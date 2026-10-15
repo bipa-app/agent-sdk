@@ -327,6 +327,7 @@ mod tests {
             display_name: name.to_owned(),
             tier: ToolTier::Confirm,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
             input: json!({"task": "x"}),
             effective_input: json!({"task": "x"}),
             listen_context: None,

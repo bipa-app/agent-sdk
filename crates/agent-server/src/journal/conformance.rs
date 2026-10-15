@@ -958,6 +958,7 @@ fn suspension_with_pending_tools(thread: &ThreadId, count: usize) -> SuspensionP
             display_name: format!("Tool {idx}"),
             tier: agent_sdk_foundation::ToolTier::Confirm,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
             input: serde_json::json!({ "slot": idx }),
             effective_input: serde_json::json!({ "slot": idx }),
             listen_context: None,

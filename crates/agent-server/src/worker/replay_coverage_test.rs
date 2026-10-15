@@ -74,6 +74,7 @@ fn definition_with_tools() -> AgentDefinition {
             display_name: "Bash".into(),
             tier: ToolTier::Observe,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
         }],
         ..sample_definition()
     }
@@ -743,6 +744,7 @@ async fn multiple_tool_tasks_interleave_correctly() -> Result<()> {
                 display_name: "Read".into(),
                 tier: ToolTier::Observe,
                 concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+                replay: agent_sdk_foundation::ToolReplay::Unsafe,
             },
             Tool {
                 name: "write".into(),
@@ -751,6 +753,7 @@ async fn multiple_tool_tasks_interleave_correctly() -> Result<()> {
                 display_name: "Write".into(),
                 tier: ToolTier::Observe,
                 concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+                replay: agent_sdk_foundation::ToolReplay::Unsafe,
             },
         ],
         ..sample_definition()

@@ -13,7 +13,7 @@ use agent_sdk::builtin_tools::{BuiltinToolsConfig, register_builtin_tools};
 use agent_sdk::llm::{ChatRequest, LlmProvider, Message, Tool};
 use agent_sdk::todo::TodoState;
 use agent_sdk::{AgentCapabilities, AskUserQuestionTool, InMemoryFileSystem, ToolRegistry};
-use agent_sdk_foundation::{ToolConcurrency, ToolTier};
+use agent_sdk_foundation::{ToolConcurrency, ToolReplay, ToolTier};
 use agent_sdk_providers::GeminiProvider;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Map, Value, json};
@@ -71,6 +71,7 @@ fn bip_tools() -> Result<Vec<Tool>> {
             input_schema,
             tier: ToolTier::Observe,
             concurrency: ToolConcurrency::Exclusive,
+            replay: ToolReplay::Unsafe,
         })
         .collect())
 }

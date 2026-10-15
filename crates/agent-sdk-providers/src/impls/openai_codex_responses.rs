@@ -5111,6 +5111,7 @@ mod tests {
             display_name: "T".to_string(),
             tier: agent_sdk_foundation::ToolTier::Observe,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
         };
 
         let api_tool = convert_tool(tool);
@@ -5145,6 +5146,7 @@ mod tests {
             display_name: "T".to_string(),
             tier: agent_sdk_foundation::ToolTier::Observe,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
         };
 
         let api_tool = convert_tool(tool);
@@ -5171,6 +5173,7 @@ mod tests {
             display_name: "Configure".to_owned(),
             tier: agent_sdk_foundation::ToolTier::Confirm,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
         };
 
         let api_tool = convert_tool(tool);

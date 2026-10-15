@@ -217,6 +217,35 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "web")]
+    #[test]
+    fn only_tools_that_change_nothing_declare_replay_safe() {
+        let mut registry = ToolRegistry::<()>::new();
+        register_builtin_tools(
+            &mut registry,
+            BuiltinToolsConfig {
+                environment: Arc::new(InMemoryFileSystem::new("/workspace")),
+                capabilities: AgentCapabilities::full_access(),
+                todo_state: Some(Arc::new(RwLock::new(TodoState::new()))),
+                link_fetch: true,
+            },
+        );
+
+        let safe = ["read", "glob", "grep", "todo_read"];
+        let unsafe_ = ["write", "edit", "bash", "todo_write", "link_fetch"];
+        let tools = registry.to_llm_tools();
+        assert_eq!(tools.len(), safe.len() + unsafe_.len());
+        for tool in tools {
+            let expected = if safe.contains(&tool.name.as_str()) {
+                crate::ToolReplay::Safe
+            } else {
+                assert!(unsafe_.contains(&tool.name.as_str()), "{}", tool.name);
+                crate::ToolReplay::Unsafe
+            };
+            assert_eq!(tool.replay, expected, "{}", tool.name);
+        }
+    }
+
     #[test]
     fn builtin_tools_config_skips_optional_families_when_unset() {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));

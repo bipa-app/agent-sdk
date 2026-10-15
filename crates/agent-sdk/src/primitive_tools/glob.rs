@@ -1,5 +1,6 @@
 use crate::{
-    Environment, PrimitiveToolName, Tool, ToolConcurrency, ToolContext, ToolResult, ToolTier,
+    Environment, PrimitiveToolName, Tool, ToolConcurrency, ToolContext, ToolReplay, ToolResult,
+    ToolTier,
 };
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -54,6 +55,10 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for GlobToo
 
     fn concurrency(&self) -> ToolConcurrency {
         ToolConcurrency::ReadOnly
+    }
+
+    fn replay(&self) -> ToolReplay {
+        ToolReplay::Safe
     }
 
     fn input_schema(&self) -> Value {

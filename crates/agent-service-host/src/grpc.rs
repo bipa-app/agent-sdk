@@ -6340,6 +6340,7 @@ mod tests {
             display_name: "Transfer".into(),
             tier: ToolTier::Confirm,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
         };
         let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(vec![
             transfer_tool,
@@ -6994,6 +6995,7 @@ mod tests {
             display_name: "Lookup".into(),
             tier: ToolTier::Observe,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
         };
         let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(vec![
             lookup_tool,
@@ -7730,6 +7732,7 @@ mod tests {
             display_name: "bash".to_owned(),
             tier: agent_sdk_foundation::ToolTier::Observe,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
             input: serde_json::json!({"command": "make"}),
             effective_input: serde_json::Value::Null,
             listen_context: None,
@@ -8562,6 +8565,7 @@ mod tests {
                 display_name: "Ask User".into(),
                 tier: ToolTier::Observe,
                 concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+                replay: agent_sdk_foundation::ToolReplay::Unsafe,
                 input: serde_json::json!({"question": "Choose?"}),
                 effective_input: serde_json::json!({"question": "Choose?"}),
                 listen_context: None,
@@ -8955,6 +8959,7 @@ mod tests {
                 display_name: (*name).into(),
                 tier: *tier,
                 concurrency: agent_sdk_foundation::ToolConcurrency::ReadOnly,
+                replay: agent_sdk_foundation::ToolReplay::Unsafe,
             })
             .collect();
         let registry: Arc<dyn AgentDefinitionRegistry> =
@@ -9044,6 +9049,7 @@ mod tests {
             display_name: "Transfer".into(),
             tier: ToolTier::Confirm,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
         };
         let registry: Arc<dyn AgentDefinitionRegistry> =
             Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(vec![
@@ -9129,6 +9135,7 @@ mod tests {
             display_name: "Transfer".into(),
             tier: ToolTier::Confirm,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
         };
         let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(vec![
             transfer_tool,

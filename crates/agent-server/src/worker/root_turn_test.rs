@@ -281,6 +281,7 @@ fn sample_definition_with_tools() -> AgentDefinition {
             display_name: "Bash".into(),
             tier: agent_sdk_foundation::ToolTier::Observe,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
         }],
         ..sample_definition()
     }
@@ -5492,6 +5493,7 @@ async fn pending_tool_tier_uses_per_turn_tools_fn_not_static_list() -> Result<()
             display_name: "Bash (static)".into(),
             tier: agent_sdk_foundation::ToolTier::Observe,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
         }],
         thinking: ThinkingPolicy::default(),
         thinking_display: None,
@@ -5505,6 +5507,7 @@ async fn pending_tool_tier_uses_per_turn_tools_fn_not_static_list() -> Result<()
                 display_name: "Bash (hardened)".into(),
                 tier: agent_sdk_foundation::ToolTier::Confirm,
                 concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+                replay: agent_sdk_foundation::ToolReplay::Unsafe,
             }]
         })),
         tool_input_sanitizer: None,
@@ -10034,6 +10037,7 @@ async fn quoted_late_results_do_not_close_a_call() -> Result<()> {
         display_name: "bash".to_owned(),
         tier: agent_sdk_foundation::ToolTier::Confirm,
         concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+        replay: agent_sdk_foundation::ToolReplay::Unsafe,
         input: serde_json::json!({"command": "call_1"}),
         effective_input: serde_json::Value::Null,
         listen_context: None,
@@ -12598,6 +12602,7 @@ fn sample_definition_with_subagent_tools() -> AgentDefinition {
                 display_name: "Subagent: Explore".into(),
                 tier: agent_sdk_foundation::ToolTier::Confirm,
                 concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+                replay: agent_sdk_foundation::ToolReplay::Unsafe,
             },
             Tool {
                 name: "bash".into(),
@@ -12606,6 +12611,7 @@ fn sample_definition_with_subagent_tools() -> AgentDefinition {
                 display_name: "Bash".into(),
                 tier: agent_sdk_foundation::ToolTier::Observe,
                 concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+                replay: agent_sdk_foundation::ToolReplay::Unsafe,
             },
         ],
         ..sample_definition()

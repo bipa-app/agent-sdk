@@ -634,6 +634,7 @@ mod tests {
                     display_name: "Read".to_owned(),
                     tier: ToolTier::Observe,
                     concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+                    replay: agent_sdk_foundation::ToolReplay::Unsafe,
                 },
             ]);
 

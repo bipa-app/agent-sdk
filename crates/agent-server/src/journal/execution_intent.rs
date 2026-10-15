@@ -23,7 +23,9 @@
 //! # Tool effect classification
 //!
 //! [`ToolEffectClass`] classifies every tool call into one of three
-//! categories that control the durability and retry rules:
+//! categories that control the durability and retry rules. The class
+//! comes from the replay value the tool declares
+//! ([`agent_sdk_foundation::ToolReplay`]), never from its approval tier:
 //!
 //! | Class | Intent required? | Retry rule |
 //! |-------|-----------------|------------|
@@ -33,7 +35,9 @@
 //!
 //! Replay-safe tools (e.g. read-only queries) skip the intent write
 //! entirely. Side-effecting and resumable tools must persist intent
-//! before the executor callback runs.
+//! before the executor callback runs. When recovery finds such an intent
+//! that never reached a terminal status, the tool is not run again: the
+//! child task fails with a [`TOOL_INTERRUPTED_PREFIX`] result.
 //!
 //! # Execution-intent record
 //!
@@ -64,7 +68,8 @@
 //! See the module-level doc of [`failure_model`] for the full decision
 //! table that later confirmation and replay work can build on.
 
-use agent_sdk_foundation::{PendingToolCallInfo, ToolResult};
+use agent_sdk_foundation::events::AgentEvent;
+use agent_sdk_foundation::{PendingToolCallInfo, ToolReplay, ToolResult};
 use anyhow::{Context, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -440,21 +445,19 @@ impl ExecutionIntentStore for InMemoryExecutionIntentStore {
 
 /// Classify a tool call's effect characteristics.
 ///
-/// The current classification uses the tool's tier from the
-/// [`PendingToolCallInfo`] as a heuristic:
+/// The classification reads only the replay class the tool declared
+/// ([`PendingToolCallInfo::replay`]). The approval tier does not take
+/// part: a host may lower a mutating tool to `Observe` to skip the
+/// prompt, and that must not make the tool run again after a crash.
 ///
-/// - `Observe` tier → [`ToolEffectClass::ReplaySafe`]
-/// - `Confirm` tier → [`ToolEffectClass::SideEffecting`]
-/// - `Confirm` tier with `listen_context` → [`ToolEffectClass::Resumable`]
-///
-/// Future phases may introduce explicit per-tool annotations.
+/// - [`ToolReplay::Safe`] → [`ToolEffectClass::ReplaySafe`]
+/// - [`ToolReplay::Unsafe`] → [`ToolEffectClass::SideEffecting`]
+/// - [`ToolReplay::Unsafe`] with `listen_context` → [`ToolEffectClass::Resumable`]
 #[must_use]
 pub const fn classify_tool_effect(tool_call: &PendingToolCallInfo) -> ToolEffectClass {
-    use agent_sdk_foundation::ToolTier;
-
-    match tool_call.tier {
-        ToolTier::Observe => ToolEffectClass::ReplaySafe,
-        ToolTier::Confirm => {
+    match tool_call.replay {
+        ToolReplay::Safe => ToolEffectClass::ReplaySafe,
+        ToolReplay::Unsafe => {
             if tool_call.listen_context.is_some() {
                 ToolEffectClass::Resumable
             } else {
@@ -586,7 +589,9 @@ where
         .get_intent(&operation_id)
         .await
         .context("failed to check prior intent")?;
-    enforce_retry_safety(check_retry_safety(prior))?;
+    if let Some(interrupted) = enforce_retry_safety(check_retry_safety(prior))? {
+        return interrupt_unsafe_replay(&bootstrap, deps, interrupted, now).await;
+    }
 
     // ── Persist intent (fail-closed) ─────────────────────────────
     let mut intent = ExecutionIntent::new(
@@ -644,35 +649,88 @@ where
     outcome
 }
 
-/// Reject a retry the [`check_retry_safety`] decision deems unsafe.
+/// Stable error prefix for a tool call that recovery did not run again.
+pub const TOOL_INTERRUPTED_PREFIX: &str = "interrupted:";
+
+/// Apply the [`check_retry_safety`] decision.
 ///
-/// `AlreadyCompleted` and `AmbiguousInFlight` bail; the safe-to-proceed
-/// decisions return `Ok(())`.
-fn enforce_retry_safety(decision: RetryDecision) -> anyhow::Result<()> {
+/// `AlreadyCompleted` bails. `AmbiguousInFlight` returns the prior
+/// intent, which the caller settles as interrupted without running the
+/// tool. The safe-to-proceed decisions return `Ok(None)`.
+fn enforce_retry_safety(decision: RetryDecision) -> anyhow::Result<Option<ExecutionIntent>> {
     match decision {
         RetryDecision::AlreadyCompleted(intent) => {
-            // Already done. The result was already committed on the first
-            // run, so refuse the duplicate — the caller should not have
-            // retried.
             bail!(
                 "operation {} already completed at {}; refusing duplicate execution",
                 intent.operation_id,
                 intent.updated_at,
             );
         }
-        RetryDecision::AmbiguousInFlight(intent) => {
-            // The previous attempt may have started a side-effecting
-            // operation. Fail-closed: do not re-execute.
-            bail!(
-                "operation {} has ambiguous in-flight status ({:?}); \
-                 refusing automatic retry for {:?} tool — manual intervention required",
-                intent.operation_id,
-                intent.status,
-                intent.effect_class,
-            );
-        }
-        RetryDecision::NoPriorIntent | RetryDecision::FailedBeforeStart(_) => Ok(()),
+        RetryDecision::AmbiguousInFlight(intent) => Ok(Some(intent)),
+        RetryDecision::NoPriorIntent | RetryDecision::FailedBeforeStart(_) => Ok(None),
     }
+}
+
+/// Settle a tool call whose earlier attempt started and never finished,
+/// without running it again.
+///
+/// The tool may have changed state before the process stopped, and it
+/// is not declared replay-safe, so the model gets an interrupted result
+/// instead of a second run.
+async fn interrupt_unsafe_replay(
+    bootstrap: &ToolTaskBootstrap,
+    deps: &GuardedExecutionDeps<'_>,
+    mut prior: ExecutionIntent,
+    now: OffsetDateTime,
+) -> anyhow::Result<ToolTaskOutcome> {
+    let error_msg = format!(
+        "{TOOL_INTERRUPTED_PREFIX} tool '{}' started before the process stopped and did not \
+         finish (operation {}, last status {:?}). It was not run again because it is not \
+         declared replay-safe. Check its effects before you call it again.",
+        bootstrap.tool_call.name, prior.operation_id, prior.status,
+    );
+    let (child, parent) = deps
+        .task_store
+        .fail_task(
+            &bootstrap.task_id,
+            &bootstrap.worker_id,
+            &bootstrap.lease_id,
+            error_msg.clone(),
+            now,
+        )
+        .await
+        .with_context(|| format!("fail interrupted tool task {}", bootstrap.task_id))?;
+
+    let end_event = AgentEvent::tool_call_end(
+        &bootstrap.tool_call.id,
+        &bootstrap.tool_call.name,
+        &bootstrap.tool_call.display_name,
+        ToolResult {
+            success: false,
+            output: error_msg.clone(),
+            artifact: None,
+            data: None,
+            documents: Vec::new(),
+            duration_ms: None,
+        },
+    );
+    let committed = deps
+        .event_repo
+        .commit_event(&bootstrap.thread_id, end_event, now)
+        .await
+        .context("commit ToolCallEnd for interrupted tool task")?;
+
+    if !prior.is_terminal() {
+        prior.mark_failed(error_msg.clone(), now);
+        record_intent_update(deps.intent_store, &prior, "Failed", "interrupted").await;
+    }
+
+    Ok(ToolTaskOutcome::Failed {
+        child,
+        parent,
+        error: error_msg,
+        committed_events: vec![committed],
+    })
 }
 
 /// Fail the child task without executing when the intent could not be
@@ -759,8 +817,8 @@ async fn record_intent_update(
 /// |---|---------------|-------------|--------------|----------|
 /// | 1 | Intent persist fails | `SideEffecting` / `Resumable` | **Fail-closed.** Child task is failed without executing. | Retry the child task from scratch. |
 /// | 2 | Intent persist fails | `ReplaySafe` | N/A — intent is not required. | Execute directly. |
-/// | 3 | Executor crashes after intent `Started` | `SideEffecting` | Intent stays `Started`. On retry, [`check_retry_safety`] returns `AmbiguousInFlight`. **No automatic retry.** | Manual intervention or confirmation from external system. |
-/// | 4 | Executor crashes after intent `Started` | `Resumable` | Intent stays `Started`. On retry, [`check_retry_safety`] returns `AmbiguousInFlight`. | Poll the operation id to check if the operation completed. |
+/// | 3 | Executor crashes after intent `Started` | `SideEffecting` | Intent stays `Started`. On retry, [`check_retry_safety`] returns `AmbiguousInFlight`. **No automatic retry.** The child fails with a [`TOOL_INTERRUPTED_PREFIX`] result and a `ToolCallEnd`. | The model decides what to do next. |
+/// | 4 | Executor crashes after intent `Started` | `Resumable` | Intent stays `Started`. On retry, [`check_retry_safety`] returns `AmbiguousInFlight`, and the child fails as interrupted, as in row 3. | Later work may poll the operation id. |
 /// | 5 | Executor crashes after intent `Started` | `ReplaySafe` | On retry, re-execute freely. | Automatic retry is safe. |
 /// | 6 | Intent update to `Completed` fails | Any | Intent stays `Started`, but the task store has the child as `Completed`. | On retry, the task store will reject the retry (already terminal). The intent can be reconciled from the task's terminal state. |
 /// | 7 | Task store `complete_task` fails | Any | Intent was `Started`, child is not terminal. | Retry the child task; the intent's `Started` status triggers the appropriate retry decision. |
@@ -776,8 +834,6 @@ async fn record_intent_update(
 ///
 /// ## Open questions for later phases
 ///
-/// - **User confirmation transport** (out of scope for Phase 5.2):
-///   how the `AmbiguousInFlight` decision surfaces to users.
 /// - **Automatic resume for `Resumable` tools**: Phase 5.2 treats
 ///   them the same as `SideEffecting` for retry (fail-closed). Later
 ///   work should attempt to poll the operation id first.
@@ -789,7 +845,7 @@ pub mod failure_model {}
 mod tests {
     use super::*;
     use crate::journal::task::AgentTaskId;
-    use agent_sdk_foundation::{PendingToolCallInfo, ToolTier};
+    use agent_sdk_foundation::{PendingToolCallInfo, ToolReplay, ToolTier};
 
     // ── OperationId ──────────────────────────────────────────────
 
@@ -842,12 +898,17 @@ mod tests {
     // ── classify_tool_effect ─────────────────────────────────────
 
     fn make_tool_call(tier: ToolTier, listen: bool) -> PendingToolCallInfo {
+        make_replay_call(tier, ToolReplay::Unsafe, listen)
+    }
+
+    fn make_replay_call(tier: ToolTier, replay: ToolReplay, listen: bool) -> PendingToolCallInfo {
         PendingToolCallInfo {
             id: "call_1".into(),
             name: "test_tool".into(),
             display_name: "Test Tool".into(),
             tier,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay,
             input: serde_json::json!({}),
             effective_input: serde_json::json!({}),
             listen_context: if listen {
@@ -864,21 +925,41 @@ mod tests {
     }
 
     #[test]
-    fn classify_observe_tool_is_replay_safe() {
-        let tool = make_tool_call(ToolTier::Observe, false);
-        assert_eq!(classify_tool_effect(&tool), ToolEffectClass::ReplaySafe);
+    fn classify_safe_tool_is_replay_safe_in_either_tier() {
+        for tier in [ToolTier::Observe, ToolTier::Confirm] {
+            let tool = make_replay_call(tier, ToolReplay::Safe, false);
+            assert_eq!(classify_tool_effect(&tool), ToolEffectClass::ReplaySafe);
+        }
     }
 
     #[test]
-    fn classify_confirm_tool_is_side_effecting() {
-        let tool = make_tool_call(ToolTier::Confirm, false);
+    fn classify_unsafe_tool_is_side_effecting_in_either_tier() {
+        for tier in [ToolTier::Observe, ToolTier::Confirm] {
+            let tool = make_replay_call(tier, ToolReplay::Unsafe, false);
+            assert_eq!(classify_tool_effect(&tool), ToolEffectClass::SideEffecting);
+        }
+    }
+
+    #[test]
+    fn classify_unsafe_tool_with_listen_is_resumable() {
+        for tier in [ToolTier::Observe, ToolTier::Confirm] {
+            let tool = make_replay_call(tier, ToolReplay::Unsafe, true);
+            assert_eq!(classify_tool_effect(&tool), ToolEffectClass::Resumable);
+        }
+    }
+
+    #[test]
+    fn a_call_without_a_replay_declaration_is_side_effecting() -> anyhow::Result<()> {
+        let tool: PendingToolCallInfo = serde_json::from_value(serde_json::json!({
+            "id": "call_1",
+            "name": "bash",
+            "display_name": "Bash",
+            "tier": "Observe",
+            "input": {},
+        }))?;
+        assert_eq!(tool.replay, ToolReplay::Unsafe);
         assert_eq!(classify_tool_effect(&tool), ToolEffectClass::SideEffecting);
-    }
-
-    #[test]
-    fn classify_confirm_tool_with_listen_is_resumable() {
-        let tool = make_tool_call(ToolTier::Confirm, true);
-        assert_eq!(classify_tool_effect(&tool), ToolEffectClass::Resumable);
+        Ok(())
     }
 
     // ── ExecutionIntent lifecycle ────────────────────────────────

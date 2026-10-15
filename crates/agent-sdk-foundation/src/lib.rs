@@ -41,5 +41,6 @@ pub use types::{
     CONTINUATION_VERSION, ContinuationEnvelope, ExecutionStatus, ExternalToolResult,
     ListenExecutionContext, PendingToolCallInfo, QuestionAnswer, QuestionOption, QuestionPayload,
     RetryConfig, ThreadId, TokenUsage, ToolConcurrency, ToolExecution, ToolInvocation, ToolOutcome,
-    ToolResult, ToolResultArtifact, ToolRuntime, ToolTier, TurnOptions, TurnOutcome, TurnSummary,
+    ToolReplay, ToolResult, ToolResultArtifact, ToolRuntime, ToolTier, TurnOptions, TurnOutcome,
+    TurnSummary,
 };

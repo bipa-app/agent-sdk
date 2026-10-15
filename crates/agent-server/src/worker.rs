@@ -28,7 +28,8 @@
 //! must persist an [`ExecutionIntent`] before the executor callback
 //! runs. If persistence fails, execution is blocked (fail-closed).
 //! The [`classify_tool_effect`] helper determines a tool's
-//! [`ToolEffectClass`] from its [`PendingToolCallInfo`] metadata.
+//! [`ToolEffectClass`] from the replay value its
+//! [`PendingToolCallInfo`] carries, never from its tier.
 //!
 //! # Confirmation pause/resume
 //!
@@ -178,8 +179,8 @@ pub use user_input::{UserInput, user_input_from_submitted};
 // Re-export durable execution intent from journal.
 pub use crate::journal::execution_intent::{
     ExecutionIntent, ExecutionIntentStore, InMemoryExecutionIntentStore, IntentStatus, OperationId,
-    RetryDecision, ToolEffectClass, check_retry_safety, classify_tool_effect,
-    guarded_tool_execution,
+    RetryDecision, TOOL_INTERRUPTED_PREFIX, ToolEffectClass, check_retry_safety,
+    classify_tool_effect, guarded_tool_execution,
 };
 
 // Re-export confirmation types and functions.

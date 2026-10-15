@@ -43,7 +43,7 @@ use agent_sdk_foundation::llm::late_tool_result::LateToolResultStatus;
 use agent_sdk_foundation::llm::{self, ChatRequest};
 use agent_sdk_foundation::{
     AgentContinuation, AgentState, ContinuationEnvelope, PendingToolCallInfo, QuestionOption,
-    QuestionPayload, TerminalReason, TokenUsage, ToolConcurrency, ToolResult, ToolTier,
+    QuestionPayload, TerminalReason, TokenUsage, ToolConcurrency, ToolReplay, ToolResult, ToolTier,
 };
 use agent_sdk_providers::LlmProvider;
 use agent_sdk_providers::streaming::{StreamAccumulator, StreamBox, StreamDelta, StreamErrorKind};
@@ -7325,6 +7325,7 @@ fn extract_pending_tool_calls(
                     display_name: def.map_or_else(|| name.clone(), |d| d.display_name.clone()),
                     tier: def.map_or(ToolTier::Confirm, |d| d.tier),
                     concurrency: def.map_or(ToolConcurrency::Exclusive, |d| d.concurrency),
+                    replay: def.map_or(ToolReplay::Unsafe, |d| d.replay),
                     input: input.clone(),
                     effective_input: input.clone(),
                     listen_context: None,
@@ -9002,6 +9003,7 @@ async fn undelivered_call_closures(
             display_name: name.to_owned(),
             tier: agent_sdk_foundation::ToolTier::Confirm,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
             input: input.clone(),
             effective_input: serde_json::Value::Null,
             listen_context: None,
@@ -10597,6 +10599,7 @@ mod tests {
                 display_name: "Bash".to_owned(),
                 tier: ToolTier::Observe,
                 concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+                replay: agent_sdk_foundation::ToolReplay::Unsafe,
                 input: serde_json::json!({"command": "true"}),
                 effective_input: serde_json::json!({"command": "true"}),
                 listen_context: None,

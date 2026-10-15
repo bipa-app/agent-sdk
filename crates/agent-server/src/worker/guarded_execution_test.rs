@@ -19,7 +19,7 @@ use crate::journal::event_repository::InMemoryEventRepository;
 use crate::journal::execution_context::build_root_worker_inputs;
 use crate::journal::execution_intent::{
     ExecutionIntent, ExecutionIntentStore, GuardedExecutionDeps, InMemoryExecutionIntentStore,
-    IntentStatus, OperationId, ToolEffectClass, guarded_tool_execution,
+    IntentStatus, OperationId, TOOL_INTERRUPTED_PREFIX, ToolEffectClass, guarded_tool_execution,
 };
 use crate::journal::message_store::InMemoryMessageProjectionStore;
 use crate::journal::store::{AgentTaskStore, InMemoryAgentTaskStore};
@@ -28,6 +28,7 @@ use crate::journal::thread_store::InMemoryThreadStore;
 use crate::journal::turn_attempt_store::InMemoryTurnAttemptStore;
 use crate::worker::bootstrap::WorkerBootstrapContext;
 use crate::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
+use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Tool, Usage,
 };
@@ -174,6 +175,7 @@ fn sample_definition_with_tools() -> AgentDefinition {
                 display_name: "Bash".into(),
                 tier: ToolTier::Observe,
                 concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+                replay: agent_sdk_foundation::ToolReplay::Unsafe,
             },
             Tool {
                 name: "transfer".into(),
@@ -182,6 +184,7 @@ fn sample_definition_with_tools() -> AgentDefinition {
                 display_name: "Transfer".into(),
                 tier: ToolTier::Confirm,
                 concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+                replay: agent_sdk_foundation::ToolReplay::Unsafe,
             },
         ],
         thinking: ThinkingPolicy::default(),
@@ -319,7 +322,7 @@ async fn replay_safe_tool_bypasses_intent_persistence() -> Result<()> {
     let intent_store = InMemoryExecutionIntentStore::new();
     let cancel = CancellationToken::new();
 
-    // Bash is Observe tier → ReplaySafe.
+    // The caller passes ReplaySafe, so no intent is written.
     let (_parent, children) = suspend_root_with_tools(
         &stores,
         vec![(
@@ -600,11 +603,19 @@ async fn retry_blocked_when_intent_ambiguous_in_flight() -> Result<()> {
     )
     .await;
 
-    assert!(result.is_err(), "expected error for ambiguous retry");
-    let err = format!("{:#}", result.unwrap_err());
+    let error = assert_interrupted(result)?;
     assert!(
-        err.contains("ambiguous in-flight"),
-        "error should mention ambiguous: {err}"
+        error.contains("transfer"),
+        "the result names the tool: {error}"
+    );
+    let intent = intent_store
+        .get_intent(&op_id)
+        .await?
+        .context("intent should exist")?;
+    assert_eq!(
+        intent.status,
+        IntentStatus::Failed,
+        "the started intent is closed as failed"
     );
 
     Ok(())
@@ -665,14 +676,19 @@ async fn retry_blocked_when_side_effecting_intent_failed() -> Result<()> {
     )
     .await;
 
+    let error = assert_interrupted(result)?;
     assert!(
-        result.is_err(),
-        "expected error for failed side-effecting retry"
+        error.contains("transfer"),
+        "the result names the tool: {error}"
     );
-    let err = format!("{:#}", result.unwrap_err());
-    assert!(
-        err.contains("ambiguous in-flight"),
-        "error should mention ambiguous: {err}"
+    let intent = intent_store
+        .get_intent(&op_id)
+        .await?
+        .context("intent should exist")?;
+    assert_eq!(
+        intent.status,
+        IntentStatus::Failed,
+        "the failed intent stays failed"
     );
 
     Ok(())
@@ -859,4 +875,33 @@ async fn cancellation_records_intent_as_failed() -> Result<()> {
     assert_eq!(intent.status, IntentStatus::Failed);
 
     Ok(())
+}
+
+/// Assert `result` settled the child as interrupted without running it:
+/// the child is `Failed` with the interrupted prefix, and one
+/// `ToolCallEnd` closes the call.
+fn assert_interrupted(result: Result<ToolTaskOutcome>) -> Result<String> {
+    let ToolTaskOutcome::Failed {
+        child,
+        error,
+        committed_events,
+        ..
+    } = result?
+    else {
+        anyhow::bail!("an unsafe in-flight retry must settle as interrupted");
+    };
+    assert_eq!(child.status, TaskStatus::Failed);
+    assert!(
+        error.starts_with(TOOL_INTERRUPTED_PREFIX),
+        "error should be an interrupted result: {error}"
+    );
+    assert_eq!(child.last_error.as_deref(), Some(error.as_str()));
+    let [end] = committed_events.as_slice() else {
+        anyhow::bail!("expected exactly one ToolCallEnd, got {committed_events:?}");
+    };
+    assert!(
+        matches!(&end.event, AgentEvent::ToolCallEnd { result, .. } if !result.success && result.output == error),
+        "expected a failed ToolCallEnd carrying the interrupted result: {end:?}"
+    );
+    Ok(error)
 }

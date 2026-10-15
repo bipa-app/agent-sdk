@@ -74,6 +74,7 @@ fn allowed_keys(ident: &str) -> Option<&'static [&'static str]> {
             "context",
             "tier",
             "concurrency",
+            "replay",
             "schema",
             "input",
         ]),

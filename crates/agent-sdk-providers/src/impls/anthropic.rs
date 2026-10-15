@@ -2000,6 +2000,7 @@ mod tests {
             display_name: name.to_string(),
             tier: agent_sdk_foundation::ToolTier::Observe,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
         }
     }
 

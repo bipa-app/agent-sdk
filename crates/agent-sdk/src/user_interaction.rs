@@ -37,7 +37,7 @@
 //! // The UI handles requests and responses through the channels
 //! ```
 
-use crate::{PrimitiveToolName, Tool, ToolContext, ToolResult, ToolTier};
+use crate::{PrimitiveToolName, Tool, ToolContext, ToolReplay, ToolResult, ToolTier};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -426,6 +426,10 @@ impl<Ctx: Send + Sync + 'static> Tool<Ctx> for AskUserQuestionTool {
         ToolTier::Observe
     }
 
+    fn replay(&self) -> ToolReplay {
+        ToolReplay::Safe
+    }
+
     async fn execute(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {
         // Parse input
         let input: AskUserInput =
@@ -485,6 +489,12 @@ impl<Ctx: Send + Sync + 'static> Tool<Ctx> for AskUserQuestionTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ask_user_declares_replay_safe() {
+        let (tool, _requests, _responses) = AskUserQuestionTool::with_channels(1);
+        assert_eq!(Tool::<()>::replay(&tool), ToolReplay::Safe);
+    }
     use crate::Tool;
 
     fn parse_ask_user_input(input: Value) -> Result<AskUserInput, serde_json::Error> {

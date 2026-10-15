@@ -3153,6 +3153,7 @@ async fn test_unknown_continuation_version_rejected() -> anyhow::Result<()> {
                 display_name: "Echo".into(),
                 tier: ToolTier::Observe,
                 concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+                replay: agent_sdk_foundation::ToolReplay::Unsafe,
                 input: serde_json::json!({}),
                 effective_input: serde_json::json!({}),
                 listen_context: None,
