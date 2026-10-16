@@ -37,10 +37,6 @@ use agent_server::journal::commit::{
     LostCommitOwnership, StaleTurnCommit,
 };
 use agent_server::journal::committed_event::CommittedEvent;
-use agent_server::journal::completed_turn_transaction::AtomicCompletedTurnCommitter;
-use agent_server::journal::event_outbox_transaction::{
-    AtomicEventOutboxCommitter, EventOutboxCommit, EventOutboxCommitOutcome,
-};
 use agent_server::journal::event_repository::EventRepository;
 use agent_server::journal::execution_intent::{ExecutionIntent, ExecutionIntentStore, OperationId};
 use agent_server::journal::fork_transaction::ForkCommitParams;
@@ -89,7 +85,7 @@ use agent_server::journal::thread::{
     PurgeReceipt, PurgeSeed, Thread, ThreadNotFound, ThreadOperation, ThreadStatus,
 };
 use agent_server::journal::thread_creation_transaction::{
-    ThreadCreationCommit, ThreadCreationRows,
+    ThreadCreationCommit, ThreadCreationCommitted, ThreadCreationRows, ThreadNaming,
 };
 use agent_server::journal::thread_store::{
     BeginPurge, ThreadCreation, ThreadCreationOutcome, ThreadIdConflict, ThreadStore,
@@ -2819,9 +2815,31 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
     async fn commit_thread_creation_atomic_inner(
         &self,
         params: ThreadCreationCommit,
-    ) -> Result<ThreadCreationRows> {
+    ) -> Result<ThreadCreationCommitted> {
         let mut tx = self.begin().await?;
-        Self::bootstrap_thread_row_tx(&mut tx, &params.thread_id, params.now).await?;
+        match params.naming {
+            ThreadNaming::Minted => {
+                Self::bootstrap_thread_row_tx(&mut tx, &params.thread_id, params.now).await?;
+            }
+            ThreadNaming::CallerNamed => {
+                let claim = Self::claim_thread_creation_tx(
+                    &mut tx,
+                    &params.thread_id,
+                    &ThreadCreation::Create,
+                    params.now,
+                )
+                .await?;
+                match claim {
+                    ThreadCreationOutcome::Created => {}
+                    ThreadCreationOutcome::Existing => {
+                        tx.commit()
+                            .await
+                            .context("commit idempotent thread creation lookup")?;
+                        return Ok(ThreadCreationCommitted::Existing);
+                    }
+                }
+            }
+        }
         let thread = Self::get_thread_tx(&mut tx, &params.thread_id)
             .await?
             .context("created thread missing after bootstrap")?;
@@ -2851,10 +2869,12 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
         tx.commit()
             .await
             .context("commit sqlite thread creation transaction")?;
-        Ok(ThreadCreationRows {
-            thread,
-            committed_event,
-        })
+        Ok(ThreadCreationCommitted::Created(Box::new(
+            ThreadCreationRows {
+                thread,
+                committed_event,
+            },
+        )))
     }
 
     /// Atomic fork transaction for `SQLite`.
@@ -3578,6 +3598,10 @@ impl AgentTaskStore for SqliteDurableStore {
         params: SubagentSpawnCommit,
     ) -> Result<SubagentSpawnOutcome> {
         self.commit_subagent_spawn_atomic_inner(params).await
+    }
+
+    async fn commit_completed_turn(&self, params: CompletedTurnCommit) -> Result<CommitOutcome> {
+        self.commit_completed_turn_atomic_inner(params).await
     }
 
     async fn insert(&self, task: AgentTask) -> Result<()> {
@@ -5176,14 +5200,10 @@ impl SqliteDurableStore {
 
 #[async_trait]
 impl ThreadStore for SqliteDurableStore {
-    fn atomic_completed_turn_committer(&self) -> Option<&dyn AtomicCompletedTurnCommitter> {
-        Some(self)
-    }
-
     async fn commit_thread_creation(
         &self,
         params: ThreadCreationCommit,
-    ) -> Result<ThreadCreationRows> {
+    ) -> Result<ThreadCreationCommitted> {
         self.commit_thread_creation_atomic_inner(params).await
     }
 
@@ -5624,29 +5644,11 @@ impl CheckpointStore for SqliteDurableStore {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// AtomicCompletedTurnCommitter
-// ─────────────────────────────────────────────────────────────────────
-
-#[async_trait]
-impl AtomicCompletedTurnCommitter for SqliteDurableStore {
-    async fn commit_completed_turn_atomic(
-        &self,
-        params: CompletedTurnCommit,
-    ) -> Result<CommitOutcome> {
-        self.commit_completed_turn_atomic_inner(params).await
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────
 // EventRepository
 // ─────────────────────────────────────────────────────────────────────
 
 #[async_trait]
 impl EventRepository for SqliteDurableStore {
-    fn atomic_event_outbox_committer(&self) -> Option<&dyn AtomicEventOutboxCommitter> {
-        Some(self)
-    }
-
     async fn commit_event(
         &self,
         thread_id: &ThreadId,
@@ -5787,16 +5789,14 @@ impl EventRepository for SqliteDurableStore {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// AtomicEventOutboxCommitter
-// ─────────────────────────────────────────────────────────────────────
-
-#[async_trait]
-impl AtomicEventOutboxCommitter for SqliteDurableStore {
-    async fn commit_events_with_outbox(
+#[cfg(test)]
+impl SqliteDurableStore {
+    /// Commit `events` and their coalesced advisory in one transaction, for
+    /// the outbox tests that need a real `thread_events_available` row.
+    async fn seed_events_with_outbox(
         &self,
-        params: EventOutboxCommit,
-    ) -> Result<EventOutboxCommitOutcome> {
+        params: tests::SeedEvents,
+    ) -> Result<tests::SeededEvents> {
         ensure!(
             !params.events.is_empty(),
             "cannot commit an empty event batch"
@@ -5821,9 +5821,9 @@ impl AtomicEventOutboxCommitter for SqliteDurableStore {
         tx.commit()
             .await
             .context("commit atomic events + outbox transaction")?;
-        Ok(EventOutboxCommitOutcome {
+        Ok(tests::SeededEvents {
             committed_events: committed,
-            outbox_row: Some(outbox_row),
+            outbox_row,
         })
     }
 }
@@ -6929,6 +6929,18 @@ fn i64_from_u64(value: u64, label: &str) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
+    pub(super) struct SeedEvents {
+        pub(super) thread_id: agent_sdk_foundation::ThreadId,
+        pub(super) events: Vec<agent_sdk_foundation::events::AgentEvent>,
+        pub(super) outbox_max_attempts: u32,
+        pub(super) now: time::OffsetDateTime,
+    }
+
+    pub(super) struct SeededEvents {
+        pub(super) committed_events: Vec<agent_server::journal::CommittedEvent>,
+        pub(super) outbox_row: agent_server::journal::outbox::OutboxRow,
+    }
+
     use agent_server::journal::BeginPurge;
     use agent_server::journal::thread::PurgeSeed;
     use anyhow::{Context, Result};
@@ -7925,12 +7937,9 @@ INSERT INTO agent_sdk_turn_attempts (
     // ── Phase 8.1: outbox advisory contract ─────────────────────────
 
     #[tokio::test]
-    async fn commit_events_with_outbox_emits_one_thread_events_advisory_per_batch() -> Result<()> {
+    async fn an_event_batch_gets_one_thread_events_advisory() -> Result<()> {
         use agent_sdk_foundation::ThreadId;
         use agent_sdk_foundation::events::AgentEvent;
-        use agent_server::journal::event_outbox_transaction::{
-            AtomicEventOutboxCommitter, EventOutboxCommit,
-        };
         use agent_server::journal::outbox::OutboxStore;
         use agent_server::journal::outbox_message::{
             OutboxMessage, OutboxMessageKind, ThreadEventsAvailablePayload,
@@ -7941,9 +7950,8 @@ INSERT INTO agent_sdk_turn_attempts (
         let thread_id = ThreadId::from_string("t-sqlite-outbox-coalesce");
         ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
 
-        let outcome = AtomicEventOutboxCommitter::commit_events_with_outbox(
-            &store,
-            EventOutboxCommit {
+        let outcome = store
+            .seed_events_with_outbox(SeedEvents {
                 thread_id: thread_id.clone(),
                 events: vec![
                     AgentEvent::text("msg_a", "first"),
@@ -7952,15 +7960,11 @@ INSERT INTO agent_sdk_turn_attempts (
                 ],
                 outbox_max_attempts: 5,
                 now: t0(),
-            },
-        )
-        .await?;
+            })
+            .await?;
 
         assert_eq!(outcome.committed_events.len(), 3);
-        let row = outcome
-            .outbox_row
-            .as_ref()
-            .context("Phase 8.1 contract: outbox_row must be present")?;
+        let row = outcome.outbox_row;
         assert_eq!(row.kind, OutboxMessageKind::ThreadEventsAvailable);
         assert_eq!(row.thread_id, thread_id);
         // The row columns reference the FIRST event of the batch
@@ -8076,9 +8080,6 @@ INSERT INTO agent_sdk_turn_attempts (
     #[tokio::test]
     async fn outbox_mark_delivered_is_noop_when_row_was_cascade_deleted() -> Result<()> {
         use agent_sdk_foundation::events::AgentEvent;
-        use agent_server::journal::event_outbox_transaction::{
-            AtomicEventOutboxCommitter, EventOutboxCommit,
-        };
         use agent_server::journal::outbox::OutboxStore;
         use agent_server::journal::retention::RetentionStore;
         use agent_server::journal::thread_store::ThreadStore;
@@ -8087,20 +8088,15 @@ INSERT INTO agent_sdk_turn_attempts (
         let thread_id = ThreadId::from_string("t-sqlite-outbox-delivered-missing");
         ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
 
-        let outcome = AtomicEventOutboxCommitter::commit_events_with_outbox(
-            &store,
-            EventOutboxCommit {
+        let outcome = store
+            .seed_events_with_outbox(SeedEvents {
                 thread_id: thread_id.clone(),
                 events: vec![AgentEvent::text("msg_a", "first")],
                 outbox_max_attempts: 3,
                 now: t0(),
-            },
-        )
-        .await?;
-        let row_id = outcome
-            .outbox_row
-            .context("outbox row should exist for committed event batch")?
-            .id;
+            })
+            .await?;
+        let row_id = outcome.outbox_row.id;
 
         RetentionStore::advance_floor(&store, &thread_id, 1, t_plus(1)).await?;
         assert!(OutboxStore::get(&store, &row_id).await?.is_none());
@@ -8112,9 +8108,6 @@ INSERT INTO agent_sdk_turn_attempts (
     #[tokio::test]
     async fn outbox_mark_failed_is_noop_when_row_was_cascade_deleted() -> Result<()> {
         use agent_sdk_foundation::events::AgentEvent;
-        use agent_server::journal::event_outbox_transaction::{
-            AtomicEventOutboxCommitter, EventOutboxCommit,
-        };
         use agent_server::journal::outbox::OutboxStore;
         use agent_server::journal::retention::RetentionStore;
         use agent_server::journal::thread_store::ThreadStore;
@@ -8123,20 +8116,15 @@ INSERT INTO agent_sdk_turn_attempts (
         let thread_id = ThreadId::from_string("t-sqlite-outbox-failed-missing");
         ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
 
-        let outcome = AtomicEventOutboxCommitter::commit_events_with_outbox(
-            &store,
-            EventOutboxCommit {
+        let outcome = store
+            .seed_events_with_outbox(SeedEvents {
                 thread_id: thread_id.clone(),
                 events: vec![AgentEvent::text("msg_a", "first")],
                 outbox_max_attempts: 3,
                 now: t0(),
-            },
-        )
-        .await?;
-        let row_id = outcome
-            .outbox_row
-            .context("outbox row should exist for committed event batch")?
-            .id;
+            })
+            .await?;
+        let row_id = outcome.outbox_row.id;
 
         RetentionStore::advance_floor(&store, &thread_id, 1, t_plus(1)).await?;
         assert!(OutboxStore::get(&store, &row_id).await?.is_none());
@@ -8202,9 +8190,6 @@ INSERT INTO agent_sdk_turn_attempts (
     #[tokio::test]
     async fn outbox_list_by_thread_orders_task_wakeups_after_thread_events() -> Result<()> {
         use agent_sdk_foundation::events::AgentEvent;
-        use agent_server::journal::event_outbox_transaction::{
-            AtomicEventOutboxCommitter, EventOutboxCommit,
-        };
         use agent_server::journal::outbox::{NewOutboxRow, OutboxStore};
         use agent_server::journal::outbox_message::{
             OutboxMessage, OutboxMessageKind, TaskWakeupPayload,
@@ -8215,16 +8200,14 @@ INSERT INTO agent_sdk_turn_attempts (
         let thread_id = ThreadId::from_string("t-sqlite-outbox-order");
         ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
 
-        AtomicEventOutboxCommitter::commit_events_with_outbox(
-            &store,
-            EventOutboxCommit {
+        store
+            .seed_events_with_outbox(SeedEvents {
                 thread_id: thread_id.clone(),
                 events: vec![AgentEvent::text("msg_a", "first")],
                 outbox_max_attempts: 3,
                 now: t0(),
-            },
-        )
-        .await?;
+            })
+            .await?;
 
         let task_id = AgentTaskId::new();
         let payload = OutboxMessage::TaskWakeup(TaskWakeupPayload {
@@ -8264,9 +8247,6 @@ INSERT INTO agent_sdk_turn_attempts (
     #[tokio::test]
     async fn outbox_reclaim_returns_stale_claimed_rows_to_pending() -> Result<()> {
         use agent_sdk_foundation::events::AgentEvent;
-        use agent_server::journal::event_outbox_transaction::{
-            AtomicEventOutboxCommitter, EventOutboxCommit,
-        };
         use agent_server::journal::outbox::{OutboxStatus, OutboxStore};
         use agent_server::journal::thread_store::ThreadStore;
 
@@ -8274,16 +8254,14 @@ INSERT INTO agent_sdk_turn_attempts (
         let thread_id = ThreadId::from_string("t-sqlite-reclaim-stale");
         ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
 
-        AtomicEventOutboxCommitter::commit_events_with_outbox(
-            &store,
-            EventOutboxCommit {
+        store
+            .seed_events_with_outbox(SeedEvents {
                 thread_id: thread_id.clone(),
                 events: vec![AgentEvent::text("msg_a", "first")],
                 outbox_max_attempts: 3,
                 now: t0(),
-            },
-        )
-        .await?;
+            })
+            .await?;
 
         let claimed = OutboxStore::claim_pending(&store, "worker-a", 10, t_plus(1)).await?;
         assert_eq!(claimed.len(), 1);
@@ -8312,9 +8290,6 @@ INSERT INTO agent_sdk_turn_attempts (
     #[tokio::test]
     async fn outbox_reclaim_skips_live_claims() -> Result<()> {
         use agent_sdk_foundation::events::AgentEvent;
-        use agent_server::journal::event_outbox_transaction::{
-            AtomicEventOutboxCommitter, EventOutboxCommit,
-        };
         use agent_server::journal::outbox::OutboxStore;
         use agent_server::journal::thread_store::ThreadStore;
 
@@ -8322,16 +8297,14 @@ INSERT INTO agent_sdk_turn_attempts (
         let thread_id = ThreadId::from_string("t-sqlite-reclaim-live");
         ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
 
-        AtomicEventOutboxCommitter::commit_events_with_outbox(
-            &store,
-            EventOutboxCommit {
+        store
+            .seed_events_with_outbox(SeedEvents {
                 thread_id: thread_id.clone(),
                 events: vec![AgentEvent::text("msg_live", "first")],
                 outbox_max_attempts: 3,
                 now: t0(),
-            },
-        )
-        .await?;
+            })
+            .await?;
 
         OutboxStore::claim_pending(&store, "worker-live", 10, t_plus(1)).await?;
 
@@ -8357,7 +8330,6 @@ INSERT INTO agent_sdk_turn_attempts (
         use agent_sdk_foundation::{TokenUsage, audit::AuditProvenance};
         use agent_server::journal::checkpoint::CheckpointKind;
         use agent_server::journal::commit::CompletedTurnCommit;
-        use agent_server::journal::completed_turn_transaction::AtomicCompletedTurnCommitter;
         use agent_server::journal::message_store::MessageProjectionStore;
         use agent_server::journal::task::AgentTask;
         use agent_server::journal::turn_attempt::{
@@ -8420,7 +8392,7 @@ INSERT INTO agent_sdk_turn_attempts (
             llm::Message::user("user prompt"),
             llm::Message::assistant("final reply"),
         ];
-        let commit = AtomicCompletedTurnCommitter::commit_completed_turn_atomic(
+        let commit = AgentTaskStore::commit_completed_turn(
             &store,
             CompletedTurnCommit {
                 checkpoint_kind: CheckpointKind::FullTurn,
@@ -8508,7 +8480,6 @@ INSERT INTO agent_sdk_turn_attempts (
         use agent_sdk_foundation::{TokenUsage, audit::AuditProvenance};
         use agent_server::journal::checkpoint::CheckpointKind;
         use agent_server::journal::commit::CompletedTurnCommit;
-        use agent_server::journal::completed_turn_transaction::AtomicCompletedTurnCommitter;
         use agent_server::journal::event_repository::EventRepository;
         use agent_server::journal::outbox::OutboxStore;
         use agent_server::journal::outbox_message::OutboxMessageKind;
@@ -8551,7 +8522,7 @@ INSERT INTO agent_sdk_turn_attempts (
         )
         .await?;
 
-        let outcome = AtomicCompletedTurnCommitter::commit_completed_turn_atomic(
+        let outcome = AgentTaskStore::commit_completed_turn(
             &store,
             CompletedTurnCommit {
                 checkpoint_kind: CheckpointKind::FullTurn,

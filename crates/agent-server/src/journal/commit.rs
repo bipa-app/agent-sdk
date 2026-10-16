@@ -15,19 +15,14 @@
 //!    [`super::thread_recover`]. A successful commit subsumes the
 //!    draft, so it must be wiped before the next turn starts.
 //!
-//! If any step fails the function returns `Err` and no subsequent
-//! steps execute. For the in-memory stores each individual call is
-//! internally atomic (single write-lock scope). Durable backends can
-//! expose an atomic transaction hook through
-//! [`super::thread_store::ThreadStore::atomic_completed_turn_committer`]
-//! so this helper routes steps 1-5 — plus the turn's lifecycle events
-//! and their coalesced advisory outbox row — through one database
-//! transaction (see "Event + state atomicity" below).
-//! Atomic backends are responsible for clearing the draft as part of
-//! their transaction — the helper does not call `clear_draft` after
-//! the atomic hook returns, because doing so outside the transaction
-//! would open a tiny crash window where committed history and draft
-//! could both contain the same messages.
+//! Every backend commits all of it, plus the delivered injections'
+//! completion, the turn's lifecycle events and their coalesced
+//! `thread_events_available` advisory, through the required
+//! [`AgentTaskStore::commit_completed_turn`].
+//! The durable backends run one database transaction, which also clears
+//! the draft, so committed history and draft never both hold the same
+//! messages. The in-memory task store holds its write lock across every
+//! step.
 //!
 //! # Guarantees
 //!
@@ -40,19 +35,12 @@
 //!   suspension boundary survives so the next turn can recover the
 //!   in-flight conversation.
 //!
-//! # Event + state atomicity (Phase 10 · D)
+//! # Event + state atomicity
 //!
-//! On a durable backend the lifecycle events **and** their single
-//! coalesced `thread_events_available` advisory outbox row are written
-//! inside the same transaction as the state projections, via
-//! [`super::completed_turn_transaction::AtomicCompletedTurnCommitter`].
-//! The previous design committed events in a *separate* transaction
-//! after the state commit, so a crash in between could leave a
-//! committed turn with no persisted events and a lost in-process
-//! notify. Folding both into one transaction makes the invariant
-//! "events exist iff the turn committed" hold on Postgres and `SQLite`.
-//! The in-memory path keeps committing events after the state steps
-//! because each individual store mutation is already atomic.
+//! The lifecycle events **and** their single coalesced
+//! `thread_events_available` advisory outbox row are written in the same
+//! unit as the state projections, so "events exist iff the turn
+//! committed" holds on every backend.
 //!
 //! # What this module does **not** own
 //!
@@ -62,21 +50,16 @@
 
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::{ThreadId, TokenUsage, llm};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use time::OffsetDateTime;
 
 use super::checkpoint::Checkpoint;
 use super::checkpoint::CheckpointKind;
-use super::checkpoint::NewCheckpointParams;
-use super::checkpoint_store::CheckpointStore;
 use super::committed_event::CommittedEvent;
-use super::event_repository::EventRepository;
-use super::message_store::MessageProjectionStore;
+use super::store::AgentTaskStore;
 use super::task::{AgentTaskId, LeaseId, WorkerId};
 use super::thread::Thread;
-use super::thread_store::ThreadStore;
 use super::turn_attempt::{CloseAttemptParams, TurnAttempt, TurnAttemptId};
-use super::turn_attempt_store::TurnAttemptStore;
 
 // ─────────────────────────────────────────────────────────────────────
 // Param struct
@@ -128,47 +111,28 @@ pub struct CompletedTurnCommit {
     pub checkpoint_kind: CheckpointKind,
     /// Opaque agent-state snapshot for v1 recovery.
     pub agent_state_snapshot: serde_json::Value,
-    /// Lifecycle events to commit atomically with the turn.
-    ///
-    /// On a durable backend that exposes an
-    /// [`AtomicCompletedTurnCommitter`](super::completed_turn_transaction::AtomicCompletedTurnCommitter),
-    /// these events — together with the single coalesced advisory outbox
-    /// row — are written inside the **same** transaction as the state
+    /// Lifecycle events to commit with the turn, together with their single
+    /// coalesced advisory outbox row, in the same unit as the state
     /// projections (attempt close, thread aggregate, message head, raw
-    /// message batch, checkpoint). A crash between the state commit and
-    /// the event commit can therefore no longer leave a committed turn
-    /// with zero persisted events.
-    ///
-    /// On the non-atomic in-memory path each store mutation is already
-    /// atomic under its own write lock, so the events are committed via
-    /// [`EventRepository::commit_event_batch`]
-    /// after the state steps. An empty vec skips the event-commit step.
+    /// message batch, checkpoint). An empty vec writes no event and no
+    /// advisory.
     pub events: Vec<AgentEvent>,
     /// Maximum relay attempts for the coalesced advisory outbox row
-    /// written alongside `events` on the atomic durable path.
-    ///
-    /// Ignored when `events` is empty or when the backend has no atomic
-    /// committer (the in-memory path writes no outbox row from this
-    /// helper).
+    /// written alongside `events`. Ignored when `events` is empty.
     pub outbox_max_attempts: u32,
     /// Optional task-row ownership validation performed **inside** the
     /// commit transaction.
     ///
-    /// When set, the atomic durable committers re-read the task row
-    /// (`FOR UPDATE` on Postgres; under `SQLite`'s exclusive write
-    /// transaction) and reject the commit with [`LostCommitOwnership`]
+    /// When set, the store re-reads the task row (`FOR UPDATE` on
+    /// Postgres; under `SQLite`'s exclusive write transaction; under the
+    /// in-memory task store's write lock) and rejects the commit with
+    /// [`LostCommitOwnership`]
     /// unless the row is still `Running` and owned by exactly this
     /// `(worker, lease)` pair — closing the window where a
     /// cancellation or lease loss lands between a caller-side
     /// ownership check and the commit. Used only by the worker's
     /// turn-slot-shift retry; the first (non-shifted) commit attempt
     /// passes `None` so the normal path is unchanged.
-    ///
-    /// The non-atomic in-memory path cannot enforce this (it has no
-    /// handle on the task journal and no cross-store transaction);
-    /// there the worker's shift path re-validates ownership
-    /// immediately before the retry, accepting the same in-process
-    /// race window every other non-atomic in-memory step already has.
     pub owner_guard: Option<CommitOwnerGuard>,
     /// Current wall-clock time.
     pub now: OffsetDateTime,
@@ -274,217 +238,30 @@ pub struct CommitOutcome {
 // Atomic commit
 // ─────────────────────────────────────────────────────────────────────
 
-/// Atomically commit a completed turn across all projections.
-///
-/// This is the heart of the crash-safety guarantee. A single call
-/// advances the turn-attempt audit, thread aggregate, message
-/// projection, and checkpoint table together. If any step fails the
-/// function returns `Err` before touching subsequent stores.
-///
-/// # Steps
-///
-/// 1. **Close attempt** — fills response fields on the open turn
-///    attempt.
-/// 2. **Commit thread** — increments `committed_turns` and
-///    accumulates `total_usage` on the thread aggregate.
-/// 3. **Append messages** — extends the committed message history.
-/// 4. **Create checkpoint** — writes a snapshot at
-///    `(thread_id, thread.committed_turns)`.
+/// Commit a completed turn across all projections through
+/// [`AgentTaskStore::commit_completed_turn`], recording the commit's
+/// duration.
 ///
 /// # Errors
 ///
-/// Returns an error if any step fails. Callers should treat a
-/// partial failure as a bug — the in-memory stores guarantee
-/// per-call atomicity, and durable backends should surface an atomic
-/// transaction hook.
+/// Whatever the store returns; see
+/// [`AgentTaskStore::commit_completed_turn`].
 pub async fn commit_completed_turn(
-    mut params: CompletedTurnCommit,
-    task_store: &dyn super::store::AgentTaskStore,
-    thread_store: &dyn ThreadStore,
-    message_store: &dyn MessageProjectionStore,
-    turn_attempt_store: &dyn TurnAttemptStore,
-    checkpoint_store: &dyn CheckpointStore,
-    event_repo: &dyn EventRepository,
+    params: CompletedTurnCommit,
+    task_store: &dyn AgentTaskStore,
 ) -> Result<CommitOutcome> {
     #[cfg(feature = "otel")]
     let started_at = std::time::Instant::now();
 
-    if let Some(committer) = thread_store.atomic_completed_turn_committer() {
-        // Atomic durable path: events + the coalesced advisory outbox
-        // row commit inside the SAME transaction as the state
-        // projections, so the params (including `events`) are handed
-        // straight to the committer. This closes the crash window where
-        // a host death between the state commit and a separate event
-        // commit left a committed turn with no persisted events.
-        //
-        // Phase 10 · D × 11 · A: because the events now commit inside the
-        // atomic transaction, there is no separate post-commit event write
-        // on this path. The `commit.before_event_commit` failpoint that
-        // 11 · A placed here therefore moves to its true crash boundary —
-        // immediately before the atomic `tx.commit()` in the backend
-        // committer (`agent-service-host`), alongside the
-        // `InjectedCommitFailure` test hook. Both still target the
-        // "about to commit the events/outbox" boundary, now inside the
-        // single transaction.
-        let outcome = committer
-            .commit_completed_turn_atomic(params)
-            .await
-            .context("commit: atomic completed-turn transaction")?;
-
-        #[cfg(feature = "otel")]
-        crate::observability::ServerMetrics::global().record_journal_commit(
-            crate::observability::attrs::COMMIT_KIND_ATOMIC,
-            started_at.elapsed().as_secs_f64(),
-        );
-
-        return Ok(outcome);
-    }
-
-    // Non-atomic in-memory path: each store mutation is already atomic
-    // under its own write lock. Pull the events out so the state steps
-    // run first, then commit the events as the final step.
-    let events = std::mem::take(&mut params.events);
-    let delivered_injection_ids = std::mem::take(&mut params.delivered_injection_ids);
-    let thread_id_for_events = params.thread_id.clone();
-
-    // Stale turn double-commit guard. Two racing committers could both
-    // pass this read on the non-atomic path, so the
-    // whole sequential body runs under the store's sequential-commit
-    // lock (acquired above): under it this pre-check is decisive, and
-    // a rejected stale commit provably leaves no side effects — the
-    // attempt is still open for the caller's slot-shift retry. The
-    // expected-turn CAS inside `ThreadStore::commit_turn` (step 2)
-    // remains as defense in depth.
-    // Serialize the entire non-atomic commit body when the backend
-    // provides a sequential-commit lock (the in-memory store does; the
-    // durable backends get equivalent atomicity from their
-    // transactions and never reach this path). This is what makes the
-    // pre-check + close + aggregate sequence race-free in-process.
-    let _sequential_guard = match thread_store.sequential_commit_lock() {
-        Some(lock) => Some(lock.lock().await),
-        None => None,
-    };
-    let committed_turns_before = thread_store
-        .get(&params.thread_id)
-        .await
-        .context("commit: re-read thread for stale-turn guard")?
-        .map_or(0, |thread| thread.committed_turns);
-    if committed_turns_before.saturating_add(1) != params.expected_turn {
-        return Err(anyhow::Error::new(StaleTurnCommit {
-            expected_turn: params.expected_turn,
-            committed_turns: committed_turns_before,
-        }));
-    }
-
-    // 1. Close the turn attempt. Strict: any already-closed row fails
-    //    the commit before a single projection advances. The
-    //    serialization guard above makes the CAS-loss-after-close
-    //    window unreachable on this path, so no idempotent-close
-    //    tolerance is needed.
-    let closed_attempt = turn_attempt_store
-        .close_attempt(
-            &params.turn_attempt_id,
-            params.close_attempt_params,
-            params.now,
-        )
-        .await
-        .context("commit: close turn attempt")?;
-
-    // 2. Commit the turn to the thread aggregate. This carries the
-    //    AUTHORITATIVE expected-turn CAS (inside the store's write
-    //    lock/transaction on every backend) — under the sequential
-    //    lock it is defense in depth; for the durable backends' trait
-    //    method it protects standalone callers like the fork mirror.
-    let thread = thread_store
-        .commit_turn(
-            &params.thread_id,
-            params.expected_turn,
-            &params.turn_usage,
-            params.now,
-        )
-        .await
-        .context("commit: advance thread aggregate")?;
-
-    // 3. Append messages to the message projection.
-    let updated_projection = message_store
-        .commit_messages(&params.thread_id, params.messages, params.now)
-        .await
-        .context("commit: append messages")?;
-
-    // 4. Create the checkpoint with the *full effective* accumulated history,
-    //    not the append-only raw transcript and not merely this turn's delta.
-    //    Recovery and fork consumers must inherit the same compacted view the
-    //    provider saw; the raw transcript remains recoverable from the message
-    //    projection together with its compaction lineage.
-    let checkpoint = checkpoint_store
-        .commit_checkpoint(NewCheckpointParams {
-            thread_id: params.thread_id.clone(),
-            turn_number: thread.committed_turns,
-            task_id: params.task_id,
-            messages: updated_projection.context_history(),
-            agent_state_snapshot: params.agent_state_snapshot,
-            turn_usage: params.turn_usage,
-            kind: params.checkpoint_kind,
-            now: params.now,
-        })
-        .await
-        .context("commit: create checkpoint")?;
-
-    // 5. Clear the in-flight draft so the next turn starts with a
-    //    clean slot. The committed history and checkpoint we just
-    //    wrote already contain everything the suspension path
-    //    snapshotted into the draft. Calling `clear_draft` is safe
-    //    when the slot is already empty — the store returns `None`
-    //    on first-turn threads with no projection row yet, which
-    //    means there was nothing to clear in the first place.
-    //
-    //    The non-atomic path (in-memory stores) accepts a tiny race
-    //    window: a concurrent reader between step 4 and step 5 could
-    //    observe the committed history together with a stale draft.
-    //    Durable backends close this gap by clearing the draft inside
-    //    their atomic completed-turn transaction; see the module
-    //    docs.
-    message_store
-        .clear_draft(&params.thread_id, params.now)
-        .await
-        .context("commit: clear in-flight draft")?;
-
-    // Failpoint: simulate a crash after the thread/checkpoint/draft
-    // steps committed but before lifecycle events are persisted. No-op
-    // (and not compiled) unless the `failpoints` feature is enabled.
-    crate::fail_point!("commit.before_event_commit");
-
-    // 6. Complete the boundary-injection rows this turn delivered. The
-    //    in-memory task store is atomic per call; durable backends never
-    //    reach this path (their committer completes the rows in-tx).
-    task_store
-        .complete_delivered_injections(&delivered_injection_ids, params.now)
-        .await
-        .context("commit: complete delivered injections")?;
-
-    // 7. Commit lifecycle events. Skipped when no events are provided
-    //    (e.g. callers that don't produce lifecycle events yet).
-    let committed_events = if events.is_empty() {
-        Vec::new()
-    } else {
-        event_repo
-            .commit_event_batch(&thread_id_for_events, events, params.now)
-            .await
-            .context("commit: persist lifecycle events")?
-    };
+    let outcome = task_store.commit_completed_turn(params).await?;
 
     #[cfg(feature = "otel")]
     crate::observability::ServerMetrics::global().record_journal_commit(
-        crate::observability::attrs::COMMIT_KIND_NON_ATOMIC,
+        crate::observability::attrs::COMMIT_KIND_ATOMIC,
         started_at.elapsed().as_secs_f64(),
     );
 
-    Ok(CommitOutcome {
-        thread,
-        checkpoint,
-        closed_attempt,
-        committed_events,
-    })
+    Ok(outcome)
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -493,12 +270,16 @@ pub async fn commit_completed_turn(
 
 #[cfg(test)]
 mod tests {
+    use super::super::checkpoint_store::CheckpointStore;
     use super::super::checkpoint_store::InMemoryCheckpointStore;
     use super::super::event_repository::InMemoryEventRepository;
     use super::super::message_store::InMemoryMessageProjectionStore;
+    use super::super::message_store::MessageProjectionStore;
     use super::super::thread_store::InMemoryThreadStore;
+    use super::super::thread_store::ThreadStore;
     use super::super::turn_attempt::{OpenAttemptParams, TurnAttemptOutcome};
     use super::super::turn_attempt_store::InMemoryTurnAttemptStore;
+    use super::super::turn_attempt_store::TurnAttemptStore;
     use super::*;
     use agent_sdk_foundation::audit::AuditProvenance;
     use anyhow::Context;
@@ -562,18 +343,27 @@ mod tests {
         messages: InMemoryMessageProjectionStore,
         attempts: InMemoryTurnAttemptStore,
         checkpoints: InMemoryCheckpointStore,
-        events: InMemoryEventRepository,
     }
 
     impl Stores {
         fn new() -> Self {
+            let threads = InMemoryThreadStore::new();
+            let messages = InMemoryMessageProjectionStore::new();
+            let attempts = InMemoryTurnAttemptStore::new();
+            let checkpoints = InMemoryCheckpointStore::new();
+            let tasks = crate::journal::store::InMemoryAgentTaskStore::committing_turns_to(
+                &threads,
+                &messages,
+                &attempts,
+                &checkpoints,
+                &InMemoryEventRepository::new(),
+            );
             Self {
-                tasks: crate::journal::store::InMemoryAgentTaskStore::new(),
-                threads: InMemoryThreadStore::new(),
-                messages: InMemoryMessageProjectionStore::new(),
-                attempts: InMemoryTurnAttemptStore::new(),
-                checkpoints: InMemoryCheckpointStore::new(),
-                events: InMemoryEventRepository::new(),
+                tasks,
+                threads,
+                messages,
+                attempts,
+                checkpoints,
             }
         }
 
@@ -622,11 +412,6 @@ mod tests {
                 now: t_plus(5),
             },
             &s.tasks,
-            &s.threads,
-            &s.messages,
-            &s.attempts,
-            &s.checkpoints,
-            &s.events,
         )
         .await
         .context("commit")?;
@@ -688,11 +473,6 @@ mod tests {
                 now: t_plus(1),
             },
             &s.tasks,
-            &s.threads,
-            &s.messages,
-            &s.attempts,
-            &s.checkpoints,
-            &s.events,
         )
         .await
         .context("turn 1")?;
@@ -716,11 +496,6 @@ mod tests {
                 now: t_plus(2),
             },
             &s.tasks,
-            &s.threads,
-            &s.messages,
-            &s.attempts,
-            &s.checkpoints,
-            &s.events,
         )
         .await
         .context("turn 2")?;
@@ -782,11 +557,6 @@ mod tests {
                 now: t_plus(1),
             },
             &s.tasks,
-            &s.threads,
-            &s.messages,
-            &s.attempts,
-            &s.checkpoints,
-            &s.events,
         )
         .await
         .context("commit pre-compaction turn")?;
@@ -822,11 +592,6 @@ mod tests {
                 now: t_plus(3),
             },
             &s.tasks,
-            &s.threads,
-            &s.messages,
-            &s.attempts,
-            &s.checkpoints,
-            &s.events,
         )
         .await
         .context("commit post-compaction turn")?;
@@ -894,11 +659,6 @@ mod tests {
                 now: t_plus(1),
             },
             &s.tasks,
-            &s.threads,
-            &s.messages,
-            &s.attempts,
-            &s.checkpoints,
-            &s.events,
         )
         .await
         .context("turn 1")?;
@@ -923,11 +683,6 @@ mod tests {
                 now: t_plus(2),
             },
             &s.tasks,
-            &s.threads,
-            &s.messages,
-            &s.attempts,
-            &s.checkpoints,
-            &s.events,
         )
         .await
         .unwrap_err();
@@ -960,11 +715,6 @@ mod tests {
                 now: t_plus(3),
             },
             &s.tasks,
-            &s.threads,
-            &s.messages,
-            &s.attempts,
-            &s.checkpoints,
-            &s.events,
         )
         .await
         .context("turn 2")?;
@@ -1003,11 +753,6 @@ mod tests {
                 now: t_plus(1),
             },
             &s.tasks,
-            &s.threads,
-            &s.messages,
-            &s.attempts,
-            &s.checkpoints,
-            &s.events,
         )
         .await
         .context("thread a")?;
@@ -1030,11 +775,6 @@ mod tests {
                 now: t_plus(2),
             },
             &s.tasks,
-            &s.threads,
-            &s.messages,
-            &s.attempts,
-            &s.checkpoints,
-            &s.events,
         )
         .await
         .context("thread b")?;
@@ -1077,11 +817,6 @@ mod tests {
                 now: t_plus(1),
             },
             &s.tasks,
-            &s.threads,
-            &s.messages,
-            &s.attempts,
-            &s.checkpoints,
-            &s.events,
         )
         .await
         .unwrap_err();
@@ -1135,11 +870,6 @@ mod tests {
                 now: t_plus(2),
             },
             &s.tasks,
-            &s.threads,
-            &s.messages,
-            &s.attempts,
-            &s.checkpoints,
-            &s.events,
         )
         .await
         .unwrap_err();
@@ -1188,16 +918,7 @@ mod tests {
         };
 
         let run = |params: CompletedTurnCommit, stores: std::sync::Arc<Stores>| async move {
-            commit_completed_turn(
-                params,
-                &stores.tasks,
-                &stores.threads,
-                &stores.messages,
-                &stores.attempts,
-                &stores.checkpoints,
-                &stores.events,
-            )
-            .await
+            commit_completed_turn(params, &stores.tasks).await
         };
 
         let first = tokio::spawn(run(
@@ -1245,17 +966,10 @@ mod tests {
         assert_eq!(occupant.task_id, winner_task);
 
         // The loser retries at the next slot and lands cleanly.
-        let retried = commit_completed_turn(
-            commit_for(loser_task.clone(), loser_attempt, 2),
-            &s.tasks,
-            &s.threads,
-            &s.messages,
-            &s.attempts,
-            &s.checkpoints,
-            &s.events,
-        )
-        .await
-        .context("the loser's retried commit must land on turn 2")?;
+        let retried =
+            commit_completed_turn(commit_for(loser_task.clone(), loser_attempt, 2), &s.tasks)
+                .await
+                .context("the loser's retried commit must land on turn 2")?;
         assert_eq!(retried.thread.committed_turns, 2);
         assert_eq!(retried.checkpoint.task_id, loser_task);
         Ok(())
@@ -1290,11 +1004,6 @@ mod tests {
                 now: t_plus(1),
             },
             &s.tasks,
-            &s.threads,
-            &s.messages,
-            &s.attempts,
-            &s.checkpoints,
-            &s.events,
         )
         .await
         .context("first commit")?;
@@ -1323,11 +1032,6 @@ mod tests {
                 now: t_plus(3),
             },
             &s.tasks,
-            &s.threads,
-            &s.messages,
-            &s.attempts,
-            &s.checkpoints,
-            &s.events,
         )
         .await
         .unwrap_err();
@@ -1393,11 +1097,6 @@ mod tests {
                 now: t_plus(5),
             },
             &s.tasks,
-            &s.threads,
-            &s.messages,
-            &s.attempts,
-            &s.checkpoints,
-            &s.events,
         )
         .await
         .context("commit")?;
@@ -1444,11 +1143,6 @@ mod tests {
                 now: t_plus(1),
             },
             &s.tasks,
-            &s.threads,
-            &s.messages,
-            &s.attempts,
-            &s.checkpoints,
-            &s.events,
         )
         .await
         .context("commit without prior draft")?;
@@ -1508,11 +1202,6 @@ mod tests {
                 now: t_plus(5),
             },
             &s.tasks,
-            &s.threads,
-            &s.messages,
-            &s.attempts,
-            &s.checkpoints,
-            &s.events,
         )
         .await
         .context("commit")?;

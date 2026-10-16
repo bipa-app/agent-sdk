@@ -9967,6 +9967,12 @@ mod tests {
         ) -> Result<agent_server::journal::SubagentSpawnOutcome> {
             self.inner.commit_subagent_spawn(params).await
         }
+        async fn commit_completed_turn(
+            &self,
+            params: agent_server::journal::CompletedTurnCommit,
+        ) -> Result<agent_server::journal::CommitOutcome> {
+            self.inner.commit_completed_turn(params).await
+        }
         async fn insert(&self, task: AgentTask) -> Result<()> {
             self.inner.insert(task).await
         }

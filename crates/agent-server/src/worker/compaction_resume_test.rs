@@ -228,6 +228,8 @@ struct Harness {
 
 impl Harness {
     fn new(engine: CompactionEngine, trigger: Trigger, retention: Retention) -> Result<Self> {
+        let attempts = InMemoryTurnAttemptStore::new();
+        let checkpoints = InMemoryCheckpointStore::new();
         let threads = InMemoryThreadStore::new();
         let events = InMemoryEventRepository::new();
         let outbox = InMemoryOutboxStore::new();
@@ -242,7 +244,11 @@ impl Harness {
                 events.clone(),
                 outbox,
             )))
-            .with_message_store(Arc::new(messages.clone()));
+            .with_message_store(Arc::new(messages.clone()))
+            .with_completed_turns(crate::journal::store::CompletedTurnSink {
+                attempt_store: std::sync::Arc::new(attempts.clone()),
+                checkpoint_store: std::sync::Arc::new(checkpoints.clone()),
+            });
         let threshold = match trigger {
             Trigger::Threshold => 1,
             Trigger::Overflow => usize::MAX,
@@ -263,8 +269,8 @@ impl Harness {
             tasks,
             threads,
             messages,
-            attempts: InMemoryTurnAttemptStore::new(),
-            checkpoints: InMemoryCheckpointStore::new(),
+            attempts,
+            checkpoints,
             events,
             event_notifier: Arc::new(EventNotifier::new()),
             config,

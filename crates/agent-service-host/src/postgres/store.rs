@@ -7,12 +7,10 @@
 //! locking, uniqueness constraints, and transaction scope.
 //!
 //! The same concrete type implements the task, thread, message,
-//! turn-attempt, and checkpoint store traits. That lets the thread
-//! store surface a backend-specific
-//! [`agent_server::journal::AtomicCompletedTurnCommitter`] hook so
-//! `commit_completed_turn` can collapse the attempt close, thread
-//! aggregate advance, message head/raw-batch write, and checkpoint
-//! insert into one SQL transaction.
+//! turn-attempt, and checkpoint store traits. That lets
+//! `AgentTaskStore::commit_completed_turn` collapse the attempt close,
+//! thread aggregate advance, message head/raw-batch write, and
+//! checkpoint insert into one SQL transaction.
 
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::{
@@ -37,10 +35,6 @@ use agent_server::journal::commit::{
     LostCommitOwnership, StaleTurnCommit,
 };
 use agent_server::journal::committed_event::CommittedEvent;
-use agent_server::journal::completed_turn_transaction::AtomicCompletedTurnCommitter;
-use agent_server::journal::event_outbox_transaction::{
-    AtomicEventOutboxCommitter, EventOutboxCommit, EventOutboxCommitOutcome,
-};
 use agent_server::journal::event_repository::EventRepository;
 use agent_server::journal::execution_intent::{ExecutionIntent, ExecutionIntentStore, OperationId};
 use agent_server::journal::fork_transaction::ForkCommitParams;
@@ -90,7 +84,7 @@ use agent_server::journal::thread::{
     PurgeReceipt, PurgeSeed, Thread, ThreadNotFound, ThreadOperation, ThreadStatus,
 };
 use agent_server::journal::thread_creation_transaction::{
-    ThreadCreationCommit, ThreadCreationRows,
+    ThreadCreationCommit, ThreadCreationCommitted, ThreadCreationRows, ThreadNaming,
 };
 use agent_server::journal::thread_store::{
     BeginPurge, ThreadCreation, ThreadCreationOutcome, ThreadIdConflict, ThreadStore,
@@ -3302,9 +3296,31 @@ FOR UPDATE
     async fn commit_thread_creation_atomic_inner(
         &self,
         params: ThreadCreationCommit,
-    ) -> Result<ThreadCreationRows> {
+    ) -> Result<ThreadCreationCommitted> {
         let mut tx = self.begin().await?;
-        Self::bootstrap_thread_row_tx(&mut tx, &params.thread_id, params.now).await?;
+        match params.naming {
+            ThreadNaming::Minted => {
+                Self::bootstrap_thread_row_tx(&mut tx, &params.thread_id, params.now).await?;
+            }
+            ThreadNaming::CallerNamed => {
+                let claim = Self::claim_thread_creation_tx(
+                    &mut tx,
+                    &params.thread_id,
+                    &ThreadCreation::Create,
+                    params.now,
+                )
+                .await?;
+                match claim {
+                    ThreadCreationOutcome::Created => {}
+                    ThreadCreationOutcome::Existing => {
+                        tx.commit()
+                            .await
+                            .context("commit idempotent thread creation lookup")?;
+                        return Ok(ThreadCreationCommitted::Existing);
+                    }
+                }
+            }
+        }
         let thread = Self::lock_thread_tx(&mut tx, &params.thread_id)
             .await?
             .context("created thread missing after bootstrap")?;
@@ -3334,10 +3350,12 @@ FOR UPDATE
         tx.commit()
             .await
             .context("commit postgres thread creation transaction")?;
-        Ok(ThreadCreationRows {
-            thread,
-            committed_event,
-        })
+        Ok(ThreadCreationCommitted::Created(Box::new(
+            ThreadCreationRows {
+                thread,
+                committed_event,
+            },
+        )))
     }
 
     /// Atomic fork transaction for Postgres (mirror of
@@ -4299,6 +4317,10 @@ impl AgentTaskStore for PostgresDurableStore {
         params: SubagentSpawnCommit,
     ) -> Result<SubagentSpawnOutcome> {
         self.commit_subagent_spawn_atomic_inner(params).await
+    }
+
+    async fn commit_completed_turn(&self, params: CompletedTurnCommit) -> Result<CommitOutcome> {
+        self.commit_completed_turn_atomic_inner(params, None).await
     }
 
     async fn insert(&self, task: AgentTask) -> Result<()> {
@@ -6109,14 +6131,10 @@ CASCADE
 
 #[async_trait]
 impl ThreadStore for PostgresDurableStore {
-    fn atomic_completed_turn_committer(&self) -> Option<&dyn AtomicCompletedTurnCommitter> {
-        Some(self)
-    }
-
     async fn commit_thread_creation(
         &self,
         params: ThreadCreationCommit,
-    ) -> Result<ThreadCreationRows> {
+    ) -> Result<ThreadCreationCommitted> {
         self.commit_thread_creation_atomic_inner(params).await
     }
 
@@ -6634,26 +6652,12 @@ WHERE thread_id = $1
     }
 }
 
-#[async_trait]
-impl AtomicCompletedTurnCommitter for PostgresDurableStore {
-    async fn commit_completed_turn_atomic(
-        &self,
-        params: CompletedTurnCommit,
-    ) -> Result<CommitOutcome> {
-        self.commit_completed_turn_atomic_inner(params, None).await
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────
 // EventRepository
 // ─────────────────────────────────────────────────────────────────────
 
 #[async_trait]
 impl EventRepository for PostgresDurableStore {
-    fn atomic_event_outbox_committer(&self) -> Option<&dyn AtomicEventOutboxCommitter> {
-        Some(self)
-    }
-
     async fn commit_event(
         &self,
         thread_id: &ThreadId,
@@ -7193,16 +7197,14 @@ VALUES ($1, 'task_wakeup', $2, NULL, NULL, 'pending', $3, $4, $4, 0, $5)
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// AtomicEventOutboxCommitter
-// ─────────────────────────────────────────────────────────────────────
-
-#[async_trait]
-impl AtomicEventOutboxCommitter for PostgresDurableStore {
-    async fn commit_events_with_outbox(
+#[cfg(test)]
+impl PostgresDurableStore {
+    /// Commit `events` and their coalesced advisory in one transaction, for
+    /// the outbox tests that need a real `thread_events_available` row.
+    async fn seed_events_with_outbox(
         &self,
-        params: EventOutboxCommit,
-    ) -> Result<EventOutboxCommitOutcome> {
+        params: tests::SeedEvents,
+    ) -> Result<tests::SeededEvents> {
         ensure!(
             !params.events.is_empty(),
             "cannot commit an empty event batch"
@@ -7231,9 +7233,9 @@ impl AtomicEventOutboxCommitter for PostgresDurableStore {
             .await
             .context("commit atomic events + outbox transaction")?;
 
-        Ok(EventOutboxCommitOutcome {
+        Ok(tests::SeededEvents {
             committed_events: committed,
-            outbox_row: Some(outbox_row),
+            outbox_row,
         })
     }
 }
@@ -8511,6 +8513,18 @@ fn maybe_inject_failure(
 
 #[cfg(test)]
 mod tests {
+    pub(super) struct SeedEvents {
+        pub(super) thread_id: agent_sdk_foundation::ThreadId,
+        pub(super) events: Vec<agent_sdk_foundation::events::AgentEvent>,
+        pub(super) outbox_max_attempts: u32,
+        pub(super) now: time::OffsetDateTime,
+    }
+
+    pub(super) struct SeededEvents {
+        pub(super) committed_events: Vec<agent_server::journal::CommittedEvent>,
+        pub(super) outbox_row: agent_server::journal::outbox::OutboxRow,
+    }
+
     use agent_server::journal::BeginPurge;
     use agent_server::journal::thread::PurgeSeed;
     use std::env;
@@ -8525,7 +8539,6 @@ mod tests {
 
     use agent_server::journal::checkpoint_store::CheckpointStore;
     use agent_server::journal::commit::commit_completed_turn;
-    use agent_server::journal::event_repository::InMemoryEventRepository;
     use agent_server::journal::execution_intent::ExecutionIntentStore;
     use agent_server::journal::message_store::MessageProjectionStore;
     use agent_server::journal::recovery::FailureReason;
@@ -9415,8 +9428,7 @@ INSERT INTO agent_sdk_turn_attempts (
         assert!(checkpoints.is_empty(), "checkpoint must roll back too");
 
         // ── Phase 2: a clean commit persists turn + events together ──
-        let outcome = store
-            .commit_completed_turn_atomic(commit_params(t_plus(3)))
+        let outcome = AgentTaskStore::commit_completed_turn(&store, commit_params(t_plus(3)))
             .await
             .context("clean commit")?;
         assert_eq!(outcome.thread.committed_turns, 1);
@@ -9437,7 +9449,7 @@ INSERT INTO agent_sdk_turn_attempts (
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn commit_completed_turn_uses_atomic_postgres_hook() -> Result<()> {
+    async fn commit_completed_turn_commits_through_the_postgres_store() -> Result<()> {
         let Some((store, _schema_guard)) = test_store().await? else {
             return Ok(());
         };
@@ -9455,7 +9467,6 @@ INSERT INTO agent_sdk_turn_attempts (
             .await?
             .context("acquire hook task")?;
         let attempt = store.open_attempt(open_params(&running.id)).await?;
-        let event_repo = InMemoryEventRepository::new();
 
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
@@ -9479,11 +9490,6 @@ INSERT INTO agent_sdk_turn_attempts (
                 now: t_plus(2),
             },
             &store,
-            &store,
-            &store,
-            &store,
-            &store,
-            &event_repo,
         )
         .await?;
 
@@ -9988,8 +9994,7 @@ INSERT INTO agent_sdk_turn_attempts (
     // ── Phase 8.1: outbox advisory contract ─────────────────────────
 
     #[tokio::test]
-    async fn commit_events_with_outbox_emits_one_thread_events_advisory_per_batch() -> Result<()> {
-        use agent_server::journal::event_outbox_transaction::EventOutboxCommit;
+    async fn an_event_batch_gets_one_thread_events_advisory() -> Result<()> {
         use agent_server::journal::outbox_message::{
             OutboxMessage, OutboxMessageKind, ThreadEventsAvailablePayload,
         };
@@ -10002,9 +10007,8 @@ INSERT INTO agent_sdk_turn_attempts (
         let thread_id = thread_id("t-pg-outbox-coalesce");
         ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
 
-        let outcome = AtomicEventOutboxCommitter::commit_events_with_outbox(
-            &store,
-            EventOutboxCommit {
+        let outcome = store
+            .seed_events_with_outbox(SeedEvents {
                 thread_id: thread_id.clone(),
                 events: vec![
                     AgentEvent::text("msg_a", "first"),
@@ -10013,15 +10017,11 @@ INSERT INTO agent_sdk_turn_attempts (
                 ],
                 outbox_max_attempts: 5,
                 now: t0(),
-            },
-        )
-        .await?;
+            })
+            .await?;
 
         assert_eq!(outcome.committed_events.len(), 3);
-        let row = outcome
-            .outbox_row
-            .as_ref()
-            .context("Phase 8.1 contract: outbox_row must be present")?;
+        let row = outcome.outbox_row;
         assert_eq!(row.kind, OutboxMessageKind::ThreadEventsAvailable);
         assert_eq!(row.thread_id, thread_id);
         // The row columns reference the FIRST event of the batch
@@ -10140,7 +10140,6 @@ INSERT INTO agent_sdk_turn_attempts (
 
     #[tokio::test]
     async fn outbox_mark_delivered_is_noop_when_row_was_cascade_deleted() -> Result<()> {
-        use agent_server::journal::event_outbox_transaction::EventOutboxCommit;
         use agent_server::journal::retention::RetentionStore;
         use agent_server::journal::thread_store::ThreadStore;
 
@@ -10151,20 +10150,15 @@ INSERT INTO agent_sdk_turn_attempts (
         let thread_id = thread_id("t-pg-outbox-delivered-missing");
         ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
 
-        let outcome = AtomicEventOutboxCommitter::commit_events_with_outbox(
-            &store,
-            EventOutboxCommit {
+        let outcome = store
+            .seed_events_with_outbox(SeedEvents {
                 thread_id: thread_id.clone(),
                 events: vec![AgentEvent::text("msg_a", "first")],
                 outbox_max_attempts: 3,
                 now: t0(),
-            },
-        )
-        .await?;
-        let row_id = outcome
-            .outbox_row
-            .context("outbox row should exist for committed event batch")?
-            .id;
+            })
+            .await?;
+        let row_id = outcome.outbox_row.id;
 
         RetentionStore::advance_floor(&store, &thread_id, 1, t_plus(1)).await?;
         assert!(OutboxStore::get(&store, &row_id).await?.is_none());
@@ -10175,7 +10169,6 @@ INSERT INTO agent_sdk_turn_attempts (
 
     #[tokio::test]
     async fn outbox_mark_failed_is_noop_when_row_was_cascade_deleted() -> Result<()> {
-        use agent_server::journal::event_outbox_transaction::EventOutboxCommit;
         use agent_server::journal::retention::RetentionStore;
         use agent_server::journal::thread_store::ThreadStore;
 
@@ -10186,20 +10179,15 @@ INSERT INTO agent_sdk_turn_attempts (
         let thread_id = thread_id("t-pg-outbox-failed-missing");
         ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
 
-        let outcome = AtomicEventOutboxCommitter::commit_events_with_outbox(
-            &store,
-            EventOutboxCommit {
+        let outcome = store
+            .seed_events_with_outbox(SeedEvents {
                 thread_id: thread_id.clone(),
                 events: vec![AgentEvent::text("msg_a", "first")],
                 outbox_max_attempts: 3,
                 now: t0(),
-            },
-        )
-        .await?;
-        let row_id = outcome
-            .outbox_row
-            .context("outbox row should exist for committed event batch")?
-            .id;
+            })
+            .await?;
+        let row_id = outcome.outbox_row.id;
 
         RetentionStore::advance_floor(&store, &thread_id, 1, t_plus(1)).await?;
         assert!(OutboxStore::get(&store, &row_id).await?.is_none());
@@ -10218,7 +10206,6 @@ INSERT INTO agent_sdk_turn_attempts (
 
     #[tokio::test]
     async fn outbox_list_by_thread_orders_task_wakeups_after_thread_events() -> Result<()> {
-        use agent_server::journal::event_outbox_transaction::EventOutboxCommit;
         use agent_server::journal::outbox_message::{
             OutboxMessage, OutboxMessageKind, TaskWakeupPayload,
         };
@@ -10231,16 +10218,14 @@ INSERT INTO agent_sdk_turn_attempts (
         let thread_id = thread_id("t-pg-outbox-order");
         ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
 
-        AtomicEventOutboxCommitter::commit_events_with_outbox(
-            &store,
-            EventOutboxCommit {
+        store
+            .seed_events_with_outbox(SeedEvents {
                 thread_id: thread_id.clone(),
                 events: vec![AgentEvent::text("msg_a", "first")],
                 outbox_max_attempts: 3,
                 now: t0(),
-            },
-        )
-        .await?;
+            })
+            .await?;
 
         let task_id = AgentTaskId::new();
         let payload = OutboxMessage::TaskWakeup(TaskWakeupPayload {
@@ -10279,7 +10264,6 @@ INSERT INTO agent_sdk_turn_attempts (
 
     #[tokio::test]
     async fn outbox_reclaim_returns_stale_claimed_rows_to_pending() -> Result<()> {
-        use agent_server::journal::event_outbox_transaction::EventOutboxCommit;
         use agent_server::journal::thread_store::ThreadStore;
 
         let Some((store, _guard)) = test_store().await? else {
@@ -10289,16 +10273,14 @@ INSERT INTO agent_sdk_turn_attempts (
         let thread_id = thread_id("t-pg-reclaim-stale");
         ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
 
-        AtomicEventOutboxCommitter::commit_events_with_outbox(
-            &store,
-            EventOutboxCommit {
+        store
+            .seed_events_with_outbox(SeedEvents {
                 thread_id: thread_id.clone(),
                 events: vec![AgentEvent::text("msg_a", "first")],
                 outbox_max_attempts: 3,
                 now: t0(),
-            },
-        )
-        .await?;
+            })
+            .await?;
 
         // Worker-A claims at t+1 then "crashes" before marking.
         let claimed = OutboxStore::claim_pending(&store, "worker-a", 10, t_plus(1)).await?;
@@ -10381,7 +10363,6 @@ INSERT INTO agent_sdk_turn_attempts (
 
     #[tokio::test]
     async fn outbox_reclaim_skips_live_claims_and_terminal_rows() -> Result<()> {
-        use agent_server::journal::event_outbox_transaction::EventOutboxCommit;
         use agent_server::journal::thread_store::ThreadStore;
 
         let Some((store, _guard)) = test_store().await? else {
@@ -10391,16 +10372,14 @@ INSERT INTO agent_sdk_turn_attempts (
         let thread_id = thread_id("t-pg-reclaim-live");
         ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
 
-        AtomicEventOutboxCommitter::commit_events_with_outbox(
-            &store,
-            EventOutboxCommit {
+        store
+            .seed_events_with_outbox(SeedEvents {
                 thread_id: thread_id.clone(),
                 events: vec![AgentEvent::text("msg_live", "first")],
                 outbox_max_attempts: 3,
                 now: t0(),
-            },
-        )
-        .await?;
+            })
+            .await?;
 
         OutboxStore::claim_pending(&store, "worker-live", 10, t_plus(1)).await?;
 
@@ -10873,6 +10852,7 @@ ON CONFLICT (thread_id) DO UPDATE SET
         let crashed =
             std::panic::AssertUnwindSafe(store.commit_thread_creation(ThreadCreationCommit {
                 thread_id: thread.clone(),
+                naming: agent_server::journal::thread_creation_transaction::ThreadNaming::Minted,
                 event: agent_sdk_foundation::events::AgentEvent::thread_created(
                     thread.clone(),
                     None,

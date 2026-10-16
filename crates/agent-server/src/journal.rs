@@ -564,7 +564,6 @@ pub mod checkpoint;
 pub mod checkpoint_store;
 pub mod commit;
 pub mod committed_event;
-pub mod completed_turn_transaction;
 /// Reusable journal/store conformance battery.
 ///
 /// Compiled both for this crate's own tests and for downstream
@@ -575,7 +574,6 @@ pub mod conformance;
 #[cfg(test)]
 mod durability_dst_test;
 pub mod event_notifier;
-pub mod event_outbox_transaction;
 pub mod event_repository;
 pub mod event_stream;
 pub mod execution_context;
@@ -624,11 +622,7 @@ pub use checkpoint::{Checkpoint, CheckpointId, CheckpointSchemaError, NewCheckpo
 pub use checkpoint_store::{CheckpointStore, InMemoryCheckpointStore};
 pub use commit::{CommitOutcome, CompletedTurnCommit, commit_completed_turn};
 pub use committed_event::CommittedEvent;
-pub use completed_turn_transaction::AtomicCompletedTurnCommitter;
 pub use event_notifier::{EventNotifier, EventReceiver};
-pub use event_outbox_transaction::{
-    AtomicEventOutboxCommitter, EventOutboxCommit, EventOutboxCommitOutcome,
-};
 pub use event_repository::{EventRepository, InMemoryEventRepository};
 pub use event_stream::{EventStream, StreamEvent, stream_events};
 pub use execution_context::{RootWorkerInputs, build_root_worker_inputs};
@@ -663,9 +657,9 @@ pub use retention_janitor::{
 };
 pub use staged::{StagedMessageStore, StagedStateStore, StagedStores};
 pub use store::{
-    AgentTaskStore, CancelTreeOutcome, CancellationMarkerSink, ChildProbe, InMemoryAgentTaskStore,
-    MixedChildrenSpawn, ReattachedChild, SpawnedMixedChildren, SubagentInvocationSpawn,
-    ToolChildSpawn, mixed_child_ids_in_slot_order, new_mixed_tool_child,
+    AgentTaskStore, CancelTreeOutcome, CancellationMarkerSink, ChildProbe, CompletedTurnSink,
+    InMemoryAgentTaskStore, MixedChildrenSpawn, ReattachedChild, SpawnedMixedChildren,
+    SubagentInvocationSpawn, ToolChildSpawn, mixed_child_ids_in_slot_order, new_mixed_tool_child,
     validate_mixed_children_spawn, validate_mixed_slot_coverage,
 };
 pub use subagent_spawn_transaction::{
@@ -684,7 +678,9 @@ pub use thread::{
     PurgeReceipt, PurgeRecord, PurgeScope, PurgeSeed, Thread, ThreadNotFound, ThreadOperation,
     ThreadSchemaError, ThreadStateConflict, ThreadStatus,
 };
-pub use thread_creation_transaction::{ThreadCreationCommit, ThreadCreationRows};
+pub use thread_creation_transaction::{
+    ThreadCreationCommit, ThreadCreationCommitted, ThreadCreationRows, ThreadNaming,
+};
 #[cfg(any(test, feature = "test-support"))]
 pub use thread_events_watch::CapturingThreadEventsWatchHandler;
 pub use thread_events_watch::{

@@ -35,7 +35,7 @@ use agent_server::journal::message_store::{
 use agent_server::journal::outbox::{InMemoryOutboxStore, OutboxStore};
 use agent_server::journal::retention::{InMemoryRetentionStore, RetentionStore};
 use agent_server::journal::store::{
-    AgentTaskStore, CancellationMarkerSink, InMemoryAgentTaskStore,
+    AgentTaskStore, CancellationMarkerSink, CompletedTurnSink, InMemoryAgentTaskStore,
     InMemoryAtomicSpawnEventCommitter,
 };
 use agent_server::journal::task::AgentTaskId;
@@ -560,6 +560,8 @@ impl StoreRegistry {
             Arc::new(InMemoryMessageProjectionStore::new());
         let checkpoint_store: Arc<InMemoryCheckpointStore> =
             Arc::new(InMemoryCheckpointStore::new());
+        let attempt_store: Arc<InMemoryTurnAttemptStore> =
+            Arc::new(InMemoryTurnAttemptStore::new());
         let thread_store: Arc<InMemoryThreadStore> =
             Arc::new(InMemoryThreadStore::new().with_journal(ThreadJournalSink {
                 message_store: message_store.clone(),
@@ -578,12 +580,16 @@ impl StoreRegistry {
                 outbox_store.as_ref().clone(),
             )))
             .with_intent_store(execution_intent_store.clone())
-            .with_message_store(message_store.clone());
+            .with_message_store(message_store.clone())
+            .with_completed_turns(CompletedTurnSink {
+                attempt_store: attempt_store.clone(),
+                checkpoint_store: checkpoint_store.clone(),
+            });
         Self {
             task_store: Arc::new(task_store),
             thread_store,
             message_store,
-            attempt_store: Arc::new(InMemoryTurnAttemptStore::new()),
+            attempt_store,
             checkpoint_store,
             event_repo,
             execution_intent_store,
