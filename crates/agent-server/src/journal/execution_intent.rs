@@ -82,6 +82,7 @@ use tokio_util::sync::CancellationToken;
 use crate::journal::event_repository::EventRepository;
 use crate::journal::store::AgentTaskStore;
 use crate::journal::task::AgentTaskId;
+use crate::journal::transition::{Settle, Transition, Write};
 use crate::worker::tool_task::{ToolTaskBootstrap, ToolTaskOutcome, execute_tool_task};
 
 // ─────────────────────────────────────────────────────────────────────
@@ -356,10 +357,11 @@ pub trait ExecutionIntentStore: Send + Sync {
 /// In-memory implementation of [`ExecutionIntentStore`].
 ///
 /// Suitable for testing and single-process deployments.
-#[derive(Default)]
+/// Cloning shares the same intents, as the other in-memory stores do.
+#[derive(Clone, Default)]
 pub struct InMemoryExecutionIntentStore {
-    intents: RwLock<HashMap<String, ExecutionIntent>>,
-    task_index: RwLock<HashMap<String, String>>,
+    intents: std::sync::Arc<RwLock<HashMap<String, ExecutionIntent>>>,
+    task_index: std::sync::Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl InMemoryExecutionIntentStore {
@@ -673,47 +675,30 @@ async fn interrupt_unsafe_replay(
          declared replay-safe. Check its effects before you call it again.",
         bootstrap.tool_call.name, prior.operation_id, prior.status,
     );
-    let (child, parent) = deps
-        .task_store
-        .fail_task(
-            &bootstrap.task_id,
-            &bootstrap.worker_id,
-            &bootstrap.lease_id,
-            error_msg.clone(),
-            now,
-        )
-        .await
-        .with_context(|| format!("fail interrupted tool task {}", bootstrap.task_id))?;
-
-    let end_event = AgentEvent::tool_call_end(
-        &bootstrap.tool_call.id,
-        &bootstrap.tool_call.name,
-        &bootstrap.tool_call.display_name,
-        ToolResult {
-            success: false,
-            output: error_msg.clone(),
-            artifact: None,
-            data: None,
-            documents: Vec::new(),
-            duration_ms: None,
+    let mut transition = Transition::settle(
+        bootstrap.task_id.clone(),
+        bootstrap.worker_id.clone(),
+        bootstrap.lease_id.clone(),
+        Settle::Fail {
+            error: error_msg.clone(),
         },
+        bootstrap.thread_id.clone(),
+        vec![failure_tool_call_end(bootstrap, &error_msg)],
     );
-    let committed = deps
-        .event_repo
-        .commit_event(&bootstrap.thread_id, end_event, now)
-        .await
-        .context("commit ToolCallEnd for interrupted tool task")?;
-
     if !prior.is_terminal() {
         prior.mark_failed(error_msg.clone(), now);
-        record_intent_update(deps.intent_store, &prior, "Failed", "interrupted").await;
+        transition.writes.push(Write::RecordIntent(Box::new(prior)));
     }
+    let (child, parent, committed_events) =
+        commit_settle(deps.task_store, transition, now)
+            .await
+            .with_context(|| format!("fail interrupted tool task {}", bootstrap.task_id))?;
 
     Ok(ToolTaskOutcome::Failed {
         child,
         parent,
         error: error_msg,
-        committed_events: vec![committed],
+        committed_events,
     })
 }
 
@@ -734,21 +719,70 @@ async fn fail_closed_on_claim_error(
         intent.tool_name, intent.operation_id,
     );
 
-    let task_id = &bootstrap.task_id;
-    let worker_id = &bootstrap.worker_id;
-    let lease_id = &bootstrap.lease_id;
-
-    let (child, parent) = task_store
-        .fail_task(task_id, worker_id, lease_id, error_msg.clone(), now)
+    let transition = Transition::settle(
+        bootstrap.task_id.clone(),
+        bootstrap.worker_id.clone(),
+        bootstrap.lease_id.clone(),
+        Settle::Fail {
+            error: error_msg.clone(),
+        },
+        bootstrap.thread_id.clone(),
+        vec![failure_tool_call_end(bootstrap, &error_msg)],
+    );
+    let (child, parent, committed_events) = commit_settle(task_store, transition, now)
         .await
-        .with_context(|| format!("fail_task after intent-claim failure for {task_id}"))?;
+        .with_context(|| {
+            format!(
+                "fail_task after intent-claim failure for {}",
+                bootstrap.task_id
+            )
+        })?;
 
     Ok(ToolTaskOutcome::Failed {
         child,
         parent,
         error: error_msg,
-        committed_events: Vec::new(),
+        committed_events,
     })
+}
+
+/// The `ToolCallEnd` that closes a failed tool call with `error`.
+fn failure_tool_call_end(bootstrap: &ToolTaskBootstrap, error: &str) -> AgentEvent {
+    AgentEvent::tool_call_end(
+        &bootstrap.tool_call.id,
+        &bootstrap.tool_call.name,
+        &bootstrap.tool_call.display_name,
+        ToolResult {
+            success: false,
+            output: error.to_owned(),
+            artifact: None,
+            data: None,
+            documents: Vec::new(),
+            duration_ms: None,
+        },
+    )
+}
+
+/// Commit a settle transition and return its settled task and events.
+async fn commit_settle(
+    task_store: &dyn AgentTaskStore,
+    transition: Transition,
+    now: OffsetDateTime,
+) -> anyhow::Result<(
+    crate::journal::task::AgentTask,
+    Option<crate::journal::task::AgentTask>,
+    Vec<crate::journal::committed_event::CommittedEvent>,
+)> {
+    let committed = task_store
+        .commit(transition, now)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let (child, parent) = committed
+        .settled
+        .into_iter()
+        .next()
+        .context("a settle transition returns its settled task")?;
+    Ok((child, parent, committed.events))
 }
 
 /// Transition `intent` to its terminal status based on the executor

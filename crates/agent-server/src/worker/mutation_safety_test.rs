@@ -275,6 +275,7 @@ fn sample_bootstrap(task: AgentTask) -> WorkerBootstrapContext {
 }
 
 struct TestStores {
+    intents: InMemoryExecutionIntentStore,
     tasks: InMemoryAgentTaskStore,
     threads: InMemoryThreadStore,
     messages: InMemoryMessageProjectionStore,
@@ -288,20 +289,22 @@ impl TestStores {
     fn new() -> Self {
         let threads = InMemoryThreadStore::new();
         let events = InMemoryEventRepository::new();
+        let intents = InMemoryExecutionIntentStore::new();
         Self {
-            tasks: InMemoryAgentTaskStore::new().with_cancellation_markers(
-                crate::journal::CancellationMarkerSink {
+            tasks: InMemoryAgentTaskStore::new()
+                .with_cancellation_markers(crate::journal::CancellationMarkerSink {
                     event_repo: Arc::new(events.clone()),
                     outbox_store: Arc::new(crate::journal::outbox::InMemoryOutboxStore::new()),
                     thread_store: Arc::new(threads.clone()),
-                },
-            ),
+                })
+                .with_intent_store(Arc::new(intents.clone())),
             threads,
             messages: InMemoryMessageProjectionStore::new(),
             attempts: InMemoryTurnAttemptStore::new(),
             checkpoints: InMemoryCheckpointStore::new(),
             events,
             event_notifier: Arc::new(EventNotifier::new()),
+            intents,
         }
     }
 
@@ -478,7 +481,7 @@ async fn execution_marks_intent_completed_blocking_retry() -> Result<()> {
 #[tokio::test]
 async fn retry_with_ambiguous_in_flight_is_blocked() -> Result<()> {
     let stores = TestStores::new();
-    let intent_store = InMemoryExecutionIntentStore::new();
+    let intent_store = stores.intents.clone();
     let cancel = CancellationToken::new();
 
     let (_parent, children) = suspend_root_with_tools(
@@ -636,7 +639,6 @@ async fn confirmation_state_survives_restart() -> Result<()> {
         &child_id,
         ConfirmationDecision::Approved,
         &stores.tasks,
-        &stores.events,
         t_plus(20),
     )
     .await?;
@@ -679,7 +681,6 @@ async fn confirmation_approved_then_policy_denied() -> Result<()> {
         &child_id,
         ConfirmationDecision::Approved,
         &stores.tasks,
-        &stores.events,
         t_plus(20),
     )
     .await?;
@@ -779,7 +780,6 @@ async fn confirmation_rejected_produces_canonical_error() -> Result<()> {
             reason: "user declined".into(),
         },
         &stores.tasks,
-        &stores.events,
         t_plus(20),
     )
     .await?;
@@ -840,7 +840,6 @@ async fn confirmation_timeout_produces_canonical_error() -> Result<()> {
         &child_id,
         ConfirmationDecision::Timeout,
         &stores.tasks,
-        &stores.events,
         t_plus(60),
     )
     .await?;
@@ -1077,7 +1076,6 @@ async fn confirmation_approval_then_successful_execution() -> Result<()> {
         &child_id,
         ConfirmationDecision::Approved,
         &stores.tasks,
-        &stores.events,
         t_plus(20),
     )
     .await?;

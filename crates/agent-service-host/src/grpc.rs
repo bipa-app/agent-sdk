@@ -1341,7 +1341,6 @@ impl GrpcControlService {
                     task_id,
                     other,
                     self.shared.stores.task_store.as_ref(),
-                    self.shared.stores.event_repo.as_ref(),
                     now,
                 )
                 .await

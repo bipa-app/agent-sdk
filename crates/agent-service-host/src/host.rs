@@ -3086,6 +3086,7 @@ async fn run_tool_task(
     };
     let effect_class = classify_tool_effect(&bootstrap.tool_call);
     let exec_bootstrap = bootstrap.clone();
+    let settle_bootstrap = bootstrap.clone();
     let tool_executor = Arc::clone(runtime.tool_executor());
     let executor_artifact_store = artifact_store_guard.clone();
     let outcome = guarded_tool_execution(
@@ -3116,7 +3117,7 @@ async fn run_tool_task(
     )
     .await;
 
-    let result = finish_tool_task_execution(outcome, &task, stores, &worker_id, &lease_id).await;
+    let result = finish_tool_task_execution(outcome, &settle_bootstrap, stores).await;
     drop(artifact_store_guard);
     result
 }
@@ -3153,10 +3154,8 @@ pub(crate) async fn settle_tool_child(
 
 async fn finish_tool_task_execution(
     outcome: Result<ToolTaskOutcome>,
-    task: &AgentTask,
+    bootstrap: &agent_server::worker::ToolTaskBootstrap,
     stores: &StoreRegistry,
-    worker_id: &WorkerId,
-    lease_id: &LeaseId,
 ) -> Result<()> {
     match outcome {
         Ok(
@@ -3179,11 +3178,39 @@ async fn finish_tool_task_execution(
             // the whole execution, so a parent parked on sibling work reads a
             // just-failed child as long-silent.
             let failed_at = time::OffsetDateTime::now_utc();
-            stores
+            let error = format!("{err:#}");
+            // The child fails and its tool call closes in one transition,
+            // so clients never see a failed child with an open call.
+            let end_event = agent_sdk_foundation::AgentEvent::tool_call_end(
+                &bootstrap.tool_call.id,
+                &bootstrap.tool_call.name,
+                &bootstrap.tool_call.display_name,
+                agent_sdk_foundation::ToolResult {
+                    success: false,
+                    output: error.clone(),
+                    artifact: None,
+                    data: None,
+                    documents: Vec::new(),
+                    duration_ms: None,
+                },
+            );
+            let committed = stores
                 .task_store
-                .fail_task(&task.id, worker_id, lease_id, format!("{err:#}"), failed_at)
+                .commit(
+                    agent_server::journal::Transition::settle(
+                        bootstrap.task_id.clone(),
+                        bootstrap.worker_id.clone(),
+                        bootstrap.lease_id.clone(),
+                        agent_server::journal::Settle::Fail { error },
+                        bootstrap.thread_id.clone(),
+                        vec![end_event],
+                    ),
+                    failed_at,
+                )
                 .await
+                .map_err(anyhow::Error::from)
                 .context("fail tool task after guarded execution error")?;
+            publish_events(stores, &committed.events);
             Ok(())
         }
     }
@@ -8204,6 +8231,34 @@ mod tests {
              after the tool actually ran ({ran_at}) — a `now` bound at task entry predates \
              the executor and backdates the row by the whole execution",
         );
+
+        assert_failed_with_one_closed_call(&stores, &tool_child.id, &child_root.thread_id).await
+    }
+
+    async fn assert_failed_with_one_closed_call(
+        stores: &StoreRegistry,
+        child: &agent_server::AgentTaskId,
+        thread: &agent_sdk_foundation::ThreadId,
+    ) -> Result<()> {
+        let settled = stores.task_store.get(child).await?.context("tool child")?;
+        assert_eq!(settled.status, agent_server::TaskStatus::Failed);
+        let ends: Vec<_> = stores
+            .event_repo
+            .get_events(thread)
+            .await?
+            .into_iter()
+            .filter_map(|event| {
+                if let agent_sdk_foundation::AgentEvent::ToolCallEnd { result, .. } = event.event {
+                    Some(result)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let [end] = ends.as_slice() else {
+            anyhow::bail!("the error arm must close the call once, got {ends:?}");
+        };
+        assert!(!end.success);
         Ok(())
     }
 
@@ -9879,7 +9934,9 @@ mod tests {
                         outcome: Settle::Fail { .. } | Settle::FailWithReason { .. },
                         ..
                     } => self.observe_failure(now)?,
-                    Write::AppendEvents { .. } => {}
+                    Write::RejectConfirmation { .. }
+                    | Write::RecordIntent(_)
+                    | Write::AppendEvents { .. } => {}
                 }
             }
             self.inner.commit(transition, now).await

@@ -506,7 +506,6 @@ async fn approve_and_policy_allows_executes_tool_successfully() -> Result<()> {
         &children[0].id,
         ConfirmationDecision::Approved,
         &stores.tasks,
-        &stores.events,
         t_plus(20),
     )
     .await?;
@@ -596,7 +595,6 @@ async fn approve_but_policy_denies_fails_child() -> Result<()> {
         &children[0].id,
         ConfirmationDecision::Approved,
         &stores.tasks,
-        &stores.events,
         t_plus(20),
     )
     .await?;
@@ -697,7 +695,6 @@ async fn rejection_fails_child_without_executing() -> Result<()> {
             reason: "user declined the transfer".into(),
         },
         &stores.tasks,
-        &stores.events,
         t_plus(20),
     )
     .await?;
@@ -763,7 +760,6 @@ async fn rejection_emits_failure_tool_call_end() -> Result<()> {
             reason: "user declined".into(),
         },
         &stores.tasks,
-        &stores.events,
         t_plus(20),
     )
     .await?;
@@ -813,7 +809,6 @@ async fn timeout_fails_child_without_executing() -> Result<()> {
         &children[0].id,
         ConfirmationDecision::Timeout,
         &stores.tasks,
-        &stores.events,
         t_plus(20),
     )
     .await?;
@@ -865,7 +860,6 @@ async fn reject_on_non_awaiting_row_fails() -> Result<()> {
             reason: "nope".into(),
         },
         &stores.tasks,
-        &stores.events,
         t_plus(20),
     )
     .await;
@@ -897,7 +891,6 @@ async fn approve_on_non_awaiting_row_fails() -> Result<()> {
         &children[0].id,
         ConfirmationDecision::Approved,
         &stores.tasks,
-        &stores.events,
         t_plus(20),
     )
     .await;
@@ -955,7 +948,6 @@ async fn awaiting_confirmation_state_survives_store_reread() -> Result<()> {
         &children[0].id,
         ConfirmationDecision::Approved,
         &stores.tasks,
-        &stores.events,
         t_plus(25),
     )
     .await?;
@@ -1044,7 +1036,6 @@ async fn multi_child_confirmation_does_not_affect_siblings() -> Result<()> {
             reason: "denied".into(),
         },
         &stores.tasks,
-        &stores.events,
         t_plus(25),
     )
     .await?;
@@ -1109,7 +1100,6 @@ async fn a_command_after_a_pending_confirmation_waits_for_the_decision() -> Resu
             reason: "denied".into(),
         },
         &stores.tasks,
-        &stores.events,
         t_plus(25),
     )
     .await?;
@@ -1209,7 +1199,6 @@ async fn full_confirmation_lifecycle_pause_approve_execute() -> Result<()> {
         &children[0].id,
         ConfirmationDecision::Approved,
         &stores.tasks,
-        &stores.events,
         t_plus(20),
     )
     .await?;
@@ -1331,7 +1320,6 @@ async fn approved_confirmation_pickup_continues_the_paused_attempt() -> Result<(
         &children[0].id,
         ConfirmationDecision::Approved,
         &stores.tasks,
-        &stores.events,
         t_plus(20),
     )
     .await?;

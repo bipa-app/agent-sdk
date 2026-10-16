@@ -555,6 +555,8 @@ impl StoreRegistry {
         let thread_store: Arc<InMemoryThreadStore> = Arc::new(InMemoryThreadStore::new());
         let event_repo: Arc<InMemoryEventRepository> = Arc::new(InMemoryEventRepository::new());
         let outbox_store: Arc<InMemoryOutboxStore> = Arc::new(InMemoryOutboxStore::new());
+        let execution_intent_store: Arc<InMemoryExecutionIntentStore> =
+            Arc::new(InMemoryExecutionIntentStore::new());
         let task_store = InMemoryAgentTaskStore::new()
             .with_cancellation_markers(CancellationMarkerSink {
                 event_repo: event_repo.clone(),
@@ -564,7 +566,8 @@ impl StoreRegistry {
             .with_spawn_event_committer(Arc::new(InMemoryAtomicSpawnEventCommitter::new(
                 event_repo.as_ref().clone(),
                 outbox_store.as_ref().clone(),
-            )));
+            )))
+            .with_intent_store(execution_intent_store.clone());
         Self {
             task_store: Arc::new(task_store),
             thread_store,
@@ -572,7 +575,7 @@ impl StoreRegistry {
             attempt_store: Arc::new(InMemoryTurnAttemptStore::new()),
             checkpoint_store: Arc::new(InMemoryCheckpointStore::new()),
             event_repo,
-            execution_intent_store: Arc::new(InMemoryExecutionIntentStore::new()),
+            execution_intent_store,
             tool_audit_store: Arc::new(InMemoryToolAuditEventStore::new()),
             outbox_store,
             retention_store: Arc::new(InMemoryRetentionStore::new()),
