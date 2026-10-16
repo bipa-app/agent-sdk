@@ -1725,10 +1725,11 @@ pub trait AgentTaskStore: super::transition::DurableStore + Send + Sync {
     /// the reservation (it now owns the key, must run the effect, then
     /// call [`Self::record_idempotency`] to fill in the result),
     /// [`IdempotencyClaim::Replay`] when a matching record with a
-    /// recorded result already exists, and [`IdempotencyClaim::Conflict`]
-    /// when the key was used for a different kind/fingerprint **or** is
-    /// still reserved by a concurrent in-flight claim (placeholder not
-    /// yet filled). A `Conflict` caller must not run the effect.
+    /// recorded result already exists, [`IdempotencyClaim::Conflict`]
+    /// when the key was used for a different kind/fingerprint, and
+    /// [`IdempotencyClaim::InFlight`] when it is reserved for the same
+    /// request but no result was recorded (placeholder not yet filled).
+    /// A `Conflict` or `InFlight` caller must not run the effect.
     ///
     /// # Errors
     /// Returns an error if the store cannot be queried.
@@ -5689,8 +5690,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             }
             Some(record) if record.kind == kind && record.fingerprint == fingerprint => {
                 if record.result_json.is_null() {
-                    // Reserved by a concurrent in-flight claim; fail closed.
-                    IdempotencyClaim::Conflict
+                    IdempotencyClaim::InFlight
                 } else {
                     IdempotencyClaim::Replay(Box::new(record))
                 }
@@ -7189,12 +7189,12 @@ mod tests {
         ));
 
         // A second claim before the effect records its result must NOT
-        // also be Fresh — the placeholder reservation makes it Conflict.
+        // also be Fresh — the placeholder reservation makes it InFlight.
         assert!(matches!(
             store
                 .claim_idempotency("req-1", IdempotencyKind::CreateThread, fp)
                 .await?,
-            IdempotencyClaim::Conflict
+            IdempotencyClaim::InFlight
         ));
 
         // Once the winner records the durable references, retries replay.

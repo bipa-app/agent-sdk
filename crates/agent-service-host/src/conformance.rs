@@ -2221,7 +2221,7 @@ mod tests {
 
     /// `claim_idempotency` is an atomic reservation (findings #3/#15):
     /// the first claim reserves the key (`Fresh`), a second claim before
-    /// the result is recorded observes `Conflict` (reservation in-flight),
+    /// the result is recorded observes `InFlight`,
     /// and once the winner records the result, retries `Replay`. A
     /// different fingerprint under the same key is also a `Conflict`.
     async fn test_claim_idempotency_reserve_then_replay(
@@ -2236,10 +2236,18 @@ mod tests {
         ));
 
         // Before the effect records its result, a retry must NOT also be
-        // Fresh — the placeholder reservation makes it Conflict.
+        // Fresh — the placeholder reservation makes it InFlight.
         assert!(matches!(
             task_store
                 .claim_idempotency("conf-req-seq", IdempotencyKind::CreateThread, fp)
+                .await?,
+            IdempotencyClaim::InFlight,
+        ));
+        // A different fingerprint on an unrecorded key is still a
+        // conflict, never InFlight.
+        assert!(matches!(
+            task_store
+                .claim_idempotency("conf-req-seq", IdempotencyKind::CreateThread, b"fp-other")
                 .await?,
             IdempotencyClaim::Conflict,
         ));
@@ -2283,8 +2291,7 @@ mod tests {
 
     /// Two concurrent claims on one key yield **exactly one** `Fresh`
     /// (findings #3/#15) — the atomic reservation prevents both retries
-    /// from running the effect. The loser observes `Conflict` (in-flight
-    /// reservation). Generic over the concrete store so each backend's
+    /// from running the effect. The loser observes `InFlight`. Generic over the concrete store so each backend's
     /// real locking (in-memory write lock, `SQLite` `BEGIN IMMEDIATE`,
     /// Postgres `INSERT … ON CONFLICT DO NOTHING`) is exercised.
     async fn test_two_concurrent_claims_one_fresh<S>(store: S) -> Result<()>
@@ -2309,13 +2316,13 @@ mod tests {
             .filter(|c| matches!(c, IdempotencyClaim::Fresh))
             .count();
         assert_eq!(fresh, 1, "exactly one concurrent claim must win Fresh");
-        let conflicts = outcomes
+        let in_flight = outcomes
             .iter()
-            .filter(|c| matches!(c, IdempotencyClaim::Conflict))
+            .filter(|c| matches!(c, IdempotencyClaim::InFlight))
             .count();
         assert_eq!(
-            conflicts, 1,
-            "the losing concurrent claim must observe Conflict, not a second Fresh",
+            in_flight, 1,
+            "the losing concurrent claim must observe InFlight, not a second Fresh",
         );
         Ok(())
     }
@@ -4455,6 +4462,42 @@ mod tests {
         probe.commit().await?;
         let (failed, _) = failing.await??;
         assert_eq!(failed.status, TaskStatus::Failed);
+        Ok(())
+    }
+
+    /// `update` on a root turn locks the root's thread before the root's
+    /// row, like every other root write. The probe holds the thread, then
+    /// asks for the root's row under a lock timeout shorter than deadlock
+    /// detection.
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_update_of_a_root_takes_the_thread_lock_first() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let root = fresh_root("pg-update-lock-order", 60);
+        let root = AgentTaskStore::submit_root_turn(&store, root).await?;
+        let mut probe = store.pool_for_test().begin().await?;
+        sqlx::query("SET LOCAL lock_timeout = '500ms'")
+            .execute(&mut *probe)
+            .await?;
+        sqlx::query("SELECT 1 FROM agent_sdk_threads WHERE thread_id = $1 FOR UPDATE")
+            .bind(root.thread_id.0.clone())
+            .execute(&mut *probe)
+            .await?;
+        let updating = tokio::spawn({
+            let store = store.clone();
+            let root = root.clone();
+            async move { AgentTaskStore::update(&store, root).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        sqlx::query("SELECT 1 FROM agent_sdk_tasks WHERE id = $1 FOR UPDATE")
+            .bind(root.id.as_str())
+            .execute(&mut *probe)
+            .await
+            .context("update must not hold the root while it waits on the thread")?;
+        probe.commit().await?;
+        updating.await??;
         Ok(())
     }
 

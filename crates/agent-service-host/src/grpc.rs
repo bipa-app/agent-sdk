@@ -1591,6 +1591,12 @@ impl AgentControlService for GrpcControlService {
                     &request.request_id,
                 ));
             }
+            IdempotencyClaim::InFlight => {
+                return Err(idempotency_in_flight_status(
+                    "CreateThread",
+                    &request.request_id,
+                ));
+            }
             IdempotencyClaim::Replay(record) => {
                 let result: CreateThreadResult = decode_idempotency_result(&record.result_json)?;
                 let thread_id = ThreadId::from_string(result.thread_id);
@@ -1867,6 +1873,12 @@ impl AgentControlService for GrpcControlService {
                     &request.request_id,
                 ));
             }
+            IdempotencyClaim::InFlight => {
+                return Err(idempotency_in_flight_status(
+                    "ForkThread",
+                    &request.request_id,
+                ));
+            }
             IdempotencyClaim::Replay(record) if caller_minted && record.result_json.is_null() => {
                 // A prior caller-minted attempt died between claim and
                 // record; fall through — the destination PK claim is
@@ -1962,6 +1974,12 @@ impl AgentControlService for GrpcControlService {
                     &request.request_id,
                 ));
             }
+            IdempotencyClaim::InFlight => {
+                return Err(idempotency_in_flight_status(
+                    "DecideConfirmation",
+                    &request.request_id,
+                ));
+            }
             IdempotencyClaim::Replay(record) => {
                 let result: DecideConfirmationResult =
                     decode_idempotency_result(&record.result_json)?;
@@ -2024,11 +2042,20 @@ impl AgentControlService for GrpcControlService {
             )
             .await
             .map_err(internal_status("answer-question idempotency lookup"))?;
-        if matches!(&claim, IdempotencyClaim::Conflict) {
-            return Err(idempotency_conflict_status(
-                "AnswerQuestion",
-                &request.request_id,
-            ));
+        match &claim {
+            IdempotencyClaim::Conflict => {
+                return Err(idempotency_conflict_status(
+                    "AnswerQuestion",
+                    &request.request_id,
+                ));
+            }
+            IdempotencyClaim::InFlight => {
+                return Err(idempotency_in_flight_status(
+                    "AnswerQuestion",
+                    &request.request_id,
+                ));
+            }
+            IdempotencyClaim::Fresh | IdempotencyClaim::Replay(_) => {}
         }
 
         let current = self
@@ -2072,7 +2099,7 @@ impl AgentControlService for GrpcControlService {
                         Status::failed_precondition(error.to_string())
                     }
                 })?,
-            IdempotencyClaim::Conflict => {
+            IdempotencyClaim::Conflict | IdempotencyClaim::InFlight => {
                 return Err(idempotency_conflict_status(
                     "AnswerQuestion",
                     &request.request_id,
@@ -3121,6 +3148,18 @@ fn map_purge_receipt(receipt: &PurgeReceipt) -> Result<pb::PurgeReceipt, Status>
         started_at: Some(map_timestamp(receipt.started_at)?),
         completed_at: Some(map_timestamp(receipt.completed_at)?),
     })
+}
+
+/// A `request_id` whose earlier request reserved it for the same payload
+/// but never recorded a result: it is still running, or it failed first.
+/// Nothing ran for this call.
+fn idempotency_in_flight_status(method: &str, request_id: &str) -> Status {
+    Status::aborted(format!(
+        "request_id '{request_id}' is held by an earlier {method} request with the same \
+         payload that has not recorded a result: it is still running, or it failed before \
+         it recorded one. Nothing ran for this call; read the current state, or retry with a \
+         new request_id"
+    ))
 }
 
 fn idempotency_conflict_status(method: &str, request_id: &str) -> Status {
@@ -6324,6 +6363,99 @@ mod tests {
 
         assert_second_postgres_persistence(&persisted, &second_task_id).await?;
         Ok(())
+    }
+
+    /// A `DecideConfirmation` retried under a `request_id` whose earlier
+    /// attempt reserved the key but never recorded a result is refused as
+    /// in flight, not as a key reused for a different request, and runs
+    /// nothing: the child stays parked.
+    #[tokio::test]
+    async fn a_decision_on_an_unrecorded_request_id_is_refused_as_in_flight() -> Result<()> {
+        let transfer_tool = Tool {
+            name: "transfer".into(),
+            description: "Transfer funds".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "amount": { "type": "number" } },
+                "required": ["amount"]
+            }),
+            display_name: "Transfer".into(),
+            tier: ToolTier::Confirm,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
+        };
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(vec![
+            transfer_tool,
+        ])));
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(vec![
+                tool_use_response(
+                    "resp_in_flight_1",
+                    "tool_call_1",
+                    "transfer",
+                    json!({"amount": 42}),
+                ),
+                text_response("resp_in_flight_2", "transfer complete"),
+            ])),
+            Arc::new(NoopToolExecutor),
+        )?;
+        let captured: Arc<Mutex<Option<Arc<dyn AgentTaskStore>>>> = Arc::new(Mutex::new(None));
+        let capture = Arc::clone(&captured);
+        let daemon = LocalDaemon::start_with_store_decorator(
+            ServiceConfig::default(),
+            registry,
+            runtime,
+            move |stores| {
+                if let Ok(mut slot) = capture.lock() {
+                    *slot = Some(Arc::clone(&stores.task_store));
+                }
+                stores
+            },
+        )
+        .await?;
+
+        let result = async {
+            let task_store = captured
+                .lock()
+                .map_err(|_| anyhow::anyhow!("store slot poisoned"))?
+                .clone()
+                .context("the decorator saw the task store")?;
+            let (mut control, _events) = connect_clients(&daemon.endpoint()).await?;
+            let thread_id = create_thread(&mut control, "create-in-flight-thread").await?;
+            let _task =
+                submit_text_work(&mut control, "submit-in-flight", &thread_id, "transfer 42")
+                    .await?;
+            let parked = wait_for_awaiting_confirmation(&control, &thread_id).await?;
+            let request = approval_request("decide-in-flight", &thread_id, &parked.task_id, false);
+            let earlier = task_store
+                .claim_idempotency(
+                    &request.request_id,
+                    IdempotencyKind::DecideConfirmation,
+                    &decide_confirmation_fingerprint(&request),
+                )
+                .await?;
+            ensure!(
+                earlier == IdempotencyClaim::Fresh,
+                "the earlier attempt reserves the key: {earlier:?}",
+            );
+
+            let status = control
+                .decide_confirmation(request)
+                .await
+                .err()
+                .context("a decision on an unrecorded request_id is refused")?;
+            ensure!(
+                status.code() == tonic::Code::Aborted
+                    && status.message().contains("has not recorded a result"),
+                "an in-flight refusal, not a reused key: {status}",
+            );
+            let still = wait_for_awaiting_confirmation(&control, &thread_id).await?;
+            ensure!(still.task_id == parked.task_id, "the child stays parked");
+            Ok(())
+        }
+        .await;
+        daemon.stop().await?;
+        result
     }
 
     #[tokio::test]

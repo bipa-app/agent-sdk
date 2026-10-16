@@ -3681,9 +3681,7 @@ impl AgentTaskStore for SqliteDurableStore {
         let result_json: serde_json::Value = serde_json::from_str(&row.result_json)
             .context("decode stored idempotency result_json")?;
         if result_json.is_null() {
-            // Reserved by a concurrent in-flight claim that hasn't
-            // recorded its result yet — fail closed.
-            return Ok(IdempotencyClaim::Conflict);
+            return Ok(IdempotencyClaim::InFlight);
         }
         let stored_kind = IdempotencyKind::from_wire(&row.kind)
             .ok_or_else(|| anyhow!("unknown idempotency kind {} stored", row.kind))?;
