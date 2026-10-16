@@ -1,8 +1,8 @@
-//! Atomic durable subagent-spawn commit hook.
+//! The write set of one durable subagent spawn, committed by
+//! [`super::store::AgentTaskStore::commit_subagent_spawn`].
 
 use agent_sdk_foundation::events::AgentEvent;
 use anyhow::Result;
-use async_trait::async_trait;
 use time::OffsetDateTime;
 
 use super::committed_event::CommittedEvent;
@@ -76,16 +76,6 @@ pub fn started_event_from_invocation(
         cache_read_input_tokens: 0,
         cache_creation_input_tokens: 0,
     })
-}
-
-/// Backend hook that creates child-thread/task rows, the parent progress event,
-/// and its coalesced outbox advisory in one transaction.
-#[async_trait]
-pub trait AtomicSubagentSpawnCommitter: Send + Sync {
-    async fn commit_subagent_spawn_atomic(
-        &self,
-        params: SubagentSpawnCommit,
-    ) -> Result<SubagentSpawnOutcome>;
 }
 
 /// Build the parent-visible start event after the store has minted linked ids.

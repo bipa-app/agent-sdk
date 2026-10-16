@@ -39,7 +39,7 @@ use agent_server::journal::store::{
     InMemoryAtomicSpawnEventCommitter,
 };
 use agent_server::journal::task::AgentTaskId;
-use agent_server::journal::thread_store::{InMemoryThreadStore, ThreadStore};
+use agent_server::journal::thread_store::{InMemoryThreadStore, ThreadJournalSink, ThreadStore};
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 use agent_server::journal::tool_audit::RedactingToolAuditEventStore;
 use agent_server::journal::tool_audit::{InMemoryToolAuditEventStore, ToolAuditEventStore};
@@ -552,13 +552,21 @@ impl StoreRegistry {
         // markers (+ outbox advisories) through these shared stores —
         // the in-memory analogue of the durable backends committing
         // the marker inside the cancellation transaction (issue #354).
-        let thread_store: Arc<InMemoryThreadStore> = Arc::new(InMemoryThreadStore::new());
         let event_repo: Arc<InMemoryEventRepository> = Arc::new(InMemoryEventRepository::new());
         let outbox_store: Arc<InMemoryOutboxStore> = Arc::new(InMemoryOutboxStore::new());
         let execution_intent_store: Arc<InMemoryExecutionIntentStore> =
             Arc::new(InMemoryExecutionIntentStore::new());
         let message_store: Arc<InMemoryMessageProjectionStore> =
             Arc::new(InMemoryMessageProjectionStore::new());
+        let checkpoint_store: Arc<InMemoryCheckpointStore> =
+            Arc::new(InMemoryCheckpointStore::new());
+        let thread_store: Arc<InMemoryThreadStore> =
+            Arc::new(InMemoryThreadStore::new().with_journal(ThreadJournalSink {
+                message_store: message_store.clone(),
+                checkpoint_store: checkpoint_store.clone(),
+                event_repo: event_repo.clone(),
+                outbox_store: outbox_store.clone(),
+            }));
         let task_store = InMemoryAgentTaskStore::new()
             .with_cancellation_markers(CancellationMarkerSink {
                 event_repo: event_repo.clone(),
@@ -576,7 +584,7 @@ impl StoreRegistry {
             thread_store,
             message_store,
             attempt_store: Arc::new(InMemoryTurnAttemptStore::new()),
-            checkpoint_store: Arc::new(InMemoryCheckpointStore::new()),
+            checkpoint_store,
             event_repo,
             execution_intent_store,
             tool_audit_store: Arc::new(InMemoryToolAuditEventStore::new()),

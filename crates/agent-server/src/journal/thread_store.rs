@@ -26,16 +26,24 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::{ThreadId, TokenUsage};
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
 
+use super::checkpoint_store::CheckpointStore;
+use super::committed_event::CommittedEvent;
 use super::completed_turn_transaction::AtomicCompletedTurnCommitter;
+use super::event_repository::EventRepository;
+use super::fork_transaction::ForkCommitParams;
+use super::message_store::MessageProjectionStore;
+use super::outbox::{OutboxStore, insert_events_available_advisory};
 use super::thread::{
     PurgeReceipt, PurgeSeed, Thread, ThreadNotFound, ThreadOperation, ThreadStatus,
 };
+use super::thread_creation_transaction::{ThreadCreationCommit, ThreadCreationRows};
 
 /// Parameters that define the operation which first claimed a thread id.
 ///
@@ -149,30 +157,31 @@ pub trait ThreadStore: Send + Sync {
         None
     }
 
-    /// Optional backend-specific hook that can copy a thread's
-    /// committed state onto a freshly-minted destination thread
-    /// inside one durable transaction.
+    /// Create a thread, its empty message projection, its creation event
+    /// and the event's coalesced `thread_events_available` advisory as one
+    /// unit.
     ///
-    /// Used by `agent.service.v1.AgentControlService.ForkThread` to
-    /// guarantee that a partial fork (aggregate written, projection
-    /// rewritten, but events / checkpoint never landed) is impossible
-    /// to observe. In-memory stores leave this as `None` because the
-    /// per-store mutations are already serialized under their own
-    /// write locks; durable SQL backends implement it via a single
-    /// transaction wrapping the entire write set.
-    #[must_use]
-    fn atomic_fork_committer(&self) -> Option<&dyn super::fork_transaction::AtomicForkCommitter> {
-        None
-    }
-
-    /// Optional backend hook for creating a thread, its empty message
-    /// projection, creation event, and outbox advisory in one transaction.
-    #[must_use]
-    fn atomic_thread_creation_committer(
+    /// # Errors
+    /// Returns an error if the thread is not active or a write fails; the
+    /// durable backends then write nothing.
+    async fn commit_thread_creation(
         &self,
-    ) -> Option<&dyn super::thread_creation_transaction::AtomicThreadCreationCommitter> {
-        None
-    }
+        params: ThreadCreationCommit,
+    ) -> Result<ThreadCreationRows>;
+
+    /// Write a fork's destination as one unit: the thread aggregate (with
+    /// its creation identity when `params.creation` is set), the mirrored
+    /// `committed_turns` and usage, the message projection, the checkpoint,
+    /// the events and their coalesced advisory.
+    ///
+    /// A caller-addressed destination that already exists with the same
+    /// creation identity returns [`ThreadCreationOutcome::Existing`] and
+    /// writes nothing.
+    ///
+    /// # Errors
+    /// - [`ThreadIdConflict`] when the id was claimed by different parameters.
+    /// - Store-level write errors; the durable backends then write nothing.
+    async fn commit_fork(&self, params: ForkCommitParams) -> Result<ThreadCreationOutcome>;
 
     /// Return the thread row, creating it if it does not exist.
     ///
@@ -199,15 +208,6 @@ pub trait ThreadStore: Send + Sync {
         creation: &ThreadCreation,
         now: OffsetDateTime,
     ) -> Result<ThreadCreationOutcome>;
-
-    /// Optional lock held across the non-atomic fork fallback.
-    ///
-    /// In-memory stores expose this so a concurrent matching fork cannot
-    /// observe the destination between its aggregate claim and projection
-    /// copy. Durable stores transact the full fork and return `None`.
-    fn sequential_fork_lock(&self) -> Option<&tokio::sync::Mutex<()>> {
-        None
-    }
 
     /// Optional process-wide serialization lock for the NON-ATOMIC
     /// sequential commit path in [`super::commit::commit_completed_turn`].
@@ -325,8 +325,24 @@ pub struct InMemoryThreadStore {
     /// See [`ThreadStore::sequential_commit_lock`]. Shared across
     /// clones so every handle serializes against the same lock.
     sequential_commit_lock: Arc<tokio::sync::Mutex<()>>,
-    /// See [`ThreadStore::sequential_fork_lock`].
-    sequential_fork_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The stores a thread creation or fork writes beside the thread row.
+    /// `None` refuses [`ThreadStore::commit_thread_creation`] and
+    /// [`ThreadStore::commit_fork`].
+    journal: Option<Arc<ThreadJournalSink>>,
+}
+
+/// The stores [`InMemoryThreadStore`] writes a thread creation or a fork
+/// to, beside its own thread rows. Wire the same instances the rest of the
+/// composed in-memory backend reads.
+pub struct ThreadJournalSink {
+    /// Message projections a creation bootstraps and a fork seeds.
+    pub message_store: Arc<dyn MessageProjectionStore>,
+    /// Checkpoints a fork mirrors.
+    pub checkpoint_store: Arc<dyn CheckpointStore>,
+    /// Journal the creation and fork events are appended to.
+    pub event_repo: Arc<dyn EventRepository>,
+    /// Outbox the `thread_events_available` advisory row is written to.
+    pub outbox_store: Arc<dyn OutboxStore>,
 }
 
 impl InMemoryThreadStore {
@@ -334,6 +350,45 @@ impl InMemoryThreadStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Wire the stores a thread creation or a fork writes to.
+    #[must_use]
+    pub fn with_journal(mut self, sink: ThreadJournalSink) -> Self {
+        self.journal = Some(Arc::new(sink));
+        self
+    }
+
+    fn journal(&self) -> Result<&ThreadJournalSink> {
+        self.journal.as_deref().ok_or_else(|| {
+            anyhow!(
+                "a thread creation or fork needs the in-memory thread store's journal sink \
+                 (InMemoryThreadStore::with_journal)"
+            )
+        })
+    }
+
+    /// Append `events` to `thread_id` with one coalesced advisory.
+    async fn append_with_advisory(
+        sink: &ThreadJournalSink,
+        thread_id: &ThreadId,
+        events: Vec<AgentEvent>,
+        max_attempts: u32,
+        now: OffsetDateTime,
+    ) -> Result<Vec<CommittedEvent>> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        let committed = sink
+            .event_repo
+            .commit_event_batch(thread_id, events, now)
+            .await
+            .context("commit thread journal events")?;
+        if let Some(last) = committed.last() {
+            insert_events_available_advisory(sink.outbox_store.as_ref(), last, max_attempts, now)
+                .await?;
+        }
+        Ok(committed)
     }
 }
 
@@ -343,8 +398,108 @@ impl ThreadStore for InMemoryThreadStore {
         Some(&self.sequential_commit_lock)
     }
 
-    fn sequential_fork_lock(&self) -> Option<&tokio::sync::Mutex<()>> {
-        Some(&self.sequential_fork_lock)
+    /// Holds the store's write lock across every write, so no reader of
+    /// this store sees the thread before its projection and event. The
+    /// in-memory store is not durable: a failure after the first side-store
+    /// write cannot roll it back.
+    async fn commit_thread_creation(
+        &self,
+        params: ThreadCreationCommit,
+    ) -> Result<ThreadCreationRows> {
+        let sink = self.journal()?;
+        let mut inner = self.inner.write().await;
+        let thread = inner
+            .by_id
+            .get(&params.thread_id)
+            .cloned()
+            .unwrap_or_else(|| Thread::new(params.thread_id.clone(), params.now));
+        thread.require_active(ThreadOperation::Create)?;
+        sink.message_store
+            .get_or_create(&params.thread_id, params.now)
+            .await
+            .context("create thread message projection")?;
+        let mut committed = Self::append_with_advisory(
+            sink,
+            &params.thread_id,
+            vec![params.event],
+            params.outbox_max_attempts,
+            params.now,
+        )
+        .await?;
+        let committed_event = committed
+            .pop()
+            .context("thread creation event batch was empty")?;
+        inner.by_id.insert(params.thread_id, thread.clone());
+        drop(inner);
+        Ok(ThreadCreationRows {
+            thread,
+            committed_event,
+        })
+    }
+
+    /// Holds the store's write lock across every write, so a concurrent
+    /// fork onto the same destination waits for this one and then sees it
+    /// whole. The in-memory store is not durable: a failure after the first
+    /// side-store write cannot roll it back.
+    async fn commit_fork(&self, params: ForkCommitParams) -> Result<ThreadCreationOutcome> {
+        let sink = self.journal()?;
+        let mut inner = self.inner.write().await;
+        let existing = inner.by_id.get(&params.new_thread_id);
+        if let (Some(_), Some(creation)) = (existing, params.creation.as_ref()) {
+            if inner.creation_by_id.get(&params.new_thread_id) == Some(creation) {
+                return Ok(ThreadCreationOutcome::Existing);
+            }
+            return Err(anyhow::Error::new(ThreadIdConflict {
+                thread_id: params.new_thread_id.clone(),
+            }));
+        }
+        let mut thread = existing
+            .cloned()
+            .unwrap_or_else(|| Thread::new(params.new_thread_id.clone(), params.now));
+        thread.require_active(ThreadOperation::Create)?;
+        let zero = TokenUsage::default();
+        for turn_index in 0..params.committed_turns {
+            let usage = if turn_index + 1 == params.committed_turns {
+                &params.cumulative_total_usage
+            } else {
+                &zero
+            };
+            thread = thread
+                .apply_committed_turn(usage, params.now)
+                .context("mirror the source's committed turns onto the fork")?;
+        }
+        sink.message_store
+            .get_or_create(&params.new_thread_id, params.now)
+            .await
+            .context("create forked message projection")?;
+        if !params.messages.is_empty() {
+            sink.message_store
+                .replace_history(&params.new_thread_id, params.messages, params.now)
+                .await
+                .context("seed forked message history")?;
+        }
+        if let Some(checkpoint) = params.checkpoint {
+            sink.checkpoint_store
+                .commit_checkpoint(checkpoint)
+                .await
+                .context("seed forked checkpoint")?;
+        }
+        Self::append_with_advisory(
+            sink,
+            &params.new_thread_id,
+            params.events,
+            params.outbox_max_attempts,
+            params.now,
+        )
+        .await?;
+        if let Some(creation) = params.creation {
+            inner
+                .creation_by_id
+                .insert(params.new_thread_id.clone(), creation);
+        }
+        inner.by_id.insert(params.new_thread_id, thread);
+        drop(inner);
+        Ok(ThreadCreationOutcome::Created)
     }
 
     async fn get_or_create(&self, thread_id: &ThreadId, now: OffsetDateTime) -> Result<Thread> {

@@ -35,72 +35,40 @@ fn error_text(error: &anyhow::Error) -> String {
     format!("{error:#}")
 }
 
-struct FailingEventRepository;
+struct FailingAtomicSpawnCommitter;
 
 #[async_trait]
-impl EventRepository for FailingEventRepository {
-    async fn commit_event(
+impl crate::journal::store::AtomicSpawnEventCommitter for FailingAtomicSpawnCommitter {
+    async fn commit_spawn_events(
         &self,
-        _thread_id: &agent_sdk_foundation::ThreadId,
-        _event: AgentEvent,
+        _batches: Vec<crate::journal::store::AtomicSpawnEventBatch>,
         _now: OffsetDateTime,
-    ) -> Result<crate::journal::CommittedEvent> {
-        anyhow::bail!("synthetic event commit failure");
-    }
-
-    async fn commit_event_batch(
-        &self,
-        _thread_id: &agent_sdk_foundation::ThreadId,
-        _events: Vec<AgentEvent>,
-        _now: OffsetDateTime,
-    ) -> Result<Vec<crate::journal::CommittedEvent>> {
+    ) -> Result<Vec<Vec<crate::journal::CommittedEvent>>> {
         anyhow::bail!("synthetic event batch commit failure");
     }
-
-    async fn next_sequence(&self, _thread_id: &agent_sdk_foundation::ThreadId) -> Result<u64> {
-        Ok(0)
-    }
-
-    async fn get_events(
-        &self,
-        _thread_id: &agent_sdk_foundation::ThreadId,
-    ) -> Result<Vec<crate::journal::CommittedEvent>> {
-        Ok(Vec::new())
-    }
-
-    async fn get_events_in_range(
-        &self,
-        _thread_id: &agent_sdk_foundation::ThreadId,
-        _after_sequence: u64,
-        _up_to_sequence: u64,
-    ) -> Result<Vec<crate::journal::CommittedEvent>> {
-        Ok(Vec::new())
-    }
-
-    async fn threads_with_events_before(
-        &self,
-        _cutoff: OffsetDateTime,
-        _limit: u32,
-    ) -> Result<Vec<agent_sdk_foundation::ThreadId>> {
-        Ok(Vec::new())
-    }
-
-    async fn max_sequence_before(
-        &self,
-        _thread_id: &agent_sdk_foundation::ThreadId,
-        _cutoff: OffsetDateTime,
-    ) -> Result<Option<u64>> {
-        Ok(None)
-    }
-
-    async fn min_sequence_at_or_after(
-        &self,
-        _thread_id: &agent_sdk_foundation::ThreadId,
-        _cutoff: OffsetDateTime,
-    ) -> Result<Option<u64>> {
-        Ok(None)
-    }
 }
+
+/// A task store wired to `thread_store` and `event_repo`, as the composed
+/// in-memory backend wires it.
+fn wired_task_store(
+    thread_store: &InMemoryThreadStore,
+    event_repo: &InMemoryEventRepository,
+) -> InMemoryAgentTaskStore {
+    let outbox_store = crate::journal::outbox::InMemoryOutboxStore::new();
+    InMemoryAgentTaskStore::new()
+        .with_cancellation_markers(CancellationMarkerSink {
+            event_repo: std::sync::Arc::new(event_repo.clone()),
+            outbox_store: std::sync::Arc::new(outbox_store.clone()),
+            thread_store: std::sync::Arc::new(thread_store.clone()),
+        })
+        .with_spawn_event_committer(std::sync::Arc::new(
+            crate::journal::store::InMemoryAtomicSpawnEventCommitter::new(
+                event_repo.clone(),
+                outbox_store,
+            ),
+        ))
+}
+
 struct ShortBatchAtomicSpawnCommitter;
 
 #[async_trait]
@@ -1166,9 +1134,9 @@ async fn spawn_batch_rejects_out_of_bounds_spawn_index() -> Result<()> {
 
 #[tokio::test]
 async fn spawn_flow_creates_invocation_child_thread_and_child_root() -> Result<()> {
-    let task_store = InMemoryAgentTaskStore::new();
     let thread_store = InMemoryThreadStore::new();
     let event_repo = InMemoryEventRepository::new();
+    let task_store = wired_task_store(&thread_store, &event_repo);
     let (parent, worker, lease) = running_parent_root(&task_store).await?;
     let task = "Inspect durable linkage";
     let spec = sample_spec(task);
@@ -1257,9 +1225,9 @@ async fn spawn_carries_child_caller_metadata_onto_child_root() -> Result<()> {
     // child ROOT task so an AgentDefinitionRegistry can resolve a
     // per-subagent model/toolset from it. `None` (the default, covered
     // by every other test) leaves caller_metadata unset.
-    let task_store = InMemoryAgentTaskStore::new();
     let thread_store = InMemoryThreadStore::new();
     let event_repo = InMemoryEventRepository::new();
+    let task_store = wired_task_store(&thread_store, &event_repo);
     let (parent, worker, lease) = running_parent_root(&task_store).await?;
     let task = "Inspect durable linkage";
     let spec = sample_spec(task);
@@ -1297,18 +1265,25 @@ async fn spawn_carries_child_caller_metadata_onto_child_root() -> Result<()> {
 
 #[tokio::test]
 async fn spawn_flow_surfaces_parent_progress_commit_failures() -> Result<()> {
-    let task_store = InMemoryAgentTaskStore::new();
     let thread_store = InMemoryThreadStore::new();
-    let event_repo = FailingEventRepository;
+    let event_repo = InMemoryEventRepository::new();
+    let task_store = InMemoryAgentTaskStore::new()
+        .with_cancellation_markers(CancellationMarkerSink {
+            event_repo: std::sync::Arc::new(event_repo.clone()),
+            outbox_store: std::sync::Arc::new(crate::journal::outbox::InMemoryOutboxStore::new()),
+            thread_store: std::sync::Arc::new(thread_store.clone()),
+        })
+        .with_spawn_event_committer(std::sync::Arc::new(FailingAtomicSpawnCommitter));
     let (parent, worker, lease) = running_parent_root(&task_store).await?;
     let task = "Inspect durable linkage";
+    let child_thread_id = agent_sdk_foundation::ThreadId::new();
 
     let error = spawn_subagent_invocation(
         &parent.id,
         &worker,
         &lease,
         SubagentInvocationSpawn {
-            child_thread_id: agent_sdk_foundation::ThreadId::new(),
+            child_thread_id: child_thread_id.clone(),
             spec: sample_spec(task),
             child_root_input: child_root_input(task),
             spawn_index: 0,
@@ -1328,9 +1303,21 @@ async fn spawn_flow_surfaces_parent_progress_commit_failures() -> Result<()> {
     .ok_or_else(|| anyhow!("spawn must surface parent progress commit failure"))?;
 
     assert!(
-        error_text(&error).contains("commit child ThreadCreated"),
+        error_text(&error).contains("synthetic event batch commit failure"),
         "unexpected error: {error:#}",
     );
+    let parent_after = task_store
+        .get(&parent.id)
+        .await?
+        .context("spawn parent must survive the failed spawn")?;
+    assert_eq!(parent_after.status, TaskStatus::Running);
+    assert!(
+        task_store
+            .list_by_thread(&child_thread_id)
+            .await?
+            .is_empty()
+    );
+    assert!(event_repo.get_events(&parent.thread_id).await?.is_empty());
     Ok(())
 }
 

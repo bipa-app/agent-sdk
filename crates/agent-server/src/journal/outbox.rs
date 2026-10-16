@@ -209,6 +209,44 @@ pub struct OutboxRow {
     pub delivered_at: Option<OffsetDateTime>,
 }
 
+/// Insert the `thread_events_available` advisory for `last`, the newest
+/// event a commit appended to its thread.
+pub(crate) async fn insert_events_available_advisory(
+    outbox: &dyn OutboxStore,
+    last: &super::committed_event::CommittedEvent,
+    max_attempts: u32,
+    now: OffsetDateTime,
+) -> Result<()> {
+    use anyhow::Context as _;
+
+    let payload_json = super::outbox_message::OutboxMessage::ThreadEventsAvailable(
+        super::outbox_message::ThreadEventsAvailablePayload {
+            thread_id: last.thread_id.clone(),
+            last_sequence: last.sequence,
+        },
+    )
+    .to_payload_json()
+    .context("serialise thread_events_available advisory payload")?;
+    outbox
+        .insert_batch(vec![NewOutboxRow {
+            kind: OutboxMessageKind::ThreadEventsAvailable,
+            thread_id: last.thread_id.clone(),
+            event_id: Some(last.event_id),
+            sequence: Some(last.sequence),
+            payload_json,
+            max_attempts,
+            now,
+        }])
+        .await
+        .with_context(|| {
+            format!(
+                "insert thread_events_available advisory for thread {}",
+                last.thread_id
+            )
+        })?;
+    Ok(())
+}
+
 /// Parameters for inserting a new outbox row.
 ///
 /// For `ThreadEventsAvailable` rows, `event_id` and `sequence` MUST be

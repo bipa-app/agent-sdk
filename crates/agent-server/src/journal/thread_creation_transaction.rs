@@ -1,9 +1,8 @@
-//! Atomic thread-creation commit hook for durable backends.
+//! The write set of one thread creation, committed by
+//! [`super::thread_store::ThreadStore::commit_thread_creation`].
 
 use agent_sdk_foundation::ThreadId;
 use agent_sdk_foundation::events::AgentEvent;
-use anyhow::Result;
-use async_trait::async_trait;
 use time::OffsetDateTime;
 
 use super::committed_event::CommittedEvent;
@@ -21,14 +20,4 @@ pub struct ThreadCreationCommit {
 pub struct ThreadCreationRows {
     pub thread: Thread,
     pub committed_event: CommittedEvent,
-}
-
-/// Backend hook that creates the thread aggregate, empty message projection,
-/// creation event, and coalesced outbox advisory in one transaction.
-#[async_trait]
-pub trait AtomicThreadCreationCommitter: Send + Sync {
-    async fn commit_thread_creation_atomic(
-        &self,
-        params: ThreadCreationCommit,
-    ) -> Result<ThreadCreationRows>;
 }

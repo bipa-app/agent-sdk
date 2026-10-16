@@ -94,6 +94,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     wires both. Fixtures that compact must wire them too.
   - `Transition::validate` refuses a guard on a re-parked task: its lock
     would come before the re-attached children's.
+- **Breaking: subagent spawn, thread creation and fork commit through
+  required store methods (sites 11–13).** `AgentTaskStore::commit_subagent_spawn`,
+  `ThreadStore::commit_thread_creation` and `ThreadStore::commit_fork` have
+  no default. The `AtomicSubagentSpawnCommitter`, `AtomicThreadCreationCommitter`
+  and `AtomicForkCommitter` traits, their `atomic_*_committer` accessors and
+  `ThreadStore::sequential_fork_lock` are gone, and with them the sequential
+  fallbacks that wrote these in separate steps. A store that wraps another
+  must forward the three methods; one that decorates a subagent spawn
+  decorates `commit_subagent_spawn`, which the worker now calls instead of
+  `spawn_subagent_invocation`.
+  - The in-memory stores write them under one write lock. `InMemoryAgentTaskStore`
+    needs `with_cancellation_markers` and `with_spawn_event_committer` to
+    spawn a subagent; `InMemoryThreadStore` needs the new `with_journal`
+    (`ThreadJournalSink`: message, checkpoint, event and outbox stores) to
+    create or fork a thread. `StoreRegistry::in_memory` wires both with the
+    stores it exposes.
+  - An in-memory thread creation and fork now write the advisory row the
+    durable backends write.
+  - The SQLite and Postgres `commit_subagent_spawn` now complete the
+    delivered boundary injections and refuse a spawn onto a parent or child
+    thread being purged, as the fallback and the in-memory store did.
 - The `INTERNAL` answer for an approval that lands before its tool starts now
   says the confirmation is asked again when the task's lease expires.
 - **Breaking: sites 6, 7 and 9 commit their state and events together.**

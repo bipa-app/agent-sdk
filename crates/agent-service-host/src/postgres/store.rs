@@ -43,7 +43,7 @@ use agent_server::journal::event_outbox_transaction::{
 };
 use agent_server::journal::event_repository::EventRepository;
 use agent_server::journal::execution_intent::{ExecutionIntent, ExecutionIntentStore, OperationId};
-use agent_server::journal::fork_transaction::{AtomicForkCommitter, ForkCommitParams};
+use agent_server::journal::fork_transaction::ForkCommitParams;
 use agent_server::journal::idempotency::{IdempotencyClaim, IdempotencyKind, IdempotencyRecord};
 use agent_server::journal::message::{CompactionEntry, MessageProjection};
 use agent_server::journal::message_store::MessageProjectionStore;
@@ -78,8 +78,8 @@ use agent_server::journal::store::{
     validate_tool_child_specs_for_pure_spawn,
 };
 use agent_server::journal::subagent_spawn_transaction::{
-    AtomicSubagentSpawnCommitter, SubagentSpawnCommit, SubagentSpawnEvent, SubagentSpawnOutcome,
-    started_event_from_invocation, subagent_started_event,
+    SubagentSpawnCommit, SubagentSpawnEvent, SubagentSpawnOutcome, started_event_from_invocation,
+    subagent_started_event,
 };
 use agent_server::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, SuspensionPayload,
@@ -90,7 +90,7 @@ use agent_server::journal::thread::{
     PurgeReceipt, PurgeSeed, Thread, ThreadNotFound, ThreadOperation, ThreadStatus,
 };
 use agent_server::journal::thread_creation_transaction::{
-    AtomicThreadCreationCommitter, ThreadCreationCommit, ThreadCreationRows,
+    ThreadCreationCommit, ThreadCreationRows,
 };
 use agent_server::journal::thread_store::{
     BeginPurge, ThreadCreation, ThreadCreationOutcome, ThreadIdConflict, ThreadStore,
@@ -123,9 +123,16 @@ use super::migrations::apply_durable_core_migrations;
 /// only by transactions that already hold the root's thread, so their order
 /// relative to the root does not matter.
 ///
-/// A thread's message head is the last row a transaction locks: a
-/// completed turn takes thread, task, message head; a compaction transition
-/// thread, message head; the message-store methods take the head alone.
+/// Once a thread's message head exists, it is the last row a transaction
+/// waits on: a completed turn takes attempt, thread, task, message head; a
+/// compaction transition thread, message head; the message-store methods
+/// take the head alone. What follows the head are fresh inserts that wait on
+/// nothing. A transaction that inserts the head instead takes `FOR KEY SHARE`
+/// on the thread row through `agent_sdk_message_heads_thread_fk`, after
+/// holding the new head, so a head-creating message-store method on a thread
+/// with no head yet can wait on the thread while a thread holder waits on
+/// that uncommitted head. A compaction never meets it (it always has
+/// history); a completed turn on a thread with no head has the same shape.
 ///
 /// A transition (`DurableStore::commit`) first locks the threads it needs:
 /// each thread it appends events to, each thread whose message head it
@@ -3199,11 +3206,13 @@ FOR UPDATE
             .ok_or_else(|| anyhow!("spawn rejected: task {} does not exist", params.parent_id))?;
         Self::lock_thread_tx(&mut tx, &screened_parent.thread_id)
             .await?
-            .with_context(|| format!("thread {} missing", screened_parent.thread_id))?;
+            .with_context(|| format!("thread {} missing", screened_parent.thread_id))?
+            .require_active(ThreadOperation::Spawn)?;
         Self::bootstrap_thread_row_tx(&mut tx, &params.spawn.child_thread_id, params.now).await?;
         let child_thread = Self::lock_thread_tx(&mut tx, &params.spawn.child_thread_id)
             .await?
             .context("spawned child thread missing after bootstrap")?;
+        child_thread.require_active(ThreadOperation::Spawn)?;
 
         let old_parent = Self::load_task_tx(&mut tx, &params.parent_id, true)
             .await?
@@ -3254,6 +3263,7 @@ FOR UPDATE
         Self::update_task_tx(&mut tx, &parent_task).await?;
         Self::insert_task_tx(&mut tx, &invocation).await?;
         Self::insert_task_tx(&mut tx, &child_root).await?;
+        Self::complete_injections_tx(&mut tx, &params.delivered_injection_ids, params.now).await?;
 
         agent_server::fail_point!("atomic_spawn.after_rows");
 
@@ -4284,8 +4294,11 @@ impl PostgresDurableStore {
 
 #[async_trait]
 impl AgentTaskStore for PostgresDurableStore {
-    fn atomic_subagent_spawn_committer(&self) -> Option<&dyn AtomicSubagentSpawnCommitter> {
-        Some(self)
+    async fn commit_subagent_spawn(
+        &self,
+        params: SubagentSpawnCommit,
+    ) -> Result<SubagentSpawnOutcome> {
+        self.commit_subagent_spawn_atomic_inner(params).await
     }
 
     async fn insert(&self, task: AgentTask) -> Result<()> {
@@ -6100,12 +6113,15 @@ impl ThreadStore for PostgresDurableStore {
         Some(self)
     }
 
-    fn atomic_fork_committer(&self) -> Option<&dyn AtomicForkCommitter> {
-        Some(self)
+    async fn commit_thread_creation(
+        &self,
+        params: ThreadCreationCommit,
+    ) -> Result<ThreadCreationRows> {
+        self.commit_thread_creation_atomic_inner(params).await
     }
 
-    fn atomic_thread_creation_committer(&self) -> Option<&dyn AtomicThreadCreationCommitter> {
-        Some(self)
+    async fn commit_fork(&self, params: ForkCommitParams) -> Result<ThreadCreationOutcome> {
+        self.commit_fork_atomic_inner(params).await
     }
 
     async fn get_or_create(&self, thread_id: &ThreadId, now: OffsetDateTime) -> Result<Thread> {
@@ -6625,33 +6641,6 @@ impl AtomicCompletedTurnCommitter for PostgresDurableStore {
         params: CompletedTurnCommit,
     ) -> Result<CommitOutcome> {
         self.commit_completed_turn_atomic_inner(params, None).await
-    }
-}
-
-#[async_trait]
-impl AtomicSubagentSpawnCommitter for PostgresDurableStore {
-    async fn commit_subagent_spawn_atomic(
-        &self,
-        params: SubagentSpawnCommit,
-    ) -> Result<SubagentSpawnOutcome> {
-        self.commit_subagent_spawn_atomic_inner(params).await
-    }
-}
-
-#[async_trait]
-impl AtomicThreadCreationCommitter for PostgresDurableStore {
-    async fn commit_thread_creation_atomic(
-        &self,
-        params: ThreadCreationCommit,
-    ) -> Result<ThreadCreationRows> {
-        self.commit_thread_creation_atomic_inner(params).await
-    }
-}
-
-#[async_trait]
-impl AtomicForkCommitter for PostgresDurableStore {
-    async fn commit_fork_atomic(&self, params: ForkCommitParams) -> Result<ThreadCreationOutcome> {
-        self.commit_fork_atomic_inner(params).await
     }
 }
 
@@ -10881,8 +10870,8 @@ ON CONFLICT (thread_id) DO UPDATE SET
         fail::cfg("atomic_create.after_rows", "panic")
             .map_err(|error| anyhow::anyhow!("configure create failpoint: {error}"))?;
         let thread = thread_id("00000000-0000-4000-8000-0000000fa1c0");
-        let crashed = std::panic::AssertUnwindSafe(store.commit_thread_creation_atomic(
-            ThreadCreationCommit {
+        let crashed =
+            std::panic::AssertUnwindSafe(store.commit_thread_creation(ThreadCreationCommit {
                 thread_id: thread.clone(),
                 event: agent_sdk_foundation::events::AgentEvent::thread_created(
                     thread.clone(),
@@ -10891,8 +10880,7 @@ ON CONFLICT (thread_id) DO UPDATE SET
                 ),
                 outbox_max_attempts: 3,
                 now: t_plus(1),
-            },
-        ));
+            }));
         let result = futures::FutureExt::catch_unwind(crashed).await;
         fail::remove("atomic_create.after_rows");
         assert!(result.is_err(), "create failpoint must panic");
@@ -10928,7 +10916,7 @@ ON CONFLICT (thread_id) DO UPDATE SET
         fail::cfg("atomic_fork.after_rows", "panic")
             .map_err(|error| anyhow::anyhow!("configure fork failpoint: {error}"))?;
         let forked = thread_id("00000000-0000-4000-8000-0000000fa1c1");
-        let crashed = std::panic::AssertUnwindSafe(store.commit_fork_atomic(ForkCommitParams {
+        let crashed = std::panic::AssertUnwindSafe(store.commit_fork(ForkCommitParams {
             creation: None,
             new_thread_id: forked.clone(),
             now: t_plus(1),

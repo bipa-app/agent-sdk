@@ -230,7 +230,9 @@ use super::outbox_message::{OutboxMessage, OutboxMessageKind, ThreadEventsAvaila
 use super::recovery::{
     FailureReason, RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
 };
-use super::subagent_spawn_transaction::{SubagentSpawnEvent, started_event_from_invocation};
+use super::subagent_spawn_transaction::{
+    SubagentSpawnCommit, SubagentSpawnEvent, SubagentSpawnOutcome, started_event_from_invocation,
+};
 use super::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, SuspensionPayload,
     TaskKind, TaskStatus, WorkerId,
@@ -1637,14 +1639,23 @@ pub fn apply_question_answer(
 
 #[async_trait]
 pub trait AgentTaskStore: super::transition::DurableStore + Send + Sync {
-    /// Optional backend hook for atomically creating one subagent's child
-    /// thread/tasks, parent progress event, and outbox advisory.
-    #[must_use]
-    fn atomic_subagent_spawn_committer(
+    /// Spawn one subagent as one unit: the child thread row, the parent's
+    /// `Running` → `WaitingOnChildren` transition, the invocation and child
+    /// root rows, the delivered injections' completion, the parent's
+    /// `SubagentProgress` start event, the child's `ThreadCreated`, and
+    /// each thread's `thread_events_available` advisory.
+    ///
+    /// The worker's subagent spawn goes through this method alone, so a
+    /// decorating store that adds behaviour to a spawn wraps this method.
+    ///
+    /// # Errors
+    /// Same CAS and non-leaf envelope as
+    /// [`AgentTaskStore::spawn_subagent_invocation`]; store-level write
+    /// errors. The durable backends then write nothing.
+    async fn commit_subagent_spawn(
         &self,
-    ) -> Option<&dyn super::subagent_spawn_transaction::AtomicSubagentSpawnCommitter> {
-        None
-    }
+        params: super::subagent_spawn_transaction::SubagentSpawnCommit,
+    ) -> Result<super::subagent_spawn_transaction::SubagentSpawnOutcome>;
 
     /// Insert a new task row. **Not a mutation API** — see the
     /// [CAS discipline](Self#cas-discipline-phase-27) table for the
@@ -3119,6 +3130,31 @@ pub struct InMemoryAgentTaskStore {
     held_probe: super::sibling_order::HeldProbe<(OffsetDateTime, AgentTaskId)>,
 }
 
+/// A one-subagent mixed spawn as [`AgentTaskStore::commit_subagent_spawn`]
+/// returns it.
+fn single_subagent_outcome(
+    spawned: SpawnedMixedChildren,
+    child_thread: super::thread::Thread,
+) -> Result<SubagentSpawnOutcome> {
+    let (invocation_task, child_root_task) = spawned
+        .subagents
+        .into_iter()
+        .next()
+        .context("subagent spawn staged no invocation")?;
+    let committed_event = spawned
+        .committed_events
+        .into_iter()
+        .next()
+        .context("subagent spawn committed no start event")?;
+    Ok(SubagentSpawnOutcome {
+        parent_task: spawned.parent,
+        invocation_task,
+        child_thread,
+        child_root_task,
+        committed_event,
+    })
+}
+
 /// Cancellation-safe rollback for the staged half of an in-memory mixed
 /// spawn.
 ///
@@ -4182,30 +4218,13 @@ impl InMemoryAgentTaskStore {
         committed: &CommittedEvent,
         now: OffsetDateTime,
     ) -> Result<()> {
-        let payload_json = OutboxMessage::ThreadEventsAvailable(ThreadEventsAvailablePayload {
-            thread_id: committed.thread_id.clone(),
-            last_sequence: committed.sequence,
-        })
-        .to_payload_json()
-        .context("cancel_tree: serialise marker advisory payload")?;
-        sink.outbox_store
-            .insert_batch(vec![NewOutboxRow {
-                kind: OutboxMessageKind::ThreadEventsAvailable,
-                thread_id: committed.thread_id.clone(),
-                event_id: Some(committed.event_id),
-                sequence: Some(committed.sequence),
-                payload_json,
-                max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
-                now,
-            }])
-            .await
-            .with_context(|| {
-                format!(
-                    "cancel_tree: insert marker outbox advisory for thread {}",
-                    committed.thread_id,
-                )
-            })?;
-        Ok(())
+        super::outbox::insert_events_available_advisory(
+            sink.outbox_store.as_ref(),
+            committed,
+            DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+            now,
+        )
+        .await
     }
 
     /// Give a reused marker an advisory the relay can still publish.
@@ -6596,6 +6615,84 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
 
         drop(inner);
         Ok((new_parent, invocation, child_root))
+    }
+
+    /// Stages the rows under the store's write lock and commits both
+    /// threads' events through the atomic spawn event committer before
+    /// releasing it; a failed or dropped event commit rolls the rows back.
+    /// The child thread row is the one write a failure leaves behind, as
+    /// an idempotent bootstrap with no tasks.
+    async fn commit_subagent_spawn(
+        &self,
+        params: SubagentSpawnCommit,
+    ) -> Result<SubagentSpawnOutcome> {
+        let SubagentSpawnCommit {
+            delivered_injection_ids,
+            parent_id,
+            worker,
+            lease,
+            spawn,
+            event,
+            outbox_max_attempts: _,
+            now,
+        } = params;
+        let sink = self.marker_sink.as_ref().ok_or_else(|| {
+            anyhow!(
+                "a subagent spawn needs the in-memory task store's event sink \
+                 (InMemoryAgentTaskStore::with_cancellation_markers)"
+            )
+        })?;
+        ensure!(
+            self.spawn_event_committer.is_some(),
+            "a subagent spawn needs the in-memory task store's atomic spawn event committer \
+             (InMemoryAgentTaskStore::with_spawn_event_committer)"
+        );
+        self.guard_mixed_spawn_threads(&parent_id, std::slice::from_ref(&spawn))
+            .await?;
+        let child_thread_id = spawn.child_thread_id.clone();
+        let payload = spawn.payload.clone();
+        let spawns = vec![spawn];
+
+        let mut guard = MixedSpawnRollbackGuard::begin(self.inner.write().await);
+        let inner = &mut *guard.inner;
+        let old_parent =
+            inner.validate_running_owned_non_leaf_parent(&parent_id, &worker, &lease)?;
+        inner.validate_batch_thread_uniqueness(&spawns)?;
+        let rollback_rows =
+            inner.mixed_spawn_rollback_rows(&old_parent, &[], &delivered_injection_ids);
+        let (prepared, child_ids) = inner.build_batch_invocation_pairs(&old_parent, spawns, now)?;
+        let parent_task = old_parent
+            .clone()
+            .wait_on_children(1, payload, child_ids, now)
+            .context("spawn rejected: wait_on_children transition failed")?;
+        let event_batches = Self::prepare_atomic_spawn_event_batches(
+            &parent_task.thread_id,
+            &prepared,
+            Vec::new(),
+            vec![event],
+            Vec::new(),
+        )?;
+        if let Err(error) = inner.apply_mixed_spawn_rows(
+            (&old_parent, &parent_task),
+            &prepared,
+            &[],
+            Vec::new(),
+            &delivered_injection_ids,
+            now,
+        ) {
+            inner.rollback_mixed_spawn(&rollback_rows, &prepared, &[]);
+            return Err(error);
+        }
+        guard.arm(rollback_rows, prepared, Vec::new());
+        let child_thread = sink
+            .thread_store
+            .get_or_create(&child_thread_id, now)
+            .await
+            .context("materialize child thread")?;
+        guard
+            .commit_events(self, parent_task, event_batches, now)
+            .await
+            .and_then(|spawned| single_subagent_outcome(spawned, child_thread))
     }
 
     async fn spawn_subagent_batch(

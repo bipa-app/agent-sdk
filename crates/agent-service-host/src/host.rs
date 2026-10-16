@@ -9961,6 +9961,12 @@ mod tests {
 
     #[async_trait]
     impl AgentTaskStore for FlakyTaskStore {
+        async fn commit_subagent_spawn(
+            &self,
+            params: agent_server::journal::SubagentSpawnCommit,
+        ) -> Result<agent_server::journal::SubagentSpawnOutcome> {
+            self.inner.commit_subagent_spawn(params).await
+        }
         async fn insert(&self, task: AgentTask) -> Result<()> {
             self.inner.insert(task).await
         }
