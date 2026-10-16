@@ -1331,19 +1331,35 @@ async fn execute_subagent_task_inner(
         .context("build tool result")?;
     let result_payload =
         serde_json::to_value(&tool_result).context("serialize subagent tool result")?;
-    let (invocation_task, parent_task) = deps
+    let committed = deps
         .task_store
-        .complete_task_with_result(
-            &bootstrap.task_id,
-            &bootstrap.worker_id,
-            &bootstrap.lease_id,
-            result_payload,
+        .commit(
+            crate::journal::Transition::settle(
+                bootstrap.task_id.clone(),
+                bootstrap.worker_id.clone(),
+                bootstrap.lease_id.clone(),
+                crate::journal::Settle::Complete {
+                    result: result_payload,
+                },
+                bootstrap.thread_id.clone(),
+                vec![completed_progress_event(
+                    &bootstrap,
+                    &subagent_result.summary,
+                )],
+            ),
             now,
         )
         .await
+        .map_err(|rejected| {
+            crate::journal::transition::wrapper_error("complete_task_with_result", rejected)
+        })
         .context("complete subagent invocation task")?;
-    let committed_events =
-        commit_completed_subagent_progress(&bootstrap, &subagent_result.summary, deps, now).await?;
+    let (invocation_task, parent_task) = committed
+        .settled
+        .into_iter()
+        .next()
+        .context("a settle transition returns its settled task")?;
+    let committed_events = committed.events;
 
     Ok(SubagentTaskOutcome {
         invocation_task,
@@ -2451,13 +2467,14 @@ async fn materialize_terminal_subagent_result(
     })
 }
 
-async fn commit_completed_subagent_progress(
+/// The parent-visible `SubagentProgress` that reports an invocation's
+/// completion. It commits in the same transition as the invocation's
+/// settle, so the parent never sees the result without the event.
+fn completed_progress_event(
     bootstrap: &SubagentTaskBootstrap,
     summary: &SubagentSummary,
-    deps: &SubagentResultDeps<'_>,
-    now: OffsetDateTime,
-) -> Result<Vec<CommittedEvent>> {
-    let completed_event = build_parent_progress_event(&SubagentProgressSnapshot {
+) -> AgentEvent {
+    build_parent_progress_event(&SubagentProgressSnapshot {
         subagent_id: &bootstrap.subagent_id,
         subagent_name: &bootstrap.subagent_name,
         spec: &bootstrap.spec,
@@ -2469,16 +2486,7 @@ async fn commit_completed_subagent_progress(
         current_turn: summary.total_turns,
         tool_count: summary.tool_count,
         usage: summary.total_usage.clone(),
-    });
-
-    // The card's contract: a failed progress commit PROPAGATES — the
-    // swallowed-error arm is deleted, not bypassed. The invocation row
-    // completed above; a failed event commit surfaces to the worker,
-    // whose retry/lease machinery re-drives the completion path rather
-    // than silently losing the parent-visible completion event.
-    commit_parent_subagent_progress(deps.event_repo, &bootstrap.thread_id, completed_event, now)
-        .await
-        .context("commit completed subagent progress event")
+    })
 }
 
 fn validate_request(request: &SubagentSpawnRequest) -> Result<()> {

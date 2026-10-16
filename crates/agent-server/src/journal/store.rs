@@ -1504,8 +1504,9 @@ fn validate_parked_question_identities<'a>(
 /// persisted, [`QuestionAnswerMismatch`] when the batch does not resolve
 /// the parked questions one-to-one, a plain error when a legacy parked batch
 /// has malformed identities, and a plain error when the task is not awaiting
-/// a question (a client retrying a delivered answer must reuse its original
-/// `request_id`, which replays at the RPC layer).
+/// a question. A retry under the original `request_id` replays at the RPC
+/// layer once the answer is recorded; once the turn has consumed an answer
+/// whose result was never recorded, the retry gets this error too.
 pub fn apply_question_answer(
     old: &AgentTask,
     receipt_id: &str,
@@ -1530,8 +1531,9 @@ pub fn apply_question_answer(
     }
     if old.status != TaskStatus::AwaitingQuestion {
         return Err(anyhow!(
-            "answer_question rejected: task {id} is not awaiting a question (status {:?}); \
-             a retry of an already-delivered answer must reuse its original request_id",
+            "answer_question rejected: task {id} is not awaiting a question (status {:?}): \
+             no question is open, or an answer was delivered and the turn has moved past it; \
+             read the task's state",
             old.status
         ));
     }
@@ -7043,6 +7045,25 @@ mod tests {
             ids.iter().map(|id| question_payload(id)).collect(),
             t_plus(2),
         )?)
+    }
+
+    #[test]
+    fn an_answer_for_a_task_past_its_question_does_not_blame_the_request_id() -> Result<()> {
+        let mut task = awaiting_question_with_ids(&["call-1"])?;
+        task.status = TaskStatus::Running;
+        task.state = TaskState::None;
+        let error =
+            apply_question_answer(&task, "receipt-1", &[question_answer("call-1")], t_plus(3))
+                .err()
+                .context("a task past its question refuses the answer")?;
+        let message = error.to_string();
+        assert!(
+            message.contains("is not awaiting a question")
+                && message.contains("read the task's state")
+                && !message.contains("reuse"),
+            "{message}",
+        );
+        Ok(())
     }
 
     #[test]
