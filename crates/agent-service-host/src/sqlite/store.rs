@@ -505,6 +505,26 @@ ON CONFLICT (thread_id) DO NOTHING
         Ok(inserted.rows_affected() == 1)
     }
 
+    async fn append_compaction_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        thread_id: &ThreadId,
+        result_messages: Vec<llm::Message>,
+        source_message_count: usize,
+        retained_message_count: usize,
+        now: OffsetDateTime,
+    ) -> Result<MessageProjection> {
+        Self::bootstrap_thread_row_tx(tx, thread_id, now).await?;
+        let projection = Self::get_message_head_tx(tx, thread_id, now).await?;
+        let updated = projection.append_compaction(
+            result_messages,
+            source_message_count,
+            retained_message_count,
+            now,
+        )?;
+        Self::upsert_message_head_tx(tx, &updated).await?;
+        Ok(updated)
+    }
+
     async fn bootstrap_thread_row_tx(
         tx: &mut Transaction<'_, Sqlite>,
         thread_id: &ThreadId,
@@ -3455,6 +3475,23 @@ impl SqliteDurableStore {
                 committed.reparked.push(reparked);
             }
             Write::RecordIntent(intent) => Self::update_intent_tx(tx, &intent).await?,
+            Write::AppendCompaction {
+                thread,
+                messages,
+                source_message_count,
+                retained_message_count,
+            } => {
+                let compacted = Self::append_compaction_tx(
+                    tx,
+                    &thread,
+                    messages,
+                    source_message_count,
+                    retained_message_count,
+                    now,
+                )
+                .await?;
+                committed.compacted.push(compacted);
+            }
             Write::AppendEvents { thread, events } => {
                 if events.is_empty() {
                     return Ok(());
@@ -5341,15 +5378,15 @@ impl MessageProjectionStore for SqliteDurableStore {
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
         let mut tx = self.begin().await?;
-        Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
-        let projection = Self::get_message_head_tx(&mut tx, thread_id, now).await?;
-        let updated = projection.append_compaction(
+        let updated = Self::append_compaction_tx(
+            &mut tx,
+            thread_id,
             result_messages,
             source_message_count,
             retained_message_count,
             now,
-        )?;
-        Self::upsert_message_head_tx(&mut tx, &updated).await?;
+        )
+        .await?;
         tx.commit().await.context("commit append_compaction")?;
         Ok(updated)
     }

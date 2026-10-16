@@ -217,6 +217,7 @@ async fn assert_unchanged(
 
 #[tokio::test]
 async fn tool_settle_failpoint_rolls_back_the_child_with_its_tool_call_end() -> Result<()> {
+    let _scenario = serial_failpoints();
     let temp = tempfile::tempdir()?;
     let url = format!(
         "sqlite://{}?mode=rwc",
@@ -226,7 +227,6 @@ async fn tool_settle_failpoint_rolls_back_the_child_with_its_tool_call_end() -> 
     let bootstrap = leased_tool_child(&store).await?;
     let child = bootstrap.task_id.clone();
 
-    let _scenario = fail::FailScenario::setup();
     fail::cfg(FAILPOINT, "panic").map_err(|error| anyhow::anyhow!("{error}"))?;
     let crashed = std::panic::AssertUnwindSafe(run_tool(&store, bootstrap));
     let result = futures::FutureExt::catch_unwind(crashed).await;
@@ -243,6 +243,7 @@ async fn tool_settle_failpoint_rolls_back_the_child_with_its_tool_call_end() -> 
 /// and wait to be killed there.
 #[tokio::test]
 async fn tool_settle_failpoint_kill_child() -> Result<()> {
+    let _scenario = serial_failpoints();
     if std::env::var_os(CHILD_ENV).is_none() {
         return Ok(());
     }
@@ -262,6 +263,7 @@ async fn tool_settle_failpoint_kill_child() -> Result<()> {
 
 #[tokio::test]
 async fn kill_nine_inside_the_tool_settle_failpoint_leaves_neither_half() -> Result<()> {
+    let _scenario = serial_failpoints();
     let temp = tempfile::tempdir()?;
     let db = temp.path().join("settle-kill.db");
     let ready = temp.path().join("in-settle");
@@ -306,6 +308,13 @@ async fn kill_nine_inside_the_tool_settle_failpoint_leaves_neither_half() -> Res
     assert_neither_half(&store, &task_id).await
 }
 
+/// Every test here shares fail-rs's process-global registry, and the setup
+/// of one passes through the failpoint another has armed. Holding the
+/// scenario for the whole test serializes them under a plain `cargo test`.
+fn serial_failpoints() -> fail::FailScenario<'static> {
+    fail::FailScenario::setup()
+}
+
 /// Run `crashing` with the transition failpoint armed to panic, and require
 /// that it fired.
 async fn crash_in_transition<F: std::future::Future>(crashing: F) -> Result<()> {
@@ -335,10 +344,10 @@ async fn fresh_store(temp: &tempfile::TempDir) -> Result<SqliteDurableStore> {
 
 #[tokio::test]
 async fn reject_failpoint_keeps_the_confirmation_parked_without_its_tool_call_end() -> Result<()> {
+    let _scenario = serial_failpoints();
     let temp = tempfile::tempdir()?;
     let store = fresh_store(&temp).await?;
     let child = paused_on_confirmation(&store).await?.task_id;
-    let _scenario = fail::FailScenario::setup();
     crash_in_transition(agent_server::worker::apply_confirmation_decision(
         &child,
         agent_server::worker::ConfirmationDecision::Rejected {
@@ -353,10 +362,10 @@ async fn reject_failpoint_keeps_the_confirmation_parked_without_its_tool_call_en
 
 #[tokio::test]
 async fn pause_failpoint_keeps_the_child_running_without_its_prompt() -> Result<()> {
+    let _scenario = serial_failpoints();
     let temp = tempfile::tempdir()?;
     let store = fresh_store(&temp).await?;
     let bootstrap = leased_tool_child(&store).await?;
-    let _scenario = fail::FailScenario::setup();
     crash_in_transition(agent_server::worker::pause_tool_for_confirmation(
         &bootstrap,
         &store,
@@ -387,9 +396,9 @@ async fn pause_failpoint_keeps_the_child_running_without_its_prompt() -> Result<
 /// suspension event.
 #[tokio::test]
 async fn suspension_failpoint_leaves_the_root_running_without_children_or_events() -> Result<()> {
+    let _scenario = serial_failpoints();
     let temp = tempfile::tempdir()?;
     let store = fresh_store(&temp).await?;
-    let _scenario = fail::FailScenario::setup();
     fail::cfg("atomic_spawn_batch.after_rows", "panic")
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     let crashed = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
@@ -425,6 +434,7 @@ async fn suspension_failpoint_leaves_the_root_running_without_children_or_events
 /// the root's `ToolCallStart` is in the journal.
 #[tokio::test]
 async fn a_suspension_commits_its_tool_call_start_with_the_spawn() -> Result<()> {
+    let _scenario = serial_failpoints();
     let temp = tempfile::tempdir()?;
     let store = fresh_store(&temp).await?;
     let (_, outcome) = suspend_root_on_one_tool_call(&store).await?;
@@ -458,6 +468,7 @@ async fn error_events(store: &SqliteDurableStore) -> Result<usize> {
 /// no error event.
 #[tokio::test]
 async fn root_failure_failpoint_leaves_the_root_running_without_its_error() -> Result<()> {
+    let _scenario = serial_failpoints();
     let temp = tempfile::tempdir()?;
     let store = fresh_store(&temp).await?;
     let thread_id = ThreadId::from_string(THREAD);
@@ -474,7 +485,6 @@ async fn root_failure_failpoint_leaves_the_root_running_without_its_error() -> R
     let notifier = EventNotifier::new();
     let deps = root_deps(&store, &notifier);
     let error = anyhow::anyhow!("the provider stopped");
-    let _scenario = fail::FailScenario::setup();
     crash_in_transition(agent_server::worker::fail_root_turn_with_reason(
         agent_server::worker::FailRootTurnParams {
             task_id: &root_id,
@@ -505,6 +515,7 @@ async fn root_failure_failpoint_leaves_the_root_running_without_its_error() -> R
 /// leaves the steering exchange running with no error event.
 #[tokio::test]
 async fn steering_revert_failpoint_leaves_the_exchange_running_without_its_error() -> Result<()> {
+    let _scenario = serial_failpoints();
     let temp = tempfile::tempdir()?;
     let store = fresh_store(&temp).await?;
     let (root_id, _) = suspend_root_on_one_tool_call(&store).await?;
@@ -527,7 +538,6 @@ async fn steering_revert_failpoint_leaves_the_exchange_running_without_its_error
     let notifier = EventNotifier::new();
     let deps = root_deps(&store, &notifier);
     let error = anyhow::anyhow!("the steering exchange failed");
-    let _scenario = fail::FailScenario::setup();
     crash_in_transition(agent_server::worker::revert_steering_wake(
         &parent,
         &worker,
@@ -565,6 +575,7 @@ impl agent_server::worker::ConfirmationPolicy for DenyAll {
 
 #[tokio::test]
 async fn policy_denial_failpoint_keeps_the_child_running_without_its_tool_call_end() -> Result<()> {
+    let _scenario = serial_failpoints();
     let temp = tempfile::tempdir()?;
     let store = fresh_store(&temp).await?;
     let child = paused_on_confirmation(&store).await?.task_id;
@@ -591,7 +602,6 @@ async fn policy_denial_failpoint_keeps_the_child_running_without_its_tool_call_e
         intent_store: &store,
         event_repo: &store,
     };
-    let _scenario = fail::FailScenario::setup();
     crash_in_transition(Box::pin(agent_server::worker::resume_confirmed_tool(
         bootstrap,
         &deps,
@@ -610,6 +620,7 @@ async fn interrupt_failpoint_keeps_the_child_and_its_intent_unsettled() -> Resul
         ExecutionIntent, ExecutionIntentStore, GuardedExecutionDeps, IntentStatus, OperationId,
         ToolEffectClass, guarded_tool_execution,
     };
+    let _scenario = serial_failpoints();
     let temp = tempfile::tempdir()?;
     let store = fresh_store(&temp).await?;
     let bootstrap = leased_tool_child(&store).await?;
@@ -631,7 +642,6 @@ async fn interrupt_failpoint_keeps_the_child_and_its_intent_unsettled() -> Resul
         intent_store: &store,
         event_repo: &store,
     };
-    let _scenario = fail::FailScenario::setup();
     crash_in_transition(guarded_tool_execution(
         bootstrap,
         &deps,
@@ -692,6 +702,7 @@ async fn claim_failure_failpoint_keeps_the_child_running_without_its_tool_call_e
     use agent_server::journal::execution_intent::{
         GuardedExecutionDeps, ToolEffectClass, guarded_tool_execution,
     };
+    let _scenario = serial_failpoints();
     let temp = tempfile::tempdir()?;
     let store = fresh_store(&temp).await?;
     let bootstrap = leased_tool_child(&store).await?;
@@ -701,7 +712,6 @@ async fn claim_failure_failpoint_keeps_the_child_running_without_its_tool_call_e
         intent_store: &ClaimFails,
         event_repo: &store,
     };
-    let _scenario = fail::FailScenario::setup();
     crash_in_transition(guarded_tool_execution(
         bootstrap,
         &deps,
@@ -712,4 +722,124 @@ async fn claim_failure_failpoint_keeps_the_child_running_without_its_tool_call_e
     ))
     .await?;
     assert_unchanged(&store, &child, TaskStatus::Running).await
+}
+
+struct Summarizer;
+
+#[async_trait]
+impl LlmProvider for Summarizer {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        Ok(ChatOutcome::Success(ChatResponse {
+            id: "summary".into(),
+            content: vec![ContentBlock::Text {
+                text: "[summary]".into(),
+            }],
+            model: "crash-test-model".into(),
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage {
+                served_speed: None,
+                input_tokens: 1,
+                output_tokens: 1,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                request_input_tokens: None,
+            },
+        }))
+    }
+
+    fn model(&self) -> &'static str {
+        "crash-test-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "crash-test"
+    }
+}
+
+/// Site 10: a compaction and its `ContextCompacted` event commit in one
+/// transaction. A crash between the writes leaves the message projection
+/// uncompacted with no `ContextCompacted` and no advisory row.
+#[tokio::test]
+async fn compaction_failpoint_leaves_the_projection_uncompacted_without_its_event() -> Result<()> {
+    let _scenario = serial_failpoints();
+    let temp = tempfile::tempdir()?;
+    let store = fresh_store(&temp).await?;
+    let thread_id = ThreadId::from_string(THREAD);
+    ThreadStore::get_or_create(&store, &thread_id, at(0)).await?;
+    let earlier: Vec<llm::Message> = (0..6)
+        .map(|turn| {
+            let text = format!("turn {turn}: {}", "context ".repeat(400));
+            if turn % 2 == 0 {
+                llm::Message::user(text)
+            } else {
+                llm::Message::assistant(text)
+            }
+        })
+        .collect();
+    MessageProjectionStore::commit_messages(&store, &thread_id, earlier.clone(), at(0)).await?;
+    let root = AgentTask::new_root_turn(thread_id.clone(), at(0), 3);
+    let root_id = root.id.clone();
+    store.submit_root_turn(root).await?;
+    let worker = WorkerId::from_string("root-worker");
+    let lease = LeaseId::from_string("root-lease");
+    let root = store
+        .try_acquire_task(&root_id, worker.clone(), lease.clone(), at(60), at(0))
+        .await?
+        .context("root was not acquired")?;
+    let bootstrap = WorkerBootstrapContext {
+        thread_id: thread_id.clone(),
+        task_id: root_id,
+        task: root,
+        worker_id: worker,
+        lease_id: lease,
+        definition: definition(),
+    };
+    let inputs = build_root_worker_inputs(bootstrap, &store, &store, &store, at(1)).await?;
+    let config = agent_sdk::context::CompactionConfig::default()
+        .with_threshold_tokens(1)
+        .with_min_messages(2)
+        .with_retain_recent(0);
+    let summarizer: std::sync::Arc<dyn LlmProvider> = std::sync::Arc::new(Summarizer);
+    let notifier = EventNotifier::new();
+    let deps = RootTurnDeps {
+        compaction_config: Some(&config),
+        compaction_provider: Some(&summarizer),
+        ..root_deps(&store, &notifier)
+    };
+    crash_in_transition(execute_root_turn(
+        inputs,
+        "Carry on",
+        &OneToolCallProvider,
+        &deps,
+        at(2),
+    ))
+    .await?;
+
+    let projection = MessageProjectionStore::get(&store, &thread_id)
+        .await?
+        .context("the projection")?;
+    let compacted = EventRepository::get_events(&store, &thread_id)
+        .await?
+        .iter()
+        .filter(|event| matches!(event.event, AgentEvent::ContextCompacted { .. }))
+        .count();
+    let advisories = agent_server::journal::outbox::OutboxStore::list_by_thread(&store, &thread_id)
+        .await?
+        .iter()
+        .filter(|row| {
+            row.kind
+                == agent_server::journal::outbox_message::OutboxMessageKind::ThreadEventsAvailable
+        })
+        .count();
+    ensure!(
+        projection.compactions.is_empty() && compacted == 0 && advisories == 0,
+        "the compaction and its event disagree after a crash: {} compactions, \
+         {compacted} ContextCompacted, {advisories} advisories",
+        projection.compactions.len(),
+    );
+    ensure!(
+        projection.messages.len() == earlier.len(),
+        "the raw transcript is unchanged"
+    );
+    Ok(())
 }

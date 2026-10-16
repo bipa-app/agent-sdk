@@ -123,10 +123,15 @@ use super::migrations::apply_durable_core_migrations;
 /// only by transactions that already hold the root's thread, so their order
 /// relative to the root does not matter.
 ///
+/// A thread's message head is the last row a transaction locks: a
+/// completed turn takes thread, task, message head; a compaction transition
+/// thread, message head; the message-store methods take the head alone.
+///
 /// A transition (`DurableStore::commit`) first locks the threads it needs:
-/// each thread it appends events to, and the thread of each guarded root
-/// turn (whose terminal transition locks it). Then it locks its guarded
-/// tasks, then the rows its writes reach. A settle of a child that appends
+/// each thread it appends events to, each thread whose message head it
+/// compacts, and the thread of each guarded root turn (whose terminal
+/// transition locks it). Then it locks its guarded tasks, then the rows its
+/// writes reach. A settle of a child that appends
 /// no events takes no thread lock, like the settle methods it replaces, so
 /// it never waits on a cancel that holds the child's thread.
 #[derive(Clone)]
@@ -327,6 +332,26 @@ RETURNING thread_id
         .await
         .context("insert thread row")?;
         Ok(inserted.is_some())
+    }
+
+    async fn append_compaction_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        thread_id: &ThreadId,
+        result_messages: Vec<llm::Message>,
+        source_message_count: usize,
+        retained_message_count: usize,
+        now: OffsetDateTime,
+    ) -> Result<MessageProjection> {
+        Self::bootstrap_thread_row_tx(tx, thread_id, now).await?;
+        let projection = Self::lock_message_head_tx(tx, thread_id, now).await?;
+        let updated = projection.append_compaction(
+            result_messages,
+            source_message_count,
+            retained_message_count,
+            now,
+        )?;
+        Self::upsert_message_head_tx(tx, &updated).await?;
+        Ok(updated)
     }
 
     async fn bootstrap_thread_row_tx(
@@ -4037,10 +4062,19 @@ impl PostgresDurableStore {
             }
         }
         for write in &transition.writes {
-            if let Write::AppendEvents { thread, events } = write
-                && !events.is_empty()
-            {
-                threads.insert(thread_key(thread).to_owned(), thread.clone());
+            match write {
+                Write::AppendEvents { thread, events } if !events.is_empty() => {
+                    threads.insert(thread_key(thread).to_owned(), thread.clone());
+                }
+                Write::AppendCompaction { thread, .. } => {
+                    threads.insert(thread_key(thread).to_owned(), thread.clone());
+                }
+                Write::AppendEvents { .. }
+                | Write::SettleTask { .. }
+                | Write::RejectConfirmation { .. }
+                | Write::PauseOnConfirmation { .. }
+                | Write::ReparkAfterSteering { .. }
+                | Write::RecordIntent(_) => {}
             }
         }
         for thread in threads.values() {
@@ -4076,8 +4110,8 @@ impl PostgresDurableStore {
     /// [`PostgresDurableStore`]):
     ///
     /// 1. read each guarded task without a lock, to learn its thread;
-    /// 2. lock the threads it needs (its event threads and its guarded
-    ///    root turns' threads), by thread key;
+    /// 2. lock the threads it needs (its event threads, its compacted
+    ///    threads and its guarded root turns' threads), by thread key;
     /// 3. lock and check each guarded task in `task_lock_order`;
     /// 4. apply the writes, whose own task locks (a settled child, then its
     ///    parent) follow the same order.
@@ -4156,6 +4190,23 @@ impl PostgresDurableStore {
                 committed.reparked.push(reparked);
             }
             Write::RecordIntent(intent) => Self::update_intent_tx(tx, &intent).await?,
+            Write::AppendCompaction {
+                thread,
+                messages,
+                source_message_count,
+                retained_message_count,
+            } => {
+                let compacted = Self::append_compaction_tx(
+                    tx,
+                    &thread,
+                    messages,
+                    source_message_count,
+                    retained_message_count,
+                    now,
+                )
+                .await?;
+                committed.compacted.push(compacted);
+            }
             Write::AppendEvents { thread, events } => {
                 if events.is_empty() {
                     return Ok(());
@@ -6262,15 +6313,15 @@ impl MessageProjectionStore for PostgresDurableStore {
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
         let mut tx = self.begin().await?;
-        Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
-        let projection = Self::lock_message_head_tx(&mut tx, thread_id, now).await?;
-        let updated = projection.append_compaction(
+        let updated = Self::append_compaction_tx(
+            &mut tx,
+            thread_id,
             result_messages,
             source_message_count,
             retained_message_count,
             now,
-        )?;
-        Self::upsert_message_head_tx(&mut tx, &updated).await?;
+        )
+        .await?;
         tx.commit().await.context("commit append_compaction")?;
         Ok(updated)
     }

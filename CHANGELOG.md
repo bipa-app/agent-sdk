@@ -84,6 +84,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     gone.
   - In-memory fixtures that drive tool tasks must wire
     `with_cancellation_markers`.
+- **Breaking: a compaction commits with its `ContextCompacted` event (site
+  10).** `Write::AppendCompaction` joins the transition writes, and
+  `Committed` gains `compacted`. The worker's compaction appends the
+  projection's compaction entry and its event in one transition; the event
+  was a second commit before, with no advisory row.
+  - `InMemoryAgentTaskStore` needs `with_message_store` (the same store the
+    worker reads) to apply the write, and its event sink; `StoreRegistry::in_memory`
+    wires both. Fixtures that compact must wire them too.
+  - `Transition::validate` refuses a guard on a re-parked task: its lock
+    would come before the re-attached children's.
+- The `INTERNAL` answer for an approval that lands before its tool starts now
+  says the confirmation is asked again when the task's lease expires.
 - **Breaking: sites 6, 7 and 9 commit their state and events together.**
   `Write::ReparkAfterSteering` joins the transition writes; it takes no
   guard, because the backend checks the parent's ownership after locking
