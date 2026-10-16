@@ -3224,6 +3224,29 @@ impl InMemoryAgentTaskStore {
 
     /// Fail a task parked on a confirmation and recompute its waiting
     /// parent, under the caller's write lock.
+    /// Park a running task on a confirmation under the caller's write
+    /// lock. The caller's guard has checked its status and lease.
+    fn pause_on_confirmation_locked(
+        inner: &mut Inner,
+        id: &AgentTaskId,
+        continuation: ContinuationEnvelope,
+        prepared_operation: Option<ListenExecutionContext>,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask> {
+        let old = inner
+            .by_id
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow!("pause rejected: task {id} does not exist"))?;
+        let paused = old
+            .clone()
+            .await_confirmation(continuation, prepared_operation, now)
+            .context("pause rejected: await_confirmation transition failed")?;
+        inner.rebalance_after_row_change(&old, &paused);
+        inner.by_id.insert(paused.id.clone(), paused.clone());
+        Ok(paused)
+    }
+
     fn reject_confirmation_locked(
         inner: &mut Inner,
         id: &AgentTaskId,
@@ -5271,6 +5294,20 @@ impl super::transition::DurableStore for InMemoryAgentTaskStore {
                     let rejected = Self::reject_confirmation_locked(&mut inner, &task, error, now)?;
                     committed.settled.push(rejected);
                 }
+                Write::PauseOnConfirmation {
+                    task,
+                    continuation,
+                    prepared_operation,
+                } => {
+                    let paused = Self::pause_on_confirmation_locked(
+                        &mut inner,
+                        &task,
+                        *continuation,
+                        prepared_operation,
+                        now,
+                    )?;
+                    committed.paused.push(paused);
+                }
                 Write::RecordIntent(intent) => {
                     let intent_store = intent_store.ok_or_else(|| anyhow!("no intent store"))?;
                     intent_store
@@ -6192,36 +6229,24 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         prepared_operation: Option<ListenExecutionContext>,
         now: OffsetDateTime,
     ) -> Result<AgentTask> {
-        let mut inner = self.inner.write().await;
-        let old = inner
-            .by_id
-            .get(id)
-            .cloned()
-            .ok_or_else(|| anyhow!("pause rejected: task {id} does not exist"))?;
-
-        if old.status != TaskStatus::Running {
-            let status = old.status;
-            return Err(anyhow!(
-                "pause rejected: task {id} is not running (status {status:?})"
-            ));
-        }
-        match &old.worker_id {
-            Some(current) if current == worker => {}
-            _ => return Err(anyhow!("pause rejected: worker mismatch on task {id}")),
-        }
-        match &old.lease_id {
-            Some(current) if current == lease => {}
-            _ => return Err(anyhow!("pause rejected: lease mismatch on task {id}")),
-        }
-
-        let paused = old
-            .clone()
-            .await_confirmation(continuation, prepared_operation, now)
-            .context("pause rejected: await_confirmation transition failed")?;
-        inner.rebalance_after_row_change(&old, &paused);
-        inner.by_id.insert(paused.id.clone(), paused.clone());
-        drop(inner);
-        Ok(paused)
+        let committed = super::transition::DurableStore::commit(
+            self,
+            super::transition::Transition::pause_only(
+                id.clone(),
+                worker.clone(),
+                lease.clone(),
+                continuation,
+                prepared_operation,
+            ),
+            now,
+        )
+        .await
+        .map_err(|rejected| super::transition::wrapper_error("pause", rejected))?;
+        committed
+            .paused
+            .into_iter()
+            .next()
+            .context("a pause transition returns its parked task")
     }
 
     async fn pause_on_question(

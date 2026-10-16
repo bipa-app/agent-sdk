@@ -1756,6 +1756,25 @@ LIMIT 1
         u32_from_i64(live, "live child count")
     }
 
+    /// Park a running task on a confirmation inside the caller's
+    /// transaction. The caller's guard has checked its status and lease.
+    async fn pause_on_confirmation_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        id: &AgentTaskId,
+        continuation: ContinuationEnvelope,
+        prepared_operation: Option<ListenExecutionContext>,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask> {
+        let old = Self::load_task_tx(tx, id)
+            .await?
+            .ok_or_else(|| anyhow!("pause rejected: task {id} does not exist"))?;
+        let paused = old
+            .await_confirmation(continuation, prepared_operation, now)
+            .context("pause rejected: await_confirmation transition failed")?;
+        Self::update_task_tx(tx, &paused).await?;
+        Ok(paused)
+    }
+
     /// Fail a task parked on a confirmation and recompute its waiting
     /// parent, inside the caller's transaction.
     async fn reject_confirmation_tx(
@@ -3302,6 +3321,21 @@ impl SqliteDurableStore {
                 let rejected = Self::reject_confirmation_tx(tx, &task, error, now).await?;
                 committed.settled.push(rejected);
             }
+            Write::PauseOnConfirmation {
+                task,
+                continuation,
+                prepared_operation,
+            } => {
+                let paused = Self::pause_on_confirmation_tx(
+                    tx,
+                    &task,
+                    *continuation,
+                    prepared_operation,
+                    now,
+                )
+                .await?;
+                committed.paused.push(paused);
+            }
             Write::RecordIntent(intent) => Self::update_intent_tx(tx, &intent).await?,
             Write::AppendEvents { thread, events } => {
                 if events.is_empty() {
@@ -4288,31 +4322,24 @@ impl AgentTaskStore for SqliteDurableStore {
         prepared_operation: Option<ListenExecutionContext>,
         now: OffsetDateTime,
     ) -> Result<AgentTask> {
-        let mut tx = self.begin().await?;
-        let old = Self::load_task_tx(&mut tx, id)
-            .await?
-            .ok_or_else(|| anyhow!("pause rejected: task {id} does not exist"))?;
-        if old.status != TaskStatus::Running {
-            let status = old.status;
-            return Err(anyhow!(
-                "pause rejected: task {id} is not running (status {status:?})"
-            ));
-        }
-        match &old.worker_id {
-            Some(current) if current == worker => {}
-            _ => return Err(anyhow!("pause rejected: worker mismatch on task {id}")),
-        }
-        match &old.lease_id {
-            Some(current) if current == lease => {}
-            _ => return Err(anyhow!("pause rejected: lease mismatch on task {id}")),
-        }
-        let paused = old
-            .clone()
-            .await_confirmation(continuation, prepared_operation, now)
-            .context("pause rejected: await_confirmation transition failed")?;
-        Self::update_task_tx(&mut tx, &paused).await?;
-        tx.commit().await.context("commit pause_on_confirmation")?;
-        Ok(paused)
+        let committed = agent_server::journal::DurableStore::commit(
+            self,
+            agent_server::journal::Transition::pause_only(
+                id.clone(),
+                worker.clone(),
+                lease.clone(),
+                continuation,
+                prepared_operation,
+            ),
+            now,
+        )
+        .await
+        .map_err(|rejected| agent_server::journal::transition::wrapper_error("pause", rejected))?;
+        committed
+            .paused
+            .into_iter()
+            .next()
+            .context("a pause transition returns its parked task")
     }
 
     async fn pause_on_question(

@@ -3064,14 +3064,10 @@ async fn run_tool_task(
         };
 
     if bootstrap.tool_call.tier == ToolTier::Confirm {
-        let (_paused, committed_events) = pause_tool_for_confirmation(
-            &bootstrap,
-            stores.task_store.as_ref(),
-            stores.event_repo.as_ref(),
-            now,
-        )
-        .await
-        .context("pause tool task for confirmation")?;
+        let (_paused, committed_events) =
+            pause_tool_for_confirmation(&bootstrap, stores.task_store.as_ref(), now)
+                .await
+                .context("pause tool task for confirmation")?;
         publish_events(stores, &committed_events);
         return Ok(());
     }
@@ -9935,6 +9931,7 @@ mod tests {
                         ..
                     } => self.observe_failure(now)?,
                     Write::RejectConfirmation { .. }
+                    | Write::PauseOnConfirmation { .. }
                     | Write::RecordIntent(_)
                     | Write::AppendEvents { .. } => {}
                 }

@@ -9,7 +9,9 @@
 //! (design invariants I1–I4, bip `docs/durable-transitions-design-2026-10-12.md`).
 
 use agent_sdk_foundation::events::AgentEvent;
-use agent_sdk_foundation::{TerminalReason, ThreadId};
+use agent_sdk_foundation::{
+    ContinuationEnvelope, ListenExecutionContext, TerminalReason, ThreadId,
+};
 use async_trait::async_trait;
 use time::OffsetDateTime;
 
@@ -47,6 +49,14 @@ pub enum Write {
     /// recompute its parent. Needs a [`Guard::TaskIs`] for
     /// [`TaskStatus::AwaitingConfirmation`] on the same task.
     RejectConfirmation { task: AgentTaskId, error: String },
+    /// Park a running task on a confirmation: it drops its lease and keeps
+    /// the parent's continuation and the call's prepared operation. Needs a
+    /// [`Guard::TaskIs`] with a lease on the same task.
+    PauseOnConfirmation {
+        task: AgentTaskId,
+        continuation: Box<ContinuationEnvelope>,
+        prepared_operation: Option<ListenExecutionContext>,
+    },
     /// Store an execution intent's new status.
     RecordIntent(Box<ExecutionIntent>),
     /// Events on `thread`, without sequences: the backend allocates them
@@ -79,6 +89,8 @@ pub struct Committed {
     /// the terminal task and its parent
     /// after the parent was recomputed (`None` for a root).
     pub settled: Vec<(AgentTask, Option<AgentTask>)>,
+    /// For each [`Write::PauseOnConfirmation`]: the parked task.
+    pub paused: Vec<AgentTask>,
     /// Every event the transition appended, with its sequence.
     pub events: Vec<CommittedEvent>,
 }
@@ -176,6 +188,49 @@ impl Transition {
         }
     }
 
+    /// Park a running, leased task on a confirmation and append `events`,
+    /// one transaction.
+    #[must_use]
+    pub fn pause_on_confirmation(
+        task: AgentTaskId,
+        worker: WorkerId,
+        lease: LeaseId,
+        continuation: ContinuationEnvelope,
+        prepared_operation: Option<ListenExecutionContext>,
+        thread: ThreadId,
+        events: Vec<AgentEvent>,
+    ) -> Self {
+        let mut transition =
+            Self::pause_only(task, worker, lease, continuation, prepared_operation);
+        transition
+            .writes
+            .push(Write::AppendEvents { thread, events });
+        transition
+    }
+
+    /// Park a running, leased task on a confirmation with no events.
+    #[must_use]
+    pub fn pause_only(
+        task: AgentTaskId,
+        worker: WorkerId,
+        lease: LeaseId,
+        continuation: ContinuationEnvelope,
+        prepared_operation: Option<ListenExecutionContext>,
+    ) -> Self {
+        Self {
+            guards: vec![Guard::TaskIs {
+                task: task.clone(),
+                status: TaskStatus::Running,
+                lease: Some((worker, lease)),
+            }],
+            writes: vec![Write::PauseOnConfirmation {
+                task,
+                continuation: Box::new(continuation),
+                prepared_operation,
+            }],
+        }
+    }
+
     /// Whether a guard holds `task` in `status`.
     #[must_use]
     pub fn guards_status(&self, task: &AgentTaskId, status: TaskStatus) -> bool {
@@ -209,6 +264,7 @@ impl Transition {
             Write::AppendEvents { events, .. } => !events.is_empty(),
             Write::SettleTask { .. }
             | Write::RejectConfirmation { .. }
+            | Write::PauseOnConfirmation { .. }
             | Write::RecordIntent(_) => false,
         })
     }
@@ -222,8 +278,9 @@ impl Transition {
     }
 
     /// Check the shape every backend relies on before it opens a
-    /// transaction: each settle has a leased guard on its task, and each
-    /// confirmation reject a guard that it is awaiting confirmation.
+    /// transaction: each settle has a leased guard on its task, each pause
+    /// a leased guard that its task is running, and each confirmation
+    /// reject a guard that it is awaiting confirmation.
     ///
     /// # Errors
     ///
@@ -235,6 +292,16 @@ impl Transition {
                     if self.lease_for(task).is_none() {
                         return Err(Rejected::Store(anyhow::anyhow!(
                             "settling task {task} needs a TaskIs guard with its lease"
+                        )));
+                    }
+                }
+                Write::PauseOnConfirmation { task, .. } => {
+                    if self.lease_for(task).is_none()
+                        || !self.guards_status(task, TaskStatus::Running)
+                    {
+                        return Err(Rejected::Store(anyhow::anyhow!(
+                            "pausing task {task} needs a TaskIs guard that it is running \
+                             under its lease"
                         )));
                     }
                 }

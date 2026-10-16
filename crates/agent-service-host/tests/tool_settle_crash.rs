@@ -307,7 +307,7 @@ async fn crash_in_transition<F: std::future::Future>(crashing: F) -> Result<()> 
 
 async fn paused_on_confirmation(store: &SqliteDurableStore) -> Result<ToolTaskBootstrap> {
     let bootstrap = leased_tool_child(store).await?;
-    agent_server::worker::pause_tool_for_confirmation(&bootstrap, store, store, at(12)).await?;
+    agent_server::worker::pause_tool_for_confirmation(&bootstrap, store, at(12)).await?;
     Ok(bootstrap)
 }
 
