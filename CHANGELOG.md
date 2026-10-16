@@ -84,6 +84,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     gone.
   - In-memory fixtures that drive tool tasks must wire
     `with_cancellation_markers`.
+- **Breaking: a child parked on a confirmation and its prompt commit in
+  one transaction.** `Write::PauseOnConfirmation` (guarded on `Running` with
+  the lease) joins the transition writes, and `Committed` gains `paused`.
+  - `pause_tool_for_confirmation` parks the child and commits its
+    `ToolRequiresConfirmation` in one `commit`. A crash between the two can
+    no longer park a child whose prompt no client ever sees. Its
+    `event_repo` parameter is gone.
+  - `pause_on_confirmation` is a `commit` wrapper on every backend, with its
+    `pause rejected: ...` error text unchanged.
+  - A guard rejection of a confirmation reject reads
+    `reject_confirmation rejected: ...` again.
+- **Breaking: `IdempotencyClaim::InFlight`.** A key reserved for the same
+  kind and payload whose result was never recorded (an earlier request is
+  still running, or failed before it recorded one) is `InFlight`, no longer
+  `Conflict`. The gRPC methods answer it with `ABORTED` and a message that
+  says nothing ran, instead of `ALREADY_EXISTS` "already used for a
+  different request". A different payload under the key is still
+  `Conflict` / `ALREADY_EXISTS`.
+- On Postgres, `AgentTaskStore::update` locks a root turn's thread before
+  the root's row, the store's thread → task order.
 - **Breaking: every tool-child failure closes its call in the same
   transaction.** `Write::RejectConfirmation` (guarded on
   `AwaitingConfirmation`) and `Write::RecordIntent` join the transition

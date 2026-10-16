@@ -1725,10 +1725,11 @@ pub trait AgentTaskStore: super::transition::DurableStore + Send + Sync {
     /// the reservation (it now owns the key, must run the effect, then
     /// call [`Self::record_idempotency`] to fill in the result),
     /// [`IdempotencyClaim::Replay`] when a matching record with a
-    /// recorded result already exists, and [`IdempotencyClaim::Conflict`]
-    /// when the key was used for a different kind/fingerprint **or** is
-    /// still reserved by a concurrent in-flight claim (placeholder not
-    /// yet filled). A `Conflict` caller must not run the effect.
+    /// recorded result already exists, [`IdempotencyClaim::Conflict`]
+    /// when the key was used for a different kind/fingerprint, and
+    /// [`IdempotencyClaim::InFlight`] when it is reserved for the same
+    /// request but no result was recorded (placeholder not yet filled).
+    /// A `Conflict` or `InFlight` caller must not run the effect.
     ///
     /// # Errors
     /// Returns an error if the store cannot be queried.
@@ -3224,6 +3225,29 @@ impl InMemoryAgentTaskStore {
 
     /// Fail a task parked on a confirmation and recompute its waiting
     /// parent, under the caller's write lock.
+    /// Park a running task on a confirmation under the caller's write
+    /// lock. The caller's guard has checked its status and lease.
+    fn pause_on_confirmation_locked(
+        inner: &mut Inner,
+        id: &AgentTaskId,
+        continuation: ContinuationEnvelope,
+        prepared_operation: Option<ListenExecutionContext>,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask> {
+        let old = inner
+            .by_id
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow!("pause rejected: task {id} does not exist"))?;
+        let paused = old
+            .clone()
+            .await_confirmation(continuation, prepared_operation, now)
+            .context("pause rejected: await_confirmation transition failed")?;
+        inner.rebalance_after_row_change(&old, &paused);
+        inner.by_id.insert(paused.id.clone(), paused.clone());
+        Ok(paused)
+    }
+
     fn reject_confirmation_locked(
         inner: &mut Inner,
         id: &AgentTaskId,
@@ -5271,6 +5295,20 @@ impl super::transition::DurableStore for InMemoryAgentTaskStore {
                     let rejected = Self::reject_confirmation_locked(&mut inner, &task, error, now)?;
                     committed.settled.push(rejected);
                 }
+                Write::PauseOnConfirmation {
+                    task,
+                    continuation,
+                    prepared_operation,
+                } => {
+                    let paused = Self::pause_on_confirmation_locked(
+                        &mut inner,
+                        &task,
+                        *continuation,
+                        prepared_operation,
+                        now,
+                    )?;
+                    committed.paused.push(paused);
+                }
                 Write::RecordIntent(intent) => {
                     let intent_store = intent_store.ok_or_else(|| anyhow!("no intent store"))?;
                     intent_store
@@ -5652,8 +5690,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             }
             Some(record) if record.kind == kind && record.fingerprint == fingerprint => {
                 if record.result_json.is_null() {
-                    // Reserved by a concurrent in-flight claim; fail closed.
-                    IdempotencyClaim::Conflict
+                    IdempotencyClaim::InFlight
                 } else {
                     IdempotencyClaim::Replay(Box::new(record))
                 }
@@ -6192,36 +6229,24 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         prepared_operation: Option<ListenExecutionContext>,
         now: OffsetDateTime,
     ) -> Result<AgentTask> {
-        let mut inner = self.inner.write().await;
-        let old = inner
-            .by_id
-            .get(id)
-            .cloned()
-            .ok_or_else(|| anyhow!("pause rejected: task {id} does not exist"))?;
-
-        if old.status != TaskStatus::Running {
-            let status = old.status;
-            return Err(anyhow!(
-                "pause rejected: task {id} is not running (status {status:?})"
-            ));
-        }
-        match &old.worker_id {
-            Some(current) if current == worker => {}
-            _ => return Err(anyhow!("pause rejected: worker mismatch on task {id}")),
-        }
-        match &old.lease_id {
-            Some(current) if current == lease => {}
-            _ => return Err(anyhow!("pause rejected: lease mismatch on task {id}")),
-        }
-
-        let paused = old
-            .clone()
-            .await_confirmation(continuation, prepared_operation, now)
-            .context("pause rejected: await_confirmation transition failed")?;
-        inner.rebalance_after_row_change(&old, &paused);
-        inner.by_id.insert(paused.id.clone(), paused.clone());
-        drop(inner);
-        Ok(paused)
+        let committed = super::transition::DurableStore::commit(
+            self,
+            super::transition::Transition::pause_only(
+                id.clone(),
+                worker.clone(),
+                lease.clone(),
+                continuation,
+                prepared_operation,
+            ),
+            now,
+        )
+        .await
+        .map_err(|rejected| super::transition::wrapper_error("pause", rejected))?;
+        committed
+            .paused
+            .into_iter()
+            .next()
+            .context("a pause transition returns its parked task")
     }
 
     async fn pause_on_question(
@@ -7164,12 +7189,12 @@ mod tests {
         ));
 
         // A second claim before the effect records its result must NOT
-        // also be Fresh — the placeholder reservation makes it Conflict.
+        // also be Fresh — the placeholder reservation makes it InFlight.
         assert!(matches!(
             store
                 .claim_idempotency("req-1", IdempotencyKind::CreateThread, fp)
                 .await?,
-            IdempotencyClaim::Conflict
+            IdempotencyClaim::InFlight
         ));
 
         // Once the winner records the durable references, retries replay.

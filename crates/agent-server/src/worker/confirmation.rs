@@ -92,7 +92,6 @@ use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 
 use crate::journal::committed_event::CommittedEvent;
-use crate::journal::event_repository::EventRepository;
 use crate::journal::execution_intent::{
     GuardedExecutionDeps, classify_tool_effect, guarded_tool_execution,
 };
@@ -218,9 +217,10 @@ pub enum ConfirmationResumeOutcome {
 
 /// Pause a running tool-runtime child task for user confirmation.
 ///
-/// Calls [`AgentTaskStore::pause_on_confirmation`] with the parent's
-/// continuation envelope and the tool call's prepared operation (from
-/// [`PendingToolCallInfo::listen_context`], if any).
+/// Parks the child with the parent's continuation envelope and the tool
+/// call's prepared operation (from [`PendingToolCallInfo::listen_context`],
+/// if any), and commits its `ToolRequiresConfirmation` in the same
+/// transition, so a client never misses the prompt of a parked child.
 ///
 /// # Preconditions
 ///
@@ -237,7 +237,6 @@ pub enum ConfirmationResumeOutcome {
 pub async fn pause_tool_for_confirmation(
     bootstrap: &ToolTaskBootstrap,
     task_store: &dyn AgentTaskStore,
-    event_repo: &dyn EventRepository,
     now: OffsetDateTime,
 ) -> anyhow::Result<(AgentTask, Vec<CommittedEvent>)> {
     ensure!(
@@ -253,26 +252,6 @@ pub async fn pause_tool_for_confirmation(
         .context("parent task has no continuation for confirmation pause")?
         .clone();
 
-    let prepared_operation = bootstrap.tool_call.listen_context.clone();
-
-    let paused_task = task_store
-        .pause_on_confirmation(
-            &bootstrap.task_id,
-            &bootstrap.worker_id,
-            &bootstrap.lease_id,
-            continuation,
-            prepared_operation,
-            now,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "failed to pause child {} for confirmation",
-                bootstrap.task_id
-            )
-        })?;
-
-    // Commit ToolRequiresConfirmation event after state transition.
     let confirm_event = AgentEvent::tool_requires_confirmation(
         &bootstrap.tool_call.id,
         &bootstrap.tool_call.name,
@@ -283,12 +262,33 @@ pub async fn pause_tool_for_confirmation(
             bootstrap.tool_call.display_name
         ),
     );
-    let committed = event_repo
-        .commit_event(&bootstrap.thread_id, confirm_event, now)
+    let committed = task_store
+        .commit(
+            Transition::pause_on_confirmation(
+                bootstrap.task_id.clone(),
+                bootstrap.worker_id.clone(),
+                bootstrap.lease_id.clone(),
+                continuation,
+                bootstrap.tool_call.listen_context.clone(),
+                bootstrap.thread_id.clone(),
+                vec![confirm_event],
+            ),
+            now,
+        )
         .await
-        .context("commit ToolRequiresConfirmation event")?;
-
-    Ok((paused_task, vec![committed]))
+        .map_err(|rejected| crate::journal::transition::wrapper_error("pause", rejected))
+        .with_context(|| {
+            format!(
+                "failed to pause child {} for confirmation",
+                bootstrap.task_id
+            )
+        })?;
+    let paused = committed
+        .paused
+        .into_iter()
+        .next()
+        .context("a pause transition returns its parked task")?;
+    Ok((paused, committed.events))
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -454,7 +454,9 @@ async fn reject_with_tool_call_end(
     let committed = task_store
         .commit(transition, now)
         .await
-        .map_err(anyhow::Error::from)?;
+        .map_err(|rejected| {
+            crate::journal::transition::wrapper_error("reject_confirmation", rejected)
+        })?;
     committed
         .settled
         .into_iter()

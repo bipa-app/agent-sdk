@@ -612,7 +612,7 @@ async fn confirmation_state_survives_restart() -> Result<()> {
     let child_id = ctx.task_id.clone();
 
     let (paused, _committed_events) =
-        pause_tool_for_confirmation(&ctx, &stores.tasks, &stores.events, t_plus(10)).await?;
+        pause_tool_for_confirmation(&ctx, &stores.tasks, t_plus(10)).await?;
     assert_eq!(paused.status, TaskStatus::AwaitingConfirmation);
 
     // Simulate restart: re-read from store
@@ -674,7 +674,7 @@ async fn confirmation_approved_then_policy_denied() -> Result<()> {
     let child_id = ctx.task_id.clone();
 
     // Pause for confirmation
-    pause_tool_for_confirmation(&ctx, &stores.tasks, &stores.events, t_plus(10)).await?;
+    pause_tool_for_confirmation(&ctx, &stores.tasks, t_plus(10)).await?;
 
     // Approve
     apply_confirmation_decision(
@@ -772,7 +772,7 @@ async fn confirmation_rejected_produces_canonical_error() -> Result<()> {
     let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let child_id = ctx.task_id.clone();
 
-    pause_tool_for_confirmation(&ctx, &stores.tasks, &stores.events, t_plus(10)).await?;
+    pause_tool_for_confirmation(&ctx, &stores.tasks, t_plus(10)).await?;
 
     let outcome = apply_confirmation_decision(
         &child_id,
@@ -834,7 +834,7 @@ async fn confirmation_timeout_produces_canonical_error() -> Result<()> {
     let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let child_id = ctx.task_id.clone();
 
-    pause_tool_for_confirmation(&ctx, &stores.tasks, &stores.events, t_plus(10)).await?;
+    pause_tool_for_confirmation(&ctx, &stores.tasks, t_plus(10)).await?;
 
     let outcome = apply_confirmation_decision(
         &child_id,
@@ -1069,7 +1069,7 @@ async fn confirmation_approval_then_successful_execution() -> Result<()> {
     let child_id = ctx.task_id.clone();
 
     // Pause for confirmation
-    pause_tool_for_confirmation(&ctx, &stores.tasks, &stores.events, t_plus(10)).await?;
+    pause_tool_for_confirmation(&ctx, &stores.tasks, t_plus(10)).await?;
 
     // Approve
     apply_confirmation_decision(

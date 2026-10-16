@@ -2211,23 +2211,13 @@ FOR UPDATE
         Ok(())
     }
 
-    /// # WARNING: inverted lock order — do not extend
+    /// Check the immutable columns of `task` against its stored row,
+    /// with the row locked.
     ///
-    /// This helper locks the TASK row first (`load_task_tx(.., true)`
-    /// below) and only then, for root turns, the THREAD row — the
-    /// reverse of the thread→task order every production write path
-    /// observes (`submit_root_turn`, `cancel_tree`, the owner-guarded
-    /// completed-turn commit). It is reachable only through
-    /// [`AgentTaskStore::update`], the structural rehydration / test
-    /// primitive that worker code must never use for lifecycle
-    /// transitions, so the inversion is not on any concurrent
-    /// production path today. Do NOT route new runtime paths through
-    /// `update`, and do not add thread-row locking after task-row
-    /// locking elsewhere: pairing this order with any thread→task
-    /// path on live traffic is a 40P01 deadlock. Fixing the order
-    /// here would require locking the thread row before knowing the
-    /// row's kind (or re-reading), which is not worth it for a
-    /// test-only surface — hence this fence instead.
+    /// For a root turn the thread row is locked first, keeping the store's
+    /// thread → task order. The thread comes from the incoming `task`; the
+    /// checks below reject a `kind` or `thread_id` that does not match the
+    /// stored row, so a wrong guess only locks an unrelated thread first.
     async fn validate_update_row_invariants_tx(
         tx: &mut Transaction<'_, Postgres>,
         task: &AgentTask,
@@ -2235,6 +2225,9 @@ FOR UPDATE
         task.validate()
             .context("update rejected: task failed schema validation")?;
 
+        if task.kind == TaskKind::RootTurn {
+            let _ = Self::lock_thread_tx(tx, &task.thread_id).await?;
+        }
         let old = Self::load_task_tx(tx, &task.id, true)
             .await?
             .ok_or_else(|| anyhow!("update rejected: task {} does not exist", task.id))?;
@@ -2285,10 +2278,8 @@ FOR UPDATE
             ));
         }
 
-        if task.kind == TaskKind::RootTurn {
-            let _ = Self::lock_thread_tx(tx, &task.thread_id).await?;
-            if task.status.blocks_root_admission() {
-                let current = sqlx::query_scalar!(
+        if task.kind == TaskKind::RootTurn && task.status.blocks_root_admission() {
+            let current = sqlx::query_scalar!(
                     r"
 SELECT id
 FROM agent_sdk_tasks
@@ -2307,13 +2298,12 @@ FOR UPDATE
                 .with_context(|| {
                     format!("check competing root slot for thread {}", task.thread_id)
                 })?;
-                if let Some(current) = current {
-                    return Err(anyhow!(
-                        "update rejected: thread {} already has a different active root task {}",
-                        task.thread_id,
-                        current
-                    ));
-                }
+            if let Some(current) = current {
+                return Err(anyhow!(
+                    "update rejected: thread {} already has a different active root task {}",
+                    task.thread_id,
+                    current
+                ));
             }
         }
 
@@ -2562,6 +2552,25 @@ WHERE parent_id = $1
                 Ok(None)
             }
         }
+    }
+
+    /// Park a running task on a confirmation inside the caller's
+    /// transaction. The caller's guard has checked its status and lease.
+    async fn pause_on_confirmation_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        id: &AgentTaskId,
+        continuation: ContinuationEnvelope,
+        prepared_operation: Option<ListenExecutionContext>,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask> {
+        let old = Self::load_task_tx(tx, id, true)
+            .await?
+            .ok_or_else(|| anyhow!("pause rejected: task {id} does not exist"))?;
+        let paused = old
+            .await_confirmation(continuation, prepared_operation, now)
+            .context("pause rejected: await_confirmation transition failed")?;
+        Self::update_task_tx(tx, &paused).await?;
+        Ok(paused)
     }
 
     /// Fail a task parked on a confirmation and recompute its waiting
@@ -4039,6 +4048,21 @@ impl PostgresDurableStore {
                 let rejected = Self::reject_confirmation_tx(tx, &task, error, now).await?;
                 committed.settled.push(rejected);
             }
+            Write::PauseOnConfirmation {
+                task,
+                continuation,
+                prepared_operation,
+            } => {
+                let paused = Self::pause_on_confirmation_tx(
+                    tx,
+                    &task,
+                    *continuation,
+                    prepared_operation,
+                    now,
+                )
+                .await?;
+                committed.paused.push(paused);
+            }
             Write::RecordIntent(intent) => Self::update_intent_tx(tx, &intent).await?,
             Write::AppendEvents { thread, events } => {
                 if events.is_empty() {
@@ -4368,9 +4392,7 @@ SELECT EXISTS (
             return Ok(IdempotencyClaim::Conflict);
         }
         if row.result_json.is_null() {
-            // Reserved by a concurrent in-flight claim that hasn't
-            // recorded its result yet — fail closed.
-            return Ok(IdempotencyClaim::Conflict);
+            return Ok(IdempotencyClaim::InFlight);
         }
         let stored_kind = IdempotencyKind::from_wire(&row.kind)
             .ok_or_else(|| anyhow!("unknown idempotency kind {} stored", row.kind))?;
@@ -5228,32 +5250,24 @@ FOR UPDATE SKIP LOCKED
         prepared_operation: Option<ListenExecutionContext>,
         now: OffsetDateTime,
     ) -> Result<AgentTask> {
-        let mut tx = self.begin().await?;
-        let old = Self::load_task_tx(&mut tx, id, true)
-            .await?
-            .ok_or_else(|| anyhow!("pause rejected: task {id} does not exist"))?;
-        if old.status != TaskStatus::Running {
-            let status = old.status;
-            return Err(anyhow!(
-                "pause rejected: task {id} is not running (status {status:?})"
-            ));
-        }
-        match &old.worker_id {
-            Some(current) if current == worker => {}
-            _ => return Err(anyhow!("pause rejected: worker mismatch on task {id}")),
-        }
-        match &old.lease_id {
-            Some(current) if current == lease => {}
-            _ => return Err(anyhow!("pause rejected: lease mismatch on task {id}")),
-        }
-
-        let paused = old
-            .clone()
-            .await_confirmation(continuation, prepared_operation, now)
-            .context("pause rejected: await_confirmation transition failed")?;
-        Self::update_task_tx(&mut tx, &paused).await?;
-        tx.commit().await.context("commit pause_on_confirmation")?;
-        Ok(paused)
+        let committed = agent_server::journal::DurableStore::commit(
+            self,
+            agent_server::journal::Transition::pause_only(
+                id.clone(),
+                worker.clone(),
+                lease.clone(),
+                continuation,
+                prepared_operation,
+            ),
+            now,
+        )
+        .await
+        .map_err(|rejected| agent_server::journal::transition::wrapper_error("pause", rejected))?;
+        committed
+            .paused
+            .into_iter()
+            .next()
+            .context("a pause transition returns its parked task")
     }
 
     async fn pause_on_question(

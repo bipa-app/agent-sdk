@@ -114,17 +114,16 @@ pub enum IdempotencyClaim {
     /// original response from the stored references rather than
     /// re-running the effect.
     Replay(Box<IdempotencyRecord>),
-    /// The claim could not be granted. Either:
-    /// - a record exists under this key for a *different* kind or payload
-    ///   fingerprint (a caller contract violation), or
-    /// - the key is *reserved by a concurrent in-flight claim* whose
-    ///   effect has not finished recording yet (the placeholder is still
-    ///   `JSON null`).
-    ///
-    /// In both cases the caller must **not** run the effect. A retry
-    /// after the in-flight original completes will observe
-    /// [`Replay`](Self::Replay) instead.
+    /// A record exists under this key for a *different* kind or payload
+    /// fingerprint (a caller contract violation). The caller must **not**
+    /// run the effect.
     Conflict,
+    /// The key is reserved for the same kind and payload, but its result
+    /// was never recorded (the placeholder is still `JSON null`): an
+    /// earlier claim is still running its effect, or it failed before it
+    /// recorded one. The caller must **not** run the effect; whether it
+    /// landed is only known from the state it would have changed.
+    InFlight,
 }
 
 #[cfg(test)]
