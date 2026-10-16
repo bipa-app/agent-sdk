@@ -110,13 +110,21 @@ struct TestStores {
 
 impl TestStores {
     fn new() -> Self {
+        let threads = InMemoryThreadStore::new();
+        let events = InMemoryEventRepository::new();
         Self {
-            tasks: InMemoryAgentTaskStore::new(),
-            threads: InMemoryThreadStore::new(),
+            tasks: InMemoryAgentTaskStore::new().with_cancellation_markers(
+                crate::journal::CancellationMarkerSink {
+                    event_repo: Arc::new(events.clone()),
+                    outbox_store: Arc::new(crate::journal::outbox::InMemoryOutboxStore::new()),
+                    thread_store: Arc::new(threads.clone()),
+                },
+            ),
+            threads,
             messages: InMemoryMessageProjectionStore::new(),
             attempts: InMemoryTurnAttemptStore::new(),
             checkpoints: InMemoryCheckpointStore::new(),
-            events: InMemoryEventRepository::new(),
+            events,
             event_notifier: Arc::new(EventNotifier::new()),
         }
     }
@@ -479,7 +487,6 @@ async fn tool_completion_emits_tool_call_end() -> Result<()> {
     let tool_outcome = execute_tool_task(
         child_bootstrap,
         &stores.tasks,
-        &stores.events,
         &cancel,
         |_tc, _collector| async {
             Ok(ToolResult {
@@ -556,7 +563,6 @@ async fn tool_failure_emits_tool_call_end_with_error() -> Result<()> {
     let tool_outcome = execute_tool_task(
         child_bootstrap,
         &stores.tasks,
-        &stores.events,
         &cancel,
         |_tc, _collector| async { anyhow::bail!("tool execution failed") },
         t0(),
@@ -641,7 +647,6 @@ async fn execute_child_and_resume(
     execute_tool_task(
         child_bootstrap,
         &stores.tasks,
-        &stores.events,
         &cancel,
         |_tc, _collector| async {
             Ok(ToolResult {

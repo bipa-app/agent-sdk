@@ -135,13 +135,21 @@ struct TestStores {
 
 impl TestStores {
     fn new() -> Self {
+        let threads = InMemoryThreadStore::new();
+        let events = InMemoryEventRepository::new();
         Self {
-            tasks: InMemoryAgentTaskStore::new(),
-            threads: InMemoryThreadStore::new(),
+            tasks: InMemoryAgentTaskStore::new().with_cancellation_markers(
+                crate::journal::CancellationMarkerSink {
+                    event_repo: Arc::new(events.clone()),
+                    outbox_store: Arc::new(crate::journal::outbox::InMemoryOutboxStore::new()),
+                    thread_store: Arc::new(threads.clone()),
+                },
+            ),
+            threads,
             messages: InMemoryMessageProjectionStore::new(),
             attempts: InMemoryTurnAttemptStore::new(),
             checkpoints: InMemoryCheckpointStore::new(),
-            events: InMemoryEventRepository::new(),
+            events,
             event_notifier: Arc::new(EventNotifier::new()),
         }
     }
@@ -439,7 +447,6 @@ async fn monotonic_ordering_across_full_lifecycle() -> Result<()> {
     execute_tool_task(
         child_bootstrap,
         &stores.tasks,
-        &stores.events,
         &cancel,
         |_tc, _collector| async { Ok(ToolResult::success("output")) },
         t0(),
@@ -934,7 +941,6 @@ async fn acquire_and_execute_child_with_progress(
     execute_tool_task(
         cb,
         &stores.tasks,
-        &stores.events,
         &cancel,
         |tc, collector| {
             let stages = stages;

@@ -260,13 +260,21 @@ struct TestStores {
 
 impl TestStores {
     fn new() -> Self {
+        let threads = InMemoryThreadStore::new();
+        let events = InMemoryEventRepository::new();
         Self {
-            tasks: InMemoryAgentTaskStore::new(),
-            threads: InMemoryThreadStore::new(),
+            tasks: InMemoryAgentTaskStore::new().with_cancellation_markers(
+                crate::journal::CancellationMarkerSink {
+                    event_repo: Arc::new(events.clone()),
+                    outbox_store: Arc::new(crate::journal::outbox::InMemoryOutboxStore::new()),
+                    thread_store: Arc::new(threads.clone()),
+                },
+            ),
+            threads,
             messages: InMemoryMessageProjectionStore::new(),
             attempts: InMemoryTurnAttemptStore::new(),
             checkpoints: InMemoryCheckpointStore::new(),
-            events: InMemoryEventRepository::new(),
+            events,
             event_notifier: Arc::new(EventNotifier::new()),
         }
     }
@@ -1009,7 +1017,6 @@ async fn multi_child_confirmation_does_not_affect_siblings() -> Result<()> {
     let outcome_1 = super::tool_task::execute_tool_task(
         bootstrap_1,
         &stores.tasks,
-        &stores.events,
         &cancel,
         |_info, _collector| async { Ok(ToolResult::success("report")) },
         t_plus(20),
@@ -1126,7 +1133,6 @@ async fn a_command_after_a_pending_confirmation_waits_for_the_decision() -> Resu
     let outcome_1 = super::tool_task::execute_tool_task(
         bootstrap_1,
         &stores.tasks,
-        &stores.events,
         &cancel,
         |_info, _collector| async { Ok(ToolResult::success("echo output")) },
         t_plus(35),

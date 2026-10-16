@@ -101,13 +101,21 @@ struct TestStores {
 
 impl TestStores {
     fn new() -> Self {
+        let threads = InMemoryThreadStore::new();
+        let events = InMemoryEventRepository::new();
         Self {
-            tasks: InMemoryAgentTaskStore::new(),
-            threads: InMemoryThreadStore::new(),
+            tasks: InMemoryAgentTaskStore::new().with_cancellation_markers(
+                crate::journal::CancellationMarkerSink {
+                    event_repo: Arc::new(events.clone()),
+                    outbox_store: Arc::new(crate::journal::outbox::InMemoryOutboxStore::new()),
+                    thread_store: Arc::new(threads.clone()),
+                },
+            ),
+            threads,
             messages: InMemoryMessageProjectionStore::new(),
             attempts: InMemoryTurnAttemptStore::new(),
             checkpoints: InMemoryCheckpointStore::new(),
-            events: InMemoryEventRepository::new(),
+            events,
             event_notifier: Arc::new(EventNotifier::new()),
         }
     }
@@ -481,7 +489,6 @@ async fn tool_progress_events_are_durable() -> Result<()> {
     let tool_outcome = execute_tool_task(
         child_bootstrap,
         &stores.tasks,
-        &stores.events,
         &cancel,
         |tc, collector| async move {
             // Emit two progress events during execution.
@@ -580,7 +587,6 @@ async fn execute_child_and_resume(
     execute_tool_task(
         child_bootstrap,
         &stores.tasks,
-        &stores.events,
         &cancel,
         |_tc, _collector| async { Ok(ToolResult::success("hi")) },
         t0(),
@@ -813,7 +819,6 @@ async fn multiple_tool_tasks_interleave_correctly() -> Result<()> {
         execute_tool_task(
             cb,
             &stores.tasks,
-            &stores.events,
             &cancel,
             |_tc, _collector| async { Ok(ToolResult::success("ok")) },
             t0(),
@@ -898,7 +903,6 @@ async fn empty_collector_adds_no_events() -> Result<()> {
     let tool_outcome = execute_tool_task(
         cb,
         &stores.tasks,
-        &stores.events,
         &cancel,
         |_tc, _collector| async {
             // No progress events emitted.

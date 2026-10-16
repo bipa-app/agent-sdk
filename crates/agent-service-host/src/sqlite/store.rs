@@ -3177,6 +3177,96 @@ async fn prepare_mixed_tool_and_reattach_rows_tx(
     Ok((tool_rows, reattached_rows))
 }
 
+/// Applies a transition in one database transaction: the guards are read
+/// first, then the writes in order, then each thread's coalesced outbox
+/// row. Any error drops the transaction, so nothing was written.
+#[async_trait]
+impl agent_server::journal::DurableStore for SqliteDurableStore {
+    async fn commit(
+        &self,
+        transition: agent_server::journal::Transition,
+        now: OffsetDateTime,
+    ) -> Result<agent_server::journal::Committed, agent_server::journal::Rejected> {
+        use agent_server::journal::{Committed, Settle, Write};
+
+        transition.validate()?;
+        let mut tx = self.begin().await?;
+        for (index, guard) in transition.guards.iter().enumerate() {
+            let stored = Self::load_task_tx(&mut tx, guard.task()).await?;
+            guard.check(index, stored.as_ref())?;
+        }
+        let mut committed = Committed::default();
+        for write in transition.writes.iter().cloned() {
+            match write {
+                Write::SettleTask { task, outcome } => {
+                    let (worker, lease) = transition
+                        .lease_for(&task)
+                        .map(|(worker, lease)| (worker.clone(), lease.clone()))
+                        .ok_or_else(|| anyhow!("settling task {task} needs a leased guard"))?;
+                    let settled = match outcome {
+                        Settle::Complete { result } => {
+                            Self::apply_task_terminal_transition_tx(
+                                &mut tx,
+                                &task,
+                                &worker,
+                                &lease,
+                                now,
+                                "commit",
+                                move |child| child.complete_with_result(result, now),
+                            )
+                            .await
+                        }
+                        Settle::Fail { error } => {
+                            Self::apply_task_terminal_transition_tx(
+                                &mut tx,
+                                &task,
+                                &worker,
+                                &lease,
+                                now,
+                                "commit",
+                                move |child| child.fail(error, now),
+                            )
+                            .await
+                        }
+                        Settle::FailWithReason { error, reason } => {
+                            Self::apply_task_terminal_transition_tx(
+                                &mut tx,
+                                &task,
+                                &worker,
+                                &lease,
+                                now,
+                                "commit",
+                                move |child| child.fail_with_terminal_reason(error, reason, now),
+                            )
+                            .await
+                        }
+                    }?;
+                    committed.settled.push(settled);
+                }
+                Write::AppendEvents { thread, events } => {
+                    if events.is_empty() {
+                        continue;
+                    }
+                    agent_server::fail_point!("transition.before_events");
+                    let start = Self::next_event_sequence_tx(&mut tx, &thread).await?;
+                    let batch =
+                        Self::insert_events_tx(&mut tx, &thread, events, start, now).await?;
+                    Self::insert_thread_events_outbox_row_tx(
+                        &mut tx,
+                        &batch,
+                        DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+                        now,
+                    )
+                    .await?;
+                    committed.events.extend(batch);
+                }
+            }
+        }
+        tx.commit().await.context("commit transition")?;
+        Ok(committed)
+    }
+}
+
 #[async_trait]
 impl AgentTaskStore for SqliteDurableStore {
     fn atomic_subagent_spawn_committer(&self) -> Option<&dyn AtomicSubagentSpawnCommitter> {

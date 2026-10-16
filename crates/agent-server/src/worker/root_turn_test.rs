@@ -13063,7 +13063,6 @@ async fn mixed_batch_tool_child_executes_and_fans_in() -> Result<()> {
     let executed = crate::worker::tool_task::execute_tool_task(
         ctx,
         &stores.tasks,
-        &stores.events,
         &cancel,
         |_call, _collector| async {
             Ok(agent_sdk_foundation::ToolResult {

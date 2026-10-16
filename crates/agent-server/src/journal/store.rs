@@ -1628,7 +1628,7 @@ pub fn apply_question_answer(
 /// terminal root is ever left holding live input.
 
 #[async_trait]
-pub trait AgentTaskStore: Send + Sync {
+pub trait AgentTaskStore: super::transition::DurableStore + Send + Sync {
     /// Optional backend hook for atomically creating one subagent's child
     /// thread/tasks, parent progress event, and outbox advisory.
     #[must_use]
@@ -5145,6 +5145,100 @@ impl Inner {
             }
             self.by_id.insert(original.id.clone(), original.clone());
         }
+    }
+}
+
+/// The in-memory store applies a transition under its one write lock: no
+/// reader sees the settled row before its events. It is not durable, so a
+/// failure between the row and the event commit cannot roll the row back;
+/// the durable backends apply both in one database transaction.
+#[async_trait]
+impl super::transition::DurableStore for InMemoryAgentTaskStore {
+    async fn commit(
+        &self,
+        transition: super::transition::Transition,
+        now: OffsetDateTime,
+    ) -> Result<super::transition::Committed, super::transition::Rejected> {
+        use super::transition::{Committed, Rejected, Settle, Write};
+
+        transition.validate()?;
+        let sink = if transition.appends_events() {
+            Some(self.marker_sink.as_ref().ok_or_else(|| {
+                Rejected::Store(anyhow!(
+                    "a transition that appends events needs the store's event sink"
+                ))
+            })?)
+        } else {
+            None
+        };
+        let mut inner = self.inner.write().await;
+        for (index, guard) in transition.guards.iter().enumerate() {
+            guard.check(index, inner.by_id.get(guard.task()))?;
+        }
+        let mut committed = Committed::default();
+        for write in transition.writes.iter().cloned() {
+            match write {
+                Write::SettleTask { task, outcome } => {
+                    let (worker, lease) = transition
+                        .lease_for(&task)
+                        .map(|(worker, lease)| (worker.clone(), lease.clone()))
+                        .ok_or_else(|| anyhow!("settling task {task} needs a leased guard"))?;
+                    let thread = self.thread_admission_locked(&inner, &task).await?;
+                    let settled = match outcome {
+                        Settle::Complete { result } => inner.apply_task_terminal_transition(
+                            &task,
+                            (&worker, &lease),
+                            thread,
+                            now,
+                            "commit",
+                            move |child| child.complete_with_result(result, now),
+                        ),
+                        Settle::Fail { error } => inner.apply_task_terminal_transition(
+                            &task,
+                            (&worker, &lease),
+                            thread,
+                            now,
+                            "commit",
+                            move |child| {
+                                child.fail_with_terminal_reason(
+                                    error,
+                                    TerminalReason::InternalError,
+                                    now,
+                                )
+                            },
+                        ),
+                        Settle::FailWithReason { error, reason } => inner
+                            .apply_task_terminal_transition(
+                                &task,
+                                (&worker, &lease),
+                                thread,
+                                now,
+                                "commit",
+                                move |child| child.fail_with_terminal_reason(error, reason, now),
+                            ),
+                    }?;
+                    committed.settled.push(settled);
+                }
+                Write::AppendEvents { thread, events } => {
+                    if events.is_empty() {
+                        continue;
+                    }
+                    crate::fail_point!("transition.before_events");
+                    let sink = sink.ok_or_else(|| anyhow!("no event sink"))?;
+                    let batch = sink
+                        .event_repo
+                        .commit_event_batch(&thread, events, now)
+                        .await
+                        .context("commit transition events")?;
+                    if let Some(last) = batch.last() {
+                        Self::insert_marker_advisory(sink, last, now).await?;
+                    }
+                    committed.events.extend(batch);
+                }
+            }
+        }
+        drop(inner);
+        Ok(committed)
     }
 }
 

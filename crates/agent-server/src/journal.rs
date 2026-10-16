@@ -615,6 +615,7 @@ mod thread_events_watch_regression;
 pub mod thread_recover;
 pub mod thread_store;
 pub mod tool_audit;
+pub mod transition;
 pub mod turn_attempt;
 pub mod turn_attempt_store;
 
@@ -698,6 +699,7 @@ pub use tool_audit::{
     InMemoryToolAuditEventStore, ToolAuditEvent, ToolAuditEventId, ToolAuditEventKind,
     ToolAuditEventParams, ToolAuditEventStore,
 };
+pub use transition::{Committed, DurableStore, Guard, Rejected, Settle, Transition, Write};
 pub use turn_attempt::{
     CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptId, TurnAttemptOutcome,
     TurnAttemptSchemaError,

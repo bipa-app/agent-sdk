@@ -992,6 +992,200 @@ mod tests {
         Ok(())
     }
 
+    /// A running root parked on one tool child that `(worker, lease)` holds.
+    async fn leased_tool_child(
+        task_store: &dyn AgentTaskStore,
+        name: &str,
+    ) -> Result<(AgentTask, WorkerId, LeaseId)> {
+        let root = fresh_root(name, 60);
+        let _ = task_store.submit_root_turn(root.clone()).await?;
+        let root_worker = WorkerId::new();
+        let root_lease = LeaseId::new();
+        let _ = task_store
+            .try_acquire_task(
+                &root.id,
+                root_worker.clone(),
+                root_lease.clone(),
+                t_plus(90),
+                t_plus(61),
+            )
+            .await?;
+        let payload = SuspensionPayload {
+            continuation: agent_sdk_foundation::ContinuationEnvelope::wrap(
+                agent_sdk_foundation::AgentContinuation {
+                    thread_id: thread_id(name),
+                    turn: 1,
+                    total_usage: TokenUsage::default(),
+                    turn_usage: TokenUsage::default(),
+                    pending_tool_calls: vec![],
+                    awaiting_index: 0,
+                    completed_results: vec![],
+                    state: agent_sdk_foundation::AgentState::new(thread_id(name)),
+                    response_id: None,
+                    stop_reason: None,
+                    response_content: vec![],
+                },
+            ),
+            suspended_messages: vec![],
+            child_join_policy: agent_server::ChildJoinPolicy::default(),
+        };
+        let (_, children) = task_store
+            .spawn_tool_children(
+                &root.id,
+                &root_worker,
+                &root_lease,
+                vec![ChildSpawnSpec::new(3)],
+                payload,
+                None,
+                Vec::new(),
+                t_plus(62),
+            )
+            .await?;
+        let child = children.into_iter().next().context("one tool child")?;
+        let worker = WorkerId::new();
+        let lease = LeaseId::new();
+        let leased = task_store
+            .try_acquire_task(
+                &child.id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(90),
+                t_plus(63),
+            )
+            .await?
+            .context("the tool child is acquirable")?;
+        Ok((leased, worker, lease))
+    }
+
+    fn settle_with_tool_call_end(
+        child: &AgentTask,
+        worker: &WorkerId,
+        lease: &LeaseId,
+    ) -> agent_server::journal::Transition {
+        agent_server::journal::Transition::settle(
+            child.id.clone(),
+            worker.clone(),
+            lease.clone(),
+            agent_server::journal::Settle::Complete {
+                result: serde_json::json!({ "success": true }),
+            },
+            child.thread_id.clone(),
+            vec![AgentEvent::tool_call_end(
+                "call-1",
+                "probe",
+                "Probe",
+                agent_sdk_foundation::ToolResult::success("done"),
+            )],
+        )
+    }
+
+    async fn thread_events_rows(outbox: &dyn OutboxStore, thread: &ThreadId) -> Result<usize> {
+        Ok(OutboxStore::list_by_thread(outbox, thread)
+            .await?
+            .iter()
+            .filter(|row| row.kind == OutboxMessageKind::ThreadEventsAvailable)
+            .count())
+    }
+
+    /// I1–I4 for [`agent_server::journal::DurableStore::commit`]: a guard
+    /// that fails writes nothing; a transition that holds settles the child,
+    /// resumes the parent, sequences the event and writes one advisory row,
+    /// all together.
+    async fn test_transition_is_all_or_nothing(
+        task_store: &dyn AgentTaskStore,
+        events: &dyn EventRepository,
+        outbox: &dyn OutboxStore,
+    ) -> Result<()> {
+        let (child, worker, lease) =
+            leased_tool_child(task_store, "conformance-transition").await?;
+        let advisories_before = thread_events_rows(outbox, &child.thread_id).await?;
+
+        let stale = settle_with_tool_call_end(&child, &worker, &LeaseId::new());
+        let rejected = task_store.commit(stale, t_plus(64)).await;
+        assert!(
+            matches!(
+                rejected,
+                Err(agent_server::journal::Rejected::Guard { index: 0, .. })
+            ),
+            "a stale lease is rejected by the guard: {rejected:?}",
+        );
+        let unchanged = AgentTaskStore::get(task_store, &child.id)
+            .await?
+            .context("child")?;
+        assert_eq!(unchanged.status, TaskStatus::Running);
+        assert!(events.get_events(&child.thread_id).await?.is_empty());
+        assert_eq!(
+            thread_events_rows(outbox, &child.thread_id).await?,
+            advisories_before
+        );
+
+        let committed = task_store
+            .commit(
+                settle_with_tool_call_end(&child, &worker, &lease),
+                t_plus(65),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        let [(settled, parent)] = committed.settled.as_slice() else {
+            anyhow::bail!("one settled task, got {:?}", committed.settled);
+        };
+        assert_eq!(settled.status, TaskStatus::Completed);
+        assert_eq!(
+            parent.as_ref().map(|parent| parent.status),
+            Some(TaskStatus::Pending),
+            "the last child's settle resumes its parent in the same transaction",
+        );
+        let [event] = committed.events.as_slice() else {
+            anyhow::bail!("one committed event, got {:?}", committed.events);
+        };
+        assert!(matches!(event.event, AgentEvent::ToolCallEnd { .. }));
+        assert_eq!(events.get_events(&child.thread_id).await?.len(), 1);
+        assert_eq!(
+            thread_events_rows(outbox, &child.thread_id).await?,
+            advisories_before + 1,
+            "one coalesced advisory row per transition",
+        );
+        Ok(())
+    }
+
+    /// A crash between the task write and the event write of a transition
+    /// leaves neither: the backend's transaction drops both. The caller
+    /// holds the `fail::FailScenario`.
+    #[cfg(feature = "failpoints")]
+    async fn test_transition_failpoint_writes_neither_half(
+        task_store: &dyn AgentTaskStore,
+        events: &dyn EventRepository,
+        outbox: &dyn OutboxStore,
+    ) -> Result<()> {
+        let (child, worker, lease) =
+            leased_tool_child(task_store, "conformance-transition-crash").await?;
+        let advisories_before = thread_events_rows(outbox, &child.thread_id).await?;
+        fail::cfg("transition.before_events", "panic")
+            .map_err(|error| anyhow::anyhow!("configure transition failpoint: {error}"))?;
+        let crashed = std::panic::AssertUnwindSafe(task_store.commit(
+            settle_with_tool_call_end(&child, &worker, &lease),
+            t_plus(65),
+        ));
+        let result = futures::FutureExt::catch_unwind(crashed).await;
+        fail::remove("transition.before_events");
+        assert!(result.is_err(), "the transition failpoint must fire");
+
+        let after = AgentTaskStore::get(task_store, &child.id)
+            .await?
+            .context("child")?;
+        assert_eq!(
+            after.status,
+            TaskStatus::Running,
+            "the settle rolled back with its event",
+        );
+        assert!(events.get_events(&child.thread_id).await?.is_empty());
+        assert_eq!(
+            thread_events_rows(outbox, &child.thread_id).await?,
+            advisories_before
+        );
+        Ok(())
+    }
+
     /// Durable subagent spawn hands the child ROOT the root-turn retry
     /// budget on every backend.
     ///
@@ -2994,6 +3188,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_transition_is_all_or_nothing() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_transition_is_all_or_nothing(s.task.as_ref(), s.event.as_ref(), s.outbox.as_ref())
+            .await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_child_spawn() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_child_spawn_and_resume(s.task.as_ref()).await
@@ -3337,6 +3538,21 @@ mod tests {
             &store, &store, &store, &store, &store, &store,
         )
         .await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_transition_is_all_or_nothing() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_transition_is_all_or_nothing(&store, &store, &store).await
+    }
+
+    #[cfg(all(feature = "sqlite", feature = "failpoints"))]
+    #[tokio::test]
+    async fn sqlite_transition_failpoint_writes_neither_half() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_transition_failpoint_writes_neither_half(&store, &store, &store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -3903,6 +4119,25 @@ mod tests {
             &store, &store, &store, &store, &store, &store,
         )
         .await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_transition_is_all_or_nothing() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_transition_is_all_or_nothing(&store, &store, &store).await
+    }
+
+    #[cfg(all(feature = "postgres", feature = "failpoints"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_transition_failpoint_writes_neither_half() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_transition_failpoint_writes_neither_half(&store, &store, &store).await
     }
 
     #[cfg(feature = "postgres")]
