@@ -1756,6 +1756,83 @@ LIMIT 1
         u32_from_i64(live, "live child count")
     }
 
+    /// Re-park a steering exchange's parent inside the caller's
+    /// transaction, checking its ownership after locking its children.
+    async fn repark_after_steering_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        parent_id: &AgentTaskId,
+        (worker, lease): (&WorkerId, &LeaseId),
+        payload: SuspensionPayload,
+        reattach: Vec<AgentTaskId>,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask> {
+        let old = Self::load_task_tx(tx, parent_id)
+            .await?
+            .ok_or_else(|| anyhow!("repark rejected: task {parent_id} does not exist"))?;
+        if old.status != TaskStatus::Running {
+            let status = old.status;
+            return Err(anyhow!(
+                "repark rejected: task {parent_id} is not running (status {status:?})"
+            ));
+        }
+        match &old.worker_id {
+            Some(current) if current == worker => {}
+            _ => {
+                return Err(anyhow!(
+                    "repark rejected: worker mismatch on task {parent_id}"
+                ));
+            }
+        }
+        match &old.lease_id {
+            Some(current) if current == lease => {}
+            _ => {
+                return Err(anyhow!(
+                    "repark rejected: lease mismatch on task {parent_id}"
+                ));
+            }
+        }
+        if !matches!(old.state, TaskState::ReadyToResume { .. }) {
+            return Err(anyhow!(
+                "repark rejected: task {parent_id} is not a child resume"
+            ));
+        }
+
+        // Re-index the re-attach children to dense spawn_index
+        // positions matching the new continuation's tool-use order.
+        let mut live = 0_u32;
+        for (idx, child_id) in reattach.iter().enumerate() {
+            let mut child = Self::load_task_tx(tx, child_id)
+                .await?
+                .ok_or_else(|| anyhow!("repark rejected: re-attach child {child_id} missing"))?;
+            if child.parent_id.as_ref() != Some(parent_id) {
+                return Err(anyhow!(
+                    "repark rejected: re-attach child {child_id} is not a child of {parent_id}"
+                ));
+            }
+            child.spawn_index =
+                Some(u32::try_from(idx).context("repark rejected: reattach index exceeds u32")?);
+            child.updated_at = now;
+            child
+                .validate()
+                .context("repark rejected: re-attach child validate failed")?;
+            if !child.status.is_terminal() {
+                live = live
+                    .checked_add(1)
+                    .context("repark rejected: live child count exceeds u32")?;
+            }
+            Self::update_task_tx(tx, &child).await?;
+        }
+
+        // A re-attach child that finished during the LLM call is already
+        // terminal here and excluded.
+        let reparked = old
+            .clone()
+            .repark_after_steering(live, payload, reattach, now)
+            .context("repark rejected: repark_after_steering transition failed")?;
+        Self::update_task_tx(tx, &reparked).await?;
+        Ok(reparked)
+    }
+
     /// Park a running task on a confirmation inside the caller's
     /// transaction. The caller's guard has checked its status and lease.
     async fn pause_on_confirmation_tx(
@@ -3359,6 +3436,24 @@ impl SqliteDurableStore {
                 .await?;
                 committed.paused.push(paused);
             }
+            Write::ReparkAfterSteering {
+                task,
+                worker,
+                lease,
+                payload,
+                reattach,
+            } => {
+                let reparked = Self::repark_after_steering_tx(
+                    tx,
+                    &task,
+                    (&worker, &lease),
+                    *payload,
+                    reattach,
+                    now,
+                )
+                .await?;
+                committed.reparked.push(reparked);
+            }
             Write::RecordIntent(intent) => Self::update_intent_tx(tx, &intent).await?,
             Write::AppendEvents { thread, events } => {
                 if events.is_empty() {
@@ -4265,73 +4360,27 @@ impl AgentTaskStore for SqliteDurableStore {
         reattach: Vec<AgentTaskId>,
         now: OffsetDateTime,
     ) -> Result<AgentTask> {
-        let mut tx = self.begin().await?;
-        let old = Self::load_task_tx(&mut tx, parent_id)
-            .await?
-            .ok_or_else(|| anyhow!("repark rejected: task {parent_id} does not exist"))?;
-        if old.status != TaskStatus::Running {
-            let status = old.status;
-            return Err(anyhow!(
-                "repark rejected: task {parent_id} is not running (status {status:?})"
-            ));
-        }
-        match &old.worker_id {
-            Some(current) if current == worker => {}
-            _ => {
-                return Err(anyhow!(
-                    "repark rejected: worker mismatch on task {parent_id}"
-                ));
-            }
-        }
-        match &old.lease_id {
-            Some(current) if current == lease => {}
-            _ => {
-                return Err(anyhow!(
-                    "repark rejected: lease mismatch on task {parent_id}"
-                ));
-            }
-        }
-        if !matches!(old.state, TaskState::ReadyToResume { .. }) {
-            return Err(anyhow!(
-                "repark rejected: task {parent_id} is not a child resume"
-            ));
-        }
-
-        // Re-index the re-attach children to dense spawn_index
-        // positions matching the new continuation's tool-use order.
-        let mut live = 0_u32;
-        for (idx, child_id) in reattach.iter().enumerate() {
-            let mut child = Self::load_task_tx(&mut tx, child_id)
-                .await?
-                .ok_or_else(|| anyhow!("repark rejected: re-attach child {child_id} missing"))?;
-            if child.parent_id.as_ref() != Some(parent_id) {
-                return Err(anyhow!(
-                    "repark rejected: re-attach child {child_id} is not a child of {parent_id}"
-                ));
-            }
-            child.spawn_index =
-                Some(u32::try_from(idx).context("repark rejected: reattach index exceeds u32")?);
-            child.updated_at = now;
-            child
-                .validate()
-                .context("repark rejected: re-attach child validate failed")?;
-            if !child.status.is_terminal() {
-                live = live
-                    .checked_add(1)
-                    .context("repark rejected: live child count exceeds u32")?;
-            }
-            Self::update_task_tx(&mut tx, &child).await?;
-        }
-
-        // A re-attach child that finished during the LLM call is already
-        // terminal here and excluded.
-        let reparked = old
-            .clone()
-            .repark_after_steering(live, payload, reattach, now)
-            .context("repark rejected: repark_after_steering transition failed")?;
-        Self::update_task_tx(&mut tx, &reparked).await?;
-        tx.commit().await.context("commit repark_after_steering")?;
-        Ok(reparked)
+        let committed = agent_server::journal::DurableStore::commit(
+            self,
+            agent_server::journal::Transition {
+                guards: Vec::new(),
+                writes: vec![agent_server::journal::Write::ReparkAfterSteering {
+                    task: parent_id.clone(),
+                    worker: worker.clone(),
+                    lease: lease.clone(),
+                    payload: Box::new(payload),
+                    reattach,
+                }],
+            },
+            now,
+        )
+        .await
+        .map_err(|rejected| agent_server::journal::transition::wrapper_error("repark", rejected))?;
+        committed
+            .reparked
+            .into_iter()
+            .next()
+            .context("a repark transition returns its parent")
     }
 
     async fn pause_on_confirmation(

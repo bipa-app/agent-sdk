@@ -9932,6 +9932,7 @@ mod tests {
                     } => self.observe_failure(now)?,
                     Write::RejectConfirmation { .. }
                     | Write::PauseOnConfirmation { .. }
+                    | Write::ReparkAfterSteering { .. }
                     | Write::RecordIntent(_)
                     | Write::AppendEvents { .. } => {}
                 }
