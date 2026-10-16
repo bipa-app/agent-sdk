@@ -668,19 +668,39 @@ async fn fail_root_turn_inner(
     // next turn, which must not find these children live.
     let mut settled =
         settle_descendants_before_failing(task_id, worker_id, lease_id, deps, now).await;
-    let failed_task = match deps
+    // The root fails and its terminal error event commits in one
+    // transition, so clients never see a failed turn without its error.
+    let error_event = AgentEvent::terminal_error(error_msg.clone(), reason.clone())
+        .with_emitter_task_id(task_id.as_str());
+    let failed = deps
         .task_store
-        .fail_task_with_reason(
-            task_id,
-            worker_id,
-            lease_id,
-            error_msg.clone(),
-            reason.clone(),
+        .commit(
+            crate::journal::Transition::settle(
+                task_id.clone(),
+                worker_id.clone(),
+                lease_id.clone(),
+                crate::journal::Settle::FailWithReason {
+                    error: error_msg,
+                    reason,
+                },
+                thread_id.clone(),
+                vec![error_event],
+            ),
             now,
         )
         .await
-        .context("fail root task")
-    {
+        .map_err(|rejected| {
+            crate::journal::transition::wrapper_error("fail_task_with_reason", rejected)
+        })
+        .and_then(|committed| {
+            committed
+                .settled
+                .into_iter()
+                .next()
+                .context("a settle transition returns its settled task")
+        })
+        .context("fail root task");
+    let failed_task = match failed {
         Ok((failed_task, _parent)) => failed_task,
         Err(refused) => {
             return FailedRootTurn {
@@ -695,16 +715,6 @@ async fn fail_root_turn_inner(
             settled: settled.clone(),
         }
     });
-
-    // Best-effort: the task is durably Failed; event commit failure
-    // must not override that outcome. Consistent with
-    // best_effort_close_open_attempts.
-    let error_event =
-        AgentEvent::terminal_error(error_msg, reason).with_emitter_task_id(task_id.as_str());
-    let _ = deps
-        .event_repo
-        .commit_event(thread_id, error_event, now)
-        .await;
 
     // Best-effort for the same reason; the host's orphan sweep settles
     // whatever this misses.
@@ -1043,23 +1053,31 @@ pub async fn revert_steering_wake(
     // as if the wake never happened.
     let child_ids = parent.state.child_ids().to_vec();
 
-    let reparked = deps
-        .task_store
-        .repark_after_steering(&parent.id, worker_id, lease_id, payload, child_ids, now)
-        .await
-        .context("revert failed steering wake to parked state")?;
-
-    // Surface the failure as a non-fatal error event (best-effort — the
-    // durable re-park already succeeded; an event-commit failure must
-    // not override that outcome).
+    // The non-fatal error event that tells the note's author the reply
+    // did not land commits with the re-park.
     let error_event =
         AgentEvent::error(format!("{error:#}"), false).with_emitter_task_id(parent.id.as_str());
-    let _ = deps
-        .event_repo
-        .commit_event(&parent.thread_id, error_event, now)
-        .await;
-
-    Ok(reparked)
+    let committed = deps
+        .task_store
+        .commit(
+            crate::journal::Transition::repark_after_steering(
+                parent.id.clone(),
+                (worker_id.clone(), lease_id.clone()),
+                payload,
+                child_ids,
+                parent.thread_id.clone(),
+                vec![error_event],
+            ),
+            now,
+        )
+        .await
+        .map_err(|rejected| crate::journal::transition::wrapper_error("repark", rejected))
+        .context("revert failed steering wake to parked state")?;
+    committed
+        .reparked
+        .into_iter()
+        .next()
+        .context("a repark transition returns its parent")
 }
 
 /// Best-effort close any open (non-closed) turn attempts for a task.
@@ -9937,14 +9955,17 @@ async fn repark_after_steering_exchange(
         events,
         preflight_calls,
     } = prepare_steering_repark(inputs, deps, repark, now).await?;
-    let mut boundary_events = if preflight_calls.is_empty() {
-        Vec::new()
+    // The answer's content events commit with the re-park: as boundary
+    // events ahead of the preflight ToolCallEnds, and otherwise after any
+    // subagent starts.
+    let (mut boundary_events, trailing_events) = if preflight_calls.is_empty() {
+        (Vec::new(), events)
     } else {
-        events.clone()
+        (events, Vec::new())
     };
     boundary_events.extend(preflight_end_events(&preflight_calls));
     let thread_id = &inputs.bootstrap.thread_id;
-    let (parent_task, child_tasks, atomic_committed) = if let Some(routing) = routing {
+    let (parent_task, child_tasks, committed_events) = if let Some(routing) = routing {
         apply_batch_routing(
             inputs,
             deps,
@@ -9953,7 +9974,7 @@ async fn repark_after_steering_exchange(
                 batch: SuspendedBatch {
                     payload,
                     boundary_events,
-                    trailing_events: Vec::new(),
+                    trailing_events,
                     delivered_injection_ids: Vec::new(),
                 },
                 specs,
@@ -9966,19 +9987,31 @@ async fn repark_after_steering_exchange(
         .await?
     } else {
         let child_ids = reattach.into_iter().map(|child| child.child_id).collect();
-        let parent = deps
+        let committed = deps
             .task_store
-            .repark_after_steering(
-                &inputs.bootstrap.task_id,
-                &inputs.bootstrap.worker_id,
-                &inputs.bootstrap.lease_id,
-                payload,
-                child_ids,
+            .commit(
+                crate::journal::Transition::repark_after_steering(
+                    inputs.bootstrap.task_id.clone(),
+                    (
+                        inputs.bootstrap.worker_id.clone(),
+                        inputs.bootstrap.lease_id.clone(),
+                    ),
+                    payload,
+                    child_ids,
+                    thread_id.clone(),
+                    trailing_events,
+                ),
                 now,
             )
             .await
+            .map_err(|rejected| crate::journal::transition::wrapper_error("repark", rejected))
             .context("re-park parent after partial child resume")?;
-        (parent, Vec::new(), Vec::new())
+        let parent = committed
+            .reparked
+            .into_iter()
+            .next()
+            .context("a repark transition returns its parent")?;
+        (parent, Vec::new(), committed.events)
     };
 
     snapshot_suspension_draft(
@@ -9990,18 +10023,6 @@ async fn repark_after_steering_exchange(
         "refresh child re-park draft",
     )
     .await;
-    let committed_events = if preflight_calls.is_empty() {
-        if events.is_empty() {
-            Vec::new()
-        } else {
-            deps.event_repo
-                .commit_event_batch(thread_id, events, now)
-                .await
-                .context("commit child-resume suspension events")?
-        }
-    } else {
-        atomic_committed
-    };
     let (parent_task, child_tasks) =
         complete_preflight_children(deps, parent_task, child_tasks, preflight_calls)?;
     Ok(RootTurnOutcome::Suspended {

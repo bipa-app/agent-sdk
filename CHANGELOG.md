@@ -84,6 +84,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     gone.
   - In-memory fixtures that drive tool tasks must wire
     `with_cancellation_markers`.
+- **Breaking: sites 6, 7 and 9 commit their state and events together.**
+  `Write::ReparkAfterSteering` joins the transition writes; it takes no
+  guard, because the backend checks the parent's ownership after locking
+  the re-attached children (the store's child-before-parent order), and
+  `Committed` gains `reparked`. `repark_after_steering` is a `commit`
+  wrapper on every backend, with its error text unchanged.
+  - A failed root turn and its terminal error event commit in one
+    transition; the event was best-effort before.
+  - Reverting a failed steering wake re-parks the parent and commits its
+    error event together.
+  - A steering re-park commits the answer's content events with it.
+- An approval that lands before starting its tool fails answers
+  `INTERNAL` saying the approval landed, not `FAILED_PRECONDITION`.
 - **Breaking: a suspension's events commit with its spawn (site 8).** An
   ordinary suspension spawned its children in one transaction and committed
   its content and `ToolCallStart` events in a second. Every suspension now

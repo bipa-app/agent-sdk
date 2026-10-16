@@ -15394,3 +15394,150 @@ async fn continuation_requests_keep_the_thread_session_id() -> Result<()> {
     assert_eq!(second.single_request()?.session_id, expected);
     Ok(())
 }
+
+/// An event repository that stops, the way a process stopping does, at
+/// the first commit of a suspension's `ToolCallStart`s. Site 8's old path
+/// committed those after its spawn transaction, so stopping there left
+/// a parked parent with children whose calls no client saw start.
+struct StopsAtToolCallStarts<'a> {
+    inner: &'a InMemoryEventRepository,
+}
+
+#[async_trait]
+impl EventRepository for StopsAtToolCallStarts<'_> {
+    async fn commit_event(
+        &self,
+        thread_id: &ThreadId,
+        event: AgentEvent,
+        now: time::OffsetDateTime,
+    ) -> Result<CommittedEvent> {
+        if matches!(event, AgentEvent::ToolCallStart { .. }) {
+            bail!("process stopped before the suspension's events");
+        }
+        self.inner.commit_event(thread_id, event, now).await
+    }
+
+    async fn commit_event_batch(
+        &self,
+        thread_id: &ThreadId,
+        events: Vec<AgentEvent>,
+        now: time::OffsetDateTime,
+    ) -> Result<Vec<CommittedEvent>> {
+        if events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolCallStart { .. }))
+        {
+            bail!("process stopped before the suspension's events");
+        }
+        self.inner.commit_event_batch(thread_id, events, now).await
+    }
+
+    async fn next_sequence(&self, thread_id: &ThreadId) -> Result<u64> {
+        self.inner.next_sequence(thread_id).await
+    }
+
+    async fn get_events(&self, thread_id: &ThreadId) -> Result<Vec<CommittedEvent>> {
+        self.inner.get_events(thread_id).await
+    }
+
+    async fn get_events_in_range(
+        &self,
+        thread_id: &ThreadId,
+        after: u64,
+        up_to: u64,
+    ) -> Result<Vec<CommittedEvent>> {
+        self.inner
+            .get_events_in_range(thread_id, after, up_to)
+            .await
+    }
+
+    async fn threads_with_events_before(
+        &self,
+        cutoff: time::OffsetDateTime,
+        limit: u32,
+    ) -> Result<Vec<ThreadId>> {
+        self.inner.threads_with_events_before(cutoff, limit).await
+    }
+
+    async fn max_sequence_before(
+        &self,
+        thread_id: &ThreadId,
+        cutoff: time::OffsetDateTime,
+    ) -> Result<Option<u64>> {
+        self.inner.max_sequence_before(thread_id, cutoff).await
+    }
+
+    async fn min_sequence_at_or_after(
+        &self,
+        thread_id: &ThreadId,
+        cutoff: time::OffsetDateTime,
+    ) -> Result<Option<u64>> {
+        self.inner.min_sequence_at_or_after(thread_id, cutoff).await
+    }
+}
+
+/// Site 8: a suspension never leaves its parent parked on children whose
+/// calls no client saw start, for tools-only, subagent-only and mixed
+/// batches. (From the agent-sdk #493 review.)
+#[tokio::test]
+async fn a_suspension_never_strands_children_without_their_tool_call_starts() -> Result<()> {
+    let tool = (
+        "c1".to_owned(),
+        "bash".to_owned(),
+        serde_json::json!({"command": "ls"}),
+    );
+    let subagent = (
+        "c1".to_owned(),
+        "subagent_explore".to_owned(),
+        serde_json::json!({"task": "t"}),
+    );
+    let mixed_tool = (
+        "c2".to_owned(),
+        "bash".to_owned(),
+        serde_json::json!({"command": "ls"}),
+    );
+    for (name, calls, with_selector) in [
+        ("tools", vec![tool], false),
+        ("subagent", vec![subagent.clone()], true),
+        ("mixed", vec![subagent, mixed_tool], true),
+    ] {
+        let stores = TestStores::new();
+        let provider = MockToolCallProvider::new(calls);
+        let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+        let task_id = task.id.clone();
+        let mut bootstrap = sample_bootstrap_with_tools(task);
+        bootstrap.definition = sample_definition_with_subagent_tools();
+        let inputs = build_root_worker_inputs(
+            bootstrap,
+            &stores.threads,
+            &stores.checkpoints,
+            &stores.messages,
+            t0(),
+        )
+        .await?;
+        let selector = MixedSpawnSelector;
+        let stopping = StopsAtToolCallStarts {
+            inner: &stores.events,
+        };
+        let mut deps = stores.deps();
+        deps.event_repo = &stopping;
+        if with_selector {
+            deps.subagent_spawn_selector = Some(&selector);
+        }
+        let _outcome = execute_root_turn(inputs, "go", &provider, &deps, t_plus(5)).await;
+        let parent = stores.tasks.get(&task_id).await?.context("parent")?;
+        let starts = stores
+            .events
+            .get_events(&thread_a())
+            .await?
+            .into_iter()
+            .filter(|event| matches!(event.event, AgentEvent::ToolCallStart { .. }))
+            .count();
+        assert!(
+            parent.status != TaskStatus::WaitingOnChildren || starts > 0,
+            "{name}: parent parked on {} children with no ToolCallStart",
+            parent.pending_child_count,
+        );
+    }
+    Ok(())
+}

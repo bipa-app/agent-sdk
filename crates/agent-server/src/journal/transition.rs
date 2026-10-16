@@ -17,7 +17,7 @@ use time::OffsetDateTime;
 
 use super::committed_event::CommittedEvent;
 use super::execution_intent::ExecutionIntent;
-use super::task::{AgentTask, AgentTaskId, LeaseId, TaskStatus, WorkerId};
+use super::task::{AgentTask, AgentTaskId, LeaseId, SuspensionPayload, TaskStatus, WorkerId};
 
 /// Guards and writes applied in one transaction.
 #[derive(Clone, Debug, Default)]
@@ -57,6 +57,18 @@ pub enum Write {
         continuation: Box<ContinuationEnvelope>,
         prepared_operation: Option<ListenExecutionContext>,
     },
+    /// Re-park a steering exchange's parent on `reattach`, its still-live
+    /// children, under `(worker, lease)`. Unlike the other task writes it
+    /// takes no guard: the backend checks the parent's ownership itself,
+    /// after locking the children, so the store's child-before-parent lock
+    /// order holds.
+    ReparkAfterSteering {
+        task: AgentTaskId,
+        worker: WorkerId,
+        lease: LeaseId,
+        payload: Box<SuspensionPayload>,
+        reattach: Vec<AgentTaskId>,
+    },
     /// Store an execution intent's new status.
     RecordIntent(Box<ExecutionIntent>),
     /// Events on `thread`, without sequences: the backend allocates them
@@ -91,6 +103,8 @@ pub struct Committed {
     pub settled: Vec<(AgentTask, Option<AgentTask>)>,
     /// For each [`Write::PauseOnConfirmation`]: the parked task.
     pub paused: Vec<AgentTask>,
+    /// For each [`Write::ReparkAfterSteering`]: the re-parked parent.
+    pub reparked: Vec<AgentTask>,
     /// Every event the transition appended, with its sequence.
     pub events: Vec<CommittedEvent>,
 }
@@ -231,6 +245,32 @@ impl Transition {
         }
     }
 
+    /// Re-park a steering exchange's parent on its still-live children and
+    /// append `events`, one transaction.
+    #[must_use]
+    pub fn repark_after_steering(
+        task: AgentTaskId,
+        (worker, lease): (WorkerId, LeaseId),
+        payload: SuspensionPayload,
+        reattach: Vec<AgentTaskId>,
+        thread: ThreadId,
+        events: Vec<AgentEvent>,
+    ) -> Self {
+        Self {
+            guards: Vec::new(),
+            writes: vec![
+                Write::ReparkAfterSteering {
+                    task,
+                    worker,
+                    lease,
+                    payload: Box::new(payload),
+                    reattach,
+                },
+                Write::AppendEvents { thread, events },
+            ],
+        }
+    }
+
     /// Whether a guard holds `task` in `status`.
     #[must_use]
     pub fn guards_status(&self, task: &AgentTaskId, status: TaskStatus) -> bool {
@@ -265,6 +305,7 @@ impl Transition {
             Write::SettleTask { .. }
             | Write::RejectConfirmation { .. }
             | Write::PauseOnConfirmation { .. }
+            | Write::ReparkAfterSteering { .. }
             | Write::RecordIntent(_) => false,
         })
     }
@@ -313,7 +354,9 @@ impl Transition {
                         )));
                     }
                 }
-                Write::RecordIntent(_) | Write::AppendEvents { .. } => {}
+                Write::ReparkAfterSteering { .. }
+                | Write::RecordIntent(_)
+                | Write::AppendEvents { .. } => {}
             }
         }
         Ok(())

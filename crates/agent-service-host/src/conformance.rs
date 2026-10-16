@@ -1546,6 +1546,120 @@ mod tests {
         Ok(())
     }
 
+    /// A root parked on two tool children, one finished, woken by a
+    /// steering note and re-acquired: ready to re-park on the survivor.
+    async fn steering_woken_root(
+        task_store: &dyn AgentTaskStore,
+        tid: &str,
+    ) -> Result<(AgentTask, AgentTaskId, WorkerId, LeaseId)> {
+        let root = fresh_root(tid, 60);
+        task_store.submit_root_turn(root.clone()).await?;
+        let worker = WorkerId::new();
+        let lease = LeaseId::new();
+        task_store
+            .try_acquire_task(
+                &root.id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(90),
+                t_plus(61),
+            )
+            .await?;
+        let (_, children) = task_store
+            .spawn_tool_children(
+                &root.id,
+                &worker,
+                &lease,
+                vec![ChildSpawnSpec::new(3), ChildSpawnSpec::new(3)],
+                suspension_payload(tid),
+                None,
+                Vec::new(),
+                t_plus(62),
+            )
+            .await?;
+        let (cw, cl) = (WorkerId::new(), LeaseId::new());
+        task_store
+            .try_acquire_task(
+                &children[0].id,
+                cw.clone(),
+                cl.clone(),
+                t_plus(90),
+                t_plus(63),
+            )
+            .await?;
+        task_store
+            .complete_task(&children[0].id, &cw, &cl, t_plus(64))
+            .await?;
+        task_store
+            .enqueue_steering_resume(
+                &root.id,
+                vec![agent_sdk_foundation::llm::ContentBlock::Text {
+                    text: "status?".into(),
+                }],
+                t_plus(65),
+            )
+            .await?
+            .context("wake must succeed on a parked parent")?;
+        let (sw, sl) = (WorkerId::new(), LeaseId::new());
+        task_store
+            .try_acquire_task(&root.id, sw.clone(), sl.clone(), t_plus(200), t_plus(67))
+            .await?;
+        Ok((root, children[1].id.clone(), sw, sl))
+    }
+
+    /// I1–I4 for [`agent_server::journal::Write::ReparkAfterSteering`]: a
+    /// stale lease writes nothing; a good re-park parks the parent on the
+    /// survivor, and its event and advisory row commit with it.
+    async fn test_repark_transition_is_all_or_nothing(
+        task_store: &dyn AgentTaskStore,
+        events: &dyn EventRepository,
+        outbox: &dyn OutboxStore,
+    ) -> Result<()> {
+        let tid = "conformance-repark-transition";
+        let (root, survivor, worker, lease) = steering_woken_root(task_store, tid).await?;
+        let advisories_before = thread_events_rows(outbox, &root.thread_id).await?;
+        let repark = |lease: LeaseId| {
+            agent_server::journal::Transition::repark_after_steering(
+                root.id.clone(),
+                (worker.clone(), lease),
+                suspension_payload(tid),
+                vec![survivor.clone()],
+                root.thread_id.clone(),
+                vec![AgentEvent::error("the steering reply failed", false)],
+            )
+        };
+
+        let stale = task_store.commit(repark(LeaseId::new()), t_plus(68)).await;
+        let stale = stale.err().context("a stale lease cannot re-park")?;
+        assert!(
+            format!("{stale}").contains("repark rejected: lease mismatch"),
+            "{stale}"
+        );
+        let unchanged = task_store.get(&root.id).await?.context("root")?;
+        assert_eq!(unchanged.status, TaskStatus::Running);
+        assert!(events.get_events(&root.thread_id).await?.is_empty());
+        assert_eq!(
+            thread_events_rows(outbox, &root.thread_id).await?,
+            advisories_before
+        );
+
+        let committed = task_store
+            .commit(repark(lease), t_plus(69))
+            .await
+            .map_err(anyhow::Error::from)?;
+        let [reparked] = committed.reparked.as_slice() else {
+            anyhow::bail!("one re-parked parent, got {:?}", committed.reparked);
+        };
+        assert_eq!(reparked.status, TaskStatus::WaitingOnChildren);
+        assert_eq!(reparked.pending_child_count, 1);
+        assert_eq!(events.get_events(&root.thread_id).await?.len(), 1);
+        assert_eq!(
+            thread_events_rows(outbox, &root.thread_id).await?,
+            advisories_before + 1
+        );
+        Ok(())
+    }
+
     /// Cancel tree cancels the root **and all its descendants** (invariant
     /// #8). The root spawns two tool children (so the parent parks on
     /// `WaitingOnChildren`) before the cancel, and the cascade must drive
@@ -3375,6 +3489,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_repark_transition() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_repark_transition_is_all_or_nothing(
+            s.task.as_ref(),
+            s.event.as_ref(),
+            s.outbox.as_ref(),
+        )
+        .await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_pause_transition() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_pause_transition_is_all_or_nothing(
@@ -3747,6 +3872,13 @@ mod tests {
             &store, &store, &store, &store, &store, &store,
         )
         .await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_repark_transition() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_repark_transition_is_all_or_nothing(&store, &store, &store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -4342,6 +4474,15 @@ mod tests {
             &store, &store, &store, &store, &store, &store,
         )
         .await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_repark_transition() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_repark_transition_is_all_or_nothing(&store, &store, &store).await
     }
 
     #[cfg(feature = "postgres")]

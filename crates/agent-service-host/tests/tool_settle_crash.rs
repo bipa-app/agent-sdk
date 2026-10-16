@@ -100,6 +100,26 @@ impl LlmProvider for OneToolCallProvider {
 
 const THREAD: &str = "tool-settle-thread";
 
+fn root_deps<'a>(store: &'a SqliteDurableStore, notifier: &'a EventNotifier) -> RootTurnDeps<'a> {
+    RootTurnDeps {
+        task_store: store,
+        thread_store: store,
+        message_store: store,
+        attempt_store: store,
+        checkpoint_store: store,
+        event_repo: store,
+        event_notifier: notifier,
+        subagent_spawn_selector: None,
+        compaction_config: None,
+        compaction_provider: None,
+        compaction_artifact_store: None,
+        cancel: None,
+        wakeup: None,
+        activity: None,
+        connectivity_waits: None,
+    }
+}
+
 /// Run a fresh root turn whose model calls one tool, up to its suspension.
 async fn suspend_root_on_one_tool_call(
     store: &SqliteDurableStore,
@@ -126,23 +146,7 @@ async fn suspend_root_on_one_tool_call(
     };
     let inputs = build_root_worker_inputs(bootstrap, store, store, store, at(1)).await?;
     let notifier = EventNotifier::new();
-    let deps = RootTurnDeps {
-        task_store: store,
-        thread_store: store,
-        message_store: store,
-        attempt_store: store,
-        checkpoint_store: store,
-        event_repo: store,
-        event_notifier: &notifier,
-        subagent_spawn_selector: None,
-        compaction_config: None,
-        compaction_provider: None,
-        compaction_artifact_store: None,
-        cancel: None,
-        wakeup: None,
-        activity: None,
-        connectivity_waits: None,
-    };
+    let deps = root_deps(store, &notifier);
     let outcome =
         execute_root_turn(inputs, "Run the tool", &OneToolCallProvider, &deps, at(2)).await?;
     Ok((root_id, outcome))
@@ -435,6 +439,112 @@ async fn a_suspension_commits_its_tool_call_start_with_the_spawn() -> Result<()>
             .iter()
             .any(|event| matches!(event.event, AgentEvent::ToolCallStart { .. })),
         "the outcome carries the suspension's ToolCallStart",
+    );
+    Ok(())
+}
+
+async fn error_events(store: &SqliteDurableStore) -> Result<usize> {
+    Ok(
+        EventRepository::get_events(store, &ThreadId::from_string(THREAD))
+            .await?
+            .iter()
+            .filter(|event| matches!(event.event, AgentEvent::Error { .. }))
+            .count(),
+    )
+}
+
+/// Site 6: a failing root turn and its terminal error event commit in one
+/// transaction. A crash between the writes leaves the root running with
+/// no error event.
+#[tokio::test]
+async fn root_failure_failpoint_leaves_the_root_running_without_its_error() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let store = fresh_store(&temp).await?;
+    let thread_id = ThreadId::from_string(THREAD);
+    ThreadStore::get_or_create(&store, &thread_id, at(0)).await?;
+    let root = AgentTask::new_root_turn(thread_id.clone(), at(0), 3);
+    let root_id = root.id.clone();
+    store.submit_root_turn(root).await?;
+    let worker = WorkerId::from_string("root-worker");
+    let lease = LeaseId::from_string("root-lease");
+    store
+        .try_acquire_task(&root_id, worker.clone(), lease.clone(), at(60), at(0))
+        .await?
+        .context("root was not acquired")?;
+    let notifier = EventNotifier::new();
+    let deps = root_deps(&store, &notifier);
+    let error = anyhow::anyhow!("the provider stopped");
+    let _scenario = fail::FailScenario::setup();
+    crash_in_transition(agent_server::worker::fail_root_turn_with_reason(
+        agent_server::worker::FailRootTurnParams {
+            task_id: &root_id,
+            worker_id: &worker,
+            lease_id: &lease,
+            thread_id: &thread_id,
+            error: &error,
+            reason: agent_sdk_foundation::TerminalReason::InternalError,
+        },
+        &deps,
+        at(5),
+    ))
+    .await?;
+    let after = AgentTaskStore::get(&store, &root_id)
+        .await?
+        .context("the root")?;
+    let errors = error_events(&store).await?;
+    ensure!(
+        after.status == TaskStatus::Running && errors == 0,
+        "the failure and its error disagree after a crash: root {:?}, {errors} error events",
+        after.status,
+    );
+    Ok(())
+}
+
+/// Site 7: reverting a failed steering wake re-parks the parent and
+/// commits its error event in one transaction. A crash between the writes
+/// leaves the steering exchange running with no error event.
+#[tokio::test]
+async fn steering_revert_failpoint_leaves_the_exchange_running_without_its_error() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let store = fresh_store(&temp).await?;
+    let (root_id, _) = suspend_root_on_one_tool_call(&store).await?;
+    store
+        .enqueue_steering_resume(
+            &root_id,
+            vec![agent_sdk_foundation::llm::ContentBlock::Text {
+                text: "also check the logs".into(),
+            }],
+            at(20),
+        )
+        .await?
+        .context("the parked root takes the steering note")?;
+    let worker = WorkerId::from_string("steering-worker");
+    let lease = LeaseId::from_string("steering-lease");
+    let parent = store
+        .try_acquire_task(&root_id, worker.clone(), lease.clone(), at(600), at(21))
+        .await?
+        .context("the woken root acquires")?;
+    let notifier = EventNotifier::new();
+    let deps = root_deps(&store, &notifier);
+    let error = anyhow::anyhow!("the steering exchange failed");
+    let _scenario = fail::FailScenario::setup();
+    crash_in_transition(agent_server::worker::revert_steering_wake(
+        &parent,
+        &worker,
+        &lease,
+        &error,
+        &deps,
+        at(22),
+    ))
+    .await?;
+    let after = AgentTaskStore::get(&store, &root_id)
+        .await?
+        .context("the root")?;
+    let errors = error_events(&store).await?;
+    ensure!(
+        after.status == TaskStatus::Running && errors == 0,
+        "the re-park and its error disagree after a crash: root {:?}, {errors} error events",
+        after.status,
     );
     Ok(())
 }

@@ -3233,6 +3233,95 @@ impl InMemoryAgentTaskStore {
 
     /// Fail a task parked on a confirmation and recompute its waiting
     /// parent, under the caller's write lock.
+    /// Re-park a steering exchange's parent under the caller's write lock,
+    /// checking its ownership first.
+    fn repark_after_steering_locked(
+        inner: &mut Inner,
+        parent_id: &AgentTaskId,
+        (worker, lease): (&WorkerId, &LeaseId),
+        payload: SuspensionPayload,
+        reattach: Vec<AgentTaskId>,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask> {
+        let old = inner
+            .by_id
+            .get(parent_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("repark rejected: task {parent_id} does not exist"))?;
+
+        if old.status != TaskStatus::Running {
+            let status = old.status;
+            return Err(anyhow!(
+                "repark rejected: task {parent_id} is not running (status {status:?})"
+            ));
+        }
+        match &old.worker_id {
+            Some(current) if current == worker => {}
+            _ => {
+                return Err(anyhow!(
+                    "repark rejected: worker mismatch on task {parent_id}"
+                ));
+            }
+        }
+        match &old.lease_id {
+            Some(current) if current == lease => {}
+            _ => {
+                return Err(anyhow!(
+                    "repark rejected: lease mismatch on task {parent_id}"
+                ));
+            }
+        }
+        if !matches!(old.state, TaskState::ReadyToResume { .. }) {
+            return Err(anyhow!(
+                "repark rejected: task {parent_id} is not a child resume"
+            ));
+        }
+
+        // Re-index the re-attach children to dense spawn_index
+        // positions matching the new continuation's pending_tool_calls
+        // order. Build every updated child row first so a validation
+        // error on any child rolls the whole batch back cleanly.
+        let mut updated_children: Vec<AgentTask> = Vec::with_capacity(reattach.len());
+        for (idx, child_id) in reattach.iter().enumerate() {
+            let mut child =
+                inner.by_id.get(child_id).cloned().ok_or_else(|| {
+                    anyhow!("repark rejected: re-attach child {child_id} missing")
+                })?;
+            if child.parent_id.as_ref() != Some(parent_id) {
+                return Err(anyhow!(
+                    "repark rejected: re-attach child {child_id} is not a child of {parent_id}"
+                ));
+            }
+            child.spawn_index =
+                Some(u32::try_from(idx).context("repark rejected: reattach index exceeds u32")?);
+            child.updated_at = now;
+            child
+                .validate()
+                .context("repark rejected: re-attach child validate failed")?;
+            updated_children.push(child);
+        }
+        let live = updated_children
+            .iter()
+            .filter(|child| !child.status.is_terminal())
+            .count();
+        let live = u32::try_from(live).context("repark rejected: live child count exceeds u32")?;
+        // spawn_index is not an indexed field, so a plain primary-key
+        // overwrite keeps every secondary index consistent.
+        for child in updated_children {
+            inner.by_id.insert(child.id.clone(), child);
+        }
+
+        // A re-attach child that finished during the LLM call is already
+        // terminal here and excluded.
+        let reparked = old
+            .clone()
+            .repark_after_steering(live, payload, reattach, now)
+            .context("repark rejected: repark_after_steering transition failed")?;
+        inner.rebalance_after_row_change(&old, &reparked);
+        inner.by_id.insert(reparked.id.clone(), reparked.clone());
+        Ok(reparked)
+    }
+
     /// Park a running task on a confirmation under the caller's write
     /// lock. The caller's guard has checked its status and lease.
     fn pause_on_confirmation_locked(
@@ -5319,6 +5408,23 @@ impl super::transition::DurableStore for InMemoryAgentTaskStore {
                     )?;
                     committed.paused.push(paused);
                 }
+                Write::ReparkAfterSteering {
+                    task,
+                    worker,
+                    lease,
+                    payload,
+                    reattach,
+                } => {
+                    let reparked = Self::repark_after_steering_locked(
+                        &mut inner,
+                        &task,
+                        (&worker, &lease),
+                        *payload,
+                        reattach,
+                        now,
+                    )?;
+                    committed.reparked.push(reparked);
+                }
                 Write::RecordIntent(intent) => {
                     let intent_store = intent_store.ok_or_else(|| anyhow!("no intent store"))?;
                     intent_store
@@ -6149,85 +6255,27 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         reattach: Vec<AgentTaskId>,
         now: OffsetDateTime,
     ) -> Result<AgentTask> {
-        let mut inner = self.inner.write().await;
-        let old = inner
-            .by_id
-            .get(parent_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("repark rejected: task {parent_id} does not exist"))?;
-
-        if old.status != TaskStatus::Running {
-            let status = old.status;
-            return Err(anyhow!(
-                "repark rejected: task {parent_id} is not running (status {status:?})"
-            ));
-        }
-        match &old.worker_id {
-            Some(current) if current == worker => {}
-            _ => {
-                return Err(anyhow!(
-                    "repark rejected: worker mismatch on task {parent_id}"
-                ));
-            }
-        }
-        match &old.lease_id {
-            Some(current) if current == lease => {}
-            _ => {
-                return Err(anyhow!(
-                    "repark rejected: lease mismatch on task {parent_id}"
-                ));
-            }
-        }
-        if !matches!(old.state, TaskState::ReadyToResume { .. }) {
-            return Err(anyhow!(
-                "repark rejected: task {parent_id} is not a child resume"
-            ));
-        }
-
-        // Re-index the re-attach children to dense spawn_index
-        // positions matching the new continuation's pending_tool_calls
-        // order. Build every updated child row first so a validation
-        // error on any child rolls the whole batch back cleanly.
-        let mut updated_children: Vec<AgentTask> = Vec::with_capacity(reattach.len());
-        for (idx, child_id) in reattach.iter().enumerate() {
-            let mut child =
-                inner.by_id.get(child_id).cloned().ok_or_else(|| {
-                    anyhow!("repark rejected: re-attach child {child_id} missing")
-                })?;
-            if child.parent_id.as_ref() != Some(parent_id) {
-                return Err(anyhow!(
-                    "repark rejected: re-attach child {child_id} is not a child of {parent_id}"
-                ));
-            }
-            child.spawn_index =
-                Some(u32::try_from(idx).context("repark rejected: reattach index exceeds u32")?);
-            child.updated_at = now;
-            child
-                .validate()
-                .context("repark rejected: re-attach child validate failed")?;
-            updated_children.push(child);
-        }
-        let live = updated_children
-            .iter()
-            .filter(|child| !child.status.is_terminal())
-            .count();
-        let live = u32::try_from(live).context("repark rejected: live child count exceeds u32")?;
-        // spawn_index is not an indexed field, so a plain primary-key
-        // overwrite keeps every secondary index consistent.
-        for child in updated_children {
-            inner.by_id.insert(child.id.clone(), child);
-        }
-
-        // A re-attach child that finished during the LLM call is already
-        // terminal here and excluded.
-        let reparked = old
-            .clone()
-            .repark_after_steering(live, payload, reattach, now)
-            .context("repark rejected: repark_after_steering transition failed")?;
-        inner.rebalance_after_row_change(&old, &reparked);
-        inner.by_id.insert(reparked.id.clone(), reparked.clone());
-        drop(inner);
-        Ok(reparked)
+        let committed = super::transition::DurableStore::commit(
+            self,
+            super::transition::Transition {
+                guards: Vec::new(),
+                writes: vec![super::transition::Write::ReparkAfterSteering {
+                    task: parent_id.clone(),
+                    worker: worker.clone(),
+                    lease: lease.clone(),
+                    payload: Box::new(payload),
+                    reattach,
+                }],
+            },
+            now,
+        )
+        .await
+        .map_err(|rejected| super::transition::wrapper_error("repark", rejected))?;
+        committed
+            .reparked
+            .into_iter()
+            .next()
+            .context("a repark transition returns its parent")
     }
 
     async fn pause_on_confirmation(
