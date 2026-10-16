@@ -313,6 +313,10 @@ pub struct MixedChildrenSpawn {
     /// Parent-thread boundary events (Thinking + tool call starts) committed
     /// before any precompleted child can wake the parent.
     pub boundary_events: Vec<AgentEvent>,
+    /// Parent-thread events committed in the same transaction after each
+    /// new subagent's `SubagentProgress` start: an ordinary suspension's
+    /// content and tool call starts, which follow the subagent starts.
+    pub trailing_events: Vec<AgentEvent>,
     /// Durable subagent invocations to persist, in input order.
     pub subagents: Vec<SubagentInvocationSpawn>,
     /// Tool-runtime children to persist, in input order.
@@ -373,14 +377,16 @@ pub fn validate_mixed_children_spawn(spawn: &MixedChildrenSpawn) -> Result<()> {
         .iter()
         .map(|child| child.spawn_index)
         .collect();
-    // The atomic preflight path deliberately reuses this transaction with
-    // only tool children so their boundary ToolCallEnd events cannot be
-    // overtaken by a resumed parent. Ordinary callers still require a true
-    // mixed partition below.
-    if spawn.subagents.is_empty() && spawn.reattach.is_empty() && !spawn.boundary_events.is_empty()
+    // A suspension that commits its events with the spawn (the preflight
+    // path's boundary events, an ordinary suspension's trailing events)
+    // reuses this transaction for any batch shape: only tools, only
+    // subagents, or both. It must still cover every pending call once.
+    // Callers without events still require a true mixed partition below.
+    if spawn.reattach.is_empty()
+        && !(spawn.boundary_events.is_empty() && spawn.trailing_events.is_empty())
     {
         return validate_reattached_slot_coverage(
-            &[],
+            &subagent_slots,
             &tool_slots,
             &[],
             spawn.payload.continuation.payload.pending_tool_calls.len(),
@@ -3939,12 +3945,14 @@ impl InMemoryAgentTaskStore {
         prepared: &[(AgentTask, AgentTask)],
         mut boundary_events: Vec<AgentEvent>,
         events: Vec<SubagentSpawnEvent>,
+        trailing_events: Vec<AgentEvent>,
     ) -> Result<Vec<AtomicSpawnEventBatch>> {
         for (event, (invocation, child_root)) in events.into_iter().zip(prepared) {
             boundary_events.push(started_event_from_invocation(
                 event, invocation, child_root,
             )?);
         }
+        boundary_events.extend(trailing_events);
         let mut batches =
             Vec::with_capacity(usize::from(!boundary_events.is_empty()) + prepared.len());
         if !boundary_events.is_empty() {
@@ -6570,7 +6578,9 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         now: OffsetDateTime,
     ) -> Result<SpawnedMixedChildren> {
         validate_mixed_children_spawn(&spawn)?;
-        if self.marker_sink.is_none() && !spawn.boundary_events.is_empty() {
+        if self.marker_sink.is_none()
+            && !(spawn.boundary_events.is_empty() && spawn.trailing_events.is_empty())
+        {
             return Err(anyhow!(
                 "spawn rejected: boundary events require an in-memory event sink"
             ));
@@ -6579,6 +6589,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         let MixedChildrenSpawn {
             delivered_injection_ids,
             boundary_events,
+            trailing_events,
             subagents,
             tool_children,
             reattach,
@@ -6628,6 +6639,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                 &prepared,
                 boundary_events,
                 events,
+                trailing_events,
             )?
         } else {
             Vec::new()
@@ -12462,6 +12474,7 @@ mod tests {
         MixedChildrenSpawn {
             delivered_injection_ids: Vec::new(),
             boundary_events: Vec::new(),
+            trailing_events: Vec::new(),
             subagents,
             tool_children,
             reattach: Vec::new(),

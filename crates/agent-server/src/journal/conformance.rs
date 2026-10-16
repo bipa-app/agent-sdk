@@ -1131,12 +1131,89 @@ fn mixed_batch_spawn(
     Ok(crate::journal::store::MixedChildrenSpawn {
         delivered_injection_ids: Vec::new(),
         boundary_events: Vec::new(),
+        trailing_events: Vec::new(),
         subagents,
         tool_children,
         reattach: Vec::new(),
         payload,
         child_otel_traceparent: None,
     })
+}
+
+// ── mixed batch: suspension events commit with the spawn, in order ──
+
+/// A suspension that commits its events with the spawn: boundary events
+/// first, then each new subagent's `SubagentProgress` start, then the
+/// trailing events (an ordinary suspension's content and tool call
+/// starts), in one transaction with consecutive sequences. A batch of
+/// only subagents is accepted when it carries events.
+async fn case_mixed_batch_orders_boundary_starts_then_trailing<S: JournalStore>(
+    store: &S,
+) -> Result<()> {
+    let thread = tid("conf-mixed-event-order");
+    let fixture = mixed_batch_fixture(store, &thread, 1).await?;
+    let payload = suspension_with_pending_tools(&thread, 1);
+    let mut spawn = mixed_batch_spawn(&fixture, payload, &[0], &[])?;
+    spawn.boundary_events = vec![AgentEvent::text("boundary", "before the starts")];
+    spawn.trailing_events = vec![AgentEvent::tool_call_start(
+        "call-0",
+        "subagent_explore",
+        "Explore",
+        serde_json::json!({}),
+        agent_sdk_foundation::ToolTier::Confirm,
+    )];
+
+    let spawned = AgentTaskStore::spawn_mixed_children(
+        store,
+        &fixture.parent_id,
+        &fixture.worker,
+        &fixture.lease,
+        spawn,
+        spawn_events(1),
+        t_plus(2),
+    )
+    .await
+    .context("a subagent-only batch carrying events must spawn")?;
+
+    let kinds: Vec<&'static str> = spawned
+        .committed_events
+        .iter()
+        .map(|event| {
+            if matches!(event.event, AgentEvent::Text { .. }) {
+                "boundary"
+            } else if matches!(event.event, AgentEvent::SubagentProgress { .. }) {
+                "start"
+            } else if matches!(event.event, AgentEvent::ToolCallStart { .. }) {
+                "trailing"
+            } else {
+                "other"
+            }
+        })
+        .collect();
+    ensure!(
+        kinds == ["boundary", "start", "trailing"],
+        "suspension events must commit boundary, then starts, then trailing: {kinds:?}",
+    );
+    ensure!(
+        spawned
+            .committed_events
+            .windows(2)
+            .all(|pair| pair[1].sequence == pair[0].sequence + 1),
+        "the spawn's events take consecutive sequences",
+    );
+    let journal: Vec<u64> = EventRepository::get_events(store, &thread)
+        .await?
+        .iter()
+        .map(|event| event.sequence)
+        .collect();
+    ensure!(
+        spawned
+            .committed_events
+            .iter()
+            .all(|event| journal.contains(&event.sequence)),
+        "every returned event is in the parent's journal",
+    );
+    Ok(())
 }
 
 // ── pure tool spawn: precompleted specs require mixed transaction ────
@@ -1673,6 +1750,7 @@ async fn case_attached_tool_batch_accepts_empty_spawn_events<S: JournalStore>(
     let spawn = crate::journal::store::MixedChildrenSpawn {
         delivered_injection_ids: Vec::new(),
         boundary_events: Vec::new(),
+        trailing_events: Vec::new(),
         subagents: Vec::new(),
         tool_children: vec![crate::journal::store::ToolChildSpawn {
             spawn_index: 0,
@@ -1831,6 +1909,8 @@ pub async fn run_journal_store_conformance<S: JournalStore + Clone + 'static>(
 
     case_mixed_batch_spawns_subagents_and_tools(store).await?;
     report.passed("mixed_batch_spawns_subagents_and_tools");
+    case_mixed_batch_orders_boundary_starts_then_trailing(store).await?;
+    report.passed("mixed_batch_orders_boundary_starts_then_trailing");
 
     case_attached_tool_batch_accepts_empty_spawn_events(store).await?;
     report.passed("attached_tool_batch_accepts_empty_spawn_events");

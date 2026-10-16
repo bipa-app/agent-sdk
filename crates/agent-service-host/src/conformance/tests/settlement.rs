@@ -1995,6 +1995,56 @@ SELECT count(*) AS "blocked!" FROM blocked
         .await
     }
 
+    /// Site 8's shape: a tools-only suspension that commits its
+    /// `ToolCallStart`s inside the spawn transaction, racing a cancel of
+    /// the tree. Neither deadlocks, and nothing is stranded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_cancel_racing_a_suspension_with_its_events_strands_nothing()
+    -> Result<()> {
+        race_cancel_against("suspend", async |store, tid, root, worker, lease, at| {
+            let spawned = store
+                .spawn_mixed_children(
+                    &root,
+                    &worker,
+                    &lease,
+                    MixedChildrenSpawn {
+                        delivered_injection_ids: Vec::new(),
+                        boundary_events: Vec::new(),
+                        trailing_events: (0..2)
+                            .map(|index| {
+                                agent_sdk_foundation::AgentEvent::tool_call_start(
+                                    format!("call-{index}"),
+                                    "read_file",
+                                    "Read File",
+                                    serde_json::json!({}),
+                                    ToolTier::Observe,
+                                )
+                            })
+                            .collect(),
+                        subagents: Vec::new(),
+                        tool_children: (0..2)
+                            .map(|spawn_index| ToolChildSpawn {
+                                spawn_index,
+                                spec: ChildSpawnSpec::new(3),
+                            })
+                            .collect(),
+                        reattach: Vec::new(),
+                        payload: payload_with_calls(&tid, 2),
+                        child_otel_traceparent: None,
+                    },
+                    Vec::new(),
+                    t_plus(at + 4),
+                )
+                .await;
+            match spawned {
+                Ok(_) => Ok(()),
+                Err(error) if format!("{error:#}").contains("deadlock") => Err(error),
+                Err(_rejected_after_the_stop) => Ok(()),
+            }
+        })
+        .await
+    }
+
     /// A suspension waiting on `count` tool calls.
     fn payload_with_calls(tid: &str, count: usize) -> SuspensionPayload {
         let mut payload = super::super::suspension_payload(tid);
@@ -2123,6 +2173,7 @@ SELECT count(*) AS "blocked!" FROM blocked
                 MixedChildrenSpawn {
                     delivered_injection_ids: Vec::new(),
                     boundary_events: Vec::new(),
+                    trailing_events: Vec::new(),
                     subagents: Vec::new(),
                     tool_children: vec![ToolChildSpawn {
                         spawn_index: 1,
@@ -2266,6 +2317,7 @@ SELECT count(*) AS "blocked!" FROM blocked
                         MixedChildrenSpawn {
                             delivered_injection_ids: Vec::new(),
                             boundary_events: Vec::new(),
+                            trailing_events: Vec::new(),
                             subagents: Vec::new(),
                             tool_children: vec![ToolChildSpawn {
                                 spawn_index: 2,

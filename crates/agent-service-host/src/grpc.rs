@@ -6412,6 +6412,19 @@ mod tests {
         Ok(())
     }
 
+    async fn decision_claim(
+        task_store: &dyn AgentTaskStore,
+        request: &pb::DecideConfirmationRequest,
+    ) -> Result<IdempotencyClaim> {
+        task_store
+            .claim_idempotency(
+                &request.request_id,
+                IdempotencyKind::DecideConfirmation,
+                &decide_confirmation_fingerprint(request),
+            )
+            .await
+    }
+
     fn confirm_transfer_tool() -> Tool {
         Tool {
             name: "transfer".into(),
@@ -6477,16 +6490,9 @@ mod tests {
                     .await?;
             let parked = wait_for_awaiting_confirmation(&control, &thread_id).await?;
             let request = approval_request("decide-in-flight", &thread_id, &parked.task_id, false);
-            let earlier = task_store
-                .claim_idempotency(
-                    &request.request_id,
-                    IdempotencyKind::DecideConfirmation,
-                    &decide_confirmation_fingerprint(&request),
-                )
-                .await?;
             ensure!(
-                earlier == IdempotencyClaim::Fresh,
-                "the earlier attempt reserves the key: {earlier:?}",
+                decision_claim(task_store.as_ref(), &request).await? == IdempotencyClaim::Fresh,
+                "the earlier attempt reserves the key",
             );
 
             let decided = control
@@ -6503,16 +6509,12 @@ mod tests {
                 task.status != pb::TaskStatus::AwaitingConfirmation as i32,
                 "the decision applied: {task:?}",
             );
-            let replayed = task_store
-                .claim_idempotency(
-                    &request.request_id,
-                    IdempotencyKind::DecideConfirmation,
-                    &decide_confirmation_fingerprint(&request),
-                )
-                .await?;
             ensure!(
-                matches!(replayed, IdempotencyClaim::Replay(_)),
-                "the key is recorded after the decision: {replayed:?}",
+                matches!(
+                    decision_claim(task_store.as_ref(), &request).await?,
+                    IdempotencyClaim::Replay(_)
+                ),
+                "the key is recorded after the decision",
             );
             let again = control
                 .decide_confirmation(request)

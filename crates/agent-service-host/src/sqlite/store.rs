@@ -1775,6 +1775,29 @@ LIMIT 1
         Ok(paused)
     }
 
+    /// Commit `events` on `thread_id` with their outbox row, inside the
+    /// caller's transaction; nothing for an empty list.
+    async fn commit_parent_events_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        thread_id: &ThreadId,
+        events: Vec<AgentEvent>,
+        now: OffsetDateTime,
+    ) -> Result<Vec<CommittedEvent>> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        let start_seq = Self::next_event_sequence_tx(tx, thread_id).await?;
+        let committed = Self::insert_events_tx(tx, thread_id, events, start_seq, now).await?;
+        Self::insert_thread_events_outbox_row_tx(
+            tx,
+            &committed,
+            DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+            now,
+        )
+        .await?;
+        Ok(committed)
+    }
+
     /// Fail a task parked on a confirmation and recompute its waiting
     /// parent, inside the caller's transaction.
     async fn reject_confirmation_tx(
@@ -4637,6 +4660,7 @@ impl AgentTaskStore for SqliteDurableStore {
         let MixedChildrenSpawn {
             delivered_injection_ids,
             boundary_events,
+            trailing_events,
             subagents,
             tool_children,
             reattach,
@@ -4703,27 +4727,9 @@ impl AgentTaskStore for SqliteDurableStore {
 
         agent_server::fail_point!("atomic_spawn_batch.after_rows");
 
-        let mut committed = if boundary_events.is_empty() {
-            Vec::new()
-        } else {
-            let start_seq = Self::next_event_sequence_tx(&mut tx, &new_parent.thread_id).await?;
-            let committed = Self::insert_events_tx(
-                &mut tx,
-                &new_parent.thread_id,
-                boundary_events,
-                start_seq,
-                now,
-            )
-            .await?;
-            Self::insert_thread_events_outbox_row_tx(
-                &mut tx,
-                &committed,
-                DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
-                now,
-            )
-            .await?;
-            committed
-        };
+        let mut committed =
+            Self::commit_parent_events_tx(&mut tx, &new_parent.thread_id, boundary_events, now)
+                .await?;
         committed.extend(
             Self::insert_spawn_started_events_tx(
                 &mut tx,
@@ -4733,6 +4739,10 @@ impl AgentTaskStore for SqliteDurableStore {
                 now,
             )
             .await?,
+        );
+        committed.extend(
+            Self::commit_parent_events_tx(&mut tx, &new_parent.thread_id, trailing_events, now)
+                .await?,
         );
         Self::complete_injections_tx(&mut tx, &delivered_injection_ids, now).await?;
         tx.commit().await.context("commit spawn_mixed_children")?;

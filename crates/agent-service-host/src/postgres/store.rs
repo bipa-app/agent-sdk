@@ -5551,6 +5551,7 @@ FOR UPDATE SKIP LOCKED
         let MixedChildrenSpawn {
             delivered_injection_ids,
             boundary_events,
+            trailing_events,
             subagents,
             tool_children,
             reattach,
@@ -5640,6 +5641,10 @@ FOR UPDATE SKIP LOCKED
                 now,
             )
             .await?,
+        );
+        committed.extend(
+            Self::commit_boundary_events_tx(&mut tx, &new_parent.thread_id, trailing_events, now)
+                .await?,
         );
         Self::complete_injections_tx(&mut tx, &delivered_injection_ids, now).await?;
         tx.commit().await.context("commit spawn_mixed_children")?;

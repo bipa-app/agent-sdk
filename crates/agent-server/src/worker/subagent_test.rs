@@ -1640,6 +1640,7 @@ async fn spawn_mixed_creates_subagents_and_tool_children_under_one_parent() -> R
         MixedChildrenRequest {
             delivered_injection_ids: Vec::new(),
             boundary_events: Vec::new(),
+            trailing_events: Vec::new(),
             subagents: mixed_subagent_entries(&tasks)?,
             tool_children: mixed_tool_children(tasks.len(), 3)?,
             reattach: Vec::new(),
@@ -1729,6 +1730,7 @@ async fn spawn_mixed_reports_short_committed_event_batch_without_panicking() -> 
         MixedChildrenRequest {
             delivered_injection_ids: Vec::new(),
             boundary_events: vec![AgentEvent::text("boundary", "boundary")],
+            trailing_events: Vec::new(),
             subagents: mixed_subagent_entries(&tasks)?,
             tool_children: mixed_tool_children(tasks.len(), 2)?,
             reattach: Vec::new(),
@@ -1776,11 +1778,12 @@ async fn assemble_mixed_batch_rejects_short_committed_event_batch() -> Result<()
         },
         Vec::new(),
         0,
-        1,
+        (1, 0),
     )
     .expect_err("short committed-event batch must return an error");
     assert!(
-        error_text(&error).contains("returned 0 committed events for 1 boundary events"),
+        error_text(&error)
+            .contains("returned 0 committed events for 1 boundary and 0 trailing events"),
         "unexpected error: {error:#}",
     );
     Ok(())
@@ -1805,6 +1808,7 @@ async fn spawn_mixed_rejects_losing_cas_without_partial_spawn() -> Result<()> {
         MixedChildrenRequest {
             delivered_injection_ids: Vec::new(),
             boundary_events: Vec::new(),
+            trailing_events: Vec::new(),
             subagents: mixed_subagent_entries(&tasks)?,
             tool_children: mixed_tool_children(tasks.len(), 2)?,
             reattach: Vec::new(),
@@ -1857,6 +1861,7 @@ async fn spawn_mixed_rejects_uncovered_pending_tool_call() -> Result<()> {
         MixedChildrenRequest {
             delivered_injection_ids: Vec::new(),
             boundary_events: Vec::new(),
+            trailing_events: Vec::new(),
             subagents: mixed_subagent_entries(&tasks)?,
             tool_children: mixed_tool_children(tasks.len(), 2)?,
             reattach: Vec::new(),
@@ -1915,6 +1920,7 @@ async fn spawn_mixed_rejects_bad_tool_slot_without_orphaning_child_threads() -> 
         MixedChildrenRequest {
             delivered_injection_ids: Vec::new(),
             boundary_events: Vec::new(),
+            trailing_events: Vec::new(),
             subagents,
             tool_children: vec![ToolChildSpawn {
                 spawn_index: 7, // out of range — only 2 pending tool calls
@@ -1988,6 +1994,7 @@ async fn spawn_mixed_records_child_ids_in_slot_order_when_interleaved() -> Resul
         MixedChildrenRequest {
             delivered_injection_ids: Vec::new(),
             boundary_events: Vec::new(),
+            trailing_events: Vec::new(),
             subagents,
             tool_children: vec![ToolChildSpawn {
                 spawn_index: 0,
@@ -2136,6 +2143,7 @@ async fn spawn_mixed_rejects_duplicate_child_thread_without_orphaning_projection
         MixedChildrenRequest {
             delivered_injection_ids: Vec::new(),
             boundary_events: Vec::new(),
+            trailing_events: Vec::new(),
             subagents,
             tool_children: mixed_tool_children(tasks.len(), 3)?,
             reattach: Vec::new(),
