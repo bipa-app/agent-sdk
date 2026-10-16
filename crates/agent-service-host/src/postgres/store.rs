@@ -3206,11 +3206,13 @@ FOR UPDATE
             .ok_or_else(|| anyhow!("spawn rejected: task {} does not exist", params.parent_id))?;
         Self::lock_thread_tx(&mut tx, &screened_parent.thread_id)
             .await?
-            .with_context(|| format!("thread {} missing", screened_parent.thread_id))?;
+            .with_context(|| format!("thread {} missing", screened_parent.thread_id))?
+            .require_active(ThreadOperation::Spawn)?;
         Self::bootstrap_thread_row_tx(&mut tx, &params.spawn.child_thread_id, params.now).await?;
         let child_thread = Self::lock_thread_tx(&mut tx, &params.spawn.child_thread_id)
             .await?
             .context("spawned child thread missing after bootstrap")?;
+        child_thread.require_active(ThreadOperation::Spawn)?;
 
         let old_parent = Self::load_task_tx(&mut tx, &params.parent_id, true)
             .await?
@@ -3261,6 +3263,7 @@ FOR UPDATE
         Self::update_task_tx(&mut tx, &parent_task).await?;
         Self::insert_task_tx(&mut tx, &invocation).await?;
         Self::insert_task_tx(&mut tx, &child_root).await?;
+        Self::complete_injections_tx(&mut tx, &params.delivered_injection_ids, params.now).await?;
 
         agent_server::fail_point!("atomic_spawn.after_rows");
 

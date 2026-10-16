@@ -1,35 +1,41 @@
 //! Design §6.6: state changes go through the journal's transitions. Outside
 //! `journal/`, every textual call to a split write is counted per file and
 //! held to an allowlist that can only shrink.
+//!
+//! The counted methods are a subset of §6.6's write methods: `set_draft`,
+//! `replace_history`, `cancel_tree`, `complete_task` and `insert_batch` are
+//! called outside `journal/` today and are not counted yet.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 
+/// Store write methods whose calls are counted, in method-call, UFCS
+/// (`EventRepository::commit_event(repo, …)`) and bare-call form. A
+/// definition (`fn commit_event(`) and a transition constructor
+/// (`Transition::append_compaction(`) are not calls to the split write.
 const SPLIT_WRITES: &[&str] = &[
-    ".commit_event(",
-    ".commit_event_batch(",
-    "complete_task_with_result(",
-    ".fail_task(",
-    "fail_task_with_reason(",
-    "pause_on_confirmation(",
-    "reject_confirmation(",
-    "repark_after_steering(",
-    ".append_compaction(",
+    "commit_event",
+    "commit_event_batch",
+    "complete_task_with_result",
+    "fail_task",
+    "fail_task_with_reason",
+    "pause_on_confirmation",
+    "reject_confirmation",
+    "repark_after_steering",
+    "append_compaction",
 ];
-
 /// `(path relative to the crates directory, calls)`. Streaming
 /// `TextDelta` / `ThinkingDelta` commits and other events that record no
 /// state change are the legitimate bulk of these.
 const ALLOWED: &[(&str, usize)] = &[
     ("agent-server/src/worker/activity.rs", 2),
-    ("agent-server/src/worker/confirmation.rs", 2),
-    ("agent-server/src/worker/root_turn.rs", 9),
+    ("agent-server/src/worker/root_turn.rs", 7),
     ("agent-service-host/src/grpc.rs", 1),
     ("agent-service-host/src/host.rs", 4),
-    ("agent-service-host/src/postgres/store.rs", 9),
-    ("agent-service-host/src/sqlite/store.rs", 9),
+    ("agent-service-host/src/postgres/store.rs", 4),
+    ("agent-service-host/src/sqlite/store.rs", 4),
 ];
 
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -75,6 +81,21 @@ fn production_part(source: &str) -> &str {
     source
 }
 
+/// Calls of `method` in `source`: each `method(` not preceded by an
+/// identifier character, `fn ` or `Transition::`.
+fn call_count(source: &str, method: &str) -> usize {
+    let call = format!("{method}(");
+    source
+        .match_indices(&call)
+        .filter(|(at, _)| {
+            let before = &source[..*at];
+            !before.ends_with(|c: char| c.is_alphanumeric() || c == '_')
+                && !before.ends_with("fn ")
+                && !before.ends_with("Transition::")
+        })
+        .count()
+}
+
 fn split_write_counts() -> Result<BTreeMap<String, usize>> {
     let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -90,7 +111,7 @@ fn split_write_counts() -> Result<BTreeMap<String, usize>> {
         let production = production_part(&source);
         let calls: usize = SPLIT_WRITES
             .iter()
-            .map(|pattern| production.matches(pattern).count())
+            .map(|method| call_count(production, method))
             .sum();
         if calls > 0 {
             let relative = file

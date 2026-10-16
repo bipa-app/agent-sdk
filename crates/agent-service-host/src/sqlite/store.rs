@@ -2707,10 +2707,13 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
         let child_thread = Self::get_thread_tx(&mut tx, &params.spawn.child_thread_id)
             .await?
             .context("spawned child thread missing after bootstrap")?;
+        child_thread.require_active(ThreadOperation::Spawn)?;
 
         let old_parent = Self::load_task_tx(&mut tx, &params.parent_id)
             .await?
             .ok_or_else(|| anyhow!("spawn rejected: task {} does not exist", params.parent_id))?;
+        Self::require_active_thread_tx(&mut tx, &old_parent.thread_id, ThreadOperation::Spawn)
+            .await?;
         validate_subagent_spawn_parent(
             &old_parent,
             &params.parent_id,
@@ -2786,6 +2789,7 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
         Self::update_task_tx(&mut tx, &parent_task).await?;
         Self::insert_task_tx(&mut tx, &invocation).await?;
         Self::insert_task_tx(&mut tx, &child_root).await?;
+        Self::complete_injections_tx(&mut tx, &params.delivered_injection_ids, params.now).await?;
 
         agent_server::fail_point!("atomic_spawn.after_rows");
 

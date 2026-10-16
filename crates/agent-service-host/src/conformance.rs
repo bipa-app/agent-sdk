@@ -68,7 +68,6 @@ mod tests {
     use agent_server::journal::outbox_message::OutboxMessageKind;
     use agent_server::journal::recovery::{FailureReason, RecoveryAction};
     use agent_server::journal::store::{AgentTaskStore, QuestionPause, SubagentInvocationSpawn};
-    #[cfg(feature = "sqlite")]
     use agent_server::journal::subagent_spawn_transaction::{
         SubagentSpawnCommit, SubagentSpawnEvent,
     };
@@ -196,23 +195,33 @@ mod tests {
         store: &crate::sqlite::SqliteDurableStore,
         name: &str,
     ) -> Result<(AgentTaskId, WorkerId, LeaseId, SubagentInvocationSpawn)> {
+        prepare_spawn_parent(store, store, name).await
+    }
+
+    /// A running parent root on `{name}-parent`, leased, with a subagent
+    /// spawn onto `{name}-child` ready to commit.
+    async fn prepare_spawn_parent(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
+        name: &str,
+    ) -> Result<(AgentTaskId, WorkerId, LeaseId, SubagentInvocationSpawn)> {
         let parent_thread = thread_id(&format!("{name}-parent"));
-        ThreadStore::get_or_create(store, &parent_thread, t0()).await?;
+        thread_store.get_or_create(&parent_thread, t0()).await?;
         let parent = AgentTask::new_root_turn(parent_thread.clone(), t0(), 3);
         let parent_id = parent.id.clone();
-        AgentTaskStore::submit_root_turn(store, parent).await?;
+        task_store.submit_root_turn(parent).await?;
         let worker = WorkerId::new();
         let lease = LeaseId::new();
-        AgentTaskStore::try_acquire_task(
-            store,
-            &parent_id,
-            worker.clone(),
-            lease.clone(),
-            t_plus(600),
-            t_plus(1),
-        )
-        .await?
-        .context("atomic spawn parent must acquire")?;
+        task_store
+            .try_acquire_task(
+                &parent_id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(600),
+                t_plus(1),
+            )
+            .await?
+            .context("atomic spawn parent must acquire")?;
         let spawn = SubagentInvocationSpawn {
             child_thread_id: thread_id(&format!("{name}-child")),
             spec: sample_subagent_spec(),
@@ -222,6 +231,141 @@ mod tests {
             payload: suspension_payload(&parent_thread.0),
         };
         Ok((parent_id, worker, lease, spawn))
+    }
+
+    fn spawn_commit(
+        parent_id: AgentTaskId,
+        worker: WorkerId,
+        lease: LeaseId,
+        spawn: SubagentInvocationSpawn,
+        delivered_injection_ids: Vec<AgentTaskId>,
+    ) -> SubagentSpawnCommit {
+        SubagentSpawnCommit {
+            delivered_injection_ids,
+            parent_id,
+            worker,
+            lease,
+            spawn,
+            event: SubagentSpawnEvent {
+                subagent_id: "call-1".into(),
+                subagent_name: "explore".into(),
+            },
+            outbox_max_attempts: 3,
+            now: t_plus(5),
+        }
+    }
+
+    /// A subagent spawn that delivers a queued boundary injection completes
+    /// it in the same unit, so the resumed parent never drains it again.
+    async fn test_subagent_spawn_completes_delivered_injections(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
+    ) -> Result<()> {
+        use agent_server::journal::store::{SubmitDisposition, SubmitRootTurnParams};
+        use agent_server::journal::task::TaskKind;
+
+        let (parent_id, worker, lease, spawn) =
+            prepare_spawn_parent(task_store, thread_store, "spawn-injection").await?;
+        let injection = task_store
+            .submit_root_turn_idempotent(SubmitRootTurnParams {
+                task: AgentTask::new_root_turn_with_input(
+                    thread_id("spawn-injection-parent"),
+                    vec![SubmittedInputItem::Text {
+                        text: "steer".into(),
+                    }],
+                    t_plus(2),
+                    3,
+                ),
+                idempotency: None,
+                max_queued_depth: None,
+                disposition: SubmitDisposition::InjectAtBoundary,
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("submit boundary injection: {error}"))?
+            .task;
+        assert_eq!(injection.kind, TaskKind::InputInjection);
+        assert_eq!(injection.status, TaskStatus::Queued);
+
+        task_store
+            .commit_subagent_spawn(spawn_commit(
+                parent_id,
+                worker,
+                lease,
+                spawn,
+                vec![injection.id.clone()],
+            ))
+            .await?;
+        let after = task_store
+            .get(&injection.id)
+            .await?
+            .context("injection row")?;
+        assert_eq!(
+            after.status,
+            TaskStatus::Completed,
+            "the spawn that delivered the injection completes it",
+        );
+        Ok(())
+    }
+
+    /// A subagent spawn onto a parent thread, or a child thread, that is
+    /// being purged is refused and writes nothing.
+    async fn test_subagent_spawn_is_fenced_by_a_purge(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
+    ) -> Result<()> {
+        use agent_server::journal::thread::{PurgeScope, PurgeSeed};
+
+        for fenced in ["parent", "child"] {
+            let name = format!("spawn-fence-{fenced}");
+            let (parent_id, worker, lease, spawn) =
+                prepare_spawn_parent(task_store, thread_store, &name).await?;
+            let child_thread = spawn.child_thread_id.clone();
+            let purged = thread_id(&format!("{name}-{fenced}"));
+            thread_store.get_or_create(&purged, t_plus(2)).await?;
+            thread_store
+                .begin_purge(
+                    &purged,
+                    PurgeSeed {
+                        root_thread_id: purged.clone(),
+                        scope: PurgeScope::Thread,
+                        started_at: t_plus(3),
+                    },
+                )
+                .await?;
+
+            let error = task_store
+                .commit_subagent_spawn(spawn_commit(
+                    parent_id.clone(),
+                    worker,
+                    lease,
+                    spawn,
+                    Vec::new(),
+                ))
+                .await
+                .err()
+                .with_context(|| {
+                    format!("a spawn onto a purging {fenced} thread must be refused")
+                })?;
+            assert!(
+                format!("{error:#}").contains("spawn is fenced"),
+                "{fenced}: expected the purge fence, got: {error:#}",
+            );
+            let parent = task_store.get(&parent_id).await?.context("parent")?;
+            assert_eq!(
+                parent.status,
+                TaskStatus::Running,
+                "{fenced}: parent unchanged"
+            );
+            assert!(
+                task_store.list_by_thread(&child_thread).await?.is_empty(),
+                "{fenced}: no child task",
+            );
+            assert!(
+                task_store.list_children(&parent_id).await?.is_empty(),
+                "{fenced}: no invocation",
+            );
+        }
+        Ok(())
     }
 
     /// Build a parent root → subagent invocation → child-thread root tree.
@@ -3820,6 +3964,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_subagent_spawn_completes_delivered_injections() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_subagent_spawn_completes_delivered_injections(s.task.as_ref(), s.thread.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_subagent_spawn_is_fenced_by_a_purge() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_subagent_spawn_is_fenced_by_a_purge(s.task.as_ref(), s.thread.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_lease_expiry() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_lease_expiry_sweep(s.task.as_ref()).await
@@ -4243,6 +4399,20 @@ mod tests {
     async fn conformance_sqlite_requeue_owned_task() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_requeue_owned_task(&store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_subagent_spawn_completes_delivered_injections() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_subagent_spawn_completes_delivered_injections(&store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_subagent_spawn_is_fenced_by_a_purge() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_subagent_spawn_is_fenced_by_a_purge(&store, &store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -4875,6 +5045,24 @@ mod tests {
             &store, &store, &store, &store, &store, &store,
         )
         .await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_subagent_spawn_completes_delivered_injections() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_subagent_spawn_completes_delivered_injections(&store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_subagent_spawn_is_fenced_by_a_purge() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_subagent_spawn_is_fenced_by_a_purge(&store, &store).await
     }
 
     #[cfg(feature = "postgres")]

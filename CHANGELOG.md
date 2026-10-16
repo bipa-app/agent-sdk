@@ -112,6 +112,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     stores it exposes.
   - An in-memory thread creation and fork now write the advisory row the
     durable backends write.
+  - The SQLite and Postgres `commit_subagent_spawn` now complete the
+    delivered boundary injections and refuse a spawn onto a parent or child
+    thread being purged, as the fallback and the in-memory store did.
 - The `INTERNAL` answer for an approval that lands before its tool starts now
   says the confirmation is asked again when the task's lease expires.
 - **Breaking: sites 6, 7 and 9 commit their state and events together.**
