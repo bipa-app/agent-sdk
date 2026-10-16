@@ -6388,13 +6388,8 @@ mod tests {
         Ok(())
     }
 
-    /// A `DecideConfirmation` retried under a `request_id` whose earlier
-    /// attempt reserved the key and stopped before it recorded a result
-    /// runs the decision: the child leaves the parked state, and the key
-    /// is recorded, so the next retry replays.
-    #[tokio::test]
-    async fn a_decision_on_an_unrecorded_request_id_runs_again() -> Result<()> {
-        let transfer_tool = Tool {
+    fn confirm_transfer_tool() -> Tool {
+        Tool {
             name: "transfer".into(),
             description: "Transfer funds".into(),
             input_schema: json!({
@@ -6406,9 +6401,17 @@ mod tests {
             tier: ToolTier::Confirm,
             concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
             replay: agent_sdk_foundation::ToolReplay::Unsafe,
-        };
+        }
+    }
+
+    /// A `DecideConfirmation` retried under a `request_id` whose earlier
+    /// attempt reserved the key and stopped before it recorded a result
+    /// runs the decision: the child leaves the parked state, and the key
+    /// is recorded, so the next retry replays.
+    #[tokio::test]
+    async fn a_decision_on_an_unrecorded_request_id_runs_again() -> Result<()> {
         let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(vec![
-            transfer_tool,
+            confirm_transfer_tool(),
         ])));
         let runtime = runtime_with(
             Arc::new(ScriptedProvider::new(vec![
@@ -7745,7 +7748,7 @@ mod tests {
     /// Without a caller-named destination, an unrecorded key is refused:
     /// the earlier attempt may have created a thread whose id the caller
     /// never learned. Nothing is created, and the answer says to retry with
-    /// the same request_id.
+    /// the same `request_id`.
     #[tokio::test]
     async fn an_unrecorded_anonymous_fork_or_create_is_refused_without_a_new_thread() -> Result<()>
     {
