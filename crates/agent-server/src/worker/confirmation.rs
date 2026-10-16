@@ -170,7 +170,7 @@ pub trait ConfirmationPolicy: Send + Sync {
 /// Outcome of [`apply_confirmation_decision`].
 #[derive(Debug)]
 pub enum ConfirmationDecisionOutcome {
-    /// User approved. Child is now [`TaskStatus::Pending`](crate::journal::task::TaskStatus::Pending) and will
+    /// User approved. Child is now [`TaskStatus::Pending`] and will
     /// be re-acquired by a worker for policy recheck + execution.
     ///
     /// `prepared_operation` is the listen/execute context that was
@@ -181,13 +181,13 @@ pub enum ConfirmationDecisionOutcome {
         child: AgentTask,
         prepared_operation: Option<ListenExecutionContext>,
     },
-    /// User rejected. Child is now [`TaskStatus::Failed`](crate::journal::task::TaskStatus::Failed).
+    /// User rejected. Child is now [`TaskStatus::Failed`].
     Rejected {
         child: AgentTask,
         parent: Option<AgentTask>,
         reason: String,
     },
-    /// Confirmation timed out. Child is now [`TaskStatus::Failed`](crate::journal::task::TaskStatus::Failed).
+    /// Confirmation timed out. Child is now [`TaskStatus::Failed`].
     TimedOut {
         child: AgentTask,
         parent: Option<AgentTask>,
@@ -204,7 +204,7 @@ pub enum ConfirmationResumeOutcome {
     /// Tool executed after approval and policy recheck.
     Executed(ToolTaskOutcome),
     /// Policy denied execution despite user approval. Child is
-    /// now [`TaskStatus::Failed`](crate::journal::task::TaskStatus::Failed).
+    /// now [`TaskStatus::Failed`].
     PolicyDenied {
         child: AgentTask,
         parent: Option<AgentTask>,
@@ -224,10 +224,10 @@ pub enum ConfirmationResumeOutcome {
 ///
 /// # Preconditions
 ///
-/// - `bootstrap.child_task` must be in [`TaskStatus::Running`](crate::journal::task::TaskStatus::Running).
+/// - `bootstrap.child_task` must be in [`TaskStatus::Running`].
 /// - `bootstrap.child_task.kind` must be [`TaskKind::ToolRuntime`].
 /// - The parent task must carry a continuation (it should, since it
-///   is in [`TaskStatus::WaitingOnChildren`](crate::journal::task::TaskStatus::WaitingOnChildren)).
+///   is in [`TaskStatus::WaitingOnChildren`]).
 ///
 /// # Errors
 ///
@@ -304,7 +304,7 @@ pub async fn pause_tool_for_confirmation(
 /// then:
 ///
 /// - **Approved**: extracts the prepared operation, resumes the child
-///   to [`TaskStatus::Pending`](crate::journal::task::TaskStatus::Pending) via
+///   to [`TaskStatus::Pending`] via
 ///   [`AgentTaskStore::resume_from_confirmation`], and returns the
 ///   extracted prepared operation so the caller can pass it to the
 ///   worker on re-acquisition.
@@ -325,7 +325,7 @@ pub async fn pause_tool_for_confirmation(
 /// # Errors
 ///
 /// Returns an error if the child does not exist, is not in
-/// [`TaskStatus::AwaitingConfirmation`](crate::journal::task::TaskStatus::AwaitingConfirmation), or if the store transition
+/// [`TaskStatus::AwaitingConfirmation`], or if the store transition
 /// fails. The closing `ToolCallEnd` commit is best-effort (logged on
 /// failure) — the child is already durably failed by then, so an event
 /// commit blip must not override that outcome.
@@ -419,39 +419,36 @@ async fn reject_with_tool_call_end(
     error: String,
     now: OffsetDateTime,
 ) -> anyhow::Result<(AgentTask, Option<AgentTask>)> {
-    let transition = match tool_call {
-        Some((thread_id, tool_call)) => {
-            let end_event = AgentEvent::tool_call_end(
-                &tool_call.id,
-                &tool_call.name,
-                &tool_call.display_name,
-                ToolResult {
-                    success: false,
-                    output: error.clone(),
-                    artifact: None,
-                    data: None,
-                    documents: Vec::new(),
-                    duration_ms: None,
-                },
-            );
-            Transition::reject_confirmation(child_id.clone(), error, thread_id, vec![end_event])
-        }
-        None => {
-            log::warn!(
-                "rejecting confirmation of {child_id} without a ToolCallEnd: no pending tool call \
+    let transition = if let Some((thread_id, tool_call)) = tool_call {
+        let end_event = AgentEvent::tool_call_end(
+            &tool_call.id,
+            &tool_call.name,
+            &tool_call.display_name,
+            ToolResult {
+                success: false,
+                output: error.clone(),
+                artifact: None,
+                data: None,
+                documents: Vec::new(),
+                duration_ms: None,
+            },
+        );
+        Transition::reject_confirmation(child_id.clone(), error, thread_id, vec![end_event])
+    } else {
+        log::warn!(
+            "rejecting confirmation of {child_id} without a ToolCallEnd: no pending tool call \
                  is readable"
-            );
-            Transition {
-                guards: vec![Guard::TaskIs {
-                    task: child_id.clone(),
-                    status: TaskStatus::AwaitingConfirmation,
-                    lease: None,
-                }],
-                writes: vec![Write::RejectConfirmation {
-                    task: child_id.clone(),
-                    error,
-                }],
-            }
+        );
+        Transition {
+            guards: vec![Guard::TaskIs {
+                task: child_id.clone(),
+                status: TaskStatus::AwaitingConfirmation,
+                lease: None,
+            }],
+            writes: vec![Write::RejectConfirmation {
+                task: child_id.clone(),
+                error,
+            }],
         }
     };
     let committed = task_store
@@ -488,10 +485,10 @@ async fn reject_with_tool_call_end(
 /// # Preconditions
 ///
 /// - `bootstrap` must be a valid [`ToolTaskBootstrap`] for a
-///   [`TaskStatus::Running`](crate::journal::task::TaskStatus::Running) child (i.e. the child was re-acquired
-///   after the approval resumed it to [`TaskStatus::Pending`](crate::journal::task::TaskStatus::Pending)).
+///   [`TaskStatus::Running`] child (i.e. the child was re-acquired
+///   after the approval resumed it to [`TaskStatus::Pending`]).
 /// - The caller must have verified that the child was previously in
-///   [`TaskStatus::AwaitingConfirmation`](crate::journal::task::TaskStatus::AwaitingConfirmation) and was approved. This
+///   [`TaskStatus::AwaitingConfirmation`] and was approved. This
 ///   function does not re-read the confirmation decision.
 ///
 /// # Errors

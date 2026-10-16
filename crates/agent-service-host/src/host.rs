@@ -8232,15 +8232,19 @@ mod tests {
              the executor and backdates the row by the whole execution",
         );
 
-        let settled = stores
-            .task_store
-            .get(&tool_child.id)
-            .await?
-            .context("tool child")?;
+        assert_failed_with_one_closed_call(&stores, &tool_child.id, &child_root.thread_id).await
+    }
+
+    async fn assert_failed_with_one_closed_call(
+        stores: &StoreRegistry,
+        child: &agent_server::AgentTaskId,
+        thread: &agent_sdk_foundation::ThreadId,
+    ) -> Result<()> {
+        let settled = stores.task_store.get(child).await?.context("tool child")?;
         assert_eq!(settled.status, agent_server::TaskStatus::Failed);
         let ends: Vec<_> = stores
             .event_repo
-            .get_events(&child_root.thread_id)
+            .get_events(thread)
             .await?
             .into_iter()
             .filter_map(|event| {

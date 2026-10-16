@@ -380,14 +380,14 @@ async fn policy_denial_failpoint_keeps_the_child_running_without_its_tool_call_e
         event_repo: &store,
     };
     let _scenario = fail::FailScenario::setup();
-    crash_in_transition(agent_server::worker::resume_confirmed_tool(
+    crash_in_transition(Box::pin(agent_server::worker::resume_confirmed_tool(
         bootstrap,
         &deps,
         &DenyAll,
         &CancellationToken::new(),
         |_call, _collector| async { Ok(ToolResult::success("must not run")) },
         at(15),
-    ))
+    )))
     .await?;
     assert_unchanged(&store, &child, TaskStatus::Running).await
 }
